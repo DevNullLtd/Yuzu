@@ -283,6 +283,14 @@ def render_installer(platform, *extra, visudo=None):
             with open(os.path.join(d, "visudo"), "w") as f:
                 f.write("#!/bin/sh\n" + visudo + "\n")
             os.chmod(os.path.join(d, "visudo"), 0o755)
+        # The dry run says what it would find in the helper directory, with the stat form of the SIMULATED
+        # platform, which this host's stat may not speak (GNU `-f` is a different mode, BSD has no `-c`): answer
+        # the owner-and-mode read of either form with a directory the verdict accepts, and leave every other
+        # stat call to the real one.
+        stat = os.path.join(d, "stat")
+        with open(stat, "w") as f:
+            f.write('#!/bin/sh\ncase "$1 $2" in "-L -c" | "-L -f") echo "0 755 root"; exit 0 ;; esac\nexec /usr/bin/stat "$@"\n')
+        os.chmod(stat, 0o755)
         env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""))
         r = subprocess.run(["bash", os.path.join(REPO, INSTALLER), "--dry-run", *extra],
                            capture_output=True, text=True, timeout=60, env=env)
@@ -1770,6 +1778,101 @@ class InstallerDryRun(unittest.TestCase):
             self.assertIn("[dry-run]   %s ALL=(root) NOPASSWD: %s\n" % (acct, fw), out, platform)
             self.assertIn("[dry-run]   %s ALL=(root) NOPASSWD: %s\n" % (acct, svc), out, platform)
             self.assertNotRegex(out, r"NOPASSWD: /usr/sbin/ip6?tables", platform)
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the installer under bash")
+class InstallerDryRunHelperDirectory(unittest.TestCase):
+    """`--dry-run` says what the real run would find in the helper directory and fails as it would: a
+    directory that would be refused prints the verdict and ends the dry run non-zero, ok and warn end it 0,
+    and an absent directory says it would be created. The installer is run from a copy with the account
+    steps stubbed and the helper paths pointed into a temporary directory (the real host's own
+    directories are never judged here), so the verdict is the one the stubbed owner and mode give."""
+
+    BASH = "/bin/bash" if os.path.exists("/bin/bash") else "bash"
+    ANCHOR = 'case "$ACTION" in\n    install)\n'
+    MARK = "# yuzu-test-splice"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = read_text(INSTALLER)
+        assert cls.text is not None and cls.text.count(cls.ANCHOR) == 1, "the install dispatch moved"
+
+    def dry_run(self, d, helper_dir, dir_info=None):
+        stub = "\n".join([
+            self.MARK,
+            "require_root() { :; }",
+            "macos_create_user() { :; }",
+            "linux_user_exists() { return 0; }",
+            "create_state_dirs() { :; }",
+            "strip_file_capabilities() { :; }",
+            "SUDOERS_FILE='%s'" % os.path.join(d, "yuzu-agent"),
+            "FW_HELPER_PATH='%s'" % os.path.join(helper_dir, "yuzu-fw-helper"),
+            "SVC_HELPER_PATH='%s'" % os.path.join(helper_dir, "yuzu-svc-helper"),
+            "" if dir_info is None else "dir_info() { echo '%s'; }" % dir_info,
+            "",
+        ])
+        spliced = self.text.replace(self.ANCHOR, stub + self.ANCHOR, 1)
+        self.assertEqual(spliced.count(self.MARK), 1)   # an unspliced copy is the real installer: never run it
+        script = os.path.join(d, "install.sh")
+        with open(script, "w") as f:
+            f.write(spliced)
+        r = subprocess.run([self.BASH, script, "--dry-run"], capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout, r.stderr
+
+    def test_a_refused_directory_prints_the_verdict_and_fails_the_dry_run(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+            helper_dir = os.path.join(d, "helpers")
+            os.mkdir(helper_dir)
+            # an owner that is not root and a world-writable mode: anyone could replace the helper
+            rc, out, err = self.dry_run(d, helper_dir, dir_info="501 777 staff")
+            self.assertNotEqual(rc, 0, (out, err))
+            self.assertIn("[dry-run] helper directory %s: would be refused\n" % helper_dir, out)
+            self.assertIn("must live in a directory owned by root", err)
+            self.assertNotIn("would write the following to %s" % os.path.join(helper_dir, "yuzu-fw-helper"), out)
+            self.assertEqual(os.listdir(helper_dir), [], "a dry run writes nothing")
+
+    def test_a_real_world_writable_directory_is_refused_as_it_is_without_a_stub(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+            helper_dir = os.path.join(d, "helpers")
+            os.mkdir(helper_dir)
+            os.chmod(helper_dir, 0o777)
+            rc, out, err = self.dry_run(d, helper_dir)
+            self.assertNotEqual(rc, 0, (out, err))
+            self.assertIn("[dry-run] helper directory %s: would be refused\n" % helper_dir, out)
+
+    def test_ok_and_warn_end_the_dry_run_zero_and_print_the_helpers(self):
+        for verdict, info in (("ok", "0 755 root"), ("warn", "0 775 staff")):
+            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+                helper_dir = os.path.join(d, "helpers")
+                os.mkdir(helper_dir)
+                rc, out, err = self.dry_run(d, helper_dir, dir_info=info)
+                self.assertEqual(rc, 0, (out, err))
+                self.assertIn("[dry-run] helper directory %s: %s\n" % (helper_dir, verdict), out)
+                self.assertIn("would write the following to %s" % os.path.join(helper_dir, "yuzu-fw-helper"), out)
+                self.assertIn("would write the following to %s" % os.path.join(helper_dir, "yuzu-svc-helper"), out)
+                self.assertEqual(os.listdir(helper_dir), [], "a dry run writes nothing")
+                if verdict == "warn":
+                    self.assertIn("writable by group staff", err)
+
+    def test_an_absent_directory_says_it_would_be_created(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+            helper_dir = os.path.join(d, "not-yet")
+            rc, out, err = self.dry_run(d, helper_dir)
+            self.assertEqual(rc, 0, (out, err))
+            self.assertRegex(out, r"\[dry-run\] helper directory %s: would be created root:(root|wheel) 0755\n"
+                             % re.escape(helper_dir))
+            self.assertFalse(os.path.exists(helper_dir), "a dry run creates nothing")
+
+    def test_the_verdict_line_is_not_part_of_the_helper_text_the_render_reads(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+            helper_dir = os.path.join(d, "helpers")
+            os.mkdir(helper_dir)
+            rc, out, err = self.dry_run(d, helper_dir, dir_info="0 755 root")
+            self.assertEqual(rc, 0, (out, err))
+            self.assertNotIn("[dry-run]   helper directory", out)   # one space: not a line of the `[dry-run]   ` block
+            prefix = "[dry-run] would write the following to %s (root:" % os.path.join(helper_dir, "yuzu-fw-helper")
+            marker = next(l for l in out.splitlines() if l.startswith(prefix))
+            self.assertEqual(rendered_section(out, marker), helper_text())
 
 
 @unittest.skipIf(sys.platform == "win32", "runs the installer under bash")

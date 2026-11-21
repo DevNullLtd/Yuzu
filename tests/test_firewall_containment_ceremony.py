@@ -11,14 +11,24 @@ host by full hostname, the 300 s limit floor (0 and negative refused in apply mo
 exiting 2, a host the apply found already contained is never released, and a pass needs a release of
 this run's own that succeeded and undid something (otherwise exit 1, "release unproven"). A held run lock
 exits 2 with nothing dispatched, and a poll's error answer is reported, never swallowed.
+
+Also pinned (FW0.2): the run lock tells an open failure from a held lock; the remote mode (--remote,
+--agent-hostname, --i-have-console-access-to-the-agent: the usage rules, the binding to a named agent that is
+not this machine, no local install check, no SSH refusal, the same lock, floor, retries and reads); a
+`refused|self_host` apply answer exits 2 with the one-host message and no release; the loopback refusal and
+--help name that outcome and --remote; and the #7860 items: a status read that sits RUNNING and unchanged ends
+early, a refused dispatch is `dispatch refused` (exit 1) and never RELEASE NOT CONFIRMED, and --record writes a
+0600 pass or fail record on every exit path and refuses a symlink.
 """
 import contextlib
 import io
+import json
 import os
 import platform
 import signal
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -31,7 +41,8 @@ import instructions_firewall_containment as fc  # noqa: E402
 
 def args(**kw):
     base = dict(dashboard="http://127.0.0.1:9", user="a", password="", agent_id="", exceptions="127.0.0.1",
-                apply_containment=False, i_have_console_access=False)
+                apply_containment=False, i_have_console_access=False, remote=False, agent_hostname="",
+                i_have_console_access_to_agent=False, record="")
     base.update(kw)
     return type("A", (), base)()
 
@@ -280,13 +291,12 @@ class Local(unittest.TestCase):
             self.assertFalse(fc.dashboard_is_local(bad), bad)
 
 
-@unittest.skipUnless(hasattr(signal, "SIGHUP"), "the ceremony is POSIX-only")
-class Flow(unittest.TestCase):
+class FlowHarness:
     """main() against a recording fake of the dispatch seam. `script` maps an action to the list of replies
-    (or exceptions) it answers with, in order."""
+    (or exceptions) it answers with, in order. A mixin: the cases are in Flow and the FW0.2 classes below."""
 
     def run_main(self, script, apply=True, extra=(), dashboard="http://127.0.0.1:9", agent=True, client=None,
-                 lock=None):
+                 lock=None, install=None):
         # a per-process lock file: concurrent jobs on one CI box must not share the run lock
         if lock is None:
             lock = os.path.join(fc.tempfile.gettempdir(), f"yuzu_test_fwc_run_{os.getpid()}.lock")
@@ -307,8 +317,9 @@ class Flow(unittest.TestCase):
 
         argv = ["--dashboard", dashboard] + (["--agent-id", "a"] if agent else []) + \
                (["--apply-containment"] if apply else []) + list(extra)
+        self.install = install if install is not None else mock.MagicMock(return_value=(0, ""))
         with mock.patch.object(fc, "refusal", return_value=None), \
-                mock.patch.object(fc, "install_check", return_value=(0, "")), \
+                mock.patch.object(fc, "install_check", self.install), \
                 mock.patch.object(fc, "Client", return_value=client), \
                 mock.patch.object(fc, "this_host_names", return_value=["box"]), \
                 mock.patch.object(fc, "this_host_os", return_value="linux"), \
@@ -317,6 +328,9 @@ class Flow(unittest.TestCase):
                 mock.patch.object(fc, "dispatch", side_effect=fake):
             return fc.main(argv), calls
 
+
+@unittest.skipUnless(hasattr(signal, "SIGHUP"), "the ceremony is POSIX-only")
+class Flow(FlowHarness, unittest.TestCase):
     def test_probe_requires_an_agent_answer(self):
         rc, calls = self.run_main({"quarantine_status": [EMPTY]}, apply=False)
         self.assertEqual(rc, fc.EXIT_PRECONDITION)
@@ -717,6 +731,533 @@ class Flow(unittest.TestCase):
                                    "release": [lambda _c: signal.raise_signal(signal.SIGTERM) or REL]})
         self.assertEqual(rc, fc.EXIT_FAIL)
         self.assertEqual(calls[-2:], ["release", "quarantine_status"])
+
+
+# ── FW0.2: the run lock, the remote mode, the self-host answer, #7860 ───────────────────────────────
+
+SELF_HOST = {"responses": [{"agent_id": "a", "status": 2, "output": "status|refused|self_host\nrefused|self_host"}]}
+REMOTE_HOST = "agent-box.example"
+REMOTE_CLIENT_AGENTS = {"agents": [{"agent_id": "a", "hostname": "Agent-Box.example", "os": "windows"}]}
+REMOTE_FLAGS = ["--remote", "--agent-hostname", REMOTE_HOST, "--i-have-console-access-to-the-agent"]
+OFF_HOST = "http://192.0.2.7:8080"   # a server on another host: not loopback
+
+
+def remote_client(agents=None):
+    client = mock.MagicMock()
+    client.login.return_value = agents if agents is not None else REMOTE_CLIENT_AGENTS
+    return client
+
+
+@unittest.skipUnless(hasattr(signal, "SIGHUP"), "the ceremony is POSIX-only")
+class RunLock(unittest.TestCase):
+    """The lock tells a file it could not open from a lock another run holds: two different faults."""
+
+    def harness(self):
+        """A FlowHarness bound to this case (its addCleanup), for run_main."""
+        outer = self
+
+        class Bound(FlowHarness):
+            def addCleanup(self, *a, **kw):
+                return outer.addCleanup(*a, **kw)
+        return Bound()
+
+    def lock_path(self, name):
+        path = os.path.join(fc.tempfile.gettempdir(), f"yuzu_test_fwc_{name}_{os.getpid()}.lock")
+        self.addCleanup(lambda: Path(path).unlink(missing_ok=True))
+        return path
+
+    def test_a_free_lock_is_taken_and_a_held_one_is_reported_held(self):
+        path = self.lock_path("take")
+        with mock.patch.object(fc, "LOCK_PATH", path):
+            fd, reason, error = fc.take_run_lock()
+            self.assertIsNotNone(fd)
+            self.assertEqual((reason, error), (None, ""))
+            try:
+                fd2, reason2, error2 = fc.take_run_lock()
+                self.assertIsNone(fd2)
+                self.assertEqual((reason2, error2), ("held", ""))
+            finally:
+                os.close(fd)
+
+    def test_a_lock_file_that_cannot_be_opened_is_not_reported_as_held(self):
+        missing = os.path.join(fc.tempfile.gettempdir(), f"yuzu_test_fwc_nodir_{os.getpid()}", "x.lock")
+        with mock.patch.object(fc, "LOCK_PATH", missing):
+            fd, reason, error = fc.take_run_lock()
+        self.assertIsNone(fd)
+        self.assertEqual(reason, "open_failed")
+        self.assertTrue(error)   # the operating system's own reason
+
+    def test_main_names_each_fault_and_dispatches_nothing_in_either(self):
+        flow = self.harness()
+        missing = os.path.join(fc.tempfile.gettempdir(), f"yuzu_test_fwc_nodir_{os.getpid()}", "x.lock")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, calls = flow.run_main({"quarantine_status": [row("inactive")]}, lock=missing)
+        self.assertEqual((rc, calls), (fc.EXIT_PRECONDITION, []))
+        self.assertIn("could not open the run lock", err.getvalue())
+        self.assertNotIn("another containment run", err.getvalue())
+
+        held = self.lock_path("held")
+        holder = os.open(held, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fc.fcntl.flock(holder, fc.fcntl.LOCK_EX | fc.fcntl.LOCK_NB)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc, calls = flow.run_main({"quarantine_status": [row("inactive")]}, lock=held)
+            self.assertEqual((rc, calls), (fc.EXIT_PRECONDITION, []))
+            self.assertIn("another containment run", err.getvalue())
+            self.assertNotIn("could not open the run lock", err.getvalue())
+        finally:
+            os.close(holder)
+
+    def test_the_docstring_and_help_say_where_the_lock_lives(self):
+        r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, timeout=60)
+        for text in (fc.__doc__, fc.take_run_lock.__doc__, " ".join(r.stdout.split())):
+            self.assertIn("per user", text)
+            self.assertIn("another user created", text)
+
+
+class Usage(unittest.TestCase):
+    def test_the_remote_only_flags_without_remote_are_a_usage_error(self):
+        with on("Linux"):
+            for extra in ({"agent_hostname": "x"}, {"i_have_console_access_to_agent": True}):
+                with self.subTest(extra=extra):
+                    why = fc.refusal(args(**extra), {})
+                    self.assertIn("--remote", why or "")
+        with on("Linux"):
+            self.assertIsNone(fc.refusal(args(remote=True, agent_hostname="x", i_have_console_access_to_agent=True), {}))
+
+    def test_the_usage_error_exits_2_through_main_with_nothing_dispatched(self):
+        for flag in (["--agent-hostname", "x"], ["--i-have-console-access-to-the-agent"]):
+            with self.subTest(flag=flag), on("Linux"), mock.patch.object(fc, "Client") as client, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(fc.main(["--dashboard", "http://127.0.0.1:9", *flag]), fc.EXIT_PRECONDITION)
+                client.assert_not_called()
+
+    def test_an_ssh_session_refuses_a_local_apply_but_not_a_remote_one(self):
+        env = {"SSH_CONNECTION": "1 2 3 4"}
+        with on("Linux"):
+            self.assertIn("SSH", fc.refusal(args(apply_containment=True), env) or "")
+            self.assertIsNone(fc.refusal(args(apply_containment=True, remote=True, agent_hostname="x",
+                                              i_have_console_access_to_agent=True), env))
+
+    def test_help_and_the_loopback_refusal_say_what_a_one_host_run_ends_with(self):
+        r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0)
+        flat = " ".join(r.stdout.split())
+        for needle in ("--remote", "refused|self_host", "exit 2", "--agent-hostname",
+                       "--i-have-console-access-to-the-agent", "--record"):
+            self.assertIn(needle, flat)
+        for needle in ("--remote", "refused|self_host", "exit 2", "one host"):
+            self.assertIn(needle, fc.LOOPBACK_REFUSAL)
+        self.assertIn("one host", fc.__doc__)
+        self.assertIn("refused|self_host", fc.__doc__)
+
+
+class NamedRemote(unittest.TestCase):
+    OK = [{"agent_id": "a", "hostname": "Agent-Box.example"}]
+    THIS = ["box", "box.local"]
+
+    def bound(self, agents, agent_id="a", name=REMOTE_HOST, nodes=None):
+        return fc.agent_is_named_remote(agents, agent_id, name, self.THIS if nodes is None else nodes)
+
+    def test_an_exact_match_binds_whatever_the_case_dot_or_os(self):
+        self.assertTrue(self.bound(self.OK))
+        self.assertTrue(self.bound(self.OK, name="AGENT-BOX.EXAMPLE."))
+        self.assertTrue(self.bound([{"agent_id": "a", "hostname": "agent-box.local"}], name="agent-box"))
+        self.assertTrue(self.bound([{"agent_id": "a", "hostname": REMOTE_HOST, "os": "windows"}]))
+
+    def test_a_first_label_match_localhost_an_empty_name_and_a_wrong_id_do_not(self):
+        self.assertFalse(self.bound(self.OK, name="agent-box"))                    # first label only
+        self.assertFalse(self.bound([{"agent_id": "a", "hostname": "agent-box"}], name=REMOTE_HOST))
+        self.assertFalse(self.bound([{"agent_id": "a", "hostname": "localhost"}], name="localhost"))
+        self.assertFalse(self.bound([{"agent_id": "a", "hostname": "localhost.localdomain"}], name="localhost.localdomain"))
+        self.assertFalse(self.bound([{"agent_id": "a", "hostname": ""}], name=""))
+        self.assertFalse(self.bound(self.OK, name=""))
+        self.assertFalse(self.bound(self.OK, agent_id="z"))                        # no such id
+        self.assertFalse(self.bound([], agent_id="a"))
+        self.assertFalse(self.bound(None))
+
+    def test_a_second_agent_under_the_same_name_or_a_repeated_id_do_not(self):
+        self.assertFalse(self.bound(self.OK + [{"agent_id": "b", "hostname": "AGENT-BOX.example."}]))
+        self.assertFalse(self.bound(self.OK + [{"agent_id": "a", "hostname": REMOTE_HOST}]))
+        self.assertTrue(self.bound(self.OK + [{"agent_id": "b", "hostname": "other.example"}]))
+
+    def test_a_name_that_is_this_machines_never_binds(self):
+        # the one-host case: it ends refused|self_host, so it is refused up front
+        self.assertFalse(self.bound([{"agent_id": "a", "hostname": "box"}], name="box"))
+        self.assertFalse(self.bound([{"agent_id": "a", "hostname": "Box.local"}], name="box.local"))
+        self.assertFalse(self.bound(self.OK, nodes=[REMOTE_HOST]))
+
+
+@unittest.skipUnless(hasattr(signal, "SIGHUP"), "the ceremony is POSIX-only")
+class RemoteFlow(FlowHarness, unittest.TestCase):
+    """The remote mode against the same recording fake."""
+
+    def remote(self, script, extra=(), dashboard=OFF_HOST, **kw):
+        kw.setdefault("client", remote_client())
+        return self.run_main(script, dashboard=dashboard, extra=[*REMOTE_FLAGS, *extra], **kw)
+
+    def good(self):
+        return {"quarantine_status": [row("inactive"), row("active"), row("inactive")], "quarantine": [{}],
+                "release": [REL]}
+
+    def test_a_non_loopback_dashboard_needs_remote(self):
+        rc, calls = self.run_main(self.good(), dashboard=OFF_HOST)
+        self.assertEqual((rc, calls), (fc.EXIT_PRECONDITION, []))
+        rc, calls = self.remote(self.good())
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.assertEqual(calls, ["quarantine_status", "quarantine", "quarantine_status", "release", "quarantine_status"])
+
+    def test_a_loopback_dashboard_with_remote_is_accepted(self):
+        # the script on the server's host, the agent on another machine
+        rc, calls = self.remote(self.good(), dashboard="http://127.0.0.1:9")
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.assertIn("release", calls)
+
+    def test_a_full_remote_round_trip_holds_the_lock_and_keeps_the_floor_and_the_retries(self):
+        lock = os.path.join(fc.tempfile.gettempdir(), f"yuzu_test_fwc_remote_{os.getpid()}.lock")
+        self.addCleanup(lambda: Path(lock).unlink(missing_ok=True))
+
+        def lock_is_held(_calls):
+            probe = os.open(lock, os.O_RDWR)
+            try:
+                with self.assertRaises(OSError):
+                    fc.fcntl.flock(probe, fc.fcntl.LOCK_EX | fc.fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+            return {}
+        script = {"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                  "quarantine": [lock_is_held], "release": [REL]}
+        rc, calls = self.remote(script, lock=lock)
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.assertEqual(calls.count("release"), 1)
+        # the dead-man floor is the same 300 s
+        rc, calls = self.remote(self.good(), extra=["--ttl-seconds", str(fc.MIN_TTL_S - 1)])
+        self.assertEqual((rc, calls), (fc.EXIT_PRECONDITION, []))
+        # a refused release is retried exactly as in the local mode
+        reads = [row("inactive"), row("active")] + [row("active")] * fc.RELEASE_READS + [row("inactive")]
+        rc, calls = self.remote({"quarantine_status": reads, "quarantine": [{}], "release": [BUSY, REL]})
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.assertEqual(calls.count("release"), 2)
+        # and a release that never confirms is still exit 3
+        rc, _ = self.remote({"quarantine_status": [row("inactive"), row("active")] + [row("active")] * (fc.RELEASE_READS * fc.RELEASE_ATTEMPTS),
+                             "quarantine": [{}], "release": [BUSY] * fc.RELEASE_ATTEMPTS})
+        self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)
+
+    def test_the_remote_apply_needs_its_agent_the_typed_hostname_and_the_console_flag(self):
+        cases = (
+            (["--remote", "--i-have-console-access-to-the-agent"], "--agent-hostname"),
+            (["--remote", "--agent-hostname", "localhost", "--i-have-console-access-to-the-agent"], "--agent-hostname"),
+            (["--remote", "--agent-hostname", REMOTE_HOST], "--i-have-console-access-to-the-agent"),
+            (["--remote", "--agent-hostname", "BOX", "--i-have-console-access-to-the-agent"], "one of this machine's own names"),
+            (["--remote", "--agent-hostname", "Box.Local.", "--i-have-console-access-to-the-agent"], "one of this machine's own names"),
+        )
+        for flags, why in cases:
+            with self.subTest(flags=flags):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc, calls = self.run_main(self.good(), dashboard=OFF_HOST, extra=flags,
+                                              client=remote_client())
+                self.assertEqual((rc, calls), (fc.EXIT_PRECONDITION, []))
+                self.assertIn(why, err.getvalue())
+        # no --agent-id is refused first, with its own message
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, calls = self.run_main({}, agent=False, dashboard=OFF_HOST, extra=REMOTE_FLAGS, client=remote_client())
+        self.assertEqual((rc, calls), (fc.EXIT_PRECONDITION, []))
+        self.assertIn("--agent-id is required", err.getvalue())
+
+    def test_the_agent_must_be_registered_exactly_once_under_the_typed_name(self):
+        for agents in ({"agents": [{"agent_id": "a", "hostname": "other.example"}]},
+                       {"agents": [{"agent_id": "z", "hostname": "Agent-Box.example"}]},
+                       {"agents": []},
+                       {"agents": [{"agent_id": "a", "hostname": "Agent-Box.example"},
+                                   {"agent_id": "b", "hostname": "agent-box.example."}]},
+                       {"agents": [{"agent_id": "a", "hostname": "box"}]}):
+            with self.subTest(agents=agents):
+                rc, calls = self.remote(self.good(), client=remote_client(agents))
+                self.assertEqual((rc, calls), (fc.EXIT_PRECONDITION, []))
+
+    def test_the_local_install_check_runs_in_local_mode_and_not_in_remote_mode(self):
+        rc, _ = self.run_main({"quarantine_status": [row("inactive")]}, apply=False)
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.install.assert_called_once()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc, _ = self.remote(self.good())
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.install.assert_not_called()
+        # says so, once, with what the release depends on
+        self.assertEqual(out.getvalue().count("remote mode:"), 1)
+        self.assertIn("scripts/install-agent-user.sh --check", out.getvalue())
+        self.assertIn("backstop", out.getvalue())
+        # a failing install check cannot stop a remote run (it is not this machine's check)
+        failing = mock.MagicMock(return_value=(1, "account missing"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc, _ = self.remote(self.good(), install=failing)
+        self.assertEqual(rc, fc.EXIT_OK)
+        failing.assert_not_called()
+
+    def test_a_refused_self_host_apply_exits_2_with_the_topology_message_and_no_release(self):
+        for flags in ((), REMOTE_FLAGS):
+            with self.subTest(remote=bool(flags)):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    if flags:
+                        rc, calls = self.remote({"quarantine_status": [row("inactive")], "quarantine": [SELF_HOST],
+                                                 "release": [REL]})
+                    else:
+                        rc, calls = self.run_main({"quarantine_status": [row("inactive")], "quarantine": [SELF_HOST],
+                                                   "release": [REL]})
+                self.assertEqual(rc, fc.EXIT_PRECONDITION)
+                self.assertEqual(calls, ["quarantine_status", "quarantine"])   # no status read, no release
+                text = err.getvalue()
+                self.assertIn("control endpoint is the agent host itself", text)
+                self.assertIn("nothing was changed", text)
+                self.assertIn("--remote", text)
+                self.assertNotIn("RELEASE NOT CONFIRMED", text)
+        self.assertTrue(fc.self_host_refused(SELF_HOST, "a"))
+        self.assertFalse(fc.self_host_refused(SELF_HOST, "b"))
+        for other in ({"responses": [{"agent_id": "a", "status": 2, "output": "status|refused|privilege_unavailable"}]},
+                      {"responses": [{"agent_id": "a", "status": 1, "output": "note|x status|refused|self_host"}]}, {}, None):
+            self.assertFalse(fc.self_host_refused(other, "a"), other)
+
+
+# ── #7860 ────────────────────────────────────────────────────────────────────────────────────────────
+
+class NoProgress(unittest.TestCase):
+    def poll(self, replies, timeout_s=1000, no_progress_polls=3):
+        client = fc.Client("http://127.0.0.1:9")
+        reads, clock = [], iter(range(0, 100000))
+        err = io.StringIO()
+        seq = list(replies)
+        with mock.patch.object(fc.time, "monotonic", side_effect=lambda: next(clock)), \
+                mock.patch.object(client, "get_responses",
+                                  side_effect=lambda _p: reads.append(1) or (seq.pop(0) if len(seq) > 1 else seq[0])), \
+                mock.patch.object(fc.time, "sleep"), contextlib.redirect_stderr(err):
+            got = client.poll_response("cid", timeout_s=timeout_s, no_progress_polls=no_progress_polls)
+        return got, len(reads), err.getvalue()
+
+    def test_a_row_that_never_leaves_running_ends_before_the_deadline_and_says_no_progress(self):
+        got, reads, err = self.poll([running()])
+        self.assertEqual(got, running())
+        self.assertEqual(reads, 4)                    # one read, then three unchanged ones
+        self.assertLess(reads, 1000)                  # nowhere near the deadline
+        self.assertIn("no progress", err)
+        with mock.patch.object(fc, "dispatch", return_value=got):
+            self.assertEqual(fc.status_token(None, "a"), "")   # and it is no answer
+
+    def test_a_row_that_changes_does_not_end_the_poll(self):
+        moving = [{"responses": [{"agent_id": "a", "status": 0, "output": "step %d" % i}], "count": 1} for i in range(10)]
+        got, reads, err = self.poll(moving + [row("inactive")])
+        self.assertEqual(got, row("inactive"))
+        self.assertEqual(reads, 11)
+        self.assertNotIn("no progress", err)
+
+    def test_a_lost_poll_neither_counts_nor_resets_the_bound(self):
+        lost = {"error": "ConnectionResetError: x"}
+        got, reads, err = self.poll([running(), lost, running(), lost, running(), running()])
+        self.assertEqual(got, running())
+        self.assertEqual(reads, 6)                    # four successful reads: the first, then three unchanged
+        self.assertIn("no progress", err)
+
+    def test_the_bound_is_off_by_default_and_the_deadline_stays_the_outer_limit(self):
+        client = fc.Client("http://127.0.0.1:9")
+        ticks = iter(range(0, 1000, 3))
+        with mock.patch.object(fc.time, "monotonic", side_effect=lambda: next(ticks)), \
+                mock.patch.object(client, "get_responses", return_value=running()), mock.patch.object(fc.time, "sleep"):
+            self.assertEqual(client.poll_response("cid", timeout_s=10), running())
+        # with the bound on but never reached, the deadline still ends the poll
+        got, reads, err = self.poll([running(), {"responses": [{"agent_id": "a", "status": 0, "output": "a"}]}] * 50,
+                                    timeout_s=6, no_progress_polls=3)
+        self.assertEqual(reads, 5)   # one clock tick per check: the deadline, not the bound, ended it
+        self.assertNotIn("no progress", err)
+
+    def test_only_a_status_read_is_held_to_the_bound(self):
+        client = mock.MagicMock()
+        client.post_json.return_value = {"command_id": "c"}
+        for action, want in (("quarantine", 0), ("release", 0), ("quarantine_status", fc.NO_PROGRESS_POLLS),
+                             ("quarantine_allow", fc.NO_PROGRESS_POLLS)):
+            with self.subTest(action=action):
+                fc.dispatch(client, "a", action, {})
+                self.assertEqual(client.poll_response.call_args.kwargs["no_progress_polls"], want)
+        self.assertGreater(fc.NO_PROGRESS_POLLS, 0)
+
+
+class DispatchRefused(unittest.TestCase):
+    def post(self, effect):
+        client = mock.MagicMock()
+        client.post_json.side_effect = effect if isinstance(effect, BaseException) else None
+        if not isinstance(effect, BaseException):
+            client.post_json.return_value = effect
+        return client
+
+    def test_a_client_error_or_no_command_id_is_a_refusal(self):
+        for code in (400, 401, 403, 404, 429):
+            with self.subTest(code=code):
+                client = self.post(fc.urllib.error.HTTPError("u", code, "Forbidden", None, None))
+                with self.assertRaises(fc.DispatchRefused) as cm:
+                    fc.dispatch(client, "a", "quarantine", {})
+                self.assertIn(str(code), str(cm.exception))
+                client.poll_response.assert_not_called()
+        for body in ({}, {"command_id": ""}, {"error": "denied"}, [], None):
+            with self.subTest(body=body):
+                with self.assertRaises(fc.DispatchRefused):
+                    fc.dispatch(self.post(body), "a", "quarantine_status", {})
+
+    def test_a_failure_the_server_may_have_acted_on_is_not_a_refusal(self):
+        # a reset, a timeout or a 5xx: the command may already be on its way to the agent
+        for effect in (fc.urllib.error.HTTPError("u", 503, "x", None, None), ConnectionResetError("x"),
+                       fc.urllib.error.URLError("timed out"), TimeoutError("t")):
+            with self.subTest(effect=type(effect).__name__):
+                with self.assertRaises(type(effect)):
+                    fc.dispatch(self.post(effect), "a", "quarantine", {})
+
+    def test_a_command_id_is_polled_as_before(self):
+        client = self.post({"command_id": "c"})
+        fc.dispatch(client, "a", "quarantine", {"ttl_seconds": 300})
+        client.poll_response.assert_called_once()
+
+
+@unittest.skipUnless(hasattr(signal, "SIGHUP"), "the ceremony is POSIX-only")
+class RefusedIsNotUnconfirmed(FlowHarness, unittest.TestCase):
+    """A user whose POST is refused (not an administrator): nothing was applied, so the run ends
+    `dispatch refused` (exit 1), never RELEASE NOT CONFIRMED."""
+
+    DENIED = fc.DispatchRefused("HTTP 403 Forbidden")
+
+    def run_quiet(self, script, **kw):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc, calls = self.run_main(script, **kw)
+        return rc, calls, err.getvalue()
+
+    def test_a_refused_probe_read_ends_the_run_as_dispatch_refused(self):
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                rc, calls, err = self.run_quiet({"quarantine_status": [self.DENIED]}, apply=apply)
+                self.assertEqual(rc, fc.EXIT_FAIL)
+                self.assertEqual(calls, ["quarantine_status"])
+                self.assertIn("dispatch refused", err)
+                self.assertIn("HTTP 403", err)
+                self.assertNotIn("RELEASE NOT CONFIRMED", err)
+
+    def test_a_refused_apply_dispatches_no_release_and_is_not_unconfirmed(self):
+        rc, calls, err = self.run_quiet({"quarantine_status": [row("inactive")], "quarantine": [self.DENIED],
+                                         "release": [REL]})
+        self.assertEqual(rc, fc.EXIT_FAIL)
+        self.assertEqual(calls, ["quarantine_status", "quarantine"])
+        self.assertIn("dispatch refused", err)
+        self.assertIn("nothing to release", err)
+        self.assertNotIn("RELEASE NOT CONFIRMED", err)
+        self.assertNotEqual(rc, fc.EXIT_RELEASE_FAILED)
+
+    def test_an_apply_that_was_sent_and_a_host_that_cannot_be_shown_inactive_is_still_exit_3(self):
+        # the apply went out; every later call is refused (an expired session): the host may be contained
+        n = 1 + fc.RELEASE_READS * fc.RELEASE_ATTEMPTS
+        rc, calls, err = self.run_quiet({"quarantine_status": [row("inactive")] + [self.DENIED] * n,
+                                         "quarantine": [{}], "release": [self.DENIED] * fc.RELEASE_ATTEMPTS})
+        self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)
+        self.assertEqual(calls.count("release"), fc.RELEASE_ATTEMPTS)
+        self.assertIn("RELEASE NOT CONFIRMED", err)
+
+    def test_a_release_that_was_sent_and_not_confirmed_is_exit_3(self):
+        rc, _, err = self.run_quiet({"quarantine_status": [row("inactive"), row("active")] + [row("active")] * (fc.RELEASE_READS * fc.RELEASE_ATTEMPTS),
+                                     "quarantine": [{}], "release": [BUSY] * fc.RELEASE_ATTEMPTS})
+        self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)
+        self.assertIn("RELEASE NOT CONFIRMED", err)
+
+
+@unittest.skipUnless(hasattr(signal, "SIGHUP"), "the ceremony is POSIX-only")
+class RunRecord(FlowHarness, unittest.TestCase):
+    """--record: one JSON object when the run ends, on every exit path, mode 0600, never through a symlink."""
+
+    def record_run(self, script, extra=(), **kw):
+        tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_rec_")
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "run.json")
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            rc, calls = self.run_main(script, extra=[*extra, "--record", path], **kw)
+        self.assertTrue(os.path.exists(path), "the record exists on every exit path")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        with open(path) as f:
+            return rc, calls, json.load(f), path
+
+    def test_a_pass_is_recorded(self):
+        rc, _, rec, _ = self.record_run({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                                         "quarantine": [{}], "release": [REL]})
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.assertEqual(rec["exit_code"], 0)
+        self.assertEqual(rec["mode"], "local")
+        self.assertEqual(rec["agent_id"], "a")
+        self.assertEqual(rec["hostname"], "Box.local")
+        self.assertEqual(rec["statuses"], ["inactive", "active", "inactive"])
+        self.assertIs(rec["contained"], True)
+        self.assertIs(rec["released"], True)
+        self.assertIsNone(rec["refusal"])
+        self.assertRegex(rec["time"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$")
+        self.assertEqual(set(rec), {"time", "mode", "agent_id", "hostname", "statuses", "contained", "released",
+                                    "exit_code", "refusal"})
+
+    def test_a_failure_and_an_unconfirmed_release_are_recorded(self):
+        rc, _, rec, _ = self.record_run({"quarantine_status": [row("inactive"), row("inactive"), row("inactive")],
+                                         "quarantine": [{}], "release": [REL]})
+        self.assertEqual((rc, rec["exit_code"], rec["contained"], rec["released"]), (fc.EXIT_FAIL, 1, False, True))
+        rc, _, rec, _ = self.record_run({"quarantine_status": [row("inactive"), row("active")] + [row("active")] * (fc.RELEASE_READS * fc.RELEASE_ATTEMPTS),
+                                         "quarantine": [{}], "release": [BUSY] * fc.RELEASE_ATTEMPTS})
+        self.assertEqual((rc, rec["exit_code"], rec["contained"], rec["released"]),
+                         (fc.EXIT_RELEASE_FAILED, 3, True, False))
+
+    def test_a_refusal_by_the_agent_and_one_by_the_script_are_recorded(self):
+        rc, _, rec, _ = self.record_run({"quarantine_status": [row("inactive")], "quarantine": [SELF_HOST]})
+        self.assertEqual((rc, rec["exit_code"], rec["refusal"], rec["contained"]), (fc.EXIT_PRECONDITION, 2, "self_host", False))
+        self.assertEqual(rec["statuses"], ["inactive"])
+        # a refusal before anything is dispatched still leaves its record
+        rc, calls, rec, _ = self.record_run({}, extra=["--ttl-seconds", "60"])
+        self.assertEqual((rc, calls, rec["exit_code"]), (fc.EXIT_PRECONDITION, [], 2))
+        self.assertEqual(rec["statuses"], [])
+
+    def test_a_remote_run_says_so(self):
+        client = remote_client()
+        rc, _, rec, _ = self.record_run({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                                         "quarantine": [{}], "release": [REL]}, dashboard=OFF_HOST, client=client,
+                                        extra=REMOTE_FLAGS)
+        self.assertEqual((rc, rec["mode"], rec["hostname"]), (fc.EXIT_OK, "remote", "Agent-Box.example"))
+
+    def test_the_record_survives_a_run_that_raises(self):
+        rc, _, rec, _ = self.record_run({"quarantine_status": [row("inactive"), row("inactive")],
+                                         "quarantine": [RuntimeError("boom")], "release": [REL]})
+        self.assertEqual((rc, rec["exit_code"]), (fc.EXIT_FAIL, 1))
+
+    def test_a_symlink_is_refused_before_anything_is_dispatched_and_never_written_through(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_link_") as d:
+            target = os.path.join(d, "target.json")
+            Path(target).write_text("keep")
+            link = os.path.join(d, "run.json")
+            os.symlink(target, link)
+            with on("Linux"):
+                self.assertIn("symlink", fc.refusal(args(record=link), {}) or "")
+                self.assertIsNone(fc.refusal(args(record=os.path.join(d, "fresh.json")), {}))
+            with on("Linux"), mock.patch.object(fc, "Client") as client, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(fc.main(["--dashboard", "http://127.0.0.1:9", "--record", link]), fc.EXIT_PRECONDITION)
+                client.assert_not_called()
+            self.assertEqual(Path(target).read_text(), "keep")
+            self.assertTrue(os.path.islink(link))
+
+    def test_an_existing_record_is_replaced_and_made_0600(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_old_") as d:
+            path = os.path.join(d, "run.json")
+            Path(path).write_text("stale")
+            os.chmod(path, 0o666)
+            fc.write_record(path, {"exit_code": 0})
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(Path(path).read_text()), {"exit_code": 0})
+            # a write that cannot happen is reported and never raises
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                fc.write_record(os.path.join(d, "no", "such", "dir.json"), {})
+            self.assertIn("could not write the run record", err.getvalue())
 
 
 if __name__ == "__main__":

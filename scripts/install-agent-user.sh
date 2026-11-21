@@ -1677,6 +1677,15 @@ check_helper_dir() {
     esac
 }
 
+# helper_dir_verdict DIR: ok, warn or refuse for DIR as it is now (refuse also when its owner and
+# mode cannot be read), by the same rule check_helper_dir applies.
+helper_dir_verdict() {
+    local info uid mode grp
+    info=$(dir_info "$1" 2>/dev/null) || { echo refuse; return; }
+    read -r uid mode grp <<<"$info"
+    fw_dir_verdict "$uid" "$mode"
+}
+
 # install_helper PATH GENERATOR: writes the helper GENERATOR prints to PATH, root:$ROOT_GROUP 0755.
 install_helper() {
     local path="$1" generator="$2"
@@ -1685,6 +1694,20 @@ install_helper() {
     local dir tmp
     dir=$(dirname "$path")
     if [[ "$DRY_RUN" -eq 1 ]]; then
+        # Say what the real run would find in the helper directory, and fail as it would: a directory
+        # that would be refused fails the dry run too, so the dry run is no longer a promise the real
+        # run breaks. (This line starts "[dry-run] " with one space: only the "[dry-run]   " block
+        # below is the helper text.)
+        if [[ -d "$dir" ]]; then
+            case "$(helper_dir_verdict "$dir")" in
+                ok) echo "[dry-run] helper directory $dir: ok" ;;
+                warn) echo "[dry-run] helper directory $dir: warn" ;;
+                *) echo "[dry-run] helper directory $dir: would be refused" ;;
+            esac
+            check_helper_dir "$dir" || return 1
+        else
+            echo "[dry-run] helper directory $dir: would be created root:$ROOT_GROUP 0755"
+        fi
         echo "[dry-run] would write the following to $path (root:$ROOT_GROUP 0755):"
         "$generator" | sed 's/^/[dry-run]   /'
         return 0
