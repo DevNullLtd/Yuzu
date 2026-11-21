@@ -1622,6 +1622,7 @@ if build_server
       'unit/server/test_instruction_param_golden.cpp', # golden accept/reject table over the shipped definitions
       'unit/server/test_instruction_canonical_schema.cpp', # canonicalise_param_schema: the discovery input_schema source
       'unit/server/test_sensitive_instruction_params.cpp',
+      'unit/server/test_approval_continuation.cpp', # one approval for a whole multi-slice read: pure subject/token/row rules
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
       'unit/server/test_compliance_fragments.cpp', # pure renderers for the Compliance page fragments + tag table

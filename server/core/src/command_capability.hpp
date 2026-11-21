@@ -123,6 +123,15 @@ struct CommandCapability {
     /// See `StoredRowTier`. Defaulted and last, so every existing designated-initializer row is
     /// unchanged and only the one fragment that needs the Forensics read tier names it.
     StoredRowTier stored_rows{StoredRowTier::Ordinary};
+    /// The request parameter that carries an AGENT-ISSUED resume token, so one approval can cover
+    /// every slice of a multi-slice read (`approval_continuation.hpp`). Empty (the default) means
+    /// the row has none: each dispatch needs its own approval, exactly as before. Declare it only
+    /// where the agent treats any non-empty value of that parameter as a token and refuses one it
+    /// did not issue for these same arguments before doing any work, because the server never
+    /// reads the token: it only sees that a non-empty one is present. A declaration is honoured
+    /// only for a ReadOnly/None row gated `None` or `AdminOrApproval` (`covered_param`); on any
+    /// other row it is ignored. Defaulted and last, so omitting it fails closed.
+    std::string_view continuation_param{};
 };
 
 namespace detail {

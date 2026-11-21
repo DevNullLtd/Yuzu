@@ -1013,7 +1013,9 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "Windows is planned; read-only, default-off, AdminOrApproval; stored results are "
          "readable only with Forensics:Read; busy, timed_out, rejected, no_progress retryable "
          "on the same cursor; bad_cursor, max_slices, mount_table_changed terminal; each slice "
-         "is its own dispatch (a non-admin needs an approval per slice)"},
+         "is its own dispatch, and a non-admin on the supervised MCP tier needs ONE approval "
+         "for the whole search (the first slice spends it, later slices that carry the cursor "
+         "ride it for 24 hours)"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},

@@ -842,6 +842,23 @@ public:
     /// a dead one. Read-only; consumes nothing.
     [[nodiscard]] std::expected<bool, std::string> ticket_is_live(const std::string& id) const;
 
+    /// Does the already-SPENT ticket `id` still cover a continuation call (`approval_continuation.hpp`)
+    /// by `principal` on the `expected_origin` surface, for exactly `definition_id` and
+    /// `scope_expression`? ONE read-only SELECT, no write, on the database's wall clock. True only
+    /// when ALL hold: status approved; origin, definition_id and scope_expression equal; submitted_by
+    /// and consumed_by both equal `principal` (a non-empty one); reviewed_by non-empty and not the
+    /// submitter; request_json, request_digest and excluded_roots all empty (an UNBOUND ticket only:
+    /// a four-eyes ticket binds one request and never covers a second); consumed_at is set, no
+    /// older than `approval_continuation::kCoverSeconds` and not ahead of now by more than
+    /// `kApprovalReviewedAtSlackSeconds`. Anything else is `false`, never an error: a caller that
+    /// is refused learns nothing about WHICH condition failed. An empty argument or an origin that
+    /// names no concrete surface is `false` too. A store failure is an error, never `false`, so the
+    /// caller can answer it as it answers any other store fault on the lookup (fail closed, retry).
+    [[nodiscard]] std::expected<bool, StoreReadError>
+    covers_continuation(const std::string& id, const std::string& principal,
+                        ApprovalOrigin expected_origin, const std::string& definition_id,
+                        const std::string& scope_expression) const;
+
     /// The schedule-origin retire (#6096): settle the approved or rejected tickets `ids` of
     /// `schedule_id` once the ScheduleRunner has settled an occurrence, so a scheduled
     /// ticket needs `consumed_at == 0` to be eligible (necessary but not sufficient: the outbox

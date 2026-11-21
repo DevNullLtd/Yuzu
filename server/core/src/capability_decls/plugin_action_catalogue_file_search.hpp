@@ -37,6 +37,12 @@
 /// consequence is deliberate: a non-administrator who launches a search under an approval cannot
 /// read its stored results unless they also hold `Forensics:Read`. There is no second read tier
 /// and no second permission check for this plugin.
+///
+/// CONTINUATION: `continuation_param = "cursor"` declares the agent-issued resume token, so ONE
+/// approval covers every slice of one search (`approval_continuation.hpp`): the first slice
+/// spends the approval as for any other action, and later slices that carry a cursor, from the
+/// same principal with the same arguments, ride it for a bounded window. The agent answers
+/// `bad_cursor`, before any read, for a cursor it did not issue for the same arguments.
 namespace yuzu::server::capdecls {
 
 namespace detail {
@@ -53,6 +59,7 @@ inline constexpr std::array<CommandCapability, 1> kPluginActionCatalogueFileSear
         .system_reserved = false,
         .execute_gate = ExecuteGate::AdminOrApproval,
         .stored_rows = StoredRowTier::ForensicsRead,
+        .continuation_param = "cursor",
     },
 }};
 
@@ -61,6 +68,11 @@ inline constexpr std::array<CommandCapability, 1> kPluginActionCatalogueFileSear
 // silent runtime gap. See ExecuteGate's doc comment in command_capability.hpp.
 static_assert(::yuzu::server::detail::all_gates_specified(kPluginActionCatalogueFileSearch),
               "every row in kPluginActionCatalogueFileSearch must author .execute_gate");
+
+// The one approval that covers a whole multi-slice search rides on this declaration. Removing it
+// would silently put the cost back at one approval per slice, so it is a build failure instead.
+static_assert(kPluginActionCatalogueFileSearch[0].continuation_param == "cursor",
+              "the search row must declare its resume parameter (.continuation_param = \"cursor\")");
 
 } // namespace detail
 

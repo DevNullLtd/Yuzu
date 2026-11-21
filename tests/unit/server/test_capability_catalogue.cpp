@@ -51,8 +51,10 @@
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "capability_decls/plugin_action_catalogue_process_introspect.hpp"
 #include "capability_decls/plugin_action_catalogue_file_search.hpp"
+#include "approval_continuation.hpp"
 #include "command_capability.hpp"
 #include "forensics_plugin_set.hpp"
+#include "sensitive_instruction_params.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -653,6 +655,9 @@ TEST_CASE("capability catalogue: file_search.search pins its exact classificatio
         CHECK(r.risk_tier == authz::RiskTier::High);
         CHECK(r.execute_gate == ExecuteGate::AdminOrApproval);
         CHECK(r.stored_rows == StoredRowTier::ForensicsRead);
+        // The resume parameter that lets ONE approval cover every slice of a search.
+        CHECK(r.continuation_param == "cursor");
+        CHECK(approval_continuation::covered_param(r) == "cursor");
         CHECK_FALSE(r.system_reserved);
     };
     check_row(rows.front());
@@ -660,6 +665,35 @@ TEST_CASE("capability catalogue: file_search.search pins its exact classificatio
     const auto classified = registry.classify("file_search", "search");
     REQUIRE(classified.has_value());
     check_row(*classified);
+}
+
+/// The continuation declaration is an authority: a row that declares one lets a single approval
+/// admit more than one dispatch. It is therefore pinned to exactly the one row that needs it (a new
+/// declaring row must be acknowledged HERE), every declaring row must be one `covered_param`
+/// actually honours (a read gated None or AdminOrApproval: a declaration on a mutating or
+/// AlwaysApproval row would be dead text that reads as a promise), and every declared parameter
+/// must be one the server never retains (`kUnretainedInstructionParamKeys`), so a request copy
+/// never holds a resume token.
+TEST_CASE("capability catalogue: only file_search.search declares a continuation parameter, and every "
+          "declaring row is one the cover honours and the server never retains",
+          "[server][dispatch][capability]") {
+    std::size_t declaring = 0;
+    for (const auto& source : all_labeled_sources()) {
+        for (const auto& row : source.rows) {
+            if (row.continuation_param.empty())
+                continue;
+            ++declaring;
+            INFO("source=" << source.label << " plugin=" << row.plugin << " action=" << row.action
+                           << " continuation_param=" << row.continuation_param);
+            CHECK(row.plugin == "file_search");
+            CHECK(row.action == "search");
+            CHECK(approval_continuation::covered_param(row) == row.continuation_param);
+            CHECK(is_unretained_instruction_param_key(row.continuation_param));
+            // Never a secret key: a resume token must not make a form mask its field.
+            CHECK_FALSE(is_redacted_instruction_param_key(row.continuation_param));
+        }
+    }
+    CHECK(declaring == 1);
 }
 
 TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across every "
