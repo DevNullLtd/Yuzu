@@ -72,7 +72,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "search",
         /* .linux_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
-         "resumable breadth-first search of the requested root, one slice per call, through no-follow "
+         "resumable sorted depth-first search of the requested root, one slice per call, through no-follow "
          "directory opens; the mount table from /proc/<pid>/mountinfo decides which mounts are searched; "
          "the extents of every matched regular file from FIEMAP; matched files are opened and never read",
          "constrained: only local filesystem types on the allow-list are searched and every other mount is "
@@ -82,7 +82,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "mount, directory or name was not searched"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
-         "resumable breadth-first search of the requested root, one slice per call, through no-follow "
+         "resumable sorted depth-first search of the requested root, one slice per call, through no-follow "
          "directory opens; the mount table from getmntinfo_r_np decides which mounts are searched; the "
          "extents of every matched regular file from F_LOG2PHYS_EXT; dataless files are never "
          "materialised; matched files are opened and never read",

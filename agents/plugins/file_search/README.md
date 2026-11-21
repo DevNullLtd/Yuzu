@@ -16,7 +16,7 @@
 
 `search` finds files or directories by leaf name under one absolute root on the local disks of one device. Each match is reported with its type, size, modification time and, for a regular file, its extents (where on the volume the filesystem keeps the file's data). The plugin reads names, types, sizes, times and extents. It never reads the contents of a file and takes no hash of anything. A matched regular file is opened read-only, without following a link, so the system can be asked for its size, time and extents; no byte of it is read, and an on-access scanner on the host sees the open. A matched directory carries no size, time or extents. Nothing is written, signalled or changed.
 
-One call is one slice of the search. A slice ends when the walk finishes, or when it reaches a time, entry, row or byte budget, or when the search reaches its slice maximum (the budgets are named constants in the source and are not restated here). Every slice ends with exactly one `search` row. A slice that stopped early also writes a `cursor` row; the caller repeats the call with that token as `cursor` until a slice answers without one. A search roots at one directory but may cross several mounts: each searched mount is one unit and a slice searches one unit, the mount that contains the root first and the others in order of mount point. Every answer carries a `coverage` row that says whether everything under the root was searched, so an empty result is never confusable with a failed or partial one.
+One call is one slice of the search. A slice ends when the walk finishes, or when it reaches a time, entry, row or byte budget, or when the search reaches its slice maximum (the budgets are named constants in the source and are not restated here). Every slice ends with exactly one `search` row. A slice that stopped early also writes a `cursor` row; the caller repeats the call with that token as `cursor` until a slice answers without one. A search roots at one directory but may cross several mounts: each searched mount is one unit and a slice searches one unit, the mount that contains the root first and the others in order of mount point. Within a unit the walk is depth-first and visits the names of each directory in byte order. Every answer carries a `coverage` row that says whether everything under the root was searched, so an empty result is never confusable with a failed or partial one.
 
 ```mermaid
 flowchart LR
@@ -95,7 +95,7 @@ What a search stores is a different matter from who may launch it. The stored ro
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `search` | 🟡 planned · rung 1 · NTFS volume search and a directory walk with the same rows | 🟡 constrained · rung 1 · resumable breadth-first search of the requested root, one slice per call, through no-follow directory opens; the mount table from getmntinfo_r_np decides which mounts are searched; the extents of every matched regular file from F_LOG2PHYS_EXT; dataless files are never materialised; matched files are opened and never read | 🟡 constrained · rung 1 · resumable breadth-first search of the requested root, one slice per call, through no-follow directory opens; the mount table from /proc/<pid>/mountinfo decides which mounts are searched; the extents of every matched regular file from FIEMAP; matched files are opened and never read |
+| `search` | 🟡 planned · rung 1 · NTFS volume search and a directory walk with the same rows | 🟡 constrained · rung 1 · resumable sorted depth-first search of the requested root, one slice per call, through no-follow directory opens; the mount table from getmntinfo_r_np decides which mounts are searched; the extents of every matched regular file from F_LOG2PHYS_EXT; dataless files are never materialised; matched files are opened and never read | 🟡 constrained · rung 1 · resumable sorted depth-first search of the requested root, one slice per call, through no-follow directory opens; the mount table from /proc/<pid>/mountinfo decides which mounts are searched; the extents of every matched regular file from FIEMAP; matched files are opened and never read |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
@@ -183,7 +183,7 @@ The status is a coarse summary for the host; the `search` row and the `coverage`
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-21 · euid 501 · leg-hash 11fbe6d0b00c
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-21 · euid 501 · leg-hash c2884861b725
 
 ```
 == action=search root=/private/tmp/yuzu_test_file_search_sample pattern=yuzu-fs-control-* kinds=both
