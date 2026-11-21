@@ -2,14 +2,16 @@ Directory: tests/unit/fixtures/wave10/runtimes/linux/
 Fixtures for the runtimes Linux-leg tests (tests/unit/test_runtimes_parsers.cpp loads the
 capture files; tests/unit/test_runtimes_linux_parsers.cpp materializes tree.manifest and
 jdk_layouts.manifest and reads mountinfo_docker_nfs4.txt).
-One directory-level provenance file; every fixture below is labelled. The three capture
-files are REAL CAPTURE from command-only Docker containers (no long-running service,
-nothing installed beyond the stated apt packages); tree.manifest carries per-section
-labels, including two RECONSTRUCTION lines named in the file itself.
+One directory-level provenance file; every fixture below is labelled. The six capture
+files (temurin17_release.txt, debian_openjdk17_release.txt, dotnet_shared_listing.txt and
+the three SAM-48 release files named below) are REAL CAPTURE from command-only Docker
+containers (no long-running service, nothing installed beyond the stated packages);
+tree.manifest and jdk_layouts.manifest carry per-section labels, including RECONSTRUCTION
+lines named in the files themselves.
 
 host:      Docker Desktop (linux/arm64 containers) on macOS
 identity:  root inside the container (the images' default)
-date:      2026-09-21
+date:      2026-09-21 (applies unless a section states its own date)
 
 -- temurin17_release.txt --
 status:    REAL CAPTURE
@@ -46,10 +48,14 @@ loaded by: tests/unit/test_runtimes_linux_parsers.cpp (materialized under a yuzu
            TempDir per case)
 
 -- jdk_layouts.manifest --
-status:    REAL CAPTURE structure of four package layouts (each under its own roots/<distro>/
-           directory), trimmed to the paths the walk reads. RECONSTRUCTION: every regular file
-           other than the SUSE `release` is an EMPTY placeholder (the capture recorded names,
-           not contents), and the Ubuntu .jinfo file is empty.
+status:    REAL CAPTURE structure of the four package layouts captured 2026-09-24
+           (roots/ubuntu2204-openjdk8, rocky9-openjdk8, alpine320-openjdk8 and
+           opensuse156-openjdk17; each under its own roots/<distro>/ directory), trimmed to the
+           paths the walk reads. RECONSTRUCTION in these four roots: every regular file other
+           than the SUSE `release` is an EMPTY placeholder (the capture recorded names, not
+           contents), and the Ubuntu .jinfo file is empty. The roots added for SAM-48 are
+           described in the SAM-48 section below; their Debian and Ubuntu roots also carry real
+           `release` payloads.
 host:      Docker Desktop (linux/arm64 containers, kernel Linux 7.0.12-linuxkit), root in the
            container, command-only `docker run --rm`, 2026-09-24
 commands:  ls -la <jvm root>; find <jvm root> -maxdepth 4 \( -name release -o -name java -o
@@ -77,6 +83,9 @@ images:    debian:12        (digest sha256:268fb24c39bca92d326dd83ea3abebe4a3f77
            ubuntu:24.04     (digest sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8)
            opensuse/leap:15.6 (digest sha256:79be7751205ea84559990fb76b1bec71e38d6fad41c70a4f6c921b803b58f421)
 files:     debian12_openjdk17_jre_release.txt   <- openjdk-17-jre-headless 17.0.21.1+2-1~deb12u1
+                                                   (the openjdk-17-jdk-headless home's release payload,
+                                                   roots/debian12-openjdk17-jdk in jdk_layouts.manifest,
+                                                   is byte-identical to this file)
            ubuntu2404_openjdk21_release.txt     <- openjdk-21-jdk-headless 21.0.13.1+2-1~24.04.1
                                                    (byte-identical to the openjdk-21-jre-headless one)
            opensuse156_openjdk17_release.txt    <- java-17-openjdk-devel 17.0.18.0-150400.3.63.1

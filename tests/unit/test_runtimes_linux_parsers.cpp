@@ -1128,6 +1128,9 @@ TEST_CASE("runtimes linux: the bin/javac flavour fallback is exact about what it
     // a symlinked bin is refused, never followed: unmodelled, token recorded
     probe([&](const fs::path& h) { both(h / "real"); fs::create_symlink("real/bin", h / "bin"); },
           kNoType, "jvm|unmodelled|17.0.1|/opt/java/h|Vendor", lnx::kTokSymlinkRefused);
+    // a bin that is not a directory fails its open: undecided, not "no javac", even with a java at jre/bin
+    probe([&](const fs::path& h) { write_text(h / "bin", ""); write_text(h / "jre/bin/java", ""); },
+          kNoType, "jvm|unmodelled|17.0.1|/opt/java/h|Vendor", lnx::kTokNotADirectory);
     // no release file, java and javac present: the release_missing row carries the flavour
     probe(both, "", "jvm|jdk|-|/opt/java/h|-", lnx::kTokReleaseMissing);
     probe(java_only, "", "jvm|jre|-|/opt/java/h|-", lnx::kTokReleaseMissing);
@@ -1137,8 +1140,11 @@ TEST_CASE("runtimes linux: an unsearchable bin leaves the flavour unmodelled and
           "[runtimes][linux][walk][flavour]") {
     if (running_privileged()) SKIP("euid 0: permission bits are bypassed, the unsearchable-bin case is not run");
     yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_perm_"};
+    // bin opens (read permission) but fstatat(javac) is EACCES. jre/bin/java is there so that a stat
+    // failure read as "no javac" would fall through to the java probe and answer `jre`.
     write_text(dir.path / "opt/java/h/release", "JAVA_VERSION=\"17.0.1\"\n");
     write_text(dir.path / "opt/java/h/bin/javac", "");
+    write_text(dir.path / "opt/java/h/jre/bin/java", "");
     REQUIRE(::chmod((dir.path / "opt/java/h/bin").c_str(), 0644) == 0); // listable, not searchable
     const PermRestore restore{dir.path / "opt/java/h/bin"};
     Acc acc;
