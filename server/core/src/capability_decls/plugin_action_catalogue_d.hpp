@@ -23,14 +23,14 @@
 /// type (`rbac_store.cpp:292-339`), `operation` reuses only a
 /// `seed_defaults()`-seeded op (`rbac_store.cpp:380`), and every
 /// `risk_tier >= min_risk_tier_for(operation)` (`authz_model.hpp`).
-/// `system_reserved` is `false` on every row below — none of these 43 rows
+/// `system_reserved` is `false` on every row below — none of these 44 rows
 /// is a server-self-issued dispatch.
 ///
 /// FOUR of the six plugins the originating spec called out as carrying
 /// "the arbitrary-code and endpoint-mutation surface" — `bitlocker`,
 /// `msi_packages`, `software_actions`, and `agent_actions` — turn out, on
 /// reading the code, to expose ONLY read-only query actions for the rows
-/// listed below (`bitlocker.state`; `msi_packages.list`/`product_codes`/`list_inventory`;
+/// listed below (`bitlocker.state`; `msi_packages.list`/`product_codes`/`list_inventory`/`installer_records`;
 /// `software_actions.list_upgradable`/`installed_count`;
 /// `agent_actions.info`): none of the four plugins' shipped `actions()`
 /// tables contains an install/uninstall/encrypt/write action at all. Per

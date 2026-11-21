@@ -145,8 +145,8 @@ TEST_CASE("msi database read: a real cached package reads while a no-reparse han
 
     static msi::SingleFlightSlot slot;
     int tried = 0;
-    bool read_one = false;
-    for (const fs::directory_iterator end; it != end && tried < 64 && !read_one; it.increment(ec)) {
+    bool exercised = false;
+    for (const fs::directory_iterator end; it != end && tried < 64 && !exercised; it.increment(ec)) {
         if (ec)
             break;
         const auto& p = it->path();
@@ -156,23 +156,28 @@ TEST_CASE("msi database read: a real cached package reads while a no-reparse han
         if (ext != ".msi")
             continue;
         ++tried;
-        // The handle the plugin holds while the database is read: shares read and delete, so the
-        // API's own read-only open must be compatible with it.
-        auto held = yuzu::win::open_file_no_reparse(p.wstring());
-        if (held.status != yuzu::win::NoReparseOpen::ok)
+        // A candidate is a package this identity reads Ok with no handle held; one it cannot
+        // open at all is skipped here, so a failure under the handle below is the handle's.
+        const auto bare = msi::read_property_table(slot, p.string(), milliseconds{5000});
+        if (bare.status != msi::ReadStatus::Completed || bare.outcome.kind != msi::Outcome::Kind::Ok)
             continue;
-        const auto r = msi::read_property_table(slot, p.string(), milliseconds{5000});
-        if (r.status != msi::ReadStatus::Completed || r.outcome.kind != msi::Outcome::Kind::Ok)
-            continue; // a package this identity cannot open is skipped, not a failure
-        read_one = true;
-        const auto& code = r.outcome.props.product_code;
+        exercised = true;
         INFO(p.string());
+        // The handle the plugin holds while the database is read: share read only, so the API's
+        // own read-only open must be share-compatible with it.
+        auto held = yuzu::win::open_file_no_reparse(p.wstring(), FILE_SHARE_READ);
+        REQUIRE(held.status == yuzu::win::NoReparseOpen::ok);
+        const auto r = msi::read_property_table(slot, p.string(), milliseconds{5000});
+        REQUIRE(r.status == msi::ReadStatus::Completed);
+        REQUIRE(r.outcome.kind == msi::Outcome::Kind::Ok);
+        const auto& code = r.outcome.props.product_code;
         REQUIRE(code.size() == 38);
         CHECK(code.front() == '{');
         CHECK(code.back() == '}');
+        CHECK(code == bare.outcome.props.product_code);
     }
-    if (!read_one)
-        SKIP("the Installer cache holds no package this identity can open and read");
+    if (!exercised)
+        SKIP("the Installer cache holds no package this identity can read without a held handle");
 }
 
 TEST_CASE("msi database read: a zero deadline never blocks and the slot frees when the worker returns",

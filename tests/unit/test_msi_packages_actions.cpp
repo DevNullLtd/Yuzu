@@ -379,8 +379,10 @@ TEST_CASE("msi_packages plugin: a package upgrade code equals list_inventory's s
     REQUIRE_FALSE(records.empty());
     const auto status = split_pipes(records[0]);
     REQUIRE(status.size() == 4);
-    if (status[2] != "supported")
-        SKIP("installer_records was " << status[2] << " (" << status[3] << ") on this identity");
+    // A constrained answer (a refused key, the 45 second budget, a busy reader) still carries the
+    // rows it did read, so the comparison below runs whatever the status; only `unsupported` is
+    // wrong on Windows.
+    REQUIRE((status[2] == "supported" || status[2] == "constrained"));
 
     // the sixth token of each list_inventory row, keyed by upper-cased product code
     std::map<std::string, std::string> sixth;
@@ -405,6 +407,9 @@ TEST_CASE("msi_packages plugin: a package upgrade code equals list_inventory's s
         REQUIRE(it != sixth.end());
         CHECK(it->second == f[9]);
     }
+    if (with_upgrade_code == 0 && status[2] != "supported")
+        SKIP("installer_records was " << status[2] << " (" << status[3]
+                                      << ") and no row carries a package upgrade code on this identity");
     CHECK(with_upgrade_code > 0);
 }
 

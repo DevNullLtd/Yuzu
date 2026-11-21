@@ -324,9 +324,11 @@ std::string system_windows_directory() {
     return yuzu::win::from_wide(buf, static_cast<int>(n));
 }
 
-// The user profiles directory and each profile's folder, for the privacy rule. A failed
-// read of either falls back to the default `%SystemDrive%\Users`: this only widens what is
-// withheld, so it never needs to fail the answer.
+// The user profiles directory and each user profile's folder, for the privacy rule. The
+// LocalSystem, LocalService and NetworkService profiles are skipped: their folders sit under the
+// Windows directory, where a machine install source is not a user path. A failed read of either
+// falls back to the default `%SystemDrive%\Users`: this only widens what is withheld, so it
+// never needs to fail the answer.
 std::vector<std::string> read_profile_roots() {
     std::vector<std::string> roots;
     std::string profiles_dir;
@@ -341,13 +343,14 @@ std::vector<std::string> read_profile_roots() {
     roots.push_back(yuzu::win::from_wide(expanded.c_str(), static_cast<int>(expanded.size())));
     const auto profiles = yuzu::win::enumerate_profile_list();
     for (const auto& p : profiles.records)
-        if (!p.profile_image_path.empty())
+        if (!p.profile_image_path.empty() && !yuzu::profiles::is_system_sid(p.sid))
             roots.push_back(p.profile_image_path);
     return roots;
 }
 
 // A package opened with no reparse point followed below the drive root; the handle is held
-// until this object is destroyed, which the collector arranges to be after the database read.
+// (share read only: no rename, delete or rewrite while it is open) until this object is
+// destroyed, which the collector arranges to be after the database read.
 struct OpenedPackage {
     rec::OpenStatus status = rec::OpenStatus::refused;
     yuzu::win::NoReparseHandle hold;
@@ -361,7 +364,7 @@ OpenedPackage open_package(const std::string& path) {
     const wchar_t root[] = {wide[0], L':', L'\\', L'\0'};
     if (GetDriveTypeW(root) != DRIVE_FIXED)
         return out; // refused: only a local fixed drive is ever opened
-    auto opened = yuzu::win::open_file_no_reparse(wide);
+    auto opened = yuzu::win::open_file_no_reparse(wide, FILE_SHARE_READ);
     if (opened.status == yuzu::win::NoReparseOpen::absent) {
         out.status = rec::OpenStatus::absent;
         return out;

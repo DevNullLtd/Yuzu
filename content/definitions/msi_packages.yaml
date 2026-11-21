@@ -272,7 +272,8 @@ metadata:
     registry read, an exceeded bound or a package read that timed out or found
     the single package reader busy makes the status row `constrained` with a
     `windows:installer_records:<detail>` token. Install locations and sources
-    under the user profiles directory are reported as `withheld:user_path`.
+    under the user profiles directory, or under a registered user profile's
+    folder, are reported as `withheld:user_path`.
     Exactly one status row leads the result.
   tags: [software, msi, inventory, windows]
 
@@ -314,7 +315,7 @@ spec:
         platforms: [windows]
       - name: version
         type: string
-        description: 'Record rows: the DisplayVersion value, empty when unset. Status rows: the failure tokens, comma-joined, or "-" when none. Tokens read <os>:installer_records:<detail> (enum:<code>, row_cap, access_denied, msi_db:deadline, msi_db:busy), windows:msi_upgrade_map:<code>, macos:no_windows_installer, linux:no_msi or msi_packages:exception (the action threw).'
+        description: 'Record rows: the DisplayVersion value, empty when unset. Status rows: the failure tokens, comma-joined, or "-" when none. Tokens read <os>:installer_records:<detail> (enum:<code>, row_cap, access_denied, msi_db:deadline, msi_db:busy), macos:no_windows_installer, linux:no_msi or msi_packages:exception (the action threw).'
         example: "26.04.00.0"
         platforms: [windows]
       - name: publisher
@@ -329,12 +330,12 @@ spec:
         platforms: [windows]
       - name: install_location
         type: string
-        description: 'Record rows only: the InstallLocation value, empty when unset. `withheld:user_path` when it is under the user profiles directory.'
+        description: 'Record rows only: the InstallLocation value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder.'
         example: "C:\\Program Files\\7-Zip\\"
         platforms: [windows]
       - name: install_source
         type: string
-        description: 'Record rows only: the InstallSource value, empty when unset. `withheld:user_path` when it is under the user profiles directory; a UNC source is reported as recorded.'
+        description: 'Record rows only: the InstallSource value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder; a UNC source is reported as recorded.'
         example: "C:\\ProgramData\\Package Cache\\"
         platforms: [windows]
       - name: local_package

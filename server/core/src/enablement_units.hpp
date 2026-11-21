@@ -147,8 +147,9 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added 2026-11-08,
 // virtualization runtime_posture added by PR12.1-b2; firewall quarantine, release, quarantine_status
 // and quarantine_allow added by PRQ.1; PRQ.2 removed the old containment plugin's four rows; component_inventory scan added by SAM-16 and native by SAM-22, Windows leg
-// planned for both; process_introspect inspect added by PR13.1-a, Windows and macOS legs planned so applicable on all three), 251 rows.
-inline constexpr std::array<UnitOsRow, 251> kUnitOs{{
+// planned for both; process_introspect inspect added by PR13.1-a, Windows and macOS legs planned so applicable on all three;
+// msi_packages installer_records added by SAM-46), 252 rows.
+inline constexpr std::array<UnitOsRow, 252> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
