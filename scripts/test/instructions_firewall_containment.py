@@ -401,15 +401,6 @@ def refusal_token(answer, agent_id: str):
     return None
 
 
-def self_host_refused(answer, agent_id: str) -> bool:
-    """True iff this agent answered the apply `status|refused|self_host`: its control endpoint is the agent
-    host itself (loopback or one of its own addresses), so it never contained anything and there is nothing to
-    release. A one-host run whose control endpoint is a host address (loopback included) ends here, by design;
-    the one exception is a server in a container or VM on this host reached at a bridge address (see the
-    standing ruling in the module docstring)."""
-    return "status|refused|self_host" in agent_rows(answer, agent_id)
-
-
 def apply_was_not_ours(answer, agent_id: str) -> bool:
     """True iff the `quarantine` answer shows the containment is not this run's, so it is left alone: the
     plugin said the host was already contained or converged (`already_active`, `repaired`,
@@ -749,7 +740,7 @@ def run(args: argparse.Namespace, rec: dict | None = None) -> int:
                     refused = e  # the server never sent it: nothing was applied
                 if refused is None:
                     rec["refusal"] = refusal_token(answer, agent_id)
-                    if self_host_refused(answer, agent_id):
+                    if rec["refusal"] == "self_host":
                         say(SELF_HOST_TEXT + signal_note(got), file=sys.stderr)
                         return EXIT_PRECONDITION
                     not_ours = apply_was_not_ours(answer, agent_id)

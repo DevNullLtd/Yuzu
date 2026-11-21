@@ -485,15 +485,22 @@ void close_sock(SockT s) { ::close(s); }
     return std::make_pair(fq::format_ip(ip->ip), ip->port);
 }
 
-/// One TCP connect to ip:port with a bounded wait; the tri-state outcome.
-[[nodiscard]] fq::ProbeOutcome probe(const std::string& endpoint, int timeout_ms = 3000) {
+/// The address and port of an `ip:port` endpoint, or nullopt when it does not parse or resolve.
+[[nodiscard]] std::optional<yuzu::shared::Resolved> resolve_endpoint(const std::string& endpoint) {
     const auto ep = split_endpoint(endpoint);
     if (!ep || !net_init())
-        return fq::ProbeOutcome::timeout;
+        return std::nullopt;
     auto dst = yuzu::shared::resolve_first(ep->first, AF_UNSPEC);
+    if (dst)
+        yuzu::shared::set_port(*dst, ep->second);
+    return dst;
+}
+
+/// One TCP connect to ip:port with a bounded wait; the tri-state outcome.
+[[nodiscard]] fq::ProbeOutcome probe(const std::string& endpoint, int timeout_ms = 3000) {
+    const auto dst = resolve_endpoint(endpoint);
     if (!dst)
         return fq::ProbeOutcome::timeout;
-    yuzu::shared::set_port(*dst, ep->second);
     const auto r = yuzu::shared::tcp_sample(*dst, timeout_ms);
     return r.rtt_ms ? fq::ProbeOutcome::connected
                     : (r.refused ? fq::ProbeOutcome::refused : fq::ProbeOutcome::timeout);
@@ -503,13 +510,9 @@ void close_sock(SockT s) { ::close(s); }
 /// own name. A UDP connect sends nothing (it only picks the route), so this learns the address
 /// without touching the network. nullopt when it cannot be learned.
 [[nodiscard]] std::optional<std::string> own_address_toward(const std::string& endpoint) {
-    const auto ep = split_endpoint(endpoint);
-    if (!ep || !net_init())
-        return std::nullopt;
-    auto dst = yuzu::shared::resolve_first(ep->first, AF_UNSPEC);
+    const auto dst = resolve_endpoint(endpoint);
     if (!dst)
         return std::nullopt;
-    yuzu::shared::set_port(*dst, ep->second);
     const SockT sock = ::socket(dst->family, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == kBadSock)
         return std::nullopt;
@@ -556,13 +559,6 @@ enum class HttpReply { need_more, complete, unframed };
             out += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
         return out;
     };
-    const auto trim = [](std::string_view in) {
-        while (!in.empty() && (in.front() == ' ' || in.front() == '\t'))
-            in.remove_prefix(1);
-        while (!in.empty() && (in.back() == ' ' || in.back() == '\t'))
-            in.remove_suffix(1);
-        return in;
-    };
 
     const auto status_end = head.find("\r\n");
     const bool http10 = head.substr(0, status_end).starts_with("HTTP/1.0");
@@ -576,8 +572,8 @@ enum class HttpReply { need_more, complete, unframed };
         const auto colon = line.find(':');
         if (colon == std::string_view::npos)
             continue;
-        const auto name = lower(trim(line.substr(0, colon)));
-        const auto value = lower(trim(line.substr(colon + 1)));
+        const auto name = lower(fq::detail::trim(line.substr(0, colon)));
+        const auto value = lower(fq::detail::trim(line.substr(colon + 1)));
         if (name == "content-length") {
             if (value.empty() || value.size() > 15 ||
                 value.find_first_not_of("0123456789") != std::string::npos)
@@ -609,13 +605,9 @@ public:
             close_sock(s_);
     }
     [[nodiscard]] bool open(const std::string& endpoint) {
-        const auto ep = split_endpoint(endpoint);
-        if (!ep || !net_init())
-            return false;
-        auto dst = yuzu::shared::resolve_first(ep->first, AF_UNSPEC);
+        const auto dst = resolve_endpoint(endpoint);
         if (!dst)
             return false;
-        yuzu::shared::set_port(*dst, ep->second);
         s_ = ::socket(dst->family, SOCK_STREAM, IPPROTO_TCP);
         if (s_ == kBadSock)
             return false;

@@ -1370,10 +1370,8 @@ macos_rules_rows(const yuzu::agent::SubprocessResult& listapps, const yuzu::agen
 [[nodiscard]] inline std::string win_rule_count_row(bool have_rules, std::uint32_t rules_hr,
                                                     bool count_ok, std::uint32_t count_hr,
                                                     long long count) {
-    if (!have_rules)
-        return std::format("error|rules_count:0x{:08x}", rules_hr);
-    if (!count_ok)
-        return std::format("error|rules_count:0x{:08x}", count_hr);
+    if (!have_rules || !count_ok)
+        return std::format("error|rules_count:0x{:08x}", have_rules ? count_hr : rules_hr);
     return std::format("ruleset|{}", count);
 }
 

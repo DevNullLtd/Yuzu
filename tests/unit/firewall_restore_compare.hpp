@@ -37,9 +37,10 @@
 
 #include "firewall_quarantine_parsers.hpp"
 
+#include <base64.hpp>
+
 #include <algorithm>
 #include <cstddef>
-#include <cstdint>
 #include <format>
 #include <map>
 #include <optional>
@@ -125,13 +126,7 @@ inline void finish(std::string& out) {
 
 namespace detail {
 
-[[nodiscard]] inline std::string_view trim(std::string_view s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r'))
-        s.remove_prefix(1);
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r'))
-        s.remove_suffix(1);
-    return s;
-}
+using fq::detail::trim;
 
 struct Section {
     std::string name;
@@ -146,12 +141,8 @@ struct Parsed {
 
 [[nodiscard]] inline Parsed parse(std::string_view text) {
     Parsed p;
-    std::size_t pos = 0;
     bool ended = false;
-    while (pos < text.size()) {
-        const auto nl = text.find('\n', pos);
-        std::string_view line = text.substr(pos, nl == std::string_view::npos ? nl : nl - pos);
-        pos = nl == std::string_view::npos ? text.size() : nl + 1;
+    for (std::string_view line : fq::detail::split(text, '\n')) {
         while (!line.empty() && line.back() == '\r')
             line.remove_suffix(1);
         if (ended) {
@@ -381,11 +372,14 @@ inline void diff_multiset(const std::vector<std::string>& before, const std::vec
 
 inline void compare_windows(const Parsed& a, const Parsed& b, Verdict& v) {
     // profile defaults: a profile whose line differs, or that is on one side only
-    std::map<std::string, std::string> pa, pb;
-    for (const auto& l : content_lines(*find_section(a, label::kProfiles)))
-        pa[std::string{field(l, 0)}] = l;
-    for (const auto& l : content_lines(*find_section(b, label::kProfiles)))
-        pb[std::string{field(l, 0)}] = l;
+    const auto keyed = [](const Parsed& p, std::string_view label) {
+        std::map<std::string, std::string> m;
+        for (const auto& l : content_lines(*find_section(p, label)))
+            m[std::string{field(l, 0)}] = l;
+        return m;
+    };
+    const auto pa = keyed(a, label::kProfiles);
+    const auto pb = keyed(b, label::kProfiles);
     for (const auto& [name, line] : pa) {
         if (!pb.count(name) || pb.at(name) != line) {
             ++v.defaults_changed;
@@ -398,11 +392,8 @@ inline void compare_windows(const Parsed& a, const Parsed& b, Verdict& v) {
             note(v.detail, "profile added", line);
         }
 
-    std::map<std::string, std::string> ra, rb;
-    for (const auto& l : content_lines(*find_section(a, label::kRules)))
-        ra[std::string{field(l, 0)}] = l;
-    for (const auto& l : content_lines(*find_section(b, label::kRules)))
-        rb[std::string{field(l, 0)}] = l;
+    const auto ra = keyed(a, label::kRules);
+    const auto rb = keyed(b, label::kRules);
     const auto was_enabled = [](const std::string& line) { return line.find("|en=True|") != std::string::npos; };
     const auto now_disabled = [](const std::string& line) { return line.find("|en=False|") != std::string::npos; };
     for (const auto& [key, line] : ra) {
@@ -580,11 +571,8 @@ inline void compare_macos(const Parsed& a, const Parsed& b, Verdict& v) {
 /// The `Status:` line of `pfctl -s info` (the first one), or empty. The rest of `-s info` carries
 /// counters and an uptime that are never equal between two reads, so only this line is recorded.
 [[nodiscard]] inline std::string pf_status_line(std::string_view info_text) {
-    std::size_t pos = 0;
-    while (pos < info_text.size()) {
-        const auto nl = info_text.find('\n', pos);
-        const auto line = detail::trim(info_text.substr(pos, nl == std::string_view::npos ? nl : nl - pos));
-        pos = nl == std::string_view::npos ? info_text.size() : nl + 1;
+    for (const auto raw : fq::detail::split(info_text, '\n')) {
+        const auto line = detail::trim(raw);
         if (line.starts_with("Status:"))
             return std::string{line};
     }
@@ -598,13 +586,9 @@ inline void compare_macos(const Parsed& a, const Parsed& b, Verdict& v) {
 /// handle on its last line only, so it counts once.
 [[nodiscard]] inline std::size_t count_nft_rules(std::string_view nft_text) {
     std::size_t count = 0;
-    std::size_t pos = 0;
     constexpr std::string_view kHandle = "# handle ";
-    while (pos < nft_text.size()) {
-        const auto nl = nft_text.find('\n', pos);
-        auto line = nft_text.substr(pos, nl == std::string_view::npos ? nl : nl - pos);
-        pos = nl == std::string_view::npos ? nft_text.size() : nl + 1;
-        line = detail::trim(line);
+    for (const auto raw : fq::detail::split(nft_text, '\n')) {
+        const auto line = detail::trim(raw);
         const auto at = line.rfind(kHandle);
         if (at == std::string_view::npos)
             continue;
@@ -652,25 +636,13 @@ inline void compare_macos(const Parsed& a, const Parsed& b, Verdict& v) {
 /// argument is plain ASCII, so no quoting rule of any shell or command line can change it.
 /// `ascii` must be ASCII.
 [[nodiscard]] inline std::string utf16le_base64(std::string_view ascii) {
-    constexpr std::string_view kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(ascii.size() * 2);
+    std::string wide;
+    wide.reserve(ascii.size() * 2);
     for (const char c : ascii) {
-        bytes.push_back(static_cast<std::uint8_t>(c));
-        bytes.push_back(0);
+        wide += c;
+        wide += '\0';
     }
-    std::string out;
-    for (std::size_t i = 0; i < bytes.size(); i += 3) {
-        const std::uint32_t b0 = bytes[i];
-        const std::uint32_t b1 = i + 1 < bytes.size() ? bytes[i + 1] : 0;
-        const std::uint32_t b2 = i + 2 < bytes.size() ? bytes[i + 2] : 0;
-        const std::uint32_t n = (b0 << 16) | (b1 << 8) | b2;
-        out += kAlphabet[(n >> 18) & 63];
-        out += kAlphabet[(n >> 12) & 63];
-        out += i + 1 < bytes.size() ? kAlphabet[(n >> 6) & 63] : '=';
-        out += i + 2 < bytes.size() ? kAlphabet[n & 63] : '=';
-    }
-    return out;
+    return yuzu::shared::base64_encode(wide);
 }
 
 } // namespace yuzu::test::fwrestore

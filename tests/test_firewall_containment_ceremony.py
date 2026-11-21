@@ -1017,11 +1017,11 @@ class RemoteFlow(FlowHarness, unittest.TestCase):
                 self.assertIn("nothing was changed", text)
                 self.assertIn("--remote", text)
                 self.assertNotIn("RELEASE NOT CONFIRMED", text)
-        self.assertTrue(fc.self_host_refused(SELF_HOST, "a"))
-        self.assertFalse(fc.self_host_refused(SELF_HOST, "b"))
+        self.assertEqual(fc.refusal_token(SELF_HOST, "a"), "self_host")
+        self.assertIsNone(fc.refusal_token(SELF_HOST, "b"))
         for other in ({"responses": [{"agent_id": "a", "status": 2, "output": "status|refused|privilege_unavailable"}]},
                       {"responses": [{"agent_id": "a", "status": 1, "output": "note|x status|refused|self_host"}]}, {}, None):
-            self.assertFalse(fc.self_host_refused(other, "a"), other)
+            self.assertNotEqual(fc.refusal_token(other, "a"), "self_host", other)
 
 
 # ── #7860 ────────────────────────────────────────────────────────────────────────────────────────────
