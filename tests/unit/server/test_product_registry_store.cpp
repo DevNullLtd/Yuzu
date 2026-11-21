@@ -857,7 +857,9 @@ TEST_CASE("derive_curated_alias takes an edition word as the edition column and 
         REQUIRE(k.has_value());
         CHECK(k->edition == yuzu::server::normalize_edition(edition));
         CHECK(k->norm_key == "contoso:studio:" + k->edition);
-        CHECK(k->alias_key.ends_with(" " + k->edition)); // the edition is in the key
+        // The key comes from raw_name alone, which is what a resolver matches an observed raw
+        // name against; the column sets only the product's edition, never the key.
+        CHECK(k->alias_key == "contoso studio");
     }
     // A raw_name that is one edition word is a title, not an empty one.
     const auto home = derive_curated_alias("macos", "Home", "", "Apple", "Home", "");
@@ -867,6 +869,11 @@ TEST_CASE("derive_curated_alias takes an edition word as the edition column and 
     CHECK(home->norm_key == "apple:home");
     // The column still refuses any word that is not an edition.
     CHECK_FALSE(derive_curated_alias("rpm", "n", "", "v", "p", "Pro Display").has_value());
+    // A vendor that is only a legal-form word is kept, not stripped to nothing and refused.
+    const auto inc = derive_curated_alias("windows", "Contoso Studio", "", "inc", "Studio", "");
+    REQUIRE(inc.has_value());
+    CHECK(inc->vendor == "inc");
+    CHECK(inc->norm_key == "inc:studio");
 }
 
 TEST_CASE("curate_alias with no category keeps an existing product's category; a new one gets other",

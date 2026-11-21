@@ -357,7 +357,9 @@ TEST_CASE("expiry alert constants", "[normalize]") {
 //
 // tests/unit/fixtures/software-estate/normaliser/s2_cases.tsv holds the real titles and vendors
 // (provenance.txt next to it says where each came from) with the output each must give. A row
-// per defect 1 to 7 plus controls for the neighbouring forms that must not move.
+// per defect 1 to 7 plus controls for the neighbouring forms that must not move. The rows are
+// the committed reproduction evidence, so they are read from the file once, through a static;
+// there is no temp file, process or timing dependence.
 
 namespace {
 
@@ -482,10 +484,35 @@ TEST_CASE("an edition word is an edition only after a title word", "[normalize][
         CHECK(nt.title == "home");
         CHECK(nt.edition == "pro");
     }
-    SECTION("the word 'edition' is dropped only right after an architecture or edition word") {
+    SECTION("the word 'edition' is dropped only right after an architecture word or a word taken "
+            "as the edition") {
         CHECK(normalize_title("Studio Pro Edition").title == "studio");
         CHECK(normalize_title("Studio (64-bit edition)").title == "studio");
         CHECK(normalize_title("Collector's Edition Pack").title == "collector's edition pack");
+    }
+    SECTION("a leading edition word kept as a title word does not arm the drop") {
+        const NormalizedTitle home = normalize_title("Home Edition");
+        CHECK(home.title == "home edition");
+        CHECK(home.edition.empty());
+        const NormalizedTitle pro = normalize_title("Pro 2019 Edition");
+        CHECK(pro.title == "pro edition");
+        CHECK(pro.edition.empty());
+        CHECK(pro.version == "2019");
+    }
+}
+
+TEST_CASE("a normalised title plus its edition re-normalises to the same title and edition",
+          "[normalize][s2]") {
+    // The stored alias key is the title plus its edition; a pack built from stored keys must
+    // read each one back as the same title and edition.
+    for (const char* raw : {"Home Edition", "Pro 2019 Edition", "Home - Edition",
+                            "Pro Edition Edition", "Standard 2019 Edition Pro"}) {
+        CAPTURE(raw);
+        const NormalizedTitle once = normalize_title(raw);
+        const NormalizedTitle again =
+            normalize_title(once.edition.empty() ? once.title : once.title + ' ' + once.edition);
+        CHECK(again.title == once.title);
+        CHECK(again.edition == once.edition);
     }
 }
 
@@ -525,7 +552,8 @@ TEST_CASE("name@version sets the version only when none was seen earlier", "[nor
 }
 
 TEST_CASE("a year range stays in the title and is never the version", "[normalize][s2]") {
-    const NormalizedTitle nt = normalize_title("Microsoft Visual C++ 2015-2022 Redistributable (x64)");
+    const NormalizedTitle nt =
+        normalize_title("Microsoft Visual C++ 2015-2022 Redistributable (x64)");
     CHECK(nt.title == "microsoft visual c++ 2015-2022 redistributable");
     CHECK(nt.version.empty());
     CHECK(normalize_title("Foo 2015-2022 Bar").version.empty());

@@ -63,9 +63,11 @@ struct NormalizedTitle {
 ///     AFTER a title word has been kept: a title that is one ("Home") or starts
 ///     with one ("Pro Display Calibrator") keeps it as a title word, so a title
 ///     never normalises to nothing because of it,
-///   - the word "edition" directly after an architecture or edition token is
-///     dropped with it ("7-Zip 26.04 (x64 edition)" and "Visual Studio Pro
-///     Edition" lose it; elsewhere it is a title word),
+///   - the word "edition" directly after an architecture token, or after a word
+///     taken as the edition, is dropped with it ("7-Zip 26.04 (x64 edition)" and
+///     "Visual Studio Pro Edition" lose it; elsewhere it is a title word, so a
+///     leading edition word kept as a title word does not arm it: "Home Edition"
+///     is "home edition"),
 ///   - a standalone "-" token is dropped ("Redistributable (x64) - 14.38"),
 ///   - a Homebrew-style "name@version" token keeps `name` in the title and
 ///     supplies the version when none was seen before it ("openssl@3" gives
@@ -100,9 +102,10 @@ inline constexpr std::string_view kOriginLabelPrefix = "via:";
 /// part of the name ("macOS Software Signing", "Software AG"), and the last
 /// remaining token is never stripped, so a non-empty vendor never normalises
 /// to nothing ("Software" stays "software"). Compound legal forms ("GmbH & Co.
-/// KG", "S.A.S.") are not reduced: kg, co and & are not in the list. A RAW value starting with kOriginLabelPrefix (case-sensitive, exact: the
-/// agent emits it lowercase, so a Windows Publisher of "VIA:..." is a vendor) is an origin label,
-/// not a vendor, and normalises to "". Total over arbitrary bytes; never throws.
+/// KG", "S.A.S.") are not reduced: kg, co and & are not in the list. A RAW value starting with
+/// kOriginLabelPrefix (case-sensitive, exact: the agent emits it lowercase, so a Windows
+/// Publisher of "VIA:..." is a vendor) is an origin label, not a vendor, and normalises to "".
+/// Total over arbitrary bytes; never throws.
 std::string normalize_vendor(std::string_view raw);
 
 /// Deterministic canonical product key — the `products.norm_key` UNIQUE

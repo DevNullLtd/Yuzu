@@ -52,4 +52,4 @@ row of defects 1 to 5, the name@version rows of defect 6, the defect 7 row (by i
 the three Visual C++ control rows (by their dangling dash) and the Example Software GmbH & Co. KG
 control (it changes once, by design). All 34 pass after the fix. The glued-version rows of defect 6
 (python3.14, postgresql-18, gcc-15) and the other controls pass on both: they pin behaviour that
-must not move. The old output of each failing row is in the PR body.
+must not move. Run the fixture against that commit to see each old output.

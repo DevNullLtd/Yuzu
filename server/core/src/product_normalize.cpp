@@ -181,13 +181,13 @@ NormalizedTitle normalize_title(std::string_view raw) {
         }
         // An edition word is an edition only after a title word: a title that is an edition
         // word ("Home") or starts with one ("Pro Display Calibrator") keeps it as a title word.
-        if (is_edition_token(t)) {
+        // Only a word actually taken as the edition arms the "edition" drop above, so a kept
+        // "Home" leaves "Home Edition" as `home edition` and the key stays idempotent.
+        if (is_edition_token(t) && !kept.empty()) {
             after_arch_or_edition = true;
-            if (!kept.empty()) {
-                if (out.edition.empty())
-                    out.edition = std::string{t};
-                continue;
-            }
+            if (out.edition.empty())
+                out.edition = std::string{t};
+            continue;
         }
         kept.push_back(std::move(token));
     }
