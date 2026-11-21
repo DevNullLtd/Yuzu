@@ -8,7 +8,9 @@
  *    BEFORE its first OS call, over a fresh KV store. They prove the action
  *    routing, parameter checks, record read and result emission of the real
  *    plugin, which the pure-core tests cannot. Every `quarantine` dispatch in
- *    them carries a probe_target that does not parse, so none can reach the OS.
+ *    them is refused or answered before the plugin's first OS call; each carries a
+ *    probe_target that does not parse, except the `repair=1` dispatches, which are
+ *    the record-only repair route or are refused for naming a containment parameter.
  *  - live cases, tagged [.][firewall_quarantine_live]: HIDDEN, so the shard
  *    partition never selects them; they change the firewall of the machine they
  *    run on and need root / Administrator, or the agent account (see "Who runs
@@ -1004,8 +1006,9 @@ TEST_CASE("quarantine: the plugin action checks its parameters before it touches
     // 60..2592000 (or not a number) is refused with no record started. Only refused
     // values are run here, never a valid one, which would reach the OS.
     for (const char* v : {"5", "59", "2592001", "soon", "0", "-5"})
-        check_refused(rig.run("quarantine", {{"ttl_seconds", v}}), "ttl_out_of_bounds");
-    const auto bad = rig.run("quarantine", {{"exceptions", "garbage"}});
+        check_refused(rig.run("quarantine", {{"ttl_seconds", v}, {"probe_target", "nope"}}),
+                      "ttl_out_of_bounds");
+    const auto bad = rig.run("quarantine", {{"exceptions", "garbage"}, {"probe_target", "nope"}});
     CHECK(has_prefix(bad.captured, "status|refused|exceptions_invalid:"));
     CHECK(bad.rc == 1);
     CHECK_FALSE(rig.record().has_value()); // no recovery record was even started
@@ -1072,7 +1075,8 @@ TEST_CASE("quarantine repair=1: a dispatch that also names containment parameter
                   "repair_with_containment_parameters");
     CHECK_FALSE(rig.record().has_value());
     // and `repair` other than `1` is no repair at all: the ordinary parameter checks apply
-    check_refused(rig.run("quarantine", {{"repair", "0"}, {"ttl_seconds", "soon"}}), "ttl_out_of_bounds");
+    check_refused(rig.run("quarantine", {{"repair", "0"}, {"ttl_seconds", "soon"}, {"probe_target", "nope"}}),
+                  "ttl_out_of_bounds");
 }
 
 TEST_CASE("quarantine: a control endpoint that is this host's own loopback is refused self_host",
@@ -1081,10 +1085,12 @@ TEST_CASE("quarantine: a control endpoint that is this host's own loopback is re
     // refused whatever the read of this host's addresses returned. The refusal comes before
     // the privilege check, the staging check and any apply, on every OS and for an
     // unprivileged run, so this is what the built plugin answers here. Every `quarantine`
-    // dispatch in this suite carries a probe_target that does not parse (`nope`): with the
-    // check intact the answer is still self_host, and if the check ever regresses the
-    // dispatch ends in a parse refusal and a clean test failure instead of a real apply
-    // on a root runner.
+    // dispatch in this suite is refused or answered before the plugin's first OS call; each
+    // carries a probe_target that does not parse (`nope`), except the `repair=1` dispatches,
+    // which are the record-only repair route or are refused for naming a containment
+    // parameter. With the check intact the answer is still self_host, and if the check ever
+    // regresses the dispatch ends in a parse refusal and a clean test failure instead of a
+    // real apply on a root runner.
     {
         PLUGIN_RIG_AT_OR_RETURN(rig, "127.0.0.1:50051", "127.0.0.1");
         check_refused(rig.run("quarantine", {{"probe_target", "nope"}}), "self_host");
@@ -1144,8 +1150,9 @@ TEST_CASE("quarantine: the self_host check is skipped for a device whose own rec
     // An apply to a device whose record is active only keeps or repairs the STORED set, and
     // its answer is what tells the server the requested set was not applied; a refusal
     // there would let the server confirm a record whose set the device never applied. Any
-    // other record (applying, releasing) is checked. The probe_target does not parse, so
-    // no case here reaches the OS: apply_and_verify refuses it before it loads the store.
+    // other record (applying, releasing, unreadable) is checked. The probe_target does not
+    // parse, so no case here reaches the OS: apply_and_verify refuses it before it loads the
+    // store.
     PLUGIN_RIG_AT_OR_RETURN(rig, "127.0.0.1:50051", "127.0.0.1");
     const auto stored = [&](fq::Phase phase) {
         fq::QuarantineState st;
@@ -1166,6 +1173,13 @@ TEST_CASE("quarantine: the self_host check is skipped for a device whose own rec
         check_refused(rig.run("quarantine", {{"probe_target", "nope"}}), "self_host");
         CHECK(raw_record() == before); // the refusal leaves the record as it was
     }
+
+    // an unreadable record is not read as active: it fails closed, checked like the others
+    REQUIRE(rig.kv->set("firewall", std::string{fq::kStateKey}, "not a record"));
+    const auto garbage = raw_record();
+    REQUIRE(garbage.has_value());
+    check_refused(rig.run("quarantine", {{"probe_target", "nope"}}), "self_host");
+    CHECK(raw_record() == garbage);
 
     rig.put_record(stored(fq::Phase::active));
     const auto before = raw_record();
@@ -2017,8 +2031,8 @@ TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release resto
     // pre-quarantine values, and our anchor holds nothing
     check_restored(before);
     // our anchor is empty, not merely unreferenced
-    // An absence needs a read that completed, or the anchor's own absence (pfctl exits non-zero for
-    // an anchor that is not loaded) seen after the two main reads completed.
+    // An absence needs a read that completed, or the anchor's own absence (pfctl is expected to exit
+    // non-zero for an anchor that is not loaded) seen after the two main reads completed.
     const auto emptied = pf_anchor_capture("rules");
     const bool main_complete = yuzu::firewall::subprocess_complete(pf_main_capture("rules")) &&
                                yuzu::firewall::subprocess_complete(pf_main_capture("info"));

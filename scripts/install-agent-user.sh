@@ -2023,7 +2023,9 @@ case "$ACTION" in
             if [[ "$DRY_RUN" -ne 1 && -e "$SUDOERS_FILE" ]]; then
                 fail "a root-owned helper was not installed and $SUDOERS_FILE could not be removed: remove it by hand, correct the helper directory and re-run this installer"
             fi
-            fail "a root-owned helper was not installed, so $SUDOERS_FILE was removed: until the helper directory is corrected (owned by root, not writable by all users) and this installer is re-run, every sudo-backed action fails on a non-root agent, firewall containment and services.set_start_mode included"
+            removed="was removed"
+            if [[ "$DRY_RUN" -eq 1 ]]; then removed="would be removed"; fi
+            fail "a root-owned helper was not installed, so $SUDOERS_FILE $removed: until the helper directory is corrected (owned by root, not writable by all users) and this installer is re-run, every sudo-backed action fails on a non-root agent, firewall containment and services.set_start_mode included"
         fi
         if [[ "$sudoers_rc" -ne 0 ]]; then
             warn "$SUDOERS_FILE was not installed (status $sudoers_rc); removing any earlier file so no old grant stays"

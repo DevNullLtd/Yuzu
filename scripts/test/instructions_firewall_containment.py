@@ -176,7 +176,7 @@ def say(*args, **kw) -> None:
 
 
 # What to run on the host when the ceremony cannot confirm a release (the names are the plugin's own).
-HAND_RELEASE = ("dispatch firewall.release from the dashboard (the plugin's own undo; a rule removed by hand "
+HAND_RELEASE = ("dispatch firewall.release from the dashboard (the plugin's own undo; a containment removed by hand "
                 "while its record is still active is re-applied within 60 s). Only when the agent cannot be "
                 "reached: stop the agent service first, then Linux: sudo nft delete table inet yuzu_quarantine "
                 "(without nft: delete the yuzu-fwq-* chains and the jumps to them, in iptables and ip6tables), "
@@ -562,7 +562,7 @@ LOOPBACK_REFUSAL = ("refused: the dashboard must be loopback (http://127.0.0.1:<
                     "server are on one host ends refused|self_host (exit 2) by design: the agent will not contain "
                     "the host its own control endpoint is on, so a containment round trip needs --remote. The "
                     "check compares the host's own addresses only: a server in a container or VM on this host, "
-                    "reached at a bridge address, is not one, and that host is contained")
+                    "reached at a bridge address, is not one of them, so the agent does contain that host")
 
 SELF_HOST_TEXT = ("the agent's control endpoint is the agent host itself, so it refused to contain it "
                   "(status|refused|self_host): nothing was changed and no release was dispatched. The check compares "
@@ -577,9 +577,11 @@ REMOTE_NOTE = ("remote mode: the agent host is not this machine. The release goe
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
-                                epilog="One host cannot run the containment: an --apply-containment run with the "
-                                       "agent and the server on the same host ends refused|self_host (exit 2) by "
-                                       "design, and a containment round trip needs --remote. The run lock file is "
+                                epilog="One host cannot run the containment: an --apply-containment run whose agent "
+                                       "control endpoint is one of the host's own addresses (the agent and the "
+                                       "server on the same host) ends refused|self_host (exit 2) by design, and a "
+                                       "containment round trip needs --remote. A server in a container or VM on "
+                                       "this host, reached at a bridge address, is not refused. The run lock file is "
                                        "in the temp directory, which on macOS is per user (runs by different users, "
                                        "or under sudo, do not exclude each other), and on Linux a lock file another "
                                        "user created there makes the run refuse to start. See the module docstring.")
@@ -628,13 +630,20 @@ def new_record(args: argparse.Namespace) -> dict:
 def write_record(path: str, rec: dict) -> None:
     """Write the run record to a file this call creates (O_EXCL: an existing path, a symlink included, is
     never opened, truncated or written through), mode 0600 (a new file has at most the creation mode). A
-    failure to write it is reported and never changes the run's exit code."""
+    failure to write it is reported and never changes the run's exit code; a write that fails after this
+    call created the file removes it, and an open that fails never removes anything."""
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as e:   # EEXIST: the file is another run's record, never ours to remove
+        say(f"could not write the run record {path}: {e}", file=sys.stderr)
+        return
+    try:
         with os.fdopen(fd, "w") as f:
             json.dump(rec, f, indent=2, sort_keys=True)
             f.write("\n")
-    except OSError as e:
+    except OSError as e:   # a partial file this call created would block the corrected retry
+        with contextlib.suppress(OSError):
+            os.unlink(path)
         say(f"could not write the run record {path}: {e}", file=sys.stderr)
 
 
@@ -647,7 +656,7 @@ def main(argv=None) -> int:
         return rc
     finally:
         rec["exit_code"] = rc
-        if getattr(args, "record", "") and not os.path.lexists(args.record):
+        if getattr(args, "record", ""):
             write_record(args.record, rec)
 
 

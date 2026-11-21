@@ -103,7 +103,8 @@ spec:
           that failed, written when the leg hands off to the next backend
           (the reason is torn_persistent when churn ended three probes in a
           row; generation:changed means the dumps disagreed on the ruleset
-          generation after one re-run).
+          generation after the one re-run saw it again, or at once when
+          under 2 seconds of the budget remained).
         example: enabled
     aggregation:
       groupBy: [state]
@@ -275,7 +276,8 @@ metadata:
     own addresses cannot be read, is never contained: every apply is checked,
     whoever sent it, before the privilege check, and it answers
     refused|self_host or refused|own_addresses_unreadable and changes nothing.
-    An apply to a device whose own record is already active is not checked.
+    An apply when the record the plugin keeps on the device is already active
+    is not checked.
   tags: [security, quarantine, incident-response, network]
 
 spec:

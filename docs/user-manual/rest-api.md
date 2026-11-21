@@ -2276,10 +2276,11 @@ gate and the same `503` on a degraded read apply to them. **Any other value, an 
 > addresses it cannot read, answers the apply with that refusal and is never contained, so the record
 > never confirms (`last_confirmed_at` stays `0`) and `YuzuQuarantineEndpointUnconfirmed` fires after
 > 15 minutes. The device changes nothing and stores no record; the refusal is in the apply's stored
-> reply (the `status|refused|<token>` row, `GET /api/v1/responses/{command_id}`) and in the agent log.
+> reply (the `status|refused|<token>` row, `GET /api/v1/responses/{command_id}`; the `command_id` is in the
+> device's `quarantine.reapply` audit row) and in the agent log.
 > `own_addresses_unreadable` is permanent where the agent cannot read its interfaces (for example a
 > unit or seccomp profile that denies `AF_NETLINK`): allow `AF_NETLINK` for the agent, the agent log
-> names the errno. An apply to a device whose own record is already active is not checked (it keeps
+> names the errno. An apply when the record the plugin keeps on the device is already active is not checked (it keeps
 > its stored set and answers as described above). The record still refuses operator commands to the
 > device. The server keeps re-dispatching, so nothing ends the record by itself: end it with
 > `DELETE /api/v1/quarantine/{agent_id}`. A device that was never contained holds no rules, so it
@@ -2291,10 +2292,10 @@ gate and the same `503` on a degraded read apply to them. **Any other value, an 
 > server in a container or VM on the same host reached at a bridge address is not refused: that host
 > is contained with `forward` at policy drop and no rules, so forwarded traffic is dropped and the
 > server's published ports vanish for the whole fleet; a server apply carries no time limit and the
-> 60-second repair undoes a rule removed by hand. A host that runs the server while its agent reaches
+> 60-second repair puts back a table removed by hand. A host that runs the server while its agent reaches
 > a remote gateway or VIP passes the check the same way. The exits are the `DELETE` while the API is
-> reachable, otherwise console recovery: stop the agent service first, then remove the table. See
-> `docs/user-manual/security-hardening.md` "A device that is its own server is never contained".
+> reachable, otherwise console recovery (the steps are in
+> `docs/user-manual/security-hardening.md` "A device that is its own server is never contained").
 >
 > **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
 > progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed,
@@ -2440,11 +2441,12 @@ Quarantine a device.
 >   call — a brand-new record isn't in the heartbeat fast path's cache until
 >   the next periodic tick populates it, so a heartbeat arriving in that
 >   narrow window doesn't shortcut the wait. A record created here for a
->   reachable device does not stay dormant — the one exception is a stored
->   `whitelist` the re-dispatch validator refuses. As of #3425 (`d1f71c58f`)
+>   reachable device does not stay dormant — the exceptions are a stored
+>   `whitelist` the re-dispatch validator refuses and a device that refuses the apply (see "A
+>   device that refuses" above). As of #3425 (`d1f71c58f`)
 >   this route validates `whitelist` at write time (`400` instead of `201`
 >   for a malformed value), the same rule MCP's `quarantine_device`
->   enforces — so a fresh write here cannot land in this state. A
+>   enforces — so a fresh write here cannot land in the first state. A
 >   `validation_failed` reconcile points at a record written under an
 >   earlier, looser rule, not a fresh call. Either way, every reconcile
 >   attempt then counts `validation_failed` and nothing is ever dispatched.

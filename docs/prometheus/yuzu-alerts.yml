@@ -3253,7 +3253,8 @@ groups:
             the quarantine.reapply row, and in the agent log
             (firewall: quarantine -> refused:<token>). The record still blocks
             operator commands to the device while it exists. A device whose own
-            record is already active is not refused this way.
+            stored containment (the record the plugin keeps on the device) is
+            already active is not refused this way.
             This alert also fires when the device's agent lacks the
             firewall plugin: the dispatch is accepted but never
             confirmed. An agent without the firewall plugin comes from an

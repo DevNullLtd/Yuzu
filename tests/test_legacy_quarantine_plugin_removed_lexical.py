@@ -641,9 +641,10 @@ class IptablesHelperRuns(unittest.TestCase):
                 self.assertNotEqual(r.returncode, 0, (shell, argv))
                 self.assertEqual(r.stdout, "", (shell, argv))
 
-    def test_a_hostile_path_cannot_change_what_runs(self):
-        # The only environment variable this observes is PATH: the helper resets it itself, so a PATH
-        # that names nothing still runs the stub tool at its own fixed path.
+    def test_an_unusable_path_still_runs_the_tool_at_its_fixed_path(self):
+        # The only environment variable this observes is PATH: a PATH that names nothing still runs the
+        # stub tool at its own fixed path. Nothing here resolves a command through PATH, so this proves
+        # no more than that; the planted-command case is SnapshotRuns' (its `head` is resolved by name).
         env = {"PATH": "/nonexistent"}
         for shell in available_shells():
             r = subprocess.run([shell, self.path, "iptables", "-N", "yuzu-fwq-1"], capture_output=True,
@@ -775,12 +776,23 @@ class SnapshotRuns(unittest.TestCase):
 
     def test_a_hostile_path_cannot_change_what_runs(self):
         # PATH is the only variable observed here (the helper resets it itself); the others are not
-        # reachable through the sudo grant, whose env_reset strips them.
-        env = {"PATH": "/nonexistent"}
+        # reachable through the sudo grant, whose env_reset strips them. The snapshot resolves one
+        # command by name (`head`, the byte cap), so a `head` that writes a marker is planted first in
+        # the caller's PATH: it must never run. Deleting the helper's own PATH line, or appending to
+        # the caller's PATH instead of replacing it, would run it.
         want = self.expected_listing(["stub-nft", "stub-iptables", "stub-ip6tables"])
         for shell in available_shells():
+            plant = tempfile.TemporaryDirectory(prefix="yuzu_test_fwplant_")
+            self.addCleanup(plant.cleanup)
+            marker = os.path.join(plant.name, "ran")
+            planted = os.path.join(plant.name, "head")
+            with open(planted, "w") as f:
+                f.write('#!/bin/sh\n: > "%s"\nPATH=/usr/bin:/bin\nexec head "$@"\n' % marker)
+            os.chmod(planted, 0o755)
+            env = {"PATH": plant.name + ":/usr/bin:/bin"}
             r = self.run_helper(shell, self.make_helper({}), ["snapshot"], env=env)
             self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, ""), shell)
+            self.assertFalse(os.path.exists(marker), (shell, "the planted head ran"))
 
     def test_the_label_format_is_the_one_the_restore_comparison_reads(self):
         # The section labels and the three markers are kept by hand in three places: the helper, this

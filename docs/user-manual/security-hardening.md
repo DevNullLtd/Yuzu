@@ -626,8 +626,9 @@ whitelist leaves IPv6 fully contained.
 
 ### A device that is its own server is never contained
 
-A device whose server or gateway address is one of its own addresses, loopback included, is
-never contained. Every `firewall.quarantine` apply is checked, whoever sent it (an operator's
+No containment is applied to a device whose server or gateway address is one of its own
+addresses, loopback included; one stored earlier is still re-applied (see "Which applies are
+checked"). Every `firewall.quarantine` apply is checked, whoever sent it (an operator's
 dispatch, the server's reconciler or an MCP re-apply): the agent compares the control addresses (the
 address it is connected through, plus every address the configured server name resolved to at agent
 start) with every address the host answers to, and answers `refused|self_host` when one matches, or
@@ -635,10 +636,10 @@ when a control address is loopback or unspecified. Containing such a host would 
 from the very server that has to release it. A read of the host's own addresses that fails is refused
 too (`refused|own_addresses_unreadable`): an unknown is not "not this host". That read fails for good
 where the agent cannot read its interfaces, for example a unit or seccomp profile that denies
-`AF_NETLINK`: every quarantine is refused there until the agent is allowed `AF_NETLINK` (the agent
+`AF_NETLINK`: every checked apply is refused there until the agent is allowed `AF_NETLINK` (the agent
 log names the errno). Either answer changes nothing on the device and stores no record, and there is
 no override. The refusal is visible in the `status|refused|<token>` row of the command's stored reply
-and in the agent log (`firewall: quarantine -> refused:self_host`).
+(the `command_id` is in the device's `quarantine.reapply` audit row) and in the agent log (`firewall: quarantine -> refused:self_host`).
 
 - **A single-host stack cannot apply a containment.** An agent that talks to a server on the
   same machine, such as a one-machine evaluation stack or a loopback test rig, answers
@@ -648,7 +649,7 @@ and in the agent log (`firewall: quarantine -> refused:self_host`).
   refused apply counts as a failed command, so `YuzuHighCommandFailureRate` can fire on an otherwise
   idle server while the record stands.
 - **Which applies are checked.** Every `firewall.quarantine` apply is checked, whoever sent it. Not
-  checked: an apply to a device whose own record is already active (it is answered from the stored
+  checked: an apply when the record the plugin keeps on the device is already active (it is answered from the stored
   set: it only keeps or repairs the stored allow set and says when the requested set was not applied,
   see "A new record on a contained device"), the agent's 60-second repair, its boot-time re-apply,
   `firewall.release` and `firewall.quarantine_allow`. A containment that is already stored is
@@ -668,11 +669,15 @@ and in the agent log (`firewall: quarantine -> refused:self_host`).
   server's address changes. A host contained this way has `forward` at policy drop with no rules, so
   forwarded traffic is dropped and the server's published ports vanish for the whole fleet while the
   containment stands; a server apply carries no time limit (`ttl_seconds`), and the 60-second repair
-  puts back a rule removed by hand. A host that runs the server while its agent reaches a remote
+  puts back a table removed by hand. A host that runs the server while its agent reaches a remote
   gateway or VIP passes the check the same way, and its new inbound connections are dropped. The
   exits are `DELETE /api/v1/quarantine/{agent_id}` while the API is reachable, otherwise console
-  recovery: stop the agent service first, then remove the table. Put the server on a separate host
-  when containment matters.
+  recovery: stop the agent service first, then remove the containment by hand (Linux: `sudo nft
+  delete table inet yuzu_quarantine`, or without nft delete the `yuzu-fwq-*` chains and the jumps
+  to them, in iptables and ip6tables; macOS: `sudo pfctl -a com.apple/000.yuzu_quarantine -F rules
+  -F nat`). Keep the agent stopped until the record is ended with `?force=true`: a restarted agent
+  re-applies a stored containment, and the release the server then owes lifts it. Put the server on
+  a separate host when containment matters.
 
 ### Reading the result honestly
 

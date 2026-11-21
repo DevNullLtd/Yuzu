@@ -21,9 +21,11 @@
  * Assumes an unprivileged run on macOS: pf (read via pfctl) requires root, so a
  * pf|unknown state field is expected there, and the plugin says WHY with an
  * `error|pf:...` row (#4891, #6611) instead of an unexplained unknown. The
- * pairing is what the macOS cases pin: `pf|unknown` if and only if the pf info
- * error row, `ruleset|unknown` if and only if the pf rules error row, so an
- * unprivileged and a privileged run both pass.
+ * pairing is what the macOS cases pin, on a live host: `pf|unknown` if and only if
+ * the pf info error row (a `pfctl -s info` that completes always names Enabled or
+ * Disabled; the completed-but-unrecognised read, where `pf|unknown` comes alone,
+ * is the pure layer's case), `ruleset|unknown` if and only if the pf rules error
+ * row, so an unprivileged and a privileged run both pass.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -129,7 +131,9 @@ std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall_p
 // (MESON_BUILD_ROOT set) the agent shards depend on the plugin build, so a plugin that is
 // missing or does not load is a defect and FAILs: a green skip there would let a partial build
 // pass these cases without running one. A bare run of the test binary outside meson has no such
-// guarantee and skips (the same rule as firewall_plugin_built() in test_firewall_quarantine_live.cpp).
+// guarantee and skips. Not quite the rule of firewall_plugin_built() in
+// test_firewall_quarantine_live.cpp: that one REQUIREs a plugin file that is present to load even on
+// a bare run, while this skips there when the plugin is present but does not load.
 [[nodiscard]] bool skip_without_plugin(
     const std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError>& ph) {
     if (ph)

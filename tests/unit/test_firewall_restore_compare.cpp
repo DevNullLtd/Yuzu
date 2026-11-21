@@ -443,8 +443,8 @@ TEST_CASE("macOS: a non-empty yuzu anchor is residue", "[firewall]") {
 
 TEST_CASE("macOS: pf_anchor_absent reads an anchor that is not loaded as absent, and nothing else",
           "[firewall]") {
-    // what pfctl answers for an anchor that does not exist: it ran, exited 1 and printed its
-    // error; both main reads completed
+    // what pfctl is expected to answer for an anchor that does not exist (not yet observed on a
+    // macOS host): it ran, exited non-zero (1 here) and printed its error; both main reads completed
     const std::string_view invalid = "pfctl: DIOCGETRULES: Invalid argument\n";
     CHECK(pf_anchor_absent(true, true, 1, invalid));
     // the exit status decides, not the wording: another pfctl text with the same exit is absent too

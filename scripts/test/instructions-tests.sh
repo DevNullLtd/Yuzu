@@ -24,7 +24,7 @@
 # refused|self_host (exit 2) by design; the check compares addresses only, so a server in a container
 # or VM reached at a bridge address is not one. A containment round trip needs the server on another
 # host: --target-agent-hostname NAME with --console-access-to-agent runs the ceremony in its --remote
-# mode. This wrapper forwards neither --record nor --probe-target, --ttl-seconds or --exceptions, so
+# mode. This wrapper forwards none of --record, --probe-target, --ttl-seconds and --exceptions, so
 # a retained record or a verified containment needs the script run directly (--record,
 # --probe-target).
 # scripts/test/instructions-risk-classification.json is the authority.

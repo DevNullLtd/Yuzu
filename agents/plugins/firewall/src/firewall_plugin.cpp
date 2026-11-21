@@ -2853,8 +2853,10 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
     // repair=1 and the boot re-apply already do unchecked) and is the only emitter of the
     // `allow_set_unchanged_use_quarantine_allow=1` note the server keys on, so a refusal
     // there would let the server confirm a record whose set the device never applied. An
-    // applying, releasing, unreadable or absent record is checked. repair, boot re-apply,
-    // release and quarantine_allow never reach this line.
+    // applying, releasing, unreadable or absent record is checked, so on a host that became
+    // its own server while a record sat `applying` a retried apply is refused and does not
+    // finish it; a release, or the unchecked boot re-apply, ends that state. repair, boot
+    // re-apply, release and quarantine_allow never reach this line.
     const auto stored = KvStateStore{raw}.load();
     const bool already_active =
         stored.kind == fq::StateLoad::Kind::ok && stored.state.phase == fq::Phase::active;

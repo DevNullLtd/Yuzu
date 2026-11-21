@@ -599,9 +599,11 @@ inline void compare_macos(const Parsed& a, const Parsed& b, Verdict& v) {
     return count;
 }
 
-/// Is the yuzu pf anchor simply not loaded? `pfctl -a <anchor> -s rules` exits non-zero for an
-/// anchor that does not exist (`DIOCGETRULES: Invalid argument`), which is not an unreadable
-/// host: the plugin itself reads it as "no anchor" after two good main reads (PfLeg::read_status).
+/// Is the yuzu pf anchor simply not loaded? `pfctl -a <anchor> -s rules` is expected to exit
+/// non-zero for an anchor that does not exist (the text is expected to be `DIOCGETRULES: Invalid
+/// argument`; neither the exit nor the text has been observed on a macOS host yet), which is not
+/// an unreadable host: the plugin itself reads it as "no anchor" after two good main reads
+/// (PfLeg::read_status).
 /// True only when BOTH main pf reads completed, the anchor call ran to a non-zero exit (it did
 /// start, was not killed by a signal or the deadline and was not clipped: `ran_to_exit`, with
 /// `exit_code` > 0) and no output line is a sudo refusal. The caller then records the anchor

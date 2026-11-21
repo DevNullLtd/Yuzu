@@ -879,6 +879,7 @@ class Usage(unittest.TestCase):
         self.assertIn("refused|self_host", fc.__doc__)
 
 
+@unittest.skipUnless(hasattr(signal, "SIGHUP"), "the ceremony is POSIX-only")
 class Cleartext(FlowHarness, unittest.TestCase):
     """A plain http dashboard at a non-loopback address sends the admin password and cookie unencrypted:
     the run says so (on stderr, before the login) in every mode, and says nothing for loopback or https."""
@@ -907,6 +908,20 @@ class Cleartext(FlowHarness, unittest.TestCase):
                 self.assertIn("unencrypted", err)
                 self.assertIn("192.0.2.7", err)
                 self.assertNotIn("8080", err)   # the host only: never a URL that could carry credentials
+
+    def test_the_warning_is_printed_before_the_login_whose_failure_it_must_survive(self):
+        # the credentials have crossed the network by the time the login returns or fails
+        err, at_login = io.StringIO(), []
+
+        def login(*_):
+            at_login.append(err.getvalue())
+            raise fc.LoginError("denied")
+        client = remote_client()
+        client.login.side_effect = login
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.run_main({}, apply=False, dashboard=OFF_HOST, extra=["--remote"], client=client)
+        self.assertEqual(len(at_login), 1)
+        self.assertIn("unencrypted", at_login[0])
 
     def test_loopback_and_https_are_not_warned(self):
         self.assertNotIn("unencrypted", self.stderr_of("http://127.0.0.1:9", True))
@@ -1362,12 +1377,43 @@ class RunRecord(FlowHarness, unittest.TestCase):
                 client.assert_not_called()
             self.assertEqual(Path(path).read_bytes(), before)
 
+    def test_a_write_that_fails_part_way_leaves_no_file_to_block_the_retry(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_enospc_") as d:
+            path = os.path.join(d, "run.json")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), \
+                    mock.patch.object(fc.json, "dump", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+                fc.write_record(path, {"exit_code": 0})
+            self.assertIn("could not write the run record", err.getvalue())
+            self.assertIn("No space left", err.getvalue())
+            self.assertFalse(os.path.lexists(path))
+            fc.write_record(path, {"exit_code": 0})   # the corrected retry at the same path now succeeds
+            self.assertEqual(json.loads(Path(path).read_text()), {"exit_code": 0})
+
+    def test_a_path_taken_during_the_run_is_reported_and_left_untouched(self):
+        # a second run refused at the lock writes its own refusal record at once; the run still going must say
+        # its record was not kept (exit code unchanged) and never overwrite the file (O_EXCL is the one check)
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_taken_") as d:
+            path = os.path.join(d, "run.json")
+            other = '{"exit_code": 2, "statuses": []}\n'
+
+            def take_the_path(_calls):
+                Path(path).write_text(other)
+                return row("inactive")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc, _ = self.run_main({"quarantine_status": [take_the_path]}, apply=False, extra=["--record", path])
+            self.assertEqual(rc, fc.EXIT_OK)
+            self.assertIn("could not write the run record", err.getvalue())
+            self.assertEqual(Path(path).read_text(), other)
+
     def test_a_refused_non_posix_run_writes_its_record_and_exits_2(self):
-        # refusal() stops a non-POSIX host first; the record is still written like on every exit path
-        # (it used to raise AttributeError from os.fchmod on Windows and leave a 0-byte file)
+        # refusal() stops a non-POSIX host first; the record is still written like on every exit path,
+        # and without os.fchmod (absent on Windows): a call to it here would raise
         with tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_win_") as d:
             path = os.path.join(d, "run.json")
-            with on("Windows"), mock.patch.object(fc, "Client") as client, contextlib.redirect_stderr(io.StringIO()):
+            with on("Windows"), mock.patch.object(fc, "Client") as client, contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(fc.os, "fchmod", create=True, side_effect=AttributeError):
                 self.assertEqual(fc.main(["--dashboard", "http://127.0.0.1:9", "--record", path]),
                                  fc.EXIT_PRECONDITION)
                 client.assert_not_called()
