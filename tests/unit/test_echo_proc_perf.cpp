@@ -14,6 +14,7 @@
  * box; the rest runs on every host.
  */
 
+#include "echo_aggregator.hpp" // interval_baseline_reset_due
 #include "echo_fold_schema.hpp"
 #include "echo_local_image_path.hpp"
 #include "echo_proc_perf.hpp"
@@ -77,6 +78,26 @@ TEST_CASE("procperf derive: invalid snapshots / zero elapsed / zero cores never 
     auto nocores = cur;
     nocores.ncores = 0;
     CHECK(derive_proc_samples(prev, nocores, kNoRedaction).empty());
+}
+
+TEST_CASE("procperf derive: a baseline reset on errored recovery derives nothing across the gap",
+          "[echo][procperf][issue1624]") {
+    // A skipped (errored) tick leaves the previous reading untouched, so without
+    // the reset the first tick after recovery would diff against a reading from
+    // before the errored interval and record that interval's activity (#1624).
+    // do_configure replaces the baseline with a default ProcSnapshot when
+    // interval_baseline_reset_due says so; this pins what that reset buys.
+    auto before_error = snap(1000), first_tick_after = snap(1300);
+    before_error.procs.push_back(proc(10, 1, 0, 50 << 20, "burner.exe"));
+    first_tick_after.procs.push_back(proc(10, 1, 300 * kSec100ns, 50 << 20, "burner.exe"));
+
+    // Control: the stale baseline WOULD yield a row covering the whole gap.
+    REQUIRE(derive_proc_samples(before_error, first_tick_after, kNoRedaction).size() == 1);
+
+    auto baseline = before_error;
+    if (yuzu::echo::interval_baseline_reset_due("errored", "true"))
+        baseline = ProcSnapshot{};
+    CHECK(derive_proc_samples(baseline, first_tick_after, kNoRedaction).empty());
 }
 
 TEST_CASE("procperf derive: CPU is the app's share of TOTAL capacity", "[echo][procperf]") {

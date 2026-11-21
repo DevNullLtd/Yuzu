@@ -13,6 +13,7 @@
  * rest runs on every host.
  */
 
+#include "echo_aggregator.hpp"  // interval_baseline_reset_due
 #include "echo_collectors.hpp" // kCollectStatus* — the operator-facing token contract
 #include "echo_fold_schema.hpp"
 #include "echo_perf.hpp"
@@ -63,6 +64,28 @@ TEST_CASE("perf: invalid inputs and zero elapsed never derive", "[echo][perf]") 
     CHECK(!derive_sample(good, PerfCounters{}).valid);
     PerfCounters same_ts = good;
     CHECK(!derive_sample(good, same_ts).valid); // elapsed == 0
+}
+
+TEST_CASE("perf: a baseline reset on errored recovery derives nothing across the gap",
+          "[echo][perf][issue1624]") {
+    // The device sampler keeps its previous reading in memory across skipped
+    // (errored) ticks, so the first tick after recovery would otherwise derive a
+    // sample spanning the whole errored interval (#1624). do_configure resets the
+    // baseline to a default PerfCounters when interval_baseline_reset_due says so.
+    PerfCounters before_error = baseline();
+    PerfCounters first_tick_after = before_error;
+    first_tick_after.ts_epoch = 1300;
+    first_tick_after.cpu_idle += 3'000'000'000;
+    first_tick_after.cpu_kernel += 4'000'000'000; // kernel includes the idle delta
+    first_tick_after.cpu_user += 2'000'000'000;
+
+    // Control: the stale baseline WOULD yield a valid sample over the gap.
+    REQUIRE(derive_sample(before_error, first_tick_after).valid);
+
+    PerfCounters kept = before_error;
+    if (yuzu::echo::interval_baseline_reset_due("errored", "true"))
+        kept = PerfCounters{};
+    CHECK(!derive_sample(kept, first_tick_after).valid);
 }
 
 TEST_CASE("perf: normal 30 s derivation", "[echo][perf]") {

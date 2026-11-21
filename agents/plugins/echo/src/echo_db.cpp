@@ -766,6 +766,7 @@ EchoDatabase::EchoDatabase(EchoDatabase&& other) noexcept
     : db_{other.db_.load()},
       query_db_{other.query_db_},
       quarantined_at_{other.quarantined_at_},
+      warehouse_tables_ok_{other.warehouse_tables_ok_},
       fold_{std::move(other.fold_)} {
     other.quarantined_at_.reset();
     other.db_ = nullptr;
@@ -781,6 +782,7 @@ EchoDatabase& EchoDatabase::operator=(EchoDatabase&& other) noexcept {
         db_ = other.db_.load();
         query_db_ = other.query_db_;
         quarantined_at_ = other.quarantined_at_;
+        warehouse_tables_ok_ = other.warehouse_tables_ok_;
         fold_ = std::move(other.fold_);
         other.quarantined_at_.reset();
         other.db_ = nullptr;
@@ -1176,8 +1178,12 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
                 std::string{"echo.db schema transaction could neither commit nor roll back; "
                             "refusing to open on a wedged connection"});
         }
-        spdlog::warn("EchoDatabase: warehouse table creation failed{}",
-                     db.schema_version() < 2 ? ", continuing in legacy mode" : "");
+        // Opened, but without every warehouse table: collectors and rollups that need
+        // the missing ones fail on every pass. Recorded for `echo status`
+        // (warehouse_tables_ok) so an operator sees it rather than a healthy store (#2626).
+        db.warehouse_tables_ok_ = false;
+        spdlog::error("EchoDatabase: warehouse table creation failed{}",
+                      db.schema_version() < 2 ? ", continuing in legacy mode" : "");
     }
 
     // Disable load_extension for defense-in-depth (H2)

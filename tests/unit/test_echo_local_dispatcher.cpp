@@ -690,6 +690,9 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
         CHECK(status_value("db_auto_vacuum") == std::optional<std::string>{"incremental"});
         CHECK(status_value("module_dedup_overflow_total") == std::optional<std::string>{"0"});
         CHECK(status_value("tcp_closing_dedup_overflow_total") == std::optional<std::string>{"0"});
+        // #2626: the store's shape is always reported, and a healthy open says so.
+        CHECK(status_value("config|schema_version") == std::optional<std::string>{"10"});
+        CHECK(status_value("config|warehouse_tables_ok") == std::optional<std::string>{"true"});
         // db_size_bytes is now used pages + WAL, never zero for an initialised database.
         const auto size = status_value("db_size_bytes");
         REQUIRE(size.has_value());
