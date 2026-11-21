@@ -51,13 +51,26 @@
  * names), so a cursor an agent did not issue must never be believed: a forged last-unit token would read
  * `complete` over volumes never searched. The <mac> is the first 16 bytes (32 lowercase hex digits) of
  * HMAC-SHA-256, under a per-process key the agent draws once (file_search_posix.cpp), over every other
- * byte of the token. The inner fs1 token is not authenticated on its own; this enclosing token is. Both
- * codec calls take the key as a required parameter. The mac is compared with no early exit, and a token
- * whose mac is not exact is refused before its inner token is decoded. A token is therefore valid only in
- * the agent process that issued it: after an agent restart it is refused and the search starts again.
+ * byte of the PLAINTEXT token (before the seal below). The inner fs1 token is not authenticated on its
+ * own; this enclosing token is. Both codec calls take the key as a required parameter. The mac is compared
+ * with no early exit, and a token whose mac is not exact is refused before its inner token is decoded. A
+ * token is therefore valid only in the agent process that issued it: after an agent restart it is refused
+ * and the search starts again.
+ *
+ * THE SEAL. The fs1 body names every directory of the walk position and the last entry, and a caller
+ * sends the cursor back as a request parameter that the server keeps and other principals can read, so the
+ * issued token never carries a readable name. The fs1 body is XORed with a keystream of HMAC-SHA-256
+ * blocks, block n = HMAC(K_seal, <mac>.<n>), K_seal = HMAC(key, kCursorSealLabel); the field stays `fs1:`
+ * and strict base64 of the same length, so every size bound stands. The mac is a function of the whole
+ * plaintext token, so it is the nonce: equal cursors give equal tokens (every accepted token still
+ * re-encodes to itself) and distinct ones never share a keystream. Decoding unseals with the token's own
+ * mac, rebuilds the plaintext token and checks the mac before fsr::decode_cursor sees a byte, so a fault in
+ * the seal can only refuse a token, never admit one. The seal hides names from a reader without the key;
+ * it is not a second authenticator, and it protects nothing once the issuing process's key is known.
  */
 #pragma once
 
+#include <base64.hpp>
 #include <file_search_coverage.hpp>
 #include <file_search_cursor.hpp>
 #include <file_search_governor.hpp>
@@ -348,19 +361,55 @@ namespace detail {
     return diff == 0;
 }
 
+/// The label the sealing key is derived under. It never starts with the token prefix, so no token's mac
+/// input can equal it.
+inline constexpr std::string_view kCursorSealLabel = "yuzu.file_search.cursor.seal";
+
+/// The inner fs1 token with its body XORed against a keystream, the same length. The keystream is
+/// HMAC-SHA-256 blocks under a key derived from the cursor key, nonced by `mac`, which is a function of the
+/// whole plaintext token: equal cursors seal to equal tokens and distinct ones never share a keystream.
+/// Self-inverse. nullopt when the token is not `fs1:` and strict base64.
+[[nodiscard]] inline std::optional<std::string> xor_inner_body(const CursorKey& key, std::string_view mac,
+                                                               std::string_view inner) {
+    if (!inner.starts_with(fsr::kCursorPrefix))
+        return std::nullopt;
+    auto body = yuzu::shared::base64_decode(inner.substr(fsr::kCursorPrefix.size()));
+    if (!body)
+        return std::nullopt;
+    const auto seal_key = yuzu::shared::hmac_sha256_raw(
+        std::string_view(reinterpret_cast<const char*>(key.data()), key.size()), kCursorSealLabel);
+    const std::string_view k(reinterpret_cast<const char*>(seal_key.data()), seal_key.size());
+    std::size_t block = 0;
+    for (std::size_t at = 0; at < body->size(); at += seal_key.size(), ++block) {
+        const auto pad = yuzu::shared::hmac_sha256_raw(k, std::string(mac) + "." + std::to_string(block));
+        for (std::size_t i = 0; i < pad.size() && at + i < body->size(); ++i)
+            (*body)[at + i] = static_cast<char>(static_cast<unsigned char>((*body)[at + i]) ^ pad[i]);
+    }
+    return std::string(fsr::kCursorPrefix) + yuzu::shared::base64_encode(*body);
+}
+
+/// The token before sealing and without its mac: fsv1.<index>.<units hash>.<refused hash>.<fs1>.
+[[nodiscard]] inline std::string plain_token(std::size_t index, std::string_view units_hash,
+                                             std::string_view refused_hash, std::string_view inner) {
+    return std::string(kVolumeCursorPrefix) + "." + std::to_string(index) + "." + std::string(units_hash) + "." +
+           std::string(refused_hash) + "." + std::string(inner);
+}
+
 } // namespace detail
 
-/// Empty when the inner cursor has no spelling (an invalid position) or a field is not canonical.
+/// Empty when the inner cursor has no spelling (an invalid position) or a field is not canonical. The mac
+/// covers the plaintext token; the fs1 body inside the issued token is sealed (see THE SEAL).
 [[nodiscard]] inline std::string encode_volume_cursor(const VolumeCursor& c, const CursorKey& key) {
     if (c.index >= kMaxVolumes || !detail::is_hash16(c.units_hash) || !detail::is_hash16(c.refused_hash))
         return {};
     const std::string inner = fsr::encode_cursor(c.inner);
     if (inner.empty())
         return {};
-    const std::string token = std::string(kVolumeCursorPrefix) + "." + std::to_string(c.index) + "." + c.units_hash + "." +
-                              c.refused_hash + "." + inner;
-    const std::string mac = detail::cursor_mac(key, token);
-    return token + "." + mac;
+    const std::string mac = detail::cursor_mac(key, detail::plain_token(c.index, c.units_hash, c.refused_hash, inner));
+    const auto sealed = detail::xor_inner_body(key, mac, inner);
+    if (!sealed)
+        return {};
+    return detail::plain_token(c.index, c.units_hash, c.refused_hash, *sealed) + "." + mac;
 }
 
 /// The six fields of a token, strictly: nullopt for any other spelling. The inner token is returned as
@@ -400,19 +449,23 @@ struct VolumeTokenFields {
     return VolumeTokenFields{index, std::string(f[2]), std::string(f[3]), std::string(f[4]), std::string(rest)};
 }
 
-/// Decodes a token for the query whose hash is `expected`, issued under `key`. Nothing is opened. A token
-/// whose mac is not exact is refused before its inner token is read. Every accepted token re-encodes to
-/// itself.
+/// Decodes a token for the query whose hash is `expected`, issued under `key`. Nothing is opened. The fs1
+/// body is unsealed with the token's own mac and the mac is checked over the rebuilt plaintext token: a
+/// token whose mac is not exact is refused before its inner token is read. Every accepted token re-encodes
+/// to itself.
 [[nodiscard]] inline std::optional<VolumeCursor> decode_volume_cursor(std::string_view token,
                                                                       const fsr::QueryHash& expected,
                                                                       const CursorKey& key) {
     const auto fields = split_volume_cursor(token);
     if (!fields)
         return std::nullopt;
-    const std::string_view signed_part = token.substr(0, token.size() - fields->mac.size() - 1);
-    if (!detail::mac_equal(fields->mac, detail::cursor_mac(key, signed_part)))
+    const auto plain_inner = detail::xor_inner_body(key, fields->mac, fields->inner);
+    if (!plain_inner)
         return std::nullopt;
-    auto inner = fsr::decode_cursor(fields->inner, expected);
+    const std::string plain = detail::plain_token(fields->index, fields->units_hash, fields->refused_hash, *plain_inner);
+    if (!detail::mac_equal(fields->mac, detail::cursor_mac(key, plain)))
+        return std::nullopt;
+    auto inner = fsr::decode_cursor(*plain_inner, expected);
     if (!inner)
         return std::nullopt;
     VolumeCursor c{fields->index, fields->units_hash, fields->refused_hash, std::move(*inner)};

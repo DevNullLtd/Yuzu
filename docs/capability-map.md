@@ -667,7 +667,7 @@ Partial — read-only posture only (Wave 8 PR8.6; refs #282, `docs/roadmap.md` I
 
 `filesystem` plugin.
 
-`file_search` plugin `search`: on-demand, resumable search of the local disks of a device by leaf-name glob under one absolute root, one slice per call with a cursor the agent signs and a per-volume coverage verdict, reporting each match's type, size, modification time and extents (names, types, sizes, times and extents only: a matched file is opened and never read, no hash is taken). `FileRetrieval` securable, `AdminOrApproval`, default-off, not single-target; the rows it stores are read in the Forensics tier (global `Forensics:Read`). Linux and macOS constrained, Windows planned. *(Evidence: `agents/plugins/file_search/README.md`.)*
+`file_search` plugin `search`: on-demand, resumable search of the local disks of a device by leaf-name glob under one absolute root, one slice per call with a cursor the agent authenticates and seals and a per-volume coverage verdict, reporting each match's type, size, modification time and extents (names, types, sizes, times and extents only: a matched file is opened and never read, no file content is read or hashed). `FileRetrieval` securable, `AdminOrApproval`, default-off, not single-target; the rows it stores are read in the Forensics tier (global `Forensics:Read`). Linux and macOS constrained, Windows planned. *(Evidence: `agents/plugins/file_search/README.md`.)*
 
 ### 10.3 File Content Read (by Line) :white_check_mark: `T1`
 

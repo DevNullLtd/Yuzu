@@ -4,12 +4,13 @@
 // The token is wholly caller controlled, so the decoder must be total, and every accepted token must
 // be the canonical spelling of what it decodes to (the harness aborts otherwise).
 //
-// THE MAC. A mutation of the raw input almost never carries a valid mac, so it would die at the mac
-// check and the inner decoder would never be reached. Each input is therefore decoded twice: as it
-// came (it must be refused unless it happens to be a token this harness's key signed), and re-signed,
-// with everything after its last dot replaced by the mac of everything before it, so a mutation of any
-// other field reaches the field checks and the inner decoder. The mac is computed here from the HMAC
-// primitive, not by the codec, so the harness is an independent check of what the codec signs.
+// THE MAC AND THE SEAL. A mutation of the raw input almost never carries a valid mac, so it would die at
+// the mac check and the inner decoder would never be reached. Each input is therefore decoded twice: as
+// it came (it must be refused unless it happens to be a token this harness's key issued), and re-issued:
+// everything before its last dot is taken as a PLAINTEXT token, its mac computed, and its fs1 body sealed
+// under that mac, so a mutation of any other field reaches the field checks and the inner decoder. The mac
+// and the keystream are computed here from the HMAC primitive, not by the codec, so the harness is an
+// independent check of what the codec issues.
 //
 // Registered in tests/fuzz/meson.build AND .clusterfuzzlite/build.sh - keep the two in sync when
 // adding sources.
@@ -47,10 +48,30 @@ fs::CursorKey key_of(unsigned char fill) {
     return k;
 }
 
-/// `body` + "." + the first 16 bytes (32 hex digits) of HMAC-SHA-256 of `body` under `key`.
-std::string sign(const fs::CursorKey& key, std::string_view body) {
+/// What the codec issues for the plaintext token `plain` (no mac): its mac is the first 16 bytes (32 hex
+/// digits) of HMAC-SHA-256 of `plain` under `key`, and the body of its fifth field (the fs1 token) is XORed
+/// against HMAC-SHA-256 blocks, block n over "<mac>.<n>" under HMAC(key, the seal label). A `plain` that does
+/// not split into six well-formed fields once the mac is added, or whose fifth field is not strict base64,
+/// is returned with only its mac: the decoder refuses it either way.
+std::string issue(const fs::CursorKey& key, std::string_view plain) {
     const std::string_view k(reinterpret_cast<const char*>(key.data()), key.size());
-    return std::string(body) + "." + yuzu::shared::hmac_sha256_hex(k, body).substr(0, fs::kCursorMacHexBytes);
+    const std::string mac = yuzu::shared::hmac_sha256_hex(k, plain).substr(0, fs::kCursorMacHexBytes);
+    const std::string unsealed = std::string(plain) + "." + mac;
+    const auto fields = fs::split_volume_cursor(unsealed);
+    if (!fields)
+        return unsealed;
+    auto body = yuzu::shared::base64_decode(std::string_view(fields->inner).substr(fsr::kCursorPrefix.size()));
+    if (!body)
+        return unsealed;
+    const auto seal_key = yuzu::shared::hmac_sha256_raw(k, fs::detail::kCursorSealLabel);
+    const std::string_view sk(reinterpret_cast<const char*>(seal_key.data()), seal_key.size());
+    for (std::size_t at = 0; at < body->size(); at += seal_key.size()) {
+        const auto pad = yuzu::shared::hmac_sha256_raw(sk, mac + "." + std::to_string(at / seal_key.size()));
+        for (std::size_t i = 0; i < pad.size() && at + i < body->size(); ++i)
+            (*body)[at + i] = static_cast<char>(static_cast<unsigned char>((*body)[at + i]) ^ pad[i]);
+    }
+    return std::string(fs::kVolumeCursorPrefix) + "." + std::to_string(fields->index) + "." + fields->units_hash + "." +
+           fields->refused_hash + "." + std::string(fsr::kCursorPrefix) + yuzu::shared::base64_encode(*body) + "." + mac;
 }
 
 } // namespace
@@ -66,17 +87,18 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     if (const auto as_is = fs::decode_volume_cursor(raw, fsr::QueryHash{}, kKey))
         require(fs::encode_volume_cursor(*as_is, kKey) == raw);
 
-    // Re-signed: everything after the last dot is replaced by the mac of everything before it.
+    // Re-issued: everything after the last dot is dropped, the rest is a plaintext token that gets a mac over
+    // itself and a sealed fs1 body.
     const auto last_dot = raw.rfind('.');
-    const std::string resigned =
-        last_dot == std::string_view::npos ? std::string(raw) : sign(kKey, raw.substr(0, last_dot));
-    const std::string_view token = resigned;
+    const std::string_view plain = last_dot == std::string_view::npos ? raw : raw.substr(0, last_dot);
+    const std::string reissued = issue(kKey, plain);
+    const std::string_view token = reissued;
 
-    // The expected query hash is lifted from the inner fs1 token's own body (bytes 1..16) when the
+    // The expected query hash is lifted from the PLAINTEXT inner fs1 token's own body (bytes 1..16) when the
     // token has six well-formed fields, so mutations reach the inner decoder instead of dying at
     // query_mismatch.
     fsr::QueryHash expected{};
-    if (const auto fields = fs::split_volume_cursor(token)) {
+    if (const auto fields = fs::split_volume_cursor(std::string(plain) + "." + std::string(fs::kCursorMacHexBytes, '0'))) {
         const std::string_view inner{fields->inner};
         if (inner.starts_with(fsr::kCursorPrefix))
             if (const auto body = yuzu::shared::base64_decode(inner.substr(fsr::kCursorPrefix.size())))

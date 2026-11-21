@@ -140,7 +140,7 @@ class FileSearchDefinitionContract(unittest.TestCase):
     def test_description_states_the_never_disclosed_wording(self):
         text = " ".join(_definition()["metadata"]["description"].lower().split())
         for phrase in (
-            "names, types, sizes, times and extents", "opened and never read", "no hash of anything",
+            "names, types, sizes, times and extents", "opened and never read", "no file content is read or hashed",
             "off until enabled", "forensics:read", "not a snapshot",
         ):
             with self.subTest(phrase=phrase):

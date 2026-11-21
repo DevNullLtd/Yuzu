@@ -17,8 +17,8 @@ path around the set); no second-tier or new-audit-verb spelling. The four
 `unrestricted_internal_consumer()` sites stay pinned, per site, by tests/test_response_store_read_tripwire.py.
 
 GREP LIMIT: lexical; it cannot see a branch that never runs, a plugin name built at run time or one split
-across adjacent string literals (the unit tests assert the behaviour). `--selftest` deletes each required statement and appends each forbidden
-spelling in memory and requires the gate to name it.
+across adjacent string literals (the unit tests assert the behaviour). `--selftest` deletes each required
+statement and appends each forbidden spelling in memory and requires the gate to name it.
 
 Usage: python3 -I tests/test_file_search_read_tier_tripwire.py [--selftest]
 """

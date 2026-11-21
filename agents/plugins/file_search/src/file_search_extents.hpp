@@ -8,7 +8,7 @@
  * where the system cannot count without listing). Offsets are the numbers the filesystem reports; what
  * they are offsets INTO depends on the filesystem (a block device, a btrfs logical address space, an APFS
  * container) and the `btrfs_logical` flag marks the one case the leg can name. Nothing here reads a byte
- * of the file and no hash of it is ever taken: the file is opened and never read.
+ * of the file and none is hashed: the file is opened and never read.
  *
  * The request carries flags 0 on purpose. The sync flag of the Linux interface writes the file's dirty
  * pages back before it answers; a search must never cause a write.

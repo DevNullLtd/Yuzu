@@ -1,5 +1,5 @@
 /**
- * file_search_execute.hpp -- the whole body of the plugin's execute() and its ONE try/catch, and the entry
+ * file_search_execute.hpp -- the whole body of the plugin's execute() and the ABI seam's try/catch, and the entry
  * points the POSIX shell (file_search_posix.cpp) exports to the plugin TU.
  *
  * It sits between the plugin TU (file_search_plugin.cpp: descriptors, init, shutdown, the heartbeat and log

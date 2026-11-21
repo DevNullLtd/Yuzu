@@ -17,8 +17,8 @@
  *
  * THE CURSOR KEY. 32 random bytes from getentropy, drawn once per process on first use and held for the life
  * of the (pinned) module: init draws it and fails if it cannot, and a re-init never draws another. It is
- * never written anywhere. A cursor is a token the agent signs under it (file_search_volumes.hpp), so a
- * cursor is valid only in the agent process that issued it.
+ * never written anywhere. A cursor is a token the agent authenticates and seals under it
+ * (file_search_volumes.hpp), so a cursor is valid, and readable, only in the agent process that issued it.
  *
  * THE SLOT. One atomic flag, taken with compare_exchange by run_slice on the pool thread before it reads any
  * state and released only by that pool thread's RAII guard (file_search_driver.hpp). A second concurrent call
@@ -34,7 +34,7 @@
  *          instead of downloading inside a call the deadline cannot interrupt), and the throttled disk class.
  *
  * NO CONTENT IS READ. A matched regular file is opened (O_RDONLY | O_NONBLOCK | O_NOFOLLOW) for its size,
- * time and extents and never read; no hash of anything is taken anywhere in this plugin.
+ * time and extents and never read; no file content is read or hashed anywhere in this plugin.
  */
 #include "file_search_execute.hpp"
 

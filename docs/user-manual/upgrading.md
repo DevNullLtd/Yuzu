@@ -66,7 +66,7 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **What to do.** Update log parsers and runbooks as above. No data migration.
 
-## Behaviour change: the Windows agent carries the Visual C++ runtime, and its installer installs five more plugins (0.16.0)
+## Behaviour change: the Windows agent carries the Visual C++ runtime, and its installer installs more plugins (0.16.0)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
 

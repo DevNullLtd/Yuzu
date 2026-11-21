@@ -8,7 +8,7 @@
  *
  * Wire rows (file_search_rows.hpp): match, extents, volume, gap, coverage and cursor rows, then exactly one
  * `search` trailer last. Names, types, sizes, times and extents only: a matched file is opened for its
- * facts and never read, and no hash of anything is taken.
+ * facts and never read, and no file content is read or hashed.
  *
  * SHIPPED LEGS. Linux and macOS. The Windows leg is a later change and answers through the shared
  * planned-leg reporter. All three descriptor legs are declared unconditionally so the capability-matrix
@@ -118,17 +118,9 @@ constexpr std::string_view kExceptionProvenance = "linux:file_search:exception";
 // The plugin's own KV namespace, read by the agent on every heartbeat (docs/observability-conventions.md,
 // "Plugin heartbeat-tag bridge"): at most eight keys, each a bounded counter of what slices did since the
 // agent started.
-constexpr std::array<std::string_view, 8> kHeartbeatKeys = {
+constexpr std::array<const char*, 8> kHeartbeatKeys = {
     "heartbeat.slices",    "heartbeat.budget_stops", "heartbeat.stalled", "heartbeat.unstable",
     "heartbeat.timed_out", "heartbeat.rejected",     "heartbeat.failed",  "heartbeat.gaps"};
-
-// init deletes these through the C entry with data(): each must be the NUL-terminated literal it came from.
-static_assert([] {
-    for (const std::string_view k : kHeartbeatKeys)
-        if (k.data()[k.size()] != '\0')
-            return false;
-    return true;
-}());
 
 std::mutex g_heartbeat_mutex;              // guards the totals and the context pointer
 std::array<std::uint64_t, 8> g_totals{};   // under g_heartbeat_mutex
@@ -216,11 +208,11 @@ public:
         // "Since the agent started": the KV is a file that outlives the process and the totals restart at
         // zero, so a key this process never counts would keep the last process's value. Delete them all: a
         // tag is absent until this process counts something (a counter that never fired is absent, not
-        // zero). Through the C entry with the literal's own NUL-terminated data(): init must not throw, and
-        // PluginContext::storage_delete builds a std::string.
+        // zero). Through the C entry: init must not throw, and PluginContext::storage_delete builds a
+        // std::string.
         g_totals.fill(0);
-        for (const std::string_view key : kHeartbeatKeys)
-            (void)yuzu_ctx_storage_delete(g_plugin_ctx, key.data());
+        for (const char* key : kHeartbeatKeys)
+            (void)yuzu_ctx_storage_delete(g_plugin_ctx, key);
 #else
         (void)ctx;
 #endif

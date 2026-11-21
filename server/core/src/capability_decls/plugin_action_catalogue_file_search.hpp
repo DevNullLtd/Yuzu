@@ -14,7 +14,7 @@
 /// `search` is ReadOnly/None -- the plugin never writes, signals or changes a file. It walks the
 /// local disks of one device from a caller-named root, compares leaf names against one pattern,
 /// and reports for each match the name, type, size, times and the extents of the file. A matched
-/// file is opened and never read, and no hash of anything is taken. One call is one slice of the
+/// file is opened and never read, and no file content is read or hashed. One call is one slice of the
 /// search; the caller loops on the cursor.
 ///
 /// ONE row covers the action at the top tier: data above this contract (file contents, hashes)

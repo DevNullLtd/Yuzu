@@ -28,7 +28,8 @@
  *    partial, cancelled volume fails the cancelled case.
  *  - limits and caps: a governor built from invalid limits, a sequence past kMaxSlices, a per-directory
  *    match cap or a byte budget that drops a row instead of ending the slice fails its own case.
- *  - cursor: issuing a cursor the validator refuses, or one with no spelling, fails the unencodable case.
+ *  - cursor: issuing a cursor the validator refuses, or one with no spelling, fails the unencodable case;
+ *    emitting the walk position's names readable in a cursor row fails the no-name case.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -36,6 +37,7 @@
 #include "file_search_driver.hpp"
 #include "file_search_test_support.hpp"
 
+#include <base64.hpp>
 #include <file_search_names.hpp>
 
 #include <algorithm>
@@ -47,6 +49,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1064,6 +1067,50 @@ TEST_CASE("file_search driver: invalid governor limits are refused before a gove
     CHECK(rig.mount_reads == 0);
     CHECK(rig.runner_calls == 0);
     CHECK(rig.legs.empty());
+}
+
+TEST_CASE("file_search driver: no name the walk visited appears in an emitted cursor row",
+          "[file_search][file_search_driver]") {
+    const std::vector<std::string> names = {"home", "alice-smith", "tax-return-2025.pdf"};
+    const auto qh = fsr::query_hash(make_request(kCtl).query);
+    std::set<std::string> carried; // the names some issued cursor's own position held
+    std::size_t cursors = 0;
+    for (std::size_t entries = 1; entries <= 8; ++entries) {
+        Rig rig;
+        rig.fs.add_file("/r/home/alice-smith/tax-return-2025.pdf", "");
+        rig.fs.add_file("/r/home/alice-smith/yuzu-fs-control-1.bin", "");
+        rig.fs.add_file("/r/home/bob/yuzu-fs-control-2.bin", "");
+        rig.b.limits.max_entries = entries;
+        const Run run = search(rig, kCtl);
+        for (const auto& slice : run.slices) {
+            if (slice.cursor.empty())
+                continue;
+            ++cursors;
+            const auto fields = split_volume_cursor(slice.cursor);
+            REQUIRE(fields.has_value());
+            const auto body = yuzu::shared::base64_decode(std::string_view(fields->inner).substr(4));
+            REQUIRE(body.has_value());
+            const std::string row = row_of(slice, "cursor|");
+            CHECK(row == "cursor|" + slice.cursor);
+            // what the cursor means to the agent that issued it
+            const auto own = decode_volume_cursor(slice.cursor, qh, rig.b.cursor_key);
+            REQUIRE(own.has_value());
+            for (const auto& name : names) {
+                if (own->inner.position.after == name)
+                    carried.insert(name);
+                for (const auto& dir : own->inner.position.dirs)
+                    if (dir.name == name)
+                        carried.insert(name);
+                INFO("entries " << entries << " name " << name);
+                CHECK(row.find(name) == std::string::npos);
+                CHECK(slice.cursor.find(name) == std::string::npos);
+                CHECK(body->find(name) == std::string::npos);
+            }
+        }
+    }
+    // the check above is not vacuous: across the sweep every canary name was in some cursor's position
+    CHECK(cursors > 0);
+    CHECK(carried == std::set<std::string>(names.begin(), names.end()));
 }
 
 TEST_CASE("file_search driver: a forged cursor is refused before any boundary is called",

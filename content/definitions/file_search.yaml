@@ -1,7 +1,7 @@
 ## File Search Definitions
 ## An on-demand search of the local disks of one device by file or directory name, with the
 ## extents of every matched file. Names, types, sizes, times and extents only: a matched file
-## is opened and never read, and no hash of anything is taken. Nothing is changed.
+## is opened and never read, and no file content is read or hashed. Nothing is changed.
 ## Plugin: file_search | Actions: search
 ##
 ## Dispatched under the FileRetrieval securable with AdminOrApproval, NOT the single-target
@@ -31,14 +31,14 @@ metadata:
     Searches the local disks of a device, under one absolute root, for files or directories
     whose name matches a leaf-name pattern, and reports each match with its type, size,
     modification time and the extents of the file. Names, types, sizes, times and extents are
-    all that is returned: matched files are opened and never read, and no hash of anything is
-    taken. One call is one slice of the search; repeat the call with the cursor row of the
+    all that is returned: matched files are opened and never read, and no file content is read
+    or hashed. One call is one slice of the search; repeat the call with the cursor row of the
     previous answer until a slice answers without one. Every answer ends with a search row
     stating whether the slice ran, and a coverage row stating whether everything under the
     root was searched, so an empty result is never confusable with a failed or partial one.
     Only local filesystem types on the allow-list are searched; every other mount under the
     root is named by its own volume row with the reason. A search of more than one slice is not
-    a snapshot. Off until enabled; a non-administrator also needs an approval. What is stored
+    a snapshot. Off until enabled; a non-administrator also needs an approval for each slice. What is stored
     is readable only with Forensics:Read. The Windows leg is planned and answers one
     unsupported status row.
   tags: [filesystem, search, inventory, extents]

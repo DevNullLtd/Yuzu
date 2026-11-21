@@ -12,11 +12,13 @@
 //
 // Trust rule for consumers: the decoder is pure, it opens nothing. Cursor names are only ever
 // COMPARED with the entries of a real directory listing, never joined into a path that is opened.
-// This token carries no MAC or secret of its own: it is unauthenticated, and a consumer that believes
-// what it carries (prior_gaps, the resume point) must authenticate the ENCLOSING token. The search
-// plugin's fsv1 token does (HMAC-SHA-256 under a per-process key, file_search_volumes.hpp), so a cursor
-// that reaches this decoder through it was issued by this agent process; the query hash is only a
-// binding to the validated query, not a proof of origin.
+// This token carries no MAC or secret of its own: it is unauthenticated and its names are PLAIN, so a
+// consumer that believes what it carries (prior_gaps, the resume point) must authenticate the ENCLOSING
+// token, and one that lets a copy leave the process must seal it. The search plugin's fsv1 token does
+// both (HMAC-SHA-256 under a per-process key, the body then sealed under that key,
+// file_search_volumes.hpp), so a cursor that reaches this decoder through it was issued by this agent
+// process and no copy of the request that carried it reads a name; the query hash is only a binding to
+// the validated query, not a proof of origin.
 //
 // Recovery: the agent keeps no cursor state, but a cursor is valid only in the agent process that issued
 // it. The same cursor replayed to that process re-walks the same slice (duplicates possible, no skip of

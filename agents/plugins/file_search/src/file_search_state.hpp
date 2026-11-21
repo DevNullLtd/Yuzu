@@ -19,7 +19,7 @@
  * agent is the holder and a caller needs no counter. The map is bounded; the oldest lineage is evicted,
  * and an evicted or never-seen lineage starts at zero. Only a COUNT is kept: a terminal verdict (stalled or
  * unstable) is delivered once, on the slice that reached it, and is not stored, so a later search of the
- * same query, which starts at the same lineage, never inherits a dead search's verdict. `unstable` is
+ * same query, which reaches the same lineage, never inherits a dead search's verdict. `unstable` is
  * re-derived from the cursor's generation on every slice, so forgetting it loses nothing.
  *
  * THREADS. Nothing here is synchronised: a SearchState is touched only by the pool thread that holds the

@@ -33,6 +33,11 @@
  *    every one-character edit of a token; a wrong key); a mac that is not HMAC-SHA-256 of the rest of the
  *    token truncated to 16 bytes fails the pinned-vector case. (The compare's lack of an early exit and
  *    the order of the mac check before the inner decode are not observable from a pure function.)
+ *  - fsv1 seal: issuing the fs1 body in plain base64, sealing under a keystream the key does not define, or
+ *    sharing one keystream between two cursors fails the seal case (no walked name in the token or its
+ *    base64-decoded fifth field; the independent seal of the same mac); accepting a token whose body is
+ *    unsealed fails the same case; checking the mac over the sealed spelling instead of the plaintext
+ *    fails the pinned-vector case.
  *  - volume_advances: accepting a skipped index, a changed units hash, a backward sequence, a stale
  *    position or a changed generation on the move to the next unit fails the transition table; refusing a
  *    changed refused hash fails the accepting case.
@@ -42,6 +47,7 @@
 #include "file_search_test_support.hpp"
 #include "file_search_volumes.hpp"
 
+#include <base64.hpp>
 #include <file_search_cursor.hpp>
 #include <hmac_sha256.hpp>
 #include <network_fstype.hpp>
@@ -50,6 +56,8 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::file_search;
@@ -298,6 +306,14 @@ TEST_CASE("file_search volumes: a private tmp bind is recognised by its last two
     CHECK(reason_at(s, "/tmp") == fsr::Reason::private_namespace);
     CHECK(reason_at(s, "/var/tmp") == fsr::Reason::private_namespace);
 
+    // a tmpfs /tmp bound the same way, the default layout of current distributions: private_namespace, not
+    // fstype_not_allowed, because the private rule is decided before the allow-list
+    Mounts tmp;
+    tmp.add("/", "ext4", "8:1").add("/tmp", "tmpfs", "0:40", "/systemd-private-abc-foo.service-xyz/tmp");
+    const VolumePlan t = build_plan(tmp.table(), "/", Os::linux_os);
+    CHECK(mount_points(t) == Strs{"/"});
+    CHECK(reason_at(t, "/tmp") == fsr::Reason::private_namespace);
+
     // NEGATIVES: an ordinary own-partition /tmp (root "/") stays a unit, and the same private root on any
     // other mount point is not matched (the rule names the two mount points)
     Mounts neg;
@@ -459,11 +475,58 @@ CursorKey test_key(unsigned char fill = 0x42) {
 }
 const CursorKey kKey = test_key();
 
-/// body + "." + mac, the way the codec signs a token: the 16 leading bytes of HMAC-SHA-256 as hex, computed
-/// here from the primitive, not by the codec.
-std::string signed_with(const CursorKey& key, const std::string& body) {
+/// The seal, from the primitive and not by the codec: the fs1 body XORed against HMAC-SHA-256 blocks, block n
+/// under HMAC(key, label) over "<mac>.<n>". Self-inverse. Empty when `inner` is not `fs1:` and strict base64.
+std::string seal_inner(const CursorKey& key, const std::string& mac, const std::string& inner) {
+    if (!inner.starts_with("fs1:"))
+        return {};
+    auto body = yuzu::shared::base64_decode(std::string_view(inner).substr(4));
+    if (!body)
+        return {};
     const std::string_view k(reinterpret_cast<const char*>(key.data()), key.size());
-    return body + "." + yuzu::shared::hmac_sha256_hex(k, body).substr(0, 32);
+    const auto seal_key = yuzu::shared::hmac_sha256_raw(k, "yuzu.file_search.cursor.seal");
+    const std::string_view sk(reinterpret_cast<const char*>(seal_key.data()), seal_key.size());
+    for (std::size_t at = 0; at < body->size(); at += 32) {
+        const auto pad = yuzu::shared::hmac_sha256_raw(sk, mac + "." + std::to_string(at / 32));
+        for (std::size_t i = 0; i < 32 && at + i < body->size(); ++i)
+            (*body)[at + i] = static_cast<char>(static_cast<unsigned char>((*body)[at + i]) ^ pad[i]);
+    }
+    return "fs1:" + yuzu::shared::base64_encode(*body);
+}
+
+/// The [start, end) of the fifth dot-separated field of `token`; npos start when there are fewer than four dots.
+std::pair<std::size_t, std::size_t> fifth_field(const std::string& token) {
+    std::size_t start = 0;
+    for (int i = 0; i < 4; ++i) {
+        start = token.find('.', start);
+        if (start == std::string::npos)
+            return {std::string::npos, std::string::npos};
+        ++start;
+    }
+    return {start, std::min(token.find('.', start), token.size())};
+}
+
+/// plaintext + "." + mac, the way the codec issues a token: the mac is the 16 leading bytes of HMAC-SHA-256 of
+/// the PLAINTEXT as hex, and the fifth field (the fs1 token) is sealed under it. A body with no sealable fifth
+/// field is signed as it is.
+std::string signed_with(const CursorKey& key, const std::string& plain) {
+    const std::string_view k(reinterpret_cast<const char*>(key.data()), key.size());
+    const std::string mac = yuzu::shared::hmac_sha256_hex(k, plain).substr(0, 32);
+    const auto [start, end] = fifth_field(plain);
+    if (start != std::string::npos) {
+        const std::string sealed = seal_inner(key, mac, plain.substr(start, end - start));
+        if (!sealed.empty())
+            return plain.substr(0, start) + sealed + plain.substr(end) + "." + mac;
+    }
+    return plain + "." + mac;
+}
+
+/// The plaintext token (no mac) an issued token seals: the inverse of signed_with.
+std::string plaintext_of(const CursorKey& key, const std::string& token) {
+    const std::string mac = token.substr(token.rfind('.') + 1);
+    const std::string body = token.substr(0, token.rfind('.'));
+    const auto [start, end] = fifth_field(body);
+    return body.substr(0, start) + seal_inner(key, mac, body.substr(start, end - start)) + body.substr(end);
 }
 
 VolumeCursor cursor_at(std::size_t index, std::uint64_t sequence, std::uint32_t generation = 0,
@@ -522,15 +585,80 @@ TEST_CASE("file_search volumes: the fsv1 cursor round-trips through its six fiel
     CHECK(widest.size() - widest_fields->inner.size() <= 128);
 }
 
-TEST_CASE("file_search volumes: the mac is HMAC-SHA-256 of the rest of the token, 16 bytes of it, as hex",
+TEST_CASE("file_search volumes: the mac is HMAC-SHA-256 of the plaintext token, 16 bytes of it, as hex",
           "[file_search][file_search_volumes]") {
     const std::string token = encode_volume_cursor(cursor_at(2, 5, 0, 1, pos_in("a", "b")), kKey);
-    const std::string body = token.substr(0, token.rfind('.'));
-    CHECK(token == signed_with(kKey, body));
+    const std::string plain = plaintext_of(kKey, token);
+    CHECK(token == signed_with(kKey, plain));
+    // the mac covers the plaintext, not the sealed spelling the token carries
+    CHECK(token.substr(token.rfind('.') + 1) ==
+          yuzu::shared::hmac_sha256_hex(std::string_view(reinterpret_cast<const char*>(kKey.data()), kKey.size()), plain)
+              .substr(0, 32));
     // RFC 4231 test case 2: key "Jefe", data "what do ya want for nothing?"
     CHECK(yuzu::shared::hmac_sha256_hex("Jefe", "what do ya want for nothing?").starts_with("5bdcc146bf60754e6a042426089575c7"));
-    // a different key makes a different mac over the same body
-    CHECK(signed_with(test_key(0x43), body) != token);
+    // a different key makes a different mac over the same plaintext
+    CHECK(signed_with(test_key(0x43), plain) != token);
+}
+
+TEST_CASE("file_search volumes: the issued token carries no name the walk visited, and only this key reads it",
+          "[file_search][file_search_volumes]") {
+    fsr::Position pos;
+    pos.root_dev = 1;
+    pos.root_file_id = 2;
+    pos.dirs.push_back({"home", 3, 4});
+    pos.dirs.push_back({"alice-smith", 5, 6});
+    pos.after = "tax-return-2025.pdf";
+    const VolumeCursor c = cursor_at(1, 9, 0, 2, pos);
+    const std::vector<std::string> names = {"home", "alice-smith", "tax-return-2025.pdf"};
+
+    const std::string token = encode_volume_cursor(c, kKey);
+    REQUIRE_FALSE(token.empty());
+    const auto fields = split_volume_cursor(token);
+    REQUIRE(fields.has_value());
+    const std::string plain_inner = fsr::encode_cursor(c.inner);
+    const auto plain_body = yuzu::shared::base64_decode(std::string_view(plain_inner).substr(4));
+    const auto sealed_body = yuzu::shared::base64_decode(std::string_view(fields->inner).substr(4));
+    REQUIRE(plain_body.has_value());
+    REQUIRE(sealed_body.has_value());
+    for (const auto& name : names) {
+        INFO(name);
+        CHECK(plain_body->find(name) != std::string::npos); // the names are there to be hidden
+        CHECK(token.find(name) == std::string::npos);
+        CHECK(sealed_body->find(name) == std::string::npos); // nor in the fifth field once base64-decoded
+    }
+    // the same length, the same `fs1:` spelling: every size bound the plaintext met still holds
+    CHECK(fields->inner.size() == plain_inner.size());
+    CHECK(sealed_body->size() == plain_body->size());
+    CHECK(fields->inner.starts_with("fs1:"));
+    // what the codec seals is what the keystream defined above says it is
+    CHECK(fields->inner == seal_inner(kKey, fields->mac, plain_inner));
+    CHECK(seal_inner(kKey, fields->mac, fields->inner) == plain_inner);
+
+    // it still round-trips, and equal cursors give equal tokens
+    const auto back = decode_volume_cursor(token, hash_of(7), kKey);
+    REQUIRE(back.has_value());
+    CHECK(*back == c);
+    CHECK(encode_volume_cursor(c, kKey) == token);
+
+    // only the issuing key reads or accepts it
+    CHECK_FALSE(decode_volume_cursor(token, hash_of(7), test_key(0x43)).has_value());
+
+    // a token that carries its fs1 body UNSEALED is refused even under a mac over exactly that token
+    const std::string plain = plaintext_of(kKey, token);
+    const std::string_view k(reinterpret_cast<const char*>(kKey.data()), kKey.size());
+    CHECK_FALSE(decode_volume_cursor(plain + "." + yuzu::shared::hmac_sha256_hex(k, plain).substr(0, 32), hash_of(7), kKey)
+                    .has_value());
+
+    // distinct cursors never share a keystream: the same names under another gap count seal differently
+    VolumeCursor other = c;
+    other.inner.prior_gaps = 3;
+    const auto other_fields = split_volume_cursor(encode_volume_cursor(other, kKey));
+    REQUIRE(other_fields.has_value());
+    const auto other_sealed = yuzu::shared::base64_decode(std::string_view(other_fields->inner).substr(4));
+    REQUIRE(other_sealed.has_value());
+    constexpr std::size_t kFixedHeader = 50; // version, query hash, sequence, generation, gaps, root ids, ndirs
+    CHECK(sealed_body->substr(kFixedHeader) != other_sealed->substr(kFixedHeader));
+    CHECK(sealed_body->size() == other_sealed->size());
 }
 
 TEST_CASE("file_search volumes: every non-canonical spelling is refused even when it is signed",
@@ -538,8 +666,9 @@ TEST_CASE("file_search volumes: every non-canonical spelling is refused even whe
     const VolumeCursor c = cursor_at(3, 12);
     const std::string good = encode_volume_cursor(c, kKey);
     REQUIRE(decode_volume_cursor(good, hash_of(7), kKey).has_value());
-    const std::size_t fs1_at = good.find("fs1:");
-    const std::string inner = good.substr(fs1_at, good.rfind('.') - fs1_at); // without its mac
+    const std::string plain_good = plaintext_of(kKey, good);
+    const std::size_t fs1_at = plain_good.find("fs1:");
+    const std::string inner = plain_good.substr(fs1_at); // the plaintext fs1 token, which signed_with seals
     const std::string uh = "0123456789abcdef";
     const std::string rh = "fedcba9876543210";
 
