@@ -66,10 +66,12 @@
 /// replaces the temporary in that gap has their entry published, and on macOS `link(2)` follows a
 /// link at its source), the removal of the temporary after a failed copy (a unique name this call
 /// created; a third party who swaps a link or an empty directory in at it between the failure and
-/// the removal loses it) and the final drop of the original sidecar. On Windows the copy is the
-/// standard library's `copy_file`, by name at both ends: it follows a link at the source, and a file put at the destination inside the gap is not
-/// proven safe (unverified until the Windows leg runs), and a crash mid-copy there can leave a
-/// truncated file at the quarantine name. All of it needs write access to the data directory.
+/// the removal loses it; a failed removal of the temporary after the link is not reported and leaves
+/// a second, inert name for the same file) and the final drop of the original sidecar. On Windows
+/// the copy is the standard library's `copy_file`, by name at both ends: it follows a link at the
+/// source, and a file put at the destination inside the gap is not proven safe (unverified until
+/// the Windows leg runs), and a crash mid-copy there can leave a truncated file at the quarantine
+/// name. All of it needs write access to the data directory.
 /// A HARD link planted at the name is a regular file with its target's identity,
 /// so it is judged, claimed and secured as that target: the open that judged it had already used
 /// it as the database (pre-existing; Linux protected_hardlinks refuses a link to a file the
@@ -247,6 +249,9 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
     // Never create the file at its final name: a crash mid-copy would leave a truncated file there
     // that reads as the real evidence. A counter and the pid make the temporary's name unique; a
     // collision (a stale temporary of an earlier crash) just takes the next counter value.
+    // The suffix adds 14 to 31 bytes to the name: a quarantine name within that many bytes of the
+    // filesystem's component limit fails with ENAMETOOLONG here (the two callers' names are about
+    // 30 to 41 bytes, so it is unreachable in tree).
     static std::atomic<unsigned> counter{0};
     std::filesystem::path tmp;
     int out = -1;
@@ -314,7 +319,9 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
             partial.created = false; // not ours: nothing of this call's is at the quarantine name
         return;
     }
-    std::error_code rm; // a failure only leaves a second name for the same file
+    // A failure here is not reported: it leaves a second, inert name for the same file (the prune
+    // and every evidence read ignore a `.partial-` name), recorded in the banner.
+    std::error_code rm;
     std::filesystem::remove(tmp, rm);
 }
 
