@@ -2,9 +2,17 @@
 
 #include "dex_json_detail.hpp"
 #include "dex_window.hpp"
+#include "mgmt_group_limits.hpp" // mgmt_group_id_ok
+#include "tag_store.hpp"        // TagStore::validate_key - the .cpp only; the header stays store-free
+#include "web_utils.hpp"        // audit_token
+
+#include <yuzu/log_token.hpp> // ::yuzu::log_token
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+#include <expected>
+#include <string>
 #include <utility>
 
 namespace yuzu::server {
@@ -101,6 +109,127 @@ std::string dex_apps_usage_json(const DexAppsUsageModel& m) {
     out["apps"] = std::move(apps);
     // A label is agent or caller data: invalid UTF-8 is replaced, never thrown.
     return out.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+DexUsageRefusalClass dex_usage_refusal_class(const DexUsageRefusal& f) {
+    DexUsageRefusalClass c;
+    if (f.reason == "invalid_slice") {
+        c.kind = DexUsageRefusalKind::CallerError;
+        c.message = f.detail == "unknown_group" ? "unknown management group" : "invalid slice";
+        return c;
+    }
+    // Tokens only, never caller text.
+    c.message = "fleet application usage unavailable (" + f.reason +
+                (f.detail.empty() || f.detail == f.reason ? "" : ": " + f.detail) + ")";
+    if (f.reason == "usage_unavailable" && f.detail == "fleet_too_large") {
+        // Sustained statement timeouts: retrying does not help.
+        c.kind = DexUsageRefusalKind::Terminal;
+        c.remediation = "the usage read no longer fits its time bound for this fleet; "
+                        "retrying does not help, only a narrower platform scope "
+                        "reduces the read, and the state clears on the first "
+                        "successful read (see 'Fleet usage per application' in the "
+                        "DEX guide, docs/dex/app-usage.md)";
+    } else if (f.reason == "no_population" || f.reason == "invalid_request") {
+        c.kind = DexUsageRefusalKind::Terminal;
+    } else {
+        c.kind = DexUsageRefusalKind::Retryable;
+        c.remediation = "retry shortly";
+        c.retry_after_ms = 2000;
+    }
+    return c;
+}
+
+std::expected<DexUsageMcpRequest, std::string> dex_usage_mcp_request(const json& args) {
+    if (!args.is_object())
+        return std::unexpected(std::string("arguments must be a JSON object"));
+    for (const auto& [key, value] : args.items()) {
+        (void)value;
+        if (key != "window" && key != "platform" && key != "slice" && key != "group" &&
+            key != "tag_key" && key != "floor") {
+            // Cap first, neutralise second (as dex_score_policy_mcp_request does).
+            return std::unexpected("unknown argument '" + ::yuzu::log_token(key.substr(0, 64)) +
+                                   "'");
+        }
+    }
+    // A string argument's value, or the default when absent; nullopt-by-error for a non-string.
+    const auto text = [&args](const char* name, const char* fallback,
+                              std::string& out) -> std::string {
+        const auto it = args.find(name);
+        if (it == args.end()) {
+            out = fallback;
+            return {};
+        }
+        if (!it->is_string())
+            return std::string(name) + " must be a string";
+        out = it->get<std::string>();
+        return {};
+    };
+
+    DexUsageMcpRequest rq;
+    if (auto e = text("window", "7d", rq.window); !e.empty())
+        return std::unexpected(std::move(e));
+    if (!dex_window_is_valid(rq.window))
+        return std::unexpected(std::string("invalid window (expected 24h|7d|30d|all)"));
+
+    std::string platform;
+    if (auto e = text("platform", kDexAppsScopeAll, platform); !e.empty())
+        return std::unexpected(std::move(e));
+    rq.platform_scope = dex_normalize_apps_scope(platform);
+    if (rq.platform_scope.empty())
+        return std::unexpected(std::string("invalid platform (expected all|windows|macos|linux)"));
+
+    if (auto e = text("slice", "fleet", rq.slice_name); !e.empty())
+        return std::unexpected(std::move(e));
+    if (rq.slice_name == "fleet")
+        rq.slice.kind = DexUsageSliceKind::Fleet;
+    else if (rq.slice_name == "platform")
+        rq.slice.kind = DexUsageSliceKind::Platform;
+    else if (rq.slice_name == "group")
+        rq.slice.kind = DexUsageSliceKind::Group;
+    else if (rq.slice_name == "tag")
+        rq.slice.kind = DexUsageSliceKind::Tag;
+    else
+        return std::unexpected(std::string("invalid slice (expected fleet|platform|group|tag)"));
+
+    if (args.contains("group") && rq.slice.kind != DexUsageSliceKind::Group)
+        return std::unexpected(std::string("'group' is only valid with slice=group"));
+    if (args.contains("tag_key") && rq.slice.kind != DexUsageSliceKind::Tag)
+        return std::unexpected(std::string("'tag_key' is only valid with slice=tag"));
+    if (rq.slice.kind == DexUsageSliceKind::Group) {
+        if (auto e = text("group", "", rq.slice.key); !e.empty())
+            return std::unexpected(std::move(e));
+        if (rq.slice.key.empty() || !mgmt_group_id_ok(rq.slice.key))
+            return std::unexpected(std::string("slice=group requires 'group' (1 to 256 bytes, no "
+                                               "control characters, valid UTF-8)"));
+    } else if (rq.slice.kind == DexUsageSliceKind::Tag) {
+        if (auto e = text("tag_key", kDexDefaultCohortKey, rq.slice.key); !e.empty())
+            return std::unexpected(std::move(e));
+        if (!TagStore::validate_key(rq.slice.key))
+            return std::unexpected(std::string("invalid tag_key"));
+    }
+
+    if (const auto it = args.find("floor"); it != args.end()) {
+        // Integers only: a string, a float or a boolean is refused, and an unsigned value
+        // above the bound is refused before it can wrap into the signed range.
+        const std::string bad = "invalid floor (expected an integer from 1 to 10000)";
+        if (!it->is_number_integer())
+            return std::unexpected(bad);
+        if (it->is_number_unsigned()) {
+            if (it->get<std::uint64_t>() > 10000)
+                return std::unexpected(bad);
+            rq.floor = static_cast<std::int64_t>(it->get<std::uint64_t>());
+        } else {
+            rq.floor = it->get<std::int64_t>();
+        }
+        if (rq.floor < 1 || rq.floor > 10000)
+            return std::unexpected(bad);
+    }
+    return rq;
+}
+
+std::string dex_usage_audit_shape(const DexUsageMcpRequest& rq) {
+    return "window=" + rq.window + " platform=" + rq.platform_scope + " slice=" + rq.slice_name +
+           " key=" + audit_token(rq.slice.key) + " floor=" + std::to_string(rq.floor);
 }
 
 } // namespace yuzu::server

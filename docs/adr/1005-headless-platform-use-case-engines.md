@@ -2043,6 +2043,54 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        /api/v1/dex/apps/usage"; audit row: `docs/user-manual/audit-log.md`.
      - Recorded by the change author; ADR-owner acceptance pending.
 
+   - **2026-11-21 - fleet application usage has its MCP twin, `get_dex_apps_usage`;
+     the exception recorded on 2026-11-17 is retired.** The tool reads the same
+     `DexApi::apps_usage` seam as the route and serves the body
+     `dex_apps_usage_json` builds, so the two surfaces return the same figures.
+     - **Exception and baseline.** The v1-keyed `exception:#8096` row
+       `get.api-v1-dex-apps-usage` is removed from
+       `scripts/ci/api-parity/dex.json` and its `STRICT_EXCEPTION_PINS` entry
+       is deleted; `BASELINE_UNTWINNED` falls from 197 to 196. A v1-keyed row may
+       only be an `exception:` row, so the route is not re-keyed as `twinned`;
+       the pair is carried by the registry (the tool, its expected-twin row
+       and the shrink-only ledger backfill list in
+       `tests/unit/server/test_twin_completeness.cpp`, which gains
+       `get_dex_apps_usage`, cap 4 to 5, until a ledger row can name the tool).
+       The 2026-11-17 entry above is history and is not edited.
+     - **Declared pair and second gate.** The record declares
+       `GuaranteedState:Read`, the pair the route's first gate asks, because
+       the generic tier, approval and service-scope checks act on the declared
+       pair and the parity check holds it to the route's first gate; a
+       service-scoped token is refused before the handler. The handler then
+       requires `Forensics:Read` through the fleet-read gate, in the route's
+       order (Administrator-only while role-based access control is off), and
+       hands that gate's device scope to the read. Both permissions are
+       required. The two gates name different pairs, so this is not same-pair
+       stacking.
+     - **Audit posture.** One fail-closed domain row, `dex.apps.usage.view`,
+       is written before the read; if it cannot be stored the read does not run
+       and the answer is a retryable error (`retry_after_ms` 5000) with no data.
+       The row records the admitted request (window, platform, slice, the tag
+       key or group id asked for, floor), never the outcome and never an agent
+       id. The generic `mcp.get_dex_apps_usage` row is written after the
+       outcome and is set-and-proceed: if it drops, the data is served with
+       `audit_persisted:false`. No second domain row is written. Every admitted
+       call, a retry included, writes its own domain row on both surfaces.
+       This is a deliberate choice, not the dual fail-closed posture of
+       `get_agent_app_usage`: the access evidence is durable before the read, so
+       withholding an aggregate that names no device over a second bookkeeping
+       row would add no evidence.
+     - **Refusals.** One pure classifier, `dex_usage_refusal_class`
+       (`dex_usage_json.hpp`), maps a refused read to an answer: an invalid
+       slice or unknown group is a caller error; `fleet_too_large`,
+       `no_population` and `invalid_request` are terminal; every other reason
+       is retryable (2000 ms). The REST route calls the same classifier.
+     - Ledger paragraph: `docs/api-parity-ledger.md`, "Fleet application usage
+       twin (`get_dex_apps_usage`)", which replaces the paragraph the
+       2026-11-17 entry cites. Wire reference: `docs/user-manual/mcp.md`; audit row:
+       `docs/user-manual/audit-log.md`.
+     - Recorded by the change author; ADR-owner acceptance pending.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

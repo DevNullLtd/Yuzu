@@ -279,6 +279,9 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"get_dex_score_policy", "GuaranteedState", "Read", true},
     {"set_dex_score_policy", "Infrastructure", "Write", false},
     {"reset_dex_score_policy", "Infrastructure", "Delete", false},
+    // Fleet application usage: twin of GET /api/v1/dex/apps/usage. The declared pair is the REST
+    // route's first gate; the handler also requires Forensics:Read through the fleet gate.
+    {"get_dex_apps_usage", "GuaranteedState", "Read", true},
     // get_me, the twin of GET /api/v1/me (ledger row get.api-me). The REST route has no
     // permission gate (auth_fn only), so this row pins the MCP side alone:
     // Infrastructure:Read drives MCP tier classification only, with no RBAC check behind it

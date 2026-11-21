@@ -29,6 +29,10 @@ hands what to whom, not of behaviour:
      closure reads the members BEFORE the group's existence, so a group deleted between the two
      reads is an `unknown_group` 400 and never a cached whole-population 200.
 
+  5. THE MCP TOOL HAS ITS READ. `tool_deps.dex_apps_usage_fn` must capture the very object
+     `make_local_dex_api` returned. Without it get_dex_apps_usage answers an internal error on a
+     healthy server, and every handler test still passes because each injects its own closure.
+
 `//` and block comments are stripped before matching, so prose cannot satisfy a check. The
 self-test applies in-memory mutations and requires problems() to report each one.
 
@@ -105,6 +109,13 @@ def problems(server_text: str) -> list:
     elif any(a != var for a in sets):
         found.append(f"server.cpp: dex_routes_->set_dex_api( is not handed `{var}`, the object "
                      "make_local_dex_api returned")
+    mcp = re.search(r"\btool_deps\.dex_apps_usage_fn\s*=\s*\[\s*(\w+)\s*\]", code)
+    if not mcp:
+        found.append("server.cpp: no `tool_deps.dex_apps_usage_fn = [<x>]` assignment (the MCP tool "
+                     "get_dex_apps_usage would answer an internal error on a healthy server)")
+    elif mcp.group(1) != var:
+        found.append(f"server.cpp: tool_deps.dex_apps_usage_fn captures `{mcp.group(1)}`, not `{var}`, "
+                     "the object make_local_dex_api returned")
     return found
 
 
@@ -139,6 +150,11 @@ class DexAppsWiring(unittest.TestCase):
             "dex_usage pre-seed on the wrong source": mutated(
                 '{{"reason", reason}, {"source", "dex_usage"}}', '{{"reason", reason}, {"source", "guardian_state"}}'),
         }
+        cases["MCP usage closure assignment removed"] = mutated("tool_deps.dex_apps_usage_fn =",
+                                                                "tool_deps.dex_apps_usage_fn_x =")
+        cases["MCP usage closure captures another object"] = mutated(
+            "[dex_api](const std::string& window, const std::string& platform_scope,",
+            "[other_api](const std::string& window, const std::string& platform_scope,")
         i, j = base.index("dex_usage.group_members = [this]"), base.index("dex_usage.tag_values = [this]")
         region = (base[i:j].replace("get_members_checked", "@@").replace("get_group_checked", "get_members_checked")
                   .replace("@@", "get_group_checked"))

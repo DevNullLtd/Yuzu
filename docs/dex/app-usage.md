@@ -70,14 +70,19 @@ empty `200`.
 ## MCP
 
 `get_agent_app_usage` takes `agent_id` and returns the same data. The fleet read
-below has no MCP tool yet.
+below is the `get_dex_apps_usage` tool, which takes the route's query parameters
+(`window`, `platform`, `slice`, `group`, `tag_key`, `floor`) as arguments and
+returns the same body as the route's `data` object. It is strict: an unknown
+argument, a value of the wrong type or an out-of-range value is refused with an
+invalid-params error that names the argument, and nothing is clamped.
 
 ## Fleet usage per application
 
 `GET /api/v1/dex/apps/usage` answers, for each application on the Apps list, how
 many devices ran it, for how long and how often, and how often it crashed or hung
 per hour of use. The rows are the Apps rows, in the same order (at most 100
-applications). There is no dashboard view for it yet.
+applications). There is no dashboard view for it yet; the REST route and the MCP
+tool serve it.
 
 Parameters, all optional:
 
@@ -163,7 +168,11 @@ permissions are checked across all of a principal's roles, so the route is open 
 the Administrator role and to a principal assigned both the built-in Viewer role
 (`GuaranteedState:Read`) and the ForensicsAnalyst role (`Forensics:Read`).
 ForensicsAnalyst alone is refused because it lacks `GuaranteedState:Read`. A
-service-scoped token is refused.
+service-scoped token is refused. The MCP tool needs the same two permissions and
+declares `GuaranteedState:Read` as its permission pair, so a token's tier, the
+service-scope check and the tool's approval rules act on that pair; the handler
+then requires `Forensics:Read` as well, in the route's order. The tool is
+readable at every MCP tier.
 
 Every request that passes parameter validation writes a `dex.apps.usage.view`
 audit row **before** the read, with an empty target and the request shape (window,
@@ -172,9 +181,26 @@ device and no agent id. If the row cannot be stored the route answers `503` with
 `Sec-Audit-Failed: true` and does not read. The row records the request that was
 admitted, not its outcome: an unknown-group `400` or a `503` after the row still
 leaves it, while a `400` for a malformed parameter is refused before it and leaves
-none. Unlike the Apps list, this aggregate is audited, because it reads
+none. Every admitted request writes its own row, a retry of a refused read
+included. Unlike the Apps list, this aggregate is audited, because it reads
 Forensics-tier usage and at the default floor of 1 a cell can be one device's
 figures.
+
+The MCP tool writes the same `dex.apps.usage.view` row before it reads and fails
+closed the same way: if the row cannot be stored the tool does not read and
+answers a retryable error (`retry_after_ms` 5000) with no data. It also records
+the generic `mcp.get_dex_apps_usage` row after the outcome. That second row does
+not withhold data: if it cannot be stored the answer is served with
+`audit_persisted: false`, because the access evidence was already durable before
+the read. This differs from `get_agent_app_usage`, which withholds data when
+either of its rows is lost.
+
+Refusals follow the route's table. An invalid or unknown group is a caller error
+(invalid params, no retry hint). `fleet_too_large`, `no_population` and
+`invalid_request` are terminal and carry no retry hint. Every other refusal is
+retryable with `retry_after_ms` 2000, and a failed read is never an answer with
+zero figures. Because each admitted call writes its own audit row, wait the
+hinted time before a retry.
 
 The usage figures are computed over the caller's visible devices only: the route
 hands the caller's device scope to the model, which filters its device list before
@@ -249,7 +275,7 @@ Read the health row of `summary` before treating a result as complete.
 |---|---|---|
 | Per-device REST route, MCP tool, dashboard panel | `Forensics:Read`, scoped to the device. Administrator and ForensicsAnalyst hold it by default. | `app_usage.agent.view`, written before any data is served. If the row cannot be stored the read fails closed: REST answers `503` with `Sec-Audit-Failed: true`, MCP answers with an error and no data, and the dashboard panel shows a note instead of the figures. |
 | `app_usage` plugin actions | `Forensics:Read`, administrator or approval | Standard command audit |
-| Fleet REST route | `Forensics:Read` and `GuaranteedState:Read` | `dex.apps.usage.view`, written before the read (after parameter validation) and failing closed, as described [above](#fleet-permissions-and-audit) |
+| Fleet REST route and MCP tool `get_dex_apps_usage` | `Forensics:Read` and `GuaranteedState:Read` | `dex.apps.usage.view`, written before the read (after parameter validation) and failing closed, as described [above](#fleet-permissions-and-audit). The MCP tool also records `mcp.get_dex_apps_usage` after the outcome, which does not withhold data. |
 
 A service-scoped token is refused on the REST route and the MCP tool, and the
 dashboard panel shows a permission note instead of data, because the service

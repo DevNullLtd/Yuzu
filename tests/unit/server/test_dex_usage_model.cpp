@@ -1117,3 +1117,193 @@ TEST_CASE("usage serializer: no agent id appears anywhere in the body", "[dex][u
     CHECK(body.find("agent-secret") == std::string::npos);
     CHECK(body.find("agent_id") == std::string::npos);
 }
+
+// ── Refusal classifier, MCP argument parser and audit shape (dex_usage_json.hpp) ──
+
+namespace {
+
+using Kind = DexUsageRefusalKind;
+
+DexUsageRefusalClass classify(const char* reason, const char* detail = "") {
+    return dex_usage_refusal_class(DexUsageRefusal{reason, detail});
+}
+
+} // namespace
+
+TEST_CASE("usage refusal class: an invalid slice is the caller's error", "[dex][usage_model]") {
+    const auto group = classify("invalid_slice", "unknown_group");
+    CHECK(group.kind == Kind::CallerError);
+    CHECK(group.message == "unknown management group");
+    CHECK(group.retry_after_ms == -1);
+    const auto slice = classify("invalid_slice");
+    CHECK(slice.kind == Kind::CallerError);
+    CHECK(slice.message == "invalid slice");
+}
+
+TEST_CASE("usage refusal class: terminal reasons carry no retry hint", "[dex][usage_model]") {
+    const auto big = classify("usage_unavailable", "fleet_too_large");
+    CHECK(big.kind == Kind::Terminal);
+    CHECK(big.retry_after_ms == -1);
+    CHECK(std::string(big.remediation).find("narrower platform scope") != std::string::npos);
+    CHECK(big.message == "fleet application usage unavailable (usage_unavailable: fleet_too_large)");
+    for (const char* reason : {"no_population", "invalid_request"}) {
+        INFO(reason);
+        const auto c = classify(reason);
+        CHECK(c.kind == Kind::Terminal);
+        CHECK(c.retry_after_ms == -1);
+        CHECK(c.remediation.empty());
+    }
+}
+
+TEST_CASE("usage refusal class: every other refusal is retryable after 2 seconds",
+          "[dex][usage_model]") {
+    struct Row {
+        const char* reason;
+        const char* detail;
+    };
+    // not_wired, invalid_read and score_policy_invalid are pinned equal to the REST route today.
+    const Row rows[] = {{"usage_unavailable", "pool_acquire_timeout"},
+                        {"usage_unavailable", "query_error"},
+                        {"usage_unavailable", "statement_timeout"},
+                        {"usage_unavailable", "concurrency_budget"},
+                        {"usage_unavailable", "not_wired"},
+                        {"usage_unavailable", "invalid_read"},
+                        {"apps_degraded", "score_policy_invalid"},
+                        {"apps_degraded", "query_error"},
+                        {"group_unavailable", "query_error"},
+                        {"tag_unavailable", "query_error"},
+                        {"some_future_reason", ""}};
+    for (const auto& row : rows) {
+        INFO(row.reason << ":" << row.detail);
+        const auto c = classify(row.reason, row.detail);
+        CHECK(c.kind == Kind::Retryable);
+        CHECK(c.retry_after_ms == 2000);
+        CHECK(c.remediation == "retry shortly");
+    }
+}
+
+TEST_CASE("usage refusal class: the message carries a detail only when it adds something",
+          "[dex][usage_model]") {
+    CHECK(classify("no_population").message == "fleet application usage unavailable (no_population)");
+    CHECK(classify("no_population", "no_population").message ==
+          "fleet application usage unavailable (no_population)");
+    CHECK(classify("apps_degraded", "query_error").message ==
+          "fleet application usage unavailable (apps_degraded: query_error)");
+}
+
+TEST_CASE("usage mcp request: no arguments yields the REST defaults", "[dex][usage_model]") {
+    const auto rq = dex_usage_mcp_request(json::object());
+    REQUIRE(rq);
+    CHECK(rq->window == "7d");
+    CHECK(rq->platform_scope == "all");
+    CHECK(rq->slice_name == "fleet");
+    CHECK(rq->slice.kind == DexUsageSliceKind::Fleet);
+    CHECK(rq->slice.key.empty());
+    CHECK(rq->floor == kDexCohortFloor);
+}
+
+TEST_CASE("usage mcp request: valid arguments are accepted", "[dex][usage_model]") {
+    const auto group = dex_usage_mcp_request({{"slice", "group"}, {"group", "grp-1"}});
+    REQUIRE(group);
+    CHECK(group->slice.kind == DexUsageSliceKind::Group);
+    CHECK(group->slice.key == "grp-1");
+
+    const auto tag = dex_usage_mcp_request({{"slice", "tag"}});
+    REQUIRE(tag);
+    CHECK(tag->slice.kind == DexUsageSliceKind::Tag);
+    CHECK(tag->slice.key == kDexDefaultCohortKey);
+
+    const auto ring = dex_usage_mcp_request({{"slice", "tag"}, {"tag_key", "ring"}});
+    REQUIRE(ring);
+    CHECK(ring->slice.key == "ring");
+
+    const auto other = dex_usage_mcp_request({{"platform", "linux"}, {"window", "30d"}});
+    REQUIRE(other);
+    CHECK(other->platform_scope == "linux");
+    CHECK(other->window == "30d");
+
+    for (const int floor : {1, 10, 10000}) {
+        const auto f = dex_usage_mcp_request({{"floor", floor}});
+        REQUIRE(f);
+        CHECK(f->floor == floor);
+    }
+    // A JSON text number parses as unsigned: the same value, accepted the same way.
+    const auto parsed = dex_usage_mcp_request(json::parse(R"({"floor":10})"));
+    REQUIRE(parsed);
+    CHECK(parsed->floor == 10);
+}
+
+TEST_CASE("usage mcp request: it refuses and never clamps or coerces", "[dex][usage_model]") {
+    const std::string bad_utf8 = "g\xC3(";
+    const std::string with_control = std::string("g") + '\x01';
+    const json refused[] = {
+        json::array(),
+        json{{"bogus", 1}},
+        json{{"window", 7}},
+        json{{"platform", true}},
+        json{{"slice", 1}},
+        json{{"slice", "group"}, {"group", 5}},
+        json{{"slice", "tag"}, {"tag_key", 5}},
+        json{{"window", "90d"}},
+        json{{"platform", "bsd"}},
+        json{{"slice", "cohort"}},
+        json{{"group", "grp-1"}},                           // group without slice=group
+        json{{"tag_key", "ring"}},                          // tag_key without slice=tag
+        json{{"slice", "group"}},                           // group is required
+        json{{"slice", "group"}, {"group", ""}},
+        json{{"slice", "group"}, {"group", std::string(257, 'g')}},
+        json{{"slice", "group"}, {"group", with_control}},
+        json{{"slice", "group"}, {"group", bad_utf8}},
+        json{{"slice", "tag"}, {"tag_key", std::string(65, 'k')}},
+        json{{"slice", "tag"}, {"tag_key", "has space"}},
+        json{{"floor", "5"}},
+        json{{"floor", 0}},
+        json{{"floor", 10001}},
+        json{{"floor", -1}},
+        json{{"floor", 1.5}},
+        json{{"floor", true}},
+        json{{"floor", std::uint64_t{18446744073709551615ULL}}}, // above int64 max: must not wrap
+    };
+    for (const auto& args : refused) {
+        INFO(args.dump(-1, ' ', false, json::error_handler_t::replace));
+        CHECK_FALSE(dex_usage_mcp_request(args));
+    }
+}
+
+TEST_CASE("usage mcp request: a group bound is bytes, not characters", "[dex][usage_model]") {
+    // 86 three-byte characters are 258 bytes: under 256 characters, over the 256-byte bound.
+    std::string group;
+    for (int i = 0; i < 86; ++i)
+        group += "\xE2\x82\xAC";
+    REQUIRE(group.size() == 258);
+    CHECK_FALSE(dex_usage_mcp_request({{"slice", "group"}, {"group", group}}));
+}
+
+TEST_CASE("usage mcp request: a refusal names the argument and never echoes a value",
+          "[dex][usage_model]") {
+    const auto unknown = dex_usage_mcp_request(
+        {{std::string("evil key\n") + std::string(200, 'z'), "SECRET-VALUE"}});
+    REQUIRE_FALSE(unknown);
+    CHECK(unknown.error().starts_with("unknown argument '"));
+    CHECK(unknown.error().size() < 100);
+    CHECK(unknown.error().find('\n') == std::string::npos);
+    CHECK(unknown.error().find("SECRET-VALUE") == std::string::npos);
+
+    const auto window = dex_usage_mcp_request({{"window", "SECRET-VALUE"}});
+    REQUIRE_FALSE(window);
+    CHECK(window.error().find("SECRET-VALUE") == std::string::npos);
+    const auto group = dex_usage_mcp_request({{"slice", "group"}, {"group", "SECRET\x01VALUE"}});
+    REQUIRE_FALSE(group);
+    CHECK(group.error().find("SECRET") == std::string::npos);
+}
+
+TEST_CASE("usage audit shape: the five tokens, a group key neutralised", "[dex][usage_model]") {
+    const auto fleet = dex_usage_mcp_request({{"floor", 5}});
+    REQUIRE(fleet);
+    CHECK(dex_usage_audit_shape(*fleet) == "window=7d platform=all slice=fleet key= floor=5");
+
+    const auto group = dex_usage_mcp_request({{"slice", "group"}, {"group", "a b=c,d"}});
+    REQUIRE(group);
+    const std::string shape = dex_usage_audit_shape(*group);
+    CHECK(shape == "window=7d platform=all slice=group key=a_b_c_d floor=1");
+}
