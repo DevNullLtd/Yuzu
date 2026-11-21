@@ -68,7 +68,25 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
       entries in force as a grype config holding only `ignore:` rules
       (vulnerability, package name, version and type); grype reads that
       file (`-c`), never PATH. Prints in_force=, pending= and
-      pending_not_honoured= like ignore-file.
+      pending_not_honoured= like ignore-file, and waivers_in_force=.
+
+      The file may also hold one optional `provider_waivers:` section, parsed
+      by the same parser under the same shape rules:
+
+        provider_waivers:
+          - provider: nvd              first key: nvd, alpine, debian or ubuntu
+            statement: >-              required: why, with the evidence that
+              ...                      the upstream source is stalled
+            expired_at: 2026-11-30     required, at most MAX_WAIVER_DAYS out
+            approved_by, approved_on, approval_ref: as for an entry
+
+      A waiver lets grype-db-providers admit that provider's capture when it
+      is older than MAX_DB_AGE_HOURS, and nothing else. A duplicate provider,
+      an unknown one, an expiry more than MAX_WAIVER_DAYS out, and an EXPIRED
+      waiver refuse the whole file (an expired entry is only not in force);
+      with --require-approved a pending one is not in force. With
+      --emit-waivers OUT it writes the waivers in force (JSON, without the
+      statement) for grype-db-providers --waivers.
 
   not-covered PATH [--require-approved]
       Validate scripts/ci/image-vuln-gate-not-covered.txt (same approval
@@ -76,8 +94,8 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
 
   pending IGNORE_FILE NOT_COVERED_FILE GRYPE_IGNORE_FILE
       The release skills' pre-tag check: validate the three files and fail
-      (exit 1) when any ignore entry (of either scanner) or not-covered
-      listing that is not expired still
+      (exit 1) when any ignore entry (of either scanner), provider waiver or
+      not-covered listing that is not expired still
       has approval_ref `pending`, when any of them has EXPIRED or expires
       within RELEASE_WINDOW_DAYS (each publish leg re-reads the date, so one
       lapsing during the release fails the legs that have not run yet), or
@@ -146,12 +164,17 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
       at most MAX_DB_AGE_HOURS old: the DB grype will scan with is the one the
       gate downloaded and verified.
 
-  grype-db-providers PROVIDERS_JSON PROVIDER...
+  grype-db-providers PROVIDERS_JSON [--waivers WAIVERS_JSON] PROVIDER...
       Read `grype db providers -o json` and fail unless every named provider
       is listed with a dateCaptured at most MAX_DB_AGE_HOURS old (and not more
       than an hour in the future). The DB's own `built` time says when it was
       assembled, not how fresh each source in it is: a provider whose capture
-      went stale would otherwise read as current.
+      went stale would otherwise read as current. With --waivers (the file
+      grype-ignore-file --emit-waivers wrote), a provider with a waiver in
+      force whose readable capture is merely older than MAX_DB_AGE_HOURS
+      passes, with a `waiver: ...` line naming its age and the waiver; a
+      missing provider, an unreadable or future capture time, or an
+      unreadable waivers file still fails.
 
   grype-components CYCLONEDX_JSON NAME[=VERSION]...
       Read grype's CycloneDX output (every catalogued component) and fail
@@ -186,6 +209,16 @@ WARN_DAYS = 21
 # tomorrow): a release, re-runs included, can run past midnight.
 RELEASE_WINDOW_DAYS = 2
 MAX_DB_AGE_HOURS = 72
+# A provider waiver (`provider_waivers:` in .grypeignore.yaml) admits one grype
+# DB provider whose capture is older than MAX_DB_AGE_HOURS, for a release that
+# cannot wait for a stalled upstream. It waives that one freshness check and
+# nothing else (not a missing provider, not an unreadable or future capture
+# time, not the DB's own age, checksum or status, not a finding), so its expiry
+# is far tighter than an acceptance's. The providers are a closed set: NVD (the
+# OTP runtime's matches) and the canary families' OS providers.
+MAX_WAIVER_DAYS = 14
+WAIVABLE_PROVIDERS = ("nvd", "alpine", "debian", "ubuntu")
+WAIVER_KEYS = ("provider", "statement", "expired_at", "approved_by", "approved_on", "approval_ref")
 
 ENTRY_KEYS = ("id", "paths", "purls", "statement", "expired_at", "approved_by",
               "approved_on", "approval_ref")
@@ -307,15 +340,20 @@ def plain_scalar(raw, where):
     return v
 
 
-def parse_ignore(text, entry_keys=ENTRY_KEYS, list_keys=LIST_KEYS):
-    """Entries of an ignore file. `entry_keys`/`list_keys` are the scanner's
-    schema: ENTRY_KEYS/LIST_KEYS for .trivyignore.yaml, GRYPE_ENTRY_KEYS and
-    no list key for .grypeignore.yaml. The shape rules are the same for both."""
+def parse_sections(text, sections):
+    """The one parser of an acceptance file: {section: [entries]} for each
+    top-level block list named in `sections`, {name: (first key, entry keys,
+    list keys)}: for .trivyignore.yaml `vulnerabilities` with ENTRY_KEYS and
+    LIST_KEYS; for .grypeignore.yaml `vulnerabilities` with GRYPE_ENTRY_KEYS
+    and no list key, and `provider_waivers` with WAIVER_KEYS (the schemas'
+    sixth field). `vulnerabilities` is required; another section is optional,
+    each at most once. Every section's entries follow the same shape rules."""
     lines = text.split("\n")
-    entries = []
-    top_seen = False
+    out = {}
+    section = None
     i = 0
     n = len(lines)
+    names = ", ".join(f"`{s}:`" for s in sections)
 
     def skip(line):
         s = line.strip()
@@ -332,23 +370,25 @@ def parse_ignore(text, entry_keys=ENTRY_KEYS, list_keys=LIST_KEYS):
         indent = len(line) - len(line.lstrip(" "))
         body = line.strip()
         if indent == 0:
-            if body != "vulnerabilities:":
-                raise Bad(f"{where}: only a `vulnerabilities:` key is allowed at the top level")
-            if top_seen:
-                raise Bad(f"{where}: second `vulnerabilities:` key")
-            top_seen = True
+            if not body.endswith(":") or body[:-1] not in sections:
+                raise Bad(f"{where}: only {names} allowed at the top level")
+            if body[:-1] in out:
+                raise Bad(f"{where}: second `{body}` key")
+            section = body[:-1]
+            out[section] = []
             i += 1
             continue
-        if not top_seen:
-            raise Bad(f"{where}: content before `vulnerabilities:`")
+        if section is None:
+            raise Bad(f"{where}: content before {names}")
+        first_key, entry_keys, list_keys = sections[section]
         if indent != 2 or not body.startswith("- "):
-            raise Bad(f"{where}: expected an entry `  - id: ...` at indentation 2")
-        # One entry: "  - id: X" then keys at indentation 4.
+            raise Bad(f"{where}: expected an entry `  - {first_key}: ...` at indentation 2")
+        # One entry: "  - id: X" (or "  - provider: X") then keys at indentation 4.
         first = body[2:]
         m = re.match(r"^([a-z_]+):(?:\s+(.*))?$", first)
-        if not m or m.group(1) != "id":
-            raise Bad(f"{where}: every entry starts with `- id:`")
-        entry = {"_line": i + 1, "id": plain_scalar(m.group(2) or "", where)}
+        if not m or m.group(1) != first_key:
+            raise Bad(f"{where}: every `{section}` entry starts with `- {first_key}:`")
+        entry = {"_line": i + 1, first_key: plain_scalar(m.group(2) or "", where)}
         i += 1
         while i < n:
             line = lines[i]
@@ -367,7 +407,7 @@ def parse_ignore(text, entry_keys=ENTRY_KEYS, list_keys=LIST_KEYS):
             if not m:
                 raise Bad(f"{where}: expected `key: value`")
             key, raw = m.group(1), (m.group(2) or "")
-            if key not in entry_keys or key == "id":
+            if key not in entry_keys or key == first_key:
                 raise Bad(f"{where}: key `{key}` is not allowed in an entry")
             if key in entry:
                 raise Bad(f"{where}: duplicate key `{key}`")
@@ -427,10 +467,12 @@ def parse_ignore(text, entry_keys=ENTRY_KEYS, list_keys=LIST_KEYS):
                     if nind > 4:
                         raise Bad(f"line {j + 1}: continuation of `{key}`; use `statement: >-` for long text")
                 entry[key] = v
-        entries.append(entry)
-    if not top_seen:
+        out[section].append(entry)
+    if "vulnerabilities" not in out:
         raise Bad("no `vulnerabilities:` key")
-    return entries
+    for s in sections:
+        out.setdefault(s, [])
+    return out
 
 
 def list_item(raw, where):
@@ -576,29 +618,100 @@ def emit_grype_yaml(entries, out):
 
 
 TRIVY_SCHEMA = (ENTRY_KEYS, LIST_KEYS, trivy_scope_errors, emit_trivy_yaml,
-                "a concrete scope, a statement, an expiry and approval fields (format-checked only)")
+                "a concrete scope, a statement, an expiry and approval fields (format-checked only)",
+                {"vulnerabilities": ("id", ENTRY_KEYS, LIST_KEYS)})
 GRYPE_SCHEMA = (GRYPE_ENTRY_KEYS, (), grype_scope_errors, emit_grype_yaml,
-                 "a package name and version, a statement, an expiry and approval fields (format-checked only)")
+                "a package name and version, a statement, an expiry and approval fields (format-checked only)",
+                {"vulnerabilities": ("id", GRYPE_ENTRY_KEYS, ()),
+                 "provider_waivers": ("provider", WAIVER_KEYS, ())})
 
 
-def read_ignore(path, schema):
-    """(entries, None) or (None, message) for an unreadable or unparsable file."""
+def read_ignore_sections(path, schema):
+    """({section: entries}, None) or (None, message) for an unreadable or
+    unparsable file."""
     try:
         with open(path, encoding="utf-8") as f:
             text = f.read()
     except (OSError, UnicodeDecodeError) as e:
         return None, f"{path}: unreadable: {e}"
     try:
-        return parse_ignore(text, schema[0], schema[1]), None
+        return parse_sections(text, schema[5]), None
     except Bad as e:
         return None, f"{path}: {e}"
 
 
-def cmd_ignore_file(path, emit=None, require_approved=False, schema=TRIVY_SCHEMA):
-    entries, why = read_ignore(path, schema)
-    if entries is None:
+def check_waivers(path, waivers, require_approved, errors, excluded, pending_all):
+    """The in-force provider waivers of a grype acceptance file, and the
+    problems with any, into `errors`. An expired waiver, or one more than
+    MAX_WAIVER_DAYS out, is an ERROR that refuses the whole file (an expired
+    acceptance merely stops being in force): a waiver is a temporary exception
+    to a hard check, and one left behind must not linger in the tree. With
+    `require_approved` (the release gate) a pending one is not in force."""
+    now = today()
+    seen = set()
+    in_force = []
+    for w in waivers:
+        prov = w["provider"]
+        tag = f"{path}:{w['_line']}: provider waiver {prov}"
+        if prov not in WAIVABLE_PROVIDERS:
+            errors.append(f"{tag}: provider must be one of {', '.join(WAIVABLE_PROVIDERS)}")
+        if prov in seen:
+            errors.append(f"{tag}: duplicate provider waiver")
+        seen.add(prov)
+        if "statement" not in w:
+            errors.append(f"{tag}: no `statement` (why, with the evidence that the upstream source is stalled)")
+        pending = check_approval(tag, w.get("approved_by"), w.get("approved_on"), w.get("approval_ref"), errors)
+        exp = parse_date(w.get("expired_at"))
+        if "expired_at" not in w or exp is None:
+            errors.append(f"{tag}: expired_at must be a YYYY-MM-DD date")
+            continue
+        left = (exp - now).days
+        if left > MAX_WAIVER_DAYS:
+            errors.append(f"{tag}: expired_at {exp} is {left} days out; the maximum for a provider waiver is "
+                          f"{MAX_WAIVER_DAYS}")
+            continue
+        if left < 0:
+            errors.append(f"{tag}: expired on {exp}; an expired provider waiver refuses the file: remove it "
+                          f"(or renew it with a new review and approval)")
+            continue
+        if pending:
+            pending_all.append(w)
+        if pending and require_approved:
+            excluded.append(w)
+            print(f"NOT IN FORCE: {tag}: approval_ref is pending; a release gate honours only a provider waiver "
+                  f"whose approval is recorded (docs/ci-architecture.md \"Recording an approval\")")
+            continue
+        if pending:
+            print(f"warning: {tag}: approval_ref is pending; honoured here, but the release gate "
+                  f"(--release) does not honour it")
+        print(f"note: {tag}: in force until {exp}: an image may be judged with grype DB provider {prov} "
+              f"older than {MAX_DB_AGE_HOURS} hours, and its report then says so; a release judged with it "
+              f"must say so in its release notes")
+        in_force.append(w)
+    return in_force
+
+
+def emit_waivers_json(path, waivers, out):
+    """The in-force provider waivers, for grype-db-providers --waivers. Every
+    value written has passed the format checks above (the statement is left
+    out: it is free text, and the reports and logs name the file line)."""
+    rows = [{"provider": w["provider"], "expired_at": w["expired_at"], "approved_by": w["approved_by"],
+             "approval_ref": w["approval_ref"], "approved_on": w.get("approved_on") or "-",
+             "where": f"{os.path.basename(path)}:{w['_line']}"} for w in waivers]
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(rows, f)
+        f.write("\n")
+
+
+def cmd_ignore_file(path, emit=None, require_approved=False, schema=TRIVY_SCHEMA, emit_waivers=None):
+    sections, why = read_ignore_sections(path, schema)
+    if sections is None:
         print(why, file=sys.stderr)
         return 1
+    entries = sections["vulnerabilities"]
+    waiver_errors, waivers_excluded, waivers_pending = [], [], []
+    waivers_in_force = check_waivers(path, sections.get("provider_waivers", []), require_approved,
+                                     waiver_errors, waivers_excluded, waivers_pending)
     now = today()
     errors = []
     seen = set()
@@ -642,20 +755,27 @@ def cmd_ignore_file(path, emit=None, require_approved=False, schema=TRIVY_SCHEMA
             print(f"warning: {tag}: approval_ref is pending; honoured here, but the release gate "
                   f"(--release) does not honour it")
         in_force.append(e)
+    errors += waiver_errors
     if errors:
         for m in errors:
             print(m, file=sys.stderr)
         return 1
-    if emit:
-        try:
+    try:
+        if emit:
             schema[3](in_force, emit)
-        except OSError as e:
-            print(f"cannot write {emit}: {e}", file=sys.stderr)
-            return 1
+        if emit_waivers:
+            emit_waivers_json(path, waivers_in_force, emit_waivers)
+    except OSError as e:
+        print(f"cannot write the generated file: {e}", file=sys.stderr)
+        return 1
     print(f"{path}: {len(entries)} entry(ies), each with {schema[4]}")
     print(f"in_force={len(in_force)}")
     print(f"pending={pending_excluded + pending_honoured}")
     print(f"pending_not_honoured={pending_excluded}")
+    if "provider_waivers" in schema[5]:
+        print(f"waivers_in_force={len(waivers_in_force)}")
+        print(f"waivers_pending={len(waivers_pending)}")
+        print(f"waivers_pending_not_honoured={len(waivers_excluded)}")
     return 0
 
 
@@ -861,14 +981,16 @@ def cmd_pending(ignore_path, not_covered_path, grype_path):
     """Exit 1 when any file is malformed or anything in force is pending."""
     found = []
     files = []
+    waivers = []
     for path, schema in ((ignore_path, TRIVY_SCHEMA), (grype_path, GRYPE_SCHEMA)):
-        entries, why = read_ignore(path, schema)
-        if entries is None:
+        sections, why = read_ignore_sections(path, schema)
+        if sections is None:
             print(why, file=sys.stderr)
             return 1
         if cmd_ignore_file(path, schema=schema) != 0:
             return 1
-        files.append((path, entries))
+        files.append((path, sections["vulnerabilities"]))
+        waivers += [(path, w) for w in sections.get("provider_waivers", [])]
     now = today()
 
     def check_expiry(tag, exp):
@@ -890,6 +1012,12 @@ def cmd_pending(ignore_path, not_covered_path, grype_path):
                 check_expiry(tag, exp)
             if e.get("approval_ref") == PENDING and exp is not None and exp >= now:
                 found.append(f"{tag}: approval_ref is pending")
+    for path, w in waivers:
+        # Validation above already refused an expired or too-distant waiver.
+        tag = f"{path}:{w['_line']}: provider waiver {w['provider']}"
+        check_expiry(tag, parse_date(w["expired_at"]))
+        if w.get("approval_ref") == PENDING:
+            found.append(f"{tag}: approval_ref is pending")
     try:
         listed = read_not_covered(not_covered_path, require_approved=True)
         with open(not_covered_path, encoding="utf-8") as f:
@@ -1083,19 +1211,26 @@ def cmd_canary_check(report, family, os_name):
 
 
 # ── grype: the DB listing, the imported DB, the report ─────────────────────
-def _db_age_problem(what, built_raw):
-    """None, or why a DB built at `built_raw` may not be used."""
+def _db_age(what, built_raw):
+    """(kind, why, age_hours): kind None (usable), "unreadable", "future" or
+    "stale" (older than MAX_DB_AGE_HOURS). Only "stale" is ever waivable, and
+    only for a grype DB provider (cmd_grype_db_providers)."""
     try:
         built = parse_time(built_raw)
     except (ValueError, TypeError):
-        return f"{what}: built {built_raw!r} is not an RFC 3339 time"
+        return "unreadable", f"{what}: built {built_raw!r} is not an RFC 3339 time", None
     age_h = (dt.datetime.now(dt.timezone.utc) - built).total_seconds() / 3600
     if age_h < -1:
-        return f"{what}: built {built_raw} is in the future"
+        return "future", f"{what}: built {built_raw} is in the future", age_h
     if age_h > MAX_DB_AGE_HOURS:
-        return (f"{what}: built {age_h:.0f} hours ago ({built_raw}), more than {MAX_DB_AGE_HOURS}; a stale DB "
-                f"misses recent fixes, so the gate does not pass on it")
-    return None
+        return "stale", (f"{what}: built {age_h:.0f} hours ago ({built_raw}), more than {MAX_DB_AGE_HOURS}; a "
+                         f"stale DB misses recent fixes, so the gate does not pass on it"), age_h
+    return None, None, age_h
+
+
+def _db_age_problem(what, built_raw):
+    """None, or why a DB built at `built_raw` may not be used."""
+    return _db_age(what, built_raw)[1]
 
 
 def _load_json_object(path, what):
@@ -1166,7 +1301,39 @@ def cmd_grype_db_status(path, built, schema):
     return 0
 
 
-def cmd_grype_db_providers(path, required):
+def read_waivers_json(path):
+    """{provider: waiver} from the file grype-ignore-file --emit-waivers wrote.
+    Raises ValueError on anything else. A waiver whose date has passed since
+    that file was written (a run crossing midnight) is left out."""
+    with open(path, encoding="utf-8") as f:
+        rows = json.load(f)
+    if not isinstance(rows, list):
+        raise ValueError("not a JSON list of provider waivers")
+    out = {}
+    for w in rows:
+        if not isinstance(w, dict) or w.get("provider") not in WAIVABLE_PROVIDERS or w["provider"] in out:
+            raise ValueError(f"not a provider waiver of a waivable provider: {w!r}")
+        for k in ("expired_at", "approved_by", "approval_ref", "approved_on", "where"):
+            if not isinstance(w.get(k), str):
+                raise ValueError(f"provider waiver {w['provider']}: no {k}")
+        exp = parse_date(w["expired_at"])
+        if exp is None:
+            raise ValueError(f"provider waiver {w['provider']}: expired_at is not a date")
+        if exp >= today():
+            out[w["provider"]] = w
+    return out
+
+
+def _hours(age_h):
+    return "an unknown number of hours" if age_h is None else f"{age_h:.0f} hours"
+
+
+def cmd_grype_db_providers(path, required, waivers_path=None):
+    try:
+        waivers = read_waivers_json(waivers_path) if waivers_path is not None else {}
+    except (OSError, ValueError, RecursionError) as e:
+        print(f"provider waivers {waivers_path} are missing or unreadable ({e})", file=sys.stderr)
+        return 1
     try:
         with open(path, encoding="utf-8") as f:
             rows = json.load(f)
@@ -1180,14 +1347,27 @@ def cmd_grype_db_providers(path, required):
     for name in required:
         r = by_name.get(name)
         if r is None:
+            # A waiver never admits a missing provider: there is nothing to be stale.
             problems.append(f"provider {name!r} is not in the DB")
             continue
         captured = r.get("dateCaptured")
-        why = _db_age_problem(f"provider {name}", captured if isinstance(captured, str) else repr(captured))
-        if why:
-            problems.append(why)
-        else:
+        kind, why, age_h = _db_age(f"provider {name}", captured if isinstance(captured, str) else repr(captured))
+        if kind is None:
             print(f"provider_{name}={captured}")
+        elif kind == "stale" and name in waivers:
+            # The ONE thing a provider waiver admits: a capture time that reads
+            # fine and is merely older than MAX_DB_AGE_HOURS.
+            w = waivers[name]
+            print(f"provider_{name}={captured}")
+            print(f"waiver: provider {name} captured {captured}, {_hours(age_h)} old (over the "
+                  f"{MAX_DB_AGE_HOURS}-hour limit), admitted by the provider waiver at {w['where']}: expires "
+                  f"{w['expired_at']}, approved_by {w['approved_by']}, approval_ref {w['approval_ref']}, "
+                  f"approved_on {w['approved_on']}")
+        else:
+            if kind == "stale":
+                why += (f" (only a reviewed provider waiver for {name} in .grypeignore.yaml admits a stale "
+                        f"provider: docs/ci-architecture.md \"A grype DB provider is stale\")")
+            problems.append(why)
     if problems:
         for m in problems:
             print(f"grype db providers: {m}", file=sys.stderr)
@@ -1305,10 +1485,10 @@ def main(argv):
             if len(pos) == 1:
                 return cmd_not_covered(pos[0], bool(f.get("--require-approved")))
         elif argv and argv[0] == "grype-ignore-file":
-            pos, f = flags(argv[1:], {"--emit": True, "--require-approved": False})
+            pos, f = flags(argv[1:], {"--emit": True, "--emit-waivers": True, "--require-approved": False})
             if len(pos) == 1:
                 return cmd_ignore_file(pos[0], f.get("--emit"), bool(f.get("--require-approved")),
-                                       schema=GRYPE_SCHEMA)
+                                       schema=GRYPE_SCHEMA, emit_waivers=f.get("--emit-waivers"))
         elif len(argv) == 4 and argv[0] == "pending":
             return cmd_pending(argv[1], argv[2], argv[3])
         elif len(argv) == 2 and argv[0] == "grype-db-listing":
@@ -1317,8 +1497,10 @@ def main(argv):
             pos, f = flags(argv[1:], {"--built": True, "--schema": True})
             if len(pos) == 1 and f.get("--built") and f.get("--schema"):
                 return cmd_grype_db_status(pos[0], f["--built"], f["--schema"])
-        elif len(argv) >= 3 and argv[0] == "grype-db-providers":
-            return cmd_grype_db_providers(argv[1], argv[2:])
+        elif argv and argv[0] == "grype-db-providers":
+            pos, f = flags(argv[1:], {"--waivers": True})
+            if len(pos) >= 2:
+                return cmd_grype_db_providers(pos[0], pos[1:], f.get("--waivers"))
         elif len(argv) >= 3 and argv[0] == "grype-components":
             return cmd_grype_components(argv[1], argv[2:])
         elif len(argv) == 2 and argv[0] == "grype-report":

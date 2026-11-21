@@ -59,6 +59,18 @@
 #     grype scan runs with DB updates off and grype's own age check on. The
 #     listing is NOT signed upstream: TLS to its host and the recorded
 #     checksum are the only evidence of which DB was used;
+#   - a grype DB provider the images need (nvd for every image, and each
+#     image's OS family's: alpine, debian, ubuntu) is missing, or its capture
+#     time is unreadable, in the future or older than 72 hours. A reviewed
+#     provider waiver in .grypeignore.yaml (`provider_waivers:`, one per
+#     provider, at most 14 days out) admits that provider's capture when it
+#     is ONLY older than 72 hours, and nothing else: never a missing
+#     provider, a bad capture time, the DB's own age, checksum or status, a
+#     finding, a component or coverage failure. An image judged with one
+#     passes DEGRADED: its grype .gate.txt names the waiver (`provider
+#     waiver: ...` and a `DEGRADED: ...` line) and the step summary says so.
+#     No flag, input or variable enables one on GitHub Actions: only the
+#     committed file does (YUZU_GRYPEIGNORE is pinned to it there);
 #   - grype did not detect the OS that Trivy did, on an image whose OS
 #     packages Trivy scanned: grype then matches none of them.
 #
@@ -100,7 +112,8 @@
 # result); and grype-NAME.json (grype's report: every match, every severity,
 # and the accepted ones as ignoredMatches), grype-NAME.txt (its table) and
 # grype-NAME.gate.txt (grype version, the DB's URL, checksum, schema and build
-# time, image ID, distro, match counts, the ignore file and grype's result).
+# time, the provider waivers used or `provider waiver: none used`, image ID,
+# distro, match counts, the ignore file and grype's result).
 # A .gate.txt of EACH scanner is written for every image on every exit the
 # script reaches after reading its arguments, including a SIGTERM/SIGINT
 # (`gate: FAIL: cancelled ...`), with `gate: FAIL: <reason>` when the gate
@@ -124,10 +137,12 @@
 #                    GitHub Actions.
 #   YUZU_TRIVYIGNORE ignore file to validate (default: <repo>/.trivyignore.yaml).
 #                    It goes through the same parser; Trivy reads only the
-#                    checker's canonical YAML copy of it.
+#                    checker's canonical YAML copy of it. On GitHub Actions it
+#                    may name only the repository's file.
 #   YUZU_GRYPEIGNORE grype acceptance file to validate (default:
 #                    <repo>/.grypeignore.yaml); grype reads only the config
-#                    generated from it.
+#                    generated from it. On GitHub Actions it may name only the
+#                    repository's file (so it cannot supply a provider waiver).
 # The pinned binaries, both DBs, the image archive grype reads and the
 # scanners' temporary files live in a per-run directory ($RUNNER_TEMP, else
 # $TMPDIR), never a fixed shared path: the self-hosted pools run four runners
@@ -232,9 +247,11 @@ SIGNAL_GRACE=3
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IGNORE_FILE="${YUZU_TRIVYIGNORE:-$ROOT/.trivyignore.yaml}"
+trivy_ignore_env="${YUZU_TRIVYIGNORE:-}"
 CHECKS=(python3 -I "$ROOT/scripts/ci/image-vuln-gate-checks.py")
 NOT_COVERED="$ROOT/scripts/ci/image-vuln-gate-not-covered.txt"
 GRYPE_IGNORE_FILE="${YUZU_GRYPEIGNORE:-$ROOT/.grypeignore.yaml}"
+grype_ignore_env="${YUZU_GRYPEIGNORE:-}"
 
 # Keep the one TRIVY_* variable this script reads, then clear every other one:
 # Trivy maps every flag to a TRIVY_* variable (TRIVY_DB_REPOSITORY,
@@ -340,6 +357,10 @@ summary_header() {
     SUMMARY_HEADER=1
     summary "### Image vulnerability gate (Trivy ${TRIVY_VERSION}, DB ${DB_REF}, UpdatedAt ${db_updated}; grype ${GRYPE_VERSION}, DB ${GRYPE_DB_REF})"
     summary ""
+    if [ "${#GRYPE_DB_WAIVERS[@]}" -gt 0 ]; then
+        summary "**DEGRADED: provider waiver in force** for grype DB provider(s) $(waived_desc), older than 72 hours: every image judged while it is in force uses it (each grype .gate.txt names the waiver)."
+        summary ""
+    fi
     summary "| Image | OS packages | Coverage | Result |"
     summary "|---|---|---|---|"
 }
@@ -352,6 +373,17 @@ db_downloaded="?"
 ignore_desc="(not validated)"
 GRYPE_DB_REF="(not downloaded)"
 grype_ignore_desc="(not validated)"
+# Provider waivers USED (one `waiver: ...` line from the checker each): for the
+# providers every image needs (nvd), and for the image being judged (its OS
+# family's provider). Each makes that image's grype pass DEGRADED.
+GRYPE_DB_WAIVERS=()
+IMAGE_WAIVERS=()
+declare -A waived_providers=()
+UNJUDGED=0
+IMAGE_LAPSED=0
+# Set once an image found the run-wide waiver lapsed (a run crossing UTC
+# midnight on its expiry day), so images reported later say so too.
+RUN_LAPSED=0
 ABORT_REASON=""
 declare -A reported=()
 declare -A grype_reported=()
@@ -387,12 +419,61 @@ write_grype_gate_txt() {
         [ -z "$ATTEMPT" ] || echo "run attempt: $ATTEMPT"
         echo "grype: $GRYPE_VERSION"
         echo "grype db: $GRYPE_DB_REF"
+        waiver_lines
         [ $# -eq 0 ] || printf '%s\n' "$@"
         echo "ignore file: $grype_ignore_desc"
         echo "gate: $res"
         echo "scanned at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$REPORT_DIR/grype-${n}${ATTEMPT_SUFFIX}.gate.txt"
     grype_reported[$n]=1
+}
+
+# waiver_lines: the provider waivers used for the image being reported, one
+# `provider waiver: ...` line each and a `DEGRADED: ...` line, or a line saying
+# none was used. Never a line a `gate:` reader would count.
+waiver_lines() {
+    local w provs=""
+    if [ $((${#GRYPE_DB_WAIVERS[@]} + ${#IMAGE_WAIVERS[@]})) -eq 0 ]; then
+        echo "provider waiver: none used"
+        return 0
+    fi
+    if [ "$UNJUDGED" = 1 ]; then
+        # The run's waiver was in force (or lapsed), but this image was never judged.
+        if [ "$RUN_LAPSED" = 1 ]; then
+            echo "provider waiver: lapsed during this run ($(waived_desc run)), and the image was not judged"
+        else
+            echo "provider waiver: in force for this run ($(waived_desc)), but the image was not judged"
+        fi
+        return 0
+    fi
+    if [ "$IMAGE_LAPSED" = 1 ]; then
+        # The run-wide (nvd) waiver lapsed before this image was judged: name
+        # only that one as lapsed; an OS-provider waiver the image did use is
+        # still listed. The image failed, so nothing here says DEGRADED.
+        echo "provider waiver: lapsed during this run ($(waived_desc run)), so it did not admit the stale provider for this image"
+        for w in "${IMAGE_WAIVERS[@]}"; do
+            echo "provider waiver: ${w#waiver: }"
+        done
+        return 0
+    fi
+    for w in "${GRYPE_DB_WAIVERS[@]}" "${IMAGE_WAIVERS[@]}"; do
+        echo "provider waiver: ${w#waiver: }"
+        w="${w#waiver: provider }"
+        provs="${provs:+$provs, }${w%% *}"
+    done
+    echo "DEGRADED: provider waiver in force ($provs): grype judged this image with a DB provider older than 72 hours"
+}
+# waived_desc [run]: the providers waived for the image being judged (with
+# `run`, only the run-wide ones), or empty.
+waived_desc() {
+    local w provs=""
+    local -a ws=("${GRYPE_DB_WAIVERS[@]}")
+    [ "${1:-}" = run ] || ws+=("${IMAGE_WAIVERS[@]}")
+    for w in "${ws[@]}"; do
+        w="${w#waiver: provider }"
+        provs="${provs:+$provs, }${w%% *}"
+    done
+    printf '%s' "$provs"
 }
 
 die() {
@@ -414,6 +495,9 @@ report_unjudged() {
     else
         res="FAIL: gate stopped before this image was judged: ${ABORT_REASON:-unexpected error (exit $rc)}"
     fi
+    UNJUDGED=1
+    IMAGE_WAIVERS=()
+    IMAGE_LAPSED=0
     for i in "${!NAMES[@]}"; do
         if [ -z "${reported[${NAMES[$i]}]:-}" ]; then
             write_gate_txt "${NAMES[$i]}" "${REFS[$i]}" "$res" || true
@@ -482,6 +566,27 @@ finish() {
 }
 trap finish EXIT
 
+# A provider waiver (or an acceptance) is honoured only from the committed
+# files: on GitHub Actions YUZU_GRYPEIGNORE and YUZU_TRIVYIGNORE may name
+# nothing but the repository's own file, and the gate then reads that path,
+# never the one given, so no workflow input or variable can supply one. A
+# path that cannot be resolved is refused, never let through.
+# pin_repo_file VAR VALUE REPO_FILE: refuse VALUE unless it is REPO_FILE.
+pin_repo_file() {
+    local given want
+    [ -n "$2" ] || return 0
+    given="$(realpath -m -- "$2" 2>/dev/null)" || given=""
+    want="$(realpath -m -- "$3" 2>/dev/null)" || want=""
+    if [ -z "$given" ] || [ -z "$want" ] || [ "$given" != "$want" ]; then
+        die "$1 is for local runs and tests; on GitHub Actions the gate reads only $3"
+    fi
+}
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    pin_repo_file YUZU_GRYPEIGNORE "$grype_ignore_env" "$ROOT/.grypeignore.yaml"
+    pin_repo_file YUZU_TRIVYIGNORE "$trivy_ignore_env" "$ROOT/.trivyignore.yaml"
+    GRYPE_IGNORE_FILE="$ROOT/.grypeignore.yaml"
+    IGNORE_FILE="$ROOT/.trivyignore.yaml"
+fi
 if [ -n "$trivy_bin_env" ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
     die "TRIVY_BIN is for local runs and tests; the gate on GitHub Actions installs its pinned Trivy itself"
 fi
@@ -529,17 +634,21 @@ TRIVY_IGNORE="$WORK/trivyignore.yaml"
 if [ ! -r "$GRYPE_IGNORE_FILE" ]; then
     die "grype ignore file $GRYPE_IGNORE_FILE is missing or unreadable (the gate does not run without it)"
 fi
-gign_flags=(--emit "$WORK/grype-config.yaml")
+GRYPE_WAIVERS="$WORK/grype-waivers.json"
+gign_flags=(--emit "$WORK/grype-config.yaml" --emit-waivers "$GRYPE_WAIVERS")
 [ "$RELEASE" = 0 ] || gign_flags+=(--require-approved)
 if ! gign_out="$("${CHECKS[@]}" grype-ignore-file "$GRYPE_IGNORE_FILE" "${gign_flags[@]}")"; then
     printf '%s\n' "$gign_out"
-    die "$GRYPE_IGNORE_FILE is not in the shape the gate accepts (above): every entry needs a package_name and a package_version (grype's, exact; package_type optional), a statement, an expired_at at most 92 days out, approved_by, and approved_on with approval_ref (or approval_ref: pending)"
+    die "$GRYPE_IGNORE_FILE is not in the shape the gate accepts (above): every entry needs a package_name and a package_version (grype's, exact; package_type optional), a statement, an expired_at at most 92 days out, approved_by, and approved_on with approval_ref (or approval_ref: pending); every provider waiver a provider (nvd, alpine, debian or ubuntu, once each), a statement, an expired_at at most 14 days out and not passed, and the same approval fields"
 fi
-printf '%s\n' "$gign_out" | grep -v -E '^(in_force|pending|pending_not_honoured)=' || true
+printf '%s\n' "$gign_out" | grep -v -E '^(in_force|pending|pending_not_honoured|waivers_in_force|waivers_pending|waivers_pending_not_honoured)=' || true
 g_in_force="$(printf '%s\n' "$gign_out" | sed -n 's/^in_force=//p')"
 g_pending_all="$(printf '%s\n' "$gign_out" | sed -n 's/^pending=//p')"
 g_pending_out="$(printf '%s\n' "$gign_out" | sed -n 's/^pending_not_honoured=//p')"
-grype_ignore_desc="$(sha256sum "$GRYPE_IGNORE_FILE" | cut -d' ' -f1), ${g_in_force} entry(ies) in force, ${g_pending_all} pending approval (${g_pending_out} not honoured)"
+g_waivers="$(printf '%s\n' "$gign_out" | sed -n 's/^waivers_in_force=//p')"
+g_waivers_out="$(printf '%s\n' "$gign_out" | sed -n 's/^waivers_pending_not_honoured=//p')"
+g_waivers_pend="$(printf '%s\n' "$gign_out" | sed -n 's/^waivers_pending=//p')"
+grype_ignore_desc="$(sha256sum "$GRYPE_IGNORE_FILE" | cut -d' ' -f1), ${g_in_force} entry(ies) in force, ${g_pending_all} pending approval (${g_pending_out} not honoured), ${g_waivers} provider waiver(s) in force, ${g_waivers_pend} pending approval (${g_waivers_out} not honoured)"
 GRYPE_CONFIG="$WORK/grype-config.yaml"
 if ! nc_out="$("${CHECKS[@]}" not-covered "$NOT_COVERED" "${nc_flags[@]}")"; then
     die "$NOT_COVERED is malformed (above)"
@@ -696,11 +805,19 @@ if ! gstat="$("${CHECKS[@]}" grype-db-status "$WORK/grype-db-status.json" --buil
     die "grype's status of the imported DB is not the DB this run downloaded and verified, or it is stale (above)"
 fi
 run_grype "$RESOLVE_DEADLINE" db providers -o json > "$WORK/grype-db-providers.json" 2>"$WORK/grype-db-status.err" || true
-if ! gprov="$("${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" "${GRYPE_REQUIRED_PROVIDERS[@]}")"; then
+if ! gprov="$("${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" --waivers "$GRYPE_WAIVERS" \
+        "${GRYPE_REQUIRED_PROVIDERS[@]}")"; then
     cat "$WORK/grype-db-status.err" >&2 || true
-    die "a grype DB provider every image needs (${GRYPE_REQUIRED_PROVIDERS[*]}) is missing or older than 72 hours (above): an old one, re-run once the published DB is current; a missing one, the DB may have renamed it and GRYPE_REQUIRED_PROVIDERS needs updating"
+    die "a grype DB provider every image needs (${GRYPE_REQUIRED_PROVIDERS[*]}) is missing or older than 72 hours, or the provider waivers could not be read (above): an old one, re-run once the published DB is current, or, when its upstream source is stalled and the release cannot wait, record a reviewed provider waiver in .grypeignore.yaml (docs/ci-architecture.md \"A grype DB provider is stale\"); a missing one, the DB may have renamed it and GRYPE_REQUIRED_PROVIDERS needs updating"
 fi
 printf '%s\n' "$gprov" | sed 's/^/    /'
+mapfile -t GRYPE_DB_WAIVERS < <(printf '%s\n' "$gprov" | grep '^waiver: ' || true)
+for w in "${GRYPE_DB_WAIVERS[@]}"; do
+    w="${w#waiver: provider }"
+    waived_providers[${w%% *}]=1
+    [ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::DEGRADED: provider waiver in force: grype DB provider ${w%% *} is older than 72 hours (every image)"
+done
+[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    DEGRADED: provider waiver in force for $(waived_desc): every image judged while it is in force uses it"
 GRYPE_DB_REF="$GRYPE_DB_URL/$gdb_path ($gdb_sum, schema $gdb_schema, built $gdb_built)"
 printf '%s\n' "$gstat" | sed 's/^/    /'
 echo "    $GRYPE_DB_REF"
@@ -741,9 +858,11 @@ advisory_canary() {
 # image or cannot judge it.
 ARCHIVE="$WORK/image.tar"
 grype_scan() {
-    local n="$1" img="$2" want_family="$3" id stem gjson gtable gcdx ginfo gres rc comps="" cinfo=""
+    local n="$1" img="$2" want_family="$3" id stem gjson gtable gcdx ginfo gres rc comps="" cinfo="" pinfo=""
     local distro="?" matches="?" ignored="?" fcrit="?" fcrit_acc="?" gid="?"
     stem="grype-${n}${ATTEMPT_SUFFIX}"
+    IMAGE_WAIVERS=()
+    IMAGE_LAPSED=0
     gjson="$WORK/${stem}.json"
     gtable="$WORK/${stem}.txt"
     gcdx="$WORK/${stem}.cdx.json"
@@ -824,10 +943,33 @@ grype_scan() {
     run_grype "$SCAN_DEADLINE" -c "$GRYPE_CONFIG" --only-fixed --fail-on critical -o table \
         "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" || rc=$?
     rm -f "$ARCHIVE"
+    # A run that started on a run-wide (nvd) waiver re-checks it for each image:
+    # it may have lapsed since (a run crossing UTC midnight on its expiry day).
+    # A waivers file that cannot be read is told apart from a lapse.
+    local recheck="ok"
+    if [ "${#GRYPE_DB_WAIVERS[@]}" -gt 0 ] && ! "${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" \
+            --waivers "$GRYPE_WAIVERS" "${GRYPE_REQUIRED_PROVIDERS[@]}" > /dev/null 2>"$WORK/grype-recheck.err"; then
+        cat "$WORK/grype-recheck.err" >&2 || true
+        if grep -q '^provider waivers .* missing or unreadable' "$WORK/grype-recheck.err"; then
+            recheck="unreadable"
+        else
+            recheck="lapsed"
+            IMAGE_LAPSED=1
+            RUN_LAPSED=1
+        fi
+    fi
     case "$rc" in
-        0) if [ -n "$want_family" ] && ! "${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" \
-                   "$want_family" > /dev/null; then
-               err "$img: grype's DB provider for $want_family is missing or older than 72 hours, so its $want_family advisories are not current (treated as a failure): an old one, re-run once the published DB is current; a missing one, the DB may have renamed it"
+        0) if [ "$recheck" = lapsed ]; then
+               err "$img: the $(waived_desc run) provider waiver lapsed during this run, so the stale provider is not admitted for this image (treated as a failure)"
+               gres="FAIL: provider waiver lapsed during the run"
+               failed=1
+           elif [ "$recheck" = unreadable ]; then
+               err "$img: the provider waivers could not be read again for this image (above; treated as a failure)"
+               gres="FAIL: provider waivers unreadable"
+               failed=1
+           elif [ -n "$want_family" ] && ! pinfo="$("${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" \
+                   --waivers "$GRYPE_WAIVERS" "$want_family")"; then
+               err "$img: grype's DB provider for $want_family is missing or older than 72 hours, so its $want_family advisories are not current (treated as a failure): an old one, re-run once the published DB is current, or, when its upstream source is stalled and the release cannot wait, record a reviewed provider waiver in .grypeignore.yaml, or renew one that has lapsed (docs/ci-architecture.md \"A grype DB provider is stale\"); a missing one, the DB may have renamed it"
                gres="FAIL: grype DB provider $want_family is stale"
                failed=1
            elif [ "$comps_ok" != 1 ]; then
@@ -857,7 +999,23 @@ grype_scan() {
            gres="FAIL: grype exited $rc"
            failed=1 ;;
     esac
-    summary "| $n (grype) | - | distro ${distro:-none} | $gres |"
+    # The image's own provider waiver, when the OS provider check above used one
+    # (pinfo holds that check's output; a failed check prints no `waiver:` line).
+    mapfile -t IMAGE_WAIVERS < <(printf '%s\n' "$pinfo" | grep '^waiver: ' || true)
+    local wdesc w
+    wdesc="$(waived_desc)"
+    for w in "${IMAGE_WAIVERS[@]}"; do
+        [ "$IMAGE_LAPSED" = 0 ] || break
+        w="${w#waiver: provider }"
+        waived_providers[${w%% *}]=1
+        printf '    %s\n' "DEGRADED: provider waiver in force: grype DB provider ${w%% *} is older than 72 hours"
+        [ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::$n: DEGRADED: provider waiver in force: grype DB provider ${w%% *} is older than 72 hours"
+    done
+    if [ -n "$wdesc" ] && [ "$IMAGE_LAPSED" = 0 ]; then
+        summary "| $n (grype) | - | distro ${distro:-none} | $gres (DEGRADED: provider waiver in force: $wdesc) |"
+    else
+        summary "| $n (grype) | - | distro ${distro:-none} | $gres |"
+    fi
     if [ -n "$REPORT_DIR" ]; then
         cp "$gjson" "$gtable" "$REPORT_DIR/"
         write_grype_gate_txt "$n" "$img" "$gres" \
@@ -869,6 +1027,8 @@ grype_scan() {
             "required components: $comps_desc"
     fi
     grype_reported[$n]=1
+    IMAGE_WAIVERS=()
+    IMAGE_LAPSED=0
 }
 
 # ── Scan ─────────────────────────────────────────────────────────────────────
@@ -996,4 +1156,10 @@ for idx in "${!NAMES[@]}"; do
     grype_scan "$name" "$image" "$want_family"
 done
 
+if [ "${#waived_providers[@]}" -gt 0 ]; then
+    wsum="$(printf '%s\n' "${!waived_providers[@]}" | sort | paste -sd, - | sed 's/,/, /g')"
+    echo "DEGRADED: provider waiver in force for grype DB provider(s) $wsum (older than 72 hours; each grype .gate.txt names the waiver)"
+    summary ""
+    summary "**DEGRADED: provider waiver in force** for grype DB provider(s) $wsum (older than 72 hours; each grype .gate.txt names the waiver)."
+fi
 exit "$failed"
