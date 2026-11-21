@@ -1982,6 +1982,45 @@ TEST_CASE("ResultSetStore: GC sweep caps a large expired batch at kGcSweepCapPer
     CHECK(get_ok(store, live->id).has_value());
 }
 
+// gc_sweep row budget: a pass stops at kGcSweepRowBudgetPerPass (5,000,000) summed device_count,
+// oldest first, but always takes the first set. The headers are seeded directly with large
+// device_count values and no member rows: the budget reads the stored count, so the test needs
+// no millions of rows. A live row keeps would_wipe from tripping, as in the cap test above.
+TEST_CASE("ResultSetStore: GC sweep stops a pass at the member-row budget",
+          "[pg][result_set][gc]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto live = store.create_materialized(req("alice", "fresh-budget"), {"y"});
+    REQUIRE(live.has_value());
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(
+            conn.get(),
+            "INSERT INTO result_set_store.result_sets "
+            "(id, owner_principal, created_at, ttl_at, last_used_at, source_kind, "
+            "source_payload, device_count) VALUES "
+            "('rs_budget1', 'alice', 1, 2, 1, 'manual_curate', '{}', 3000000), "
+            "('rs_budget2', 'alice', 1, 3, 1, 'manual_curate', '{}', 3000000), "
+            "('rs_budget3', 'alice', 1, 4, 1, 'manual_curate', '{}', 1000000), "
+            "('rs_budget4', 'alice', 1, 5, 1, 'manual_curate', '{}', 9000000), "
+            "('rs_budget5', 'alice', 1, 6, 1, 'manual_curate', '{}', 0)")};
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.ok());
+    }
+
+    CHECK(store.gc_sweep() == 1); // 3M fits; 3M + 3M does not
+    CHECK(store.gc_sweep() == 2); // 3M + 1M fits; adding 9M does not
+    CHECK(store.gc_sweep() == 1); // 9M alone is over budget but the first set always goes
+    CHECK(store.gc_sweep() == 1); // the empty set
+    CHECK(store.gc_sweep() == 0);
+    CHECK(get_ok(store, live->id).has_value());
+}
+
 // gc_sweep would_wipe decline-once (2026-07-29 hardening round): when EVERY
 // datable (unpinned) row is expired, part 1's would_wipe classifier trips —
 // the pass reports the anomaly, records it in gc_meta, and declines to

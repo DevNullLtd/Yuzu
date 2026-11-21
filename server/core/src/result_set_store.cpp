@@ -1572,6 +1572,14 @@ bool ResultSetStore::heal_poisoned_payload(const std::string& id) {
 // operation and a first pass against it deletes at most 1-hour-old scratch).
 namespace {
 constexpr int64_t kGcSweepCapPerPass = 5000;      // part 5: unconditional
+// part 5, second half: a pass also stops at this many member rows (summed device_count, the
+// stored member count), always taking at least one set. The set cap alone let one pass cascade
+// up to 5000 x kMaxMembersPerSet rows; past the 30 s statement_timeout the pass rolls back and
+// the next one retries the same oldest-first cohort forever. Measured on PostgreSQL 16 a cascade
+// with the v7 DELETE trigger runs at about 0.5-0.6 s per million rows, so 5M rows is about 3 s:
+// roughly a tenth of the timeout. device_count is the server's own count; a member row written
+// out of band is not in it, so the budget is best-effort and the set cap still always applies.
+constexpr int64_t kGcSweepRowBudgetPerPass = 5'000'000;
 constexpr int64_t kGcBigStepSecs = 86'400;        // part 7: absolute, ~1 day
 constexpr int64_t kGcImplausiblyAheadSecs = 604'800; // part 1: probe excludes
 } // namespace
@@ -1749,16 +1757,25 @@ int ResultSetStore::gc_sweep() {
             return true; // nothing to drain
 
         // part 5: cap every accepted pass UNCONDITIONALLY — the detectors
-        // above are best-effort, the cap always applies. DELETE ... RETURNING
-        // counts what the statement actually removed (the #1033-banning
-        // idiom). Cascades to result_set_members via the FK.
+        // above are best-effort, the cap always applies: at most
+        // kGcSweepCapPerPass sets, oldest first, and within those only the
+        // prefix whose summed device_count stays within kGcSweepRowBudgetPerPass
+        // (the first set always goes, so a pass is never empty while sets are
+        // expired). DELETE ... RETURNING counts what the statement actually
+        // removed (the #1033-banning idiom). Cascades to result_set_members via
+        // the FK.
         pg::PgResult res = pg::exec_params(
             conn,
             "DELETE FROM result_set_store.result_sets WHERE id IN ("
-            "SELECT id FROM result_set_store.result_sets "
+            "SELECT id FROM ("
+            "SELECT id, row_number() OVER w AS n, sum(device_count) OVER w AS rows_through "
+            "FROM (SELECT id, ttl_at, device_count FROM result_set_store.result_sets "
             "WHERE pinned = false AND ttl_at < $1::bigint "
-            "ORDER BY ttl_at ASC LIMIT $2) RETURNING id",
-            std::vector<std::string>{std::to_string(now), std::to_string(kGcSweepCapPerPass)});
+            "ORDER BY ttl_at ASC, id ASC LIMIT $2) cohort "
+            "WINDOW w AS (ORDER BY ttl_at ASC, id ASC ROWS UNBOUNDED PRECEDING)) ranked "
+            "WHERE n = 1 OR rows_through <= $3::bigint) RETURNING id",
+            std::vector<std::string>{std::to_string(now), std::to_string(kGcSweepCapPerPass),
+                                     std::to_string(kGcSweepRowBudgetPerPass)});
         if (res.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResultSetStore::gc_sweep: delete failed: {}", PQerrorMessage(conn));
             return false;

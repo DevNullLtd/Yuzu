@@ -415,7 +415,11 @@ temporary files without the trigger, 9.9 MB with it): DELETE's single-slot marke
 the header once per change of set in a bulk load that interleaves sets. A cascade from a
 `result_sets` delete writes nothing, because the header is gone: one key probe per set and one
 expression per row (about 0.55 s instead of 0.45 s for a 1M-row cascade, measured once on
-PostgreSQL 16). At open the store checks that the four triggers are present, `ENABLE ALWAYS`,
+PostgreSQL 16). Because the trigger adds that cost to every cascaded row, `gc_sweep` now also
+bounds each pass by member rows: within its 5,000-set cap it deletes only the oldest-first prefix
+whose summed `device_count` stays within 5,000,000 (about 3 s measured, the first set always
+goes), so an expired backlog can no longer make a pass exceed the 30 s statement timeout, roll
+back and retry the same sets forever (a defect the set cap alone already had). At open the store checks that the four triggers are present, `ENABLE ALWAYS`,
 of v7's shape and bound to v7's function bodies; otherwise, or if the check cannot be read, it
 logs an error and serves membership uncached. A writer that disables the triggers while servers run, or writes
 `membership_generation` directly, breaks the
