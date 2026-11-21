@@ -34,8 +34,8 @@
 ## SCOPE: Machine scope only: per-user package stores are out of scope, deferred to the user-session helper (ADR-3003).
 ## No overlap claim with installed_apps on macOS: Homebrew casks install .app
 ## bundles that installed_apps' macOS `list` also reports via system_profiler, and
-## installed_apps' `list_per_user` lists Homebrew formulae per user (user_app|brew|...);
-## this plugin is the machine-scope, zero-subprocess view of the same store and
+## installed_apps' `list_per_user` no longer lists Homebrew (WP13/F19: it ran the user-owned
+## brew as root); this plugin is the machine-scope, zero-subprocess view of the same store and
 ## adds the manager identity and the cask version.
 
 ---

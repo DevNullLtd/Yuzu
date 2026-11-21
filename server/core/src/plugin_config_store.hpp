@@ -249,7 +249,27 @@ public:
                                                      std::string_view reason,
                                                      std::string_view os = "");
 
+    /// SAM-22: the same idempotent boot-time seed for ONE ACTION of a plugin
+    /// that is otherwise on (`component_inventory.native`: its sibling `scan`
+    /// stays on). Writes an ACTION-LEVEL row (`<plugin>.<action>`) with
+    /// `enabled=false`, `set_by="system"`, `ON CONFLICT (scope_key) DO
+    /// NOTHING`, so an operator's own row is never overwritten. The decision
+    /// layers compose as the class comment states (the plugin/action layer
+    /// ANDed with the per-OS layer), so this switches only that action off.
+    /// A separate method name, not a parameter of the one above: the source
+    /// tests read `seed_kill_switch_default_off("<plugin>"` as "this whole
+    /// plugin ships off". `action` must be non-empty (an empty one would seed
+    /// the whole plugin); `false` on that, on a closed store, an invalid name
+    /// or reason, or a failed write.
+    [[nodiscard]] bool seed_action_kill_switch_default_off(std::string_view plugin,
+                                                            std::string_view action,
+                                                            std::string_view reason);
+
 private:
+    /// The one INSERT behind both seed methods (an empty `action` = the plugin level).
+    [[nodiscard]] bool seed_default_off_row(std::string_view plugin, std::string_view action,
+                                            std::string_view reason, std::string_view os);
+
     pg::PgPool& pool_;
     pg::SecretCodec& secret_codec_;
     bool open_{false};

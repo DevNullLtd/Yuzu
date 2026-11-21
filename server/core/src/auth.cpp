@@ -3328,11 +3328,11 @@ std::expected<ConsumeEnrollResult, StoreError>
 AuthManager::consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                                 const std::string& hostname, const std::string& os,
                                 const std::string& arch, const std::string& agent_version,
-                                bool enforce_new_id_charset) {
+                                bool enforce_new_id_charset, bool require_single_use) {
     return enrollment_store_call<ConsumeEnrollResult>(
         "consume", [&](yuzu::server::AuthDB& db) {
             return db.consume_and_enroll(raw_token, agent_id, hostname, os, arch, agent_version,
-                                         enforce_new_id_charset);
+                                         enforce_new_id_charset, require_single_use);
         });
 }
 

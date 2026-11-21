@@ -40,6 +40,7 @@
 #include <cctype>
 #include <cstddef>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility> // std::move
@@ -73,6 +74,125 @@ inline bool is_safe_service_name(std::string_view name) {
         }
     }
     return true;
+}
+
+// ── Linux set_start_mode: the start-mode readback (WP13 / UP11) ──────────
+
+/// Does `systemctl is-enabled`'s first output line show that the requested start mode took
+/// effect (WP13 governance UP11)? A privileged helper that exits 0 without acting (an empty or
+/// replaced file) must not be reported as success, so the state must be a member of a CLOSED set
+/// per requested mode; anything else (empty, `not-found`, `bad`, `transient`, `linked`, or
+/// diagnostic text such as "Failed to connect to bus") is NOT a match (fail closed).
+///
+/// Derivation from systemctl's documented `is-enabled` states (systemctl(1)): `enabled`,
+/// `enabled-runtime`, `linked`, `linked-runtime`, `alias`, `masked`, `masked-runtime`, `static`,
+/// `indirect`, `disabled`, `generated`, `transient`, `bad`, `not-found`. `static`, `indirect`,
+/// `alias` and `generated` units have no [Install] enablement a verb can change, and
+/// `systemctl enable|disable` exits 0 for them, so they are the legitimate end state of either
+/// verb. The verbs the helper runs (`enable`, `disable`, `mask`) are PERSISTENT, so after a real
+/// one the state is `enabled` / `disabled` / `masked`; a `-runtime` state (`enabled-runtime`,
+/// `masked-runtime`) lives under /run and means the helper did NOT act, so it never matches.
+/// `linked*` and `transient` are not end states of enable, disable or mask.
+///   automatic -> enabled, static, indirect, alias, generated
+///   manual    -> disabled, static, indirect, alias, generated
+///   disabled  -> masked
+[[nodiscard]] inline bool start_mode_took_effect(std::string_view mode, std::string_view state) {
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
+        state.remove_suffix(1);
+    if (const auto nl = state.find('\n'); nl != std::string_view::npos)
+        state = state.substr(0, nl);
+    if (state.empty())
+        return false;
+    const bool unchangeable = state == "static" || state == "indirect" || state == "alias" ||
+                              state == "generated";
+    if (mode == "automatic")
+        return unchangeable || state == "enabled";
+    if (mode == "manual")
+        return unchangeable || state == "disabled";
+    if (mode == "disabled")
+        return state == "masked";
+    return false;
+}
+
+/// True for the states no verb can change (`static`, `indirect`, `alias`, `generated`): a unit
+/// there is accepted for either mode but does NOT auto-start because of it, so the action
+/// reports the state back to the caller.
+[[nodiscard]] inline bool start_state_is_unchangeable(std::string_view state) {
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
+        state.remove_suffix(1);
+    if (const auto nl = state.find('\n'); nl != std::string_view::npos)
+        state = state.substr(0, nl);
+    return state == "static" || state == "indirect" || state == "alias" || state == "generated";
+}
+
+/// The read-back as a whole: the `is-enabled` command itself must have RUN to completion (a
+/// spawn failure, deadline, cancel or signal is not a match) and its state must match. Its exit
+/// code is not required to be 0: `is-enabled` exits non-zero for `disabled` and `masked`.
+[[nodiscard]] inline bool start_mode_readback_matches(std::string_view mode,
+                                                      const yuzu::agent::SubprocessResult& res) {
+    if (!res.tool_ran || res.timed_out || yuzu::agent::classify_runner_failure(res).has_value())
+        return false;
+    return start_mode_took_effect(mode, res.output);
+}
+
+/// The plan for `automatic` and `manual`: `enable` and `disable` both fail on a masked unit, so a
+/// best-effort `unmask` runs first. `disabled` (mask) never unmasks.
+[[nodiscard]] inline bool start_mode_needs_unmask(std::string_view mode) {
+    return mode == "automatic" || mode == "manual";
+}
+
+/// A prior `is-enabled` first line that shows the unit was masked PERSISTENTLY (exactly
+/// `masked`): the one state a failed change may restore with the helper's `mask`.
+[[nodiscard]] inline bool start_state_is_masked(std::string_view state) {
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
+        state.remove_suffix(1);
+    if (const auto nl = state.find('\n'); nl != std::string_view::npos)
+        state = state.substr(0, nl);
+    return state == "masked";
+}
+
+/// The prior `is-enabled` read of a change that unmasks first: it must have RUN to completion (no
+/// spawn failure, deadline, cancel or signal) and its first line must be one of systemctl's
+/// documented states (systemctl(1): enabled, enabled-runtime, linked, linked-runtime, alias,
+/// masked, masked-runtime, static, indirect, disabled, generated, transient, bad, not-found).
+/// Its exit status is not required to be 0 (`is-enabled` exits non-zero for most states). Anything
+/// else leaves "is the unit masked?" unknown.
+[[nodiscard]] inline bool start_prior_state_known(const yuzu::agent::SubprocessResult& res) {
+    if (!res.tool_ran || res.timed_out || yuzu::agent::classify_runner_failure(res).has_value())
+        return false;
+    std::string_view state = res.output;
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
+        state.remove_suffix(1);
+    if (const auto nl = state.find('\n'); nl != std::string_view::npos)
+        state = state.substr(0, nl);
+    for (std::string_view k :
+         {"enabled", "enabled-runtime", "linked", "linked-runtime", "alias", "masked", "masked-runtime",
+          "static", "indirect", "disabled", "generated", "transient", "bad", "not-found"})
+        if (state == k)
+            return true;
+    return false;
+}
+
+/// A prior state of `masked-runtime`: masked under /run for this boot only. The helper's `unmask`
+/// removes a PERSISTENT mask only, so `enable`/`disable` would fail on such a unit and a re-mask
+/// would write a persistent mask the unit never had; `automatic` and `manual` are refused up front
+/// (nothing is unmasked or re-masked) with a typed CONSTRAINED status.
+[[nodiscard]] inline bool start_state_is_runtime_masked(std::string_view state) {
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
+        state.remove_suffix(1);
+    if (const auto nl = state.find('\n'); nl != std::string_view::npos)
+        state = state.substr(0, nl);
+    return state == "masked-runtime";
+}
+
+/// Re-mask after a failed change: the unmask before `enable`/`disable` removed a restriction, so
+/// when the change then fails the unit must not be left LESS restricted than it was found. Only
+/// when this call unmasked a unit it saw masked (`was_masked` comes from a readback taken before
+/// the unmask; an unreadable prior state is not masked, never guessed) and the change did not
+/// take effect.
+[[nodiscard]] inline bool start_mode_should_remask(std::string_view mode, bool was_masked,
+                                                   bool change_succeeded) {
+    return start_mode_needs_unmask(mode) && was_masked && !change_succeeded;
 }
 
 /// One row of `systemctl list-units --type=service [--all|--state=running]
