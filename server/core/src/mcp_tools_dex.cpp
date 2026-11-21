@@ -409,6 +409,7 @@ void handle_get_dex_apps_usage(const ToolCallContext& ctx) {
     if (!yuzu::server::detail::try_persist_audit(
             deps->audit_fn, ctx.req, "dex.apps.usage.view", "success", "Forensics", "",
             "MCP DEX fleet application usage read via get_dex_apps_usage " + shape)) {
+        spdlog::warn("dex.apps.usage.view audit fail-closed (MCP get_dex_apps_usage)");
         (void)ctx.audit("failure", "access audit row not persisted; read not run");
         answer(ctx, ctx.a4_error(kInternalError,
                                  "audit subsystem unavailable; refusing to serve fleet "
