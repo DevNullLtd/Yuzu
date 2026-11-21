@@ -56,6 +56,28 @@ struct Targets {
 /// /Applications, /usr/local, /opt/homebrew.
 [[nodiscard]] std::vector<std::string> native_candidate_roots();
 
+/// Test seam and the one listing the python roots need: the names of the directories (and links, which
+/// the root checks then count and drop) directly inside `dir`, nothing below them. The live one lists
+/// through the leg's own no-follow PosixFs and never opens a path under a network mount; a test passes
+/// a fake, so python_candidate_roots stays unit-testable without touching the host.
+using ChildLister = std::function<std::vector<std::string>(const std::string& dir)>;
+
+/// The machine roots the `python` action walks, in walk order. A Python install is a directory
+/// `python3` or `python3.<digits>` beside the libraries, and the scan wants the distributions inside it,
+/// so this lists ONE directory per OS through `children` (it is the only function in this header that
+/// does I/O, and only through the injected lister) and keeps those names; nothing else under it is
+/// walked here. Linux: each child of /usr/local/lib named `python3` or `python3.<digits>`, then /opt.
+/// /usr/lib is NOT a root: the interpreter trees under it are owned by the package manager and their
+/// distributions are already package rows, the same principle the `native` roots state above. macOS:
+/// /Library/Frameworks/Python.framework/Versions, then each child of /opt/homebrew/lib and
+/// /usr/local/lib named `python3.<digits>`.
+[[nodiscard]] std::vector<std::string> python_candidate_roots(const ChildLister& children);
+
+/// The machine roots the `node` action walks, in walk order. Linux: /usr/lib/node_modules,
+/// /usr/local/lib/node_modules, /opt. macOS: /opt/homebrew/lib/node_modules,
+/// /usr/local/lib/node_modules, /Applications.
+[[nodiscard]] std::vector<std::string> node_candidate_roots();
+
 /// Directories the `native` walk must not list, by exact path: the macOS Homebrew package trees
 /// (/usr/local/Cellar, /opt/homebrew/Cellar), which held most of a measured host's native libraries
 /// and are the package manager's, not an application's. Empty on Linux, where the package-owned trees
@@ -111,6 +133,15 @@ using MountTableReader = std::function<std::optional<std::vector<std::string>>()
 /// scan_targets for the `native` action: native_candidate_roots() against the same live mount table,
 /// with the same mount-table guard, link refusal and network-mount skip.
 [[nodiscard]] Targets scan_native_targets();
+
+/// scan_targets for the `python` action. The mount table is read first and the one parent listing
+/// python_candidate_roots needs goes through the leg with that table's mounts, so a parent on or under a
+/// network mount is never opened; an unreadable table lists nothing and yields no roots, as for scan.
+/// The roots then take the same link refusal and network-mount skip as every other action.
+[[nodiscard]] Targets scan_python_targets();
+
+/// scan_targets for the `node` action: node_candidate_roots() against the live mount table.
+[[nodiscard]] Targets scan_node_targets();
 
 /// Types one entry of the directory `dir` (open as `dir_fd`). A path in `network_mounts` is
 /// network_mount decided from the path alone, whatever d_type says: it is never passed to stat. DT_UNKNOWN

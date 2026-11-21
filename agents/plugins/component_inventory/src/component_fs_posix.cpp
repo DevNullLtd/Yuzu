@@ -345,6 +345,57 @@ std::vector<std::string> native_excluded_dirs() {
 #endif
 }
 
+namespace {
+
+/// `python3` (when `bare`) or `python3.<digits>`: the name of an interpreter's library directory.
+[[nodiscard]] bool is_python_dir_name(std::string_view n, bool bare) {
+    constexpr std::string_view kPrefix = "python3";
+    if (!n.starts_with(kPrefix))
+        return false;
+    n.remove_prefix(kPrefix.size());
+    if (n.empty())
+        return bare;
+    if (n.size() < 2 || n.front() != '.')
+        return false;
+    return std::ranges::all_of(n.substr(1), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+/// The `python3[.N]` children of `parent`, sorted so the walk order does not depend on the lister.
+void append_python_dirs(std::vector<std::string>& out, const ChildLister& children, const std::string& parent,
+                        bool bare) {
+    std::vector<std::string> names;
+    for (auto& n : children(parent))
+        if (is_python_dir_name(n, bare))
+            names.push_back(std::move(n));
+    std::ranges::sort(names);
+    for (const auto& n : names)
+        out.push_back(parent + '/' + n);
+}
+
+} // namespace
+
+std::vector<std::string> python_candidate_roots(const ChildLister& children) {
+    std::vector<std::string> roots;
+#if defined(__APPLE__)
+    roots.push_back("/Library/Frameworks/Python.framework/Versions");
+    append_python_dirs(roots, children, "/opt/homebrew/lib", false);
+    append_python_dirs(roots, children, "/usr/local/lib", false);
+#else
+    // /usr/lib is deliberately absent: the package manager owns the interpreter trees under it.
+    append_python_dirs(roots, children, "/usr/local/lib", true);
+    roots.push_back("/opt");
+#endif
+    return roots;
+}
+
+std::vector<std::string> node_candidate_roots() {
+#if defined(__APPLE__)
+    return {"/opt/homebrew/lib/node_modules", "/usr/local/lib/node_modules", "/Applications"};
+#else
+    return {"/usr/lib/node_modules", "/usr/local/lib/node_modules", "/opt"};
+#endif
+}
+
 Targets plan_targets(const std::vector<std::string>& candidates, const std::vector<std::string>& network_mount_points,
                      bool table_ok) {
     Targets t;
@@ -398,6 +449,29 @@ Targets scan_targets() {
 
 Targets scan_native_targets() {
     return scan_targets(native_candidate_roots(), read_network_mounts);
+}
+
+Targets scan_python_targets() {
+    const auto mounts = read_network_mounts();
+    if (!mounts)
+        return scan_targets({}, [] { return std::nullopt; }); // no table, no listing: reported as unreadable
+    const PosixFs fs{*mounts};
+    const ChildLister children = [&fs](const std::string& dir) {
+        std::vector<std::string> names;
+        // A listing cut at the walk's per-directory cap offers the names it got; a parent that large is
+        // not a Python library directory.
+        const ListResult lr = fs.list(dir, WalkLimits{}.max_dir_entries);
+        if (!lr.error)
+            for (const auto& e : lr.entries)
+                if (e.type == DirEntry::Type::dir || e.type == DirEntry::Type::link)
+                    names.push_back(e.name);
+        return names;
+    };
+    return scan_targets(python_candidate_roots(children), [&mounts] { return mounts; });
+}
+
+Targets scan_node_targets() {
+    return scan_targets(node_candidate_roots(), read_network_mounts);
 }
 
 FsOps make_fs_ops(const Targets& targets, AccessLog on_access) {
