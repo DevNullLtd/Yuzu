@@ -15,7 +15,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <span>
 
 using namespace yuzu::firewall;
 
@@ -914,4 +916,548 @@ TEST_CASE("nft: subprocess_complete requires every one of tool_ran/exit_code==0/
     CHECK_FALSE(broken([](auto& r) { r.exit_code = 1; }));
     CHECK_FALSE(broken([](auto& r) { r.timed_out = true; }));
     CHECK_FALSE(broken([](auto& r) { r.output_truncated = true; }));
+}
+
+// ── Failure tokens and the macOS rows (#6611, #4891, #4375) ─────────────────
+
+namespace {
+
+yuzu::agent::SubprocessResult done(std::string out) {
+    yuzu::agent::SubprocessResult r;
+    r.tool_ran = true;
+    r.exit_code = 0;
+    r.output = std::move(out);
+    return r;
+}
+
+yuzu::agent::SubprocessResult not_run() {
+    return {}; // tool_ran == false: the default result
+}
+
+yuzu::agent::SubprocessResult timed_out(std::string partial = "") {
+    auto r = done(std::move(partial));
+    r.exit_code = -1;
+    r.timed_out = true;
+    return r;
+}
+
+yuzu::agent::SubprocessResult truncated(std::string partial) {
+    auto r = done(std::move(partial));
+    r.output_truncated = true;
+    return r;
+}
+
+yuzu::agent::SubprocessResult exited(int code, std::string out = "") {
+    auto r = done(std::move(out));
+    r.exit_code = code;
+    return r;
+}
+
+bool has_row(const std::vector<std::string>& rows, std::string_view row) {
+    return std::find(rows.begin(), rows.end(), row) != rows.end();
+}
+
+std::size_t index_of(const std::vector<std::string>& rows, std::string_view row) {
+    const auto it = std::find(rows.begin(), rows.end(), row);
+    return static_cast<std::size_t>(it - rows.begin());
+}
+
+bool any_row_starts_with(const std::vector<std::string>& rows, std::string_view prefix) {
+    return std::any_of(rows.begin(), rows.end(),
+                       [&](const std::string& r) { return r.rfind(prefix, 0) == 0; });
+}
+
+constexpr std::string_view kAlfOn = "Firewall is enabled. (State = 1)";
+constexpr std::string_view kPfInfoOn = "Status: Enabled for 0 days 00:00:15           Debug: Urgent";
+
+} // namespace
+
+TEST_CASE("subprocess_failure_token names the cause, timeout before truncated before exit",
+          "[firewall]") {
+    CHECK(subprocess_failure_token(done("ok")).empty());
+    CHECK(subprocess_failure_token(not_run()) == "not_run");
+    CHECK(subprocess_failure_token(timed_out("x")) == "timeout");
+    CHECK(subprocess_failure_token(truncated("x")) == "truncated");
+    CHECK(subprocess_failure_token(exited(1)) == "exit:1");
+    CHECK(subprocess_failure_token(exited(127)) == "exit:127");
+    CHECK(subprocess_failure_token(exited(-1)) == "exit:-1");
+    // precedence: a timed-out, clipped, non-zero run is a timeout; a clipped non-zero run is clipped
+    auto all = exited(2);
+    all.timed_out = true;
+    all.output_truncated = true;
+    CHECK(subprocess_failure_token(all) == "timeout");
+    auto clipped = exited(2);
+    clipped.output_truncated = true;
+    CHECK(subprocess_failure_token(clipped) == "truncated");
+    // and a never-started tool wins over everything the empty result also says
+    auto never = not_run();
+    never.timed_out = true;
+    CHECK(subprocess_failure_token(never) == "not_run");
+}
+
+TEST_CASE("subprocess_failure_token is empty exactly when subprocess_complete holds", "[firewall]") {
+    for (const bool ran : {false, true})
+        for (const int code : {-1, 0, 1})
+            for (const bool to : {false, true})
+                for (const bool clip : {false, true}) {
+                    yuzu::agent::SubprocessResult r;
+                    r.tool_ran = ran;
+                    r.exit_code = code;
+                    r.timed_out = to;
+                    r.output_truncated = clip;
+                    INFO("ran=" << ran << " code=" << code << " timed_out=" << to << " clipped=" << clip);
+                    CHECK(subprocess_failure_token(r).empty() == subprocess_complete(r));
+                }
+}
+
+TEST_CASE("macos_state_rows: a complete read gives today's rows and no error row (golden)",
+          "[firewall]") {
+    const auto rows = macos_state_rows(
+        done(std::string{kAlfOn}), done(std::string{kPfInfoOn}),
+        done("com.apple\n  com.apple/200.AirDrop\n"),
+        done("scrub-anchor \"com.apple/*\" all fragment reassemble\nanchor \"com.apple/*\" all\n"));
+    const std::vector<std::string> expected{"backend|appfirewall", "state|enabled",
+                                            "pf|enabled",          "anchor|com.apple",
+                                            "anchor|com.apple/200.AirDrop", "ruleset|2"};
+    CHECK(rows == expected);
+    CHECK_FALSE(any_row_starts_with(rows, "error|"));
+
+    // block-all adds the mode row straight after the state row
+    const auto block = macos_state_rows(done("Firewall is enabled. (State = 2)"),
+                                        done("Status: Disabled for 0 days"), done(""), done(""));
+    const std::vector<std::string> expected_block{"backend|appfirewall", "state|enabled",
+                                                  "mode|block_all",      "pf|disabled",
+                                                  "ruleset|0"};
+    CHECK(block == expected_block);
+}
+
+TEST_CASE("#6611 macos_state_rows: an incomplete globalstate read is state|unknown plus its error row",
+          "[firewall]") {
+    struct Case {
+        yuzu::agent::SubprocessResult res;
+        std::string token;
+    };
+    // the partial text would parse to `enabled` (and block_all): none of it may show
+    for (const auto& c : {Case{not_run(), "not_run"}, Case{timed_out(std::string{kAlfOn}), "timeout"},
+                          Case{truncated("Firewall is enabled. (State = 2)"), "truncated"},
+                          Case{exited(1, std::string{kAlfOn}), "exit:1"}}) {
+        INFO("token " << c.token);
+        const auto rows = macos_state_rows(c.res, done(std::string{kPfInfoOn}), done(""), done(""));
+        REQUIRE(rows.size() >= 3);
+        CHECK(rows[0] == "backend|appfirewall");
+        CHECK(rows[1] == "state|unknown");
+        CHECK(rows[2] == "error|appfirewall:globalstate:" + c.token); // right after the row it explains
+        CHECK_FALSE(has_row(rows, "mode|block_all"));
+        CHECK_FALSE(has_row(rows, "state|enabled"));
+        CHECK(has_row(rows, "pf|enabled")); // the other reads are unaffected
+    }
+}
+
+TEST_CASE("#6611/#4891 macos_state_rows: an incomplete pfctl read is pf|unknown plus its error row",
+          "[firewall]") {
+    struct Case {
+        yuzu::agent::SubprocessResult res;
+        std::string token;
+    };
+    for (const auto& c : {Case{not_run(), "not_run"}, Case{timed_out(std::string{kPfInfoOn}), "timeout"},
+                          Case{truncated(std::string{kPfInfoOn}), "truncated"},
+                          // a clean unprivileged-shaped failure: pfctl cannot open /dev/pf
+                          Case{exited(1), "exit:1"}}) {
+        INFO("token " << c.token);
+        const auto rows = macos_state_rows(done(std::string{kAlfOn}), c.res, done(""), done(""));
+        const auto at = index_of(rows, "pf|unknown");
+        REQUIRE(at < rows.size());
+        REQUIRE(at + 1 < rows.size());
+        CHECK(rows[at + 1] == "error|pf:info:" + c.token);
+        CHECK_FALSE(has_row(rows, "pf|enabled"));
+    }
+}
+
+TEST_CASE("#6611 macos_state_rows: the anchor and rule reads are gated and explained",
+          "[firewall]") {
+    // an unprivileged agent: every pfctl read exits 1
+    const auto rows = macos_state_rows(done(std::string{kAlfOn}), exited(1), exited(1), exited(1));
+    const std::vector<std::string> expected{"backend|appfirewall",     "state|enabled",
+                                            "pf|unknown",              "error|pf:info:exit:1",
+                                            "error|pf:anchors:exit:1", "ruleset|unknown",
+                                            "error|pf:rules:exit:1"};
+    CHECK(rows == expected);
+
+    // a clipped rule read never publishes the partial count, and the anchors still read
+    const auto clipped = macos_state_rows(done(std::string{kAlfOn}), done(std::string{kPfInfoOn}),
+                                          done("com.apple\n"), truncated("pass all\npass all\n"));
+    CHECK(has_row(clipped, "anchor|com.apple"));
+    CHECK(has_row(clipped, "ruleset|unknown"));
+    CHECK(has_row(clipped, "error|pf:rules:truncated"));
+    CHECK_FALSE(has_row(clipped, "ruleset|2"));
+    CHECK_FALSE(any_row_starts_with(clipped, "error|pf:anchors"));
+}
+
+TEST_CASE("macos_state_rows: pf|unknown if and only if the pf info error row, every combination",
+          "[firewall]") {
+    for (const bool info_ok : {false, true})
+        for (const bool rules_ok : {false, true}) {
+            const auto rows =
+                macos_state_rows(done(std::string{kAlfOn}),
+                                 info_ok ? done(std::string{kPfInfoOn}) : exited(1), done(""),
+                                 rules_ok ? done("pass all\n") : exited(1));
+            CHECK(has_row(rows, "pf|unknown") == !info_ok);
+            CHECK(any_row_starts_with(rows, "error|pf:info:") == !info_ok);
+            CHECK(has_row(rows, "ruleset|unknown") == !rules_ok);
+            CHECK(any_row_starts_with(rows, "error|pf:rules:") == !rules_ok);
+        }
+}
+
+TEST_CASE("#4375 macos_rules_rows: pf rule lines are sanitised at the rule site", "[firewall]") {
+    // a pipe or a carriage return in an echoed rule line must not make a second field or row
+    const auto rows = macos_rules_rows(
+        done(""), done("block drop in all label \"a|b\"\npass out proto tcp from any to any\rport 22\n"),
+        done(""));
+    CHECK(has_row(rows, "rule|block drop in all label \"a_b\""));
+    CHECK(has_row(rows, "rule|pass out proto tcp from any to any_port 22"));
+    for (const auto& r : rows)
+        if (r.rfind("rule|", 0) == 0) {
+            CHECK(r.find('\r') == std::string::npos);
+            CHECK(std::count(r.begin(), r.end(), '|') == 1); // `rule` and its one field
+        }
+    CHECK(has_row(rows, "ruleset|2"));
+    CHECK_FALSE(any_row_starts_with(rows, "error|"));
+}
+
+TEST_CASE("#4375 macos_rules_rows: an incomplete app or anchor read gives no rows and its error row",
+          "[firewall]") {
+    const auto rows = macos_rules_rows(exited(1), done("pass all\n"), timed_out("com.apple\n"));
+    CHECK_FALSE(any_row_starts_with(rows, "app|"));
+    CHECK_FALSE(any_row_starts_with(rows, "anchor|"));
+    CHECK(has_row(rows, "error|appfirewall:listapps:exit:1"));
+    CHECK(has_row(rows, "error|pf:anchors:timeout"));
+    // the rule read was clean: its lines and count stand
+    CHECK(has_row(rows, "rule|pass all"));
+    CHECK(has_row(rows, "ruleset|1"));
+    CHECK_FALSE(any_row_starts_with(rows, "error|pf:rules"));
+
+    // a complete listapps read still produces its app rows
+    const auto ok = macos_rules_rows(done(std::string{kAlfListappsCapture}), done(""), done(""));
+    CHECK(has_row(ok, "app|/usr/libexec/remoted|allow"));
+    CHECK(has_row(ok, "ruleset|0"));
+}
+
+TEST_CASE("#4375 macos_rules_rows: a clipped rule read publishes no rule line and no count",
+          "[firewall]") {
+    for (const auto& res : {truncated("pass all\n"), timed_out("pass all\n"), exited(1, "pass all\n"),
+                            not_run()}) {
+        const auto rows = macos_rules_rows(done(""), res, done(""));
+        CHECK_FALSE(any_row_starts_with(rows, "rule|"));
+        const auto at = index_of(rows, "ruleset|unknown");
+        REQUIRE(at + 1 < rows.size());
+        CHECK(rows[at + 1].rfind("error|pf:rules:", 0) == 0); // right after the row it explains
+    }
+}
+
+TEST_CASE("macos_rules_rows: ruleset|unknown if and only if the pf rules error row", "[firewall]") {
+    for (const bool rules_ok : {false, true}) {
+        const auto rows = macos_rules_rows(done(""), rules_ok ? done("pass all\n") : exited(1), done(""));
+        CHECK(has_row(rows, "ruleset|unknown") == !rules_ok);
+        CHECK(any_row_starts_with(rows, "error|pf:rules:") == !rules_ok);
+    }
+}
+
+// ── Windows rows (#4375): pure, so this host pins what only Windows compiles ─
+
+TEST_CASE("#4375 win_rule_count_row: the count, or the HRESULT of the step that failed", "[firewall]") {
+    CHECK(win_rule_count_row(true, 0, true, 0, 532) == "ruleset|532");
+    CHECK(win_rule_count_row(true, 0, true, 0, 0) == "ruleset|0");
+    // S_FALSE from get_Count is not a count
+    CHECK(win_rule_count_row(true, 0, false, 1, 0) == "error|rules_count:0x00000001");
+    // get_Rules failed (or returned nothing): the HRESULT of THAT step, not the count's
+    CHECK(win_rule_count_row(false, 0x80070005u, true, 0, 5) == "error|rules_count:0x80070005");
+    CHECK(win_rule_count_row(false, 1, false, 0x80004005u, 0) == "error|rules_count:0x00000001");
+}
+
+TEST_CASE("#4375 win_rule_row: field order, enabled/disabled words and a sanitised name",
+          "[firewall]") {
+    CHECK(win_rule_row("Core Networking - DNS (UDP-Out)", true, "out", "allow", 2147483647) ==
+          "rule|Core Networking - DNS (UDP-Out)|enabled|out|allow|2147483647");
+    CHECK(win_rule_row("x", false, "in", "block", 7) == "rule|x|disabled|in|block|7");
+    CHECK(win_rule_row("a|b\r\nc", true, "unknown", "unknown", 0) ==
+          "rule|a_b__c|enabled|unknown|unknown|0");
+}
+
+TEST_CASE("#4375 win_rules_trailer_rows: count, truncation, and a failed enumeration", "[firewall]") {
+    using Rows = std::vector<std::string>;
+    CHECK(win_rules_trailer_rows(37, false, false, 0) == Rows{"ruleset|37"});
+    // exactly 100 rules, none cut off
+    CHECK(win_rules_trailer_rows(100, false, false, 0) == Rows{"ruleset|100"});
+    // a 101st rule exists: the cap row follows the count
+    CHECK(win_rules_trailer_rows(100, true, false, 0) == Rows{"ruleset|100", "truncated|true"});
+    // a partial tally is never a count
+    CHECK(win_rules_trailer_rows(42, false, true, 0x80004005u) ==
+          Rows{"error|enum_next:0x80004005", "ruleset|unknown"});
+    CHECK(win_rules_trailer_rows(100, true, true, 0x8007000eu) ==
+          Rows{"error|enum_next:0x8007000e", "ruleset|unknown"});
+}
+
+// ── nftables generation, re-run and failure list (#4400, #4401, #4402) ──────
+
+namespace {
+
+std::vector<std::byte> nfgenmsg_gen(std::uint8_t family, std::uint16_t res_id) {
+    // res_id is a __be16 on the wire: high byte first
+    return {static_cast<std::byte>(family), std::byte{0}, static_cast<std::byte>(res_id >> 8),
+            static_cast<std::byte>(res_id & 0xff)};
+}
+
+constexpr std::uint16_t kNewTable = (nft_raw::kNfnlSubsysNftables << 8) | nft_raw::kNftMsgNewtable;
+constexpr std::uint16_t kNewChain = (nft_raw::kNfnlSubsysNftables << 8) | nft_raw::kNftMsgNewchain;
+constexpr std::uint16_t kNewRule = (nft_raw::kNfnlSubsysNftables << 8) | nft_raw::kNftMsgNewrule;
+
+/// A dump of `n` table messages whose nfgenmsg all carry `gen`, then NLMSG_DONE.
+std::vector<std::byte> table_dump(std::uint16_t gen, int n = 1) {
+    std::vector<std::byte> buf;
+    for (int i = 0; i < n; ++i) {
+        auto body = nfgenmsg_gen(nft_raw::kNfprotoInet, gen);
+        push_attr_str(body, nft_raw::kNftaTableName, "t" + std::to_string(i));
+        push_nlmsg(buf, kNewTable, body);
+    }
+    push_done(buf);
+    return buf;
+}
+
+} // namespace
+
+TEST_CASE("#4400 nft_dump_generation reads the big-endian res_id of the first typed message",
+          "[firewall]") {
+    // 0x0102 on the wire is 01 02: a host-order read would say 0x0201
+    CHECK(nft_dump_generation(table_dump(0x0102), kNewTable) == std::optional<std::uint16_t>{0x0102});
+    CHECK(nft_dump_generation(table_dump(0), kNewTable) == std::optional<std::uint16_t>{0});
+    CHECK(nft_dump_generation(table_dump(65535, 3), kNewTable) == std::optional<std::uint16_t>{65535});
+    CHECK(nft_dump_generation(table_dump(7), kNewTable) != nft_dump_generation(table_dump(8), kNewTable));
+
+    // a message of another type is not this dump's data
+    CHECK_FALSE(nft_dump_generation(table_dump(5), kNewChain).has_value());
+    // a stray first message of the wrong type is skipped, the typed one is read
+    std::vector<std::byte> mixed;
+    {
+        auto stray = nfgenmsg_gen(nft_raw::kNfprotoInet, 9);
+        push_nlmsg(mixed, kNewRule, stray);
+        auto data = nfgenmsg_gen(nft_raw::kNfprotoInet, 11);
+        push_attr_str(data, nft_raw::kNftaTableName, "t");
+        push_nlmsg(mixed, kNewTable, data);
+        push_done(mixed);
+    }
+    CHECK(nft_dump_generation(mixed, kNewTable) == std::optional<std::uint16_t>{11});
+}
+
+TEST_CASE("#4400 nft_dump_generation: an empty dump has no generation, which is not zero",
+          "[firewall]") {
+    // an empty ruleset dumps NLMSG_DONE and nothing else
+    std::vector<std::byte> empty_ruleset;
+    push_done(empty_ruleset);
+    CHECK_FALSE(nft_dump_generation(empty_ruleset, kNewTable).has_value());
+    CHECK_FALSE(nft_dump_generation(std::vector<std::byte>{}, kNewTable).has_value());
+    // a typed message too short to carry an nfgenmsg is skipped, not read past
+    std::vector<std::byte> shortmsg;
+    push_nlmsg(shortmsg, kNewTable, std::vector<std::byte>{std::byte{2}, std::byte{0}});
+    CHECK_FALSE(nft_dump_generation(shortmsg, kNewTable).has_value());
+}
+
+TEST_CASE("#4400 nft_generations_consistent: equal, one absent, two differ, empty", "[firewall]") {
+    using G = std::optional<std::uint16_t>;
+    CHECK(nft_generations_consistent(G{4}, G{4}, G{4}));
+    CHECK(nft_generations_consistent(G{0}, G{0}, G{0}));
+    // an absent value takes no part
+    CHECK(nft_generations_consistent(G{4}, std::nullopt, G{4}));
+    CHECK(nft_generations_consistent(std::nullopt, G{9}, std::nullopt));
+    CHECK_FALSE(nft_generations_consistent(G{4}, std::nullopt, G{5}));
+    // a mismatch in any position
+    CHECK_FALSE(nft_generations_consistent(G{4}, G{4}, G{5}));
+    CHECK_FALSE(nft_generations_consistent(G{4}, G{5}, G{4}));
+    CHECK_FALSE(nft_generations_consistent(G{5}, G{4}, G{4}));
+    // an empty ruleset (nothing present at all) is consistent with itself and with anything
+    CHECK(nft_generations_consistent(std::nullopt, std::nullopt, std::nullopt));
+    // zero is a value, not an absence
+    CHECK_FALSE(nft_generations_consistent(G{0}, G{1}, std::nullopt));
+}
+
+TEST_CASE("#4400 nft_rerun_worthwhile: churn-only, one pass done, time left", "[firewall]") {
+    using std::chrono::milliseconds;
+    CHECK(nft_rerun_worthwhile(true, 1, milliseconds{3000}));
+    CHECK(nft_rerun_worthwhile(true, 1, kNftRerunFloor)); // exactly the floor is enough
+    CHECK_FALSE(nft_rerun_worthwhile(true, 1, kNftRerunFloor - milliseconds{1}));
+    CHECK_FALSE(nft_rerun_worthwhile(true, 1, milliseconds{0}));
+    // a second pass is the last
+    CHECK_FALSE(nft_rerun_worthwhile(true, kNftMaxAttempts, milliseconds{4000}));
+    CHECK_FALSE(nft_rerun_worthwhile(true, 3, milliseconds{4000}));
+    // a timeout, an error or any other failure gets no second look
+    CHECK_FALSE(nft_rerun_worthwhile(false, 1, milliseconds{4000}));
+}
+
+TEST_CASE("#4400 nft_churn_only: torn and a moved generation are churn, nothing else is",
+          "[firewall]") {
+    CHECK(nft_is_churn(NftDumpStatus::torn));
+    CHECK(nft_is_churn(NftDumpStatus::generation_changed));
+    for (const auto s : {NftDumpStatus::ok, NftDumpStatus::timeout, NftDumpStatus::kernel_error,
+                         NftDumpStatus::foreign_flood, NftDumpStatus::truncated,
+                         NftDumpStatus::oversized, NftDumpStatus::io_error})
+        CHECK_FALSE(nft_is_churn(s));
+
+    const NftDumpResult torn{NftDumpStatus::torn, 0};
+    const NftDumpResult slow{NftDumpStatus::timeout, 0};
+    const std::vector<NftFailedDump> churn{{"chain", torn}, {"generation", {NftDumpStatus::generation_changed, 0}}};
+    const std::vector<NftFailedDump> mixed{{"chain", torn}, {"rule", slow}};
+    CHECK(nft_churn_only(churn));
+    CHECK_FALSE(nft_churn_only(mixed));
+    CHECK_FALSE(nft_churn_only(std::vector<NftFailedDump>{})); // nothing failed: nothing to re-run
+}
+
+TEST_CASE("#4401 nft_failed_dumps returns every failure in order, the generation only alone",
+          "[firewall]") {
+    const NftDumpResult ok{NftDumpStatus::ok, 0};
+    const NftDumpResult timeout{NftDumpStatus::timeout, 0};
+    const NftDumpResult big{NftDumpStatus::oversized, 0};
+
+    // chain timeout plus rule oversized: both, chain first
+    const auto both = nft_failed_dumps(timeout, big, true);
+    REQUIRE(both.size() == 2);
+    CHECK(both[0].dump == "chain");
+    CHECK(both[0].result.status == NftDumpStatus::timeout);
+    CHECK(both[1].dump == "rule");
+    CHECK(both[1].result.status == NftDumpStatus::oversized);
+
+    // one failure is one entry
+    const auto chain_only = nft_failed_dumps(timeout, ok, true);
+    REQUIRE(chain_only.size() == 1);
+    CHECK(chain_only[0].dump == "chain");
+    const auto rule_only = nft_failed_dumps(ok, big, true);
+    REQUIRE(rule_only.size() == 1);
+    CHECK(rule_only[0].dump == "rule");
+
+    // a generation mismatch between two clean dumps is its own failure
+    const auto moved = nft_failed_dumps(ok, ok, false);
+    REQUIRE(moved.size() == 1);
+    CHECK(moved[0].dump == "generation");
+    CHECK(moved[0].result.status == NftDumpStatus::generation_changed);
+    CHECK(nft_fallthrough_row(moved[0].dump, moved[0].result) ==
+          "fallthrough|nftables:generation:changed");
+
+    // next to a failed dump the generation adds nothing: a failed dump has none to compare
+    CHECK(nft_failed_dumps(timeout, ok, false).size() == 1);
+
+    // a clean, consistent pass has no failure at all
+    CHECK(nft_failed_dumps(ok, ok, true).empty());
+}
+
+TEST_CASE("#4402 nft_open_diag_rows: each actionable condition once, in first-seen order",
+          "[firewall]") {
+    using Rows = std::vector<std::string>;
+    CHECK(nft_open_diag_rows(std::vector<int>{EMFILE, EMFILE, EMFILE}) == Rows{"error|fd_exhausted"});
+    CHECK(nft_open_diag_rows(std::vector<int>{ENFILE, EMFILE}) == Rows{"error|fd_exhausted"});
+    CHECK(nft_open_diag_rows(std::vector<int>{EMFILE, EPERM}) ==
+          Rows{"error|fd_exhausted", "error|nftables:socket:eperm"});
+    CHECK(nft_open_diag_rows(std::vector<int>{EACCES, EMFILE, EPERM}) ==
+          Rows{"error|nftables:socket:eperm", "error|fd_exhausted"});
+    // a kernel with no NETLINK_NETFILTER, or an unclassified errno, is silent
+    CHECK(nft_open_diag_rows(std::vector<int>{EPROTONOSUPPORT, EAFNOSUPPORT, EINVAL}).empty());
+    CHECK(nft_open_diag_rows(std::vector<int>{}).empty());
+    // the classification the rows rest on
+    CHECK(classify_open_errno(EMFILE) == OpenNftErrClass::fd_exhausted);
+    CHECK(classify_open_errno(EPERM) == OpenNftErrClass::permission_denied);
+    CHECK(classify_open_errno(EPROTONOSUPPORT) == OpenNftErrClass::unsupported);
+    CHECK(classify_open_errno(EINVAL) == OpenNftErrClass::other);
+}
+
+TEST_CASE("#4402 nft_churn_reason: torn stays torn below the threshold, torn_persistent from 3",
+          "[firewall]") {
+    CHECK(kNftChurnThreshold == 3u);
+    CHECK(nft_churn_reason("torn", 0) == "torn");
+    CHECK(nft_churn_reason("torn", 1) == "torn");
+    CHECK(nft_churn_reason("torn", 2) == "torn");
+    CHECK(nft_churn_reason("torn", 3) == "torn_persistent");
+    CHECK(nft_churn_reason("torn", 40) == "torn_persistent");
+    // a moved generation is churn too
+    CHECK(nft_churn_reason("changed", 2) == "changed");
+    CHECK(nft_churn_reason("changed", 3) == "torn_persistent");
+    // any other reason is not churn, however long the streak
+    CHECK(nft_churn_reason("timeout", 9) == "timeout");
+    CHECK(nft_churn_reason("eperm", 9) == "eperm");
+    // and the rows carry it
+    const NftDumpResult torn{NftDumpStatus::torn, 0};
+    CHECK(nft_fallthrough_row("chain", torn, 2) == "fallthrough|nftables:chain:torn");
+    CHECK(nft_fallthrough_row("chain", torn, 3) == "fallthrough|nftables:chain:torn_persistent");
+    CHECK(nft_diag_row("rule", torn, 3) == "error|nftables:rule:torn_persistent");
+    CHECK(nft_diag_row("rule", torn) == "error|nftables:rule:torn");
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::generation_changed, 0}) == "changed");
+}
+
+// ── ufw and iptables: output the parser does not know is not "no rules" (#4402) ─
+
+TEST_CASE("#4402 ufw_shape_ok: real shapes pass", "[firewall]") {
+    // an active ufw with a table: a Status line, a column title, a dashed line, bracketed rows
+    CHECK(ufw_shape_ok("Status: active\n"
+                       "\n"
+                       "     To                         Action      From\n"
+                       "     --                         ------      ----\n"
+                       "[ 1] 22/tcp                     ALLOW IN    Anywhere\n"
+                       "[ 2] 80,443/tcp                 ALLOW IN    192.168.1.0/24\n"
+                       "[ 3] 22/tcp (v6)                ALLOW IN    Anywhere (v6)\n"));
+    // ufw prints no table at all when it is off, or on with no rules
+    CHECK(ufw_shape_ok("Status: inactive\n"));
+    CHECK(ufw_shape_ok("Status: inactive"));
+    CHECK(ufw_shape_ok("Status: active\n"));
+    CHECK(ufw_shape_ok("Status: active\n\n"));
+}
+
+TEST_CASE("#4402 ufw_shape_ok: output that drifted does not pass", "[firewall]") {
+    CHECK_FALSE(ufw_shape_ok(""));
+    CHECK_FALSE(ufw_shape_ok("sh: ufw: command not found"));
+    CHECK_FALSE(ufw_shape_ok("ERROR: You need to be root to run this script\n"));
+    // a Status line the parser recognises, then a table that lost its shape
+    CHECK_FALSE(ufw_shape_ok("Status: active\n"
+                             "\n"
+                             "     Dest           Policy      Source\n"
+                             "[ 1] 22/tcp         ALLOW       Anywhere\n"));
+    // a dashed header, then a row that is not bracketed
+    CHECK_FALSE(ufw_shape_ok("Status: active\n"
+                             "\n"
+                             "     To                         Action      From\n"
+                             "     --                         ------      ----\n"
+                             "[ 1] 22/tcp                     ALLOW IN    Anywhere\n"
+                             "22/tcp ALLOW Anywhere\n"));
+    // a Status line with junk after it and no table
+    CHECK_FALSE(ufw_shape_ok("Status: active\nsomething else entirely\n"));
+}
+
+TEST_CASE("#4402 iptables_shape_ok: real captures pass, ignorable lines are ignored", "[firewall]") {
+    constexpr std::string_view real = "-P INPUT ACCEPT\n"
+                                      "-P FORWARD ACCEPT\n"
+                                      "-P OUTPUT ACCEPT\n"
+                                      "-N fixture-chain\n"
+                                      "-A INPUT -j fixture-chain\n"
+                                      "-A fixture-chain -j DROP\n";
+    CHECK(iptables_shape_ok(parse_iptables_save(real)));
+    // three bare policies and nothing else is still a recognised, empty ruleset
+    CHECK(iptables_shape_ok(parse_iptables_save("-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n")));
+    // a warning or comment line and blank lines must not make a healthy host unrecognised
+    CHECK(iptables_shape_ok(parse_iptables_save(
+        "# Warning: iptables-legacy tables present, use iptables-legacy to see them\n"
+        "\n"
+        "   \n"
+        "-P INPUT ACCEPT\n"
+        "  # indented comment\n"
+        "-P FORWARD ACCEPT\n"
+        "-P OUTPUT ACCEPT\n")));
+}
+
+TEST_CASE("#4402 iptables_shape_ok: no policy line, or an unknown line, does not pass", "[firewall]") {
+    CHECK_FALSE(iptables_shape_ok(parse_iptables_save("")));
+    CHECK_FALSE(iptables_shape_ok(parse_iptables_save("-N a\n-A a -j ACCEPT\n")));
+    CHECK_FALSE(iptables_shape_ok(parse_iptables_save("# only a comment\n")));
+    // a line that is none of -P, -N, -A next to good ones
+    CHECK_FALSE(iptables_shape_ok(parse_iptables_save(
+        "-P INPUT ACCEPT\n"
+        "iptables v1.8.9 (nf_tables): unknown option\n"
+        "-P FORWARD ACCEPT\n")));
+    CHECK_FALSE(iptables_shape_ok(parse_iptables_save("Permission denied (you must be root)\n")));
+    CHECK(unrecognised_output_row("ufw") == "error|ufw:unrecognised_output");
+    CHECK(unrecognised_output_row("iptables") == "error|iptables:unrecognised_output");
 }

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <bit>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -446,12 +447,14 @@ static_assert(std::is_standard_layout_v<NlMsgHdr>,
 /// follows nlmsghdr in every NFNETLINK-family message, nftables included.
 /// `family`/`version` are read like `nlmsghdr`/`nlattr` header fields (host
 /// byte order); `res_id` is `__be16` (network byte order) in the real UAPI
-/// struct, but this code always sends it as 0 and never reads it back on the
-/// decode side, so the byte-order distinction is inert here today.
+/// struct. A request always sends it as 0. On a dump REPLY the kernel puts the
+/// ruleset generation there (the low 16 bits of its commit counter): it moves
+/// with every commit, so nft_dump_generation() reads it, always from the wire
+/// bytes as big-endian and never through this host-order field.
 struct NfGenMsg {
     std::uint8_t family{};
     std::uint8_t version{};
-    std::uint16_t res_id{}; // __be16 in the kernel struct; unused/always-zero here
+    std::uint16_t res_id{}; // __be16 in the kernel struct; 0 in a request, the generation in a reply
 };
 static_assert(sizeof(NfGenMsg) == 4);
 static_assert(std::is_trivially_copyable_v<NfGenMsg>,
@@ -843,6 +846,10 @@ enum class NftDumpStatus {
                      // "io_error" (a syscall failure) would be the wrong
                      // diagnosis for an operator troubleshooting it
                      // (code-review finding).
+    generation_changed, // every dump ended cleanly, but they did not all carry
+                        // the same ruleset generation: a commit landed between
+                        // two dumps, so the three views describe different
+                        // rulesets even though none was individually torn
 };
 
 /// One dump round-trip's outcome: the status plus, for `kernel_error`, the
@@ -966,23 +973,179 @@ enum class NftVerdict { active, inactive, unknown };
         return "io_error";
     case NftDumpStatus::torn:
         return "torn";
+    case NftDumpStatus::generation_changed:
+        return "changed";
     }
     return "io_error"; // unreachable — cases are exhaustive so -Wswitch flags enum drift
+}
+
+/// How many consecutive probes that still end in churn (torn or a moved generation, after the
+/// one re-run) it takes for the reason to stop reading as a passing collision and say so.
+constexpr unsigned kNftChurnThreshold = 3;
+
+/// The reason token for a churn failure, given how many consecutive probes (this one
+/// included) have ended in churn. A ruleset that is rewritten continuously is not a collision
+/// any more: from the third such probe in a row the reason is `torn_persistent`. Any other
+/// reason, and a streak below the threshold, passes through unchanged.
+[[nodiscard]] inline std::string nft_churn_reason(std::string_view reason, unsigned consecutive) {
+    if (consecutive >= kNftChurnThreshold && (reason == "torn" || reason == "changed"))
+        return "torn_persistent";
+    return std::string{reason};
+}
+
+/// A dump that was torn mid-read or whose generation moved between dumps: the ruleset was being
+/// rewritten while it was read, which a second look can settle. Every other failure is not that.
+[[nodiscard]] constexpr bool nft_is_churn(NftDumpStatus s) noexcept {
+    return s == NftDumpStatus::torn || s == NftDumpStatus::generation_changed;
+}
+
+/// One failed dump of a probe pass: its label (`chain`, `rule` or `generation`) and how it ended.
+struct NftFailedDump {
+    std::string_view dump;
+    NftDumpResult result;
+};
+
+/// Every dump of a pass that was not trusted, in a fixed order: the chain dump, the rule dump,
+/// and only when both of those ended cleanly the generation check. A mismatch between two clean
+/// dumps is a failure of its own; next to a failed dump it adds nothing, because a failed dump
+/// has no trustworthy generation to compare. Empty means the pass can be trusted.
+[[nodiscard]] inline std::vector<NftFailedDump> nft_failed_dumps(NftDumpResult chain_res,
+                                                                 NftDumpResult rule_res,
+                                                                 bool generations_consistent) {
+    std::vector<NftFailedDump> out;
+    if (chain_res.status != NftDumpStatus::ok)
+        out.push_back({"chain", chain_res});
+    if (rule_res.status != NftDumpStatus::ok)
+        out.push_back({"rule", rule_res});
+    if (out.empty() && !generations_consistent)
+        out.push_back({"generation", NftDumpResult{NftDumpStatus::generation_changed, 0}});
+    return out;
+}
+
+/// True when there is at least one failure and every failure is churn.
+[[nodiscard]] inline bool nft_churn_only(std::span<const NftFailedDump> failed) noexcept {
+    return !failed.empty() &&
+           std::all_of(failed.begin(), failed.end(),
+                       [](const NftFailedDump& f) { return nft_is_churn(f.result.status); });
+}
+
+/// A probe reads the ruleset at most this many times: the pass and, on churn, one re-run.
+constexpr int kNftMaxAttempts = 2;
+/// A re-run needs at least this long left in the overall acquisition budget.
+constexpr std::chrono::milliseconds kNftRerunFloor{2000};
+
+/// Whether to read the ruleset again. `only_churn_failures` is nft_churn_only() of the pass just
+/// finished; a timeout, an error or an oversized dump gets no second look, because the cause is
+/// not a collision and a second read would only spend more of the budget.
+[[nodiscard]] constexpr bool nft_rerun_worthwhile(bool only_churn_failures, int attempts_done,
+                                                  std::chrono::milliseconds remaining) noexcept {
+    return only_churn_failures && attempts_done < kNftMaxAttempts && remaining >= kNftRerunFloor;
+}
+
+// ── nftables ruleset generation (#4400) ─────────────────────────────────
+
+/// The ruleset generation the kernel stamped on a dump: the big-endian `res_id` of the nfgenmsg
+/// that follows the nlmsghdr of the first data message of exactly `expected_type`. It moves with
+/// every committed change and is the same on every message of one dump. nullopt when the dump
+/// holds no such message (an empty ruleset dumps no table, chain or rule at all, so there is no
+/// value to compare, which is different from a value of zero). The counter is 16 bits wide, so
+/// a wrap between two dumps (65536 commits) is not seen.
+[[nodiscard]] inline std::optional<std::uint16_t>
+nft_dump_generation(std::span<const std::byte> buf, std::uint16_t expected_type) {
+    for (const auto& m : detail::nft_data_msgs(buf, expected_type)) {
+        if (m.payload.size() < sizeof(nft_raw::NfGenMsg))
+            continue;
+        return static_cast<std::uint16_t>((std::to_integer<unsigned>(m.payload[2]) << 8) |
+                                          std::to_integer<unsigned>(m.payload[3]));
+    }
+    return std::nullopt;
+}
+
+/// True when every generation that is present is the same one. An absent value (a dump with no
+/// data message) takes no part: there is nothing to compare, and an empty ruleset must not read
+/// as a change.
+[[nodiscard]] constexpr bool nft_generations_consistent(std::optional<std::uint16_t> a,
+                                                        std::optional<std::uint16_t> b,
+                                                        std::optional<std::uint16_t> c) noexcept {
+    std::optional<std::uint16_t> seen;
+    for (const auto& g : {a, b, c}) {
+        if (!g)
+            continue;
+        if (seen && *seen != *g)
+            return false;
+        seen = g;
+    }
+    return true;
+}
+
+// ── opening the netlink socket (#4402) ──────────────────────────────────
+
+/// How an open_nft_socket() failure should be handled by the caller.
+enum class OpenNftErrClass {
+    fd_exhausted,      // EMFILE/ENFILE -- a system-wide condition worth surfacing
+    unsupported,       // EPROTONOSUPPORT/EAFNOSUPPORT -- this kernel has no
+                       // NETLINK_NETFILTER at all; not worth a diagnostic row
+    permission_denied, // EPERM/EACCES -- socket()/bind() itself was refused
+                       // (RestrictAddressFamilies=, seccomp, AppArmor). Distinct
+                       // from `other`: this is diagnosable and actionable the
+                       // same way the existing dump-level eperm token already is
+                       // (governance gate6 sre finding, r2 -- previously fell
+                       // into `other` and emitted no row at all, indistinguishable
+                       // from "kernel genuinely has no nftables").
+    other,
+};
+
+[[nodiscard]] inline OpenNftErrClass classify_open_errno(int err) noexcept {
+    if (err == EMFILE || err == ENFILE)
+        return OpenNftErrClass::fd_exhausted;
+    if (err == EPROTONOSUPPORT || err == EAFNOSUPPORT)
+        return OpenNftErrClass::unsupported;
+    if (err == EPERM || err == EACCES)
+        return OpenNftErrClass::permission_denied;
+    return OpenNftErrClass::other;
+}
+
+/// The diagnostic rows for the socket-open errnos one probe collected, each actionable row once
+/// and in the order it was first seen: `fd_exhausted` and `permission_denied` only. `unsupported`
+/// (this kernel has no NETLINK_NETFILTER) and `other` stay silent. The three dumps of a pass, and
+/// the re-run, hit the same condition together, so one row says it, not one per dump.
+[[nodiscard]] inline std::vector<std::string> nft_open_diag_rows(std::span<const int> errnos) {
+    std::vector<std::string> rows;
+    auto add = [&rows](std::string row) {
+        if (std::find(rows.begin(), rows.end(), row) == rows.end())
+            rows.push_back(std::move(row));
+    };
+    for (const int err : errnos) {
+        switch (classify_open_errno(err)) {
+        case OpenNftErrClass::fd_exhausted:
+            add("error|fd_exhausted");
+            break;
+        case OpenNftErrClass::permission_denied:
+            add("error|nftables:socket:eperm");
+            break;
+        case OpenNftErrClass::unsupported:
+        case OpenNftErrClass::other:
+            break;
+        }
+    }
+    return rows;
 }
 
 /// Formats a failed-dump diagnostic row for one nftables sub-dump (`dump` is
 /// "table"/"chain"/"rule") in the same `<kind>|nftables|...` row family the
 /// rest of this backend writes.
-[[nodiscard]] inline std::string nft_diag_row(std::string_view dump, NftDumpResult res) {
-    return std::format("error|nftables:{}:{}", dump, nft_dump_reason(res));
+[[nodiscard]] inline std::string nft_diag_row(std::string_view dump, NftDumpResult res,
+                                              unsigned churn_streak = 0) {
+    return std::format("error|nftables:{}:{}", dump, nft_churn_reason(nft_dump_reason(res), churn_streak));
 }
 
 /// Formats the row written when the nftables backend gives up on `dump`
 /// entirely and probing falls through to the next backend in the ladder
 /// (ufw/iptables) — same shape as nft_diag_row(), distinct leading token so
 /// the two cases are distinguishable downstream.
-[[nodiscard]] inline std::string nft_fallthrough_row(std::string_view dump, NftDumpResult res) {
-    return std::format("fallthrough|nftables:{}:{}", dump, nft_dump_reason(res));
+[[nodiscard]] inline std::string nft_fallthrough_row(std::string_view dump, NftDumpResult res,
+                                                     unsigned churn_streak = 0) {
+    return std::format("fallthrough|nftables:{}:{}", dump, nft_churn_reason(nft_dump_reason(res), churn_streak));
 }
 
 [[nodiscard]] inline std::string nft_family_name(std::uint8_t family) {
@@ -1083,6 +1246,221 @@ enum class NftVerdict { active, inactive, unknown };
 /// through platform-specific dispatch tests (code-review finding).
 [[nodiscard]] constexpr bool subprocess_complete(const yuzu::agent::SubprocessResult& res) noexcept {
     return res.tool_ran && res.exit_code == 0 && !res.timed_out && !res.output_truncated;
+}
+
+/// Why a read did not complete, as the token a row carries: empty exactly when
+/// subprocess_complete() holds. `not_run` (the tool never started), `timeout`, `truncated` (the
+/// output was clipped) or `exit:<n>` (it ran and exited non-zero, `-1` when a signal ended it).
+/// A timeout wins over a clipped output, which wins over an exit code, because the earlier cause
+/// makes the later ones meaningless.
+[[nodiscard]] inline std::string subprocess_failure_token(const yuzu::agent::SubprocessResult& res) {
+    if (!res.tool_ran)
+        return "not_run";
+    if (res.timed_out)
+        return "timeout";
+    if (res.output_truncated)
+        return "truncated";
+    if (res.exit_code != 0)
+        return std::format("exit:{}", res.exit_code);
+    return {};
+}
+
+// ── macOS rows ──────────────────────────────────────────────────────────
+//
+// Every macOS read below is gated on subprocess_complete(): an incomplete read yields no rows
+// built from its text, and a row that says `unknown` is followed by the error row that explains
+// it, so an unprivileged agent (pfctl exits 1) reads as "could not read", never as "no firewall".
+
+[[nodiscard]] inline std::string alf_decision_name(AlfDecision d) {
+    switch (d) {
+    case AlfDecision::allow:
+        return "allow";
+    case AlfDecision::block:
+        return "block";
+    case AlfDecision::unknown:
+        return "unknown";
+    }
+    return "unknown"; // unreachable -- exhaustive switch, -Wswitch flags enum drift
+}
+
+/// The `state` rows of macOS, from the four reads: `socketfilterfw --getglobalstate`,
+/// `pfctl -s info`, `pfctl -s Anchors` and `pfctl -s rules`. Row order: backend, state (and
+/// `mode|block_all`), pf, the anchors, the rule count; an error row sits right after the row it
+/// explains, or where the rows it replaces would have been.
+[[nodiscard]] inline std::vector<std::string>
+macos_state_rows(const yuzu::agent::SubprocessResult& alf, const yuzu::agent::SubprocessResult& pf_info,
+                 const yuzu::agent::SubprocessResult& anchors,
+                 const yuzu::agent::SubprocessResult& rules) {
+    std::vector<std::string> rows;
+    rows.emplace_back("backend|appfirewall");
+    if (const auto why = subprocess_failure_token(alf); why.empty()) {
+        const auto g = parse_alf_global_state(alf.output);
+        rows.push_back(std::format("state|{}", to_string(g.state)));
+        if (g.block_all)
+            rows.emplace_back("mode|block_all");
+    } else {
+        rows.emplace_back("state|unknown");
+        rows.push_back(std::format("error|appfirewall:globalstate:{}", why));
+    }
+    if (const auto why = subprocess_failure_token(pf_info); why.empty()) {
+        rows.push_back(std::format("pf|{}", to_string(parse_pf_status(pf_info.output))));
+    } else {
+        rows.emplace_back("pf|unknown");
+        rows.push_back(std::format("error|pf:info:{}", why));
+    }
+    if (const auto why = subprocess_failure_token(anchors); why.empty()) {
+        for (const auto& anchor : parse_pf_anchors(anchors.output))
+            rows.push_back(std::format("anchor|{}", sanitize_field(anchor)));
+    } else {
+        rows.push_back(std::format("error|pf:anchors:{}", why));
+    }
+    if (const auto why = subprocess_failure_token(rules); why.empty()) {
+        rows.push_back(std::format("ruleset|{}", count_pf_rules(rules.output)));
+    } else {
+        rows.emplace_back("ruleset|unknown");
+        rows.push_back(std::format("error|pf:rules:{}", why));
+    }
+    return rows;
+}
+
+/// The `rules` rows of macOS, from `socketfilterfw --listapps`, `pfctl -s rules` and
+/// `pfctl -s Anchors`: the app rows, the raw pf rule lines, the anchors, then the rule count.
+/// The rule lines and the count share one gate, so a clipped or timed-out read never publishes
+/// a partial rule set as the whole.
+[[nodiscard]] inline std::vector<std::string>
+macos_rules_rows(const yuzu::agent::SubprocessResult& listapps, const yuzu::agent::SubprocessResult& rules,
+                 const yuzu::agent::SubprocessResult& anchors) {
+    std::vector<std::string> rows;
+    if (const auto why = subprocess_failure_token(listapps); why.empty()) {
+        for (const auto& app : parse_alf_listapps(listapps.output))
+            rows.push_back(
+                std::format("app|{}|{}", sanitize_field(app.path), alf_decision_name(app.decision)));
+    } else {
+        rows.push_back(std::format("error|appfirewall:listapps:{}", why));
+    }
+    const auto rules_why = subprocess_failure_token(rules);
+    if (rules_why.empty()) {
+        std::istringstream iss(rules.output);
+        std::string line;
+        while (std::getline(iss, line))
+            if (!line.empty())
+                rows.push_back(std::format("rule|{}", sanitize_field(line)));
+    }
+    if (const auto why = subprocess_failure_token(anchors); why.empty()) {
+        for (const auto& anchor : parse_pf_anchors(anchors.output))
+            rows.push_back(std::format("anchor|{}", sanitize_field(anchor)));
+    } else {
+        rows.push_back(std::format("error|pf:anchors:{}", why));
+    }
+    if (rules_why.empty()) {
+        rows.push_back(std::format("ruleset|{}", count_pf_rules(rules.output)));
+    } else {
+        rows.emplace_back("ruleset|unknown");
+        rows.push_back(std::format("error|pf:rules:{}", rules_why));
+    }
+    return rows;
+}
+
+// ── Windows rows (pure: no windows.h, so a macOS or Linux build pins the output) ────────────
+
+/// The row `state` ends with: the true rule count, or the failure that kept it from being read.
+/// `have_rules` = get_Rules succeeded and returned a collection; `count_ok` = get_Count returned
+/// S_OK (S_FALSE is a failure, as everywhere in this plugin). Which HRESULT is reported is the one
+/// of the step that failed.
+[[nodiscard]] inline std::string win_rule_count_row(bool have_rules, std::uint32_t rules_hr,
+                                                    bool count_ok, std::uint32_t count_hr,
+                                                    long long count) {
+    if (!have_rules)
+        return std::format("error|rules_count:0x{:08x}", rules_hr);
+    if (!count_ok)
+        return std::format("error|rules_count:0x{:08x}", count_hr);
+    return std::format("ruleset|{}", count);
+}
+
+/// One `rule|` row of the Windows `rules` action. The name is echoed, so it is sanitised here.
+[[nodiscard]] inline std::string win_rule_row(std::string_view name, bool enabled, std::string_view dir,
+                                              std::string_view action, long profiles) {
+    return std::format("rule|{}|{}|{}|{}|{}", sanitize_field(name), enabled ? "enabled" : "disabled",
+                       dir, action, profiles);
+}
+
+/// The rows that close the Windows `rules` action. A failed enumeration step means `count` is a
+/// partial tally, so it is reported as `error|enum_next` and `ruleset|unknown`, never as a count;
+/// otherwise the count, and `truncated|true` only when a rule past the cap really exists.
+[[nodiscard]] inline std::vector<std::string> win_rules_trailer_rows(int count, bool truncated,
+                                                                     bool enum_failed,
+                                                                     std::uint32_t hr) {
+    if (enum_failed)
+        return {std::format("error|enum_next:0x{:08x}", hr), "ruleset|unknown"};
+    std::vector<std::string> rows{std::format("ruleset|{}", count)};
+    if (truncated)
+        rows.emplace_back("truncated|true");
+    return rows;
+}
+
+// ── Linux: the recognised shape of ufw and iptables output (#4402) ──────────────────────────
+
+/// Whether `ufw status numbered` output is the shape this parser understands, so output that
+/// drifted reads as "not recognised", not as a firewall with no rules. A Status line that
+/// parse_ufw_status recognises is required. `Status: inactive` alone, and `Status: active` with
+/// no rules, carry no table (ufw prints no header then) and are in shape. When a dashed header
+/// line is present, every non-empty line after it must be a bracketed rule row; without one,
+/// nothing but blank lines may follow the Status line.
+[[nodiscard]] inline bool ufw_shape_ok(std::string_view out) {
+    if (parse_ufw_status(out) == FwState::unknown)
+        return false;
+    std::istringstream iss{std::string(out)};
+    std::string line;
+    bool first = true;
+    bool after_header = false;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (first) {
+            first = false; // the Status line itself
+            continue;
+        }
+        std::string_view trimmed(line);
+        while (!trimmed.empty() && trimmed.front() == ' ')
+            trimmed.remove_prefix(1);
+        if (trimmed.empty())
+            continue;
+        if (after_header) {
+            if (trimmed.front() != '[')
+                return false;
+        } else if (trimmed.starts_with("--")) {
+            after_header = true;
+        } else if (trimmed.starts_with("To ") || trimmed.starts_with("To\t")) {
+            continue; // the column title line above the dashed line
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether `iptables -S` output is the shape this parser understands: at least one `-P` policy
+/// line, and no line that is none of `-P`, `-N` or `-A`. Blank lines and lines that start with
+/// `#` are ignored: a warning or a comment must not make a healthy host unrecognised.
+[[nodiscard]] inline bool iptables_shape_ok(const std::vector<IptablesRule>& rules) {
+    bool have_policy = false;
+    for (const auto& r : rules) {
+        if (r.type == IptablesEntryType::policy) {
+            have_policy = true;
+        } else if (r.type == IptablesEntryType::unknown) {
+            std::string_view spec(r.spec);
+            while (!spec.empty() && (spec.front() == ' ' || spec.front() == '\t'))
+                spec.remove_prefix(1);
+            if (!spec.empty() && spec.front() != '#')
+                return false;
+        }
+    }
+    return have_policy;
+}
+
+/// The row that says a backend's output was complete but not in the shape this plugin knows.
+[[nodiscard]] inline std::string unrecognised_output_row(std::string_view backend) {
+    return std::format("error|{}:unrecognised_output", backend);
 }
 
 } // namespace yuzu::firewall

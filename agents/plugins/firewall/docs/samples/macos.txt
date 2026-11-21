@@ -1,9 +1,12 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-09 · euid 501 · leg-hash 4731564d9d1d
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-21 · euid 501 · leg-hash 4731564d9d1d
 == action=state
 backend|appfirewall
 state|disabled
 pf|unknown
+error|pf:info:exit:1
+error|pf:anchors:exit:1
 ruleset|unknown
+error|pf:rules:exit:1
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=rules
@@ -15,7 +18,9 @@ app|/usr/sbin/cupsd|allow
 app|/usr/libexec/sharingd|allow
 app|/usr/libexec/sshd-keygen-wrapper|allow
 app|/usr/sbin/smbd|allow
+error|pf:anchors:exit:1
 ruleset|unknown
+error|pf:rules:exit:1
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=quarantine
