@@ -53,6 +53,15 @@
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
+
+// struct stat spells its timestamps differently on macOS.
+#if defined(__APPLE__)
+#define YT_ST_MTIM st_mtimespec
+#define YT_ST_CTIM st_ctimespec
+#else
+#define YT_ST_MTIM st_mtim
+#define YT_ST_CTIM st_ctim
+#endif
 #endif
 
 namespace fs = std::filesystem;
@@ -581,7 +590,7 @@ TEST_CASE("image hash cache: the key is the opened image's identity, not path te
 
     // Same size and inode but a different mtime (a same-length rewrite): still a different key.
     { std::ofstream(exe, std::ios::binary | std::ios::trunc) << "A DIFFERENT, LONGER IMAGE"; }
-    struct timespec times[2] = {{0, 0}, {b.st_mtim.tv_sec + 5, 0}};
+    struct timespec times[2] = {{0, 0}, {b.YT_ST_MTIM.tv_sec + 5, 0}};
     REQUIRE(::utimensat(AT_FDCWD, exe.c_str(), times, 0) == 0);
     REQUIRE(::stat(exe.c_str(), &c) == 0);
     CHECK(b.st_size == c.st_size);
@@ -592,27 +601,27 @@ TEST_CASE("image hash cache: the key is the opened image's identity, not path te
     // with utimensat() still moves ctime (the owner cannot set it), so ctime alone must change the key.
     struct stat s0{};
     s0.st_dev = 7; s0.st_ino = 11; s0.st_size = 100;
-    s0.st_mtim = {1000, 5}; s0.st_ctim = {2000, 9};
+    s0.YT_ST_MTIM = {1000, 5}; s0.YT_ST_CTIM = {2000, 9};
     const auto base_key = yuzu::shared::image_identity_key(s0);
     CHECK(yuzu::shared::image_identity_key(s0) == base_key); // deterministic
     { auto v = s0; v.st_dev = 8;            CHECK(yuzu::shared::image_identity_key(v) != base_key); }
     { auto v = s0; v.st_ino = 12;           CHECK(yuzu::shared::image_identity_key(v) != base_key); }
     { auto v = s0; v.st_size = 101;         CHECK(yuzu::shared::image_identity_key(v) != base_key); }
-    { auto v = s0; v.st_mtim.tv_sec = 1001; CHECK(yuzu::shared::image_identity_key(v) != base_key); }
-    { auto v = s0; v.st_mtim.tv_nsec = 6;   CHECK(yuzu::shared::image_identity_key(v) != base_key); }
+    { auto v = s0; v.YT_ST_MTIM.tv_sec = 1001; CHECK(yuzu::shared::image_identity_key(v) != base_key); }
+    { auto v = s0; v.YT_ST_MTIM.tv_nsec = 6;   CHECK(yuzu::shared::image_identity_key(v) != base_key); }
     // A far-future timestamp must not overflow the key arithmetic (sec * 1e9 + nsec is undefined
     // behaviour past ~9.2e9 s) nor collide with a neighbour: the fields are written separately.
     {
         auto v = s0;
-        v.st_mtim.tv_sec = static_cast<decltype(v.st_mtim.tv_sec)>(0x7ffffffffffffff0LL);
-        v.st_mtim.tv_nsec = 5;
+        v.YT_ST_MTIM.tv_sec = static_cast<decltype(v.YT_ST_MTIM.tv_sec)>(0x7ffffffffffffff0LL);
+        v.YT_ST_MTIM.tv_nsec = 5;
         auto w = v;
-        w.st_mtim.tv_sec -= 1;
+        w.YT_ST_MTIM.tv_sec -= 1;
         CHECK(yuzu::shared::image_identity_key(v) != yuzu::shared::image_identity_key(w));
         CHECK(yuzu::shared::image_identity_key(v) == yuzu::shared::image_identity_key(v));
     }
-    { auto v = s0; v.st_ctim.tv_sec = 2001; CHECK(yuzu::shared::image_identity_key(v) != base_key); }
-    { auto v = s0; v.st_ctim.tv_nsec = 10;  CHECK(yuzu::shared::image_identity_key(v) != base_key); } // ctime only
+    { auto v = s0; v.YT_ST_CTIM.tv_sec = 2001; CHECK(yuzu::shared::image_identity_key(v) != base_key); }
+    { auto v = s0; v.YT_ST_CTIM.tv_nsec = 10;  CHECK(yuzu::shared::image_identity_key(v) != base_key); } // ctime only
 
     // The cache returns what was stored under a key and nothing for another.
     yuzu::shared::ImageHashCache cache;
@@ -1460,6 +1469,8 @@ TEST_CASE("windows_updates plugin: the TCP probe path runs to completion (addrin
 TEST_CASE("procfetch plugin: this process's image is hashed through its exe link and the run completes",
           "[shared][local_path][procfetch]") {
 #ifdef __linux__
+    if (find_plugin("procfetch").empty())
+        SKIP("procfetch is a demo plugin, not built with -Dbuild_examples=false");
     auto plugin = load_or_fail("procfetch");
     yuzu::agent::LocalDispatcher dispatcher;
     const auto r = dispatcher.run(plugin.descriptor, "procfetch_fetch");

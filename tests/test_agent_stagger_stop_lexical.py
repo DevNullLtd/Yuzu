@@ -35,6 +35,9 @@ def check(src):
         defects.append("command_pool_closing_ is never set before a pool reset")
     elif not any(0 < r - c < 400 for c in closing for r in resets):
         defects.append("command_pool_closing_.store(true) is not immediately before thread_pool_.reset()")
+    # run()'s teardown guard closes the start gate before any plugin is shut down, on EVERY exit.
+    if not re.search(r"ShutdownDeadlineGuard watchdog\{kShutdownDeadlineGrace\};[^;]*(?:;\s*//[^\n]*|\n\s*//[^\n]*)*\s*command_pool_closing_\.store\(true", src):
+        defects.append("run()'s teardown guard does not set command_pool_closing_ before shutting plugins down")
     body = re.search(r"void execute_command_task\([^)]*\)\s*\{(.*?)Stagger/delay", src, re.S)
     if (not body or not re.search(r"command_may_start\(\s*cmd\.plugin\(\)\s*,\s*cmd\.action\(\)\s*,\s*command_pool_closing\(\)\s*\)", body.group(1))
             or "reject_unstarted_command" not in body.group(1)):
@@ -64,7 +67,8 @@ def drop_release_in_reject(src):
 def selftest(src):
     mutants = {
         "bare sleep": src.replace("if (!sleep_interruptible(std::chrono::seconds(total_delay),", "std::this_thread::sleep_for(std::chrono::seconds(total_delay)); if (!sleep_interruptible(std::chrono::seconds(0),", 1),
-        "no closing flag set": src.replace("command_pool_closing_.store(true, std::memory_order_release);", "", 1),
+        "no closing flag set": src.replace("command_pool_closing_.store(true, std::memory_order_release);", ""),
+        "run() exit guard does not close the gate": src.replace("command_pool_closing_.store(true, std::memory_order_release);", "", 1),
         "no start check": src.replace("if (!command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())) {", "if (false) {", 1),
         "reject drops the claim release": drop_release_in_reject(src),
         "protective exemption dropped": src.replace("command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())", "command_pool_closing()", 1),

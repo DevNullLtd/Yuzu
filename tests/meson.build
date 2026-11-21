@@ -248,6 +248,10 @@ else
   test_partial_init_args = ['-Wno-missing-field-initializers']
 endif
 
+# procfetch is a demo plugin built only when build_examples is on (#4262); a test that loads it
+# skips itself when the library is absent.
+procfetch_test_dep = build_examples ? [procfetch_plugin_lib] : []
+
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
@@ -908,7 +912,7 @@ agent_test_exe = executable(
                 network_diag_plugin_lib,
                 os_info_plugin_lib,
                 processes_plugin_lib,
-                procfetch_plugin_lib,  # WP10: test_local_path_policy.cpp loads the real procfetch plugin by path
+                procfetch_test_dep,  # WP10: test_local_path_policy.cpp loads the real procfetch plugin by path
                 reserved_name_fixture_plugin,
                 retired_name_fixture_plugin,
                 sccm_plugin_lib,
