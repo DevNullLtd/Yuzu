@@ -62,8 +62,8 @@
 /// name (a link included) is neither overwritten nor written through, and a process that dies
 /// mid-copy leaves at most a stray temporary, never a truncated file at the quarantine name (the
 /// stray is not swept; it is not evidence). What stays by name is the publish (the `link(2)` from
-/// the temporary to the quarantine name runs after the descriptor is closed, so a writer who
-/// replaces the temporary in that gap has their entry published, and on macOS `link(2)` follows a
+/// the temporary to the quarantine name is by name at both ends, so a writer who replaces the
+/// temporary between its creation and the link has their entry published, and on macOS `link(2)` follows a
 /// link at its source), the removal of the temporary after a failed copy (a unique name this call
 /// created; a third party who swaps a link or an empty directory in at it between the failure and
 /// the removal loses it; a failed removal of the temporary after the link is not reported and leaves
@@ -274,7 +274,8 @@ inline void hard_link(const std::filesystem::path& target, const std::filesystem
 /// failed fsync does NOT: the complete copy is kept and `partial.unsynced` reports it, because the
 /// earlier `copy_file` never flushed and a finished copy is better evidence than none. The temporary's
 /// create is by descriptor but the publish and the removals are by name (a writer of the data
-/// directory could replace the temporary between its close and the link; see the banner).
+/// directory could replace the temporary between its creation and the link; see the banner). A link
+/// that fails with anything but `file_exists` keeps the complete copy (`partial.kept`).
 /// `write_fn`, `fsync_fn` and `link_fn` are test seams.
 inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
                                        const std::filesystem::path& to, std::error_code& ec,
@@ -305,9 +306,9 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
     // Never create the file at its final name: a crash mid-copy would leave a truncated file there
     // that reads as the real evidence. A counter and the pid make the temporary's name unique; a
     // collision (a stale temporary of an earlier crash) just takes the next counter value.
-    // The suffix adds 14 to 31 bytes to the name: a quarantine name within that many bytes of the
+    // The suffix adds 12 to 30 bytes to the name: a quarantine name within that many bytes of the
     // filesystem's component limit fails with ENAMETOOLONG here (the two callers' names are about
-    // 30 to 41 bytes, so it is unreachable in tree).
+    // 30 to 43 bytes, so it is unreachable in tree).
     static std::atomic<unsigned> counter{0};
     std::filesystem::path tmp;
     int out = -1;
