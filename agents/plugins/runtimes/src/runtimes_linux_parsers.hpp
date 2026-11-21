@@ -832,9 +832,7 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
 /// `release_missing`; an unreadable / oversized / version-less `release` is a recorded constraint.
 /// Symlinked homes are aliases. The flavour is the release file's IMAGE_TYPE; where that is absent
 /// (Debian, Ubuntu, openSUSE, ...) it is read from the home's bin/ by directory entry (see
-/// flavour_from_bin): a few fixed-name O_NOFOLLOW opens per such home (up to four, no listing),
-/// each home's probe charged one unit of the same entries-visited budget that bounds the homes
-/// listed; a spent budget stops the walk with `row_cap` and the home gets no row.
+/// flavour_from_bin, which states the opens and the budget charge).
 [[nodiscard]] inline std::vector<std::string> jvm_rows_at(
     const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
     const WalkConfig& cfg = {}) {
