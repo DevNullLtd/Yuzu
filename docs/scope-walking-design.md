@@ -53,7 +53,7 @@ CREATE TABLE result_sets (
   name            TEXT,                    -- nullable; operator-supplied alias (unique per owner)
   owner_principal TEXT NOT NULL,           -- session principal; result sets are per-operator
   created_at      INTEGER NOT NULL,        -- epoch seconds
-  ttl_at          INTEGER NOT NULL,        -- epoch seconds; row is GC'd when CURRENT_TIMESTAMP > ttl_at AND pinned=0
+  ttl_at          INTEGER NOT NULL,        -- epoch seconds; row is GC'd when the serving replica's clock > ttl_at AND pinned=0
   pinned          INTEGER NOT NULL DEFAULT 0,
   parent_id       TEXT REFERENCES result_sets(id) ON DELETE SET NULL,  -- lineage edge (nullable for ground sets)
   source_kind     TEXT NOT NULL,           -- 'inventory_query' | 'echo_query' | 'instruction_result' | 'manual_curate'
@@ -123,7 +123,8 @@ expiry, readiness, completeness and the materialization generation before using 
 The generation identifies the committed membership even if PostgreSQL failover rolls back a
 previous materialization of the same pending set. A generation mismatch reloads the IDs.
 A set without a generation uses the ordinary joined read. An expired, unpinned set
-is unusable even before the GC sweep removes it; expiry is judged on the serving replica's
+is refused as a `from_result_set:` scope even before the GC sweep removes it (reads,
+`parent_id` seeding and re-evaluation still accept it; follow-up in ADR-0036); expiry is judged on the serving replica's
 clock, the clock that writes `ttl_at` and that the GC sweep deletes by. The caller's current
 device visibility still bounds the result.
 

@@ -19,7 +19,7 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **An expired set is refused before GC.** An unpinned result set whose TTL (one hour after its last use) has passed is now refused as a `from_result_set:` scope (`404`, audited as an owner-check failure, the same answer as a deleted set) from the moment it expires, not only once the GC sweep has deleted it. Earlier, a set used between its expiry and the next sweep still resolved and the use extended its TTL. Expiry is judged on the serving replica's clock, the clock that wrote the TTL, so keep the server replicas' clocks synchronised (NTP).
 
-**Schedules and saved instructions.** A schedule, workflow or saved instruction whose scope names a result set by ID or alias and runs less often than once an hour now fails every run once the set expires (`owner_check_failed`), and no metric or alert reports it. Pin a result set that a recurring job targets (`POST /api/v1/result-sets/{id}/pin`, at most 50 per operator), or target a scope expression or management group instead.
+**Schedules and saved instructions.** A schedule, workflow or saved instruction whose scope names a result set by ID or alias and runs less often than once an hour now fails every run once the set expires. It shows only as `yuzu_scope_eval_degraded_total{reason="owner_check_failed"}` and the `instruction.scope_resolution_failed` audit row; no alert ships for it. Pin a result set that a recurring job targets (`POST /api/v1/result-sets/{id}/pin`, at most 50 per operator), or target a scope expression or management group instead.
 
 ## ⚠️ Breaking: `device.filesystem.search_dir` is bounded, refuses a regex lookahead and reports what it skipped (#6478)
 
