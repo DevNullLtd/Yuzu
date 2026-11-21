@@ -122,8 +122,6 @@ parse_request(std::string_view root, std::string_view pattern, std::string_view 
     if (!r)
         return std::unexpected(r.error());
 
-    if (pattern.empty())
-        return std::unexpected(RequestError::missing_pattern);
     auto p = fsr::Pattern::compile(pattern, semantics);
     if (!p) {
         switch (p.error()) {

@@ -464,18 +464,15 @@ TEST_CASE("file_search: the REAL catalogue fragment is NOT single-target — its
     CHECK(classified->dispatch_class == DispatchClass::ReadOnly);
     CHECK_FALSE(requires_explicit_targets(*classified));
 
-    // The same decision the dispatch surfaces make: never RefuseUntargeted for this row, whatever
-    // the targeting (no ids, one id, two ids, a scope or the __all__ broadcast).
-    for (const bool ids : {false, true}) {
-        for (const bool scope : {false, true}) {
-            for (const std::size_t n : {std::size_t{0}, std::size_t{1}, std::size_t{2}}) {
-                const auto decision = evaluate_destructive_targeting(
-                    classified, /*valid_nonempty_agent_ids=*/ids, /*scope_key_present=*/scope,
-                    /*agent_id_count=*/n);
-                CHECK(decision.verdict == DestructiveTargetingVerdict::NotDestructive);
-            }
-        }
-    }
+    // The same decision the dispatch surfaces make: never RefuseUntargeted for this row. The verdict is
+    // decided before any targeting argument is read, so two shapes stand for them all: two ids, and a
+    // scope with no ids.
+    CHECK(evaluate_destructive_targeting(classified, /*valid_nonempty_agent_ids=*/true,
+                                         /*scope_key_present=*/false, /*agent_id_count=*/2)
+              .verdict == DestructiveTargetingVerdict::NotDestructive);
+    CHECK(evaluate_destructive_targeting(classified, /*valid_nonempty_agent_ids=*/false,
+                                         /*scope_key_present=*/true, /*agent_id_count=*/0)
+              .verdict == DestructiveTargetingVerdict::NotDestructive);
 }
 
 TEST_CASE("process_introspect: the REAL catalogue fragment is Forensics-securable and gates "

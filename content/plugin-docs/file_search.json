@@ -280,7 +280,7 @@
     },
     {
       "completeness": "unknown",
-      "provenance": "`linux:file_search:exception` / `macos:file_search:exception` / `windows:file_search:exception`",
+      "provenance": "`linux:file_search:exception` / `macos:file_search:exception`",
       "status": "`UNAVAILABLE`",
       "when": "The body threw: one `search|failed|internal_error` row and the command returns 0"
     },

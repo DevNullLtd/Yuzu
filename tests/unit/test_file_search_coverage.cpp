@@ -151,43 +151,6 @@ TEST_CASE("coverage: add_gap caps at kMaxGaps", "[file_search][coverage]") {
     CHECK(rows.back().rfind("coverage|partial|", 0) == 0);
 }
 
-TEST_CASE("coverage: tokens are distinct and the shared gap tokens are exact",
-          "[file_search][coverage]") {
-    using fs::GapCause;
-    std::set<std::string> s;
-    for (auto c : {GapCause::depth, GapCause::dir_unreadable, GapCause::dir_truncated,
-                   GapCause::other_device, GapCause::network_mount, GapCause::memory_cap,
-                   GapCause::permission_denied, GapCause::dataless, GapCause::private_namespace,
-                   GapCause::name_too_long})
-        s.insert(fs::to_token(c));
-    CHECK(s.size() == 10);
-    CHECK(std::string(fs::to_token(GapCause::name_too_long)) == "name_too_long");
-    CHECK(std::string(fs::to_token(GapCause::depth)) == "depth");
-    CHECK(std::string(fs::to_token(GapCause::dir_unreadable)) == "dir_unreadable");
-    CHECK(std::string(fs::to_token(GapCause::dir_truncated)) == "dir_truncated");
-    CHECK(std::string(fs::to_token(GapCause::other_device)) == "other_device");
-    CHECK(std::string(fs::to_token(GapCause::network_mount)) == "network_mount");
-    CHECK(std::string(fs::to_token(GapCause::memory_cap)) == "memory_cap");
-
-    using fs::Reason;
-    std::set<std::string> r;
-    for (auto x : {Reason::none, Reason::budget_entries, Reason::budget_time, Reason::budget_rows,
-                   Reason::cancelled, Reason::fstype_not_allowed, Reason::network_mount,
-                   Reason::mount_table_unreadable, Reason::permission_denied,
-                   Reason::private_namespace, Reason::other_device, Reason::stalled,
-                   Reason::unstable, Reason::unsupported})
-        r.insert(fs::to_token(x));
-    CHECK(r.size() == 14);
-
-    std::set<std::string> v{fs::to_token(fs::VolumeState::complete),
-                            fs::to_token(fs::VolumeState::partial),
-                            fs::to_token(fs::VolumeState::not_searched),
-                            fs::to_token(fs::Extents::not_collected),
-                            fs::to_token(fs::Extents::collected),
-                            fs::to_token(fs::Extents::unsupported)};
-    CHECK(v.size() == 6);
-}
-
 TEST_CASE("coverage: a volume that is complete while naming a reason reads partial", "[file_search][coverage]") {
     fs::CoverageEnvelope e;
     e.volumes.push_back(vol("/", fs::VolumeState::complete, fs::Reason::budget_time)); // contradicts itself
@@ -270,4 +233,13 @@ TEST_CASE("coverage: every reason and gap cause is spelled, and the shared token
     CHECK(std::string(fs::to_token(Reason::permission_denied)) == fs::to_token(GapCause::permission_denied));
     CHECK(std::string(fs::to_token(Reason::private_namespace)) == fs::to_token(GapCause::private_namespace));
     CHECK(std::string(fs::to_token(Reason::other_device)) == fs::to_token(GapCause::other_device));
+
+    // the volume-state and extents vocabularies are distinct from each other
+    const std::set<std::string> v{fs::to_token(fs::VolumeState::complete),
+                                  fs::to_token(fs::VolumeState::partial),
+                                  fs::to_token(fs::VolumeState::not_searched),
+                                  fs::to_token(fs::Extents::not_collected),
+                                  fs::to_token(fs::Extents::collected),
+                                  fs::to_token(fs::Extents::unsupported)};
+    CHECK(v.size() == 6);
 }

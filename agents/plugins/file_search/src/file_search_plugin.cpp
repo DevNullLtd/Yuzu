@@ -55,18 +55,6 @@ namespace {
 
 namespace fs_plugin = yuzu::file_search;
 
-// The exception provenance is a literal per OS: the catch-all must answer without allocating outside its own
-// guarded calls.
-#if defined(_WIN32)
-[[maybe_unused]] constexpr std::string_view kExceptionProvenance = "windows:file_search:exception";
-#elif defined(__linux__)
-[[maybe_unused]] constexpr std::string_view kExceptionProvenance = "linux:file_search:exception";
-#elif defined(__APPLE__)
-[[maybe_unused]] constexpr std::string_view kExceptionProvenance = "macos:file_search:exception";
-#else
-#error "file_search_plugin.cpp: unsupported host OS"
-#endif
-
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "search",
@@ -113,6 +101,14 @@ struct InFlight {
 constexpr std::chrono::milliseconds kShutdownQuiesce{3'000};
 
 #if !defined(_WIN32)
+
+// The exception provenance is a literal per OS: the catch-all must answer without allocating outside its own
+// guarded calls. (The Windows leg answers `planned` and never reads one.)
+#if defined(__APPLE__)
+constexpr std::string_view kExceptionProvenance = "macos:file_search:exception";
+#else
+constexpr std::string_view kExceptionProvenance = "linux:file_search:exception";
+#endif
 
 // ---- the heartbeat counters and the log line ----
 

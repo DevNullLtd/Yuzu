@@ -34,6 +34,7 @@
 #include "component_legs.hpp" // ci::AroundLookup
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <string>
@@ -57,16 +58,11 @@ using AfterSliceFn = std::function<void(const SliceResult&)>;
 
 namespace execute_detail {
 
-[[nodiscard]] inline bool has_row(const std::vector<std::string>& rows, std::string_view prefix) {
-    for (const auto& r : rows)
-        if (r.starts_with(prefix))
-            return true;
-    return false;
-}
-
 inline void report_status(yuzu::CommandContext& ctx, const SliceResult& r) {
     if (r.status == Status::ok) {
-        const bool complete = r.cursor.empty() && has_row(r.rows, "coverage|complete|");
+        const bool complete = r.cursor.empty() && std::ranges::any_of(r.rows, [](const std::string& row) {
+            return row.starts_with("coverage|complete|");
+        });
         ctx.set_result_status(YUZU_RESULT_STATUS_OK,
                               complete ? YUZU_RESULT_COMPLETENESS_FULL : YUZU_RESULT_COMPLETENESS_PARTIAL);
         return;
@@ -92,12 +88,10 @@ inline int execute_search(yuzu::CommandContext& ctx, std::string_view action, st
         }
         const auto req = parse_request(root, pattern, kinds, cursor, semantics());
         if (!req) {
-            Trailer t;
-            t.status = Status::invalid;
-            t.reason = to_token(req.error());
-            ctx.write_output(format_search_row(t));
+            const std::string reason = to_token(req.error());
+            ctx.write_output(format_search_row({.status = Status::invalid, .reason = reason}));
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
-                                  "file_search:" + t.reason);
+                                  "file_search:" + reason);
             return 1;
         }
         const SliceResult r = run(*req);
@@ -109,10 +103,8 @@ inline int execute_search(yuzu::CommandContext& ctx, std::string_view action, st
         return r.status == Status::invalid ? 1 : 0;
     } catch (...) {
         try {
-            Trailer t;
-            t.status = Status::failed;
-            t.reason = to_token(Fault::internal_error);
-            ctx.write_output(format_search_row(t));
+            ctx.write_output(
+                format_search_row({.status = Status::failed, .reason = to_token(Fault::internal_error)}));
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
                                   std::string{provenance_on_throw});
         } catch (...) {

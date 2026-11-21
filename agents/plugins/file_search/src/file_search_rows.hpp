@@ -51,8 +51,6 @@ inline constexpr std::uint64_t kMaxSlices = 5'000;
 inline constexpr std::chrono::milliseconds kSliceGrace{5'000};
 /// Volumes (units, then refused rows) one search plans; the rest are counted, never silently lost.
 inline constexpr std::size_t kMaxVolumes = 64;
-/// Mounts the mount-table read keeps; a host with more at or under the root answers unreadable.
-inline constexpr std::size_t kMaxPlanMounts = 16'384;
 /// The whole answer of one slice.
 inline constexpr std::size_t kSliceRowBytes = 8u * 1024 * 1024;
 /// A gap path longer than this is counted in gaps_dropped, never emitted.
@@ -91,25 +89,26 @@ enum class Scope { system, user };
     return s == Scope::user ? "user" : "system";
 }
 
-namespace detail {
+// ---- path tests ----
 
-[[nodiscard]] constexpr bool under_prefix(std::string_view path, std::string_view prefix) noexcept {
-    // `prefix` has no trailing slash: path is prefix itself or below it, on a component boundary.
+/// `path` is `prefix` or below it, on a component boundary. Both are absolute and have no trailing slash
+/// ("/" is the prefix of everything). The ONE component-boundary test every path rule here uses.
+[[nodiscard]] constexpr bool under(std::string_view path, std::string_view prefix) noexcept {
+    if (prefix == "/")
+        return !path.empty() && path.front() == '/';
     return path.size() >= prefix.size() && path.substr(0, prefix.size()) == prefix &&
            (path.size() == prefix.size() || path[prefix.size()] == '/');
 }
-
-} // namespace detail
 
 /// A user profile directory or anything below one. Linux: /home/<name> and /root. macOS: /Users/<name>
 /// except /Users/Shared, and /private/var/root (/var is a link there, so /var/root is never walked into
 /// and is not tagged). A home relocated elsewhere is NOT tagged: the tag is a path rule, not a lookup.
 [[nodiscard]] constexpr bool is_user_profile_path(std::string_view path, Os os) noexcept {
     if (os == Os::linux_os)
-        return (path.size() > 6 && path.substr(0, 6) == "/home/") || detail::under_prefix(path, "/root");
-    if (detail::under_prefix(path, "/private/var/root"))
+        return (path.size() > 6 && path.substr(0, 6) == "/home/") || under(path, "/root");
+    if (under(path, "/private/var/root"))
         return true;
-    return path.size() > 7 && path.substr(0, 7) == "/Users/" && !detail::under_prefix(path, "/Users/Shared");
+    return path.size() > 7 && path.substr(0, 7) == "/Users/" && !under(path, "/Users/Shared");
 }
 
 /// A gap path that may be emitted; a longer one is counted in gaps_dropped.
@@ -165,12 +164,10 @@ enum class Status { ok, invalid, busy, failed };
 }
 
 /// Why a slice answered without a result, beyond the coverage reasons of file_search_coverage.hpp.
-enum class Fault { none, busy, timed_out, rejected, no_progress, internal_error, cursor_refused };
+enum class Fault { busy, timed_out, rejected, no_progress, internal_error, cursor_refused };
 
 [[nodiscard]] constexpr const char* to_token(Fault f) noexcept {
     switch (f) {
-    case Fault::none:
-        return "none";
     case Fault::busy:
         return "busy";
     case Fault::timed_out:

@@ -137,14 +137,6 @@ using MountTableReader = std::function<std::optional<std::vector<std::string>>()
 
 // ---- the on-demand file search leg ----
 
-/// What one search leg walks: the unit's walk root and the mount points strictly BELOW it (never an
-/// ancestor: acquiring a root beneath its own mount point must work). Mount points in `prune` are never
-/// stat'ed, opened or listed, and no listing names them: the search plan reports each of them once.
-struct SearchTargets {
-    std::string root;               // absolute, no trailing '/'
-    std::vector<std::string> prune; // mount points strictly below `root`
-};
-
 /// Runs `lookup` and returns when it is done. The leg wraps EXACTLY three kinds of work in it and puts
 /// nothing else inside: the whole of one path acquisition (every directory open and the link probe of a
 /// failed hop), the enumeration of one directory (readdir and the stat of an untyped entry) and the
@@ -178,10 +170,14 @@ struct SearchLeg {
     std::function<RootState(const std::string& path)> root_state;
 };
 
+/// `prune` is the mount points strictly BELOW the unit's walk root (never an ancestor: acquiring a root
+/// beneath its own mount point must work). A pruned mount point is never stat'ed, opened or listed, and no
+/// listing names it: the search plan reports each of them once.
+///
 /// The descriptor stack is on: sibling and child directories open only the components the previous one
 /// did not already hold, at most file_search::kMaxPositionDepth + 1 descriptors in all. Not thread-safe:
 /// one walk at a time per leg, which is how the search drives it.
-[[nodiscard]] SearchLeg make_search_leg(const SearchTargets& targets, AccessLog on_access = {},
+[[nodiscard]] SearchLeg make_search_leg(std::vector<std::string> prune, AccessLog on_access = {},
                                         SearchHooks hooks = {}, ReadDirFn read_dir = {});
 
 } // namespace yuzu::component_inventory

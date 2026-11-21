@@ -705,9 +705,9 @@ using shared_mount = yuzu::shared::MountEntry;
     return static_cast<std::uint64_t>(static_cast<std::make_unsigned_t<decltype(st.st_dev)>>(st.st_dev));
 }
 
-[[nodiscard]] SearchLeg search_leg(const std::string& root, std::vector<std::string> prune = {}, AccessLog log = {},
-                                   SearchHooks hooks = {}, ReadDirFn read_dir = {}) {
-    return make_search_leg(SearchTargets{root, std::move(prune)}, std::move(log), std::move(hooks), std::move(read_dir));
+[[nodiscard]] SearchLeg search_leg(std::vector<std::string> prune = {}, AccessLog log = {}, SearchHooks hooks = {},
+                                   ReadDirFn read_dir = {}) {
+    return make_search_leg(std::move(prune), std::move(log), std::move(hooks), std::move(read_dir));
 }
 
 // Restores a directory's permissions so the temporary tree can be removed.
@@ -785,7 +785,7 @@ TEST_CASE("component_fs_posix: with the descriptor stack on, sibling and child l
     const auto p = [&](const char* rel) { return (t.root / rel).string(); };
 
     std::vector<std::string> log;
-    const auto leg = search_leg(t.root.string(), {}, [&log](const std::string& s) { log.push_back(s); });
+    const auto leg = search_leg({}, [&log](const std::string& s) { log.push_back(s); });
     const auto plain = plain_ops();
 
     const auto same_as_plain = [&](const std::string& dir) {
@@ -812,8 +812,6 @@ TEST_CASE("component_fs_posix: with the descriptor stack on, sibling and child l
     const auto again = same_as_plain(p("a/b")); // an ancestor: nothing is opened, the stream is read from its start
     CHECK(log.empty());
     CHECK(by_name(again).count("x.jar") == 1);
-    same_as_plain(p("a/b")); // and again
-    CHECK(log.empty());
     same_as_plain(p("a/e")); // an uncle: one hop
     CHECK(log == std::vector<std::string>{p("a/e")});
     log.clear();
@@ -829,7 +827,7 @@ TEST_CASE("component_fs_posix: with the stack on, a directory swapped for a link
     REQUIRE(fs::create_directories(t.root / "elsewhere"));
     write_file(t.root / "elsewhere" / "secret.jar", "S");
     write_file(t.root / "app" / "inner" / "kept.jar", "K");
-    const auto leg = search_leg(t.root.string());
+    const auto leg = search_leg();
     const auto app = (t.root / "app").string();
 
     CHECK(by_name(leg.ops.list(app, 100)).at("sub") == Type::dir); // `app` is now held
@@ -858,7 +856,7 @@ TEST_CASE("component_fs_posix: a pruned mount point is never passed to stat or o
     const std::string mnt = (t.root / "mnt").string();
 
     std::vector<std::string> log;
-    const auto leg = search_leg(t.root.string(), {mnt}, [&log](const std::string& s) { log.push_back(s); });
+    const auto leg = search_leg({mnt}, [&log](const std::string& s) { log.push_back(s); });
     const auto touched = [&] {
         return std::ranges::any_of(log, [&](const std::string& p) { return p == mnt || p.starts_with(mnt + "/"); });
     };
@@ -903,14 +901,14 @@ TEST_CASE("component_fs_posix: a root whose ancestor is a mount point is acquire
     const std::string deep = (t.root / "mnt" / "inner" / "deep").string();
 
     // the mount point `mnt` is an ancestor of the root: not in the prune set, so the walk reaches the root
-    const auto ok = search_leg(inner, {deep});
+    const auto ok = search_leg({deep});
     const auto r = ok.ops.list(inner, 100);
     CHECK_FALSE(r.error);
     CHECK(by_name(r) == std::map<std::string, Type>{{"f.jar", Type::file}}); // `deep` is erased
     CHECK(ok.root_state(inner) == RootState::ok);
 
     // the rule is real: put the ancestor in the prune set and the root cannot be reached at all
-    const auto refused = search_leg(inner, {mnt});
+    const auto refused = search_leg({mnt});
     CHECK(refused.ops.list(inner, 100).error);
     CHECK(refused.root_state(inner) != RootState::ok);
 }
@@ -948,7 +946,7 @@ TEST_CASE("component_fs_posix: every lookup runs inside around_lookup and nothin
         return e;
     };
     const auto leg = search_leg(
-        t.root.string(), {},
+        {},
         [&](const std::string& p) {
             logged.push_back(p);
             if (depth == 0)
@@ -976,10 +974,6 @@ TEST_CASE("component_fs_posix: every lookup runs inside around_lookup and nothin
 
     CHECK(outside.empty());
     CHECK(depth == 0);
-
-    // the same leg without a hook behaves the same
-    const auto bare = search_leg(t.root.string());
-    CHECK(by_name(bare.ops.list(d, 100)).size() == 2);
 }
 
 TEST_CASE("component_fs_posix: root_state tells a link at any component, a missing path and a non-directory apart",
@@ -989,7 +983,7 @@ TEST_CASE("component_fs_posix: root_state tells a link at any component, a missi
     write_file(t.root / "d" / "f.txt", "f");
     fs::create_directory_symlink(t.root / "d", t.root / "lnk");
     fs::create_symlink(t.root / "d" / "f.txt", t.root / "flnk");
-    const auto leg = search_leg(t.root.string());
+    const auto leg = search_leg();
     const auto st = [&](const std::string& p) { return leg.root_state(p); };
 
     CHECK(st((t.root / "d").string()) == RootState::ok);
@@ -1020,11 +1014,10 @@ TEST_CASE("component_fs_posix: facts opens the leaf under the cached parent, fol
         seen.emplace_back(static_cast<std::uint64_t>(st.st_size), ::fcntl(fd, F_GETFD) != -1);
     };
     std::vector<std::string> log;
-    const auto leg = search_leg(t.root.string(), {}, [&log](const std::string& s) { log.push_back(s); }, hooks);
+    const auto leg = search_leg({}, [&log](const std::string& s) { log.push_back(s); }, hooks);
 
     const auto f = leg.facts(d, "f.bin");
     CHECK(f.opened);
-    CHECK(f.error == FactsError::none);
     CHECK(f.size == 3);
     struct stat st {};
     REQUIRE(::stat((t.root / "d" / "f.bin").c_str(), &st) == 0);
@@ -1036,19 +1029,15 @@ TEST_CASE("component_fs_posix: facts opens the leaf under the cached parent, fol
 
     const auto link = leg.facts(d, "lnk");
     CHECK_FALSE(link.opened);
-    CHECK(link.error == FactsError::link);
     const auto pipe = leg.facts(d, "pipe"); // opened without blocking, then refused as not regular
     CHECK_FALSE(pipe.opened);
-    CHECK(pipe.error == FactsError::not_regular);
     const auto dir = leg.facts(d, "sub");
     CHECK_FALSE(dir.opened);
-    CHECK(dir.error == FactsError::not_regular);
     const auto gone = leg.facts(d, "missing");
     CHECK_FALSE(gone.opened);
-    CHECK(gone.error == FactsError::vanished);
-    CHECK(leg.facts(d, "a/b").error == FactsError::other); // not a single component
-    CHECK(leg.facts(d, "").error == FactsError::other);
-    CHECK(leg.facts((t.root / "nope").string(), "x").error == FactsError::vanished);
+    CHECK_FALSE(leg.facts(d, "a/b").opened); // not a single component
+    CHECK_FALSE(leg.facts(d, "").opened);
+    CHECK_FALSE(leg.facts((t.root / "nope").string(), "x").opened);
     CHECK(seen.size() == 1); // the extent reader saw the one regular file and nothing else
 }
 

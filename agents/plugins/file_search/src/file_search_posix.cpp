@@ -41,6 +41,7 @@
 #include <macos_network_mounts.hpp>
 #include <posix_secure_read.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -50,7 +51,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 
 #include <unistd.h>
@@ -72,15 +72,8 @@ namespace {
 
 // ---- process-wide state: the slot, the stop flag, the in-memory search state ----
 
-[[nodiscard]] std::atomic<bool>& search_slot() noexcept {
-    static std::atomic<bool> taken{false};
-    return taken;
-}
-
-[[nodiscard]] std::atomic<bool>& stop_flag() noexcept {
-    static std::atomic<bool> stop{false};
-    return stop;
-}
+std::atomic<bool> g_slot{false};
+std::atomic<bool> g_stop{false};
 
 /// Touched only by the pool thread that holds the slot (run_slice), never by a worker.
 [[nodiscard]] SearchState& search_state() {
@@ -121,38 +114,27 @@ constexpr Os kOs = Os::linux_os;
     if (!table.opened())
         return std::nullopt;
     return ci::read_mount_entries_stream([fd = table.file.fd()](char* buf, std::size_t len) { return ::read(fd, buf, len); },
-                                         keep_for(root), ci::kMaxMountTable, kMaxPlanMounts);
+                                         keep_for(root));
 }
 
 #else // __APPLE__
 
 /// getmntinfo_r_np(MNT_NOWAIT): the kernel's cache, answered without a call into any server. The same keep
-/// rule as the Linux read, a later entry for a mount point covering an earlier one. A table of zero entries
-/// is a failed read (the root mount is always listed), as is one with more kept mounts than kMaxPlanMounts.
+/// rule as the Linux read; the plan itself lets a later entry for a mount point cover an earlier one. A
+/// table of zero entries is a failed read (the root mount is always listed), as is one with more kept
+/// mounts than ci::kMaxKeptMounts.
 [[nodiscard]] std::optional<yuzu::shared::MountTable> read_live_mounts(const std::string& root) {
     struct statfs* raw = nullptr;
     const int n = ::getmntinfo_r_np(&raw, MNT_NOWAIT);
     const std::unique_ptr<struct statfs, decltype(&::free)> listed{raw, &::free};
     if (n <= 0 || raw == nullptr)
         return std::nullopt;
-    yuzu::shared::MountTable all = yuzu::shared::macos_mount_entries(raw, n);
+    yuzu::shared::MountTable table = yuzu::shared::macos_mount_entries(raw, n);
     const ci::MountKeep keep = keep_for(root);
-    yuzu::shared::MountTable out;
-    out.malformed = all.malformed;
-    std::unordered_map<std::string, std::size_t> at; // mount point -> its index in out.entries
-    for (auto& e : all.entries) {
-        if (!keep(e))
-            continue;
-        if (const auto it = at.find(e.mount_point); it != at.end()) {
-            out.entries[it->second] = std::move(e);
-            continue;
-        }
-        if (out.entries.size() >= kMaxPlanMounts)
-            return std::nullopt;
-        at.emplace(e.mount_point, out.entries.size());
-        out.entries.push_back(std::move(e));
-    }
-    return out;
+    std::erase_if(table.entries, [&keep](const yuzu::shared::MountEntry& e) { return !keep(e); });
+    if (table.entries.size() > ci::kMaxKeptMounts)
+        return std::nullopt;
+    return table;
 }
 
 #endif
@@ -183,7 +165,7 @@ namespace {
     ci::SearchHooks hooks;
     hooks.around_lookup = around_lookup_hook();
     hooks.read_extents = [cell](int fd, const struct stat& st) { *cell = read_file_extents(fd, st); };
-    ci::SearchLeg leg = ci::make_search_leg({unit.walk_root, unit.prune}, {}, std::move(hooks));
+    ci::SearchLeg leg = ci::make_search_leg(unit.prune, {}, std::move(hooks));
 
     UnitLeg out;
     out.ops = std::move(leg.ops);
@@ -259,13 +241,8 @@ RunOutcome<WorkResult> run_on_worker(std::chrono::milliseconds timeout, std::fun
 #if defined(__APPLE__)
 
 std::string macos_canonical_name(std::string_view name) {
-    bool ascii = true;
-    for (const char c : name)
-        if (static_cast<unsigned char>(c) >= 0x80) {
-            ascii = false;
-            break;
-        }
-    if (ascii) { // the common case: no CoreFoundation
+    // The common case needs no CoreFoundation.
+    if (std::ranges::all_of(name, [](unsigned char c) { return c < 0x80; })) {
         std::string out(name);
         for (auto& c : out)
             if (c >= 'A' && c <= 'Z')
@@ -308,23 +285,23 @@ fsr::NameSemantics posix_name_semantics() {
 // ---- the slice ----
 
 SliceResult run_posix_slice(const Request& req) {
-    Boundaries b{.state = search_state(), .slot = search_slot()};
+    Boundaries b{.state = search_state(), .slot = g_slot};
     b.read_mounts = &read_live_mounts;
     b.make_leg = &make_live_leg;
     b.run_bounded = &run_on_worker;
     b.now = [] { return fsr::Clock::now(); };
     b.sleep = [](std::chrono::milliseconds d) { std::this_thread::sleep_for(d); };
-    b.stop_requested = [] { return stop_flag().load(std::memory_order_acquire); };
+    b.stop_requested = [] { return g_stop.load(std::memory_order_acquire); };
     b.os = kOs;
     return run_slice(req, b);
 }
 
 void posix_request_stop() noexcept {
-    stop_flag().store(true, std::memory_order_release);
+    g_stop.store(true, std::memory_order_release);
 }
 
 void posix_clear_stop() noexcept {
-    stop_flag().store(false, std::memory_order_release);
+    g_stop.store(false, std::memory_order_release);
 }
 
 } // namespace yuzu::file_search

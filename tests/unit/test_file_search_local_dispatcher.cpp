@@ -38,6 +38,7 @@
 #include <yuzu/plugin.hpp>
 
 #include "file_search_rows.hpp"
+#include "file_search_test_support.hpp"
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
@@ -61,6 +62,7 @@
 
 namespace fs = std::filesystem;
 namespace fsr = yuzu::shared::file_search;
+using namespace yuzu::file_search_test;
 
 namespace {
 
@@ -162,41 +164,6 @@ struct Call {
 
 #if !defined(_WIN32)
 
-std::vector<std::string> fields(const std::string& row) {
-    std::vector<std::string> out;
-    std::size_t at = 0;
-    for (;;) {
-        const auto bar = row.find('|', at);
-        out.push_back(row.substr(at, bar == std::string::npos ? std::string::npos : bar - at));
-        if (bar == std::string::npos)
-            return out;
-        at = bar + 1;
-    }
-}
-
-bool starts(const std::string& s, const std::string& p) { return s.rfind(p, 0) == 0; }
-
-/// A directory under the canonical build root, named with the yuzu_test_ prefix and the helpers' salt.
-struct Fixture {
-    fs::path root;
-    Fixture() {
-        fs::path base;
-        if (const char* b = std::getenv("MESON_BUILD_ROOT"); b != nullptr && *b != '\0')
-            base = fs::canonical(fs::path{b});
-        else
-            base = fs::canonical(fs::temp_directory_path());
-        root = base / yuzu::test::unique_temp_path("yuzu_test_fs_disp_").filename();
-        fs::create_directories(root);
-        root = fs::canonical(root);
-    }
-    ~Fixture() {
-        std::error_code ec;
-        fs::remove_all(root, ec);
-    }
-    Fixture(const Fixture&) = delete;
-    Fixture& operator=(const Fixture&) = delete;
-};
-
 void write_file(const fs::path& p, const std::string& content) {
     fs::create_directories(p.parent_path());
     std::ofstream(p, std::ios::binary) << content;
@@ -232,7 +199,7 @@ Search search_all(const YuzuPluginDescriptor* d, Call call, std::size_t max_slic
 bool fixture_was_searched(const Search& s) {
     for (const auto& row : s.rows)
         if (starts(row, "volume|")) {
-            const auto f = fields(row);
+            const auto f = split(row);
             if (f.size() > 3 && (f[3] == "complete" || f[3] == "partial"))
                 return true;
         }
@@ -243,7 +210,7 @@ std::vector<std::string> found_paths(const Search& s) {
     std::vector<std::string> out;
     for (const auto& row : s.rows)
         if (starts(row, "match|")) {
-            const auto path = fsr::decode_name(fields(row)[1]);
+            const auto path = fsr::decode_name(split(row)[1]);
             REQUIRE(path.has_value());
             out.push_back(*path);
         }
@@ -370,7 +337,7 @@ TEST_CASE("file_search plugin: one real search over a fixture finds the controls
     yuzu::agent::StandalonePluginContext pctx("file_search", {});
     REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
 
-    Fixture fx;
+    Fixture fx{"yuzu_test_fs_disp_"};
     const std::string salt = fx.root.filename().string();
     const std::string c1 = "yuzu-fs-control-" + salt + "-1.bin";
     const std::string c2 = "yuzu-fs-control-" + salt + "-2.bin";
@@ -391,7 +358,7 @@ TEST_CASE("file_search plugin: one real search over a fixture finds the controls
                                                                     : "refused (the plan reported the fixture's filesystem and did not search it)"));
     const auto trailer = captured_rows(last.captured).back();
     REQUIRE(starts(trailer, "search|"));
-    const auto t = fields(trailer);
+    const auto t = split(trailer);
     REQUIRE(t.size() == 7);
     CHECK(t[1] == "ok");
     CHECK(t[3] == kSemantics);
@@ -406,7 +373,7 @@ TEST_CASE("file_search plugin: one real search over a fixture finds the controls
         for (const auto& row : s.rows) {
             if (!starts(row, "match|"))
                 continue;
-            const auto f = fields(row);
+            const auto f = split(row);
             REQUIRE(f.size() == 7);
             CHECK(f[2] == "file");
             const std::string path = *fsr::decode_name(f[1]);
@@ -424,7 +391,7 @@ TEST_CASE("file_search plugin: one real search over a fixture finds the controls
             for (const auto& other : s.rows)
                 if (starts(other, "extents|" + f[3] + "|")) {
                     ++extents_rows;
-                    const auto e = fields(other);
+                    const auto e = split(other);
                     REQUIRE(e.size() == 5);
                     CHECK((e[2] == "ok" || e[2] == "unsupported" || e[2] == "compressed" || e[2] == "failed"));
                     if (path == p2.string() && e[2] == "ok")
@@ -457,7 +424,7 @@ TEST_CASE("file_search plugin: the name rule of the OS decides whether a differe
     yuzu::agent::StandalonePluginContext pctx("file_search", {});
     REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
 
-    Fixture fx;
+    Fixture fx{"yuzu_test_fs_disp_"};
     // The name on disk: lower case, decomposed (e then a combining acute). The pattern: upper case, composed.
     const std::string on_disk = "cafe\xCC\x81-yuzu-fs-name.bin";
     write_file(fx.root / on_disk, "x");
@@ -485,7 +452,7 @@ TEST_CASE("file_search plugin: a root that is a link is refused with its own tok
     yuzu::agent::StandalonePluginContext pctx("file_search", {});
     REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
 
-    Fixture fx;
+    Fixture fx{"yuzu_test_fs_disp_"};
     write_file(fx.root / "real" / "yuzu-fs-control-link-1.bin", "x");
     fs::create_directory_symlink(fx.root / "real", fx.root / "lnk");
 

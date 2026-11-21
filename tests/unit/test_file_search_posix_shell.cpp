@@ -32,6 +32,7 @@
 
 #include "file_search_execute.hpp"
 #include "file_search_legs.hpp"
+#include "file_search_test_support.hpp"
 #include "file_search_volumes.hpp"
 #include "test_helpers.hpp"
 
@@ -68,6 +69,7 @@
 
 namespace fs = std::filesystem;
 using namespace yuzu::file_search;
+using yuzu::file_search_test::Fixture;
 namespace caps = yuzu::shared::thread_caps;
 
 // ---- the thread-capability planner (pure: runs on every host) ----
@@ -243,28 +245,6 @@ TEST_CASE("file_search worker environment: the plugin's own runner drops the bit
 
 namespace {
 
-/// A directory under the canonical build root (or, with no MESON_BUILD_ROOT, the canonical temp directory),
-/// named with the yuzu_test_ prefix and the helpers' process salt, removed afterwards.
-struct Fixture {
-    fs::path root;
-    Fixture() {
-        fs::path base;
-        if (const char* b = std::getenv("MESON_BUILD_ROOT"); b != nullptr && *b != '\0')
-            base = fs::canonical(fs::path{b});
-        else
-            base = fs::canonical(fs::temp_directory_path());
-        root = base / yuzu::test::unique_temp_path("yuzu_test_fs_shell_").filename();
-        fs::create_directories(root);
-        root = fs::canonical(root);
-    }
-    ~Fixture() {
-        std::error_code ec;
-        fs::remove_all(root, ec);
-    }
-    Fixture(const Fixture&) = delete;
-    Fixture& operator=(const Fixture&) = delete;
-};
-
 void write_file(const fs::path& p, std::size_t bytes) {
     std::ofstream out(p, std::ios::binary);
     const std::string block(4096, 'x');
@@ -330,7 +310,7 @@ TEST_CASE("file_search extents shell: the state follows the errno of the call an
 
 TEST_CASE("file_search extents shell: a dense, an empty and a sparse file read as the volume lays them out",
           "[file_search][file_search_shell][file_search_extents]") {
-    Fixture fx;
+    Fixture fx{"yuzu_test_fs_shell_"};
     const fs::path dense = fx.root / "dense.bin";
     const fs::path empty = fx.root / "empty.bin";
     const fs::path hole = fx.root / "hole.bin";
@@ -403,7 +383,7 @@ TEST_CASE("file_search extents shell: a dense, an empty and a sparse file read a
 #if defined(__APPLE__)
 TEST_CASE("file_search extents shell: a clone shares all its blocks and a plain file shares none",
           "[file_search][file_search_shell][file_search_extents]") {
-    Fixture fx;
+    Fixture fx{"yuzu_test_fs_shell_"};
     const fs::path original = fx.root / "original.bin";
     const fs::path plain = fx.root / "plain.bin";
     const fs::path clone = fx.root / "clone.bin";

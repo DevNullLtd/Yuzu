@@ -44,7 +44,8 @@ struct FileFacts {
     FileExtents extents;
 };
 
-/// One unit's filesystem: the walk's listing seam, the per-match facts and the root check.
+/// One unit's filesystem: the walk's listing seam, the per-match facts and the root check. All three are
+/// required: the driver calls them without a null check.
 struct UnitLeg {
     ci::FsOps ops;
     std::function<FileFacts(const std::string& dir, const std::string& name)> facts;

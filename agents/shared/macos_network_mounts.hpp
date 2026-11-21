@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -59,30 +60,22 @@ namespace yuzu::shared {
     return out;
 }
 
-namespace detail {
-/// The text of a fixed-size, NUL-terminated `statfs` name field, never reading past its end.
-template <std::size_t N>
-[[nodiscard]] inline std::string statfs_text(const char (&field)[N]) {
-    std::size_t len = 0;
-    while (len < N && field[len] != '\0') ++len;
-    return std::string(field, len);
-}
-} // namespace detail
-
 /// `table[0..n)` as mount entries, in table order. An entry whose mount point is empty is counted in
 /// `malformed` and yields no row (the kernel never produces one; a hand-filled table can).
 [[nodiscard]] inline MountTable macos_mount_entries(const struct statfs* table, int n) {
+    // The text of a fixed-size, NUL-terminated `statfs` name field, never reading past its end.
+    const auto text = [](const auto& f) { return std::string(f, ::strnlen(f, sizeof f)); };
     MountTable out;
     for (int i = 0; i < n; ++i) {
         MountEntry e;
-        e.mount_point = detail::statfs_text(table[i].f_mntonname);
+        e.mount_point = text(table[i].f_mntonname);
         if (e.mount_point.empty()) {
             ++out.malformed;
             continue;
         }
         e.root = "/";
-        e.fstype = detail::statfs_text(table[i].f_fstypename);
-        e.source = detail::statfs_text(table[i].f_mntfromname);
+        e.fstype = text(table[i].f_fstypename);
+        e.source = text(table[i].f_mntfromname);
         e.dev_major = static_cast<std::uint32_t>(table[i].f_fsid.val[0]);
         e.dev_minor = static_cast<std::uint32_t>(table[i].f_fsid.val[1]);
         out.entries.push_back(std::move(e));

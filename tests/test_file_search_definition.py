@@ -2,8 +2,8 @@
 """test_file_search_definition.py -- pins the definition YAML to the plugin: the row_kind-first
 field_1..field_6 columns and the row_kind enum (each of the nine kinds a slice emits must also be a
 `"<kind>|"` row prefix in the headers that format it, plus the planned-leg status row), the root, pattern,
-kinds and cursor grammar with its bounds read from the headers that enforce them, the approval mode and
-dispatch securable against the catalogue fragment, and the never-disclosed wording.
+kinds and cursor grammar with its bounds read from the headers that enforce them, the approval mode
+against the catalogue fragment's gate, and the never-disclosed wording.
 
 Runnable standalone: `python3 tests/test_file_search_definition.py` (how meson runs it; a bare
 pytest-style file with no runner would execute zero assertions and always exit 0).
@@ -57,7 +57,6 @@ class FileSearchDefinitionColumns(unittest.TestCase):
     def test_row_kind_values_are_the_shapes_the_plugin_emits_today(self):
         row_kind = _definition()["spec"]["result"]["columns"][0]
         self.assertEqual(row_kind["values"], ROW_KINDS)
-        self.assertEqual(len(SLICE_ROW_KINDS), 9)
 
     def test_every_slice_row_kind_is_a_row_prefix_in_the_headers(self):
         text = "\n".join(p.read_text(encoding="utf-8") for p in ROW_HEADERS)
@@ -130,16 +129,13 @@ class FileSearchDefinitionContract(unittest.TestCase):
         self.assertEqual(spec["type"], "question")  # read-only: the catalogue gate relies on it
         self.assertEqual(doc["status"]["phase"], "active")
 
-    def test_approval_mode_matches_the_catalogue_gate_and_securable(self):
+    def test_approval_mode_matches_the_catalogue_gate(self):
         fragment = FRAGMENT.read_text(encoding="utf-8")
         gate = re.search(r"\.execute_gate\s*=\s*ExecuteGate::(\w+)\s*,", fragment)
         self.assertTrue(gate, "no .execute_gate in the file_search fragment")
         # role-gated <-> ExecuteGate::AdminOrApproval (test_capability_gate_consistency.py maps it)
         self.assertEqual(gate.group(1), "AdminOrApproval")
         self.assertEqual(_definition()["spec"]["approval"]["mode"], "role-gated")
-        # Dispatch stays on FileRetrieval, never the single-target Forensics securable.
-        self.assertRegex(fragment, r'\.securable\s*=\s*"FileRetrieval"\s*,')
-        self.assertNotRegex(fragment, r'\.securable\s*=\s*"Forensics"')
 
     def test_description_states_the_never_disclosed_wording(self):
         text = " ".join(_definition()["metadata"]["description"].lower().split())

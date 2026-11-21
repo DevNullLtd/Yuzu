@@ -156,7 +156,7 @@ The status is a coarse summary for the host; the `search` row and the `coverage`
 | `UNAVAILABLE` | unknown | `file_search:busy` | Another search slice holds the agent's one slot, or two blocked workers are still recorded; repeat the call |
 | `UNAVAILABLE` | unknown | `file_search:<token>` for a request token (`missing_root`, `root_not_absolute`, `root_too_long`, `root_bad_component`, `missing_pattern`, `pattern_too_long`, `pattern_too_many_stars`, `pattern_too_few_literals`, `pattern_forbidden_byte`, `bad_kinds`, `bad_cursor`, `root_is_link`, `root_not_found`, `root_not_a_directory`) | The request was refused (the command also returns 1); the `search` row says `invalid` and nothing was searched |
 | `UNAVAILABLE` | unknown | `file_search:<reason>` for a failure reason (`timed_out`, `rejected`, `no_progress`, `stalled`, `unstable`, `cancelled`, `cursor_refused`, `max_slices`, `mount_table_unreadable`, `mount_table_changed`, `internal_error`) | The slice or the search ended without a result for that reason; the `search` row says `failed` |
-| `UNAVAILABLE` | unknown | `linux:file_search:exception` / `macos:file_search:exception` / `windows:file_search:exception` | The body threw: one `search\|failed\|internal_error` row and the command returns 0 |
+| `UNAVAILABLE` | unknown | `linux:file_search:exception` / `macos:file_search:exception` | The body threw: one `search\|failed\|internal_error` row and the command returns 0 |
 | `UNAVAILABLE` | unknown | `windows:planned` / `macos:planned` / `linux:planned` | The leg reads nothing (caveat 1): one `status\|search\|unsupported\|<os>:planned` row. `macos:planned` and `linux:planned` are the shared reporter's tokens and are not emitted by this plugin's POSIX legs |
 
 ### What to do about a reason

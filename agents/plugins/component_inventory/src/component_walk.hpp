@@ -108,16 +108,12 @@ struct FileView {
 /// What a root path turned out to be when the leg tried to reach it with no link followed.
 enum class RootState { ok, is_link, not_found, not_a_directory, other };
 
-/// Why the leaf of a match could not be opened for its facts.
-enum class FactsError { none, vanished, permission_denied, link, not_regular, other };
-
 /// The facts of one matched regular file, taken from the descriptor of the opened leaf (never from the
 /// name), so they describe the object any extent read then sees. The file is opened and never read.
 struct MatchFacts {
     bool opened{false};
     std::uint64_t size{0};
     std::int64_t mtime{0}; // seconds
-    FactsError error{FactsError::none};
 };
 
 struct FsOps {

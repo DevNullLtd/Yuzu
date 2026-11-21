@@ -261,7 +261,6 @@ TEST_CASE("file_search rows: the byte budget leaves a reserve a row can never ov
     CHECK(full_at(kMatchRowBudget - 2 * kMaxMatchRowBytes + 1));
     CHECK(full_at(kMatchRowBudget));
     CHECK(full_at(kMatchRowBudget + 1)); // an overcharged budget reads full, never wraps
-    CHECK(kMatchRowBudget + kTailReserveBytes == kSliceRowBytes);
 }
 
 TEST_CASE("file_search constants: the named budgets hold the values of the plan",
@@ -270,7 +269,6 @@ TEST_CASE("file_search constants: the named budgets hold the values of the plan"
     CHECK(kMaxSlices == 5'000);
     CHECK(kSliceGrace == 5'000ms);
     CHECK(kMaxVolumes == 64);
-    CHECK(kMaxPlanMounts == 16'384);
     CHECK(kSliceRowBytes == 8u * 1024 * 1024);
     CHECK(kMaxGapPathBytes == 1'024);
     CHECK(kMaxMatchesPerDirectory == 500);

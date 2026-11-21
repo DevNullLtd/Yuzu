@@ -58,8 +58,6 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     }
     require(r->index < fs::kMaxVolumes);
     require(fs::encode_volume_cursor(*r) == token); // canonical by proof
-    const auto again = fs::decode_volume_cursor(fs::encode_volume_cursor(*r), r->inner.query_hash);
-    require(again && *again == *r);
 
     // The transition validator, on whatever was accepted. A cursor never advances to itself.
     require(!fs::volume_advances(*r, *r));

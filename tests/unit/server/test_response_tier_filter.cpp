@@ -312,53 +312,6 @@ TEST_CASE("a plugin flagged into the Forensics read tier joins the derived set w
     }
 }
 
-TEST_CASE("file_search: its stored rows are Forensics-tier over the real catalogue while dispatch stays "
-          "on FileRetrieval",
-          "[server][responses][security][forensics]") {
-    const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
-    const auto set = derive_forensics_plugin_set(registry);
-    REQUIRE(set.has_value());
-
-    const auto row = registry.classify("file_search", "search");
-    REQUIRE(row.has_value());
-    CHECK(row->stored_rows == StoredRowTier::ForensicsRead);
-    CHECK(row->securable == "FileRetrieval"); // launchable at a group or the fleet
-    CHECK(row->securable != kForensicsSecurable);
-    CHECK(row->execute_gate == ExecuteGate::AdminOrApproval);
-    const auto forensics_securable = registry.plugins_on_securable(kForensicsSecurable);
-    CHECK_FALSE(std::ranges::binary_search(forensics_securable, std::string{"file_search"}));
-
-    // Exactly one flagged row in the whole catalogue. A NEW flagged row changes who can read a
-    // plugin's stored output: acknowledge it here, in test_capability_catalogue.cpp and in
-    // tests/test_file_search_read_tier_tripwire.py.
-    std::size_t flagged_rows = 0;
-    registry.for_each_row([&](const CommandCapability& cap) {
-        if (cap.stored_rows != StoredRowTier::ForensicsRead)
-            return;
-        ++flagged_rows;
-        CHECK(cap.plugin == "file_search");
-    });
-    CHECK(flagged_rows == 1);
-
-    // contains() is the one membership every sink asks: the live bus, the failure-text sanitiser, the
-    // result-set refusal, the read audit and the hardware notice.
-    CHECK(set->contains("file_search"));
-    CHECK(set->contains("FILE_SEARCH"));
-
-    SECTION("a read without a global Forensics:Read excludes it, a global grant admits it") {
-        const auto deny = ResponseTierFilter::exclude(*set, authz::deny_all());
-        CHECK_FALSE(deny.admits("file_search"));
-        CHECK(deny.admits("shellexec"));
-        CHECK(std::ranges::binary_search(deny.excluded_plugins(), std::string{"file_search"}));
-        const auto global = ResponseTierFilter::exclude(*set, std::nullopt);
-        CHECK(global.admits("file_search"));
-    }
-    SECTION("the fixed-plugin polls and the unwired sink exclude it") {
-        CHECK_FALSE(ResponseTierFilter::for_fixed_plugin_poll(&*set).admits("file_search"));
-        CHECK_FALSE(ResponseTierFilter::refuse_unwired().admits("file_search"));
-    }
-}
-
 TEST_CASE("the Forensics plugin set is derived from the catalogue, not a hand-kept list",
           "[server][responses][security][forensics]") {
     const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};

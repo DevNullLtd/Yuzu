@@ -111,7 +111,6 @@ struct Boundaries {
     BoundedRunner<WorkResult> run_bounded;
     std::function<fsr::Clock::time_point()> now;
     std::function<void(std::chrono::milliseconds)> sleep;
-    std::function<void()> worker_setup;   // optional: first thing the worker does (privilege, I/O class)
     std::function<bool()> stop_requested; // optional: polled between entries; true ends the walk
     fsr::GovernorLimits limits{};         // the defaults are the ruled slice, entry and row budgets
     Os os{Os::linux_os};
@@ -152,7 +151,6 @@ struct WorkInput {
     fsr::GovernorLimits limits;
     std::function<fsr::Clock::time_point()> now;
     std::function<void(std::chrono::milliseconds)> sleep;
-    std::function<void()> setup;
     std::function<bool()> stop;
     bool check_root{false};
     Os os{Os::linux_os};
@@ -172,16 +170,24 @@ struct DirTally {
     bool capped{false};
 };
 
+/// The ONE gap rule, for the worker's own list and the pool thread's envelope alike: a gap whose path fits
+/// is kept up to fsr::kMaxGaps; any other is counted in `dropped`, never emitted.
+inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, std::string path,
+                            fsr::GapCause cause) {
+    if (!gap_path_fits(path) || gaps.size() >= fsr::kMaxGaps)
+        ++dropped;
+    else
+        gaps.push_back({std::move(path), cause});
+}
+
 /// The worker body. Never throws: a throw is reported as `threw`, never mistaken for a timeout.
 [[nodiscard]] inline WorkResult run_unit(WorkInput in) {
     using Type = ci::DirEntry::Type;
     WorkResult out;
     const DoneOnExit done{in.done};
     try {
-        if (in.setup)
-            in.setup();
         if (in.check_root) {
-            switch (in.leg.root_state ? in.leg.root_state(in.search_root) : ci::RootState::other) {
+            switch (in.leg.root_state(in.search_root)) {
             case ci::RootState::is_link:
                 out.root_error = RequestError::root_is_link;
                 return out;
@@ -208,10 +214,7 @@ struct DirTally {
         yuzu::shared::RowByteBudget budget{.max_bytes = kMatchRowBudget}; // the match and extents rows of this slice
         std::unordered_map<std::string, DirTally> per_dir;
         const auto add_gap = [&out](std::string path, fsr::GapCause cause) {
-            if (!gap_path_fits(path) || out.gaps.size() >= fsr::kMaxGaps)
-                ++out.gaps_dropped;
-            else
-                out.gaps.push_back({std::move(path), cause});
+            add_bounded_gap(out.gaps, out.gaps_dropped, std::move(path), cause);
         };
 
         const ci::OrderedVisit visit = [&](const std::string& dir, const ci::DirEntry& e, std::uint64_t dir_dev) {
@@ -246,7 +249,7 @@ struct DirTally {
             m.scope = is_user_profile_path(full, in.os) ? Scope::user : Scope::system;
             std::string extents_row;
             if (!is_dir) { // a file is opened for its facts and never read; a directory is never opened
-                FileFacts f = in.leg.facts ? in.leg.facts(dir, e.name) : FileFacts{};
+                FileFacts f = in.leg.facts(dir, e.name);
                 if (f.facts.opened) {
                     m.size = f.facts.size;
                     m.mtime = f.facts.mtime;
@@ -293,13 +296,6 @@ struct DirTally {
     v.state = r.reason == fsr::Reason::firmlinks_only ? fsr::VolumeState::partial : fsr::VolumeState::not_searched;
     v.reason = r.reason;
     return v;
-}
-
-inline void add_env_gap(fsr::CoverageEnvelope& env, std::string path, fsr::GapCause cause) {
-    if (!gap_path_fits(path))
-        ++env.gaps_dropped;
-    else
-        env.add_gap({std::move(path), cause});
 }
 
 } // namespace driver_detail
@@ -414,6 +410,11 @@ inline void add_env_gap(fsr::CoverageEnvelope& env, std::string path, fsr::GapCa
     vol.mount_point = unit.mount_point;
     vol.fstype = unit.fstype;
     vol.extents = fsr::Extents::collected;
+    // The unit's own row, then the refused rows: the one place both are emitted, so no path forgets them.
+    const auto emit_vol = [&] {
+        env.volumes.push_back(vol);
+        add_refused_rows();
+    };
 
     // The cursor that follows this slice, or the reason the search ends here. `gap_delta` is what the
     // running count grows by. A finished or ended search has no cursor.
@@ -457,8 +458,7 @@ inline void add_env_gap(fsr::CoverageEnvelope& env, std::string path, fsr::GapCa
     if (b.state.is_stalled(unit.key())) {
         vol.state = fsr::VolumeState::partial;
         vol.reason = fsr::Reason::stalled;
-        env.volumes.push_back(vol);
-        add_refused_rows();
+        emit_vol();
         counters.stalled = 1;
         std::string token, why;
         const Next next = next_cursor_for(true, {}, false, 1 + refused_counted, token, why);
@@ -483,7 +483,6 @@ inline void add_env_gap(fsr::CoverageEnvelope& env, std::string path, fsr::GapCa
                    .limits = b.limits,
                    .now = b.now,
                    .sleep = b.sleep,
-                   .setup = b.worker_setup,
                    .stop = b.stop_requested,
                    .check_root = !in,
                    .os = b.os,
@@ -499,8 +498,7 @@ inline void add_env_gap(fsr::CoverageEnvelope& env, std::string path, fsr::GapCa
         b.state.store(lineage, gov);
         vol.state = fsr::VolumeState::partial;
         vol.reason = fsr::Reason::stalled;
-        env.volumes.push_back(vol);
-        add_refused_rows();
+        emit_vol();
         std::string reason = to_token(fault);
         if (gov.health == fsr::Health::stalled) {
             counters.stalled = 1;
@@ -530,9 +528,9 @@ inline void add_env_gap(fsr::CoverageEnvelope& env, std::string path, fsr::GapCa
     // 7. the slice's result
     ci::OrderedResult& res = w.walk;
     for (auto& g : res.gaps)
-        driver_detail::add_env_gap(env, std::move(g.path), g.cause);
+        driver_detail::add_bounded_gap(env.gaps, env.gaps_dropped, std::move(g.path), g.cause);
     for (auto& g : w.gaps)
-        driver_detail::add_env_gap(env, std::move(g.path), g.cause);
+        driver_detail::add_bounded_gap(env.gaps, env.gaps_dropped, std::move(g.path), g.cause);
     env.gaps_dropped += res.gaps_dropped + w.gaps_dropped;
     vol.entries = res.stats.entries;
     const bool complete = res.stop == ci::Stop::complete;
@@ -541,8 +539,7 @@ inline void add_env_gap(fsr::CoverageEnvelope& env, std::string path, fsr::GapCa
     if (w.cancelled) { // the agent is shutting down: nothing is carried, nothing is retried
         vol.state = fsr::VolumeState::partial;
         vol.reason = fsr::Reason::cancelled;
-        env.volumes.push_back(vol);
-        add_refused_rows();
+        emit_vol();
         return conclude(env, std::move(w.rows), Status::failed, fsr::to_token(fsr::Reason::cancelled), {},
                         res.stats.links_skipped);
     }
@@ -574,15 +571,13 @@ inline void add_env_gap(fsr::CoverageEnvelope& env, std::string path, fsr::GapCa
         if (next == Next::ended && why == fsr::to_token(fsr::Reason::max_slices)) {
             if (!complete)
                 vol.reason = fsr::Reason::max_slices;
-            env.volumes.push_back(vol);
-            add_refused_rows();
+            emit_vol();
             not_searched_rest(index + 1, fsr::Reason::max_slices);
             return conclude(env, std::move(w.rows), Status::failed, why, {}, res.stats.links_skipped);
         }
     }
 
-    env.volumes.push_back(vol);
-    add_refused_rows();
+    emit_vol();
     if (next == Next::ended)
         return conclude(env, std::move(w.rows), Status::failed, why, {}, res.stats.links_skipped);
     env.has_cursor = next == Next::issued;

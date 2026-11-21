@@ -158,14 +158,6 @@ constexpr int kMountHopRefused = EXDEV;
     return ListError::unreadable;
 }
 
-[[nodiscard]] FactsError facts_error_of(int err) noexcept {
-    if (err == ENOENT || err == ENOTDIR)
-        return FactsError::vanished;
-    if (err == EACCES || err == EPERM)
-        return FactsError::permission_denied;
-    return FactsError::other;
-}
-
 struct PosixFsOptions {
     bool descriptor_stack{false}; // keep the directories of the current path open (the search leg)
     AroundLookup around;          // wraps a path acquisition, one enumeration, one leaf open
@@ -275,26 +267,18 @@ public:
         MatchFacts f;
         const std::string full = walk_detail::join(dir, name);
         if (mounts_.contains(full) || name.empty() || name.find('/') != std::string::npos ||
-            name.find('\0') != std::string::npos) {
-            f.error = FactsError::other;
+            name.find('\0') != std::string::npos)
             return f;
-        }
         const Acquired parent = acquire(dir);
-        if (!parent.opened()) {
-            f.error = facts_error_of(parent.err);
+        if (!parent.opened())
             return f;
-        }
         shared::FileOpen leaf;
         guarded([&] {
             note(log_, full);
             leaf = shared::open_file_no_follow_at(parent.fd(), name.c_str());
         });
-        if (!leaf.opened()) {
-            f.error = leaf.error == shared::ReadError::symlink_refused ? FactsError::link
-                      : leaf.error == shared::ReadError::not_regular   ? FactsError::not_regular
-                                                                       : facts_error_of(leaf.err);
+        if (!leaf.opened())
             return f;
-        }
         f.opened = true;
         f.size = leaf.size;
         f.mtime = static_cast<std::int64_t>(leaf.mtime.tv_sec);
@@ -475,10 +459,6 @@ private:
 
 #endif
 
-} // namespace
-
-namespace {
-
 // A container host's table runs to tens of megabytes, so it is streamed line-wise rather than held
 // whole. A line longer than kMaxMountLine is a failure, not skipped: skipping would hide a mount from
 // the guard. Every completed line is length-checked, not just the unfinished tail. `take` is handed each
@@ -655,13 +635,13 @@ FsOps make_fs_ops(const Targets& targets, AccessLog on_access) {
     return ops;
 }
 
-SearchLeg make_search_leg(const SearchTargets& targets, AccessLog on_access, SearchHooks hooks,
+SearchLeg make_search_leg(std::vector<std::string> prune, AccessLog on_access, SearchHooks hooks,
                           ReadDirFn read_dir) {
     PosixFsOptions opts;
     opts.descriptor_stack = true;
     opts.around = std::move(hooks.around_lookup);
     opts.read_dir = std::move(read_dir);
-    const auto fs = std::make_shared<const PosixFs>(targets.prune, std::move(on_access), std::move(opts));
+    const auto fs = std::make_shared<const PosixFs>(prune, std::move(on_access), std::move(opts));
 
     SearchLeg leg;
     leg.ops.list = [fs](const std::string& dir, std::size_t cap) {

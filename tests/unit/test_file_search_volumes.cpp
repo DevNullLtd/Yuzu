@@ -31,6 +31,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include "file_search_test_support.hpp"
 #include "file_search_volumes.hpp"
 
 #include <file_search_cursor.hpp>
@@ -43,21 +44,10 @@
 #include <vector>
 
 using namespace yuzu::file_search;
+using yuzu::file_search_test::Mounts;
 namespace fsr = yuzu::shared::file_search;
 
 namespace {
-
-/// A /proc/self/mountinfo table built a line at a time.
-struct Mounts {
-    std::string text;
-    int id{1};
-    Mounts& add(const std::string& mp, const std::string& fstype, const std::string& label = "8:1",
-                const std::string& root = "/", const std::string& source = "/dev/x") {
-        text += std::to_string(id++) + " 1 " + label + " " + root + " " + mp + " rw - " + fstype + " " + source + " rw\n";
-        return *this;
-    }
-    [[nodiscard]] yuzu::shared::MountTable table() const { return yuzu::shared::mount_entries(text); }
-};
 
 std::vector<std::string> mount_points(const VolumePlan& p) {
     std::vector<std::string> v;

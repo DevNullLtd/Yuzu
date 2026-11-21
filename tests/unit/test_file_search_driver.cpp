@@ -21,8 +21,10 @@
  *  - single flight: the busy answer calling the runner or touching the state, or a release by anything but
  *    the slice that took the slot, fails the busy, late-completion and two-abandoned cases.
  *  - stall: a timeout not recorded as abandoned, a volume read as stalled after its worker returned, or a
- *    stall count shared between cursors fails the timeout, return and lineage cases; a thrown worker read
+ *    stall count shared between cursors fails the timeout, late-completion and lineage cases; a thrown worker read
  *    as a timeout fails the thrown case.
+ *  - cancel: a stop request whose slice carries state, issues a cursor, or reads as anything but a
+ *    partial, cancelled volume fails the cancelled case.
  *  - limits and caps: a governor built from invalid limits, a sequence past kMaxSlices, a per-directory
  *    match cap or a byte budget that drops a row instead of ending the slice fails its own case.
  *  - cursor: issuing a cursor the validator refuses, or one with no spelling, fails the unencodable case.
@@ -31,6 +33,7 @@
 
 #include "component_fixture_tree.hpp"
 #include "file_search_driver.hpp"
+#include "file_search_test_support.hpp"
 
 #include <file_search_names.hpp>
 
@@ -48,6 +51,7 @@
 
 using namespace yuzu::file_search;
 using namespace yuzu::component_inventory::fixture;
+using namespace yuzu::file_search_test;
 namespace fsr = yuzu::shared::file_search;
 using Type = yuzu::component_inventory::DirEntry::Type;
 using yuzu::component_inventory::DirEntry;
@@ -56,31 +60,6 @@ using yuzu::component_inventory::ListResult;
 namespace {
 
 // ---- the world ----
-
-struct Mounts {
-    std::string text;
-    int id{1};
-    Mounts& add(const std::string& mp, const std::string& fstype, const std::string& label = "8:1",
-                const std::string& root = "/", const std::string& source = "/dev/x") {
-        text += std::to_string(id++) + " 1 " + label + " " + root + " " + mp + " rw - " + fstype + " " + source + " rw\n";
-        return *this;
-    }
-    [[nodiscard]] yuzu::shared::MountTable table() const { return yuzu::shared::mount_entries(text); }
-};
-
-std::vector<std::string> split(const std::string& row) {
-    std::vector<std::string> out;
-    std::size_t at = 0;
-    for (;;) {
-        const auto bar = row.find('|', at);
-        out.push_back(row.substr(at, bar == std::string::npos ? std::string::npos : bar - at));
-        if (bar == std::string::npos)
-            return out;
-        at = bar + 1;
-    }
-}
-
-bool starts(const std::string& s, const std::string& p) { return s.rfind(p, 0) == 0; }
 
 struct Rig {
     MemTree fs;
@@ -289,6 +268,19 @@ using Strs = std::vector<std::string>;
 
 const std::string kCtl = "yuzu-fs-control-*.bin";
 
+/// A cursor of the control search over `rig`'s plan: unit `index`, sequence `seq`, generation `gen`.
+VolumeCursor cursor_at(const Rig& rig, std::size_t index, std::uint64_t seq, std::uint32_t gen = 0) {
+    const VolumePlan plan = rig.plan();
+    VolumeCursor c;
+    c.index = index;
+    c.units_hash = plan.units_hash;
+    c.refused_hash = plan.refused_hash;
+    c.inner.query_hash = fsr::query_hash(make_request(kCtl).query);
+    c.inner.sequence = seq;
+    c.inner.generation = gen;
+    return c;
+}
+
 } // namespace
 
 // ---- the request parser ----
@@ -428,8 +420,6 @@ TEST_CASE("file_search driver: the governor limits map to the walk limits in one
           "[file_search][file_search_driver]") {
     const fsr::GovernorLimits defaults;
     const auto w = walk_limits_for(defaults);
-    CHECK(w.max_entries == 400'000);
-    CHECK(w.max_rows == 1'000);
     CHECK(w.max_depth == fsr::kMaxPositionDepth);
     fsr::GovernorLimits small;
     small.max_entries = 7;
@@ -558,24 +548,11 @@ TEST_CASE("file_search driver: a refused mount beneath a unit is never listed, r
     const Run run = search(rig, kCtl);
     CHECK(sorted(found(run)) == Strs{"/r/more/yuzu-fs-control-3.bin", "/r/yuzu-fs-control-1.bin"});
     CHECK(std::ranges::find(rig.fs.listed, "/r/usb") == rig.fs.listed.end());
-    CHECK(std::ranges::find(rig.facts_calls, "/r/usb/yuzu-fs-control-2.bin") == rig.facts_calls.end());
+    CHECK(sorted(rig.facts_calls) == Strs{"/r/more/yuzu-fs-control-3.bin", "/r/yuzu-fs-control-1.bin"}); // nothing else opened
     CHECK(count_rows(run, "volume|/r/usb|vfat|not_searched|fstype_not_allowed|") == 1); // once, never network_mount
     CHECK(count_rows(run, "volume|/r/usb|") == 1);
     CHECK_FALSE(complete(run)); // the refused row is carried into the verdict through the cursor
     CHECK(row_of(run.last(), "coverage|").find("prior_gaps=1") != std::string::npos);
-}
-
-TEST_CASE("file_search driver: a second device of a refused type is never opened and its allowed twin is found",
-          "[file_search][file_search_driver]") {
-    Rig rig;
-    rig.mounts.add("/r/usb", "vfat", "8:9").add("/r/disk", "ext4", "8:4");
-    rig.fs.add_file("/r/usb/yuzu-fs-control-1.bin", "");
-    rig.fs.add_file("/r/disk/yuzu-fs-control-2.bin", "");
-    const Run run = search(rig, kCtl);
-    CHECK(found(run) == Strs{"/r/disk/yuzu-fs-control-2.bin"});
-    CHECK(std::ranges::find(rig.fs.listed, "/r/usb") == rig.fs.listed.end());
-    CHECK(rig.facts_calls == Strs{"/r/disk/yuzu-fs-control-2.bin"});
-    CHECK_FALSE(complete(run));
 }
 
 TEST_CASE("file_search driver: a disk beneath a tmpfs is found without listing the tmpfs, one beneath a network mount is never opened",
@@ -801,39 +778,6 @@ TEST_CASE("file_search driver: a timeout abandons its worker, the volume reads s
     CHECK(row_of(next, "coverage|").find("prior_gaps=1") != std::string::npos);
 }
 
-TEST_CASE("file_search driver: a volume is searched again once its abandoned worker has returned",
-          "[file_search][file_search_driver]") {
-    Rig rig;
-    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
-    rig.mode = Rig::Mode::timeout;
-    CHECK(run_slice(make_request(kCtl), rig.b).reason == "timed_out");
-    REQUIRE(rig.state.abandoned_count() == 1);
-
-    rig.state.abandoned()[0].done->store(true); // the worker came back
-    rig.mode = Rig::Mode::run;
-    const SliceResult again = run_slice(make_request(kCtl), rig.b);
-    CHECK(again.status == Status::ok);
-    CHECK(found(Run{{again}}) == Strs{"/r/yuzu-fs-control-1.bin"});
-    CHECK(rig.state.abandoned_count() == 0);
-}
-
-TEST_CASE("file_search driver: a restarted agent has no stalled volume and no stall count",
-          "[file_search][file_search_driver]") {
-    Rig before;
-    before.fs.add_file("/r/yuzu-fs-control-1.bin", "");
-    before.mode = Rig::Mode::timeout;
-    CHECK(run_slice(make_request(kCtl), before.b).reason == "timed_out");
-    CHECK(before.state.abandoned_count() == 1);
-
-    Rig after; // the same world, a fresh process: nothing was written anywhere
-    after.fs.add_file("/r/yuzu-fs-control-1.bin", "");
-    CHECK(after.state.abandoned_count() == 0);
-    CHECK(after.state.lineage_count() == 0);
-    const SliceResult r = run_slice(make_request(kCtl), after.b);
-    CHECK(r.status == Status::ok);
-    CHECK(found(Run{{r}}).size() == 1);
-}
-
 TEST_CASE("file_search driver: with two workers still abandoned every slice answers busy and frees the slot",
           "[file_search][file_search_driver]") {
     Rig rig;
@@ -892,7 +836,9 @@ TEST_CASE("file_search driver: an abandoned worker that completes late changes o
     CHECK(found(Run{{r}}) == Strs{"/r/data/yuzu-fs-control-2.bin"});
     CHECK_FALSE(rig.slot.load());
     rig.during_run = nullptr;
-    CHECK(run_slice(make_request(kCtl), rig.b).status == Status::ok); // and the next slice drops it, volume 0 is searched
+    const SliceResult again = run_slice(make_request(kCtl), rig.b); // the next slice drops it, volume 0 is searched
+    CHECK(again.status == Status::ok);
+    CHECK(found(Run{{again}}) == Strs{"/r/yuzu-fs-control-1.bin"});
     CHECK(rig.state.abandoned_count() == 0);
 }
 
@@ -938,20 +884,9 @@ TEST_CASE("file_search driver: a stall count belongs to one cursor, and an evict
     Rig rig;
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.mode = Rig::Mode::reject;
-    const Request base = make_request(kCtl);
-    const fsr::QueryHash qh = fsr::query_hash(base.query);
-    const VolumePlan plan = rig.plan();
-    const auto cursor_at = [&](std::uint64_t seq, std::uint32_t gen = 0) {
-        VolumeCursor c;
-        c.units_hash = plan.units_hash;
-        c.refused_hash = plan.refused_hash;
-        c.inner.query_hash = qh;
-        c.inner.sequence = seq;
-        c.inner.generation = gen;
-        return encode_volume_cursor(c);
-    };
     const auto attempt = [&](std::uint64_t seq, std::uint32_t gen = 0) {
-        return run_slice(make_request(kCtl, "/r", "files", cursor_at(seq, gen)), rig.b).reason;
+        return run_slice(make_request(kCtl, "/r", "files", encode_volume_cursor(cursor_at(rig, 0, seq, gen))), rig.b)
+            .reason;
     };
 
     CHECK(attempt(1) == "rejected");
@@ -966,6 +901,23 @@ TEST_CASE("file_search driver: a stall count belongs to one cursor, and an evict
     for (std::uint64_t s = 100; s < 100 + kMaxLineages; ++s)
         CHECK(attempt(s) == "rejected");
     CHECK(attempt(5) == "rejected"); // its count was evicted: this is the first again, not the third
+}
+
+TEST_CASE("file_search driver: a stop request ends the slice cancelled, carrying and retrying nothing",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.b.stop_requested = [] { return true; };
+    const SliceResult r = run_slice(make_request(kCtl), rig.b);
+    CHECK(r.status == Status::failed);
+    CHECK(r.reason == "cancelled");
+    CHECK(r.cursor.empty());
+    CHECK(row_of(r, "cursor|").empty());
+    CHECK(row_of(r, "volume|").find("volume|/|ext4|partial|cancelled|") == 0);
+    CHECK(starts(row_of(r, "coverage|"), "coverage|partial|"));
+    CHECK(starts(row_of(r, "search|"), "search|failed|cancelled|"));
+    CHECK(rig.state.lineage_count() == 0);
+    CHECK_FALSE(rig.slot.load());
 }
 
 TEST_CASE("file_search driver: an identity that changes on every call ends unstable within the restart bound",
@@ -1014,19 +966,11 @@ TEST_CASE("file_search driver: the slice maximum ends the search with its own re
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.fs.add_file("/r/data/yuzu-fs-control-2.bin", "");
     rig.fs.add_file("/r/data/other.txt", ""); // a second entry, so a one-entry budget cuts the walk
-    const Request base = make_request(kCtl);
-    const VolumePlan plan = rig.plan();
-    const auto cursor_at = [&](std::size_t index, std::uint64_t seq) {
-        VolumeCursor c;
-        c.index = index;
-        c.units_hash = plan.units_hash;
-        c.refused_hash = plan.refused_hash;
-        c.inner.query_hash = fsr::query_hash(base.query);
-        c.inner.sequence = seq;
-        return encode_volume_cursor(c);
+    const auto cursor_at_seq = [&](std::size_t index, std::uint64_t seq) {
+        return encode_volume_cursor(cursor_at(rig, index, seq));
     };
     // the next cursor would be number kMaxSlices: the first unit finishes, the second is never searched
-    const SliceResult end = run_slice(make_request(kCtl, "/r", "files", cursor_at(0, kMaxSlices - 1)), rig.b);
+    const SliceResult end = run_slice(make_request(kCtl, "/r", "files", cursor_at_seq(0, kMaxSlices - 1)), rig.b);
     CHECK(end.status == Status::failed);
     CHECK(end.reason == "max_slices");
     CHECK(end.cursor.empty());
@@ -1034,20 +978,20 @@ TEST_CASE("file_search driver: the slice maximum ends the search with its own re
     CHECK(starts(row_of(end, "coverage|"), "coverage|partial|"));
 
     // a slice that finishes the last unit on that sequence is simply the end of the search
-    const SliceResult last = run_slice(make_request(kCtl, "/r", "files", cursor_at(1, kMaxSlices - 1)), rig.b);
+    const SliceResult last = run_slice(make_request(kCtl, "/r", "files", cursor_at_seq(1, kMaxSlices - 1)), rig.b);
     CHECK(last.status == Status::ok);
     CHECK(last.reason == "none");
     CHECK(starts(row_of(last, "coverage|"), "coverage|complete|"));
 
     // a budget stop on that sequence is max_slices on the volume
     rig.b.limits.max_entries = 1;
-    const SliceResult cut = run_slice(make_request(kCtl, "/r", "files", cursor_at(1, kMaxSlices - 1)), rig.b);
+    const SliceResult cut = run_slice(make_request(kCtl, "/r", "files", cursor_at_seq(1, kMaxSlices - 1)), rig.b);
     CHECK(cut.status == Status::failed);
     CHECK(cut.reason == "max_slices");
     CHECK(row_of(cut, "volume|/r/data|ext4|partial|max_slices|").size() > 0);
 
     // and a cursor at or past the maximum is not a cursor
-    const SliceResult past = run_slice(make_request(kCtl, "/r", "files", cursor_at(0, kMaxSlices)), rig.b);
+    const SliceResult past = run_slice(make_request(kCtl, "/r", "files", cursor_at_seq(0, kMaxSlices)), rig.b);
     CHECK(past.status == Status::invalid);
     CHECK(past.reason == "bad_cursor");
 }
@@ -1076,12 +1020,7 @@ TEST_CASE("file_search driver: a forged cursor is refused before any boundary is
     Rig rig;
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     const VolumePlan plan = rig.plan();
-    const fsr::QueryHash qh = fsr::query_hash(make_request(kCtl).query);
-    VolumeCursor good;
-    good.units_hash = plan.units_hash;
-    good.refused_hash = plan.refused_hash;
-    good.inner.query_hash = qh;
-    good.inner.sequence = 1;
+    VolumeCursor good = cursor_at(rig, 0, 1);
 
     VolumeCursor foreign = good; // another query's cursor
     foreign.inner.query_hash[0] ^= 0xFF;

@@ -13,8 +13,8 @@ Pinned over server/core/src (comments stripped): the enum and its ordinary defau
 two catalogue defect rules and the four properties of the file_search row; the tier flag named only in the
 enum, the derivation and the fragment; the plugin named by a string literal only in its fragment, the
 enablement table, the action descriptions and the kill-switch seed (a name-keyed special case is a second
-path around the set); no second-tier or new-audit-verb spelling; exactly the four
-`unrestricted_internal_consumer()` sites tests/test_response_store_read_tripwire.py freezes.
+path around the set); no second-tier or new-audit-verb spelling. The four
+`unrestricted_internal_consumer()` sites stay pinned, per site, by tests/test_response_store_read_tripwire.py.
 
 GREP LIMIT: lexical; it cannot see a branch that never runs or a plugin name built at run time (the unit
 tests assert the behaviour). `--selftest` deletes each required statement and appends each forbidden
@@ -90,12 +90,10 @@ TIER_FLAG_FILES = frozenset({CAP_HPP, SET_HPP, FRAGMENT})
 PLUGIN_NAME_FILES = frozenset({FRAGMENT, ENABLEMENT, DESCRIPTIONS, SERVER_CPP})
 TIER_FLAG = re.compile(r"\bStoredRowTier\b|\bstored_rows\b")
 PLUGIN_NAME = re.compile(r'"file_search\b')
-INTERNAL_CONSUMER = re.compile(r"\bunrestricted_internal_consumer\(\)")
-INTERNAL_CONSUMER_SITES = 4
 
 # A cheap raw-text prefilter: only a file that mentions one of these is canonicalised.
 _PREFILTER = re.compile(
-    r'StoredRowTier|stored_rows|"file_search|unrestricted_internal_consumer|response\.restricted|'
+    r'StoredRowTier|stored_rows|"file_search|response\.restricted|'
     r"TierVisibility|restricted_names|same_securable")
 _SRC_EXTS = (".cpp", ".hpp", ".h", ".cc")
 
@@ -137,11 +135,6 @@ def problems(texts: dict[str, str]) -> list[tuple[str, str]]:
         if path not in PLUGIN_NAME_FILES and PLUGIN_NAME.search(text):
             found.append(("plugin-name-outside", f"{path} names the file_search plugin by a string literal; "
                           f"a name-keyed special case is a second path around the Forensics set{HINT}"))
-    sites = sum(len(INTERNAL_CONSUMER.findall(t)) for p, t in texts.items() if p != FILTER_HPP)
-    if sites != INTERNAL_CONSUMER_SITES:
-        found.append(("internal-consumer-count", f"unrestricted_internal_consumer() has {sites} call sites "
-                      f"under {SRC}, expected exactly {INTERNAL_CONSUMER_SITES}: a new one is a security "
-                      f"decision reviewed in tests/test_response_store_read_tripwire.py{HINT}"))
     return found
 
 
@@ -193,18 +186,6 @@ def selftest() -> int:
            "plugin-name-outside: the plugin named in another file was NOT detected")
     expect("plugin-name-outside" not in ids(dict(base, **{outside: canonical('// "file_search" in a comment')})),
            "plugin-name-outside: a comment mention must not count")
-
-    # The internal-consumer count: one more, and one fewer.
-    extra = os.path.join(SRC, "execution_tracker.cpp")
-    expect("internal-consumer-count" in ids(dict(base, **{
-        extra: base.get(extra, "") + canonical("auto f = ResponseTierFilter::unrestricted_internal_consumer();")})),
-        "internal-consumer-count: a fifth call site was NOT detected")
-    site = os.path.join(SRC, "preflight_eval.cpp")
-    expect(INTERNAL_CONSUMER.search(base.get(site, "")) is not None,
-           "internal-consumer-count: the pinned preflight site moved (update this self-test)")
-    expect("internal-consumer-count" in ids(dict(base, **{
-        site: INTERNAL_CONSUMER.sub("x", base.get(site, ""))})),
-        "internal-consumer-count: a removed call site was NOT detected")
 
     print(f"selftest: {len(failures)} failure(s)")
     return 1 if failures else 0

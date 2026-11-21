@@ -59,7 +59,6 @@
 #include "component_fixture_tree.hpp"
 #include "component_walk.hpp"
 #include "file_search_cursor.hpp"
-#include <file_search_coverage.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -1183,7 +1182,7 @@ TEST_CASE("walk_ordered: a fault on a resume-path directory is one gap, no resta
     CHECK(next_of(first).generation == in.generation);
 }
 
-TEST_CASE("walk_ordered: a root that fails on a resumed slice completes with one gap and the verdict is partial",
+TEST_CASE("walk_ordered: a root that fails on a resumed slice completes with one gap",
           "[walk_ordered][file_search][component_walk]") {
     Rig r; // /r has no listing at all: it was replaced by something unreadable between slices
     fsr::Cursor in;
@@ -1197,18 +1196,4 @@ TEST_CASE("walk_ordered: a root that fails on a resumed slice completes with one
     CHECK(res.gaps[0].path == "/r");
     CHECK(res.gaps[0].cause == Cause::dir_unreadable);
     CHECK(r.visits.empty());
-
-    // what the driver makes of it: the slice completes, so no cursor follows, and the verdict reads partial
-    fsr::CoverageEnvelope env;
-    env.prior_gaps = in.prior_gaps;
-    env.slices = static_cast<std::uint32_t>(in.sequence + 1);
-    fsr::VolumeCoverage v;
-    v.mount_point = "/r";
-    v.fstype = "memfs";
-    v.state = fsr::VolumeState::complete;
-    env.volumes.push_back(v);
-    for (const auto& g : res.gaps)
-        env.add_gap({g.path, g.cause});
-    CHECK_FALSE(env.complete());
-    CHECK(fsr::format_coverage_rows(env).back().rfind("coverage|partial|", 0) == 0);
 }

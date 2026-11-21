@@ -10,8 +10,8 @@
  * PATH TESTS. Every path test here is on a component boundary (under()): /home2 is not under /home.
  *
  * WHAT THE PLAN READS. The mounts at or under the root, plus the mounts that contain the root; a later
- * entry for a mount point covers an earlier one (the caller's table already did that; the plan does it
- * again so it never depends on it). The mount that contains the root is the longest of the latter.
+ * entry for a mount point covers an earlier one (the plan does that itself, so it never depends on the
+ * reader). The mount that contains the root is the longest of the latter.
  * Without one the table does not describe the root and the plan is not valid.
  *
  * IDENTITY. A mount is its device label ("major:minor") and its root field. Two in-scope mounts with
@@ -76,16 +76,7 @@ namespace yuzu::file_search {
 
 // ---- path tests ----
 
-/// `path` is `prefix` or below it, on a component boundary. Both are absolute and have no trailing slash
-/// ("/" is the prefix of everything).
-[[nodiscard]] inline bool under(std::string_view path, std::string_view prefix) noexcept {
-    if (prefix == "/")
-        return !path.empty() && path.front() == '/';
-    return path.size() >= prefix.size() && path.substr(0, prefix.size()) == prefix &&
-           (path.size() == prefix.size() || path[prefix.size()] == '/');
-}
-
-/// Strictly below: under() and not equal.
+/// Strictly below: under() (file_search_rows.hpp) and not equal.
 [[nodiscard]] inline bool strictly_under(std::string_view path, std::string_view prefix) noexcept {
     return path != prefix && under(path, prefix);
 }
@@ -146,15 +137,7 @@ inline constexpr const char* kMacosDataVolume = "/System/Volumes/Data";
             buf.push_back(static_cast<char>((n >> (8 * i)) & 0xFFu));
         buf += p;
     }
-    yuzu::shared::Sha256 sha;
-    sha.update(buf.data(), buf.size());
-    const auto digest = sha.raw_digest();
-    std::string out(16, '0');
-    for (std::size_t i = 0; i < 8; ++i) {
-        out[2 * i] = fsr::detail::kHexLower[digest[i] >> 4];
-        out[2 * i + 1] = fsr::detail::kHexLower[digest[i] & 0x0F];
-    }
-    return out;
+    return yuzu::shared::sha256_hex(buf).substr(0, 16);
 }
 
 } // namespace detail
