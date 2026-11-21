@@ -2087,7 +2087,13 @@ TEST_CASE("get_dex_apps_usage: every admitted call writes its own access row, a 
 
 TEST_CASE("get_dex_apps_usage: a population of zero is a success, not an error",
           "[mcp][dex][usage]") {
-    Twin t; // the default model: no devices, no applications
+    Twin t;
+    // No devices and no applications, but a real window and platform scope: an empty string would
+    // fall outside the output schema's enums, which the assertion below holds the body to.
+    DexAppsUsageModel empty;
+    empty.window = "7d";
+    empty.platform_scope = "all";
+    t.usage_result = empty;
     const json r = t.call("get_dex_apps_usage");
     REQUIRE_FALSE(r.contains("error"));
     const json& sc = r["result"]["structuredContent"];

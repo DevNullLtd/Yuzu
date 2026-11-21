@@ -2055,7 +2055,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        the pair is carried by the registry (the tool, its expected-twin row
        and the shrink-only ledger backfill list in
        `tests/unit/server/test_twin_completeness.cpp`, which gains
-       `get_dex_apps_usage`, cap 4 to 5, until a ledger row can name the tool).
+       `get_dex_apps_usage`, cap 4 to 5, until a ledger row can name the tool;
+       #6700 decides the ledger row shape that retires the list).
        The 2026-11-17 entry above is history and is not edited.
      - **Declared pair and second gate.** The record declares
        `GuaranteedState:Read`, the pair the route's first gate asks, because

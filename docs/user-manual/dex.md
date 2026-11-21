@@ -657,7 +657,7 @@ does (agentic-first parity):
   launches over a 30-day basis and its crashes and hangs per hour of use, marked as estimated. It
   needs `Forensics:Read` as well as `GuaranteedState:Read` (administrators only while RBAC is off) and
   is audited fail-closed as `dex.apps.usage.view` once its parameters validate. The device floor applies per table only. No
-  agent ids appear. It is REST only for now: there is no MCP tool and no dashboard view yet. See
+  agent ids appear. The MCP tool `get_dex_apps_usage` serves the same read; there is no dashboard view yet. See
   [app usage](../dex/app-usage.md#fleet-usage-per-application).
 - **`GET /api/v1/dex/catalogue?os=&window=`**, the Catalogue family cards, fleet
   coverage and the uncatalogued list, and **`GET /api/v1/dex/catalogue/group?name=&os=&window=`**,
