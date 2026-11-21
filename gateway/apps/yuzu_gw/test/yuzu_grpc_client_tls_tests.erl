@@ -66,6 +66,14 @@ tls_test_() ->
                   fun() -> mtls_ok(State) end},
                  {"mTLS: a client without a certificate is refused and the handler never runs",
                   {timeout, 30, fun() -> mtls_no_cert(State) end}},
+                 {"witness listener (WP01): a client with no certificate is served, the handler sees none",
+                  fun() -> witness_no_cert(State) end},
+                 {"witness listener (WP01): a certificate the gateway cannot chain is witnessed, not refused",
+                  fun() -> witness_foreign_cert(State) end},
+                 {"witness listener (WP01 CH-3): a victim's certificate WITHOUT its private key fails the handshake",
+                  {timeout, 30, fun() -> witness_no_key_possession(State) end}},
+                 {"verify_peer without witness: the same foreign certificate aborts the handshake",
+                  {timeout, 30, fun() -> request_only_foreign_cert(State) end}},
                  {"TCP_NODELAY is on a live TLS socket by default",
                   fun() -> nodelay_tls_default(State) end},
                  {"an operator's {nodelay, false} wins on a TLS socket",
@@ -111,9 +119,19 @@ setup() ->
                                   Base#{name => cli_tls_oneway,
                                         tls => Tls#{verify => verify_none, fail_if_no_peer_cert => false}}),
             {MutualPort, MutualPid} = yuzu_gw_test_listener:start(Base#{name => cli_tls_mutual, tls => Tls}),
+            {WitnessPort, WitnessPid} = yuzu_gw_test_listener:start(
+                                          Base#{name => cli_tls_witness,
+                                                tls => Tls#{verify => verify_peer,
+                                                            fail_if_no_peer_cert => false,
+                                                            witness_client_cert => true}}),
+            {ReqPort, ReqPid} = yuzu_gw_test_listener:start(
+                                  Base#{name => cli_tls_request_only,
+                                        tls => Tls#{verify => verify_peer,
+                                                    fail_if_no_peer_cert => false}}),
             #{certs => Certs, counter => counters:new(1, []),
               plain_port => PlainPort, oneway_port => OnePort, mutual_port => MutualPort,
-              listeners => [PlainPid, OnePid, MutualPid]}
+              witness_port => WitnessPort, request_only_port => ReqPort,
+              listeners => [PlainPid, OnePid, MutualPid, WitnessPid, ReqPid]}
     end.
 
 cleanup({error, _}) ->
@@ -224,6 +242,60 @@ failure_is_classified(#{certs := #{selfs_pem := Selfs} = Certs, oneway_port := P
                      ?assertEqual({true, <<"unknown_ca">>}, yuzu_gw_upstream:classify_tls_error(Reason)),
                      ?assertEqual({true, <<"unknown_ca">>},
                                   yuzu_gw_upstream:classify_tls_error({error, Reason}))
+                 end).
+
+%% WP01: the gateway witnesses a client certificate for the server to verify. A
+%% peer with none is still served (an unenrolled agent has none)...
+witness_no_cert(#{certs := Certs, witness_port := Port} = S) ->
+    with_channel(S, https, Port, ssl_opts(Certs, undefined), #{}, #{},
+                 fun(Name) ->
+                     ok = wait_up(Name, 2),
+                     {ok, #{pending_commands := [#{action := Cert}]}, _} = heartbeat(Name, <<"ctx">>),
+                     ?assertEqual(<<"no-cert">>, Cert)
+                 end).
+
+%% ...and a certificate the gateway cannot chain (self-signed here: stale or
+%% foreign in the field) does not lock the agent out; the handler sees it.
+witness_foreign_cert(#{certs := Certs, witness_port := Port} = S) ->
+    with_channel(S, https, Port, ssl_opts(Certs, "selfs"), #{}, #{},
+                 fun(Name) ->
+                     ok = wait_up(Name, 2),
+                     {ok, #{pending_commands := [#{action := Cert}]}, _} = heartbeat(Name, <<"ctx">>),
+                     ?assertEqual(<<"cert">>, Cert)
+                 end).
+
+%% CH-3 / UP-10: the accept-any verify_fun relaxes CHAIN validation only. The TLS
+%% CertificateVerify message must still prove possession of the presented
+%% certificate's key. A client that presents the victim's leaf ("agent.pem") but signs
+%% with a DIFFERENT key (the self-signed cert's key) must not complete a handshake,
+%% whichever side notices. Raw ssl, not gun, so the handshake result is the assertion.
+witness_no_key_possession(#{certs := #{dir := Dir, ca := Ca}, witness_port := Port}) ->
+    Opts = [{cacertfile, Ca}, {verify, verify_peer}, {versions, ['tlsv1.2']},
+            {server_name_indication, "localhost"},
+            {certfile, filename:join(Dir, "agent.pem")},
+            {keyfile, filename:join(Dir, "selfs.key")}],
+    Result = try ssl:connect("127.0.0.1", Port, Opts, 5000) of
+                 {ok, Sock} ->
+                     %% If the handshake "completed" the server may still tear it down;
+                     %% a read must then fail. Completion without teardown is the defect.
+                     R = ssl:recv(Sock, 0, 2000),
+                     catch ssl:close(Sock),
+                     {connected, R};
+                 {error, Why} ->
+                     {refused, Why}
+             catch C:E -> {refused, {C, E}}
+             end,
+    io:format(user, "CH-3 wrong-key handshake result: ~p~n", [Result]),
+    ?assertMatch({refused, _}, Result).
+
+%% The reason `witness_client_cert' exists: stage 2 of the gateway doc's mTLS ladder
+%% (verify_peer, nothing required) aborts the handshake on such a certificate.
+request_only_foreign_cert(#{certs := Certs, request_only_port := Port} = S) ->
+    yuzu_grpc_stub_svc:reset(),
+    with_channel(S, https, Port, ssl_opts(Certs, "selfs"), #{}, #{},
+                 fun(Name) ->
+                     {tls_alert, _} = wait_tls_failure(Name),
+                     ?assertEqual(0, yuzu_grpc_stub_svc:calls())
                  end).
 
 mtls_no_cert(#{certs := Certs, mutual_port := Port} = S) ->

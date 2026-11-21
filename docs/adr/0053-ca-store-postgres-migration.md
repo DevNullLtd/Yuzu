@@ -603,3 +603,30 @@ the table's history**, which is never pruned. It is designed for a CA whose live
 (183,000 active). With the v5 indexes every group is an index range scan (EXPLAIN, 1,000,000
 rows); the live group is index-only once `status` is included. The statement must stay
 unnamed (`exec_params`): a generic plan turns the live group into a whole-table scan.
+
+## Update (2026-11-17): schema v6, the agent re-registration identity read (WP01)
+
+`ca_store` migration v6 adds `idx_ca_issued_agent_subject` on `ca_issued (subject, not_after) WHERE
+purpose = 'agent'`. It backs `CaStore::agent_leaf_state(agent_id)` (and `revoke_older_agent_leaves`),
+which `Register` and the gateway `ProxyRegister` call before re-admitting an already-enrolled agent id
+(`docs/pki-architecture.md` "Re-registration proof (WP01)"). The read is unauthenticated-hot, and
+`ca_issued` is never pruned, so a table scan was not acceptable (measured on 200,000 rows: 0.057 ms
+with the index, 113.7 ms without). Like v5 the build uses a plain, transactional `CREATE INDEX` that
+blocks `ca_issued` writers while it runs, the same accepted exception, with the same `lock_timeout` and
+`statement_timeout = 0`; the non-transactional kind this ADR names for later indexes is not available
+until #4432 delivers it (still open at this date). In a fresh deployment the table is empty when v6 runs, so nothing blocks; an existing database is outside the Deployment contract (hard cutover).
+
+Two behaviours of the store are part of the contract: a leaf the server revokes as `reenrolled` (the
+older leaf of an agent that re-enrolled with a single-use token) is lifecycle bookkeeping, written only
+by system code (`revoke_older_agent_leaves`, one statement that revokes only leaves OLDER than the new
+one by `(issued_at, serial_hex)`, never a newer one, and only when the new leaf is itself active, so concurrent re-enrolments never revoke each other's fresh leaf), is skipped by `agent_leaf_state` and `sign_agent_csr`'s revoked-identity guard, and is
+counted in the superseded revocation bucket, never in "other". The revoked set stays append-only. A
+return to an earlier build is not a supported path; `reenrolled` revocations are append-only and are
+never undone.
+
+The supersede is best effort (#8254): there is no durable "owed" marker, so a crash between issuance
+and the revoke leaves the older leaf valid until it expires; `issued_at` has one-second resolution,
+so on a same-second tie whose caller serial is the lower one both leaves stay live until the next
+re-enrolment (never zero); and no lock surrounds issuance, only the revoke. Review by 2027-03-01.
+An operator-revoked leaf cannot be cleared (#8255): an old revoked leaf of an id that also holds a
+newer live leaf blocks renewal and token re-enrolment of that id until it expires.
