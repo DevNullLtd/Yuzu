@@ -55,15 +55,19 @@
 /// unsupported). The release of a claim that is not the judged file is also by name, so a file a
 /// third party put at the claimed name between the re-check and the release loses that name.
 /// The sidecar copy is by descriptor on POSIX: the sidecar is opened `O_NOFOLLOW` (a link
-/// swapped in at its live name is refused, never copied through) and must be a regular file, and the
-/// destination is created `O_EXCL|O_NOFOLLOW`, so an entry of any kind that appears at the quarantine
-/// name (a link included) is neither overwritten nor written through. What stays by name is the
-/// removal of a partial copy this call created (it acts on whatever entry is at the name when it
-/// runs: a third party who swaps a link or an empty directory in after a failed copy and before the
-/// removal loses it) and the final drop of the original sidecar. On Windows the copy is the
-/// standard library's `copy_file`, by name at both ends: it follows a link at the source, and a file
-/// put at the destination inside the gap is not proven safe (unverified until the Windows leg runs). All of it needs write
-/// access to the data directory.
+/// swapped in at its live name is refused, never copied through) and must be a regular file, and
+/// the bytes go to a temporary beside the quarantine name (`<name>.partial-<pid>-<n>`, outside the
+/// name grammar below, so it is never counted, pruned or read as evidence) and are linked into
+/// place with `link(2)` only when complete: an entry of any kind that appears at the quarantine
+/// name (a link included) is neither overwritten nor written through, and a process that dies
+/// mid-copy leaves at most a stray temporary, never a truncated file at the quarantine name (the
+/// stray is not swept; it is not evidence). What stays by name is the removal of the temporary
+/// after a failed copy (a unique name this call created; a third party who swaps a link or an
+/// empty directory in at it between the failure and the removal loses it) and the final drop of
+/// the original sidecar. On Windows the copy is the standard library's `copy_file`, by name at both
+/// ends: it follows a link at the source, and a file put at the destination inside the gap is not
+/// proven safe (unverified until the Windows leg runs), and a crash mid-copy there can leave a
+/// truncated file at the quarantine name. All of it needs write access to the data directory.
 /// A HARD link planted at the name is a regular file with its target's identity,
 /// so it is judged, claimed and secured as that target: the open that judged it had already used
 /// it as the database (pre-existing; Linux protected_hardlinks refuses a link to a file the
@@ -79,6 +83,7 @@
 /// Names have the exact form `<file><suffix><epoch>[-<n>]` (suffix `.corrupt-` or `.planted-`),
 /// which `parse_quarantine_name` / `prune_old_quarantines` (below) rely on.
 
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -167,9 +172,9 @@ struct FsOps {
     /// (default: `std::filesystem::remove`).
     std::function<void(const std::filesystem::path& name, std::error_code&)> remove;
     /// Copy a sidecar when it could not be moved. Default on POSIX: a copy by descriptor (the source
-    /// opened `O_NOFOLLOW`, the destination created `O_EXCL|O_NOFOLLOW`, mode 0600, fsynced; a
-    /// failed read or write after the create removes the destination it made, a failed flush keeps
-    /// the complete copy and the note says so); default on Windows:
+    /// opened `O_NOFOLLOW`, the bytes written at mode 0600 to a temporary beside the destination,
+    /// fsynced and linked into place only when complete; a failed read, write or publish removes the
+    /// temporary, a failed flush keeps the complete copy and the note says so); default on Windows:
     /// `std::filesystem::copy_file` with `copy_options::none`, which fails rather than overwrite.
     /// When set it replaces the whole default. It is only called when no directory entry of any
     /// kind, a dangling link included, exists at `to`. When it fails with anything but
@@ -183,9 +188,10 @@ struct FsOps {
 #ifndef _WIN32
 namespace detail {
 
-/// What a descriptor copy left behind: `created` is true when THIS call made the destination
-/// (the `O_EXCL` create succeeded), and `removal` is the result of removing it by name after a
-/// failure. `unsynced` is true when every byte was written but flushing the destination to disk
+/// What a descriptor copy left behind: `created` is true when THIS call made a file (the `O_EXCL`
+/// create of the temporary succeeded; false again when the publish found an entry that is not
+/// ours at the destination), and `removal` is the result of removing that temporary by name after
+/// a failure. `unsynced` is true when every byte was written but flushing the file to disk
 /// failed: the complete copy is KEPT (`sync_error` says why) and the call still succeeds.
 struct PartialCopy {
     bool created = false;
@@ -195,13 +201,17 @@ struct PartialCopy {
 };
 
 /// Copy `from` to `to` by descriptor. `from` is opened `O_NOFOLLOW` (a link at the name fails with
-/// ELOOP) and must be a regular file; `to` is created `O_EXCL|O_NOFOLLOW` with mode 0600 (an entry
-/// of ANY kind there, a link included, fails with `file_exists`: no overwrite, no write through a
-/// link). The bytes are copied in bounded chunks (EINTR retried, short writes continued) and the
-/// destination is fsynced (EINTR retried). A failure to read or write after the create removes the
-/// destination, which this call provably made, by name and `partial` says so; a failed fsync does
-/// NOT: the complete copy is kept and `partial.unsynced` reports it, because the earlier
-/// `copy_file` never flushed and a finished copy is better evidence than none.
+/// ELOOP) and must be a regular file. The bytes go to a TEMPORARY file beside `to`
+/// (`<to>.partial-<pid>-<n>`, created `O_EXCL|O_NOFOLLOW` at mode 0600; a name outside the
+/// quarantine grammar, so `parse_quarantine_name` and `prune_old_quarantines` never count it) in
+/// bounded chunks (EINTR retried, short writes continued), then the temporary is fsynced (EINTR
+/// retried) and published with `link(2)`, which fails with `file_exists` for an entry of ANY kind at
+/// `to`, a link included, and never follows one: nothing is overwritten or written through, and a
+/// file appears at `to` only when it is COMPLETE, so a process that dies mid-copy leaves at most a
+/// stray temporary, never a truncated file at the quarantine name. A failure to read, write or
+/// publish removes the temporary, which this call provably made, by name and `partial` says so; a
+/// failed fsync does NOT: the complete copy is kept and `partial.unsynced` reports it, because the
+/// earlier `copy_file` never flushed and a finished copy is better evidence than none.
 /// `write_fn` and `fsync_fn` are test seams.
 inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
                                        const std::filesystem::path& to, std::error_code& ec,
@@ -226,9 +236,21 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
         ec = std::make_error_code(std::errc::not_supported); // not a regular file: nothing created
         return;
     }
-    const int out = ::open(to.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    // Never create the file at its final name: a crash mid-copy would leave a truncated file there
+    // that reads as the real evidence. A counter and the pid make the temporary's name unique; a
+    // collision (a stale temporary of an earlier crash) just takes the next counter value.
+    static std::atomic<unsigned> counter{0};
+    std::filesystem::path tmp;
+    int out = -1;
+    for (int attempt = 0; attempt < 8 && out < 0; ++attempt) {
+        tmp = to;
+        tmp += std::format(".partial-{}-{}", static_cast<long long>(::getpid()), counter.fetch_add(1));
+        out = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (out < 0 && errno != EEXIST)
+            break;
+    }
     if (out < 0) {
-        ec.assign(errno, std::generic_category()); // EEXIST: not ours, never removed
+        ec.assign(errno, std::generic_category());
         return;
     }
     partial.created = true;
@@ -272,8 +294,21 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
             }
         }
     }
-    if (!ok)
-        std::filesystem::remove(to, partial.removal); // the file this call created, by name
+    if (!ok) {
+        std::filesystem::remove(tmp, partial.removal); // the file this call created, by name
+        return;
+    }
+    // Publish: link(2) fails with EEXIST for an entry of any kind at `to` and follows none.
+    if (::link(tmp.c_str(), to.c_str()) != 0) {
+        const int err = errno;
+        ec.assign(err, std::generic_category());
+        std::filesystem::remove(tmp, partial.removal);
+        if (err == EEXIST)
+            partial.created = false; // not ours: nothing of this call's is at the quarantine name
+        return;
+    }
+    std::error_code rm; // a failure only leaves a second name for the same file
+    std::filesystem::remove(tmp, rm);
 }
 
 } // namespace detail

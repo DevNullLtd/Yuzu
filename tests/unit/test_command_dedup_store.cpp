@@ -1274,6 +1274,27 @@ int eintr_once_fsync(int fd) {
     }
     return ::fsync(fd);
 }
+// Entries of the temporary-name form the descriptor copy writes before it links a file into place.
+std::size_t partial_temporaries(const fs::path& dir) {
+    std::size_t n = 0;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (e.path().filename().string().find(".partial-") != std::string::npos)
+            ++n;
+    }
+    return n;
+}
+// Records, at every write, whether anything is at the destination name and how many temporaries exist.
+fs::path g_probe_dst;
+bool g_dst_seen = false;
+std::size_t g_probe_temps = 0;
+ssize_t probing_write(int fd, const void* b, std::size_t n) {
+    std::error_code pec;
+    if (fs::symlink_status(g_probe_dst, pec).type() != fs::file_type::not_found)
+        g_dst_seen = true;
+    const auto t = partial_temporaries(g_probe_dst.parent_path());
+    g_probe_temps = t > g_probe_temps ? t : g_probe_temps;
+    return ::write(fd, b, n);
+}
 std::string mode_of(const fs::path& p) {
     struct stat st {};
     REQUIRE(::lstat(p.c_str(), &st) == 0);
@@ -1370,6 +1391,7 @@ TEST_CASE("sqlite_quarantine: the descriptor copy creates its destination exclus
         CHECK(read_bytes(victim) == "victim bytes");
     }
     CHECK(read_bytes(src) == "wal bytes"); // the source is never touched by the copy
+    CHECK(partial_temporaries(dir.path) == 0); // the temporary of a refused publish is removed
 }
 
 TEST_CASE("sqlite_quarantine: the descriptor copy is byte-exact, owner-only and continues short writes",
@@ -1389,6 +1411,7 @@ TEST_CASE("sqlite_quarantine: the descriptor copy is byte-exact, owner-only and 
         CHECK_FALSE(ec);
         CHECK(read_bytes(dst) == big);
         CHECK(mode_of(dst) == "600");
+        CHECK(partial_temporaries(dir.path) == 0);
     }
     SECTION("a write that lands 3 bytes at a time") {
         write_bytes(src, "wal bytes!");
@@ -1414,7 +1437,49 @@ TEST_CASE("sqlite_quarantine: a descriptor copy that fails part-way removes the 
     CHECK(partial.created);
     CHECK_FALSE(partial.removal);
     CHECK(fs::symlink_status(dst).type() == fs::file_type::not_found); // 3 bytes landed, then gone
+    CHECK(partial_temporaries(dir.path) == 0); // and the temporary that held them is removed
     CHECK(read_bytes(src) == "wal bytes");
+}
+
+TEST_CASE("sqlite_quarantine: the descriptor copy never has a file at the quarantine name until it is complete",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // #8427: a process that dies mid-copy must not leave a truncated file at the quarantine name.
+    // The probe runs inside every write of a multi-chunk copy: the name is still free and exactly
+    // one temporary holds the bytes; afterwards only the final file is left.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    std::string big(200'000, 'w');
+    write_bytes(src, big);
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    g_probe_dst = dst;
+    g_dst_seen = false;
+    g_probe_temps = 0;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial, &probing_write);
+    CHECK_FALSE(ec);
+    CHECK_FALSE(g_dst_seen);
+    CHECK(g_probe_temps == 1);
+    CHECK(read_bytes(dst) == big);
+    CHECK(partial_temporaries(dir.path) == 0);
+}
+
+TEST_CASE("sqlite_quarantine: a stray temporary of a crashed copy is never read as quarantined evidence",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const std::string stem = "x.db.corrupt-";
+    CHECK(sq::parse_quarantine_name(stem, "x.db.corrupt-1-wal").has_value());
+    CHECK_FALSE(sq::parse_quarantine_name(stem, "x.db.corrupt-1-wal.partial-123-0").has_value());
+
+    const auto db = dir.path / "x.db";
+    for (const char* e : {"1", "2", "3", "4", "5"})
+        write_bytes(fs::path(db.string() + ".corrupt-" + e), "old");
+    const fs::path stray{db.string() + ".corrupt-3-wal.partial-123-0"};
+    write_bytes(stray, "truncated");
+    sq::prune_old_quarantines(db, fs::path(db.string() + ".corrupt-5"), 3);
+    CHECK(fs::exists(stray)); // a bystander: never counted, never pruned
+    CHECK_FALSE(fs::exists(fs::path(db.string() + ".corrupt-1")));
+    CHECK(fs::exists(fs::path(db.string() + ".corrupt-5")));
 }
 
 TEST_CASE("sqlite_quarantine: a failed flush keeps the complete copy and reports it",
@@ -1435,6 +1500,7 @@ TEST_CASE("sqlite_quarantine: a failed flush keeps the complete copy and reports
     CHECK(g_fsync_calls == 1);
     CHECK(read_bytes(dst) == "wal bytes");
     CHECK(mode_of(dst) == "600");
+    CHECK(partial_temporaries(dir.path) == 0);
 }
 
 TEST_CASE("sqlite_quarantine: an interrupted flush is retried",
@@ -1945,6 +2011,7 @@ TEST_CASE("sqlite_quarantine: a failed default sidecar copy reports the partial 
     REQUIRE(r.notes.size() == 1);
     CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
     CHECK(r.notes[0].find("the partial copy was removed") != std::string::npos);
+    CHECK(partial_temporaries(dir.path) == 0); // the quarantine set holds nothing stray either
 }
 #endif
 
