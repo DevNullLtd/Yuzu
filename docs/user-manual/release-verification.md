@@ -178,7 +178,13 @@ verified assets):
 grep -H -e '^provider waiver:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt
 ```
 
-A grype `.gate.txt` with no `provider waiver:` line at all records nothing either way. Follow the waiver's `approval_ref` to audit it, as for an accepted finding.
+A grype `.gate.txt` with no `provider waiver:` line at all records nothing either way. A
+`gate: pass` line alone therefore does not say whether a pass was degraded; read the
+`DEGRADED:` line too. The waiver bounds how long it is in force (14 days), not how old the
+capture it admits may be: the capture's age is on the `provider waiver:` line. A release
+scanned degraded says so in its release notes. Follow the waiver's `approval_ref` to audit it,
+as for an accepted finding, and read its `statement` (the evidence of the stall) in the tag's own
+file: `git show vX.Y.Z:.grypeignore.yaml`.
 
 After the release, the pre-release QA workflow scans the published tags again with a newer database;
 a finding there is reported, it cannot unpublish anything.
@@ -315,14 +321,16 @@ for sums in yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*.SHA256SUMS; do
     "$sums"
   sha256sum -c "$sums"
 done
-grep -H '^gate:' trivy-yuzu-agent-bundle-chisel.attempt-*.gate.txt grype-yuzu-agent-bundle-chisel.attempt-*.gate.txt
+grep -H -e '^gate:' -e '^provider waiver:' -e '^DEGRADED:' trivy-yuzu-agent-bundle-chisel.attempt-*.gate.txt \
+  grype-yuzu-agent-bundle-chisel.attempt-*.gate.txt
 for f in $(ls publish-yuzu-agent-bundle-chisel.attempt-*.txt | sort -V); do echo "$f: $(tail -n 1 "$f")"; done
 docker buildx imagetools inspect "ghcr.io/${OWNER}/yuzu-agent-bundle-chisel:${TAG#v}" --format '{{.Manifest.Digest}}'
 ```
 
 Every list must print `Verified OK` and every file `OK`. The highest attempt whose journal's last
 line is `publish: tagged ...` is the published bundle image: the digest on that line must equal
-what the last command prints, and that attempt's `gate:` line must be `gate: pass`. If an attempt
+what the last command prints, and that attempt's `gate:` line must be `gate: pass` (a grype
+`gate: pass` beside a `DEGRADED:` line is a degraded pass: see "A degraded pass" above). If an attempt
 above it ends `publish: tagging`, the tag may name either digest: do not deploy the bundle until a
 later attempt ends `tagged`. When no attempt ends `publish: tagged`, the record cannot say what the
 tag names: an attempt ending `tagging` may have moved it, and so may an attempt whose record was

@@ -49,10 +49,11 @@
 #     refuses this whole file (remove it), unlike an expired entry.
 #   - `approved_by`, `approval_ref`, `approved_on`: as for an entry; a
 #     `pending` waiver is not honoured by the release gate.
-#   - No flag, workflow input or variable enables one: only this committed
-#     file. Each image judged with one says `DEGRADED: provider waiver in
-#     force` in its grype .gate.txt and the step summary. Remove the waiver as
-#     soon as the provider is current. Procedure: docs/ci-architecture.md "A
+#   - No flag, workflow input or variable enables one on GitHub Actions
+#     (the gate reads only this committed file there). Each image judged
+#     with one says `DEGRADED: provider waiver in force` in its grype
+#     .gate.txt and the step summary. Remove the waiver as soon as the
+#     provider is current. Procedure: docs/ci-architecture.md "A
 #     grype DB provider is stale".
 #
 # Example (not in force: it is a comment):

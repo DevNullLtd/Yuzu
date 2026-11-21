@@ -3602,8 +3602,10 @@ test('image vulnerability gate',
   # hit 60.02 s on PR #8315 with the old limit of 60); with it (WP15), 86 s on
   # the same workstation, so a loaded runner can need about 190 s. With the
   # provider-waiver cases and their mutants, 167 s on that workstation, so a
-  # loaded runner can need about 370 s.
+  # loaded runner can need about 370 s. Started early so the long serial run
+  # overlaps the shorter tests of the suite.
   timeout: 720,
+  priority: 10,
 )
 
 # WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate

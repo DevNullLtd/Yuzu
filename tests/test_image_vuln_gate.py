@@ -328,6 +328,27 @@ def grype_db_fixture(root, built_hours_ago=2, body=b"grype db", tamper=False, li
     (d / "latest.json").write_text(json.dumps(listing), encoding="utf-8")
     return d, built
 
+def repo_grype_ignore(tmp):
+    """The repository's .grypeignore.yaml with any `provider_waivers:` section
+    removed, written under `tmp`. The gate cases default to it, so a provider
+    waiver committed under the stalled-provider runbook (or one left to expire)
+    changes no test's outcome but the repository-file checks that are meant to
+    see it."""
+    p = Path(tmp) / "repo-grypeignore.yaml"
+    p.write_text(strip_provider_waivers(GRYPE_IGNORE.read_text(encoding="utf-8")), encoding="utf-8")
+    return p
+
+
+def strip_provider_waivers(text):
+    out, skip = [], False
+    for ln in text.split("\n"):
+        if ln and not ln[0].isspace() and not ln.startswith("#"):
+            skip = ln.rstrip() == "provider_waivers:"
+        if not skip:
+            out.append(ln)
+    return "\n".join(out)
+
+
 def have_bash():
     return os.name != "nt" and shutil.which("bash") is not None
 
@@ -402,8 +423,10 @@ class GateBehaviour(unittest.TestCase):
         self.dlog = self.tmp / "docker.log"
         self.gdb, self.gdb_built = grype_db_fixture(self.tmp / "grype-db-src")
 
-    def grype_env(self, grype_mode="clean", grype_ignore=GRYPE_IGNORE, distro="debian:12.15", gdb=None,
+    def grype_env(self, grype_mode="clean", grype_ignore=None, distro="debian:12.15", gdb=None,
                   built=None):
+        if grype_ignore is None:
+            grype_ignore = repo_grype_ignore(self.tmp)
         return dict(
             GRYPE_BIN=str(self.grype),
             STUB_GRYPE_LOG=str(self.glog),
@@ -418,7 +441,7 @@ class GateBehaviour(unittest.TestCase):
 
     def run_gate(self, *images, mode="clean", ignore=IGNORE, bad_image="", extra=(), missing="",
                  db="fresh", os_pkgs="5", env_extra=None, gate=GATE, grype_mode="clean",
-                 grype_ignore=GRYPE_IGNORE, distro=None):
+                 grype_ignore=None, distro=None):
         env = dict(os.environ)
         for k in list(env):
             if k.startswith("TRIVY_") or k.startswith("STUB_") or k.startswith("GRYPE_"):
@@ -706,7 +729,7 @@ class GateBehaviour(unittest.TestCase):
         self.assertFalse(self.scans())
 
     def test_trivy_bin_is_refused_on_github_actions(self):
-        r = self.run_gate("img:1", env_extra={"GITHUB_ACTIONS": "true"})
+        r = self.run_gate("img:1", grype_ignore=GRYPE_IGNORE, env_extra={"GITHUB_ACTIONS": "true"})
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("TRIVY_BIN is for local runs", r.stdout + r.stderr)
         self.assertEqual(self.calls(), [])
@@ -1350,7 +1373,7 @@ class GateBehaviour(unittest.TestCase):
         self.assertEqual(self.gscans(), [])
 
     def test_grype_bin_is_refused_on_github_actions_and_the_db_hook_needs_it(self):
-        r = self.run_gate("img:1", env_extra={"GITHUB_ACTIONS": "true", "TRIVY_BIN": None})
+        r = self.run_gate("img:1", grype_ignore=GRYPE_IGNORE, env_extra={"GITHUB_ACTIONS": "true", "TRIVY_BIN": None})
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("GRYPE_BIN is for local runs", r.stdout + r.stderr)
         r = self.run_gate("img:1", env_extra={"GRYPE_BIN": None})
@@ -1615,6 +1638,7 @@ class ProviderWaiver(unittest.TestCase):
     grype_entry = GateBehaviour.grype_entry
     write_grype_ignore = GateBehaviour.write_grype_ignore
     calls = GateBehaviour.calls
+    write_ignore = GateBehaviour.write_ignore
     gcalls = GateBehaviour.gcalls
     gscans = GateBehaviour.gscans
     scans = GateBehaviour.scans
@@ -1732,14 +1756,14 @@ class ProviderWaiver(unittest.TestCase):
 
     def test_an_invalid_or_expired_waiver_refuses_the_whole_file_before_any_scan(self):
         cases = {
-            "expired": waiver(expired_at=days(-1)),
-            "more than 14 days out": waiver(expired_at=days(15)),
-            "unknown provider": waiver(provider="rhel"),
-            "duplicate provider": waiver() + waiver(),
-            "no statement": waiver(statement=None),
-            "no approver": waiver(approved_by=None),
+            "expired": (waiver(expired_at=days(-2)), "expired on"),
+            "more than 14 days out": (waiver(expired_at=days(16)), "the maximum for a provider waiver is 14"),
+            "unknown provider": (waiver(provider="rhel"), "provider must be one of"),
+            "duplicate provider": (waiver() + waiver(), "duplicate provider waiver"),
+            "no statement": (waiver(statement=None), "no `statement`"),
+            "no approver": (waiver(approved_by=None), "approved_by must be"),
         }
-        for label, body in cases.items():
+        for label, (body, why) in cases.items():
             with self.subTest(label):
                 self.log.unlink(missing_ok=True)
                 self.glog.unlink(missing_ok=True)
@@ -1748,6 +1772,7 @@ class ProviderWaiver(unittest.TestCase):
                 r = self.run_gate("img:1", grype_ignore=self.waived(body), extra=("--report-dir", str(rep)))
                 self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
                 self.assertIn("is not in the shape the gate accepts", r.stdout + r.stderr)
+                self.assertIn(why, r.stdout + r.stderr)
                 self.assertEqual(self.scans(), [])
                 self.assertEqual(self.gscans(), [])
                 self.assertIn("gate: FAIL: gate stopped before this image was judged",
@@ -1755,10 +1780,15 @@ class ProviderWaiver(unittest.TestCase):
 
     def test_a_pending_waiver_is_not_honoured_by_a_release(self):
         pend = self.waived(waiver(approved_on=None, approval_ref="pending"))
-        r = self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=pend, extra=("--release",))
+        rrep = self.tmp / "rep-release"
+        r = self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=pend,
+                          extra=("--release", "--report-dir", str(rrep)))
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("NOT IN FORCE", r.stdout)
         self.assertIn("provider nvd", r.stderr)
+        # The durable report records the waiver that was not honoured.
+        self.assertIn("0 provider waiver(s) in force (1 pending, not honoured)",
+                      (rrep / "grype-img.gate.txt").read_text(encoding="utf-8"))
         rep = self.tmp / "rep"
         r = self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=pend, extra=("--report-dir", str(rep)))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1775,6 +1805,21 @@ class ProviderWaiver(unittest.TestCase):
         self.assertIn("YUZU_GRYPEIGNORE is for local runs and tests", r.stdout + r.stderr)
         r = self.run_gate("img:1", grype_ignore=GRYPE_IGNORE, env_extra={"GITHUB_ACTIONS": "true"})
         self.assertNotIn("YUZU_GRYPEIGNORE is for local runs", r.stdout + r.stderr)
+        # The same for Trivy's file.
+        r = self.run_gate("img:1", ignore=self.write_ignore("vulnerabilities:\n"), grype_ignore=GRYPE_IGNORE,
+                          env_extra={"GITHUB_ACTIONS": "true"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("YUZU_TRIVYIGNORE is for local runs and tests", r.stdout + r.stderr)
+        # A path that cannot be resolved is refused, never let through.
+        fake = self.tmp / "nort"
+        fake.mkdir()
+        (fake / "realpath").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        (fake / "realpath").chmod(0o755)
+        r = self.run_gate("img:1", grype_ignore=other,
+                          env_extra={"GITHUB_ACTIONS": "true",
+                                     "PATH": f"{fake}{os.pathsep}{self.bin}{os.pathsep}{os.environ.get('PATH', '')}"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("YUZU_GRYPEIGNORE is for local runs and tests", r.stdout + r.stderr)
         # No option of the gate's names a waiver.
         for opt in ("--provider-waiver", "--waive", "--waivers"):
             with self.subTest(opt=opt):
@@ -1783,6 +1828,64 @@ class ProviderWaiver(unittest.TestCase):
         text = GATE.read_text(encoding="utf-8")
         self.assertEqual(re.findall(r"^\s+--[a-z-]+\)", text, re.M),
                          ["        --report-dir)", "        --attempt)", "        --budget)", "        --release)"])
+
+    def test_the_suite_does_not_depend_on_a_committed_waiver(self):
+        # The gate cases read a copy of the repository file without its
+        # provider_waivers section, so committing (or leaving) one changes no
+        # outcome but the repository-file checks.
+        text = "# c\nvulnerabilities:\n" + self.grype_entry() + "provider_waivers:\n" + waiver() \
+            + waiver(provider="debian")
+        stripped = strip_provider_waivers(text)
+        self.assertNotIn("provider", stripped.replace("provider_waivers", "").replace("package", ""))
+        self.assertIn("- id: CVE-2001-0001", stripped)
+        self.assertIsNone(re.search(r"^provider_waivers:", stripped, re.M))
+        self.assertIsNone(re.search(r"^provider_waivers:", repo_grype_ignore(self.tmp).read_text(encoding="utf-8"),
+                                    re.M))
+
+    def test_an_nvd_waiver_that_lapses_during_the_run_fails_the_later_images(self):
+        # Simulate the waiver lapsing after the run-wide nvd check (a run
+        # crossing UTC midnight on its expiry day): the generated waivers file
+        # is emptied once the run's nvd waiver has been read.
+        lapse = ('[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    DEGRADED: provider waiver in force for $(waived_desc): '
+                 'every image\'s grype verdict uses it"\n')
+        def gate_copy(label, extra_edits=()):
+            return GrypeMutants.mutant(self, label, [(lapse, lapse + 'echo "[]" > "$GRYPE_WAIVERS"\n'),
+                                                     *extra_edits], [])
+        rep = self.tmp / "rep-lapse"
+        r = self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=self.waived(waiver()),
+                          gate=gate_copy("lapse"), extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        g = (rep / "grype-img.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("gate: FAIL: provider waiver lapsed during the run", g)
+        self.assertIn("provider waiver: lapsed during this run (nvd)", g)
+        self.assertNotIn("DEGRADED", g)
+        # Without the per-image re-check, the lapsed waiver would still admit it.
+        m = gate_copy("lapse-no-recheck", [('           elif [ "${#GRYPE_DB_WAIVERS[@]}" -gt 0 ] && ! "${CHECKS[@]}" '
+                                            'grype-db-providers \\', '           elif false && ! "${CHECKS[@]}" '
+                                            'grype-db-providers \\')])
+        r = self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=self.waived(waiver(), name="w2.yaml"),
+                          gate=m)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_an_image_never_judged_is_not_reported_degraded(self):
+        import subprocess as sp
+        rep = self.tmp / "rep"
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith(("TRIVY_", "STUB_", "GITHUB_", "GRYPE_")):
+                del env[k]
+        env.update(TRIVY_BIN=str(self.stub), STUB_LOG=str(self.log), STUB_MODE="hang-stubborn",
+                   YUZU_TRIVYIGNORE=str(IGNORE), YUZU_GATE_TEST_DB_DIGEST=DB_DIGEST, RUNNER_TEMP=str(self.tmp),
+                   PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                   **self.grype_env("provider-stale", grype_ignore=self.waived(waiver())))
+        p = sp.Popen(["bash", str(GATE), "--budget", "6", "--report-dir", str(rep), "a=img:1"], env=env,
+                     stdout=sp.PIPE, stderr=sp.PIPE, text=True)
+        out, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 1, out + err)
+        g = (rep / "grype-a.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("gate: FAIL: gate stopped before this image was judged", g)
+        self.assertIn("provider waiver: in force for this run (nvd), but the image was not judged", g)
+        self.assertNotIn("DEGRADED", g)
 
     def test_the_waivable_providers_are_the_gates_providers(self):
         ck = CHECKS.read_text(encoding="utf-8")
@@ -1842,10 +1945,8 @@ class ProviderWaiverMutants(unittest.TestCase):
              [("        if left > MAX_WAIVER_DAYS:", "        if False:")]),
             ("a pending waiver honoured in a release",
              gate_with("provider-stale", waiver(approved_on=None, approval_ref="pending"), release=True), [],
-             [("        if pending and require_approved:\n            print(f\"NOT IN FORCE: {tag}: approval_ref is "
-               "pending; a release gate honours only a provider waiver",
-               "        if False:\n            print(f\"NOT IN FORCE: {tag}: approval_ref is "
-               "pending; a release gate honours only a provider waiver")]),
+             [("        if pending and require_approved:\n            excluded.append(w)\n",
+               "        if False:\n            excluded.append(w)\n")]),
         ]
         for label, scenario, gate_edits, checks_edits in cases:
             with self.subTest(mutant=label):
@@ -1862,6 +1963,52 @@ class ProviderWaiverMutants(unittest.TestCase):
         dead = self.mutant("OS provider waiver not read per image", [
             ('                   --waivers "$GRYPE_WAIVERS" "$want_family")"; then', '                   "$want_family")"; then')])
         self.assertEqual(gate_with("provider-os-stale", waiver(provider="debian"))(dead).returncode, 1)
+
+    def test_no_other_check_yields_to_a_waiver(self):
+        # A regression that let a waiver in force switch off any OTHER check
+        # must fail ProviderWaiver.test_a_waiver_waives_nothing_but_a_stale_provider.
+        # Each mutant below skips one check whenever the run holds an nvd
+        # waiver; the scenario is that test's case for the check.
+        W = 'grep -q nvd "$GRYPE_WAIVERS"'
+        ign = self.waived(waiver(), waiver(provider="debian"), name="nothing.yaml")
+        stale = {"STUB_GRYPE_PROVIDERS": "provider-stale,provider-os-stale"}
+
+        def db(gmode="clean", **fixture):
+            n = len(list(self.tmp.glob("gdb-*")))
+            gdb, built = grype_db_fixture(self.tmp / f"gdb-{n}", **fixture)
+            return dict(env_extra=self.grype_env(gmode, grype_ignore=ign, gdb=gdb, built=built))
+
+        cases = [
+            ("grype finding admitted", dict(grype_mode="findings", env_extra=stale),
+             ('    rm -f "$ARCHIVE"\n    case "$rc" in\n', f'    rm -f "$ARCHIVE"\n    ! {W} || rc=0\n    case "$rc" in\n'),
+             ('           elif [ "$fcrit" != 0 ]; then', f'           elif [ "$fcrit" != 0 ] && ! {W}; then')),
+            ("Trivy finding admitted", dict(mode="findings", env_extra=stale),
+             ('        --exit-code 3 --format table "$image" || rc=$?\n',
+              f'        --exit-code 3 --format table "$image" || rc=$?\n    ! {W} || rc=0\n')),
+            ("component check skipped", dict(grype_mode="no-erlang", env_extra=stale, image="yuzu-gateway=img:1"),
+             ('           elif [ "$comps_ok" != 1 ]; then', f'           elif [ "$comps_ok" != 1 ] && ! {W}; then')),
+            ("OS cross-check skipped", dict(distro="", env_extra=stale),
+             ('           elif [ -n "$want_family" ] && [ "$distro" != "$want_family" ]; then',
+              f'           elif [ -n "$want_family" ] && [ "$distro" != "$want_family" ] && ! {W}; then')),
+            ("coverage failure ignored", dict(os_pkgs="0", env_extra=stale),
+             ('    [ "$cov_ok" = 1 ] || failed=1\n', f'    [ "$cov_ok" = 1 ] || {W} || failed=1\n')),
+            ("DB checksum skipped", db(tamper=True),
+             ('    || die "the grype DB archive $gdb_path does not match',
+              f'    || {W} || die "the grype DB archive $gdb_path does not match')),
+            ("imported DB status skipped", db("status-mismatch"),
+             ("    die \"grype's status of the imported DB is not the DB",
+              f"    {W} || die \"grype's status of the imported DB is not the DB")),
+            ("Trivy DB age skipped", dict(db="predownloaded"),
+             ('    die "the Trivy vulnerability DB is stale, unreadable',
+              f'    {W} || die "the Trivy vulnerability DB is stale, unreadable')),
+        ]
+        for label, kw, *edits in cases:
+            with self.subTest(mutant=label):
+                kw = dict(kw)
+                image = kw.pop("image", "img:1")
+                kw.setdefault("grype_ignore", ign)
+                scenario = lambda gate, kw=kw, image=image: self.run_gate(image, gate=gate, **kw)  # noqa: E731
+                self.assert_killed(label, scenario, edits, [])
 
     def test_mutants_of_the_file_rules_are_killed(self):
         def checks(path, args):
@@ -1913,7 +2060,8 @@ class ProviderWaiverMutants(unittest.TestCase):
                                  env_extra={"GITHUB_ACTIONS": "true"})
         self.assertIn("YUZU_GRYPEIGNORE is for local runs", actions(GATE).stderr + actions(GATE).stdout)
         m = self.mutant("YUZU_GRYPEIGNORE honoured on Actions", [
-            ('if [ -n "$grype_ignore_env" ] && [ -n "${GITHUB_ACTIONS:-}" ] \\', 'if false \\')])
+            ('    [ -n "$2" ] || return 0\n', '    return 0\n'),
+            ('    GRYPE_IGNORE_FILE="$ROOT/.grypeignore.yaml"\n', '')])
         r = actions(m)
         self.assertNotIn("YUZU_GRYPEIGNORE is for local runs", r.stdout + r.stderr)
 
@@ -2188,17 +2336,17 @@ class Checks(unittest.TestCase):
         ign = self.tmp / "ign.yaml"
         ign.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0001"), encoding="utf-8")
         ok_nc = self.nc(nc_line())
-        r = self.run_checks("pending", ign, ok_nc, GRYPE_IGNORE)
+        r = self.run_checks("pending", ign, ok_nc, repo_grype_ignore(self.tmp))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         pend = self.tmp / "pend.yaml"
         pend.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0002", approved_on=None, approval_ref="pending"),
                         encoding="utf-8")
-        r = self.run_checks("pending", pend, ok_nc, GRYPE_IGNORE)
+        r = self.run_checks("pending", pend, ok_nc, repo_grype_ignore(self.tmp))
         self.assertEqual(r.returncode, 1)
         self.assertIn("CVE-2000-0002: approval_ref is pending", r.stderr)
         p_nc = self.tmp / "pnc.txt"
         p_nc.write_text(nc_line(on="-", ref="pending"), encoding="utf-8")
-        r = self.run_checks("pending", ign, p_nc, GRYPE_IGNORE)
+        r = self.run_checks("pending", ign, p_nc, repo_grype_ignore(self.tmp))
         self.assertEqual(r.returncode, 1)
         self.assertIn("yuzu-server-chisel: approval_ref is pending", r.stderr)
         # An expired entry is not pending, but it is not in force either: a
@@ -2206,7 +2354,7 @@ class Checks(unittest.TestCase):
         old = self.tmp / "old.yaml"
         old.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0003", approved_on=None, approval_ref="pending",
                                                      expired_at=days(-1)), encoding="utf-8")
-        r = self.run_checks("pending", old, ok_nc, GRYPE_IGNORE)
+        r = self.run_checks("pending", old, ok_nc, repo_grype_ignore(self.tmp))
         self.assertEqual(r.returncode, 1)
         self.assertIn("CVE-2000-0003: expired on", r.stderr)
         self.assertNotIn("approval_ref is pending", r.stderr)
@@ -2214,12 +2362,12 @@ class Checks(unittest.TestCase):
         for n in (0, 1):
             soon = self.tmp / f"soon{n}.yaml"
             soon.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0004", expired_at=days(n)), encoding="utf-8")
-            r = self.run_checks("pending", soon, ok_nc, GRYPE_IGNORE)
+            r = self.run_checks("pending", soon, ok_nc, repo_grype_ignore(self.tmp))
             self.assertEqual(r.returncode, 1, n)
             self.assertIn("CVE-2000-0004: expires on", r.stderr)
         later = self.tmp / "later.yaml"
         later.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0005", expired_at=days(2)), encoding="utf-8")
-        r = self.run_checks("pending", later, ok_nc, GRYPE_IGNORE)
+        r = self.run_checks("pending", later, ok_nc, repo_grype_ignore(self.tmp))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("warning:", r.stdout)
         # The same for a not-covered listing: expired, expiring, and a warning.
@@ -2227,15 +2375,15 @@ class Checks(unittest.TestCase):
                               (days(1), 1, "yuzu-server-chisel: expires on"),
                               (days(10), 0, "warning:")):
             with self.subTest(listing_expires=exp):
-                r = self.run_checks("pending", ign, self.nc(nc_line(exp=exp)), GRYPE_IGNORE)
+                r = self.run_checks("pending", ign, self.nc(nc_line(exp=exp)), repo_grype_ignore(self.tmp))
                 self.assertEqual(r.returncode, rc, r.stdout + r.stderr)
                 self.assertIn(text, r.stdout + r.stderr)
         bad = self.tmp / "bad.yaml"
         bad.write_text("vulnerabilities:\n" + entry(paths=['"**"']), encoding="utf-8")
-        self.assertEqual(self.run_checks("pending", bad, ok_nc, GRYPE_IGNORE).returncode, 1)
+        self.assertEqual(self.run_checks("pending", bad, ok_nc, repo_grype_ignore(self.tmp)).returncode, 1)
         bad_nc = self.tmp / "bnc.txt"
         bad_nc.write_text("junk\n", encoding="utf-8")
-        self.assertEqual(self.run_checks("pending", ign, bad_nc, GRYPE_IGNORE).returncode, 1)
+        self.assertEqual(self.run_checks("pending", ign, bad_nc, repo_grype_ignore(self.tmp)).returncode, 1)
 
     def test_emitted_copy_is_the_entries_in_force_only(self):
         src = self.tmp / "src.yaml"
@@ -2514,57 +2662,91 @@ class ProviderWaiverChecks(unittest.TestCase):
         return out, r
 
     def test_well_formed_waivers_are_accepted_beside_entries_in_either_order(self):
-        for label, p in (
-                ("after", self.wfile(waiver(), waiver(provider="debian", expired_at=days(14)),
-                                     waiver(provider="alpine", expired_at=days(0)), entries=self.gentry())),
-                ("before", self.wfile(raw="provider_waivers:\n" + waiver() + "vulnerabilities:\n" + self.gentry())),
-                ("empty", self.wfile())):
+        # Each case writes its own file inside its subtest (one shared name in
+        # an eagerly built tuple would test only the last file written).
+        cases = {
+            "after": lambda: self.wfile(waiver(), waiver(provider="debian"), waiver(provider="alpine"),
+                                        entries=self.gentry(), name="after.yaml"),
+            "before": lambda: self.wfile(raw="provider_waivers:\n" + waiver() + "vulnerabilities:\n"
+                                         + self.gentry(), name="before.yaml"),
+            "empty": lambda: self.wfile(name="empty.yaml"),
+        }
+        for label, make in cases.items():
             with self.subTest(label):
+                p = make()
                 r = self.run_checks("grype-ignore-file", p, "--require-approved")
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                want = {"after": 3, "before": 1, "empty": 0}[label]
+                self.assertIn(f"waivers_in_force={want}", r.stdout)
+                self.assertIn("in_force=" + ("0" if label == "empty" else "1"), r.stdout)
+
+    def test_the_expiry_bounds_are_inclusive_at_14_days_and_today(self):
+        # The exact boundaries: 14 days out and expiring today are in force;
+        # 15 days out and yesterday refuse the file. (A run straddling UTC
+        # midnight between building a case and checking it shifts every date
+        # by a day; the window is milliseconds.)
+        for label, exp, rc, why in (("14 days out", days(14), 0, None), ("expires today", days(0), 0, None),
+                                    ("15 days out", days(15), 1, "the maximum for a provider waiver is 14"),
+                                    ("expired yesterday", days(-1), 1, "expired on")):
+            with self.subTest(label):
+                p = self.wfile(waiver(expired_at=exp), name=label.replace(" ", "-") + ".yaml")
+                r = self.run_checks("grype-ignore-file", p, "--require-approved")
+                self.assertEqual(r.returncode, rc, r.stdout + r.stderr)
+                if why:
+                    self.assertIn(why, r.stderr)
+                else:
+                    self.assertIn("waivers_in_force=1", r.stdout)
 
     def test_a_bad_waiver_refuses_the_whole_file(self):
+        # Each case is one field changed from a valid waiver, and must be
+        # refused for THAT reason.
         bad = {
-            "expired": waiver(expired_at=days(-1)),
-            "15 days out": waiver(expired_at=days(15)),
-            "unknown provider": waiver(provider="rhel"),
-            "provider spelled in capitals": waiver(provider="NVD"),
-            "the github provider": waiver(provider="github"),
-            "duplicate provider": waiver() + waiver(expired_at=days(3)),
-            "no statement": waiver(statement=None),
-            "no expiry": waiver(expired_at=None),
-            "quoted expiry": waiver(expired_at=f'"{days(3)}"'),
-            "not a date": waiver(expired_at="soon"),
-            "no approver": waiver(approved_by=None),
-            "approver not a login": waiver(approved_by="-x"),
-            "bad approval ref": waiver(approval_ref='"PR 12"'),
-            "no approval ref": waiver(approval_ref=None),
-            "pending with a date": waiver(approval_ref="pending"),
-            "approved in the future": waiver(approved_on=days(2)),
-            "an entry key": waiver() + "    package_name: erlang\n",
-            "an unknown key": waiver() + "    hours: 200\n",
-            "a comment after a value": waiver(provider="nvd # stalled"),
-            "flow style": None,
+            "expired": (waiver(expired_at=days(-2)), "expired on"),
+            "16 days out": (waiver(expired_at=days(16)), "the maximum for a provider waiver is 14"),
+            "unknown provider": (waiver(provider="rhel"), "provider must be one of"),
+            "provider spelled in capitals": (waiver(provider="NVD"), "provider must be one of"),
+            "the github provider": (waiver(provider="github"), "provider must be one of"),
+            "duplicate provider": (waiver() + waiver(expired_at=days(3)), "duplicate provider waiver"),
+            "no statement": (waiver(statement=None), "no `statement`"),
+            "no expiry": (waiver(expired_at=None), "expired_at must be a YYYY-MM-DD date"),
+            "quoted expiry": (waiver(expired_at=f'"{days(3)}"'), "is an unquoted YYYY-MM-DD date"),
+            "not a date": (waiver(expired_at="soon"), "expired_at must be a YYYY-MM-DD date"),
+            "no approver": (waiver(approved_by=None), "approved_by must be"),
+            "approver not a login": (waiver(approved_by="-x"), "approved_by must be"),
+            "bad approval ref": (waiver(approval_ref='"PR 12"'), "must be `#N`"),
+            "no approval ref": (waiver(approval_ref=None), "no approval_ref"),
+            "pending with a date": (waiver(approval_ref="pending"), "approved_on is set but approval_ref is pending"),
+            "approved in the future": (waiver(approved_on=days(2)), "is in the future"),
+            "an entry key": (waiver() + "    package_name: erlang\n", "key `package_name` is not allowed"),
+            "an unknown key": (waiver() + "    hours: 200\n", "key `hours` is not allowed"),
+            "a comment after a value": (waiver(provider="nvd # stalled"), "a comment after a value"),
+            "flow style": (None, "allowed at the top level"),
         }
-        for label, body in bad.items():
+        for label, (body, why) in bad.items():
             with self.subTest(label):
-                p = self.wfile(raw="vulnerabilities:\nprovider_waivers: []\n") if body is None else self.wfile(body)
+                name = re.sub(r"[^a-z0-9]+", "-", label) + ".yaml"
+                p = (self.wfile(raw="vulnerabilities:\nprovider_waivers: []\n", name=name) if body is None
+                     else self.wfile(body, name=name))
                 r = self.run_checks("grype-ignore-file", p)
                 self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn(why, r.stderr)
         # Shape: a waiver section twice, an entry under the wrong section, and
         # the section in Trivy's file are refused by the same parser.
-        for label, raw, sub in (
+        for label, raw, sub, why in (
                 ("twice", "vulnerabilities:\nprovider_waivers:\n" + waiver() + "provider_waivers:\n"
-                 + waiver(provider="debian"), "grype-ignore-file"),
-                ("waiver under vulnerabilities", "vulnerabilities:\n" + waiver(), "grype-ignore-file"),
+                 + waiver(provider="debian"), "grype-ignore-file", "second `provider_waivers:` key"),
+                ("waiver under vulnerabilities", "vulnerabilities:\n" + waiver(), "grype-ignore-file",
+                 "every `vulnerabilities` entry starts with `- id:`"),
                 ("entry under provider_waivers", "vulnerabilities:\nprovider_waivers:\n" + self.gentry(),
-                 "grype-ignore-file"),
-                ("no vulnerabilities key", "provider_waivers:\n" + waiver(), "grype-ignore-file"),
+                 "grype-ignore-file", "every `provider_waivers` entry starts with `- provider:`"),
+                ("no vulnerabilities key", "provider_waivers:\n" + waiver(), "grype-ignore-file",
+                 "no `vulnerabilities:` key"),
                 ("in .trivyignore.yaml", "vulnerabilities:\n" + entry() + "provider_waivers:\n" + waiver(),
-                 "ignore-file")):
+                 "ignore-file", "only `vulnerabilities:` allowed at the top level")):
             with self.subTest(label):
-                r = self.run_checks(sub, self.wfile(raw=raw, name="shape.yaml"))
+                r = self.run_checks(sub, self.wfile(raw=raw, name=re.sub(r"[^a-z]+", "-", label) + ".yaml"))
                 self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn(why, r.stderr)
 
     def test_the_emitted_waivers_are_those_in_force_without_free_text(self):
         out, r = self.emitted(waiver(), waiver(provider="debian", approved_on=None, approval_ref="pending"),
@@ -2601,6 +2783,14 @@ class ProviderWaiverChecks(unittest.TestCase):
                 self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
                 self.assertIn(why, r.stderr)
                 self.assertNotIn("waiver:", r.stdout)
+        # A malformed providers listing fails even with a waiver in force.
+        for raw in ("{", "{}", "[1]", "null"):
+            with self.subTest(providers=raw):
+                bad = self.tmp / "bad-providers.json"
+                bad.write_text(raw, encoding="utf-8")
+                r = self.run_checks("grype-db-providers", bad, "--waivers", out, "nvd")
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn("missing or unreadable", r.stderr)
         # A current provider with a waiver in force is reported plainly.
         r = self.run_checks("grype-db-providers", self.providers(), "--waivers", out, "nvd")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -2628,7 +2818,8 @@ class ProviderWaiverChecks(unittest.TestCase):
         nc = self.nc(nc_line())
         r = self.run_checks("pending", ign, nc, self.wfile(waiver()))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("provider waiver nvd is in force until", r.stdout)
+        self.assertIn("provider waiver nvd: in force until", r.stdout)
+        self.assertEqual(r.stdout.count("in force until"), 1, r.stdout)
         for label, w, why in (("pending", waiver(approved_on=None, approval_ref="pending"), "approval_ref is pending"),
                               ("expires tomorrow", waiver(expired_at=days(1)), "within 2 days"),
                               ("expired", waiver(expired_at=days(-1)), "expired on")):

@@ -1238,7 +1238,8 @@ The environment cannot steer the scan: the script clears every inherited `TRIVY_
 (`TRIVY_CACHE_DIR` included), names the DB repositories explicitly, and gives Trivy an empty
 config file so a `trivy.yaml` in the working directory is not read. `TRIVY_BIN` (use another trivy
 binary) is for local runs and tests and is refused on GitHub Actions. `YUZU_TRIVYIGNORE` (another
-ignore file) goes through the same parser, and Trivy never reads the named file at all: it reads
+ignore file, which on GitHub Actions may name only the repository's `.trivyignore.yaml`) goes
+through the same parser, and Trivy never reads the named file at all: it reads
 the checker's canonical YAML copy of the entries in force, so a plain-format file or an entry the
 parser did not see cannot reach it. Trivy's temporary files go under the script's own work
 directory.
@@ -1816,11 +1817,33 @@ provider_waivers:
   waiver in force** (an `nvd` waiver, which every image uses) and marks each degraded row; the log
   prints a `::warning::` per waiver used. A report that used none says `provider waiver: none used`.
   A waiver in force for a provider that is current is not used and changes nothing.
+- **Decision record (2026-11-21).** The project owner decided that a release must be able to
+  ship through a stalled upstream grype provider, under the bounds above (one named provider, at
+  most 14 days, the committed file only, every use reported DEGRADED), and fixed that design for
+  this change; the routed-concern row states the bound. Revisit it if a waiver is ever needed for
+  more than one release in a row, or if grype adds per-provider freshness of its own.
+- The waiver bounds how long it is in force, not how old the capture it admits may be: a
+  capture of any age is admitted while it is in force, and its age is printed on the
+  `provider waiver:` line. Its approval fields are, as for an acceptance, a recorded reference
+  checked for format only ("What the approval fields are" below).
+- Nothing warns about a waiver between releases (the same tracked gap as for acceptances): the
+  pre-tag `pending` check refuses one expiring within two days, and an expired one refuses the
+  whole file wherever it is read, the repository's own tests of that file included, so remove a
+  waiver before it expires. The 21-day warning an acceptance gets does not apply: a waiver is
+  never more than 14 days out.
 - What a degraded pass means: grype matched that provider's packages (for `nvd`, the gateway's
   Erlang/OTP runtime and other binaries grype identifies by version) against advisories as old as
   the capture, so a fixable CRITICAL published upstream since then can be missed. Remove the waiver
   as soon as the provider is current again. The post-release scan (`pre-release.yml`) reads the
-  `.grypeignore.yaml` of the commit it checks out, so a waiver there degrades that scan the same way.
+  `.grypeignore.yaml` of the commit it checks out, which is the default branch's tip on its
+  automatic run (the dispatched ref on a manual one), not the release tag: a waiver there degrades
+  that scan the same way, and a release scanned with a waiver that is no longer on that branch
+  turns that scan red while the provider is still stale.
+- A run that starts on an `nvd` waiver re-checks it for each image, so an image judged after the
+  waiver lapsed (a run crossing UTC midnight on its expiry day) fails (`provider waiver lapsed
+  during the run`). An image the gate never judged (a stop or a cancel) records `provider waiver:
+  in force for this run (...), but the image was not judged` instead of DEGRADED, and the
+  `ignore file:` line counts the waivers in force and those pending and not honoured.
 
 **What the approval fields are, and what the control is.** `approved_by`, `approved_on` and
 `approval_ref` are a RECORDED REFERENCE: the gate checks that they are present and well formed (a
@@ -1946,17 +1969,28 @@ except the agent bundle:
   An old one, as for a stale DB: wait and "Re-run failed jobs". When the upstream source itself is
   stalled and the release cannot wait for it:
   1. Confirm the stall upstream (the provider's own status, or grype's and vunnel's issue trackers)
-     and that the rest of the DB is current: the log's `grype_db_built` is under 72 hours old and
-     only this provider is old. A stale DB, or a provider whose capture time is unreadable, is not
-     a stall and no waiver helps.
+     and that the rest of the DB is current. Reaching the provider check means the DB's own build
+     time already passed its 72-hour check; to see every provider's capture time, run the pinned
+     grype's `grype db providers -o json` against the same DB. A stale DB, or a provider whose
+     capture time is unreadable, is not a stall and no waiver helps.
   2. Open a pull request adding a provider waiver for exactly that provider to
      `.grypeignore.yaml` ("Provider waivers" above): the evidence of the stall in `statement`, an
-     `expired_at` as short as the release needs (at most 14 days), and the approval recorded as
+     `expired_at` as short as the release needs but at least two days past the tag, with headroom
+     for re-runs (at most 14 days; the pre-tag check refuses one expiring today or tomorrow, and
+     a re-run after it expires refuses the whole file), and the approval recorded as
      "Recording an approval" above describes. A pending waiver is not honoured by the release.
   3. Merge, run the pre-tag `pending` check, and re-tag (the waiver is a commit). Every image that
-     needed the provider passes DEGRADED; check that each grype `.gate.txt` names the waiver.
-  4. Remove the waiver in a follow-up pull request as soon as the provider is current again; once
-     it expires the gate refuses the whole file until it is removed.
+     needed the provider passes DEGRADED; check that each grype `.gate.txt` names the waiver, and
+     say in the release notes that the release was scanned degraded (which provider, its capture
+     age, the waiver's expiry and `approval_ref`), linking `docs/user-manual/release-verification.md`
+     "A degraded pass".
+  4. Remove the waiver in a follow-up pull request as soon as the provider is current again (on
+     the default branch too, which the post-release scan reads); once it expires the gate refuses
+     the whole file until it is removed. Then dispatch `pre-release.yml` for the degraded release
+     (`gh workflow run pre-release.yml -f tag=vX.Y.Z`), so its images are scanned again with the
+     provider current: a fixable CRITICAL the stale capture hid surfaces there, and is then handled
+     as a CRITICAL in a published release (a patch release; the security policy's advisory path
+     if it is exploitable).
 
 **When the agent bundle's gate fails, never re-tag.** `docker-publish-agent-bundle` runs after
 the `release` job has published the GitHub Release, so the tag is already a published release:
@@ -1968,7 +2002,9 @@ all. So:
 - **A distro package with a fix, a stale DB, the gate's budget running out, or a cancel**: "Re-run
   failed jobs" on that run (the only recovery the release skill allows for this job); the chisel
   cut takes the current archive.
-- **Anything that needs a commit**: this version ships without the agent-bundle image. The
+- **Anything that needs a commit** (including a provider waiver for a stalled grype provider, and
+  a waiver in the tag that has expired since, which refuses the whole file on a re-run): this
+  version ships without the agent-bundle image. The
   release itself is complete and its other images are signed; say so in the release notes or
   announcement, land the fix, and cut the next version (a patch release) to deliver the bundle.
   Publishing a bundle outside `release.yml` bypasses the gate and journal (Release tag policy,

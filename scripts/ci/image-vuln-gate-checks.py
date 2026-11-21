@@ -340,19 +340,14 @@ def plain_scalar(raw, where):
     return v
 
 
-def parse_ignore(text, entry_keys=ENTRY_KEYS, list_keys=LIST_KEYS):
-    """Entries of an ignore file. `entry_keys`/`list_keys` are the scanner's
-    schema: ENTRY_KEYS/LIST_KEYS for .trivyignore.yaml, GRYPE_ENTRY_KEYS and
-    no list key for .grypeignore.yaml. The shape rules are the same for both."""
-    return parse_sections(text, {"vulnerabilities": ("id", entry_keys, list_keys)})["vulnerabilities"]
-
-
 def parse_sections(text, sections):
     """The one parser of an acceptance file: {section: [entries]} for each
     top-level block list named in `sections`, {name: (first key, entry keys,
-    list keys)}. `vulnerabilities` is required; another section (grype's
-    `provider_waivers`) is optional, each at most once. Every section's
-    entries follow the same shape rules."""
+    list keys)}: for .trivyignore.yaml `vulnerabilities` with ENTRY_KEYS and
+    LIST_KEYS; for .grypeignore.yaml `vulnerabilities` with GRYPE_ENTRY_KEYS
+    and no list key, and `provider_waivers` with WAIVER_KEYS (the schemas'
+    sixth field). `vulnerabilities` is required; another section is optional,
+    each at most once. Every section's entries follow the same shape rules."""
     lines = text.split("\n")
     out = {}
     section = None
@@ -645,13 +640,7 @@ def read_ignore_sections(path, schema):
         return None, f"{path}: {e}"
 
 
-def read_ignore(path, schema):
-    """(entries, None) or (None, message) for an unreadable or unparsable file."""
-    sections, why = read_ignore_sections(path, schema)
-    return (None, why) if sections is None else (sections["vulnerabilities"], None)
-
-
-def check_waivers(path, waivers, require_approved, errors):
+def check_waivers(path, waivers, require_approved, errors, excluded):
     """The in-force provider waivers of a grype acceptance file, and the
     problems with any, into `errors`. An expired waiver, or one more than
     MAX_WAIVER_DAYS out, is an ERROR that refuses the whole file (an expired
@@ -686,6 +675,7 @@ def check_waivers(path, waivers, require_approved, errors):
                           f"(or renew it with a new review and approval)")
             continue
         if pending and require_approved:
+            excluded.append(w)
             print(f"NOT IN FORCE: {tag}: approval_ref is pending; a release gate honours only a provider waiver "
                   f"whose approval is recorded (docs/ci-architecture.md \"Recording an approval\")")
             continue
@@ -716,9 +706,9 @@ def cmd_ignore_file(path, emit=None, require_approved=False, schema=TRIVY_SCHEMA
         print(why, file=sys.stderr)
         return 1
     entries = sections["vulnerabilities"]
-    waiver_errors = []
+    waiver_errors, waivers_excluded = [], []
     waivers_in_force = check_waivers(path, sections.get("provider_waivers", []), require_approved,
-                                     waiver_errors)
+                                     waiver_errors, waivers_excluded)
     now = today()
     errors = []
     seen = set()
@@ -781,6 +771,7 @@ def cmd_ignore_file(path, emit=None, require_approved=False, schema=TRIVY_SCHEMA
     print(f"pending_not_honoured={pending_excluded}")
     if "provider_waivers" in schema[5]:
         print(f"waivers_in_force={len(waivers_in_force)}")
+        print(f"waivers_pending_not_honoured={len(waivers_excluded)}")
     return 0
 
 
@@ -1023,9 +1014,6 @@ def cmd_pending(ignore_path, not_covered_path, grype_path):
         check_expiry(tag, parse_date(w["expired_at"]))
         if w.get("approval_ref") == PENDING:
             found.append(f"{tag}: approval_ref is pending")
-        else:
-            print(f"note: {tag} is in force until {w['expired_at']}: an image that needs a stale "
-                  f"{w['provider']} provider will pass DEGRADED; remove the waiver once the provider is current")
     try:
         listed = read_not_covered(not_covered_path, require_approved=True)
         with open(not_covered_path, encoding="utf-8") as f:
