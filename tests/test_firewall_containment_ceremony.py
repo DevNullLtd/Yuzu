@@ -1218,6 +1218,18 @@ class RunRecord(FlowHarness, unittest.TestCase):
         self.assertEqual((rc, calls, rec["exit_code"]), (fc.EXIT_PRECONDITION, [], 2))
         self.assertEqual(rec["statuses"], [])
 
+    def test_any_refusal_token_the_agent_answers_is_recorded(self):
+        # own_addresses_unreadable is the other token this branch adds; none of them dispatches a release
+        unreadable = {"responses": [{"agent_id": "a", "status": 2,
+                                     "output": "note|x\nstatus|refused|own_addresses_unreadable"}]}
+        rc, calls, rec, _ = self.record_run({"quarantine_status": [row("inactive")], "quarantine": [unreadable]})
+        self.assertEqual((rc, rec["exit_code"], rec["refusal"], rec["contained"]), (fc.EXIT_FAIL, 1, "own_addresses_unreadable", False))
+        self.assertEqual(calls, ["quarantine_status", "quarantine"])  # the probe, the apply, and no release
+        # an apply that was not refused records none
+        rc, _, rec, _ = self.record_run({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                                         "quarantine": [{}], "release": [REL]})
+        self.assertIsNone(rec["refusal"])
+
     def test_a_remote_run_says_so(self):
         client = remote_client()
         rc, _, rec, _ = self.record_run({"quarantine_status": [row("inactive"), row("active"), row("inactive")],

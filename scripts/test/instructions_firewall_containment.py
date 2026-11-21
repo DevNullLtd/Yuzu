@@ -37,8 +37,9 @@ which is how a login is proven.
 ONE HOST CANNOT RUN THE CONTAINMENT. A containment whose control endpoint is the host itself is refused
 by the agent (`refused|self_host`, exit 2 here, nothing changed, nothing released), by design: the server
 it must keep reaching would be the host that is cut off. So an --apply-containment run with the agent and
-the server on one host (a loopback dashboard against this host's own agent) always ends that way; a
-containment round trip needs the server on ANOTHER host and --remote.
+the server on one host (a loopback dashboard against this host's own agent) ends that way whenever the
+agent's control endpoint is a host address, loopback included; a containment round trip needs the server on
+ANOTHER host and --remote.
 
 --remote: this script runs on the server's host (or any other host), and the agent it contains is on a
 DIFFERENT machine that this script does not run on, so nothing here is cut off and the dashboard may be
@@ -88,10 +89,13 @@ change for NO_PROGRESS_POLLS polls in a row ends that read early (`no progress`)
 its whole budget; an apply or release is never cut short that way, because its row legitimately stays
 RUNNING while the plugin works.
 
-Standing ruling (the URL-versus-path precondition of #7860): a check that the dashboard URL and the
-network path agree is moot. A loopback (single-host) run can no longer apply a containment, because the
-agent refuses `refused|self_host`, and a --remote run does not run on the contained host, so this
-script's own calls cannot be cut by its own apply. No authenticated-read probe is added.
+Standing ruling (the URL-versus-path precondition of #7860, item d): the agent refuses
+(`refused|self_host`) when its control endpoint is one of its host's own addresses, loopback included,
+and a --remote run is not on the contained host, so in both cases this script's own calls cannot be cut
+by its own apply. One case remains: a server in a container or VM on this host, reached at a bridge
+address, is not an own address, so a local run does contain the host and its loopback dashboard calls
+can then be cut (the hazard described above). There the precondition above is the operator's to meet,
+and the time limit (--ttl-seconds) is the backstop. No authenticated-read probe is added.
 
 The status is read from the exact `status|<token>` row of the agent's reply, taken only from a SUCCESS
 (status 1) row once no row is still RUNNING (status 0); FAILURE, TIMEOUT and REJECTED rows are no answer. The flow is covered
@@ -387,10 +391,22 @@ def agent_rows(answer, agent_id: str) -> list[str]:
     return lines
 
 
+def refusal_token(answer, agent_id: str):
+    """The text after `status|refused|` of the first such row this agent answered (`self_host`,
+    `own_addresses_unreadable`, `privilege_unavailable`, ...), else None: what --record keeps as the refusal."""
+    prefix = "status|refused|"
+    for line in agent_rows(answer, agent_id):
+        if line.startswith(prefix):
+            return line[len(prefix):] or None
+    return None
+
+
 def self_host_refused(answer, agent_id: str) -> bool:
     """True iff this agent answered the apply `status|refused|self_host`: its control endpoint is the agent
     host itself (loopback or one of its own addresses), so it never contained anything and there is nothing to
-    release. A one-host run always ends here, by design."""
+    release. A one-host run whose control endpoint is a host address (loopback included) ends here, by design;
+    the one exception is a server in a container or VM on this host reached at a bridge address (see the
+    standing ruling in the module docstring)."""
     return "status|refused|self_host" in agent_rows(answer, agent_id)
 
 
@@ -732,8 +748,8 @@ def run(args: argparse.Namespace, rec: dict | None = None) -> int:
                 except DispatchRefused as e:
                     refused = e  # the server never sent it: nothing was applied
                 if refused is None:
+                    rec["refusal"] = refusal_token(answer, agent_id)
                     if self_host_refused(answer, agent_id):
-                        rec["refusal"] = "self_host"
                         say(SELF_HOST_TEXT + signal_note(got), file=sys.stderr)
                         return EXIT_PRECONDITION
                     not_ours = apply_was_not_ours(answer, agent_id)

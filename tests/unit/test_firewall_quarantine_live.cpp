@@ -381,35 +381,59 @@ void check_restored(const std::string& before) {
     CHECK(verdict.restored);
 }
 
+/// A read a verdict depends on: its output only when the tool ran to completion (it started, was
+/// not killed or clipped, and exited 0). capture() cannot say that: it merges stderr and drops the
+/// exit code, so sudo's refusal or a tool's error text would pass for a listing.
+[[nodiscard, maybe_unused]] std::optional<std::string> read_complete(const std::vector<std::string>& argv) {
+    const auto res = capture_result(argv);
+    if (!yuzu::firewall::subprocess_complete(res))
+        return std::nullopt;
+    return res.output;
+}
+
 /// The rules the containment put in force, as text, for "this address is (not) in the live
 /// ruleset". Read the way the agent account reads them: our nft table through the granted
 /// `nft list table` line, the iptables generation through the helper, our pf anchor through the
-/// granted anchor line.
-[[nodiscard, maybe_unused]] std::string contained_rules_text() {
+/// granted anchor line. Only reads that completed contribute; nullopt when none did.
+[[nodiscard, maybe_unused]] std::optional<std::string> contained_rules_text() {
 #if defined(__APPLE__)
-    return capture(harness_sudo({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", "rules"}));
+    return read_complete(harness_sudo({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", "rules"}));
 #elif defined(__linux__)
-    std::string out = capture(harness_sudo(fq::nft_list_argv()));
+    std::optional<std::string> out;
+    const auto keep = [&out](const std::optional<std::string>& part) {
+        if (part)
+            out = out.value_or(std::string{}) + *part;
+    };
+    keep(read_complete(harness_sudo(fq::nft_list_argv())));
     for (const auto tool : {fq::kIptablesPath, fq::kIp6tablesPath}) {
         const fq::Argv plan{std::string{tool}, "-S"};
         if (running_as_root()) {
-            out += capture(plan);
+            keep(read_complete(plan));
         } else if (const auto helper = fq::iptables_helper_argv(plan)) {
-            out += capture(harness_sudo(*helper));
+            keep(read_complete(harness_sudo(*helper)));
         }
     }
     return out;
 #else
-    return firewall_snapshot();
+    auto text = firewall_snapshot(); // the failed form of a read is an unreadable snapshot
+    if (!fr::readable(kThisOs, text))
+        return std::nullopt;
+    return text;
 #endif
 }
 
-/// The listed rules mention `needle`, or do not, with the listing known to have been read: an
-/// empty listing proves no absence (the read failed, or the host is not contained at all).
+/// The listed rules mention `needle`, or do not, with the containment's own listing known to have
+/// been read: an absence proves nothing from a read that failed or that listed something else.
+/// Every caller runs while the host is contained, so a completed read must show the containment.
 void check_listed(std::string_view needle, bool expect_present) {
     const auto text = contained_rules_text();
-    REQUIRE_FALSE(text.empty());
-    CHECK((text.find(needle) != std::string::npos) == expect_present);
+    REQUIRE(text.has_value()); // at least one read of the containment's listing completed
+#if defined(__linux__)
+    // The nft table or an iptables generation chain is the containment itself.
+    REQUIRE((text->find(fq::kNftTable) != std::string::npos ||
+             text->find(fq::kIptablesChainPrefix) != std::string::npos));
+#endif
+    CHECK((text->find(needle) != std::string::npos) == expect_present);
 }
 
 #if defined(__linux__)
@@ -1508,6 +1532,12 @@ TEST_CASE("live: quarantine is refused self_host when the control endpoint is th
     const auto q = rig.run("quarantine", env.quarantine_params());
     check_refused(q, "self_host"); // rc 1, the refusal rows, UNAVAILABLE / PARTIAL / firewall:refused
     CHECK_FALSE(rig.record().has_value());
+    // The release of a device that was never contained: the REST manual says it answers `inactive`
+    // (docs/user-manual/rest-api.md, Quarantine). This is where that sentence is measured, per OS;
+    // an OS that answers otherwise changes the manual to the measured answer.
+    const auto rel = rig.run("release");
+    INFO(rel.captured);
+    CHECK(has_row(rel.captured, "status|inactive"));
     check_restored(before);
 }
 
@@ -1795,13 +1825,17 @@ TEST_CASE("live (linux nft): a failed update keeps the previous generation in fo
     req.probe_target = env.probe_target;
     const auto applied = fq::apply_and_verify(fenv, req, dl);
     REQUIRE((applied.status == "active"));
-    const auto table_before = capture(harness_sudo(fq::nft_list_argv()));
-    REQUIRE_FALSE(table_before.empty());
+    // Both reads must have completed: two identical failed reads (sudo's refusal, a tool error)
+    // would otherwise compare equal and pass for "nothing changed".
+    const auto table_before = capture_result(harness_sudo(fq::nft_list_argv()));
+    REQUIRE(yuzu::firewall::subprocess_complete(table_before));
 
     fq::Deadline dl2;
     const auto upd = fq::update(fenv, true, {*fq::parse_exception("198.18.0.9:22/tcp/in")}, dl2);
     CHECK(upd.status == "update_failed");
-    CHECK(capture(harness_sudo(fq::nft_list_argv())) == table_before);
+    const auto table_after = capture_result(harness_sudo(fq::nft_list_argv()));
+    REQUIRE(yuzu::firewall::subprocess_complete(table_after));
+    CHECK(table_after.output == table_before.output);
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout); // still blocked
     REQUIRE(store.s.has_value());
     CHECK(store.s->phase == fq::Phase::active);
@@ -1824,8 +1858,10 @@ std::optional<std::string> live_boot_time() {
            std::to_string(static_cast<long long>(tv.tv_usec));
 }
 
-[[nodiscard]] std::string pf_anchor_capture(const char* what) {
-    return capture(harness_sudo({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", what}));
+/// One listing of our pf anchor as a whole result: a caller whose verdict rests on it checks
+/// subprocess_complete() first.
+[[nodiscard]] yuzu::agent::SubprocessResult pf_anchor_capture(const char* what) {
+    return capture_result(harness_sudo({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", what}));
 }
 
 } // namespace
@@ -1847,12 +1883,12 @@ TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release resto
     const auto anchors = capture(harness_sudo({"/sbin/pfctl", "-a", "com.apple", "-s", "Anchors"}));
     INFO("-a com.apple -s Anchors:\n" << anchors);
     INFO("-s References:\n" << capture(harness_sudo({"/sbin/pfctl", "-s", "References"})));
-    INFO("anchor -s rules:\n" << pf_anchor_capture("rules"));
-    INFO("anchor -s nat:\n" << pf_anchor_capture("nat"));
+    INFO("anchor -s rules:\n" << pf_anchor_capture("rules").output);
+    INFO("anchor -s nat:\n" << pf_anchor_capture("nat").output);
     CHECK(anchors.find(std::string{fq::kPfAnchorLeaf}) != std::string::npos);
     CHECK(fq::pf_siblings_before(anchors).empty()); // nothing is evaluated before us
     CHECK(fq::pf_anchor_referenced(capture(harness_sudo({"/sbin/pfctl", "-s", "rules"}))));
-    CHECK(fq::pf_anchor_enforcing(pf_anchor_capture("rules")));
+    CHECK(fq::pf_anchor_enforcing(pf_anchor_capture("rules").output));
     CHECK(rig.has_status(rig.run("quarantine_status").captured, "active"));
 
     const auto rel = rig.run("release");
@@ -1862,7 +1898,9 @@ TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release resto
     // pre-quarantine values, and our anchor holds nothing
     check_restored(before);
     // our anchor is empty, not merely unreferenced
-    CHECK_FALSE(fq::pf_anchor_enforcing(pf_anchor_capture("rules")));
+    const auto emptied = pf_anchor_capture("rules");
+    REQUIRE(yuzu::firewall::subprocess_complete(emptied)); // an absence needs a read that completed
+    CHECK_FALSE(fq::pf_anchor_enforcing(emptied.output));
 }
 
 TEST_CASE("live (macOS pf): pf switched off behind the plugin's back is reported, then repaired",
@@ -1924,12 +1962,16 @@ TEST_CASE("live (macOS pf): a failed update keeps the previous generation in for
     req.allow = *allow;
     req.probe_target = env.probe_target;
     REQUIRE(fq::apply_and_verify(fenv, req, dl).status == "active");
+    // Both reads must have completed: two identical failed reads would otherwise compare equal.
     const auto rules_before = pf_anchor_capture("rules");
+    REQUIRE(yuzu::firewall::subprocess_complete(rules_before));
 
     fq::Deadline dl2;
     const auto upd = fq::update(fenv, true, {*fq::parse_exception("198.18.0.9:22/tcp/in")}, dl2);
     CHECK(upd.status == "update_failed");
-    CHECK(pf_anchor_capture("rules") == rules_before); // the anchor load is atomic: nothing changed
+    const auto rules_after = pf_anchor_capture("rules");
+    REQUIRE(yuzu::firewall::subprocess_complete(rules_after));
+    CHECK(rules_after.output == rules_before.output); // the anchor load is atomic: nothing changed
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout); // still blocked
     REQUIRE(store.s.has_value());
     CHECK(store.s->phase == fq::Phase::active);

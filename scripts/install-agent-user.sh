@@ -537,8 +537,8 @@ EOF
 # flush is -F rules / -F nat on that anchor only (never -F all: that is global). The installer
 # writes the helper before this file; a host without it is provisioned with this build's installer.
 # The helper also takes one read-only word, snapshot, with no other argument; on a Mac it finds none
-# of the nft or iptables tools and prints empty sections, and the pf reads below stay on the exact
-# pfctl lines.
+# of the nft or iptables tools and prints [absent] sections (at most 1 MiB), and the pf reads below
+# stay on the exact pfctl lines.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E
 EOF
@@ -695,7 +695,8 @@ remove_sudoers() {
 # compares each installed file with it byte for byte. The sudoers file names each helper with no
 # argument and no wildcard:
 #   - $FW_HELPER_PATH, firewall containment: iptables, ip6tables and the nftables ruleset load on
-#     Linux, the pf anchor load on macOS.
+#     Linux, the pf anchor load on macOS; and one read-only word, snapshot, that lists the host's
+#     nft and iptables rulesets.
 #   - $SVC_HELPER_PATH, services.set_start_mode: systemctl on Linux, launchctl on macOS.
 #
 # The firewall helper's contract (the C++ twins are iptables_helper_argv, nft_ruleset_text and
@@ -714,6 +715,11 @@ remove_sudoers() {
 #   - pf load: the same, for the macOS anchor: the staged file is read ONCE, every line is checked
 #     against the ruleset the plugin generates, and pfctl is given a ruleset the helper builds from
 #     its own literals plus the checked tokens on standard input.
+#   - snapshot: exactly one argument, the word snapshot, and read-only. It runs $NFT -a list
+#     ruleset, $IPT -S and $IP6T -S, each with those fixed arguments and nothing from the caller,
+#     and prints them under `== <label>` headings: `[absent]` for a tool that is not installed,
+#     `[failed]` after the output of one that exits non-zero, then `== end`. The whole listing is
+#     cut at 1 MiB (a cut one has no `== end`) and the exit status is 0.
 #   - anything else exits 64 having run nothing.
 # The helper is ONE text on both platforms. An action whose tool is not on the host (iptables or
 # nft on a Mac, pfctl on Linux) fails at exec, after the same validation, having changed nothing.

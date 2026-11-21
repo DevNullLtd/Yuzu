@@ -38,9 +38,7 @@ metadata:
     is read once more before it is distrusted (fallthrough|nftables:generation:changed),
     a ruleset that keeps changing reads torn_persistent, and ufw or iptables
     output that is not in the expected shape reads unknown with
-    error|ufw:unrecognised_output or error|iptables:unrecognised_output. Older agents report pf as the sole
-    macOS state source (backend|pf), so a mixed fleet shows several shapes
-    until fully upgraded.
+    error|ufw:unrecognised_output or error|iptables:unrecognised_output.
   tags: [security, firewall, compliance, network]
 
 spec:
