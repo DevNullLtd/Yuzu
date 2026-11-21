@@ -286,7 +286,7 @@ void load_hostnames(Stream& st) {
 
 // ── XLSX ────────────────────────────────────────────────────────────────────────────────────────
 
-// The 23 header cells, split once from the list CSV's own header so the two formats cannot drift.
+// The 24 header cells, split once from the list CSV's own header so the two formats cannot drift.
 constexpr std::array<std::string_view, swl::kListCsvColumns> list_header() {
     std::array<std::string_view, swl::kListCsvColumns> out{};
     std::string_view rest = swl::kListCsvHeader;
