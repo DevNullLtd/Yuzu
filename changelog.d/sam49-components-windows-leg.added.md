@@ -1,0 +1,1 @@
+- **component_inventory**: the `scan` and `native` actions now run on Windows over the Program Files trees, through a filesystem binding that never follows a reparse point.

@@ -40,7 +40,7 @@ class ComponentInventoryDefinitionColumns(unittest.TestCase):
             self.assertEqual(d["metadata"]["id"], f"crossplatform.components.{action}")
             self.assertEqual(d["spec"]["execution"]["plugin"], "component_inventory")
             self.assertEqual(d["spec"]["parameters"]["properties"], {})
-            self.assertEqual(d["spec"]["platforms"], ["darwin", "linux"])
+            self.assertEqual(d["spec"]["platforms"], ["darwin", "linux", "windows"])
 
     def test_row_kind_leads_and_the_columns_match_the_wire_row(self):
         for action in ("scan", "native"):
@@ -55,7 +55,7 @@ class ComponentInventoryDefinitionColumns(unittest.TestCase):
         cols = {c["name"]: c for c in _definition("native")["spec"]["result"]["columns"]}
         self.assertEqual(cols["kind"]["example"], "native")
         # The server's closed version_source set (installed_software_v3.hpp) already holds all four.
-        self.assertEqual(cols["version_source"]["values"], ["filename", "elf", "macho", "unreadable"])
+        self.assertEqual(cols["version_source"]["values"], ["filename", "elf", "macho", "pe", "unreadable"])
         self.assertEqual(cols["version_source"]["example"], "filename")
         self.assertEqual(_definition("scan")["spec"]["result"]["columns"][4]["values"],
                          ["filename", "pom", "manifest", "unreadable"])

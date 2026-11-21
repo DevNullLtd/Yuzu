@@ -2,7 +2,10 @@
  * component_legs.hpp -- what the POSIX leg of the component_inventory plugin walks, and the
  * filesystem it walks it through (component_fs_posix.cpp).
  *
- * POSIX only: the whole body is compiled out on Windows, where the shell answers `planned`.
+ * Everything below `struct Targets` is POSIX only: it is compiled out on Windows, whose leg is
+ * component_legs_win.hpp / component_fs_win.cpp. `struct Targets` sits above the guard because it is
+ * the one shape both legs fill and the portable answer reads (answer_scan / answer_native take any type
+ * with these members); the Windows leg fills roots and roots_network_skipped and leaves the rest alone.
  *
  * The flow the shell runs is  scan_targets()  ->  make_fs_ops(targets)  ->  walk(targets.roots, ...).
  * plan_targets() is the pure part of scan_targets() (no I/O), so the mount-table decisions are unit
@@ -20,29 +23,38 @@
  */
 #pragma once
 
-#if !defined(_WIN32)
-
-#include "component_walk.hpp"
-
 #include <cstddef>
-#include <functional>
-#include <optional>
 #include <string>
-#include <unordered_set>
 #include <vector>
-
-#include <dirent.h>
-#include <sys/types.h>
 
 namespace yuzu::component_inventory {
 
+/// What an OS leg offers the portable answer: the roots to walk and what was kept out. Shared by the
+/// POSIX leg (below) and the Windows leg (component_legs_win.hpp).
 struct Targets {
     std::vector<std::string> roots;          // absolute, no trailing '/', safe to hand to walk()
     std::vector<std::string> network_mounts; // mount points strictly below a kept root
     std::size_t roots_link_skipped{0};       // roots dropped for a link at any component
     std::size_t roots_network_skipped{0};    // roots dropped for sitting on or under a network mount
-    bool mount_table_unreadable{false};      // the table could not be read: roots is empty
+    // The table could not be read, so roots is empty. On Windows, where there is no table, it means the
+    // root list could not be established (a Program Files lookup failed): same answer, nothing walked.
+    bool mount_table_unreadable{false};
 };
+
+} // namespace yuzu::component_inventory
+
+#if !defined(_WIN32)
+
+#include "component_walk.hpp"
+
+#include <functional>
+#include <optional>
+#include <unordered_set>
+
+#include <dirent.h>
+#include <sys/types.h>
+
+namespace yuzu::component_inventory {
 
 /// The machine roots worth walking on this OS, all inside the machine allowlist of
 /// installed_software_v3.cpp (kMachineRoots), in walk order: cheap roots first, because the walk has

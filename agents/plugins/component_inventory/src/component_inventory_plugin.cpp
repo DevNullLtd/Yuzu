@@ -7,10 +7,11 @@
  * Actions (neither takes a parameter; the roots come from the OS leg and from nothing a request can
  * supply):
  *   "scan"   -- Java archives. Roots: scan_targets().
- *   "native" -- shared libraries, capped at 5,000 rows. Roots: scan_native_targets(); package-owned
- *               trees are excluded and counted. The server refuses it until an operator switches it
- *               on (an action-level kill-switch row seeded off at boot). Publishes no heartbeat keys:
- *               scan already uses 6 of the 8 a plugin may publish.
+ *   "native" -- shared libraries (ELF .so, Mach-O .dylib, PE .dll), capped at 5,000 rows. Roots:
+ *               scan_native_targets(); package-owned trees are excluded and counted. The server
+ *               refuses it until an operator switches it on (an action-level kill-switch row seeded
+ *               off at boot). Publishes no heartbeat keys: scan already uses 6 of the 8 a plugin may
+ *               publish.
  *
  * Wire rows (component_scan.hpp): exactly one leading `status|<action>|<level>|<tokens or ->` row,
  * then `comp|<java|native>|name|version|version_source|path|size|mtime|anchor_app` rows.
@@ -22,8 +23,10 @@
  * archive that changed while read answers constrained and CONSTRAINED/PARTIAL with the cause as a
  * `<os>:component_inventory:<cause>` token. The rows that were reachable are written at both levels.
  *
- * SHIPPED LEGS. Linux and macOS (machine roots only). The Windows leg of both actions is a later change
- * and answers through the shared planned-leg reporter. All three descriptor legs are declared unconditionally so
+ * SHIPPED LEGS. Linux and macOS (machine roots only), and Windows (the two Program Files trees on fixed
+ * drives, through a filesystem binding that follows no reparse point; component_fs_win.cpp). The Windows leg
+ * is declared CONSTRAINED, not supported, until a real capture from a Windows host is committed; Python and
+ * Node components on Windows are a later change. All three descriptor legs are declared unconditionally so
  * the capability-matrix generator sees a complete, stable shape.
  *
  * ZERO SUBPROCESS, READ-ONLY. Nothing here mutates the host; the only write is the plugin's own
@@ -32,14 +35,14 @@
 
 #include <yuzu/plugin.hpp>
 
-#include <planned_leg.hpp> // yuzu::shared::report_planned (agents/shared)
-
 #include <yuzu/string_utils.hpp>
 
 #include "component_native_scan.hpp" // portable: the native answer
 #include "component_scan.hpp"        // portable: the answer, its emission and the catch-all's answer
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include "component_legs_win.hpp"
+#else
 #include "component_legs.hpp"
 #endif
 
@@ -87,8 +90,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "Java archives only; machine roots only (per-user installs are not read); any budget, "
          "unreadable directory or unenumerable archive answers constrained"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "bounded Program Files walk with the same archive reads",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "bounded read-only walk of the Program Files and Program Files (x86) directories (the shell's "
+         "known-folder paths, fixed drives only); every directory and file opened relative to its volume "
+         "root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); "
+         "archive central directory, pom.properties and MANIFEST.MF read in-process",
+         "not yet verified against a real capture; Java archives only; machine roots only (per-user "
+         "installs are not read); a reparse point is counted and never read; any budget, unreadable "
+         "directory or unenumerable archive answers constrained"},
     },
     {
         /* .action      = */ "native",
@@ -111,15 +120,23 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "are not read; machine roots only; the server refuses it until an operator switches it on; "
          "any budget, unreadable directory or changed file answers constrained"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "bounded Program Files walk with the same library reads",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "bounded read-only walk of the Program Files and Program Files (x86) directories for .dll files, "
+         "at most 5,000 rows; every directory and file opened relative to its volume root with no reparse "
+         "point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); the PE fixed file "
+         "version read in-process within fixed bounds; WindowsApps under each root excluded and counted",
+         "not yet verified against a real capture; libraries inside applications only; machine roots only; "
+         "the server refuses it until an operator switches it on; a reparse point is counted and never "
+         "read; any budget, unreadable directory or changed file answers constrained"},
     },
 };
 
-#if !defined(_WIN32)
 // The native action's per-OS parts: which names are candidates, how a file is read, which trees are
 // the package manager's. Chosen at compile time, like kOs.
-#if defined(__APPLE__)
+#if defined(_WIN32)
+constexpr auto kNativeCandidate = &yuzu::component_inventory::is_windows_native_candidate;
+const yuzu::component_inventory::NativeParse kNativeParse = yuzu::component_inventory::describe_windows_file;
+#elif defined(__APPLE__)
 constexpr auto kNativeCandidate = &yuzu::component_inventory::is_macos_native_candidate;
 const yuzu::component_inventory::NativeParse kNativeParse = yuzu::component_inventory::describe_macos_file;
 #else
@@ -127,15 +144,21 @@ constexpr auto kNativeCandidate = &yuzu::component_inventory::is_linux_native_ca
 const yuzu::component_inventory::NativeParse kNativeParse = yuzu::component_inventory::describe_linux_file;
 #endif
 
-yuzu::component_inventory::WalkPolicy native_policy() {
+yuzu::component_inventory::WalkPolicy native_policy([[maybe_unused]] const yuzu::component_inventory::Targets& t) {
     yuzu::component_inventory::WalkPolicy p;
     p.is_candidate = kNativeCandidate;
+#if defined(_WIN32)
+    // WindowsApps under each root that was planned, compared ASCII case-insensitively.
+    p.skip_dir = [excluded = yuzu::component_inventory::windows_native_excluded_dirs(t.roots)](const std::string& dir) {
+        return yuzu::component_inventory::is_windows_excluded_dir(excluded, dir);
+    };
+#else
     p.skip_dir = [excluded = yuzu::component_inventory::native_excluded_dirs()](const std::string& dir) {
         return std::ranges::find(excluded, dir) != excluded.end();
     };
+#endif
     return p;
 }
-#endif
 
 } // namespace
 
@@ -180,14 +203,12 @@ public:
                 ctx.write_output(std::string{"unknown action: "} + yuzu::util::safe_output_field(action));
                 return 1;
             }
-#if defined(_WIN32)
-            return yuzu::shared::report_planned(ctx, answered);
-#else
             const auto make_fs = [](const ci::Targets& x) { return ci::make_fs_ops(x); };
             if (action == ci::kNativeAction) {
                 // No heartbeat keys: scan already uses 6 of the 8 a plugin may publish.
-                const ci::Answer a = ci::answer_native(kOs, ci::scan_native_targets(), make_fs, ci::native_limits(),
-                                                       native_policy(), kNativeParse);
+                const ci::Targets nt = ci::scan_native_targets();
+                const ci::Answer a = ci::answer_native(kOs, nt, make_fs, ci::native_limits(), native_policy(nt),
+                                                       kNativeParse);
                 ci::emit_answer(ctx, static_cast<yuzu::PluginContext*>(nullptr), a, wrote);
                 return 0;
             }
@@ -197,7 +218,6 @@ public:
             yuzu::PluginContext pctx{plugin_ctx_};
             ci::emit_answer(ctx, plugin_ctx_ != nullptr ? &pctx : nullptr, a, wrote);
             return 0; // a degraded read is never a failed command
-#endif
         } catch (...) {
             ci::answer_internal_error(ctx, kInternalError, wrote, answered);
             return 1; // a genuine internal failure is a failed command

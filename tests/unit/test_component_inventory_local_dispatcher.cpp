@@ -7,16 +7,20 @@
  * is how a sibling plugin once shipped a compiled-out Windows leg and stayed green). Only the
  * expectations differ per host.
  *
- * `scan` and `native` are dispatched on Windows ONLY, where the planned leg answers at once. On Linux
- * and macOS a dispatch would walk this host's real application roots for up to 45 s, which the unit
- * suites must not do, and the plugin takes its roots from nothing a request or the environment can
- * supply, so a test cannot point it at a temporary tree. The populated answers are pinned in
+ * `scan` and `native` are dispatched on Windows ONLY, and there for real: the Windows leg reads the
+ * Program Files trees of the host, bounded to 45 s and 400,000 directory entries per action (the plan's
+ * stated cost of this wiring check; the roots come from the shell's known-folder lookup and cannot be
+ * pointed at a temporary tree). On Linux and macOS a dispatch would walk this host's real application
+ * roots for the same bound, which the unit suites must not do, and the plugin takes its roots from
+ * nothing a request or the environment can supply. The populated answers are pinned in
  * test_component_scan.cpp and test_component_native_scan.cpp over an in-memory tree and a
- * materialised one, and the real end-to-end run is the sample capture taken against a host.
+ * materialised one, the Windows leg's own behaviour in test_component_fs_win.cpp, and the real
+ * end-to-end run is the sample capture taken against a host.
  *
  * MUTATION: adding a third action, changing a declared leg, or loading the wrong plugin fails the
- * descriptor case; removing the report_planned call on the Windows path, or letting `native` reach
- * the unknown-action guard, fails the planned-row cases.
+ * descriptor case; putting the planned-leg reporter back on the Windows path, or letting `native`
+ * reach the unknown-action guard, fails the Windows cases (an `unsupported` row); an exception out of
+ * the Windows leg fails them through the internal_error token and the return code.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -147,7 +151,11 @@ TEST_CASE("component_inventory plugin: exactly two actions, `scan` and `native`,
         CHECK(d.linux_leg.rung == 1);
         CHECK(d.macos_leg.support == YUZU_SUPPORT_SUPPORTED);
         CHECK(d.macos_leg.rung == 1);
-        CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);
+        // Windows is CONSTRAINED until a real capture from a Windows host is committed, and says so.
+        CHECK(d.windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(d.windows_leg.rung == 1);
+        REQUIRE(d.windows_leg.fallback != nullptr);
+        CHECK(std::string_view{d.windows_leg.fallback}.contains("not yet verified against a real capture"));
     }
 }
 
@@ -174,7 +182,7 @@ TEST_CASE("component_inventory plugin: an unknown action is refused with one non
 }
 
 #if defined(_WIN32)
-TEST_CASE("component_inventory plugin: the Windows leg answers the planned row at once, for both actions",
+TEST_CASE("component_inventory plugin: on Windows scan and native answer a real status row, never unsupported",
           "[component_inventory][actions]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -183,13 +191,22 @@ TEST_CASE("component_inventory plugin: the Windows leg answers the planned row a
     }
     yuzu::agent::LocalDispatcher dispatcher;
     for (const char* action : {"scan", "native"}) {
+        INFO(action);
         const auto result = dispatcher.run(plugin->descriptor, action);
-        CHECK(result.rc == 0); // a planned leg is not a failed command
+        CHECK(result.rc == 0); // a degraded read is not a failed command; an exception out of the leg is
         const auto rows = captured_rows(result.captured);
-        REQUIRE(rows.size() == 1);
-        CHECK(rows[0] == std::string{"status|"} + action + "|unsupported|windows:planned");
-        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
-        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+        REQUIRE_FALSE(rows.empty());
+        const std::string prefix = std::string{"status|"} + action + "|";
+        const bool supported = rows[0].starts_with(prefix + "supported|");
+        const bool constrained = rows[0].starts_with(prefix + "constrained|");
+        CHECK((supported || constrained)); // never `unsupported`, never the planned row
+        CHECK(rows[0].find("windows:planned") == std::string::npos);
+        CHECK(rows[0].find("internal_error") == std::string::npos);
+        CHECK((result.result_status == YUZU_RESULT_STATUS_OK || result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
+        // Only the status row first, then component rows of this action's kind.
+        const std::string kind = std::string{"comp|"} + (std::string_view{action} == "scan" ? "java" : "native") + "|";
+        for (std::size_t i = 1; i < rows.size(); ++i)
+            CHECK(rows[i].starts_with(kind));
     }
 }
 #endif
