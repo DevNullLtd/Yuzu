@@ -7,7 +7,7 @@
 # component_inventory plugin walks (walk_ordered and PosixFs, make_search_leg in component_legs.hpp), and
 # there is no second walker. That code lives under component_inventory/src and is compiled into THIS plugin
 # directly rather than hoisted to agents/shared, because another change owns the breadth-first walk it sits
-# beside; the hoist is tracked as a follow-up and replaces these two lines when it lands.
+# beside; the hoist is tracked in #8429 and replaces these two lines when it lands.
 file_search_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 
 if host_machine.system() == 'darwin'
