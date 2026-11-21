@@ -22,8 +22,9 @@
 ##   Windows: no reparse point (junction, symbolic link, mount point) is followed at any path
 ##            component, and one met inside a tree is counted (`link_skipped`) and never opened. A root
 ##            on a drive that is not a fixed local disk (a mapped network drive, removable or optical
-##            media) is dropped and reported as `network_fs_skipped`. A root that is itself a reparse
-##            point is refused and answers constrained (`dir_unreadable`); a Program Files location
+##            media) is dropped and reported as `network_fs_skipped`. A root that is missing, or is itself a reparse
+##            point, is refused and answers constrained (`dir_unreadable`; the POSIX legs drop a
+##            missing root silently); a Program Files location
 ##            the shell cannot name answers constrained (`mount_table_unreadable`). The WindowsApps
 ##            directory directly under each root (the Store packages) is not entered, matched by
 ##            exact path without regard to case; it is counted and reported as
