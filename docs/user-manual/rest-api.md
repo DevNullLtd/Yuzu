@@ -2269,6 +2269,17 @@ gate and the same `503` on a degraded read apply to them. **Any other value, an 
 > `allow_set_not_applied`), and the whitelist is not on the device until it is released and quarantined
 > again.
 >
+> **A device that refuses (`refused|self_host`, `refused|own_addresses_unreadable`).** A device whose
+> control endpoint is one of its own addresses, loopback included, or whose own addresses it cannot
+> read, answers every apply with that refusal and is never contained, so the record never confirms
+> (`last_confirmed_at` stays `0`) and `YuzuQuarantineEndpointUnconfirmed` fires after 15 minutes. The
+> record still refuses operator commands to the device. The server keeps re-dispatching, so nothing
+> ends the record by itself: end it with `DELETE /api/v1/quarantine/{agent_id}`, and with
+> `?force=true` when that answers `202`. A device that was never contained holds no rules, so it
+> answers a release with `status|inactive`, and a plain `DELETE` ends the record. A single-host stack
+> (agent and server on one machine) always ends this way. See
+> `docs/user-manual/security-hardening.md` "A device that is its own server is never contained".
+>
 > **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
 > progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed,
 > except with `?include=release_owed`: those rows read `release_owed` and carry two more keys,

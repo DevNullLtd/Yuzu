@@ -3239,6 +3239,13 @@ groups:
             record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
             record_id=... command_id=..." once per transition to confirmed,
             or "drift status=..." when a re-verify no longer confirms).
+            This alert also fires when the device answers
+            status|refused|self_host or
+            status|refused|own_addresses_unreadable to every apply: a
+            device whose control endpoint is one of its own addresses is never
+            contained, so it never confirms. The record still blocks
+            operator commands to it and the device is not contained; the way
+            out is DELETE /api/v1/quarantine/{agent_id}.
             This alert also fires when the device's agent lacks the
             firewall plugin: the dispatch is accepted but never
             confirmed. An agent without the firewall plugin comes from an

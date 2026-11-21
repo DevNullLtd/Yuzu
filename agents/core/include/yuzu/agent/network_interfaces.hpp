@@ -19,6 +19,7 @@
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,19 @@ namespace yuzu::agent {
  * Returns an empty vector on unsupported platforms or on failure.
  */
 YUZU_EXPORT std::vector<std::string> enumerate_local_ips();
+
+/**
+ * Enumerate every IP address (IPv4 + IPv6) this host answers to, loopback and
+ * link-local included (on Windows the software-loopback adapter too; adapters
+ * that are not up are still skipped). Same canonical text form and
+ * deduplication as enumerate_local_ips().
+ *
+ * Returns nullopt when the OS read fails or the platform is unsupported, so a
+ * caller can tell "could not read" from "no addresses"; a decision that needs
+ * the answer must fail closed on nullopt. On Windows the adapter read is tried
+ * up to three times, so an adapter added mid-read does not read as a failure.
+ */
+YUZU_EXPORT std::optional<std::vector<std::string>> enumerate_own_addresses();
 
 /**
  * Read the host's name (POSIX gethostname / Windows gethostname via winsock2).

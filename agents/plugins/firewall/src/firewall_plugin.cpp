@@ -51,6 +51,7 @@
 #include "firewall_parsers.hpp"
 #include "firewall_quarantine_parsers.hpp"
 
+#include <yuzu/agent/network_interfaces.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <spdlog/spdlog.h> // one line per containment state change / non-OK outcome (SRE)
@@ -2873,6 +2874,24 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
     const auto exceptions = fq::parse_exceptions_csv(params.get("exceptions"));
     if (!exceptions)
         return emit_refusal(ctx, "exceptions_invalid:" + exceptions.error(), "quarantine");
+    // The start-resolved set was read ONCE at agent start and the live peer is the
+    // address agents/core published from the stream the server answered on (never
+    // resolved here: the host being contained must not choose which address survives
+    // its own containment, #3429). The live peer leads the set, so a server that moved
+    // since start is allowed, and it is what the verification connects to.
+    auto allow = fq::build_allow_set(config_value(raw, "agent.server_address_resolved"),
+                                     config_value(raw, "agent.server_address"), host_resolvers(),
+                                     *exceptions, config_value(raw, "agent.server_peer"));
+    if (!allow)
+        return emit_refusal(ctx, allow.error());
+    // A host whose control endpoint is one of its own addresses (loopback included) cannot
+    // be contained: the server it must keep reaching is itself, so the apply could never
+    // be released from outside. Checked on every operator dispatch, before any record is
+    // read and before any leg is built; repair, boot re-apply, release and
+    // quarantine_allow never reach this line (a stored record is still re-applied and can
+    // always be released).
+    if (const auto why = fq::self_host_refusal(allow->control, yuzu::agent::enumerate_own_addresses()))
+        return emit_refusal(ctx, std::string{*why}, "quarantine");
     // The packaged Linux unit cannot elevate: refuse before any record exists,
     // rather than write `applying` and fail every tool call after it.
     if (const auto why = privilege_refusal())
@@ -2889,17 +2908,6 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
         private_staging_dir(raw).empty())
         return emit_refusal(ctx, "staging_unavailable");
 #endif
-
-    // The start-resolved set was read ONCE at agent start and the live peer is the
-    // address agents/core published from the stream the server answered on (never
-    // resolved here: the host being contained must not choose which address survives
-    // its own containment, #3429). The live peer leads the set, so a server that moved
-    // since start is allowed, and it is what the verification connects to.
-    auto allow = fq::build_allow_set(config_value(raw, "agent.server_address_resolved"),
-                                     config_value(raw, "agent.server_address"), host_resolvers(),
-                                     *exceptions, config_value(raw, "agent.server_peer"));
-    if (!allow)
-        return emit_refusal(ctx, allow.error());
 
     fq::ApplyRequest req;
     req.allow = *allow;

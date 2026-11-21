@@ -53,6 +53,7 @@
 #include "test_helpers.hpp"
 
 #include <yuzu/agent/kv_store.hpp>
+#include <yuzu/agent/network_interfaces.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.hpp>
@@ -468,14 +469,16 @@ struct LiveEnv {
     return true;
 }
 
-#define PLUGIN_RIG_OR_RETURN(rig)                                                                  \
+#define PLUGIN_RIG_AT_OR_RETURN(rig, server, resolved)                                             \
     if (!firewall_plugin_built()) {                                                                \
         WARN("firewall plugin not found in the build tree -- skipping (build with "                \
              "-Dbuild_agent=true)");                                                               \
         SUCCEED();                                                                                 \
         return;                                                                                    \
     }                                                                                              \
-    PluginRig rig("203.0.113.7:50051", "203.0.113.7")
+    PluginRig rig(server, resolved)
+
+#define PLUGIN_RIG_OR_RETURN(rig) PLUGIN_RIG_AT_OR_RETURN(rig, "203.0.113.7:50051", "203.0.113.7")
 
 /// A refusal as the plugin reports it: rc 1, `status|refused|<reason>` plus the
 /// `refused|<reason>` row, and the typed result UNAVAILABLE / PARTIAL.
@@ -639,6 +642,53 @@ TEST_CASE("quarantine repair=1: a dispatch that also names containment parameter
     CHECK_FALSE(rig.record().has_value());
     // and `repair` other than `1` is no repair at all: the ordinary parameter checks apply
     check_refused(rig.run("quarantine", {{"repair", "0"}, {"ttl_seconds", "soon"}}), "ttl_out_of_bounds");
+}
+
+TEST_CASE("quarantine: a control endpoint that is this host's own loopback is refused self_host",
+          "[agent][firewall_quarantine]") {
+    // A server on 127.0.0.1 or ::1 is always this host, so no enumeration is needed to refuse
+    // it. The refusal comes before the privilege check, the staging check and any record, on
+    // every OS and for an unprivileged run, so this is what the built plugin answers here.
+    {
+        PLUGIN_RIG_AT_OR_RETURN(rig, "127.0.0.1:50051", "127.0.0.1");
+        check_refused(rig.run("quarantine"), "self_host");
+        CHECK_FALSE(rig.record().has_value()); // a refusal writes nothing
+    }
+    {
+        PLUGIN_RIG_AT_OR_RETURN(rig, "[::1]:50051", "::1");
+        check_refused(rig.run("quarantine"), "self_host");
+        // valid optional parameters do not change the answer
+        check_refused(rig.run("quarantine", {{"ttl_seconds", "3600"},
+                                             {"exceptions", "198.18.0.9:22/tcp/in"}}),
+                      "self_host");
+        CHECK_FALSE(rig.record().has_value());
+    }
+}
+
+TEST_CASE("quarantine repair=1: a loopback rig still answers inactive, repair never checks self_host",
+          "[agent][firewall_quarantine]") {
+    PLUGIN_RIG_AT_OR_RETURN(rig, "127.0.0.1:50051", "127.0.0.1");
+    // A stored record is always re-applied and always releasable: the repair route is
+    // answered before the self-host check is reached.
+    const auto r = rig.run("quarantine", {{"repair", "1"}});
+    INFO(r.captured);
+    CHECK(r.rc == 0);
+    CHECK(has_row(r.captured, "status|inactive"));
+    CHECK(has_row(r.captured, "note|nothing_to_repair=1"));
+    CHECK_FALSE(rig.record().has_value());
+}
+
+TEST_CASE("agent core: enumerate_own_addresses answers a non-empty list of literals",
+          "[agent][firewall_quarantine]") {
+    // The shell of the self-host check reads this; nullopt would make every quarantine refuse
+    // own_addresses_unreadable. Loopback is kept, so a host with any interface answers.
+    const auto own = yuzu::agent::enumerate_own_addresses();
+    REQUIRE(own.has_value());
+    CHECK_FALSE(own->empty());
+    for (const auto& lit : *own) {
+        INFO("own address literal: " << lit);
+        CHECK(fq::parse_ip(lit).has_value());
+    }
 }
 
 TEST_CASE("live: apply, verify the block, release restores the host byte-identical",

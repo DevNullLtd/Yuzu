@@ -7,6 +7,7 @@
 
 #include <yuzu/agent/network_interfaces.hpp>
 
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -61,21 +62,29 @@ bool is_ipv6_link_local(const in6_addr& addr) {
 
 #ifdef _WIN32
 
-std::vector<std::string> enumerate_local_ips() {
+namespace {
+
+// One walk behind both public functions. include_local_scopes = false drops
+// loopback and link-local (the fleet-identification view); true keeps them
+// and the software-loopback adapter (every address this host answers to).
+// nullopt = the OS read failed, which is not the same as "no addresses".
+std::optional<std::set<std::string>> collect(bool include_local_scopes) {
     constexpr ULONG kFlags =
         GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST;
+    // An adapter added between the sizing call and the read grows the table again, so
+    // the buffer is re-sized on every ERROR_BUFFER_OVERFLOW, up to three reads in all.
+    constexpr int kMaxReads = 3;
 
     ULONG bufsize = 16 * 1024;
     std::vector<unsigned char> buf(bufsize);
-    ULONG rc = GetAdaptersAddresses(AF_UNSPEC, kFlags, nullptr,
-                                    reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()), &bufsize);
-    if (rc == ERROR_BUFFER_OVERFLOW) {
+    ULONG rc = ERROR_BUFFER_OVERFLOW;
+    for (int attempt = 0; attempt < kMaxReads && rc == ERROR_BUFFER_OVERFLOW; ++attempt) {
         buf.resize(bufsize);
         rc = GetAdaptersAddresses(AF_UNSPEC, kFlags, nullptr,
                                   reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()), &bufsize);
     }
     if (rc != ERROR_SUCCESS)
-        return {};
+        return std::nullopt;
 
     std::set<std::string> uniq;
     char text_buf[INET6_ADDRSTRLEN];
@@ -84,7 +93,7 @@ std::vector<std::string> enumerate_local_ips() {
          adapter = adapter->Next) {
         if (adapter->OperStatus != IfOperStatusUp)
             continue;
-        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+        if (!include_local_scopes && adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
             continue;
 
         for (auto* unicast = adapter->FirstUnicastAddress; unicast != nullptr;
@@ -94,28 +103,35 @@ std::vector<std::string> enumerate_local_ips() {
                 continue;
             if (sa->sa_family == AF_INET) {
                 const auto* sin = reinterpret_cast<const sockaddr_in*>(sa);
-                if (is_ipv4_loopback(sin->sin_addr) || is_ipv4_link_local(sin->sin_addr))
+                if (!include_local_scopes &&
+                    (is_ipv4_loopback(sin->sin_addr) || is_ipv4_link_local(sin->sin_addr)))
                     continue;
                 if (inet_ntop(AF_INET, &sin->sin_addr, text_buf, sizeof(text_buf)))
                     uniq.emplace(text_buf);
             } else if (sa->sa_family == AF_INET6) {
                 const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(sa);
-                if (is_ipv6_loopback(sin6->sin6_addr) || is_ipv6_link_local(sin6->sin6_addr))
+                if (!include_local_scopes &&
+                    (is_ipv6_loopback(sin6->sin6_addr) || is_ipv6_link_local(sin6->sin6_addr)))
                     continue;
                 if (inet_ntop(AF_INET6, &sin6->sin6_addr, text_buf, sizeof(text_buf)))
                     uniq.emplace(text_buf);
             }
         }
     }
-    return std::vector<std::string>(uniq.begin(), uniq.end());
+    return uniq;
 }
+
+} // namespace
 
 #elif defined(__linux__) || defined(__APPLE__)
 
-std::vector<std::string> enumerate_local_ips() {
+namespace {
+
+// See the Windows copy above: one walk, loopback and link-local kept only when asked.
+std::optional<std::set<std::string>> collect(bool include_local_scopes) {
     ifaddrs* head = nullptr;
     if (getifaddrs(&head) != 0)
-        return {};
+        return std::nullopt;
 
     std::set<std::string> uniq;
     char text_buf[INET6_ADDRSTRLEN];
@@ -125,13 +141,15 @@ std::vector<std::string> enumerate_local_ips() {
             continue;
         if (p->ifa_addr->sa_family == AF_INET) {
             const auto* sin = reinterpret_cast<const sockaddr_in*>(p->ifa_addr);
-            if (is_ipv4_loopback(sin->sin_addr) || is_ipv4_link_local(sin->sin_addr))
+            if (!include_local_scopes &&
+                (is_ipv4_loopback(sin->sin_addr) || is_ipv4_link_local(sin->sin_addr)))
                 continue;
             if (inet_ntop(AF_INET, &sin->sin_addr, text_buf, sizeof(text_buf)))
                 uniq.emplace(text_buf);
         } else if (p->ifa_addr->sa_family == AF_INET6) {
             const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(p->ifa_addr);
-            if (is_ipv6_loopback(sin6->sin6_addr) || is_ipv6_link_local(sin6->sin6_addr))
+            if (!include_local_scopes &&
+                (is_ipv6_loopback(sin6->sin6_addr) || is_ipv6_link_local(sin6->sin6_addr)))
                 continue;
             if (inet_ntop(AF_INET6, &sin6->sin6_addr, text_buf, sizeof(text_buf)))
                 uniq.emplace(text_buf);
@@ -139,13 +157,36 @@ std::vector<std::string> enumerate_local_ips() {
     }
 
     freeifaddrs(head);
-    return std::vector<std::string>(uniq.begin(), uniq.end());
+    return uniq;
+}
+
+} // namespace
+
+#endif
+
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
+
+std::vector<std::string> enumerate_local_ips() {
+    const auto addrs = collect(false);
+    return addrs ? std::vector<std::string>(addrs->begin(), addrs->end())
+                 : std::vector<std::string>{};
+}
+
+std::optional<std::vector<std::string>> enumerate_own_addresses() {
+    const auto addrs = collect(true);
+    if (!addrs)
+        return std::nullopt;
+    return std::vector<std::string>(addrs->begin(), addrs->end());
 }
 
 #else
 
 std::vector<std::string> enumerate_local_ips() {
     return {};
+}
+
+std::optional<std::vector<std::string>> enumerate_own_addresses() {
+    return std::nullopt;
 }
 
 #endif

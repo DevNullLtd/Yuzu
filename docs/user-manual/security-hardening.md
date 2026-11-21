@@ -624,6 +624,33 @@ whitelist leaves IPv6 fully contained.
 - A device that cannot reach the server needs out-of-band recovery. When in doubt, whitelist both
   families for the management server.
 
+### A device that is its own server is never contained
+
+A device whose server or gateway address is one of its own addresses, loopback included, is
+never contained. The agent compares the control addresses (the address it is connected through,
+plus every address the configured server name resolved to at agent start) with every address the
+host answers to, and answers `refused|self_host` when one matches, or when a control address is
+loopback or unspecified. Containing such a host would cut the agent off from the very server that
+has to release it. An enumeration of the host's own addresses that cannot be read is refused too
+(`refused|own_addresses_unreadable`): an unknown is not "not this host". Either answer changes
+nothing and writes nothing, and there is no override.
+
+- **A single-host stack cannot apply a containment.** An agent that talks to a server on the
+  same machine, such as a one-machine evaluation stack or a loopback test rig, answers
+  `refused|self_host` to every operator quarantine. A containment round trip needs the server on
+  a separate host.
+- **Only an operator's quarantine is checked.** The agent's repair, its boot-time re-apply,
+  `firewall.release` and `firewall.quarantine_allow` never are, so a containment that is already
+  stored is still re-applied and can always be released.
+- **The record of a refused device stays unconfirmed.** The server keeps re-dispatching to a
+  device that refuses, so the record never confirms and `YuzuQuarantineEndpointUnconfirmed` fires
+  after 15 minutes. Operator commands to the device stay refused while the record exists. End it
+  with `DELETE /api/v1/quarantine/{agent_id}`.
+- **Known limit: addresses only.** The check compares addresses. A server that runs in a
+  container or a VM on the same host and is reached at a bridge address (for example `172.17.0.2`
+  behind `docker0`) is not one of the host's own addresses, so that host can still be contained.
+  Put the server on a separate host when containment matters.
+
 ### Reading the result honestly
 
 The plugin reports on two channels: the `status|<token>[|<reason>]` row in the output, and the ABI

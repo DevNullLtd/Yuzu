@@ -247,7 +247,10 @@ metadata:
     sub-anchor. Reports active only when the block is verified and
     active_unproven when it could not be proven. Waits up to 2s for any other
     in-flight containment change on this device. The Linux packaged unit
-    refuses every containment action (privilege_unavailable).
+    refuses every containment action (privilege_unavailable). A device whose
+    control endpoint is one of its own addresses (loopback included), or whose
+    own addresses cannot be read, is never contained: it answers
+    refused|self_host or refused|own_addresses_unreadable and changes nothing.
   tags: [security, quarantine, incident-response, network]
 
 spec:
