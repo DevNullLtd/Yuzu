@@ -2277,7 +2277,9 @@ gate and the same `503` on a degraded read apply to them. **Any other value, an 
 > ends the record by itself: end it with `DELETE /api/v1/quarantine/{agent_id}`, and with
 > `?force=true` when that answers `202`. A device that was never contained holds no rules, so it
 > answers a release with `status|inactive`, and a plain `DELETE` ends the record. A single-host stack
-> (agent and server on one machine) always ends this way. See
+> (agent and server on one machine) ends this way whenever the agent reaches the server at one of the
+> host's own addresses, loopback included; a server in a container or VM on the same host reached at a
+> bridge address is the one case that is not refused. See
 > `docs/user-manual/security-hardening.md` "A device that is its own server is never contained".
 >
 > **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
