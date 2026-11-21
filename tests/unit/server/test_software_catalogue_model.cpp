@@ -1478,8 +1478,12 @@ TEST_CASE("catalogue/versions JSON shaping", "[server][software_catalogue_model]
 
 TEST_CASE("devices JSON shaping", "[server][software_catalogue_model]") {
     const auto dr = device_row_json(fleet_row("git", "a1", 3));
-    CHECK(dr.size() == 14);
+    CHECK(dr.size() == 15);
     CHECK(dr["source"] == "installed_apps.list_inventory");
+    CHECK(dr["package_id"] == "");  // unset -> empty string, never null or omitted
+    auto with_pid = fleet_row("git", "a1", 3);
+    with_pid.entry.package_id = "{PID}";
+    CHECK(device_row_json(with_pid)["package_id"] == "{PID}");
     auto dj = devices_response_json({fleet_row("git", "a1", 3)}, "", 2, true);
     CHECK(dj["count"] == 1);
     CHECK(dj["next_cursor"].is_null());
@@ -1519,11 +1523,13 @@ TEST_CASE("installs_csv: every cell lands under its header, neutralised and quot
     r.entry.distro_id = "di";
     r.entry.distro_version = "dv";
     r.entry.source = "so";
+    r.entry.package_id = "pid";
     // header cells: agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,
-    // arch,signature_status,distro_id,distro_version,source
+    // arch,signature_status,distro_id,distro_version,source,package_id
     CHECK(installs_csv({r}) == std::string(kInstallsCsvHeader) +
-                                   "\n'=A,'+N,'-V,'@P,'\tD,\"'\rK\",\"e\nco\",ep,rel,ar,sig,di,dv,so\n");
+                                   "\n'=A,'+N,'-V,'@P,'\tD,\"'\rK\",\"e\nco\",ep,rel,ar,sig,di,dv,so,pid\n");
     CHECK(std::ranges::count(kInstallsCsvHeader, ',') + 1 == static_cast<long>(kInstallsCsvColumns));
+    CHECK(std::string(kInstallsCsvHeader).ends_with(",source,package_id"));
 }
 
 TEST_CASE("titles_csv", "[server][software_catalogue_model]") {

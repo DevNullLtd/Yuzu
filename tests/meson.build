@@ -3595,16 +3595,19 @@ test('qa-stack gateway crash signatures',
   timeout: 30,
 )
 # WP15/S9: the release image vulnerability gate (scripts/ci/image-vuln-gate.sh)
-# fails closed, run against a stub trivy; plus lexical tripwires that every
+# fails closed, run against a stub trivy, a stub grype and a stub docker; the
+# grype rules' mutants must be killed; plus lexical tripwires that every
 # release.yml publish job runs it before its push and pre-release.yml scans
 # every published image. Hermetic, no Docker; the bash cases skip on Windows.
 test('image vulnerability gate',
   _python3_test,
   args: [files('test_image_vuln_gate.py')],
   suite: 'docs',
-  # 68-92 s when the runner is loaded (CI hit 60.02 s on PR #8315 with the old
-  # limit of 60): many cases each run the gate script and a stub trivy.
-  timeout: 240,
+  # Many cases each run the gate script with its stubs. Before the grype path
+  # it took 41 s on an idle workstation and 68-92 s on a loaded CI runner (CI
+  # hit 60.02 s on PR #8315 with the old limit of 60); with it (WP15), 86 s on
+  # the same workstation, so a loaded runner can need about 190 s.
+  timeout: 480,
 )
 
 # WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
