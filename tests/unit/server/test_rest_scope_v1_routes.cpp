@@ -488,9 +488,9 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview with a null ResultSetStore* abor
 
 TEST_CASE("scope v1: POST /api/v1/scope/preview resolves from_result_set: against a real, "
           "owned result set",
-          "[pg][rest][scope][v1]") {
+          "[pg][rest][scope][v1][member_cache]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
     REQUIRE(pool.valid());
     ResultSetStore store(pool);
     REQUIRE(store.is_open());
@@ -506,13 +506,35 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview resolves from_result_set: agains
     // FleetReadGate{.admitted=true} alone defaults .scope to deny_all() —
     // see the harness's own unconfined-match test above for the same note.
     h.fleet_gate = authz::FleetReadGate{.admitted = true, .scope = std::nullopt};
-    auto r = h.sink.Post("/api/v1/scope/preview",
-                         nlohmann::json({{"expression", "from_result_set:" + set->id}}).dump());
-    REQUIRE(r);
-    REQUIRE(r->status == 200);
-    auto body = nlohmann::json::parse(r->body);
-    CHECK(body["data"]["matched_count"] == 1);
-    CHECK(body["data"]["matched_agents"][0] == "agent-001");
+    const auto body = nlohmann::json({{"expression", "from_result_set:" + set->id}}).dump();
+    auto preview = [&] {
+        auto response = h.sink.Post("/api/v1/scope/preview", body);
+        REQUIRE(response);
+        REQUIRE(response->status == 200);
+        return nlohmann::json::parse(response->body)["data"]["matched_agents"];
+    };
+    REQUIRE(preview() == nlohmann::json::array({"agent-001"}));
+
+    // A second preview can read the live header and use the same members even while
+    // PostgreSQL blocks access to the member table. A fresh membership query times out.
+    {
+        PgConn locker{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+        REQUIRE(PgResult{PQexec(locker.get(), "BEGIN")}.ok());
+        REQUIRE(PgResult{PQexec(locker.get(), "LOCK TABLE result_set_store.result_set_members "
+                                              "IN ACCESS EXCLUSIVE MODE")}.ok());
+        CHECK(preview() == nlohmann::json::array({"agent-001"}));
+        h.fleet_gate.scope = authz::deny_all();
+        CHECK(preview().empty());
+    }
+
+    // A delete by a different replica must be seen even with the old membership cached here.
+    ResultSetStore other_replica{pool};
+    REQUIRE(other_replica.delete_set(set->id).has_value());
+    h.fleet_gate.scope = std::nullopt;
+    auto after_delete = h.sink.Post("/api/v1/scope/preview", body);
+    REQUIRE(after_delete);
+    CHECK(after_delete->status == 404);
 }
 
 TEST_CASE("scope v1: POST /api/v1/scope/preview 404s on a foreign result set, existence-"

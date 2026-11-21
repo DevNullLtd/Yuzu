@@ -11,6 +11,15 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Result-set membership cache on the server
+
+The server's result-set store migration v6 adds a nullable materialization generation.
+Newly materialized sets receive a generation in the transaction that writes their members.
+Existing rows without one remain readable through the ordinary PostgreSQL query. The cache
+needs no backfill or operator configuration. A cached set whose generation changes after
+failover is loaded again. As on a cold read, a referenced unpinned set whose TTL has passed
+is refused even before garbage collection deletes it.
+
 ## ⚠️ Breaking: `device.filesystem.search_dir` is bounded, refuses a regex lookahead and reports what it skipped (#6478)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

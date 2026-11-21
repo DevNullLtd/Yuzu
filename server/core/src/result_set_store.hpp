@@ -39,8 +39,10 @@
 /// — never treat it as empty-container."
 ///
 /// **`member_set_owned` (#4981 PR-1, Finding A) is a single, snapshot-consistent
-/// SELECT — existence, ownership, and membership are read together under one
-/// Postgres statement/snapshot, closing a TOCTOU window the pre-#4981 two-fact
+/// SELECT for its result. A miss joins the current header and membership. A hit revalidates
+/// the header and materialization generation in Postgres. A changed generation reloads
+/// both header and members together, including all authorization checks. This closes the
+/// TOCTOU window the pre-#4981 two-fact
 /// query (existence via a separate `get()` gate, membership via a plain owner-
 /// filtered JOIN) left open.** Pre-#4981, a result set deleted (`delete_set` or
 /// `gc_sweep`, both FK-cascading) BETWEEN a caller's own pre-dispatch ownership
@@ -106,8 +108,13 @@
 
 #include "authz_model.hpp" // authz::VisibleSet: the members read's visibility scope
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <list>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -182,10 +189,13 @@ struct ResultSet {
     int64_t agents_unanswered{0};
 };
 
+using MembershipIds = std::unordered_set<std::string>;
+
 /// The membership `member_set_owned` returns for a `materialized` set: the member ids, plus
 /// whether the set is complete (no agent failed and none went unanswered). An incomplete set
 /// can only under-match, so it is safe to include and unsafe to exclude.
-struct OwnedMembers : std::unordered_set<std::string> {
+struct OwnedMembers {
+    std::shared_ptr<const MembershipIds> ids;
     bool complete{true};
 };
 
@@ -296,10 +306,13 @@ public:
     static constexpr int kMaxPinsPerOwner = 50;          // pin-storm guard
     static constexpr int kLineageDepthCap = 10;          // breadcrumb truncation
 
+    static constexpr std::size_t kDefaultMemberCacheBytes = 16 * 1024 * 1024;
+
     /// Borrows the shared pool and runs the `result_set_store` schema
     /// migration on a pinned lease. `is_open()` is false if the lease was
-    /// empty or the migration failed.
-    explicit ResultSetStore(pg::PgPool& pool);
+    /// empty or the migration failed. Zero cache budget disables retention.
+    explicit ResultSetStore(pg::PgPool& pool,
+                            std::size_t member_cache_bytes = kDefaultMemberCacheBytes);
 
     ResultSetStore(const ResultSetStore&) = delete;
     ResultSetStore& operator=(const ResultSetStore&) = delete;
@@ -403,10 +416,9 @@ public:
     /// `result.value()`) for the actual boolean membership answer.
     std::expected<bool, ResultSetError> contains(const std::string& id,
                                                  const std::string& device_id);
-    /// #4981 PR-1 (Finding A/A1) rewrite: a SINGLE snapshot-consistent SELECT
-    /// (existence + ownership + membership together, see the file-header note
-    /// above) rather than the pre-#4981 owner-filtered JOIN alone. Outcomes:
-    /// `id` absent entirely -> `std::unexpected(ResultSetError::NotFound)`;
+    /// The authoritative result comes from one statement snapshot, including when a
+    /// changed generation requires a second, joined read (see the file-header note).
+    /// `id` absent or expired and unpinned -> `std::unexpected(ResultSetError::NotFound)`;
     /// `id` exists but `owner` does not own it ->
     /// `std::unexpected(ResultSetError::NotOwner)`; `id` exists, owned, ZERO
     /// members -> a REAL SUCCESS, an empty (but present) set — the case the
@@ -544,6 +556,25 @@ public:
 private:
     pg::PgPool& pool_;
     bool open_{false};
+
+    struct CachedMembership {
+        std::string generation;
+        std::shared_ptr<const MembershipIds> members;
+    };
+    struct MemberCacheEntry {
+        std::string id;
+        CachedMembership snapshot;
+        std::size_t bytes;
+    };
+    const std::size_t member_cache_budget_;
+    std::mutex member_cache_mutex_;
+    std::size_t member_cache_bytes_{0};
+    std::list<MemberCacheEntry> member_cache_fifo_;
+    // Views refer to stable list nodes. Erase an index entry before removing its node.
+    std::map<std::string_view, std::list<MemberCacheEntry>::iterator> member_cache_index_;
+    CachedMembership cached_members(const std::string& id);
+    void retain_members(const std::string& id, CachedMembership snapshot,
+                        std::size_t bytes);
 
     static std::string generate_id();
     // Shared body for create_materialized/create_pending: dedups members,

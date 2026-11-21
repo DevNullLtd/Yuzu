@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <format>
+#include <iterator>
 #include <limits>
 #include <random>
 #include <string_view>
@@ -218,6 +219,10 @@ const std::vector<pg::PgMigration>& migrations() {
         {5,
          "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS agents_unanswered BIGINT NOT NULL "
          "DEFAULT 0;"},
+        // A promoted standby may fill the same pending ID differently after asynchronous
+        // replication loses a committed fill. Only a writer committing the members can
+        // stamp their generation. Pre-upgrade sets and fills by older writers stay NULL.
+        {6, "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS membership_generation UUID;"},
     };
     return kMigrations;
 }
@@ -289,7 +294,8 @@ int count_pinned_on(PGconn* conn, const std::string& owner) {
 
 // ── Construction ─────────────────────────────────────────────────────────────
 
-ResultSetStore::ResultSetStore(pg::PgPool& pool) : pool_(pool) {
+ResultSetStore::ResultSetStore(pg::PgPool& pool, std::size_t member_cache_bytes)
+    : pool_(pool), member_cache_budget_(member_cache_bytes) {
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("ResultSetStore: no database connection at construction ({}) — result-set "
@@ -378,9 +384,10 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
             "INSERT INTO result_set_store.result_sets "
             "(id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, "
             " source_kind, source_payload, status, source_execution_id, matcher, device_count, "
-            " agents_failed, agents_unanswered) "
+            " agents_failed, agents_unanswered, membership_generation) "
             "VALUES ($1,$2,$3,$4::bigint,$5::bigint,$6::bigint,false,$7,$8,$9,$10,$11,$12,"
-            "$13::bigint,$14::bigint,$15::bigint) RETURNING id",
+            "$13::bigint,$14::bigint,$15::bigint,"
+            "CASE WHEN $10 = 'materialized' THEN pg_catalog.gen_random_uuid() END) RETURNING id",
             std::vector<std::optional<std::string>>{
                 row.id, row.name.empty() ? std::nullopt : std::optional<std::string>(row.name),
                 row.owner_principal, std::to_string(row.created_at), std::to_string(row.ttl_at),
@@ -674,6 +681,43 @@ std::expected<bool, ResultSetError> ResultSetStore::contains(const std::string& 
     return PQntuples(res.get()) > 0;
 }
 
+ResultSetStore::CachedMembership ResultSetStore::cached_members(const std::string& id) {
+    std::lock_guard lock(member_cache_mutex_);
+    const auto it = member_cache_index_.find(id);
+    return it == member_cache_index_.end() ? CachedMembership{} : it->second->snapshot;
+}
+
+void ResultSetStore::retain_members(const std::string& id,
+                                    CachedMembership snapshot,
+                                    std::size_t bytes) {
+    if (bytes > member_cache_budget_)
+        return;
+    std::lock_guard lock(member_cache_mutex_);
+    if (auto it = member_cache_index_.find(id); it != member_cache_index_.end()) {
+        auto entry = it->second;
+        if (entry->snapshot.generation == snapshot.generation)
+            return; // A concurrent miss retained this generation.
+        member_cache_bytes_ -= entry->bytes;
+        member_cache_index_.erase(it);
+        member_cache_fifo_.erase(entry);
+    }
+    while (member_cache_bytes_ > member_cache_budget_ - bytes) {
+        const auto& oldest = member_cache_fifo_.front();
+        member_cache_bytes_ -= oldest.bytes;
+        member_cache_index_.erase(oldest.id);
+        member_cache_fifo_.pop_front();
+    }
+    member_cache_fifo_.push_back({id, std::move(snapshot), bytes});
+    const auto entry = std::prev(member_cache_fifo_.end());
+    try {
+        member_cache_index_.emplace(entry->id, entry);
+    } catch (...) {
+        member_cache_fifo_.pop_back();
+        throw;
+    }
+    member_cache_bytes_ += bytes;
+}
+
 std::expected<OwnedMembers, ResultSetError>
 ResultSetStore::member_set_owned(const std::string& id, const std::string& owner) {
     if (!open_)
@@ -683,25 +727,33 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         spdlog::error("ResultSetStore::member_set_owned: no connection ({})", pool_.last_error());
         return std::unexpected(ResultSetError::DbError);
     }
-    // #4981 PR-1 (Finding A/A1): a SINGLE statement, one Postgres snapshot,
-    // existence + ownership + membership together — closes the TOCTOU window
-    // the pre-#4981 plain owner-filtered JOIN left open (a set deleted
-    // between a caller's own pre-dispatch ownership gate and this read used
-    // to surface here as a SUCCESSFUL EMPTY set, not an error — see the
-    // header's file-level note). The LEFT JOIN's ON-clause carries the owner
-    // predicate (not a WHERE clause) so a row for `id` is ALWAYS returned
-    // when `id` exists regardless of who owns it — the `owned` column tells
-    // the caller which case it is — while `m.device_id` is NULL on every row
-    // when the owner predicate didn't match (or when `id` has zero members).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT (r.owner_principal = $2) AS owned, m.device_id, r.status, r.agents_failed, "
-        "r.agents_unanswered "
-        "FROM result_set_store.result_sets r "
+    // Read a live header on every use. The UUID identifies the materialization across
+    // divergent PostgreSQL timelines. A generation mismatch takes the full joined read,
+    // with its own complete owner/readiness/TTL check in the snapshot returning the IDs.
+    // No database access takes place under the cache mutex.
+    static constexpr std::string_view columns =
+        "SELECT (r.owner_principal = $2) AS owned, r.status, r.agents_failed, "
+        "r.agents_unanswered, r.membership_generation ";
+    static constexpr std::string_view live_row =
+        "WHERE r.id = $1 AND (r.pinned OR r.ttl_at >= floor(extract(epoch FROM "
+        "statement_timestamp()))::bigint)";
+    static const auto header_sql = std::format("{}FROM result_set_store.result_sets r {}",
+                                               columns, live_row);
+    static const auto members_sql = std::format(
+        "{}, m.device_id FROM result_set_store.result_sets r "
         "LEFT JOIN result_set_store.result_set_members m "
-        "ON m.result_set_id = r.id AND r.owner_principal = $2 "
-        "WHERE r.id = $1",
-        std::vector<std::string>{id, owner});
+        "ON m.result_set_id = r.id AND r.owner_principal = $2 {}", columns, live_row);
+    auto cached = cached_members(id);
+    const std::vector<std::string> params{id, owner};
+    pg::PgResult res;
+    if (cached.members) {
+        res = pg::exec_params(lease.get(), header_sql.c_str(), params);
+        if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1 &&
+            cached.generation != PQgetvalue(res.get(), 0, 4))
+            cached = {};
+    }
+    if (!cached.members)
+        res = pg::exec_params(lease.get(), members_sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::member_set_owned: query failed: {}",
                       PQerrorMessage(lease.get()));
@@ -723,7 +775,7 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         return std::unexpected(ResultSetError::NotOwner);
     // Only a `materialized` set has a membership that means anything: a pending set has none
     // yet and a failed set never will. Both are errors here, never an empty success.
-    switch (result_set_status_from(PQgetvalue(res.get(), 0, 2))) {
+    switch (result_set_status_from(PQgetvalue(res.get(), 0, 1))) {
     case ResultSetStatus::Materialized:
         break;
     case ResultSetStatus::Pending:
@@ -731,16 +783,32 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
     case ResultSetStatus::Failed:
         return std::unexpected(ResultSetError::Failed);
     }
-    OwnedMembers out;
-    out.complete =
-        to_i64(PQgetvalue(res.get(), 0, 3)) == 0 && to_i64(PQgetvalue(res.get(), 0, 4)) == 0;
-    out.reserve(static_cast<std::size_t>(rows));
+    const bool complete =
+        to_i64(PQgetvalue(res.get(), 0, 2)) == 0 && to_i64(PQgetvalue(res.get(), 0, 3)) == 0;
+    if (cached.members)
+        return OwnedMembers{std::move(cached.members), complete};
+
+    auto members = std::make_shared<MembershipIds>();
+    members->reserve(static_cast<std::size_t>(rows));
+    // Account for retained keys, the shared object, list/tree nodes and hash buckets.
+    // Charge string capacity even for small strings stored inline. The per-node allowance
+    // includes links, cached hashes and allocation overhead on the supported platforms.
+    constexpr std::size_t node_overhead = 4 * sizeof(void*);
+    std::size_t bytes = sizeof(MemberCacheEntry) + id.size() + 1 + sizeof(MembershipIds) +
+                        sizeof(decltype(member_cache_index_)::value_type) + 4 * node_overhead +
+                        members->bucket_count() * sizeof(void*);
     for (int i = 0; i < rows; ++i) {
-        if (PQgetisnull(res.get(), i, 1))
-            continue; // owned, zero members: every row's device_id is NULL
-        out.insert(PQgetvalue(res.get(), i, 1));
+        if (PQgetisnull(res.get(), i, 5))
+            continue; // owned, zero members
+        const auto& member = *members->emplace(PQgetvalue(res.get(), i, 5)).first;
+        bytes += sizeof(member) + member.capacity() + 1 + node_overhead;
     }
-    return out;
+    if (!PQgetisnull(res.get(), 0, 4)) {
+        std::string generation{PQgetvalue(res.get(), 0, 4)};
+        bytes += generation.capacity() + 1;
+        retain_members(id, {std::move(generation), members}, bytes);
+    }
+    return OwnedMembers{std::move(members), complete};
 }
 
 std::expected<std::optional<std::string>, ResultSetError>
@@ -1083,6 +1151,7 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
             // The counters ADD to what the pending row carries: a child inherits its parent's
             // at create time (inherit_completeness), so the fill never reads the parent.
             "UPDATE result_set_store.result_sets SET status = 'materialized', "
+            "membership_generation = pg_catalog.gen_random_uuid(), "
             "device_count = $1::bigint, agents_failed = agents_failed + $2::bigint, "
             "agents_unanswered = agents_unanswered + $3::bigint "
             "WHERE id = $4 AND status = 'pending' RETURNING id",

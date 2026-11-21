@@ -112,6 +112,22 @@ All shapes carry enough information to **re-evaluate the query against the curre
 
 `evaluated_at` is informational; it does **not** make the membership list stale by itself — re-eval is operator-driven. See §5 for staleness semantics.
 
+Each server process caches immutable member IDs for materialized result sets. The cache
+charges estimated bytes for the IDs, string capacities, hash buckets and entry overhead
+against a 16 MiB budget. It evicts the oldest inserted sets first. A set larger than the
+budget serves the current evaluation without entering the cache. An in-flight evaluation
+keeps its snapshot through eviction, so the budget covers retained entries only.
+
+Every scope evaluation still reads the set header from PostgreSQL. This checks ownership,
+expiry, readiness, completeness and the materialization generation before using cached IDs.
+The generation identifies the committed membership even if PostgreSQL failover rolls back a
+previous materialization of the same pending set. A generation mismatch reloads the IDs.
+A set without a generation uses the ordinary joined read. An expired, unpinned set
+is unusable even before the GC sweep removes it. The caller's current device visibility
+still bounds the result. To verify reuse, the REST scope-preview regression test previews
+the same set twice and takes a PostgreSQL lock on the member table between previews. The
+second request still succeeds under that lock and responds to a change in device visibility.
+
 ### 3.3 TTLs and GC
 
 | Lifecycle stage | TTL behaviour |

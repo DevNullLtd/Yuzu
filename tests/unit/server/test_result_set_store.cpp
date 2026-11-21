@@ -113,7 +113,7 @@ std::unordered_set<std::string> member_set_owned_ok(ResultSetStore& s, const std
                                                     const std::string& owner) {
     auto r = s.member_set_owned(id, owner);
     REQUIRE(r.has_value());
-    return *r;
+    return *r->ids;
 }
 
 } // namespace
@@ -580,7 +580,8 @@ TEST_CASE("ResultSetStore: migration v4 applies on a v3 database and is a no-op 
         REQUIRE(rs.has_value());
         old_id = rs->id;
     }
-    exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets DROP COLUMN agents_failed");
+    exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets DROP COLUMN agents_failed, "
+                       "DROP COLUMN membership_generation");
     exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 3 WHERE store = 'result_set_store'");
     REQUIRE(query_scalar(db.dsn(),
                          "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
@@ -598,7 +599,7 @@ TEST_CASE("ResultSetStore: migration v4 applies on a v3 database and is a no-op 
         CHECK(got->device_count == 2);
         CHECK(got->agents_failed == 0);
         CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta WHERE store = "
-                                     "'result_set_store'") == "5");
+                                     "'result_set_store'") == "6");
     }
 }
 
@@ -620,7 +621,8 @@ TEST_CASE("ResultSetStore: migration v5 applies on a v4 database and old rows re
         REQUIRE(rs.has_value());
         old_id = rs->id;
     }
-    exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets DROP COLUMN agents_unanswered");
+    exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets DROP COLUMN agents_unanswered, "
+                       "DROP COLUMN membership_generation");
     exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 4 WHERE store = 'result_set_store'");
     const std::string column_count_sql =
         "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
@@ -639,10 +641,15 @@ TEST_CASE("ResultSetStore: migration v5 applies on a v4 database and old rows re
         REQUIRE(got.has_value());
         CHECK(got->agents_unanswered == 0);
         CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta WHERE store = "
-                                     "'result_set_store'") == "5");
+                                     "'result_set_store'") == "6");
         auto owned = store.member_set_owned(old_id, "alice");
         REQUIRE(owned.has_value());
         CHECK(owned->complete);
+        CHECK(owned->ids->contains("dev-1"));
+        auto reread = store.member_set_owned(old_id, "alice");
+        REQUIRE(reread.has_value());
+        CHECK(reread->ids != owned->ids); // a legacy snapshot carries no generation
+        CHECK(*reread->ids == *owned->ids);
     }
 }
 
@@ -909,6 +916,111 @@ TEST_CASE("ResultSetStore: member_set_owned is owner-scoped", "[pg][result_set][
     CHECK(bob_result.error() == ResultSetError::NotOwner);
 }
 
+TEST_CASE("ResultSetStore: cached membership is bounded by bytes and held snapshots survive eviction",
+          "[pg][result_set][member_cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ResultSetStore store{pool, 8192};
+    REQUIRE(store.is_open());
+
+    // Five long IDs fit comfortably; ten exceed the budget even before node overhead.
+    std::vector<std::string> ids;
+    for (char c = 'a'; c <= 'j'; ++c)
+        ids.emplace_back(1000, c);
+    const std::vector<std::string> first_ids(ids.begin(), ids.begin() + 5);
+    const std::vector<std::string> second_ids(ids.begin() + 5, ids.end());
+    auto first = store.create_materialized(req("alice"), first_ids);
+    auto second = store.create_materialized(req("alice"), second_ids);
+    auto large = store.create_materialized(req("alice"), ids);
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    REQUIRE(large.has_value());
+
+    auto read = [&](const std::string& id) {
+        auto result = store.member_set_owned(id, "alice");
+        REQUIRE(result.has_value());
+        return result->ids;
+    };
+    auto initial = read(first->id);
+    REQUIRE(read(first->id) == initial);
+    auto next = read(second->id);
+    REQUIRE(read(second->id) == next);
+    auto reloaded = read(first->id);
+    CHECK(reloaded != initial);
+    CHECK(*initial == *reloaded);
+    CHECK(initial->size() == first_ids.size());
+    CHECK(initial->contains(first_ids.front()));
+
+    auto oversized = read(large->id);
+    CHECK(oversized->size() == ids.size());
+    CHECK(read(large->id) != oversized);
+}
+
+TEST_CASE("ResultSetStore: a promoted primary can materialize the same pending ID differently",
+          "[pg][result_set][member_cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ResultSetStore store{pool};
+    auto rs = store.create_pending(req("alice"), "exec-1");
+    REQUIRE(rs.has_value());
+    REQUIRE(store.materialize(rs->id, {"previous-device"}).has_value());
+    auto old = store.member_set_owned(rs->id, "alice");
+    REQUIRE(old.has_value());
+    REQUIRE(old->ids->contains("previous-device"));
+
+    // Stand in for the standby's state immediately before promotion: it received the
+    // pending row but not the first materialization. Core still holds its warm cache.
+    const auto id = "'" + rs->id + "'";
+    exec_sql(db.dsn(),
+             "BEGIN; DELETE FROM result_set_store.result_set_members WHERE result_set_id = " +
+                 id + "; UPDATE result_set_store.result_sets SET status = 'pending', "
+                      "device_count = 0, membership_generation = NULL WHERE id = " +
+                 id + "; COMMIT");
+    SECTION("a current writer commits a new membership generation") {
+        REQUIRE(store.materialize(rs->id, {"replacement-device"}).has_value());
+        auto fresh = store.member_set_owned(rs->id, "alice");
+        REQUIRE(fresh.has_value());
+        REQUIRE(fresh->ids->size() == 1);
+        CHECK(fresh->ids->contains("replacement-device"));
+        auto reread = store.member_set_owned(rs->id, "alice");
+        REQUIRE(reread.has_value());
+        CHECK(reread->ids == fresh->ids);
+    }
+    SECTION("a rolling-upgrade writer commits without a generation") {
+        exec_sql(db.dsn(),
+                 "BEGIN; INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
+                 "VALUES (" + id + ", 'legacy-device'); UPDATE result_set_store.result_sets "
+                 "SET status = 'materialized', device_count = 1 WHERE id = " + id + "; COMMIT");
+        auto fresh = store.member_set_owned(rs->id, "alice");
+        REQUIRE(fresh.has_value());
+        REQUIRE(fresh->ids->size() == 1);
+        CHECK(fresh->ids->contains("legacy-device"));
+        auto reread = store.member_set_owned(rs->id, "alice");
+        REQUIRE(reread.has_value());
+        CHECK(reread->ids != fresh->ids);
+        CHECK(*reread->ids == *fresh->ids);
+    }
+}
+
+TEST_CASE("ResultSetStore: a warmed membership rechecks owner and unswept expiry",
+          "[pg][result_set][member_cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ResultSetStore store{pool};
+    auto rs = store.create_materialized(req("alice"), {"device-1"});
+    REQUIRE(rs.has_value());
+    REQUIRE(store.member_set_owned(rs->id, "alice").has_value());
+
+    auto foreign = store.member_set_owned(rs->id, "bob");
+    REQUIRE_FALSE(foreign.has_value());
+    CHECK(foreign.error() == ResultSetError::NotOwner);
+    exec_sql(db.dsn(), "UPDATE result_set_store.result_sets SET created_at = 1, ttl_at = 2 "
+                       "WHERE id = '" + rs->id + "'");
+    auto expired = store.member_set_owned(rs->id, "alice");
+    REQUIRE_FALSE(expired.has_value());
+    CHECK(expired.error() == ResultSetError::NotFound);
+}
+
 TEST_CASE("ResultSetStore: member_set_owned's four outcomes (#4981 PR-1 A1 rewrite)",
           "[pg][result_set][owner]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
@@ -928,16 +1040,16 @@ TEST_CASE("ResultSetStore: member_set_owned's four outcomes (#4981 PR-1 A1 rewri
         REQUIRE(rs.has_value());
         auto r = store.member_set_owned(rs->id, "alice");
         REQUIRE(r.has_value());
-        CHECK(r->empty());
+        CHECK(r->ids->empty());
     }
     SECTION("owned, non-empty membership -> the correct set") {
         auto rs = store.create_materialized(req("alice", "full-set"), {"x", "y"});
         REQUIRE(rs.has_value());
         auto r = store.member_set_owned(rs->id, "alice");
         REQUIRE(r.has_value());
-        CHECK(r->size() == 2);
-        CHECK(r->contains("x"));
-        CHECK(r->contains("y"));
+        CHECK(r->ids->size() == 2);
+        CHECK(r->ids->contains("x"));
+        CHECK(r->ids->contains("y"));
     }
     SECTION("exists but not owned -> NotOwner, indistinguishable from NotFound by design "
             "(the caller-facing collapse is at ScopeEvalError::Kind::OwnerCheckFailed, not "
@@ -994,7 +1106,7 @@ TEST_CASE("ResultSetStore: member_set_owned refuses a set that is not materializ
         REQUIRE(store.materialize(rs->id, {"dev-1", "dev-2"}).has_value());
         auto r = store.member_set_owned(rs->id, "alice");
         REQUIRE(r.has_value());
-        CHECK(r->size() == 2);
+        CHECK(r->ids->size() == 2);
         CHECK(r->complete);
     }
     SECTION("a synchronous set is complete") {
@@ -1010,7 +1122,7 @@ TEST_CASE("ResultSetStore: member_set_owned refuses a set that is not materializ
         REQUIRE(store.materialize(rs->id, {"dev-1"}, 2, 0).has_value());
         auto r = store.member_set_owned(rs->id, "alice");
         REQUIRE(r.has_value());
-        CHECK(r->size() == 1);
+        CHECK(r->ids->size() == 1);
         CHECK_FALSE(r->complete);
     }
     SECTION("materialized with an unanswered agent is incomplete and the count is stored") {
@@ -1174,6 +1286,8 @@ TEST_CASE("ResultSetStore: member_set_owned reports DbError on a genuine store f
     ResultSetStore degraded_store{short_lock_pool};
     REQUIRE(degraded_store.is_open());
 
+    REQUIRE(degraded_store.member_set_owned(rs->id, "alice").has_value());
+
     PgConn locker{PQconnectdb(db.dsn().c_str())};
     REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
     REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
@@ -1192,7 +1306,7 @@ TEST_CASE("ResultSetStore: member_set_owned reports DbError on a genuine store f
 
     auto recovered = degraded_store.member_set_owned(rs->id, "alice");
     REQUIRE(recovered.has_value());
-    CHECK(recovered->size() == 1);
+    CHECK(recovered->ids->size() == 1);
 }
 
 TEST_CASE("ResultSetStore: lineage stops at a cross-owner ancestor", "[pg][result_set][lineage]") {

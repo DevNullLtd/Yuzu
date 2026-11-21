@@ -1,0 +1,1 @@
+- Repeated scope previews and evaluations reuse materialized result-set membership within a bounded server cache. Ownership, expiry and readiness are checked on every use, including before expired sets are swept.
