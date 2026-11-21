@@ -157,11 +157,13 @@ constexpr Os kOs = Os::linux_os;
 
 #endif
 
+} // namespace
+
 // ---- the leg of one unit ----
 
 /// The hook the leg wraps around every lookup that may need the capability. Linux: raise it for the lookup
-/// and drop it after. macOS: none.
-[[nodiscard]] ci::AroundLookup around_lookup_hook() {
+/// and drop it after. macOS: none. Declared in file_search_execute.hpp: the shell test runs this one.
+ci::AroundLookup around_lookup_hook() {
 #if defined(__linux__)
     return [](const std::function<void()>& lookup) {
         const yuzu::shared::thread_caps::ScopedCapRaise raise;
@@ -171,6 +173,8 @@ constexpr Os kOs = Os::linux_os;
     return {};
 #endif
 }
+
+namespace {
 
 [[nodiscard]] UnitLeg make_live_leg(const Unit& unit) {
     // The cell the extent hook fills while the leaf is open; the facts wrapper below reads it back. One walk
@@ -218,9 +222,12 @@ private:
 #endif
 };
 
+} // namespace
+
 /// Runs `work` on a fresh worker thread for at most `timeout`. The work runs inside the worker environment,
 /// whose scope is the whole call of `work`; a throw before or after it is a failed result, never a timeout.
-[[nodiscard]] RunOutcome<WorkResult> run_on_worker(std::chrono::milliseconds timeout, std::function<WorkResult()> work) {
+/// Declared in file_search_execute.hpp: the shell test runs this one.
+RunOutcome<WorkResult> run_on_worker(std::chrono::milliseconds timeout, std::function<WorkResult()> work) {
     auto ran = yuzu::shared::bounded_call_ex(timeout, [work = std::move(work)]() -> WorkResult {
         try {
             const WorkerEnvironment environment;
@@ -246,8 +253,6 @@ private:
     }
     return out;
 }
-
-} // namespace
 
 // ---- names ----
 

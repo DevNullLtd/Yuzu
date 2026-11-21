@@ -30,6 +30,11 @@
 #include "file_search_driver.hpp"
 #include "file_search_request.hpp"
 
+#if !defined(_WIN32)
+#include "component_legs.hpp" // ci::AroundLookup
+#endif
+
+#include <chrono>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -128,6 +133,18 @@ inline int execute_search(yuzu::CommandContext& ctx, std::string_view action, st
 /// One slice over the live filesystem: the mount table, a leg per unit, a worker thread per slice. Never
 /// throws except for an allocation failure, which the execute seam contains.
 [[nodiscard]] SliceResult run_posix_slice(const Request& req);
+
+/// The hook the search leg wraps around every lookup that may need a capability. Linux: raises
+/// CAP_DAC_READ_SEARCH on the calling thread for the lookup and drops it after; macOS: empty. Exported so
+/// the shell test runs the hook the plugin runs.
+[[nodiscard]] ci::AroundLookup around_lookup_hook();
+
+/// Runs `work` on a fresh worker thread for at most `timeout`, inside the worker environment (Linux: the
+/// capability dropped from the thread's effective set and the idle I/O class; macOS: dataless
+/// materialisation off and the throttled disk class). The driver's BoundedRunner in production. Exported so
+/// the shell test runs the environment the plugin runs.
+[[nodiscard]] RunOutcome<WorkResult> run_on_worker(std::chrono::milliseconds timeout,
+                                                   std::function<WorkResult()> work);
 
 /// Asks a slice that is running to end at the next entry (the stop flag the worker polls). Idempotent.
 void posix_request_stop() noexcept;

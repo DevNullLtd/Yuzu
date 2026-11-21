@@ -1,8 +1,9 @@
 /**
  * test_file_search_posix_shell.cpp -- the pieces of the file_search plugin that bind the operating system:
- * the thread-capability planner and (Linux, root only) its system calls, the macOS name rule and mount-table
- * converter, and the extents of real files. The driver, the volume plan and the rows are pure and are tested
- * beside it (test_file_search_driver.cpp and siblings) over fakes; the whole plugin, loaded, is
+ * the thread-capability planner and (Linux, where the capability is permitted) its system calls and the
+ * plugin's own worker environment and lookup hook, the macOS name rule and mount-table converter, and the
+ * extents of real files. The driver, the volume plan and the rows are pure and are tested beside it
+ * (test_file_search_driver.cpp and siblings) over fakes; the whole plugin, loaded, is
  * test_file_search_local_dispatcher.cpp.
  *
  * REAL FILES. The extent cases need a real filesystem: what a file's extents are is a fact of the volume it
@@ -21,8 +22,11 @@
  *  - extents: mapping a hole to an allocated extent, losing the compressed flag's role, or reading a
  *    failure as `unsupported` fails the shell cases; reporting `shared` for a file that is not a clone, or
  *    not reporting it for one, fails the clone case.
- *  - capability scope (Linux, root): not dropping the bit, or a raise that outlives its scope, fails the
- *    thread case; dropping it on every thread instead of the caller's fails the other-thread check.
+ *  - capability scope (Linux, bit permitted): not dropping the bit, or a raise that outlives its scope,
+ *    fails the thread case; dropping it on every thread instead of the caller's fails the other-thread
+ *    check. The worker case runs the plugin's own runner and hook (run_on_worker, around_lookup_hook): it
+ *    fails if the worker environment stops dropping the bit, if the hook stops raising it or leaves it
+ *    raised, or if the environment changes the calling thread's set.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -37,12 +41,14 @@
 #include <network_fstype.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -120,10 +126,6 @@ TEST_CASE("file_search thread caps: on a thread the bit is dropped outside a rai
           "[file_search][file_search_shell][file_search_caps]") {
     // The system calls act on the calling thread, so the cases run on a thread of their own and report
     // plain booleans back (Catch2 assertions are made on the test's own thread).
-    if (::geteuid() != 0) {
-        WARN("file_search thread caps: not root, the capability system calls are not exercised");
-        return;
-    }
     caps::ThreadCaps main_before;
     REQUIRE(caps::detail::read_caps(main_before));
     if (!main_before.permitted.has(caps::kCapDacReadSearch)) {
@@ -171,6 +173,65 @@ TEST_CASE("file_search thread caps: on a thread the bit is dropped outside a rai
     CHECK_FALSE(seen.nested_raised);
     CHECK(seen.clear_after_scope);
     CHECK(seen.permitted_after_scope);
+
+    caps::ThreadCaps main_after;
+    REQUIRE(caps::detail::read_caps(main_after));
+    CHECK(main_after.effective.has(caps::kCapDacReadSearch) == main_before.effective.has(caps::kCapDacReadSearch));
+}
+
+TEST_CASE("file_search worker environment: the plugin's own runner drops the bit and its own hook raises it for a lookup only",
+          "[file_search][file_search_shell][file_search_caps]") {
+    // What the plugin does on its worker, not what the primitives can do: the work function runs through
+    // run_on_worker (the environment the driver's BoundedRunner is bound to) and the lookup through
+    // around_lookup_hook (the hook the search leg is given). Everything is read from inside the worker and
+    // handed back as plain booleans (Catch2 assertions are made on the test's own thread).
+    caps::ThreadCaps main_before;
+    REQUIRE(caps::detail::read_caps(main_before));
+    if (!main_before.permitted.has(caps::kCapDacReadSearch)) {
+        WARN("file_search worker environment: CAP_DAC_READ_SEARCH is not permitted here, the capability scope is not exercised");
+        return;
+    }
+    const auto hook = around_lookup_hook();
+    REQUIRE(static_cast<bool>(hook));
+
+    struct Seen {
+        bool reads_ok{true}; // every capget the worker made answered
+        bool clear_before_lookup{false};
+        bool permitted_before_lookup{false};
+        bool set_inside_lookup{false};
+        bool clear_after_lookup{false};
+        bool permitted_after_lookup{false};
+    };
+    const auto seen = std::make_shared<Seen>(); // co-owned: a worker that timed out would outlive this frame
+    const auto out = run_on_worker(std::chrono::seconds{60}, [seen, hook]() -> WorkResult {
+        const auto read = [&seen](caps::ThreadCaps& c) {
+            if (!caps::detail::read_caps(c))
+                seen->reads_ok = false;
+        };
+        caps::ThreadCaps c;
+        read(c);
+        seen->clear_before_lookup = !c.effective.has(caps::kCapDacReadSearch);
+        seen->permitted_before_lookup = c.permitted.has(caps::kCapDacReadSearch);
+        hook([&] {
+            caps::ThreadCaps inside;
+            read(inside);
+            seen->set_inside_lookup = inside.effective.has(caps::kCapDacReadSearch);
+        });
+        read(c);
+        seen->clear_after_lookup = !c.effective.has(caps::kCapDacReadSearch);
+        seen->permitted_after_lookup = c.permitted.has(caps::kCapDacReadSearch);
+        return WorkResult{};
+    });
+
+    REQUIRE(out.status == RunStatus::completed);
+    REQUIRE(out.value.has_value());
+    CHECK_FALSE(out.value->threw);
+    CHECK(seen->reads_ok);
+    CHECK(seen->clear_before_lookup);
+    CHECK(seen->permitted_before_lookup);
+    CHECK(seen->set_inside_lookup);
+    CHECK(seen->clear_after_lookup);
+    CHECK(seen->permitted_after_lookup);
 
     caps::ThreadCaps main_after;
     REQUIRE(caps::detail::read_caps(main_after));
