@@ -10,24 +10,32 @@
 // run_bounded_subprocess acquisition is the impure shell; this header only
 // ever sees an already-captured output blob.
 //
-// Wave 4 PR4.3a de-shells the Linux dpkg/rpm/pacman '|'-format line parsers
-// (previously inline istringstream loops in installed_apps_plugin.cpp), the
+// Wave 4 PR4.3a de-shelled the Linux pacman '|'-format line parser
+// (previously an inline istringstream loop in installed_apps_plugin.cpp), the
 // macOS `system_profiler SPApplicationsDataType -detailLevel mini` text
 // parse (previously piped through `| grep` before reaching C++), the macOS
 // (the `brew list --versions` parse was removed in WP13/F19: the root agent no longer
 // runs brew), and adds the #2273 macOS enrichment
 // acquisition's own pure parsers (`pkgutil --pkgs` id list, `pkgutil
-// --pkg-info <id>` version/install-time extraction).
+// --pkg-info <id>` version/install-time extraction). SAM-45 took dpkg and rpm out of
+// that list: their rows are mapped from the in-process database readers below, and the
+// old dpkg/rpm line parsers are test-only (tests/unit/installed_apps_old_path_oracle.hpp).
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <ctime>
 #include <format>
+#include <functional>
 #include <initializer_list>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <dpkg_status_parsers.hpp> // yuzu::shared::DpkgPackage
+#include <rpmdb_parsers.hpp>       // yuzu::shared::RpmPackage, rpm_date_c_locale
 #include <subprocess_degradation.hpp>
 #include <yuzu/plugin.h>         // YUZU_RESULT_STATUS_CONSTRAINED / _COMPLETENESS_PARTIAL
 #include <row_field.hpp>          // yuzu::shared::row_field (backslash-preserving)
@@ -54,8 +62,8 @@ using yuzu::shared::is_degraded_run;
 // when the source format doesn't carry a given field (matches
 // installed_apps_inventory.hpp's own convention) -- never synthesised by the
 // parsers that read a source without one (format_app_row applies the "-" display
-// convention at format time; parse_dpkg_list writes "-" for install_date and
-// parse_rpm_list maps a "(none)" publisher to "-" themselves, where dpkg/rpm
+// convention at format time; app_record_from_dpkg writes "-" for install_date and
+// app_record_from_rpm maps an unset VENDOR to "-" themselves, where dpkg/rpm
 // report none).
 struct AppRecord {
     std::string name;
@@ -92,56 +100,34 @@ inline void strip_trailing_cr(std::string& line) {
 
 } // namespace detail
 
-// ── Linux: dpkg-query ───────────────────────────────────────────────────────
+// ── Linux: dpkg and rpm, from the in-process database readers ───────────────
+//
+// SAM-45: `list`/`query`/`list_per_user` no longer parse `dpkg-query` / `rpm -qa` text; they map the
+// readers' records (agents/shared dpkg_status_parsers.hpp, rpmdb_parsers.hpp). The row each package
+// produces is the one the old line parsers produced for the same database (see
+// tests/unit/installed_apps_old_path_oracle.hpp, which keeps the old parsers as the test oracle).
 
-// One line of `dpkg-query -W -f='${Package}|${Version}|${Maintainer}|${Status}\n'`
-// (the `\n` here is the LITERAL two-byte escape dpkg-query's own format-string
-// interpreter expands -- see the plugin's argv construction comment). Only
-// fully-installed packages are kept ("install ok installed"), matching the
-// legacy shell-out this replaces exactly.
-[[nodiscard]] inline std::vector<AppRecord> parse_dpkg_list(std::string_view output) {
-    std::vector<AppRecord> apps;
-    std::string buf(output);
-    std::istringstream ss(buf);
-    std::string line;
-    while (std::getline(ss, line)) {
-        detail::strip_trailing_cr(line);
-        if (line.find("install ok installed") == std::string::npos)
-            continue;
-        std::istringstream ls(line);
-        std::string name, version, publisher;
-        std::getline(ls, name, '|');
-        std::getline(ls, version, '|');
-        std::getline(ls, publisher, '|');
-        apps.push_back(AppRecord{std::move(name), std::move(version), std::move(publisher),
-                                 "-", {}});
-    }
-    return apps;
+// A dpkg package for `list`. The old filter was a substring test for "install ok installed" on the
+// Status text, which is true for want `install` AND `deinstall` (a package marked for removal is
+// still installed) with flag `ok`: kept exactly, so a held, half-installed or reinstreq package is
+// not listed (as before) and a deinstall-marked installed one is. nullopt = not listed.
+[[nodiscard]] inline std::optional<AppRecord> app_record_from_dpkg(const yuzu::shared::DpkgPackage& p) {
+    if (p.status != "installed" || p.flag != "ok" || (p.want != "install" && p.want != "deinstall"))
+        return std::nullopt;
+    return AppRecord{p.name, p.version, p.maintainer, "-", {}};
 }
 
-// ── Linux: rpm ───────────────────────────────────────────────────────────
-
-// One line of `rpm -qa --queryformat '%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\n'`.
-[[nodiscard]] inline std::vector<AppRecord> parse_rpm_list(std::string_view output) {
-    std::vector<AppRecord> apps;
-    std::string buf(output);
-    std::istringstream ss(buf);
-    std::string line;
-    while (std::getline(ss, line)) {
-        detail::strip_trailing_cr(line);
-        std::istringstream ls(line);
-        std::string name, version, publisher, date;
-        std::getline(ls, name, '|');
-        std::getline(ls, version, '|');
-        std::getline(ls, publisher, '|');
-        std::getline(ls, date, '|');
-        if (publisher == "(none)")
-            publisher = "-";
-        apps.push_back(AppRecord{std::move(name), std::move(version), std::move(publisher),
-                                 std::move(date), {}});
-    }
-    return apps;
+// An rpm package for `list`: version is VERSION-RELEASE, the publisher the VENDOR ("-" when unset),
+// the install date rpm's C-locale `%c` form of INSTALLTIME (empty when the tag is absent).
+// `to_local_tm` is injected (localtime_r in the plugin) so this stays timezone-free and pure.
+[[nodiscard]] inline AppRecord app_record_from_rpm(const yuzu::shared::RpmPackage& p,
+                                                   const std::function<std::tm(std::int64_t)>& to_local_tm) {
+    AppRecord r{p.name, p.version + "-" + p.release, p.vendor.empty() ? std::string{"-"} : p.vendor, {}, {}};
+    if (p.install_time)
+        r.install_date = yuzu::shared::rpm_date_c_locale(to_local_tm(static_cast<std::int64_t>(*p.install_time)));
+    return r;
 }
+
 
 // ── Linux: pacman ───────────────────────────────────────────────────────
 
@@ -403,12 +389,16 @@ constexpr long kErrorNoMoreItems = 259;
 // load (yuzu::CommandContext satisfies the same two members).
 inline constexpr const char* kDegradedProvenance = "installed_apps:acquisition_degraded";
 
-template <class Ctx> void declare_acquisition_degraded(Ctx& ctx) {
+// `provenance` names the cause when the acquisition knows it: the Linux dpkg and rpm database
+// readers pass `installed_apps:<source>:<cause>` (e.g. installed_apps:rpm_sqlite:locked); every
+// other leg keeps the default token. It must be a delimiter-free token (the readers' vocabulary is).
+template <class Ctx>
+void declare_acquisition_degraded(Ctx& ctx, std::string_view provenance = kDegradedProvenance) {
     ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                          kDegradedProvenance);
+                          provenance);
 }
 
-// What a degraded Linux/macOS acquisition means (the wording in docs/samples).
+// What a degraded subprocess acquisition (pacman, apk, macOS) means (the wording in docs/samples).
 inline constexpr std::string_view kSubprocessCauses =
     "tool timed out, was killed, failed to start, exited nonzero, or its output was truncated";
 // The Windows registry-walk equivalent (Uninstall root/app key unreadable).
@@ -416,12 +406,14 @@ inline constexpr std::string_view kRegistryCauses =
     "an Uninstall registry key could not be fully read";
 
 // list / query: true when healthy (caller proceeds); otherwise the typed status
-// plus the honest error row, and the caller returns rc 1.
+// plus the honest error row, and the caller returns rc 1. A caller that knows the cause passes
+// its token as `provenance` and as `causes`, so the typed status and the row name the same one.
 template <class Ctx>
-bool report_degraded(Ctx& ctx, bool degraded, std::string_view causes = kSubprocessCauses) {
+bool report_degraded(Ctx& ctx, bool degraded, std::string_view causes = kSubprocessCauses,
+                     std::string_view provenance = kDegradedProvenance) {
     if (!degraded)
         return true;
-    declare_acquisition_degraded(ctx);
+    declare_acquisition_degraded(ctx, provenance);
     std::string row = "error|installed_apps: acquisition degraded (";
     row += causes;
     row += ") -- result withheld rather than reported as complete";
@@ -465,9 +457,10 @@ void report_hive_file_refused(Ctx& ctx, std::string_view sid, std::string_view t
 // `fmt` renders one record to its wire row; a record with no name is dropped. This is the one
 // chokepoint every OS leg reaches (registry_walk.hpp, the macOS and Linux collectors).
 template <class Ctx, class Rec, class Fmt>
-int emit_inventory(Ctx& ctx, bool degraded, const std::vector<Rec>& records, Fmt&& fmt) {
+int emit_inventory(Ctx& ctx, bool degraded, const std::vector<Rec>& records, Fmt&& fmt,
+                   std::string_view provenance = kDegradedProvenance) {
     if (degraded) {
-        declare_acquisition_degraded(ctx);
+        declare_acquisition_degraded(ctx, provenance);
         return 1;
     }
     for (const auto& r : records) {

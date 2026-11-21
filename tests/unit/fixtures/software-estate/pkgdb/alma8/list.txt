@@ -1,0 +1,5 @@
+basesystem|11-5.el8|CloudLinux|Sat Nov 14 18:09:25 2026
+gpg-pubkey|3abb34f8-5ffd890e|(none)|Sat Nov 14 18:08:25 2026
+gpg-pubkey|ced7258b-6525146f|(none)|Sat Nov 14 18:08:25 2026
+findutils|4.6.0-24.el8_10|AlmaLinux|Sat Nov 14 18:10:17 2026
+libverto|0.3.2-2.el8|AlmaLinux|Sat Nov 14 18:09:54 2026

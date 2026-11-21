@@ -14,16 +14,16 @@
 
 ## How it works
 
-`installed_apps` answers "what software is on this device" from the operating system's own records and never installs, removes or verifies anything. Four actions share one set of OS readers. `list` returns one `app|` row per application: Windows reads the Uninstall registry keys (64-bit and 32-bit machine keys, plus the agent account's own user key); Linux uses the first package manager it finds (`dpkg-query`, else `rpm`, else `pacman`); macOS runs `system_profiler SPApplicationsDataType` for GUI applications and then reads each bundle's identifier in one bounded pass. `query` takes the same collection and returns the rows whose name contains the given text (case-insensitive), preceded by `found|true` or followed by only `found|false`. `list_per_user` is the per-person view: on Windows it walks every local profile's registry hive; on Linux and macOS it returns the same system-wide set tagged `system` (Homebrew formulae are no longer listed here: use `pkg_inventory.packages`; the macOS agent is root and must not run a user-owned `brew`). `list_inventory` is a separate, richer collector for the daily sync: it has no instruction definition, so it is not offered to operators; the agent's daily sync runs it.
+`installed_apps` answers "what software is on this device" from the operating system's own records and never installs, removes or verifies anything. Four actions share one set of OS readers. `list` returns one `app|` row per application: Windows reads the Uninstall registry keys (64-bit and 32-bit machine keys, plus the agent account's own user key); Linux reads the package database in-process and read-only, choosing by the database file it finds (the dpkg status file and `status.d`, else the rpm database in whichever of its three formats the host uses, sqlite, ndb or Berkeley DB), and runs `pacman` only when neither holds a package; macOS runs `system_profiler SPApplicationsDataType` for GUI applications and then reads each bundle's identifier in one bounded pass. `query` takes the same collection and returns the rows whose name contains the given text (case-insensitive), preceded by `found|true` or followed by only `found|false`. `list_per_user` is the per-person view: on Windows it walks every local profile's registry hive; on Linux and macOS it returns the same system-wide set tagged `system` (Homebrew formulae are no longer listed here: use `pkg_inventory.packages`; the macOS agent is root and must not run a user-owned `brew`). `list_inventory` is a separate, richer collector for the daily sync: it has no instruction definition, so it is not offered to operators; the agent's daily sync runs it.
 
-If the OS reader fails part-way (a tool is killed, times out, exits non-zero or is truncated, or a Windows Uninstall key cannot be read to the end), `list`, `query` and `list_inventory` return an `error|` row (or nothing, for `list_inventory`) and rc 1 instead of a short list, so a partial result is never mistaken for a complete one. A genuinely empty `list` is a single `app|No applications found` row.
+If the OS reader fails part-way (a tool is killed, times out, exits non-zero or is truncated, a Linux package database is locked (a writer holds it: an rpm transaction, a pending dpkg update journal), damaged, over a limit or changes while it is read, or a Windows Uninstall key cannot be read to the end), `list`, `query` and `list_inventory` return an `error|` row (or nothing, for `list_inventory`) and rc 1 instead of a short list, so a partial result is never mistaken for a complete one. A genuinely empty `list` is a single `app|No applications found` row.
 
 ```mermaid
 flowchart LR
   OP["Operator, workflow or daily sync"] --> EX["installed_apps action"]
   EX --> WIN["Windows: Uninstall registry keys"]
   EX --> MAC["macOS: system_profiler, pkgutil, bundle reads"]
-  EX --> LIN["Linux: dpkg-query, rpm, pacman, apk"]
+  EX --> LIN["Linux: dpkg and rpm databases read in-process; pacman, apk run"]
   WIN --> OUT["app, user_app or inv rows"]
   MAC --> OUT
   LIN --> OUT
@@ -94,10 +94,10 @@ A logged-in user's loaded hive is read with no privilege. A logged-out profile n
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `list` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler via bounded argv runner + native CFBundle enrichment | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
-| `list_inventory` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment | ✅ supported · rung 2 · dpkg-query/rpm/pacman/apk via bounded argv runner |
-| `list_per_user` | ✅ supported · rung 1 · Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | ✅ supported · rung 2 · system_profiler via bounded argv runner | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
-| `query` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler via bounded argv runner | ✅ supported · rung 2 · dpkg-query/rpm/pacman via bounded argv runner |
+| `list` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler via bounded argv runner + native CFBundle enrichment | ✅ supported · rung 2 · dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman via bounded argv runner |
+| `list_inventory` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment | ✅ supported · rung 2 · dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman/apk via bounded argv runner |
+| `list_per_user` | ✅ supported · rung 1 · Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | ✅ supported · rung 2 · system_profiler via bounded argv runner | ✅ supported · rung 2 · dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman via bounded argv runner |
+| `query` | ✅ supported · rung 1 · Reg*W enumeration of the Uninstall key(s) | ✅ supported · rung 2 · system_profiler via bounded argv runner | ✅ supported · rung 2 · dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman via bounded argv runner |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -106,9 +106,9 @@ A logged-in user's loaded hive is read with no privilege. A logged-out profile n
 |---|---|---|---|---|
 | Windows | Agent service account, LocalSystem today, not the intended virtual service account (`docs/agent-privilege-model.md` Correction). | **None** for `list`, `query` and `list_inventory`: `Reg*W` reads only. `list_per_user`'s offline `NTUSER.DAT` mount for a logged-out profile uses `SeBackupPrivilege` and `SeRestorePrivilege`, which the agent account already holds. | Bare-metal Windows (10.0.26200) as `LocalSystem`, 2026-09-21. The capture predates the typed hive-read status and the default-on hive-file guard, so neither shows in it. | `list_per_user` writes `warning\|privilege_missing: ...` naming how many logged-out profiles could not be read, `warning\|hive_file_refused` per refused hive and `warning\|hive_read_failed` for unreadable Uninstall keys; machine-scope actions are unaffected. An unreadable profile list is `error\|profile_list_unreadable` with rc 1; a failed or unstable `HKEY_USERS` listing (re-read until two consecutive walks agree, at most four walks) is `error\|hku_list_incomplete` with rc 1, never a list built as if no hive were loaded. |
 | macOS | Agent daemon, **root** today (the LaunchDaemon has no `UserName` key, `docs/agent-privilege-model.md`). | **None.** No keychain, TCC or Location Services grant is touched. A missing Security framework at build time turns the signature enrichment into a no-op (empty `publisher` and `signature_status`) rather than an error. | Bare-metal macOS 26.6.2 as an ordinary user (euid 501), 2026-09-21, not the daemon's root identity. That capture predates the removal of the `brew` subprocess from `list_per_user`. | No privilege is required, so there is no refusal path; a failed tool is reported as a degraded acquisition (`error\|` row, rc 1). |
-| Linux | Agent daemon, an unprivileged account by design. | **None.** The dpkg, rpm, pacman and apk databases are expected to be world-readable (inferred, not measured as the unprivileged account). | Debian 13 container, euid 0, 2026-09-21; not the intended unprivileged account. | No privilege is required. If no package manager binary is found at its fixed path the collection is empty (not degraded); a found tool that fails is a degraded acquisition. |
+| Linux | Agent daemon, an unprivileged account by design. | **None** for the dpkg status file, the rpm database, rpm's `.rpm.lock` file (opened read-only and only asked about, never locked) and the names in `/var/lib/dpkg/updates/` (listed, never opened), which are expected to be world-readable. The pacman and apk databases are read by those tools, so the same expectation applies to them (inferred). | rpm sqlite read as `nobody` on one AlmaLinux 9 container, 2026-11-19: `rpm -qa` failed there when the WAL sidecars were missing (the account cannot create the shared-memory file), while the in-process read of the same file returned all 159 rows. That is **one image**; the dpkg, ndb and Berkeley DB legs, the lock-file and update-journal checks, and every other account and distribution, were measured only as root or not at all, and the unprivileged case is inferred. | No privilege is required. A package database that exists but cannot be read is a degraded acquisition with a named reason (`rpmdb:unreadable`, `rpm_sqlite:unreadable`, `dpkg_status:unreadable` ...), never an empty list. If neither a dpkg nor an rpm database holds a package and no `pacman` or `apk` binary is found at its fixed path, the collection is empty (not degraded). |
 
-Subprocesses: Linux runs `dpkg-query`, `rpm`, `pacman` and (`list_inventory` only) `apk`, found at fixed absolute paths and run without a shell through the bounded runner (20 s deadline each). macOS runs `system_profiler` and `pkgutil` (`list_inventory`) the same way. This plugin never runs Homebrew's `brew`: it is a script owned by the installing user, and the macOS agent is root (WP13/F19); the `vuln_scan` plugin's macOS `cve_scan` still runs `brew list --versions` as root (#8256). Homebrew formulae and casks are listed by `pkg_inventory.packages`, which reads the Cellar/Caskroom directories without a subprocess; `list_per_user` therefore reports the system apps only on macOS. Windows spawns nothing. No network use on any OS.
+Subprocesses: Linux runs `pacman` and (`list_inventory` only) `apk`, found at fixed absolute paths and run without a shell through the bounded runner (20 s deadline each); it runs **no** `dpkg-query` or `rpm` process, because those two databases are read in-process (the files are opened without following symlinks and read-only, and the whole read is bounded to 20 s, 50,000 packages (for dpkg, stanzas), 32 MiB of dpkg text in total (the status file and `status.d` share it: one file over it is `oversized`, the sum over it is `byte_cap`), 32 MiB per rpm header, 1 GiB of rpm headers read in total and 8 MiB of text kept from them in total, which is `byte_cap` too: one stored string can be named by several fields of a hostile header, so the copies are charged apart from the bytes read). macOS runs `system_profiler` and `pkgutil` (`list_inventory`) the same way. This plugin never runs Homebrew's `brew`: it is a script owned by the installing user, and the macOS agent is root (WP13/F19); the `vuln_scan` plugin's macOS `cve_scan` still runs `brew list --versions` as root (#8256). Homebrew formulae and casks are listed by `pkg_inventory.packages`, which reads the Cellar/Caskroom directories without a subprocess; `list_per_user` therefore reports the system apps only on macOS. Windows spawns nothing. No network use on any OS.
 
 ## Data contract
 
@@ -166,7 +166,8 @@ Pipe-delimited rows, one per application, written via `write_output()`. Every fi
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `CONSTRAINED` | PARTIAL | `installed_apps:acquisition_degraded` | a degraded acquisition (Linux/macOS: a subprocess that failed to start, exited nonzero, was killed, timed out or was truncated; Windows: an Uninstall root that could not be opened or enumerated to the end, or an application subkey whose open failed): `list`, `query` and `list_inventory` return rc 1, and so does `list_per_user` on Linux and macOS |
+| `CONSTRAINED` | PARTIAL | `installed_apps:acquisition_degraded` | a degraded acquisition (Linux pacman or apk, and macOS: a subprocess that failed to start, exited nonzero, was killed, timed out or was truncated; Windows: an Uninstall root that could not be opened or enumerated to the end, or an application subkey whose open failed): `list`, `query` and `list_inventory` return rc 1, and so does `list_per_user` on Linux and macOS |
+| `CONSTRAINED` | PARTIAL | `installed_apps:<source>:<cause>` | a Linux dpkg or rpm database read that failed; the typed status and the `error\|` row name the same token, `list`, `query` and `list_inventory` return rc 1 and `list_per_user` too, with no rows. `<source>` is `dpkg_status` (the status file), `dpkg_status_d` (the `status.d` directory), `dpkg_updates` (the update-journal directory), `rpm_sqlite`, `rpm_ndb`, `rpm_bdb`, `rpmdb` (the directory, or an LMDB `data.mdb` this reader does not decode) or `pkgdb` (the whole bounded read). `<cause>` is `unreadable`, `symlink_refused`, `not_regular`, `oversized`, `corrupt`, `truncated`, `unsupported_format`, `locked` (a writer holds the database: sqlite write-locked past 2 s, an rpm transaction running on an ndb or Berkeley DB host, or a pending dpkg update journal), `changed_during_read` (its size or times moved during the read), `row_cap`, `byte_cap` (bytes read or kept), `timeout` or `busy` (the bounded-call ceiling refused the read). The daily sync still reports the section with its generic constrained token until the follow-up that carries the reason end to end |
 | `CONSTRAINED` | PARTIAL | `installed_apps:acquisition_degraded` | Windows `list_per_user`: one or more profiles' Uninstall key could not be read (a trailing `warning\|hive_read_failed` row counts the profiles), or a profile's hive file was refused by the offline guard (a trailing `warning\|hive_file_refused` row names the SID and the guard's token); the rows already read stay, rc 0 |
 | `CONSTRAINED` | PARTIAL | `installed_apps:bundle_id_timeout` | macOS `list`: the 30 s bundle-id pass deadline hit; a leading `warning\|bundle_id_timeout` row, unread rows carry `-`, rc 0 |
 | `CONSTRAINED` | PARTIAL | `installed_apps:bundle_id_busy` | macOS `list`: another bundle-id pass is in flight on this device (a concurrent `list` or an earlier abandoned pass); all rows carry `-`, rc 0 |
@@ -181,7 +182,7 @@ Provenance and completeness are agent-log only (the wire carries the status enum
 
 - **Instruction result.** `list`/`query`/`list_per_user` rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (operator-configurable retention, 90-day default), queryable at `/api/v1/responses/{id}`.
 - **Daily-sync typed store.** `list_inventory` is never dispatched through `execute_instruction` — it has no definition. The agent's own `SyncSource` (`make_installed_software_source` in `sync_source_installed_software.cpp`) runs it every 24 hours as one section of the sectioned (v3) installed-software report (the first report in full, then a row-hash delta, then nothing while unchanged) and pushes it to the server's typed `SoftwareInventoryStore` (ADR-0016), served fleet-wide at `GET /api/v1/inventory/software` gated on `Inventory:Read`.
-- **Publisher derivation in `list_inventory` rows.** rpm: the package's `VENDOR` tag, falling back to `PACKAGER` (a person or a build-system address) only when the vendor is unset; deb: `Maintainer`; a tab inside one of these free-text fields keeps the package row and truncates the publisher at the tab (the rpm query format puts `VENDOR` and `PACKAGER` last for this reason, and a package row is never dropped for its free text); Windows: the Uninstall key's `Publisher`; macOS apps: the signing certificate's leaf common name; pacman, apk and macOS installer receipts: none (`pacman -Q` and `apk info -v` list no vendor, and a receipt's reverse-domain id is an identifier, not a vendor). Where the row carries none, the daily sync writes the origin label `via:<ecosystem>` (`via:deb`, `via:pacman`, `via:apk`, `via:windows`, `via:macos`, `via:macos_pkgutil`, `via:rpm`), which the server treats as no vendor. The `list`, `query` and `list_per_user` rows carry `-` for a missing publisher. Residuals: a newline inside a free-text field can split one package into two lines, and a hand-built rpm header with a tab inside one of the first eight tags (name, epoch, version, release, arch, install time, signatures) can shift a field, because `rpmbuild` forbids that at build time but the installed-package database does not.
+- **Publisher derivation in `list_inventory` rows.** rpm: the package's `VENDOR` tag, falling back to `PACKAGER` (a person or a build-system address) only when the vendor is unset; deb: `Maintainer`; a tab, pipe or newline inside one of these free-text fields neither truncates the value nor splits or drops the row (the separators are stripped from an `inv` row, or escaped in a `list` row, when it is formatted); Windows: the Uninstall key's `Publisher`; macOS apps: the signing certificate's leaf common name; pacman, apk and macOS installer receipts: none (`pacman -Q` and `apk info -v` list no vendor, and a receipt's reverse-domain id is an identifier, not a vendor). Where the row carries none, the daily sync writes the origin label `via:<ecosystem>` (`via:deb`, `via:pacman`, `via:apk`, `via:windows`, `via:macos`, `via:macos_pkgutil`, `via:rpm`), which the server treats as no vendor. The `list`, `query` and `list_per_user` rows carry `-` for a missing publisher. The Linux rows come from the dpkg and rpm databases directly, so no field can shift between columns whatever bytes a package carries.
 - **Not consumed by** Echo, DEX, or metrics — no reference to `installed_apps`/`crossplatform.software.*` was found in the Echo or DEX collector sources.
 - **Sensitivity.** `list_per_user`/`list_inventory` rows carry per-account software names/versions/publishers, and `list_per_user`'s `username` field is a resolved local account name (not a raw SID) — a per-person installed-software inventory; `list`/`query`/`list_inventory` alone already name specific installed software (`name`/`version`/`publisher`) even at machine scope. `list`'s `install_location` (and the raw fourteenth token of a `list_inventory` row dispatched directly as a command, which only the daily-sync writer minimises) names a user's home directory when an application is installed under it (`/Users/<account>/Applications/…`, `/Users/<account>/Library/…` — 4 of 323 rows in the macOS capture), or `C:/Users/<name>/...` on Windows; the macOS count is from an unprivileged capture — the root daemon may list every account's `~/Applications`; the committed sample redacts the account to `jsmith`.
 - **Siblings:** `msi_packages.*` (Windows-only MSI package detail) and `license_scan.list` (software-licence/entitlement detection) — grouped alongside `installed_apps` in the privilege model's read-only row (`docs/agent-privilege-model.md`).
@@ -192,7 +193,7 @@ Provenance and completeness are agent-log only (the wire carries the status enum
 > **Capture predates a row-format change.** The Windows sample below was captured before `list` stopped folding every backslash to `/`: current agents keep interior backslashes (`C:\Program Files\7-Zip/` for an install location ending in a backslash). The sample shows `/` and awaits a Windows recapture.
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated; profile name redacted to jsmith) · leg-hash 1b150809d05d
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated; profile name redacted to jsmith) · leg-hash 41d3c7502afe
 
 ```
 == action=list
@@ -257,7 +258,7 @@ inv|DayZ||Bohemia Interactive||app|windows||||||
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 (account redacted to jsmith; user-profile paths redacted) · leg-hash 1b150809d05d
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 (account redacted to jsmith; user-profile paths redacted) · leg-hash 41d3c7502afe
 
 ```
 == action=list
@@ -314,78 +315,78 @@ inv|Grapher|2.8|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 1b150809d05d
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · container · 2026-11-20 · euid 0 (maintainer e-mail redacted to user@example.com) · leg-hash 41d3c7502afe
 
 ```
 == action=list
-app|apt|3.0.3|APT Development Team <deity@lists.debian.org>|-|-|-
-app|autoconf|2.72-3.1|Alex Myczko <tar@debian.org>|-|-|-
-app|automake|1:1.17-4|Eric Dorland <eric@debian.org>|-|-|-
-app|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>|-|-|-
-app|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>|-|-|-
-app|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-|-|-
-app|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>|-|-|-
-app|binutils|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
-app|binutils-aarch64-linux-gnu|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
-app|binutils-common|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
-app|bison|2:3.8.2+dfsg-1+b2|Chuan-kai Lin <cklin@debian.org>|-|-|-
-app|bsdutils|1:2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
-… 12 of 206 rows shown
+app|apt|3.2.1ubuntu0.1|APT Development Team <deity@lists.debian.org>|-|-|-
+app|base-files|14ubuntu6.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|base-passwd|3.6.8|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|bash|5.3-2ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|bsdutils|1:2.41.3-3ubuntu2.2|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|coreutils|9.5-1ubuntu2+0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|coreutils-from-uutils|0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|dash|0.5.12-12ubuntu3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|debconf|1.5.92|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|debianutils|5.23.2build1|Ileana Dumitrescu <user@example.com>|-|-|-
+app|diffutils|1:3.12-1ubuntu0.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|dpkg|1.23.7ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+… 12 of 87 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=query name=bash
 found|true
-app|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>
+app|bash|5.3-2ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
 [result_status] UNDECLARED / UNKNOWN
 
 == action=list_per_user
-user_app|system|apt|3.0.3|APT Development Team <deity@lists.debian.org>|-
-user_app|system|autoconf|2.72-3.1|Alex Myczko <tar@debian.org>|-
-user_app|system|automake|1:1.17-4|Eric Dorland <eric@debian.org>|-
-user_app|system|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>|-
-user_app|system|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>|-
-user_app|system|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-
-user_app|system|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>|-
-user_app|system|binutils|2.44-3|Matthias Klose <doko@debian.org>|-
-user_app|system|binutils-aarch64-linux-gnu|2.44-3|Matthias Klose <doko@debian.org>|-
-user_app|system|binutils-common|2.44-3|Matthias Klose <doko@debian.org>|-
-user_app|system|bison|2:3.8.2+dfsg-1+b2|Chuan-kai Lin <cklin@debian.org>|-
-user_app|system|bsdutils|1:2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
-… 12 of 206 rows shown
+user_app|system|apt|3.2.1ubuntu0.1|APT Development Team <deity@lists.debian.org>|-
+user_app|system|base-files|14ubuntu6.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|base-passwd|3.6.8|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|bash|5.3-2ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|bsdutils|1:2.41.3-3ubuntu2.2|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|coreutils|9.5-1ubuntu2+0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|coreutils-from-uutils|0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|dash|0.5.12-12ubuntu3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|debconf|1.5.92|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|debianutils|5.23.2build1|Ileana Dumitrescu <user@example.com>|-
+user_app|system|diffutils|1:3.12-1ubuntu0.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|dpkg|1.23.7ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+… 12 of 87 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=list_inventory
-inv|apt|3.0.3|APT Development Team <deity@lists.debian.org>||package|deb|||arm64||debian|13
-inv|autoconf|2.72|Alex Myczko <tar@debian.org>||package|deb||3.1|all||debian|13
-inv|automake|1.17|Eric Dorland <eric@debian.org>||package|deb|1|4|all||debian|13
-inv|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>||package|deb|||all||debian|13
-inv|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>||package|deb|||arm64||debian|13
-inv|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>||package|deb|||arm64||debian|13
-inv|bash|5.2.37|Matthias Klose <doko@debian.org>||package|deb||2+b9|arm64||debian|13
-inv|binutils|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
-inv|binutils-aarch64-linux-gnu|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
-inv|binutils-common|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
-inv|bison|3.8.2+dfsg|Chuan-kai Lin <cklin@debian.org>||package|deb|2|1+b2|arm64||debian|13
-inv|bsdutils|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb|1|0+deb13u1|arm64||debian|13
-… 12 of 206 rows shown
-[result_status] UNDECLARED / UNKNOWN
+inv|apt|3.2.1ubuntu0.1|APT Development Team <deity@lists.debian.org>||package|deb|||amd64||ubuntu|26.04|
+inv|base-files|14ubuntu6.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||amd64||ubuntu|26.04|
+inv|base-passwd|3.6.8|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||amd64||ubuntu|26.04|
+inv|bash|5.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb||2ubuntu1|amd64||ubuntu|26.04|
+inv|bsdutils|2.41.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|1|3ubuntu2.2|amd64||ubuntu|26.04|
+inv|coreutils|9.5|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb||1ubuntu2+0.0.0~ubuntu25|all||ubuntu|26.04|
+inv|coreutils-from-uutils|0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||all||ubuntu|26.04|
+inv|dash|0.5.12|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb||12ubuntu3|amd64||ubuntu|26.04|
+inv|debconf|1.5.92|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||all||ubuntu|26.04|
+inv|debianutils|5.23.2build1|Ileana Dumitrescu <user@example.com>||package|deb|||amd64||ubuntu|26.04|
+inv|diffutils|3.12|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|1|1ubuntu0.1|amd64||ubuntu|26.04|
+inv|dpkg|1.23.7ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||amd64||ubuntu|26.04|
+… 12 of 87 rows shown
+[result_status] OK / FULL
 ```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
 
-1. **Per-user installs on Windows appear only in `list_per_user`.** `list`, `query` and `list_inventory` read the machine keys and the agent account's own user key, so an application installed for one user is not in them. In `list_per_user`, a missing privilege, a truncated profile list or a hive that fails to unload is reported by a warning row only, with the typed status still `UNDECLARED`, so check the rows and not just the status.
-2. **Windows hive reads degrade loudly, with one benign exception.** A missing user or 32-bit Uninstall key is normal and ignored; any other open or enumeration failure, an over-long subkey name or an application key whose open fails marks the walk degraded while the apps already read are kept. A `DisplayName` that is not a string, or is over 64 KiB, is read as empty and that entry is skipped without a degraded mark, and a subkey deleted during enumeration can hide a sibling.
-3. **macOS `signature_status` is presence, not validity.** The enrichment reads the code-signing information only and never checks the signature, so a bundle with its `_CodeSignature` removed or with bytes appended still reads `signed`, and `publisher` is then unverified attribution. Deep verification is deliberately not performed.
-4. **A failed read is withheld, and macOS `list_inventory` is cached.** A killed, timed-out, truncated or non-zero-exit tool makes the action emit an `error|` row and return rc 1 rather than a partial list, and the daily sync then reports a status-only `installed_apps.list_inventory` section: the server keeps the stored application rows, shown as unconfirmed, and every other source is still sent. macOS `list_inventory` reuses its `system_profiler` scan for 10 minutes unless the Applications or receipt directories change, and a degraded or empty scan is never cached.
-5. **`install_location` and `bundle_id` are untrusted.** Both are as the local bundle or installer reports them, so a local user can plant a bundle whose identifier is any string, and `install_location` can sit under a user's home. On Windows a product registered in more than one hive keeps the first record's fields and the smallest populated `InstallLocation`; on Linux both columns are always `-`.
+1. **Windows: per-user installs appear only in `list_per_user`, and hive reads degrade loudly.** `list`, `query` and `list_inventory` read the machine keys and the agent account's own user key, so an application installed for one user is not in them. In `list_per_user`, a missing privilege, a truncated profile list or a hive that fails to unload is reported by a warning row only, with the typed status still `UNDECLARED`, so check the rows and not just the status. A missing user or 32-bit Uninstall key is normal and ignored; any other open or enumeration failure, an over-long subkey name or an application key whose open fails marks the walk degraded while the apps already read are kept. A `DisplayName` that is not a string, or is over 64 KiB, is read as empty and that entry is skipped without a degraded mark, and a subkey deleted during enumeration can hide a sibling.
+2. **macOS `signature_status` is presence, not validity.** The enrichment reads the code-signing information only and never checks the signature, so a bundle with its `_CodeSignature` removed or with bytes appended still reads `signed`, and `publisher` is then unverified attribution. Deep verification is deliberately not performed.
+3. **A failed read is withheld, and macOS `list_inventory` is cached.** A killed, timed-out, truncated or non-zero-exit tool, or a Linux dpkg or rpm database that is locked, damaged, over a limit or changed while it was read, makes the action emit an `error|` row and return rc 1 rather than a partial list, and the daily sync then reports a status-only `installed_apps.list_inventory` section: the server keeps the stored application rows, shown as unconfirmed, and every other source is still sent. macOS `list_inventory` reuses its `system_profiler` scan for 10 minutes unless the Applications or receipt directories change, and a degraded or empty scan is never cached. On Linux the same holds for the whole database: one unreadable record (a damaged rpm header, a malformed dpkg stanza, or a `Status` outside the form described in caveat 5) makes the read `corrupt` and that host's package rows stay frozen until the database is repaired, so a partial roster is never published. Detection is by the database file, not the tool binary: the dpkg status file wins when at least one of its stanzas is `installed`, and one with none (empty, or only config-files, half-installed and other non-installed states) falls through to rpm; the rpm locations are tried in the order `/usr/lib/sysimage/rpm`, `/var/lib/rpm`, `/usr/share/rpm` (a symlinked directory is never followed and is skipped, since on current Fedora, RHEL and SUSE `/var/lib/rpm` links to the first, which is read directly), and the first of `rpmdb.sqlite`, `Packages.db` and `Packages` in a location that holds one is read; an rpm database that was read and holds no package does not end detection (the next location is tried, and when none yields a package the `pacman` leg runs, and for `list_inventory` (the daily sync) the `apk` leg too, so a host with an empty rpm database and no other manager reports an empty collection, not a degraded one); a lone `data.mdb` is `rpmdb:unsupported_format`. A skipped link with a database file behind it (checked by `stat`; nothing is opened through it) is `rpmdb:symlink_refused`, never an empty list, unless it resolves to a directory whose database this reader read itself (an empty one counts: `/var/lib/rpm` linking to the sysimage directory just read, or on the older layout the sysimage link to `/var/lib/rpm`).
+4. **`install_location` and `bundle_id` are untrusted.** Both are as the local bundle or installer reports them, so a local user can plant a bundle whose identifier is any string, and `install_location` can sit under a user's home. On Windows a product registered in more than one hive keeps the first record's fields and the smallest populated `InstallLocation`; on Linux both columns are always `-`.
+5. **Linux database reader: proven layouts, `status.d`, and the sqlite open.** The Berkeley DB reader was verified on 4096-byte pages and hash version 9, little-endian (arm64) and big-endian (s390x); other page sizes are accepted by construction, any other hash version answers `unsupported_format`, so does an unsorted hash page (type 2), which an in-place upgrade of an older file can leave inside a version 9 file and which holds records this reader does not decode (a shorter list is never reported as complete), and RHEL 7 itself was not captured. The ndb reader was verified on two openSUSE releases and does not verify the stored Adler-32 (the exact-length checks, the before and after change stamp and the transaction-lock check below catch a torn read, and a checksum adds nothing against a hostile file). rpm rewrites the ndb and Berkeley DB files in place under its transaction lock (an fcntl write lock on `.rpm.lock` in the database directory), which `rpm -qa` was isolated from, so those two are read only when no rpm transaction holds it: the reader asks `fcntl(F_GETLK)` after the first change stamp and before the first read, never takes a lock, and answers `locked` with no rows while one is held; a missing lock file means no transaction has run there, a link or a non-regular file is refused by name, a lock file the agent account cannot open is `rpm_ndb:unreadable` or `rpm_bdb:unreadable` on every read (no rows, the stored rows kept; rpm creates the file with mode 0644, as read from its source and not measured as an unprivileged account, so this needs a later chmod, an ACL or a mandatory-access rule), and a lock path moved out of the database directory (`%_rpmlock_path`) is not seen. A pending dpkg update journal (a file named with digits only in `/var/lib/dpkg/updates`, where `dpkg-query` replayed the records over the status file before it answered) answers `dpkg_updates:locked` with no rows and no fall-through to rpm; the directory is listed by name only, and `dpkg --configure -a`, when no dpkg run is in progress, completes an interrupted one. The check runs on any host with such a file, including an rpm host that carries a stale dpkg tree, where there is no dpkg to run: the leftover record is removed by hand. A symlink at the status file, `status.d` or the rpm database file is refused where the tools followed it. `/var/lib/dpkg/status.d/`, the layout minimal images with no shell and no package manager use, is read although `dpkg-query` never read it. It holds one control file per package, named for the package, and a `<package>.md5sums` sibling that is skipped. A directory listing that fails part-way fails the read (`dpkg_status_d:unreadable`) and is never a shorter list, and the listing is bounded to twice the package limit in entries (`dpkg_status_d:row_cap` over it) and checks the deadline on every entry, skipped or not. A real control file there has no `Status` field (proven on a captured image), so a package whose file is present is reported as installed; a file that does carry a `Status` is held to the same rule as the status file, and the status file itself still requires one. A `Status` is accepted only as dpkg writes it (dpkg's own words, lowercase, one space between the three), so a file hand-edited to mixed case or repeated blanks, which `dpkg-query` read, is `dpkg_status:corrupt` (no rows, the stored rows kept) until dpkg next rewrites it. A package in both places keeps the status-file entry, a symlink in the directory fails the read, and a host whose packages live only there newly reports them. The converse is also new: a host with a healthy status file and one unparseable regular file in `status.d` answers `dpkg_status_d:corrupt` where `dpkg-query` ignored the directory, and the packages of the status file are withheld with it (a roster without the `status.d`-only packages must not be published as complete). Remove the file or give it a leading dot, which is skipped. The sqlite file is opened without following symlinks and then reopened by path (sqlite needs the path to find its `-wal` and `-shm`), accepted because the directories are root-owned; a WAL-mode database whose `-wal` is absent or empty is read immutable, a rollback-journal one is read under a shared lock exactly as `rpm -qa` did (an owner holding it write-locked past 2 s gives `locked`; a transaction that commits during that read waits for it, at most the 20 s bound, while a WAL database, which is what rpm itself creates, is never blocked by the read), and a size or time change during the read is `changed_during_read`.
 
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/installed_apps/src/installed_apps_bundle_ids.hpp` · `agents/plugins/installed_apps/src/installed_apps_inventory.hpp` · `agents/plugins/installed_apps/src/installed_apps_macos_enrich.hpp` · `agents/plugins/installed_apps/src/installed_apps_macos_receipts.hpp` · `agents/plugins/installed_apps/src/installed_apps_parsers.hpp` · `agents/plugins/installed_apps/src/installed_apps_plugin.cpp` · `agents/plugins/installed_apps/src/installed_apps_registry_utf8.hpp` · `agents/plugins/installed_apps/src/installed_apps_registry_walk.hpp`
+- Plugin: `agents/plugins/installed_apps/src/installed_apps_bundle_ids.hpp` · `agents/plugins/installed_apps/src/installed_apps_inventory.hpp` · `agents/plugins/installed_apps/src/installed_apps_macos_enrich.hpp` · `agents/plugins/installed_apps/src/installed_apps_macos_receipts.hpp` · `agents/plugins/installed_apps/src/installed_apps_parsers.hpp` · `agents/plugins/installed_apps/src/installed_apps_pkgdb_read.hpp` · `agents/plugins/installed_apps/src/installed_apps_plugin.cpp` · `agents/plugins/installed_apps/src/installed_apps_registry_utf8.hpp` · `agents/plugins/installed_apps/src/installed_apps_registry_walk.hpp`
 - Definitions: `content/definitions/installed_apps.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
-- Tests: `tests/test_installed_apps_no_brew_lexical.py` · `tests/unit/test_installed_apps_actions.cpp` · `tests/unit/test_installed_apps_bundle_ids.cpp` · `tests/unit/test_installed_apps_inventory.cpp` · `tests/unit/test_installed_apps_macos_enrich.cpp` · `tests/unit/test_installed_apps_macos_receipts.cpp` · `tests/unit/test_installed_apps_parsers.cpp` · `tests/unit/test_installed_apps_registry_utf8.cpp` · `tests/unit/test_installed_apps_registry_walk.cpp` · `tests/unit/test_installed_apps_win_actions.cpp`
+- Tests: `tests/test_installed_apps_no_brew_lexical.py` · `tests/test_installed_apps_pkgdb_wiring_lexical.py` · `tests/unit/test_installed_apps_actions.cpp` · `tests/unit/test_installed_apps_bundle_ids.cpp` · `tests/unit/test_installed_apps_inventory.cpp` · `tests/unit/test_installed_apps_macos_enrich.cpp` · `tests/unit/test_installed_apps_macos_receipts.cpp` · `tests/unit/test_installed_apps_parsers.cpp` · `tests/unit/test_installed_apps_pkgdb.cpp` · `tests/unit/test_installed_apps_registry_utf8.cpp` · `tests/unit/test_installed_apps_registry_walk.cpp` · `tests/unit/test_installed_apps_win_actions.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

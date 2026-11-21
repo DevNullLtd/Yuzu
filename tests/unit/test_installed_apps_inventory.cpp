@@ -13,8 +13,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "installed_apps_inventory.hpp"
+#include "installed_apps_old_path_oracle.hpp" // the old CLI line parsers (test-only since SAM-45)
 
 #include <algorithm>
+#include <cstdint>
+#include <ctime>
 #include <string>
 #include <string_view>
 
@@ -505,4 +508,76 @@ TEST_CASE("format_inv_row owns the 14-token layout", "[installed_apps][inventory
         CHECK(std::count(row.begin(), row.end(), '|') == 13);
         CHECK(row.find('\n') == std::string::npos);
     }
+}
+
+// ── SAM-45: records mapped from the in-process database readers ──────────────
+//
+// The CLI line parsers above are the OLD path (kept as the test oracle in
+// installed_apps_old_path_oracle.hpp); these pin the functions the plugin runs now. The
+// per-capture row-set parity between the two is test_installed_apps_pkgdb.cpp's job.
+
+TEST_CASE("inv_record_from_dpkg: the installed state decides, the want does not",
+          "[installed_apps][inventory][pkgdb]") {
+    const auto pkg = [](std::string want, std::string flag, std::string status) {
+        return yuzu::shared::DpkgPackage{"bash", "1:5.2.21-2ubuntu4", "amd64",
+                                         "Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>",
+                                         std::move(want), std::move(flag), std::move(status)};
+    };
+    const auto r = inv_record_from_dpkg(pkg("install", "ok", "installed"));
+    REQUIRE(r.has_value());
+    CHECK(r->name == "bash");
+    CHECK(r->epoch == "1");
+    CHECK(r->version == "5.2.21");
+    CHECK(r->release == "2ubuntu4");
+    CHECK(r->arch == "amd64");
+    CHECK(r->publisher == "Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>");
+    CHECK(r->kind == "package");
+    CHECK(r->ecosystem == "deb");
+    CHECK(r->signature_status.empty()); // dpkg stores none: honest-empty, never synthesised
+
+    CHECK(inv_record_from_dpkg(pkg("hold", "ok", "installed")).has_value());       // "hi"
+    CHECK(inv_record_from_dpkg(pkg("install", "reinstreq", "installed")).has_value());
+    CHECK_FALSE(inv_record_from_dpkg(pkg("deinstall", "ok", "config-files")).has_value()); // "rc"
+    CHECK_FALSE(inv_record_from_dpkg(pkg("install", "ok", "half-installed")).has_value());
+    CHECK_FALSE(inv_record_from_dpkg(pkg("install", "ok", "unpacked")).has_value());
+}
+
+TEST_CASE("inv_record_from_rpm: the same fields the old rpm line parser produced",
+          "[installed_apps][inventory][pkgdb]") {
+    yuzu::shared::RpmPackage p;
+    p.name = "libgcc";
+    p.version = "11.4.1";
+    p.release = "2.1.el9";
+    p.arch = "aarch64";
+    p.vendor = "Rocky Enterprise Software Foundation";
+    p.packager = "Rocky Linux Build System (Peridot) <releng@rockylinux.org>";
+    p.install_time = 1700432736; // Sun Nov 19 22:25:36 2023 UTC
+    p.rsaheader = true;
+    const auto utc = [](std::int64_t t) {
+        std::tm out{};
+        const std::time_t tt = static_cast<std::time_t>(t);
+#ifdef _WIN32
+        gmtime_s(&out, &tt);
+#else
+        gmtime_r(&tt, &out);
+#endif
+        return out;
+    };
+    const auto r = inv_record_from_rpm(p, utc);
+    CHECK(r.name == "libgcc");
+    CHECK(r.epoch.empty());
+    CHECK(r.version == "11.4.1");
+    CHECK(r.release == "2.1.el9");
+    CHECK(r.arch == "aarch64");
+    CHECK(r.publisher == "Rocky Enterprise Software Foundation"); // VENDOR wins over PACKAGER
+    CHECK(r.install_date == "Sun Nov 19 22:25:36 2023");
+    CHECK(r.signature_status == "signed"); // RSAHEADER alone: a header-signed package is signed
+    CHECK(r.kind == "package");
+    CHECK(r.ecosystem == "rpm");
+    // The same record, through the old parser on the line rpm printed for it, formats identically.
+    const auto old = parse_rpm_inv_line("libgcc\t(none)\t11.4.1\t2.1.el9\taarch64\tSun Nov 19 22:25:36 2023\t(none)\t89024a04\t"
+                                        "Rocky Enterprise Software Foundation\t"
+                                        "Rocky Linux Build System (Peridot) <releng@rockylinux.org>");
+    REQUIRE(old.has_value());
+    CHECK(format_inv_row(r) == format_inv_row(*old));
 }

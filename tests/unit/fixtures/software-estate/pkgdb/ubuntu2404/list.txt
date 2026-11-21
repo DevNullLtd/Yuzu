@@ -1,0 +1,10 @@
+debconf|1.5.86ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|install ok installed
+gzip|1.12-1ubuntu3.2|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|install ok installed
+hostname|3.23+nmu2ubuntu2|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|install ok installed
+libacl1|2.3.2-1build1.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|install ok installed
+libattr1|1:2.5.2-1ubuntu0.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|install ok installed
+libaudit-common|1:3.1.2-2.1ubuntu0.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|install ok installed
+libgmp10|2:6.3.0+dfsg-2ubuntu6.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|install ok installed
+libpam-runtime|1.5.3-5ubuntu5.7|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|install ok installed
+sed|4.9-2ubuntu0.24.04.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|install ok installed
+ubuntu-keyring|2023.11.28.1|Dimitri John Ledkov <dimitri.ledkov@canonical.com>|install ok installed

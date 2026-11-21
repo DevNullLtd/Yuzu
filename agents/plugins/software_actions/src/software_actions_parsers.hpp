@@ -477,8 +477,8 @@ struct YumUpgradeRow {
 
 /// Count lines from `dpkg-query -W -f='${db:Status-Abbrev}\n'` output whose
 /// 2nd character is 'i' — matches installed_apps_inventory.hpp's
-/// parse_dpkg_inv_line: "ii" (want=install) and "hi" (want=hold) count, "rc"
-/// (removed) and "un" (unknown) do not. NOT vuln_scan_plugin.cpp's own dpkg
+/// inv_record_from_dpkg (the state decides, not the want): "ii" (want=install) and "hi"
+/// (want=hold) count, "rc" (removed) and "un" (unknown) do not. NOT vuln_scan_plugin.cpp's own dpkg
 /// query, which filters on the opposite convention (a `${Status}` ==
 /// "install ok installed" substring match, excluding held packages) — a
 /// pre-existing inconsistency between vuln_scan and its inventory sibling,

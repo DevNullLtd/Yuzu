@@ -1,0 +1,13 @@
+system-user-root|20190513-3.3.1|SUSE LLC <https://www.suse.com/>|Fri Apr 24 22:56:00 2026
+diffutils|3.6-4.3.1|SUSE LLC <https://www.suse.com/>|Fri Apr 24 22:56:09 2026
+libnsl2|1.2.0-2.44|SUSE LLC <https://www.suse.com/>|Fri Apr 24 22:56:09 2026
+libcrypt1|4.4.15-150300.4.7.1|SUSE LLC <https://www.suse.com/>|Fri Apr 24 22:56:02 2026
+gpg-pubkey|65176565-61a0ee8f|(none)|Fri Apr 24 22:56:21 2026
+libffi7|3.2.1.git259-10.8|SUSE LLC <https://www.suse.com/>|Fri Apr 24 22:56:16 2026
+gpg-pubkey|3dbdc284-53674dd4|(none)|Fri Apr 24 22:56:20 2026
+gpg-pubkey|39db7c82-5f68629b|(none)|Fri Apr 24 22:56:20 2026
+gpg-pubkey|25db7ae0-645bae34|(none)|Fri Apr 24 22:56:20 2026
+gpg-pubkey|29b700a4-62b07e22|(none)|Fri Apr 24 22:56:20 2026
+libverto1|0.2.6-3.20|SUSE LLC <https://www.suse.com/>|Fri Apr 24 22:56:03 2026
+fillup|1.42-2.18|SUSE LLC <https://www.suse.com/>|Fri Apr 24 22:56:03 2026
+gpg-pubkey|3fa1d6ce-63c9481c|(none)|Fri Apr 24 22:56:20 2026
