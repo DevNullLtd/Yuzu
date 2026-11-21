@@ -84,12 +84,13 @@ A home with no `release` file is only reported when a java binary proves it is a
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `dotnet` | ✅ supported · rung 1 · HKLM\\SOFTWARE\\dotnet\\Setup\\InstalledVersions\\<arch>\\{sharedfx,sdk} values + NDP v4 Full Release key table and v3.5 Version, both registry views; no filesystem walk | ✅ supported · rung 1 · /usr/local/share/dotnet (and x64/) shared/<framework>/<version> and sdk/<version> directory walk; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version> and sdk/<version> directory walk; network mounts skipped via /proc/self/mountinfo |
-| `jvm` | ✅ supported · rung 1 · HKLM JavaSoft, Eclipse Adoptium, Microsoft JDK and Azul Zulu keys (both views) + one <home>\\release read; no Program Files walk | ✅ supported · rung 1 · /Library/Java/JavaVirtualMachines/*/Contents/Home/release read (Contents/Info.plist JavaVM dict fallback); network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · <home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java (bin/java probe when a home has no release; JDK vs JRE from the bin/javac directory entry when the release file has no IMAGE_TYPE); network mounts skipped via /proc/self/mountinfo |
+| `jvm` | ✅ supported · rung 1 · HKLM JavaSoft, Eclipse Adoptium, Microsoft JDK and Azul Zulu keys (both views) + one <home>\\release read; no Program Files walk | ✅ supported · rung 1 · /Library/Java/JavaVirtualMachines/*/Contents/Home/release read (Contents/Info.plist JavaVM dict fallback); network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · <home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java (bin/java probe when a home has no release); network mounts skipped via /proc/self/mountinfo |
 | `python` | ✅ supported · rung 1 · HKLM\\SOFTWARE\\Python\\PythonCore\\<tag> Version/SysVersion/InstallPath in both registry views (PEP 514); per-user hives never read | ✅ supported · rung 1 · single-level listing of /Library/Frameworks/Python.framework/Versions; version from each version's Resources/Info.plist; network mounts skipped via getmntinfo_r_np | 🟡 constrained · rung 1 · single-level listing of /usr/bin and /usr/local/bin for python3.<minor> regular files; version is major.minor from the name (patch level not read); network mounts skipped via /proc/self/mountinfo |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
 - **`jvm` / macOS** — fixture-verified only: no JDK is installed on the macOS development host, so this leg rests on trees built from the documented bundle layout
+- **`jvm` / Linux** — flavour is IMAGE_TYPE when the release file has it; otherwise jdk when bin/javac is a directory entry (regular file or symlink, never followed or run), jre when only a java binary is present, unmodelled when neither can be established
 - **`python` / Linux** — patch level unavailable without running the interpreter
 <!-- END GENERATED -->
 
@@ -131,7 +132,7 @@ Every row is pipe-delimited. The first row is always `status|<action>|<level>|<r
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `row_kind` | string | `status` `jvm` | Windows, macOS, Linux | `jvm` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), jvm (one per runtime found). |
-| `flavour` | string | `jdk` `jre` `unmodelled` | Windows, macOS, Linux | `jdk` | Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — Debian and SUSE OpenJDK release files have no IMAGE_TYPE, and a release-less home has no file at all; never guessed from the path). Status rows: the action name. |
+| `flavour` | string | `jdk` `jre` `unmodelled` | Windows, macOS, Linux | `jdk` | Image kind. The IMAGE_TYPE key of the release file decides when it is present. Values: jdk, jre, unmodelled. Where the file has no IMAGE_TYPE, or on Linux there is no release file, the Linux leg reads the home's bin directory by directory entry (nothing is run or followed): jdk when bin/javac is there, jre when only a java binary is; unmodelled when neither can be established, and on macOS and Windows whenever the file does not say. Never guessed from the path or a package name. Status rows: the action name. |
 | `version` | string | - | Windows, macOS, Linux | `17.0.20` | JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; on Linux a home with a java binary but no release file yields - and a release_missing constraint; on Windows such a home keeps its row, with the version key of the registry registration as the version, and no constraint; on macOS the Info.plist JavaVM dictionary of the bundle supplies the version. Status rows: the level (supported, constrained or unsupported). |
 | `install_path` | string | - | Windows, macOS, Linux | `/opt/java/openjdk` | Absolute path of the JVM home directory. Status rows: the comma-joined failure tokens, or -. |
 | `vendor` | string | - | Windows, macOS, Linux | `Eclipse Adoptium` | IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified; on macOS, a bundle with an openable Contents and no release file under Contents/Home reports JVMVendor from its Info.plist instead; "-" when the source gives no vendor. |
@@ -167,7 +168,7 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · interactive user (elevated) · leg-hash 05bb94193f11
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · interactive user (elevated) · leg-hash 3cef2d295916
 
 ```
 == action=dotnet
@@ -192,7 +193,7 @@ python|cpython|3.14.6|C:/Python314/|PythonCore
 [result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-04 · euid 501 · leg-hash 05bb94193f11
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-04 · euid 501 · leg-hash 3cef2d295916
 
 ```
 == action=dotnet
@@ -208,7 +209,7 @@ status|python|supported|-
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-28 · euid 1000 · leg-hash 05bb94193f11
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-28 · euid 1000 · leg-hash 3cef2d295916
 
 ```
 == action=dotnet

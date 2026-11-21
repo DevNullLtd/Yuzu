@@ -1148,20 +1148,41 @@ TEST_CASE("runtimes linux: an unsearchable bin leaves the flavour unmodelled and
     CHECK(acc.reason() == std::string{lnx::kTokPermissionDenied});
 }
 
-TEST_CASE("runtimes linux: the bin/javac probe stays inside the walk budget (SYNTHETIC)",
-          "[runtimes][linux][walk][flavour]") {
-    // One extra open per home, no listing of bin: the entries-visited and row caps that bound the
-    // homes still bound the walk. MUTATION: a probe that lists bin/ would not be capped here.
-    yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_cap_"};
-    for (const char* n : {"a", "b", "c", "d", "e"}) {
-        write_text(dir.path / "usr/lib/jvm" / n / "release", "JAVA_VERSION=\"17.0.1\"\n");
-        write_text(dir.path / "usr/lib/jvm" / n / "bin/javac", "");
+TEST_CASE("runtimes linux: each bin flavour probe is charged to the entries-visited budget (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour][cap]") {
+    // Five homes: listing them costs 5 entries and each flavour probe one more, so
+    // entries_visited = 5 + k admits exactly k rows and then reports row_cap (the home whose probe
+    // cannot be paid gets no row and the walk stops). MUTATION: charging nothing for the probe
+    // returns all five rows with no row_cap at every limit below 10; charging a probe that
+    // IMAGE_TYPE made unnecessary fails the last case.
+    const char* const kNoType = "JAVA_VERSION=\"17.0.1\"\n";
+    const char* const kTyped = "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"JDK\"\n";
+    const std::string missing_then_cap = std::string{lnx::kTokReleaseMissing} + "," + std::string{lnx::kTokRowCap};
+    struct Case { const char* release; std::size_t entries, rows; std::string reason; };
+    for (const Case& c : {
+             Case{kNoType, 10, 5, ""},                                  // five homes + five probes: exact fit
+             Case{kNoType, 9, 4, std::string{lnx::kTokRowCap}},         // one probe short
+             Case{kNoType, 7, 2, std::string{lnx::kTokRowCap}},
+             Case{kNoType, 5, 0, std::string{lnx::kTokRowCap}},         // the listing spends it all
+             Case{"", 7, 2, missing_then_cap},                          // no release file: the same charge
+             Case{kTyped, 5, 5, ""}}) {                                 // IMAGE_TYPE decides: no probe, no charge
+        INFO("entries_visited=" << c.entries << " has_release=" << (*c.release != '\0')
+                                << " has_image_type=" << (c.release == kTyped));
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_cap_"};
+        for (const char* n : {"a", "b", "c", "d", "e"}) {
+            const fs::path home = dir.path / "usr/lib/jvm" / n;
+            if (*c.release != '\0') write_text(home / "release", c.release);
+            write_text(home / "bin/java", "");
+            write_text(home / "bin/javac", "");
+        }
+        lnx::WalkLimits l;
+        l.entries_visited = c.entries;
+        Acc acc;
+        const auto rows = lnx::jvm_rows_at(dir.path, acc, limits_cfg(l));
+        CHECK(rows.size() == c.rows);
+        for (const auto& r : rows) CHECK(r.rfind("jvm|jdk|", 0) == 0);
+        CHECK(acc.reason() == c.reason);
     }
-    Acc acc;
-    const auto rows = lnx::jvm_rows_at(dir.path, acc, dir_cap(2));
-    CHECK(rows.size() == 2); // the cap admits two homes; both are jdk
-    for (const auto& r : rows) CHECK(r.rfind("jvm|jdk|17.0.1|", 0) == 0);
-    CHECK(acc.reason() == std::string{lnx::kTokRowCap});
 }
 
 TEST_CASE("runtimes linux: /opt -> var/opt (rpm-ostree) is a covered alias, not a refusal (SYNTHETIC)",

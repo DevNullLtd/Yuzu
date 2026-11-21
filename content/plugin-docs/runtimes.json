@@ -33,8 +33,8 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "<home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java (bin/java probe when a home has no release; JDK vs JRE from the bin/javac directory entry when the release file has no IMAGE_TYPE); network mounts skipped via /proc/self/mountinfo",
+          "fallback": "flavour is IMAGE_TYPE when the release file has it; otherwise jdk when bin/javac is a directory entry (regular file or symlink, never followed or run), jre when only a java binary is present, unmodelled when neither can be established",
+          "mechanism": "<home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java (bin/java probe when a home has no release); network mounts skipped via /proc/self/mountinfo",
           "rung": "1",
           "support": "supported"
         },
@@ -159,7 +159,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "05bb94193f11",
+  "leg_hash": "3cef2d295916",
   "manifest_version": 1,
   "name": "runtimes",
   "outputs": [
@@ -255,7 +255,7 @@
           ]
         },
         {
-          "description": "Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — Debian and SUSE OpenJDK release files have no IMAGE_TYPE, and a release-less home has no file at all; never guessed from the path). Status rows: the action name.",
+          "description": "Image kind. The IMAGE_TYPE key of the release file decides when it is present. Values: jdk, jre, unmodelled. Where the file has no IMAGE_TYPE, or on Linux there is no release file, the Linux leg reads the home's bin directory by directory entry (nothing is run or followed): jdk when bin/javac is there, jre when only a java binary is; unmodelled when neither can be established, and on macOS and Windows whenever the file does not say. Never guessed from the path or a package name. Status rows: the action name.",
           "example": "jdk",
           "name": "flavour",
           "platforms": [
@@ -487,7 +487,7 @@
       "stamp": {
         "date": "2026-10-28",
         "host_class": "vm",
-        "leg_hash": "05bb94193f11",
+        "leg_hash": "3cef2d295916",
         "os": "linux",
         "os_version": "Ubuntu 26.04.1 LTS x86_64",
         "privilege": "euid 1000"
@@ -547,7 +547,7 @@
       "stamp": {
         "date": "2026-11-04",
         "host_class": "bare-metal",
-        "leg_hash": "05bb94193f11",
+        "leg_hash": "3cef2d295916",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -614,7 +614,7 @@
       "stamp": {
         "date": "2026-11-04",
         "host_class": "bare-metal",
-        "leg_hash": "05bb94193f11",
+        "leg_hash": "3cef2d295916",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "interactive user (elevated)"

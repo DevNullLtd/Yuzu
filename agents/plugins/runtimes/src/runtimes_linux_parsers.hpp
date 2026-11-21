@@ -697,8 +697,20 @@ inline bool home_has_java_binary(DIR* home, ConstraintAccumulator& acc) {
 /// when it is not but a java binary is (`java_known` skips the second probe when the caller has
 /// already found one), `unmodelled` when neither can be established. Validated by real Debian,
 /// Ubuntu and openSUSE JDK/JRE package captures (tests/unit/fixtures/wave10/runtimes/linux/).
-[[nodiscard]] inline JvmFlavour flavour_from_bin(DIR* home, bool java_known,
-                                                 ConstraintAccumulator& acc) {
+///
+/// The probe is charged one unit of `budget.entries_left` BEFORE it runs, however many fixed-name
+/// opens it makes (up to four per home: `bin` for javac, then `bin`, `jre` and `jre/bin` for java).
+/// A spent budget answers nullopt after recording `row_cap` and exhausting the walk, exactly as
+/// list_entries does: the caller stops, and the home's flavour is never guessed.
+[[nodiscard]] inline std::optional<JvmFlavour> flavour_from_bin(DIR* home, bool java_known,
+                                                                ConstraintAccumulator& acc,
+                                                                WalkBudget& budget) {
+    if (budget.entries_left == 0) {
+        budget.exhausted = true;
+        acc.add_failure(kTokRowCap);
+        return std::nullopt;
+    }
+    --budget.entries_left;
     const auto javac = home_has_javac(home, acc);
     if (!javac) return JvmFlavour::unmodelled;
     if (*javac) return JvmFlavour::jdk;
@@ -820,8 +832,9 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
 /// `release_missing`; an unreadable / oversized / version-less `release` is a recorded constraint.
 /// Symlinked homes are aliases. The flavour is the release file's IMAGE_TYPE; where that is absent
 /// (Debian, Ubuntu, openSUSE, ...) it is read from the home's bin/ by directory entry (see
-/// flavour_from_bin): one extra O_NOFOLLOW open of `bin` per such home, bounded by the same
-/// entries-visited budget that bounds the homes listed.
+/// flavour_from_bin): a few fixed-name O_NOFOLLOW opens per such home (up to four, no listing),
+/// each home's probe charged one unit of the same entries-visited budget that bounds the homes
+/// listed; a spent budget stops the walk with `row_cap` and the home gets no row.
 [[nodiscard]] inline std::vector<std::string> jvm_rows_at(
     const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
     const WalkConfig& cfg = {}) {
@@ -843,8 +856,9 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
             if (rr.status == ReadStatus::absent) {
                 if (!home_has_java_binary(hh.get(), acc)) continue;
                 acc.add_failure(kTokReleaseMissing);
-                const auto flavour = flavour_from_bin(hh.get(), /*java_known=*/true, acc);
-                if (!push_row(rows, jvm_row_release_missing(path, flavour), budget, acc)) break;
+                const auto flavour = flavour_from_bin(hh.get(), /*java_known=*/true, acc, budget);
+                if (!flavour) break;
+                if (!push_row(rows, jvm_row_release_missing(path, *flavour), budget, acc)) break;
                 continue;
             }
             if (rr.status == ReadStatus::failed) {
@@ -853,10 +867,12 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
             }
             const auto fields = parse_release_file(rr.text);
             if (fields.oversized) acc.add_failure(kTokFieldOversized);
-            const auto fallback = has_image_type(fields)
-                                      ? JvmFlavour::unmodelled
-                                      : flavour_from_bin(hh.get(), /*java_known=*/false, acc);
-            auto row = jvm_row(fields, path, fallback);
+            std::optional<JvmFlavour> fallback = JvmFlavour::unmodelled; // IMAGE_TYPE decides
+            if (!has_image_type(fields)) {
+                fallback = flavour_from_bin(hh.get(), /*java_known=*/false, acc, budget);
+                if (!fallback) break;
+            }
+            auto row = jvm_row(fields, path, *fallback);
             if (!row) {
                 acc.add_failure(kTokReleaseUnparsable);
                 continue;

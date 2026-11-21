@@ -66,10 +66,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "<home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java "
-         "(bin/java probe when a home has no release; JDK vs JRE from the bin/javac directory "
-         "entry when the release file has no IMAGE_TYPE); network mounts skipped via "
+         "(bin/java probe when a home has no release); network mounts skipped via "
          "/proc/self/mountinfo",
-         nullptr},
+         "flavour is IMAGE_TYPE when the release file has it; otherwise jdk when bin/javac is a "
+         "directory entry (regular file or symlink, never followed or run), jre when only a java "
+         "binary is present, unmodelled when neither can be established"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "/Library/Java/JavaVirtualMachines/*/Contents/Home/release read (Contents/Info.plist "
