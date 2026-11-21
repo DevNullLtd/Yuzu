@@ -379,7 +379,7 @@ int do_system(yuzu::CommandContext& ctx) {
 #ifdef __linux__
     // /sys/class/dmi/id/product_serial and product_uuid are 0400 (root-owned) and the agent
     // runs unprivileged. The packaged unit grants CAP_DAC_READ_SEARCH as an ambient
-    // capability (the dev install script uses setcap on the binary instead); this in-process
+    // capability (the dev/UAT launcher uses setpriv --ambient-caps instead; no file capability, WP13/F21); this in-process
     // ifstream reads with the effective set. The agent clears its inheritable and ambient
     // sets at start, so an exec'd child such as dmidecode does NOT get it, which is why the
     // read stays in-process. Without the capability (opt-out, dev/manual launch) both
@@ -473,8 +473,9 @@ int do_processors(yuzu::CommandContext& ctx) {
         ctx.write_output("cpu|0|unknown|0|0|0|-|-");
     } else {
         for (auto& [id, c] : cpus) {
-            ctx.write_output(
-                std::format("cpu|{}|{}|{}|{}|{:.0f}|-|-", id, c.model, c.cores, c.threads, c.mhz));
+            // The model is /proc/cpuinfo text: format_cpu_row_sampled escapes a pipe (#7040).
+            ctx.write_output(yuzu::hardware::estate::format_cpu_row_sampled(id, c.model, c.cores,
+                                                                            c.threads, c.mhz));
         }
     }
 
@@ -487,8 +488,10 @@ int do_processors(yuzu::CommandContext& ctx) {
     // mhz stays 0.0 in that case, matching the pre-Wave-3 fallback exactly.
     auto freq = sysctl_value<uint64_t>("hw.cpufrequency");
     double mhz = freq ? static_cast<double>(*freq) / 1e6 : 0.0;
-    ctx.write_output(
-        std::format("cpu|0|{}|{}|{}|{:.0f}|-|-", brand.empty() ? "unknown" : brand, cores, threads, mhz));
+    // machdep.cpu.brand_string is firmware text: format_cpu_row_sampled escapes a pipe (#7040).
+    ctx.write_output(yuzu::hardware::estate::format_cpu_row_sampled(
+        0, brand.empty() ? std::string_view{"unknown"} : std::string_view{brand}, cores, threads,
+        mhz));
 
 #elif defined(_WIN32)
     int idx = 0;

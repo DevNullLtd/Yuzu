@@ -23,7 +23,7 @@ flowchart LR
   EX --> WIN[Windows leg<br/>CreateToolhelp32Snapshot<br/>+ QueryFullProcessImageNameW]
   EX --> MAC[macOS leg<br/>sysctl KERN_PROC_ALL<br/>+ proc_pidpath]
   EX --> LIN[Linux leg<br/>/proc enumeration<br/>+ readlink /proc/pid/exe]
-  WIN & MAC & LIN --> ROWS[rows, no typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses · /api/v1/dex/devices/id/live]
+  WIN & MAC & LIN --> ROWS[rows, typed status only for the Linux /proc gap] --> RS[(ResponseStore)] --> API[REST /api/responses · /api/v1/dex/devices/id/live]
 ```
 
 **Image hashing does not re-open path text.** On Linux `list_hashed`/`list_tree` hash through an open of `/proc/<pid>/exe` itself (the kernel's own reference to the running image, so a `(deleted)` image is hashed from its inode and the readlink text is never opened), with `O_NONBLOCK`, an `fstat` regular-file check, the 512 MiB cap, on a bounded helper (30 s per image, 120 s for all images; a stalled filesystem cannot hold a command-pool worker, though the helper itself can stay blocked; a hash that timed out reads `hash_unavailable:timeout`, and after two helpers are left behind in one dispatch (or the 120 s are used) each further row reads `hash_unavailable:skipped` (including a row whose image was already hashed earlier in the same action: no row is answered from a cache once the cap is reached), never an empty hash), cached for the action by the opened image's identity (device, inode, size, mtime, ctime); **Linux makes no network-mount judgement** (the `path` column shows the readlink text with the `(deleted)` marker stripped). On Windows and macOS an image path that is a UNC/device/non-fixed-drive path or on (or symlinked into) a listed network mount is not opened and reads as an empty `sha256` (the same bounded helper and markers apply), so a process a standard user launched from a share cannot make the agent authenticate to that share; the mount table is read once per action.
@@ -37,6 +37,11 @@ flowchart LR
 | `list_hashed` | ✅ supported · rung 1 · CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | ✅ supported · rung 1 · sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | ✅ supported · rung 1 · /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 |
 | `list_tree` | ✅ supported · rung 1 · CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | ✅ supported · rung 1 · sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | ✅ supported · rung 1 · /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 |
 | `query` | ✅ supported · rung 1 · CreateToolhelp32Snapshot | ✅ supported · rung 1 · sysctl(KERN_PROC_ALL) | ✅ supported · rung 1 · /proc enumeration |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`list_hashed` / Linux** — CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable
+- **`list_tree` / Linux** — CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -63,7 +68,7 @@ No external binaries, no subprocesses, no network access — every leg is an in-
 
 ### Outputs
 
-Pipe-delimited rows via `write_output()`, one line per process (or, for `query`, one `found|` line plus zero or more matching rows). A field is never omitted for width — `list_hashed`/`list_tree` always carry the full field count, with an empty (not `-`) string where the executable path or hash could not be resolved. A process name containing `|`, CR, or LF has those bytes replaced with a space before emission, so the pipe format can never desync (`processes_plugin.cpp:71-76`).
+Pipe-delimited rows via `write_output()`, one line per process (or, for `query`, one `found|` line plus zero or more matching rows). A field is never omitted for width — `list_hashed`/`list_tree` always carry the full field count, with an empty (not `-`) string where the executable path or hash could not be resolved. A process name (or path) containing `|`, CR, or LF has those bytes replaced with a space, and a trailing backslash is folded to `/` (it would otherwise glue onto the next `|`); other backslashes are kept. This applies to `list`, `query`, `list_hashed` and `list_tree` alike (`processes_rows.hpp`), so the pipe format can never desync.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.process.list` — `pid|name`**
@@ -71,7 +76,7 @@ Pipe-delimited rows via `write_output()`, one line per process (or, for `query`,
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `pid` | int64 | - | Windows, Linux, macOS | `1936` | The process's numeric identifier, as assigned by the OS kernel at process creation. Values: integer. |
-| `name` | string | - | Windows, Linux, macOS | `svchost.exe` | The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '\|', CR and LF are replaced with a space before the row is emitted. Values: free text. |
+| `name` | string | - | Windows, Linux, macOS | `svchost.exe` | The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '\|', CR and LF are replaced with a space and a trailing backslash with '/' before the row is emitted. Values: free text. |
 
 **`crossplatform.process.query` — `found|pid|name`**
 
@@ -86,7 +91,12 @@ Pipe-delimited rows via `write_output()`, one line per process (or, for `query`,
 
 ### Result status
 
-This plugin does not set a typed result status; the agent records `UNDECLARED` and every sample shows `UNDECLARED / UNKNOWN / ` for all four actions on all three OSes (grep confirms no `set_result_status`/`yuzu_ctx_set_result_status` call anywhere in `processes_plugin.cpp`). A failed `enumerate_processes()` (e.g. `CreateToolhelp32Snapshot` or `opendir("/proc")` failing) silently returns zero rows with no distinguishing status — indistinguishable, on the wire, from a host with no processes.
+On Linux, `list_hashed` and `list_tree` declare a typed status when the agent could not read another user's `/proc` entries (WP13 UP14). Otherwise the agent records `UNDECLARED` (every other leg and OS; a clean read).
+
+| Status | Completeness | Provenance | When |
+|---|---|---|---|
+| `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows and macOS run, and a Linux run where every process was readable. |
+| `CONSTRAINED` | PARTIAL | `processes:exe_unreadable` | `list_hashed` and `list_tree` readlink of `/proc/<pid>/exe` was refused (EACCES/EPERM) for at least one process, so its `path` and `sha256` are empty. Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. **Linux only:** a refused read on macOS or Windows can still blank a row while the status stays `OK`, and other `/proc` readers are not tallied; treat `OK` there as not proof of completeness (tracked in #8165). |
 
 ### Where the data goes
 
@@ -252,16 +262,16 @@ proc|1|sh
 
 ## Caveats and known gaps
 
-1. **No typed result status, ever.** Every action on every OS reports `UNDECLARED / UNKNOWN /` in every capture — the plugin has no `set_result_status` call at all, so an enumeration failure (a failed `CreateToolhelp32Snapshot` or `opendir("/proc")`) and "this host genuinely has zero processes" are indistinguishable on the wire. Likewise `hidepid` hides processes rather than marking them: A pid whose `/proc/<pid>/status` cannot be opened (for example another user's process under `hidepid=1` or `2`) is omitted from the rows of every action. `hash_unavailable:pid_unverified` and `pid_exited` cover only a pid whose `/proc/<pid>/stat` could not be read while its `status` opened.
+1. **Typed result status only for one Linux gap.** On Linux, `list_hashed` and `list_tree` set `CONSTRAINED`/`PARTIAL` (`processes:exe_unreadable`) when another user's `/proc/<pid>/exe` is unreadable; for an unprivileged agent that is the steady state. Every other action and OS reports `UNDECLARED / UNKNOWN /` in every capture (Windows and macOS `list_hashed`/`list_tree` included), so an enumeration failure (a failed `CreateToolhelp32Snapshot` or `opendir("/proc")`) and "this host genuinely has zero processes" are indistinguishable on the wire, and on Windows and macOS a refused image-path read blanks a row's `path`/`sha256` without any status. Likewise `hidepid` hides processes rather than marking them: A pid whose `/proc/<pid>/status` cannot be opened (for example another user's process under `hidepid=1` or `2`) is omitted from the rows of every action. `hash_unavailable:pid_unverified` and `pid_exited` cover only a pid whose `/proc/<pid>/stat` could not be read while its `status` opened.
 2. **`list_hashed`/`list_tree` have no privilege-model row.** `docs/agent-privilege-model.md:83` covers `processes.fetch`/`echo.process_tree` (needing `cap_sys_ptrace` on Linux to inspect non-child processes) — that is a different action id, not present in this plugin's descriptor, so it must not be read as documenting `list_hashed`/`list_tree`. Both were captured only as root/SYSTEM/unprivileged-but-same-user, so a production unprivileged Linux capture (where `readlink(/proc/<pid>/exe)` on another user's process would be denied) has not been taken; add the row when it is.
 3. **512 MiB hash cap refuses, not truncates.** The hash is empty for any image over the cap rather than a truncated prefix (Windows/macOS: `sha256_file()`; Linux: `hash_fd_regular` on `/proc/<pid>/exe`, which also enforces a 30 s per-image deadline) — an empty `sha256` on a real, resolved `path` can mean "oversized," "refused" (a network, device or non-fixed-drive path on Windows and macOS) or "unreadable," and the row cannot say which; only a helper that timed out or was not started is named (`hash_unavailable:timeout`, `hash_unavailable:skipped`) on every OS.
-4. **`query` output is not sanitized.** `do_query` writes `p->name` directly (`processes_plugin.cpp:419`), unlike `list`/`list_hashed`/`list_tree`, which run every name through `sanitize_field()`. A process name containing `|`/CR/LF would desync a `query` row's fields; none of the three captures exercised this.
+4. **Row fields are neutralised, and only a trailing backslash is folded.** Every action (`list`, `query`, `list_hashed`, `list_tree`) builds its rows in `processes_rows.hpp`: `|`, CR and LF in a name or path become a space and a trailing backslash becomes `/` (it would otherwise glue onto the next `|`). Interior backslashes are kept, so a Windows path stays readable (the same backslash rule as `procfetch`, `wmi`, `installed_apps`, `network_config` and `filesystem`; unlike them, `processes` folds a `|` to a space because its consumers split rows on a raw `|`). An agent on a build before this change still emits unsanitised `query` rows and glues a trailing backslash until it is upgraded.
 5. **macOS name field is dual-shaped.** `list`/`list_hashed`/`list_tree` report the full resolved executable path as `name` when one was found, else the 16-byte-truncated `p_comm` (`processes_plugin.cpp:173-174`) — a consumer joining on `name` across OSes gets a path on macOS and a bare filename on Windows/Linux.
 
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/processes/src/processes_plugin.cpp`
+- Plugin: `agents/plugins/processes/src/processes_plugin.cpp` · `agents/plugins/processes/src/processes_rows.hpp`
 - Definitions: `content/definitions/processes.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: none found by name

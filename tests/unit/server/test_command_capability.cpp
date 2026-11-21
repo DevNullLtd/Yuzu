@@ -156,14 +156,33 @@ TEST_CASE("CommandCapabilityRegistry: too many sources throws rather than silent
     // literal at the call site, so exceeding kMaxSources means literally
     // writing kMaxSources + 1 elements. The static_assert keeps that literal
     // count honest if kMaxSources ever changes.
-    static_assert(CommandCapabilityRegistry::kMaxSources == 32,
-                 "this test hardcodes 33 literal sources (kMaxSources + 1); update the "
+    static_assert(CommandCapabilityRegistry::kMaxSources == 48,
+                 "this test hardcodes 49 literal sources (kMaxSources + 1); update the "
                  "literal list below if kMaxSources changes");
     const auto s = std::span<const CommandCapability>(kFragmentAlpha);
     CHECK_THROWS_AS(
         CommandCapabilityRegistry({s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s,
-                                    s, s, s, s, s, s, s, s, s, s, s, s}),
+                                    s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s,
+                                    s, s, s, s, s, s, s}),
         std::invalid_argument);
+}
+
+TEST_CASE("CommandCapabilityRegistry: exactly kMaxSources sources construct and the last one "
+          "still classifies",
+          "[server][dispatch][capability]") {
+    // The acceptance side of the ceiling: a cutoff below kMaxSources would pass the 49-source
+    // rejection case above, so pin that the final slot is usable. 47 empty sources, then one
+    // populated source in slot 48.
+    static_assert(CommandCapabilityRegistry::kMaxSources == 48,
+                 "this test hardcodes 48 literal sources (kMaxSources); update the literal "
+                 "list below if kMaxSources changes");
+    const auto e = std::span<const CommandCapability>{};
+    const auto s = std::span<const CommandCapability>(kFragmentAlpha);
+    CommandCapabilityRegistry registry({e, e, e, e, e, e, e, e, e, e, e, e, e, e, e, e,
+                                        e, e, e, e, e, e, e, e, e, e, e, e, e, e, e, e,
+                                        e, e, e, e, e, e, e, e, e, e, e, e, e, e, e, s});
+    auto result = registry.classify("echo", "collect_inventory");
+    REQUIRE(result.has_value());
 }
 
 // ── core_dispatch_capabilities() ─────────────────────────────────────────

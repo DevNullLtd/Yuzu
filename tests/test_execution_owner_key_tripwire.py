@@ -45,7 +45,7 @@ CHECK 5 (mutation request). Every `ExecutionMutationRequest` constructed under s
 CHECK 6 (raw-username guards). Every handler (the innermost lambda, or an MCP `if (tool_name == ...)`
   block) that BINDS an owner key to a variable or ternary also carries a `username.empty()` guard on
   the RAW username, never replaced by a check on the key. The twelve such handlers are frozen by route
-  path or tool name. The ten handlers that only use the key inertly (`.owns(`, a predicate argument,
+  path or tool name. The eleven handlers that only use the key inertly (`.owns(`, a predicate argument,
   `.owner =`) need no guard by design (an empty key owns nothing) and are frozen as a second set.
 CHECK 7 (the key type). `execution_owner_key` is DEFINED exactly once under server/, its body tests
   the service scope before returning a key, `ExecutionOwnerKey` is a class whose only public
@@ -293,6 +293,7 @@ _RA = "/api/v1/executions/([A-Za-z0-9_-]{1,128})"
 INERT_OWNER_KEY_HANDLERS = {
     (_SRC + "mcp_server.cpp", "cancel_execution"): 1,
     (_SRC + "mcp_server.cpp", "get_execution_status"): 1,
+    (_SRC + "mcp_server.cpp", "get_software_sync_status"): 1,
     (_SRC + "mcp_server.cpp", "record_execution_rerun"): 1,
     (_SRC + "mcp_server.cpp", "summarize_working_set"): 1,
     (_SRC + "rest_api_v1.cpp", "/api/v1/events"): 1,

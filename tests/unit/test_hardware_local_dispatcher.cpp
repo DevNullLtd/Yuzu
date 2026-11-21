@@ -51,12 +51,18 @@ std::vector<std::string> captured_rows(const std::string& captured) {
     return out;
 }
 
-/// Splits on '|'. The rows asserted on here carry only fixed tokens, so no escape handling.
+/// Splits on an UNESCAPED '|' and decodes `\|` to a literal pipe: the plugin writes a pipe in firmware
+/// text (a CPU model, a DIMM slot) as `\|` and folds a backslash to `/` (yuzu::util::safe_output_field),
+/// so a real host whose model holds a pipe still yields the eight columns asserted below (#7040).
 std::vector<std::string> split_pipes(const std::string& row) {
     std::vector<std::string> out;
     std::string cur;
-    for (char c : row) {
-        if (c == '|') {
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        const char c = row[i];
+        if (c == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
+            cur += '|';
+            ++i;
+        } else if (c == '|') {
             out.push_back(cur);
             cur.clear();
         } else {

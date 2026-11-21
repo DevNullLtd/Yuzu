@@ -1,0 +1,224 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "ghcr.io/devnullltd/yuzu-agent-chisel",
+  "documentNamespace": "https://anchore.com/syft/image/ghcr.io/devnullltd/yuzu-agent-chisel-a1dbee75-171a-486b-858b-476336c77200",
+  "creationInfo": {
+    "licenseListVersion": "3.29",
+    "creators": [
+      "Organization: Anchore, Inc",
+      "Tool: syft-1.57.2"
+    ],
+    "created": "2026-11-18T00:29:11Z"
+  },
+  "packages": [
+    {
+      "name": "busybox",
+      "SPDXID": "SPDXRef-Package-deb-busybox-7f1f2a16ef6da4ee",
+      "versionInfo": "1:1.37.0-7ubuntu1",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "sourceInfo": "acquired package info from DPKG DB: /usr/bin/busybox",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceType": "cpe23Type",
+          "referenceLocator": "cpe:2.3:a:busybox:busybox:1\\:1.37.0-7ubuntu1:*:*:*:*:*:*:*"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:deb/ubuntu/busybox@1%3A1.37.0-7ubuntu1?distro=ubuntu"
+        }
+      ]
+    },
+    {
+      "name": "openssl",
+      "SPDXID": "SPDXRef-Package-deb-openssl-4cd1251aba1f0bdf",
+      "versionInfo": "3.5.5-1ubuntu3.6",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "sourceInfo": "acquired package info from DPKG DB: /usr/lib/x86_64-linux-gnu/engines-3/afalg.so, /usr/lib/x86_64-linux-gnu/engines-3/loader_attic.so, /usr/lib/x86_64-linux-gnu/libcrypto.so.3, /usr/lib/x86_64-linux-gnu/libssl.so.3, /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceType": "cpe23Type",
+          "referenceLocator": "cpe:2.3:a:openssl:openssl:3.5.5-1ubuntu3.6:*:*:*:*:*:*:*"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:deb/ubuntu/openssl@3.5.5-1ubuntu3.6?distro=ubuntu"
+        }
+      ]
+    },
+    {
+      "name": "ghcr.io/devnullltd/yuzu-agent-chisel",
+      "SPDXID": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-agent-chisel",
+      "versionInfo": "0.14.1",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": true,
+      "packageVerificationCode": {
+        "packageVerificationCodeValue": "a744f0b0165e1211c7589dc2bd67ef2124f1b713"
+      },
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "2376bdecdd81b5546403e91f20f0c13d48f29e903505712190486ef365f50042"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:oci/ghcr.io%2Fdevnullltd%2Fyuzu-agent-chisel@sha256%3A2376bdecdd81b5546403e91f20f0c13d48f29e903505712190486ef365f50042?arch=amd64&tag=0.14.1"
+        }
+      ],
+      "primaryPackagePurpose": "CONTAINER"
+    }
+  ],
+  "files": [
+    {
+      "fileName": "usr/bin/busybox",
+      "SPDXID": "SPDXRef-File-usr-bin-busybox-1dec9578d16bf7ac",
+      "fileTypes": [
+        "APPLICATION",
+        "BINARY"
+      ],
+      "checksums": [
+        {
+          "algorithm": "SHA1",
+          "checksumValue": "50a12b9f0469725569569e621af5b7b610ed4668"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "df12634c17fcdca839ae5dc47d7627b7558511f7645de7c99ccf097a0f28ed5b"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "licenseInfoInFiles": [
+        "NOASSERTION"
+      ],
+      "copyrightText": "NOASSERTION",
+      "comment": "layerID: sha256:4e1150b59696d804eb832aa9a43eb063df53a29345c4126a93c12f9413fb4897"
+    },
+    {
+      "fileName": "usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+      "SPDXID": "SPDXRef-File-...lib-x86-64-linux-gnu-libcrypto.so.3-dce564e1dbad3bad",
+      "fileTypes": [
+        "APPLICATION",
+        "BINARY"
+      ],
+      "checksums": [
+        {
+          "algorithm": "SHA1",
+          "checksumValue": "561dffafe35b991dbc91ec168e11173687b967fd"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "dcce5a26377117c295c05a3c85261749e02cab31e0fb517a0f505a957ca49f4e"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "licenseInfoInFiles": [
+        "NOASSERTION"
+      ],
+      "copyrightText": "NOASSERTION",
+      "comment": "layerID: sha256:4e1150b59696d804eb832aa9a43eb063df53a29345c4126a93c12f9413fb4897"
+    },
+    {
+      "fileName": "usr/lib/yuzu/plugins/os_info/os_info.so",
+      "SPDXID": "SPDXRef-File-...lib-yuzu-plugins-os-info-os-info.so-7af7ae3b8e082758",
+      "checksums": [
+        {
+          "algorithm": "SHA1",
+          "checksumValue": "0000000000000000000000000000000000000000"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "licenseInfoInFiles": [
+        "NOASSERTION"
+      ],
+      "copyrightText": "NOASSERTION",
+      "comment": "layerID: sha256:4e1150b59696d804eb832aa9a43eb063df53a29345c4126a93c12f9413fb4897"
+    },
+    {
+      "fileName": "usr/local/bin/yuzu-agent",
+      "SPDXID": "SPDXRef-File-usr-local-bin-yuzu-agent-c2a9f1a007cfff1b",
+      "checksums": [
+        {
+          "algorithm": "SHA1",
+          "checksumValue": "0000000000000000000000000000000000000000"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "licenseInfoInFiles": [
+        "NOASSERTION"
+      ],
+      "copyrightText": "NOASSERTION",
+      "comment": "layerID: sha256:4e1150b59696d804eb832aa9a43eb063df53a29345c4126a93c12f9413fb4897"
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-Package-deb-openssl-4cd1251aba1f0bdf",
+      "relatedSpdxElement": "SPDXRef-File-...lib-x86-64-linux-gnu-libcrypto.so.3-dce564e1dbad3bad",
+      "relationshipType": "OTHER",
+      "comment": "evident-by: indicates the package's existence is evident by the given file"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-deb-busybox-7f1f2a16ef6da4ee",
+      "relatedSpdxElement": "SPDXRef-File-usr-bin-busybox-1dec9578d16bf7ac",
+      "relationshipType": "OTHER",
+      "comment": "evident-by: indicates the package's existence is evident by the given file"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-agent-chisel",
+      "relatedSpdxElement": "SPDXRef-Package-deb-busybox-7f1f2a16ef6da4ee",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-agent-chisel",
+      "relatedSpdxElement": "SPDXRef-Package-deb-openssl-4cd1251aba1f0bdf",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-agent-chisel",
+      "relatedSpdxElement": "SPDXRef-File-usr-bin-busybox-1dec9578d16bf7ac",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-agent-chisel",
+      "relatedSpdxElement": "SPDXRef-File-...lib-x86-64-linux-gnu-libcrypto.so.3-dce564e1dbad3bad",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-agent-chisel",
+      "relatedSpdxElement": "SPDXRef-File-...lib-yuzu-plugins-os-info-os-info.so-7af7ae3b8e082758",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-agent-chisel",
+      "relatedSpdxElement": "SPDXRef-File-usr-local-bin-yuzu-agent-c2a9f1a007cfff1b",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relatedSpdxElement": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-agent-chisel",
+      "relationshipType": "DESCRIBES"
+    }
+  ]
+}

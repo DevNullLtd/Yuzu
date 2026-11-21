@@ -123,7 +123,8 @@ struct DevicesRequest {
 [[nodiscard]] std::optional<std::string> strict_args_error(const nlohmann::json& args);
 
 /// The type-only check for the raw per-install MCP tool `query_installed_software`: agent_id,
-/// name, version and cursor must be JSON strings, `limit` a JSON integer that fits an int64 (a
+/// name, version, cursor and the lookup filters (q, kind, ecosystem, source, match, version_min,
+/// version_max, status) must be JSON strings, `limit` a JSON integer that fits an int64 (a
 /// uint64 above INT64_MAX is refused, never wrapped). No length or range check: the
 /// parse_devices_params bounds and the legacy `limit` clamp still apply. Unknown argument names
 /// are ignored. nullopt = acceptable; otherwise the kInvalidParams message.

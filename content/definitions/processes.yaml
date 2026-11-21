@@ -41,7 +41,7 @@ spec:
       - name: name
         type: string
         description: >-
-          The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '|', CR and LF are replaced with a space before the row is emitted. Values: free text.
+          The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '|', CR and LF are replaced with a space and a trailing backslash with '/' before the row is emitted. Values: free text.
         example: "svchost.exe"
         platforms: [windows, linux, darwin]
     aggregation:

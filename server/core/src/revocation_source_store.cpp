@@ -27,11 +27,15 @@ const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the migration
     // transaction. Runtime statements below schema-qualify explicitly.
     //
-    // The WHOLE schema of the design's "The store" table is created here, in v1, so the
-    // fetcher PR (2b-1b) adds no migration for its tables. Times a CA signs (`this_update`,
-    // `next_update`, `revocation_date`) are the CA's own; `fetched_at`, `last_*_at`,
-    // `created_at` and `updated_at` are Postgres now(). CRL numbers are up to 20 octets
-    // (RFC 5280 5.2.3), so NUMERIC; `serial` is UPPERCASE hex in the minimal BYTE form (even length, whole bytes, no leading 00 byte unless the value is zero); a CHECK pins that form so two spellings of one serial can never be two rows.
+    // v1 creates the tables of the design's "The store" section that the fetcher (2b-1b) uses;
+    // `cert_signature_check` (2b-2) is not created here. The #6590 rulings (2026-11-18: reset key
+    // list, `scope_key` encoding, canonical URLs) land as migration v2 before 2b-1b.
+    //
+    // Times a CA signs (`this_update`, `next_update`, `revocation_date`) are the CA's own;
+    // `fetched_at`, `last_*_at`, `created_at` and `updated_at` are Postgres now(). CRL numbers are
+    // up to 20 octets (RFC 5280 5.2.3), so NUMERIC; `serial` is UPPERCASE hex in the minimal BYTE
+    // form (even length, whole bytes, no leading 00 byte unless the value is zero); a CHECK pins
+    // that form so two spellings of one serial can never be two rows.
     //
     // `rollback_high_water` is keyed by the CA (subject Name hash) and scope, NOT by `source`,
     // and has no foreign key: it deliberately outlives a removed source. `crl_number` and
@@ -440,6 +444,9 @@ std::expected<std::vector<RevocationSourceRecord>, RevocationSourceStoreError>
 RevocationSourceStore::list() {
     if (!open_)
         return fail(Kind::kNotOpen, "revocation source store is not open");
+    if (read_fault_)
+        if (const auto k = read_fault_("list"))
+            return fail(*k, "injected read fault");
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease) {
         warn_no_connection("list", timeout_);
@@ -457,6 +464,9 @@ std::expected<RevocationSourceRecord, RevocationSourceStoreError>
 RevocationSourceStore::get(std::int64_t id) {
     if (!open_)
         return fail(Kind::kNotOpen, "revocation source store is not open");
+    if (read_fault_)
+        if (const auto k = read_fault_("get"))
+            return fail(*k, "injected read fault");
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease) {
         warn_no_connection("get", timeout_);
@@ -478,6 +488,9 @@ std::expected<std::int64_t, RevocationSourceStoreError>
 RevocationSourceStore::crl_past_next_update_count() {
     if (!open_)
         return fail(Kind::kNotOpen, "revocation source store is not open");
+    if (read_fault_)
+        if (const auto k = read_fault_("crl_past_next_update_count"))
+            return fail(*k, "injected read fault");
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease) {
         warn_no_connection("crl_past_next_update_count", timeout_);
@@ -497,7 +510,7 @@ RevocationSourceStore::crl_past_next_update_count() {
     return to_i64(res, 0, 0);
 }
 
-std::expected<std::int64_t, RevocationSourceStoreError>
+std::expected<RevocationSourceRecord, RevocationSourceStoreError>
 RevocationSourceStore::create(const NewRevocationSource& src, const std::string& created_by) {
     if (!open_)
         return fail(Kind::kNotOpen, "revocation source store is not open");
@@ -557,11 +570,21 @@ RevocationSourceStore::create(const NewRevocationSource& src, const std::string&
     for (const auto& u : src.urls)
         if (auto r = insert_url(conn, id, u); !r)
             return std::unexpected(r.error());
+    // Read the new source back INSIDE this transaction, as `replace` does: a re-read on a second
+    // lease after COMMIT can time out, which would report a committed registration as a failure.
+    if (read_fault_)
+        if (const auto k = read_fault_("create.reread"))
+            return fail(*k, "injected read fault"); // the open transaction rolls back
+    auto reread = load_sources(conn, id);
+    if (!reread)
+        return std::unexpected(reread.error());
+    if (reread->size() != 1)
+        return fail(Kind::kQueryError, "create: source vanished");
     if (!txn.commit()) {
         const bool lost = PQstatus(conn) == CONNECTION_BAD;
         return fail(lost ? Kind::kOutcomeUnknown : Kind::kQueryError, "create: commit failed");
     }
-    return id;
+    return std::move(reread->front());
 }
 
 std::expected<RevocationSourceUpdate, RevocationSourceStoreError>

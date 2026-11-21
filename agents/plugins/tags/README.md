@@ -292,6 +292,6 @@ count|0
 - Plugin: `agents/plugins/tags/src/tags_plugin.cpp`
 - Definitions: `content/definitions/tags.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: `tests/unit/test_tags_plugin.cpp`
+- Tests: `tests/unit/test_tags_concurrency.cpp` · `tests/unit/test_tags_plugin.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

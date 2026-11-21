@@ -55,7 +55,9 @@ rather than copying it.
   and network figures arrive on heartbeats, and the first heartbeat of a session
   only sets a baseline for the rates, so give a new device two.
 - **You hold the permission.** `GuaranteedState:Read` covers every DEX read
-  except per-device application usage, which needs `Forensics:Read`. The
+  except application usage: per-device application usage needs `Forensics:Read`,
+  and fleet usage per application needs both `GuaranteedState:Read` and
+  `Forensics:Read`. The
   built-in Administrator, PlatformEngineer, Operator, ITServiceOwner and Viewer
   roles hold `GuaranteedState:Read`, and it also covers Guardian reads. With RBAC
   enforcement off, which is the default, any signed-in user passes

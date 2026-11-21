@@ -469,6 +469,21 @@ carries usernames / tenant / project names (`/home/jsmith/...`), which must not 
 `storage_low_observation` chokepoint the collector calls (subject / sentence / `detail_json`
 asserted free of any path component).
 
+**journald attribution is by journald-stamped sender fields only (F58 / #3872 / #3871).**
+`MESSAGE_ID`, `COREDUMP_*`, `UNIT` and `UNIT_RESULT` are client-settable, so alone they prove
+nothing. `service.crashed` / `service.hung` require `_PID=1` and `_UID=0` (the system manager;
+a user-manager entry carries `_UID=1000` and `USER_UNIT` and is dropped by design, as is any entry from a forged sender or a non-PID-1 process);
+`process.crashed` requires `_UID=0` plus the `systemd-coredump` helper identity (`_COMM`
+`systemd-coredum` - the 15-char comm truncation - or `_SYSTEMD_UNIT=systemd-coredump@*`); the
+`os.time_unsynced` branch requires `_COMM=chronyd` AND `_SYSTEMD_UNIT=chronyd.service|chrony.service`
+(`_COMM` alone is settable with `prctl`). A missing or malformed trusted field drops the entry
+(fail closed), and the same terms are in the `journalctl` match so forged entries are not fetched
+or counted against the rate cap. Container journals with remapped uids see the container's root
+as `_UID=0`. The coredump identity terms (systemd-coredump comm/unit) are derived from systemd
+documentation, not from a captured journal entry on every distro family; if they mismatch,
+`process.crashed` signals can be silently absent on that distro; the drop counter/log makes this
+visible. Capturing one specimen per distro family is an open follow-up.
+
 **journald egress is comm/unit-only.** `process.crashed` ships the process **comm**, never
 `COREDUMP_EXE` (a full binary path that can embed a user/tenant directory); `memory.exhausted`
 ships the OOM **victim comm**, never the kernel memory figures (total-vm / anon-rss / file-rss) or
@@ -594,7 +609,7 @@ crashes, the OOM-killer) are **shipped** — see the Linux collector section abo
   other signals get their own panels. Rates always pair with coverage
   (reporting Windows agents) and show "—" when the denominator is missing.
 - The fleet usage read model (`dex_usage_model.hpp`, with the `DexAppUsageOwner` query owner) is
-  not yet exposed on any surface. Its rules: figures are aggregates and never carry an agent id; a
+  served by `GET /api/v1/dex/apps/usage`; the Apps page and MCP do not show it yet. Its rules: figures are aggregates and never carry an agent id; a
   floor applies to the devices that contributed to a figure, sub-floor cells merge into `other`, and
   a table below the floor publishes the device count only. `other` also holds devices on an
   unrecognised platform, devices outside the chosen group, and tag values beyond the 50 with the
@@ -637,3 +652,5 @@ test service, run a disk check) rather than injecting security-provider events.
 Moved verbatim from the `Guardian / Guaranteed State` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
 
 Guardian / Guaranteed State — real-time agent-side policy enforcement (guard categories, YAML DSL, `__guard__` wire protocol, approval workflow, quarantine; §24 invariants). DEX families: ruleless signal observations (`rule_id="__observation__"`, `event_type` = obs_type — the ruleless-ness IS the discriminator); plus state-poll/perf-breach, blast-radius/alert-routing, device+app perf-over-time, `/auto` VERIFY. CRITICAL: `kDexCohortFloor` is ONE device (ruled 2026-10-14): every app-perf, cohort, tag and Apps read publishes any point or figure with >=1 device — by app/version/cohort value only, never an `agent_id`, behind `GuaranteedState:Read`; a cohort of one keyed by a per-device tag value is that device's exact figures, un-audited, and the opt-in Prometheus cohort export puts the same on `/metrics`, NOT behind `GuaranteedState:Read`. `/auto` VERIFY has NO floor; its audited `dex.app_perf.compare` read is the control. (2) The "which devices" drill (`list_devices_for_version`, `GET /api/v1/dex/perf/app/devices`, MCP `list_dex_app_perf_devices`) is floor-free (names `agent_id`s), gated on `require_fleet_read` (ADR-0017) + the `dex.app_perf.devices.view` audit verb. BRD map `docs/dex-brd-coverage.md` is local-only/untracked (commercially sensitive) — ask the operator if missing.
+
+Fleet application usage (`GET /api/v1/dex/apps/usage`, per-application device counts, run time, launches and exposure rate, never an `agent_id`) needs `GuaranteedState:Read` AND `Forensics:Read` (the second through `require_fleet_read`, admit-then-filter) plus the fail-closed `dex.apps.usage.view` audit written before the read. Any twin of it (the MCP tool tracked by #8096, a dashboard view) must carry the same two gates and the same audit: at the default floor of 1 a cell can be one device's figures, so those gates and that audit are the control.

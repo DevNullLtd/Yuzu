@@ -445,6 +445,50 @@ TEST_CASE("estate: cpu row formatter escapes WMI text so it cannot shift columns
     CHECK(nl.find('\r') == std::string::npos);
 }
 
+TEST_CASE("estate: the Linux/macOS cpu row builder is byte-identical for ordinary text and escapes a "
+          "pipe (#7040)",
+          "[hardware_estate]") {
+    // what the Linux and macOS legs always wrote for a model with no pipe, backslash or newline
+    CHECK(est::format_cpu_row_sampled(0, "Intel(R) Core(TM) i7-1185G7 @ 3.00GHz", 4, 8, 2800.0) ==
+          "cpu|0|Intel(R) Core(TM) i7-1185G7 @ 3.00GHz|4|8|2800|-|-");
+    CHECK(est::format_cpu_row_sampled(1, "unknown", 0, 0, 0.0) == "cpu|1|unknown|0|0|0|-|-");
+    // the clock rounds to a whole number, as the inline `{:.0f}` always did
+    CHECK(est::format_cpu_row_sampled(0, "X", 1, 2, 2799.6) == "cpu|0|X|1|2|2800|-|-");
+    // a '|' in the model is escaped, so the row keeps exactly 8 raw columns
+    CHECK(est::format_cpu_row_sampled(0, "Foo | Bar", 4, 8, 2800.0) ==
+          "cpu|0|Foo \\| Bar|4|8|2800|-|-");
+    // a newline would forge a second row; a backslash folds to '/'
+    CHECK(est::format_cpu_row_sampled(0, "A\nB", 1, 1, 1.0).find('\n') == std::string::npos);
+    CHECK(est::format_cpu_row_sampled(0, "A\\B", 1, 1, 1.0) == "cpu|0|A/B|1|1|1|-|-");
+}
+
+TEST_CASE("estate: the Linux and macOS cpu rows are written through format_cpu_row_sampled "
+          "(lexical pin, #7040)",
+          "[hardware_estate]") {
+    // LEXICAL, not behavioural: /proc/cpuinfo and sysctl are not injectable, so the two call sites
+    // are pinned by reading hardware_plugin.cpp (comments dropped). Reverting either leg to an
+    // inline std::format drops the escape again with every other test green; the macOS block is
+    // not compiled on a Linux host, so this is the only check on it that runs here.
+    const auto path = std::filesystem::path(YUZU_PLUGIN_SRC_DIR) / "hardware" / "src" / "hardware_plugin.cpp";
+    std::ifstream in(path);
+    REQUIRE(in.good());
+    std::string code, line;
+    while (std::getline(in, line)) {
+        const auto cut = line.find("//");
+        code += (cut == std::string::npos ? line : line.substr(0, cut));
+        code += '\n';
+    }
+    auto count = [&](std::string_view needle) {
+        std::size_t n = 0;
+        for (auto pos = code.find(needle); pos != std::string::npos; pos = code.find(needle, pos + 1))
+            ++n;
+        return n;
+    };
+    CHECK(count("format_cpu_row_sampled(") == 2); // the Linux leg and the macOS leg
+    CHECK(count("{:.0f}|-|-") == 0);               // no inline cpu row format is left
+    CHECK(count("std::format(\"cpu|") == 0);       // nor any other inline `cpu|` format call
+}
+
 TEST_CASE("estate: dimm row formatter escapes the slot and keeps the column order", "[hardware_estate]") {
     CHECK(est::format_dimm_row("Controller1-ChannelA-DIMM0", 32768, "DDR5", 5600, "Micron Technology",
                                "CT32G56C46S5.C8BA", "0A1B2C3D") ==

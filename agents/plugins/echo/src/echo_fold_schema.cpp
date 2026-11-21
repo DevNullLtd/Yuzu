@@ -393,7 +393,16 @@ std::string fold_upsert_assignments(const FoldSourceDef& def) {
         const std::string name = physical_column_name(c);
         switch (c.merge) {
         case MergeOp::kSum:
-            add(std::format("{0}={0}+excluded.{0}", name));
+            if (c.sql_type == "INTEGER")
+                // Saturate at the int64 bounds exactly as TierAccumulator::merge does: a bare
+                // `+` would overflow into a REAL and change the column's stored type.
+                add(std::format("{0}=CASE WHEN excluded.{0}>0 AND {0}>9223372036854775807-excluded.{0} "
+                                "THEN 9223372036854775807 "
+                                "WHEN excluded.{0}<0 AND {0}<(-9223372036854775807-1)-excluded.{0} "
+                                "THEN (-9223372036854775807-1) ELSE {0}+excluded.{0} END",
+                                name));
+            else
+                add(std::format("{0}={0}+excluded.{0}", name));
             break;
         case MergeOp::kMax:
             add(std::format("{0}=MAX({0},excluded.{0})", name));

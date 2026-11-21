@@ -31,8 +31,10 @@
 
 #include "local_dispatcher.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <thread>
 #include <pwd.h>
 #include <string>
 #include <unistd.h>
@@ -229,5 +231,45 @@ TEST_CASE("users plugin: session_history executes the real last(1) argv with a c
     // would surface as a crash, a hang, or an rc!=0 from the real tool
     // rejecting a malformed invocation).
 }
+
+#ifdef __linux__
+// F40: group_members / local_admins resolve groups through getgrnam_r into owned copies, so
+// concurrent dispatch-pool calls never walk each other's libc static buffer. Under TSan the old
+// getgrnam()/getpwuid() statics are reported as a race.
+TEST_CASE("users plugin: concurrent group_members/local_admins stay coherent",
+          "[users][posix_actions][tsan]") {
+    auto plugin = load_users_plugin();
+    if (!plugin) {
+        WARN("users plugin library not found -- skipping");
+        return;
+    }
+    yuzu::agent::LocalDispatcher base;
+    const std::vector<YuzuParam> root_params{{"group", "root"}};
+    const auto expect = base.run(plugin->descriptor, "group_members", root_params);
+    REQUIRE(expect.rc == 0);
+    // uid 0's primary group is root: always listed (as the primary-group row) on a stock host.
+    REQUIRE(expect.captured.find("group_member|root|root|primary_group") != std::string::npos);
+    const auto expect_admins = base.run(plugin->descriptor, "local_admins");
+    REQUIRE(expect_admins.captured.find("admin|root|user|root") != std::string::npos);
+
+    std::atomic<int> wrong{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t)
+        threads.emplace_back([&] {
+            yuzu::agent::LocalDispatcher dispatcher;
+            for (int i = 0; i < 100; ++i) {
+                if (dispatcher.run(plugin->descriptor, "group_members", root_params).captured !=
+                    expect.captured)
+                    ++wrong;
+                if (dispatcher.run(plugin->descriptor, "local_admins").captured !=
+                    expect_admins.captured)
+                    ++wrong;
+            }
+        });
+    for (auto& th : threads)
+        th.join();
+    CHECK(wrong.load() == 0);
+}
+#endif // __linux__
 
 #endif // !_WIN32

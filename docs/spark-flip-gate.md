@@ -1823,7 +1823,666 @@ flip, with a red-first test each:
     limit); (d) an explicit census resync mechanism for
     server-state loss (loss (1); #5718); (e) a per-mechanism deaf-watch test (watched directory
     deleted and recreated, stale handle) proving each shipped mechanism calls `fault()` (loss (6);
-    #5719); (e) is tracked in #5719; (b) is implemented by #5719 PR-A (inactive in production; observed only on rig-flipped agents, see precondition (b)).
+    #5719); (e) is tracked in #5719, and its tests are #5719 item 5 (not every mechanism is covered: the Windows Service mechanism is uncovered; status below); (b) is implemented by #5719 PR-A (inactive in production; observed only on rig-flipped agents, see precondition (b)).
+    **(e) status, #5719 item 5 (per-mechanism deaf-watch cases, one File-mechanism fix and its fault paths, and one Registry-mechanism fix; (e) stays OPEN, and not every mechanism is covered).**
+    **Pre-flip requirements at a glance (File fix, #5719 item 5).** This list only points at the detail below; none of
+    it is done. Before any `prefer_spark` flip:
+    - #7874: resource-exhaustion and network open errors (see #7874) no longer count toward the undecided-result
+      streak.
+    - #7875: a lost path whose cancelled read never drains gets a deadline-driven recovery, or the owner re-accepts
+      the residual (it is also in section 5).
+    - #7876: a runtime off switch exists for the Spark File AND Registry mechanisms (the issue now covers both; the
+      cost and audit statement of item (2) of the File list below applies to the Registry verification of #7836
+      by reference, but the Registry verification is OFF by default with a boot-time opt-in, see the REG-15-I2
+      paragraph below, and #7876 still owes the runtime switch for it and the File half). The Registry re-open cost is
+      unmeasured at 50, 200 and 500 watched keys.
+    - REG-15-I2: decide the Registry path verification interval per estate (`--spark-registry-path-verify-interval`,
+      0 where the watched keys carry auditing SACLs; the default is 0, off) before enabling it anywhere. With the
+      default, flipping leaves the Registry parent-rename deaf watch (#7836 loss 6) open; enabling it is an estate
+      decision.
+    - File default (#7877 item 48): decide File's default (opt-in like Registry) or obtain the audit owner's sign-off;
+      a runtime off switch (#7876) alone does not stop the check being on by default at the flip.
+    - The pre-flip measurement of Security-log behaviour (#7877 item 39) covers watched DIRECTORIES (File: default ON,
+      every 5 s, and a UNC path means a periodic NTLM sign-in) as well as Registry keys; neither is measured.
+    - #7877: the umbrella of the remaining verification residuals is triaged, File and Registry. The Registry items
+      are item 31 (a rename followed by a re-creation of the path before the next sample is not noticed; ACCEPTED
+      residual, Dave, no independent adjudicator) and two more accepted residuals found by the #7836 governance
+      review: item 32 (an undecided verification keeps the old handle and so misses a rename it saw until the next
+      verification that decides) and item 33 (an Ancestor-mode watch is never verified, so a later rename of its
+      shelter ancestor, including one re-committed in Ancestor mode after a verdict, is missed); item 34 (a Fired
+      from a write in the renamed tree during the Faulted window, adjudicated LOW) is a fourth, noted in the residual
+      list. Items 35 to 40 (a probe lane of its own for the Registry verification, the admission backoff reset after
+      a refused verification, a transient false fault on a delete-and-recreate, no signal for a check that cannot
+      decide, the alert and cost measurement, and the missing tests) need code or tests and are triaged here, not
+      accepted. Items 43 to 48 are also triaged here: 43 (the Registry `admission_attempts` ratchet: a refused
+      verification launch increments it and only a commit resets it), 44 (a File verification launch failure is
+      invisible to `verify_starved`), 45 (a File `stop()` with a hung verification is not counted as quarantined), 46
+      (the Registry armed-plus-Deferred state after a Lost verdict), 47 (the Registry flag's bad-value fatal exit
+      and its untested wiring) and 48 (the File default decision above). Items 41 and 42 are pre-existing test-helper lifetime items (the `FileProbeGate` and
+      `ServiceProbeGate` hooks capture `this`; a `[&]` `probe_hook` in the "allocation failure after a probe
+      launches" case).
+    - #7901: a CI leg installs `dbus-daemon` and sets `YUZU_REQUIRE_SPARK_DBUS_TESTS`, so the Linux Service case runs.
+    - Also below: export of the File debug counters (#7658; the Registry `verify_lost` and `verify_undecided` counters
+      are test-only too and should be exported alongside them, a recommendation: #7658 does not yet say so), the audit,
+      EDR and SMB sign-in check of item (2), and the Gate 5 flip-time scenarios of item (4).
+    **Flip-blocking under the owner threat model (Dave, 2026-11-16, also posted on #7877).** A local administrator who
+    defeats a Registry guard IS in the Guardian threat model, so a deaf watch that reads Healthy is a security-control
+    failure (I1) at the flip, not only a lost wakeup (I3). Before any `prefer_spark` flip each of these needs code, a
+    measurement, or a fresh explicit owner decision recorded against it:
+    - #7877 item 31: a Registry parent renamed and the original path recreated within one verification interval leaves
+      the watch Healthy and deaf. Detect it before any flip (for example the held-handle name check through a
+      `DuplicateHandle` of the held `HKEY`, which the rig showed to be feasible).
+    - #7877 items 32 and 33: an undecided Registry verification keeps the old handle, and an Ancestor-mode Registry
+      watch is never verified.
+    - The File residual "renamed away and back between two samples" (the same class as item 31): not noticed.
+    - #7877 item 48: decide File's default (opt-in like Registry) or obtain the audit owner's sign-off.
+    - #7877 item 39: the Security-log measurement, for watched directories as well as Registry keys.
+    - #7876: the runtime off switch for the File and Registry mechanisms.
+    - The other E6 (dormancy) rows of this PR's ledger: every dormancy-based E6 is withdrawn at the flip PR and
+      governance re-runs; the band at the flip is the one with E6 removed (UP-1, REG-01, REG-02, REG-04 and REG-15-I2
+      derive HIGH there). `prefer_spark_` is the literal `false` at `agents/core/src/agent.cpp:959-960`, pinned by
+      `tests/test_guardian_emit_stamp_lexical.py`; editing that literal is the forcing function.
+    The opt-in Registry flag's own residual (an estate that enables it keeps the audit-eviction hazard, I2/E4,
+    unmeasured) is an owner-accepted residual deferred to item 39 and #7876, which is why "decide the interval per
+    estate" stays on the list above.
+    *Provenance of the figures below.* Anything marked "author-reported" is the author's own report from the Windows
+    rig (weecolin, MSVC), made before the governance round: the logs were not retained and it was not re-measured.
+    Anything marked "governance-round" was produced on the same rig by the committed cases and the scripted loops and
+    mutations named, on the source tree whose git tree hash is given with the figures; those run logs are
+    author-reported too: held in the author's scratch area, not committed to the repository, and not reproducible from
+    it. No figure here is a macOS or CI result; the only sanitizer result is the MSVC AddressSanitizer one of fix
+    round 8, on the Windows rig.
+    The commits after `6f10e561f6` (the last wording fixes from the round-9 re-review and the governance ledger rows)
+    change comments, documentation and the ledger only, and were not run on the rig. The rig-run bytes are those of
+    `9ae268a80b` (`spark_file.cpp` md5 `809af7a9e2e01387e80db677fd5f883b`, `spark_mechanism.hpp`
+    `f74eeae461ece34dc0f3f99a0c95d035`, `test_spark_mechanism.cpp`
+    `9a68a170a1805af64909cb33c5e11723`); `spark_file.cpp` and `spark_mechanism.hpp` now differ from those md5s by
+    comment lines only (checked with a diff that ignores comment lines), and the test file is byte-identical.
+    The oracle is the literal one in (e): within a bound the mechanism calls `fault()`. A watch that only drops
+    its coverage, or only stops delivering, is a red case, not a pass; delivery after the object is repaired is a
+    secondary check. The File cases LATCH on the Collector's Faulted event (the delivery of that `fault()` call)
+    rather than polling `engine.stats().armed_faulted == 1`, because that level returns to 0 at recovery and was
+    briefly 1 only; the oracle's meaning is unchanged. All cases are in `tests/unit/test_spark_mechanism.cpp`; the
+    item-5 cases are the ones whose titles end "(#5719 item 5...)", tagged `[5719]` (the `[5719]` tag is shared with
+    the #5719 PR-A cases in other files, so a `[5719]` run's case count mixes the two).
+    *Covered.* Linux Service: one case, a private `dbus-daemon` the test spawns on a per-process salted socket and a
+    child process (hidden `[.][5719-service-child]`, selected by exact name) whose `DBUS_SYSTEM_BUS_ADDRESS` points
+    at it; the parent kills the daemon and the child reaches `armed_faulted == 1`. It SKIPs where `dbus-daemon` is
+    not installed or the socket path is too long, unless `YUZU_REQUIRE_SPARK_DBUS_TESTS` is set (then it FAILs);
+    no CI leg sets that variable yet (tracked in #7901), so in CI a missing daemon is a silent skip. Windows File, 25
+    cases: a parent directory held pending-delete by a second handle; a failed ancestor re-arm plus a failing
+    re-probe; the parent directory renamed away; replaced by a different directory at the same path; reached
+    through a junction whose target is renamed; renamed away and back between two verifications (not a fault); an
+    idle healthy watch verified repeatedly; no Fired event between Faulted and Recovered while a writer changes the
+    renamed directory (a low-power check); and the fault paths of the verification itself: one or two undecidable
+    results never fault and a decided one resets the run, undecidable forever faults after 3 in a row and recovers,
+    a network path that stops answering takes the same streak and is never counted as a decided loss (one case run for
+    three error values),
+    a DENY-ACL replacement the agent may not open (the real-world twin; the case switches the process's
+    SeBackupPrivilege and SeRestorePrivilege off for its duration, because the identity check opens with backup
+    semantics, which bypass a directory DACL while either privilege is enabled; both are present but typically
+    disabled in an elevated token, so the guard switches both off and checks the result),
+    a lost path whose cancelled read never drains (a hook-held completion) is counted once
+    and recovers when it does, `stop()` while that completion is held back is prompt (model-limited: the case swallows
+    the completion with a
+    test hook, so by `stop()` no read is outstanding and the 2 s drain wait and the quarantine path are never reached;
+    it does NOT model a read the OS never completes, which is a Gate 5 flip-time chaos scenario, a never-completing
+    cancelled read including `stop()`, not run), the test-control completion stash cannot outlive its watch (four cases:
+    a completion handed back and then unwatched is dropped and counted by `stash_dropped`; one handed back and then
+    followed by `stop()` with a second watch's read outstanding completes within the bound and quarantines nothing,
+    a contract pin that cannot go red on the old code by itself; a release after `stop()` replays nothing, delivers
+    no event and drops nothing; and the hook swallows at most eight completions, processes the ninth normally, and
+    after a release each replayed watch's Fired count equals that of the unswallowed ninth watch), an OK completion
+    queued on the stale read when the path is found
+    lost is drained and never fired, a throw while the lost path's read drains still ends in one Recovered, a throw
+    on the OK completion of a lost path whose old handle can no longer be read (the unwind's OK-completion arm, its
+    reissue-failure sub-branch) still ends in one Recovered with the slow-establishment count
+    unchanged, the retry window is not counted as a slow establishment, repeated losses with no decided verify between
+    them back off while a decided verify between two losses is not a flap (two cases), and a saturated verification
+    lane (10 watches, 4 pinned workers) serves the least recently verified first, counts the starved ones once and never
+    refuses.
+    *Registry: the parent-key rename case is now a normal case (#7836).* The case for the parent of the watched key
+    renamed (`RegRenameKey`) was a hidden known gap tagged `[.][known-gap-5719]`; it is now an ordinary
+    `[spark][mechanism][windows][5719]` case and `[known-gap-5719]` lists no case. It is the same class as the legacy
+    guard's disclosed residual (`guard_registry.cpp` lines 25-32 describe a rename of the watched KEY; this case renames
+    the key's PARENT), and the legacy guard was not run on this case, so no parity claim is made either way.
+    *The Registry fix.* When the verification is enabled (it is OFF by default, see the REG-15-I2 paragraph below), an idle,
+    healthy Registry watch in Target mode is verified every configured interval (floor 5 s, `kRegistryPathVerifyFloor`; a
+    sampled check, not continuous): the sweeper stages it as a Deferred probe (`RegWatch::verify_probe`)
+    that runs on the existing probe lane, F3-counted, with no new long-lived thread but one short-lived detached worker per
+    watched key per check; the probe re-opens the registered PATH with
+    `KEY_NOTIFY` and arms a throw-away notify on that fresh handle. If the path resolves to no key (the probe falls
+    back to Ancestor mode: the parent was renamed away, or the key deleted before its notification was consumed), the
+    live handle is following a renamed tree and is deaf to the path: the watch is faulted with the reason `registry watch
+    key renamed or replaced`, owes a synthetic fire (`needs_resync`, the observation gap), and re-opens the path on the
+    ordinary backend retry (30 s in production, doubling on repeated failure to a 300 s cap; the retry's commit clears the
+    fault, in Ancestor mode while the path is still absent, in Target mode once it exists again). If the path still
+    resolves to a key the result is discarded and the live handle stays. A verification that could not decide (open
+    refused, notify refused, the probe threw) is counted (`verify_undecided`, a debug counter; the File counterpart is
+    `verify_unverifiable`, and the Registry mechanism has no launch-refusal counter of its own, only the shared
+    `probe_admission_rejected` / `probe_launch_failed`, which also count arm and re-arm refusals) and leaves the watch
+    healthy and unfaulted, with no streak. Detection takes at most one interval plus a sweep wake plus the probe's own
+    latency, plus the admission backoff (50 ms doubling to 30 s) on each verification launch the probe lane refused, so
+    it is about one interval (5 s at the floor) only while the lane admits every verification: a refused launch increments the
+    watch's admission attempts and only a commit resets them, so with more than 16 watches verifying together the
+    bound is not the interval (the tests shorten the interval; the figure is a bound from the design, not a measurement). A fire that lands while a verification is outstanding consumes the live notification, so that probe is
+    committed as the watch's re-arm (`resolve_probe_locked` checks `armed`), with the ordinary re-arm grace restarted
+    from the fire; a refused or failed verification LAUNCH (lane cap, launch failure) does not mark the watch's coverage
+    None, because its notify is still live.
+    **The Registry verification is OFF by default (REG-15-I2, owner ruling 2026-11-16, Dave).** Each verification opens
+    the watched key by path, and on a key that carries an auditing SACL that open can write a Security-log event, so an
+    open per key per interval can push older events out of the Security log: irreversible and unmeasured. So
+    `make_registry_mechanism(f3_counter, path_verify)` seeds the interval at ZERO (off; the default lives in the factory,
+    so a test calling the factory with no second value observes the FACTORY default: that the flag reaches the factory is
+    pinned lexically by `tests/test_registry_verify_default_wiring_lexical.py`, not behaviourally), and the agent passes
+    `clamp_registry_path_verify(spark_registry_path_verify_interval_s)` (0 stays 0, 1 to 4 becomes 5 s, `n` >= 5 becomes
+    `n` s, ceiling 86400). The operator opts in at boot with `--spark-registry-path-verify-interval SECONDS` or
+    `YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL` (a negative or above-ceiling value is refused at startup, from either
+    source). It is boot-time only: changing it needs an agent restart, and a runtime switch is still owed (#7876, which
+    also owes the File mechanism a setting; File is NOT changed by this). The flag exists on every OS and is ignored where
+    there is no Registry mechanism. A Windows service reaches the value only through `main.cpp`'s parse and
+    `--install-service` records no flag, so a machine-wide environment variable is the route; persistence of a value across
+    a service restart and an upgrade is NOT verified. **Consequence: with the default, #7836's rename detection does not
+    run**: a Registry watch whose parent key is renamed away is silently deaf again, as before the fix, until an operator
+    opts in. The #7836 acceptance criterion 4 (an operator knob exists) is now met, boot-time only; criterion 1 (the rename
+    is detected) holds only when the check is enabled. The tests count open attempts per key through a probe hook (zero
+    over a 6.5 s hold with the default, fenced by a sweeper pass counter so a stalled box cannot end the hold early, and
+    bounded by window over interval when enabled); Security-log behaviour (event 4656
+    counts, eviction) is NOT observed or asserted by any test, and no SACL is set in them. At boot the agent logs ONE line
+    on every OS with the effective state (`Registry path verification: off (default)`, or `every N ms (opt-in; floor
+    5000 ms)`, with `(Windows only; ignored)` on Linux and macOS when a non-zero value is configured).
+    **What the default does NOT cover (REG-15-I2 residuals, none closed):** the flag governs only the periodic
+    verification opens; the failure-driven retry opens (30 s doubling to a 300 s cap, after a failed establishment or a
+    verdict) are unchanged by it and can write failure-audit events on an audited key; an estate that opts in carries the
+    full hazard, which is unmeasured; the File twin is unmitigated (ON by default, see the File default item above);
+    the cost at 50, 200 and 500 keys is unmeasured; the runtime off switch is still owed (#7876); and the persistence of
+    the value across a Windows service restart is not verified. **A bad value is fatal at boot, on every OS** (tracked as
+    #7877 item 47): a malformed or out-of-range `--spark-registry-path-verify-interval` or
+    `YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL` refuses to start even where the flag is ignored, and `--spark-disable`
+    does not bypass the validation. On a Windows service that shows as Service Control Manager error 1053 with nothing in
+    the agent log. A trailing `#` comment on the environment line is fatal too, because a systemd `EnvironmentFile` does
+    not strip comments and the whole text becomes the value.
+    **Open residuals of the Registry fix** (none is claimed as covered; the first three are ACCEPTED residuals, owner
+    Dave, no independent adjudicator, tracked in #7877): a parent renamed away and a key re-created at
+    the original path BEFORE the next sample is not noticed (#7877 item 31), because the fresh open succeeds and is not
+    compared with the key the watch holds (a held-handle name check, `NtQueryKey(KeyNameInformation)` on a duplicate of
+    the notify handle, was measured to work on the rig, see the Runs paragraph, and is not implemented: it needs a handle
+    duplication under the pass lock; a test pins the residual); an undecided verification keeps the old handle, so a
+    rename the probe saw but could not conclude on (its ancestor walk failed) is missed until the next verification that
+    decides; an Ancestor-mode watch is never verified, so after a verdict re-commits the watch in Ancestor mode a later
+    rename of its shelter ancestor is missed (and an Ancestor-mode watch whose shelter ancestor is renamed is not
+    verified in general); a rename away and back inside one interval is not noticed;
+    a key deleted and re-created around a verification (an installer) can fault a healthy watch with the same reason
+    text and leave it without coverage until the retry, about 30 s, the synthetic fire covering the gap;
+    a persistent access-denied on the verification open leaves the watch unverified with no fault and no streak (unlike
+    File); HKCR is a merged view, so a user-hive key that appears later changes what the path resolves to, and a
+    registry link re-pointed to another target is the same class (the verification open follows links; both are
+    sub-cases of the rename-plus-recreate residual, item 31); every
+    watch commits at about the same time at startup, so N watches launch their verifications together against the
+    16-slot probe lane (no fairness queue like File's; a refused launch is retried on the admission backoff and does not
+    demote coverage); a verification that hangs pins one probe-lane slot and that watch stays unverified, and because the
+    Registry verification shares that one 16-slot lane with every Registry arm and re-arm (File has a separate verification
+    lane), 16 hung verifications stall every arm and re-arm, including Guardian registry-rule re-arming after a fire,
+    until they return (a residual, not a measured event); and a write in the renamed (ghost) tree during the Faulted
+    window can still deliver one `Fired` for the registered key (an accepted residual, #7877 item 34, adjudicated LOW
+    by a governance review agent that did not write the change; see #7877 item 34; the emission is pre-existing, this change only bounds the window): it
+    costs one idempotent evaluation that re-reads live state, ends at the retry, and the File mechanism suppresses
+    it (the "no Fired event between Faulted and Recovered" case above is a File case). Cost and audit: one
+    detached worker launch, one `RegOpenKeyExW`, one `RegNotifyChangeKeyValue`, one event and two or three handle
+    closes per watched key per interval, and an object-access audit event on a key that carries an auditing SACL (not
+    measured; no figure is quoted). The cost statement of item (2) below and #7876 (now titled for the File and Registry
+    mechanisms) apply to the Registry verification by reference, which the owner accepted; the operator levers until the
+    runtime switch exists are the boot-time Registry interval (0 = off, the default) and `--spark-disable`, a boot-time
+    flag that restarts the agent and switches off all three spark mechanisms. A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
+    that transition, with a coverage oracle rather than a `fault()` oracle. *Windows Service: NOT covered*, by owner
+    ruling: deleting a Windows service needs administrator rights. macOS has no File, Registry or Service
+    mechanism, so there is nothing to test there.
+    *The File fix.* An idle File watch re-opens its directory path every `path_verify_interval` (5 s in production;
+    a sampled check, not continuous) on a detached worker and compares the directory identity (volume serial plus
+    `FileIdInfo` file id) with the identity its own handle was opened on. A different identity, or a path that names
+    nothing, faults the watch with the reason `file watch parent directory renamed or replaced`, cancels the stale
+    read, and hands the watch to the ordinary retry once the cancelled read's completion has been consumed (on the
+    ordinary drain route the first backend retry, 30 s in production, doubling on repeated failure to a 300 s cap; if a
+    pass throws while the lost path drains, recovery uses the 50 ms admission backoff instead, still bounded by the 30 s
+    admission cap). A check that could not decide (open refused, no id, worker threw) is counted; 3 such
+    results in a row also fault the watch (`file watch parent directory unverifiable`). That streak counts every
+    open error other than not-found (handle or memory exhaustion, `BAD_NETPATH`, `NETNAME_DELETED`, a DACL tightened
+    in place, a verification worker that threw), and it is not time-bounded: results separated by refused launches or
+    a long quiet stretch still add up. The 3rd undecided result lands about 10 s after the first one (two further 5 s
+    samples), and a watch whose handle may still have been working is then cancelled and dropped, and is retried on the
+    same route as above (30 s first retry, backing off to the 300 s cap on repeated failure). Excluding
+    resource-exhaustion errors from the streak is tracked in #7874. The shapes this
+    cost statement covers are a herd of N watches that go blind together for up to 300 s under handle or memory pressure
+    (review id UP-G8-3), and an SMB blip longer than the streak whose cancelled read then does not drain (the
+    never-draining case below). A directory that stays unverifiable but openable will re-fault about every (3 intervals
+    plus the retry). The retry is damped: it doubles 30 s, 60, 120, 240, then the 300 s cap across repeated
+    losses with no decided (Same) check between them and no failed re-establishment or shelter commit in between
+    (counted in `path_lost_flaps`; the counter is 0 at the first loss and 1 at the second, so it counts repeats); a
+    genuine rename after any Same, or a first loss, restarts at 30 s. It adds no fault edge and changes no verdict.
+    The damping covers the loop loss, drain, re-establishment commit, loss with no decided Same between. Three routes
+    restart the run (the next loss is treated as a first loss, 30 s), and all three only under-damp: (i) the
+    re-establishment itself fails first (the failure overwrites the fault reason before the eventual commit); (ii) the
+    retry finds the target absent and commits Ancestor shelter mode (health is cleared there, so the later
+    reappearance commit finds it clear); and (iii) an unwind recovery of the drain (a completion hook throw or an
+    allocation failure, on either the failed-completion arm or the OK-completion arm's failed reissue) recovers on the
+    50 ms admission backoff instead and skips the seeded retry (above). A replace loop faster than the verify interval
+    is blind for up to 300 s per cycle by design: the Faulted state stays reported and one resync `Fired` per key on
+    re-establishment covers the net state, but a change made and reverted inside the blind window is missed. A lost
+    path whose cancelled read has not drained after 30 s is counted (`path_lost_stuck`) and warned once; there is no
+    escalation.
+    **Open residuals of the File fix** (none is claimed as covered): detection is sampled, so a watch can be deaf
+    for up to one interval and then stays Faulted until the retry; a rename away and back between two samples is not
+    noticed (flip-blocking under the owner threat model, see the at-a-glance list); an ancestor shelter whose own parent is renamed away is not verified, and whether a rename of an
+    ancestor of the watched directory moves the handle at all is unmeasured (the 2026-09-21 probe recorded that a
+    parent rename is refused while the handle is open); a watch whose directory gives no usable file id is never
+    verified (author-reported: on a FAT32 volume no verification ran and the rename went undetected; ReFS, SMB,
+    OneDrive and other filesystems were not tested); a verification that hangs pins one of 4 verification slots, that
+    watch stays unverified, and 4 hung verifications disable verification for every other watch; a due watch waits
+    for a free slot and is admitted least-recently-verified first (a queue, not a refusal); a wait of at least 3
+    intervals is counted (`verify_starved`) and warned once per episode, per watch (the warn is unthrottled and logged
+    under the pass lock, so a pinned lane or a post-resume queue can emit one warn per queued watch in a pass; the
+    episode flag clears only at a decided Same or a commit, so an episode that ends Unverifiable does not re-arm the
+    warn or the count until the next Same or commit; `verify_starved` is a debug counter that is not exported, tracked
+    with #7658 below, and there is no standing "starved now" gauge); `verify_refused` is expected to stay 0 (it is
+    a tripwire that admission and the lane agree); least-recently-first turns starvation into lag, it does not remove
+    it, and the hung verification of a watch is not itself flagged; a launch failure
+    is retried after 50 ms (counted in `verify_launch_failed`, which counts only launches that were attempted); the
+    stuck-drain wait has no deadline-driven recovery, only the observation, so a lost path whose cancelled read never
+    drains stays Faulted with the sweep re-cancelling at 20 Hz (observe-only, accepted by owner ruling as a documented
+    residual, #5719 PR-B review id UP-1; tracked in #7875); one not-found sample faults the
+    watch with no hysteresis, and an atomic directory swap that spans a sample can leave a healthy watch Faulted for
+    about 35 s (review id UP-4); a hung verification costs a standing 20 Hz sweep for as long as it is outstanding, and
+    a `CreateFileW` parked in a verification at agent stop races the F3 hard exit (review id UP-7); a network path that
+    stops answering (`BAD_NETPATH`, `NETNAME_DELETED`, `BAD_NET_NAME`) is treated like any undecided result: the 3rd
+    consecutive undecided result faults the watch, about 10 to 15 s when the open returns promptly and longer if the
+    open hangs (unmeasured), and a hung open pins a slot, is not a result, and shows only as `verify_starved` on the
+    watches queued behind it; after a resume or network drop every watch falls due together, admission is capped at 4
+    concurrent workers and served least-recently-verified first, a queue and not a thread burst (review id UP-8); a
+    cancelled read on a dead SMB handle that never drains is the never-draining-read residual above (review id UP-1);
+    a false "same" on a filesystem that reuses directory ids (exFAT or FAT class) is possible and unmeasured
+    (review id UP-9); renaming the parent of N watched directories gives N Faulted edges, N warns (one per Lost) and N
+    infos (one per drain), and N probes that all retry at the same instant against the probe lane (review id UP-10); a watched path reached through a
+    junction or symlink whose target is renamed away and later restored outside the link's parent is not seen to return,
+    because the shelter sits under the link's parent (the watch reads Recovered with coverage None); the mapping of a
+    not-found error at the file-identity stage of a verification, which must stay undecidable rather than lost, has no
+    test, and neither has a forced not-found error at the open mapping to lost; and every re-fault cycle
+    delivers one resync `Fired` event per key when the watch is re-established. The File deaf-watch verification
+    residuals above (review ids UP-4, UP-7, UP-9 and UP-10) and the further ones carried in the governance ledger are
+    tracked together in #7877. In words, the further ones are: the fixed 50 ms retry of a refused verification launch;
+    no tripwire that the unwatch discard list always has reserved capacity; one mutation that only a debug assert
+    catches, which release builds compile out; the OK-completion case's fixed 150 ms notification allowance (it has
+    since run 50 of 50 under a busy-loop load, but it is still a fixed allowance); no case that pins the three routes on
+    which the damping restarts; the per-watch, unthrottled starvation warn logged under the pass lock; and the damping
+    that under-applies on those three routes. The OK-completion arm's reissue-failure guard was once on this list; a
+    case now covers it.
+    **Before any flip (File), not done here:** (1) the verification-failure signals (`verify_unverifiable`,
+    `verify_refused`, `verify_launch_failed`, `path_lost_stuck`, `verify_starved`, `path_lost_flaps`, and the
+    debug-only `sweep_passes`) are debug counters visible only to tests; of these only `verify_unverifiable` (one warn
+    per run of undecided results), `path_lost_stuck` (one warn per episode) and `verify_starved` (one warn per
+    episode) have a log line, and `verify_refused`, `verify_launch_failed` and `path_lost_flaps` have none (a flap shows
+    in the drain's info line). They must be exported before any flip,
+    tracked with #7658 (the Spark counter-export follow-up; #7658 now also tracks these File debug counters, a
+    comment saying so was posted). (2) The check opens every watched directory every 5 s and runs on a short-lived
+    thread per directory: it can raise object-access audit events (4656 class, a handle request; 4663 only if an audited
+    access operation follows; unmeasured) on a directory that carries an auditing SACL, adds EDR noise and thread churn,
+    has no cap on the number of directories, and its cost was
+    measured only up to 200 directories (author-reported, below). A rule path on a network share (a UNC path) makes it
+    a periodic SMB session that authenticates as the machine account (an NTLM sign-in, by review; not measured), once
+    per directory every 5 s, so audit and EDR owners must expect that sign-in and share traffic as well as local handle
+    requests. The pre-flip measurement of Security-log behaviour (#7877 item 39) must therefore cover these watched
+    directories (File: ON by default, every 5 s) as well as the Registry keys. What is and is not known
+    about the cost: the only measurement is a non-committed probe at a 1 s interval over 30 s at 200 watched directories
+    (3864 verifications, about 129 per second, which is a throughput ceiling and not a budget); no committed document
+    carries a "share of a core" figure and none should be quoted from a review; above roughly 600 directories at the
+    5 s interval the lag between samples stops being 5 s and becomes the directory count divided by that throughput
+    (4 verification slots, the sweep polling at 20 Hz); and the idle wake rate, about 2N/5 per second for N directories, is
+    unmeasured. There is no knob to turn it off: the sole rollback
+    lever is `--spark-disable` (section 6), which is boot-time and restart-required and persists across restarts only
+    on Linux (#3973). A runtime off switch is required before a flip and this verification does not add one: it is an
+    agent flag with 0 meaning off, for the Spark File mechanism as a whole and not only this verification, and
+    `--spark-disable` stays the sole current lever (tracked in #7876). (3) The cost model in
+    precondition (c) predates this verification: the File
+    measurements there were taken before it existed and do not include its cost.
+    (4) Gate 5 flip-time chaos scenarios, none run here: a cancelled read that never completes (a blackholed SMB share
+    or a filter driver), including `stop()` with it outstanding; a `CreateFileW` hung inside a verification at `stop()`
+    or `unwatch()` while all 4 verification slots are pinned; a handle or memory-pressure herd of watches going blind
+    together; an in-place DENY ACL applied to a live watch's directory; a pinned verification lane with N healthy
+    watches (expected: the starvation signal and no refusal churn); and, added in fix round 5 from the round 4 review
+    (words only, no label ids): a replace loop faster than the verify interval (the blind fraction approaches 300 s per
+    cycle, Faulted is reported, one resync `Fired` per recovery); a rename-away-then-recreate loop that is absent at the
+    30 s retry (not damped: the shelter route); a pinned lane with 1,000 and with 10,000 healthy watches (the warn
+    count, the time the pass lock is held, and `verify_refused` staying 0); a resume or clock-jump burst with all
+    watches due (no spin, a bounded `sweep_passes`); a completion hook throw during the drain combined with flapping
+    (the 50 ms route); a saturated lane plus a late genuine rename (it is classified as a flap); a recommit during a
+    hung verification; and the dead-share latency to the 3rd undecided result under queue lag (longer than 10 to
+    15 s). Added after the full governance pass (all not run; whether to run each is an owner decision, and #7877
+    lists them): the least-recently-verified queue monopolised by watches on dead shares (a watch that never decides
+    keeps the oldest verification stamp and so sorts first, and four of them can pin all four slots); an unpinned scale
+    ramp from 200 to 10,000 watched directories to find the verification throughput ceiling and the time the pass lock
+    is held; a dead read whose directory identity still compares equal after an SMB server restart (verification
+    cannot see it); the 256-entry list of cancelled watches filling with never-draining reads and refusing every File
+    arm, local ones included; closing a handle on a dead SMB handle while the pass lock is held (the drain branch does
+    this, against the off-lock rule followed elsewhere); a watched path reached through a junction whose target is
+    renamed away and later restored, with its shelter; and the compound of a hung verification, `stop()`, a
+    never-draining read and the hard exit of the process (the stop should finish in under 7 s with exit code 3 and no
+    crash dump). (5) Two test gaps: the DENY-ACL case has not been measured
+    under LOCAL SYSTEM, the identity of the Windows CI runner (`deploy/windows/README.md`), so a red first CI run there
+    would mean the case itself does not hold under that identity (a broken leg), not that the mechanism regressed; and
+    `verify_launch_failed` has no test (`verify_refused` is only asserted to stay 0 under a saturated lane). (6) Shard B
+    timing: the five round 4 File cases add roughly 10 to 15 s to the Windows agent shard that holds them (an estimate
+    from the single-case run times, not a shard measurement); no post-change shard B timing exists, so measure it on
+    the first Windows CI run.
+    **Runs.** Author-reported (pre-governance, logs not retained): the cancelled read's completion was consumed in
+    the same millisecond as detection in the one run whose log was read; the identity read was stable across
+    repeated opens on the NTFS temp volume (about 5300 verifications, none unverifiable) and the four File identity
+    cases passed on a subst drive over that volume (one run each); the idle cost of a throw-away probe (not committed)
+    at a 1 s interval over 30 s was about 0.9 s more process CPU at 50 watched directories (1450 verifications) and
+    about 0.95 s more at 200 (3864 verifications), with run-to-run noise about 0.3 s, so an order-of-magnitude
+    figure, not a budget; five mutations of the first version, four caught and "restrict the drain branch to aborts"
+    not caught.
+    Fix round 4, rig bytes: `spark_file.cpp` and `spark_mechanism.hpp` as committed in `aef43b21ac` (the round 4
+    production commit, whole-repo tree `6c43d2fbd956f9864542a2e58841cc1de6ca4a80`) and `test_spark_mechanism.cpp` as
+    committed in `133cd5c27f` (the round 4 test commit, whole-repo tree `99ca6f47bb3308af325d023b338a5a1c2b63dbcf`). The
+    rig tree was a tar of the tracked files of the working tree at `aa16689bef` with those three files copied over, and
+    only those three files were md5-compared with the committed files (equal); the tree hashes name the whole repository
+    at those commits and were not themselves checked on the rig. The docs commit that follows changes no source, so the
+    rig bytes are the round 4 production and test commits and nothing else; figures from earlier rounds are superseded.
+    Linux debug: `[mechanism]` 62 cases (3526 assertions), `[5719]` 43 cases (1262 assertions) and `[4415prA]` 105
+    cases (3544 assertions) all green (the File mechanism is Windows-only, so the new cases do not run there; only the
+    `spark_mechanism.hpp` counter fields compile there). Windows (MSVC, weecolin, debug-type build without debug info):
+    `[mechanism]` 187 cases (5629 assertions), `[5719]` 62 cases (2052 assertions) and `[4415prA]` 105 cases (3544
+    assertions) all green, the parked Registry case excluded from all three and red (1 case, 2 assertions) when run
+    explicitly by tag (its absence from `--list-tests` for the three agent shard specs and the reference spec of
+    `tests/meson.build` was checked in round 2 and not re-run); each of the 20 File cases 20 of 20 green in a loop; and
+    each of the throw-while-draining, renamed-away, replaced-directory, junction, OK-completion-drain (the case with a
+    fixed 150 ms notification allowance), retry-window, network-error, the two damping and the saturated-lane cases also
+    50 of 50 green while one busy-loop process per logical core kept the box saturated. The saturated-lane case's
+    not-spinning bound (100 sweep passes in 500 ms) was set from one measurement of 16 passes on the rig.
+    Twenty-two mutations of that tree (up to 3 runs of each of the 20 File cases per mutation, stopping at a case's
+    first red run, so "red" below means red on its first run and an unlisted case was green 3 of 3): M1 to M12 are
+    those of the earlier rounds, re-run on the new bytes, and M1 to M11 were each caught by at least one case (the
+    idle-watch wake clause removed: 17 cases red; every verification treated as lost: 13; existence compared instead of
+    identity: only the replaced-directory case; the drain branch restricted to aborts: only the OK-completion case;
+    detection routed through the generic backend failure: 12; streak 1: 4; streak never: 3; stuck-drain observation
+    never firing: 2; stale grace fix reverted: the retry-window case and the consecutive-loss damping case; streak not
+    reset on a decided result: the one-or-two case; unwind failed-arm grace guard removed: only the throw-while-draining
+    case). M12, removing the guard on the unwind OK-completion arm's reissue-failure sub-branch, was again NOT caught
+    (untested guard, no seam). The ten new mutations were each caught by the intended case: no seed from `lost_flaps`
+    into `backend_attempts` (consecutive-loss case only), the flap rule without the decided-verify gate and a decided
+    verify that never sets the flag (each: the decided-verify case only), `lost_flaps` reset at commit again
+    (consecutive-loss case only), admission in map order, admission ignoring free slots, the starvation check deleted,
+    and the lane wake clause dropped (each: the saturated-lane case only), network errors that leave the streak
+    untouched (network case only) and streak 4 (the stays-undecidable case and the network case). The mutated sources
+    were restored and the rig tree rebuilt from the unmutated source after each. The set of cases is not a proof that
+    no other deaf path exists in any mechanism.
+    Fix round 5 (round 4 Gate 8 low items), rig bytes: commit `23b1d42fbb` (comments and one log format string in
+    `spark_file.cpp`, whole-repo tree `2627bceb120084a6f5e0bdcde919c8df8e78770d`) and commit `6b0365a74d` (two test
+    flake fixes and comments in `test_spark_mechanism.cpp`, whole-repo tree `c1087c75393cccfc6748167fb5e8fa09879e3749`;
+    `spark_mechanism.hpp` is unchanged since `aef43b21ac`). The rig tree was `git archive` of `6b0365a74d` (the docs
+    commit that follows changes no source), and the md5 of the three source files on the rig equalled the md5 of the
+    committed files (`spark_file.cpp` `258ebab4b6707ba0748203c80e9dab8e`, `spark_mechanism.hpp`
+    `81d44cb03545293a6e7f76db72a32099`, `test_spark_mechanism.cpp` `4652ff04bdae21ab559ae710d8b1a04e`); the tree hashes
+    name the whole repository and were not themselves checked on the rig. The production commit of this round changes
+    comments and one log format string ("repeat losses" for "consecutive losses" in the drain info line) and nothing
+    else (checked by listing every non-comment changed line of the diff), so the earlier full table of 22 mutations
+    was run on the round 4 production bytes and is not re-run in full; only the subset below was re-run on the new
+    bytes. Linux debug: `[mechanism]` 62 cases (3526 assertions), `[5719]` 43 (1262) and `[4415prA]` 105 (3544) green.
+    Windows (weecolin): `[mechanism]` 187 cases (5631 assertions), `[5719]` 62 (2053) and `[4415prA]` 105 (3544)
+    green (the assertion totals moved by one or two against round 4 because some cases count assertions per
+    iteration), the parked Registry case red when run by tag (1 case, 16 assertions, 2 failed) and still counted once
+    among the hidden cases. The four changed or flake-prone cases (network error, the two damping cases, the
+    saturated lane) each ran 20 of 20 green normally and 50 of 50 green with one busy-loop process per logical core;
+    in addition the saturated-lane case and the first damping case each ran 200 of 200 green normally, the window of
+    the two flakes fixed this round (the flakes are race windows, so a clean run is evidence of absence only up to
+    that count). Eleven mutations were re-run on the new test bytes (up to 3 runs of each of the 20 File cases,
+    stopping at a case's first red run): admission in map order, admission ignoring free slots, the starvation check
+    deleted and the lane wake clause dropped (each: the saturated-lane case only); no seed from `lost_flaps` into
+    `backend_attempts` and `lost_flaps` reset at commit (each: the first damping case only, which now uses an exact
+    count of three failing verifications); the flap rule without the decided-verify gate and a decided verify that
+    never sets the flag (each: the decided-verify case only); network errors that leave the streak untouched (network
+    case only); streak 4 (the stays-undecidable case and the network case); all ten caught as in round 4. M12 (the
+    guard on the unwind OK-completion arm's reissue-failure sub-branch) was again NOT caught (untested guard, no
+    seam). The mutated source was restored and the rig tree rebuilt after each (the restored md5 equalled the
+    committed one).
+    Fix round 6 (the follow-up issues named in the comments, and the scratch-tree constructor), rig bytes: commit
+    `21d351f448` (whole-repo tree `0ef77039ca14cadf3c2cb096f561e8da80da1ac5`), which changes `test_spark_mechanism.cpp`
+    only (the `DeafWatchTree` constructor now removes a partially created scratch tree and rethrows; the throw path
+    itself has no seam and was not exercised) on top of `1ac4735c2f`, which changes one comment line in
+    `spark_file.cpp` (a placeholder token replaced by #7874) and nothing else. The rig tree was a tar of the tracked
+    files of the working tree at that commit, and the md5 of the three source files on the rig equalled the md5 of the
+    committed files (`spark_file.cpp` `d31bdf4a50103f2e6afea0bd38309264`, `spark_mechanism.hpp`
+    `81d44cb03545293a6e7f76db72a32099` unchanged, `test_spark_mechanism.cpp` `d4be52b15d86c188e027e3f6fb557ca3`); the
+    tree hash names the whole repository and was not itself checked on the rig. The two commits that follow (this
+    documentation change and the ledger rows) change no source. Linux debug: `[mechanism]` 62 cases (3526
+    assertions), `[5719]` 43 (1262) and `[4415prA]` 105 (3544) green. Windows (weecolin): `[mechanism]` 187 cases (5630
+    assertions), `[5719]` 62 (2052) and `[4415prA]` 105 (3544) green (the assertion totals of rounds 4 to 6 differ by one or two
+    because some cases count assertions per iteration), the parked Registry case red when run by tag (1
+    case, 16 assertions, 2 failed) and still counted once among the hidden cases; the `File spark (real mechanism): *`
+    pattern (49 cases, a superset of the 20 File cases of the earlier rounds) ran 20 of 20 green in a loop. The
+    mutation table was not re-run (no production code line changed). No agent re-review covered this round; the
+    confirmation is the rig run and the diff check alone.
+    Fix round 7 (the OK-completion arm's reissue-failure guard, mutation M12), rig bytes: no production change; the one
+    new case is in commit `d7b59efcc1` (whole-repo tree `b5dce0b1de00bb7be5ac6a6129fc4e2e10b23ea9`), which adds a case
+    and three fields to `OkDrainState` in `test_spark_mechanism.cpp` and nothing else. The rig tree was a tar of the
+    tracked files at `b46d17d999` with the working copy of that one test file copied over (the same bytes as
+    `d7b59efcc1`), and the md5 of the three source files on the rig equalled the md5 of the committed files at that
+    commit (`spark_file.cpp` `d31bdf4a50103f2e6afea0bd38309264` and `spark_mechanism.hpp`
+    `81d44cb03545293a6e7f76db72a32099`, both unchanged; `test_spark_mechanism.cpp` `7c3497518f46f74e6042c6141ab62f7a`);
+    the tree hash names the whole repository and was not itself checked on the rig. The commit `040cbe21aa` that follows
+    changes three comment lines of the same test file (its md5 is `e017b27ae03c611cc96acb109e06b525`; it was compiled on
+    Linux, not run on the rig) and this documentation change changes no source. **M12 is now caught.** The new case,
+    "a throw on the OK completion of a lost path whose old handle can no longer be read still ends in one Recovered and
+    a verified watch", needs no new seam: the OK-drain case's construction leaves an `ok` completion on the stale read
+    while the owner is held in a pass whose sweep then finds the path lost; `completion_hook` removes the renamed
+    directory and throws; the unwind's OK arm reissues `ReadDirectoryChangesW` on the old handle, which the OS refuses
+    (measured on the rig: FALSE with ERROR_ACCESS_DENIED for a handle whose directory was removed), so the reissue-failure
+    sub-branch and its grace guard run. It asserts `probe_launch_failed` rose and `path_lost_drained_ok` stayed 0 (the
+    sub-branch ran, not the drain), the first Faulted detail is the loss reason, `slow_op_total` is unchanged across the
+    episode (the discriminating check: the detail line reads only the first Faulted event and cannot see an overwrite),
+    and that the watch recovers, fires after repair and stays verified. It uses a 300 ms admission seed so a sweep
+    falls inside the retry wait. Model limits, stated in the case: the `ok` completion completed before the cancel (that
+    CancelIoEx ever completes a read `ok` is not shown), removing the directory is the only reissue-failure cause
+    exercised, and the 150 ms is a notification allowance that fails loudly on a counter rather than passing
+    vacuously. The reissue-SUCCESS sub-branch of the same arm (which converges through the sweep's re-cancel) is still
+    exercised by no case. Windows (weecolin, MSVC, debug-type build without debug info): the new case 20 of 20 green
+    normally and 50 of 50 green with one busy-loop process per logical core; `[mechanism]` 188 cases (5675 assertions),
+    `[5719]` 63 (2098) and `[4415prA]` 105 (3544) green, the parked Registry case red when run by tag (1 case, 16
+    assertions, 2 failed). Linux debug: `[mechanism]` 62 cases (3526 assertions), `[5719]` 43 (1262) and `[4415prA]` 105
+    (3544) green. Mutations on the rig bytes, each built from the restored source and restored afterwards (the restored
+    md5 equalled the committed one): M12 (the guard line deleted at the OK arm) was built twice, and in both builds the
+    new case was red on its first run while the other three lost-path cases run (the throw-while-draining, the
+    OK-completion-drain and the retry-window cases) were green 3 of 3; a third build ran the new case three times, red
+    3 of 3, every time on the single check `slow_op_total` (1 against 0). M11 (the same guard on the failed-completion arm) was
+    built twice and in both the throw-while-draining case was red on its first run and the new case and the other two
+    were green 3 of 3. Not re-run this round: the other 20 File cases' loops, the full 22-mutation table, and the
+    `File spark (real mechanism): *` pattern loop (it now matches 50 cases). No agent re-review covered this round.
+    Fix round 8 (the full governance pass: the test-control stash lifetime cure and the docs batch), rig bytes:
+    production commit `09c038ac7b` (`spark_file.cpp` and `spark_mechanism.hpp`, whole-repo tree
+    `8da8920b551afc5b955fc300281c044031f79411`) and test commit `be187fea47` (`test_spark_mechanism.cpp`, whole-repo tree
+    `ba729196cc244e10262ee13991cf2b50405006c1`); the documentation commit that follows changes no source. The rig tree
+    was a `git archive` of `e850a0f387` with the three working-copy files copied over (the same bytes as the commits), and
+    the md5 of the three source files on the rig equalled the md5 of the committed files (`spark_file.cpp`
+    `c3a5f2c8db2a1bc741225e5350a522ca`, `spark_mechanism.hpp` `13856b76c0c7655aa8d2160e3e75fb00`,
+    `test_spark_mechanism.cpp` `3ff6db952e1f181cc6818ad21dab48c0`); the tree hashes name the whole repository and were not
+    themselves checked on the rig. **What changed.** The File mechanism's test seam (`completion_suppress_hook` and
+    `release_suppressed_completions`) kept a swallowed completion as a raw `DirWatch` pointer and a release posted it back
+    through the IOCP carrying that pointer, so a release followed by an unwatch freed the watch while the packet was
+    queued; a release followed by `stop()` could let the reap charge the queued packet to another watch's cancelled read.
+    The stash now names a watch by a never-reused id and posts nothing; `run()` builds the handed-back completion from
+    that state when the watch is still armed and drops it when not; `stop()` clears the stash. The seam is test-only
+    (nothing under `agents/` calls `set_file_test_controls_for_test`), so no shipped path could reach the defect. The
+    header comments now state the real rules (including that the hook is consulted only while fewer than 8 completions
+    are stashed, so a ninth is not swallowed) and the banner states the File mechanism's own 5 s verification sampling.
+    **The defect was reproduced.** Three new cases (24 item-5 File cases now, 21 before; the "20 File cases" of fix rounds
+    4 to 6 above were the count at those rounds). MSVC AddressSanitizer build (debugoptimized, `/fsanitize=address /MD`,
+    string and vector annotations disabled, `halt_on_error=1`) of the production bytes before the stash cure
+    (`e850a0f387`) plus the new test file: the unwatch case reports a heap-use-after-free, WRITE of size 1, at
+    `spark_file.cpp:3871` in `run()`, freed from `unwatch()` via `SparkEngine::disarm`; the stop case and the
+    ninth-swallow case are green there. The stop
+    case cannot go red on the old code by itself, because the kernel's write into freed memory is invisible to ASan; it
+    pins the contract. On the cured bytes all three are green under ASan, and the whole ASan run reported nothing:
+    `[mechanism]` 191 cases (5744 assertions), `[5719]` 66 (2165) and `[4415prA]` 105 (3544) green, the parked Registry case
+    red when run by tag (1 case, 16 assertions, 2 failed) and the `File spark (real mechanism): *` pattern (53 cases) green
+    3 of 3. Normal build (the weecolin debug-type build without debug info): `[mechanism]` 191 cases (5746 assertions),
+    `[5719]` 66 (2166) and `[4415prA]` 105 (3544) green, the parked Registry case red by tag (1 case, 16 assertions, 2
+    failed), the `File spark (real mechanism): *` pattern 3 of 3 green (53 cases), each new case 20 of 20 green, and 50 of
+    50 green with one busy-loop process per logical core (16). Mutations of the cured source, each built from the
+    restored source and restored afterwards (the restored md5 equalled the committed one): `run()` never builds a
+    handed-back completion: caught by the ninth-swallow case and by the held-completion-recovers case (the replay oracle
+    in each), while the unwatch and stop cases stayed green, since they pin the absence of a fault and not a replay; the
+    lookup ignoring the id (it returns the first armed watch): caught only by the ninth-swallow case; the unwatch case
+    stayed green because an aborted completion misdelivered to a healthy watch is harmless to it, so the id check itself is
+    pinned by the ninth-swallow case alone. Reverting the whole cure (the ASan run above) is caught by the unwatch case.
+    Linux debug: `[mechanism]` 62 cases (3526 assertions), `[5719]` 43 (1262) and `[4415prA]` 105 (3544) green, unchanged
+    (the file change is Windows-only; the header change is comments). Not run: the flip-time chaos scenarios named in item
+    (4), any Linux sanitizer on the File mechanism (it is Windows-only), and a TSan run. No agent re-review covered this
+    round; the confirmation is the rig runs, the ASan reproduction and the diff check.
+    Fix round 9 (a default-leg observer for the stash cure, a stricter replay lookup, tighter stash tests), rig bytes:
+    production commit `b2344dc3c8` (`spark_file.cpp` and `spark_mechanism.hpp`, whole-repo tree
+    `f0684df16195fec657e58f8ee077f5ba9fc6d66e`) and test commit `9ae268a80b` (`test_spark_mechanism.cpp`, whole-repo tree
+    `f11ddf4ffcd3c3e158d16551894f7f0d953bcf6a`); the documentation commit that follows changes no source. The rig tree
+    was a `git archive` of `b2344dc3c8` with the test file copied over (the same bytes as the commits), and the md5 of
+    the three source files on the rig equalled the md5 of the committed files (`spark_file.cpp`
+    `809af7a9e2e01387e80db677fd5f883b`, `spark_mechanism.hpp` `f74eeae461ece34dc0f3f99a0c95d035`,
+    `test_spark_mechanism.cpp` `9a68a170a1805af64909cb33c5e11723`); the tree hashes name the whole repository and were not
+    themselves checked on the rig. **What changed.** A new debug counter, `stash_dropped`, counts a handed-back stash
+    entry that `run()` drops instead of replaying. The replay lookup now returns a watch only when its id matches, it is
+    not being removed and it has no read outstanding (the state a swallowed completion leaves); anything else is dropped
+    and counted. **Which leg observes what.** The unwatch case asserts `stash_dropped == 1`, so every Windows leg sees the
+    drop arm run; a heap-use-after-free report for a dereference of the freed watch exists only on the windows-asan
+    nightly leg (main only). The stop case is a contract pin, not an observer: the premature-reap half of the old defect
+    (a reap that ended while another watch's read was pending) has no test observer, because a kernel write into freed
+    memory is invisible to ASan and no counter or stat shows that no watch is `io_pending` when the reap ends; its
+    closure rests on the cure (a release posts nothing) and on code reading. A fourth case (25 item-5 File cases now, 24
+    before) pins that a release after `stop()` is harmless (no crash, no event, nothing dropped, nothing quarantined;
+    that the stash was cleared is not directly observable). The ninth-swallow case now states "replayed once" against a
+    control, the unswallowed ninth watch, because one change yields two Fired events per completion on the rig, not one;
+    its post-release check on the
+    hook's call count was trivially true and was removed. Test-only wording and ordering fixes: the park guard is declared
+    after the engine, the new waits are scaled for the slow legs, the unwatch case takes its liveness baseline after a
+    settle, and the comment on the backup-privilege guard no longer claims the privileges are enabled in an elevated
+    token. **Runs.** Normal build (the weecolin debug-type build without debug info): `[mechanism]` 192 cases (5760
+    assertions), `[5719]` 67 (2184) and `[4415prA]` 105 (3544) green, the parked Registry case red by tag (1 case, 16
+    assertions, 2 failed), the `File spark (real mechanism): *` pattern 3 of 3 green (54 cases), each of the four stash
+    cases 20 of 20 green, and 50 of 50 green with one busy-loop process per logical core (16). MSVC AddressSanitizer
+    build of the same bytes (`/fsanitize=address /MD`, annotations disabled, `halt_on_error=1`): the four stash cases,
+    `[mechanism]` 192 cases (5762 assertions), `[5719]` 67 (2184), `[4415prA]` 105 (3544) green, the parked case red by
+    tag, the File pattern (54 cases) green 3 of 3, no AddressSanitizer report in any run. Linux debug: `[mechanism]` 62
+    cases (3526 assertions), `[5719]` 43 (1262) and `[4415prA]` 105 (3544) green, unchanged. **Mutations** (each built
+    from the restored source and restored afterwards; the restored md5 equalled the committed one): removing the
+    `stash_dropped` increment turns the unwatch case red in the NORMAL build, on its first run, at the
+    `stash_dropped == 1` requirement, while the other stash cases and the two lost-path stash cases stayed green 3 of 3
+    (the default-leg observer is real). Reverting the lookup to id-only (dropping the removing and `io_pending`
+    predicates) turned NO case red (3 of 3 green on every stash and lost-path case): the two extra predicates have no
+    test observer, and the existing seams do not reach a stash entry whose watch is removing or re-armed, so they are
+    hardening by construction, not a tested guard. **The old bytes in a non-ASan build.** The production bytes before
+    the stash cure (`e850a0f387`) with the first stash test file (`be187fea47`, whose unwatch case reproduced the
+    heap-use-after-free under ASan in fix round 8) in the NORMAL build: the unwatch, stop and ninth-swallow cases each
+    passed 5 of 5. So without the sanitizer the old defect is silent in these cases, which is why the counter assertion
+    (on the old bytes there is
+    no drop to count: the entry's watch is dereferenced) and the windows-asan leg are the observers. That the counter
+    assertion would turn red on the old design is by construction (the old design has no drop arm), not a measured
+    mutation: the old bytes cannot compile against a test that reads `stash_dropped`. Not run: the retired-watch and
+    re-armed-watch arms of the lookup (no existing seam reaches them), any TSan run, and the flip-time chaos
+    scenarios. **Corrections to the commit bodies (which are immutable).** The note in the `b2344dc3c8` commit
+    body (only that one; the `9ae268a80b` body does not carry it) that a stash push "cannot throw within the reserved
+    capacity" holds only while `replay_` is empty: a second release could push `replay_` past its reserve of 8, and
+    that allocation would happen on the test thread, under the lock, never on the worker. The statement in the
+    `9ae268a80b` commit message that nothing re-arms a swallowed watch in place (a resync builds a new watch with a new
+    id) is unverified for
+    its resync part: the cpp-safety code reading of round 9 found that every site that sets `io_pending = true`
+    needs a consumed completion or a probe commit. The stricter lookup's removing and `io_pending` predicates are
+    by-construction hardening with no test observer (a mutation to id-only keeps every case green). A second entry
+    for the same watch id (swallow, re-arm, swallow again) is legitimately dropped after the first replay re-arms
+    the watch, so a test that asserts an exact `stash_dropped` count must allow for it. Deferred to #7877: the
+    ninth-swallow oracle reads once after a fixed 500 ms sleep (it should poll with `eventually` and the slow-leg
+    scale factor), the release-after-stop case is a labelled contract pin, and an optional true mutation run of the
+    counter assertion. No agent re-review covered the rig-run round; the round-9 re-review by cpp-safety,
+    security-guardian and quality-engineer found no blocking finding, and the wording and ledger commits after
+    `6f10e561f6` were not re-reviewed.
+    **Registry rename fix (#7836), rig bytes and runs.** Rig bytes: `spark_registry.cpp` and `spark_mechanism.hpp` as committed
+    in `d6e800fa53` (the production commit, whole-repo tree `c1895aa3948c56eb0e1cbdc43424d5632a6ae247`; md5
+    `914e7ec8c79d9b59edb61d2b3d77b6d9` and `ededdb067f5044c63e1621d3a9c9bf7b`) and `test_spark_mechanism.cpp` as committed in
+    `0a8a02a1a6` (the test commit, whole-repo tree `d3b08942f9195f9011f8d46e2c67691440f0d696`; md5
+    `c7307d76df93371c0b9649f942e1ed06`). The commits after `0a8a02a1a6` and before the governance fixes below changed documentation and one changelog
+    fragment only (no ledger file) and were not run on the rig. All of this is author-reported on the weecolin Windows rig (logs not committed, the scripts are not in
+    the tree) and was not part of a CI run. **Phase 0 measurements** (ctypes against an HKCU scratch tree): `NtQueryKey`
+    with `KeyNameInformation` succeeds on a `KEY_NOTIFY`-only handle; after `RegRenameKey` of the PARENT of a held handle
+    the held handle's name is the NEW name and a fresh open of the original path returns `ERROR_FILE_NOT_FOUND`; with the
+    original path re-created, a fresh open's name is the ORIGINAL path while the held handle's is still the renamed one;
+    a held handle whose key was deleted returns `STATUS_KEY_DELETED` (0xC000017C) and no name; `DuplicateHandle` of an
+    `HKEY` works, the duplicate's name tracks the rename, and closing the duplicate does not cancel the original's
+    notify. Consequence: a name compare between the stored name of the fresh handle and a later fresh handle is blind to
+    rename-plus-recreate (both are the path's own name), so it was not implemented; only the HELD handle's name differs,
+    and reading it needs a duplicate made under the pass lock (the never-launched job would close it there too), a design
+    change that is not made: the residual is accepted and tracked in #7877 item 31. **Runs.** Normal build (the weecolin debug-type build without debug info):
+    `[mechanism]` 198 cases (5850 assertions), `[5719]` 73 (2271) and `[4415prA]` 105 (3544) green (before the change 192, 67,
+    105, with the parked case excluded: the parked case moved into the normal count and five cases were added);
+    `[known-gap-5719]` matches no case; the `Registry spark (real mechanism): *` pattern 30 cases (749 assertions) green
+    and the `File spark (real mechanism): *` pattern 54 cases green once; each of the six Registry cases of this change
+    20 of 20 green, and 50 of 50 green with one busy-loop process per logical core (16). MSVC AddressSanitizer build of
+    the same bytes (`/fsanitize=address /MD`, annotations disabled, `halt_on_error=1`): the Registry pattern 3 times
+    (30 cases each), `[mechanism]` 198, `[5719]` 73, `[4415prA]` 105 and the File pattern (54) green, no AddressSanitizer
+    report in any run. Linux debug: `[mechanism]` 62 cases (3526 assertions), `[5719]` 43 (1262) and `[4415prA]` 105 (3544) green,
+    unchanged. **Mutations** (each built from the restored source and run 3 times per Registry case; the restored md5
+    equalled the committed one): dropping the `next_wake_locked` clause turned all six cases red (the sweeper sleeps to
+    its 1 h ceiling and no verification runs); treating an Ancestor result as healthy turned the rename case and the
+    undecidable case red; treating a not-ok result as lost turned the undecidable case red; dropping `&& w.armed` in
+    `resolve_probe_locked` turned the fire case red; dropping the `defer_admission_locked` guard turned the lane-cap case
+    red; dropping `needs_resync` on loss turned the rename case red at the synthetic-fire check taken before the repair;
+    and dropping the grace restart in `on_fire` turned the fire case red at the check that a parked re-arm is reported
+    faulted. All seven mutations were caught. Not run: any TSan run, the 50, 200 and 500 key cost measurements (no
+    figure is quoted anywhere), the flip-time chaos scenarios, and the object-access audit behaviour on a key with a
+    SACL.
+    **Governance review and the fixes after it (#7836).** A scoped `/governance` run (range `da67bf0371..5731eb0632`, ten
+    governance agents; happy-path, compliance-officer and enterprise-readiness were omitted by the caller, and the chaos
+    plan was written, not executed) was NOT a pass: it raised 43 findings (REG-01 to REG-43), four of them blocking-provisional
+    (REG-01, REG-02, REG-03 and the test-side REG-07) and one owner-accepted row (REG-04). REG-01, REG-02 and REG-04 are
+    ACCEPTED residuals (owner Dave, no independent adjudicator; deferred to #7877, see the residuals above); REG-03 is
+    adjudicated separately. Four commits follow `5731eb0632`: a test commit (`96882cae88`, whole-repo tree `6086bb292f87b1e7633c3fdbd25590180704c618`; REG-07: the
+    `ProbeGate` hook of the Registry cases now owns its state by value) and three documentation and comment commits (`9c04408b6a`, `1beb84467e`, `b330b7c60a`; no behaviour
+    change: `git diff -U0` over `spark_registry.cpp` and `spark_mechanism.hpp` shows comment lines only). **Rig run of the final
+    bytes** (author-reported, weecolin Windows rig, not a CI run; md5 `499383dc23c13432a92e2137bc6506a8` for
+    `test_spark_mechanism.cpp`, `8b9507c896a2dbc9b5b48548a8b6a106` for `spark_registry.cpp`, `d5edb42d65297f641c0912fab06c2c72`
+    for `spark_mechanism.hpp`; the figures of the Runs paragraph above are for the earlier bytes): `[mechanism]` 198 cases
+    (5851 assertions), `[5719]` 73 (2271) and `[4415prA]` 105 (3544) green; `[known-gap-5719]` matches no case; the
+    `Registry spark (real mechanism): *` pattern 30 cases (749 assertions) green; each of the six Registry cases of this change
+    20 of 20 green, and 50 of 50 green with one busy-loop process per logical core (16); MSVC AddressSanitizer build of the
+    same bytes (same flags as above): the Registry pattern 3 times and `[5719]` green, no AddressSanitizer report. The
+    `ProbeGate` change is verified by code reading plus that AddressSanitizer run, not by a mutation (restoring a by-reference
+    capture does not give a red test, because the destructor's bounded wait keeps the gate alive in every normal run). Not
+    re-run for the final bytes: the File pattern, the seven mutations, the Linux build and suites. Commit `1beb84467e`
+    then changed seven lines of comment in `spark_registry.cpp` (the Faulted-window residual; md5
+    `08542dfb794b1b0072a3d157e8a11de6` at `1beb84467e`, recomputed with `git show 1beb84467e:agents/core/src/spark_registry.cpp | md5sum`)
+    and no code line, so it was not re-run; the rig-run md5 `8b9507c8...` above is the `9c04408b6a` blob.
+    `b330b7c60a` changed three more comment lines in `spark_registry.cpp` (md5 `c9a84156f7b9c2c517b37bed9f067f55` at
+    `b330b7c60a`, recomputed with `git show b330b7c60a:agents/core/src/spark_registry.cpp | md5sum`): every change to
+    `spark_registry.cpp` after `5731eb0632` is comment-only and was not re-run, and the rig-run bytes remain those of
+    `9c04408b6a`. The commit after `b330b7c60a` changes documentation and comments only.
+    **Registry verification default-off (REG-15-I2), rig bytes and runs.** Rig bytes (author-reported, weecolin Windows rig, not a
+    CI run, logs not committed): the commits `f4df321a9e` (production; whole-repo tree `2c55212c7e10506ebb81f30150d1c808e02ba4ac`) and
+    `1bdae636ab` (tests; tree `ca52b7b64fcd326dfd2111d3e22c5469f9515780`); md5 `5c6f1729417bc54093519b29c2f4a277` for
+    `test_spark_mechanism.cpp`, `a3e352b2830c5ab3912dcf13eafd51e4` for `spark_registry.cpp`, `f9d4e44e897d1b749a13c2528f764141`
+    for `spark_mechanism.hpp`, `ad55e31477b10f1a576c0ed1f134b862` for `agent.cpp`, `37136dc381f338541931c867f601fdd2` for `main.cpp`
+    and `c9c95d473e9e5fdeb8db143195721176` for `agent.hpp`. Normal build: `[mechanism]` 201 cases (5910 assertions), `[5719]` 76 (2332) and `[4415prA]`
+    105 (3544) green (before 198, 73, 105); `[known-gap-5719]` matches no case; the `Registry spark (real mechanism): *` pattern 32
+    cases (795 assertions) and the `File spark (real mechanism): *` pattern 54 cases (1687) green once; each of the eight Registry
+    cases 20 of 20 green, and 50 of 50 green with one busy-loop process per logical core (16). MSVC AddressSanitizer build of the same bytes
+    (same flags as above): the Registry pattern 3 times (32 cases each), `[5719]` 76, `[mechanism]` 201 and the File pattern (54) green,
+    no AddressSanitizer report in any run. Linux debug: `[mechanism]` 63 cases (3541 assertions), `[5719]` 44 (1276) and `[4415prA]`
+    105 (3544) green; the full agent suite on Linux showed 1 to 3 failures that differed between two runs under load
+    (the `[4415prA]` CH-7 case, a content-distribution fixture lookup) and pass when run alone (`[4415prA]` 105 cases, the content
+    distribution cases 15), so they are load-dependent and not caused by this change, which touches neither. **Mutations** (each
+    built from the restored source, 3 runs per case, restored md5 equal to the committed one): putting the compiled default back to
+    5 s in the constructor turned the default-off case red 3 of 3 (the other cases stayed green, as they pass their own
+    interval); removing the `count() > 0` guard at the sweeper's stage step turned the default-off case red 3 of 3 (it was not
+    asserted that the wake guard in `next_wake_locked` alone prevents a spin: that guard was not mutated); not counting
+    `verify_launched` turned the default-off case (its positive control) and the opt-in case red; ignoring the constructor's seed
+    turned the opt-in case red 3 of 3; removing the clamp's floor turned the Linux clamp case red. The default-off case holds for 6.5 s on
+    purpose: with a 1 s window the 5 s default mutation could not go red. Not observed or asserted by any of this: Security-log behaviour
+    (event 4656 counts, eviction on a key with an auditing SACL); the tests count open attempts through the probe hook only. Not run: a Windows
+    service restart with the value set (persistence on a service is NOT verified), any TSan run, any macOS build.
+    **Registry verification, final batch (boot log, `path_verify_ms`, default-chain tripwire, stall fence), rig bytes and runs.** Rig bytes (author-reported, weecolin Windows rig, not a CI run, logs not committed): the commits `0f98b85990` (production and header; whole-repo tree `c5f1fc3b42864715975f4c0f9c039448b9376c61`), `81b458717e` (tests; tree `2a77fd740a0f1af11d5d13a9261c15f29bc4dff6`) and `c2e1751015` (test fix; tree `606f3fbb3f8a079b7309394ddf8ff277baadf504`); md5 `0a07e58cae3693a033d5e0fa0c918a3d` for `test_spark_mechanism.cpp`, `6d46ad00f87c955406619bfeb3458f5a` for `spark_registry.cpp`, `cf2a85f1cc0f998de47740aed90c8f0f` for `spark_mechanism.hpp`, `6970b75feaf01df01a8dc3f3a61274f7` for `agent.cpp`, `37136dc381f338541931c867f601fdd2` for `main.cpp` and `c9c95d473e9e5fdeb8db143195721176` for `agent.hpp`, identical in the normal and the AddressSanitizer trees. The first run of the default-off case with a sweeper-pass fence that waited for two passes after one nudge FAILED on the rig (with the verification off the sweeper has no deadline to wake for, so one nudge is one pass); `c2e1751015` nudges twice instead. Normal build: `[mechanism]` 202 cases (5919 assertions), `[5719]` 77 (2339) and `[4415prA]` 105 (3544) green (before 201, 76, 105); `[known-gap-5719]` matches no case; the `Registry spark (real mechanism): *` pattern 32 cases (800 assertions) and the `File spark (real mechanism): *` pattern 54 cases (1689) green once; each of the eight Registry cases 20 of 20 green, and 50 of 50 green with one busy-loop process per logical core (16). MSVC AddressSanitizer build of the same bytes (same flags as above): the Registry pattern 3 times (32 cases each), `[5719]` 77, `[mechanism]` 202 and the File pattern (54) green, no AddressSanitizer report in any run. Linux debug: `[mechanism]` 64 cases (3543 assertions), `[5719]` 45 (1278) and `[4415prA]` 105 (3544) green. **Mutations** (each built from the restored source, 3 runs per case, restored md5 equal to the committed one): putting the compiled default back to 5 s in the constructor turned the default-off case red 3 of 3 (the other cases stayed green); removing the `count() > 0` guard at the sweeper's stage step turned it red 3 of 3; changing the `Config` field default to 5 turned the new cross-platform `Config` case red (Linux build); changing `main.cpp`'s `->default_val(0)` to 5 turned the lexical tripwire red. Not observed or asserted: Security-log behaviour; not run: a Windows service restart with the value set, any TSan run, any macOS build. The Registry cases add about 15 s of serial time to agent shard B on Windows (unmeasured in CI).
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
@@ -3436,6 +4095,57 @@ Registry while holding `mu_`; found by #4658's governance run)
 defect in currently-shipping legacy `IGuard` code, unrelated to whether the flip happens.
 Needs its own fix + timeline, tracked separately. Only #2797's spark-branch half (fixed by PR
 #3821) was ever flip-relevant.
+
+**#7875** (a File watch stays Faulted forever when a cancelled directory read never completes - review id UP-1)
+- Detection signal: the `path_lost_stuck` debug counter and one warn after 30 s. The counter is not exported (#7658),
+  so on a live agent the warn is the only signal.
+- Operator action: none exists beyond restarting the agent or `--spark-disable`; the watch is observe-only and
+  does not recover by itself. Not confirmed as a documented runbook step.
+- Compensating control: Spark File is not live (`prefer_spark_` is false in production), so only rig-flipped agents can
+  meet it. No escalation code is built.
+- Owner: Dave (repository owner), who ruled it an accepted observe-only residual. The same person authored the commits, and
+  no independent adjudicator reviewed the ruling.
+- Milestone: not assigned.
+- Revisit trigger: before any `prefer_spark` flip.
+
+**#7877 items 31, 32 and 33 and the File away-and-back residual** (a Registry or File watch can read Healthy and
+stay deaf after a rename; review ids REG-04, REG-01, REG-02)
+- Detection signal: none. A watch that missed a rename reports Healthy; the Registry `verify_lost` and
+  `verify_undecided` counters are test-only (#7658).
+- Operator action: none exists beyond restarting the agent or `--spark-disable`. Not confirmed as a documented
+  runbook step.
+- Compensating control: Spark File and Registry are not live (`prefer_spark_` is false in production), so only
+  rig-flipped agents can meet them. The legacy `IGuard` path stays the live detector.
+- Owner: Dave (repository owner), who accepted these as documented residuals deferred to #7877 (item 31 for REG-04,
+  item 32 for REG-01, item 33 for REG-02). The same person authored the commits and no independent adjudicator
+  reviewed the acceptance. On 2026-11-16 the owner ruled that a local administrator defeating a Registry guard is in
+  the threat model, so each of these, and the File "renamed away and back between samples" residual, is an I1
+  (security-control failure) at the flip and flip-blocking, not only I3.
+- Milestone: not assigned.
+- Revisit trigger: before any `prefer_spark` flip.
+
+**The File verification default and the Security-log hazard** (the File twin of REG-15-I2; #7877 items 39 and 48,
+#7876; review ids XP-P4, UP-MIT-4)
+- Detection signal: none. The audit events are written to the host Security log; Yuzu does not count them.
+- Operator action: none exists beyond `--spark-disable`; the runtime off switch is owed (#7876).
+- Compensating control: not live (`prefer_spark_` is false). Disclosed in the flip-gate text above, not mitigated:
+  File verifies every watched directory every 5 s by default.
+- Owner: Dave. Owner ruling 2026-11-16: a pre-flip decision only, either File's default (opt-in like Registry) or the
+  audit owner's sign-off. No independent adjudicator.
+- Milestone: not assigned.
+- Revisit trigger: before any `prefer_spark` flip.
+
+**The opt-in Registry path verification flag** (the residual of the REG-15-I2 mitigation; #7877 item 39, #7876)
+- Detection signal: none for the Security-log eviction itself (unmeasured); the boot log line states whether the
+  verification is off or on and at what interval.
+- Operator action: leave `--spark-registry-path-verify-interval` at its default of 0 where the watched keys carry
+  auditing SACLs, and decide the interval per estate before enabling it anywhere.
+- Compensating control: the verification is OFF by default, so the default configuration does not open watched keys
+  periodically. An estate that opts in keeps the audit-eviction hazard (I2, E4; E4 is not a downgrade).
+- Owner: Dave. Owner-accepted residual (2026-11-16), deferred to item 39 and #7876; no independent adjudicator; Gate
+  7/8 did not pass on this row.
+- Milestone: not assigned.
+- Revisit trigger: before any `prefer_spark` flip.
 
 ## 6. `--spark-disable` rollback drill procedure
 

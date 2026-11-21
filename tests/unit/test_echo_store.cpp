@@ -7,6 +7,7 @@
 
 #include "echo_aggregator.hpp" // run_budget: the failed-measurement case
 #include "echo_db.hpp"
+#include "echo_fold.hpp" // gc_dictionary: the cancellable sweep
 #include "echo_test_db.hpp"
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
@@ -16,6 +17,8 @@
 #include "test_log_capture.hpp"
 
 #include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption
+
+#include <sqlite_quarantine.hpp> // prune_old_quarantines: the quarantine bound (#2155)
 
 #include <sqlite3.h> // raw handle for the reopen-after-DROP upgrade simulation
 
@@ -754,7 +757,7 @@ TEST_CASE("EchoDatabase: purge old records via execute_sql_range", "[echo][store
 
     auto remaining = t.db.execute_query("SELECT hour_ts FROM process_hourly ORDER BY hour_ts");
     REQUIRE(remaining.has_value());
-    CHECK(remaining->rows.size() == 5);
+    REQUIRE(remaining->rows.size() == 5);
     CHECK(remaining->rows[0][0] == "18000");
 }
 
@@ -4203,6 +4206,180 @@ TEST_CASE("EchoDatabase: a genuinely corrupt echo.db is still quarantined and it
     sqlite3_exec(o.db, "ROLLBACK", nullptr, nullptr, nullptr);
 }
 
+// #2155. Repeated corruption must not fill the volume: after a quarantine only the newest three
+// `echo.db.corrupt-*` groups stay. The groups below are seeded with epochs far older than "now",
+// so the one this open creates is the newest.
+TEST_CASE("quarantine: a fourth corrupt database leaves the newest three groups (#2155)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qbound_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    for (const char* sfx : {"-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{db.string() + sfx}, ec);
+    }
+    for (const char* epoch : {"100", "200", "300"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "old evidence");
+    spit_file(db, "this is not a SQLite database -- fourth corruption");
+
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->quarantined_this_open().has_value());
+
+    auto names = names_with_prefix(dir.path, "echo.db.corrupt-");
+    std::sort(names.begin(), names.end());
+    auto expected = std::vector<std::string>{
+        "echo.db.corrupt-200", "echo.db.corrupt-300",
+        "echo.db.corrupt-" + std::to_string(*reopened->quarantined_this_open())};
+    std::sort(expected.begin(), expected.end());
+    CHECK(names == expected); // the oldest seeded group (100) went; the new one stayed
+}
+
+TEST_CASE("quarantine: the group just created is never removed even when its name sorts oldest (#2155)",
+          "[echo][store][corruption]") {
+    // A backward clock step makes the new group's epoch the smallest: ordered by name alone it
+    // would be the first candidate, and the prune would delete the evidence it was just handed.
+    yuzu::test::TempDir dir{"yuzu_test_echo_qclock_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"1", "500", "600", "700"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-1", 3);
+
+    CHECK(pruned.notes.empty());
+    auto names = names_with_prefix(dir.path, "echo.db.corrupt-");
+    std::sort(names.begin(), names.end());
+    // 4 groups, keep 3: the oldest NON-protected group (500) goes, never the protected "1".
+    CHECK(names == std::vector<std::string>{"echo.db.corrupt-1", "echo.db.corrupt-600",
+                                            "echo.db.corrupt-700"});
+}
+
+TEST_CASE("quarantine: a group's sidecars are removed with it (#2155)", "[echo][store][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qside_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"10", "20", "30", "40"}) {
+        for (const char* sfx : {"", "-wal", "-shm", "-journal"})
+            spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch + sfx), "evidence");
+    }
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.size() == 4); // the main file and its three sidecars
+    CHECK(pruned.notes.empty());
+    const auto names = names_with_prefix(dir.path, "echo.db.corrupt-");
+    CHECK(names.size() == 12); // three groups of four remain, none partial
+    CHECK(std::none_of(names.begin(), names.end(), [](const std::string& n) {
+        return n.starts_with("echo.db.corrupt-10");
+    }));
+}
+
+TEST_CASE("quarantine: planted files and look-alike names are never touched (#2155)",
+          "[echo][store][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qlook_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"10", "20", "30", "40"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+    const std::vector<std::string> untouched = {
+        "echo.db.planted-5",        // a different recovery's evidence
+        "echo.db.corrupt-",         // no digits
+        "echo.db.corrupt-5x",       // trailing junk
+        "echo.db.corrupt--5",       // a sign
+        "echo.db.corrupt-5-bak",    // not a sidecar suffix
+        "echo.db.corrupt-1-2-3",    // a third number
+        "other.db.corrupt-5",       // another database's quarantine
+        "echo.db",                  // the live database
+        "echo.db-wal",
+    };
+    for (const auto& n : untouched)
+        spit_file(dir.path / n, "not ours");
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.size() == 1);
+    for (const auto& n : untouched) {
+        INFO(n);
+        CHECK(fs::exists(dir.path / n));
+        CHECK(slurp_file(dir.path / n) == "not ours");
+    }
+    CHECK_FALSE(fs::exists(dir.path / "echo.db.corrupt-10"));
+}
+
+TEST_CASE("quarantine: a group with one file that cannot be removed loses its other files and the stuck file is reported and left (#2155)",
+          "[echo][store][corruption]") {
+    // A non-empty directory under a quarantine name cannot be removed by std::filesystem::remove,
+    // on any platform: the stand-in for a file another process holds open.
+    yuzu::test::TempDir dir{"yuzu_test_echo_qstuck_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"10", "20", "30", "40"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+    spit_file(dir.path / "echo.db.corrupt-10-wal", "evidence");
+    const auto stuck = dir.path / "echo.db.corrupt-10-shm";
+    REQUIRE(fs::create_directories(stuck));
+    spit_file(stuck / "inside", "held");
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.size() == 2); // the main file and the -wal went
+    REQUIRE(pruned.notes.size() == 1);
+    CHECK(pruned.notes[0].find(stuck.string()) != std::string::npos);
+    CHECK_FALSE(fs::exists(dir.path / "echo.db.corrupt-10"));
+    CHECK_FALSE(fs::exists(dir.path / "echo.db.corrupt-10-wal"));
+    CHECK(fs::exists(stuck)); // reported and left
+    for (const char* epoch : {"20", "30", "40"})
+        CHECK(fs::exists(dir.path / (std::string{"echo.db.corrupt-"} + epoch)));
+}
+
+TEST_CASE("quarantine: a stuck file left by an earlier prune is counted as a group and removed by a later one (#2155)",
+          "[echo][store][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qretry_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"20", "30", "40"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+    // What an earlier prune left: group 10 reduced to the one file that could not be removed.
+    const auto stuck = dir.path / "echo.db.corrupt-10-shm";
+    REQUIRE(fs::create_directories(stuck));
+    spit_file(stuck / "inside", "held");
+
+    // Still held: it counts as a fourth group, is tried, is reported, and stays.
+    auto first = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+    CHECK(first.removed.empty());
+    CHECK(first.notes.size() == 1);
+    CHECK(fs::exists(stuck));
+
+    // Released: the next prune removes it.
+    fs::remove(stuck / "inside");
+    auto second = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+    CHECK(second.notes.empty());
+    CHECK(second.removed.size() == 1);
+    CHECK_FALSE(fs::exists(stuck));
+}
+
+TEST_CASE("quarantine: a directory that cannot be listed deletes nothing and is reported (#2155)",
+          "[echo][store][corruption]") {
+    // The database's directory does not exist, so the listing fails on every platform with no
+    // permission tricks. Nothing can be removed from a directory that was not read, and the
+    // function reports it instead of throwing.
+    yuzu::test::TempDir dir{"yuzu_test_echo_qlist_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto missing = dir.path / "missing";
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        missing / "echo.db", missing / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.empty());
+    REQUIRE(pruned.notes.size() == 1);
+    CHECK(pruned.notes[0].starts_with("could not list"));
+}
+
 // #1527. A link at the database path (or a sidecar) is refused before anything is opened, moved or
 // secured; the link's target is never touched. A dangling link is refused as well. Windows needs a
 // privilege to create a symlink, so the case skips where it cannot; the junction/reparse arm is
@@ -5047,8 +5224,12 @@ TEST_CASE("EchoDatabase (Windows): a hard link squatted at a quarantine sidecar 
     REQUIRE(fs::exists(squatted));
     REQUIRE(fs::exists(d.dir.path / std::format("echo.db.corrupt-{}", *opened->quarantined_this_open())));
 
-    // Nothing was re-secured through the squat: the target keeps its descriptor and every link.
-    CHECK(fs::hard_link_count(decoy) == kSquats + 1);
+    // Nothing was re-secured through the squat: the target keeps its content and its descriptor.
+    // Retention (`prune_old_quarantines`) keeps the newest `kKeepQuarantined` groups (3, in
+    // echo_db.cpp) and unlinks the other squatted names; that drops links only. Every group left
+    // here carries one squatted `-wal` link, so the decoy keeps itself plus those.
+    constexpr std::size_t kKeptGroups = 3;
+    CHECK(fs::hard_link_count(decoy) == 1 + kKeptGroups);
     CHECK(read_file(decoy) == "not a wal");
     CHECK_FALSE(dacl_facts(decoy).dacl_protected);
     CHECK(dacl_facts(decoy).allows(kUsers));
@@ -5552,12 +5733,10 @@ TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
     }
 }
 
-TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not finish and counts it",
-          "[echo][store][purge][dictionary]") {
-    // The rows go either way; the strings of the purged rows are forensic data too, so a sweep
-    // that outran its deadline is reported (dictionary_pending) and counted, never a silent
-    // "purged". A deadline already past is gc_dictionary's own seam for that path.
-    auto t = make_test_db();
+namespace {
+// One "process" event whose name lands in the dictionary and in the hourly, daily and monthly
+// roll-up rows: the data the purge cases below delete.
+void fold_purged_process_row(TestEchoDb& t) {
     ProcessEvent e;
     e.ts = 1000;
     e.snapshot_id = 1;
@@ -5566,6 +5745,16 @@ TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not fi
     e.name = "purged.exe";
     e.user = "u";
     REQUIRE(t.db.fold_process_events({e}));
+}
+} // namespace
+
+TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not finish and counts it",
+          "[echo][store][purge][dictionary]") {
+    // The rows go either way; the strings of the purged rows are forensic data too, so a sweep
+    // that outran its deadline is reported (dictionary_pending) and counted, never a silent
+    // "purged". A deadline already past is gc_dictionary's own seam for that path.
+    auto t = make_test_db();
+    fold_purged_process_row(t);
 
     const auto starved = t.db.purge_source("process", std::chrono::seconds(0));
     REQUIRE(starved.has_value());
@@ -5580,6 +5769,91 @@ TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not fi
     CHECK(!swept->dictionary_pending);
     CHECK(t.db.get_config("dict_gc_starved_total", "0") == "1");
     CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "0");
+}
+
+namespace {
+// One purged-then-starved "process" row: its dictionary string is left behind as an orphan.
+void seed_orphan_string(TestEchoDb& t) {
+    fold_purged_process_row(t);
+    const auto starved = t.db.purge_source("process", std::chrono::seconds(0));
+    REQUIRE(starved.has_value());
+    REQUIRE(starved->dictionary_pending);
+}
+} // namespace
+
+TEST_CASE("EchoDatabase: dictionary sweep: a cancelled pass deletes nothing and reports the deadline as hit",
+          "[echo][store][purge][dictionary]") {
+    auto t = make_test_db();
+    seed_orphan_string(t);
+    const std::string orphan_sql = "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'";
+    const auto far_off = EchoFold::Clock::now() + std::chrono::hours(1);
+
+    const auto at_once = t.db.fold().gc_dictionary(t.db, far_off, [] { return true; });
+    REQUIRE(at_once.has_value());
+    CHECK(at_once->deadline_hit);
+    CHECK(at_once->deleted == 0);
+    CHECK(first_cell(t.db, orphan_sql) == "1");
+
+    // A stop that arrives after the first poll (the check before the scan): the second poll is the
+    // statement progress handler's, which interrupts the live-set scan. Only an interrupted scan
+    // leaves live_set_built false (the between-batch check runs after it). The scan is an EXCEPT
+    // chain over every interned key column, several handler periods of 1000 VM instructions even
+    // here, so no extra rows are needed; reverting the handler to the deadline alone fails the
+    // live_set_built check. Counted in polls, never in elapsed time.
+    int polls = 0;
+    const auto midway = t.db.fold().gc_dictionary(t.db, far_off, [&polls] { return ++polls >= 2; });
+    REQUIRE(midway.has_value());
+    CHECK(midway->deadline_hit);
+    CHECK_FALSE(midway->live_set_built);
+    CHECK(midway->deleted == 0);
+    CHECK(polls >= 2);
+    CHECK(first_cell(t.db, orphan_sql) == "1");
+
+    const auto done = t.db.fold().gc_dictionary(t.db, far_off);
+    REQUIRE(done.has_value());
+    CHECK_FALSE(done->deadline_hit);
+    CHECK(first_cell(t.db, orphan_sql) == "0");
+}
+
+TEST_CASE("EchoDatabase: purge: a stop request during the sweep returns with the dictionary and the WAL reported pending",
+          "[echo][store][purge][dictionary]") {
+    auto t = make_test_db();
+    fold_purged_process_row(t);
+
+    const auto stopped = t.db.purge_source("process", std::chrono::seconds(60), [] { return true; });
+    REQUIRE(stopped.has_value());
+    CHECK(stopped->rows_deleted == 3);
+    CHECK(stopped->dictionary_pending);
+    CHECK(stopped->wal_pending);
+    // Reported pending, not starved: a sweep the stop ended is no signal about the database.
+    CHECK(t.db.get_config("dict_gc_starved_total", "0") == "0");
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "1");
+}
+
+TEST_CASE("EchoDatabase: purge: a checkpoint that finds the WAL pinned is reported as wal pending while the rows are gone",
+          "[echo][store][purge]") {
+    auto t = make_test_db();
+    fold_purged_process_row(t);
+
+    // A read transaction on a second connection pins the WAL at its snapshot, so the purge's
+    // frames sit past the reader's mark and TRUNCATE (busy timeout 0) cannot reset the log. The
+    // owner closes the connection on every path, so a failed assertion cannot leave it locked.
+    SqliteOwner reader;
+    REQUIRE(sqlite3_open_v2(t.path.string().c_str(), &reader.db, SQLITE_OPEN_READONLY, nullptr) ==
+            SQLITE_OK);
+    exec_sql(reader.db, "BEGIN; SELECT COUNT(*) FROM echo_config;");
+
+    const auto pinned = t.db.purge_source("process");
+    REQUIRE(pinned.has_value());
+    CHECK(pinned->rows_deleted == 3);
+    CHECK_FALSE(pinned->dictionary_pending);
+    CHECK(pinned->wal_pending);
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM process_hourly_r") == "0");
+
+    exec_sql(reader.db, "COMMIT");
+    const auto clear = t.db.purge_source("process");
+    REQUIRE(clear.has_value());
+    CHECK_FALSE(clear->wal_pending);
 }
 
 // =============================================================================

@@ -52,8 +52,9 @@ template <class Fn> void for_each_line(const std::string& out, Fn&& fn) {
 
 // Split on '|' into at most `max` tokens; anything past the max-th token is dropped.
 // `escaped` additionally treats `\|` as field text, not a separator (the wire form
-// yuzu::util::safe_output_field gives a literal pipe; a literal backslash is never emitted, it
-// is replaced by '/'). Tokens stay views of the raw line, so an escaped pipe keeps its `\`.
+// yuzu::util::safe_output_field gives a literal pipe). That is the `inv|` daily-sync row's own
+// escape: it never emits a literal backslash (replaced by '/'). The `list` rows use the
+// backslash-preserving yuzu::shared::row_field and are not parsed here. Tokens stay views of the raw line, so an escaped pipe keeps its `\`.
 std::vector<std::string_view> split_tokens(std::string_view line, std::size_t max,
                                            bool escaped = false) {
     std::vector<std::string_view> tok;

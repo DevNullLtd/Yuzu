@@ -1,0 +1,1 @@
+- **A registered agent build is no longer rolled back by the OTA updater.** The agent now writes the update-verified marker as soon as registration succeeds, before the startup rollback check, instead of at the first command read after it; previously the check could never see the current run's marker and could roll back a working build onto a migrated file.

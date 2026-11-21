@@ -4,6 +4,8 @@
 #include "quarantine_store.hpp"
 #include "response_store.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cctype>
 #include <exception>
@@ -14,6 +16,16 @@ namespace yuzu::server {
 namespace {
 
 constexpr std::size_t kMaxTokenLen = 45;
+
+/// Runs `fn` when the enclosing scope is left by any route: a return, or an exception of any
+/// type (redispatch_stored_containment's dispatch callback is caller-supplied code). `fn` must not
+/// throw (a destructor that throws during unwinding terminates). The shape of the guard in
+/// api_token_store.cpp; one local variable per use, never copied or moved.
+template <typename F> struct ScopeExit {
+    F fn;
+    ~ScopeExit() { fn(); }
+};
+template <typename F> ScopeExit(F) -> ScopeExit<F>;
 
 /// The agent's `is_safe_ip` charset (`[0-9a-fA-F.:]`, <=45 chars): the first line of defence before
 /// the literal reaches the mapper's real check.
@@ -172,11 +184,55 @@ redispatch_stored_containment(QuarantineStore& store, const std::string& agent_i
         return std::unexpected(
             ContainmentReapplyError{ContainmentReapplyErrorKind::whitelist_invalid, ""});
 
+    // Claim the apply BEFORE it can reach the device (#7613). The claim moves the record's apply
+    // generation, so a confirmed end resting on an `inactive` answer observed before this point is
+    // refused, and it stays live while the dispatch is in progress (and, once the dispatch reached
+    // an agent, until the reply is consumed or the claim window passes), so a mark attempted in
+    // that time is refused too. Refused when the record changed since the read above (ended, a
+    // release requested) or another apply holds a live claim: nothing is dispatched, and the
+    // callers' no_active_record arms re-derive the record on their next pass.
+    auto gen = store.claim_apply(agent_id, out_record.id);
+    if (!gen) {
+        if (gen.error() == kQuarantineNotQuarantined)
+            return std::unexpected(ContainmentReapplyError{
+                ContainmentReapplyErrorKind::no_active_record,
+                "quarantine record changed or another apply is in flight"});
+        return std::unexpected(
+            ContainmentReapplyError{ContainmentReapplyErrorKind::store_error, gen.error()});
+    }
+
+    // Drop our own claim on EVERY exit but one: a dispatch that reached an agent keeps it (#8045).
+    // The command was only SENT; the agent runs it on a thread pool and the firewall plugin takes
+    // its gate inside `execute`, so an earlier apply can still be waiting when a later release
+    // runs. The caller drops the claim once it has consumed the apply's terminal reply
+    // (`held_claim_gen`), and otherwise it expires after kApplyClaimTtlSecs.
+    // The exits that drop it include an exception that is not a std::exception thrown out of
+    // dispatch_fn (the catch below takes only std::exception; anything else passes through and
+    // would otherwise leave the claim live for kApplyClaimTtlSecs). The generation the claim
+    // moved outlives it (see the header). A failed release leaves the claim to expire after
+    // kApplyClaimTtlSecs, which only delays a confirmed end; the guard's body cannot throw.
+    bool keep_claim = false;
+    ScopeExit release_claim{[&]() noexcept {
+        if (keep_claim)
+            return;
+        try {
+            if (auto rel = store.release_apply_claim(agent_id, out_record.id, *gen); !rel)
+                spdlog::warn("redispatch_stored_containment: could not release the apply claim "
+                             "for record {}: {}",
+                             out_record.id, rel.error());
+        } catch (...) {
+        }
+    }};
+
     ContainmentReapplyResult result;
     try {
         std::tie(result.command_id, result.agents_reached) = dispatch_fn(*params);
     } catch (const std::exception&) {
         result.dispatch_threw = true;
+    }
+    if (!result.dispatch_threw && result.agents_reached > 0) {
+        keep_claim = true;
+        result.held_claim_gen = *gen;
     }
     return result;
 }

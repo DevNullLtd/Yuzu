@@ -34,6 +34,7 @@
 #include <yuzu/plugin.h>                     // YUZU_EXPORT
 #include <yuzu/agent/dex_signal_catalog.hpp> // SignalObservation
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio> // std::FILE — read_pipe_line / drain_journal_pipe operate on the popen() stream
 #include <optional>
@@ -63,6 +64,10 @@ inline constexpr std::string_view kMsgIdUnitResult = "d9b373ed55a64feb8242e02dbe
 struct JournalLine {
     std::string cursor;                   ///< __CURSOR, "" if absent/unparsable
     std::optional<SignalObservation> obs; ///< the mapped signal, or nullopt
+    /// True when the entry carried a reliability MESSAGE_ID (or the chronyd comm) but failed
+    /// the journald-stamped sender check (WP13/F58). Counted by the collector so a trusted-field
+    /// mismatch on a real host (e.g. a different coredump identity) is visible, not silent.
+    bool untrusted_dropped{false};
 };
 
 /// PURE: parse + classify one `journalctl -o json` line. Extracts ONLY safe fields
@@ -105,7 +110,8 @@ YUZU_EXPORT std::optional<std::string> build_journald_after_cursor_query(std::st
 /// caller applies the debounce). A line with no `__CURSOR` (malformed tail) does not
 /// advance the cursor, so the same window is re-read next poll. Pure over the `FILE*`
 /// → tmpfile-testable.
-YUZU_EXPORT std::vector<SignalObservation> drain_journal_pipe(std::FILE* pipe, std::string& cursor);
+YUZU_EXPORT std::vector<SignalObservation> drain_journal_pipe(std::FILE* pipe, std::string& cursor,
+                                                              std::size_t* untrusted_dropped = nullptr);
 
 /// Per-(obs_type, subject) debounce with age eviction, so a flapping unit / crash
 /// loop collapses to one observation per window instead of flooding the wire.

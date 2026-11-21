@@ -1,0 +1,11 @@
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-17 · euid 0 · leg-hash 054f810948b5
+== action=inspect pid=75 facet=caps
+status|inspect|supported|-
+target|75|2664b550.15539926|caps
+cap|inheritable|0000000000000000
+cap|permitted|000001ffffffffff
+cap|effective|000001ffffffffff
+cap|bounding|000001ffffffffff
+cap|ambient|0000000000000000
+[result_status] OK / FULL / 
+

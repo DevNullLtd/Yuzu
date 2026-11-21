@@ -1,0 +1,1 @@
+- **`ioc.check` bounds its domain work.** More than 100 `domains` in one command is now refused with a single `error|domains|false|Too many domains (N, max 100)` row (rc 1, nothing checked) instead of running unbounded; on Windows the DNS resolver cache is read once per command rather than once per domain.
