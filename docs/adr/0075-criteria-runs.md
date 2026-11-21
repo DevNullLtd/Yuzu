@@ -1,17 +1,16 @@
 # ADR-0075: Criteria runs: three-valued verdicts over several inputs, stored as a result set
 
-- **Status:** Proposed (draft 6)
-- **Date:** 2026-11-18 (draft 1); 2026-11-20 (drafts 2 and 3); 2026-11-21 (drafts 4 to 6)
+- **Status:** Proposed (draft 7)
+- **Date:** 2026-11-18 (draft 1); 2026-11-20 (drafts 2 and 3); 2026-11-21 (drafts 4 to 7)
 - **Owner:** Nathan Dornbrook / platform (block `0xxx`; see `docs/adr/README.md`)
 - **Deciders:** Nathan Dornbrook. The owner's decisions D1 to D61, made between 2026-11-07 and
   2026-11-21 while reviewing a contributed criteria-run plan (version 4.1, 2026-11-06). This ADR
   cites them by number in brackets, for example (D25). It writes them down; it does not reopen them.
   Where a later decision replaced part of an earlier one, the later one is cited.
 - **Builds on:**
-  - `0072-scope-lifecycle-and-freshness.md` **as amended by D15**: an evaluation is metadata on a
-    result set (completeness, `evaluated_at`, a members hash), not a row in a separate evaluations
-    table, and its row grammar is the extended `result_set_matcher`. ADR-0072 is Proposed and not
-    yet in the repository. It is revised in place for D15 and lands alongside this ADR (D40).
+  - [ADR-0072, scope lifecycle and freshness](0072-scope-lifecycle-and-freshness.md).
+    Each result set carries its evaluation time, completeness and membership hash. Runs use the
+    shared row matcher. The two proposed ADRs land together (D15, D40).
   - `docs/scope-walking-design.md` (result sets, `parent_id` lineage, re-eval, the incomplete-set
     rule) and `0036-result-set-store-postgres-migration.md` (the store on Postgres).
   - `0016-agent-daily-sync-framework.md` (installed-software inventory, blob v3, facet state).
@@ -243,7 +242,7 @@ Forensics-sanitised (#4990). The closed list, by slice:
 | `coverage_unproven` | `NONE` or `ALL` over a part that is not Full (R5) | slice 1 |
 | `unconfirmed` | `ANY` rests on a row whose facet was last confirmed outside the freshness window (R5.4) | slice 1 |
 | `stale`, `no_inventory` | no fresh inventory by the deadline (R6) | slice 1 |
-| `withheld:<securable>` | the creator may not see this device under that input's gate (R9) | slice 1 |
+| `withheld:<securable>` | an admitted device loses visibility under this input’s gate before the input is collected (R9) | slice 1 |
 | `unanswered` | a live input was sent and no answer arrived (R13) | slice 3 |
 | `transient:<status>` | a live input answered with a transient plugin status (R7.2) | slice 3 |
 | `withheld:authority_withdrawn` | the creator's token was revoked or expired (R9) | slice 3 |
@@ -487,9 +486,18 @@ path uses it.
    `authz_gates.cpp:447-448`); `Execution:Execute` with the visible-device derivation of
    `dispatch_confined_arms` (`dispatch_confined_arms.hpp:704`) from slice 3. A management group, a
    scope expression or `__all__` is targeting, never authorization.
-4. A device hidden for some inputs settles those inputs as `withheld:<securable>`. Devices excluded
-   entirely are counted on the run, never silently left out.
-5. Visibility is re-checked at each delivery step from slice 3.
+4. At creation, exclude any target device outside even one input's authorized scope. Only the
+   aggregate excluded count is visible. Create no member row, input verdict or pending delivery
+   for that device. Later grants cannot add it to this run.
+5. At each delivery from slice 3, recheck the admitted device against that input's gate. If access
+   has since been withdrawn, withhold the input, send nothing for it, and record
+   `withheld:<securable>` for the input. The device stays in the original cohort. R4 combines the
+   input results into its device verdict. R9.8 governs loss of the token itself.
+
+   For example, target two devices with an inventory input and a live input. At creation, A is
+   visible for inventory alone and B is visible for both. The run has one member (B) and an
+   excluded count of one. If B loses execution visibility before delivery, the live input on B is
+   withheld. A later execution grant on A changes neither the cohort nor the count.
 6. **Only the creator reads a run in slice 1** (D6), and only while holding `CriteriaRun:Read`.
 7. **Sessionless authority** after the request returns is the creator's durable
    `CriteriaRun:Execute` grant with RBAC on, or the legacy Administrator role with RBAC off. A
