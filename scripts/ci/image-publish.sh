@@ -55,7 +55,7 @@
 # Usage:
 #   image-publish.sh open            DIR NAME N
 #       Starts the journal (`publish: none`). Refused unless every
-#       <scanner>-<NAME>.attempt-<N>.gate.txt in DIR (Trivy's is required)
+#       <scanner>-<NAME>.attempt-<N>.gate.txt in DIR (Trivy's and grype's are required)
 #       records exactly `gate: pass`, or when the journal already exists.
 #   image-publish.sh push-started    DIR NAME N CANDIDATE
 #       Records the intent to push CANDIDATE. Run it immediately BEFORE the push.
@@ -257,10 +257,12 @@ load() {
 }
 
 # gates_pass DIR NAME N: every <scanner>-NAME.attempt-N.gate.txt records
-# exactly `gate: pass` (one gate line, that one), and Trivy's exists.
+# exactly `gate: pass` (one gate line, that one), and both scanners' exist
+# (Trivy's and grype's: image-vuln-gate.sh writes both on every exit it reaches,
+# so a missing one means the gate did not judge the image with that scanner).
 # Sets GATE_WHY when not.
 gates_pass() {
-    local dir="$1" name="$2" n="$3" f base scanner have_trivy=0
+    local dir="$1" name="$2" n="$3" f base scanner have_trivy=0 have_grype=0
     local -a files=() gl=()
     GATE_WHY=""
     shopt -s nullglob
@@ -271,12 +273,14 @@ gates_pass() {
         scanner="${base%-"$name".attempt-"$n".gate.txt}"
         [[ "$scanner" =~ ^[a-z0-9]+$ ]] || continue   # another image's report (x-NAME)
         [ "$scanner" != trivy ] || have_trivy=1
+        [ "$scanner" != grype ] || have_grype=1
         mapfile -t gl < <(grep -E '(^|[[:space:]])gate:' "$f" || true)
         if [ "${#gl[@]}" -ne 1 ] || [ "${gl[0]}" != "gate: pass" ]; then
             GATE_WHY="$base does not record exactly 'gate: pass'"; return 1
         fi
     done
     [ "$have_trivy" = 1 ] || { GATE_WHY="no trivy-$name.attempt-$n.gate.txt"; return 1; }
+    [ "$have_grype" = 1 ] || { GATE_WHY="no grype-$name.attempt-$n.gate.txt"; return 1; }
 }
 
 # append DIR NAME N LINE: one write of one complete line, never after a signal.

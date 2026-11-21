@@ -1120,8 +1120,9 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   have a CycloneDX and an SPDX SBOM inside the release's cosign-signed `SHA256SUMS`
   (`scripts/check-release-artifacts.sh` refuses a release without them; the agent-bundle image's
   SBOM stays a workflow artifact). Verification: `docs/user-manual/release-verification.md`.
-- *Pre-push gate:* `release.yml` scans every published image with a pinned Trivy before the push
-  and refuses a fixable CRITICAL that is not accepted, a stale or not-freshly-downloaded DB, an
+- *Pre-push gate:* `release.yml` scans every published image with two pinned scanners, Trivy and
+  grype (grype also sees the gateway's Erlang/OTP runtime, which Trivy does not), before the push
+  and refuses a fixable CRITICAL from either that is not accepted, a stale or not-freshly-downloaded DB, an
   image whose OS release has no demonstrable advisory data, and an unlisted image whose OS
   packages the scanner cannot see. The push carries no release tag (the agent bundle's carries a
   `:candidate-<run>-<N>` tag, never a release tag); the tags move only after the
@@ -1136,7 +1137,7 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   Not kept: anything from an attempt whose runner was killed (SIGKILL, a lost runner) before the
   upload, or whose report upload and its one retry both failed, which leaves no record at all; and a refusal never followed by a release, which exists only
   as the 90-day artifact, shorter than a Type II window: export it if the period needs it.
-- *Acceptances:* `.trivyignore.yaml` and `scripts/ci/image-vuln-gate-not-covered.txt` entries
+- *Acceptances:* `.trivyignore.yaml`, `.grypeignore.yaml` and `scripts/ci/image-vuln-gate-not-covered.txt` entries
   carry an approver, a date and a pull-request reference, which the gate checks for FORMAT ONLY;
   the control is the pull-request review of changes to those files, the gate scripts and the
   workflows (`docs/ci-architecture.md` "What the approval fields are, and what the control is").

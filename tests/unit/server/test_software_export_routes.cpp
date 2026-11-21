@@ -185,7 +185,9 @@ struct Harness {
         if (generated_in_from >= 0 && i >= generated_in_from)
             return install_row(agent_id("z", i - generated_in_from, 3), i + 1);
         const auto id = agent_id("a", i);
-        return install_row(id, i + 1, generated_in_from >= 0 ? "LEAK-" + id : "Acme");
+        auto row = install_row(id, i + 1, generated_in_from >= 0 ? "LEAK-" + id : "Acme");
+        row.entry.package_id = "pid-" + std::to_string(i);
+        return row;
     }
 
     // `global_cap` is the budget's server-wide cap (the --max-sse-streams side); `concurrency` is the
@@ -2073,6 +2075,7 @@ TEST_CASE("export route xlsx: the sheet carries the CSV's cells, in the CSV's or
         CHECK(row[col("version")] == "1." + std::to_string(i + 1));
         CHECK(row[col("publisher")] == "Acme");
         CHECK(row[col("kind")] == "package");
+        CHECK(row[col("package_id")] == "pid-" + std::to_string(i));
     }
 }
 
