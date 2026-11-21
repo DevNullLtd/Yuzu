@@ -144,6 +144,46 @@ static constexpr const char* kEchoAuditRefusal =
     "The audit record could not be stored, so nothing was sent. Retry once the audit store "
     "recovers.";
 
+/// The Echo re-enable/purge body for "not yours" and "not connected" alike (one constant, so the
+/// two cannot drift into an existence oracle): a per-device scoped denial returns it verbatim.
+static constexpr const char* kEchoAgentNotReachableHtml =
+    "<span class=\"echo-row-error\">Agent not reachable.</span>";
+
+/// #2540: one probe of the per-device scoped-permission chokepoint for an Echo re-enable/purge.
+/// FAIL CLOSED: an unwired gate and a gate that itself answered 503 (it could not evaluate
+/// authority) are both `unavailable`, which the caller must NOT collapse into the 404 a plain
+/// denial gets. A degraded RBAC or management-group READ is not that case: the gate answers it
+/// 403 (ADR-0041 deny-on-degrade), so it collapses like any denial and the real cause is in the
+/// gate's own row. The gate is handed a throwaway Response (it writes its own refusal and its own
+/// `auth.scoped_permission_required` audit row into whatever it is given).
+struct EchoScopedProbe {
+    bool allowed{false};
+    bool unavailable{false};
+};
+static EchoScopedProbe probe_echo_scoped_perm(const DashboardRoutes::ScopedPermFn& gate,
+                                              const httplib::Request& req, const char* type,
+                                              const char* op, const std::string& device_id) {
+    if (!gate)
+        return {.allowed = false, .unavailable = true};
+    httplib::Response probe;
+    if (gate(req, probe, type, op, device_id))
+        return {.allowed = true, .unavailable = false};
+    return {.allowed = false, .unavailable = probe.status == 503};
+}
+
+/// Writes the refusal for a non-allowed #2540 probe: 503 when the gate is unavailable, else the
+/// 404-collapse body (identical to the offline case).
+static void write_echo_scoped_refusal(httplib::Response& res, const EchoScopedProbe& probe) {
+    if (probe.unavailable) {
+        res.status = 503;
+        res.set_content("<span class=\"echo-row-error\">Authorization unavailable.</span>",
+                        "text/html; charset=utf-8");
+        return;
+    }
+    res.status = 404;
+    res.set_content(kEchoAgentNotReachableHtml, "text/html; charset=utf-8");
+}
+
 /// #7114: answer an Echo re-enable/purge whose dispatch was REFUSED by the chokepoint (the
 /// outcome's `denied`) instead of reaching nobody. Returns the reason token for the audit detail
 /// and the metric `result`.
@@ -2046,7 +2086,22 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
     sink.Get("/fragments/echo/retention-paused",
             [this](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn_(req, res, "Infrastructure", "Read")) {
+                // #2540: gated by the fleet read chokepoint (admit-then-filter), the same seam
+                // as the REST twin below, not by the global perm_fn_ plus internal filtering:
+                // a management-group-scoped Infrastructure:Read holder is admitted and sees
+                // only the rows in gate.scope. Unwired fails closed (503).
+                auto session = auth_fn_(req, res);
+                if (!session) return;
+                if (!session->token_scope_service.empty()) {
+                    // Parity with the REST twin: the global gate this replaced denied EVERY
+                    // service-scoped token outright (kServiceScopeGlobalSafe default-deny); the
+                    // fleet gate would admit a confined one, so the denial is kept explicitly.
+                    res.status = 403;
+                    res.set_content("<span class=\"echo-row-error\">Permission denied.</span>",
+                                    "text/html; charset=utf-8");
+                    audit_or_flag(req, res, "echo.retention_paused.view", "denied",
+                                  "Infrastructure", "",
+                                  "service-scoped token denied fleet-wide retention scan read");
                     if (metrics_) {
                         metrics_->counter("yuzu_echo_dashboard_view_total",
                                           {{"frame", "retention"},
@@ -2054,8 +2109,28 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     }
                     return;
                 }
-                auto session = auth_fn_(req, res);
-                if (!session) return;
+                if (!fleet_read_fn_) {
+                    spdlog::error("echo.retention_paused fragment: fleet_read_fn_ unwired -- "
+                                  "misconfigured call site; failing closed");
+                    res.status = 503;
+                    res.set_content("<span class=\"echo-row-error\">Service unavailable.</span>",
+                                    "text/html; charset=utf-8");
+                    if (metrics_) {
+                        metrics_->counter("yuzu_echo_dashboard_view_total",
+                                          {{"frame", "retention"},
+                                           {"result", "denied"}}).increment();
+                    }
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted) {
+                    if (metrics_) {
+                        metrics_->counter("yuzu_echo_dashboard_view_total",
+                                          {{"frame", "retention"},
+                                           {"result", "denied"}}).increment();
+                    }
+                    return; // gate already wrote the refusal
+                }
                 // Per-operator scoped data — must not be cached by any
                 // shared upstream proxy. UP-11 from Gate 4 unhappy-path:
                 // a corporate proxy honoring default text/html caching
@@ -2066,14 +2141,19 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 res.set_header("Vary", "Cookie");
                 // Probe effective permissions WITHOUT mutating the real response
                 // (perm_fn_ writes a 403 into whatever Response it's handed on
-                // denial — feed it a throwaway, same pattern as the def-perm probe
-                // at ~line 637). Gates which row actions render: Re-enable needs
+                // denial — feed it a throwaway, as probe_echo_scoped_perm does for the
+                // scoped gate). Gates which row actions render: Re-enable needs
                 // Execution:Execute, Purge needs the higher Infrastructure:Delete.
+                // These stay GLOBAL probes (#2540 decision): a management-group-scoped
+                // operator sees their in-scope rows without buttons and acts through the REST
+                // twin. A per-row scoped probe would write an audit denial per refused probe
+                // (require_scoped_permission), up to two rows per visible agent per page load.
                 httplib::Response perm_probe;
                 bool can_execute = perm_fn_(req, perm_probe, "Execution", "Execute");
                 bool can_delete = perm_fn_(req, perm_probe, "Infrastructure", "Delete");
                 res.set_content(
-                    render_echo_retention_paused(session->username, can_execute, can_delete),
+                    render_echo_retention_paused(session->username, can_execute, can_delete,
+                                                 gate.scope, /*scope_is_authoritative=*/true),
                     "text/html; charset=utf-8");
                 if (metrics_) {
                     metrics_->counter("yuzu_echo_dashboard_view_total",
@@ -2379,24 +2459,33 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // tier as run-instruction and echo-sql siblings; Gate 2 governance flagged
     // the original Infrastructure:Update as a tier mismatch).
     //
-    // RBAC scope: device_id MUST be in the operator's visible agents set;
-    // out-of-scope device_ids are rejected with the same 404 body as
-    // not-connected so non-operators cannot use this endpoint as an
-    // existence-enumeration oracle.
+    // RBAC scope (#2540): the per-device scoped-permission chokepoint
+    // (`scoped_perm_fn_`, Execution:Execute on device_id) is the sole gate and is
+    // asked again after the `attempted` audit row; a denial is rejected with the
+    // same 404 body as not-connected so non-operators cannot use this endpoint as
+    // an existence-enumeration oracle. An unwired gate, or one that itself answers
+    // 503, answers 503. A service-scoped token is refused 403 before any of it.
     sink.Post("/fragments/echo/retention-paused/reenable",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "Execution", "Execute")) {
-                     // Compliance F1: denied audit on RBAC rejection.
-                     audit_or_flag(req, res, "echo.source.reenable", "denied",
-                                   "command", "", "rbac_denied");
+                 auto session = auth_fn_(req, res);
+                 if (!session) return;
+                 if (!session->token_scope_service.empty()) {
+                     // #2540: the global gate this route asked before refused EVERY
+                     // service-scoped token (kServiceScopeGlobalSafe default-deny); the scoped
+                     // gate's service branch would admit a confined one, and Re-enable has no
+                     // REST route, so the refusal is kept explicitly (as on the GET frame). It
+                     // does not depend on device_id, so it is not an existence oracle.
+                     res.status = 403;
+                     res.set_content("<span class=\"echo-row-error\">Permission denied.</span>",
+                                     "text/html; charset=utf-8");
+                     audit_or_flag(req, res, "echo.source.reenable", "denied", "command", "",
+                                   "service_scoped_token_denied");
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "denied"}}).increment();
                      }
                      return;
                  }
-                 auto session = auth_fn_(req, res);
-                 if (!session) return;
                  // CSRF same-site gate (parity with the purge fragment; defense-in-depth
                  // on top of SameSite=Lax). Reject cross-origin/header-less cookie POSTs.
                  {
@@ -2465,33 +2554,30 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
-                 // Per-device RBAC visibility check. Out-of-scope device_ids
-                 // collapse to the same 404 path as not-connected devices so
-                 // the response cannot be used to enumerate device existence.
-                 // Audit detail records the real reason on the server side.
-                 bool visible = false;
-                 if (mgmt_group_store_) {
-                     // ADR-0042: nullopt (store degraded) → not visible (fail-closed).
-                     if (auto visible_ids = mgmt_group_store_->get_visible_agents(
-                             session->username)) {
-                         for (const auto& vid : *visible_ids) {
-                             if (vid == device_id) { visible = true; break; }
-                         }
+                 // #2540: the per-device scoped-permission chokepoint
+                 // (Execution:Execute on the posted device) is the SOLE
+                 // authorization gate, as on the REST purge twin; unwired, or
+                 // a gate that itself answers 503, fails closed (503), never
+                 // as the 404. Any other denial (a degraded RBAC read
+                 // included: the gate answers it 403) collapses to the same 404 body as
+                 // not-connected so the response cannot enumerate device
+                 // existence; the audit detail records the real reason.
+                 const auto gate = probe_echo_scoped_perm(scoped_perm_fn_, req, "Execution",
+                                                          "Execute", device_id);
+                 if (!gate.allowed) {
+                     if (gate.unavailable) {
+                         audit_or_flag(req, res, "echo.source.reenable", "denied", "command", "",
+                                       std::format("scoped_gate_unavailable source={}", source));
+                     } else {
+                         audit_or_flag(req, res, "echo.source.reenable", "failure", "command", "",
+                                       std::format("scope_violation source={}", source));
                      }
-                 }
-
-                 if (!visible) {
-                     audit_or_flag(req, res, "echo.source.reenable", "failure",
-                                   "command", "",
-                                   std::format("scope_violation source={}",
-                                                source));
-                     res.status = 404;
-                     res.set_content("<span class=\"echo-row-error\">"
-                                     "Agent not reachable.</span>",
-                                     "text/html; charset=utf-8");
+                     write_echo_scoped_refusal(res, gate);
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_reenable_total",
-                                           {{"result", "scope_violation"}}).increment();
+                                           {{"result", gate.unavailable ? "denied"
+                                                                       : "scope_violation"}})
+                             .increment();
                      }
                      return;
                  }
@@ -2513,13 +2599,20 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                      return;
                  }
-                 // Execution:Execute was admitted before the wait; decide it again so a grant
-                 // withdrawn during the wait dispatches nothing (#3619 review). The gate writes
-                 // its own refusal; counted as the RBAC refusal it is.
-                 if (!perm_fn_(req, res, "Execution", "Execute")) {
+                 // Execution:Execute on this device was admitted before the wait; decide it
+                 // again so a grant withdrawn during the wait dispatches nothing (#3619 review).
+                 // The gate writes its own refusal row; counted as the RBAC refusal it is.
+                 if (const auto recheck = probe_echo_scoped_perm(scoped_perm_fn_, req, "Execution",
+                                                                 "Execute", device_id);
+                     !recheck.allowed) {
+                     // The `attempted` row exists, so this is its `failure` outcome either way;
+                     // the detail says whether the grant moved or the gate could not decide.
                      audit_or_flag(req, res, "echo.source.reenable", "failure", "command", "",
-                                   std::format("permission_revoked device={} source={}", device_id,
-                                               source));
+                                   std::format("{} device={} source={}",
+                                               recheck.unavailable ? "scoped_gate_unavailable"
+                                                                   : "permission_revoked",
+                                               device_id, source));
+                     write_echo_scoped_refusal(res, recheck);
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "denied"}}).increment();
@@ -2565,9 +2658,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                    std::format("agent_not_connected source={}",
                                                 source));
                      res.status = 404;
-                     res.set_content("<span class=\"echo-row-error\">"
-                                     "Agent not reachable.</span>",
-                                     "text/html; charset=utf-8");
+                     res.set_content(kEchoAgentNotReachableHtml, "text/html; charset=utf-8");
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_reenable_total",
                                            {{"result", "agent_not_connected"}}).increment();
@@ -2606,17 +2697,24 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // agent-side (returned in the response record) and is NOT in this audit row.
     sink.Post("/fragments/echo/retention-paused/purge",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
+                 auto session = auth_fn_(req, res);
+                 if (!session) return;
+                 if (!session->token_scope_service.empty()) {
+                     // #2540: same explicit refusal as re-enable. The global gate this route
+                     // asked before refused EVERY service-scoped token; a confined one purges
+                     // through POST /api/v1/echo/retention-paused/purge, never this
+                     // cookie-session fragment. Independent of device_id (no existence oracle).
+                     res.status = 403;
+                     res.set_content("<span class=\"echo-row-error\">Permission denied.</span>",
+                                     "text/html; charset=utf-8");
                      audit_or_flag(req, res, "echo.source.purge", "denied", "command", "",
-                                   "rbac_denied");
+                                   "service_scoped_token_denied");
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
                              .increment();
                      }
                      return;
                  }
-                 auto session = auth_fn_(req, res);
-                 if (!session) return;
                  // CSRF same-site gate for this destructive cookie-authenticated POST
                  // (mirrors ca_routes.cpp ca.revoke / ca.import-chain). Reject a
                  // cross-origin OR header-less request before the irreversible dispatch —
@@ -2684,29 +2782,24 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
-                 // Per-device RBAC visibility (same 404-collapse as reenable so the
-                 // response cannot enumerate device existence; real reason audited).
-                 bool visible = false;
-                 if (mgmt_group_store_) {
-                     // ADR-0042: nullopt (store degraded) → not visible (fail-closed).
-                     if (auto visible_ids = mgmt_group_store_->get_visible_agents(session->username)) {
-                         for (const auto& vid : *visible_ids) {
-                             if (vid == device_id) {
-                                 visible = true;
-                                 break;
-                             }
-                         }
+                 // #2540: Infrastructure:Delete on the posted device through the per-device
+                 // scoped-permission chokepoint, the SOLE gate as on the REST purge twin (same
+                 // fail-closed 503 and 404-collapse as reenable; real reason audited).
+                 const auto gate = probe_echo_scoped_perm(scoped_perm_fn_, req, "Infrastructure",
+                                                          "Delete", device_id);
+                 if (!gate.allowed) {
+                     if (gate.unavailable) {
+                         audit_or_flag(req, res, "echo.source.purge", "denied", "command", "",
+                                       std::format("scoped_gate_unavailable source={}", source));
+                     } else {
+                         audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
+                                       std::format("scope_violation source={}", source));
                      }
-                 }
-                 if (!visible) {
-                     audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
-                                   std::format("scope_violation source={}", source));
-                     res.status = 404;
-                     res.set_content("<span class=\"echo-row-error\">Agent not reachable.</span>",
-                                     "text/html; charset=utf-8");
+                     write_echo_scoped_refusal(res, gate);
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_purge_total",
-                                           {{"result", "scope_violation"}})
+                                           {{"result", gate.unavailable ? "denied"
+                                                                       : "scope_violation"}})
                              .increment();
                      }
                      return;
@@ -2730,14 +2823,21 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                      return;
                  }
-                 // Infrastructure:Delete was admitted before the wait. With RBAC off the
-                 // dispatch seam admits every human principal and echo.purge_source carries no
-                 // ExecuteGate, so a JIT elevation that lapsed during the wait is caught only
-                 // here (#3619 review). The gate writes its own refusal.
-                 if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
+                 // Infrastructure:Delete on this device was admitted before the wait. With RBAC
+                 // off the dispatch seam admits every human principal and echo.purge_source
+                 // carries no ExecuteGate, so a JIT elevation that lapsed during the wait is
+                 // caught only here (#3619 review). The gate writes its own refusal row.
+                 if (const auto recheck = probe_echo_scoped_perm(scoped_perm_fn_, req,
+                                                                 "Infrastructure", "Delete",
+                                                                 device_id);
+                     !recheck.allowed) {
+                     // Same outcome row as re-enable: `failure`, with the real cause.
                      audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
-                                   std::format("permission_revoked device={} source={}", device_id,
-                                               source));
+                                   std::format("{} device={} source={}",
+                                               recheck.unavailable ? "scoped_gate_unavailable"
+                                                                   : "permission_revoked",
+                                               device_id, source));
+                     write_echo_scoped_refusal(res, recheck);
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
                              .increment();
@@ -2781,8 +2881,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
                                    std::format("agent_not_connected source={}", source));
                      res.status = 404;
-                     res.set_content("<span class=\"echo-row-error\">Agent not reachable.</span>",
-                                     "text/html; charset=utf-8");
+                     res.set_content(kEchoAgentNotReachableHtml, "text/html; charset=utf-8");
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_source_purge_total",
                                            {{"result", "agent_not_connected"}})
@@ -3951,8 +4050,10 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
 }
 
 std::string DashboardRoutes::render_echo_retention_paused(
-    const std::string& username, bool can_execute, bool can_delete) const {
-    EchoRetentionPausedScan scan = gather_echo_retention_paused(username);
+    const std::string& username, bool can_execute, bool can_delete,
+    const authz::VisibleSet& gate_scope, bool scope_is_authoritative) const {
+    EchoRetentionPausedScan scan =
+        gather_echo_retention_paused(username, gate_scope, scope_is_authoritative);
     const std::string& scan_id = scan.scan_id;
     const int scan_count = scan.scan_count;
     const int64_t scan_at = scan.scan_at;

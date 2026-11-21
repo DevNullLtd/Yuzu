@@ -19298,6 +19298,15 @@ TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds
         CHECK(it->second.at(c.ptr).get<std::size_t>() == c.expected);
     }
 
+    // The REST twin's OpenAPI item states the same three matcher field bounds (#6478).
+    const auto openapi = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+    const auto& rest_matcher = openapi.at(nlohmann::json::json_pointer(
+        "/paths/~1result-sets~1from-instruction-result/post/requestBody/content/application~1json"
+        "/schema/properties/matcher/properties"));
+    CHECK(rest_matcher.at("column").value("maxLength", std::size_t{0}) == kMatcherColumnMaxLen);
+    CHECK(rest_matcher.at("op").value("maxLength", std::size_t{0}) == kMatcherOpMaxLen);
+    CHECK(rest_matcher.at("value").value("maxLength", std::size_t{0}) == kMatcherValueMaxLen);
+
     // The three software tools' exact property key sets and published vocabulary enums (a dropped
     // or renamed property, or a drifted enum, is an advertisement the handler no longer honours).
     const std::map<std::string, std::set<std::string>> software_keys = {
@@ -41097,6 +41106,11 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
             CHECK(body["error"]["message"].get<std::string>().find("matcher") !=
                   std::string::npos);
         }
+        // None of those refusals is the size bound, so none is counted as an input bound.
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "create_result_set_from_instruction_result"},
+                           {"reason", "arg_too_large"}})
+                  .value() == 0.0);
     }
 
     SECTION("create_result_set_from_instruction_result: oversized instruction_id, matcher "
@@ -41127,6 +41141,42 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
             auto body = nlohmann::json::parse(res->body);
             REQUIRE(body.contains("error"));
             CHECK(body["error"]["code"] == kInvalidParams);
+            // The check is the admission function the REST twin shares (#6478); this tool's
+            // text and its input-bound counter are what they were.
+            CHECK(body["error"]["message"] ==
+                  "a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)");
+            CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                              {{"tool", "create_result_set_from_instruction_result"},
+                               {"reason", "arg_too_large"}})
+                      .value() == 1.0);
+        }
+        SECTION("the matcher as a whole: the one text the REST twin also sends, counted like "
+                "the fields above (#6478)") {
+            auto res = ts.call(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":"x","matcher":{"column":"c","op":"in","value_set":[")" +
+                std::string(rs_matcher::kMatcherMaxBytes, 'v') + R"("]}}}})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"] ==
+                  "RESULT_SET_BAD_REQUEST: matcher exceeds 65536 bytes as compact JSON");
+            CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                              {{"tool", "create_result_set_from_instruction_result"},
+                               {"reason", "arg_too_large"}})
+                      .value() == 1.0);
+            // An input bound is audited as one: a denied row that names the envelope's
+            // correlation id. The refusal is permanent, so the retry hint is null.
+            const auto cid = body["error"]["data"].at("correlation_id").get<std::string>();
+            CHECK_FALSE(cid.empty());
+            CHECK(body["error"]["data"].at("retry_after_ms").is_null());
+            const auto row =
+                std::find(ts.audit_details.begin(), ts.audit_details.end(),
+                          "input bound exceeded: RESULT_SET_BAD_REQUEST: matcher exceeds 65536 "
+                          "bytes as compact JSON correlation_id=" + cid);
+            REQUIRE(row != ts.audit_details.end());
+            CHECK(ts.audit_log[row - ts.audit_details.begin()] ==
+                  "mcp.create_result_set_from_instruction_result|denied");
         }
         SECTION("params value (Gate 2 MEDIUM finding: matches execute_instruction's "
                 "65536-byte params-value convention)") {
