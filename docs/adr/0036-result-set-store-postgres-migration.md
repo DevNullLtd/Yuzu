@@ -417,10 +417,13 @@ the header once per change of set in a bulk load that interleaves sets. A cascad
 expression per row (about 0.55 s instead of 0.45 s for a 1M-row cascade, measured once on
 PostgreSQL 16). Because the trigger adds that cost to every cascaded row, `gc_sweep` now also
 bounds each pass by member rows: within its 5,000-set cap it deletes only the oldest-first prefix
-whose summed `device_count` stays within 5,000,000 (about 3 s measured, the first set always
-goes), so an expired backlog can no longer make a pass exceed the 30 s statement timeout, roll
-back and retry the same sets forever (a defect the set cap alone already had). At open the store checks that the four triggers are present, `ENABLE ALWAYS`,
-of v7's shape and bound to v7's function bodies; otherwise, or if the check cannot be read, it
+whose summed `device_count` stays within 5,000,000 (the first set always goes; a 5M-row pass
+took 3.1 s measured on PostgreSQL 16 with the trigger), so a backlog of sets the server filled can
+no longer make a pass exceed the 30 s statement timeout, roll back and retry the same sets forever
+(a defect the set cap alone already had). The budget reads the server-maintained `device_count`:
+member rows written out of band are not counted, so for them the bound is best-effort and the
+5,000-set cap still applies. At open the store checks that the four triggers are present,
+`ENABLE ALWAYS`, of v7's shape and bound to v7's function bodies; otherwise, or if the check cannot be read, it
 logs an error and serves membership uncached. A writer that disables the triggers while servers run, or writes
 `membership_generation` directly, breaks the
 invariant and requires a restart of every replica (`docs/user-manual/server-admin.md`, "Result-set

@@ -2006,7 +2006,7 @@ TEST_CASE("ResultSetStore: GC sweep stops a pass at the member-row budget",
             "source_payload, device_count) VALUES "
             "('rs_budget1', 'alice', 1, 2, 1, 'manual_curate', '{}', 3000000), "
             "('rs_budget2', 'alice', 1, 3, 1, 'manual_curate', '{}', 3000000), "
-            "('rs_budget3', 'alice', 1, 4, 1, 'manual_curate', '{}', 1000000), "
+            "('rs_budget3', 'alice', 1, 4, 1, 'manual_curate', '{}', 2000000), "
             "('rs_budget4', 'alice', 1, 5, 1, 'manual_curate', '{}', 9000000), "
             "('rs_budget5', 'alice', 1, 6, 1, 'manual_curate', '{}', 0)")};
         INFO(PQresultErrorMessage(r.get()));
@@ -2014,7 +2014,12 @@ TEST_CASE("ResultSetStore: GC sweep stops a pass at the member-row budget",
     }
 
     CHECK(store.gc_sweep() == 1); // 3M fits; 3M + 3M does not
-    CHECK(store.gc_sweep() == 2); // 3M + 1M fits; adding 9M does not
+    CHECK(store.gc_sweep() == 2); // 3M + 2M is exactly the budget (inclusive); adding 9M is not
+    CHECK_FALSE(get_ok(store, "rs_budget1").has_value());
+    CHECK_FALSE(get_ok(store, "rs_budget2").has_value());
+    CHECK_FALSE(get_ok(store, "rs_budget3").has_value());
+    CHECK(get_ok(store, "rs_budget4").has_value()); // the newer sets survive, oldest go first
+    CHECK(get_ok(store, "rs_budget5").has_value());
     CHECK(store.gc_sweep() == 1); // 9M alone is over budget but the first set always goes
     CHECK(store.gc_sweep() == 1); // the empty set
     CHECK(store.gc_sweep() == 0);

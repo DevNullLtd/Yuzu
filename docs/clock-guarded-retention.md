@@ -48,7 +48,12 @@ is why the fix is the fact set rather than a fourth patch.
 
 The cap is the half that always applies; the detectors are best-effort.
 
-Cap the WORK a pass does, not only the row count it selects, when a selected row can fan out: `ResultSetStore::gc_sweep` caps sets (5,000) AND the member rows their cascade deletes (5,000,000 summed `device_count`, always at least one set), because 5,000 sets of up to 100,000 members each could exceed the statement timeout, roll back, and retry the same oldest cohort on every pass.
+Cap the WORK a pass does, not only the row count it selects, when a selected row can fan out:
+`ResultSetStore::gc_sweep` caps sets (5,000) AND the member rows their cascade deletes (5,000,000
+summed `device_count`, always at least one set), because 5,000 sets of up to 100,000 members each
+could exceed the statement timeout, roll back, and retry the same oldest cohort on every pass. The
+row budget is best-effort: it reads the server's own count, so member rows written out of band
+are not in it; the set cap is the part that always applies.
 
 ### 6. Decide DELIBERATELY what a missing anchor means — and record which way you went
 
