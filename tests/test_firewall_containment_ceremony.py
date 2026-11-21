@@ -35,6 +35,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "test" / "instructions_firewall_containment.py"
+CHILD_TIMEOUT_S = 20  # under the meson timeout (30 s) so a hung child fails its own test by name
 sys.path.insert(0, str(SCRIPT.parent))
 import instructions_firewall_containment as fc  # noqa: E402
 
@@ -73,7 +74,8 @@ class Guards(unittest.TestCase):
     def test_script_refuses_under_ssh_before_any_network(self):
         env = dict(os.environ, SSH_CONNECTION="1 2 3 4")
         r = subprocess.run([sys.executable, str(SCRIPT), "--dashboard", "http://127.0.0.1:9",
-                            "--apply-containment"], capture_output=True, text=True, env=env, timeout=60)
+                            "--apply-containment"], capture_output=True, text=True, env=env,
+                           timeout=CHILD_TIMEOUT_S)
         self.assertEqual(r.returncode, fc.EXIT_PRECONDITION)
         self.assertIn("refused", r.stderr)
         if platform.system() in ("Linux", "Darwin"):  # elsewhere the POSIX-only refusal comes first
@@ -811,7 +813,8 @@ class RunLock(unittest.TestCase):
             os.close(holder)
 
     def test_the_docstring_and_help_say_where_the_lock_lives(self):
-        r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, timeout=60)
+        r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True,
+                           timeout=CHILD_TIMEOUT_S)
         for text in (fc.__doc__, fc.take_run_lock.__doc__, " ".join(r.stdout.split())):
             self.assertIn("per user", text)
             self.assertIn("another user created", text)
@@ -842,7 +845,8 @@ class Usage(unittest.TestCase):
                                               i_have_console_access_to_agent=True), env))
 
     def test_help_and_the_loopback_refusal_say_what_a_one_host_run_ends_with(self):
-        r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, timeout=60)
+        r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True,
+                           timeout=CHILD_TIMEOUT_S)
         self.assertEqual(r.returncode, 0)
         flat = " ".join(r.stdout.split())
         for needle in ("--remote", "refused|self_host", "exit 2", "--agent-hostname",

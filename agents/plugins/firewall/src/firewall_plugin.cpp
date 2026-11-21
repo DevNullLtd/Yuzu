@@ -1068,22 +1068,28 @@ unsigned note_probe_end(bool ended_in_churn) {
     return g_nft_churn_streak.fetch_add(1) + 1;
 }
 
-/// Opens a socket, runs ONE dump on it, closes it. A failed open is reported through
-/// `open_errnos` (the caller collects every socket-open errno so each diagnostic is written
-/// once) and answers the default (io_error) result, the same as before. `out` is appended to,
-/// so each pass passes a buffer of its own.
-[[nodiscard]] yuzu::firewall::NftDumpResult dump_once(std::uint16_t msg_type,
-                                                      std::vector<std::byte>& out,
-                                                      std::chrono::steady_clock::time_point deadline,
-                                                      std::vector<int>& open_errnos) {
+/// One dump's outcome. `res` stays the default (io_error) when the socket did not open, and
+/// `open_errno` then carries why (the caller collects every socket-open errno so each diagnostic
+/// is written once). `buf` holds this dump's bytes only: every dump owns a fresh buffer, so a
+/// re-run never stacks its bytes on the first pass's.
+struct NftDump {
+    yuzu::firewall::NftDumpResult res;
+    std::vector<std::byte> buf;
+    std::optional<int> open_errno;
+};
+
+/// Opens a socket, runs ONE dump on it, closes it.
+[[nodiscard]] NftDump dump_once(std::uint16_t msg_type,
+                                std::chrono::steady_clock::time_point deadline) {
+    NftDump dump;
     auto sock = open_nft_socket(remaining_ms(deadline));
     if (!sock) {
-        open_errnos.push_back(sock.error());
-        return yuzu::firewall::NftDumpResult{};
+        dump.open_errno = sock.error();
+        return dump;
     }
-    const auto res = nft_dump(sock->get(), msg_type, out, deadline);
+    dump.res = nft_dump(sock->get(), msg_type, dump.buf, deadline);
     sock->reset(); // UP-1: fresh fd per dump, no undrained-leftover-bytes risk
-    return res;
+    return dump;
 }
 
 struct NftProbeResult {
@@ -1127,10 +1133,10 @@ struct NftProbeResult {
             attempt == 1 ? start + std::chrono::milliseconds{2500} : overall_deadline;
         const auto rule_deadline = overall_deadline; // remainder(>=2500ms)+slack
 
-        std::vector<std::byte> table_buf;
-        const auto opens_before = open_errnos.size();
-        const auto table_res = dump_once(nft::kNftMsgGettable, table_buf, table_deadline, open_errnos);
-        if (table_res.status != yuzu::firewall::NftDumpStatus::ok) {
+        const auto table = dump_once(nft::kNftMsgGettable, table_deadline);
+        if (table.open_errno)
+            open_errnos.push_back(*table.open_errno);
+        if (table.res.status != yuzu::firewall::NftDumpStatus::ok) {
             // A table socket that would not open writes its diagnostic rows and nothing else (there
             // was no dump to report); a dump that failed writes its own row (BR-03: this used to
             // discard table_res silently, making the documented troubleshooting token unreachable).
@@ -1138,25 +1144,26 @@ struct NftProbeResult {
             // On a re-run this is the same path: the earlier pass's churn is superseded.
             for (const auto& row : yuzu::firewall::nft_open_diag_rows(open_errnos))
                 ctx.write_output(row);
-            if (open_errnos.size() == opens_before)
-                ctx.write_output(yuzu::firewall::nft_diag_row("table", table_res));
+            if (!table.open_errno)
+                ctx.write_output(yuzu::firewall::nft_diag_row("table", table.res));
             note_probe_end(/*ended_in_churn=*/false);
             return std::nullopt; // unreachable -- fall through
         }
-        info.tables_seen = info.tables_seen || !yuzu::firewall::parse_nft_tables(table_buf).empty();
+        info.tables_seen = info.tables_seen || !yuzu::firewall::parse_nft_tables(table.buf).empty();
 
-        // Fresh buffers every pass: nft_dump appends, so a re-run into `result`'s buffers would
-        // stack its bytes on the first pass's and read that pass's generation.
-        std::vector<std::byte> chain_buf, rule_buf;
-        const auto chain_res = dump_once(nft::kNftMsgGetchain, chain_buf, chain_deadline, open_errnos);
-        const auto rule_res = dump_once(nft::kNftMsgGetrule, rule_buf, rule_deadline, open_errnos);
+        auto chain = dump_once(nft::kNftMsgGetchain, chain_deadline);
+        if (chain.open_errno)
+            open_errnos.push_back(*chain.open_errno);
+        auto rule = dump_once(nft::kNftMsgGetrule, rule_deadline);
+        if (rule.open_errno)
+            open_errnos.push_back(*rule.open_errno);
         const bool consistent = yuzu::firewall::nft_generations_consistent(
-            yuzu::firewall::nft_dump_generation(table_buf, nft::nft_msg_type(nft::kNftMsgNewtable)),
-            yuzu::firewall::nft_dump_generation(chain_buf, nft::nft_msg_type(nft::kNftMsgNewchain)),
-            yuzu::firewall::nft_dump_generation(rule_buf, nft::nft_msg_type(nft::kNftMsgNewrule)));
-        failed = yuzu::firewall::nft_failed_dumps(chain_res, rule_res, consistent);
-        result.chain_buf = std::move(chain_buf);
-        result.rule_buf = std::move(rule_buf);
+            yuzu::firewall::nft_dump_generation(table.buf, nft::nft_msg_type(nft::kNftMsgNewtable)),
+            yuzu::firewall::nft_dump_generation(chain.buf, nft::nft_msg_type(nft::kNftMsgNewchain)),
+            yuzu::firewall::nft_dump_generation(rule.buf, nft::nft_msg_type(nft::kNftMsgNewrule)));
+        failed = yuzu::firewall::nft_failed_dumps(chain.res, rule.res, consistent);
+        result.chain_buf = std::move(chain.buf);
+        result.rule_buf = std::move(rule.buf);
         if (!yuzu::firewall::nft_rerun_worthwhile(yuzu::firewall::nft_churn_only(failed), attempt,
                                                   remaining_ms(overall_deadline)))
             break;

@@ -88,6 +88,10 @@ struct Verdict {
 
 // ── writing a snapshot ──────────────────────────────────────────────────────
 
+// write_section, write_absent and finish append to the snapshot text the caller is building: `out`
+// is that text, not a result or an error channel. This is a deliberate exception to the
+// output-parameter rule in docs/cpp-conventions.md, for a test-only builder.
+
 /// One section: its header, then the tool's output when the read COMPLETED, else `[failed]`.
 /// `complete` is yuzu::firewall::subprocess_complete(result) for a subprocess read, whoever ran
 /// it: a read that did not run, timed out, was clipped or exited non-zero is never recorded as
@@ -233,6 +237,7 @@ struct Parsed {
 }
 
 /// A first-line-of-detail for the first few lines that differ.
+/// `detail` is read as well as written: the cap counts the notes already in it.
 inline void note(std::string& detail, std::string_view kind, std::string_view line) {
     constexpr std::size_t kMaxNotes = 12;
     if (std::count(detail.begin(), detail.end(), '\n') >= static_cast<std::ptrdiff_t>(kMaxNotes))

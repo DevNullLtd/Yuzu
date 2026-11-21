@@ -195,11 +195,12 @@ fi
 
 # network-disrupt is never a dispatch of its definitions: it runs the firewall containment ceremony
 # (scripts/test/instructions_firewall_containment.py) against the one --target-agent-id, which must be
-# the disposable agent on this host. It runs alone, never beside another class, and never in /test.
+# the disposable agent, on this host or, with --target-agent-hostname, on another host (the ceremony's
+# --remote mode). It runs alone, never beside another class, and never in /test.
 for r in "${RISKS[@]}"; do
     [[ "$r" == "network-disrupt" ]] || continue
     if [[ "${#RISKS[@]}" -ne 1 || -z "$TARGET_AGENT_ID" ]]; then
-        echo "error: --risks network-disrupt runs alone and needs --target-agent-id (the disposable agent on this host)" >&2
+        echo "error: --risks network-disrupt runs alone and needs --target-agent-id (the disposable agent)" >&2
         exit 2
     fi
     CEREMONY_ARGS=(--dashboard "$DASHBOARD_URL" --user "$USERNAME" --agent-id "$TARGET_AGENT_ID" --apply-containment)

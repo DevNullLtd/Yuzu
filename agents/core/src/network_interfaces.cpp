@@ -167,13 +167,13 @@ std::optional<std::set<std::string>> collect(bool include_local_scopes) {
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
 
 std::vector<std::string> enumerate_local_ips() {
-    const auto addrs = collect(false);
+    const auto addrs = collect(/*include_local_scopes=*/false);
     return addrs ? std::vector<std::string>(addrs->begin(), addrs->end())
                  : std::vector<std::string>{};
 }
 
 std::optional<std::vector<std::string>> enumerate_own_addresses() {
-    const auto addrs = collect(true);
+    const auto addrs = collect(/*include_local_scopes=*/true);
     if (!addrs)
         return std::nullopt;
     return std::vector<std::string>(addrs->begin(), addrs->end());

@@ -77,7 +77,7 @@ open the run lock`, exit 2: a different message from a held lock).
 The ceremony dispatches `quarantine`, `release` and `quarantine_status` only. `quarantine_allow` (the
 fourth containment action) is not exercised here: it has no ceremony coverage, only its unit tests.
 
---record PATH writes one JSON object when the run ends, on every exit path (UTC time, mode local or
+--record PATH writes one JSON object when the run ends, on every exit path of a run (UTC time, mode local or
 remote, agent id, hostname, the statuses read in order, contained and released, the exit code, the
 agent's refusal token if it refused): the retained pass or fail record of the run. It is written mode
 0600 and a PATH that is a symlink is refused (exit 2, nothing dispatched).
@@ -585,7 +585,7 @@ def parse_args(argv):
                    help="--remote only: you are at the agent's console, so a release the network cannot "
                         "deliver can be done by hand")
     p.add_argument("--record", default="",
-                   help="write one JSON record of the run to PATH when it ends, on every exit path (mode 0600; "
+                   help="write one JSON record of the run to PATH when it ends, on every exit path of a run (mode 0600; "
                         "a symlink is refused)")
     return p.parse_args(argv)
 
