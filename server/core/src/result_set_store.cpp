@@ -210,7 +210,7 @@ BEGIN
   RETURN OLD;
 END )sql";
 
-// The DELETE trigger's WHEN clause as v7 writes it, and as PostgreSQL 16 deparses it
+// The DELETE trigger's WHEN clause as v7 writes it, and as PostgreSQL 16 to 18 deparse it
 // (pg_get_expr). member_triggers_in_force compares the deparsed text; a server version that
 // deparses it differently reads as "not in force" and serves membership uncached, never stale.
 constexpr std::string_view kRestampDeletedWhen =
@@ -369,8 +369,9 @@ bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 enum class MemberTriggerCheck { InForce, NotInForce, Unreadable };
 
 [[nodiscard]] MemberTriggerCheck query_member_triggers(PGconn* conn) {
-    // tgattr: PostgreSQL refuses a column list on a trigger with transition tables, so this
-    // conjunct cannot fail for a trigger that passes the rest; it is defence in depth only.
+    // tgattr: a column list exists only on UPDATE OF, and PostgreSQL refuses one on a trigger
+    // with transition tables, so this conjunct cannot fail for a trigger that passes the rest;
+    // it is defence in depth only.
     pg::PgResult res = pg::exec_params(
         conn,
         "SELECT count(*) = 4 AND COALESCE(bool_and("
