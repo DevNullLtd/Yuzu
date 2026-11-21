@@ -21,6 +21,7 @@
 #include <format>
 #include <iterator>
 #include <limits>
+#include <new>
 #include <random>
 #include <string_view>
 #include <utility>
@@ -219,10 +220,67 @@ const std::vector<pg::PgMigration>& migrations() {
         {5,
          "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS agents_unanswered BIGINT NOT NULL "
          "DEFAULT 0;"},
-        // A promoted standby may fill the same pending ID differently after asynchronous
-        // replication loses a committed fill. Only a writer committing the members can
-        // stamp their generation. Pre-upgrade sets and fills by older writers stay NULL.
+        // v6: the materialization generation a replica's member cache is keyed on. A promoted
+        // standby may fill the same pending ID differently after asynchronous replication loses
+        // a committed fill, so the generation is a random UUID, never a counter. The writer
+        // committing the members stamps it (insert_row_impl, materialize). NULL means "never
+        // cached": every read of such a set takes the joined read.
         {6, "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS membership_generation UUID;"},
+        // v7: enforce the cache invariant in the database, not only in the two C++ writers: any
+        // write to result_set_members that a cache could have observed re-stamps the generation
+        // of every affected set that carries one, in the writing transaction (see the header's
+        // "Member cache invariant"). Statement-level, so a bulk load costs one header UPDATE per
+        // affected set per statement, never one per member row:
+        //   INSERT/UPDATE: the transition tables name the affected sets.
+        //   DELETE at trigger depth 0 (an out-of-band delete) and TRUNCATE: no transition table
+        //     (a DELETE trigger with one would also capture every cascaded row of a gc_sweep or
+        //     delete_set), so every set carrying a generation is re-stamped. A cascade from a
+        //     result_sets delete runs inside the FK trigger (depth >= 1) and is skipped: its
+        //     header row is gone, so every cached copy already reads NotFound.
+        // ENABLE ALWAYS: also fires under session_replication_role = replica. It does not fire
+        // when the trigger is disabled (ALTER TABLE ... DISABLE TRIGGER, pg_restore
+        // --disable-triggers): the operator doc requires a restart of every replica then.
+        // Idempotent (OR REPLACE / IF EXISTS) so a test that rolls the version back re-runs it.
+        {7, R"sql(
+SET LOCAL client_min_messages = warning;
+CREATE OR REPLACE FUNCTION result_set_store.result_set_members_restamp() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
+     WHERE r.membership_generation IS NOT NULL
+       AND r.id IN (SELECT a.result_set_id FROM added a);
+  ELSIF TG_OP = 'UPDATE' THEN
+    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
+     WHERE r.membership_generation IS NOT NULL
+       AND (r.id IN (SELECT a.result_set_id FROM added a)
+            OR r.id IN (SELECT d.result_set_id FROM removed d));
+  ELSE
+    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
+     WHERE r.membership_generation IS NOT NULL;
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS result_set_members_restamp_ins ON result_set_members;
+DROP TRIGGER IF EXISTS result_set_members_restamp_upd ON result_set_members;
+DROP TRIGGER IF EXISTS result_set_members_restamp_del ON result_set_members;
+DROP TRIGGER IF EXISTS result_set_members_restamp_trunc ON result_set_members;
+CREATE TRIGGER result_set_members_restamp_ins AFTER INSERT ON result_set_members
+  REFERENCING NEW TABLE AS added
+  FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
+CREATE TRIGGER result_set_members_restamp_upd AFTER UPDATE ON result_set_members
+  REFERENCING OLD TABLE AS removed NEW TABLE AS added
+  FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
+CREATE TRIGGER result_set_members_restamp_del AFTER DELETE ON result_set_members
+  FOR EACH STATEMENT WHEN (pg_catalog.pg_trigger_depth() = 0)
+  EXECUTE FUNCTION result_set_store.result_set_members_restamp();
+CREATE TRIGGER result_set_members_restamp_trunc AFTER TRUNCATE ON result_set_members
+  FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
+ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_ins;
+ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_upd;
+ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_del;
+ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_trunc;
+)sql"},
     };
     return kMigrations;
 }
@@ -687,11 +745,26 @@ ResultSetStore::CachedMembership ResultSetStore::cached_members(const std::strin
     return it == member_cache_index_.end() ? CachedMembership{} : it->second->snapshot;
 }
 
+void ResultSetStore::forget_members(const std::string& id) {
+    // Declared before the lock: the dropped entry (possibly the last reference to a large
+    // member set) is destroyed after the mutex is released, never under it.
+    std::list<MemberCacheEntry> dropped;
+    std::lock_guard lock(member_cache_mutex_);
+    if (auto it = member_cache_index_.find(id); it != member_cache_index_.end()) {
+        const auto entry = it->second;
+        member_cache_bytes_ -= entry->bytes;
+        member_cache_index_.erase(it); // the key views the node's id: erase it first
+        dropped.splice(dropped.end(), member_cache_fifo_, entry);
+    }
+}
+
 void ResultSetStore::retain_members(const std::string& id,
                                     CachedMembership snapshot,
                                     std::size_t bytes) {
     if (bytes > member_cache_budget_)
         return;
+    // Evicted and replaced entries are moved here and destroyed after the mutex is released.
+    std::list<MemberCacheEntry> dropped;
     std::lock_guard lock(member_cache_mutex_);
     if (auto it = member_cache_index_.find(id); it != member_cache_index_.end()) {
         auto entry = it->second;
@@ -699,13 +772,13 @@ void ResultSetStore::retain_members(const std::string& id,
             return; // A concurrent miss retained this generation.
         member_cache_bytes_ -= entry->bytes;
         member_cache_index_.erase(it);
-        member_cache_fifo_.erase(entry);
+        dropped.splice(dropped.end(), member_cache_fifo_, entry);
     }
     while (member_cache_bytes_ > member_cache_budget_ - bytes) {
-        const auto& oldest = member_cache_fifo_.front();
-        member_cache_bytes_ -= oldest.bytes;
-        member_cache_index_.erase(oldest.id);
-        member_cache_fifo_.pop_front();
+        const auto oldest = member_cache_fifo_.begin();
+        member_cache_bytes_ -= oldest->bytes;
+        member_cache_index_.erase(oldest->id);
+        dropped.splice(dropped.end(), member_cache_fifo_, oldest);
     }
     member_cache_fifo_.push_back({id, std::move(snapshot), bytes});
     const auto entry = std::prev(member_cache_fifo_.end());
@@ -730,13 +803,19 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
     // Read a live header on every use. The UUID identifies the materialization across
     // divergent PostgreSQL timelines. A generation mismatch takes the full joined read,
     // with its own complete owner/readiness/TTL check in the snapshot returning the IDs.
-    // No database access takes place under the cache mutex.
+    // No database access takes place under the cache mutex. Reusing cached IDs is sound only
+    // under the header's "Member cache invariant": every write to a set's member rows
+    // re-stamps its generation in the same transaction (migration v7 enforces it in SQL).
+    //
+    // Expiry is judged on this replica's clock ($3), the clock that wrote ttl_at
+    // (insert_row_impl, touch, unpin) and that gc_sweep deletes by, so a set is refused here
+    // exactly when this replica's GC would treat it as expired. A comparison against the
+    // database clock would refuse every unpinned set on a replica running behind it.
     static constexpr std::string_view columns =
         "SELECT (r.owner_principal = $2) AS owned, r.status, r.agents_failed, "
         "r.agents_unanswered, r.membership_generation ";
     static constexpr std::string_view live_row =
-        "WHERE r.id = $1 AND (r.pinned OR r.ttl_at >= floor(extract(epoch FROM "
-        "statement_timestamp()))::bigint)";
+        "WHERE r.id = $1 AND (r.pinned OR r.ttl_at >= $3::bigint)";
     static const auto header_sql = std::format("{}FROM result_set_store.result_sets r {}",
                                                columns, live_row);
     static const auto members_sql = std::format(
@@ -744,10 +823,14 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         "LEFT JOIN result_set_store.result_set_members m "
         "ON m.result_set_id = r.id AND r.owner_principal = $2 {}", columns, live_row);
     auto cached = cached_members(id);
-    const std::vector<std::string> params{id, owner};
+    const std::vector<std::string> params{id, owner, std::to_string(now_epoch())};
     pg::PgResult res;
     if (cached.members) {
         res = pg::exec_params(lease.get(), header_sql.c_str(), params);
+        if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 0) {
+            forget_members(id); // deleted or expired: free its budget now, not at eviction
+            return std::unexpected(ResultSetError::NotFound);
+        }
         if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1 &&
             cached.generation != PQgetvalue(res.get(), 0, 4))
             cached = {};
@@ -804,9 +887,17 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         bytes += sizeof(member) + member.capacity() + 1 + node_overhead;
     }
     if (!PQgetisnull(res.get(), 0, 4)) {
-        std::string generation{PQgetvalue(res.get(), 0, 4)};
-        bytes += generation.capacity() + 1;
-        retain_members(id, {std::move(generation), members}, bytes);
+        // Retention is an optimisation: an allocation failure while retaining must not fail
+        // a read that is already complete and authorised. retain_members leaves the cache
+        // consistent when it throws.
+        try {
+            std::string generation{PQgetvalue(res.get(), 0, 4)};
+            bytes += generation.capacity() + 1;
+            retain_members(id, {std::move(generation), members}, bytes);
+        } catch (const std::bad_alloc&) {
+            spdlog::warn("ResultSetStore::member_set_owned: out of memory while caching a "
+                         "membership; served uncached");
+        }
     }
     return OwnedMembers{std::move(members), complete};
 }

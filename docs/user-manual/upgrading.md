@@ -11,14 +11,15 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
-## Result-set membership cache on the server
+## Behaviour change: result-set membership is cached on each server, and an expired set is refused before GC
 
-The server's result-set store migration v6 adds a nullable materialization generation.
-Newly materialized sets receive a generation in the transaction that writes their members.
-Existing rows without one remain readable through the ordinary PostgreSQL query. The cache
-needs no backfill or operator configuration. A cached set whose generation changes after
-failover is loaded again. As on a cold read, a referenced unpinned set whose TTL has passed
-is refused even before garbage collection deletes it.
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**What changed.** Each server keeps a bounded cache (16 MiB, not configurable) of the member IDs of materialized result sets, so a repeated `from_result_set:` scope reads only the set's header from PostgreSQL. Ownership, expiry, readiness and completeness are still read live on every use. The result-set store gains two migrations: v6 adds the `result_sets.membership_generation` column, which the server stamps in the transaction that writes a set's members, and v7 adds statement-level triggers on `result_set_members` that re-stamp it for any write the server did not make (see [Result-set membership after a restore or repair](server-admin.md#result-set-membership-after-a-restore-or-repair)). Neither needs operator action.
+
+**An expired set is refused before GC.** An unpinned result set whose TTL (one hour after its last use) has passed is now refused as a `from_result_set:` scope (`404`, audited as an owner-check failure, the same answer as a deleted set) from the moment it expires, not only once the GC sweep has deleted it. Earlier, a set used between its expiry and the next sweep still resolved and the use extended its TTL. Expiry is judged on the serving replica's clock, the clock that wrote the TTL, so keep the server replicas' clocks synchronised (NTP).
+
+**Schedules and saved instructions.** A schedule, workflow or saved instruction whose scope names a result set by ID or alias and runs less often than once an hour now fails every run once the set expires (`owner_check_failed`), and no metric or alert reports it. Pin a result set that a recurring job targets (`POST /api/v1/result-sets/{id}/pin`, at most 50 per operator), or target a scope expression or management group instead.
 
 ## ⚠️ Breaking: `device.filesystem.search_dir` is bounded, refuses a regex lookahead and reports what it skipped (#6478)
 

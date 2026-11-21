@@ -123,10 +123,20 @@ expiry, readiness, completeness and the materialization generation before using 
 The generation identifies the committed membership even if PostgreSQL failover rolls back a
 previous materialization of the same pending set. A generation mismatch reloads the IDs.
 A set without a generation uses the ordinary joined read. An expired, unpinned set
-is unusable even before the GC sweep removes it. The caller's current device visibility
-still bounds the result. To verify reuse, the REST scope-preview regression test previews
-the same set twice and takes a PostgreSQL lock on the member table between previews. The
-second request still succeeds under that lock and responds to a change in device visibility.
+is unusable even before the GC sweep removes it; expiry is judged on the serving replica's
+clock, the clock that writes `ttl_at` and that the GC sweep deletes by. The caller's current
+device visibility still bounds the result.
+
+Reusing cached IDs is sound only because a set's members never change while its generation
+stays the same. The two server writers stamp a new generation in the transaction that writes
+the members, and statement-level triggers on `result_set_members` (store migration v7)
+re-stamp it for any other writer: an INSERT or UPDATE re-stamps the sets it touched, an
+out-of-band DELETE or a TRUNCATE re-stamps every set that has a generation. A bulk load
+costs one header update per set per statement, never one per member row. A delete that
+cascades from `result_sets` is not re-stamped, since the header is gone and every cached
+copy reads it as not found. A writer that disables the triggers bypasses this; the
+operator procedure is in the server administration guide, "Result-set membership after a
+restore or repair".
 
 ### 3.3 TTLs and GC
 
@@ -136,6 +146,7 @@ second request still succeeds under that lock and responds to a change in device
 | Pin | `pinned = 1`, `ttl_at = INT64_MAX`. Audit row written. Pin is reversible — unpinning restores `ttl_at = max(now + 3600, original_ttl_at)` |
 | Use as input scope | Touching a set as the scope of a new query or action extends `ttl_at` to `max(ttl_at, now + 3600)` so an operator working a chain does not lose the head of the chain mid-investigation |
 | Pin storm guard | Per-operator cap of 50 pinned result sets; further pins return `409 PIN_LIMIT`. Operator must unpin or delete before pinning more |
+| Expiry before GC | From the moment `ttl_at` passes, an unpinned set is refused as a `from_result_set:` scope (not found, `404`), before the sweep deletes it. Using it as a scope no longer extends it: touch or pin it before it expires |
 | GC | Background sweep every 5 minutes deletes rows where `ttl_at < now AND pinned = 0`. Cascades via `ON DELETE CASCADE` to `result_set_members`. Audit row written summarising count of GC'd sets. Post-ADR-0036: one replica sweeps per pass (Postgres advisory lock); a retention-clock anomaly (unusable prior reading, big step, would-wipe) declines the pass once per distinct anomaly fact-set (routed-concern "Clock-guarded retention"); every accepted pass is capped (5,000 deletes) |
 
 Hard maximum cap: **10,000 result sets per operator** (enforced at create time, returns `429 RESULT_SET_QUOTA`). Prevents a runaway script from filling the table.

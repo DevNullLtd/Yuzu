@@ -5143,6 +5143,18 @@ docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
   --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
 ```
 
+#### Result-set membership after a restore or repair
+
+Each server caches the member IDs of materialized result sets and reuses them only while the set's `result_sets.membership_generation` is unchanged. Every server write stamps a new generation, and the triggers that store migration v7 adds to `result_set_store.result_set_members` re-stamp it for any other write: `INSERT` (including `COPY` and a `pg_restore --data-only` of that table) and `UPDATE` re-stamp the sets they touch, a `DELETE` of member rows and a `TRUNCATE` re-stamp every set that has a generation (so one such statement makes every server reload every cached set once). The triggers are enabled `ALWAYS`, so they also fire under `session_replication_role = replica`. Deleting a `result_sets` row (which cascades to its members) needs nothing: every server reads it as not found at once.
+
+Restart **every** server replica (stop them all, then start them) after any change to `result_set_store` that does not fire those triggers, or a server that had cached a set can keep using its old members while another server uses the new ones:
+
+- a restore run with `--disable-triggers`, or any session that ran `ALTER TABLE result_set_store.result_set_members DISABLE TRIGGER ...` (re-enable them afterwards with `ENABLE ALWAYS TRIGGER`);
+- a restore of `result_sets` alone (for example `pg_restore --data-only -t result_sets`) that brings back headers whose `membership_generation` no longer matches the member rows, or any direct `UPDATE` of `membership_generation`;
+- any other write a trigger does not see, such as a file-level copy into a running cluster.
+
+The full restore above is already done with the servers stopped, so it needs no further step. A PostgreSQL failover needs none either: the generation is a random value written together with the members, so a promoted standby that lost or redid a fill carries a different generation.
+
 **MFA binding after a restore.** Follow the restore procedure in `docs/ops-runbooks/auth-db-recovery.md` (end every session after any restore of the `auth` schema; a restart is not enough), then run its "Post-restore verification": the two binding triggers are enabled and no enrolled account reads factor generation `0`.
 
 **Leader epoch after a restore.** The leader epoch packs the Postgres timeline of the cluster that minted it, and a restore into a fresh cluster may start on a lower timeline (it does when the source cluster had ever failed over). The server floors every new epoch by the `leader_elector.leader_state` row the dump carries, so the restore works as written; while the stored epoch carries a higher timeline than the new cluster's, the server logs a `leader_elector: minted epoch's timeline part ... is above the real Postgres timeline` warning at each election (only the sequence, not the timeline, separates epochs against a lossy promotion until the cluster's timeline reaches it, and a sequence behind the stored epoch is advanced automatically: see `ha-postgres.md`). Only if `leader_elector.leader_state` was lost or recreated while `plugin_config_store.enablement_meta` was restored, run the `issuer_epoch` reset from [Upgrading](upgrading.md#behaviour-change-the-leader-epoch-now-carries-the-postgres-timeline-ha-6535).

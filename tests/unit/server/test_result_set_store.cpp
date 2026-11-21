@@ -23,15 +23,18 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <format>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -582,6 +585,8 @@ TEST_CASE("ResultSetStore: migration v4 applies on a v3 database and is a no-op 
     }
     exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets DROP COLUMN agents_failed, "
                        "DROP COLUMN membership_generation");
+    // A v3 database has no member triggers either: v7 must create them from nothing.
+    exec_sql(db.dsn(), "DROP FUNCTION result_set_store.result_set_members_restamp() CASCADE");
     exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 3 WHERE store = 'result_set_store'");
     REQUIRE(query_scalar(db.dsn(),
                          "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
@@ -599,7 +604,13 @@ TEST_CASE("ResultSetStore: migration v4 applies on a v3 database and is a no-op 
         CHECK(got->device_count == 2);
         CHECK(got->agents_failed == 0);
         CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta WHERE store = "
-                                     "'result_set_store'") == "6");
+                                     "'result_set_store'") == "7");
+        CHECK(query_scalar(db.dsn(),
+                           "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = "
+                           "t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE "
+                           "n.nspname = 'result_set_store' AND c.relname = 'result_set_members' "
+                           "AND t.tgname LIKE 'result_set_members_restamp_%' AND "
+                           "t.tgenabled = 'A'") == "4");
     }
 }
 
@@ -641,7 +652,14 @@ TEST_CASE("ResultSetStore: migration v5 applies on a v4 database and old rows re
         REQUIRE(got.has_value());
         CHECK(got->agents_unanswered == 0);
         CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta WHERE store = "
-                                     "'result_set_store'") == "6");
+                                     "'result_set_store'") == "7");
+        // v7 re-ran over its own objects (this test keeps them): still four, all ALWAYS.
+        CHECK(query_scalar(db.dsn(),
+                           "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = "
+                           "t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE "
+                           "n.nspname = 'result_set_store' AND c.relname = 'result_set_members' "
+                           "AND t.tgname LIKE 'result_set_members_restamp_%' AND "
+                           "t.tgenabled = 'A'") == "4");
         auto owned = store.member_set_owned(old_id, "alice");
         REQUIRE(owned.has_value());
         CHECK(owned->complete);
@@ -986,7 +1004,7 @@ TEST_CASE("ResultSetStore: a promoted primary can materialize the same pending I
         REQUIRE(reread.has_value());
         CHECK(reread->ids == fresh->ids);
     }
-    SECTION("a rolling-upgrade writer commits without a generation") {
+    SECTION("an out-of-band fill that stamps no generation is read uncached") {
         exec_sql(db.dsn(),
                  "BEGIN; INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
                  "VALUES (" + id + ", 'legacy-device'); UPDATE result_set_store.result_sets "
@@ -1019,6 +1037,215 @@ TEST_CASE("ResultSetStore: a warmed membership rechecks owner and unswept expiry
     auto expired = store.member_set_owned(rs->id, "alice");
     REQUIRE_FALSE(expired.has_value());
     CHECK(expired.error() == ResultSetError::NotFound);
+}
+
+namespace {
+std::string generation_of(const std::string& dsn, const std::string& id) {
+    return query_scalar(dsn, "SELECT coalesce(membership_generation::text, '') FROM "
+                             "result_set_store.result_sets WHERE id = '" + id + "'");
+}
+} // namespace
+
+TEST_CASE("ResultSetStore: an out-of-band member write re-stamps the generation and is seen "
+          "by a warm replica",
+          "[pg][result_set][member_cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ResultSetStore warm{pool};
+    REQUIRE(warm.is_open());
+    auto rs = warm.create_materialized(req("alice"), {"dev-1", "dev-2"});
+    REQUIRE(rs.has_value());
+    const auto first = warm.member_set_owned(rs->id, "alice");
+    REQUIRE(first.has_value());
+    REQUIRE(warm.member_set_owned(rs->id, "alice")->ids == first->ids); // cached
+    const auto before = generation_of(db.dsn(), rs->id);
+    REQUIRE_FALSE(before.empty());
+    const std::string id = "'" + rs->id + "'";
+
+    std::unordered_set<std::string> expected;
+    SECTION("INSERT") {
+        exec_sql(db.dsn(), "INSERT INTO result_set_store.result_set_members VALUES (" + id +
+                               ", 'dev-3')");
+        expected = {"dev-1", "dev-2", "dev-3"};
+    }
+    SECTION("UPDATE") {
+        exec_sql(db.dsn(), "UPDATE result_set_store.result_set_members SET device_id = 'dev-9' "
+                           "WHERE result_set_id = " + id + " AND device_id = 'dev-1'");
+        expected = {"dev-9", "dev-2"};
+    }
+    SECTION("DELETE") {
+        exec_sql(db.dsn(), "DELETE FROM result_set_store.result_set_members WHERE "
+                           "result_set_id = " + id + " AND device_id = 'dev-1'");
+        expected = {"dev-2"};
+    }
+    SECTION("TRUNCATE") {
+        exec_sql(db.dsn(), "TRUNCATE result_set_store.result_set_members");
+        expected = {};
+    }
+    SECTION("a bulk multi-row INSERT in one transaction stamps once per statement") {
+        exec_sql(db.dsn(), "BEGIN; INSERT INTO result_set_store.result_set_members "
+                           "SELECT " + id + ", 'bulk-' || g FROM generate_series(1, 5000) g; "
+                           "COMMIT");
+        expected = {"dev-1", "dev-2"};
+        for (int i = 1; i <= 5000; ++i)
+            expected.insert("bulk-" + std::to_string(i));
+    }
+    CHECK(generation_of(db.dsn(), rs->id) != before);
+    auto after = warm.member_set_owned(rs->id, "alice");
+    REQUIRE(after.has_value());
+    CHECK(after->ids != first->ids);
+    CHECK(*after->ids == expected);
+    ResultSetStore cold{pool};
+    auto cold_read = cold.member_set_owned(rs->id, "alice");
+    REQUIRE(cold_read.has_value());
+    CHECK(*cold_read->ids == *after->ids); // warm and cold replicas agree
+}
+
+TEST_CASE("ResultSetStore: the product writers' cascades do not re-stamp other sets",
+          "[pg][result_set][member_cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ResultSetStore store{pool};
+    auto doomed = store.create_materialized(req("alice"), {"dev-1"});
+    auto kept = store.create_materialized(req("alice"), {"dev-2"});
+    REQUIRE(doomed.has_value());
+    REQUIRE(kept.has_value());
+    REQUIRE(store.member_set_owned(doomed->id, "alice").has_value());
+    const auto kept_generation = generation_of(db.dsn(), kept->id);
+
+    SECTION("delete_set cascades") {
+        REQUIRE(store.delete_set(doomed->id).has_value());
+    }
+    SECTION("an out-of-band header delete cascades") {
+        exec_sql(db.dsn(), "DELETE FROM result_set_store.result_sets WHERE id = '" + doomed->id +
+                               "'");
+    }
+    CHECK(generation_of(db.dsn(), kept->id) == kept_generation);
+    auto gone = store.member_set_owned(doomed->id, "alice");
+    REQUIRE_FALSE(gone.has_value());
+    CHECK(gone.error() == ResultSetError::NotFound);
+    CHECK(member_set_owned_ok(store, kept->id, "alice") ==
+          std::unordered_set<std::string>{"dev-2"});
+
+    // An out-of-band member delete has no transition table: every stamped set is re-stamped.
+    exec_sql(db.dsn(), "DELETE FROM result_set_store.result_set_members WHERE device_id = "
+                       "'no-such-device'");
+    CHECK(generation_of(db.dsn(), kept->id) != kept_generation);
+}
+
+TEST_CASE("ResultSetStore: a materialize fill and a pending set stamp as the writer decides",
+          "[pg][result_set][member_cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ResultSetStore store{pool};
+    auto rs = store.create_pending(req("alice"), "exec-1");
+    REQUIRE(rs.has_value());
+    CHECK(generation_of(db.dsn(), rs->id).empty()); // a pending set carries none
+    REQUIRE(store.materialize(rs->id, {"dev-1"}).has_value());
+    CHECK_FALSE(generation_of(db.dsn(), rs->id).empty());
+    auto empty = store.create_materialized(req("alice"), {});
+    REQUIRE(empty.has_value());
+    CHECK_FALSE(generation_of(db.dsn(), empty->id).empty()); // stamped with no member rows
+    auto first = store.member_set_owned(empty->id, "alice");
+    REQUIRE(first.has_value());
+    CHECK(first->ids->empty());
+    CHECK(store.member_set_owned(empty->id, "alice")->ids == first->ids);
+}
+
+TEST_CASE("ResultSetStore: expiry, pinning and readiness are judged on the live header, "
+          "warm or cold",
+          "[pg][result_set][member_cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ResultSetStore store{pool};
+    auto rs = store.create_materialized(req("alice"), {"dev-1"});
+    REQUIRE(rs.has_value());
+    const std::string where = " WHERE id = '" + rs->id + "'";
+    const bool warm = GENERATE(false, true);
+    INFO("warm cache: " << warm);
+    if (warm)
+        REQUIRE(store.member_set_owned(rs->id, "alice").has_value());
+    ResultSetStore cold{pool};
+    ResultSetStore& reader = warm ? store : cold;
+
+    SECTION("a pinned set past its ttl_at resolves") {
+        exec_sql(db.dsn(), "UPDATE result_set_store.result_sets SET pinned = true, "
+                           "created_at = 1, ttl_at = 2" + where);
+        CHECK(member_set_owned_ok(reader, rs->id, "alice") ==
+              std::unordered_set<std::string>{"dev-1"});
+    }
+    SECTION("an unpinned set past its ttl_at is NotFound") {
+        exec_sql(db.dsn(),
+                 "UPDATE result_set_store.result_sets SET created_at = 1, ttl_at = 2" + where);
+        auto r = reader.member_set_owned(rs->id, "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotFound);
+    }
+    SECTION("a header moved back to pending is NotReady, never the cached members") {
+        exec_sql(db.dsn(), "UPDATE result_set_store.result_sets SET status = 'pending'" + where);
+        auto r = reader.member_set_owned(rs->id, "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotReady);
+    }
+    SECTION("a header marked failed is Failed, never the cached members") {
+        exec_sql(db.dsn(), "UPDATE result_set_store.result_sets SET status = 'failed'" + where);
+        auto r = reader.member_set_owned(rs->id, "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::Failed);
+    }
+}
+
+TEST_CASE("ResultSetStore: a zero member-cache budget retains nothing",
+          "[pg][result_set][member_cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ResultSetStore store{pool, 0};
+    auto rs = store.create_materialized(req("alice"), {"dev-1"});
+    REQUIRE(rs.has_value());
+    auto a = store.member_set_owned(rs->id, "alice");
+    auto b = store.member_set_owned(rs->id, "alice");
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    CHECK(a->ids != b->ids);
+    CHECK(*a->ids == *b->ids);
+}
+
+TEST_CASE("ResultSetStore: concurrent readers share the member cache under eviction",
+          "[pg][result_set][member_cache][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    // Small enough that the sets below evict each other continuously.
+    ResultSetStore store{pool, 2048};
+    REQUIRE(store.is_open());
+    std::vector<std::string> ids;
+    std::vector<std::unordered_set<std::string>> expected;
+    for (int s = 0; s < 4; ++s) {
+        std::vector<std::string> members;
+        for (int m = 0; m < 8; ++m)
+            members.push_back(std::format("set{}-dev{:02}", s, m));
+        auto rs = store.create_materialized(req("alice"), members);
+        REQUIRE(rs.has_value());
+        ids.push_back(rs->id);
+        expected.emplace_back(members.begin(), members.end());
+    }
+    std::atomic<int> wrong{0};
+    std::atomic<int> failed{0};
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 6; ++t)
+        readers.emplace_back([&, t] {
+            for (int i = 0; i < 40; ++i) {
+                const auto k = static_cast<std::size_t>((t + i) % 4);
+                auto r = store.member_set_owned(ids[k], "alice");
+                if (!r.has_value())
+                    failed.fetch_add(1);
+                else if (*r->ids != expected[k])
+                    wrong.fetch_add(1);
+            }
+        });
+    for (auto& r : readers)
+        r.join();
+    CHECK(failed.load() == 0);
+    CHECK(wrong.load() == 0);
 }
 
 TEST_CASE("ResultSetStore: member_set_owned's four outcomes (#4981 PR-1 A1 rewrite)",
@@ -1286,7 +1513,12 @@ TEST_CASE("ResultSetStore: member_set_owned reports DbError on a genuine store f
     ResultSetStore degraded_store{short_lock_pool};
     REQUIRE(degraded_store.is_open());
 
-    REQUIRE(degraded_store.member_set_owned(rs->id, "alice").has_value());
+    // Cold: the joined read fails. Warm: the header-only revalidation fails. Neither may
+    // serve the members, cached or not.
+    const bool warm = GENERATE(false, true);
+    INFO("warm cache: " << warm);
+    if (warm)
+        REQUIRE(degraded_store.member_set_owned(rs->id, "alice").has_value());
 
     PgConn locker{PQconnectdb(db.dsn().c_str())};
     REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);

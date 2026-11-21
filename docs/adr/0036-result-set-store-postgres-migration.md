@@ -382,3 +382,31 @@ changed from `std::optional<std::vector<std::string>>` to
 `std::expected<std::vector<std::string>, ScopeEvalError>` (`scope_eval_error.hpp`) to carry
 both this new `OwnerCheckFailed` case and the new `PresenceDegraded` case without further
 overloading a bare `nullopt`.
+
+## Update (2026-11-21) — replica-local member cache; migrations v6/v7
+
+`member_set_owned` now keeps a bounded (16 MiB, byte-estimated, FIFO) per-process cache of a
+materialized set's member IDs. The 2026-09-26 Update's guarantee is restated, not weakened:
+every call still makes ONE live, snapshot-consistent read of the set's header (existence,
+expiry, ownership, readiness, completeness), so a set deleted, expired, re-owned or moved out of
+`materialized` before that read is refused exactly as before. What changes is where the IDs come
+from on a hit: a cache entry read under the same `membership_generation` (v6, a random UUID, so
+a promoted standby that redid a lost fill carries a different value). A changed or NULL
+generation takes the original joined read.
+
+That equivalence holds only under one invariant: **a set's member rows never change while its
+generation stays the same.** Every write to `result_set_members` must re-stamp the generation of
+each affected set in the writing transaction. The two writers (`insert_row_impl`, `materialize`)
+stamp it themselves; v7 enforces it for every other writer with statement-level `ENABLE ALWAYS`
+triggers (INSERT/UPDATE re-stamp the sets in the transition tables; an out-of-band DELETE, at
+trigger depth 0, and TRUNCATE re-stamp every stamped set; a cascade from a `result_sets` delete
+is skipped, because the header is gone). Statement-level, not row-level, so a bulk load costs one
+header update per affected set per statement. A writer that disables the triggers breaks the
+invariant and requires a restart of every replica (`docs/user-manual/server-admin.md`, "Result-set
+membership after a restore or repair"). A new member writer keeps the stamp and never disables
+the triggers.
+
+Also in this change: an unpinned set past `ttl_at` is refused (`NotFound`) by `member_set_owned`
+before `gc_sweep` deletes it, judged on the serving replica's clock (the clock that writes
+`ttl_at` and that `gc_sweep` deletes by). `get`, `members`, `list_by_owner` and `resolve_alias`
+are unchanged and still return an expired, unswept set (recorded follow-up).

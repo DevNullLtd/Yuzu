@@ -38,11 +38,13 @@
 /// invert(NOT)/report success? If yes, fail closed (abort/503) on `DbError`
 /// — never treat it as empty-container."
 ///
-/// **`member_set_owned` (#4981 PR-1, Finding A) is a single, snapshot-consistent
-/// SELECT for its result. A miss joins the current header and membership. A hit revalidates
-/// the header and materialization generation in Postgres. A changed generation reloads
-/// both header and members together, including all authorization checks. This closes the
-/// TOCTOU window the pre-#4981 two-fact
+/// **`member_set_owned` (#4981 PR-1, Finding A) decides from one live, snapshot-consistent
+/// read of the set's header: existence, expiry, ownership, readiness and completeness are
+/// always read in that statement. A miss joins the header and membership in one statement. A
+/// hit (a replica-local cache of a previous read's member IDs) reads the header alone and
+/// reuses the cached IDs only when the header's materialization generation equals the one
+/// they were read under; a changed generation reloads header and members together. This
+/// closes the TOCTOU window the pre-#4981 two-fact
 /// query (existence via a separate `get()` gate, membership via a plain owner-
 /// filtered JOIN) left open.** Pre-#4981, a result set deleted (`delete_set` or
 /// `gc_sweep`, both FK-cascading) BETWEEN a caller's own pre-dispatch ownership
@@ -60,8 +62,24 @@
 /// caller — the same "not-owned is indistinguishable from not-found"
 /// oracle-safety contract this store has always held for `get()`'s consumers).
 /// An owned set with ZERO members is now a REAL, DISTINGUISHABLE success case
-/// (an empty-but-present `std::unordered_set`) — the case the pre-#4981
+/// (`OwnedMembers::ids` points at an empty set) — the case the pre-#4981
 /// contract could not express at all.
+///
+/// **Member cache invariant (migration v6/v7).** A cache hit is equivalent to the joined read
+/// ONLY because a set's member rows never change while its `membership_generation` stays the
+/// same: every write to `result_set_members` re-stamps the generation of each affected set
+/// that carries one, in the writing transaction. The two C++ writers stamp it themselves
+/// (`insert_row_impl` in the header INSERT, `materialize` in its status-guarded UPDATE), and
+/// the v7 statement-level triggers enforce it for every other writer (manual SQL, a
+/// data-only restore, a future code path): INSERT and UPDATE re-stamp the sets named in the
+/// transition tables, an out-of-band DELETE (trigger depth 0) and TRUNCATE re-stamp every
+/// set that carries a generation. A delete that cascades from `result_sets` (`delete_set`,
+/// `gc_sweep`) is not re-stamped: its header is gone and every cached copy reads `NotFound`.
+/// A writer that bypasses triggers (`ALTER TABLE ... DISABLE TRIGGER`, `pg_restore
+/// --disable-triggers`) breaks the invariant; every replica must then be restarted
+/// (`docs/user-manual/server-admin.md`, "Result-set membership after a restore or repair").
+/// A new member writer must keep the generation stamp; never add one that disables the
+/// triggers.
 ///
 /// `list_by_owner`, `members`, `lineage`, and `count_for_owner` are thin
 /// `.value_or(...)` wrappers over their `_checked` twins above, kept for API
@@ -416,8 +434,11 @@ public:
     /// `result.value()`) for the actual boolean membership answer.
     std::expected<bool, ResultSetError> contains(const std::string& id,
                                                  const std::string& device_id);
-    /// The authoritative result comes from one statement snapshot, including when a
-    /// changed generation requires a second, joined read (see the file-header note).
+    /// The decision comes from one live header read in one statement snapshot; the IDs come
+    /// from that statement on a miss, or from a cache entry read under the same
+    /// materialization generation on a hit (see the file-header note and its "Member cache
+    /// invariant"). Expiry uses this replica's clock, the clock that writes `ttl_at` and that
+    /// `gc_sweep` deletes by.
     /// `id` absent or expired and unpinned -> `std::unexpected(ResultSetError::NotFound)`;
     /// `id` exists but `owner` does not own it ->
     /// `std::unexpected(ResultSetError::NotOwner)`; `id` exists, owned, ZERO
@@ -573,6 +594,7 @@ private:
     // Views refer to stable list nodes. Erase an index entry before removing its node.
     std::map<std::string_view, std::list<MemberCacheEntry>::iterator> member_cache_index_;
     CachedMembership cached_members(const std::string& id);
+    void forget_members(const std::string& id);
     void retain_members(const std::string& id, CachedMembership snapshot,
                         std::size_t bytes);
 
