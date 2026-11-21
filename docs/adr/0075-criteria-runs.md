@@ -1,9 +1,9 @@
 # ADR-0075: Criteria runs: three-valued verdicts over several inputs, stored as a result set
 
-- **Status:** Proposed (draft 5)
-- **Date:** 2026-11-18 (draft 1); 2026-11-20 (drafts 2 and 3); 2026-11-21 (drafts 4 and 5)
+- **Status:** Proposed (draft 6)
+- **Date:** 2026-11-18 (draft 1); 2026-11-20 (drafts 2 and 3); 2026-11-21 (drafts 4 to 6)
 - **Owner:** Nathan Dornbrook / platform (block `0xxx`; see `docs/adr/README.md`)
-- **Deciders:** Nathan Dornbrook. The owner's decisions D1 to D59, made between 2026-11-07 and
+- **Deciders:** Nathan Dornbrook. The owner's decisions D1 to D61, made between 2026-11-07 and
   2026-11-21 while reviewing a contributed criteria-run plan (version 4.1, 2026-11-06). This ADR
   cites them by number in brackets, for example (D25). It writes them down; it does not reopen them.
   Where a later decision replaced part of an earlier one, the later one is cited.
@@ -23,7 +23,7 @@
   (the instruction operation digest) and ADR-1014 (armed conduits), all Proposed in the `1xxx`
   block. The response-store ADR (D30) is not yet written.
 - **Code references:** every `path:line` in this ADR is at `DevNullLtd/Yuzu@f4cc683af1`. Drafts 2
-  to 5 were written on a branch whose only change from that commit is this file, so the code is
+  to 6 were written on a branch whose only change from that commit is this file, so the code is
   the same.
 
 ## Binding status
@@ -33,13 +33,14 @@ slices (D12); slice 1 is specified in full and slices 2 and 3 only as far as the
 
 Slice 1 is a **breaking change** to three shipping surfaces (R3.3). It ships with a `changelog.d/`
 fragment and an upgrade note in `docs/user-manual/upgrading.md`, not with a deprecation window
-(D48). Both are owed by the implementing PR; this ADR adds neither.
+(D48). Both are owed by PR 1.9, which makes the break (*Slices*); this ADR adds neither.
 
-The question draft 4 raised, the operator tier's posture for `CriteriaRun:Execute`, is now an owner
-decision (D59), stated in R9.1. Draft 5 also re-cuts slice 1 into a sequence of thirteen
-independently mergeable PRs (*Slices*), because D47 to D59 made it too large for one. Two points the
-re-cut raises are listed under *Open points*; everything else left to the implementing PRs is
-mechanism, listed under *Not decided here*.
+Slice 1 lands as a sequence of thirteen independently mergeable PRs (*Slices*), because D47 to
+D59 made it too large for one. The two points that re-cut raised are owner decisions: the
+single-input producer applies R5.4's confirmation window, measured at request time (D60, R5.4), and
+a release may be cut between PRs 1.10 and 1.13 with warm-only retention documented (D61, R11.9). No
+owner question remains open; what is left to the implementing PRs is mechanism, listed under *Not
+decided here*.
 
 ## Context
 
@@ -296,10 +297,9 @@ keep (D48). Where it differs, the old result is not preserved.
     `repology/libversion`. The VERS specification says `vers:generic` will likely be similar to it,
     but has not written the algorithm down (`package-url/vers-spec@be215c54ee`,
     `docs/types/vers-types.md:60-63`), so this ADR names libversion itself rather than an unwritten
-    scheme. `nvd_db`'s
-    `compare_versions` and `nvd_version_compare` are not used for criteria, and `inventory_eval`'s
-    private comparator is deleted. The comparator is a total order. Equality under `"as":"version"`
-    is the comparator's equality, not text equality.
+    scheme. `nvd_db`'s `compare_versions` and `nvd_version_compare` are not used for criteria, and
+    `inventory_eval`'s private comparator is deleted. The comparator is a total order. Equality
+    under `"as":"version"` is the comparator's equality, not text equality.
     - **The pin is a content hash, never a release tag.** A tag can be moved upstream; a hash cannot.
       A release name such as 3.0.4 is a label for people only. The implementing PR chooses one of two
       routes, and either way names its pin as a hash:
@@ -313,8 +313,9 @@ keep (D48). Where it differs, the old result is not preserved.
       - *A reimplementation.* The algorithm and libversion's test corpus are pinned to one libversion
         commit SHA.
     - **The corpus runs as a Yuzu conformance test under either route.** The vcpkg port applies a
-      `disable-test.patch` (`microsoft/vcpkg@9eec002df1`, `ports/libversion/portfile.cmake:6-7`), so libversion's own tests do not run in a vcpkg build; the corpus diff a
-      pin change needs (below) exists only if Yuzu runs the corpus itself.
+      `disable-test.patch` (`microsoft/vcpkg@9eec002df1`, `ports/libversion/portfile.cmake:6-7`),
+      so libversion's own tests do not run in a vcpkg build; the corpus diff a pin change needs
+      (below) exists only if Yuzu runs the corpus itself.
     - **Changing the pin is a breaking change**, because it can change which devices match the same
       stored data. It ships with a `changelog.d/` fragment, an upgrade note and the diff of the
       corpus results.
@@ -339,13 +340,14 @@ keep (D48). Where it differs, the old result is not preserved.
     upgrade note. For example, a stored `"5 GB"` against `>` with the string operand `"4"` is a
     match today; under `gt` it is `malformed_value`.
 
-### R5. Coverage comes from the facet state (D34, D35, D43)
+### R5. Coverage comes from the facet state (D34, D35, D43, D60)
 
 1. Coverage for each part of the installed-software inventory is read from `software_facet_state`,
    which blob v3's `S` records already fill. No new `plugin_data` key is added: a new key would
    land in the generic store on the gateway path, readable under `Infrastructure:Read`
    (`typed_inventory_sources.hpp:5-14`), and would be missing on hash-only cycles.
-2. The mapping, applied when the run reads the facet state, is fixed:
+2. The mapping, applied wherever the shared evaluation reads the facet state (a run, and each
+   single-input `inventory_query` surface, R3.2), is fixed:
 
    | Facet status | Coverage |
    |---|---|
@@ -356,11 +358,19 @@ keep (D48). Where it differs, the old result is not preserved.
    A device whose agent still sends v2 has no facet rows and reads Unknown for every part.
 3. ADR-1012 adopts this mapping rather than adding a field of its own.
 4. **A found row proves presence (`ANY` true) only if its facet's `last_confirmed_at` is inside the
-   R6 window measured at run start** (resolved `interval_s` + 2 h; 26 h on the default) (D43).
-   Under a Full facet this always holds, because the cycle just confirmed it. Under a Partial facet
-   a status-only section leaves the last confirmed rows in place, unconfirmed
-   (`software_inventory_store.cpp:1940-1960`); a row older than the window leaves the device
-   `not_assessed:unconfirmed`.
+   R6 window** (resolved `interval_s` + 2 h; 26 h on the default) (D43). Under a Full facet this
+   always holds, because the cycle just confirmed it. Under a Partial facet a status-only section
+   leaves the last confirmed rows in place, unconfirmed (`software_inventory_store.cpp:1940-1960`);
+   a row older than the window leaves the device `not_assessed:unconfirmed`.
+   - **A run measures the window at run start**, with the interval resolved once (R6.3).
+   - **The single-input surfaces apply it too, measured at request time** (D60): the
+     `inventory_query` producer (REST `POST /api/v1/result-sets/from-inventory-query` and MCP
+     `create_result_set_from_inventory_query`) and `POST /api/v1/inventory/evaluate`. Each device's
+     interval is resolved as of the request. Without it, the preview, the stored set and a run over
+     the same data on the same afternoon would disagree, which D55 rules out.
+   - **Accepted cost** (D60, as for D50): without `"logic":"k3"`, these surfaces fold unknown to
+     false at the top (R4.3), so a device left `not_assessed:unconfirmed` drops out of the set with
+     no trace of why. With `"logic":"k3"` it shows, with its cause.
 5. `NONE` and `ALL` need Full; otherwise the device is `not_assessed:coverage_unproven`.
 6. Freshness (R6) never stands in for coverage.
 
@@ -455,9 +465,10 @@ path uses it.
    - **Supervised-tier approval** (D19, D58). On a supervised-tier MCP token, `CriteriaRun:Execute`
      needs an approval ticket, as `Execution:Execute` does: a `requires_approval` row is added beside
      it (`mcp_policy.hpp:159-160`). `create_criteria_run` mints and redeems its ticket through the
-     generic approval gate (`mcp_server.cpp:9972-9975`). Because `AuthRoutes::require_permission` applies the same rule on every
-     non-MCP transport (`auth_routes.cpp:1295-1307`), a supervised-tier token is refused on
-     `POST /api/v1/criteria-runs` and must use the MCP ticket flow.
+     generic approval gate (`mcp_server.cpp:9972-9975`). Because `AuthRoutes::require_permission`
+     applies the same rule on every non-MCP transport (`auth_routes.cpp:1295-1307`), a
+     supervised-tier token is refused on `POST /api/v1/criteria-runs` and must use the MCP ticket
+     flow.
    - **Create and re-run share this one posture** (D58): a re-run of a `criteria_run` set needs a
      ticket whenever `create_criteria_run` would (R12.6). Neither tool is added to the closed
      approval-exemption list (`mcp_policy.hpp:302`).
@@ -509,9 +520,9 @@ prerequisites:
 1. member sets are cached by result-set id within a byte budget (a materialised set never changes);
 2. members are loaded in keyset pages wherever a whole set in memory is not needed;
 3. members are inserted with `COPY` or in chunks, not one `unnest` statement;
-4. `materialize()` enforces a per-kind cap (closing #7433).
+4. `materialize()` enforces a per-kind cap (closing #7433, filed under D36).
 
-### R11. Retention: warm in Postgres, cold in ClickHouse, summary in the audit trail (D25 to D29, D37, D45)
+### R11. Retention: warm in Postgres, cold in ClickHouse, summary in the audit trail (D25 to D29, D37, D45, D61)
 
 1. **The run's set lives from creation.** Its `ttl_at` is set at creation to the deadline plus the
    warm setting, and reset at final to final plus the warm setting. It is never pinned. This
@@ -523,11 +534,11 @@ prerequisites:
    (`0006-server-postgresql-substrate.md:72-75`): ClickHouse may hold append-only, retention-bound
    records; every read goes through core under R9's gates; only core holds the credentials; Grafana
    gets no datasource on these tables; Postgres stays the only substrate for transactional state.
-4. **Export starts at final.** The set gains an `exported_at` stamp, written only when ClickHouse
-   answers HTTP 200. `gc_sweep` reaps a `criteria_run` set only when its TTL has passed **and**
-   `exported_at` is set. An unexported set stays warm and readable, is retried every tick, and
-   raises a metric and an alert.
-5. **Deduplication, two layers.** The table is `ReplacingMergeTree ORDER BY (result_set_id,
+4. **Export starts at final** (D28). The set gains an `exported_at` stamp, written only when
+   ClickHouse answers HTTP 200. `gc_sweep` reaps a `criteria_run` set only when its TTL has passed
+   **and** `exported_at` is set. An unexported set stays warm and readable, is retried every tick,
+   and raises a metric and an alert.
+5. **Deduplication, two layers** (D29). The table is `ReplacingMergeTree ORDER BY (result_set_id,
    device_id)`, partitioned by the day of final, with a 90-day TTL. Export batches are cut
    deterministically (by `device_id`, fixed size) and each is sent with
    `insert_deduplication_token = <result_set_id>:<batch_no>`, an optional parameter added to
@@ -544,6 +555,13 @@ prerequisites:
    If an act phase needs per-device evidence, that is the act phase's decision. Accepted cost: after
    90 days the record can say "device D was in a cohort of N, of which M matched", but not D's own
    verdict.
+9. **A release may ship runs before the cold copy exists** (D61). Runs land in PR 1.10 and the
+   export and reap guard in PR 1.13 (*Slices*). A release tagged between the two keeps a run's
+   verdicts only for the warm window, final plus 20 minutes by default (R11.2); after that only the
+   summary audit event survives (R11.7). PR 1.10's user-manual text, its `changelog.d/` fragment and
+   its upgrade note each state this plainly and say that the cold copy arrives in a later release.
+   PR 1.13 removes that statement in the same change that adds the export. There is no release gate
+   and no `/release` preflight check for this.
 
 ### R12. Re-runs and refusals (D13, D32, D38, D42, D53, D58, D59)
 
@@ -557,10 +575,11 @@ prerequisites:
    follow-up. The route description (`rest_api_v1.cpp:2987`) is updated in the same change.
 3. **No automatic or scheduled re-walk.** Tracking consumers, schedules and `allow_rewalk` are
    refused until an ADR-1014 conduit design covers them.
-4. **`definition_changed`** (from slice 3). Each live input records its definition's ADR-1013
-   digest in `source_payload` at creation. A re-run recomputes each digest and, if any differs, is
-   refused with `definition_changed`, naming the input and both digests. Nothing is dispatched; the
-   operator starts a new run.
+4. **`definition_changed`** (from slice 3; D32). Each live input records its definition's ADR-1013
+   digest, which covers effective impact and `expectedResponse` (D9), in `source_payload` at
+   creation. A re-run recomputes each digest and, if any differs, is refused with
+   `definition_changed`, naming the input and both digests. Nothing is dispatched; the operator
+   starts a new run.
 5. **`definition_disabled`** (from slice 3). A run or re-run whose live input names a definition with
    `enabled: false` is refused at creation with `definition_disabled`, the word the schedule runner
    already uses (`schedule_runner.cpp:98`), naming the input and the definition. Deliveries already
@@ -696,11 +715,11 @@ writer (D34; `sync_source_installed_software.cpp:1099-1111`).
 | 1.6 | The matcher evaluates in K3 and folds once, at the top; quantifiers and `and`/`or`/`not` over row tests; the `missing_value`, `malformed_value` and `row_bound` causes (R4.1 to R4.3, R4.5). Live at once for the matchers `echo_query` and `instruction_result` already accept. | none | scope walking; agentic-first A5 (the matcher's input schema in the producer tools) |
 | 1.7 | `lt`, `le`, `gt`, `ge`; `"as"` on ordering, `eq` and `in`; the strict number domain with its bounds; no text ordering (R4.7 to R4.9, R4.11; D50, D52, D57). | 1.6 | scope walking; agentic-first A5 |
 | 1.8 | `"as":"version"`: the libversion order, its pin by content hash, and the libversion corpus as a Yuzu conformance test (R4.10; D51). | 1.7 | scope walking; agentic-first A5. No row covers vcpkg or `meson.build`: `build-ci` and `cross-platform` review it under their own triggers (the Windows DLL build and the `version.lib` clash) |
-| 1.9 | `inventory_query` moved onto the matcher, reading `installed_software` through `SoftwareInventoryStore` (with any per-device read beside `query_software`); the coverage mapping and the confirmation test (R5); the old `conditions[]` shape refused on all three surfaces; `POST /api/v1/inventory/evaluate` on the same evaluation (D55); `inventory_eval`'s grammar deleted; the cases re-pinned (R3.2, R3.3, R4.12; D47, D48). Breaking: `changelog.d/` fragment and upgrade note. | 1.8 | agent daily-sync and installed-software inventory (`inventory_*`, `software_inventory_store.*`); Postgres substrate (a new store read); authentication and RBAC (a list read of per-agent data stays on `authorize_list_read`); agentic-first (the changed MCP input schema); scope walking |
-| 1.10 | Criteria runs: the `CriteriaRun` securable and its mirrors, class 2 reworded and `CriteriaRun:Read` floored (R9.1, R9.2; D19, D39); the operator-tier and supervised-tier rows (D58, D59); `POST /api/v1/criteria-runs` and MCP `create_criteria_run` with named-input combinators, `"logic":"k3"` and the verdict mapping (R4.4, R4.6); the `criteria_run` kind, cohort and excluded count (R9.3, R9.4); the read at start and settling at the deadline (R6.1 to R6.3, R6.6); write-once verdict and cause columns (R7.1); the status table and counts (R8; D56); the creation audit verb and the summary event at final (R11.7); `ttl_at` from creation and the warm setting (R11.1, R11.2); the matched-only atom and incomplete-set marking (R14.1 to R14.3; D54). | 1.2 to 1.5, 1.9 | authentication and RBAC; authorization-topology floor; service-scoped confinement (the new route refuses a service-scoped token); MCP server (`mcp_policy.hpp`); headless platform (a new REST route and MCP tool); agentic-first; pre-auth body cap and MFA step-up (a new mutating route must be classified in both tables); scope walking (`agent_registry.cpp`); Postgres substrate (member columns); clock-guarded retention (`ttl_at` for the new kind); observability and data architecture (the audit verb and event) |
+| 1.9 | `inventory_query` moved onto the matcher, reading `installed_software` through `SoftwareInventoryStore` (with any per-device read beside `query_software`); the coverage mapping and the confirmation test (R5), with R5.4's window measured at request time on all three surfaces and a device left `unconfirmed` folding to false outside K3 (D60); the old `conditions[]` shape refused on all three surfaces; `POST /api/v1/inventory/evaluate` on the same evaluation (D55); `inventory_eval`'s grammar deleted; the cases re-pinned (R3.2, R3.3, R4.12; D47, D48). Breaking: `changelog.d/` fragment and upgrade note, which also state the fold-to-false cost. | 1.8 | agent daily-sync and installed-software inventory (`inventory_*`, `software_inventory_store.*`); Postgres substrate (a new store read); authentication and RBAC (a list read of per-agent data stays on `authorize_list_read`); agentic-first (the changed MCP input schema); scope walking |
+| 1.10 | Criteria runs: the `CriteriaRun` securable and its mirrors, class 2 reworded and `CriteriaRun:Read` floored (R9.1, R9.2; D19, D39); the operator-tier and supervised-tier rows (D58, D59); `POST /api/v1/criteria-runs` and MCP `create_criteria_run` with named-input combinators, `"logic":"k3"` and the verdict mapping (R4.4, R4.6); the `criteria_run` kind, cohort and excluded count (R9.3, R9.4); the read at start and settling at the deadline (R6.1 to R6.3, R6.6); write-once verdict and cause columns (R7.1); the status table and counts (R8; D56); the creation audit verb and the summary event at final (R11.7); `ttl_at` from creation and the warm setting (R11.1, R11.2), with the warm-only retention stated in the user manual, the `changelog.d/` fragment and the upgrade note (R11.9; D61); the matched-only atom and incomplete-set marking (R14.1 to R14.3; D54). | 1.2 to 1.5, 1.9 | authentication and RBAC; authorization-topology floor; service-scoped confinement (the new route refuses a service-scoped token); MCP server (`mcp_policy.hpp`); headless platform (a new REST route and MCP tool); agentic-first; pre-auth body cap and MFA step-up (a new mutating route must be classified in both tables); scope walking (`agent_registry.cpp`); Postgres substrate (member columns); clock-guarded retention (`ttl_at` for the new kind); observability and data architecture (the audit verb and event) |
 | 1.11 | The read on a device's first `ReportInventory` or `ProxyInventory` receipt in the window, through the in-memory waiting set (R6.4, R6.5). | 1.10 | agent daily-sync (the two handlers); gateway-upstream peer authorization (`gateway_service_impl.*`) |
 | 1.12 | Re-eval of `criteria_run` sets: the floor on either securable, `load_owned`, the gate by stored kind, the MCP row, the approval pre-check and the ticket bound to the kind and the input-spec digest; the route description; a test that a service-scoped re-run is refused (R12.1, R12.2, R12.6, R12.7, R9.9; D42, D53, D58, D59). | 1.10 | MCP server (the approval pre-check); authentication and RBAC; service-scoped confinement; headless platform (a changed approval gate); agentic-first A5; scope walking |
-| 1.13 | Export at final to the ClickHouse cold store: the `ReplacingMergeTree` table, the deterministic batches and `insert_deduplication_token` on `ClickHouseSink`, `exported_at`, the reap guard in `gc_sweep`, and the unexported-set metric and alert (R11.3 to R11.6). | 1.1, 1.10 | Postgres substrate (the exception; `deploy/` for `release-deploy`); clock-guarded retention (`gc_sweep`'s predicate); observability (the metric and the shipped alert rule); data architecture |
+| 1.13 | Export at final to the ClickHouse cold store: the `ReplacingMergeTree` table, the deterministic batches and `insert_deduplication_token` on `ClickHouseSink`, `exported_at`, the reap guard in `gc_sweep`, and the unexported-set metric and alert (R11.3 to R11.6); removes PR 1.10's warm-only retention statement from the user manual, in the same change (R11.9; D61). | 1.1, 1.10 | Postgres substrate (the exception; `deploy/` for `release-deploy`); clock-guarded retention (`gc_sweep`'s predicate); observability (the metric and the shipped alert rule); data architecture |
 
 Every PR that changes C++ also triggers the C++ conventions and resource-ownership rows, and
 `docs-writer` reviews every PR. These are the rows this design reaches; each PR's governance run
@@ -718,7 +737,8 @@ Order and parallel work:
   1.10 and 1.11, a device that is not fresh at start waits for the deadline and settles as `stale`
   or `no_inventory`; between 1.10 and 1.12, re-eval refuses a `criteria_run` set with today's
   refusal (`rest_api_v1.cpp:16945-16950`), which 1.12 widens rather than deletes; between 1.10 and
-  1.13, a run is reaped at final plus the warm setting with no cold copy (see *Open points*).
+  1.13, a run is reaped at final plus the warm setting with no cold copy. A release may be tagged in
+  that gap, with the warm-only retention documented and no release gate (R11.9; D61).
 
 **Not in slice 1:** live inputs, deliver-on-connect, token checks per delivery, `definition_changed`,
 `definition_disabled`, `transient:<status>`, any act phase, and reads by anyone but the creator.
@@ -760,7 +780,10 @@ response-store ADR and ADR-1013's digest.
     1.10).
   - Until every agent sends v3, `NONE` and `ALL` read `not_assessed:coverage_unproven` on old agents.
   - Under a facet that stays Partial, `ANY` reads `not_assessed:unconfirmed` once its rows are older
-    than the window.
+    than the window. On the single-input `inventory_query` surfaces without `"logic":"k3"`, such a
+    device drops out of the set silently (R5.4; D60).
+  - A release cut between PRs 1.10 and 1.13 keeps a run's verdicts for only 20 minutes after final,
+    with only the summary audit event after that, and must say so in its documentation (R11.9; D61).
   - From slice 3, an early transient answer settles a device for the whole window (R7.3).
   - A run's cohort depends on who started it, so two operators can get different answers to the
     same criteria. The excluded count makes this visible.
@@ -865,21 +888,13 @@ routed-concern row covers `vcpkg.json` or `meson.build`.
   and approval rules then reach the `CriteriaRun:Execute` posture for a `criteria_run` set. The
   posture is decided (R9.1, R12.7); only the mechanism is left to the implementing PR.
 - The canonical serialisation of the stored input specs over which R12.7's SHA-256 is taken.
+- How the single-input surfaces resolve each candidate device's sync interval at request time for
+  R5.4's window (D60): per device or in one bulk read beside `query_software`.
 
 ## Open points
 
-Two points raised by draft 5's re-cut of slice 1. Neither reopens a decision.
-
-1. **The confirmation window in the single-input producer.** PR 1.9 puts the coverage mapping (R5)
-   into the evaluation that `inventory_query` shares with runs, so `NONE` and `ALL` over a part that
-   is not Full fold to false there too. R5.4 measures its confirmation window "at run start", from
-   the resolved sync interval. A single-input producer has no run start and no window. Whether it
-   applies R5.4 measured at the time of the request (and so resolves the interval per device), or
-   applies only the coverage mapping (R5.2, R5.5) and leaves R5.4 to runs, is not decided.
-2. **A release between PRs 1.10 and 1.13.** A release cut in that gap would ship runs whose verdicts
-   are reaped at final plus 20 minutes with no cold copy, against R11.3's 90 days. Either that is an
-   acceptable, documented intermediate state, or 1.13 must merge before the next release tag after
-   1.10.
+No owner question remains open. The two points draft 5 raised are decided (D60, D61). What is left
+to the implementing PRs is mechanism only, listed under *Not decided here*.
 
 Settled since draft 1: run status and causes (R8, R4; D41), re-runs in slice 1 (R12.1; D42), a row
 under a Partial facet (R5.4; D43), an early transient status (R7.2 to R7.4; D44), retention against
@@ -898,3 +913,8 @@ with the re-run ticket's binding (R9.1, R12.7; D58).
 
 Settled since draft 4: the operator tier admits `CriteriaRun:Execute` with no approval, for creation
 and re-run (R9.1, R12.6; D59).
+
+Settled since draft 5: the single-input producer and `POST /api/v1/inventory/evaluate` apply R5.4's
+confirmation window measured at request time, with the two-valued fold-to-false cost (R5.4; D60),
+and a release between PRs 1.10 and 1.13 is allowed with warm-only retention documented and no
+release gate (R11.9; D61).
