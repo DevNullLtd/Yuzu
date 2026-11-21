@@ -17379,14 +17379,24 @@ McpServer::HandlerFn McpServer::build_handler(
                             return true;
                     return false;
                 };
+            // Denied `result_set.create` row for a refused request. Returns the error.data to
+            // attach: empty when the row persisted (or audit is off), `audit_persisted:false`
+            // when it was lost or the sink threw (the MCP counterpart of REST's
+            // Sec-Audit-Failed). The SQL text never enters the row.
+            const auto rs_audit_refusal = [&](std::string_view rs_reason, std::string_view rs_kind,
+                                              const std::string& rs_target) -> std::string {
+                const bool rs_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "result_set.create", "denied", "ResultSet", rs_target,
+                    "reason=" + std::string(rs_reason) + " source_kind=" + audit_token(rs_kind));
+                return rs_ok ? std::string{} : std::string{R"({"audit_persisted":false})"};
+            };
             auto rs_refuse_nul = [&](std::string_view rs_what, std::string_view rs_kind) {
-                (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                               "reason=field_contains_nul source_kind=" + audit_token(rs_kind));
                 // retry-hint-exempt: caller-input rejection (a NUL byte), not a transient fault.
                 res.set_content(
                     error_response(id, kInvalidParams,
                                    "RESULT_SET_BAD_REQUEST: " + std::string(rs_what) +
-                                       " must not contain a NUL byte"),
+                                       " must not contain a NUL byte",
+                                   rs_audit_refusal("field_contains_nul", rs_kind, "")),
                     "application/json");
             };
 
@@ -18604,14 +18614,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string sql = param_str(args, "sql");
                 if (sql.empty()) {
                     res.set_content(
-                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required"),
+                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required",
+                                       rs_audit_refusal("sql_missing", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
                 if (sql.size() > 100000) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB",
+                                       rs_audit_refusal("sql_too_large", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
@@ -18626,7 +18638,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                       rs_audit_refusal("stale_source", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
@@ -18845,7 +18858,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         args.value("params", nlohmann::json::object()), def.parameter_schema)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                       rs_audit_refusal("stale_source", source_kind::kInstructionResult, "")),
                         "application/json");
                     return;
                 }
@@ -19035,7 +19049,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (sql.empty()) {
                         res.set_content(
                             error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: original carries no SQL"),
+                                           "RESULT_SET_BAD_REQUEST: original carries no SQL",
+                                           rs_audit_refusal("sql_missing", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19050,7 +19065,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (sql.size() > 100000) {
                         res.set_content(
                             error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB",
+                                           rs_audit_refusal("sql_too_large", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19060,7 +19076,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(
                                 id, kInvalidParams,
-                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                rs_audit_refusal("stale_source", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19165,7 +19182,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(
                                 id, kInvalidParams,
-                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                rs_audit_refusal("stale_source", source_kind::kInstructionResult, orig->id)),
                             "application/json");
                         return;
                     }
