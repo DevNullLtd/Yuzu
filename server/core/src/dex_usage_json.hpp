@@ -18,7 +18,7 @@
 #include "dex_api.hpp" // DexUsageRefusal
 #include "dex_usage_model.hpp"
 
-#include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <cstdint>
 #include <expected>

@@ -1921,12 +1921,33 @@ TEST_CASE("get_dex_apps_usage: an argument refusal is an invalid-params error wi
           "[mcp][dex][usage]") {
     // The handler's strict parser refuses an unknown key (the schema also says so); one case proves
     // the handler maps a parse failure to invalid-params, the full table is in test_dex_usage_model.cpp.
-    Twin t;
-    const json r = t.call("get_dex_apps_usage", json{{"bogus", 1}});
-    check_a4_refusal(r, "correct the arguments and call again");
-    CHECK(audit_count(t.generic_rows, kUsageGeneric + "denied") == 1);
-    CHECK(t.legacy_rows.empty());
-    CHECK(t.usage_calls.empty());
+    SECTION("an unknown argument") {
+        Twin t;
+        const json r = t.call("get_dex_apps_usage", json{{"bogus", 1}});
+        check_a4_refusal(r, "correct the arguments and call again");
+        CHECK(audit_count(t.generic_rows, kUsageGeneric + "denied") == 1);
+        CHECK(t.legacy_rows.empty());
+        CHECK(t.usage_calls.empty());
+    }
+    SECTION("a dropped denial row is reported in the refusal's envelope") {
+        Twin t;
+        t.generic_audit_ok = false;
+        const json r = t.call("get_dex_apps_usage", json{{"bogus", 1}});
+        check_a4_refusal(r, "correct the arguments and call again", /*audit_persisted=*/false);
+        CHECK(t.usage_calls.empty());
+    }
+    SECTION("the Forensics gate runs before argument parsing: a refused caller learns nothing "
+            "about the arguments") {
+        Twin t;
+        t.fleet_admit = false;
+        auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/call","id":7,)"
+                          R"("params":{"name":"get_dex_apps_usage","arguments":{"bogus":1}}})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(t.fleet_calls == std::vector<std::string>{"Forensics:Read"});
+        CHECK(audit_count(t.generic_rows, kUsageGeneric + "denied") == 0);
+        CHECK(t.usage_calls.empty());
+    }
 }
 
 TEST_CASE("get_dex_apps_usage: valid arguments reach the read unchanged", "[mcp][dex][usage]") {
@@ -2033,6 +2054,9 @@ TEST_CASE("get_dex_apps_usage: a refused read is an error, classified as the RES
         } else {
             CHECK(r["error"]["data"]["retry_after_ms"].is_null());
         }
+        if (std::string(row.detail) == "fleet_too_large") // the terminal answer says what to change
+            CHECK(r["error"]["data"]["remediation"].get<std::string>().find("narrower") !=
+                  std::string::npos);
         // The access row was written before the read, whatever the read answered.
         CHECK(t.legacy_rows == std::vector<std::string>{kUsageRow});
     }
