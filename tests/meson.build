@@ -683,6 +683,8 @@ agent_test_exe = executable(
     'unit/test_file_search_volumes.cpp',         # file search plugin: volume plan, units and refused rows, fsv1 cursor and its transition rule (agents/plugins/file_search/src), portable
     'unit/test_file_search_driver.cpp',          # file search plugin: request parsing, in-memory state and the one-slice driver over fakes (MemTree, fake clock, fake runner), portable
     'unit/test_file_search_rows.cpp',            # file search plugin: row arity, budgets, extents model and the user-directory tag (agents/plugins/file_search/src), portable
+    'unit/test_file_search_posix_shell.cpp',     # file search plugin: the POSIX shell's own pieces -- extents of real files, the macOS name rule and mount converter, the thread-capability planner (body POSIX-only; the capability syscalls Linux-only and root-only)
+    'unit/test_file_search_local_dispatcher.cpp', # file search plugin: real plugin via LocalDispatcher, unguarded on every OS (one real slice over a fixture under the build root on POSIX)
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
     'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
@@ -704,6 +706,9 @@ agent_test_exe = executable(
     'unit/test_middleware_local_dispatcher.cpp',    # SAM.2: real middleware plugin via LocalDispatcher and the table-generated descriptors, unguarded on every OS
     '../agents/plugins/middleware/src/middleware_linux.cpp', # SAM.2: run_linux (self-gated to __linux__, empty elsewhere)
     '../agents/plugins/component_inventory/src/component_fs_posix.cpp',  # SAM-16: POSIX filesystem leg (self-gated to non-Windows, empty on Windows)
+    '../agents/plugins/file_search/src/file_search_posix.cpp',          # file search plugin: the POSIX shell (self-gated to non-Windows, empty on Windows)
+    '../agents/plugins/file_search/src/file_search_extents_linux.cpp',  # file search plugin: FIEMAP shell (self-gated to __linux__, empty elsewhere)
+    '../agents/plugins/file_search/src/file_search_extents_macos.cpp',  # file search plugin: F_LOG2PHYS_EXT shell (self-gated to __APPLE__, empty elsewhere)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp, config_checks.hpp
@@ -936,6 +941,7 @@ agent_test_exe = executable(
                 pkg_inventory_plugin_lib,  # Wave 10 PR10.1-c
                 middleware_plugin_lib,  # SAM.2: test_middleware_local_dispatcher.cpp loads the real plugin by path
                 component_inventory_plugin_lib,  # SAM-16: test_component_inventory_local_dispatcher.cpp loads the real plugin by path
+                file_search_plugin_lib,  # test_file_search_local_dispatcher.cpp loads the real plugin by path
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -1042,6 +1048,8 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
                           include_directories('../agents/plugins/virtualization/src'),
                           include_directories('../agents/plugins/remote_access_audit/src'),
                           include_directories('../agents/plugins/process_introspect/src'),
+                          include_directories('../agents/plugins/file_search/src'),
+                          include_directories('../agents/plugins/component_inventory/src'),  # component_walk.hpp, which file_search_driver.hpp includes
                           include_directories('../agents/plugins/update_source_trust/src'),
                           include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
                           include_directories('../agents/shared')],

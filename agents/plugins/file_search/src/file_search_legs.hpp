@@ -9,6 +9,8 @@
  *   BoundedRunner  runs the slice's work on a worker thread and waits for it for a bounded time; on a
  *                  timeout the worker is left running and ABANDONED. The production binding is
  *                  shared::bounded_call_ex (bounded_wait.hpp).
+ *   read_file_extents  the extents of one open regular file, bound by the extents shell of the OS the
+ *                  plugin is built for (file_search_extents_linux.cpp, file_search_extents_macos.cpp).
  *
  * WORKER LIFETIME. The callable handed to the runner outlives the call that made it when it times out, so
  * it owns every byte it touches (values and shared_ptrs, never a reference to the caller's state) and
@@ -26,6 +28,10 @@
 #include <functional>
 #include <optional>
 #include <string>
+
+#if !defined(_WIN32)
+struct stat;
+#endif
 
 namespace yuzu::file_search {
 
@@ -62,5 +68,12 @@ struct RunOutcome {
 
 template <typename Result>
 using BoundedRunner = std::function<RunOutcome<Result>(std::chrono::milliseconds timeout, std::function<Result()> work)>;
+
+#if !defined(_WIN32)
+/// The extents of the open regular file `fd` (`st` is its fstat). Reads no byte of the file, makes no call
+/// that writes; a failure of the system call is the state of the answer, never a throw. Defined by the
+/// extents shell of the OS the plugin is built for.
+[[nodiscard]] FileExtents read_file_extents(int fd, const struct stat& st);
+#endif
 
 } // namespace yuzu::file_search

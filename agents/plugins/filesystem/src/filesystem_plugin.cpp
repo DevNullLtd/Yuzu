@@ -43,6 +43,7 @@
 #include "filesystem_find_by_hash.hpp"
 #include "filesystem_posix_names.hpp"
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
+#include <macos_dataless_off.hpp> // yuzu::shared::DatalessMaterializationOff (self-gated to __APPLE__)
 #include <network_fstype.hpp>
 
 #include <spdlog/spdlog.h>
@@ -107,7 +108,6 @@
 #ifdef __APPLE__
 #include <sys/mount.h> // getmntinfo_r_np
 #include <sys/param.h>
-#include <sys/resource.h> // getiopolicy_np / setiopolicy_np
 #endif
 #endif
 
@@ -428,34 +428,6 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
     yuzu::filesystem::find_by_hash::add_data_volume_aliases(out);
     return yuzu::filesystem::find_by_hash::mount_list_from(n > 0 && raw != nullptr, std::move(out));
 }
-
-// Dataless (iCloud / File Provider) files and directories must not be materialised by a walk: the
-// download runs inside a read the deadline cannot interrupt. The policy is per THREAD and this
-// runs on a shared pool thread, so it is read, switched OFF for the walk and restored on every
-// exit path. With it off a dataless file or directory fails its open with EDEADLK, which the walk
-// already counts as unreadable (CONSTRAINED), and a dataless directory is refused by the
-// directory open before the iterator names its children.
-class DatalessMaterializationOff {
-public:
-    DatalessMaterializationOff() {
-        previous_ = ::getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD);
-        if (previous_ < 0)
-            previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
-        changed_ = ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
-                                    IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0;
-    }
-    ~DatalessMaterializationOff() {
-        if (changed_)
-            ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
-                             previous_);
-    }
-    DatalessMaterializationOff(const DatalessMaterializationOff&) = delete;
-    DatalessMaterializationOff& operator=(const DatalessMaterializationOff&) = delete;
-
-private:
-    int previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
-    bool changed_ = false;
-};
 
 #else
 
@@ -2445,7 +2417,7 @@ private:
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
 #ifdef __APPLE__
-        const DatalessMaterializationOff dataless_off; // restored when the walk returns
+        const yuzu::shared::DatalessMaterializationOff dataless_off; // restored when the walk returns
 #endif
         fbh::WalkEnv env;
         env.cancelled = [] {

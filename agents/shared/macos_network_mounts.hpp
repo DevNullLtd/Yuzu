@@ -15,6 +15,12 @@
 // answers nullopt. Residuals the snapshot cannot close: a mount that appears after it, a stacked
 // filesystem over a dead network mount, a network type the deny-list does not name.
 //
+// `macos_mount_entries` is the same table as full MountEntry rows, for the on-demand file search's volume
+// plan: a statfs entry has no mountinfo `root` field, so every entry reads root "/" and the plan's identity
+// of a mount is its filesystem id alone (`f_fsid`, whose first word is the device number: two mounts of the
+// same filesystem share it, two filesystems never do). Entries are returned in table order; a later entry
+// for a mount point covers an earlier one, which is the plan's rule and the caller's to apply.
+//
 // Apple only: `f_fstypename` / `f_mntonname` are BSD `statfs` members. Header-only, no state.
 #pragma once
 
@@ -25,6 +31,8 @@
 #include <sys/mount.h>
 #include <sys/param.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -47,6 +55,37 @@ namespace yuzu::shared {
         if (on.size() > kDataVolume.size() + 1 && on.substr(0, kDataVolume.size()) == kDataVolume &&
             on[kDataVolume.size()] == '/')
             out.emplace_back(on.substr(kDataVolume.size()));
+    }
+    return out;
+}
+
+namespace detail {
+/// The text of a fixed-size, NUL-terminated `statfs` name field, never reading past its end.
+template <std::size_t N>
+[[nodiscard]] inline std::string statfs_text(const char (&field)[N]) {
+    std::size_t len = 0;
+    while (len < N && field[len] != '\0') ++len;
+    return std::string(field, len);
+}
+} // namespace detail
+
+/// `table[0..n)` as mount entries, in table order. An entry whose mount point is empty is counted in
+/// `malformed` and yields no row (the kernel never produces one; a hand-filled table can).
+[[nodiscard]] inline MountTable macos_mount_entries(const struct statfs* table, int n) {
+    MountTable out;
+    for (int i = 0; i < n; ++i) {
+        MountEntry e;
+        e.mount_point = detail::statfs_text(table[i].f_mntonname);
+        if (e.mount_point.empty()) {
+            ++out.malformed;
+            continue;
+        }
+        e.root = "/";
+        e.fstype = detail::statfs_text(table[i].f_fstypename);
+        e.source = detail::statfs_text(table[i].f_mntfromname);
+        e.dev_major = static_cast<std::uint32_t>(table[i].f_fsid.val[0]);
+        e.dev_minor = static_cast<std::uint32_t>(table[i].f_fsid.val[1]);
+        out.entries.push_back(std::move(e));
     }
     return out;
 }

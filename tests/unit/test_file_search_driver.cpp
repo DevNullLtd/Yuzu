@@ -711,21 +711,29 @@ TEST_CASE("file_search driver: on macOS a search from '/' reports the data volum
     rig.b.os = Os::macos;
     rig.mounts = Mounts{};
     rig.mounts.add("/", "apfs", "1:1", "/", "/dev/disk3s1s1").add("/System/Volumes/Data", "apfs", "1:2", "/", "/dev/disk3s5");
-    rig.fs.dirs["/"] = {{"Users", Type::dir}};
+    rig.fs.dirs["/"] = {{"Users", Type::dir}, {"System", Type::dir}};
     rig.fs.add_dir("/Users");
     rig.fs.add_dir("/Users/alex");
     rig.fs.add_file("/Users/alex/yuzu-fs-control-1.bin", "");
+    // The control for "never listed": the data volume IS in the tree, at its own mount point, with a twin of
+    // the control beneath it. Only the prune set keeps the walk out, so a leg that listed it would find the
+    // twin and the match below would be found twice.
+    rig.fs.add_dir("/System/Volumes/Data");
+    rig.fs.add_dir("/System/Volumes/Data/Users");
+    rig.fs.add_dir("/System/Volumes/Data/Users/alex");
+    rig.fs.add_file("/System/Volumes/Data/Users/alex/yuzu-fs-control-1.bin", "");
     const Run run = search(rig, kCtl, "/");
     CHECK(run.slices.size() == 1);
     CHECK(run.last().status == Status::ok);
     CHECK(run.last().cursor.empty());
-    CHECK(found(run) == Strs{"/Users/alex/yuzu-fs-control-1.bin"}); // reached through the system volume, once
+    CHECK(found(run) == Strs{"/Users/alex/yuzu-fs-control-1.bin"}); // reached through the system volume, exactly once
     CHECK(count_rows(run, "volume|/System/Volumes/Data|apfs|partial|firmlinks_only|") == 1);
     CHECK(count_rows(run, "volume|/System/Volumes/Data|") == 1);
     CHECK(row_of(run.last(), "volume|/|").find("volume|/|apfs|complete|none|") == 0); // the '/' unit itself
     CHECK_FALSE(complete(run)); // the refused row is still carried into the verdict
     CHECK(starts(row_of(run.last(), "coverage|"), "coverage|partial|"));
     CHECK(std::ranges::find(rig.fs.listed, "/System/Volumes/Data") == rig.fs.listed.end());
+    CHECK(rig.pruned_erased.contains("/System/Volumes/Data")); // listed in its parent, removed by the leg
 }
 
 // ---- single flight, stall and abandonment ----

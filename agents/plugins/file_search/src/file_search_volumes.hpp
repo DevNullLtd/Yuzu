@@ -34,7 +34,8 @@
  * PRUNING. A unit's prune set is every in-scope mount point strictly BELOW its walk root, refused and
  * dropped mounts included, never an ancestor. The walk never lists them and reports nothing for them: the
  * plan's rows are the one record of a pruned mount, a nested unit by its own volume row and a refused
- * mount by its own not_searched row. So a mount point's own directory name is not a match candidate.
+ * mount by its own refused row (not_searched, or partial for firmlinks_only). So a mount point's own
+ * directory name is not a match candidate.
  *
  * CAPS. At most kMaxVolumes volumes are planned, units first and then refused rows; the rest are counted
  * in volumes_dropped and make the verdict partial. A mount point longer than kMaxVolumePathBytes cannot
