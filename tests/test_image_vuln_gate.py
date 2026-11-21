@@ -262,7 +262,8 @@ GRYPE_STUB = textwrap.dedent(
     if mode == "erlang-misread":  # grype reads the ERTS version instead of OTP's
         comps = [{"name": "erlang", "version": "16.4.0.7", "purl": "pkg:generic/erlang@16.4.0.7"}]
     if mode == "os-erlang":  # an OS package of the same name is not the runtime
-        comps = [{"name": "erlang", "version": "28.5.0.8-r0", "purl": "pkg:apk/alpine/erlang@28.5.0.8-r0"}]
+        # Same name AND the expected version: only the purl tells it apart.
+        comps = [{"name": "erlang", "version": "28.5.0.8", "purl": "pkg:apk/alpine/erlang@28.5.0.8"}]
     if "cyclonedx-json" in outs:
         open(outs["cyclonedx-json"], "w").write(json.dumps({"bomFormat": "CycloneDX", "components": comps}))
     sys.exit(0)
