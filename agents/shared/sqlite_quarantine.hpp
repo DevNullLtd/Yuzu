@@ -248,7 +248,7 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
     int out = -1;
     for (int attempt = 0; attempt < 8 && out < 0; ++attempt) {
         tmp = to;
-        tmp += std::format(".partial-{}-{}", static_cast<long long>(::getpid()), counter.fetch_add(1));
+        tmp += std::format(".partial-{}-{}", ::getpid(), counter.fetch_add(1));
         out = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (out < 0 && errno != EEXIST)
             break;
@@ -303,11 +303,10 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
         return;
     }
     // Publish: link(2) fails with EEXIST for an entry of any kind at `to` and follows none.
-    if (::link(tmp.c_str(), to.c_str()) != 0) {
-        const int err = errno;
-        ec.assign(err, std::generic_category());
+    std::filesystem::create_hard_link(tmp, to, ec);
+    if (ec) {
         std::filesystem::remove(tmp, partial.removal);
-        if (err == EEXIST)
+        if (ec == std::errc::file_exists)
             partial.created = false; // not ours: nothing of this call's is at the quarantine name
         return;
     }

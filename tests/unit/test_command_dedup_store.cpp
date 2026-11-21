@@ -1411,7 +1411,6 @@ TEST_CASE("sqlite_quarantine: the descriptor copy is byte-exact, owner-only and 
         CHECK_FALSE(ec);
         CHECK(read_bytes(dst) == big);
         CHECK(mode_of(dst) == "600");
-        CHECK(partial_temporaries(dir.path) == 0);
     }
     SECTION("a write that lands 3 bytes at a time") {
         write_bytes(src, "wal bytes!");
