@@ -807,11 +807,13 @@ grype_scan() {
     local comps_ok=1 comps_desc="none required"
     if [ -n "$comps" ]; then
         # shellcheck disable=SC2086 # a space-separated list of component names
-        if cinfo="$("${CHECKS[@]}" grype-components "$gcdx" $comps)"; then
+        if cinfo="$("${CHECKS[@]}" grype-components "$gcdx" $comps 2>"$WORK/grype-components.err")"; then
             comps_desc="$(printf '%s\n' "$cinfo" | sed -n 's/^component_//p' | tr '\n' ' ' | sed 's/=/ /g; s/ $//')"
         else
             comps_ok=0
-            comps_desc="MISSING (required: $comps)"
+            cat "$WORK/grype-components.err" >&2 || true
+            # Missing, or present at another version: the checker's words say which.
+            comps_desc="NOT AS REQUIRED (required: $comps): $(tr '\n' ' ' < "$WORK/grype-components.err" | sed 's/ $//')"
         fi
     fi
 
@@ -825,12 +827,12 @@ grype_scan() {
     case "$rc" in
         0) if [ -n "$want_family" ] && ! "${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" \
                    "$want_family" > /dev/null; then
-               err "$img: grype's DB provider for $want_family is missing or older than 72 hours (above), so its $want_family advisories are not current (treated as a failure; re-run once the published DB is current)"
+               err "$img: grype's DB provider for $want_family is missing or older than 72 hours, so its $want_family advisories are not current (treated as a failure): an old one, re-run once the published DB is current; a missing one, the DB may have renamed it"
                gres="FAIL: grype DB provider $want_family is stale"
                failed=1
            elif [ "$comps_ok" != 1 ]; then
                err "$img: grype did not catalogue $comps, the component it runs on this image for (above); a grype or base-image change stopped it recognising the runtime (treated as a failure)"
-               gres="FAIL: grype did not catalogue $comps"
+               gres="FAIL: grype did not catalogue $comps as required"
                failed=1
            elif [ "$fcrit" != 0 ]; then
                # The gate scan passed, but the record scan of the same archive

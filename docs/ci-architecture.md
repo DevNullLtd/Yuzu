@@ -1879,7 +1879,9 @@ except the agent bundle:
   finding: read the record (`grype-<image>.attempt-<N>.txt`), and fix or accept it.
 - **A grype DB provider is stale** (`provider ... is not in the DB`, `provider ... built ... hours
   ago`, `grype DB provider <family> is stale`): the log names the provider and how old its capture
-  is. As for a stale DB, wait and "Re-run failed jobs"; there is no override.
+  is. An old one: as for a stale DB, wait and "Re-run failed jobs"; there is no override. A missing
+  one (`is not in the DB`): the DB may have renamed it, so re-running will not help; update
+  `GRYPE_REQUIRED_PROVIDERS` or bump grype (a commit, so re-tag).
 
 **When the agent bundle's gate fails, never re-tag.** `docker-publish-agent-bundle` runs after
 the `release` job has published the GitHub Release, so the tag is already a published release:
@@ -1904,8 +1906,13 @@ published images (a tracked gap).
 
 **What it does not see.**
 
-- **The chisel images' and the agent bundle's OS packages** (above): listed as not covered, so
-  their CVEs in libc6, libssl3t64, zlib1g and the other slices never reach this gate.
+- **The chisel images' and the agent bundle's OS packages, to Trivy** (above): listed as not
+  covered, so Trivy matches none of their CVEs in libc6, libssl3t64, zlib1g and the other slices.
+  grype does match some of them (on `yuzu-gateway-chisel` it matched Ubuntu 26.04 advisories to
+  `deb` packages such as busybox and openssl, checked 2026-11-20), and a fixable CRITICAL it reports
+  there fails the image like any other; but the gate proves nothing about that coverage for these
+  images (no canary, no OS cross-check, and the `ubuntu` provider's freshness is checked only for
+  images Trivy covers), so treat it as best effort.
 - **PostgreSQL itself.** In `yuzu-postgres` Trivy lists `postgresql-18`, `libpq5` and
   `postgresql-common` as packages but matches no vulnerability to them: they come from the PGDG
   repository, and Trivy's Debian advisories cover Debian's own packages only. And the image holds

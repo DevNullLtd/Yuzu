@@ -18,11 +18,15 @@
 #   docker build -t yuzu-gateway:chisel -f deploy/docker/Dockerfile.gateway.chisel .
 
 # ── Stage 1: deps — fetch + compile Erlang dependencies (cached) ──────────
-# erlang:28 = OTP 28.5.0.8 (built 2026-11-05; keep this OTP in step with
-# scripts/ci/image-vuln-gate.sh's GRYPE_REQUIRED_COMPONENTS, a test reads it). `include_erts` puts this
+# erlang:28 = OTP 28.5.0.8 (built 2026-11-05). `include_erts` puts this
 # image's ERTS and OTP libraries into the shipped release, so this digest decides
 # the OTP the chisel gateway runs. It is held in an ARG default, which Dependabot
-# does not see: refresh it by hand (last: 2026-11-17). It is a separate pin from
+# does not see: refresh it by hand (last: 2026-11-17). On every refresh, read the
+# new image's OTP (`docker run --rm <image> cat
+# /usr/local/lib/erlang/releases/28/OTP_VERSION`) and set it on the line above
+# and in scripts/ci/image-vuln-gate.sh's GRYPE_REQUIRED_COMPONENTS: a test
+# checks those two agree, but it cannot read the digest, so a stale line passes
+# the test and the release gate then refuses the chisel gateway. It is a separate pin from
 # Dockerfile.gateway's hexpm/erlang:28.5.0.8-alpine-3.23.8 builder (WP15).
 ARG ERLANG_IMAGE=erlang:28@sha256:fe3425a5d92e03aa3696b951b128f6c55c6f76d4ddf341c8e511ae9c515ac8d2
 FROM ${ERLANG_IMAGE} AS deps
