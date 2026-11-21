@@ -151,7 +151,34 @@ The release scan also refuses to push, rather than report a clean scan, when:
   grype: the database archive does not match the checksum its publisher's listing gives, or grype
   does not report the imported database as that one);
 - grype does not detect the operating-system release whose packages Trivy scanned (it would then
-  match none of them).
+  match none of them);
+- one of the grype database's providers that the image needs (NVD for every image, and the Alpine,
+  Debian or Ubuntu feed for an image on that release) is missing, or was last captured more than 72
+  hours ago, unless a provider waiver for it is in force (next paragraph).
+
+**A degraded pass: grype provider waivers.** One provider inside grype's database can stop
+updating because its upstream source stalls, while the database itself is still rebuilt. For a
+release that cannot wait, the release tag's `.grypeignore.yaml` may hold a reviewed provider waiver
+for exactly that provider (`nvd`, `alpine`, `debian` or `ubuntu`): a statement with the evidence of
+the stall, an expiry at most 14 days out, and the same approval fields as an accepted finding
+(checked for format only, and not honoured while `pending`). A waiver admits only that provider's
+capture being older than 72 hours. It never admits a finding, a missing provider, an unreadable
+capture time, a database that is itself older than 72 hours or does not match its checksum, or any
+other refusal above, and no setting of the release workflow can turn one on. An image scanned with
+a waiver passes **degraded**: grype matched that provider's packages against advisories as old as
+the capture, so a fix published upstream since then may be missing from the verdict. Its grype
+`.gate.txt` still says `gate: pass`, and also carries a `provider waiver: provider <name> captured
+<time>, <N> hours old (over the 72-hour limit), admitted by the provider waiver at
+.grypeignore.yaml:<line>: expires ..., approved_by ..., approval_ref ..., approved_on ...` line and a
+`DEGRADED: provider waiver in force (<name>)` line; a scan that used none says `provider waiver:
+none used`. To see whether any image of a release was scanned degraded (in the directory of its
+verified assets):
+
+```bash
+grep -H -e '^provider waiver:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt
+```
+
+A grype `.gate.txt` with no `provider waiver:` line at all records nothing either way. Follow the waiver's `approval_ref` to audit it, as for an accepted finding.
 
 After the release, the pre-release QA workflow scans the published tags again with a newer database;
 a finding there is reported, it cannot unpublish anything.
@@ -185,7 +212,8 @@ date, the OS, the OS package count, the coverage, the advisory-data check, the a
 file's hash and the result), and grype's `grype-<image>.attempt-<N>.json`, `.txt` and `.gate.txt`
 (the grype version, the database's archive, checksum and build time, the image ID, the detected
 distribution, the matches not accepted and the accepted ones with the fixable CRITICALs among each,
-the components grype was required to find, the accepted-findings file's hash and grype's result). `<N>` is the
+the components grype was required to find, the provider waivers it used (`provider waiver: none used`
+when none), the accepted-findings file's hash and grype's result). `<N>` is the
 release workflow's run attempt; every attempt's reports are
 kept, a refused or cancelled attempt's (`gate: FAIL: <reason>`, `gate: FAIL: cancelled ...`)
 included. Beside each attempt whose scan passed is its publish journal,
