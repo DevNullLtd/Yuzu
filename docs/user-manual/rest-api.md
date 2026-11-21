@@ -2446,7 +2446,7 @@ Quarantine a device.
 >   device that refuses" above). As of #3425 (`d1f71c58f`)
 >   this route validates `whitelist` at write time (`400` instead of `201`
 >   for a malformed value), the same rule MCP's `quarantine_device`
->   enforces — so a fresh write here cannot land in the first state. A
+>   enforces — so a fresh write here cannot land in the first case. A
 >   `validation_failed` reconcile points at a record written under an
 >   earlier, looser rule, not a fresh call. Either way, every reconcile
 >   attempt then counts `validation_failed` and nothing is ever dispatched.

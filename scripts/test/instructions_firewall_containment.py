@@ -57,7 +57,8 @@ usage error (exit 2). The release is dispatched through the server and depends o
 endpoint staying reachable while it is contained; the time limit (--ttl-seconds) is the backstop.
 
 Exit codes: 0 passed; 1 a check failed; 2 precondition or usage error (nothing changed);
-3 release could not be confirmed: clear the firewall by hand (see agents/plugins/firewall/README.md).
+3 release could not be confirmed: clear the firewall by hand (see docs/user-manual/security-hardening.md,
+"A device that is its own server is never contained").
 
 --agent-id is required with --apply-containment (it never contains "the first agent listed") and must be
 registered exactly once under one of this machine's hostnames (full name, case-insensitive; a first-label
@@ -642,6 +643,9 @@ def write_record(path: str, rec: dict) -> None:
             json.dump(rec, f, indent=2, sort_keys=True)
             f.write("\n")
     except OSError as e:   # a partial file this call created would block the corrected retry
+        # Best-effort cleanup that unlinks by name, so someone who controls the record's directory could
+        # rename a file onto the path and have it removed. That actor can already replace the record, and
+        # this only runs after this call's own failed write.
         with contextlib.suppress(OSError):
             os.unlink(path)
         say(f"could not write the run record {path}: {e}", file=sys.stderr)

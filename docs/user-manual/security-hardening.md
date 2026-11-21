@@ -672,12 +672,13 @@ no override. The refusal is visible in the `status|refused|<token>` row of the c
   puts back a table removed by hand. A host that runs the server while its agent reaches a remote
   gateway or VIP passes the check the same way, and its new inbound connections are dropped. The
   exits are `DELETE /api/v1/quarantine/{agent_id}` while the API is reachable, otherwise console
-  recovery: stop the agent service first, then remove the containment by hand (Linux: `sudo nft
-  delete table inet yuzu_quarantine`, or without nft delete the `yuzu-fwq-*` chains and the jumps
-  to them, in iptables and ip6tables; macOS: `sudo pfctl -a com.apple/000.yuzu_quarantine -F rules
-  -F nat`). Keep the agent stopped until the record is ended with `?force=true`: a restarted agent
-  re-applies a stored containment, and the release the server then owes lifts it. Put the server on
-  a separate host when containment matters.
+  recovery: stop the agent service first, then remove the containment by hand (Linux:
+  `sudo nft delete table inet yuzu_quarantine`, or without nft delete the `yuzu-fwq-*` chains and
+  the jumps to them, in iptables and ip6tables; macOS:
+  `sudo pfctl -a com.apple/000.yuzu_quarantine -F rules -F nat`). Keep the agent stopped until the
+  record is ended with `?force=true`: a restarted agent re-applies a stored containment, and the
+  release the server then owes lifts it. Put the server on a separate host when containment
+  matters.
 
 ### Reading the result honestly
 

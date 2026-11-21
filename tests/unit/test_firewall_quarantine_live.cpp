@@ -5,10 +5,10 @@
  *  - "action boundary" cases, tagged [agent][firewall_quarantine]: they run in the
  *    normal agent suite on every OS, need no privilege and never reach the host
  *    firewall -- each one dispatches along a path the plugin refuses (or answers)
- *    BEFORE its first OS call, over a fresh KV store. They prove the action
+ *    BEFORE any firewall read or change, over a fresh KV store. They prove the action
  *    routing, parameter checks, record read and result emission of the real
  *    plugin, which the pure-core tests cannot. Every `quarantine` dispatch in
- *    them is refused or answered before the plugin's first OS call; each carries a
+ *    them is refused or answered before any firewall read or change; each carries a
  *    probe_target that does not parse, except the `repair=1` dispatches, which are
  *    the record-only repair route or are refused for naming a containment parameter.
  *  - live cases, tagged [.][firewall_quarantine_live]: HIDDEN, so the shard
@@ -1085,7 +1085,7 @@ TEST_CASE("quarantine: a control endpoint that is this host's own loopback is re
     // refused whatever the read of this host's addresses returned. The refusal comes before
     // the privilege check, the staging check and any apply, on every OS and for an
     // unprivileged run, so this is what the built plugin answers here. Every `quarantine`
-    // dispatch in this suite is refused or answered before the plugin's first OS call; each
+    // dispatch in this suite is refused or answered before any firewall read or change; each
     // carries a probe_target that does not parse (`nope`), except the `repair=1` dispatches,
     // which are the record-only repair route or are refused for naming a containment
     // parameter. With the check intact the answer is still self_host, and if the check ever

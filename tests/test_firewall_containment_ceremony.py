@@ -871,9 +871,9 @@ class Usage(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         flat = " ".join(r.stdout.split())
         for needle in ("--remote", "refused|self_host", "exit 2", "--agent-hostname",
-                       "--i-have-console-access-to-the-agent", "--record"):
+                       "--i-have-console-access-to-the-agent", "--record", "bridge address"):
             self.assertIn(needle, flat)
-        for needle in ("--remote", "refused|self_host", "exit 2", "one host"):
+        for needle in ("--remote", "refused|self_host", "exit 2", "one host", "bridge address"):
             self.assertIn(needle, fc.LOOPBACK_REFUSAL)
         self.assertIn("one host", fc.__doc__)
         self.assertIn("refused|self_host", fc.__doc__)

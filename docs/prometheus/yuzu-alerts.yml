@@ -3260,7 +3260,7 @@ groups:
             confirmed. An agent without the firewall plugin comes from an
             earlier build, which is unsupported: reprovision the host into a
             fresh deployment of this build. On a Linux host running the
-            packaged systemd unit every containment action is refused
+            packaged systemd unit every mutating containment action is refused
             (privilege_unavailable), so a record there stays unconfirmed.
             It also fires when a NEW record lands on a device that is already
             contained under other operator exceptions: the device keeps the
