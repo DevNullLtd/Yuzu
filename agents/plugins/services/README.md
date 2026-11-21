@@ -16,7 +16,7 @@
 
 `list` and `running` read the host's service registry and return one `svc|` row per service: the Service Control Manager on Windows (Win32 services only, not kernel drivers), `systemctl list-units` on Linux (`--type=service` units that systemd has loaded, which is not every unit file on disk and excludes timers, sockets and other unit types) and `launchctl list` on macOS. `running` is the same read narrowed to services that are up: Windows asks the Service Control Manager for every state except stopped, Linux keeps systemd's `running` sub-state, and macOS keeps rows that have a PID (`launchctl` has no filter of its own, so the plugin filters after parsing). On macOS one extra call, `launchctl print-disabled system`, supplies each row's startup type; a label that domain holds no override for reads `unknown`.
 
-`set_start_mode` is the only mutation. It checks the service name and mode, then changes one service's boot-time start setting and nothing else: it does not start, stop or restart the service. Windows sets the Service Control Manager start type. Linux runs `systemctl enable` for `automatic`, `unmask` then `disable` for `manual`, and `mask` for `disabled`. macOS runs `launchctl enable` or `disable` against `system/<label>` and refuses `manual`, because launchd only has enabled and disabled. Linux and macOS commands run as shell-free argv under a 20 second deadline, prefixed with `sudo -n --` unless the agent is already root. The plugin is deliberately not a change history; the Echo service collector does that separately.
+`set_start_mode` is the only mutation. It checks the service name and mode, then changes one service's boot-time start setting and nothing else: it does not start, stop or restart the service. Windows sets the Service Control Manager start type. Linux runs `unmask` then `enable` for `automatic`, `unmask` then `disable` for `manual`, and `mask` for `disabled` (the `unmask` is best-effort, so a masked unit can be set back), then reads the unit's state back with `systemctl is-enabled`. macOS runs `launchctl enable` or `disable` against `system/<label>` and refuses `manual`, because launchd only has enabled and disabled. Linux and macOS commands run as shell-free argv under a 20 second deadline, prefixed with `sudo -n --` unless the agent is already root. The plugin is deliberately not a change history; the Echo service collector does that separately.
 
 ```mermaid
 flowchart LR
@@ -43,7 +43,7 @@ Safe workflow for `set_start_mode`:
 
 1. Run `list` and record the service's current `startup_type` (Windows and macOS only; Linux gives no startup type to record).
 2. Run `set_start_mode` with the target `name` and `mode`. The change takes effect at the next boot or login; a running service keeps running.
-3. Run `list` again and confirm the new `startup_type` (Windows and macOS). On Linux this plugin has no read-back, so confirm with `systemctl is-enabled` by other means.
+3. Run `list` again and confirm the new `startup_type` (Windows and macOS). On Linux `set_start_mode` itself reads `systemctl is-enabled` back (stderr not merged) and fails unless the state is in the accepted set for the requested mode (automatic: `enabled`, `static`, `indirect`, `alias`, `generated`; manual: `disabled`, `static`, `indirect`, `alias`, `generated`; disabled: `masked`), so a success answer has already been checked and carries a `state|` line (a `note|` line for `static`, `indirect`, `alias` and `generated` units, which `systemctl` cannot enable or disable).
 4. To undo, call `set_start_mode` with the value recorded in step 1. Windows `boot` and `system` start types cannot be restored, because the action only accepts `automatic`, `manual` and `disabled`.
 
 Target restrictions: `name` is 1 to 256 characters from letters, digits, `.`, `_`, `@` and `-`, so a Windows service name containing a space, or a systemd instance name with escaped characters, cannot be targeted. The action needs the `endpoint-admin` role and passes the `AdminOrApproval` gate.
@@ -67,10 +67,10 @@ sequenceDiagram
     P->>O: sudo -n -- launchctl enable or disable system/label
   end
   O-->>P: success or failure
-  P-->>S: status ok, service, mode  or  one error line
+  P-->>S: status ok, service, mode (Linux adds state, and note for some units)  or  one error line
 ```
 
-The plugin validates input first, then makes exactly one start-setting change per call (Linux `manual` adds a best-effort `unmask` beforehand). Nothing starts or stops the service, and a failure produces a single `error|` line instead of the three success lines.
+The plugin validates input first, then makes exactly one start-setting change per call (Linux `automatic` and `manual` add a best-effort `unmask` beforehand). Nothing starts or stops the service, and a failure produces one `error|` line and none of the success lines (`status|`, `service|`, `mode|`, and on Linux `state|` and, for a unit that cannot be enabled or disabled, `note|`). On Linux that `error|` line can be followed by one `note|` line: when `automatic` or `manual` found the unit masked, unmasked it and the change then failed, the plugin puts the mask back and writes `note|remasked: ...` (or `note|remask_failed: ...` if the mask could not be restored, in which case the unit may be left unmasked), so a failed call does not leave a masked unit less restricted. If the first state read cannot be trusted (it did not run, hit the deadline or gave an unknown state) `automatic` and `manual` are refused before anything is changed.
 
 ```mermaid
 flowchart TD
@@ -94,7 +94,11 @@ This shows why the two families of legs fail differently: Windows has no way to 
 |---|---|---|---|
 | `list` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
 | `running` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
-| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'sudo -n -- launchctl enable\|disable' | ✅ supported · rung 2 · runner argv 'sudo -n -- systemctl enable\|disable\|mask\|unmask' |
+| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 3 · sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl enable\|disable' (a root agent runs launchctl directly) | ✅ supported · rung 3 · sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl enable\|disable\|mask\|unmask' (a root agent runs systemctl directly) |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`set_start_mode` / Linux** — CONSTRAINED/PARTIAL (services:start_mode_unchangeable) for static, indirect, alias or generated units; CONSTRAINED/PARTIAL (services:start_mode_runtime_mask) for a unit masked for this boot only; CONSTRAINED/PARTIAL (services:start_mode_prior_unreadable) when the unit's prior state cannot be read
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -102,10 +106,10 @@ This shows why the two families of legs fail differently: Windows has no way to 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account, LocalSystem today (#1442) | `list`/`running`: none beyond the default account. `set_start_mode`: the plugin asks the Service Control Manager for `SC_MANAGER_CONNECT` and the target service for `SERVICE_CHANGE_CONFIG`, so the right is decided by that service's access-control list. The plugin enables or checks no privilege itself; the `SeAssignPrimaryTokenPrivilege` entry in `docs/agent-privilege-model.md` is not exercised by this code. | 2026-09-07, bare-metal, captured as `SYSTEM`; `list` and `running` only, `set_start_mode` stopped at parameter validation | `list`/`running`: a failed `OpenSCManagerW` or `EnumServicesStatusExW` returns an **empty** list with no error and no result status, so a refusal reads like "zero services". A single service whose configuration cannot be opened reports `startup_type` `unknown`. `set_start_mode`: failures are explicit `error\|...` rows (`access denied changing service '<name>'`, `service '<name>' not found`, or the Win32 error code). |
-| macOS | agent daemon, root (the shipped LaunchDaemon has no `UserName` key) | None as root: the `sudo -n --` prefix is skipped when the agent's effective uid is 0. A non-root agent needs the sudoers grants `/bin/launchctl enable system/*` and `/bin/launchctl disable system/*` (the installed grant also covers `bootstrap`/`bootout`, which this plugin does not use). | 2026-09-07, bare-metal, captured as an unprivileged interactive user, not the root identity the daemon runs under | `list`/`running`: a failed `launchctl list` or `launchctl print-disabled` sets a typed `UNAVAILABLE` or `CONSTRAINED` status through the shared runner seam. `set_start_mode`: a `sudo -n` denial is captured (stderr merged into the output) and appended to the `error\|launchctl command failed for '<name>' (exit=<n>)` line. |
-| Linux | agent daemon, dedicated unprivileged account by design (`docs/agent-privilege-model.md`) | `list`/`running`: none. `set_start_mode`: the sudoers grant `systemctl enable`, `disable`, `mask` and `unmask` (`/bin/systemctl` and `/usr/bin/systemctl`); the `sudo -n --` prefix is skipped when the agent is root. Under the packaged unit's `NoNewPrivileges=true`, `sudo` cannot escalate, so this grant takes effect only on a unit without that setting. | 2026-09-06, container, captured as root (`euid 0`), not the deployed unprivileged identity | `list`/`running`: a typed `UNAVAILABLE` or `CONSTRAINED` status; the captured sample shows `subprocess_runner:spawn_error` on both because `systemctl` could not be resolved in the capture container, not because of a permission denial. `set_start_mode`: a missing grant surfaces as `error\|systemctl command failed for '<name>' (exit=1): sudo: a password is required`. |
+| macOS | agent daemon, root (the shipped LaunchDaemon has no `UserName` key) | None as root: the `sudo -n --` prefix is skipped when the agent's effective uid is 0. A non-root agent needs the sudoers grant for the root-owned helper `/Library/PrivilegedHelperTools/yuzu-svc-helper` (written by `scripts/install-agent-user.sh`, named in sudoers with no argument and no wildcard), which takes `launchctl enable\|disable <label>` and runs `/bin/launchctl enable\|disable system/<label>` for a label of 1 to 256 letters, digits and `- _ . @`; it runs nothing else. On a host provisioned without this build's installer, `set_start_mode` fails on a non-root agent with sudo's own message. | 2026-09-07, bare-metal, captured as an unprivileged interactive user, not the root identity the daemon runs under | `list`/`running`: a failed `launchctl list` or `launchctl print-disabled` sets a typed `UNAVAILABLE` or `CONSTRAINED` status through the shared runner seam. `set_start_mode`: a `sudo -n` denial is captured (stderr merged into the output) and appended to the `error\|launchctl command failed for '<name>' (exit=<n>)` line. |
+| Linux | agent daemon, dedicated unprivileged account by design (`docs/agent-privilege-model.md`) | `list`/`running`: none. `set_start_mode`: the sudoers grant for the root-owned helper `/usr/local/sbin/yuzu-svc-helper` (written by `scripts/install-agent-user.sh`, named in sudoers with no argument and no wildcard), which takes `systemctl enable\|disable\|mask\|unmask <unit>` and runs `systemctl <verb> -- <unit>` for a unit name of 1 to 256 letters, digits and `- _ . @`; it runs nothing else. On a host provisioned without this build's installer, `set_start_mode` fails on a non-root agent with sudo's own message. The `sudo -n --` prefix is skipped when the agent is root. Under the packaged unit's `NoNewPrivileges=true`, `sudo` cannot escalate, so this grant takes effect only on a unit without that setting. | 2026-09-06, container, captured as root (`euid 0`), not the deployed unprivileged identity | `list`/`running`: a typed `UNAVAILABLE` or `CONSTRAINED` status; the captured sample shows `subprocess_runner:spawn_error` on both because `systemctl` could not be resolved in the capture container, not because of a permission denial. `set_start_mode`: a missing grant surfaces as `error\|systemctl command failed for '<name>' (exit=1): sudo: a password is required`. |
 
-Binaries and network: Linux runs `systemctl` (`list-units` for reads; `enable`, `disable`, `mask`, `unmask` under `sudo -n --` for the mutation). macOS runs `launchctl` (`list` and `print-disabled` for reads; `enable`, `disable` under `sudo -n --` for the mutation). Both go through the bounded, shell-free runner with a 20 second deadline. Windows uses the Service Control Manager API only, with no subprocess. No network access on any OS.
+Binaries and network: Linux runs `systemctl` (`list-units` for reads; `enable`, `disable`, `mask`, `unmask` through `sudo -n -- /usr/local/sbin/yuzu-svc-helper systemctl` for the mutation, or directly as root). macOS runs `launchctl` (`list` and `print-disabled` for reads; `enable`, `disable` through `sudo -n -- /Library/PrivilegedHelperTools/yuzu-svc-helper launchctl` for the mutation, or directly as root). Both go through the bounded, shell-free runner with a 20 second deadline. Windows uses the Service Control Manager API only, with no subprocess. No network access on any OS.
 
 ## Data contract
 
@@ -119,7 +123,7 @@ Binaries and network: Linux runs `systemctl` (`list-units` for reads; `enable`, 
 <!-- END GENERATED -->
 
 ### Outputs
-Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** differs by OS, not just the values: Windows and macOS emit the four fields the schema names (`name|display_name|status|startup_type`, where macOS puts the PID in the second slot), but Linux emits only **three** (`name|status|description`), because that leg never derives a startup type. A consumer must branch on OS before indexing a row (the server's own device-page parser does). `set_start_mode` never writes a `svc|` row: on success it writes three lines, `status|ok`, `service|<name>`, `mode|<mode>`; on any failure it writes one `error|<message>` line and none of the three, with return code 1. There is no placeholder-row convention for the reads. On Windows an enumeration failure returns zero rows with no status; on Linux and macOS a degraded run sets a typed `UNAVAILABLE` or `CONSTRAINED` status before whatever rows were parsed and returns code 1. On macOS the row cap (512) ends the list with a `svc|__truncated__|-|<total>|-` sentinel row.
+Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** differs by OS, not just the values: Windows and macOS emit the four fields the schema names (`name|display_name|status|startup_type`, where macOS puts the PID in the second slot), but Linux emits only **three** (`name|status|description`), because that leg never derives a startup type. A consumer must branch on OS before indexing a row (the server's own device-page parser does). `set_start_mode` never writes a `svc|` row: on success it writes `status|ok`, `service|<name>` and `mode|<mode>` on every OS, and on Linux also `state|<state>` (the unit's `systemctl is-enabled` state) and, for a `static`, `indirect`, `alias` or `generated` unit, a `note|<text>` line with a typed `CONSTRAINED`/`PARTIAL` result (`services:start_mode_unchangeable`) and return code 0. `status|ok` means the command completed: an unchangeable unit completes without the mode being applied, so a Linux caller reads `state|` and the typed status, not `status|ok` alone. On any failure it writes one `error|<message>` line and none of the success lines, with return code 1; on Linux a `note|remasked: ...` or `note|remask_failed: ...` line can follow it. There is no placeholder-row convention for the reads. On Windows an enumeration failure returns zero rows with no status; on Linux and macOS a degraded run sets a typed `UNAVAILABLE` or `CONSTRAINED` status before whatever rows were parsed and returns code 1. On macOS the row cap (512) ends the list with a `svc|__truncated__|-|<total>|-` sentinel row.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.service.list` — `name|display_name|status|startup_type`**
@@ -140,21 +144,26 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 | `status` | string | - | Windows, Linux, macOS | `running (windows) · 0 (darwin)` | Column 3, whose meaning is OS-specific. On Windows it is the service's current SCM state (always "running" for this action's filtered result). On Linux it is systemd's SUB state from `systemctl list-units --state=running`. On macOS it is launchctl's raw last-exit-status code for the job -- an integer as a string, NOT a running/stopped word; this action's own running-filter is applied on the PID column, not this one. Values: running (windows, this action always filters to it) · free text systemd SUB state (linux) · integer exit-status code as a string (darwin). |
 | `startup_type` | string | - | Windows, macOS | `automatic (windows) · unknown (darwin)` | Column 4: the service's configured startup type. On Windows this is the SCM's 5-state taxonomy. On macOS it is an honest 3-value read derived from a bulk `launchctl print-disabled` join -- a label with no explicit override reports "unknown" rather than a guessed default. It is NOT emitted on Linux at all (no 4th column on the wire), because the systemctl leg does not derive a startup type. Values: automatic, boot, manual, disabled, system, unknown (windows) · automatic, disabled, unknown (darwin) · field absent (linux). |
 
-**`crossplatform.service.set_start_mode` — `status|service|mode`**
+**`crossplatform.service.set_start_mode` — `status|service|mode|state|note`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `status` | string | - | Windows, Linux, macOS | `ok` | Literal "ok" on a successful mode change. On any failure the plugin instead writes a single "error\|<message>" line and this row does not appear at all. Values: ok (the only value ever emitted). |
 | `service` | string | - | Windows, Linux, macOS | `-` | The `name` parameter echoed back unmodified, on a successful mode change only. Values: free text — echoes the name parameter. |
 | `mode` | string | - | Windows, Linux, macOS | `-` | The `mode` parameter echoed back unmodified, on a successful mode change only. Values: automatic, disabled (all OS) · manual additionally on windows/linux (darwin rejects it before this row is ever written). |
+| `state` | string | - | Linux | `enabled` | Linux only, on a successful mode change: the unit's state read back with `systemctl is-enabled` (the first line). Values: enabled, disabled, masked, static, indirect, alias, generated (the only states that can follow a successful change). |
+| `note` | string | - | Linux | `-` | Linux only; a free-text line that can follow either outcome. On success it is written when `state` is static, indirect, alias or generated: those units cannot be enabled or disabled, so the requested mode does not change whether they start at boot, and the result status is then CONSTRAINED/PARTIAL (`services:start_mode_unchangeable`) while the exit code stays 0. After a failed change it is `note\|remasked: ...` (a unit found masked was masked again) or `note\|remask_failed: ...` (it could not be masked again; the unit may be left unmasked), written after the `error\|` line. Values: free text naming the unit. |
 <!-- END GENERATED -->
 
 ### Result status
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows read (including a failed one), every Linux/macOS read that completed cleanly, a successful `set_start_mode` on any OS, and every `set_start_mode` validation or platform-decision error (missing `name`/`mode`, unsafe name, invalid mode, macOS `manual`, a command that ran and exited non-zero). The plugin sets no status on these paths. |
+| `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows read (including a failed one), every Linux/macOS read that completed cleanly, a successful `set_start_mode` on Windows and macOS and on Linux for a unit whose state can change, and every `set_start_mode` validation or platform-decision error (missing `name`/`mode`, unsafe name, invalid mode, macOS `manual`, a command that ran and exited non-zero). The plugin sets no status on these paths. |
 | `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | Linux/macOS `list`/`running`/`set_start_mode`: `systemctl`/`launchctl` (or `sudo`) could not be started or was not found; shown in `docs/samples/linux.txt` |
+| `CONSTRAINED` | PARTIAL | `services:start_mode_unchangeable` | Linux `set_start_mode` succeeded (exit 0, `status\|ok`) but the unit's `systemctl is-enabled` state is `static`, `indirect`, `alias` or `generated`: `systemctl` cannot enable or disable such a unit, so the requested mode does not change whether it starts at boot. `state\|` and `note\|` lines say which. The typed status is stored with the result and carried on the event payload; it is not yet shown on the REST, MCP or dashboard surfaces. |
+| `CONSTRAINED` | PARTIAL | `services:start_mode_prior_unreadable` | Linux `set_start_mode` `automatic` or `manual`: the first `systemctl is-enabled` read (taken before the unmask) did not run, was cut by the 20 second deadline, or answered with a state this plugin does not know, so whether the unit is masked is unknown. Refused with rc 1 before any change, so a masked unit is never unmasked on a guess. |
+| `CONSTRAINED` | PARTIAL | `services:start_mode_runtime_mask` | Linux `set_start_mode` `automatic` or `manual` on a unit whose `systemctl is-enabled` state is `masked-runtime` (masked for this boot only): refused up front with rc 1 and nothing changed, because the helper's `unmask` removes a persistent mask only. Remove the runtime mask on the host (`systemctl unmask --runtime` as root) or reboot. |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` | The 20 second runner deadline elapsed and the child was killed |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:cancelled` | The `systemctl`/`launchctl` run was cancelled before it finished |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:signaled` | The child was killed by a signal rather than exiting cleanly |
@@ -173,7 +182,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash e724207e0989
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash d88afd69bd6a
 
 ```
 == action=list
@@ -214,7 +223,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash e724207e0989
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash d88afd69bd6a
 
 ```
 == action=list
@@ -255,7 +264,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e724207e0989
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
 
 ```
 == action=list
@@ -284,9 +293,9 @@ error|missing required parameter: name
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/services/src/services_macos_launchd.hpp` · `agents/plugins/services/src/services_parsers.hpp` · `agents/plugins/services/src/services_plugin.cpp`
+- Plugin: `agents/plugins/services/src/services_macos_launchd.hpp` · `agents/plugins/services/src/services_parsers.hpp` · `agents/plugins/services/src/services_plugin.cpp` · `agents/plugins/services/src/services_set_start_mode.hpp`
 - Definitions: `content/definitions/services.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: `tests/unit/agent/test_services_macos.cpp` · `tests/unit/test_services_parsers.cpp`
+- Tests: `tests/test_services_readback_wiring_lexical.py` · `tests/unit/agent/test_services_macos.cpp` · `tests/unit/test_services_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

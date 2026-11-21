@@ -111,6 +111,98 @@ on any other distribution. The exception is `yuzu-agent-bundle-chisel`, which de
 agent files: the Linux agent extracted from it has the tarball's requirements. Building the
 native packages to an older baseline is not part of 0.15.0; it is planned under ADR-2003 (#5143).
 
+### Windows agent: Visual C++ runtime
+
+The Windows agent, its plugins and its bundled libraries are built with Microsoft Visual C++
+and need the Visual C++ runtime, the DLLs `vcruntime140.dll`, `vcruntime140_1.dll`,
+`msvcp140.dll` and, for `yuzu-agent.exe`, `msvcp140_atomic_wait.dll`. Microsoft's Visual C++
+2015-2022 Redistributable (x64), "the Redistributable" below, is the package that installs
+that runtime into `System32`. From 0.16.0 the release archive (`yuzu-agent-windows-x64.zip`)
+and the installer (`YuzuAgentSetup-<version>.exe`) carry the runtime in the agent's own `bin`
+directory, next to `yuzu-agent.exe`, so a Windows 10 or later x64 machine needs no
+Redistributable installed first. The agent uses that copy even when the machine also has the
+Redistributable installed, and Windows Update does not service it. Each release builds the
+agent with one pinned Visual C++ toolset and ships the runtime of that toolset. The version a
+device runs is the file version of the Microsoft-signed DLLs in the agent's `bin` directory;
+the release job's step summary lists the staged DLLs and their file versions for that
+workflow run only, and is kept only as long as the run is.
+
+**Each release's installer and archive carry that release's runtime and plugins.** Deploy a
+Windows agent from the installer or archive of a single release. Agent self-update (OTA)
+replaces `yuzu-agent.exe` only; it does not install or refresh the runtime or any plugin
+(#8219, #8218). A device whose agent was updated that way mixes builds and is not a supported
+configuration (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)).
+
+**Code loaded into the agent uses the same copy.** A third-party component that runs inside
+the agent process, for example the Configuration Manager client objects the `sccm` plugin
+creates in-process, also binds to the agent's copy of the runtime, not to the one the
+Redistributable installs in `System32`. That copy is the one the installer or archive of the
+release brought. A vendor DLL built with a newer Visual C++ toolset than the release's can
+fail to load in the agent or misbehave there, up to stopping the agent. The Configuration
+Manager client that `sccm` loads is the known in-process vendor DLL; its imports have not been
+inspected (#8311 tracks running it outside the agent process).
+
+**If an agent stops reporting because `yuzu-agent.exe` cannot start.** The Windows service
+manager restarts the service every 60 seconds and each start fails the same way. Signs of it
+in Event Viewer: Service Control Manager events 7031 or 7034 for the agent service
+(`YuzuAgent`) in the System log, and an error in the Application log naming
+`VCRUNTIME140.dll` or `MSVCP140.dll`, or an access violation in `msvcp140.dll`. Deploy the
+agent from the installer or archive of one release (see "Deployment contract (hard cutover)"
+in [Upgrading](upgrading.md)).
+
+Releases up to and including 0.15.0 did not carry the runtime. On a machine without the
+Redistributable 14.44 or later (0.15.0 was built with the 14.44 toolset), the 0.15.0
+`yuzu-agent.exe` either does not start and Windows reports a missing `VCRUNTIME140.dll` or
+`MSVCP140.dll`, or, with an older Redistributable installed, stops with an access violation in
+`msvcp140.dll`. The 0.16.0 installer and archive carry the runtime; deploy the agent from one
+of them (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). The 0.15.0
+installer also left out six plugins that the archive carried. The 0.16.0 installer installs
+five of them, with these components: System (`browser_inventory`, `printing`,
+`privacy_permissions`), Network (`netprobe`) and Windows (`rdp_control`). It deliberately does
+not install `license_scan`: installing it starts the agent's daily software-licensing
+collection on the device with no operator action, and under ADR-3006 (decision D10) no release
+adds a unit that runs by default until the fleet-level setting for additions exists (#8309
+tracks it). The release archive still carries `license_scan`.
+
+#### What uninstalling removes
+
+Uninstalling an agent installed with the installer (from the installed-apps list in Settings
+or Control Panel, or with `unins000.exe` in the install directory) stops and removes the
+`YuzuAgent` service, removes the boot-time process trace setting with its file
+`%ProgramData%\Yuzu\procboot.etl`, and deletes:
+
+- every file the installer installed;
+- these, by name (the installer's `[UninstallDelete]` entries): `plugins\license_scan.dll`,
+  `bin\yuzu-agent.old.exe`, `bin\.yuzu-update-verified`, the `logs` directory,
+  `%ProgramData%\Yuzu\enrollment-token`, and the `%ProgramData%\Yuzu\enrollment-token.stage`
+  directory if it is empty. The installer does not install the first three:
+  `license_scan.dll` is in the release archive (see above), and the other two are the previous
+  executable and its marker, which agent self-update leaves.
+
+A file still in use when the uninstaller runs is not deleted. The uninstaller also leaves any
+other file added to the install directory, and the randomly named temporaries an interrupted
+self-update can leave in `bin` (`yuzu-update-*.tmp` and `.yuzu-update-verified.tmp.*`; the
+agent does not load them). Before it copies its own files, the installer deletes, by name (its
+`[InstallDelete]` entries), `plugins\sockwho.dll`, `plugins\tar.dll`, `plugins\quarantine.dll`,
+`bin\yuzu-agent.old.exe` and `bin\.yuzu-update-verified`, skipping a file still in use.
+
+**The agent data directory, `%ProgramData%\Yuzu`.** Apart from the files named above, the
+uninstaller deletes it only when asked to. Once the program is removed, an interactive
+uninstall asks "Remove agent data directory?"; the default answer is **No**, which leaves the
+directory, and **Yes** deletes the directory and everything in it that is not in use. A silent uninstall
+(`/SILENT` or `/VERYSILENT`) never asks and leaves the directory. The directory holds the
+agent's identity and local state, including `agent.db` (the agent id); `certs`, which by
+default holds the agent's client certificate and private key, and where the agent looks for
+`default-ca.pem`, the server CA it trusts when it is given no `--ca-cert`; `agent-certs`, the
+directory the installer creates for the trust bundle that verifies self-update packages
+(`update-trust-bundle.pem`, placed by an operator; see "Signing update binaries" in
+[Server Administration](server-admin.md)); and `kv_store.db`, plugin storage,
+which on a quarantined device holds the firewall plugin's quarantine record, the firewall
+policy the quarantine replaced and the list of firewall rules it turned off. Uninstalling does
+not undo a quarantine, so answering **Yes** on a quarantined device deletes that record while
+the firewall changes stay in force: the host stays contained, and an agent installed on it has
+a new agent id (unless `--agent-id` or `YUZU_AGENT_ID` sets one) and no record of the quarantine.
+
 ## Quick Start
 
 1. **Start the server** -- run `yuzu-server` with a configuration file or accept interactive first-run setup.

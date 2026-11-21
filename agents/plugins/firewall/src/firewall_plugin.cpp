@@ -38,6 +38,12 @@
  *                 the old single opaque `firewall-cmd --list-all || ufw
  *                 status numbered || iptables -L -n --line-numbers` shell
  *                 chain and its `rule|<raw line>` passthrough.
+ *   Containment calls a non-root agent makes through the root-owned yuzu-fw-helper
+ *   (nft load, iptables, pf load) are rung 3: the helper is a `#!/bin/sh` script, and a
+ *   site's rung is set by the deepest interpreter intentionally invoked (ADR-3002 Decision 5),
+ *   so those sites are registered in docs/agent-spawn-sink-manifest.md. The descriptor carries the
+ *   worst rung a leg can reach (plugin.h); an agent that runs as root runs the tool directly, which
+ *   is rung 2.
  */
 
 #include <yuzu/plugin.hpp>
@@ -1663,12 +1669,15 @@ private:
 }
 
 /// The agent-private directory a ruleset is staged in: `<agent.data_dir>/
-/// firewall-staging`, mode 0700 and owned by the agent. The privileged `nft -f` /
-/// `pfctl -f` reads the file after it is written, so a world-writable temp dir
-/// would let another local user swap the content in between. An existing
-/// directory is trusted only when it is a real directory (not a link) owned by
-/// us with no group/other access. Empty when `agent.data_dir` is unset or the
-/// directory cannot be made safe: the apply is then refused, never staged in /tmp.
+/// firewall-staging`, mode 0700 and owned by the agent. The privileged load (the helper's
+/// `nft load` on Linux, `pf load` on macOS) reads the file after it is written, so a
+/// world-writable temp dir would let another local user swap the content in between. The
+/// directory name and the `yuzu-fwq-*.nft` / `yuzu-fwq-*.pf` file names NftLeg and PfLeg stage
+/// are the shape the helper accepts (scripts/install-agent-user.sh; pinned by
+/// tests/test_legacy_quarantine_plugin_removed_lexical.py). An existing directory is trusted
+/// only when it is a real directory (not a link) owned by us with no group/other access. Empty
+/// when `agent.data_dir` is unset or the directory cannot be made safe: the apply is then refused,
+/// never staged in /tmp.
 [[maybe_unused]] std::string private_staging_dir(YuzuPluginContext* raw) {
     const auto data_dir = config_value(raw, "agent.data_dir");
     if (data_dir.empty())
@@ -1787,8 +1796,11 @@ private:
     if (use != fq::BackendKind::nft && use != fq::BackendKind::iptables)
         use = has_nft ? fq::BackendKind::nft
                       : (has_ipt ? fq::BackendKind::iptables : fq::BackendKind::none);
+    // A static decision on the euid, the one sudo_wrap makes: a root agent has no sudoers grant to
+    // bound and runs the tools itself; any other agent goes through the root-owned helper.
+    const auto access = ::geteuid() == 0 ? fq::ToolAccess::direct : fq::ToolAccess::helper;
     if (use == fq::BackendKind::nft)
-        return std::make_unique<fq::NftLeg>(sudo_runner(), temp_file_stage(raw),
+        return std::make_unique<fq::NftLeg>(sudo_runner(), temp_file_stage(raw), access,
                                             read_quarantine_table_netlink);
     if (use == fq::BackendKind::iptables) {
         // Apply decides IPv6 from the tool AND the stack (iptables_v6_plan refuses a
@@ -1798,7 +1810,7 @@ private:
         const bool has_ip6 = ::access("/usr/sbin/ip6tables", X_OK) == 0;
         const auto mode = for_apply ? fq::iptables_v6_plan(has_ip6, ipv6_stack_present())
                                     : (has_ip6 ? fq::V6Mode::cover : fq::V6Mode::v4_only);
-        return std::make_unique<fq::IptablesLeg>(sudo_runner(), mode);
+        return std::make_unique<fq::IptablesLeg>(sudo_runner(), mode, access);
     }
     return nullptr;
 }
@@ -2624,7 +2636,7 @@ private:
 
 #endif // _WIN32
 
-// ── macOS leg (rung 2, sudo pfctl over the pf sub-anchor) ───────────────────
+// ── macOS leg (rung 2, the helper's pf load and sudo pfctl over the pf sub-anchor) ──
 #if defined(__APPLE__)
 
 /// The current boot's identity, `kern.boottime` as "<sec>.<usec>", read in-process
@@ -2640,9 +2652,13 @@ private:
 }
 
 /// macOS has one backend (pf), so the hint and for_apply carry nothing: release
-/// and status use the same leg that applied.
+/// and status use the same leg that applied. The anchor load goes through the root-owned helper
+/// unless the agent is root: the static decision on the euid that sudo_wrap makes and the Linux
+/// make_leg passes on. Only the load switches on it; the enable reference is released with the
+/// same `pfctl -X <token>` argv in both modes.
 [[nodiscard]] std::unique_ptr<fq::Leg> make_leg(YuzuPluginContext* raw, fq::BackendKind, bool) {
-    return std::make_unique<fq::PfLeg>(sudo_runner(), temp_file_stage(raw), kern_boot_time);
+    const auto access = ::geteuid() == 0 ? fq::ToolAccess::direct : fq::ToolAccess::helper;
+    return std::make_unique<fq::PfLeg>(sudo_runner(), temp_file_stage(raw), kern_boot_time, access);
 }
 
 #endif // __APPLE__
@@ -3018,8 +3034,9 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
 // run_bounded_subprocess argv (rung 2), the fallback once neither native
 // backend is reachable. `state` and `rules` never mutate firewall state. The
 // four containment actions below do: Windows over COM (rung 1), Linux over
-// `sudo nft -f` / iptables argv (rung 2, with the status read rung 1 -> 2),
-// macOS over `sudo pfctl` (rung 2): an own sub-anchor plus a pf enable reference.
+// the root-owned helper's nft load / iptables argv (rung 3, with the status read rung 1 -> 3),
+// macOS over the root-owned helper's pf load and `sudo pfctl` (rung 3): an own sub-anchor plus a pf
+// enable reference.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "state",
@@ -3048,9 +3065,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "quarantine",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "sudo nft -f of an own inet table applied as one transaction (policy-drop chains); "
-         "iptables/ip6tables generation chain via run_bounded_subprocess when nft is absent",
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper nft load of an own inet table "
+         "applied as one transaction (policy-drop chains); iptables/ip6tables generation chain "
+         "through the same helper when nft is absent",
          "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
          "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges; "
          "contains the host's own IP traffic and traffic the host routes (L2-bridged guests and "
@@ -3058,9 +3076,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "wall clock (NTP is blocked while contained) and its expiry release is logged on the "
          "agent only"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "sudo pfctl: own sub-anchor com.apple/000.yuzu_quarantine loaded with -a -f (the main ruleset "
-         "is never loaded), a pf enable reference (-E), one global pf state flush (-F states)",
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper pf load of an own sub-anchor "
+         "com.apple/000.yuzu_quarantine (the main ruleset is never loaded), sudo pfctl: a pf "
+         "enable reference (-E), one global pf state flush (-F states)",
          "needs Apple's anchor com.apple/* in the main ruleset and no sibling anchor sorting before "
          "000.yuzu_quarantine, else the result is partial or degraded; the state flush cuts every pf "
          "connection once and release does not restore them; a ttl_seconds limit rides the host "
@@ -3084,7 +3103,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "release",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 2, "sudo nft delete table / iptables chain removal",
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "sh: the root-owned yuzu-fw-helper for the iptables chain removal; sudo nft delete table "
+         "directly",
          "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
          "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges"},
         /* .macos_leg   = */
@@ -3103,9 +3124,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "quarantine_status",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 1,
+        {YUZU_SUPPORT_CONSTRAINED, 3,
          "own nftables table over NETLINK_NETFILTER (rung 1), else sudo nft list table (rung 2); "
-         "iptables chain jumps via argv",
+         "iptables chain listings through sh: the root-owned yuzu-fw-helper",
          "netlink needs CAP_NET_ADMIN, which the unprivileged agent lacks: the sudo read is "
          "the usual path, and on the packaged systemd unit (NoNewPrivileges, no sudoers) it fails, "
          "so a host with a stored record reads degraded; needs the installer's sudoers grant on a "
@@ -3122,13 +3143,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "quarantine_allow",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "atomic nft reload / iptables build-then-swap of a new generation",
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "sh: the root-owned yuzu-fw-helper, atomic nft reload / iptables build-then-swap of a new "
+         "generation",
          "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
          "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "sudo pfctl: atomic reload of the own sub-anchor (-a -f), then a global pf state flush",
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper pf load: atomic reload of the own "
+         "sub-anchor, then a global pf state flush (sudo pfctl -F states)",
          "each update flushes every pf state once, so connections not covered by an allowance are "
          "cut and not restored"},
         /* .windows_leg = */

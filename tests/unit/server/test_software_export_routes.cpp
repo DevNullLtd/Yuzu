@@ -20,23 +20,45 @@
  * `active_for_surface`. Either limit refusing (the export cap, or the budget full from another
  * surface) is a 503 with a retry hint and a `denied` row; a request refused after admission holds
  * no lease; an engine principal's pending quota slot is adopted into the stream.
+ *
+ * XLSX (`format=xlsx`) is built whole before the response starts, so its cases drive a SIZED
+ * provider by hand (offset advancing to the content length) and read the body back as a workbook
+ * through minizip. File justification: the export writes a real temporary workbook by design (the
+ * property under test is that it is removed on every path), so those cases use a `yuzu_test_`
+ * directory the TempDir removes at the end; the disk-free figure and the clock are injected, so
+ * no case depends on the machine's disk or on time passing. One case makes a real write fail
+ * (RLIMIT_FSIZE, the only way short of a full volume): a guard ignores SIGXFSZ, holds the soft
+ * limit across one request only, with no assertion inside the window, and restores both.
  */
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
+#include "../test_helpers.hpp"
 #include "principal_quota.hpp"
 #include "principal_quota_gate.hpp"
 #include "software_export_routes.hpp"
+#include "software_export_xlsx.hpp"
 #include "stream_budget.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
 
+#include <minizip/unzip.h>
+
+#include <sys/resource.h>
+#include <sys/stat.h>
+
 #include <algorithm>
+#include <cctype>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -45,6 +67,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -86,11 +109,36 @@ SoftwareFleetRow install_row(const std::string& agent, std::int64_t install_id,
     return r;
 }
 
+// Forwards every registration to the TestRouteSink and keeps the export route's handler, so a case
+// can call it with a fresh httplib::Response (status -1, as httplib hands it to a handler), which
+// TestRouteSink pre-sets to 200 and so cannot tell a handler that sets its own status from one
+// that does not.
+class TapSink : public HttpRouteSink {
+public:
+    TapSink(yuzu::server::test::TestRouteSink& inner, Handler& export_get)
+        : inner_(inner), export_get_(export_get) {}
+    void Get(const std::string& p, Handler h) override {
+        if (p == "/api/v1/inventory/software/export")
+            export_get_ = h;
+        inner_.Get(p, std::move(h));
+    }
+    void Post(const std::string& p, Handler h) override { inner_.Post(p, std::move(h)); }
+    void Put(const std::string& p, Handler h) override { inner_.Put(p, std::move(h)); }
+    void Delete(const std::string& p, Handler h) override { inner_.Delete(p, std::move(h)); }
+    void Patch(const std::string& p, Handler h) override { inner_.Patch(p, std::move(h)); }
+    void Options(const std::string& p, Handler h) override { inner_.Options(p, std::move(h)); }
+
+private:
+    yuzu::server::test::TestRouteSink& inner_;
+    Handler& export_get_;
+};
+
 struct Harness {
     yuzu::MetricsRegistry metrics;     // outlives the routes that count into it
     sb::StreamBudget budget;           // the one held-open budget; outlives every Response lease
     SoftwareExportRoutes routes;       // declared BEFORE the sink that holds handlers capturing it
     yuzu::server::test::TestRouteSink sink;
+    httplib::Server::Handler export_handler; // the export route's handler, kept by TapSink
 
     // The gate.
     bool admitted{true};
@@ -124,6 +172,15 @@ struct Harness {
     // The injected deadline clock (monotonic seconds).
     std::int64_t clock_s{1'000};
 
+    // XLSX: the injected free-space figure (nullopt = unreadable) and, optionally, a script that
+    // answers per call (1-based). Called once per disk grant.
+    std::optional<std::uintmax_t> disk_free{std::uintmax_t{1} << 40};
+    std::function<std::optional<std::uintmax_t>(int)> disk_free_at;
+    int disk_free_calls{0};
+    // Runs after every installs read is counted (1-based), before it answers: lets a case move
+    // the clock or start the shutdown in the middle of a build.
+    std::function<void(int)> on_install_read;
+
     [[nodiscard]] SoftwareFleetRow generated_row(int i) const {
         if (generated_in_from >= 0 && i >= generated_in_from)
             return install_row(agent_id("z", i - generated_in_from, 3), i + 1);
@@ -134,7 +191,8 @@ struct Harness {
     // `global_cap` is the budget's server-wide cap (the --max-sse-streams side); `concurrency` is the
     // export cap (--inventory-export-concurrency). `wire_budget` false leaves Deps::stream_budget null.
     explicit Harness(int concurrency = 2, bool wire_reads = true, bool wire_budget = true,
-                     std::size_t global_cap = 64, swe::Limits limits = {})
+                     std::size_t global_cap = 64, swe::Limits limits = {},
+                     std::filesystem::path xlsx_dir = {})
         : budget(sb::StreamBudget::Config{global_cap}) {
         SoftwareExportRoutes::Deps deps;
         deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -167,11 +225,18 @@ struct Harness {
         deps.stream_budget = wire_budget ? &budget : nullptr;
         deps.concurrency = concurrency;
         deps.limits = limits;
+        deps.xlsx_tmp_dir = std::move(xlsx_dir);
+        deps.disk_free_fn = [this]() -> std::optional<std::uintmax_t> {
+            ++disk_free_calls;
+            return disk_free_at ? disk_free_at(disk_free_calls) : disk_free;
+        };
         if (wire_reads) {
             auto& r = deps.reads;
             r.installs = [this](const SoftwareFleetQuery& q)
                 -> std::optional<std::vector<SoftwareFleetRow>> {
                 ++install_reads;
+                if (on_install_read)
+                    on_install_read(install_reads);
                 last_query = q;
                 max_skip_seen = std::max(max_skip_seen, q.skip);
                 if (fail_read_at != 0 && install_reads == fail_read_at)
@@ -233,7 +298,8 @@ struct Harness {
                 return distinct;
             };
         }
-        routes.register_routes(sink, std::move(deps));
+        TapSink tap(sink, export_handler);
+        routes.register_routes(tap, std::move(deps));
     }
 
     std::unique_ptr<httplib::Response> get(const std::string& query) {
@@ -1174,4 +1240,1039 @@ TEST_CASE("export route: a version range is resolved once, then held for the who
         CHECK(one.held() == 0);
         CHECK(one.get("?format=jsonl")->status == 200); // the one export slot is still free
     }
+}
+
+// ── XLSX ────────────────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+namespace fs = std::filesystem;
+
+constexpr auto kReserve = static_cast<std::uintmax_t>(swe::kXlsxDiskReserveBytes);
+constexpr auto kGrant = static_cast<std::uintmax_t>(swe::kXlsxDiskGrantBytes);
+constexpr auto kFactor = static_cast<std::uintmax_t>(swe::kXlsxPeakDiskFactor);
+// Free space that covers exactly one export's first grant (every export here asks for kGrant).
+constexpr std::uintmax_t kRoomForOne = kReserve + kFactor * kGrant;
+
+// A Harness with a real temporary directory for the workbooks and a scratch place to read bodies
+// back (outside the export directory, so "the export directory is empty" stays checkable).
+struct XlsxHarness {
+    yuzu::test::TempDir root{"yuzu_test_xlsx_route_"};
+    fs::path dir;
+    Harness h;
+    explicit XlsxHarness(int concurrency = 2, swe::Limits limits = {},
+                         const std::function<fs::path(const fs::path&)>& make_dir = {})
+        : dir(make_dir ? make_dir(root.path) : root.path / "export-tmp"),
+          h(concurrency, true, true, 64, limits, dir) {}
+
+    [[nodiscard]] std::size_t files_in_dir() const {
+        std::error_code ec;
+        std::size_t n = 0;
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+            ++n;
+        return n;
+    }
+};
+
+struct SizedTransfer {
+    std::string body;
+    bool aborted{false};
+    int calls{0};
+};
+
+// Drives a SIZED provider the way httplib does: offset advances to the content length, the
+// provider is handed what is left each time. `before_call` sees the 0-based call index.
+SizedTransfer drive_sized(httplib::Response& res, const std::function<void(int)>& before_call = {}) {
+    SizedTransfer t;
+    httplib::DataSink sink;
+    std::size_t offset = 0;
+    sink.write = [&](const char* p, size_t n) {
+        t.body.append(p, n);
+        offset += n;
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    sink.done = [] {};
+    REQUIRE(res.content_provider_);
+    while (offset < res.content_length_) {
+        if (before_call)
+            before_call(t.calls);
+        ++t.calls;
+        const auto before = offset;
+        if (!res.content_provider_(offset, res.content_length_ - offset, sink) || offset == before) {
+            t.aborted = true;
+            break;
+        }
+    }
+    return t;
+}
+
+// The worksheet XML of a workbook held in `body` (nullopt when it is not a valid workbook).
+std::optional<std::string> sheet_xml(const fs::path& scratch, const std::string& body) {
+    fs::create_directories(scratch);
+    const auto p = scratch / "readback.xlsx";
+    {
+        std::ofstream out(p, std::ios::binary);
+        out.write(body.data(), static_cast<std::streamsize>(body.size()));
+    }
+    unzFile zf = unzOpen64(p.string().c_str());
+    if (!zf)
+        return std::nullopt;
+    std::optional<std::string> xml;
+    if (unzLocateFile(zf, "xl/worksheets/sheet1.xml", 0) == UNZ_OK &&
+        unzOpenCurrentFile(zf) == UNZ_OK) {
+        std::string got;
+        char buf[16384];
+        for (int n = unzReadCurrentFile(zf, buf, sizeof buf); n > 0;
+             n = unzReadCurrentFile(zf, buf, sizeof buf))
+            got.append(buf, static_cast<std::size_t>(n));
+        unzCloseCurrentFile(zf);
+        xml = std::move(got);
+    }
+    unzClose(zf);
+    return xml;
+}
+
+std::size_t occurrences(const std::string& hay, std::string_view needle) {
+    std::size_t n = 0;
+    for (auto at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
+        ++n;
+    return n;
+}
+
+// Makes a real write fail: the soft file-size limit for one narrow window. SIGXFSZ is ignored so
+// the failing write returns EFBIG instead of killing the process, and both are restored on every
+// path. Hold it only around the request: no assertion inside the window. (The same guard is in
+// test_software_export_xlsx.cpp; the shared test header is outside this change.)
+class FsizeLimit {
+public:
+    explicit FsizeLimit(std::uintmax_t bytes) {
+        if (getrlimit(RLIMIT_FSIZE, &old_) != 0)
+            return;
+        old_signal_ = std::signal(SIGXFSZ, SIG_IGN);
+        rlimit lim = old_;
+        lim.rlim_cur = static_cast<rlim_t>(bytes);
+        armed_ = setrlimit(RLIMIT_FSIZE, &lim) == 0;
+    }
+    ~FsizeLimit() {
+        if (armed_)
+            setrlimit(RLIMIT_FSIZE, &old_);
+        if (old_signal_ != SIG_ERR)
+            std::signal(SIGXFSZ, old_signal_);
+    }
+    FsizeLimit(const FsizeLimit&) = delete;
+    FsizeLimit& operator=(const FsizeLimit&) = delete;
+    [[nodiscard]] bool armed() const { return armed_; }
+
+private:
+    rlimit old_{};
+    void (*old_signal_)(int){SIG_ERR};
+    bool armed_{false};
+};
+
+// Rows whose publisher is far past the cell cap: a few hundred of them fill a 16 MiB disk grant.
+void fat_rows(Harness& h, int n) {
+    for (int i = 0; i < n; ++i) {
+        auto r = install_row(agent_id("a", i), i + 1);
+        r.entry.publisher = std::string(40'000, 'p');
+        h.installs.push_back(std::move(r));
+    }
+}
+
+} // namespace
+
+TEST_CASE("export route xlsx: a sized 200 whose body is the workbook, with the file gone once "
+          "released",
+          "[software_export][routes][xlsx]") {
+    XlsxHarness x;
+    x.h.installs = {install_row("a-1", 1), install_row("a-2", 2)};
+    x.h.roster = {{"a-1", "host-one"}};
+
+    auto res = x.h.get("?format=xlsx");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Content-Type") ==
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    CHECK(res->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"software-installs.xlsx\"");
+    CHECK(res->get_header_value("X-Content-Type-Options") == "nosniff");
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    REQUIRE(res->content_provider_);
+    CHECK_FALSE(res->is_chunked_content_provider_); // sized: httplib sends a Content-Length
+    CHECK(res->content_length_ > 0);
+    CHECK(x.h.held() == 1);        // the lease is held from admission to the last byte
+    CHECK(x.files_in_dir() == 1);  // the built workbook waits for its delivery
+
+    // One success audit row, written after the build, carrying what was built.
+    REQUIRE(x.h.audit_log.size() == 1);
+    const auto& a = x.h.audit_log[0];
+    CHECK(a.action == "inventory.software.export");
+    CHECK(a.result == "success");
+    CHECK(a.detail.find("format=xlsx") != std::string::npos);
+    CHECK(a.detail.find("stream=false") != std::string::npos);
+    CHECK(a.detail.find("rows=2") != std::string::npos);
+    CHECK(a.detail.find("bytes=" + std::to_string(res->content_length_)) != std::string::npos);
+    CHECK(a.detail.find("truncated_cells=0") != std::string::npos);
+    CHECK(a.detail.find("filters=") != std::string::npos);
+    CHECK(a.detail.find("cid=") != std::string::npos);
+    CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+
+    const auto t = drive_sized(*res);
+    CHECK_FALSE(t.aborted);
+    CHECK(t.body.size() == res->content_length_); // Content-Length equals the body
+    // Default limits are far under 4 GiB: an ordinary zip, version-needed 20 in the first local
+    // header (a ZIP64 container would say 45).
+    REQUIRE(t.body.size() >= 6);
+    CHECK((static_cast<unsigned>(static_cast<unsigned char>(t.body[4])) |
+           (static_cast<unsigned>(static_cast<unsigned char>(t.body[5])) << 8)) == 20U);
+    const auto xml = sheet_xml(x.root.path / "readback", t.body);
+    REQUIRE(xml.has_value()); // the body opens as a workbook
+    CHECK(occurrences(*xml, "<row ") == 3); // the header and two rows
+    for (const char* cell : {">agent_id<", ">a-1<", ">a-2<", ">host-one<", ">1.1<", ">1.2<"})
+        CHECK(xml->find(cell) != std::string::npos);
+    CHECK(xml->find("<f>") == std::string::npos); // every cell is text
+
+    release(*res, true);
+    CHECK(x.files_in_dir() == 0);
+    CHECK(x.h.held() == 0);
+    CHECK(x.h.count("xlsx", "completed") == 1);
+    CHECK(x.h.audit_log.size() == 1); // no second row at the end
+}
+
+TEST_CASE("export route xlsx: the audit miss still serves, and a cut cell is counted",
+          "[software_export][routes][xlsx][audit]") {
+    XlsxHarness x;
+    auto r = install_row("a-1", 1);
+    r.entry.publisher = std::string(40'000, 'p');
+    x.h.installs = {r};
+    x.h.audit_persists = false;
+    auto res = x.h.get("?format=xlsx");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    REQUIRE(x.h.audit_log.size() == 1);
+    CHECK(x.h.audit_log[0].detail.find("truncated_cells=1") != std::string::npos);
+    const auto t = drive_sized(*res);
+    CHECK_FALSE(t.aborted);
+    CHECK(sheet_xml(x.root.path / "readback", t.body).has_value()); // the file is still served
+}
+
+TEST_CASE("export route xlsx: the row limit is a 413 naming it, at one row past; at the limit it "
+          "serves",
+          "[software_export][routes][xlsx][limits]") {
+    swe::Limits limits;
+    limits.max_rows = swe::kPageRows; // the floor: 1,000
+    XlsxHarness x(2, limits);
+
+    SECTION("one row past the limit") {
+        x.h.generated = swe::kPageRows + 1;
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 413);
+        CHECK_FALSE(res->content_provider_);
+        CHECK(res->body.find("row limit of 1000 rows") != std::string::npos);
+        CHECK(res->body.find("--inventory-export-max-rows") != std::string::npos);
+        CHECK(res->body.find("narrow the filters, or use format=jsonl or csv") != std::string::npos);
+        CHECK(res->get_header_value("Retry-After").empty());
+        CHECK(x.files_in_dir() == 0);
+        CHECK(x.h.held() == 0);
+        CHECK(x.h.count("xlsx", "limit") == 1);
+        REQUIRE(x.h.audit_log.size() == 1);
+        CHECK(x.h.audit_log[0].result == "failure");
+        CHECK(x.h.audit_log[0].detail.find("outcome=limit_rows") != std::string::npos);
+        CHECK(x.h.audit_log[0].detail.find("format=xlsx") != std::string::npos);
+        CHECK(x.h.audit_log[0].detail.find("cid=") != std::string::npos);
+    }
+    SECTION("exactly at the limit") {
+        x.h.generated = swe::kPageRows;
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto t = drive_sized(*res);
+        const auto xml = sheet_xml(x.root.path / "readback", t.body);
+        REQUIRE(xml.has_value());
+        CHECK(occurrences(*xml, "<row ") == static_cast<std::size_t>(swe::kPageRows) + 1);
+        release(*res, true);
+        CHECK(x.h.count("xlsx", "limit") == 0);
+    }
+}
+
+TEST_CASE("export route xlsx: the byte limit counts sheet bytes, not cell text",
+          "[software_export][routes][xlsx][limits]") {
+    swe::Limits limits;
+    limits.max_bytes = std::int64_t{1} << 20; // the floor: 1 MiB
+    XlsxHarness x(2, limits);
+
+    SECTION("many short cells: the text is far under the limit, the markup is not") {
+        x.h.generated = 3'000; // ~100 bytes of text a row; ~10x that as accounted sheet bytes
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 413);
+        CHECK(res->body.find("--inventory-export-max-bytes") != std::string::npos);
+        CHECK(res->body.find("narrow the filters, or use format=jsonl or csv") != std::string::npos);
+        CHECK(x.files_in_dir() == 0);
+        CHECK(x.h.held() == 0);
+        CHECK(x.h.count("xlsx", "limit") == 1);
+        REQUIRE(x.h.audit_log.size() == 1);
+        CHECK(x.h.audit_log[0].detail.find("outcome=limit_bytes") != std::string::npos);
+    }
+    SECTION("escape-heavy text: ampersands cost five bytes each") {
+        for (int i = 0; i < 30; ++i) { // 30 x 20,000 = 600,000 bytes of text, under 1 MiB
+            auto r = install_row(agent_id("a", i), i + 1);
+            r.entry.publisher = std::string(20'000, '&');
+            x.h.installs.push_back(std::move(r));
+        }
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 413);
+        CHECK(res->body.find("--inventory-export-max-bytes") != std::string::npos);
+        CHECK(x.files_in_dir() == 0);
+        CHECK(x.h.count("xlsx", "limit") == 1);
+        // The same rows stream as JSONL: that format counts body bytes, and 600 KB is under it.
+        auto jsonl = x.h.get("?format=jsonl");
+        REQUIRE(jsonl);
+        CHECK(drive(*jsonl).done);
+    }
+}
+
+TEST_CASE("export route xlsx: a degraded read, the deadline and a closing server during the build "
+          "each answer their status with nothing left behind",
+          "[software_export][routes][xlsx][build]") {
+    XlsxHarness x(1);
+    x.h.generated = 3'000;
+
+    SECTION("a degraded read: 503 with a retry hint") {
+        x.h.fail_read_at = 2;
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "5");
+        CHECK(res->body.find("\"retry_after_ms\":5000") != std::string::npos);
+        CHECK(x.h.count("xlsx", "degraded") == 1);
+        CHECK(x.h.audit_log.back().detail.find("outcome=degraded") != std::string::npos);
+    }
+    SECTION("a degraded last-poll read is the same") {
+        x.h.fail_last_seen_at = 2;
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(x.h.count("xlsx", "degraded") == 1);
+    }
+    SECTION("the deadline: 503 with the remediation and no retry hint") {
+        x.h.on_install_read = [&x](int n) {
+            if (n == 2)
+                x.h.clock_s += swe::kExportMaxSeconds + 1;
+        };
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After").empty());
+        CHECK(res->body.find("narrow the filters, or use format=jsonl or csv") != std::string::npos);
+        CHECK(x.h.count("xlsx", "deadline") == 1);
+        CHECK(x.h.audit_log.back().detail.find("outcome=deadline") != std::string::npos);
+    }
+    SECTION("the server closing: 503 with a retry hint, counted as aborted") {
+        x.h.on_install_read = [&x](int n) {
+            if (n == 2)
+                x.h.budget.begin_closing();
+        };
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "5");
+        CHECK(x.h.count("xlsx", "aborted") == 1);
+        CHECK(x.h.audit_log.back().detail.find("outcome=closing") != std::string::npos);
+    }
+    CHECK_FALSE(x.h.get("?format=xlsx&purl=nope")->content_provider_); // a 400 holds nothing either
+    CHECK(x.files_in_dir() == 0); // no file left behind, whichever way the build ended
+    CHECK(x.h.held() == 0);       // and the lease came back
+    CHECK(x.h.audit_log.front().result == "failure");
+}
+
+TEST_CASE("export route xlsx: the deadline and a closing server during delivery end the transfer "
+          "and free everything",
+          "[software_export][routes][xlsx][delivery]") {
+    XlsxHarness x(1);
+    x.h.installs = {install_row("a-1", 1), install_row("a-2", 2)};
+    x.h.disk_free = kRoomForOne; // room for exactly one export: the grant must come back too
+
+    auto first_slice = [](httplib::Response& res, ManualSink& out) {
+        REQUIRE(res.content_provider_);
+        // httplib hands the provider what is left; it writes at most a slice, here a short one.
+        CHECK(res.content_provider_(0, 10, out.sink));
+        CHECK(out.body.size() == 10);
+    };
+
+    SECTION("the deadline passes after the workbook exists") {
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        ManualSink out;
+        first_slice(*res, out);
+        x.h.clock_s += swe::kExportMaxSeconds + 1;
+        CHECK_FALSE(res->content_provider_(10, res->content_length_ - 10, out.sink));
+        CHECK(out.body.size() == 10); // nothing more was written
+        CHECK(x.h.held() == 1);
+        release(*res, false);
+        CHECK(x.h.held() == 0);
+        CHECK(x.files_in_dir() == 0);
+        CHECK(x.h.count("xlsx", "deadline") == 1);
+        CHECK(x.h.count("xlsx", "completed") == 0);
+        auto again = x.h.get("?format=xlsx"); // room for one: only if the grant was returned
+        REQUIRE(again);
+        CHECK(again->status == 200);
+    }
+    SECTION("the server closes during delivery: counted as aborted the same way") {
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        ManualSink out;
+        first_slice(*res, out);
+        x.h.budget.begin_closing();
+        CHECK_FALSE(res->content_provider_(10, res->content_length_ - 10, out.sink));
+        release(*res, false);
+        CHECK(x.h.held() == 0);
+        CHECK(x.files_in_dir() == 0);
+        CHECK(x.h.count("xlsx", "aborted") == 1);
+        // begin_closing() is one-way, so a new export is refused as closing whether or not the
+        // grant came back. The grant comes first, so a leaked one would answer the disk 503
+        // (no Retry-After) instead.
+        auto next = x.h.get("?format=xlsx");
+        REQUIRE(next);
+        CHECK(next->status == 503);
+        CHECK(next->get_header_value("Retry-After") == "5");
+        CHECK(next->body.find("not enough free disk space") == std::string::npos);
+        CHECK(x.h.audit_log.back().detail.find("outcome=closing") != std::string::npos);
+    }
+    SECTION("a client that goes away is aborted, and the grant goes back") {
+        {
+            auto res = x.h.get("?format=xlsx");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            // Not driven at all: the response is destroyed, and ~Response runs the releaser.
+        }
+        CHECK(x.h.count("xlsx", "aborted") == 1);
+        CHECK(x.files_in_dir() == 0);
+        auto again = x.h.get("?format=xlsx"); // room for one: only if the grant was returned
+        REQUIRE(again);
+        CHECK(again->status == 200);
+    }
+}
+
+TEST_CASE("export route xlsx: the disk guard refuses before a file exists and while building",
+          "[software_export][routes][xlsx][disk]") {
+    XlsxHarness x;
+
+    SECTION("free space under the reserve: 503 before any read or file") {
+        x.h.installs = {install_row("a-1", 1)};
+        x.h.disk_free = kReserve - 1;
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->content_provider_);
+        CHECK(res->body.find("not enough free disk space on the server for an xlsx export") !=
+              std::string::npos);
+        CHECK(res->body.find("use format=jsonl or csv, or ask the administrator to free space on "
+                             "the data volume") != std::string::npos);
+        CHECK(res->get_header_value("Retry-After").empty()); // no retry hint
+        CHECK(x.h.install_reads == 0);
+        CHECK(x.files_in_dir() == 0);
+        CHECK(x.h.count("xlsx", "degraded") == 1);
+        CHECK(x.h.audit_log.back().detail.find("outcome=disk") != std::string::npos);
+        CHECK(x.h.held() == 0);
+    }
+    SECTION("an unreadable free-space figure refuses") {
+        x.h.disk_free = std::nullopt;
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(x.h.install_reads == 0);
+        CHECK(x.h.count("xlsx", "degraded") == 1);
+    }
+    SECTION("a throwing free-space reader refuses the same way") {
+        x.h.disk_free_at = [](int) -> std::optional<std::uintmax_t> {
+            throw std::runtime_error("statvfs failed");
+        };
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(x.h.install_reads == 0);
+    }
+    SECTION("free space that runs out mid-build: 503, the file removed, the grant returned") {
+        fat_rows(x.h, 600); // ~19 MiB of accounted sheet: past the first 16 MiB grant
+        x.h.disk_free_at = [](int call) -> std::optional<std::uintmax_t> {
+            return call == 1 ? std::optional<std::uintmax_t>(kRoomForOne)
+                             : std::optional<std::uintmax_t>(kReserve); // nothing left for a second grant
+        };
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->content_provider_);
+        CHECK(res->body.find("not enough free disk space") != std::string::npos);
+        CHECK(x.h.disk_free_calls == 2); // the first grant, then the refused second
+        CHECK(x.files_in_dir() == 0);
+        CHECK(x.h.held() == 0);
+        CHECK(x.h.count("xlsx", "degraded") == 1);
+        CHECK(x.h.audit_log.back().detail.find("outcome=disk") != std::string::npos);
+        // The grant went back: with room for one export, the next small export is admitted.
+        x.h.disk_free_at = nullptr;
+        x.h.disk_free = kRoomForOne;
+        x.h.installs.clear();
+        x.h.installs = {install_row("a-1", 1)};
+        auto next = x.h.get("?format=xlsx");
+        REQUIRE(next);
+        CHECK(next->status == 200);
+    }
+    SECTION("a second grant, when there is room, lets the export finish") {
+        fat_rows(x.h, 600);
+        x.h.disk_free = std::uintmax_t{1} << 40;
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(x.h.disk_free_calls >= 2); // the sheet passed one grant and asked for the next
+        const auto t = drive_sized(*res);
+        CHECK_FALSE(t.aborted);
+        const auto xml = sheet_xml(x.root.path / "readback", t.body);
+        REQUIRE(xml.has_value());
+        CHECK(occurrences(*xml, "<row ") == 601);
+    }
+}
+
+TEST_CASE("export route xlsx: concurrent exports share one disk budget",
+          "[software_export][routes][xlsx][disk]") {
+    XlsxHarness x(/*concurrency=*/2);
+    x.h.installs = {install_row("a-1", 1)};
+    x.h.disk_free = kRoomForOne; // covers A's grant and nothing more
+
+    auto a = x.h.get("?format=xlsx");
+    REQUIRE(a);
+    REQUIRE(a->status == 200); // built, its response not yet released: A holds its grant
+
+    auto b = x.h.get("?format=xlsx");
+    REQUIRE(b);
+    CHECK(b->status == 503); // the same free space is not counted twice
+    CHECK_FALSE(b->content_provider_);
+    CHECK(b->body.find("not enough free disk space") != std::string::npos);
+    CHECK(x.files_in_dir() == 1); // only A's workbook
+
+    release(*a, true);
+    CHECK(x.files_in_dir() == 0);
+    auto c = x.h.get("?format=xlsx"); // served once A is released
+    REQUIRE(c);
+    CHECK(c->status == 200);
+}
+
+TEST_CASE("export route xlsx: the lease is held until release and a full budget refuses first",
+          "[software_export][routes][xlsx][budget]") {
+    XlsxHarness x(/*concurrency=*/1);
+    x.h.installs = {install_row("a-1", 1)};
+
+    auto first = x.h.get("?format=xlsx");
+    REQUIRE(first);
+    REQUIRE(first->status == 200);
+    CHECK(x.h.held() == 1);
+    const auto reads = x.h.install_reads;
+
+    auto second = x.h.get("?format=xlsx");
+    REQUIRE(second);
+    CHECK(second->status == 503);
+    CHECK(second->get_header_value("Retry-After") == "5");
+    CHECK(x.h.rejected("export_concurrency_cap") == 1);
+    CHECK(x.h.install_reads == reads); // refused before any build
+    CHECK(x.files_in_dir() == 1);      // and before any file was created: only the first export's
+    CHECK(x.h.audit_log.back().result == "denied");
+
+    release(*first, true);
+    CHECK(x.h.held() == 0);
+    auto third = x.h.get("?format=xlsx");
+    REQUIRE(third);
+    CHECK(third->status == 200);
+}
+
+TEST_CASE("export route xlsx: a confined caller's workbook holds only in-scope rows",
+          "[software_export][routes][xlsx][scope]") {
+    XlsxHarness x;
+    for (int d = 0; d < 10; ++d)
+        for (int k = 0; k < 2; ++k)
+            x.h.installs.push_back(install_row(agent_id("a", d, 2), d * 2 + k + 1, "pub-" + agent_id("a", d, 2)));
+    x.h.scope = scope_of({agent_id("a", 3, 2), agent_id("a", 7, 2)});
+
+    auto res = x.h.get("?format=xlsx");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto t = drive_sized(*res);
+    const auto xml = sheet_xml(x.root.path / "readback", t.body);
+    REQUIRE(xml.has_value());
+    CHECK(occurrences(*xml, "<row ") == 5); // the header and four in-scope rows
+    CHECK(xml->find(">a-03<") != std::string::npos);
+    CHECK(xml->find(">a-07<") != std::string::npos);
+    for (const int d : {0, 1, 2, 4, 5, 6, 8, 9}) {
+        CHECK(xml->find(agent_id("a", d, 2)) == std::string::npos);
+        CHECK(xml->find("pub-" + agent_id("a", d, 2)) == std::string::npos);
+    }
+}
+
+TEST_CASE("export route xlsx: an unusable temporary directory answers 503 for xlsx only, and the "
+          "directory is prepared at registration",
+          "[software_export][routes][xlsx][dir]") {
+    SECTION("a regular file where the directory should be") {
+        XlsxHarness x(2, {}, [](const fs::path& root) {
+            fs::create_directories(root);
+            std::ofstream(root / "not-a-dir") << "x";
+            return root / "not-a-dir";
+        });
+        x.h.installs = {install_row("a-1", 1)};
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("xlsx export is not configured on this server") != std::string::npos);
+        CHECK(x.h.count("xlsx", "degraded") == 1);
+        CHECK(x.h.held() == 0);
+        // The other two formats are unaffected.
+        for (const char* format : {"jsonl", "csv"}) {
+            auto other = x.h.get(std::string("?format=") + format);
+            REQUIRE(other);
+            CHECK(other->status == 200);
+            CHECK(drive(*other).done);
+            release(*other, true);
+        }
+    }
+    SECTION("a link to a real directory: xlsx is off and nothing behind the link is swept") {
+        fs::path keep;
+        XlsxHarness x(2, {}, [&keep](const fs::path& root) {
+            fs::create_directories(root / "real");
+            keep = root / "real" / "keep.bin";
+            std::ofstream(keep) << "keep";
+            fs::create_directory_symlink(root / "real", root / "link");
+            return root / "link";
+        });
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(fs::exists(keep)); // symlink_status refused the path, so no sweep ran
+    }
+    SECTION("no directory configured") {
+        Harness h; // Deps::xlsx_tmp_dir left empty
+        h.installs = {install_row("a-1", 1)};
+        auto res = h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("xlsx export is not configured on this server") != std::string::npos);
+    }
+    SECTION("leftover files are removed at registration and the directory is owner-only") {
+        fs::path dir;
+        XlsxHarness x(2, {}, [&dir](const fs::path& root) {
+            dir = root / "export-tmp";
+            fs::create_directories(dir);
+            std::ofstream(dir / "yuzu_export_old.xlsx") << "crashed";
+            std::ofstream(dir / "tmp.AbCdEfGhIj") << "library file";
+            fs::create_directory(dir / "subdir"); // not a regular file: left alone
+            return dir;
+        });
+        CHECK_FALSE(fs::exists(dir / "yuzu_export_old.xlsx"));
+        CHECK_FALSE(fs::exists(dir / "tmp.AbCdEfGhIj"));
+        CHECK(fs::is_directory(dir / "subdir"));
+        struct stat st{};
+        REQUIRE(::stat(dir.c_str(), &st) == 0);
+        CHECK((st.st_mode & 0777) == 0700);
+        x.h.installs = {install_row("a-1", 1)};
+        auto res = x.h.get("?format=xlsx");
+        REQUIRE(res);
+        CHECK(res->status == 200); // a directory with a stray subdirectory still works
+    }
+    SECTION("a missing directory is created, owner-only, with its parents") {
+        XlsxHarness x(2, {}, [](const fs::path& root) { return root / "a" / "b" / "export-tmp"; });
+        CHECK(fs::is_directory(x.dir));
+        struct stat st{};
+        REQUIRE(::stat(x.dir.c_str(), &st) == 0);
+        CHECK((st.st_mode & 0777) == 0700);
+    }
+}
+
+TEST_CASE("export route xlsx: a created file name cannot be steered by the caller and a taken "
+          "name is never overwritten",
+          "[software_export][routes][xlsx][dir]") {
+    // The name is built from the server's own correlation id; no query value reaches a path.
+    XlsxHarness x;
+    x.h.installs = {install_row("../../etc/passwd", 1)};
+    auto res = x.h.get("?format=xlsx&name=../../escape&q=../x");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(x.dir, ec)) {
+        const auto name = e.path().filename().string();
+        CHECK(name.starts_with("yuzu_export_"));
+        CHECK(name.ends_with(".xlsx"));
+        CHECK(name.find("..") == std::string::npos);
+        CHECK(name.find('/') == std::string::npos);
+    }
+    CHECK_FALSE(fs::exists(x.root.path / "escape"));
+}
+
+// ── XLSX: review round 1 ────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// The first local zip header's version-needed-to-extract (bytes 4-5): 20 for an ordinary zip, 45
+// for a ZIP64 container.
+unsigned version_needed(const std::string& body) {
+    REQUIRE(body.size() >= 6);
+    return static_cast<unsigned>(static_cast<unsigned char>(body[4])) |
+           (static_cast<unsigned>(static_cast<unsigned char>(body[5])) << 8);
+}
+
+// RFC 4180 records of `text` (quoted cells, doubled quotes, newlines inside quotes).
+std::vector<std::vector<std::string>> csv_records(const std::string& text) {
+    std::vector<std::vector<std::string>> out;
+    std::vector<std::string> rec;
+    std::string cell;
+    bool quoted = false;
+    bool open = false; // a record has started
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (quoted) {
+            if (c != '"')
+                cell += c;
+            else if (i + 1 < text.size() && text[i + 1] == '"') {
+                cell += '"';
+                ++i;
+            } else
+                quoted = false;
+        } else if (c == '"') {
+            quoted = true;
+            open = true;
+        } else if (c == ',') {
+            rec.push_back(std::move(cell));
+            cell.clear();
+            open = true;
+        } else if (c == '\n') {
+            rec.push_back(std::move(cell));
+            cell.clear();
+            out.push_back(std::move(rec));
+            rec.clear();
+            open = false;
+        } else {
+            cell += c;
+            open = true;
+        }
+    }
+    if (open) {
+        rec.push_back(std::move(cell));
+        out.push_back(std::move(rec));
+    }
+    return out;
+}
+
+std::string xml_unescape(std::string in) {
+    for (const auto& [from, to] : {std::pair<std::string_view, char>{"&lt;", '<'},
+                                   {"&gt;", '>'},
+                                   {"&quot;", '"'},
+                                   {"&amp;", '&'}}) { // &amp; last: it must not create new escapes
+        for (auto at = in.find(from); at != std::string::npos; at = in.find(from, at + 1))
+            in.replace(at, from.size(), 1, to);
+    }
+    return in;
+}
+
+// The sheet's cells keyed by row number, each row `columns` wide and placed by the cell's own
+// r="REF" column: the library writes no cell for empty text, so position says nothing.
+std::map<int, std::vector<std::string>> sheet_cells(const std::string& xml, std::size_t columns) {
+    constexpr std::string_view kOpen = "<c r=\"";
+    std::map<int, std::vector<std::string>> rows;
+    for (auto at = xml.find(kOpen); at != std::string::npos; at = xml.find(kOpen, at + 1)) {
+        const auto ref_end = xml.find('"', at + kOpen.size());
+        const std::string ref = xml.substr(at + kOpen.size(), ref_end - (at + kOpen.size()));
+        std::size_t i = 0;
+        std::size_t col = 0;
+        while (i < ref.size() && std::isupper(static_cast<unsigned char>(ref[i])))
+            col = col * 26 + static_cast<std::size_t>(ref[i++] - 'A' + 1);
+        const int row = std::stoi(ref.substr(i));
+        const auto t_open = xml.find("<t", ref_end);
+        const auto t_gt = xml.find('>', t_open);
+        const auto t_close = xml.find("</t>", t_gt);
+        auto& r = rows[row];
+        if (r.empty())
+            r.resize(columns);
+        REQUIRE((col >= 1 && col <= columns));
+        r[col - 1] = xml_unescape(xml.substr(t_gt + 1, t_close - t_gt - 1));
+    }
+    return rows;
+}
+
+} // namespace
+
+TEST_CASE("export route xlsx: ZIP64 is chosen exactly at the 0xFFFFFFFF sentinel, one byte under "
+          "4 GiB",
+          "[software_export][routes][xlsx][zip64]") {
+    const auto param =
+        GENERATE(std::pair<std::int64_t, unsigned>{swe::kXlsxZip64Threshold, 45U},
+                 std::pair<std::int64_t, unsigned>{swe::kXlsxZip64Threshold - 1, 20U});
+    const unsigned expected = param.second;
+    swe::Limits limits;
+    limits.max_bytes = param.first;
+    XlsxHarness x(2, limits);
+    x.h.installs = {install_row("a-1", 1), install_row("a-2", 2)};
+    auto res = x.h.get("?format=xlsx");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto t = drive_sized(*res);
+    CHECK_FALSE(t.aborted);
+    CHECK(version_needed(t.body) == expected);
+    const auto xml = sheet_xml(x.root.path / "readback", t.body);
+    REQUIRE(xml.has_value()); // either container opens as a workbook
+    CHECK(occurrences(*xml, "<row ") == 3);
+    release(*res, true);
+}
+
+TEST_CASE("export route xlsx: the sheet carries the CSV's cells, in the CSV's order across pages",
+          "[software_export][routes][xlsx][parity]") {
+    XlsxHarness x;
+    x.h.generated = 2'500; // three store pages
+    constexpr auto kCols = swl::kListCsvColumns;
+
+    auto csv = x.h.get("?format=csv");
+    REQUIRE(csv);
+    REQUIRE(csv->status == 200);
+    const auto csv_body = drive(*csv).body;
+    release(*csv, true);
+    const auto records = csv_records(csv_body);
+    REQUIRE(records.size() == 2'501); // header + rows
+    for (const auto& r : records)
+        REQUIRE(r.size() == kCols);
+
+    auto xl = x.h.get("?format=xlsx");
+    REQUIRE(xl);
+    REQUIRE(xl->status == 200);
+    const auto t = drive_sized(*xl);
+    CHECK_FALSE(t.aborted);
+    release(*xl, true);
+    const auto xml = sheet_xml(x.root.path / "readback", t.body);
+    REQUIRE(xml.has_value());
+    const auto cells = sheet_cells(*xml, kCols);
+    REQUIRE(cells.size() == records.size());
+
+    // The two formats agree cell for cell. These rows have no leading = + - @ (CSV adds an
+    // apostrophe there) and no cell over 32,767 bytes (XLSX cuts them): both are tested elsewhere.
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        const auto& row = cells.at(static_cast<int>(i) + 1);
+        for (std::size_t c = 0; c < kCols; ++c)
+            REQUIRE(row[c] == records[i][c]);
+    }
+
+    // And the cells are the ones the fake store holds, written down here independently of the
+    // projection, including the rows either side of both page boundaries.
+    const auto col = [&](std::string_view name) {
+        const auto& head = records[0];
+        const auto it = std::ranges::find(head, std::string(name));
+        REQUIRE(it != head.end());
+        return static_cast<std::size_t>(it - head.begin());
+    };
+    for (const int i : {0, 999, 1000, 1999, 2000, 2499}) {
+        const auto& row = cells.at(i + 2); // row 1 is the header
+        CHECK(row[col("agent_id")] == agent_id("a", i));
+        CHECK(row[col("name")] == "pkg");
+        CHECK(row[col("version")] == "1." + std::to_string(i + 1));
+        CHECK(row[col("publisher")] == "Acme");
+        CHECK(row[col("kind")] == "package");
+    }
+}
+
+TEST_CASE("export route xlsx: the same filters reach the store as for csv",
+          "[software_export][routes][xlsx][parity]") {
+    XlsxHarness x;
+    x.h.generated = 5;
+    const std::string filters =
+        "&name=pkg&match=prefix&status=current&q=pk&kind=package&ecosystem=pypi&source=registry";
+
+    auto csv = x.h.get("?format=csv" + filters);
+    REQUIRE(csv);
+    REQUIRE(csv->status == 200);
+    (void)drive(*csv);
+    release(*csv, true);
+    const auto want = x.h.last_query;
+
+    auto xl = x.h.get("?format=xlsx" + filters);
+    REQUIRE(xl);
+    REQUIRE(xl->status == 200);
+    const auto got = x.h.last_query;
+    release(*xl, true);
+
+    // The request really carried the filters (the fake store ignores them, so this is the only
+    // place they can be seen) ...
+    CHECK(want.name == "pkg");
+    CHECK(want.match == NameMatch::kPrefix);
+    CHECK(want.status == "current");
+    CHECK(want.q == "pk");
+    CHECK(want.kind == "package");
+    CHECK(want.ecosystem == "pypi");
+    CHECK(want.source == "registry");
+    // ... and xlsx hands the store the same ones.
+    CHECK(got.name == want.name);
+    CHECK(got.match == want.match);
+    CHECK(got.status == want.status);
+    CHECK(got.q == want.q);
+    CHECK(got.kind == want.kind);
+    CHECK(got.ecosystem == want.ecosystem);
+    CHECK(got.source == want.source);
+    CHECK(got.purl == want.purl);
+    CHECK(got.version == want.version);
+    CHECK(got.versions == want.versions);
+    CHECK(got.agent_id == want.agent_id);
+    CHECK(got.agent_ids == want.agent_ids);
+}
+
+TEST_CASE("export route xlsx: a Range request is answered with the whole workbook, not a slice",
+          "[software_export][routes][xlsx][range]") {
+    // httplib answers 206 and calls the provider at the range's offset when a handler leaves the
+    // status unset (-1); the workbook is built per request and has no validator, so a ranged read
+    // could stitch two builds into one corrupt file and the releaser would count a slice as a
+    // completed export. The handler is called with a fresh Response (status -1) because
+    // TestRouteSink pre-sets 200, which would pass without the fix.
+    XlsxHarness x;
+    x.h.installs = {install_row("a-1", 1), install_row("a-2", 2)};
+    REQUIRE(x.h.export_handler);
+
+    httplib::Request req;
+    req.method = "GET";
+    req.path = "/api/v1/inventory/software/export";
+    httplib::detail::parse_query_text("format=xlsx", req.params);
+    req.set_header("Range", "bytes=0-9");
+    httplib::Response res;
+    REQUIRE(res.status == -1);
+    x.h.export_handler(req, res);
+
+    CHECK(res.status == 200); // explicit, so httplib sends the whole body
+    CHECK(res.content_length_ > 10);
+    CHECK_FALSE(res.has_header("Content-Range"));
+    const auto t = drive_sized(res);
+    CHECK_FALSE(t.aborted);
+    CHECK(t.body.size() == res.content_length_);
+    CHECK(sheet_xml(x.root.path / "readback", t.body).has_value());
+    release(res, true);
+    CHECK(x.h.count("xlsx", "completed") == 1);
+    CHECK(x.h.count("xlsx", "aborted") == 0);
+    CHECK(x.files_in_dir() == 0);
+}
+
+TEST_CASE("export route xlsx: a workbook file that went short before delivery aborts the transfer "
+          "and frees everything",
+          "[software_export][routes][xlsx][delivery]") {
+    XlsxHarness x(1);
+    x.h.installs = {install_row("a-1", 1), install_row("a-2", 2)};
+    x.h.disk_free = kRoomForOne; // room for exactly one export: the grant must come back too
+
+    auto res = x.h.get("?format=xlsx");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(x.files_in_dir() == 1);
+    const auto file = fs::directory_iterator(x.dir)->path();
+    fs::resize_file(file, res->content_length_ - 5);
+
+    const auto t = drive_sized(*res);
+    CHECK(t.aborted); // the provider refused rather than send a short or padded file
+    CHECK(t.body.size() < res->content_length_);
+    release(*res, false);
+    CHECK(x.h.count("xlsx", "degraded") == 1);
+    CHECK(x.h.count("xlsx", "completed") == 0);
+    CHECK(x.files_in_dir() == 0);
+    CHECK(x.h.held() == 0);
+    auto again = x.h.get("?format=xlsx"); // room for one: only if the grant was returned
+    REQUIRE(again);
+    CHECK(again->status == 200);
+}
+
+TEST_CASE("export route xlsx: a workbook that cannot be closed is a writer 503 with nothing left",
+          "[software_export][routes][xlsx][build]") {
+    XlsxHarness x(1);
+    x.h.installs = {install_row("a-1", 1), install_row("a-2", 2)};
+    x.h.disk_free = kRoomForOne;
+    // The library opens its output path only when the workbook is closed, so replacing the
+    // pre-created file with a directory during the first read makes close() fail.
+    x.h.on_install_read = [&x](int n) {
+        if (n != 1)
+            return;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(x.dir, ec)) {
+            const auto path = e.path();
+            fs::remove(path, ec);
+            fs::create_directory(path, ec);
+            return;
+        }
+    };
+
+    auto res = x.h.get("?format=xlsx");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK_FALSE(res->content_provider_);
+    CHECK(res->body.find("xlsx export failed on the server") != std::string::npos);
+    CHECK(x.h.count("xlsx", "degraded") == 1);
+    REQUIRE(x.h.audit_log.size() == 1);
+    CHECK(x.h.audit_log[0].result == "failure");
+    CHECK(x.h.audit_log[0].detail.find("outcome=writer") != std::string::npos);
+    CHECK(x.files_in_dir() == 0); // the stand-in directory is removed with the file
+    CHECK(x.h.held() == 0);
+    x.h.on_install_read = nullptr;
+    auto again = x.h.get("?format=xlsx"); // the grant went back
+    REQUIRE(again);
+    CHECK(again->status == 200);
+}
+
+TEST_CASE("export route xlsx: a volume that stops taking writes mid-build is a writer 503 with "
+          "nothing left and no success row",
+          "[software_export][routes][xlsx][build]") {
+    XlsxHarness x(1);
+    fat_rows(x.h, 40); // 40 x 32,767 compressible bytes: the row file dwarfs the finished workbook
+    x.h.disk_free = kRoomForOne;
+
+    // A clean request first, for the two sizes the limit goes between: the finished file's, and
+    // the row file's (the sheet's <sheetData> content length).
+    std::size_t finished = 0;
+    std::size_t row_file = 0;
+    {
+        auto clean = x.h.get("?format=xlsx");
+        REQUIRE(clean);
+        REQUIRE(clean->status == 200);
+        finished = clean->content_length_;
+        const auto t = drive_sized(*clean);
+        REQUIRE_FALSE(t.aborted);
+        const auto xml = sheet_xml(x.root.path / "readback", t.body);
+        REQUIRE(xml.has_value());
+        row_file = xml->find("</sheetData>") - (xml->find("<sheetData>") + 11);
+        release(*clean, true);
+    }
+    REQUIRE(finished < row_file);
+    REQUIRE(x.files_in_dir() == 0);
+    const std::size_t audit_rows = x.h.audit_log.size();
+    const int reads_before = x.h.install_reads;
+    const double completed_before = x.h.count("xlsx", "completed"); // the clean request's
+
+    // The limit is set when the first page of the second request is read and lifted when the
+    // response is back; nothing is asserted in between.
+    std::optional<FsizeLimit> limit;
+    x.h.on_install_read = [&](int n) {
+        if (n == reads_before + 1)
+            limit.emplace((finished + row_file) / 2);
+    };
+    auto res = x.h.get("?format=xlsx");
+    const bool armed = limit && limit->armed();
+    limit.reset();
+    x.h.on_install_read = nullptr;
+    REQUIRE(armed);
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK_FALSE(res->content_provider_); // no provider: not one byte of a short workbook is sent
+    CHECK(res->body.find("xlsx export failed on the server") != std::string::npos);
+    CHECK(x.h.count("xlsx", "degraded") == 1);
+    CHECK(x.h.count("xlsx", "completed") == completed_before); // the failed request is no success
+    REQUIRE(x.h.audit_log.size() == audit_rows + 1);
+    CHECK(x.h.audit_log.back().result == "failure");
+    CHECK(x.h.audit_log.back().detail.find("outcome=writer") != std::string::npos);
+    const auto successes = std::ranges::count_if(
+        x.h.audit_log, [](const AuditRecord& a) { return a.result == "success"; });
+    CHECK(successes == 1); // the clean request's row; the failed one wrote none
+    CHECK(x.files_in_dir() == 0);
+    CHECK(x.h.held() == 0);
+    auto again = x.h.get("?format=xlsx"); // room for one: only if the grant went back
+    REQUIRE(again);
+    CHECK(again->status == 200);
 }

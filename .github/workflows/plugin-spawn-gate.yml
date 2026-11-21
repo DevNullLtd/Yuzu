@@ -65,12 +65,22 @@ jobs:
         # workflow_dispatch) correctly falls through to the else branch
         # instead of the unquoted `[ -n ${{ github.event.before }} ]` always
         # evaluating true.
+        #
+        # On a pull request the base is the checked-out merge commit's first
+        # parent (scripts/ci/pr-merge-parent.sh), NOT the event's base.sha: that
+        # can lag the tip the merge commit was built on, and a grandfathered call
+        # the target branch REMOVED in between would then still count as base
+        # content, so a PR re-adding it byte-for-byte would pass.
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_BEFORE: ${{ github.event.before }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "ref=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            PR_BASE="$(bash scripts/ci/pr-merge-parent.sh "$HEAD_SHA" "$PR_HEAD_SHA")"
+            echo "ref=$PR_BASE" >> "$GITHUB_OUTPUT"
           elif [ -n "$BASE_BEFORE" ] && \
                [ "$BASE_BEFORE" != "0000000000000000000000000000000000000000" ]; then
             echo "ref=$BASE_BEFORE" >> "$GITHUB_OUTPUT"

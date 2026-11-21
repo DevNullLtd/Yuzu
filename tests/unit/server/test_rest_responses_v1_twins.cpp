@@ -1482,3 +1482,38 @@ TEST_CASE("apply_response_numeric_params: since and until are presence-tracked a
         CHECK_FALSE(q.until.has_value());
     }
 }
+
+// WP07 gate-8 UP1 (independent of the tracker test): what a REST client RECEIVES for an agent
+// response whose output / error_detail carry invalid UTF-8. The assertion is on the HTTP BODY of
+// the real poll route, parsed with nlohmann's STRICT parser (which rejects invalid UTF-8), not on
+// the store. The negative control shows the failure this guards: the same bytes through the
+// strict serialiser throw, so an unsanitised copy of the row could not be served.
+TEST_CASE("GET /api/v1/responses/:id: invalid UTF-8 agent output is served as valid JSON (U+FFFD)",
+          "[pg][rest][responses][v1][utf8]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+
+    const std::string raw = std::string("a\xff") + "b\xc0\x80" + "c\xed\xa0\x80" + "d";
+    // Negative control: an UNSANITISED copy cannot be serialised.
+    CHECK_THROWS_AS((void)nlohmann::json(raw).dump(), nlohmann::json::type_error);
+
+    StoredResponse r = mk_resp("instr-utf8-1", "agent-A", 0, raw, 1735689600);
+    r.error_detail = raw;
+    r.plugin = "shellexec";
+    h.response_store->store(r);
+
+    auto res = h.sink.Get("/api/v1/responses/instr-utf8-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    nlohmann::json body;
+    REQUIRE_NOTHROW(body = nlohmann::json::parse(res->body)); // strict: invalid UTF-8 would throw
+    REQUIRE(body["data"].size() == 1);
+    const std::string out = body["data"][0]["output"].get<std::string>();
+    const std::string err = body["data"][0]["error_detail"].get<std::string>();
+    CHECK(out.find('\xff') == std::string::npos);
+    CHECK(out.find("\xEF\xBF\xBD") != std::string::npos); // defanged to U+FFFD, not dropped
+    CHECK(err.find("\xEF\xBF\xBD") != std::string::npos);
+    CHECK(out.front() == 'a');
+    CHECK(out.back() == 'd');
+}

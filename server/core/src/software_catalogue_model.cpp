@@ -290,7 +290,8 @@ std::optional<std::string> strict_args_error(const nlohmann::json& args) {
 std::optional<std::string> installed_software_args_error(const nlohmann::json& args) {
     if (!args.is_object())
         return std::nullopt;
-    for (const char* key : {"agent_id", "name", "version", "cursor"})
+    for (const char* key : {"agent_id", "name", "version", "cursor", "q", "kind", "ecosystem",
+                            "source", "match", "version_min", "version_max", "status"})
         if (args.contains(key) && !args[key].is_string())
             return std::string(key) + " must be a JSON string";
     if (args.contains("limit")) {

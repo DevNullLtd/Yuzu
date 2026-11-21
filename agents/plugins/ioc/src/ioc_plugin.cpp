@@ -27,6 +27,8 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "ioc_parsers.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -35,6 +37,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -50,6 +53,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <win_dns_cache_table.hpp> // DnsCacheTableOwner (F66: frees the DnsGetCacheDataTable list)
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <iphlpapi.h>
 #include <windns.h>
@@ -65,6 +69,9 @@
 #endif
 
 namespace {
+
+/// Most `domains` accepted in one `check` (each is matched against one resolver-cache snapshot).
+constexpr std::size_t kMaxDomainsPerCommand = 100;
 
 // ── String utilities ─────────────────────────────────────────────────────────
 
@@ -378,50 +385,42 @@ std::vector<ConnectionInfo> get_connections() {
 
 #ifdef _WIN32
 
-/// Opaque structure returned by DnsGetCacheDataTable (undocumented but stable).
-struct DNS_CACHE_ENTRY {
-    DNS_CACHE_ENTRY* pNext;
-    PWSTR pszName;
-    WORD wType;
-    WORD wDataLength;
-    DWORD dwFlags;
-};
+using DnsGetCacheDataTableFn = BOOL(WINAPI*)(yuzu::shared::DnsCacheNode**);
 
-using DnsGetCacheDataTableFn = BOOL(WINAPI*)(DNS_CACHE_ENTRY**);
-
-/// Query the Windows DNS resolver cache for a domain name.
-bool check_dns_cache(std::string_view domain) {
-    static auto fn = []() -> DnsGetCacheDataTableFn {
-        HMODULE mod = LoadLibraryA("dnsapi.dll");
-        if (!mod)
-            return nullptr;
-        return reinterpret_cast<DnsGetCacheDataTableFn>(
-            GetProcAddress(mod, "DnsGetCacheDataTable"));
-    }();
-
-    if (!fn)
-        return false;
-
-    DNS_CACHE_ENTRY* head = nullptr;
-    if (!fn(&head))
-        return false;
-
-    // Convert search domain to wide string for comparison
-    // (#1681) shared size-based convert (NUL-excluded), identical to the prior inline;
-    // empty/untranslatable -> {} preserves the old wide_len<=0 early-return.
-    std::wstring wide_domain = yuzu::win::to_wide(domain);
-    if (wide_domain.empty())
-        return false;
-
-    bool found = false;
-    for (auto* entry = head; entry != nullptr; entry = entry->pNext) {
-        if (entry->pszName && _wcsicmp(entry->pszName, wide_domain.c_str()) == 0) {
-            found = true;
-            break;
+/// Snapshot the names in the Windows DNS resolver cache ONCE per command (F66). The table is
+/// caller-owned, so it is copied into owned strings and released at once (DnsCacheTableOwner)
+/// rather than held across the per-domain matching or re-fetched for each domain.
+///
+/// nullopt = the cache COULD NOT BE READ (dnsapi.dll will not load, the export is missing, or the
+/// call returned FALSE): the caller must say so, never report "not in cache". An empty vector is a
+/// real answer (the call succeeded and the cache is empty). The module is loaded per command and
+/// released by the guard, so a failure is never cached for the life of the process.
+std::optional<std::vector<std::wstring>> read_dns_cache_names() {
+    struct Module {
+        HMODULE h = LoadLibraryExW(L"dnsapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        ~Module() {
+            if (h)
+                FreeLibrary(h);
         }
+    } mod; // declared before `table`, so it is destroyed AFTER the owner that calls DnsFree
+    if (!mod.h)
+        return std::nullopt;
+    const auto fn = reinterpret_cast<DnsGetCacheDataTableFn>(
+        reinterpret_cast<void*>(GetProcAddress(mod.h, "DnsGetCacheDataTable")));
+    if (!fn)
+        return std::nullopt;
+    yuzu::shared::DnsCacheTableOwner table(mod.h);
+    if (!fn(table.out()))
+        return std::nullopt;
+    std::vector<std::wstring> names;
+    std::size_t nodes = 0;
+    for (auto* entry = table.head(); entry != nullptr; entry = entry->pNext) {
+        if (++nodes > yuzu::shared::kDnsCacheNodeWalkCap)
+            break; // corrupted/cyclic list: bound the walk
+        if (entry->pszName)
+            names.emplace_back(entry->pszName);
     }
-
-    return found;
+    return names;
 }
 
 #endif // _WIN32
@@ -595,35 +594,48 @@ void check_ip_addresses(yuzu::CommandContext& ctx, const std::vector<std::string
 }
 
 void check_domains(yuzu::CommandContext& ctx, const std::vector<std::string>& domains) {
+#ifdef _WIN32
+    // One snapshot for every requested domain. If the cache cannot be read, say so (CONSTRAINED
+    // + a detail on every row): "not in cache" would be a false clean answer.
+    const auto cache_snapshot = read_dns_cache_names();
+    const std::vector<std::wstring> no_names;
+    const auto& cache_names = cache_snapshot ? *cache_snapshot : no_names;
+    if (!cache_snapshot)
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows:ioc:dns_cache_unreadable");
+#else
+    // On Linux/macOS, DNS caching varies widely (systemd-resolved,
+    // dnsmasq, mDNSResponder). Check /etc/hosts as a basic fallback,
+    // read once for all domains.
+    std::vector<std::string> host_lines;
+    {
+        std::ifstream hosts("/etc/hosts");
+        std::string line;
+        while (std::getline(hosts, line))
+            host_lines.push_back(std::move(line));
+    }
+#endif
     for (const auto& domain : domains) {
 #ifdef _WIN32
-        bool found = check_dns_cache(domain);
-        std::string detail = found ? "Found in DNS resolver cache" : "Not in DNS cache";
-        ctx.write_output(std::format("domain|{}|{}|{}", escape_pipes(domain),
-                                     found ? "true" : "false", escape_pipes(detail)));
-#else
-        // On Linux/macOS, DNS caching varies widely (systemd-resolved,
-        // dnsmasq, mDNSResponder). Check /etc/hosts as a basic fallback.
         bool found = false;
-        std::string detail;
-        std::ifstream hosts("/etc/hosts");
-        if (hosts.is_open()) {
-            std::string line;
-            while (std::getline(hosts, line)) {
-                // Skip comments
-                auto pos = line.find('#');
-                if (pos != std::string::npos)
-                    line = line.substr(0, pos);
-                if (line.find(domain) != std::string::npos) {
+        const std::wstring wide_domain = yuzu::win::to_wide(domain);
+        if (!wide_domain.empty()) {
+            for (const auto& n : cache_names) {
+                if (_wcsicmp(n.c_str(), wide_domain.c_str()) == 0) {
                     found = true;
-                    detail = "Found in /etc/hosts";
                     break;
                 }
             }
         }
-        if (!found)
-            detail = "Not found in /etc/hosts (DNS cache not available)";
-
+        std::string detail = found ? "Found in DNS resolver cache"
+                             : !cache_snapshot ? "DNS resolver cache could not be read"
+                                               : "Not in DNS cache";
+        ctx.write_output(std::format("domain|{}|{}|{}", escape_pipes(domain),
+                                     found ? "true" : "false", escape_pipes(detail)));
+#else
+        const bool found = yuzu::ioc::hosts_contains_domain(host_lines, domain);
+        const std::string detail =
+            found ? "Found in /etc/hosts" : "Not found in /etc/hosts (DNS cache not available)";
         ctx.write_output(std::format("domain|{}|{}|{}", escape_pipes(domain),
                                      found ? "true" : "false", escape_pipes(detail)));
 #endif
@@ -802,6 +814,14 @@ public:
         if (ip_list.empty() && domain_list.empty() && hash_list.empty() && path_list.empty() &&
             port_list.empty()) {
             ctx.write_output("error|none|false|No IOC parameters provided");
+            return 1;
+        }
+
+        // Bound the per-command domain work (F66): refuse rather than silently truncate, so an
+        // IOC is never dropped without the caller seeing it.
+        if (domain_list.size() > kMaxDomainsPerCommand) {
+            ctx.write_output(std::format("error|domains|false|Too many domains ({}, max {})",
+                                         domain_list.size(), kMaxDomainsPerCommand));
             return 1;
         }
 

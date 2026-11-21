@@ -18,6 +18,7 @@
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (BR-07)
 
 #ifndef _WIN32
+#include <cerrno>
 #include <chrono>
 #include <spdlog/spdlog.h>
 #include <yuzu/agent/runner_status.hpp> // yuzu::agent::forward_runner_failure (ABI4 result seam)
@@ -42,6 +43,7 @@
 #include <pwd.h>
 #include <shadow.h>
 #include <utmp.h>
+#include "users_group_lookup.hpp" // reentrant getgrnam_r/getpwuid_r copies (F40)
 #endif
 
 #if defined(__APPLE__)
@@ -860,19 +862,30 @@ int do_local_users(yuzu::CommandContext& ctx) {
 int do_local_admins(yuzu::CommandContext& ctx) {
 #ifdef __linux__
     // Check sudo and wheel groups
+    // A group that does not exist is a definite answer and is skipped. A lookup that FAILED is
+    // not: the list would be silently smaller, so the result is declared CONSTRAINED/PARTIAL.
+    bool lookup_failed = false;
     for (const char* group_name : {"sudo", "wheel"}) {
-        struct group* grp = getgrnam(group_name);
-        if (!grp)
+        const auto grp = yuzu::users::lookup_group_copy(group_name);
+        if (grp.status == yuzu::users::LookupStatus::kError) {
+            lookup_failed = true;
             continue;
-        for (char** member = grp->gr_mem; *member; ++member) {
-            ctx.write_output(std::format("admin|{}|user|{}", *member, group_name));
+        }
+        if (grp.status != yuzu::users::LookupStatus::kOk)
+            continue;
+        for (const auto& member : grp.group.members) {
+            ctx.write_output(std::format("admin|{}|user|{}", member, group_name));
         }
     }
     // Also check root (uid 0) in /etc/passwd
-    struct passwd* pw = getpwuid(0);
-    if (pw) {
-        ctx.write_output(std::format("admin|{}|user|root", pw->pw_name));
-    }
+    const auto root = yuzu::users::lookup_user_name(0);
+    if (root.status == yuzu::users::LookupStatus::kOk)
+        ctx.write_output(std::format("admin|{}|user|root", root.name));
+    else if (root.status == yuzu::users::LookupStatus::kError)
+        lookup_failed = true;
+    if (lookup_failed)
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "linux:users:local_admins:lookup_failed");
 
 #elif defined(__APPLE__)
     bool status_forwarded = false;
@@ -969,13 +982,21 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #ifdef __linux__
-    struct group* grp = getgrnam(std::string(group_name).c_str());
-    if (!grp) {
+    const auto lookup = yuzu::users::lookup_group_copy(std::string(group_name).c_str());
+    if (lookup.status == yuzu::users::LookupStatus::kError) {
+        // A failed lookup is not "not found": say so, and declare the result degraded.
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "linux:users:group_members:lookup_failed");
+        ctx.write_output(std::format("group_member|error|Group lookup failed: {}", group_name));
+        return 1;
+    }
+    if (lookup.status != yuzu::users::LookupStatus::kOk) {
         ctx.write_output(std::format("group_member|error|Group not found: {}", group_name));
         return 1;
     }
-    for (char** member = grp->gr_mem; *member; ++member) {
-        ctx.write_output(std::format("group_member|{}|{}|user", *member, group_name));
+    const auto* grp = &lookup.group;
+    for (const auto& member : grp->members) {
+        ctx.write_output(std::format("group_member|{}|{}|user", member, group_name));
     }
 
     // Also check if any user has this as their primary group (GID match)
@@ -993,11 +1014,11 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
             try {
                 gid = std::stoi(gid_s);
             } catch (...) {}
-            if (gid == static_cast<int>(grp->gr_gid)) {
+            if (gid == static_cast<int>(grp->gid)) {
                 // Check if already listed as explicit member
                 bool already_listed = false;
-                for (char** member = grp->gr_mem; *member; ++member) {
-                    if (user == *member) {
+                for (const auto& member : grp->members) {
+                    if (user == member) {
                         already_listed = true;
                         break;
                     }
@@ -1441,6 +1462,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "local_admins",
         /* .linux_leg   = */
+        // The mechanism strings below name the libc family (getgrnam/getpwuid); the code uses the
+        // reentrant _r forms. They are part of the capture leg-hash (plugin-readme-standard.md
+        // rule 6), so changing them forces a recapture of every OS leg: left as written.
         {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam(sudo/wheel) + getpwuid(0)", nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,

@@ -132,7 +132,23 @@ RUN { echo "BUILD_ALPINE=$(cut -d. -f1,2 /etc/alpine-release)"; \
 # pushes it, and on every PR that touches this file. NOTE: Alpine's busybox is
 # built WITHOUT the httpd applet, so it cannot serve the probe's listener — the
 # script uses the official busybox image for that.
-FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
+FROM alpine:3.23@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2
+
+# Current Alpine 3.23 packages (WP15/S9). The base digest is only as fresh as
+# the day it was built, so every release build takes the 3.23 branch's fixes
+# (musl, zlib, ...). It runs BEFORE the abi-guard so the guard checks the musl
+# that ships. An upgrade stays on the 3.23 branch, so it cannot cross to musl
+# 1.2.6 (and if a 3.23 update ever did, the guard fails the build). The release
+# scans this image for fixable CRITICAL vulnerabilities before pushing it
+# (release.yml, scripts/ci/image-vuln-gate.sh).
+# YUZU_PACKAGE_REFRESH: release.yml passes a value that changes on every run
+# attempt, so the package step below re-runs instead of being served from the
+# runner's persistent build cache (cache-from type=local; cache-prune.yml only
+# removes blobs no cache index references, so a referenced package layer stays
+# cached indefinitely), which would otherwise keep shipping the packages of
+# whichever build first populated it. Local builds leave it empty and cache as usual.
+ARG YUZU_PACKAGE_REFRESH=
+RUN : "package refresh: ${YUZU_PACKAGE_REFRESH}" && apk upgrade --no-cache
 
 # Builder/runtime ABI guard (#2150). See the stage header above for why.
 # Every version is first required to be a plain dotted number: `apk version -t`

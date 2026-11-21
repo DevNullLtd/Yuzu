@@ -168,6 +168,16 @@ bad_values_are_refused_test_() ->
                    refused(#{tls => (?TLS)#{fail_if_no_peer_cert => yes}})),
      ?_assertEqual({error, {bad_tls_values, [ciphers]}},
                    refused(#{tls => (?TLS)#{ciphers => []}})),
+     %% witness_client_cert with NEITHER verify nor fail_if_no_peer_cert set would default to
+     %% verify_peer + fail_if_no_peer_cert=true (a client cert REQUIRED): refused at boot.
+     ?_assertEqual({error, {bad_tls_values, [witness_client_cert]}},
+                   refused(#{tls => (?TLS)#{witness_client_cert => true}})),
+     ?_assertEqual({error, {bad_tls_values, [witness_client_cert]}},
+                   refused(#{tls => (?TLS)#{verify => verify_peer, witness_client_cert => true}})),
+     ?_assertEqual({error, {bad_tls_values, [witness_client_cert]}},
+                   refused(#{tls => (?TLS)#{verify => verify_none, witness_client_cert => true}})),
+     ?_assertEqual(ok, refused(#{tls => (?TLS)#{verify => verify_peer, fail_if_no_peer_cert => false,
+                                                witness_client_cert => true}})),
      ?_assertEqual({error, bad_listen_ip}, refused(#{listen => #{port => 0, ip => "0.0.0.0"}})),
      ?_assertEqual({error, bad_listen_socket_opts},
                    refused(#{listen => #{port => 0, socket_opts => nodelay}})),

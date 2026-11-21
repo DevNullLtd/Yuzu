@@ -597,9 +597,21 @@ PluginConfigStore::set_kill_switch(std::string_view plugin, std::string_view act
 bool PluginConfigStore::seed_kill_switch_default_off(std::string_view plugin,
                                                       std::string_view reason,
                                                       std::string_view os) {
+    return seed_default_off_row(plugin, "", reason, os);
+}
+
+bool PluginConfigStore::seed_action_kill_switch_default_off(std::string_view plugin,
+                                                             std::string_view action,
+                                                             std::string_view reason) {
+    // An empty action would seed the whole plugin off: refuse it here, never write it.
+    return !action.empty() && seed_default_off_row(plugin, action, reason, "");
+}
+
+bool PluginConfigStore::seed_default_off_row(std::string_view plugin, std::string_view action,
+                                             std::string_view reason, std::string_view os) {
     if (!open_)
         return false;
-    auto scope = plugin_config::parse_kill_switch_scope(plugin, "", os);
+    auto scope = plugin_config::parse_kill_switch_scope(plugin, action, os);
     if (!scope || !plugin_config::is_valid_reason(reason) ||
         !plugin_config::is_valid_actor("system"))
         return false;
@@ -608,7 +620,7 @@ bool PluginConfigStore::seed_kill_switch_default_off(std::string_view plugin,
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease) {
         spdlog::error("PluginConfigStore: kill-switch seed for {} failed: no connection lease ({})",
-                      plugin, pool_.last_error());
+                      scope_key, pool_.last_error());
         return false;
     }
     pg::PgResult res = pg::exec_params(
@@ -620,7 +632,7 @@ bool PluginConfigStore::seed_kill_switch_default_off(std::string_view plugin,
         std::vector<std::string>{scope_key, scope->plugin, scope->action, std::string(reason),
                                  scope->os});
     if (res.status() != PGRES_COMMAND_OK) {
-        spdlog::error("PluginConfigStore: kill-switch seed for {} failed: {}", plugin,
+        spdlog::error("PluginConfigStore: kill-switch seed for {} failed: {}", scope_key,
                       PQresultErrorMessage(res.get()));
         return false;
     }

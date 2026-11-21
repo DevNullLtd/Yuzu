@@ -1407,7 +1407,7 @@ The following audit actions are emitted for authentication and authorization eve
 | `auth.oidc_login` | `success` | Successful OIDC SSO login |
 | `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt; a refused browser-binding check carries `reason=browser_binding_missing`, `browser_binding_mismatch` or `browser_binding_unavailable`; a session that could not be stored carries `reason=session_create_failed`; a sign-in refused because a Settings save replaced the provider carries `reason=provider_replaced` (`;post_mint=true` when refused after the session was minted) |
 | `auth.saml_login` | `ok` | Successful SAML 2.0 SSO login |
-| `auth.saml_login_failed` | `error` | Failed SAML login attempt (missing binding cookie, oversize body, missing SAMLResponse, or signature/audience/expiry/replay validation failure) |
+| `auth.saml_login_failed` | `error` | Failed SAML login attempt (missing binding cookie, oversize body, missing SAMLResponse, or signature/audience/expiry/replay validation failure). The `detail` carries the rejection reason folded (control and C1 characters, `;` and `=` become `_`) and clipped to its first 128 bytes with no truncation marker; the log line keeps 256 |
 
 All `denied` results include a `detail` field explaining the reason. Examples per action:
 - `auth.admin_required` → `"MCP token blocked from admin route"`, `"service-scoped token blocked from admin route"`, `"non-admin user blocked from admin route"`

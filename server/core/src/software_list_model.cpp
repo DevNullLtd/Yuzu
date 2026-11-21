@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <span>
 #include <unordered_set>
 #include <utility>
 
@@ -476,7 +477,7 @@ std::string host_text(const DeviceFacts& f, const std::string& agent_id) {
 }
 std::string epoch_text(std::int64_t v) { return v > 0 ? std::to_string(v) : std::string{}; }
 
-void append_row(std::string& out, std::initializer_list<std::string> cells) {
+void append_cells(std::string& out, std::span<const std::string> cells) {
     bool first = true;
     for (const auto& c : cells) {
         if (!first)
@@ -485,6 +486,10 @@ void append_row(std::string& out, std::initializer_list<std::string> cells) {
         out += data_export::csv_escape(c);
     }
     out += '\n';
+}
+
+void append_row(std::string& out, std::initializer_list<std::string> cells) {
+    append_cells(out, std::span<const std::string>(cells.begin(), cells.size()));
 }
 
 } // namespace
@@ -558,18 +563,24 @@ nlohmann::json components_response_json(const std::vector<SoftwareComponentRow>&
                      next_cursor, devices_omitted, truncated_by_cap);
 }
 
+std::array<std::string, kListCsvColumns> list_row_cells(const SoftwareFleetRow& r,
+                                                        const DeviceFacts& facts) {
+    const auto& e = r.entry;
+    return {r.agent_id, e.name, e.version, e.publisher, e.install_date, e.kind,
+            e.ecosystem, e.epoch, e.release, e.arch, e.signature_status, e.distro_id,
+            e.distro_version, e.source, host_text(facts, r.agent_id),
+            epoch_text(last_seen_of(facts, r.agent_id)),
+            std::string(derive_status(r.facet_status, r.facet_enabled)),
+            epoch_text(r.last_confirmed_at), e.install_type, e.install_scope,
+            e.install_location, e.instance_key, e.purl};
+}
+
 std::string list_csv(const std::vector<SoftwareFleetRow>& rows, const DeviceFacts& facts) {
     std::string out(kListCsvHeader);
     out += '\n';
     for (const auto& r : rows) {
-        const auto& e = r.entry;
-        append_row(out, {r.agent_id, e.name, e.version, e.publisher, e.install_date, e.kind,
-                         e.ecosystem, e.epoch, e.release, e.arch, e.signature_status, e.distro_id,
-                         e.distro_version, e.source, host_text(facts, r.agent_id),
-                         epoch_text(last_seen_of(facts, r.agent_id)),
-                         std::string(derive_status(r.facet_status, r.facet_enabled)),
-                         epoch_text(r.last_confirmed_at), e.install_type, e.install_scope,
-                         e.install_location, e.instance_key, e.purl});
+        const auto cells = list_row_cells(r, facts);
+        append_cells(out, cells);
     }
     return out;
 }
@@ -584,6 +595,151 @@ std::string components_csv(const std::vector<SoftwareComponentRow>& rows, const 
                          std::string(derive_status(r.facet_status, r.facet_enabled)),
                          epoch_text(r.last_confirmed_at)});
     return out;
+}
+
+// ── The lookup core ──────────────────────────────────────────────────────────
+
+LookupReads bind_lookup_reads(SoftwareInventoryStore& store,
+                              std::function<std::unordered_map<std::string, std::string>()> hostnames) {
+    LookupReads io;
+    io.installs = swc::devices_reader(store);
+    io.components = [&store](const SoftwareComponentQuery& q) { return store.query_components(q); };
+    io.install_versions = [&store](std::string_view name,
+                                   const std::optional<std::vector<std::string>>& ids) {
+        return store.installed_software_distinct_versions(name, ids);
+    };
+    io.component_versions = [&store](std::string_view kind, std::string_view name,
+                                     const std::optional<std::vector<std::string>>& ids) {
+        return store.component_versions(kind, name, ids);
+    };
+    io.facts.last_seen = [&store](const std::vector<std::string>& ids) {
+        return store.source_last_seen_bulk("installed_software", ids);
+    };
+    io.facts.hostnames = std::move(hostnames); // the device table's roster, not the agent registry
+    io.totals.catalog_meta = [&store] { return store.catalog_rollup_meta(); };
+    io.totals.component_meta = [&store] { return store.component_rollup_meta(); };
+    io.totals.title_totals = [&store](std::string_view name) {
+        return store.catalog_title_totals(name);
+    };
+    io.totals.version_set_totals = [&store](std::string_view name,
+                                            const std::vector<std::string>& vs) {
+        return store.installed_software_version_set_totals(name, vs);
+    };
+    io.totals.component_totals = [&store](std::string_view kind, std::string_view name,
+                                          const std::optional<std::vector<std::string>>& vs) {
+        return store.component_totals(kind, name, vs);
+    };
+    return io;
+}
+
+namespace {
+
+// The 503 texts are the REST route's own (they moved here, they did not change).
+LookupError unavailable(std::string_view audit_detail, std::string_view what_failed) {
+    return {LookupFault::kUnavailable,
+            std::string("software inventory store degraded — ") + std::string(what_failed),
+            std::string(audit_detail)};
+}
+
+// The version-range step both lookups share: `distinct` is the LIVE distinct-version read over the
+// caller's scope (never an hourly rollup: a version first reported since the last refresh must be
+// inside the range). nullopt = degraded; a read cut at kCatalogRowCap cannot be resolved, which
+// is a fact about the caller's own rows (a confined caller is answered for a title with many
+// versions outside its scope exactly as for an unknown title).
+std::expected<std::vector<std::string>, LookupError>
+resolve_scoped_range(const std::optional<std::vector<std::string>>& distinct, const vers::Range& range) {
+    if (!distinct)
+        return std::unexpected(unavailable("version read degraded", "version range read failed"));
+    auto set = resolve_version_range(*distinct, range);
+    if (!set)
+        return std::unexpected(LookupError{LookupFault::kBadRequest, std::move(set.error()), {}});
+    return std::move(*set);
+}
+
+// The tail both lookups share once the page is read: the cursor-400 / degraded-503 split, the
+// per-page device facts, then the totals decision and (when asked) the totals read.
+template <class Row, class Query, class ReadTotals>
+std::expected<LookupData<Row>, LookupError>
+finish_lookup(std::expected<swc::ScopedPage<Row>, std::optional<swc::CursorError>> read,
+              const LookupReads& io, bool admit_all, const Query& query, bool want_totals,
+              ReadTotals read_totals) {
+    if (!read) {
+        if (read.error())
+            return std::unexpected(LookupError{
+                LookupFault::kBadRequest, std::string(swc::cursor_error_message(*read.error())), {}});
+        // Store degraded (pool/query failure): never an empty list. A silent empty reads as
+        // "installed nowhere" for a fleet vulnerability query (ADR-0016 section 7).
+        return std::unexpected(unavailable("store degraded", "query failed"));
+    }
+    LookupData<Row> out;
+    out.page = std::move(*read);
+    auto facts = load_device_facts(io.facts, page_agent_ids(out.page.rows));
+    if (!facts)
+        return std::unexpected(unavailable("device facts degraded", "last-poll read failed"));
+    out.facts = std::move(*facts);
+    out.decision = totals_decision(admit_all, query);
+    if (want_totals && out.decision.serve) {
+        out.totals = read_totals(io.totals, query);
+        if (out.totals.status == TotalsStatus::kDegraded)
+            return std::unexpected(unavailable("totals degraded", "totals read failed"));
+    }
+    return out;
+}
+
+} // namespace
+
+std::expected<LookupData<SoftwareFleetRow>, LookupError>
+lookup_installs(const LookupReads& io, ListRequest rq, const authz::VisibleSet& scope,
+                bool want_totals) {
+    if (rq.has_range()) {
+        auto set = resolve_scoped_range(io.install_versions(rq.base.query.name, scope_ids(scope)),
+                                        *rq.range);
+        if (!set)
+            return std::unexpected(std::move(set.error()));
+        rq.base.query.versions = std::move(*set);
+    }
+    return finish_lookup<SoftwareFleetRow>(read_list_page(io.installs, rq, scope), io,
+                                           !scope.has_value(), rq.base.query, want_totals,
+                                           &read_application_totals);
+}
+
+std::expected<LookupData<SoftwareComponentRow>, LookupError>
+lookup_components(const LookupReads& io, ComponentsRequest rq, const authz::VisibleSet& scope,
+                  bool want_totals) {
+    if (rq.has_range()) {
+        auto set = resolve_scoped_range(
+            io.component_versions(rq.query.kind, rq.query.name, scope_ids(scope)), *rq.range);
+        if (!set)
+            return std::unexpected(std::move(set.error()));
+        rq.query.versions = std::move(*set);
+    }
+    return finish_lookup<SoftwareComponentRow>(read_components_page(io.components, rq, scope), io,
+                                               !scope.has_value(), rq.query, want_totals,
+                                               &read_component_totals);
+}
+
+namespace {
+template <class Row>
+void add_totals(nlohmann::json& body, const LookupData<Row>& d, bool components) {
+    if (d.decision.serve && d.totals.status == TotalsStatus::kServed)
+        set_totals(body, d.totals, components);
+    else
+        set_totals_omitted(body, d.decision.serve ? kOmittedBuilding : d.decision.omitted);
+}
+} // namespace
+
+nlohmann::json lookup_body(const LookupData<SoftwareFleetRow>& d) {
+    auto body = list_response_json(d.page.rows, d.facts, d.page.next_cursor, d.page.devices_omitted,
+                                   d.page.hit_cap);
+    add_totals(body, d, false);
+    return body;
+}
+
+nlohmann::json lookup_body(const LookupData<SoftwareComponentRow>& d) {
+    auto body = components_response_json(d.page.rows, d.facts, d.page.next_cursor,
+                                         d.page.devices_omitted, d.page.hit_cap);
+    add_totals(body, d, true);
+    return body;
 }
 
 } // namespace yuzu::server::software_list

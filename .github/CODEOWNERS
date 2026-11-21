@@ -39,3 +39,25 @@
 /tests/unit/server/test_capability_catalogue.cpp       @fjarvis @FortitudeEtc
 /tests/unit/server/test_command_capability.cpp         @fjarvis @FortitudeEtc
 /tests/unit/server/test_dispatch_destructive_gate.cpp  @fjarvis @FortitudeEtc
+
+# Release supply-chain controls: owners @fjarvis @Tr3kkR
+# Workflows, the image vulnerability gate and its acceptance files, and the SBOM,
+# signing and release-artifact checks. These entries REQUEST a review from either owner;
+# they do not require one. The Protect Dev and Protect Main rulesets have "Require review
+# from Code Owners" off (owner decision, 2026-11-18) and both owners can bypass the
+# rulesets as organisation admins, so a change here can merge with any one approval. The
+# image gate checks only the format of an acceptance's approval record, so a reviewer of
+# these paths should check that the named approver actually approved.
+# Paths that do not exist yet arrive with the WP15 supply-chain branches.
+/.github/workflows/                                    @fjarvis @Tr3kkR
+/.github/CODEOWNERS                                    @fjarvis @Tr3kkR
+/.trivyignore.yaml                                     @fjarvis @Tr3kkR
+/.grype.yaml                                           @fjarvis @Tr3kkR
+/scripts/ci/image-vuln-gate*                           @fjarvis @Tr3kkR
+/scripts/ci/image-identity.sh                          @fjarvis @Tr3kkR
+/scripts/ci/image-publish.sh                           @fjarvis @Tr3kkR
+/scripts/ci/artifact-sbom.py                           @fjarvis @Tr3kkR
+/scripts/ci/check-release-signing.sh                   @fjarvis @Tr3kkR
+/scripts/check-release-artifacts.sh                    @fjarvis @Tr3kkR
+/vcpkg.json                                            @fjarvis @Tr3kkR
+/vcpkg-configuration.json                              @fjarvis @Tr3kkR

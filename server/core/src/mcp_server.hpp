@@ -31,8 +31,10 @@
 #include "dex_perf_model.hpp"
 #include "discovered_devices_model.hpp" // list_discovered_devices read seam (DiscoveredDevicesReadFn)
 #include "software_collection_settings_api.hpp" // the four collection-settings tools: the shared REST body
+#include "software_list_model.hpp"    // query_installed_software + query_software_components: the shared lookup core
 #include "software_read_api.hpp"       // the five installed-software v3 read tools: the shared REST body
 #include "software_sync_runner.hpp"      // sync_hardware_software: the shared fleet-run (Runner)
+#include "software_sync_status.hpp"      // get_software_sync_status: the shared status function
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
@@ -106,6 +108,8 @@ class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 namespace yuzu::server {
 class HttpRouteSink; // #2542 PR-6: register_routes(HttpRouteSink&, ...) overload
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
+class SoftwareLifecycleStore; // SAM-29: lifecycle-rule twins (list/import/delete_software_lifecycle_rules)
+class ProductRegistryStore;  // SAM-29: normalisation curation twins
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
 class AppUsageStore; // wave 7 PR7.2 app-usage projection (get_agent_app_usage)
 // EnginePrincipalStore backs BOTH the PR 4.2 role-assignment MCP twins
@@ -748,10 +752,29 @@ public:
     void set_guardian_push_fn(GuardianPushFn fn) { guardian_push_fn_ = std::move(fn); }
 
     /// The fleet "Sync now" run behind `sync_hardware_software` - the SAME instance
-    /// `POST /api/v1/hardware/sync` uses, so the per-operator cooldown and the single in-flight
-    /// slot bind both surfaces. Wired once before register_routes (permanent when unset).
+    /// `POST /api/v1/hardware/sync` uses, so the run keys, the cooldown window and the pacing
+    /// budget bind both surfaces. Wired once before register_routes (permanent when unset).
     void set_software_sync_runner(std::shared_ptr<software_sync::Runner> runner) {
         software_sync_runner_ = std::move(runner);
+    }
+
+    /// The lookup reads behind query_installed_software and query_software_components: ONE
+    /// software_list::bind_lookup_reads over the SAME store and the SAME device-table roster the
+    /// REST lookup routes bind, so the two surfaces answer from one core (lookup_installs /
+    /// lookup_components). Unset = both tools answer "Software inventory store unavailable".
+    void set_software_lookup_reads(software_list::LookupReads reads) {
+        software_lookup_reads_ = std::move(reads);
+    }
+
+    /// The tracker read and the unfiltered-Execution:Execute answer behind get_software_sync_status:
+    /// the SAME two closures `GET /api/v1/hardware/sync/{execution_id}` is given. Wired once
+    /// before register_routes (permanent when unset): an unset read answers an internal error with
+    /// no retry hint (never an empty result); an unset unfiltered fn means nobody is unfiltered
+    /// (a caller reads only the runs it started).
+    void set_software_sync_status_fns(software_sync::StatusReadFn read,
+                                      software_sync::UnfilteredFn unfiltered) {
+        software_sync_status_fn_ = std::move(read);
+        software_sync_unfiltered_fn_ = std::move(unfiltered);
     }
 
     /// The installed-software v3 read context behind list_software_hosts, get_software_host,
@@ -771,6 +794,17 @@ public:
         collection_settings_stores_ = stores;
         collection_settings_probe_perm_fn_ = std::move(probe_perm_fn);
     }
+
+    /// The lifecycle rule store behind list/import/delete_software_lifecycle_rules: the SAME
+    /// instance SoftwareLifecycleRoutes borrows. Wired once at construction; unset = those tools
+    /// answer an internal error with no retry hint.
+    void set_software_lifecycle_store(SoftwareLifecycleStore* store) { software_lifecycle_store_ = store; }
+
+    /// The product registry behind get_software_normalization_status, list_software_curation_queue,
+    /// curate_software_alias, reject_software_curation and replace_software_normalization_pack: the
+    /// SAME instance SoftwareCurationRoutes borrows. Wired once at construction; unset = those tools
+    /// answer an internal error with no retry hint.
+    void set_product_registry_store(ProductRegistryStore* store) { product_registry_store_ = store; }
 
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
     /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_echo_process_
@@ -1479,10 +1513,17 @@ private:
     // #2146 Batch B1 — see set_guardian_push_fn above.
     GuardianPushFn guardian_push_fn_;
     std::shared_ptr<software_sync::Runner> software_sync_runner_;
+    // SAM-21 - see set_software_lookup_reads / set_software_sync_status_fns above.
+    std::optional<software_list::LookupReads> software_lookup_reads_;
+    software_sync::StatusReadFn software_sync_status_fn_;
+    software_sync::UnfilteredFn software_sync_unfiltered_fn_;
     // SAM-35 - see set_software_read_ctx / set_collection_settings_deps above.
     std::optional<software_read_api::Ctx> software_read_ctx_;
     software_collection_settings_api::Stores collection_settings_stores_;
     PermFn collection_settings_probe_perm_fn_;
+    // SAM-29 - see set_software_lifecycle_store / set_product_registry_store above.
+    SoftwareLifecycleStore* software_lifecycle_store_{nullptr};
+    ProductRegistryStore* product_registry_store_{nullptr};
     // #2146 Batch B3 — see set_viz_deps above.
     FleetTopologyStore* fleet_topology_store_{nullptr};
     yuzu::server::OfflineRosterFn offline_roster_fn_;

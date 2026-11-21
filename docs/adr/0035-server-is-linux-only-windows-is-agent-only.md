@@ -398,6 +398,10 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      trees included), so they list PostgreSQL client libraries and other components the agent
      archive does not ship or load (verified against the v0.15.0 SBOMs). That is pre-existing; the
      release notes, `docs/user-manual/release-verification.md` and `upgrading.md` disclose it.
+     **Update (2026-11-18, supply-chain S8):** superseded. The release no longer scans `path: .`:
+     `scripts/ci/artifact-sbom.py` makes one SBOM per release file from that file's own contents
+     plus the vcpkg ports its binaries are built from, so the agent SBOMs list the agent's
+     libraries only (`docs/user-manual/release-verification.md` section 5, `upgrading.md`).
    - **The macOS "Notarize binaries" step** now reads the notarization status and fails unless it is
      `Accepted`. Like the rest of macOS signing it is dormant until a signing secret is set.
    - **The macOS codesign and notarization steps** pointed at `build-macos/yuzu-server` and

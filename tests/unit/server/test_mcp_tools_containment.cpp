@@ -86,9 +86,18 @@ struct ContainmentHarness {
     int gate_calls{0};
     std::string gate_type_op;
 
+    // Records an operator ended by force whose device still owes a release (include=release_owed,
+    // #7624): the fake behind quarantine_owed_list_fn, filtered and cut like the real read.
+    std::vector<QuarantineRecord> owed_records;
+    bool owed_degraded{false};
+    int owed_calls{0};
+    std::optional<std::vector<std::string>> last_owed_ids;
+    std::size_t last_owed_limit{0};
+
     // Wiring switches for the unwired cases.
     bool wire_fleet{true};
     bool wire_list{true};
+    bool wire_owed{true};
 
     // The MCP-side perm_fn: counts calls and (by default) allows. The tool is gated by
     // fleet_read_fn ALONE, so a test flips perm_result to false and expects no change.
@@ -143,6 +152,25 @@ struct ContainmentHarness {
                     return std::nullopt;
                 std::vector<QuarantineRecord> out;
                 for (const auto& r : records) {
+                    if (ids && std::find(ids->begin(), ids->end(), r.agent_id) == ids->end())
+                        continue;
+                    out.push_back(r);
+                    if (limit != 0 && out.size() >= limit)
+                        break;
+                }
+                return out;
+            };
+        if (wire_owed)
+            deps.quarantine_owed_list_fn = [this](const std::vector<std::string>* ids,
+                                                  std::size_t limit)
+                -> std::optional<std::vector<QuarantineRecord>> {
+                ++owed_calls;
+                last_owed_ids = ids ? std::optional<std::vector<std::string>>(*ids) : std::nullopt;
+                last_owed_limit = limit;
+                if (owed_degraded)
+                    return std::nullopt;
+                std::vector<QuarantineRecord> out;
+                for (const auto& r : owed_records) {
                     if (ids && std::find(ids->begin(), ids->end(), r.agent_id) == ids->end())
                         continue;
                     out.push_back(r);
@@ -566,6 +594,128 @@ yuzu::test::PgTestTemplate quarantine_twin_tpl{"quarantinestore", [](const std::
 
 } // namespace
 
+namespace {
+
+// An owed record as the store reads it: ended by force, the device still owed a release.
+QuarantineRecord make_owed(const std::string& agent, std::int64_t at) {
+    QuarantineRecord r = make_record(agent, at);
+    r.status = "released";
+    r.released_at = at + 10;
+    r.device_release_owed_at = at + 10;
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("list_quarantined_devices: include=release_owed appends the owed records after the active "
+          "ones, scoped and limited, with the owed keys; without it nothing is read",
+          "[mcp][quarantine][containment_twin][release_owed]") {
+    ContainmentHarness h;
+    h.records = {make_record("a", 300), make_record("b", 200)};
+    h.owed_records = {make_owed("c", 150), make_owed("d", 100)};
+
+    SECTION("without include the owed read is never made") {
+        auto res = h.call(nlohmann::json::object());
+        REQUIRE(res);
+        CHECK(h.owed_calls == 0);
+        CHECK(ContainmentHarness::agent_ids(ContainmentHarness::result_of(*res)["structuredContent"]) ==
+              std::vector<std::string>{"a", "b"});
+    }
+    SECTION("with include the owed rows follow the active rows and carry status and the two keys") {
+        auto res = h.call({{"include", "release_owed"}});
+        REQUIRE(res);
+        const auto sc = ContainmentHarness::result_of(*res)["structuredContent"];
+        CHECK(ContainmentHarness::agent_ids(sc) == std::vector<std::string>{"a", "b", "c", "d"});
+        CHECK(sc["count"] == 4);
+        CHECK(sc["more"] == false);
+        CHECK(sc["quarantined"][0]["status"] == "active");
+        CHECK(sc["quarantined"][0].size() == 8); // an active row keeps its eight keys
+        const auto c = sc["quarantined"][2];
+        CHECK(c["status"] == "release_owed");
+        CHECK(c["released_at"] == 160);
+        CHECK(c["release_owed_since"] == 160);
+        CHECK(c.size() == 10);
+        // the audit row says the option was used
+        CHECK(h.tool_audit_rows() == 1);
+    }
+    SECTION("the caller's scope is pushed into the owed read too") {
+        h.gate_scope = std::unordered_set<std::string>{"a", "d"};
+        auto res = h.call({{"include", "release_owed"}});
+        REQUIRE(res);
+        CHECK(ContainmentHarness::agent_ids(ContainmentHarness::result_of(*res)["structuredContent"]) ==
+              std::vector<std::string>{"a", "d"});
+        REQUIRE(h.last_owed_ids.has_value());
+        std::vector<std::string> ids = *h.last_owed_ids;
+        std::sort(ids.begin(), ids.end());
+        CHECK(ids == std::vector<std::string>{"a", "d"});
+    }
+    SECTION("the limit applies to each kind on its own, and more is true if either was cut") {
+        auto res = h.call({{"include", "release_owed"}, {"limit", 1}});
+        REQUIRE(res);
+        const auto sc = ContainmentHarness::result_of(*res)["structuredContent"];
+        CHECK(ContainmentHarness::agent_ids(sc) == std::vector<std::string>{"a", "c"});
+        CHECK(sc["more"] == true);
+        CHECK(h.last_owed_limit == 2); // one extra row to detect more
+        // only the owed list is cut
+        ContainmentHarness h2;
+        h2.records = {make_record("a", 300)};
+        h2.owed_records = {make_owed("c", 150), make_owed("d", 100)};
+        auto res2 = h2.call({{"include", "release_owed"}, {"limit", 1}});
+        REQUIRE(res2);
+        CHECK(ContainmentHarness::result_of(*res2)["structuredContent"]["more"] == true);
+    }
+}
+
+TEST_CASE("list_quarantined_devices: a bad include is an invalid-params error that reads nothing; an "
+          "unwired owed closure is refused; a degraded owed read is a retryable error",
+          "[mcp][quarantine][containment_twin][release_owed]") {
+    SECTION("an unknown value, a non-string and an empty string") {
+        for (const nlohmann::json& bad : {nlohmann::json("all"), nlohmann::json(1),
+                                          nlohmann::json(""), nlohmann::json(true)}) {
+            ContainmentHarness h;
+            h.owed_records = {make_owed("c", 150)};
+            auto res = h.call({{"include", bad}});
+            REQUIRE(res);
+            const auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == -32602);
+            CHECK(res->body.find("include must be release_owed") != std::string::npos);
+            CHECK(h.list_calls == 0);
+            CHECK(h.owed_calls == 0);
+            CHECK(h.audit_log == std::vector<std::string>{"mcp.list_quarantined_devices|denied"});
+        }
+    }
+    SECTION("an unwired owed closure is a misconfiguration, never an empty owed list") {
+        ContainmentHarness h;
+        h.wire_owed = false;
+        auto res = h.call({{"include", "release_owed"}});
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == -32603);
+        CHECK(h.audit_log == std::vector<std::string>{"mcp.list_quarantined_devices|failure"});
+        // the plain call does not need the closure
+        ContainmentHarness plain;
+        plain.wire_owed = false;
+        plain.records = {make_record("a", 100)};
+        auto ok = plain.call(nlohmann::json::object());
+        REQUIRE(ok);
+        CHECK_FALSE(nlohmann::json::parse(ok->body).contains("error"));
+    }
+    SECTION("a degraded owed read fails the whole call, so owed devices are never silently left out") {
+        ContainmentHarness h;
+        h.records = {make_record("a", 100)};
+        h.owed_degraded = true;
+        auto res = h.call({{"include", "release_owed"}});
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == -32603);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_number());
+        CHECK(res->body.find("\"agent_id\"") == std::string::npos);
+    }
+}
+
 TEST_CASE("list_quarantined_devices: every served body conforms to the output schema tools/list publishes",
           "[mcp][quarantine][containment_twin]") {
     ContainmentHarness h;
@@ -615,6 +765,14 @@ TEST_CASE("list_quarantined_devices: every served body conforms to the output sc
         const auto sc = ContainmentHarness::result_of(*res)["structuredContent"];
         CHECK(yuzu::test::schema_violation(schema, sc) == "");
         CHECK(sc["audit_persisted"] == false);
+    }
+    SECTION("owed rows with released_at and release_owed_since (include=release_owed)") {
+        h.owed_records = {make_owed("agent-9", 40)};
+        const auto res = h.call({{"include", "release_owed"}});
+        const auto sc = ContainmentHarness::result_of(*res)["structuredContent"];
+        CHECK(yuzu::test::schema_violation(schema, sc) == "");
+        CHECK(sc["count"] == 4);
+        CHECK(sc["quarantined"][3]["status"] == "release_owed");
     }
 }
 
@@ -704,4 +862,111 @@ TEST_CASE("list_quarantined_devices: MCP array equals the REST GET /api/v1/quara
     CHECK(mcp_array == rest_array);
     CHECK(mcp_array.find("agent-1") != std::string::npos);
     CHECK(mcp_array.find("agent-2") != std::string::npos);
+}
+
+TEST_CASE("list_quarantined_devices: include=release_owed equals REST GET ?include=release_owed over one "
+          "real store, and the default body is unchanged by it",
+          "[mcp][quarantine][containment_twin][byte_pin][release_owed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_twin_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore store(qpool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-1", "seed", "active one", "10.0.0.1"));
+    const auto owed_id = store.quarantine_device("agent-2", "seed2", "ended by force", "");
+    REQUIRE(owed_id.has_value());
+    REQUIRE(store.mark_released("agent-2", *owed_id, ReleaseEnd::forced).has_value());
+
+    test::TestRouteSink sink;
+    RestApiV1 api;
+    auto auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "alice";
+        return s;
+    };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) -> bool { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
+    RestApiV1::FleetReadFn fleet_fn = [](const httplib::Request&, httplib::Response&,
+                                         const std::string&,
+                                         const std::string&) -> authz::FleetReadGate {
+        return {true, std::nullopt};
+    };
+    api.register_routes(sink, auth_fn, perm_fn, audit_fn,
+                        /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
+                        /*token_store=*/nullptr, &store,
+                        /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+                        /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr,
+                        /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
+                        /*audit_store=*/nullptr, /*service_group_fn=*/{},
+                        /*tag_push_fn=*/{}, /*inventory_store=*/nullptr,
+                        /*product_pack_store=*/nullptr, /*sw_deploy_store=*/nullptr,
+                        /*device_token_store=*/nullptr, /*license_store=*/nullptr,
+                        /*guaranteed_state_store=*/nullptr, /*metrics_registry=*/nullptr,
+                        /*session_revoke_fn=*/{}, /*execution_event_bus=*/nullptr,
+                        /*result_set_store=*/nullptr, /*command_dispatch_fn=*/{},
+                        /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
+                        /*network_api=*/{}, /*lockout_clear_fn=*/{},
+                        /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
+                        /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
+                        /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+                        /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
+                        /*stream_budget=*/nullptr, /*exec_visible_fn=*/{},
+                        /*list_read_fn=*/{}, fleet_fn);
+    const auto data_array = [](const std::string& body) {
+        const std::string head = R"({"data":)";
+        REQUIRE(body.rfind(head, 0) == 0);
+        const std::size_t tail = body.rfind(R"(,"pagination")");
+        REQUIRE(tail != std::string::npos);
+        return body.substr(head.size(), tail - head.size());
+    };
+    auto plain = sink.Get("/api/v1/quarantine");
+    REQUIRE(plain);
+    REQUIRE(plain->status == 200);
+    auto with_owed = sink.Get("/api/v1/quarantine?include=release_owed");
+    REQUIRE(with_owed);
+    REQUIRE(with_owed->status == 200);
+    auto bad = sink.Get("/api/v1/quarantine?include=everything");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+
+    ContainmentHarness h;
+    h.start();
+    {
+        ToolDeps deps;
+        deps.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                const std::string&) -> authz::FleetReadGate {
+            return {true, std::nullopt};
+        };
+        deps.quarantine_list_fn = [&store](const std::vector<std::string>* ids, std::size_t limit) {
+            return store.list_quarantined_in(ids, limit);
+        };
+        deps.quarantine_owed_list_fn = [&store](const std::vector<std::string>* ids, std::size_t limit) {
+            return store.list_release_owed_in(ids, limit);
+        };
+        h.mcp.set_tool_deps(std::move(deps));
+    }
+    const auto mcp_array = [&](const nlohmann::json& args) {
+        auto res = h.call(args);
+        REQUIRE(res);
+        const std::string text =
+            ContainmentHarness::result_of(*res)["content"][0]["text"].get<std::string>();
+        const std::string head = R"({"quarantined":)";
+        REQUIRE(text.rfind(head, 0) == 0);
+        const std::size_t tail = text.rfind(R"(,"count":)");
+        REQUIRE(tail != std::string::npos);
+        return text.substr(head.size(), tail - head.size());
+    };
+    const std::string rest_with = data_array(with_owed->body);
+    const std::string mcp_with = mcp_array({{"include", "release_owed"}});
+    CHECK(mcp_with == rest_with);
+    CHECK(mcp_with.find("release_owed") != std::string::npos);
+    CHECK(mcp_with.find("release_owed_since") != std::string::npos);
+    // the default bodies are the active rows only, and are the same on both twins
+    const std::string rest_plain = data_array(plain->body);
+    CHECK(mcp_array(nlohmann::json::object()) == rest_plain);
+    CHECK(rest_plain.find("agent-2") == std::string::npos);
+    CHECK(rest_plain.find("release_owed") == std::string::npos);
 }

@@ -91,6 +91,7 @@ NOT_READS = frozenset({
     "set_metrics",
     "store",                 # ingest
     "finalize_terminal_status",
+    "shorten_ttl",           # retention shortening of the reconciler's own status replies (#7627)
     "allowed_group_by",      # static allow-list accessors: constants, no stored data
     "allowed_op_column",
     "reap_expired",          # retention sweep
