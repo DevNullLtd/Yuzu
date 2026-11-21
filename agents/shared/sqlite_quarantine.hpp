@@ -597,8 +597,8 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
             std::string sync_note;
 #ifndef _WIN32
             if (copy_ran && !ops.copy && by_fd.unsynced)
-                sync_note = std::format("; flushing it to disk failed ({}), so it may not survive "
-                                        "a power loss",
+                sync_note = std::format("; flushing it to disk failed ({}), so it may not be "
+                                        "durable",
                                         by_fd.sync_error.message());
 #endif
             result.notes.push_back(std::format("copied {} to {} because it could not be renamed "
