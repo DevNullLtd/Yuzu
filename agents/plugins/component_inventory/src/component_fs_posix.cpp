@@ -360,11 +360,18 @@ namespace {
     return std::ranges::all_of(n.substr(1), [](char c) { return c >= '0' && c <= '9'; });
 }
 
-/// The `python3[.N]` children of `parent`, sorted so the walk order does not depend on the lister.
+/// The `python3[.N]` children of `parent`, sorted so the walk order does not depend on the lister. A parent
+/// that could not be listed is offered itself, so the root checks count a network mount or a link and the
+/// walk reports an unreadable one, instead of the parent vanishing without a count.
 void append_python_dirs(std::vector<std::string>& out, const ChildLister& children, const std::string& parent,
                         bool bare) {
+    auto listed = children(parent);
+    if (!listed) {
+        out.push_back(parent);
+        return;
+    }
     std::vector<std::string> names;
-    for (auto& n : children(parent))
+    for (auto& n : *listed)
         if (is_python_dir_name(n, bare))
             names.push_back(std::move(n));
     std::ranges::sort(names);
@@ -456,15 +463,16 @@ Targets scan_python_targets() {
     if (!mounts)
         return scan_targets({}, [] { return std::nullopt; }); // no table, no listing: reported as unreadable
     const PosixFs fs{*mounts};
-    const ChildLister children = [&fs](const std::string& dir) {
-        std::vector<std::string> names;
+    const ChildLister children = [&fs](const std::string& dir) -> std::optional<std::vector<std::string>> {
         // A listing cut at the walk's per-directory cap offers the names it got; a parent that large is
         // not a Python library directory.
         const ListResult lr = fs.list(dir, WalkLimits{}.max_dir_entries);
-        if (!lr.error)
-            for (const auto& e : lr.entries)
-                if (e.type == DirEntry::Type::dir || e.type == DirEntry::Type::link)
-                    names.push_back(e.name);
+        if (lr.error)
+            return std::nullopt;
+        std::vector<std::string> names;
+        for (const auto& e : lr.entries)
+            if (e.type == DirEntry::Type::dir || e.type == DirEntry::Type::link)
+                names.push_back(e.name);
         return names;
     };
     return scan_targets(python_candidate_roots(children), [&mounts] { return mounts; });

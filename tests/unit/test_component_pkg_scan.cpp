@@ -462,7 +462,7 @@ TEST_CASE("pkg answer: a link or network mount inside the tree is still reported
 TEST_CASE("python and node roots: per OS, with the one listing injected",
           "[runtime][component_pkg_scan][posix][component_inventory]") {
     std::vector<std::string> listed;
-    const ChildLister lister = [&listed](const std::string& dir) {
+    const ChildLister lister = [&listed](const std::string& dir) -> std::optional<std::vector<std::string>> {
         listed.push_back(dir);
         return std::vector<std::string>{"python3.9", "python3", "python3.12", "python3.", "python3.x", "python",
                                         "python3.11-config", "python2.7", "libfoo.a", "python3.11"};
@@ -486,11 +486,59 @@ TEST_CASE("python and node roots: per OS, with the one listing injected",
     // The package manager's interpreter trees are never python roots, and an empty parent adds nothing.
     for (const auto& root : roots)
         CHECK_FALSE((root == "/usr/lib" || root.starts_with("/usr/lib/")));
-    const auto none = python_candidate_roots([](const std::string&) { return std::vector<std::string>{}; });
+    const auto none = python_candidate_roots(
+        [](const std::string&) -> std::optional<std::vector<std::string>> { return std::vector<std::string>{}; });
 #if !defined(__APPLE__)
     CHECK(none == std::vector<std::string>{"/opt"});
 #else
     CHECK(none == std::vector<std::string>{"/Library/Frameworks/Python.framework/Versions"});
 #endif
+}
+
+TEST_CASE("python roots: a parent that cannot be listed is offered as a candidate, never dropped uncounted",
+          "[runtime][component_pkg_scan][posix][component_inventory]") {
+    const ChildLister unlistable = [](const std::string&) -> std::optional<std::vector<std::string>> {
+        return std::nullopt;
+    };
+    const auto roots = python_candidate_roots(unlistable);
+#if defined(__APPLE__)
+    const std::vector<std::string> parents{"/opt/homebrew/lib", "/usr/local/lib"};
+    CHECK(roots == std::vector<std::string>{"/Library/Frameworks/Python.framework/Versions", "/opt/homebrew/lib",
+                                            "/usr/local/lib"});
+#else
+    const std::vector<std::string> parents{"/usr/local/lib"};
+    CHECK(roots == std::vector<std::string>{"/usr/local/lib", "/opt"});
+#endif
+
+    SECTION("on a network mount it reaches plan_targets and is counted as skipped") {
+        const auto t = plan_targets(roots, parents, true);
+        CHECK(t.roots_network_skipped == parents.size());
+        for (const auto& p : parents)
+            CHECK(std::ranges::find(t.roots, p) == t.roots.end());
+    }
+    SECTION("under a network mount above it, it is counted too") {
+        const auto t = plan_targets(roots, {"/usr/local"}, true);
+        CHECK(t.roots_network_skipped == 1);
+        CHECK(std::ranges::find(t.roots, "/usr/local/lib") == t.roots.end());
+    }
+    SECTION("off any mount it stays a root, for the open check to count, drop or report") {
+        const auto t = plan_targets(roots, {}, true);
+        CHECK(t.roots == roots);
+        CHECK(t.roots_network_skipped == 0);
+    }
+    SECTION("only the parent that failed is offered; a parent that lists still yields its children") {
+        const ChildLister half = [](const std::string& dir) -> std::optional<std::vector<std::string>> {
+            if (dir == "/usr/local/lib")
+                return std::nullopt;
+            return std::vector<std::string>{"python3.12"};
+        };
+        const auto mixed = python_candidate_roots(half);
+#if defined(__APPLE__)
+        CHECK(mixed == std::vector<std::string>{"/Library/Frameworks/Python.framework/Versions",
+                                                "/opt/homebrew/lib/python3.12", "/usr/local/lib"});
+#else
+        CHECK(mixed == std::vector<std::string>{"/usr/local/lib", "/opt"});
+#endif
+    }
 }
 #endif

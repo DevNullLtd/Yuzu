@@ -57,10 +57,11 @@ struct Targets {
 [[nodiscard]] std::vector<std::string> native_candidate_roots();
 
 /// Test seam and the one listing the python roots need: the names of the directories (and links, which
-/// the root checks then count and drop) directly inside `dir`, nothing below them. The live one lists
-/// through the leg's own no-follow PosixFs and never opens a path under a network mount; a test passes
-/// a fake, so python_candidate_roots stays unit-testable without touching the host.
-using ChildLister = std::function<std::vector<std::string>(const std::string& dir)>;
+/// the root checks then count and drop) directly inside `dir`, nothing below them; nullopt when `dir`
+/// could not be listed (absent, a link, on a network mount, unreadable). The live one lists through the
+/// leg's own no-follow PosixFs and never opens a path under a network mount; a test passes a fake, so
+/// python_candidate_roots stays unit-testable without touching the host.
+using ChildLister = std::function<std::optional<std::vector<std::string>>(const std::string& dir)>;
 
 /// The machine roots the `python` action walks, in walk order. A Python install is a directory
 /// `python3` or `python3.<digits>` beside the libraries, and the scan wants the distributions inside it,
@@ -70,7 +71,10 @@ using ChildLister = std::function<std::vector<std::string>(const std::string& di
 /// /usr/lib is NOT a root: the interpreter trees under it are owned by the package manager and their
 /// distributions are already package rows, the same principle the `native` roots state above. macOS:
 /// /Library/Frameworks/Python.framework/Versions, then each child of /opt/homebrew/lib and
-/// /usr/local/lib named `python3.<digits>`.
+/// /usr/local/lib named `python3.<digits>`. A parent the lister could not list is itself kept as a
+/// candidate in its children's place, so it takes the checks every other root takes: counted when on a
+/// network mount or behind a link, dropped silently when absent, left for the walk to report as
+/// dir_unreadable when it fails to open for any other reason.
 [[nodiscard]] std::vector<std::string> python_candidate_roots(const ChildLister& children);
 
 /// The machine roots the `node` action walks, in walk order. Linux: /usr/lib/node_modules,
@@ -137,7 +141,8 @@ using MountTableReader = std::function<std::optional<std::vector<std::string>>()
 /// scan_targets for the `python` action. The mount table is read first and the one parent listing
 /// python_candidate_roots needs goes through the leg with that table's mounts, so a parent on or under a
 /// network mount is never opened; an unreadable table lists nothing and yields no roots, as for scan.
-/// The roots then take the same link refusal and network-mount skip as every other action.
+/// A parent that fails to list is offered to the root checks as a candidate, so the roots then take the
+/// same link refusal and network-mount skip, counted, as every other action.
 [[nodiscard]] Targets scan_python_targets();
 
 /// scan_targets for the `node` action: node_candidate_roots() against the live mount table.
