@@ -181,8 +181,9 @@ grep -H -e '^provider waiver:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt
 A grype `.gate.txt` with no `provider waiver:` line at all records nothing either way. A
 `gate: pass` line alone therefore does not say whether a pass was degraded; read the
 `DEGRADED:` line too. The waiver bounds how long it is in force (14 days), not how old the
-capture it admits may be: the capture's age is on the `provider waiver:` line. A release
-scanned degraded says so in its release notes. Follow the waiver's `approval_ref` to audit it,
+capture it admits may be: the capture's age is on the `provider waiver:` line. The project's
+release procedure requires the release notes of a release scanned degraded to say so; the
+reports are the record either way. Follow the waiver's `approval_ref` to audit it,
 as for an accepted finding, and read its `statement` (the evidence of the stall) in the tag's own
 file: `git show vX.Y.Z:.grypeignore.yaml`.
 

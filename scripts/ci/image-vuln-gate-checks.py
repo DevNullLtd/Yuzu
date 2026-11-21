@@ -640,7 +640,7 @@ def read_ignore_sections(path, schema):
         return None, f"{path}: {e}"
 
 
-def check_waivers(path, waivers, require_approved, errors, excluded):
+def check_waivers(path, waivers, require_approved, errors, excluded, pending_all):
     """The in-force provider waivers of a grype acceptance file, and the
     problems with any, into `errors`. An expired waiver, or one more than
     MAX_WAIVER_DAYS out, is an ERROR that refuses the whole file (an expired
@@ -674,6 +674,8 @@ def check_waivers(path, waivers, require_approved, errors, excluded):
             errors.append(f"{tag}: expired on {exp}; an expired provider waiver refuses the file: remove it "
                           f"(or renew it with a new review and approval)")
             continue
+        if pending:
+            pending_all.append(w)
         if pending and require_approved:
             excluded.append(w)
             print(f"NOT IN FORCE: {tag}: approval_ref is pending; a release gate honours only a provider waiver "
@@ -683,7 +685,8 @@ def check_waivers(path, waivers, require_approved, errors, excluded):
             print(f"warning: {tag}: approval_ref is pending; honoured here, but the release gate "
                   f"(--release) does not honour it")
         print(f"note: {tag}: in force until {exp}: an image may be judged with grype DB provider {prov} "
-              f"older than {MAX_DB_AGE_HOURS} hours, and its report then says so")
+              f"older than {MAX_DB_AGE_HOURS} hours, and its report then says so; a release judged with it "
+              f"must say so in its release notes")
         in_force.append(w)
     return in_force
 
@@ -706,9 +709,9 @@ def cmd_ignore_file(path, emit=None, require_approved=False, schema=TRIVY_SCHEMA
         print(why, file=sys.stderr)
         return 1
     entries = sections["vulnerabilities"]
-    waiver_errors, waivers_excluded = [], []
+    waiver_errors, waivers_excluded, waivers_pending = [], [], []
     waivers_in_force = check_waivers(path, sections.get("provider_waivers", []), require_approved,
-                                     waiver_errors, waivers_excluded)
+                                     waiver_errors, waivers_excluded, waivers_pending)
     now = today()
     errors = []
     seen = set()
@@ -771,6 +774,7 @@ def cmd_ignore_file(path, emit=None, require_approved=False, schema=TRIVY_SCHEMA
     print(f"pending_not_honoured={pending_excluded}")
     if "provider_waivers" in schema[5]:
         print(f"waivers_in_force={len(waivers_in_force)}")
+        print(f"waivers_pending={len(waivers_pending)}")
         print(f"waivers_pending_not_honoured={len(waivers_excluded)}")
     return 0
 

@@ -1616,8 +1616,8 @@ class GrypeMutants(unittest.TestCase):
                '"$GRYPE_WAIVERS" \\\n        "${GRYPE_REQUIRED_PROVIDERS[@]}")"; then', 'if ! gprov="$(true)"; then')], []),
             ("OS provider freshness not checked", lambda gate: self.run_gate("img:1", grype_mode="provider-os-stale",
                                                                              gate=gate),
-             [('        0) if [ -n "$want_family" ] && ! pinfo="$("${CHECKS[@]}" grype-db-providers',
-               '        0) if false && ! pinfo="$("${CHECKS[@]}" grype-db-providers')], []),
+             [('           elif [ -n "$want_family" ] && ! pinfo="$("${CHECKS[@]}" grype-db-providers',
+               '           elif false && ! pinfo="$("${CHECKS[@]}" grype-db-providers')], []),
             ("pending grype acceptance honoured in a release", pending_in_release,
              [('[ "$RELEASE" = 0 ] || gign_flags+=(--require-approved)', ':')], []),
         ]
@@ -1787,7 +1787,7 @@ class ProviderWaiver(unittest.TestCase):
         self.assertIn("NOT IN FORCE", r.stdout)
         self.assertIn("provider nvd", r.stderr)
         # The durable report records the waiver that was not honoured.
-        self.assertIn("0 provider waiver(s) in force (1 pending, not honoured)",
+        self.assertIn("0 provider waiver(s) in force, 1 pending approval (1 not honoured)",
                       (rrep / "grype-img.gate.txt").read_text(encoding="utf-8"))
         rep = self.tmp / "rep"
         r = self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=pend, extra=("--report-dir", str(rep)))
@@ -1839,6 +1839,12 @@ class ProviderWaiver(unittest.TestCase):
         self.assertNotIn("provider", stripped.replace("provider_waivers", "").replace("package", ""))
         self.assertIn("- id: CVE-2001-0001", stripped)
         self.assertIsNone(re.search(r"^provider_waivers:", stripped, re.M))
+        # The section before `vulnerabilities:`, with a trailing comment.
+        before = "provider_waivers:\n" + waiver() + "# a comment\nvulnerabilities:\n" + self.grype_entry()
+        out = strip_provider_waivers(before)
+        self.assertIsNone(re.search(r"^provider_waivers:|^  - provider:", out, re.M))
+        # (a column-0 comment inside the section goes with it)
+        self.assertTrue(out.startswith("vulnerabilities:\n  - id: CVE-2001-0001"), out)
         self.assertIsNone(re.search(r"^provider_waivers:", repo_grype_ignore(self.tmp).read_text(encoding="utf-8"),
                                     re.M))
 
@@ -1847,7 +1853,7 @@ class ProviderWaiver(unittest.TestCase):
         # crossing UTC midnight on its expiry day): the generated waivers file
         # is emptied once the run's nvd waiver has been read.
         lapse = ('[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    DEGRADED: provider waiver in force for $(waived_desc): '
-                 'every image\'s grype verdict uses it"\n')
+                 'every image judged while it is in force uses it"\n')
         def gate_copy(label, extra_edits=()):
             return GrypeMutants.mutant(self, label, [(lapse, lapse + 'echo "[]" > "$GRYPE_WAIVERS"\n'),
                                                      *extra_edits], [])
@@ -1860,12 +1866,34 @@ class ProviderWaiver(unittest.TestCase):
         self.assertIn("provider waiver: lapsed during this run (nvd)", g)
         self.assertNotIn("DEGRADED", g)
         # Without the per-image re-check, the lapsed waiver would still admit it.
-        m = gate_copy("lapse-no-recheck", [('           elif [ "${#GRYPE_DB_WAIVERS[@]}" -gt 0 ] && ! "${CHECKS[@]}" '
-                                            'grype-db-providers \\', '           elif false && ! "${CHECKS[@]}" '
-                                            'grype-db-providers \\')])
+        m = gate_copy("lapse-no-recheck", [('    if [ "${#GRYPE_DB_WAIVERS[@]}" -gt 0 ] && ! "${CHECKS[@]}" '
+                                            'grype-db-providers "$WORK/grype-db-providers.json" \\',
+                                            '    if false && ! "${CHECKS[@]}" '
+                                            'grype-db-providers "$WORK/grype-db-providers.json" \\')])
         r = self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=self.waived(waiver(), name="w2.yaml"),
                           gate=m)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # With an OS-provider waiver too, only the nvd waiver is named as
+        # lapsed, the debian one the image used is still listed, and nothing
+        # calls the failed image degraded.
+        rep2 = self.tmp / "rep-lapse-os"
+        r = self.run_gate("img:1", grype_ignore=self.waived(waiver(), waiver(provider="debian"), name="w3.yaml"),
+                          gate=gate_copy("lapse-os"), extra=("--report-dir", str(rep2)),
+                          env_extra={"STUB_GRYPE_PROVIDERS": "provider-stale,provider-os-stale"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        g = (rep2 / "grype-img.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("gate: FAIL: provider waiver lapsed during the run", g)
+        self.assertIn("provider waiver: lapsed during this run (nvd), so it did not admit", g)
+        self.assertNotIn("DEGRADED", g)
+        self.assertNotIn("DEGRADED: provider waiver in force: grype DB provider debian", r.stdout)
+        # A waivers file that cannot be read again is not called a lapse.
+        rep3 = self.tmp / "rep-unreadable"
+        broken = GrypeMutants.mutant(self, "unreadable", [(lapse, lapse + 'echo "{" > "$GRYPE_WAIVERS"\n')], [])
+        r = self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=self.waived(waiver(), name="w4.yaml"),
+                          gate=broken, extra=("--report-dir", str(rep3)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("gate: FAIL: provider waivers unreadable",
+                      (rep3 / "grype-img.gate.txt").read_text(encoding="utf-8"))
 
     def test_an_image_never_judged_is_not_reported_degraded(self):
         import subprocess as sp
@@ -1980,7 +2008,7 @@ class ProviderWaiverMutants(unittest.TestCase):
 
         cases = [
             ("grype finding admitted", dict(grype_mode="findings", env_extra=stale),
-             ('    rm -f "$ARCHIVE"\n    case "$rc" in\n', f'    rm -f "$ARCHIVE"\n    ! {W} || rc=0\n    case "$rc" in\n'),
+             ('    fi\n    case "$rc" in\n', f'    fi\n    ! {W} || rc=0\n    case "$rc" in\n'),
              ('           elif [ "$fcrit" != 0 ]; then', f'           elif [ "$fcrit" != 0 ] && ! {W}; then')),
             ("Trivy finding admitted", dict(mode="findings", env_extra=stale),
              ('        --exit-code 3 --format table "$image" || rc=$?\n',
