@@ -422,7 +422,10 @@ took 3.1 s measured on PostgreSQL 16 with the trigger), so a backlog of sets the
 no longer make a pass exceed the 30 s statement timeout, roll back and retry the same sets forever
 (a defect the set cap alone already had). The budget reads the server-maintained `device_count`:
 member rows written out of band are not counted, so for them the bound is best-effort and the
-5,000-set cap still applies. At open the store checks that the four triggers are present,
+5,000-set cap still applies. A full-budget pass writes about 650 MB of WAL (measured on PostgreSQL
+16), and a sustained backlog drains at most about 60M member rows an hour at the 5-minute cadence;
+for sets of 5,000 to 40,000 members that is below what an uncapped pass managed when it fit inside
+the timeout (perf-12, an open follow-up). At open the store checks that the four triggers are present,
 `ENABLE ALWAYS`, of v7's shape and bound to v7's function bodies; otherwise, or if the check cannot be read, it
 logs an error and serves membership uncached. A writer that disables the triggers while servers run, or writes
 `membership_generation` directly, breaks the

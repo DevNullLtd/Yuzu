@@ -1574,7 +1574,7 @@ namespace {
 constexpr int64_t kGcSweepCapPerPass = 5000;      // part 5: unconditional
 // part 5, second half: a pass also stops at this many member rows (summed device_count, the
 // stored member count), always taking at least one set. The set cap alone let one pass cascade
-// up to 5000 x kMaxMembersPerSet rows; past the 30 s statement_timeout the pass rolls back and
+// 5000 sets of any size (a background fill is bounded only by the fleet); past the 30 s statement_timeout the pass rolls back and
 // the next one retries the same oldest-first cohort forever. Measured on PostgreSQL 16 with the
 // v7 DELETE trigger, this statement deleting 50 sets of 100,000 members (5M rows) took 3.1 s:
 // roughly a tenth of the timeout. device_count is the server's own count; a member row written
