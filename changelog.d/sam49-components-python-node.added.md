@@ -1,0 +1,1 @@
+- **component_inventory**: new `python` and `node` actions list installed Python distributions and Node packages (name, version and where they live) on Linux and macOS, reading only metadata files under fixed machine-wide roots and never running anything. Windows answers planned.

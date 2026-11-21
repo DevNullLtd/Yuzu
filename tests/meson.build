@@ -674,6 +674,8 @@ agent_test_exe = executable(
     'unit/test_component_zip.cpp',               # component_inventory: bounded zip reader (wave 1)
     'unit/test_component_java_parsers.cpp',      # component_inventory: Java manifest/pom parsers (wave 1)
     'unit/test_component_native_parsers.cpp',    # component_inventory: the native adapter over the shared binary_header readers (outcome mapping, universal slice choice), name and version rules, deterministic sweep (SAM-22)
+    'unit/test_component_python_parsers.cpp',    # component_inventory: Python distribution metadata parsers over real captured METADATA, PKG-INFO and egg-info fixtures (SAM-49)
+    'unit/test_component_node_parsers.cpp',      # component_inventory: Node package.json reader and node_modules path shape over real captured fixtures (SAM-49)
     'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
     'unit/test_component_walk_ordered.cpp',      # file search core: sorted depth-first resumable walk_ordered over MemTree and a fake clock, unguarded on every OS
     'unit/test_network_fstype_mounts.cpp',       # shared mount-table entries + local filesystem allow-list (agents/shared/network_fstype.hpp), portable
@@ -685,6 +687,7 @@ agent_test_exe = executable(
     'unit/test_file_search_resume_contract.cpp', # file search core: walk_ordered + cursor transitions + governor + coverage composed over MemTree (the resume contract), portable
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
     'unit/test_component_native_scan.cpp',       # component_inventory: native-library scan over an in-memory tree and a fake clock; one POSIX-only case through the real leg and parsers (SAM-22)
+    'unit/test_component_pkg_scan.cpp',          # component_inventory: Python and Node scans over an in-memory tree and a fake clock (SAM-49)
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
     'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
