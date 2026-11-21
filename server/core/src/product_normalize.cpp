@@ -51,8 +51,10 @@ std::string join_tokens(const std::vector<std::string>& tokens) {
     return out;
 }
 
-/// Trim wrapping punctuation from a token for CLASSIFICATION only — the
-/// emitted token is never rewritten. Tolerates "(64-bit)", "[x64]", "2019,".
+/// Trim wrapping punctuation from the edges of a token as split. Tolerates
+/// "(64-bit)", "[x64]", "2019,". The name@version split runs on the token after
+/// this trim, so a wrapper just before the "@" stays in the emitted name:
+/// "(openssl)@3" gives "openssl)" (see #8462).
 std::string_view trim_wrapping(std::string_view t) {
     constexpr std::string_view kWrap = "()[]{},;";
     while (!t.empty() && kWrap.find(t.front()) != std::string_view::npos)
