@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 # Image vulnerability gate (WP15/S9).
 #
-# Scans each container image with a pinned Trivy and FAILS when any image has a
-# CRITICAL vulnerability that has a fix available and is not accepted in
-# .trivyignore.yaml. It also prints (and optionally saves) the HIGH+CRITICAL
-# table for the record; HIGH findings do not fail the gate.
+# Scans each container image with two pinned scanners, Trivy and grype, and
+# FAILS when either reports a CRITICAL vulnerability that has a fix available
+# and is not accepted in that scanner's acceptance file (.trivyignore.yaml,
+# .grypeignore.yaml). It also prints (and optionally saves) each scanner's
+# table for the record (Trivy: HIGH and CRITICAL; grype: every severity);
+# findings below CRITICAL, and CRITICALs without a fix, do not fail the gate.
+#
+# Why two: they catalogue different things. Trivy does not identify the
+# Erlang/OTP runtime the gateway image bundles (its ERTS), so OTP CVEs never
+# reach its report; grype matches it from beam.smp's version string. A
+# finding from EITHER fails the image. grype scans a `docker save` of the
+# image's local ID (`docker-archive:`), never `docker:`, because grype's
+# docker source asks the daemon to PULL an image it does not have, which
+# would scan and pass a same-named image from a registry.
 #
 # It also fails, before or instead of a pass, when the scan could not mean
 # anything:
@@ -35,7 +45,22 @@
 #     at most 92 days out, an approver, and an approval reference and date,
 #     which are checked for format only: nothing verifies them against the
 #     pull request). Trivy never reads that file: it reads a copy the checker
-#     writes holding only the entries in force.
+#     writes holding only the entries in force;
+#   - .grypeignore.yaml is not in the same strict shape (scope: grype's
+#     package name AND version, optionally its type; the same statement,
+#     expiry and approval rules). grype never reads it either: it reads a
+#     generated config holding only the `ignore:` rules in force (`-c`, which
+#     also stops grype reading a .grype.yaml from its working directory);
+#   - the grype DB: its listing (latest.json) is fetched ONCE per run, the
+#     archive it names is downloaded into a fresh directory, its sha256 is
+#     checked against the listing, and grype imports it; the gate fails when
+#     the listed or imported DB is older than 72 hours, its age cannot be
+#     read, or grype's status of the imported DB is not the listed one. Every
+#     grype scan runs with DB updates off and grype's own age check on. The
+#     listing is NOT signed upstream: TLS to its host and the recorded
+#     checksum are the only evidence of which DB was used;
+#   - grype did not detect the OS that Trivy did, on an image whose OS
+#     packages Trivy scanned: grype then matches none of them.
 #
 # Where it runs:
 #   - release.yml, on every published image, on the locally built image BEFORE
@@ -72,35 +97,50 @@
 # accepted ones), trivy-NAME.txt (the same as a table) and trivy-NAME.gate.txt
 # (Trivy version, the DB's repository@digest and dates, image ID, OS, OS
 # package count, coverage, the advisory canary, the ignore file and the gate
-# result). A trivy-NAME.gate.txt is written for every image on every exit the
+# result); and grype-NAME.json (grype's report: every match, every severity,
+# and the accepted ones as ignoredMatches), grype-NAME.txt (its table) and
+# grype-NAME.gate.txt (grype version, the DB's URL, checksum, schema and build
+# time, image ID, distro, match counts, the ignore file and grype's result).
+# A .gate.txt of EACH scanner is written for every image on every exit the
 # script reaches after reading its arguments, including a SIGTERM/SIGINT
 # (`gate: FAIL: cancelled ...`), with `gate: FAIL: <reason>` when the gate
 # refused it or stopped early, so a refusal leaves evidence too. SIGKILL, and
 # a usage error before the image list is read, leave none.
 #
 # --attempt N (release.yml passes the workflow's run attempt) names the reports
-# trivy-NAME.attempt-N.{json,txt,gate.txt} and records the attempt, so a
-# re-run's reports sit beside the earlier attempts' and never replace them.
+# trivy-NAME.attempt-N.{json,txt,gate.txt} and grype-NAME.attempt-N.{json,txt,
+# gate.txt} and records the attempt, so a re-run's reports sit beside the
+# earlier attempts' and never replace them.
 #
-# Environment: every TRIVY_* variable is cleared, so the environment cannot
-# change the DB source, the cache, the severities or what is ignored; Trivy
-# also gets an empty config file, so a trivy.yaml in the working directory is
-# not read. Two inputs remain, for local runs and tests only:
+# Environment: every TRIVY_* and GRYPE_* variable is cleared, so the
+# environment cannot change the DB source, the cache, the severities or what
+# is ignored; Trivy also gets an empty config file, so a trivy.yaml in the
+# working directory is not read, and grype runs with only the generated config
+# (`-c`), in a working directory and HOME of this run. Inputs that remain, for
+# local runs and tests only:
 #   TRIVY_BIN        use this trivy binary instead of installing the pinned one.
 #                    It must be TRIVY_VERSION. Refused on GitHub Actions.
+#   GRYPE_BIN        the same for grype; it must be GRYPE_VERSION. Refused on
+#                    GitHub Actions.
 #   YUZU_TRIVYIGNORE ignore file to validate (default: <repo>/.trivyignore.yaml).
 #                    It goes through the same parser; Trivy reads only the
 #                    checker's canonical YAML copy of it.
-# The pinned binary, the DB and Trivy's temporary files live in a per-run
-# directory ($RUNNER_TEMP, else $TMPDIR), never a fixed shared path: the
-# self-hosted pools run four runners as ONE OS identity (#1871).
+#   YUZU_GRYPEIGNORE grype acceptance file to validate (default:
+#                    <repo>/.grypeignore.yaml); grype reads only the config
+#                    generated from it.
+# The pinned binaries, both DBs, the image archive grype reads and the
+# scanners' temporary files live in a per-run directory ($RUNNER_TEMP, else
+# $TMPDIR), never a fixed shared path: the self-hosted pools run four runners
+# as ONE OS identity (#1871).
 #
 # Time budget. Every long-running call runs under `timeout`, bounded by its
 # own deadline AND by what is left of the gate's overall budget (--budget,
 # default GATE_BUDGET = 1500 s, 25 minutes): the digest lookup RESOLVE_DEADLINE
-# per DB source, the whole Trivy download (every curl retry included)
-# CURL_DEADLINE, each DB download DB_DEADLINE per source, each scan
-# SCAN_DEADLINE. When the budget runs out the gate stops itself, writes
+# per DB source, the whole Trivy and grype downloads (every curl retry
+# included) CURL_DEADLINE each, each Trivy DB download DB_DEADLINE per source,
+# the grype DB listing RESOLVE_DEADLINE, its archive DB_DEADLINE and its import
+# IMPORT_DEADLINE, each `docker image inspect` RESOLVE_DEADLINE, each `docker
+# save` SAVE_DEADLINE, each scan SCAN_DEADLINE. When the budget runs out the gate stops itself, writes
 # `gate: FAIL: gate stopped ...: the gate ran out of its <N>s budget` for every
 # image not yet judged, and exits 1. So the gate ends, with its reports, within
 # the budget plus KILL_AFTER (+ cleanup) of starting: below the 30-minute
@@ -115,11 +155,11 @@
 # SIGKILL after SIGNAL_GRACE = 3 s), removes its work directory and exits
 # 130/143: all of it well inside the 7.5 s before the runner's second signal.
 #
-# Exit status: 0 every image passed; 1 a fixable CRITICAL was found, a scan
-# failed, the DB was stale or unpinnable, an image was not covered or has no
-# advisory data, the budget ran out, or the setup failed (fail closed: a scan
-# that did not complete is never a pass); 2 usage error; 130/143 cancelled by
-# SIGINT/SIGTERM.
+# Exit status: 0 every image passed both scanners; 1 a fixable CRITICAL was
+# found by either, a scan failed, a DB was stale or unpinnable, an image was
+# not covered or has no advisory data, grype did not detect the OS, the budget
+# ran out, or the setup failed (fail closed: a scan that did not complete is
+# never a pass); 2 usage error; 130/143 cancelled by SIGINT/SIGTERM.
 set -euo pipefail
 
 # Pinned Trivy. The sha256 values are from trivy_0.70.0_checksums.txt; the
@@ -130,6 +170,42 @@ set -euo pipefail
 TRIVY_VERSION="0.70.0"
 TRIVY_SHA256_LINUX_64BIT="8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
 TRIVY_SHA256_LINUX_ARM64="2f6bb988b553a1bbac6bdd1ce890f5e412439564e17522b88a4541b4f364fc8d"
+
+# Pinned grype (published 2026-11-09; the newest release at least seven days
+# old when pinned, the repository's Dependabot cooldown). The sha256 values are
+# from grype_0.121.3_checksums.txt, whose signature was verified on 2026-11-20
+# with `cosign verify-blob --bundle grype_0.121.3_checksums.txt.sigstore.json`
+# (issuer token.actions.githubusercontent.com, identity
+# https://github.com/anchore/grype/.github/workflows/release.yaml@refs/heads/main),
+# and both tarballs matched it. Bump all three together, and re-verify.
+GRYPE_VERSION="0.121.3"
+GRYPE_SHA256_LINUX_AMD64="e9da18cc1429e786722e32161288103600efffd8e483c90761f90485bd1bec85"
+GRYPE_SHA256_LINUX_ARM64="b7815598d48da78bfd16f5b98ef28e1bb09c03d34fc8c3e350f99b6ccb3c7cba"
+# grype's DB: grype 0.121.3's default v6 listing, named explicitly. The listing
+# names one archive and its sha256; the gate downloads that archive itself and
+# checks it before grype imports it, so grype never fetches a DB on its own.
+GRYPE_DB_URL="https://grype.anchore.io/databases/v6"
+# The DB providers whose freshness the gate requires. NVD, for every run: it
+# supplies the matches for binaries grype identifies by version, the gateway's
+# Erlang/OTP runtime among them. Each image's OS family's provider (alpine,
+# debian, ubuntu: the canary families), checked per image, so a lagging
+# provider refuses only the images on that OS.
+GRYPE_REQUIRED_PROVIDERS=(nvd)
+# Components grype must catalogue in an image (NAME=component...): the reason
+# grype runs at all. Trivy does not see the gateway's Erlang/OTP runtime, and
+# grype's JSON lists only matches, so without this a runtime grype stopped
+# recognising would read as clean.
+# Each entry is component=version: grype must report that exact version, so a
+# version it misreads (an ERTS version, a truncated one) refuses the image
+# instead of being matched against the wrong advisories. The version is the OTP
+# each gateway Dockerfile pins (tests/test_image_vuln_gate.py checks they
+# agree, so a builder bump updates this table and re-runs the real gate). Both
+# gateway images were checked to catalogue erlang 28.5.0.8 (from the bundled
+# ERTS's beam.smp) with grype 0.121.3 on 2026-11-20.
+declare -A GRYPE_REQUIRED_COMPONENTS=(
+    [yuzu-gateway]="erlang=28.5.0.8"
+    [yuzu-gateway-chisel]="erlang=28.5.0.8"
+)
 
 # The DB sources, tried in order: Trivy 0.70.0's defaults (the Google mirror of
 # Docker Hub's aquasec/trivy-db, then GitHub's), named explicitly. Each tag is
@@ -144,6 +220,8 @@ RESOLVE_DEADLINE=60
 CURL_DEADLINE=180
 CURL_ATTEMPT=60
 DB_DEADLINE=420
+IMPORT_DEADLINE=300
+SAVE_DEADLINE=600
 SCAN_DEADLINE=600
 GATE_BUDGET=1500
 # `timeout --kill-after`: a child that ignores SIGTERM is killed this long after.
@@ -156,6 +234,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IGNORE_FILE="${YUZU_TRIVYIGNORE:-$ROOT/.trivyignore.yaml}"
 CHECKS=(python3 -I "$ROOT/scripts/ci/image-vuln-gate-checks.py")
 NOT_COVERED="$ROOT/scripts/ci/image-vuln-gate-not-covered.txt"
+GRYPE_IGNORE_FILE="${YUZU_GRYPEIGNORE:-$ROOT/.grypeignore.yaml}"
 
 # Keep the one TRIVY_* variable this script reads, then clear every other one:
 # Trivy maps every flag to a TRIVY_* variable (TRIVY_DB_REPOSITORY,
@@ -168,6 +247,15 @@ while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep '^TRIVY_' || tru
 # itself refused on GitHub Actions below.
 test_db_digest="${YUZU_GATE_TEST_DB_DIGEST:-}"
 unset YUZU_GATE_TEST_DB_DIGEST
+# The same for grype: GRYPE_BIN is kept, every other GRYPE_* variable cleared
+# (grype reads its whole config from the environment too: GRYPE_EXCLUDE,
+# GRYPE_IGNORE, GRYPE_ONLY_FIXED, GRYPE_DB_*, ...). Test hook (no network): a
+# directory holding latest.json and the archive it names, used instead of
+# GRYPE_DB_URL. Only with GRYPE_BIN, which is refused on GitHub Actions below.
+grype_bin_env="${GRYPE_BIN:-}"
+while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep '^GRYPE_' || true)
+test_grype_db_dir="${YUZU_GATE_TEST_GRYPE_DB_DIR:-}"
+unset YUZU_GATE_TEST_GRYPE_DB_DIR
 
 err() {
     if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::error::$*"; else echo "ERROR: $*" >&2; fi
@@ -250,7 +338,7 @@ SUMMARY_HEADER=0
 summary_header() {
     [ "$SUMMARY_HEADER" = 0 ] || return 0
     SUMMARY_HEADER=1
-    summary "### Image vulnerability gate (Trivy ${TRIVY_VERSION}, DB ${DB_REF}, UpdatedAt ${db_updated})"
+    summary "### Image vulnerability gate (Trivy ${TRIVY_VERSION}, DB ${DB_REF}, UpdatedAt ${db_updated}; grype ${GRYPE_VERSION}, DB ${GRYPE_DB_REF})"
     summary ""
     summary "| Image | OS packages | Coverage | Result |"
     summary "|---|---|---|---|"
@@ -262,8 +350,11 @@ DB_REF="(not downloaded)"
 db_updated="?"
 db_downloaded="?"
 ignore_desc="(not validated)"
+GRYPE_DB_REF="(not downloaded)"
+grype_ignore_desc="(not validated)"
 ABORT_REASON=""
 declare -A reported=()
+declare -A grype_reported=()
 
 # write_gate_txt NAME IMAGE RESULT [extra lines...]
 write_gate_txt() {
@@ -284,6 +375,26 @@ write_gate_txt() {
     reported[$n]=1
 }
 
+# write_grype_gate_txt NAME IMAGE RESULT [extra lines...]: grype's verdict for
+# the image, in grype-NAME[.attempt-N].gate.txt.
+write_grype_gate_txt() {
+    [ -n "$REPORT_DIR" ] || return 0
+    local n="$1" img="$2" res="$3"
+    shift 3
+    {
+        echo "image: $n ($img)"
+        echo "mode: $MODE"
+        [ -z "$ATTEMPT" ] || echo "run attempt: $ATTEMPT"
+        echo "grype: $GRYPE_VERSION"
+        echo "grype db: $GRYPE_DB_REF"
+        [ $# -eq 0 ] || printf '%s\n' "$@"
+        echo "ignore file: $grype_ignore_desc"
+        echo "gate: $res"
+        echo "scanned at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$REPORT_DIR/grype-${n}${ATTEMPT_SUFFIX}.gate.txt"
+    grype_reported[$n]=1
+}
+
 die() {
     ABORT_REASON="$*"
     err "$*"
@@ -298,16 +409,21 @@ CANCELLED=""
 # shellcheck disable=SC2317 # run by on_signal and finish (traps)
 report_unjudged() {
     local rc="$1" i res
+    if [ -n "$CANCELLED" ]; then
+        res="FAIL: cancelled ($CANCELLED) before this image was judged"
+    else
+        res="FAIL: gate stopped before this image was judged: ${ABORT_REASON:-unexpected error (exit $rc)}"
+    fi
     for i in "${!NAMES[@]}"; do
         if [ -z "${reported[${NAMES[$i]}]:-}" ]; then
-            if [ -n "$CANCELLED" ]; then
-                res="FAIL: cancelled ($CANCELLED) before this image was judged"
-            else
-                res="FAIL: gate stopped before this image was judged: ${ABORT_REASON:-unexpected error (exit $rc)}"
-            fi
             write_gate_txt "${NAMES[$i]}" "${REFS[$i]}" "$res" || true
             summary_header
             summary "| ${NAMES[$i]} | ? | ? | ${res} |"
+        fi
+        if [ -z "${grype_reported[${NAMES[$i]}]:-}" ]; then
+            write_grype_gate_txt "${NAMES[$i]}" "${REFS[$i]}" "$res" || true
+            summary_header
+            summary "| ${NAMES[$i]} (grype) | - | - | ${res} |"
         fi
     done
 }
@@ -369,8 +485,14 @@ trap finish EXIT
 if [ -n "$trivy_bin_env" ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
     die "TRIVY_BIN is for local runs and tests; the gate on GitHub Actions installs its pinned Trivy itself"
 fi
+if [ -n "$grype_bin_env" ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
+    die "GRYPE_BIN is for local runs and tests; the gate on GitHub Actions installs its pinned grype itself"
+fi
 if [ -n "$test_db_digest" ] && [ -z "$trivy_bin_env" ]; then
     die "YUZU_GATE_TEST_DB_DIGEST is a test hook and needs TRIVY_BIN"
+fi
+if [ -n "$test_grype_db_dir" ] && [ -z "$grype_bin_env" ]; then
+    die "YUZU_GATE_TEST_GRYPE_DB_DIR is a test hook and needs GRYPE_BIN"
 fi
 if [ -n "$inherited_cache" ]; then
     echo "note: TRIVY_CACHE_DIR=$inherited_cache is ignored; the gate downloads its DB into a fresh directory"
@@ -402,6 +524,23 @@ pending_all="$(printf '%s\n' "$ign_out" | sed -n 's/^pending=//p')"
 pending_out="$(printf '%s\n' "$ign_out" | sed -n 's/^pending_not_honoured=//p')"
 ignore_desc="$(sha256sum "$IGNORE_FILE" | cut -d' ' -f1), ${in_force} entry(ies) in force, ${pending_all} pending approval (${pending_out} not honoured)"
 TRIVY_IGNORE="$WORK/trivyignore.yaml"
+# grype's acceptance file: the same parser and rules, scoped by package name
+# and version; grype reads the generated config of the entries in force.
+if [ ! -r "$GRYPE_IGNORE_FILE" ]; then
+    die "grype ignore file $GRYPE_IGNORE_FILE is missing or unreadable (the gate does not run without it)"
+fi
+gign_flags=(--emit "$WORK/grype-config.yaml")
+[ "$RELEASE" = 0 ] || gign_flags+=(--require-approved)
+if ! gign_out="$("${CHECKS[@]}" grype-ignore-file "$GRYPE_IGNORE_FILE" "${gign_flags[@]}")"; then
+    printf '%s\n' "$gign_out"
+    die "$GRYPE_IGNORE_FILE is not in the shape the gate accepts (above): every entry needs a package_name and a package_version (grype's, exact; package_type optional), a statement, an expired_at at most 92 days out, approved_by, and approved_on with approval_ref (or approval_ref: pending)"
+fi
+printf '%s\n' "$gign_out" | grep -v -E '^(in_force|pending|pending_not_honoured)=' || true
+g_in_force="$(printf '%s\n' "$gign_out" | sed -n 's/^in_force=//p')"
+g_pending_all="$(printf '%s\n' "$gign_out" | sed -n 's/^pending=//p')"
+g_pending_out="$(printf '%s\n' "$gign_out" | sed -n 's/^pending_not_honoured=//p')"
+grype_ignore_desc="$(sha256sum "$GRYPE_IGNORE_FILE" | cut -d' ' -f1), ${g_in_force} entry(ies) in force, ${g_pending_all} pending approval (${g_pending_out} not honoured)"
+GRYPE_CONFIG="$WORK/grype-config.yaml"
 if ! nc_out="$("${CHECKS[@]}" not-covered "$NOT_COVERED" "${nc_flags[@]}")"; then
     die "$NOT_COVERED is malformed (above)"
 fi
@@ -427,6 +566,45 @@ else
 fi
 "$TRIVY" --version 2>/dev/null | grep -qx "Version: ${TRIVY_VERSION}" \
     || die "$TRIVY is not Trivy ${TRIVY_VERSION}"
+
+# ── grype ────────────────────────────────────────────────────────────────────
+if [ -n "$grype_bin_env" ]; then
+    GRYPE="$grype_bin_env"
+else
+    case "$(uname -s)/$(uname -m)" in
+        Linux/x86_64)              garch="amd64"; want="$GRYPE_SHA256_LINUX_AMD64" ;;
+        Linux/aarch64|Linux/arm64) garch="arm64"; want="$GRYPE_SHA256_LINUX_ARM64" ;;
+        *) die "no pinned grype for $(uname -s)/$(uname -m); set GRYPE_BIN" ;;
+    esac
+    gtgz="grype_${GRYPE_VERSION}_linux_${garch}.tar.gz"
+    url="https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/${gtgz}"
+    child "$CURL_DEADLINE" curl -fsSL --proto '=https' --retry 3 --retry-delay 5 --max-time "$CURL_ATTEMPT" \
+        -o "$WORK/$gtgz" "$url" \
+        || die "could not download $url (within ${CURL_DEADLINE}s)"
+    echo "${want}  $WORK/$gtgz" | sha256sum -c --quiet - \
+        || die "$gtgz does not match its pinned sha256; refusing to run it"
+    mkdir "$WORK/grype-bin"
+    tar -xzf "$WORK/$gtgz" -C "$WORK/grype-bin" grype
+    GRYPE="$WORK/grype-bin/grype"
+fi
+# grype's own state: this run's DB directory, a HOME and working directory of
+# this run (so no user or project grype config is found), and no network of
+# its own (no DB update, no update check). Its age check stays on as well.
+GRYPE_DB_CACHE="$WORK/grype-db"
+GRYPE_HOME="$WORK/grype-home"
+mkdir -p "$GRYPE_DB_CACHE" "$GRYPE_HOME"
+# run_grype DEADLINE ARGS...: grype under `child`, with only the environment
+# the gate gives it.
+run_grype() {
+    local limit="$1"
+    shift
+    child "$limit" env -C "$GRYPE_HOME" HOME="$GRYPE_HOME" XDG_CONFIG_HOME="$GRYPE_HOME/.config" \
+        XDG_CACHE_HOME="$GRYPE_HOME/.cache" GRYPE_DB_CACHE_DIR="$GRYPE_DB_CACHE" GRYPE_DB_AUTO_UPDATE=false \
+        GRYPE_DB_VALIDATE_AGE=true GRYPE_DB_MAX_ALLOWED_BUILT_AGE=72h GRYPE_DB_REQUIRE_UPDATE_CHECK=false \
+        GRYPE_CHECK_FOR_APP_UPDATE=false "$GRYPE" "$@"
+}
+run_grype "$RESOLVE_DEADLINE" --version > "$WORK/grype-version" 2>/dev/null || true
+grep -qx "grype ${GRYPE_VERSION}" "$WORK/grype-version" || die "$GRYPE is not grype ${GRYPE_VERSION}"
 
 # The DB and layer cache: always a fresh, empty directory of this run.
 CACHE="$WORK/cache"
@@ -479,6 +657,54 @@ printf '%s\n' "$db_info" | sed 's/^/    /'
 db_updated="$(printf '%s\n' "$db_info" | sed -n 's/^trivy_db_updated_at=//p')"
 db_downloaded="$(printf '%s\n' "$db_info" | sed -n 's/^trivy_db_downloaded_at=//p')"
 
+# ── The grype DB: once per run, checked against its listing, and fresh ───────
+# The listing names one archive and its sha256; the gate downloads that archive
+# into this run's directory, checks the sha256, and has grype import it. grype
+# then reports the imported DB's build time and schema, which must be the
+# listing's, so the DB recorded in every report is the DB grype scanned with.
+echo "==> grype ${GRYPE_VERSION}: vulnerability DB"
+glisting="$WORK/grype-listing.json"
+if [ -n "$test_grype_db_dir" ]; then
+    cp "$test_grype_db_dir/latest.json" "$glisting" || die "test hook: no latest.json in $test_grype_db_dir"
+else
+    child "$RESOLVE_DEADLINE" curl -fsSL --proto '=https' --retry 3 --retry-delay 5 --max-time 30 \
+        -o "$glisting" "$GRYPE_DB_URL/latest.json" \
+        || die "could not fetch the grype DB listing $GRYPE_DB_URL/latest.json (within ${RESOLVE_DEADLINE}s; treated as a failure)"
+fi
+if ! glist_info="$("${CHECKS[@]}" grype-db-listing "$glisting")"; then
+    die "the grype DB listing is stale, unreadable or not in the shape the gate accepts (above): a stale one, re-run once the published DB is current; a status other than active, the pinned grype's DB schema is retired and grype needs a bump"
+fi
+gdb_path="$(printf '%s\n' "$glist_info" | sed -n 's/^path=//p')"
+gdb_sum="$(printf '%s\n' "$glist_info" | sed -n 's/^checksum=//p')"
+gdb_built="$(printf '%s\n' "$glist_info" | sed -n 's/^built=//p')"
+gdb_schema="$(printf '%s\n' "$glist_info" | sed -n 's/^schema=//p')"
+if [ -n "$test_grype_db_dir" ]; then
+    cp "$test_grype_db_dir/$gdb_path" "$WORK/$gdb_path" || die "test hook: no $gdb_path in $test_grype_db_dir"
+else
+    child "$DB_DEADLINE" curl -fsSL --proto '=https' --retry 3 --retry-delay 5 --max-time "$((DB_DEADLINE - 20))" \
+        -o "$WORK/$gdb_path" "$GRYPE_DB_URL/$gdb_path" \
+        || die "could not download the grype DB $GRYPE_DB_URL/$gdb_path (within ${DB_DEADLINE}s; treated as a failure)"
+fi
+echo "${gdb_sum#sha256:}  $WORK/$gdb_path" | sha256sum -c --quiet - \
+    || die "the grype DB archive $gdb_path does not match the listing's $gdb_sum; refusing to import it"
+run_grype "$IMPORT_DEADLINE" db import "$WORK/$gdb_path" \
+    || die "grype could not import the DB $gdb_path (within ${IMPORT_DEADLINE}s; treated as a failure)"
+rm -f "$WORK/$gdb_path"
+run_grype "$RESOLVE_DEADLINE" db status -o json > "$WORK/grype-db-status.json" 2>"$WORK/grype-db-status.err" || true
+if ! gstat="$("${CHECKS[@]}" grype-db-status "$WORK/grype-db-status.json" --built "$gdb_built" --schema "$gdb_schema")"; then
+    cat "$WORK/grype-db-status.err" >&2 || true
+    die "grype's status of the imported DB is not the DB this run downloaded and verified, or it is stale (above)"
+fi
+run_grype "$RESOLVE_DEADLINE" db providers -o json > "$WORK/grype-db-providers.json" 2>"$WORK/grype-db-status.err" || true
+if ! gprov="$("${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" "${GRYPE_REQUIRED_PROVIDERS[@]}")"; then
+    cat "$WORK/grype-db-status.err" >&2 || true
+    die "a grype DB provider every image needs (${GRYPE_REQUIRED_PROVIDERS[*]}) is missing or older than 72 hours (above): an old one, re-run once the published DB is current; a missing one, the DB may have renamed it and GRYPE_REQUIRED_PROVIDERS needs updating"
+fi
+printf '%s\n' "$gprov" | sed 's/^/    /'
+GRYPE_DB_REF="$GRYPE_DB_URL/$gdb_path ($gdb_sum, schema $gdb_schema, built $gdb_built)"
+printf '%s\n' "$gstat" | sed 's/^/    /'
+echo "    $GRYPE_DB_REF"
+
 summary_header
 
 # advisory_canary FAMILY OS_NAME: returns 0 when this run's DB holds advisories
@@ -505,6 +731,144 @@ advisory_canary() {
     fi
     ADVISORY="${canary_result[$key]#*|}"
     [ "${canary_result[$key]%%|*}" = ok ]
+}
+
+# grype_scan NAME IMAGE TRIVY_OS_FAMILY: grype's scan of the image, judged
+# and reported on its own (grype-NAME[.attempt-N].*). TRIVY_OS_FAMILY is the
+# OS family Trivy scanned the OS packages of, or empty when Trivy did not
+# (not covered, or no scan): grype must then have detected the same family,
+# or it matched none of those packages. Sets failed=1 when grype refuses the
+# image or cannot judge it.
+ARCHIVE="$WORK/image.tar"
+grype_scan() {
+    local n="$1" img="$2" want_family="$3" id stem gjson gtable gcdx ginfo gres rc comps="" cinfo=""
+    local distro="?" matches="?" ignored="?" fcrit="?" fcrit_acc="?" gid="?"
+    stem="grype-${n}${ATTEMPT_SUFFIX}"
+    gjson="$WORK/${stem}.json"
+    gtable="$WORK/${stem}.txt"
+    gcdx="$WORK/${stem}.cdx.json"
+    echo "==> $n: grype"
+    # The image's local ID (`docker image inspect` never pulls), then a `docker
+    # save` of that ID (never pulls either): what grype reads is the image in
+    # this daemon, or nothing.
+    # Not in a $( ) subshell: `child` must run in the gate's own shell, so a
+    # budget stop or a signal is handled by the gate's traps.
+    id=""
+    if child "$RESOLVE_DEADLINE" docker image inspect --format '{{.Id}}' "$img" > "$WORK/image-id" 2>/dev/null; then
+        id="$(cat "$WORK/image-id")"
+    fi
+    if ! [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        err "$img: grype could not scan: it is not an image in the local Docker daemon (treated as a failure; the gate never pulls)"
+        failed=1
+        summary "| $n (grype) | - | - | not a local image |"
+        write_grype_gate_txt "$n" "$img" "FAIL: not an image in the local Docker daemon"
+        grype_reported[$n]=1
+        return 0
+    fi
+    rm -f "$ARCHIVE"
+    if ! child "$SAVE_DEADLINE" docker save -o "$ARCHIVE" "$id"; then
+        rm -f "$ARCHIVE"
+        err "$img: could not export $id for grype (treated as a failure)"
+        failed=1
+        summary "| $n (grype) | - | - | could not export |"
+        write_grype_gate_txt "$n" "$img" "FAIL: could not export the image for grype" "image id: $id"
+        grype_reported[$n]=1
+        return 0
+    fi
+    # The record: every severity, fixed or not, and the accepted findings
+    # (ignoredMatches), as JSON and as a table, in one scan. Not -q: it would
+    # hide grype's error messages too, so stderr is kept and shown on failure.
+    if ! run_grype "$SCAN_DEADLINE" -c "$GRYPE_CONFIG" -o "json=$gjson" -o "table=$gtable" -o "cyclonedx-json=$gcdx" \
+            "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" \
+        || ! ginfo="$("${CHECKS[@]}" grype-report "$gjson")" \
+        || [ ! -s "$gtable" ]; then
+        cat "$WORK/grype.err" >&2 || true
+        rm -f "$ARCHIVE"
+        err "$img: grype could not scan the image (treated as a failure)"
+        failed=1
+        summary "| $n (grype) | - | - | could not scan |"
+        [ -z "$REPORT_DIR" ] || [ ! -s "$gjson" ] || cp "$gjson" "$REPORT_DIR/"
+        write_grype_gate_txt "$n" "$img" "FAIL: grype could not scan the image" "image id: $id"
+        grype_reported[$n]=1
+        return 0
+    fi
+    cat "$gtable"
+    distro="$(printf '%s\n' "$ginfo" | sed -n 's/^distro_family=//p')"
+    gid="$(printf '%s\n' "$ginfo" | sed -n 's/^image_id=//p')"
+    matches="$(printf '%s\n' "$ginfo" | sed -n 's/^matches=//p')"
+    ignored="$(printf '%s\n' "$ginfo" | sed -n 's/^ignored=//p')"
+    fcrit="$(printf '%s\n' "$ginfo" | sed -n 's/^fixable_critical=//p')"
+    fcrit_acc="$(printf '%s\n' "$ginfo" | sed -n 's/^fixable_critical_accepted=//p')"
+    local dver
+    dver="$(printf '%s\n' "$ginfo" | sed -n 's/^distro_version=//p')"
+    # The components grype must have catalogued in this image (see
+    # GRYPE_REQUIRED_COMPONENTS), from its CycloneDX output of the same scan.
+    comps="${GRYPE_REQUIRED_COMPONENTS[$n]:-}"
+    local comps_ok=1 comps_desc="none required"
+    if [ -n "$comps" ]; then
+        # shellcheck disable=SC2086 # a space-separated list of component names
+        if cinfo="$("${CHECKS[@]}" grype-components "$gcdx" $comps 2>"$WORK/grype-components.err")"; then
+            comps_desc="$(printf '%s\n' "$cinfo" | sed -n 's/^component_//p' | tr '\n' ' ' | sed 's/=/ /g; s/ $//')"
+        else
+            comps_ok=0
+            cat "$WORK/grype-components.err" >&2 || true
+            # Missing, or present at another version: the checker's words say which.
+            comps_desc="NOT AS REQUIRED (required: $comps): $(tr '\n' ' ' < "$WORK/grype-components.err" | sed 's/ $//')"
+        fi
+    fi
+
+    # The gate: only matches with a fix, fail at CRITICAL. grype exits 2 when
+    # the threshold is crossed and 1 on an error; anything but 0 and 2 is an
+    # error and must not read as a pass.
+    rc=0
+    run_grype "$SCAN_DEADLINE" -c "$GRYPE_CONFIG" --only-fixed --fail-on critical -o table \
+        "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" || rc=$?
+    rm -f "$ARCHIVE"
+    case "$rc" in
+        0) if [ -n "$want_family" ] && ! "${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" \
+                   "$want_family" > /dev/null; then
+               err "$img: grype's DB provider for $want_family is missing or older than 72 hours, so its $want_family advisories are not current (treated as a failure): an old one, re-run once the published DB is current; a missing one, the DB may have renamed it"
+               gres="FAIL: grype DB provider $want_family is stale"
+               failed=1
+           elif [ "$comps_ok" != 1 ]; then
+               err "$img: grype did not catalogue $comps, the component it runs on this image for (above); a grype or base-image change stopped it recognising the runtime (treated as a failure)"
+               gres="FAIL: grype did not catalogue $comps as required"
+               failed=1
+           elif [ "$fcrit" != 0 ]; then
+               # The gate scan passed, but the record scan of the same archive
+               # lists a fixable CRITICAL that no acceptance covers: the two
+               # scans disagree, and a pass must not be published beside it.
+               err "$img: grype's gate scan passed but its record lists $fcrit fixable CRITICAL not accepted (treated as a failure)"
+               gres="FAIL: grype's record and gate scans disagree"
+               failed=1
+           elif [ -n "$want_family" ] && [ "$distro" != "$want_family" ]; then
+               err "$img: grype did not detect the OS ($want_family): it detected distro '${distro:-none}', so it matched none of the OS packages Trivy scanned (treated as a failure)"
+               gres="FAIL: grype did not detect the OS ($want_family)"
+               failed=1
+           else
+               gres="pass"
+               echo "    grype pass: no fixable CRITICAL vulnerability"
+           fi ;;
+        2) err "$img: grype found a fixable CRITICAL vulnerability (table above). Rebuild on current packages or a fixed base, or accept it in .grypeignore.yaml with a package scope, a statement, an expiry and an approval."
+           gres="FAIL: fixable CRITICAL"
+           failed=1 ;;
+        *) cat "$WORK/grype.err" >&2 || true
+           err "$img: grype exited $rc during the gate scan (treated as a failure)"
+           gres="FAIL: grype exited $rc"
+           failed=1 ;;
+    esac
+    summary "| $n (grype) | - | distro ${distro:-none} | $gres |"
+    if [ -n "$REPORT_DIR" ]; then
+        cp "$gjson" "$gtable" "$REPORT_DIR/"
+        write_grype_gate_txt "$n" "$img" "$gres" \
+            "image id: $id" \
+            "image id (grype): $gid" \
+            "distro: ${distro:-none} ${dver}" \
+            "matches: $matches not accepted, of them fixable CRITICAL: $fcrit (the gate's verdict is its own scan below)" \
+            "accepted (ignoredMatches): $ignored, of them fixable CRITICAL: $fcrit_acc" \
+            "required components: $comps_desc"
+    fi
+    grype_reported[$n]=1
 }
 
 # ── Scan ─────────────────────────────────────────────────────────────────────
@@ -544,6 +908,7 @@ for idx in "${!NAMES[@]}"; do
         [ -z "$REPORT_DIR" ] || [ ! -s "$json" ] || cp "$json" "$REPORT_DIR/"
         write_gate_txt "$name" "$image" "FAIL: Trivy could not scan the image"
         reported[$name]=1
+        grype_scan "$name" "$image" ""
         continue
     fi
     cat "$table"
@@ -622,6 +987,13 @@ for idx in "${!NAMES[@]}"; do
             "advisory data: $advisory"
     fi
     reported[$name]=1
+
+    # grype, on the same image. The OS-detection cross-check applies only when
+    # Trivy scanned the OS packages (covered); a not-covered image has none
+    # Trivy could see, so there is nothing to cross-check.
+    want_family=""
+    case "$coverage" in covered) want_family="$os_family" ;; esac
+    grype_scan "$name" "$image" "$want_family"
 done
 
 exit "$failed"
