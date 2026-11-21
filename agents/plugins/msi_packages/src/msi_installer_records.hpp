@@ -25,10 +25,10 @@
  *      |<db_manufacturer>|<db_name>|<reason or ->                    (one per product)
  *
  * Fields the OS did not give are EMPTY, never `-` (only the reason is `-` when there is
- * none). The first five columns after the code are registry values; the last five before
- * the reason are the cached database's Property rows (ProductCode, UpgradeCode,
- * ProductVersion, Manufacturer, ProductName), the upgrade_code column being the
- * database's. A row-level problem (a missing, refused or corrupt package) is the row's
+ * none). The seven columns after the code (name through local_package) are registry
+ * values; the five before the reason are the cached database's Property rows
+ * (UpgradeCode, ProductCode, ProductVersion, Manufacturer, ProductName), the upgrade_code
+ * column being the database's. A row-level problem (a missing, refused or corrupt package) is the row's
  * reason and never constrains the status; a failed registry read or a bound that cut the
  * read short is a status token and does (see the tokens below).
  */
@@ -71,6 +71,23 @@ inline constexpr std::size_t kMaxUpgradeValueNames = 256;
 /// Longest registry string (characters) read for a row field; a longer value is corrupt or
 /// planted and fails the read instead of being truncated.
 inline constexpr std::size_t kMaxValueChars = 4096;
+/// Value names read across the WHOLE UpgradeCodes tree at most (one name per product an
+/// upgrade code covers). The subkey and per-subkey bounds alone allow 20,000 x 256 = about
+/// 5.1 million names, and each becomes a map entry, from a planted tree; this holds the total
+/// to one name per visited subkey on average. A real machine registers each of its products
+/// under one upgrade code, so the total is about its product count: hundreds, and 5,000
+/// products (kMaxRecords) is a quarter of the cap. Over it the map is over_cap: every token
+/// is empty for the dispatch.
+inline constexpr std::size_t kMaxUpgradeNames = kMaxSubkeysVisited;
+/// Text bytes the records may hold in all (every string field of every record, as read). The
+/// per-field bounds alone allow 5,000 rows x 12 fields x 4,096 characters = about 246 million
+/// characters, up to three UTF-8 bytes each, from planted values. This holds the total to one
+/// full-length value (kMaxValueChars) per row on average: 5,000 x 4,096 = 20,480,000 bytes. A
+/// real row (a code, a name, a version, a publisher, a date, three paths and the cached
+/// package's five Property values) is about half a KiB, so 5,000 real products take about
+/// 2.5 MB (an eighth of the cap) and a few hundred take well under 0.25 MB. Over it the walk
+/// stops with the `row_cap` token and the records read so far are kept.
+inline constexpr std::size_t kMaxRecordBytes = kMaxRecords * kMaxValueChars;
 /// Package reads in one dispatch: 5 s each (yuzu::agent::msi::kPackageDeadline), 45 s in all.
 inline constexpr std::chrono::milliseconds kDispatchBudget{45000};
 
@@ -138,6 +155,22 @@ namespace detail {
     return out;
 }
 
+/// True when the leaf's base name is a Windows reserved device name: CON, PRN, AUX, NUL,
+/// COM1-9 or LPT1-9, in any case. Windows resolves such a name with ANY extension to the
+/// device, not to a file (`CON.msi` is the console), and ignores spaces before the dot, so
+/// the base is what precedes the first '.', trailing spaces trimmed.
+[[nodiscard]] inline bool is_reserved_device_name(std::string_view leaf) {
+    std::string_view base = leaf.substr(0, leaf.find('.'));
+    while (!base.empty() && base.back() == ' ')
+        base.remove_suffix(1);
+    using yuzu::profiles::iequals_ascii;
+    for (const std::string_view device : {"CON", "PRN", "AUX", "NUL"})
+        if (iequals_ascii(base, device))
+            return true;
+    return base.size() == 4 && base[3] >= '1' && base[3] <= '9' &&
+           (iequals_ascii(base.substr(0, 3), "COM") || iequals_ascii(base.substr(0, 3), "LPT"));
+}
+
 } // namespace detail
 
 /// Packed 32-digit form -> upper-case braced GUID. nullopt for a wrong length or a non-hex digit.
@@ -183,7 +216,8 @@ namespace detail {
 
 /// True only for `<windows_dir>\Installer\<leaf>.msi`: the parent equals the Installer
 /// directory under the system Windows directory, and the leaf is ONE plain name (no
-/// separator, no stream colon, no wildcard or control character) ending `.msi`. Both
+/// separator, no stream colon, no wildcard or control character, not a reserved device
+/// name such as `CON` or `COM1`) ending `.msi`. Both
 /// compares are ASCII case-insensitive and ordinal: the registry holds `C:\WINDOWS\...`
 /// while an API may spell the directory `C:\Windows`, and a byte-exact compare would refuse
 /// every row. Because the parent must equal a fixed absolute path and the leaf is one
@@ -207,7 +241,8 @@ namespace detail {
         return false;
     constexpr std::string_view kExt = ".msi";
     if (leaf.size() <= kExt.size() ||
-        !yuzu::profiles::iequals_ascii(leaf.substr(leaf.size() - kExt.size()), kExt))
+        !yuzu::profiles::iequals_ascii(leaf.substr(leaf.size() - kExt.size()), kExt) ||
+        detail::is_reserved_device_name(leaf))
         return false;
     return std::none_of(leaf.begin(), leaf.end(), [](char c) {
         return static_cast<unsigned char>(c) < 0x20 || c == '/' || c == ':' || c == '*' ||
@@ -266,6 +301,16 @@ struct InstallerRecord {
     std::string reason; ///< the row-level reason, empty when there is none
 };
 
+/// Every string a record holds, in bytes: what kMaxRecordBytes bounds in aggregate.
+[[nodiscard]] inline std::size_t record_bytes(const InstallerRecord& r) {
+    return r.product_code.size() + r.props.display_name.size() + r.props.display_version.size() +
+           r.props.publisher.size() + r.props.install_location.size() +
+           r.props.install_source.size() + r.props.local_package.size() +
+           r.props.install_date.size() + r.db.product_code.size() + r.db.upgrade_code.size() +
+           r.db.product_version.size() + r.db.manufacturer.size() + r.db.product_name.size() +
+           r.reason.size();
+}
+
 enum class OpenStatus { ok, absent, refused };
 
 struct Context {
@@ -310,7 +355,9 @@ struct RecordSet {
 ///
 /// A missing, refused or corrupt package is that row's reason and nothing more. The first
 /// TimedOut, Busy or ceiling-rejected read, or an exhausted dispatch budget, stops further
-/// opens: that row and every later one is `deadline_skipped`, and the status says why.
+/// opens: that row and every later one is `deadline_skipped`, and the status says why. More
+/// than kMaxRecords records, or more than kMaxRecordBytes of text in all, ends the walk with
+/// the `row_cap` token.
 template <class Enumerate, class ReadProperties, class OpenPackage, class ReadDatabase>
 RecordSet collect_records(const Context& ctx, Enumerate&& enumerate, ReadProperties&& read_properties,
                           OpenPackage&& open_package, ReadDatabase&& read_database) {
@@ -321,6 +368,7 @@ RecordSet collect_records(const Context& ctx, Enumerate&& enumerate, ReadPropert
     bool reads_stopped = false;
     std::chrono::milliseconds used{0};
     std::size_t visited = 0;
+    std::size_t text_bytes = 0; // record_bytes() summed over the records kept
 
     const auto privacy = [&](std::string v) {
         return path_under_any(v, ctx.profile_roots) ? std::string{kWithheldUserPath} : v;
@@ -406,6 +454,12 @@ RecordSet collect_records(const Context& ctx, Enumerate&& enumerate, ReadPropert
             fill_package(r); // reads local_package before it is withheld below
             r.props.local_package = privacy(std::move(r.props.local_package));
         }
+        const std::size_t bytes = record_bytes(r);
+        if (bytes > kMaxRecordBytes - text_bytes) { // aggregate cap: this row is not kept
+            set.constraints.add_failure(kTokenRowCap);
+            return false;
+        }
+        text_bytes += bytes;
         set.records.push_back(std::move(r));
         return true;
     };
@@ -468,7 +522,7 @@ struct UpgradeMap {
     };
     std::unordered_map<std::string, Entry> by_product; ///< upper-case braced product code
     std::size_t bad_names = 0;  ///< subkey or value names that are not packed GUIDs (skipped)
-    bool over_cap = false;      ///< too many subkeys or value names: every token is empty
+    bool over_cap = false;      ///< too many subkeys or value names (per key or in all): every token is empty
     std::optional<std::string> failure; ///< a read fault (anything but an absent key)
 
     /// The upgrade code of `product_code`; empty when no upgrade code names it, more than
@@ -492,8 +546,11 @@ template <class Enumerate>
 UpgradeMap build_upgrade_map(Enumerate&& enumerate) {
     UpgradeMap m;
     std::size_t subkeys = 0;
+    std::size_t names_seen = 0;
     const auto on_upgrade = [&](std::string packed_upgrade, std::vector<std::string> names) -> bool {
-        if (++subkeys > kMaxSubkeysVisited || names.size() > kMaxUpgradeValueNames) {
+        names_seen += names.size(); // at most kMaxUpgradeValueNames + 1 each, so no overflow
+        if (++subkeys > kMaxSubkeysVisited || names.size() > kMaxUpgradeValueNames ||
+            names_seen > kMaxUpgradeNames) {
             m.over_cap = true;
             return false;
         }

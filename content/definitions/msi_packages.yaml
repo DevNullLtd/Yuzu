@@ -1,6 +1,7 @@
 ## MSI / pkgutil Package Inventory Definitions
 ## Enumerates installed packages and product codes: MSI products via
-## MsiEnumProducts on Windows, pkgutil receipts on macOS.
+## MsiEnumProducts on Windows, pkgutil receipts on macOS; installer_records
+## (Windows) reads the Installer's own registry records and cached packages.
 ## Plugin: msi_packages | Actions: list, product_codes, list_inventory, installer_records
 
 ---
@@ -157,7 +158,8 @@ metadata:
   description: >
     Lists the Windows Installer products installed for the whole machine
     (MsiEnumProductsExW in the machine install context, with
-    MsiGetProductInfoExW for the name, version and publisher), in the form the
+    MsiGetProductInfoExW for the name, version and publisher, and the
+    Installer's UpgradeCodes registry map for the upgrade code), in the form the
     daily installed-software inventory collects them. Per-user MSI products are
     never listed by this action. A property the product does not have is an
     empty field, never a placeholder, and a product with no name (for example
@@ -190,7 +192,8 @@ spec:
     # inv|<product_code>|<name>|<version>|<publisher>|<upgrade_code>
     # Two row shapes on one stream, discriminated by field 0; a status row
     # populates the first four columns (product_code = the action name,
-    # name = the level, version = the tokens) and leaves publisher empty.
+    # name = the level, version = the tokens) and leaves publisher and
+    # upgrade_code empty.
     columns:
       - name: row_kind
         type: string
@@ -265,15 +268,18 @@ metadata:
     directory (ProductCode, UpgradeCode, ProductVersion, Manufacturer,
     ProductName), read read-only. Nothing is executed: no product is opened,
     repaired, installed or configured. Only the system Installer cache is ever
-    opened, with no reparse point followed, one package at a time, at most
-    5000 products, 5 seconds per package and 45 seconds of package reads per
+    opened: a path outside it, or one naming a reserved device, is refused, and
+    the package is held open through a handle that follows no reparse point
+    while it is read. One package is read at a time, for at most 5000 products
+    and 20 MB of text, 5 seconds per package and 45 seconds of package reads per
     dispatch. A product whose cached package is missing, refused or corrupt
     keeps its row with a reason and does not constrain the result. A failed
     registry read, an exceeded bound or a package read that timed out or found
     the single package reader busy makes the status row `constrained` with a
     `windows:installer_records:<detail>` token. Install locations and sources
     under the user profiles directory, or under a registered user profile's
-    folder, are reported as `withheld:user_path`.
+    folder, are reported as `withheld:user_path`. The Windows leg is not yet
+    verified against a real capture.
     Exactly one status row leads the result.
   tags: [software, msi, inventory, windows]
 

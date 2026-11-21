@@ -345,6 +345,32 @@ TEST_CASE("installer records: the path gate", "[msi_packages][installer_records]
     CHECK_FALSE(rec::package_path_allowed("WINDOWS\\Installer\\x.msi", "WINDOWS"));
 }
 
+TEST_CASE("installer records: the path gate refuses Windows reserved device names",
+          "[msi_packages][installer_records]") {
+    const std::string dir = "C:\\WINDOWS";
+    const auto in_cache = [](std::string leaf) { return "C:\\WINDOWS\\Installer\\" + leaf; };
+
+    // CON, PRN, AUX, NUL, COM1-9 and LPT1-9, any case, with the .msi extension the gate needs
+    for (const char* leaf : {"CON.msi", "con.msi", "Prn.MSI", "AUX.msi", "nul.msi", "NUL.Msi",
+                             "COM1.msi", "com9.msi", "Com5.MSI", "LPT1.msi", "lpt9.msi", "Lpt3.msi"}) {
+        INFO(leaf);
+        CHECK_FALSE(rec::package_path_allowed(in_cache(leaf), dir));
+    }
+    // the device is what precedes the first dot, and spaces before it are ignored
+    CHECK_FALSE(rec::package_path_allowed(in_cache("CON.x.msi"), dir));
+    CHECK_FALSE(rec::package_path_allowed(in_cache("com1.backup.msi"), dir));
+    CHECK_FALSE(rec::package_path_allowed(in_cache("NUL .msi"), dir));
+
+    // names that only look like one stay allowed: a longer base, a different digit range, a
+    // reserved word that is not the whole base name
+    for (const char* leaf : {"CONSOLE.msi", "CON1.msi", "COM10.msi", "COMX.msi", "COM.msi",
+                             "LPT.msi", "LPT10.msi", "AUXILIARY.msi", "NULL.msi", "PRNT.msi",
+                             "a.CON.msi", "1d2e3f40.msi", "1a2b3c.MSI"}) {
+        INFO(leaf);
+        CHECK(rec::package_path_allowed(in_cache(leaf), dir));
+    }
+}
+
 TEST_CASE("installer records: the profile-root test is ordinal, boundary-exact and either-separator",
           "[msi_packages][installer_records]") {
     const std::vector<std::string> roots{"C:\\Users", "D:\\Profiles\\"};
@@ -527,6 +553,43 @@ TEST_CASE("installer records: a key stuffed with junk names cannot pin the walk"
     CHECK(h.enumerated == rec::kMaxSubkeysVisited + 1);
     CHECK(set.records.empty());
     CHECK(rec::render(set)[0] == "status|installer_records|constrained|windows:installer_records:row_cap");
+}
+
+TEST_CASE("installer records: the records' text is capped in aggregate, not only per field",
+          "[msi_packages][installer_records]") {
+    // Every product carries six full-length values (the per-field bound allows it): far fewer
+    // than kMaxRecords products reach the aggregate cap, so only that cap can stop the walk.
+    const std::string full(rec::kMaxValueChars, 'a');
+    rec::InstallProps heavy;
+    heavy.display_name = heavy.display_version = heavy.publisher = full;
+    heavy.install_date = heavy.install_location = heavy.install_source = full;
+    // six values, the 38-character product code, and the reason a row with no LocalPackage gets
+    const std::size_t per_row = 6 * rec::kMaxValueChars + 38 + std::string_view{"no_local_package"}.size();
+    const std::size_t fit = rec::kMaxRecordBytes / per_row;
+    REQUIRE(fit + 10 < rec::kMaxRecords);
+
+    {
+        Host h;
+        for (std::size_t i = 0; i < fit + 10; ++i)
+            h.products.push_back(synthetic_product(i + 1, heavy));
+        const auto set = run(h);
+
+        CHECK(rec::record_bytes(set.records.front()) == per_row);
+        CHECK(set.records.size() == fit); // the row that would pass the cap is dropped
+        CHECK(h.enumerated == fit + 1);   // and the walk is told to stop there
+        const auto lines = rec::render(set);
+        CHECK(lines.size() == fit + 1);
+        CHECK(lines[0] == "status|installer_records|constrained|windows:installer_records:row_cap");
+    }
+    // the cap is on the total: exactly the rows that fit are all kept and the status is supported
+    {
+        Host h;
+        for (std::size_t i = 0; i < fit; ++i)
+            h.products.push_back(synthetic_product(i + 1, heavy));
+        const auto set = run(h);
+        CHECK(set.records.size() == fit);
+        CHECK_FALSE(set.constraints.any_failure());
+    }
 }
 
 TEST_CASE("installer records: the first timeout stops further opens and skips the rest",
@@ -790,6 +853,45 @@ TEST_CASE("installer records: over its cap the upgrade map leaves every token em
         CHECK(calls == rec::kMaxSubkeysVisited + 1);
         CHECK(*map.resolve(kPythonLauncher) == "");
     }
+}
+
+TEST_CASE("installer records: the upgrade map caps the value names in all, not only per subkey",
+          "[msi_packages][installer_records]") {
+    // Each subkey is within its own bound (256 names) and the subkey count is far under its
+    // bound, so only the aggregate cap can stop the walk.
+    const auto subkey_with = [](std::size_t index, std::size_t names) {
+        FxUpgrade u{std::format("{:032X}", 0x1000 + index), "", {}};
+        for (std::size_t i = 0; i < names; ++i)
+            u.products.push_back(std::format("{:032X}", index * 1000 + i));
+        return u;
+    };
+    const std::size_t per = rec::kMaxUpgradeValueNames;
+    const std::size_t full_subkeys = rec::kMaxUpgradeNames / per; // 78 x 256 = 19,968 names
+    const std::size_t rest = rec::kMaxUpgradeNames - full_subkeys * per;
+    REQUIRE(full_subkeys + 2 < rec::kMaxSubkeysVisited);
+
+    // exactly kMaxUpgradeNames names is not over the cap
+    std::vector<FxUpgrade> up;
+    for (std::size_t i = 0; i < full_subkeys; ++i)
+        up.push_back(subkey_with(i, per));
+    up.push_back(subkey_with(full_subkeys, rest));
+    std::size_t calls = 0;
+    const auto at_cap = build_map(up, std::nullopt, &calls);
+    CHECK_FALSE(at_cap.over_cap);
+    CHECK(calls == up.size());
+    CHECK_FALSE(at_cap.by_product.empty());
+
+    // one name more: every token is empty and the builder tells the walk to stop at that subkey
+    up.push_back(subkey_with(full_subkeys + 1, 1));
+    // (that subkey is the one past the cap; further subkeys must never be asked for)
+    up.push_back(subkey_with(full_subkeys + 2, per));
+    calls = 0;
+    const auto over = build_map(up, std::nullopt, &calls);
+    CHECK(over.over_cap);
+    CHECK(calls == full_subkeys + 2);
+    CHECK_FALSE(over.failure.has_value());
+    CHECK(over.by_product.empty()); // even the products read before the cap
+    CHECK(*over.resolve("{00000000-0000-0000-0000-000000000000}") == "");
 }
 
 TEST_CASE("installer records: an absent UpgradeCodes key is an empty map; a read fault is a failure token",
