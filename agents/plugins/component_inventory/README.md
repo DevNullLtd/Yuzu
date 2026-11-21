@@ -236,7 +236,7 @@ comp|native|crypto||unreadable|/opt/erlang/OTP-28.5.0.7/lib/crypto-5.8.3.3/priv/
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/component_inventory/src/component_fs_posix.cpp` · `agents/plugins/component_inventory/src/component_inventory_plugin.cpp` · `agents/plugins/component_inventory/src/component_java_parsers.hpp` · `agents/plugins/component_inventory/src/component_legs.hpp` · `agents/plugins/component_inventory/src/component_native_parsers.hpp` · `agents/plugins/component_inventory/src/component_native_scan.hpp` · `agents/plugins/component_inventory/src/component_scan.hpp` · `agents/plugins/component_inventory/src/component_walk.hpp` · `agents/plugins/component_inventory/src/zip_directory.hpp`
+- Plugin: `agents/plugins/component_inventory/src/component_fs_posix.cpp` · `agents/plugins/component_inventory/src/component_inventory_plugin.cpp` · `agents/plugins/component_inventory/src/component_java_parsers.hpp` · `agents/plugins/component_inventory/src/component_legs.hpp` · `agents/plugins/component_inventory/src/component_native_parsers.hpp` · `agents/plugins/component_inventory/src/component_native_scan.hpp` · `agents/plugins/component_inventory/src/component_scan.hpp` · `agents/plugins/component_inventory/src/component_walk.hpp`
 - Definitions: `content/definitions/component_inventory.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_component_inventory.hpp`
 - Tests: `tests/test_component_inventory_definition.py` · `tests/unit/test_component_inventory_local_dispatcher.cpp`
