@@ -2833,6 +2833,7 @@
       "changelog.d/2026-11-02-echo-fold-substrate.changed.md",
       "changelog.d/2026-11-02-echo-offline-hive-baselines.added.md",
       "changelog.d/2155-echo-corrupt-copies-bound-configure-partial.fixed.md",
+      "changelog.d/2540-dashboard-echo-scoped-perm.security.md",
       "changelog.d/5033-echo-corruption-audit-gate-per-agent.fixed.md",
       "changelog.d/6386-echo-tests-windows-honesty.fixed.md",
       "changelog.d/6513-echo-child-key-names.fixed.md",
