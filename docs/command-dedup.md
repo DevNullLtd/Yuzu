@@ -22,7 +22,7 @@ regressible — nothing fails loudly when one is broken.
 
 3. **The `__guard__` side channel is the ONLY dispatch that skips claiming for a reason of its own.**
    Gate on the literal, so dedup stays the SAFE DEFAULT for any future reserved-name command. (The one
-   other path that never claims is a refusal made BEFORE the claim step, today a parameter holding a
+   other path that never claims is a refusal made BEFORE the claim step, such as a parameter holding a
    NUL byte: it is answered `REJECTED` and nothing is dispatched, so no claim exists to leak.)
 
 4. **A duplicate NEVER re-executes.** Terminal replays the stored frame; InFlight answers RUNNING

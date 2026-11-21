@@ -971,8 +971,7 @@ public:
         metrics_.counter("yuzu_agent_commands_rejected_closing_total");
         metrics_.describe("yuzu_agent_protective_commands_run_closing_total",
                           "Protective commands that ran while the command pool was closing for a "
-                          "reconnect or the agent was stopping; the close waits for them inside the "
-                          "stop budget",
+                          "reconnect or the agent was stopping; the close waits for them, unbounded",
                           "counter");
         metrics_.counter("yuzu_agent_protective_commands_run_closing_total");
         metrics_.describe("yuzu_agent_plugin_output_dropped_total",
@@ -4728,7 +4727,7 @@ private:
         if (protective_runs_while_closing(cmd.plugin(), cmd.action(), command_pool_closing()) &&
             note_protective_run_closing(metrics_, protective_closing_runs_)) {
             spdlog::warn("Protective command {} ({}.{}) runs while the command pool is closing; the "
-                         "close waits for it inside the stop budget (TimeoutStopSec=60)",
+                         "close waits for it, unbounded",
                          cmd.command_id(), cmd.plugin(), cmd.action());
         }
         // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --

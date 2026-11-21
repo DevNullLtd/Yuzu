@@ -16,7 +16,7 @@
 ///
 /// A protective task that runs while the pool is closing is counted on
 /// `yuzu_agent_protective_commands_run_closing_total` and logged at WARN (throttled), because the
-/// pool destructor waits, unbounded, for it inside the stop budget (`TimeoutStopSec=60`).
+/// pool destructor waits, unbounded, for it (during a systemd stop, inside `TimeoutStopSec=60`).
 
 #include <yuzu/protective_actions.hpp>
 

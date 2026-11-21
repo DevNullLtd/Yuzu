@@ -613,7 +613,7 @@ TEST_CASE("WebhookStore[pg]: a name with two addresses is not POSTed to twice on
     }
     // IPv4 is tried first whatever the order. The IPv4 listener accepts the connection and drops it
     // without answering: a READ error after connecting, so the request may have reached the
-    // receiver. The old loop then POSTed again to ::1 (the same event twice).
+    // receiver. A delivery that moved on to ::1 after this error would POST the same event twice.
     std::vector<WebhookDelivery> deliveries;
     fire_with_lookup(store, {"::1", "127.0.0.1"}, pair->v4->port, deliveries);
     REQUIRE(deliveries.size() == 1);

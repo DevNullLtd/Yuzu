@@ -46,7 +46,7 @@ residual (#8204), the ~60 s `patch_connectivity` ordinary-worker hold and the or
 stall are documented residuals the owner accepted for this change. Protective-lane starvation (#8288) is
 not owner-accepted: it is tracked in #8288.
 
-- **Pool teardown is not bounded.** The reserved lane governs worker admission while a pool is running. It does not bound pool teardown. When the stream drops the agent destroys the pool. A queued ordinary task that has not started is answered REJECTED ("agent reconnecting") without running and an ordinary command's stagger sleep ends within about a second. A queued protective action is never rejected: it runs, with no stagger sleep, before the pool is destroyed. The agent then waits, with no bound, for every task already RUNNING its plugin to return before it reconnects; a command blocked in the kernel holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` sent after the drop is not received until it returns (#8247). The 20 s shutdown watchdog does not cover this wait. On Linux the `yuzu-agent` unit sets `TimeoutStopSec=60`: a stop still waiting at 60 s ends in SIGKILL (`status=9/KILL`) and `Restart=always` restarts the agent.
+- **Pool teardown is not bounded.** The reserved lane governs worker admission while a pool is running. It does not bound pool teardown. When the stream drops the agent destroys the pool. A queued ordinary task that has not started is answered REJECTED ("agent reconnecting") without running and an ordinary command's stagger sleep ends within about a second. A queued protective action is never rejected: it runs, with no stagger sleep, before the pool is destroyed. The agent then waits, with no bound, for every task already RUNNING its plugin to return before it reconnects; a command blocked in the kernel holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` sent after the drop is not received until it returns (#8247). The 20 s shutdown watchdog does not cover this wait. On Linux the `yuzu-agent` unit sets `TimeoutStopSec=60`: a stop still waiting at 60 s ends in SIGKILL (`status=9/KILL`), and the unit is left `failed` (`Result=timeout`) and stopped: systemd does not restart a unit whose stop was requested, so it stays down until it is started again. A reconnect teardown has no such budget.
 - **Independence is asserted, not verified.** The reserve guarantees a WORKER is available to a
   protective command. It does not prove the protective action's own blocking calls (a firewall
   backend, a resolver, the filesystem it touches) are independent of whatever stalled the ordinary
@@ -68,8 +68,9 @@ not owner-accepted: it is tracked in #8288.
   protective command that was queued longer than its expiry still runs. The stored-state reconciler stays
   the authority and re-applies drift, so a late containment is applied rather than dropped.
 - **The protective drain is not bounded, and it is counted.** A protective task that is queued or starts
-  while the pool is closing runs to completion, and the pool destructor waits for it. That wait is inside
-  the `TimeoutStopSec=60` stop budget, so a long protective drain ends in SIGKILL (`status=9/KILL`). The
+  while the pool is closing runs to completion, and the pool destructor waits for it. During a systemd
+  stop that wait is inside the `TimeoutStopSec=60` budget, so a long protective drain ends in SIGKILL
+  (`status=9/KILL`); on a reconnect teardown there is no budget. The
   agent counts each such run on `yuzu_agent_protective_commands_run_closing_total` and logs a WARN for the
   first five and then every hundredth run. There is no bounded drain.
 - **Result writes share `stream_write_mu_`.** A protective result waits on the same stream write mutex as
