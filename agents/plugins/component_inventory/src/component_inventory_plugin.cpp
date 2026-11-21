@@ -6,7 +6,8 @@
  *
  * Actions (neither takes a parameter; the roots come from the OS leg and from nothing a request can
  * supply):
- *   "scan"   -- Java archives. Roots: scan_targets().
+ *   "scan"   -- Java archives. Roots: scan_targets(); on Windows the WindowsApps tree under each root is
+ *               excluded and counted.
  *   "native" -- shared libraries (ELF .so, Mach-O .dylib, PE .dll), capped at 5,000 rows. Roots:
  *               scan_native_targets(); package-owned trees are excluded and counted. The server
  *               refuses it until an operator switches it on (an action-level kill-switch row seeded
@@ -47,6 +48,7 @@
 #endif
 
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -94,7 +96,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "bounded read-only walk of the Program Files and Program Files (x86) directories (the shell's "
          "known-folder paths, fixed drives only); every directory and file opened relative to its volume "
          "root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); "
-         "archive central directory, pom.properties and MANIFEST.MF read in-process",
+         "archive central directory, pom.properties and MANIFEST.MF read in-process; WindowsApps under "
+         "each root excluded and counted",
          "not yet verified against a real capture; Java archives only; machine roots only (per-user "
          "installs are not read); a reparse point is counted and never read; any budget, unreadable "
          "directory or unenumerable archive answers constrained"},
@@ -144,14 +147,31 @@ constexpr auto kNativeCandidate = &yuzu::component_inventory::is_linux_native_ca
 const yuzu::component_inventory::NativeParse kNativeParse = yuzu::component_inventory::describe_linux_file;
 #endif
 
+#if defined(_WIN32)
+// WindowsApps under each root that was planned, compared ASCII case-insensitively. Both actions walk
+// the same roots, so both keep out of it; the walk counts each one it meets (package_tree_skipped).
+std::function<bool(const std::string&)> windows_skip_dir(const yuzu::component_inventory::Targets& t) {
+    return [excluded = yuzu::component_inventory::windows_native_excluded_dirs(t.roots)](const std::string& dir) {
+        return yuzu::component_inventory::is_windows_excluded_dir(excluded, dir);
+    };
+}
+#endif
+
+// The scan's walk reads Java archives (the default candidate test). Only the Windows scan excludes a
+// tree today; the Linux and macOS scan walk excludes nothing, as before.
+yuzu::component_inventory::WalkPolicy scan_policy([[maybe_unused]] const yuzu::component_inventory::Targets& t) {
+    yuzu::component_inventory::WalkPolicy p;
+#if defined(_WIN32)
+    p.skip_dir = windows_skip_dir(t);
+#endif
+    return p;
+}
+
 yuzu::component_inventory::WalkPolicy native_policy([[maybe_unused]] const yuzu::component_inventory::Targets& t) {
     yuzu::component_inventory::WalkPolicy p;
     p.is_candidate = kNativeCandidate;
 #if defined(_WIN32)
-    // WindowsApps under each root that was planned, compared ASCII case-insensitively.
-    p.skip_dir = [excluded = yuzu::component_inventory::windows_native_excluded_dirs(t.roots)](const std::string& dir) {
-        return yuzu::component_inventory::is_windows_excluded_dir(excluded, dir);
-    };
+    p.skip_dir = windows_skip_dir(t);
 #else
     p.skip_dir = [excluded = yuzu::component_inventory::native_excluded_dirs()](const std::string& dir) {
         return std::ranges::find(excluded, dir) != excluded.end();
@@ -213,7 +233,7 @@ public:
                 return 0;
             }
             const ci::Targets t = ci::scan_targets();
-            const ci::Answer a = ci::answer_scan(kOs, t, make_fs, ci::WalkLimits{});
+            const ci::Answer a = ci::answer_scan(kOs, t, make_fs, ci::WalkLimits{}, scan_policy(t));
             // The cost of this scan, published by the agent as yuzu.plugin.component_inventory.* tags.
             yuzu::PluginContext pctx{plugin_ctx_};
             ci::emit_answer(ctx, plugin_ctx_ != nullptr ? &pctx : nullptr, a, wrote);

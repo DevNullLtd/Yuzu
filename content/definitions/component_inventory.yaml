@@ -24,8 +24,10 @@
 ##            on a drive that is not a fixed local disk (a mapped network drive, removable or optical
 ##            media) is dropped and reported as `network_fs_skipped`. A root that is itself a reparse
 ##            point is refused and answers constrained (`dir_unreadable`); a Program Files location
-##            the shell cannot name answers constrained (`mount_table_unreadable`). Python and Node
-##            components are not read on Windows yet.
+##            the shell cannot name answers constrained (`mount_table_unreadable`). The WindowsApps
+##            directory directly under each root (the Store packages) is not entered, matched by
+##            exact path without regard to case; it is counted and reported as
+##            `package_tree_skipped`. Python and Node components are not read on Windows yet.
 ## Candidates are files ending .jar, .war or .ear. For each one the archive's central directory
 ## is read in-process; the libraries nested one level deep (BOOT-INF/lib/, WEB-INF/lib/ or lib/)
 ## are listed from that directory alone, none is unpacked. The version is the file name's; the
@@ -43,7 +45,8 @@
 ## A `supported` status means the scan finished with no bound reached and every directory and
 ## archive it opened read in full; it does not mean nothing is installed outside the roots above.
 ## What it passed over on purpose rides a `supported` status row as an informational token, never
-## silent: `root_link_skipped`, `link_skipped`, `network_fs_skipped`, `version_unreadable`.
+## silent: `root_link_skipped`, `link_skipped`, `network_fs_skipped`, `version_unreadable` and, on
+## Windows, `package_tree_skipped` (the WindowsApps directories above).
 ## A `constrained` status means a bound was hit, a directory
 ## or an archive could not be read in full, or the mount table was unreadable: the list may be
 ## incomplete, and it names its one cause. The rows already read are still returned, but when time
@@ -61,11 +64,11 @@ metadata:
     found under the machine-wide application roots: one row per archive and per nested library
     (name, version and where the version came from, path, size, modification time and the
     application folder it sits under). Linux, macOS and Windows (Program Files and Program Files
-    (x86) on fixed drives; the Windows leg has not yet been verified against a real capture);
-    per-user locations are not read. No process is started, no reparse point is followed on
-    Windows and no nested archive is unpacked. A
+    (x86) on fixed drives, WindowsApps not entered; the Windows leg has not yet been verified
+    against a real capture); per-user locations are not read. No process is started, no reparse
+    point is followed on Windows and no nested archive is unpacked. A
     `supported` status means the scan finished and read everything it opened in full, naming in a
-    token any link or network mount it passed over; a `constrained` status means a bound was hit
+    token any link, network mount or package tree it passed over; a `constrained` status means a bound was hit
     or something could not be read in full, so the list may be incomplete, and it names its one
     cause. When time runs out, archives not yet read give no rows, and a walk that used the whole
     budget returns none. Use it for software no package manager owns; for packaged applications

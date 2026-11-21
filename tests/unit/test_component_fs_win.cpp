@@ -33,14 +33,18 @@
  *  - accepting a drive root, a UNC path or a repeated root in windows_candidate_roots fails the roots
  *    case: one walk could spend its entry budget on a whole drive.
  *  - comparing the WindowsApps path case-sensitively fails the exclusion case.
+ *  - dropping `policy` from scan()'s call to walk() (or from answer_scan's call to scan()) fails the scan
+ *    case: WindowsApps would be listed, nothing counted, and the status row would carry no token.
  *  - opening a file by its joined path (a path-resolving open) fails the junction cases on Windows: the
  *    junction would be followed and the secret under its target opened.
  *  - dropping the size or last-write comparison from unchanged() fails the resize and rewrite cases.
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include "component_fixture_tree.hpp" // build_zip and the in-memory FsOps the scan case runs over
 #include "component_legs_win.hpp"
 #include "component_native_parsers.hpp" // is_windows_native_candidate: the walk policy the WindowsApps case uses
+#include "component_scan.hpp"           // answer_scan: the scan path the same exclusion must reach
 #include "component_walk.hpp"
 
 #include <algorithm>
@@ -324,6 +328,54 @@ TEST_CASE("component_legs_win: WindowsApps is excluded by exact path, case-insen
     for (const auto& c : w.candidates)
         paths.push_back(c.path);
     CHECK(paths == std::vector<std::string>{"C:/Program Files/App/lib.dll", "C:/Program Files/WindowsApps2/other.dll"});
+}
+
+TEST_CASE("component_legs_win: the scan keeps out of WindowsApps too and says so on a supported row",
+          "[component_inventory][fs_win]") {
+    namespace fx = yuzu::component_inventory::fixture;
+    // Three Java archives: one in an application, one under WindowsApps (any case), one under a
+    // sibling that only shares the prefix.
+    const auto build = [] {
+        fx::MemTree tree;
+        const std::string jar = fx::build_zip({fx::stored("a.class", "x")}).bytes;
+        tree.add_file("C:/Program Files/App/lib-1.0.jar", jar);
+        tree.add_file("C:/Program Files/windowsapps/Pkg/hidden-2.0.jar", jar);
+        tree.add_file("C:/Program Files/WindowsApps2/other-3.0.jar", jar);
+        return tree;
+    };
+    const auto row_paths = [](const Answer& a) {
+        std::vector<std::string> paths;
+        for (const auto& r : a.res.rows)
+            paths.push_back(r.path);
+        return paths;
+    };
+    Targets t;
+    t.roots = {"C:/Program Files"};
+    const auto excluded = windows_native_excluded_dirs(t.roots);
+    WalkPolicy policy; // the scan's: Java archives (the default candidate test), WindowsApps skipped
+    policy.skip_dir = [&](const std::string& dir) { return is_windows_excluded_dir(excluded, dir); };
+
+    fx::MemTree tree = build();
+    const Answer a = answer_scan("windows", t, [&](const Targets&) { return tree.ops(); }, WalkLimits{}, policy);
+
+    // Never listed, never opened, counted once; the finished walk is a supported row naming the skip.
+    CHECK(a.res.stats.dirs_excluded == 1);
+    CHECK(std::ranges::find(tree.listed, "C:/Program Files/windowsapps") == tree.listed.end());
+    CHECK(std::ranges::find(tree.listed, "C:/Program Files/windowsapps/Pkg") == tree.listed.end());
+    CHECK(tree.opens.count("C:/Program Files/windowsapps/Pkg/hidden-2.0.jar") == 0);
+    CHECK(a.verdict.complete);
+    CHECK(a.verdict.level == yuzu::shared::StatusLevel::supported);
+    REQUIRE_FALSE(a.lines.empty());
+    CHECK(a.lines[0] == "status|scan|supported|windows:component_inventory:package_tree_skipped");
+    CHECK(row_paths(a) == std::vector<std::string>{"C:/Program Files/App/lib-1.0.jar",
+                                                   "C:/Program Files/WindowsApps2/other-3.0.jar"});
+
+    // The default policy excludes nothing, which is every POSIX leg's scan: same tree, nothing counted.
+    fx::MemTree open_tree = build();
+    const Answer b = answer_scan("windows", t, [&](const Targets&) { return open_tree.ops(); }, WalkLimits{});
+    CHECK(b.res.stats.dirs_excluded == 0);
+    CHECK(b.lines[0] == "status|scan|supported|-");
+    CHECK(row_paths(b).size() == 3);
 }
 
 // ---- the fixed-volume rule ----

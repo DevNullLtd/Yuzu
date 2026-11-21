@@ -215,8 +215,8 @@ namespace win_detail {
     return out;
 }
 
-/// The directories the `native` walk must not list, by exact path: `WindowsApps` directly under each
-/// root. Those are the Store packages, owned by the package manager and unreadable to most accounts;
+/// The directories the `scan` and `native` walks must not list, by exact path: `WindowsApps` directly
+/// under each root. Those are the Store packages, owned by the package manager and unreadable to most accounts;
 /// the walk counts each one it meets (WalkStats::dirs_excluded), it never skips one silently.
 [[nodiscard]] inline std::vector<std::string> windows_native_excluded_dirs(const std::vector<std::string>& roots) {
     std::vector<std::string> out;
@@ -428,7 +428,8 @@ namespace yuzu::component_inventory {
 [[nodiscard]] Targets scan_targets();
 
 /// The roots of the `native` action: the same Program Files trees. The WindowsApps directory under
-/// each is excluded by the plugin's walk policy (windows_native_excluded_dirs), not by the roots.
+/// each is excluded by the plugin's walk policy (windows_native_excluded_dirs), not by the roots; the
+/// `scan` action's walk is given the same exclusion.
 [[nodiscard]] Targets scan_native_targets();
 
 /// The filesystem the walk goes through: every directory and file is opened relative to its volume
