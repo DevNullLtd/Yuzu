@@ -70,7 +70,7 @@ tus=(
     agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header
     agents/plugins/middleware/src/middleware_win.cpp
     agents/plugins/middleware/src/middleware_linux.cpp # empty on Windows: checks the portable half
-    agents/plugins/component_inventory/src/component_inventory_plugin.cpp # Windows answers planned; checks the portable scan headers
+    agents/plugins/component_inventory/src/component_inventory_plugin.cpp # the Windows branch of execute and the portable scan headers
     agents/plugins/component_inventory/src/component_fs_win.cpp
     agents/plugins/process_introspect/src/process_introspect_plugin.cpp # Windows answers planned; checks the portable parsers and seam headers
     agents/core/src/dism_bounded_call.cpp

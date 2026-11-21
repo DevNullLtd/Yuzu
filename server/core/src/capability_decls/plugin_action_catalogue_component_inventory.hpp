@@ -16,7 +16,7 @@
 /// mount table, all in-process with no subprocess. It writes nothing on the host beyond the
 /// plugin's own heartbeat keys, and it takes no parameter, so a request cannot choose a path.
 ///
-/// `native` is the same shape for shared libraries (ELF, Mach-O): bounded, link-free, in-process
+/// `native` is the same shape for shared libraries (ELF, Mach-O, PE): bounded, link-free, in-process
 /// reads of fixed machine roots, no subprocess, no parameter, nothing written. It is ReadOnly/None
 /// and `ExecuteGate::None` like `scan`; what makes it ship off is NOT a gate but an action-level
 /// kill-switch row seeded at boot (server.cpp, `seed_action_kill_switch_default_off`), which the

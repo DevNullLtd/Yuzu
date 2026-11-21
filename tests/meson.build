@@ -690,7 +690,7 @@ agent_test_exe = executable(
     'unit/test_component_native_scan.cpp',       # component_inventory: native-library scan over an in-memory tree and a fake clock; one POSIX-only case through the real leg and parsers (SAM-22)
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
     'unit/test_component_fs_win.cpp',            # SAM-49: Windows filesystem leg (reparse refusal, read_at, unchanged) over a salted real tree; root planning portable
-    'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
+    'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (scan and native are dispatched on Windows only, as a hidden host-walk entry)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_python_parsers.cpp',     # runtimes python: pure python layer + macOS framework walk over a materialized fixture tree (walk body POSIX-only)

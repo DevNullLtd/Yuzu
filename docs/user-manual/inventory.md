@@ -420,13 +420,16 @@ trees, and the libraries nested one level inside them (`BOOT-INF/lib/`, `WEB-INF
 It reads the archive files themselves in-process; no process is started and no nested archive is
 unpacked (the archive's directory and, when needed, two small entries are read).
 
-- **Where.** Linux and macOS only, in machine-wide locations only, walked in this order. Linux:
+- **Where.** Linux, macOS and Windows, in machine-wide locations only, walked in this order. Linux:
   `/usr/lib/jvm`, `/usr/share/java`, `/usr/share/maven`, `/usr/local/lib`, `/usr/local/share` and
-  `/opt`. macOS: `/Library/Java`, `/usr/local`, `/opt/homebrew` and `/Applications`. The root list
-  holds no per-user location, so an archive under a home directory is not looked for (a property of
-  the list: an archive found under a root is read wherever it sits). Windows is not read yet: it
-  answers one `unsupported` status row (`windows:planned`). Python and Node components are not
-  collected.
+  `/opt`. macOS: `/Library/Java`, `/usr/local`, `/opt/homebrew` and `/Applications`. Windows: the
+  `Program Files` directory, then `Program Files (x86)`, named by the shell's known-folder lookup
+  (never an environment variable), on fixed local drives only; the `WindowsApps` directory directly
+  under each is not entered, and no reparse point (a junction, a symbolic link, a mount point) is ever
+  followed. The Windows leg is declared `constrained` in the capability matrix: it has not yet been
+  verified against a real capture from a Windows host. The root list holds no per-user location, so
+  an archive under a home directory is not looked for (a property of the list: an archive found under
+  a root is read wherever it sits). Python and Node components are not collected.
 - **What a row holds.** Kind (`java`), name, version, where the version came from (`filename`,
   `pom`, `manifest`, or `unreadable` when no source gives one), path (a nested library is
   `<archive path>!<entry>`), size, modification time and the application folder it sits under.
@@ -451,7 +454,9 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   reached (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`), a directory
   could not be listed (`dir_unreadable`) or was cut at its cap (`dir_truncated`), an archive could
   not be enumerated or changed while it was read (`archive_unenumerated`, `archive_changed`), or the
-  mount table could not be read so nothing was walked (`mount_table_unreadable`). Each token is
+  mount table could not be read so nothing was walked (`mount_table_unreadable`; on Windows, where
+  there is no mount table, a Program Files location could not be named or is not a walkable
+  directory, or a drive's type could not be told). Each token is
   prefixed `<os>:component_inventory:`. The rows already read are still returned, but when time
   runs out archives not yet read give no rows, and a walk that used the whole budget returns none.
   Only `supported` means the scan finished: no bound was reached and every directory and archive
@@ -464,8 +469,11 @@ unpacked (the archive's directory and, when needed, two small entries are read).
 - **Reported without blocking the answer.** On a `supported` answer, a root dropped because it is a
   link (`root_link_skipped`), a link met inside a tree (`link_skipped`: the scan follows no link, so
   the link is neither entered nor listed), a root or directory on a network mount that was passed
-  over (`network_fs_skipped`) and a row with no readable version (`version_unreadable`) ride the
-  status row as information. A `constrained` answer names its one cause only. A missing root is
+  over (`network_fs_skipped`; on Windows, a root on a UNC path or on a drive that is not a fixed local
+  disk), a package-owned tree that was not entered (`package_tree_skipped`: `WindowsApps` on Windows)
+  and a row with no readable version (`version_unreadable`) ride the status row as information. On
+  Windows a file the OS stores behind a reparse point (a cloud placeholder, a file compressed with the
+  Windows Overlay Filter) is counted in `link_skipped` and not read. A `constrained` answer names its one cause only. A missing root is
   skipped silently.
 - **What to do about a token.** Terminal (a repeat gives the same answer): `budget_entries`,
   `section_rows`, `anchor_rows`, `depth`, `dir_truncated`, and `archive_unenumerated` for that
@@ -492,8 +500,9 @@ unpacked (the archive's directory and, when needed, two small entries are read).
 ### Native libraries (`component_inventory`, `native`)
 
 The `component_inventory` plugin's `native` action (instruction `crossplatform.components.native`)
-lists the versioned shared libraries shipped inside applications: ELF `.so` files on Linux and
-Mach-O `.dylib` files on macOS. It reads each library's header in-process; no process is started.
+lists the versioned shared libraries shipped inside applications: ELF `.so` files on Linux,
+Mach-O `.dylib` files on macOS and PE `.dll` files on Windows. It reads each library's header in-process;
+no process is started.
 **It is switched off until an operator enables it** (below).
 
 - **Switching it on.** The server refuses the action until an operator lifts its kill-switch row:
@@ -501,32 +510,39 @@ Mach-O `.dylib` files on macOS. It reads each library's header in-process; no pr
   `enabled` true. The row is separate from `scan`, which stays on. A server restart never overwrites
   an operator's own setting.
 - **Where.** Linux: `/opt` and `/usr/local/lib`. macOS: `/Applications`, `/usr/local` and
-  `/opt/homebrew`. The package manager's own trees are not read: on Linux `/usr/lib` and the other
-  system library directories are not roots, and on macOS the Homebrew Cellar trees
-  (`/usr/local/Cellar`, `/opt/homebrew/Cellar`) are not entered. Windows is not read yet: it answers
-  one `unsupported` status row (`windows:planned`). Extension-less macOS framework binaries are not
-  listed.
+  `/opt/homebrew`. Windows: `Program Files` and `Program Files (x86)` on fixed local drives, the same
+  roots as `scan` (declared `constrained` until a real capture from a Windows host is committed). The
+  package manager's own trees are not read: on Linux `/usr/lib` and the other system library
+  directories are not roots, on macOS the Homebrew Cellar trees (`/usr/local/Cellar`,
+  `/opt/homebrew/Cellar`) are not entered, and on Windows `WindowsApps` under each root is not
+  entered. Extension-less macOS framework binaries are not listed.
 - **What a row holds.** Kind (`native`), name (the SONAME on Linux or the install name on macOS,
-  without its suffix and version), version, where the version came from (`filename`, `elf`, `macho`
-  or `unreadable`), path, size, modification time and the application folder it sits under.
+  without its suffix and version; on Windows the file name without `.dll`), version, where the
+  version came from (`filename`, `elf`, `macho`, `pe` or `unreadable`), path, size, modification
+  time and the application folder it sits under.
 - **How the version is read.** On Linux, from the file name's `.so.<version>` suffix
   (`libssl.so.3.0.13` reads `3.0.13`), else from the SONAME's suffix. On macOS, from the library's
   Mach-O `current_version` when it is not `0.0.0`, else from the file name's version
-  (`libfoo.1.2.dylib` reads `1.2`). A library whose header cannot be read inside the fixed
+  (`libfoo.1.2.dylib` reads `1.2`). On Windows, from the fixed file version of the PE's version
+  resource (source `pe`; `.dll` and `.DLL` are both read, `.dll.mui` is not); a PE with no version
+  resource, or one whose fixed version is `0.0.0.0`, is listed with `version_source` `unreadable`. A
+  library whose header cannot be read inside the fixed
   bounds, or that names no version, is still listed from its file name with `version_source`
   `unreadable`; that is a gap in one row and does not make the scan incomplete. A file whose name
   looks like a library but whose header says it is not one is not listed.
 - **Bounds.** The scan's (400,000 directory entries, 45 seconds, 32 levels, 50,000 entries per
   directory, 3,000 rows per application folder) with 5,000 rows in all. Per library, at most 128
   ELF program headers, 4,096 dynamic entries, a 255-byte name, 16 fat slices and 1,024 load
-  commands in 512 KiB; a count past one of those makes that library `unreadable`, never a partial
-  answer. A universal Mach-O file is read through its first slice that has no error and is a
+  commands in 512 KiB, and for a PE 96 sections, 4,096 resource directory entries, 256 KiB of
+  version data and 512 version nodes; a count past one of those makes that library `unreadable`,
+  never a partial answer. A universal Mach-O file is read through its first slice that has no error and is a
   dynamic library.
 - **When the list may be incomplete.** The status row reads `constrained` for the same causes as
   `scan` (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`, `dir_unreadable`,
   `dir_truncated`, `mount_table_unreadable`), and `archive_changed` when a library changed or
-  vanished while it was read. On a `supported` answer, the Homebrew Cellar trees the scan did not
-  enter are named by the informational token `package_tree_skipped`, beside the `scan` tokens.
+  vanished while it was read. On a `supported` answer, the package-owned trees the scan did not
+  enter (the Homebrew Cellar trees on macOS, `WindowsApps` on Windows) are named by the informational
+  token `package_tree_skipped`, beside the `scan` tokens.
   A Mac with very large application bundles can use the whole entry budget in `/Applications`, so
   read a `budget_entries` answer as the part of the host reached.
 - **What it costs, and who can run it.** The same roles and `Inventory` read grant as `scan`; a live

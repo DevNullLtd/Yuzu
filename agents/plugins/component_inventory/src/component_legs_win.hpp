@@ -186,23 +186,52 @@ namespace win_detail {
 
 // ---- roots, exclusions and the volume rule ----
 
-/// The roots the Windows leg walks, from the two known-folder paths (FOLDERID_ProgramFilesX64 and
+/// What a known-folder path is to the Windows leg.
+enum class KnownFolderPath {
+    root,        ///< `X:` plus a separator plus something: a directory the walk can be given
+    network,     ///< a UNC path (`\\server\share\...`): a network location, never walked, counted
+    unnameable,  ///< anything else (empty, relative, a bare drive root, an extended `\\?\` path): cannot be walked
+};
+
+/// Pure. UNC means two separators followed by a name; `\\?\` and `\\.\` are device and extended-length
+/// namespaces, not network shares, so they are unnameable, which constrains the answer.
+[[nodiscard]] inline KnownFolderPath classify_known_folder_path(std::string_view native) {
+    const auto sep = [](char c) { return c == '\\' || c == '/'; };
+    if (native.size() >= 3 && sep(native[0]) && sep(native[1]) && !sep(native[2]) && native[2] != '?' &&
+        native[2] != '.')
+        return KnownFolderPath::network;
+    return win_detail::is_drive_relative_walk_path(walk_path_from_native(native)) ? KnownFolderPath::root
+                                                                                   : KnownFolderPath::unnameable;
+}
+
+/// The candidate roots from the two known-folder paths (FOLDERID_ProgramFilesX64 and
 /// FOLDERID_ProgramFilesX86, as WTF-8; never an environment variable), in walk order: the 64-bit tree
-/// first. Each is put in the walk's form. A path that is empty, is not `X:` plus a separator plus
-/// something (a UNC path, a relative one, a bare drive root) or repeats an earlier root (compared
-/// ASCII case-insensitively) is left out: a drive root must never become a root, because one walk has a
-/// single entry budget a whole drive would spend.
-[[nodiscard]] inline std::vector<std::string> windows_candidate_roots(std::string_view program_files,
-                                                                      std::string_view program_files_x86) {
-    std::vector<std::string> out;
+/// first, each in the walk's form, as a Targets whose `roots` are not yet vetted against their volume
+/// (plan_windows_targets does that). NO CANDIDATE IS DROPPED SILENTLY: a UNC path is counted in
+/// roots_network_skipped, and a path that cannot name a walkable directory (empty, relative, a bare
+/// drive root, which must never become a root because one walk has a single entry budget a whole drive
+/// would spend) sets mount_table_unreadable, the constraining token. Only a repeat of an earlier root
+/// (compared ASCII case-insensitively: the same tree seen twice) is left out without a count, because
+/// nothing is lost by it.
+[[nodiscard]] inline Targets windows_candidate_roots(std::string_view program_files,
+                                                     std::string_view program_files_x86) {
+    Targets out;
     for (const std::string_view native : {program_files, program_files_x86}) {
-        std::string root = walk_path_from_native(native);
-        if (!win_detail::is_drive_relative_walk_path(root))
+        switch (classify_known_folder_path(native)) {
+        case KnownFolderPath::network:
+            ++out.roots_network_skipped;
             continue;
+        case KnownFolderPath::unnameable:
+            out.mount_table_unreadable = true;
+            continue;
+        case KnownFolderPath::root:
+            break;
+        }
+        std::string root = walk_path_from_native(native);
         const bool repeat = std::ranges::any_of(
-            out, [&](const std::string& kept) { return java_detail::iequals(kept, root); });
+            out.roots, [&](const std::string& kept) { return java_detail::iequals(kept, root); });
         if (!repeat)
-            out.push_back(std::move(root));
+            out.roots.push_back(std::move(root));
     }
     return out;
 }
@@ -237,43 +266,107 @@ namespace win_detail {
     return p;
 }
 
-/// Test seam: whether the volume of this drive letter (upper case) is a local fixed disk.
-using FixedDriveTest = std::function<bool(char drive)>;
+/// What a volume is to the one question the leg asks of it: may it be read. The three answers carry
+/// three different consequences, so the leg never folds them into a bool.
+enum class DriveClass {
+    fixed,     ///< a local fixed disk (DRIVE_FIXED): the only kind the leg walks or opens
+    not_fixed, ///< a network, removable, optical or RAM drive: never walked, counted (informational)
+    unknown,   ///< the type cannot be told (DRIVE_UNKNOWN, DRIVE_NO_ROOT_DIR, an undocumented value): constrains
+};
 
-/// Pure. Keeps the `candidates` whose drive letter `is_fixed_drive` answers true for, in order; every
-/// other root (a mapped network drive, a removable or optical drive, a drive whose type could not be
-/// told) is dropped and counted in roots_network_skipped, which on Windows means "not on a fixed local
-/// volume" and is the same informational token. A candidate that does not start `X:` is dropped and
-/// counted too, never asked about. The other Targets fields stay clear: there is no mount table here,
-/// and a mount point or junction below a root is a reparse point the walk never enters.
-[[nodiscard]] inline Targets plan_windows_targets(const std::vector<std::string>& candidates,
-                                                  const FixedDriveTest& is_fixed_drive) {
-    Targets t;
-    for (const auto& root : candidates) {
-        const bool lettered = root.size() >= 2 && win_detail::is_drive_letter(root[0]) && root[1] == ':';
-        if (lettered && is_fixed_drive(win_detail::ascii_upper(root[0])))
-            t.roots.push_back(root);
-        else
-            ++t.roots_network_skipped;
+/// GetDriveTypeW's return values the leg tells apart (stable Windows constants, kept here so the rule
+/// is testable on every OS; component_fs_win.cpp static_asserts them against the SDK's).
+inline constexpr std::uint32_t kDriveRemovable = 2;
+inline constexpr std::uint32_t kDriveFixed = 3;
+inline constexpr std::uint32_t kDriveRemote = 4;
+inline constexpr std::uint32_t kDriveCdrom = 5;
+inline constexpr std::uint32_t kDriveRamdisk = 6;
+
+/// Pure. GetDriveTypeW's answer as a DriveClass: only the five documented kinds that name a volume are
+/// classified; DRIVE_UNKNOWN (0), DRIVE_NO_ROOT_DIR (1) and any value Windows never documented are
+/// `unknown`, because a volume whose type cannot be told must not read as a skipped network drive.
+[[nodiscard]] constexpr DriveClass drive_class_from_type(std::uint32_t drive_type) noexcept {
+    switch (drive_type) {
+    case kDriveFixed:
+        return DriveClass::fixed;
+    case kDriveRemovable:
+    case kDriveRemote:
+    case kDriveCdrom:
+    case kDriveRamdisk:
+        return DriveClass::not_fixed;
+    default:
+        return DriveClass::unknown;
     }
+}
+
+/// Test seam: the class of the volume of this drive letter (upper case). The live one is GetDriveTypeW
+/// on `X:\`, through drive_class_from_type.
+using DriveClassTest = std::function<DriveClass(char drive)>;
+
+/// Pure. The upper-case drive letter of a walk path (`X:/` plus something), nullopt for any other path
+/// (UNC, relative, a bare drive root, an embedded NUL).
+[[nodiscard]] inline std::optional<char> drive_of_walk_path(std::string_view walk_path) {
+    if (!win_detail::is_drive_relative_walk_path(walk_path))
+        return std::nullopt;
+    return win_detail::ascii_upper(walk_path[0]);
+}
+
+/// Pure. The per-open gate: true only when `walk_path` names a drive and that drive is a local fixed
+/// disk RIGHT NOW. The shell asks it before every directory open and every file open, not once at
+/// planning, because a drive letter can be re-pointed (SUBST, a disk swap, hot-plug) inside the scan
+/// window (the `runtimes` plugin re-checks DRIVE_FIXED on every read for the same reason). Anything
+/// but a fixed answer, `unknown` included, refuses the open.
+[[nodiscard]] inline bool volume_is_fixed(std::string_view walk_path, const DriveClassTest& drive_class) {
+    const auto drive = drive_of_walk_path(walk_path);
+    return drive && drive_class(*drive) == DriveClass::fixed;
+}
+
+/// Pure. Vets `candidates` (the output of windows_candidate_roots) against their volumes: a root on a
+/// fixed drive is kept, in order; a root on a network, removable, optical or RAM drive is dropped and
+/// counted in roots_network_skipped (informational: it is not on a fixed local volume); a root whose
+/// drive type cannot be told, or that does not name a drive at all, is dropped and sets
+/// mount_table_unreadable (constraining), never an informational count. The counts and flag the
+/// candidates already carry are kept. Every dropped candidate is therefore counted or constraining: no
+/// plan answers supported with a tree it never walked and nothing said. The other Targets fields stay
+/// clear: there is no mount table here, and a mount point or junction below a root is a reparse point
+/// the walk never enters.
+[[nodiscard]] inline Targets plan_windows_targets(const Targets& candidates, const DriveClassTest& drive_class) {
+    Targets t;
+    t.roots_network_skipped = candidates.roots_network_skipped;
+    t.mount_table_unreadable = candidates.mount_table_unreadable;
+    for (const auto& root : candidates.roots) {
+        const auto drive = drive_of_walk_path(root);
+        switch (drive ? drive_class(*drive) : DriveClass::unknown) {
+        case DriveClass::fixed:
+            t.roots.push_back(root);
+            break;
+        case DriveClass::not_fixed:
+            ++t.roots_network_skipped;
+            break;
+        case DriveClass::unknown:
+            t.mount_table_unreadable = true;
+            break;
+        }
+    }
+    if (t.mount_table_unreadable)
+        t.roots.clear(); // Targets' contract: an unestablished root list walks nothing
     return t;
 }
 
 /// Pure. The roots of both actions from the two known-folder lookups (nullopt: that lookup failed),
-/// the 64-bit tree first, in walk order. Both lookups must have answered and at least one path must be
-/// a usable root; otherwise nothing is walked and mount_table_unreadable is set, so a failed lookup is
-/// a constrained answer and never an empty host. `is_fixed_drive` is not asked in that case.
+/// the 64-bit tree first, in walk order. Both lookups must have answered; otherwise nothing is walked
+/// and mount_table_unreadable is set, so a failed lookup is a constrained answer and never an empty
+/// host (`drive_class` is not asked in that case). Past that, every candidate is walked, counted or
+/// constraining (windows_candidate_roots, plan_windows_targets).
 [[nodiscard]] inline Targets windows_targets_from_known_folders(const std::optional<std::string>& program_files,
                                                                 const std::optional<std::string>& program_files_x86,
-                                                                const FixedDriveTest& is_fixed_drive) {
-    if (program_files && program_files_x86) {
-        const auto candidates = windows_candidate_roots(*program_files, *program_files_x86);
-        if (!candidates.empty())
-            return plan_windows_targets(candidates, is_fixed_drive);
+                                                                const DriveClassTest& drive_class) {
+    if (!program_files || !program_files_x86) {
+        Targets t;
+        t.mount_table_unreadable = true;
+        return t;
     }
-    Targets t;
-    t.mount_table_unreadable = true;
-    return t;
+    return plan_windows_targets(windows_candidate_roots(*program_files, *program_files_x86), drive_class);
 }
 
 // ---- one directory listing, from the records the OS returns ----
@@ -443,9 +536,10 @@ using ReadOnce = std::function<std::optional<std::size_t>(std::uint64_t offset, 
 namespace yuzu::component_inventory {
 
 /// The roots of the `scan` action: the 64-bit and 32-bit Program Files directories from the shell's
-/// known-folder lookup, on fixed drives only (GetDriveTypeW). A lookup that fails, or yields no usable
-/// root, answers no roots and mount_table_unreadable: a failed read is a constrained answer, never an
-/// empty success.
+/// known-folder lookup, on fixed drives only (GetDriveTypeW). A lookup that fails, a path that names no
+/// walkable directory and a drive whose type cannot be told answer no roots and mount_table_unreadable:
+/// a failed read is a constrained answer, never an empty success. A UNC path or a drive that is not a
+/// fixed disk is counted in roots_network_skipped.
 [[nodiscard]] Targets scan_targets();
 
 /// The roots of the `native` action: the same Program Files trees. The WindowsApps directory under
@@ -456,8 +550,15 @@ namespace yuzu::component_inventory {
 /// The filesystem the walk goes through: every directory and file is opened relative to its volume
 /// root with no reparse point followed at any component (yuzu::win::open_dir_no_reparse,
 /// open_file_no_reparse), and an entry that is itself a reparse point is typed link and never opened.
-/// `targets` is unused (there is no mount table); the parameter keeps the POSIX leg's shape.
+/// The volume is re-checked before EVERY open (volume_is_fixed over GetDriveTypeW): a drive that is no
+/// longer a fixed local disk answers as an unopenable path, which the walk reports as its error cause,
+/// never as an empty directory. `targets` is unused (there is no mount table); the parameter keeps the
+/// POSIX leg's shape.
 [[nodiscard]] FsOps make_fs_ops(const Targets& targets);
+
+/// make_fs_ops over an injected volume test in place of GetDriveTypeW: the test seam that lets a unit
+/// test show the per-open volume check refuses a drive that is not fixed, over a real temporary tree.
+[[nodiscard]] FsOps make_fs_ops(const Targets& targets, const DriveClassTest& drive_class);
 
 } // namespace yuzu::component_inventory
 

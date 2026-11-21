@@ -1624,10 +1624,15 @@ is declared `constrained`, not `supported`, until a real capture from a Windows 
 descriptor says so.
 
 **Roots (Decision 1).** The 64-bit and 32-bit Program Files directories, named by the shell's
-known-folder lookup and never by an environment variable, on fixed local drives only. A root on any
-other drive type is dropped and counted in `network_fs_skipped`. A lookup that fails walks nothing and
-answers `constrained` with `mount_table_unreadable`: a failed read is never an empty host. Per-user
-locations are not read. Python and Node components on Windows are a later change.
+known-folder lookup and never by an environment variable, on fixed local drives only. A root on a UNC
+path, a mapped network drive, removable or optical media or a RAM drive is dropped and counted in
+`network_fs_skipped`. A drive whose type cannot be told, or a known-folder path that names no walkable
+directory (empty, relative or a bare drive root), is dropped and answers `constrained` with
+`mount_table_unreadable`: no candidate is dropped silently, and a tree that was never read never reads as
+an empty one. A lookup that fails walks nothing and answers the same: a failed read is never an empty
+host. The drive type is asked again before every directory and every file is opened, not only when the
+roots are planned, so a drive that stops being a fixed local disk during a scan is refused from then on.
+Per-user locations are not read. Python and Node components on Windows are a later change.
 
 **No reparse point is followed (Decision 4).** Every directory and file is opened relative to its
 volume root in one kernel name resolution that refuses a reparse point at any path component

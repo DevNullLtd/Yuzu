@@ -23,9 +23,14 @@
  * (counted by the walk) and never opened, whatever kind of reparse point it is. A file is read through
  * the handle that was opened and checked, never by path again.
  *
- * VOLUMES. Only DRIVE_FIXED volumes are walked: a root on a mapped network drive, a removable or
- * optical drive, or a drive whose type cannot be told is dropped and counted (roots_network_skipped).
- * Nothing below a root can leave its volume, because a volume mount point is a reparse point.
+ * VOLUMES. Only DRIVE_FIXED volumes are walked. At planning a root on a mapped network drive, a removable,
+ * optical or RAM drive is dropped and counted (roots_network_skipped, informational), a root whose drive
+ * type cannot be told is dropped and constrains the answer (mount_table_unreadable), and so does a
+ * known-folder path that names no walkable directory; a UNC path is counted like a network drive. The
+ * drive type is asked AGAIN before every directory open and every file open (volume_is_fixed), because a
+ * drive letter can be re-pointed inside the scan window; a drive that is no longer fixed is a refused open,
+ * which the walk reports as dir_unreadable or a changed archive, never as an empty directory. Nothing
+ * below a root can leave its volume, because a volume mount point is a reparse point.
  *
  * RESIDUALS, stated plainly:
  *  - NtCreateFile, GetFileInformationByHandleEx and ReadFile carry no deadline of their own. The 45 s
@@ -79,6 +84,11 @@ static_assert(sizeof(wchar_t) == sizeof(char16_t), "UTF-16 units are copied betw
 static_assert(kAttrDirectory == FILE_ATTRIBUTE_DIRECTORY);
 static_assert(kAttrDevice == FILE_ATTRIBUTE_DEVICE);
 static_assert(kAttrReparsePoint == FILE_ATTRIBUTE_REPARSE_POINT);
+static_assert(kDriveRemovable == DRIVE_REMOVABLE);
+static_assert(kDriveFixed == DRIVE_FIXED);
+static_assert(kDriveRemote == DRIVE_REMOTE);
+static_assert(kDriveCdrom == DRIVE_CDROM);
+static_assert(kDriveRamdisk == DRIVE_RAMDISK);
 static_assert(kDirInfoNextEntryOffset == offsetof(FILE_ID_BOTH_DIR_INFO, NextEntryOffset));
 static_assert(kDirInfoFileAttributes == offsetof(FILE_ID_BOTH_DIR_INFO, FileAttributes));
 static_assert(kDirInfoFileNameLength == offsetof(FILE_ID_BOTH_DIR_INFO, FileNameLength));
@@ -102,9 +112,9 @@ constexpr std::size_t kBatchBytes = 64u * 1024; // one GetFileInformationByHandl
     return wtf8_from_utf16(std::u16string(w.begin(), w.end()));
 }
 
-[[nodiscard]] bool is_fixed_drive(char drive) {
+[[nodiscard]] DriveClass live_drive_class(char drive) {
     const wchar_t root[] = {static_cast<wchar_t>(drive), L':', L'\\', L'\0'};
-    return GetDriveTypeW(root) == DRIVE_FIXED;
+    return drive_class_from_type(GetDriveTypeW(root));
 }
 
 /// What a handle says about its file right now: the pair unchanged() compares, and the attributes the
@@ -127,8 +137,10 @@ struct Stamp {
     return s;
 }
 
-[[nodiscard]] ListResult list_directory(const std::string& dir, std::size_t cap) {
-    if (const auto wide = native_path_from_walk(dir)) {
+[[nodiscard]] ListResult list_directory(const std::string& dir, std::size_t cap, const DriveClassTest& drive_class) {
+    const auto wide = native_path_from_walk(dir);
+    // The volume is re-checked at every open, not only at planning (volume_is_fixed): not fixed is a refusal.
+    if (wide && volume_is_fixed(dir, drive_class)) {
         const auto opened = yuzu::win::open_dir_no_reparse(to_wstring(*wide));
         if (opened.status == yuzu::win::NoReparseOpen::ok) {
             const HANDLE h = opened.file.get();
@@ -149,13 +161,15 @@ struct Stamp {
         }
     }
     ListResult out;
-    out.error = true; // not opened: missing, a reparse point on the way, refused, or a name it cannot spell
+    // Not opened: missing, a reparse point on the way, refused, a volume that is not fixed, or a name it
+    // cannot spell.
+    out.error = true;
     return out;
 }
 
-[[nodiscard]] std::optional<FileView> open_regular_file(const std::string& path) {
+[[nodiscard]] std::optional<FileView> open_regular_file(const std::string& path, const DriveClassTest& drive_class) {
     const auto wide = native_path_from_walk(path);
-    if (!wide)
+    if (!wide || !volume_is_fixed(path, drive_class)) // re-checked at every open, as in list_directory
         return std::nullopt;
     auto opened = yuzu::win::open_file_no_reparse(to_wstring(*wide));
     if (opened.status != yuzu::win::NoReparseOpen::ok)
@@ -197,19 +211,24 @@ struct Stamp {
 } // namespace
 
 Targets scan_targets() {
-    // The rule (a failed lookup walks nothing and says so) is windows_targets_from_known_folders'.
+    // The rule (a failed lookup walks nothing and says so; every dropped candidate is counted or
+    // constrains) is windows_targets_from_known_folders'.
     return windows_targets_from_known_folders(known_folder_wtf8(FOLDERID_ProgramFilesX64),
-                                              known_folder_wtf8(FOLDERID_ProgramFilesX86), is_fixed_drive);
+                                              known_folder_wtf8(FOLDERID_ProgramFilesX86), live_drive_class);
 }
 
 Targets scan_native_targets() {
     return scan_targets();
 }
 
-FsOps make_fs_ops(const Targets& /*targets*/) {
+FsOps make_fs_ops(const Targets& targets) {
+    return make_fs_ops(targets, live_drive_class);
+}
+
+FsOps make_fs_ops(const Targets& /*targets*/, const DriveClassTest& drive_class) {
     FsOps ops;
-    ops.list = [](const std::string& dir, std::size_t cap) { return list_directory(dir, cap); };
-    ops.open_file = [](const std::string& path) { return open_regular_file(path); };
+    ops.list = [drive_class](const std::string& dir, std::size_t cap) { return list_directory(dir, cap, drive_class); };
+    ops.open_file = [drive_class](const std::string& path) { return open_regular_file(path, drive_class); };
     ops.now = [] { return std::chrono::steady_clock::now(); };
     return ops;
 }
