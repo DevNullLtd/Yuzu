@@ -16,6 +16,11 @@
  * pid_reused and nothing else is read; then the facet's sources; then `stat` is re-read and any
  * change discards every row (torn_read).
  *
+ * macOS (inspect_macos): libproc only, never a task port. ONE proc_pidinfo(PROC_PIDTBSDINFO)
+ * snapshot carries both the start time and the nice value, so there is no re-read and no
+ * torn_read; the boot identity is the kern.bootsessionuuid sysctl; of the six facets only sched
+ * (nice value only) is read, the rest answer one permanent `unsupported` row and read nothing.
+ *
  * Invalid parameters return 1; every process-state outcome returns 0 with a typed status.
  */
 #pragma once
@@ -172,13 +177,16 @@ inline void report(yuzu::CommandContext& ctx, const Inspection& r) {
 namespace detail {
 
 inline constexpr std::string_view kTok = "linux:process_introspect:";
+inline constexpr std::string_view kMacTok = "macos:process_introspect:";
 
-[[nodiscard]] inline Inspection refuse(StatusState s, std::string_view cause) {
-    return Inspection{s, std::string{kTok} + std::string{cause}, {}};
+[[nodiscard]] inline Inspection refuse(StatusState s, std::string_view cause,
+                                       std::string_view tok = kTok) {
+    return Inspection{s, std::string{tok} + std::string{cause}, {}};
 }
 
-[[nodiscard]] inline std::string facet_token(Facet f, std::string_view cause) {
-    return std::string{kTok} + std::string{facet_name(f)} + ':' + std::string{cause};
+[[nodiscard]] inline std::string facet_token(Facet f, std::string_view cause,
+                                             std::string_view tok = kTok) {
+    return std::string{tok} + std::string{facet_name(f)} + ':' + std::string{cause};
 }
 
 } // namespace detail
@@ -392,6 +400,95 @@ inline constexpr std::size_t kOomCap = 64;
 }
 
 // ---------------------------------------------------------------------------
+// The macOS decision (OS-free)
+// ---------------------------------------------------------------------------
+
+/// The numbers one proc_pidinfo(PROC_PIDTBSDINFO) call yields. Numbers only: the process name in
+/// the kernel's struct is never copied, so a text member must not be added.
+struct MacBsdInfo {
+    int err = 0; ///< errno of the call; 0 when it succeeded
+    std::uint64_t start_sec = 0;
+    std::uint64_t start_usec = 0;
+    std::int32_t nice = 0;
+};
+
+/// The injected libproc / sysctl boundary. `bsdinfo` is called at most ONCE per decision.
+struct MacSource {
+    std::function<MacBsdInfo()> bsdinfo;
+    std::function<RawRead()> boot_session; ///< kern.bootsessionuuid
+};
+
+/// Order: the facet's answer (an unsupported facet reads nothing, so it is no existence oracle),
+/// ONE identity-and-value read, the boot identity, the caller's start_time guard, state.
+///
+/// Identity and the facet value come from ONE kernel snapshot of one process, so the Linux
+/// re-read (which exists because facet files are read after identity) is deliberately not
+/// mirrored: this leg never answers `supported` and never answers `torn_read`.
+[[nodiscard]] inline Inspection inspect_macos(const Request& req, const MacSource& src) {
+    using detail::kMacTok;
+    using detail::refuse;
+    const Facet f = req.facet;
+    switch (mac_facet_answer(f)) {
+    case MacFacetAnswer::nice_only:
+        break;
+    case MacFacetAnswer::not_exposed_by_libproc:
+        return Inspection{StatusState::unsupported,
+                          detail::facet_token(f, "not_exposed_by_libproc", kMacTok),
+                          {}};
+    case MacFacetAnswer::no_os_equivalent:
+        return Inspection{StatusState::unsupported,
+                          detail::facet_token(f, "no_os_equivalent", kMacTok),
+                          {}};
+    }
+
+    const MacBsdInfo b = src.bsdinfo();
+    switch (classify_open_errno(b.err)) {
+    case ReadState::ok:
+        break;
+    case ReadState::not_found:
+        return refuse(StatusState::unavailable, "no_such_process", kMacTok);
+    case ReadState::denied:
+        return refuse(StatusState::permission_denied, "permission_denied", kMacTok);
+    case ReadState::oversized:
+    case ReadState::io:
+        return refuse(StatusState::unavailable, "identity_unreadable", kMacTok);
+    }
+    const auto start = mac_start_number(b.start_sec, b.start_usec);
+    if (!start)
+        return refuse(StatusState::unavailable, "identity_unreadable", kMacTok);
+
+    const RawRead bs = src.boot_session();
+    switch (classify_read(bs.error, bs.err)) {
+    case ReadState::ok:
+        break;
+    case ReadState::denied:
+        return refuse(StatusState::permission_denied, "permission_denied", kMacTok);
+    case ReadState::not_found:
+    case ReadState::oversized:
+    case ReadState::io:
+        return refuse(StatusState::unavailable, "identity_unreadable", kMacTok);
+    }
+    const auto boot8 = boot_session_prefix(bs.data);
+    if (!boot8)
+        return refuse(StatusState::unavailable, "identity_unreadable", kMacTok);
+    const std::string token = start_time_token(*boot8, *start);
+
+    if (!req.start_time.empty() && req.start_time != token)
+        return refuse(StatusState::unavailable, "pid_reused", kMacTok);
+
+    Inspection out;
+    out.status = StatusState::constrained;
+    out.rows.push_back(format_target(req.pid, token, f));
+    if (const auto nice = mac_nice(b.nice)) {
+        out.rows.push_back(format_sched_nice_only(*nice));
+        out.reason = detail::facet_token(f, "nice_only", kMacTok);
+    } else {
+        out.reason = detail::facet_token(f, "malformed", kMacTok);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // The plugin's execute() body
 // ---------------------------------------------------------------------------
 
@@ -399,6 +496,9 @@ using LegFn = int (*)(yuzu::CommandContext&, const Request&);
 
 /// Linux shell (process_introspect_linux.cpp).
 int run_linux(yuzu::CommandContext& ctx, const Request& req);
+
+/// macOS shell (process_introspect_macos.cpp).
+int run_macos(yuzu::CommandContext& ctx, const Request& req);
 
 /// Dispatch, validation and the single ABI containment. An unknown action writes one non-status
 /// line and returns 1; an invalid parameter writes one `unavailable` status row and returns 1;

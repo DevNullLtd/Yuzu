@@ -23,8 +23,10 @@
 #include <deque>
 #include <map>
 #include <new>
+#include <regex>
 #include <set>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -963,4 +965,229 @@ TEST_CASE("process_introspect report pairs each state with its result status", "
         CHECK(r.result_completeness == c.completeness);
         CHECK(r.result_provenance == (supported ? std::string{} : tok("x:y")));
     }
+}
+
+// ---- inspect_macos over an in-memory fake libproc / sysctl ---------------------------------------
+
+namespace {
+
+const std::string kMacBoot = "0123ABCD-4567-89AB-CDEF-0123456789AB";
+const std::string kMacToken = "0123abcd.1700000000123456";
+
+/// The fake kernel: records every call so the one-snapshot rule is asserted, not assumed.
+struct MacFake {
+    MacBsdInfo info{0, 1700000000, 123456, 7};
+    RawRead boot = ok(kMacBoot);
+    mutable int bsd_calls = 0;
+    mutable int boot_calls = 0;
+
+    MacSource src() const {
+        MacSource s;
+        s.bsdinfo = [this] {
+            ++bsd_calls;
+            return info;
+        };
+        s.boot_session = [this] {
+            ++boot_calls;
+            return boot;
+        };
+        return s;
+    }
+};
+
+Inspection run_mac(const MacFake& fk, Facet f, const std::string& start_time = {}) {
+    return inspect_macos(req(f, start_time), fk.src());
+}
+
+const std::string kMacTokPrefix = "macos:process_introspect:";
+
+} // namespace
+
+TEST_CASE("process_introspect macOS: sched answers the nice value from one snapshot",
+          "[process_introspect]") {
+    const MacFake fk;
+    const auto r = run_mac(fk, Facet::sched);
+    CHECK(r.status == StatusState::constrained);
+    CHECK(r.reason == kMacTokPrefix + "sched:nice_only");
+    REQUIRE(r.rows.size() == 2);
+    CHECK(r.rows[0] == "target|4242|" + kMacToken + "|sched");
+    CHECK(r.rows[1] == "sched|-|7|-|-");
+    CHECK(fk.bsd_calls == 1);
+    CHECK(fk.boot_calls == 1);
+}
+
+TEST_CASE("process_introspect macOS: the other five facets answer unsupported and read nothing",
+          "[process_introspect]") {
+    struct Case {
+        Facet facet;
+        const char* token;
+    };
+    const Case cases[] = {
+        {Facet::resource_limits, "resource_limits:not_exposed_by_libproc"},
+        {Facet::sigmasks, "sigmasks:not_exposed_by_libproc"},
+        {Facet::oom, "oom:not_exposed_by_libproc"},
+        {Facet::caps, "caps:no_os_equivalent"},
+        {Facet::seccomp, "seccomp:no_os_equivalent"},
+    };
+    for (const auto& c : cases) {
+        for (const std::string& st : {std::string{}, kMacToken}) {
+            const MacFake fk;
+            const auto r = run_mac(fk, c.facet, st);
+            INFO(c.token);
+            CHECK(r.status == StatusState::unsupported);
+            CHECK(r.reason == kMacTokPrefix + c.token);
+            CHECK(r.rows.empty());
+            CHECK(fk.bsd_calls == 0);
+            CHECK(fk.boot_calls == 0);
+        }
+    }
+}
+
+TEST_CASE("process_introspect macOS: a read errno is classified once", "[process_introspect]") {
+    struct Case {
+        int err;
+        StatusState state;
+        const char* cause;
+    };
+    const Case cases[] = {
+        {ESRCH, StatusState::unavailable, "no_such_process"},
+        {EPERM, StatusState::permission_denied, "permission_denied"},
+        {EACCES, StatusState::permission_denied, "permission_denied"},
+        {EIO, StatusState::unavailable, "identity_unreadable"},
+        {EINVAL, StatusState::unavailable, "identity_unreadable"},
+    };
+    for (const auto& c : cases) {
+        MacFake fk;
+        fk.info.err = c.err;
+        const auto r = run_mac(fk, Facet::sched);
+        INFO(c.err);
+        CHECK(r.status == c.state);
+        CHECK(r.reason == kMacTokPrefix + c.cause);
+        CHECK(r.rows.empty());
+        CHECK(fk.bsd_calls == 1);
+        CHECK(fk.boot_calls == 0);
+    }
+}
+
+TEST_CASE("process_introspect macOS: identity that cannot be built is identity_unreadable",
+          "[process_introspect]") {
+    const std::string unreadable = kMacTokPrefix + "identity_unreadable";
+    {
+        MacFake fk;
+        fk.info.start_usec = 1000000;
+        const auto r = run_mac(fk, Facet::sched);
+        CHECK(r.status == StatusState::unavailable);
+        CHECK(r.reason == unreadable);
+        CHECK(fk.boot_calls == 0);
+    }
+    {
+        MacFake fk;
+        fk.info.start_sec = 0;
+        CHECK(run_mac(fk, Facet::sched).reason == unreadable);
+    }
+    {
+        MacFake fk;
+        fk.boot = io(EIO);
+        const auto r = run_mac(fk, Facet::sched);
+        CHECK(r.status == StatusState::unavailable);
+        CHECK(r.reason == unreadable);
+    }
+    {
+        MacFake fk;
+        fk.boot = io(EPERM);
+        const auto r = run_mac(fk, Facet::sched);
+        CHECK(r.status == StatusState::permission_denied);
+        CHECK(r.reason == kMacTokPrefix + "permission_denied");
+    }
+    {
+        MacFake fk;
+        fk.boot = ok("0123ABCG-4567");
+        CHECK(run_mac(fk, Facet::sched).reason == unreadable);
+    }
+    {
+        MacFake fk;
+        fk.boot = ok("ABCDEF01-4567");
+        const auto r = run_mac(fk, Facet::sched);
+        REQUIRE(r.rows.size() == 2);
+        CHECK(r.rows[0] == "target|4242|abcdef01.1700000000123456|sched"); // folded to lower case
+    }
+}
+
+TEST_CASE("process_introspect macOS: the start_time guard", "[process_introspect]") {
+    {
+        const MacFake fk;
+        const auto r = run_mac(fk, Facet::sched, kMacToken);
+        CHECK(r.status == StatusState::constrained);
+        REQUIRE(r.rows.size() == 2);
+        CHECK(r.rows[0] == "target|4242|" + kMacToken + "|sched");
+    }
+    {
+        const MacFake fk;
+        const auto r = run_mac(fk, Facet::sched, "0123abcd.1");
+        CHECK(r.status == StatusState::unavailable);
+        CHECK(r.reason == kMacTokPrefix + "pid_reused");
+        CHECK(r.rows.empty());
+        CHECK(fk.bsd_calls == 1);
+        CHECK(fk.boot_calls == 1);
+    }
+}
+
+TEST_CASE("process_introspect macOS: nice value edges", "[process_introspect]") {
+    {
+        MacFake fk;
+        fk.info.nice = -5;
+        const auto r = run_mac(fk, Facet::sched);
+        REQUIRE(r.rows.size() == 2);
+        CHECK(r.rows[1] == "sched|-|-5|-|-");
+    }
+    {
+        MacFake fk;
+        fk.info.nice = 21;
+        const auto r = run_mac(fk, Facet::sched);
+        CHECK(r.status == StatusState::constrained);
+        CHECK(r.reason == kMacTokPrefix + "sched:malformed");
+        REQUIRE(r.rows.size() == 1); // the target row only
+        CHECK(r.rows[0].starts_with("target|"));
+    }
+}
+
+TEST_CASE("process_introspect macOS: no fault ever reads as supported or torn", "[process_introspect]") {
+    static const std::regex shape{R"(^[a-z_]+(\|[a-z0-9_.,:-]+)*$)"};
+    std::vector<MacFake> fakes(8);
+    fakes[1].info.err = ESRCH;
+    fakes[2].info.err = EPERM;
+    fakes[3].info.err = EIO;
+    fakes[4].info.start_sec = 0;
+    fakes[5].boot = io(EPERM);
+    fakes[6].boot = ok("zzzzzzzz");
+    fakes[7].info.nice = 99;
+    for (const auto& fk : fakes) {
+        for (const auto& name : kFacetNames) {
+            const auto f = parse_facet(name);
+            REQUIRE(f.has_value());
+            const auto r = run_mac(fk, *f);
+            INFO(name);
+            CHECK(r.status != StatusState::supported);
+            CHECK(r.reason.find("torn_read") == std::string::npos);
+            if (r.status != StatusState::unavailable && r.status != StatusState::permission_denied &&
+                r.status != StatusState::unsupported)
+                CHECK_FALSE(r.rows.empty());
+            for (const auto& row : r.rows)
+                CHECK(std::regex_match(row, shape));
+        }
+    }
+}
+
+TEST_CASE("process_introspect macOS: MacBsdInfo carries numbers only", "[process_introspect]") {
+    // A fifth member (a process-name field, say) breaks this structured binding.
+    MacBsdInfo b;
+    const auto& [err, start_sec, start_usec, nice] = b;
+    static_assert(std::is_same_v<decltype(MacBsdInfo::err), int>);
+    static_assert(std::is_same_v<decltype(MacBsdInfo::start_sec), std::uint64_t>);
+    static_assert(std::is_same_v<decltype(MacBsdInfo::start_usec), std::uint64_t>);
+    static_assert(std::is_same_v<decltype(MacBsdInfo::nice), std::int32_t>);
+    CHECK(err == 0);
+    CHECK(start_sec == 0);
+    CHECK(start_usec == 0);
+    CHECK(nice == 0);
 }

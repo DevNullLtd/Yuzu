@@ -4185,6 +4185,16 @@ test('process_introspect definition columns',
   timeout: 30,
 )
 
+# process_introspect never requests a task port (a write-capable handle on the target): no
+# task_for_pid or Mach VM call, no <mach/...> include, no ptrace, a libproc flavour allow-list
+# and a single sysctlbyname name. The macOS leg reads through libproc only.
+test('process_introspect no-task-port lexical gate',
+  _python3_test,
+  args: [files('test_process_introspect_no_task_port_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # update_source_trust's failure-token contract (#4874): every `note_failure` literal and every
 # errno_detail token in the plugin headers is named in the README's Result status row and gloss
 # table, and nothing in those tables is undefined in the source.

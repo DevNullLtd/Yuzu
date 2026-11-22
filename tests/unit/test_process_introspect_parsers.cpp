@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
+#include <optional>
 #include <regex>
 #include <string>
 #include <vector>
@@ -637,4 +639,70 @@ TEST_CASE("process_introspect: a process name never reaches any row", "[process_
     for (const auto& row : {format_sched(*st, ss.cpus_allowed_list), format_seccomp(ss),
                             format_oom(1, 2), format_target(1, "0123abcd.1", Facet::sched)})
         CHECK(row.find("SECRETNAME") == std::string::npos);
+}
+
+// ---- macOS pure core -----------------------------------------------------------------------
+
+TEST_CASE("process_introspect: mac_facet_answer rules every facet", "[process_introspect]") {
+    struct Expect {
+        std::string_view facet;
+        MacFacetAnswer answer;
+    };
+    const Expect expected[] = {
+        {"resource_limits", MacFacetAnswer::not_exposed_by_libproc},
+        {"sigmasks", MacFacetAnswer::not_exposed_by_libproc},
+        {"caps", MacFacetAnswer::no_os_equivalent},
+        {"seccomp", MacFacetAnswer::no_os_equivalent},
+        {"oom", MacFacetAnswer::not_exposed_by_libproc},
+        {"sched", MacFacetAnswer::nice_only},
+    };
+    // Every Facet value is covered, each with an explicit expectation.
+    REQUIRE(std::size(expected) == kFacetNames.size());
+    for (const auto& e : expected) {
+        const auto f = parse_facet(e.facet);
+        REQUIRE(f.has_value());
+        INFO(e.facet);
+        CHECK(mac_facet_answer(*f) == e.answer);
+    }
+}
+
+TEST_CASE("process_introspect: boot_session_prefix folds an upper-case UUID", "[process_introspect]") {
+    const std::string upper = "0123ABCD-4567-89AB-CDEF-0123456789AB";
+    const auto p = boot_session_prefix(upper);
+    REQUIRE(p.has_value());
+    CHECK(*p == "0123abcd");
+    CHECK(boot_prefix("0123abcd-4567") == p);
+    CHECK(boot_session_prefix("0123abcd-4567-89ab") == std::optional<std::string>{"0123abcd"});
+    CHECK_FALSE(boot_session_prefix("0123ABC").has_value());
+    CHECK_FALSE(boot_session_prefix("").has_value());
+    CHECK_FALSE(boot_session_prefix("0123ABCG-4567").has_value());
+    CHECK_FALSE(boot_session_prefix("0123abcg-4567").has_value());
+    CHECK_FALSE(boot_session_prefix("0123-BCD-4567").has_value());
+}
+
+TEST_CASE("process_introspect: mac_start_number joins sec and usec", "[process_introspect]") {
+    CHECK(mac_start_number(1700000000, 123456) == std::optional<std::uint64_t>{1700000000123456ULL});
+    CHECK(mac_start_number(1, 0) == std::optional<std::uint64_t>{1000000ULL});
+    CHECK(mac_start_number(1, 999999) == std::optional<std::uint64_t>{1999999ULL});
+    CHECK_FALSE(mac_start_number(0, 5).has_value());
+    CHECK_FALSE(mac_start_number(1, 1000000).has_value());
+    CHECK_FALSE(mac_start_number(UINT64_MAX, 0).has_value());
+    CHECK_FALSE(mac_start_number(UINT64_MAX / 1000000ULL + 1, 0).has_value());
+    const auto n = mac_start_number(1700000000, 42);
+    REQUIRE(n.has_value());
+    CHECK(valid_start_time_token(start_time_token("0123abcd", *n)));
+}
+
+TEST_CASE("process_introspect: mac_nice accepts only -20..20", "[process_introspect]") {
+    for (const int ok : {0, 20, -5, -20})
+        CHECK(mac_nice(ok) == std::optional<int>{ok});
+    for (const int bad : {21, -21, 128})
+        CHECK_FALSE(mac_nice(bad).has_value());
+}
+
+TEST_CASE("process_introspect: format_sched_nice_only emits dashes for what libproc lacks",
+          "[process_introspect]") {
+    CHECK(format_sched_nice_only(0) == "sched|-|0|-|-");
+    CHECK(format_sched_nice_only(7) == "sched|-|7|-|-");
+    CHECK(format_sched_nice_only(-5) == "sched|-|-5|-|-");
 }

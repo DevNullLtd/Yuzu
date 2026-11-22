@@ -23,7 +23,14 @@
 ##   seccomp          /proc/<pid>/status (Seccomp, Seccomp_filters, NoNewPrivs)
 ##   oom              /proc/<pid>/oom_score and oom_score_adj
 ##   sched            /proc/<pid>/stat (policy, nice, rt priority) and status (Cpus_allowed_list)
-##   macOS, Windows:  PLANNED, not read yet; one `unsupported` status row, <os>:planned.
+##   macOS:           libproc only (one proc_pidinfo(PROC_PIDTBSDINFO) call and the
+##                    kern.bootsessionuuid sysctl), never a task port. sched answers the nice
+##                    value only (CONSTRAINED, macos:process_introspect:sched:nice_only);
+##                    resource_limits, sigmasks and oom answer `unsupported`
+##                    (not_exposed_by_libproc) and caps and seccomp answer `unsupported`
+##                    (no_os_equivalent). These three answers are PERMANENT, not a degraded
+##                    read: do not retry or alert on them. torn_read is Linux only.
+##   Windows:         PLANNED, not read yet; one `unsupported` status row, windows:planned.
 ##
 ## NEVER emitted, on any facet: file or memory contents, environment values, socket payloads,
 ## command-line arguments or the process name. Data above this contract is a NEW action, never
@@ -44,7 +51,11 @@ metadata:
     process that changed during the read, is refused rather than guessed. The first row is a
     status row stating whether the read was complete. On Linux the read is made through
     /proc, so on a host that mounts /proc with hidepid 2 or above another account's process
-    reads as no_such_process_or_hidden. macOS and Windows are planned and not yet read.
+    reads as no_such_process_or_hidden. On macOS only sched is read, and of it only the nice
+    value through libproc (always CONSTRAINED, sched:nice_only); the other five facets always
+    answer unsupported (not_exposed_by_libproc or no_os_equivalent), and these answers are
+    permanent and must not be retried; torn_read is Linux only. Windows is planned and not yet
+    read.
     Take the pid from crossplatform.process.list; a degraded read is returned as CONSTRAINED,
     never as an empty OK, and no_such_process, no_such_process_or_hidden and pid_reused are
     terminal while torn_read can be retried. Needs Forensics:Read, and a non-administrator
@@ -102,24 +113,24 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_1
         type: string
-        description: 'status: the literal "inspect". target: the pid inspected. limit: the limit name (cpu_time, file_size, data_size, stack_size, core_file_size, resident_set, processes, open_files, locked_memory, address_space, file_locks, pending_signals, msgqueue_size, nice_priority, realtime_priority, realtime_timeout). sigmask: pending, shared_pending, blocked, ignored or caught. cap: inheritable, permitted, effective, bounding or ambient. seccomp: the mode (disabled, strict, filter) or "-". oom: the OOM score, or "-". sched: the scheduling policy (other, fifo, rr, batch, idle, deadline, ext, unknown).'
+        description: 'status: the literal "inspect". target: the pid inspected. limit: the limit name (cpu_time, file_size, data_size, stack_size, core_file_size, resident_set, processes, open_files, locked_memory, address_space, file_locks, pending_signals, msgqueue_size, nice_priority, realtime_priority, realtime_timeout). sigmask: pending, shared_pending, blocked, ignored or caught. cap: inheritable, permitted, effective, bounding or ambient. seccomp: the mode (disabled, strict, filter) or "-". oom: the OOM score, or "-". sched: the scheduling policy (other, fifo, rr, batch, idle, deadline, ext, unknown), or "-" on macOS.'
         example: blocked
         platforms: [windows, linux, darwin]
       - name: field_2
         type: string
-        description: 'status: supported, constrained, permission_denied, unavailable or unsupported (the planned legs, and a leg that threw). target: the start-time token, <8 hex of the boot id>.<process start time>, to pass back as start_time. limit: the soft limit, a number or unlimited. sigmask and cap: the 16-digit hex mask. seccomp: the number of installed filters, or "-". oom: the OOM score adjustment, or "-". sched: the nice value.'
+        description: 'status: supported, constrained, permission_denied, unavailable or unsupported (the Windows planned leg, the permanent macOS facet answers, and a leg that threw). target: the start-time token, <8 hex of the boot id>.<process start time>, to pass back as start_time. limit: the soft limit, a number or unlimited. sigmask and cap: the 16-digit hex mask. seccomp: the number of installed filters, or "-". oom: the OOM score adjustment, or "-". sched: the nice value (on macOS the only value read).'
         example: '0000000000000000'
         platforms: [windows, linux, darwin]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:process_introspect:pid_reused or macos:planned. target: the facet inspected. limit: the hard limit, a number or unlimited. seccomp: NoNewPrivs, 0 or 1, or "-". sched: the realtime priority, 0 to 99.'
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:process_introspect:pid_reused or macos:process_introspect:sched:nice_only. target: the facet inspected. limit: the hard limit, a number or unlimited. seccomp: NoNewPrivs, 0 or 1, or "-". sched: the realtime priority, 0 to 99, or "-" on macOS.'
         example: unlimited
         platforms: [windows, linux, darwin]
       - name: field_4
         type: string
-        description: 'limit: the unit (seconds, bytes, count, microseconds, none). sched: the allowed-CPU list such as 0-7 or 0,2,4, or "-" when it could not be read. Not used by the other kinds.'
+        description: 'limit: the unit (seconds, bytes, count, microseconds, none). sched: the allowed-CPU list such as 0-7 or 0,2,4, or "-" when it could not be read. On macOS always "-". Not used by the other kinds.'
         example: bytes
-        platforms: [linux]
+        platforms: [linux, darwin]
     aggregation:
       groupBy:
         - row_kind

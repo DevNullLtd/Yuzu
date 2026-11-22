@@ -15,7 +15,7 @@
  *   cap|<inheritable|permitted|effective|bounding|ambient>|<hex16>
  *   seccomp|<disabled|strict|filter|->|<filters|->|<no_new_privs 0|1|->
  *   oom|<score|->|<score_adj|->
- *   sched|<policy token>|<nice>|<rt_priority>|<cpus list|->
+ *   sched|<policy token|->|<nice>|<rt_priority|->|<cpus list|->   (macOS: sched|-|<nice>|-|-)
  */
 #pragma once
 
@@ -90,11 +90,68 @@ inline constexpr std::array<std::string_view, 6> kFacetNames{
     return std::string{boot_id.substr(0, 8)};
 }
 
+/// The macOS boot identity: the first 8 characters of kern.bootsessionuuid (an upper-case UUID),
+/// folded to lower case by arithmetic (no locale), then checked by boot_prefix, which stays the
+/// only hex validator.
+[[nodiscard]] inline std::optional<std::string> boot_session_prefix(std::string_view uuid) {
+    if (uuid.size() < 8)
+        return std::nullopt;
+    std::string folded{uuid.substr(0, 8)};
+    for (char& c : folded)
+        if (c >= 'A' && c <= 'F')
+            c = static_cast<char>(c + ('a' - 'A'));
+    return boot_prefix(folded);
+}
+
 [[nodiscard]] inline std::string start_time_token(std::string_view boot8, std::uint64_t starttime) {
     std::string t{boot8};
     t += '.';
     t += std::to_string(starttime);
     return t;
+}
+
+// ---------------------------------------------------------------------------
+// macOS answers (libproc only; the pure core of the macOS leg)
+// ---------------------------------------------------------------------------
+
+/// What the macOS leg answers for a facet. All three are PERMANENT answers, not a degraded read.
+enum class MacFacetAnswer { nice_only, not_exposed_by_libproc, no_os_equivalent };
+
+// meson.build sets werror=false, so a facet missing from the switch below is only a -Wswitch
+// warning; this assert is what forces a macOS ruling when a new facet is added.
+static_assert(kFacetNames.size() == 6, "rule every new facet for macOS in mac_facet_answer");
+
+[[nodiscard]] constexpr MacFacetAnswer mac_facet_answer(Facet f) noexcept {
+    switch (f) {
+    case Facet::sched:
+        return MacFacetAnswer::nice_only;
+    case Facet::resource_limits:
+    case Facet::sigmasks:
+    case Facet::oom:
+        return MacFacetAnswer::not_exposed_by_libproc;
+    case Facet::caps:
+    case Facet::seccomp:
+        return MacFacetAnswer::no_os_equivalent;
+    }
+    // Unreachable; reads nothing, so it fails closed.
+    return MacFacetAnswer::not_exposed_by_libproc;
+}
+
+/// Kernel wall-clock creation stamp as one number: sec * 1e6 + usec. Refuses sec 0, a usec out
+/// of range and an overflow.
+[[nodiscard]] inline std::optional<std::uint64_t> mac_start_number(std::uint64_t sec,
+                                                                   std::uint64_t usec) noexcept {
+    constexpr std::uint64_t kMicro = 1000000ULL;
+    if (sec == 0 || usec >= kMicro || sec > (UINT64_MAX - usec) / kMicro)
+        return std::nullopt;
+    return sec * kMicro + usec;
+}
+
+/// pbi_nice is an int32_t (sys/proc_info.h); the valid range is -20..20.
+[[nodiscard]] inline std::optional<int> mac_nice(std::int32_t nice) noexcept {
+    if (nice < -20 || nice > 20)
+        return std::nullopt;
+    return static_cast<int>(nice);
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +594,11 @@ inline constexpr std::array<LimitName, 16> kLimitNames{{
     return "sched|" + std::string{policy_token(st.policy)} + '|' + std::to_string(st.nice) + '|' +
            std::to_string(st.rt_priority) + '|' +
            (cpus.presence == Presence::ok ? cpus.value : std::string{"-"});
+}
+
+/// macOS: only the nice value is exposed; policy, realtime priority and the cpu list read as dashes.
+[[nodiscard]] inline std::string format_sched_nice_only(int nice) {
+    return "sched|-|" + std::to_string(nice) + "|-|-";
 }
 
 } // namespace yuzu::process_introspect

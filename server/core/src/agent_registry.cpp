@@ -999,11 +999,12 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"process_introspect.inspect",
          "Per-process introspection of one pid, one facet per request (resource_limits, "
          "sigmasks, caps, seccomp, oom, sched): numbers, masks and fixed tokens only, never "
-         "file or memory contents, environment values or command-line arguments; Linux only, macOS "
-         "and Windows are planned; read-only, default-off, Forensics:Read single-target (a "
-         "non-admin also needs approval); pid from crossplatform.process.list; a degraded read is "
-         "CONSTRAINED, never an empty OK; no_such_process* and pid_reused terminal, torn_read "
-         "retryable"},
+         "file or memory contents, environment values or command-line arguments; Linux and macOS, "
+         "Windows is planned; on macOS only sched (nice value) is read and the other facets "
+         "answer unsupported permanently, so do not retry them; read-only, default-off, "
+         "Forensics:Read single-target (a non-admin also needs approval); pid from "
+         "crossplatform.process.list; a degraded read is CONSTRAINED, never an empty OK; "
+         "no_such_process* and pid_reused terminal, torn_read (Linux) retryable"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},

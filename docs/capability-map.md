@@ -1837,7 +1837,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 
 ### 42.12 Process Introspection :large_orange_diamond: `T2` *(new row, 2026-11-16)*
 
-`process_introspect` plugin `inspect`: one pid and one facet per request (`resource_limits`, `sigmasks`, `caps`, `seccomp`, `oom`, `sched`) as numbers, masks and fixed tokens — never file or memory contents, environment values, socket payloads or command-line arguments. Forensics securable, default-off, AdminOrApproval, single-target. Linux constrained, macOS and Windows planned. *(Evidence: `agents/plugins/process_introspect/README.md`.)*
+`process_introspect` plugin `inspect`: one pid and one facet per request (`resource_limits`, `sigmasks`, `caps`, `seccomp`, `oom`, `sched`) as numbers, masks and fixed tokens — never file or memory contents, environment values, socket payloads or command-line arguments. Forensics securable, default-off, AdminOrApproval, single-target. Linux and macOS constrained (macOS reads only the `sched` nice value through libproc, never a task port; the other five facets answer a permanent `unsupported`), Windows planned. *(Evidence: `agents/plugins/process_introspect/README.md`.)*
 
 ---
 
@@ -1912,7 +1912,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | update_source_trust | - | Y | - | Security |
 | mgmt_posture | - | 🟡 | Y | Security |
 | remote_access_audit | - | 🟡 | Y | Security |
-| process_introspect | - | 🟡 | - | Security |
+| process_introspect | - | 🟡 | 🟡 | Security |
 | shares | Y | Y | Y | Network |
 | virtualization | 🟡 | Y | Y | System Info |
 | agent_logging | Y | Y | Y | Agent Mgmt |
