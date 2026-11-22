@@ -86,6 +86,8 @@ flowchart TD
 
 The order matters: a positive identification is never outranked by a negative or missing signal, and an unreadable host-decision source (SMBIOS, CPUID, OS hint) can never be read as "not virtual".
 
+On Linux the virtualization leg judges a path against the mount table before opening it. The network types come from the shared list in `agents/shared/network_fstype.hpp`, which also names `ncpfs`, `coda`, `smb2` and the network-backed FUSE clients `gcsfuse`, `goofys`, `blobfuse`, `blobfuse2`, `ossfs`, `obsfs`, `cosfs`, `juicefs`, `mfsmount`, `moosefs`, `lizardfs`, `seaweedfs`, `weed`, `curlftpfs`, `httpfs2`, `s3ql`, `onedrive`, `google-drive-ocamlfuse`, `davfs2` and `fuse-nfs` (a mount of those types is treated as a network mount); an unlisted FUSE subtype and a stacked filesystem over a network mount are not detected by this list.
+
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->

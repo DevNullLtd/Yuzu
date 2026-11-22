@@ -38,13 +38,17 @@
 /// boot. No move-aside: with nothing migrated, a `.migrated-<epoch>` rename would misdescribe
 /// what happened to the file, so the legacy file is left in place at its original path.
 
+#include "bounded_resolver.hpp" // net::LookupFn (test seam)
+#include "refusal_throttle.hpp"
 #include "store_worker_pool.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu {
@@ -87,6 +91,8 @@ struct WebhookDelivery {
 /// (400); the other two are store/infra degradation (503).
 enum class WebhookWriteError {
     invalid_url,        ///< url is empty or not http(s):// — caller error, 400
+    destination_refused, ///< the host is a link-local/metadata/unspecified/multicast/reserved address
+                         ///< (or a numeric spelling of one) — caller error, 400, audited distinctly
     store_unavailable,  ///< not open / pool exhausted / codec unavailable — 503
     db_error,           ///< a query against an open store failed — 503
 };
@@ -117,6 +123,20 @@ public:
     /// contract, same as DexAlertRouter::set_metrics - call once, before
     /// the store is wired into agent_service_.
     void set_metrics(yuzu::MetricsRegistry* metrics);
+
+    /// Called (throttled to one call per webhook per window) when a delivery is DECLINED because its
+    /// destination is a refused address or could not be resolved: `cause` is `destination_refused`
+    /// or `destination_unresolved`, `destination_class` a fixed label (empty when unresolved),
+    /// `url_detail` the `scheme://host url_fp=..` audit form. The server wires it to an audit row.
+    /// Set-before-traffic, like set_metrics.
+    using DeliveryRefusedFn = std::function<void(std::int64_t webhook_id, std::string_view cause,
+                                                 std::string_view destination_class,
+                                                 const std::string& url_detail)>;
+    void set_delivery_refused_sink(DeliveryRefusedFn fn) { refused_sink_ = std::move(fn); }
+
+    /// TEST SEAM: replaces the name lookup used to vet a delivery destination (the OIDC provider has
+    /// the same hook). Never set in production.
+    void set_lookup_for_test(net::LookupFn fn) { lookup_for_test_ = std::move(fn); }
 
     /// Stop accepting new deliveries and wait up to `timeout` for every
     /// queued/in-flight delivery to finish. Returns true if fully drained.
@@ -193,6 +213,9 @@ private:
     pg::SecretCodec& secret_codec_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    DeliveryRefusedFn refused_sink_;
+    net::LookupFn lookup_for_test_; // empty in production: the system resolver
+    RefusalThrottle refusal_throttle_;
 
     /// Delivery-time view of one webhook: carries the still-ENCRYPTED
     /// secret blob (or none), never plaintext — decrypt happens in

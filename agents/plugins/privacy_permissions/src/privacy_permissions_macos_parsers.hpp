@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <macos_user_home_entry.hpp> // yuzu::shared::is_user_home_entry (agents/shared)
 #include <network_fstype.hpp> // yuzu::shared::is_network_fstype (agents/shared)
 
 #include "privacy_permissions_parsers.hpp"
@@ -269,24 +270,12 @@ struct FileStamp {
 
 // ── /Users home enumeration ─────────────────────────────────────────────
 
-/// The autoruns collect_user_launchagents rule: a real home is uid 500 or above (below is a
-/// system account's directory).
-inline constexpr std::uint32_t kMinUserHomeUid = 500;
-
-/// A /Users entry name worth an fstatat at all: not empty, not a dotfile (`.`, `..`,
-/// `.localized`, ...).
-[[nodiscard]] constexpr bool home_name_eligible(std::string_view name) noexcept {
-    return !name.empty() && name.front() != '.';
-}
-
-/// Whether one /Users entry is a real per-user home: an eligible name, a directory as seen
-/// WITHOUT following a symlink (`is_directory` from an AT_SYMLINK_NOFOLLOW fstatat, so a
-/// symlink is never a home), owned by uid >= kMinUserHomeUid (`Shared` and system entries are
-/// skipped).
-[[nodiscard]] constexpr bool is_user_home_entry(std::string_view name, bool is_directory,
-                                                std::uint32_t uid) noexcept {
-    return home_name_eligible(name) && is_directory && uid >= kMinUserHomeUid;
-}
+/// The /Users home rule (kMinUserHomeUid, home_name_eligible, is_user_home_entry) lives in
+/// agents/shared/macos_user_home_entry.hpp, shared with pkg_inventory, and is re-exported here so
+/// call sites and tests keep their names.
+using yuzu::shared::home_name_eligible;
+using yuzu::shared::is_user_home_entry;
+using yuzu::shared::kMinUserHomeUid;
 
 /// A name that reaches a provenance token (comma-joined, logged) must not carry a delimiter or a
 /// control character: `|`, `\` and `,` fold to `/`, controls and the U+2028/2029 line separators to
