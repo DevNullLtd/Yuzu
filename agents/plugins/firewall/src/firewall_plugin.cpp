@@ -1123,6 +1123,13 @@ struct NftProbeResult {
     std::vector<int> open_errnos;
     NftProbeResult result;
     std::vector<yuzu::firewall::NftFailedDump> failed;
+    // One dump on its own socket; a socket that would not open is recorded in open_errnos.
+    const auto take = [&](std::uint16_t msg_type, std::chrono::steady_clock::time_point deadline) {
+        auto dump = dump_once(msg_type, deadline);
+        if (dump.open_errno)
+            open_errnos.push_back(*dump.open_errno);
+        return dump;
+    };
 
     for (int attempt = 1;; ++attempt) {
         // The first pass keeps today's per-dump split of the 5000ms envelope; a re-run has no
@@ -1133,9 +1140,7 @@ struct NftProbeResult {
             attempt == 1 ? start + std::chrono::milliseconds{2500} : overall_deadline;
         const auto rule_deadline = overall_deadline; // remainder(>=2500ms)+slack
 
-        const auto table = dump_once(nft::kNftMsgGettable, table_deadline);
-        if (table.open_errno)
-            open_errnos.push_back(*table.open_errno);
+        const auto table = take(nft::kNftMsgGettable, table_deadline);
         if (table.res.status != yuzu::firewall::NftDumpStatus::ok) {
             // A table socket that would not open writes its diagnostic rows and nothing else (there
             // was no dump to report); a dump that failed writes its own row (BR-03: this used to
@@ -1151,12 +1156,8 @@ struct NftProbeResult {
         }
         info.tables_seen = info.tables_seen || !yuzu::firewall::parse_nft_tables(table.buf).empty();
 
-        auto chain = dump_once(nft::kNftMsgGetchain, chain_deadline);
-        if (chain.open_errno)
-            open_errnos.push_back(*chain.open_errno);
-        auto rule = dump_once(nft::kNftMsgGetrule, rule_deadline);
-        if (rule.open_errno)
-            open_errnos.push_back(*rule.open_errno);
+        auto chain = take(nft::kNftMsgGetchain, chain_deadline);
+        auto rule = take(nft::kNftMsgGetrule, rule_deadline);
         const bool consistent = yuzu::firewall::nft_generations_consistent(
             yuzu::firewall::nft_dump_generation(table.buf, nft::nft_msg_type(nft::kNftMsgNewtable)),
             yuzu::firewall::nft_dump_generation(chain.buf, nft::nft_msg_type(nft::kNftMsgNewchain)),
@@ -2848,18 +2849,13 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
     // repair=1, whoever sent it (an operator, the server's reconciler, an MCP re-apply) and
     // an apply to an already-contained device included, before any leg is built; the
     // host's addresses are read before the call, and a loopback or unspecified control
-    // address is refused whatever that read returned. A refusal changes nothing: no record
-    // is written and an existing record and its containment are left as they were, so a
-    // contained device that has since become its own server stays contained (repair, the
-    // boot re-apply and release never check, and keep working). The token alone does not
-    // say whether the device is contained. When the device's own record is active and the
-    // requested exceptions differ from the ones in force, the refusal carries the
-    // allow-set note the active branch of apply_and_verify would have carried (one shared
-    // helper owns the condition and the text), because the server keys on that note to
-    // leave a never-confirmed record unconfirmed instead of reading the device's status
-    // and confirming an allow list the device never applied. The one KV read happens only
-    // on this refusal path. repair, boot re-apply, release and quarantine_allow never
-    // reach this line.
+    // address is refused whatever that read returned. A refusal changes nothing: no record is
+    // written, no leg is built, and an existing record and its containment are left as they
+    // were, so a contained device that has since become its own server stays contained
+    // (repair, the boot re-apply and release never check and keep working; quarantine_allow
+    // never reaches this line). The token alone does not say whether the device is contained.
+    // allow_set_unchanged_note (firewall_quarantine_parsers.hpp) says when the refusal also
+    // carries the allow-set note; its KV read happens only on this path.
     if (const auto why =
             fq::self_host_refusal(allow->control, yuzu::agent::enumerate_own_addresses())) {
         auto o = fq::refused(std::string{*why});

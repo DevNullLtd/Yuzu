@@ -375,10 +375,10 @@ constexpr fr::Os kThisOs = fr::Os::lin;
     const auto anchor = pf({"-a", std::string{fq::kPfAnchor}, "-s", "rules"});
     const bool main_complete =
         yuzu::firewall::subprocess_complete(rules) && yuzu::firewall::subprocess_complete(info);
-    if (yuzu::firewall::subprocess_complete(anchor))
-        fr::write_section(out, fr::label::kYuzuAnchor, true, anchor.output);
-    else
-        fr::write_section(out, fr::label::kYuzuAnchor, pf_anchor_absent(main_complete, anchor), "");
+    const bool anchor_complete = yuzu::firewall::subprocess_complete(anchor);
+    fr::write_section(out, fr::label::kYuzuAnchor,
+                      anchor_complete || pf_anchor_absent(main_complete, anchor),
+                      anchor_complete ? anchor.output : "");
     fr::finish(out);
     return out;
 #endif
@@ -1301,9 +1301,10 @@ TEST_CASE("agent core: enumerate_own_addresses answers a non-empty list of liter
     for (const auto& lit : yuzu::agent::enumerate_local_ips()) {
         INFO("local ip: " << lit);
         CHECK(std::find(own->begin(), own->end(), lit) != own->end());
-        CHECK_FALSE(lit.starts_with("127."));
+        const auto ip = fq::parse_ip(lit);
+        REQUIRE(ip.has_value());
+        CHECK_FALSE(fq::is_loopback(*ip));
         CHECK_FALSE(lit.starts_with("169.254."));
-        CHECK(lit != "::1");
         const bool v6_link_local = lit.size() > 3 && lit.starts_with("fe") &&
                                    (lit[2] == '8' || lit[2] == '9' || lit[2] == 'a' || lit[2] == 'b');
         CHECK_FALSE(v6_link_local);
