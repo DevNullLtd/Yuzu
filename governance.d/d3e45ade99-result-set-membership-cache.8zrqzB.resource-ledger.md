@@ -68,6 +68,7 @@ in the run ledger as `corr-2`.
   It holds two leases from the test's `PgPool pool` at once (`a`, `b`, both RAII, released at block
   exit before the store is constructed on that pool), with one `PgResult r` per connection (RAII).
   It adds no production resource.
+- **`c1f1428e2a`, `578c4514d3`, `cc986cba7d`, `3b19d0fbe3`, `0980d0e513`.** Comment-only changes under `server/`, or no `server/`/`tests/` file at all. No resource added.
 - **`07eb23ab56`, `e084d7b0cf`, `d3e45ade99`, and this corrections pass.** In
   `server/core/src/result_set_store.cpp` these change comments only. `e084d7b0cf` also changes
   test data and assertions. None of them adds or changes a resource.

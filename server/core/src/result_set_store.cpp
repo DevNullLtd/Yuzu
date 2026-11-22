@@ -1576,10 +1576,10 @@ constexpr int64_t kGcSweepCapPerPass = 5000;      // part 5: unconditional
 // stored member count), always taking at least one set. The set cap alone let one pass cascade
 // up to 5000 x kMaxMembersPerSet server-written rows; past the 30 s statement_timeout the pass
 // rolls back and the next one retries the same oldest-first cohort forever. With the v7 DELETE
-// trigger, this statement deleting 5M rows (50 sets of 100,000 or 1,000 sets of 5,000 members)
-// took 3.1 to 4.1 s across runs on scratch PostgreSQL 16 (2026-11-21 and 2026-11-22): well inside
-// the timeout. device_count is the server's own count; a member row written
-// out of band is not in it, so the budget is best-effort and the set cap still always applies.
+// trigger, this statement deleting 5M rows took 3.13 to 3.35 s, and 3.65 s in a second run, in
+// Gate 8 measurements on scratch PostgreSQL 16 (2026-11-21): well inside the timeout.
+// device_count is the server's own count; a member row written out of band is not in it, so the
+// budget is best-effort and the set cap still always applies.
 constexpr int64_t kGcSweepRowBudgetPerPass = 5'000'000;
 constexpr int64_t kGcBigStepSecs = 86'400;        // part 7: absolute, ~1 day
 constexpr int64_t kGcImplausiblyAheadSecs = 604'800; // part 1: probe excludes
