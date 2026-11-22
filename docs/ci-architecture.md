@@ -912,7 +912,8 @@ of `docs/plugin-readme-standard.md` give the detectors, scope and baseline rules
 ### Docs drift gate (`docs` suite + `docs-lint.yml` + `doc-coupling.yml`, `docs/docs-drift-gate.md`)
 
 `scripts/ci/check-docs-drift.py` extends the plugin README idea to the rest of the
-product, in two layers. Fact parity (hermetic, in the required `changelog-order` job and
+product, in two layers. Fact parity (hermetic, in the required "CHANGELOG order" check's
+`docs-lint-changelog-docs` shard and
 the `docs` suite) asserts every `/api/vN/` route, MCP tool and server/agent CLI flag is
 named in the user manual, reusing `check-api-parity.py`'s extractors. It ratchets
 against the by-name `scripts/ci/docs-drift-baseline.json` with the same only-shrinks rule
@@ -955,10 +956,10 @@ but it cannot touch `content/` or the baseline, which are classified as code.
 proof, that execution admission is keyed on the owner key and that neither list gate hands a
 service-scoped session unrestricted authority; its self-test
 (`tests/test_execution_owner_key_tripwire_selftest.py`) mutates the server sources in memory and
-proves each mutation is caught. The tripwire runs as a step of the `changelog-order` job (check
-name "CHANGELOG order", the required one). The self-test costs about half a minute of CPU, more on
+proves each mutation is caught. The tripwire runs as a step of the `docs-lint-wiring-tripwires` job, one of
+the shards the required "CHANGELOG order" check aggregates. The self-test costs about half a minute of CPU, more on
 a hosted runner, so it is its own job, `execution-owner-key-selftest` (check name "Execution owner
-key tripwire self-test"), which keeps it out of the required check's five minute budget. That job
+key tripwire self-test"), which keeps it out of the required check's shard budgets. That job
 is **advisory**: the workflow's own header names only "CHANGELOG order" as required, and the
 repository owner may add the job to branch protection. Both tests are also registered in
 `tests/meson.build` (suite `docs`), and the `linux` job of `ci.yml` lists `--suite docs`, so the
