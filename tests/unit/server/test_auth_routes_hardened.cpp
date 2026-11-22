@@ -1698,6 +1698,75 @@ TEST_CASE("break-glass MFA step: an unreadable arm state never admits on an empt
     CHECK(transient_admitted(h) == 0.0);
 }
 
+// UP-2 (governance round 11). A shared refresh that STARTED before this server's own read saw "not
+// armed" can finish "armed" after it and put that older snapshot in the cache. Once this server
+// holds a not-armed read at or after the cached snapshot's start, the cache must not serve it.
+TEST_CASE("break-glass gate: an armed snapshot older than a not-armed read this server holds is not served",
+          "[pg][auth][hardened][routes][concurrency][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    auto& r = *h.auth_routes;
+    SsoOnlyGateResult refresher_answer;
+    std::optional<yuzu::test::JoiningThread> refresher;
+    // Declared AFTER `refresher`, so it is destroyed first: a failing REQUIRE cannot leave the
+    // refresher blocked on the condition variable with its join waiting for it.
+    struct ReleaseFirst {
+        ArmCtl& c;
+        ~ReleaseFirst() { c.release(); }
+    } release_first{ctl};
+
+    // 1. A shared refresh starts at T0 and blocks inside its database read.
+    ctl.block = true;
+    refresher.emplace([&] { refresher_answer = r.sso_only_local_password_gate("admin"); });
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(5); // real time
+    while (ctl.blocked.load() == 0 && std::chrono::steady_clock::now() < give_up)
+        std::this_thread::yield();
+    REQUIRE(ctl.blocked.load() == 1);
+
+    // 2. 10 ms later this server's own read (the MFA step's second check) sees "not armed".
+    r.advance_arm_clock_for_test(10);
+    ctl.mode = ArmCtl::kNotArmed;
+    const auto own = r.sso_only_local_password_gate("admin", SsoOnlyArmRead::kOwnFreshRead);
+    REQUIRE(own.state == SsoOnlyLocalGate::kRefused);
+
+    // 3. The older refresh finishes and answers "armed" (its snapshot predates the disarm). Its own
+    //    caller is told so: that is the disclosed lag. It caches that answer.
+    ctl.mode = ArmCtl::kArmed;
+    ctl.release();
+    refresher->join();
+    CHECK(refresher_answer.state == SsoOnlyLocalGate::kBreakGlassArmed);
+
+    // 4. The next request, 100 ms later and inside the 1 s cache life, must NOT be answered from
+    //    that older snapshot: this server holds a newer not-armed read. It reads again.
+    r.advance_arm_clock_for_test(100);
+    ctl.mode = ArmCtl::kNotArmed;
+    const int reads_before = ctl.reads;
+    const auto g = r.sso_only_local_password_gate("admin");
+    CHECK(g.state == SsoOnlyLocalGate::kRefused);
+    CHECK(g.why == SsoOnlyRefusedWhy::kDisarmed);
+    CHECK(ctl.reads == reads_before + 1);
+}
+
+TEST_CASE("break-glass gate: an armed snapshot newer than the last not-armed read is still served from the cache",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    auto& r = *h.auth_routes;
+    ctl.mode = ArmCtl::kNotArmed;
+    REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kRefused);
+    // The account is armed afterwards: a later read says so, and that snapshot started AFTER the
+    // not-armed read, so it is the newest evidence and is cached normally.
+    r.advance_arm_clock_for_test(1100);
+    ctl.mode = ArmCtl::kArmed;
+    REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
+    const int reads = ctl.reads;
+    r.advance_arm_clock_for_test(100);
+    CHECK(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
+    CHECK(ctl.reads == reads); // answered from the cache: no extra database read
+}
+
 // Round 10 (r10-recovery-code-burn-slow-database-shared-single-flight): the second re-check reads
 // the arm state itself. It does not answer from the shared cache and does not wait behind, or
 // give up on, a refresh another request holds.

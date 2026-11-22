@@ -1965,7 +1965,8 @@ callers: `POST /login`, the password-change verify function, and the MFA step
 Standing invariants, pinned by `tests/test_mfa_budget_wiring_lexical.py`: (1) the ONE admit set
 is `SsoOnlyGateResult::admits_password_evaluation()` (open or armed), and `kTransient` is a
 refusal for every caller except the MFA step's second check; (2) a failed, stale or
-in-flight read is never recorded as "not armed" and never cached; (3) no "armed" read is
+in-flight read is never recorded as "not armed" and never cached, and an "armed" snapshot older
+than a "not armed" read this server holds is never served from the cache; (3) no "armed" read is
 honoured more than `kArmSnapshotMaxAge` (4.5 s) after it started, one comparison
 (`arm_observation_fresh`) at every site; (4) the first MFA check uses the cached
 single-flight mode (its snapshot is what the second check's bounded rule relies on) and puts

@@ -354,6 +354,12 @@ def check_arm_recheck(files):
                      "if (armed_now && !arm_observation_fresh(started, finished)) {"):
             if stmt not in gate:
                 bad.append(f"the gate must apply the cap as `{stmt}`")
+        # An armed snapshot older than a not-armed read this server holds is never served (UP-2).
+        for stmt in ("const bool superseded = bg_arm_armed_ && bg_last_not_armed_at_ && "
+                     "*bg_last_not_armed_at_ >= bg_arm_started_;",
+                     "if (bg_arm_valid_ && now - bg_arm_at_ < kBreakGlassArmCacheTtl && !superseded) {"):
+            if stmt not in _ws(gate):
+                bad.append(f"the gate must contain `{stmt}`")
         if "const auto started = arm_clock_now();" not in gate or \
                 gate.find("const auto started = arm_clock_now();") > gate.find("read = hook();"):
             bad.append("the gate must sample `started` before the read")
@@ -568,6 +574,10 @@ def selftest(files):
                        "!(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at)"):
             mut(f"transient admit clause removed: {clause}",
                 sub_cpp(clause, "true &&" if clause.endswith("&&") else "true"))
+        mut("the cache serves an armed snapshot older than a not-armed read this server holds",
+            sub_cpp("kBreakGlassArmCacheTtl && !superseded) {", "kBreakGlassArmCacheTtl) {"))
+        mut("the superseded test never fires",
+            sub_cpp("bg_arm_armed_ && bg_last_not_armed_at_ && *bg_last_not_armed_at_ >= bg_arm_started_;", "false;"))
         mut("wall time of arm1 not recorded at the first re-check",
             sub_cpp("arm1->wall_at = arm_wall_clock_now();", ""))
         mut("a second wall sample in the second re-check",

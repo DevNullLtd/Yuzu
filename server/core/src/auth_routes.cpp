@@ -2703,7 +2703,13 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
     {
         std::lock_guard lk(bg_arm_mu_);
         out.last_not_armed_at = bg_last_not_armed_at_;
-        if (bg_arm_valid_ && now - bg_arm_at_ < kBreakGlassArmCacheTtl) {
+        // An armed snapshot is not served once this server holds a not-armed read at or after that
+        // snapshot's start: a shared refresh that began before an own read saw "not armed" can
+        // finish "armed" after it. The entry is then treated as expired, and this call reads again
+        // (or answers refresh_busy while another refresh is in flight).
+        const bool superseded =
+            bg_arm_armed_ && bg_last_not_armed_at_ && *bg_last_not_armed_at_ >= bg_arm_started_;
+        if (bg_arm_valid_ && now - bg_arm_at_ < kBreakGlassArmCacheTtl && !superseded) {
             if (!bg_arm_armed_) {
                 out.state = SsoOnlyLocalGate::kRefused;
                 out.why = bg_arm_id_.empty() ? SsoOnlyRefusedWhy::kDisarmed
