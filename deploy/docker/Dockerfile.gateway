@@ -18,42 +18,52 @@
 
 # ── Supported platforms (#6711) ───────────────────────────────────────────
 #
-# linux/amd64 ONLY. The pinned erlang:28-alpine index below is mixed: its amd64
-# entry is on Alpine 3.23 (musl 1.2.5) while every other entry, arm64 included,
-# is on Alpine 3.24 (musl 1.2.6). The runtime stage is alpine:3.23, so an arm64
-# build trips the #2150 abi-guard only after the whole rebar3 build. Moving
-# arm64 to 3.24 is not an option either: the abi-guard below bans musl >= 1.2.6
-# with OTP < 29.1 on every architecture, because that pairing aborts beam.smp at
-# boot on AMX CPUs (#1743). AMX is x86-only, so for arm64 this is the
-# builder/runtime lockstep policy, not a measured arm64 fault. The first RUN
-# below therefore refuses any other architecture up front, with the reason.
+# linux/amd64 ONLY: the platform the release builds, publishes and tests
+# (release.yml builds the gateway image for linux/amd64 alone). No other
+# platform of this image is built or tested anywhere, so the first RUN below
+# refuses it up front rather than produce an untested image.
 #
-# This is a scoping choice, not a ceiling: older erlang:28-alpine indexes exist
-# whose amd64 AND arm64 entries are both on Alpine 3.23 (registry-checked
-# 2026-10-29 for 28.5.0.0, 28.5.0.1 and 28.4.x; evidence in #6740), so re-pinning
-# to one would make arm64 buildable at the cost of an older OTP patch than the
-# 28.5.0.2 used here. That trade is tracked separately; published gateway images
-# are amd64-only either way.
+# The builder is hexpm/erlang (WP15, owner ruling 2026-11-18): its tag names
+# the exact OTP and Alpine release (28.5.0.8 on Alpine 3.23.8), and every
+# platform of the pinned index is built on that one Alpine release (its first
+# history entry is `ADD alpine-minirootfs-3.23.8-<arch>.tar.gz`, checked for
+# amd64 and arm64 on 2026-11-20). The upstream erlang:28-alpine index this
+# replaced was mixed (amd64 on Alpine 3.23, arm64 on 3.24), which is what
+# first restricted the image to amd64 (#6711).
 #
-# Lift this with that re-pin (#6740) or with the move to OTP 29.1 or newer. The
-# marker line is read by scripts/ci/check-gateway-base-index.py, which fails when the
-# listed platforms are not all annotated, in the pinned index, as built on the
-# runtime stage's Alpine release; add a platform to the marker and to the guard
-# below together. The guard treats an unset TARGETARCH (a builder that does not
-# set it) as amd64; the abi-guard below still stops such an arm64 build.
+# Before adding a platform: build and boot it, and keep the runtime stage on
+# the builder's Alpine release (the abi-guard below enforces it for the
+# platform being built, after the whole rebar3 build). The marker line is read
+# by scripts/ci/check-gateway-base-index.py, which fails when a listed platform
+# is not shown, in the pinned index, as built on the runtime stage's Alpine
+# release (by the entry's base-name annotation or, failing that, the minirootfs
+# its image config records) or when the builder tag names another Alpine
+# release; add a platform to the marker and to the guard below together. The
+# guard treats an unset TARGETARCH (a builder that does not set it) as amd64;
+# the abi-guard below still stops a build whose Alpine or musl differs.
 # yuzu:gateway-platforms linux/amd64
 
 # ── Stage 1: deps — fetch and compile Erlang dependencies (cached) ────────
-FROM erlang:28-alpine@sha256:a61e716415b2ec95369e3ba18ea59a4379a82ae7744f6045a4145297f5ca1521 AS deps
+# Erlang/OTP 28.5.0.8 on Alpine 3.23.8. The digest is the multi-arch index's,
+# resolved with `docker buildx imagetools inspect
+# hexpm/erlang:28.5.0.8-alpine-3.23.8` on 2026-11-20. The release's ERTS comes
+# from this image (`include_erts`), so this pin IS the OTP the gateway ships.
+# Trust basis: trust on first use. hexpm publishes no signature for its images,
+# so the digest proves only that every build uses the bytes resolved that day;
+# scripts/ci/check-gateway-base-index.py and the abi-guard check the Alpine
+# release and musl, not the publisher, and the release image gate scans the
+# result. Re-resolve and review the digest on every bump, and set the same OTP
+# in scripts/ci/image-vuln-gate.sh's GRYPE_REQUIRED_COMPONENTS (a test checks
+# they agree).
+FROM hexpm/erlang:28.5.0.8-alpine-3.23.8@sha256:1fc35219ea9db671006cfd87d2aa645bc80268a49d90a93c592abdb49edc8e26 AS deps
 
 # BuildKit sets TARGETARCH from --platform (and from the host when it is not
 # given). Keep the allowed set in step with the marker line above.
 ARG TARGETARCH
 RUN case "${TARGETARCH:-amd64}" in amd64) ;; *) \
       echo "FATAL: Dockerfile.gateway supports linux/amd64 only (TARGETARCH=${TARGETARCH})." \
-           "Upstream builds this architecture of the pinned erlang:28-alpine on a newer Alpine than the" \
-           "runtime stage; the abi-guard (#2150) requires the same Alpine release in both, and the runtime" \
-           "cannot move to the newer one before OTP 29.1 (#1743), unless the builder is re-pinned (#6740)." \
+           "It is the only platform the release builds, publishes and tests; another platform needs" \
+           "a build-and-boot check and the runtime stage on the builder's Alpine release (#2150)." \
            "Build with --platform linux/amd64 (on an arm64 host that is emulation, which has crashed in" \
            "the Erlang deps stage under OrbStack; prefer an amd64 host or CI)." \
            "See #6711 and docs/operations/troubleshooting.md." \
@@ -63,6 +73,22 @@ RUN case "${TARGETARCH:-amd64}" in amd64) ;; *) \
       exit 1;; esac
 
 RUN apk add --no-cache git
+
+# rebar3: the hexpm image ships Erlang/OTP only. Pinned by version AND sha256:
+# BuildKit verifies --checksum before the file is used, and fails the build on
+# a mismatch. 3.27.3 (published 2026-10-12) is the newest release at least a
+# month old; its bytes' SLSA provenance was verified on 2026-11-20 with
+#   cosign verify-blob-attestation --bundle rebar3.sigstore \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     --certificate-identity \
+#       https://github.com/erlang/rebar3/.github/workflows/publish.yml@refs/tags/3.27.3 \
+#     --type slsaprovenance1 rebar3
+# after downloading both `rebar3` and `rebar3.sigstore` from the 3.27.3 release
+# page; `sha256sum rebar3` gives the checksum below. Bump the URL, the checksum
+# and the version check below together, and re-verify the provenance.
+ADD --checksum=sha256:f1d87d78decfc56b87d971c75ee6355698ec0c49fadd57f2c056043b7ca291b5 --chmod=755 \
+    https://github.com/erlang/rebar3/releases/download/3.27.3/rebar3 /usr/local/bin/rebar3
+RUN rebar3 version | grep -q '^rebar 3\.27\.3 on Erlang/OTP 28 '
 
 WORKDIR /src
 
@@ -113,12 +139,12 @@ RUN { echo "BUILD_ALPINE=$(cut -d. -f1,2 /etc/alpine-release)"; \
 #     is still 8192 there. The fix is in ERTS (erlang/otp#11249, #11376), first
 #     released in OTP 29.1; no OTP 28 or 29.0.x release carries it.
 #
-# So: keep this FROM on the builder's Alpine release (erlang:28-alpine is on
-# 3.23 today). Do not move to Alpine 3.24 (musl 1.2.6) until the builder's OTP
-# is 29.1 or newer. Dependabot is told to ignore Alpine minor bumps for this
-# reason (.github/dependabot.yml). If upstream erlang:28-alpine itself moves to
-# 3.24 while still on OTP 28, the guard fails the build rather than ship an
-# image that crash-loops on AMX hosts.
+# So: keep this FROM on the builder's Alpine release (the hexpm builder above
+# is on 3.23.8). Do not move to Alpine 3.24 (musl 1.2.6) until the builder's
+# OTP is 29.1 or newer. Dependabot is told to ignore Alpine minor bumps for
+# this reason (.github/dependabot.yml). If the builder is ever re-pinned to a
+# 3.24-based image while still on OTP 28, the guard fails the build rather
+# than ship an image that crash-loops on AMX hosts.
 #
 # RUNTIME INVARIANT: busybox wget is required by docker-compose.uat.yml's
 # healthcheck (`wget --spider -q http://localhost:8081/healthz`). Alpine's
@@ -153,7 +179,7 @@ RUN : "package refresh: ${YUZU_PACKAGE_REFRESH}" && apk upgrade --no-cache
 # Builder/runtime ABI guard (#2150). See the stage header above for why.
 # Every version is first required to be a plain dotted number: `apk version -t`
 # prints nothing for anything else (an OTP release candidate "29.0-rc1", a
-# patched "28.5.0.2**"), and an empty comparison must never read as "not
+# patched "28.5.0.8**"), and an empty comparison must never read as "not
 # older"; each comparison must then be exactly one of < = >. Two OTP_VERSION
 # files in the builder put a bare line in the env file, which fails the build
 # at the `.` (command not found) before any of this runs. otp_fix_min is the
@@ -187,7 +213,9 @@ RUN --mount=type=bind,from=builder,source=/build-abi.env,target=/tmp/build-abi.e
            "(sys_sigaltstack internal error, #1743). Needs OTP >= $otp_fix_min or musl < 1.2.6; see docs/operations/troubleshooting.md."; \
       exit 1; fi
 
-RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
+# zlib: the hexpm-built beam.smp links the system libz.so.1 (the erlang:28-alpine
+# one did not); declared so a slimmer base cannot drop it.
+RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl zlib \
     # bind-tools (dig) + iproute2: HA WS-4 #4555 — gateway-entrypoint.sh
     # resolves this node's own advertised distribution address by DNS-A-record
     # lookup + local-interface intersection BEFORE the BEAM starts. Busybox's

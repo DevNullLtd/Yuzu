@@ -59,7 +59,7 @@
     }
   ],
   "description": "Indicator of Compromise checking — match IOCs against local endpoint state",
-  "how_it_works": "`check` is the plugin's only action. It takes five optional, comma-separated parameters (`ip_addresses`, `domains`, `file_hashes`, `file_paths`, `ports`); if none are supplied it writes one `error|none|false|No IOC parameters provided` row and returns 1 without ever writing the column-header line (`ioc_plugin.cpp:797-804`). Otherwise it writes a literal `type|value|matched|detail` header line (`ioc_plugin.cpp:804`), then runs each supplied check in a fixed order — IP, domain, hash, path, port — reporting progress at 30/50/70/90/100% (`ioc_plugin.cpp:818-842`). Active connections are enumerated once and shared by the IP and port checks (`ioc_plugin.cpp:807-810`). Domain checking is two different mechanisms depending on OS: the Windows leg queries the live DNS resolver cache via the undocumented `DnsGetCacheDataTable` export; Linux and macOS instead do an exact hostname or alias match against `/etc/hosts` (comments stripped, case-insensitive, one trailing dot ignored, address column never matched). Hash checking never touches an IOC feed or reputation service — it computes SHA-256 (a from-scratch implementation, no OpenSSL) over every path in `file_paths` and compares against each requested hash (`ioc_plugin.cpp:452-551,628-669`); without `file_paths` every requested hash reports unmatched. The plugin deliberately does no network calls, no threat-intel lookup, and no quarantine or remediation action — it only reports what is locally observable at call time.",
+  "how_it_works": "`check` is the plugin's only action. It takes five optional, comma-separated parameters (`ip_addresses`, `domains`, `file_hashes`, `file_paths`, `ports`); if none are supplied it writes one `error|none|false|No IOC parameters provided` row and returns 1 without ever writing the column-header line (`ioc_plugin.cpp:797-804`). Otherwise it writes a literal `type|value|matched|detail` header line (`ioc_plugin.cpp:804`), then runs each supplied check in a fixed order — IP, domain, hash, path, port — reporting progress at 30/50/70/90/100% (`ioc_plugin.cpp:818-842`). Active connections are enumerated once and shared by the IP and port checks (`ioc_plugin.cpp:807-810`). Domain checking is two different mechanisms depending on OS: the Windows leg queries the live DNS resolver cache via the undocumented `DnsGetCacheDataTable` export; Linux and macOS instead do an exact hostname or alias match against `/etc/hosts` (comments stripped, case-insensitive, one trailing dot ignored, address column never matched). Hash checking never touches an IOC feed or reputation service — it computes SHA-256 (a from-scratch implementation, no OpenSSL) over every path in `file_paths` and compares against each requested hash (`ioc_plugin.cpp:452-551,628-669`); without `file_paths` every requested hash reports unmatched. The plugin deliberately does no network calls, no threat-intel lookup, and no quarantine or remediation action — it only reports what is locally observable at call time.\n\n**`file_paths`/`file_hashes` are validated, bounded and never silently skipped.** Every path is examined once per action on a bounded helper thread (60 s for the whole action; a stalled filesystem reads `timeout` and cannot hold a command-pool worker, though the helper itself can stay blocked until the filesystem answers). Judging (`agents/shared/local_path_policy.hpp`, mount table read once) comes first. Windows refuses UNC/device/reserved-name paths and non-fixed drives, then normalises the spelling (relative, `.`/`..`, `/` and `\\\\?\\X:\\` forms become one absolute `X:\\...` path) and opens handle-relative with no reparse point followed, so a junction to a share is never traversed; a directory or reparse-point leaf reads `reparse_or_not_a_file`. Linux and macOS resolve symlinks (touching nothing under a network mount; a `..` after a missing component is `unresolvable`), refuse a path on or symlinked into a mount of a listed network type (any FUSE that is not a known-local type and an overlay over a network mount included), refuse `/proc`, `/sys` and `/dev` (`/proc/kmsg` would consume the kernel ring buffer), then open component by component relative to the parent descriptor with no symlink followed and check the opened file's filesystem type (network, FUSE, pseudo), so there is no window between judging and opening. Hashing reads only regular files of at most 512 MiB, once per file for all IOC hashes. **A path that was not examined is reported, not reported as absent:** each one gets a `coverage|<path>|not_examined|<cause>` row (cause: `network_or_device`, `non_fixed_drive`, `mount_table_unreadable`, `unresolvable`, `pseudo_filesystem`, `symlink`, `reparse_or_not_a_file`, `not_regular`, `too_large`, `timeout`, `unreadable`; `unreadable` includes a permission error), the `hash` rows say how many paths were not examined, and a closing `coverage|*|complete|...` or `coverage|*|partial|...` row states the total. A file that does not exist is a definitive answer, not a gap: `file|<path>|false|File not found` and a clean `complete`. More than 64 `file_paths` or 256 `file_hashes` is refused with an `error` row. There is no operator override for a network-mounted path. In a `coverage` row the third column holds the state word (`not_examined`, `complete`, `partial`), not a boolean.",
   "inputs": [
     {
       "constraints": null,
@@ -92,7 +92,7 @@
       "constraints": null,
       "default": null,
       "definition_id": "security.ioc.check",
-      "description": "Comma-separated list of file paths (e.g. `C:\\bad.exe` or `/tmp/bad.bin`) to check for existence and size. Also used as the target set for file_hashes comparison.\n",
+      "description": "Comma-separated list of file paths (e.g. `C:\\bad.exe` or `/tmp/bad.bin`) to check for existence and size. Also used as the target set for file_hashes comparison. At most 64 paths (more is refused). A network or device path (UNC, `\\\\.\\`, a non-fixed Windows drive, a path under or symlinked into a network mount) and, for hashing, a file under /proc, /sys or /dev is NOT examined: it is named in a `coverage|<path>|not_examined|<cause>` row, never reported as a clean absence; a file that does not exist is a definitive answer (examined), so a clean device reads `complete`. Hashing reads only regular files of at most 512 MiB within one 60 s deadline.\n",
       "name": "file_paths",
       "required": false,
       "type": "string"
@@ -112,14 +112,14 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "4c1360bf4eef",
+  "leg_hash": "2be3916eae08",
   "manifest_version": 1,
   "name": "ioc",
   "outputs": [
     {
       "columns": [
         {
-          "description": "Which IOC category this row checked. `error` appears only once, in place of all rows (no header row, no check run, rc 1), when no IOC parameter was provided (`error|none|false|...`) or more than 100 domains were (`error|domains|false|Too many domains ...`).\n",
+          "description": "Which IOC category this row checked. `error` appears only once, in place of all rows (no header row, no check run, rc 1), when no IOC parameter was provided (`error|none|false|...`), when more than 64 file_paths or 256 file_hashes were given, or when more than 100 domains were (`error|domains|false|Too many domains ...`). `coverage` rows (only when file_paths was given) say what was NOT examined: one `coverage|<path>|not_examined|<cause>` row per unexamined path (cause: network_or_device, non_fixed_drive, mount_table_unreadable, unresolvable, pseudo_filesystem, symlink, reparse_or_not_a_file, not_regular, too_large, timeout, unreadable) and a closing `coverage|*|complete|...` or `coverage|*|partial|...` row.\n",
           "example": "ip",
           "name": "type",
           "platforms": [
@@ -134,6 +134,7 @@
             "hash",
             "file",
             "port",
+            "coverage",
             "error"
           ]
         },
@@ -150,7 +151,7 @@
           "values": null
         },
         {
-          "description": "Whether the IOC was found on this endpoint. Always `false` for the single `error` row. Values: true, false.",
+          "description": "For `ip`, `domain`, `hash` and `port` rows, whether the IOC was found on this endpoint (`true`/`false`); for `file` rows, whether the file exists. For a `coverage` row, the completeness token: `not_examined` on a per-path row, then `complete` or `partial` on the closing `coverage|*` row. Always `false` for the single `error` row. A string, not a boolean: the coverage rows carry tokens. Values: true, false, not_examined, complete, partial.",
           "example": "true",
           "name": "matched",
           "platforms": [
@@ -158,8 +159,14 @@
             "linux",
             "darwin"
           ],
-          "type": "bool",
-          "values": null
+          "type": "string",
+          "values": [
+            "true",
+            "false",
+            "not_examined",
+            "complete",
+            "partial"
+          ]
         },
         {
           "description": "Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run; on Windows `DNS resolver cache could not be read` when the cache was unreadable, with the result also marked constrained). Values: free text.",
@@ -234,7 +241,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "container",
-        "leg_hash": "4c1360bf4eef",
+        "leg_hash": "2be3916eae08",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -265,7 +272,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "4c1360bf4eef",
+        "leg_hash": "2be3916eae08",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -296,7 +303,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "4c1360bf4eef",
+        "leg_hash": "2be3916eae08",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
         "privilege": "SYSTEM"
@@ -326,6 +333,7 @@
       "content/definitions/ioc.yaml"
     ],
     "plugin": [
+      "agents/plugins/ioc/src/ioc_examined.hpp",
       "agents/plugins/ioc/src/ioc_parsers.hpp",
       "agents/plugins/ioc/src/ioc_plugin.cpp"
     ],

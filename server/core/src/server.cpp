@@ -173,6 +173,7 @@
 #include "quarantine_store.hpp"
 #include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
 #include "refusal_log_throttle.hpp"
+#include "outbound_destination_guard.hpp"
 #include "resolver_pool_metrics.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_members.hpp" // #4990
@@ -350,6 +351,8 @@
 #include "event_bus.hpp"
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
+#include "agent_reregistration_apply.hpp"
+#include "agent_witnessed_leaf.hpp"
 #include "cidr_match.hpp"
 #include "gateway_forward_guard.hpp"
 #include "gateway_mgmt_stub_pool.hpp"
@@ -759,6 +762,10 @@ public:
         oidc_resolver_publisher_.register_metrics(
             metrics_, ::yuzu::server::oidc::oidc_resolver_pool_capacity(),
             ::yuzu::server::oidc::oidc_resolver_outcome_counts());
+        // The webhook / offload delivery resolver pool, described and pre-seeded the same way.
+        delivery_resolver_publisher_.register_metrics(
+            metrics_, ::yuzu::server::delivery_resolver_pool_capacity(),
+            ::yuzu::server::delivery_resolver_outcome_counts());
         // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".
         for (const char* reason :
              {"own_addresses_unavailable", "dns_unavailable", "dns_timeout", "dns_busy",
@@ -1712,6 +1719,17 @@ public:
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
+        // sg10 / UP-1: `param_key_invalid` (a params key the agent would truncate, refused at the
+        // ingress) on every surface that counts it, pre-seeded so absent() alerting holds. Both
+        // MCP tools (execute_instruction and execute_instruction_definition) refuse it earlier, in
+        // their input-bound check, and count it under yuzu_mcp_tool_args_too_large_total, so
+        // route="mcp" is seeded for the shared execute core's own check but no MCP handler reaches
+        // it; execute_bundle counts route="bundle".
+        for (const char* route : {"command", "command_v1", "instruction_execute", "mcp", "schedule", "bundle",
+                                  "policy_fragment"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonParamKeyInvalid)}});
         // Stored `parameter_schema` refusals on the instruction execute route: a separate
         // family (a validation refusal, not a targeting one), seeded in workflow_routes.cpp.
         seed_instruction_param_rejected_metrics(metrics_);
@@ -2973,7 +2991,9 @@ public:
         metrics_.describe("yuzu_server_webhook_delivery_success_total",
                           "Webhook deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_webhook_delivery_failed_total",
-                          "Webhook deliveries that failed (connection error, non-2xx, exception)",
+                          "Webhook deliveries that failed (connection error, non-2xx, exception); a delivery "
+                          "declined before any connect is counted under "
+                          "yuzu_server_webhook_delivery_refused_total instead",
                           "counter");
         // ADR-0057 (gov Gate 3 sre): these three joined the family above but
         // were missing describe()/pre-seed, the same HC-1-class parity gap
@@ -2996,8 +3016,36 @@ public:
                           "Offload-target deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_offload_delivery_failed_total",
                           "Offload-target deliveries that failed (connection error, non-2xx, "
-                          "exception, or a tampered non-http(s) URL)",
+                          "exception, or a tampered non-http(s) URL); a delivery declined before any "
+                          "connect is counted under yuzu_server_offload_delivery_refused_total "
+                          "instead",
                           "counter");
+        // Deliveries DECLINED before any connect because the destination is a refused address or
+        // did not resolve (outbound_destination_guard.hpp, #4816). Counted here and NOT in the
+        // `_failed_total` counters above, so a refusal can never be mistaken for a flaky receiver
+        // (nor hide inside it). Closed `cause` set, pre-seeded.
+        for (const char* kind : {"webhook", "offload"}) {
+            const std::string name = std::string("yuzu_server_") + kind + "_delivery_refused_total";
+            metrics_.describe(name,
+                              std::string(kind == std::string("webhook") ? "Webhook" : "Offload-target") +
+                                  " deliveries declined before any connect, by cause: "
+                                  "destination_refused (a resolved or literal address is link-local, "
+                                  "cloud-metadata, unspecified, multicast or reserved) or "
+                                  "destination_unresolved (the name did not resolve) or "
+                                  "destination_resolver_busy (the delivery resolver pool was full)",
+                              "counter");
+            for (const char* cause : {"destination_refused", "destination_unresolved",
+                                      "destination_resolver_busy"})
+                metrics_.counter(name, {{"cause", cause}});
+        }
+        // A delivery whose name resolved to more than four vetted addresses tries only the first
+        // four (outbound_url_policy.hpp, kMaxDeliveryConnectAddresses); counted so the truncation
+        // is visible. Described and pre-seeded like its siblings.
+        metrics_.describe("yuzu_server_delivery_connect_addresses_truncated_total",
+                          "Webhook or offload-target deliveries whose name resolved to more than "
+                          "four vetted addresses and so tried only the first four",
+                          "counter");
+        metrics_.counter("yuzu_server_delivery_connect_addresses_truncated_total");
         // The two drop counters (closed `reason` set) and the delivery pool gauges are described
         // and pre-seeded together, shared with the tests (delivery_pool_metrics.hpp).
         yuzu::server::register_delivery_pool_metrics(metrics_);
@@ -3659,6 +3707,95 @@ public:
                           "repeatedly attempting to re-provision.",
                           "counter");
         metrics_.counter("yuzu_server_ca_reissue_blocked_total", {{"reason", "revoked_identity"}});
+        // WP01: re-registration of an already-enrolled agent id (both ingest paths).
+        metrics_.describe("yuzu_register_reregistration_total",
+                          "Re-registrations of an already-enrolled agent id, by ingest path "
+                          "(direct | gateway_proxy), the proof-of-identity outcome "
+                          "(no_leaf_on_record | proven_by_leaf | via_token | no_proof | "
+                          "unattested_gateway | revoked_identity | lookup_failed) and the "
+                          "--agent-reregistration-proof mode. In audit mode a no_proof, "
+                          "unattested_gateway, revoked_identity or lookup_failed outcome was "
+                          "ADMITTED; in enforce mode it was refused. A sustained non-zero audit "
+                          "rate for real agents means enforce would lock them out.",
+                          "counter");
+        // Seeded to 0 (the #5177 trap: increase() on a series that first appears at its first
+        // increment never fires a rule). Every (path, outcome, mode) the apply helper can emit.
+        for (const char* path : {"direct", "gateway_proxy"})
+            for (const char* outcome :
+                 {"no_leaf_on_record", "proven_by_leaf", "via_token", "no_proof",
+                  "unattested_gateway", "revoked_identity", "lookup_failed"})
+                for (const char* mode : {"off", "audit", "enforce"})
+                    (void)metrics_.counter("yuzu_register_reregistration_total",
+                                           {{"path", path}, {"outcome", outcome}, {"mode", mode}});
+        for (const char* reason : {"multi_use_token", "invalid_input_length", "not_found",
+                                   "expired", "revoked", "already_consumed"})
+            (void)metrics_.counter("yuzu_register_reenrol_token_refused_total",
+                                   {{"reason", reason}});
+        for (const char* action : {"agent.reregistration_unproven", "agent.reregistration_refused"})
+            (void)metrics_.counter("yuzu_register_reregistration_audit_dropped_total",
+                                   {{"action", action}});
+        for (const char* reason : {"store_unavailable", "write_failed"})
+            (void)metrics_.counter("yuzu_register_reregistration_audit_write_failures_total",
+                                   {{"reason", reason}});
+        (void)metrics_.counter("yuzu_server_ca_superseded_leaf_total");
+        (void)metrics_.counter("yuzu_server_ca_supersede_failed_total");
+        (void)metrics_.counter("yuzu_register_reregistration_audit_ids_truncated_total");
+        for (const char* reason : {"queue_full", "write_failed", "shutdown", "alloc_failed"})
+            (void)metrics_.counter("yuzu_register_reregistration_audit_summary_dropped_total",
+                                   {{"reason", reason}});
+        for (const char* reason : {"no_csr", "no_signer", "signer_failed", "signer_threw"})
+            (void)metrics_.counter("yuzu_register_reenrol_token_no_leaf_total",
+                                   {{"reason", reason}});
+        metrics_.describe("yuzu_register_reregistration_audit_ids_truncated_total",
+                          "Dropped agent ids that NO summary row names, as an UPPER BOUND (a "
+                          "repeat of an over-cap id counts again): the excess over 20000 distinct ids "
+                          "in one 10 s window, and every id of a summary chunk that was dropped (queue "
+                          "full, three failed writes, still queued at shutdown) or never built "
+                          "(allocation failure). For those ids the only record is the unbudgeted "
+                          "decision counter. Lost with the process on a crash.",
+                          "counter");
+        metrics_.describe("yuzu_register_reregistration_audit_summary_dropped_total",
+                          "Dropped-row summary chunks that were NOT written (reason: queue_full = "
+                          "the 128-row pending queue overflowed, write_failed = the audit write "
+                          "failed three times, shutdown = still queued when the server stopped, "
+                          "alloc_failed = the window's summary could not be built).",
+                          "counter");
+        metrics_.describe("yuzu_register_reenrol_token_no_leaf_total",
+                          "A single-use enrollment token was CONSUMED to re-enrol an agent id that "
+                          "holds a live leaf, but no new leaf was issued (reason: no_csr = the agent "
+                          "sent no CSR, no_signer = no signer wired, signer_failed = the signer "
+                          "answered nothing, signer_threw = it threw). The token is spent and the "
+                          "old leaf stays; recovery is a fresh single-use token after removing the "
+                          "agent's cert_dir.",
+                          "counter");
+        metrics_.describe("yuzu_register_reregistration_audit_dropped_total",
+                          "Re-registration audit ROWS (not ids) NOT written because the audit "
+                          "budget was spent (per-source, global or per-id caps). The decision "
+                          "counter still counts every attempt; the ids of dropped rows are named best "
+                          "effort in summary rows (see ids_truncated_total for the ones that are not).",
+                          "counter");
+        metrics_.describe("yuzu_register_reregistration_audit_write_failures_total",
+                          "Re-registration audit rows whose write FAILED (audit store error).",
+                          "counter");
+        metrics_.describe("yuzu_server_agent_reregistration_proof_mode",
+                          "Active --agent-reregistration-proof mode of THIS server process "
+                          "(1 for the active mode, 0 for the others). The flag is per process: "
+                          "replicas on different modes are only as enforced as the weakest.",
+                          "gauge");
+        metrics_.describe("yuzu_register_reenrol_token_refused_total",
+                          "Re-enrolment of an already-enrolled agent id with an enrollment token "
+                          "that was refused (reason: a token-rejection variant, multi_use_token or "
+                          "invalid_input_length). Refused with a gRPC status, never accepted=false.",
+                          "counter");
+        metrics_.describe("yuzu_server_ca_superseded_leaf_total",
+                          "Agent leaves revoked as reenrolled after the agent re-enrolled with a "
+                          "single-use token and was issued a fresh leaf (WP01).",
+                          "counter");
+        metrics_.describe("yuzu_server_ca_supersede_failed_total",
+                          "Failures revoking an agent's older leaves after a token re-enrolment "
+                          "(the agent holds the new leaf; the older one stays valid until it "
+                          "expires or an operator revokes it).",
+                          "counter");
         metrics_.describe("yuzu_server_ca_revocation_sweep_read_failures_total",
                           "Revocation-sweep tick's list_revoked_serials() read failed - that "
                           "tick's sweep was skipped entirely rather than treating every live "
@@ -6297,6 +6434,22 @@ public:
             }
         }
 
+        // SAM-22: component_inventory's `native` action ships switched off — an operator must
+        // enable it explicitly via PUT /api/v1/plugin-config/component_inventory/kill-switch with
+        // action=native. An ACTION-level seed: `scan` stays on. ON CONFLICT DO NOTHING, so an
+        // operator's own row is never overwritten on a restart.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_action_kill_switch_default_off(
+                    "component_inventory", "native",
+                    "default-off: reads every shared library under the application roots; enable per "
+                    "PUT /api/v1/plugin-config/component_inventory/kill-switch with action=native")) {
+                spdlog::error(
+                    "[PG] Refusing to start: component_inventory.native default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
         // process_introspect ships default-off (Forensics class, like remote_access_audit);
         // enable via PUT /api/v1/plugin-config/process_introspect/kill-switch.
         if (plugin_config_store_ && !startup_failed_) {
@@ -8498,6 +8651,26 @@ public:
                         startup_failed_ = true;
                     } else {
                         webhook_store_->set_metrics(&metrics_);
+                        // A delivery DECLINED because its destination is a refused address or did
+                        // not resolve gets its own audit row (throttled per webhook by the store).
+                        // System attribution: no operator is on this path. The store is destroyed
+                        // (workers joined) before audit_store_.
+                        webhook_store_->set_delivery_refused_sink(
+                            [this](std::int64_t id, std::string_view cause,
+                                   std::string_view cls, const std::string& url_detail) {
+                                if (!audit_store_ || !audit_store_->is_open())
+                                    return;
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "system:webhook-delivery",
+                                     .principal_role = "system",
+                                     .action = "webhook.delivery.declined",
+                                     .target_type = "webhook",
+                                     .target_id = std::to_string(id),
+                                     .detail = std::format("cause={} class={} {}", cause,
+                                                           cls.empty() ? "-" : cls, url_detail),
+                                     .result = "denied"});
+                            });
                         legacy_sqlite_probe::harden_legacy_file_0600(
                             cfg_.db_dir() / "webhooks.db", "WebhookStore");
                         legacy_sqlite_probe::warn_if_legacy_rows(
@@ -8591,6 +8764,23 @@ public:
                         startup_failed_ = true;
                     } else {
                         offload_target_store_->set_metrics(&metrics_);
+                        // As the webhook sink above: a declined delivery gets its own audit row.
+                        offload_target_store_->set_delivery_refused_sink(
+                            [this](std::int64_t id, std::string_view cause,
+                                   std::string_view cls, const std::string& url_detail) {
+                                if (!audit_store_ || !audit_store_->is_open())
+                                    return;
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "system:offload-delivery",
+                                     .principal_role = "system",
+                                     .action = "offload_target.delivery.declined",
+                                     .target_type = "offload_target",
+                                     .target_id = std::to_string(id),
+                                     .detail = std::format("cause={} class={} {}", cause,
+                                                           cls.empty() ? "-" : cls, url_detail),
+                                     .result = "denied"});
+                            });
                         agent_service_.set_offload_target_store(offload_target_store_.get());
                         // ADR-0010 §Decision 3 evidence surface (gov Gate 6
                         // compliance-officer, contract floor — the
@@ -9758,6 +9948,62 @@ public:
                 // certs as agent identities (foreign certs fall through to bootstrap).
                 agent_service_.set_peer_cert_recognizer(
                     [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
+                // WP01: proof of identity on re-registration of an already-enrolled id, for the
+                // direct AND gateway-relayed paths (ONE hooks object, ONE decision:
+                // agent_reregistration_gate.hpp). Wired only here, with the issuing CA: an install
+                // with operator-supplied certificates has no ca_issued agent leaf to prove against,
+                // so the gate is inert there (documented, owner decision D7). Same lifetime
+                // contract as the signer above: set before BuildAndStart, cleared in stop().
+                {
+                    const auto proof_mode =
+                        parse_reregistration_proof_mode(cfg_.agent_reregistration_proof)
+                            .value_or(ReregistrationProofMode::Enforce); // CLI11 validated: unreachable, fail closed
+                    auto hooks = std::make_shared<AgentIdentityHooks>();
+                    hooks->leaf_state = [this](const std::string& agent_id) {
+                        return ca_store_->agent_leaf_state(agent_id);
+                    };
+                    hooks->attested_leaf_proves = [this](const std::string& pem,
+                                                         const std::string& agent_id) {
+                        return attested_leaf_proves_identity(pem, agent_id);
+                    };
+                    hooks->supersede_older_leaves = [this](const std::string& agent_id,
+                                                           const std::string& new_cert_pem) {
+                        return supersede_older_agent_leaves(agent_id, new_cert_pem);
+                    };
+                    agent_service_.set_agent_identity_hooks(hooks);
+                    agent_service_.set_reregistration_proof_mode(proof_mode);
+                    if (gateway_service_) {
+                        gateway_service_->set_agent_identity_hooks(hooks);
+                        gateway_service_->set_reregistration_proof_mode(proof_mode);
+                    }
+                    // The mode is per PROCESS: expose it so a replica left on another value is
+                    // visible (a fleet is only as enforced as its weakest replica).
+                    for (const auto m : {ReregistrationProofMode::Off, ReregistrationProofMode::Audit,
+                                         ReregistrationProofMode::Enforce})
+                        metrics_
+                            .gauge("yuzu_server_agent_reregistration_proof_mode",
+                                   {{"mode", std::string(to_string(m))}})
+                            .set(m == proof_mode ? 1.0 : 0.0);
+                    if (proof_mode != ReregistrationProofMode::Off &&
+                        !(cfg_.tls_enabled && !cfg_.tls_ca_cert.empty())) {
+                        // The gate runs only on a listener that requires a client identity (TLS
+                        // with a client CA): without one it is inert, whatever the flag says.
+                        spdlog::warn("PKI: agent re-registration proof mode = {} is NOT in force: "
+                                     "the agent listener has no TLS client CA, so the gate is inert",
+                                     to_string(proof_mode));
+                    } else if (proof_mode == ReregistrationProofMode::Enforce) {
+                        spdlog::info("PKI: agent re-registration proof mode = enforce");
+                    } else {
+                        // Audit/off do NOT close the takeover: say so at every boot.
+                        spdlog::warn("PKI: agent re-registration proof mode = {} - a certificate-"
+                                     "less caller that knows an enrolled agent id can STILL "
+                                     "re-register it and be issued a certificate. Set "
+                                     "witness_client_cert on every gateway's agent listener, watch "
+                                     "yuzu_register_reregistration_total, then set "
+                                     "--agent-reregistration-proof=enforce",
+                                     to_string(proof_mode));
+                    }
+                }
                 spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
                              default_cert_set_.ca_fingerprint_sha256.empty()
                                  ? std::string("operator-supplied")
@@ -9780,8 +10026,17 @@ public:
                     spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
                                  "the leader's freshness pass or the next revocation republishes");
             }
-            // else: nullopt — genuinely no root (operator brought their own certs) —
-            // no signer/recognizer/revocation-checker wiring, same as before.
+            else {
+                // nullopt — genuinely no root (operator brought their own certs) — no
+                // signer/recognizer/revocation-checker wiring, and no re-registration gate either:
+                // say so rather than leave a configured mode unexplained.
+                const auto proof_mode = parse_reregistration_proof_mode(cfg_.agent_reregistration_proof)
+                                            .value_or(ReregistrationProofMode::Enforce);
+                if (proof_mode != ReregistrationProofMode::Off)
+                    spdlog::warn("PKI: agent re-registration proof mode = {} is NOT in force: this "
+                                 "install has no CA of its own, so the gate is inert",
+                                 to_string(proof_mode));
+            }
         }
 
         grpc::EnableDefaultHealthCheckService(true);
@@ -10376,6 +10631,56 @@ public:
         }
 
         // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
+        // WP01: the audit-mode "unproven re-registration" summary flush has its OWN thread. It
+        // used to ride the health thread, whose serial budget is shared with the SECURITY-relevant
+        // revocation sweep: a slow or failing audit store stretched the sweep-to-sweep gap (21 s at
+        // 500 ms/write, 75 s with a store failing for 30 s). The only writer of the summary chunks
+        // besides stop(); per-process state, so NOT leader-gated (ReplicaSafe). Every 5 s
+        // (kReregistrationFlushIntervalMs), contained, time-bounded per round
+        // (kReregistrationFlushDeadlineMs, checked between rows: one AuditStore::log can overrun it by
+        // about 34 s: a 4 s pool acquire plus the 30 s statement_timeout) and skipped for one round after a failed round. Joined next to
+        // health_recompute_thread_ in stop(), BEFORE the forced flush and the store teardown.
+        // The spawn holds lifecycle_mu_ and re-checks teardown_complete_/stop_requested_, exactly like
+        // the typed-source purge and collation recheck starts: without it a SIGTERM during boot could
+        // run stop() (which holds lifecycle_mu_ for its whole teardown and joins this thread) between
+        // the stop_requested_ read and the assignment, leaving a joinable thread that borrows
+        // audit_store_ and metrics_. Under the lock either stop() has not begun (it will join the
+        // thread) or it has finished (skip). The thread never takes lifecycle_mu_.
+        {
+            std::lock_guard<std::mutex> life(lifecycle_mu_);
+            if (!teardown_complete_ && !stop_requested_.load(std::memory_order_acquire)) {
+            reregistration_flush_thread_ = std::thread([this]() {
+                bool skip_next_round = false;
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    // Sleep in <= 500 ms increments so the join in stop() is prompt.
+                    for (std::int64_t waited = 0; waited < detail::kReregistrationFlushIntervalMs &&
+                                                  !stop_requested_.load(std::memory_order_acquire);
+                         waited += 500)
+                        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    if (skip_next_round) {
+                        skip_next_round = false;
+                        continue;
+                    }
+                    try {
+                        YUZU_ASSERT_BACKGROUND_JOB("reregistration_audit.flush_summary"); // WS-10 ReplicaSafe
+                        skip_next_round = flush_reregistration_audit_summary(audit_store_.get(),
+                                                                             &metrics_, /*force=*/false);
+                    } catch (const std::exception& e) {
+                        skip_next_round = true;
+                        spdlog::warn("Re-registration audit summary flush failed: {}", e.what());
+                    } catch (...) {
+                        skip_next_round = true;
+                        spdlog::warn("Re-registration audit summary flush failed: unknown exception");
+                    }
+                }
+            });
+
+            }
+        }
+
+        // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
         health_recompute_thread_ = std::thread([this]() {
             spdlog::info("Fleet health recomputation thread started (interval=15s)");
             while (!stop_requested_.load(std::memory_order_acquire)) {
@@ -10429,6 +10734,10 @@ public:
                     metrics_, ::yuzu::server::oidc::oidc_resolver_in_flight(),
                     ::yuzu::server::oidc::oidc_resolver_pool_capacity(),
                     ::yuzu::server::oidc::oidc_resolver_outcome_counts());
+                delivery_resolver_publisher_.publish(
+                    metrics_, ::yuzu::server::delivery_resolver_in_flight(),
+                    ::yuzu::server::delivery_resolver_pool_capacity(),
+                    ::yuzu::server::delivery_resolver_outcome_counts());
                 // Webhook and offload delivery pool backlog, from the same tick. A store that is
                 // not open reads 0 (never a stale value).
                 {
@@ -11821,6 +12130,15 @@ public:
         if (health_recompute_thread_.joinable()) {
             health_recompute_thread_.join();
         }
+        // WP01: the summary flush thread, BEFORE the forced flush below and before audit_store_ /
+        // the pool are reset. Worst case this join waits for one round (up to 2 s of rows, each
+        // write possibly about 34 s: a 4 s pool acquire plus the 30 s statement_timeout) and the
+        // forced flush then runs one more round the same way, so the audit part of stop() is at
+        // most 2 x (2 s + 34 s) + 500 ms, about 73 s, on top of the shutdown drain (up to 60 s,
+        // kMaxShutdownDrainSeconds): about 133 s against the shipped 210 s stop grace.
+        if (reregistration_flush_thread_.joinable()) {
+            reregistration_flush_thread_.join();
+        }
 
         // Join the app-perf roll-up thread (borrows app_perf_rollup_ +
         // app_perf_fleet_store_ — must stop before they / the pool are torn down).
@@ -12127,8 +12445,17 @@ public:
         agent_service_.set_agent_cert_signer(nullptr);
         agent_service_.set_revocation_checker(nullptr);
         agent_service_.set_peer_cert_recognizer(nullptr);
-        if (gateway_service_)
+        agent_service_.set_agent_identity_hooks(nullptr);
+        // WP01: shutdown flush of the dropped-audit-row summary (the audit store is still open).
+        try {
+            flush_reregistration_audit_summary(audit_store_.get(), &metrics_, /*force=*/true);
+        } catch (...) {
+            spdlog::warn("Re-registration audit summary shutdown flush failed");
+        }
+        if (gateway_service_) {
             gateway_service_->set_agent_cert_signer(nullptr);
+            gateway_service_->set_agent_identity_hooks(nullptr);
+        }
 
         // 2f PR 3a: the bridge borrows the bus (unsubscribe on teardown) and the
         // session registry - shut it down and release it BEFORE the tracker/bus
@@ -13233,8 +13560,11 @@ private:
                 // agent-issuance path that records a different/empty purpose
                 // would silently fall out of this filter and reopen the
                 // revocation bypass this check exists to close.
+                // WP01: a leaf the SERVER revoked as `reenrolled` (superseded by a fresh leaf
+                // after a single-use-token re-enrolment) is bookkeeping, not a withdrawn
+                // identity; counting it would refuse the agent's own renewal until it expired.
                 if (rev.purpose == "agent" && rev.subject == agent_id &&
-                    rev.not_after > now_epoch) {
+                    rev.not_after > now_epoch && rev.revocation_reason != kRevokeReasonReenrolled) {
                     spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
                                  "non-expired cert (serial {}) exists; an operator must clear "
                                  "the revocation before this agent can re-provision",
@@ -13349,6 +13679,10 @@ private:
         rec.purpose = "agent";
         rec.not_after =
             std::chrono::duration_cast<std::chrono::seconds>(not_after.time_since_epoch()).count();
+        // WP01 (UP-1 / D): `issued_at` orders an agent's leaves for the supersede, so it is stamped
+        // by record_issued's INSERT from the DATABASE clock (rec.issued_at = 0), never this
+        // replica's system_clock: a lagging replica's newer leaf must not look older.
+        rec.issued_at = 0;
         rec.cert_pem = issued->cert_pem;
         rec.issued_by = "agent:" + agent_id;
         rec.enrollment_request_id = agent_id;
@@ -13769,6 +14103,83 @@ private:
                                   const std::unordered_set<std::string>& revoked_serials) {
         const std::string serial = resolve_yuzu_peer_serial(peer_cert_pem);
         return !serial.empty() && revoked_serials.contains(serial);
+    }
+
+    /// WP01: does a certificate the GATEWAY witnessed in an agent's TLS handshake prove `agent_id`?
+    /// The gateway does not validate the chain (so a stale or foreign leaf cannot abort the
+    /// handshake and lock an agent out), which makes THIS the check: the leaf chains to OUR issuing
+    /// CA (an UNCACHED verify: see agent_witnessed_leaf.hpp), is inside its validity window now, is an AGENT leaf (the install-scoped
+    /// `.../agent/<id>` URI SAN: a code-signing leaf has none), names exactly this agent id in its
+    /// CN, and is not revoked (`is_peer_cert_revoked` fails CLOSED on a degraded read, which here
+    /// means "no proof"). Size-bounded: the PEM comes off the wire.
+    bool attested_leaf_proves_identity(const std::string& cert_pem, const std::string& agent_id) {
+        // The predicate and its rationale live in agent_witnessed_leaf.hpp (unit-tested with real
+        // certificates); this supplies what ServerImpl owns. agent_ca_cert_pem_ is written once
+        // before the gRPC servers start.
+        return witnessed_leaf_proves_agent_identity(
+            cert_pem, agent_id, agent_ca_cert_pem_, std::chrono::system_clock::now(),
+            [this](const std::string& pem) { return is_peer_cert_revoked(pem); },
+            [](std::string_view segment) { return uri_encode_segment(segment); });
+    }
+
+    /// WP01 / owner decision D4: an agent re-enrolled with a single-use enrollment token and was
+    /// just issued `new_cert_pem`; revoke its OLDER live leaves (reason `kRevokeReasonReenrolled`)
+    /// so a lost-or-stolen key does not stay valid beside its replacement. Called only AFTER the new
+    /// leaf exists. Best effort by design (the agent already holds a good credential): a failure is
+    /// audited (`ca.cert.supersede_failed`), counted and logged, never thrown, and returns false.
+    /// The CRL is NOT published inline (handler thread): the leader's freshness tick does it.
+    bool supersede_older_agent_leaves(const std::string& agent_id, const std::string& new_cert_pem) {
+        const auto audit_supersede = [&](std::string_view action, const std::string& target,
+                                         std::string detail_text, std::string_view result) {
+            if (audit_store_ && audit_store_->is_open()) {
+                const bool ok = audit_store_->log({.timestamp = std::time(nullptr),
+                                                   .principal = "agent:" + agent_id,
+                                                   .principal_role = "agent",
+                                                   .action = std::string(action),
+                                                   .target_type = "AgentCertificate",
+                                                   .target_id = target,
+                                                   .detail = std::move(detail_text),
+                                                   .result = std::string(result)});
+                if (!ok)
+                    spdlog::error("PKI: audit write failed for {} (agent {})", action,
+                                  ::yuzu::log_id_token(agent_id));
+            }
+        };
+        const auto fail = [&](const std::string& why) {
+            spdlog::error("PKI: older leaves of agent {} NOT superseded after a token "
+                          "re-enrolment: {} (the new leaf was issued; the older one stays valid "
+                          "until it expires or an operator revokes it)",
+                          ::yuzu::log_id_token(agent_id), why);
+            metrics_.counter("yuzu_server_ca_supersede_failed_total").increment();
+            audit_supersede("ca.cert.supersede_failed", agent_id,
+                            "reason=reenrolled cn=" + detail::audit_token(agent_id) +
+                                " via=token_reenrolment cause=" + detail::audit_token(why),
+                            "failure");
+            return false;
+        };
+        if (!ca_store_ || !ca_store_->is_open())
+            return fail("ca store not open");
+        const auto fresh = pki::parse_certificate(new_cert_pem);
+        const auto fresh_serial =
+            fresh ? normalize_serial_hex(fresh->serial_hex) : std::optional<std::string>{};
+        if (!fresh_serial)
+            return fail("cannot read the serial of the new leaf");
+        // ONE statement, older-than-the-new-leaf only: two concurrent re-enrolments converge on
+        // the newest leaf and never cross-revoke each other's (UP-1). The CRL is NOT published
+        // here (this runs on the Register handler thread, inside the agent's RPC deadline): the
+        // revocation is effective for the mTLS gate immediately (is_revoked reads ca_store) and
+        // the leader's freshness/self-heal tick publishes the CRL (has_unpublished_revocations).
+        auto revoked = ca_store_->revoke_older_agent_leaves(agent_id, *fresh_serial);
+        if (!revoked)
+            return fail(::yuzu::log_key_token(revoked.error()));
+        for (const auto& serial : *revoked) {
+            metrics_.counter("yuzu_server_ca_superseded_leaf_total").increment();
+            audit_supersede("ca.cert.revoked", serial,
+                            "reason=reenrolled cn=" + detail::audit_token(agent_id) +
+                                " via=token_reenrolment",
+                            "success");
+        }
+        return true;
     }
 
     /// PKI PR4 / HA WS-6 CRL follow-ups (#4828-#4831): build + record a new CRL version over the
@@ -14589,7 +15000,8 @@ private:
             [this](std::string_view principal, std::string_view securable,
                    yuzu::server::authz::Operation op) {
                 return dispatch_has_permission(principal, securable, op);
-            });
+            },
+            &parameters); // sg10: the send path always passes the parameters (param-escalated securable)
 
         if (!decision) {
             const auto& denial = decision.error();
@@ -18521,6 +18933,7 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .audit_fn = audit_fn,
                              .schedule_engine = schedule_engine_.get(),
+                             .metrics = &metrics_,
                          });
 
         // #2542 PR-11: the 3-route legacy pre-v1 Responses API
@@ -19629,10 +20042,11 @@ private:
             // `test_operator_surface_twins.cpp` exercise; the fail-closed
             // cases and the legacy-open posture are documented there.
             .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                   const std::string& action) -> bool {
+                                   const std::string& action,
+                const std::unordered_map<std::string, std::string>& parameters) -> bool {
                 return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                rbac_store_.get(), principal,
-                                                               plugin, action);
+                                                               plugin, action, parameters);
             },
             // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
             // is an error, not an empty answer, so the runner holds rather than fires.
@@ -19675,10 +20089,11 @@ private:
                 // re-verified AGAIN here at send time (authority may have changed
                 // between enqueue and delivery), the load-bearing re-authorization.
                 .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                       const std::string& action) -> bool {
+                                       const std::string& action,
+                const std::unordered_map<std::string, std::string>& parameters) -> bool {
                     return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                    rbac_store_.get(), principal,
-                                                                   plugin, action);
+                                                                   plugin, action, parameters);
                 },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
                 // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is
@@ -20027,8 +20442,8 @@ private:
                             }
                             if (agents_failed > 0)
                                 spdlog::warn("result set {} materialized partial: {} agent(s) "
-                                             "answered execution {} with a failure and never "
-                                             "matched",
+                                             "answered execution {} with a failure or a partly "
+                                             "completed answer and never matched",
                                              p.id, agents_failed, p.source_execution_id);
                             if (result_set_store_->materialize(p.id, members, agents_failed,
                                                               agents_unanswered)) {
@@ -22448,6 +22863,9 @@ private:
         // above); wiring it here too so /fragments/results migrates onto
         // require_fleet_read as its sole gate.
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
+        // #2540: the Echo purge/re-enable POSTs authorize through the SAME per-device scoped
+        // gate as the REST purge twin (set before register_routes, per the ordering note above).
+        dashboard_routes_->set_scoped_perm_fn(scoped_perm_fn);
         dashboard_routes_->set_forensics_plugin_set(forensics_plugins()); // #4990
         dashboard_routes_->set_forensics_visibility_fn(forensics_visibility_fn);
         // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
@@ -25459,6 +25877,8 @@ private:
     /// registered the metrics; nothing else reads or writes it.
     yuzu::server::ResolverPoolPublisher oidc_resolver_publisher_{
         yuzu::server::kOidcResolverMetrics};
+    yuzu::server::ResolverPoolPublisher delivery_resolver_publisher_{
+        yuzu::server::kDeliveryResolverMetrics};
     /// PR1.9c: the composed classification ruleset `build_classified_command`
     /// consults on every dispatch — core (this package) plus the six
     /// per-group plugin catalogues (p7/p10-p13). A STATIC ruleset, constructed
@@ -26270,6 +26690,7 @@ private:
         kMaxConcurrentContainmentReads};
     std::thread quarantine_snapshot_refresh_thread_; // #881; joined before stores
     std::thread health_recompute_thread_;
+    std::thread reregistration_flush_thread_; // WP01: audit summary flush; started under lifecycle_mu_, joined in stop() right after health_recompute_thread_
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
     std::thread preflight_runner_thread_; // joined before stores in stop()

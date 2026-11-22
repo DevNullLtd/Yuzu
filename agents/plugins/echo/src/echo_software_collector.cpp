@@ -23,11 +23,10 @@
  */
 
 #include "echo_collectors.hpp"
-#include "echo_version.hpp"
+#include "echo_software_core.hpp" // dedup
 
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -84,23 +83,6 @@ void note_software_truncation() {
                      "inventory (further truncation warnings suppressed)",
                      kSoftwareEntryCap);
     }
-}
-
-// One-entry-per-name: sort then keep the highest-versioned of any same-name
-// duplicates (e.g. the 64-bit and 32-bit views of a product sharing a
-// DisplayName), so the diff key (name) is unambiguous. Versions compare
-// numerically (compare_versions), not lexicographically — "10.0" outranks "9.0"
-// so the diff keeps the real-latest build (#1620).
-void dedup(std::vector<SoftwareInfo>& apps) {
-    std::sort(apps.begin(), apps.end(), [](const SoftwareInfo& a, const SoftwareInfo& b) {
-        if (a.name != b.name) return a.name < b.name;
-        return compare_versions(a.version, b.version) > 0; // descending → unique keeps the highest
-    });
-    apps.erase(std::unique(apps.begin(), apps.end(),
-                           [](const SoftwareInfo& a, const SoftwareInfo& b) {
-                               return a.name == b.name;
-                           }),
-               apps.end());
 }
 
 // Enumerate one Uninstall key, appending SoftwareInfo records. SystemComponent=1

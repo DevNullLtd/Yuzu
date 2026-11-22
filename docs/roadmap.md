@@ -6,6 +6,14 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 
 **Platform constraints (binding on every phase below):** the server and the gateway are **Linux-only**; Windows and macOS are **agent-only** (ADR-0035, accepted 2026-11-10 — CI legs agent-only #7499, release ships only the agent on Windows/macOS #7523, `server` build-feature option + agent-only vcpkg off Linux #7632), on the Linux native build floor of ADR-2003 (accepted, #6632). gRPC is the permanent agent transport and QUIC is withdrawn (ADR-0066, #5582; #376 and #1042–#1044 closed NOT_PLANNED). The gateway's transport is a Cowboy edge + Gun upstream client in place of the vendored grpcbox (ADR-0069, #5695; memory give-back #6713; multi-node cluster formation #4604).
 
+### Planned Instructions work · fleet-wide incident dispatch (2026-11-22)
+
+Before enabling live criteria runs, land the response-store design (3C), authenticated bulk
+ingest and scoped ClickHouse reads (3D), then incident dispatch after general delivery (3F).
+Gate live inputs (3G) on shared admission budgets, acknowledged waves, bounded in-flight bytes
+and visible incomplete coverage under sink failure. The stored-inventory ladder keeps its
+independent PostgreSQL verdict budget in 1.13. [Instruction Engine design](Instruction-Engine.md#planned-incident-mode-dispatch).
+
 <!-- Reproducibility recipe for the next re-roll: batch-resolve every issue number cited below in one
      call — `gh api graphql -f query="query { repository(owner: \"DevNullLtd\", name: \"Yuzu\") {
      i<N>: issueOrPullRequest(number: <N>) { ... on Issue { number state stateReason closedAt title }

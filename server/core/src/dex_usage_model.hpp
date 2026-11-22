@@ -116,6 +116,31 @@ static_assert(kDexUsageCellCap == kDexCohortExportCap, "one cardinality bound fo
 
 enum class DexUsageSliceKind { Fleet, Platform, Group, Tag };
 
+/// The wire token of a slice kind: the `slice` request parameter and the payload's `slice.kind`.
+inline const char* dex_usage_slice_token(DexUsageSliceKind k) {
+    switch (k) {
+    case DexUsageSliceKind::Platform:
+        return "platform";
+    case DexUsageSliceKind::Group:
+        return "group";
+    case DexUsageSliceKind::Tag:
+        return "tag";
+    case DexUsageSliceKind::Fleet:
+        break;
+    }
+    return "fleet";
+}
+
+/// The kind a `slice` token names, or nullopt for an unknown token (the caller refuses it).
+/// Written over dex_usage_slice_token so the two directions share one table.
+inline std::optional<DexUsageSliceKind> dex_usage_slice_kind_from_token(std::string_view token) {
+    for (const auto k : {DexUsageSliceKind::Fleet, DexUsageSliceKind::Platform, DexUsageSliceKind::Group,
+                         DexUsageSliceKind::Tag})
+        if (token == dex_usage_slice_token(k))
+            return k;
+    return std::nullopt;
+}
+
 struct DexUsageSlice {
     DexUsageSliceKind kind{DexUsageSliceKind::Fleet};
     /// Group: the management group id. Tag: the tag key (empty = kDexDefaultCohortKey).
