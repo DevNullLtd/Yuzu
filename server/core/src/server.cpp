@@ -2864,9 +2864,10 @@ public:
                           "(cumulative per agent since install; a rising value is the signal)",
                           "gauge");
         metrics_.describe("yuzu_fleet_echo_storage_offline",
-                          "Agents whose Echo database is offline and being retried, by reason "
-                          "(free_space, migration_failed, open_failed; anything else sums under "
-                          "unknown). Published for every reason each sweep, 0 included",
+                          "Agents whose Echo database is offline, by reason (free_space, "
+                          "migration_failed, open_failed are retried; rollback_wedged is not and "
+                          "needs an agent restart; anything else sums under unknown). Published "
+                          "for every reason each sweep, 0 included",
                           "gauge");
         metrics_.describe("yuzu_fleet_plugin_init_failed",
                           "Agents reporting a plugin that failed init, by plugin name (absent "

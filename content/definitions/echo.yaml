@@ -19,9 +19,10 @@ metadata:
     misrepresents the active capture mechanism. On the healthy path the FIRST
     line is storage_state|ok. Offline means collection and retention are both
     stopped and every other field is withheld -- the
-    reply is then just an error| line followed by storage_state|offline (a
-    wedged rollback closed the Echo database; recovery needs an agent restart)
-    or storage_state|offline|<reason>, where free_space means the roll-up
+    reply is then just an error| line followed by
+    storage_state|offline|<reason>, where rollback_wedged means a failed
+    rollback closed the Echo database (recovery needs an agent restart),
+    free_space means the roll-up
     migration was refused because the volume held less than twice the database
     file plus its write-ahead log free (or its free space could not be read),
     migration_failed means the v10 roll-up step failed, ran out of its deadline

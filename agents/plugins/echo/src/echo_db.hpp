@@ -567,6 +567,13 @@ struct OpenSeams {
     /// True = abandon the v10 migration (rolled back, the file untouched). Production: the open
     /// retry loop's stop flag, so a shutdown does not wait out a long attempt.
     std::function<bool()> v10_cancel;
+    /// Runs in place of the plain `ROLLBACK` that `execute_atomic_batch` and `checked_transaction`
+    /// (the v10 step included) issue after a failed transaction, and returns its result code. A
+    /// test returns an error WITHOUT rolling back, which leaves the connection inside the
+    /// transaction and takes the real close path; one that rolls back and then reports an error
+    /// takes the benign branch. Copied into the database by open() before the schema steps, so it
+    /// covers the open itself. Empty = the real ROLLBACK; production never sets it.
+    std::function<int(sqlite3*)> rollback;
 };
 
 /// What `PRAGMA integrity_check` says about echo.db at open (#559, #7286). Only `corrupt` moves the
@@ -807,7 +814,9 @@ public:
     /// wedged transaction forced `execute_atomic_batch` to close it. Callers that
     /// REPORT state (rather than just read it) must consult this: with the
     /// connection gone every getter returns its default, so an unguarded status
-    /// surface describes a dead store as a healthy empty one (#2361 Gate 8).
+    /// surface describes a dead store as a healthy empty one (#2361 Gate 8). The Echo plugin's
+    /// slow collect tick also reads it to publish the closed-at-run-time store as storage offline
+    /// with reason `rollback_wedged` (echo_status_format.hpp online_offline_tag_action).
     [[nodiscard]] bool is_open() const noexcept { return db_ != nullptr; }
 
     /// True while the read-only query connection (`echo sql`) is usable.
@@ -1137,6 +1146,10 @@ private:
     /// The ONE roll-up writer for this database (echo_fold.hpp: one instance per database is a
     /// construction rule, so it lives here). Built by open(); null only in a moved-from object.
     std::unique_ptr<EchoFold> fold_;
+    /// Issues the rollback of a failed transaction on `db_` (mu_ held): the OpenSeams::rollback
+    /// seam when one was given, else a plain ROLLBACK. Always empty in production.
+    int rollback_locked(char** errmsg);
+    std::function<int(sqlite3*)> rollback_;
     std::mutex mu_;
     std::mutex query_mu_;
 };

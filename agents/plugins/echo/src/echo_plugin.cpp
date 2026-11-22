@@ -3181,13 +3181,34 @@ private:
         {
             yuzu::PluginContext pctx{plugin_ctx_};
             reconcile_db_health_publish(pctx);
-            // Replay a storage-offline tag delete that failed when the open recovered. Stateless
-            // and safe: this tick runs only past the online_ gate, where nothing legitimately
-            // sets the key (go_offline runs only while offline).
-            if (pctx.storage_exists(yuzu::echo::kStorageOfflineKey) &&
-                !pctx.storage_delete(yuzu::echo::kStorageOfflineKey))
-                spdlog::warn("ECHO: the storage-offline heartbeat tag is still set after "
-                             "recovery and could not be cleared; retried on the next slow collect");
+            // Reconcile the storage-offline tag with the store, stateless. This tick runs only
+            // past the online_ gate, where go_offline never runs, so the only legitimate value
+            // here is rollback_wedged: the store was closed at run time by a failed rollback and
+            // nothing collects until the agent restarts. Anything else is stale (a previous
+            // run's tag, or a delete that failed when the open recovered) and is cleared.
+            const bool key_present = pctx.storage_exists(yuzu::echo::kStorageOfflineKey);
+            const bool store_open = db_->is_open();
+            switch (yuzu::echo::online_offline_tag_action(
+                store_open, key_present,
+                key_present ? pctx.storage_get(yuzu::echo::kStorageOfflineKey) : std::string{})) {
+            case yuzu::echo::OfflineTagAction::publish_wedged:
+                if (pctx.storage_set(yuzu::echo::kStorageOfflineKey, yuzu::echo::kRollbackWedgedToken))
+                    spdlog::error("ECHO: storage offline (rollback_wedged): the database was closed "
+                                  "after a transaction could not be rolled back; collection and "
+                                  "retention are stopped until the agent restarts");
+                else
+                    spdlog::warn("ECHO: failed to publish the storage-offline heartbeat tag; "
+                                 "retried on the next slow collect");
+                break;
+            case yuzu::echo::OfflineTagAction::clear:
+                if (!pctx.storage_delete(yuzu::echo::kStorageOfflineKey))
+                    spdlog::warn("ECHO: the storage-offline heartbeat tag is still set after "
+                                 "recovery and could not be cleared; retried on the next slow "
+                                 "collect");
+                break;
+            case yuzu::echo::OfflineTagAction::leave:
+                break;
+            }
         }
         // §3.8 bounded mapdrive-backfill retry (related issue #5291): above collect_mu_, same as
         // init()'s call site, so hive I/O never runs under the shared lock. Cheap when nothing is

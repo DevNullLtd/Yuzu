@@ -2,18 +2,19 @@
 
 Background: `docs/user-manual/echo.md` "The retention clock guard", issue #2361.
 
-> **Alert coverage.** Two different states report `storage_state|offline`:
+> **Alert coverage.** Two different states report `storage_state|offline`, and both carry a reason,
+> publish the heartbeat tag `yuzu.plugin.echo.storage_offline`, feed the gauge
+> `yuzu_fleet_echo_storage_offline{reason}` and raise the alert `YuzuEchoStorageOffline` (held 30
+> minutes):
 >
 > - **Offline at open** (`storage_state|offline|<reason>`: `free_space`, `migration_failed`,
->   `open_failed`). The agent retries by itself (below) and the fleet sees it: heartbeat tag
->   `yuzu.plugin.echo.storage_offline`, gauge `yuzu_fleet_echo_storage_offline{reason}`, alert
->   `YuzuEchoStorageOffline` (held 30 minutes). See "Offline at open: the agent retries".
-> - **Wedged rollback** (bare `storage_state|offline`, the rest of this runbook). **There is no alert
->   for this.** The agent has no `/metrics` endpoint, Echo's guard counters are in-memory and reset on
->   agent restart, and the offline state is only visible if someone runs `echo status` against the
->   device or opens its Capture-sources frame. An endpoint whose forensic window has stopped being
->   collected is exactly the endpoint least likely to be interrogated. Treat this part as reactive
->   until a fleet-wide signal exists (tracked follow-up).
+>   `open_failed`). The agent retries by itself (below). See "Offline at open: the agent retries".
+> - **Wedged rollback** (`storage_state|offline|rollback_wedged`, the rest of this runbook). The
+>   database opened and collected, then was closed at run time after a rollback failed. It is not
+>   retried: only an agent restart recovers. The tag appears at the next slow collect tick after the
+>   close (well inside the alert's 30-minute hold), and it is cleared the same way once the agent
+>   has restarted with a healthy database. The device's own `echo status` and its Capture-sources
+>   frame show the same state.
 
 ## Offline at open: the agent retries
 
@@ -41,7 +42,7 @@ escalate rather than wait. Collection stays stopped until an attempt succeeds, t
 ```
 error|Echo storage is offline on this endpoint; the database was closed after a
 transaction could not be rolled back. ...
-storage_state|offline
+storage_state|offline|rollback_wedged
 ```
 
 Note the ORDER: `error|` comes first, because server and dashboard consumers key

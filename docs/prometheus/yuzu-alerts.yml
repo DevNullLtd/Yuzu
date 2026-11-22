@@ -8787,20 +8787,23 @@ groups:
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
 
       # Echo loaded OFFLINE because its database could not be opened (a failed v10 roll-up
-      # migration, or too little free disk for it) and is retrying in the background (#7290). Such
+      # migration, or too little free disk for it) and is retrying in the background (#7290), or
+      # because the database opened and was then closed at run time after a transaction could not
+      # be rolled back (rollback_wedged, #8099: not retried, only an agent restart recovers). Such
       # an agent no longer fails the plugin's init, so it is NOT in yuzu_fleet_plugin_init_failed:
       # this rule is what replaces that signal. The family has a fixed label set (free_space,
-      # migration_failed, open_failed, unknown) published every sweep, 0 included, so `> 0`
-      # selects only the reasons with agents. Same expression shape as YuzuPluginInitFailed
+      # migration_failed, open_failed, rollback_wedged, unknown) published every sweep, 0 included,
+      # so `> 0` selects only the reasons with agents. Same expression shape as YuzuPluginInitFailed
       # (max_over_time[5m] rides over a replica restart's one absent sample, `sum by` drops
       # `instance` so an agent moving replicas does not reset the clock).
       #
       # `for: 30m` is a DESIGN value derived from the agent's retry schedule (1, 5 and 15 minutes,
       # then hourly; the three quick retries finish about 21 minutes after the start), so a
       # transient condition such as a briefly full disk or a held lock has had its quick retries
-      # before anyone is told. It is not fitted to fleet data. Warning, not critical: the agent
-      # keeps retrying on its own (bar a collection-start failure, which needs an agent restart)
-      # and the value is agent-self-reported.
+      # before anyone is told. It is not fitted to fleet data (a rollback_wedged store is not
+      # retried, so the hold only delays that alert). Warning, not critical: the agent keeps
+      # retrying on its own (bar a collection-start failure and a rollback_wedged store, which
+      # need an agent restart) and the value is agent-self-reported.
       - alert: YuzuEchoStorageOffline
         expr: |
           sum by (job, reason) (max_over_time(yuzu_fleet_echo_storage_offline[5m])) > 0
@@ -8812,16 +8815,18 @@ groups:
           description: >-
             For more than 25 minutes, about {{ $value }} agent(s) (summed across core replicas,
             so a failover can count one twice for a few minutes) have reported that their Echo
-            database could not be opened and Echo is offline (heartbeat tag
-            yuzu.plugin.echo.storage_offline), reason {{ $labels.reason }}: free_space is too
-            little free disk for the v10 roll-up migration, migration_failed is a migration that
-            failed or ran past its deadline and was rolled back with the old data intact,
-            open_failed is any other failure on a retry. reason="unknown" sums values the server
-            does not recognise. Nothing is collected on an affected endpoint, but the agent keeps
-            retrying (1, 5 and 15 minutes, then hourly) and recovers by itself once the cause is
-            gone, except an open_failed where the database opened but collection failed to start:
-            that is not retried and needs an agent restart. The agent log and `echo status` on
-            the device name the cause. The value and the reason are agent-self-reported, so the
+            database could not be opened, or was closed at run time after a failed rollback, and
+            Echo is offline (heartbeat tag yuzu.plugin.echo.storage_offline), reason
+            {{ $labels.reason }}: free_space is too little free disk for the v10 roll-up
+            migration, migration_failed is a migration that failed or ran past its deadline and
+            was rolled back with the old data intact, open_failed is any other failure on a retry,
+            rollback_wedged is a database that opened and was then closed because a transaction
+            could not be rolled back. reason="unknown" sums values the server does not recognise.
+            Nothing is collected on an affected endpoint, but the agent keeps retrying (1, 5 and
+            15 minutes, then hourly) and recovers by itself once the cause is gone, except an
+            open_failed where the database opened but collection failed to start and every
+            rollback_wedged: neither is retried and both need an agent restart. The agent log and
+            `echo status` on the device name the cause. The value and the reason are agent-self-reported, so the
             signal is not authoritative.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/echo-storage-offline.md"
 

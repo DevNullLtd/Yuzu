@@ -178,8 +178,24 @@ TEST_CASE("offline_reason_token: the literals the server's gauge parser mirrors"
     CHECK(offline_reason_token(OfflineReason::free_space) == "free_space");
     CHECK(offline_reason_token(OfflineReason::migration_failed) == "migration_failed");
     CHECK(offline_reason_token(OfflineReason::open_failed) == "open_failed");
+    CHECK(offline_reason_token(OfflineReason::rollback_wedged) == "rollback_wedged");
+    CHECK(kRollbackWedgedToken == "rollback_wedged");
     CHECK(offline_reason_token(OfflineReason::none).empty());
     CHECK(kStorageOfflineKey == "heartbeat.storage_offline");
+}
+
+TEST_CASE("online_offline_tag_action: publish for a store closed at run time, clear a stale tag",
+          "[echo][open_retry]") {
+    // closed store: no key, or another reason's value, is (re)published as rollback_wedged
+    CHECK(online_offline_tag_action(false, false, "") == OfflineTagAction::publish_wedged);
+    CHECK(online_offline_tag_action(false, true, "open_failed") == OfflineTagAction::publish_wedged);
+    // closed store already tagged: left, so a stuck tick does not rewrite the key
+    CHECK(online_offline_tag_action(false, true, "rollback_wedged") == OfflineTagAction::leave);
+    // open store: a key (the previous run's, or a failed delete replayed) is cleared ...
+    CHECK(online_offline_tag_action(true, true, "rollback_wedged") == OfflineTagAction::clear);
+    CHECK(online_offline_tag_action(true, true, "") == OfflineTagAction::clear);
+    // ... and no key is left alone
+    CHECK(online_offline_tag_action(true, false, "") == OfflineTagAction::leave);
 }
 
 TEST_CASE("format_storage_refused_lines: error| first, then the reason token, with the retry wait",

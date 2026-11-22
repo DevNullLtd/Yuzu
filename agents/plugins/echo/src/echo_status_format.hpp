@@ -31,6 +31,11 @@
 
 namespace yuzu::echo {
 
+/// The reason token of a store closed at run time by a failed rollback (OfflineReason::
+/// rollback_wedged). Named here because the status reply below, which comes before the enum,
+/// publishes it as its second line so the reply and the heartbeat tag agree.
+inline constexpr std::string_view kRollbackWedgedToken = "rollback_wedged";
+
 /// The complete `echo status` reply for a store that has failed closed, in the
 /// order it must be written.
 ///
@@ -53,7 +58,7 @@ format_storage_offline_lines(bool query_engine_available) {
                     "are both stopped. "}
             .append(read_path)
             .append(" Restart the agent to recover."),
-        "storage_state|offline",
+        std::format("storage_state|offline|{}", kRollbackWedgedToken),
     };
 }
 
@@ -79,7 +84,11 @@ inline constexpr std::string_view kV10DeadlineMarker = "did not finish inside it
 /// Why Echo loaded offline at open (the plugin is present, nothing collects, the open is retried).
 /// `none` = the failure is not one of the retried kinds and `init` fails as it always did.
 /// The tokens are mirrored by server/core/src/echo_storage_offline_tag.hpp.
-enum class OfflineReason { none, free_space, migration_failed, open_failed };
+/// `rollback_wedged` is the one reason that is not an open failure: the database opened and ran,
+/// then was closed at run time after a ROLLBACK failed with the transaction still open
+/// (EchoDatabase closes the write connection; only an agent restart recovers). It never comes out
+/// of classify_open_failure and is never retried.
+enum class OfflineReason { none, free_space, migration_failed, open_failed, rollback_wedged };
 
 [[nodiscard]] constexpr std::string_view offline_reason_token(OfflineReason reason) noexcept {
     switch (reason) {
@@ -89,6 +98,8 @@ enum class OfflineReason { none, free_space, migration_failed, open_failed };
         return "migration_failed";
     case OfflineReason::open_failed:
         return "open_failed";
+    case OfflineReason::rollback_wedged:
+        return kRollbackWedgedToken;
     case OfflineReason::none:
         break;
     }
@@ -98,7 +109,7 @@ enum class OfflineReason { none, free_space, migration_failed, open_failed };
 /// The plugin KV key the agent's heartbeat bridge publishes as the status tag
 /// `yuzu.plugin.echo.storage_offline` (agents/core plugin_heartbeat_tags.hpp); its value is the
 /// reason token. The server's fleet gauge (server/core/src/echo_storage_offline_tag.hpp) mirrors
-/// the tag and the three tokens as literals; a test on each side pins them.
+/// the tag and the four tokens as literals; a test on each side pins them.
 inline constexpr std::string_view kStorageOfflineKey = "heartbeat.storage_offline";
 
 /// Tell the retried open failures from every other one by the wrapper text open() puts at the
@@ -168,6 +179,22 @@ format_storage_refused_lines(OfflineReason reason, std::string_view detail,
         std::move(line0),
         std::format("storage_state|offline|{}", offline_reason_token(reason)),
     };
+}
+
+/// What the slow-tick reconcile does with the storage-offline tag while the plugin is online
+/// (the open succeeded; go_offline never runs here). `store_open` is EchoDatabase::is_open(),
+/// `key_present` whether the tag is set, `current` its value. A store closed at run time by a
+/// failed rollback publishes `rollback_wedged` (once: a key already at that token is left, so a
+/// stuck tick does not rewrite it); an open store clears any tag, which is a stale one from a
+/// previous run or a failed delete replayed.
+enum class OfflineTagAction { leave, publish_wedged, clear };
+
+[[nodiscard]] constexpr OfflineTagAction online_offline_tag_action(bool store_open, bool key_present,
+                                                                   std::string_view current) noexcept {
+    if (!store_open)
+        return key_present && current == kRollbackWedgedToken ? OfflineTagAction::leave
+                                                              : OfflineTagAction::publish_wedged;
+    return key_present ? OfflineTagAction::clear : OfflineTagAction::leave;
 }
 
 /// `db_health|<ok|quarantined>|<epoch>` (#1567). `quarantined` iff THIS open

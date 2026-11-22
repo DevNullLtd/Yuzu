@@ -2227,9 +2227,9 @@ TEST_CASE("Echo #2361: a closed store skips the pass instead of reporting clock 
     // The pass must say the true thing once and stop.
     //
     // A moved-from EchoDatabase has `db_ == nullptr`, which is the same state the
-    // wedge path produces via sqlite3_close_v2. The close itself needs a rollback
-    // that fails with the transaction still open -- a disk-level fault, not
-    // inducible here -- so this covers the downstream behaviour, not the close.
+    // wedge path produces via sqlite3_close_v2. This case covers the downstream
+    // behaviour; the close itself is driven through the OpenSeams::rollback seam in
+    // the cases that follow it.
     EchoGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 10);
 
@@ -2253,6 +2253,131 @@ TEST_CASE("Echo #2361: a closed store skips the pass instead of reporting clock 
     CHECK(row_count(live, "process_hourly") == 10);
 }
 
+// A database seeded from the migrated template and opened with `seams` (a current-version open, so
+// no ladder and no extra fsyncs).
+static EchoDatabase open_with_seams(const fs::path& path, const OpenSeams& seams) {
+    (void)yuzu::test::seed_echo_db_from_template(path);
+    auto opened = EchoDatabase::open(path, seams);
+    INFO(std::string{opened.has_value() ? "" : opened.error()});
+    REQUIRE(opened.has_value());
+    return std::move(*opened);
+}
+
+TEST_CASE("Echo #8099: checked_transaction closes the store when ROLLBACK fails inside the transaction",
+          "[echo][store][rollback-wedge]") {
+    // A seam that reports an error WITHOUT rolling back leaves the connection in the transaction,
+    // which is the wedge: the store must close, the write path must fail, and the read-only query
+    // connection (a separate handle) must survive.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_ct_"};
+    int rollbacks = 0;
+    OpenSeams seams;
+    seams.rollback = [&](sqlite3*) {
+        ++rollbacks;
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+    REQUIRE(db.is_open());
+    REQUIRE(db.query_engine_available());
+
+    const auto result = db.checked_transaction(
+        [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == "injected");
+    CHECK(rollbacks == 1);
+    CHECK_FALSE(db.is_open());
+    CHECK_FALSE(db.set_config("k", "v"));
+    CHECK(db.query_engine_available());
+}
+
+TEST_CASE("Echo #8099: execute_atomic_batch closes the store when ROLLBACK fails inside the transaction",
+          "[echo][store][rollback-wedge]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_ab_"};
+    int rollbacks = 0;
+    OpenSeams seams;
+    seams.rollback = [&](sqlite3*) {
+        ++rollbacks;
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+
+    // SQLITE_TOOBIG is neither a plain error nor a constraint, so the batch abandons the pass
+    // while the transaction is still open and goes to ROLLBACK.
+    const auto batch = db.execute_atomic_batch({"SELECT zeroblob(2000000000)"});
+    CHECK(batch.began);
+    CHECK_FALSE(batch.committed);
+    CHECK(rollbacks == 1);
+    CHECK_FALSE(db.is_open());
+    CHECK(db.query_engine_available());
+}
+
+TEST_CASE("Echo #8099: a ROLLBACK that rolled back and then reported an error leaves the store open",
+          "[echo][store][rollback-wedge]") {
+    // The benign case the wedge branch must not mistake for a wedge: SQLite already ended the
+    // transaction (autocommit is 1), so closing the store would be a false alarm.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_ok_"};
+    OpenSeams seams;
+    seams.rollback = [](sqlite3* raw) {
+        sqlite3_exec(raw, "ROLLBACK", nullptr, nullptr, nullptr);
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+
+    const auto result = db.checked_transaction(
+        [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+    REQUIRE_FALSE(result.has_value());
+    CHECK(db.is_open());
+    CHECK(db.set_config("k", "v")); // a connection still inside a transaction would refuse this
+    CHECK(db.get_config("k") == "v");
+}
+
+TEST_CASE("Echo #8099: a failed rollback during the v10 step is an open failure, not a runtime wedge",
+          "[echo][store][rollback-wedge]") {
+    // The open-time counterpart, already reported as migration_failed: the step fails (here the
+    // retired daily tier has a row but no roll-up mark, so the step refuses inside its
+    // transaction), its ROLLBACK fails with the transaction open, and open() refuses (the
+    // connection closes with the transaction undone). The file stays v9 with its retired row, and classify_open_failure keeps
+    // the reason it always gave. No `rollback_wedged` tag comes out of an open.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_v10_"};
+    const auto exec_raw = [&](const char* sql) {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &raw) == SQLITE_OK);
+        const int rc = sqlite3_exec(raw, sql, nullptr, nullptr, nullptr);
+        sqlite3_close(raw);
+        REQUIRE(rc == SQLITE_OK);
+    };
+    const auto scalar = [&](const char* sql) {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &raw) == SQLITE_OK);
+        sqlite3_stmt* stmt = nullptr;
+        REQUIRE(sqlite3_prepare_v2(raw, sql, -1, &stmt, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
+        std::string out = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        sqlite3_finalize(stmt);
+        sqlite3_close(raw);
+        return out;
+    };
+    exec_raw("CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');"
+             "INSERT INTO echo_config VALUES ('schema_version', '9');"
+             "CREATE TABLE process_daily (id INTEGER PRIMARY KEY AUTOINCREMENT, day_ts INTEGER NOT "
+             "NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '', user TEXT NOT NULL DEFAULT '', "
+             "start_count INTEGER NOT NULL DEFAULT 0, stop_count INTEGER NOT NULL DEFAULT 0);"
+             "INSERT INTO process_daily VALUES (NULL, 1793613600, 'a', 'u', 3, 1);");
+
+    int rollbacks = 0;
+    OpenSeams seams;
+    seams.rollback = [&](sqlite3*) {
+        ++rollbacks;
+        return SQLITE_IOERR;
+    };
+    const auto failed = EchoDatabase::open(tmp.path, seams);
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(rollbacks == 1);
+    CHECK(failed.error().starts_with(kV10MigrationFailedPrefix));
+    CHECK(classify_open_failure(failed.error()) == OfflineReason::migration_failed);
+    CHECK(scalar("SELECT value FROM echo_config WHERE key = 'schema_version'") == "9");
+    CHECK(scalar("SELECT COUNT(*) FROM process_daily") == "1");
+}
+
 TEST_CASE("Echo #2361: the offline status reply leads with error|, not storage_state",
           "[echo][retention][clock-guard]") {
     // Governance Gate 3 (quality-engineer) BLOCKING: this ordering is the fix
@@ -2269,7 +2394,7 @@ TEST_CASE("Echo #2361: the offline status reply leads with error|, not storage_s
     const auto lines = yuzu::echo::format_storage_offline_lines(/*query_engine_available=*/true);
     REQUIRE(lines.size() == 2);
     CHECK(lines[0].starts_with("error|"));
-    CHECK(lines[1] == "storage_state|offline");
+    CHECK(lines[1] == "storage_state|offline|rollback_wedged");
     CHECK(lines[0].find("echo sql") != std::string::npos);
 
     // And when the read-only connection is gone too, the line must NOT promise
@@ -2277,7 +2402,7 @@ TEST_CASE("Echo #2361: the offline status reply leads with error|, not storage_s
     const auto dark = yuzu::echo::format_storage_offline_lines(/*query_engine_available=*/false);
     REQUIRE(dark.size() == 2);
     CHECK(dark[0].starts_with("error|"));
-    CHECK(dark[1] == "storage_state|offline");
+    CHECK(dark[1] == "storage_state|offline|rollback_wedged");
     CHECK(dark[0].find("cannot read") != std::string::npos);
 }
 
