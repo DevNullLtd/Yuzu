@@ -106,7 +106,7 @@ cadences.
   | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — | — | — | — | — |
   | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | ✓ | — |
   | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the `PythonCore` registry tag (Windows), else `via:python` (always on Linux and macOS) | `IBM` | `Microsoft` | the build's self-reported `IMPLEMENTOR`, else `via:jvm` | `via:chocolatey` | `via:winget` | `via:appx` | provider, else signer, else `via:windows`; Linux `via:kernel_module` |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — | — | — | — | ✓ (Windows driver date) |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | epoch seconds (the receipt's install time; formulae only) | — | — | — | — | — | — | — | — | — | — | — | — | ✓ (Windows driver date) |
   | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — | — | — | — | `signed`/`unsigned`; empty = unknown |
   | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
@@ -134,13 +134,21 @@ cadences.
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
   verification. `distro_id`/`distro_version` are host-level (`/etc/os-release`
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
-  packages (they are installed). Machine-scope Homebrew
+  packages (they are installed). Machine-prefix Homebrew
   is collected through `pkg_inventory` with `ecosystem` `brew`: each formula is
   `kind` `pkg`, each cask `kind` `app` (`source` `pkg_inventory.packages`), plus
   one `kind` `app` row named `homebrew` (`publisher` `Homebrew`) with `source`
   `pkg_inventory.managers` that records Homebrew itself is present — one row however many prefixes
-  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
-  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew,
+  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). The formula and cask rows
+  are one per prefix, so a formula under both prefixes is two rows, each with its own
+  `install_location`; a formula row's `install_date` is its receipt's install time (a claim the
+  installing account wrote). A Homebrew a user installed in their own home (`~/homebrew`,
+  `~/.homebrew`) is listed by `pkg_inventory.packages` as a `user`-scope row that the sync never
+  collects: the sync is machine-scope. A user row carries the package, its version, the home
+  directory's name as its owner and the `~/` prefix only: its install time, tap and requested
+  flag are always `-`, because the agent opens no receipt under a user-owned prefix. The owner name
+  is command output: whoever can dispatch the action sees it, and every `Response:Read` holder sees
+  the stored rows for the response retention window, with no per-user erasure. Only Homebrew,
   Chocolatey and winget are mapped from `managers`: the Linux manager rows (dpkg,
   apt, rpm, dnf, pacman, apk, snap, flatpak) are read but not collected as
   software, and a
@@ -383,7 +391,7 @@ cadences.
   every cycle. The sectioned v3 blob stores `install_location` and keeps
   `uninstall_string` reserved (see "Install type, scope and location, and the
   sectioned report" below). This build's agent sends `install_location` (the Windows
-  `InstallLocation`, the macOS `.app` path) and never `uninstall_string`; since a path under a
+  `InstallLocation`, the macOS `.app` path, a Homebrew machine prefix) and never `uninstall_string`; since a path under a
   user's profile names an account, the location is an allowlist: the agent canonicalises the
   value (quotes, padding, doubled separators, `.` and `..` segments, the `\\?\` prefix and the
   macOS `/System/Volumes/Data` spelling) and keeps it, in one spelling (case is kept), only when it sits under a
@@ -556,7 +564,8 @@ database.
 - **`install_location`** is the folder the software was installed into, when the collector reports
   one. It is stored only from the v3 blob (the v2 blob's slot is ignored), so a device that has not
   yet sent a v3 report has none. The agent fills it for Windows applications (the registry's
-  `InstallLocation`) and macOS applications (the `.app` path); Linux packages, MSI products, store
+  `InstallLocation`), macOS applications (the `.app` path) and Homebrew formulae and casks (the
+  machine prefix, `/opt/homebrew` or `/usr/local`); Linux packages, MSI products, store
   packages and the other sources have no single install folder, so it is empty for them. Only a
   folder under a known machine root is sent (the allowlist above); a location outside those roots
   is blanked, and the row is still reported with its name, version and publisher.
@@ -610,7 +619,14 @@ section hash (an out-of-band change to the table) set the starting point and pro
 the last case is logged as a warning and, by decision, no counter or alert counts it. Removed
 software is simply deleted from the device's list; the history entry is the record that it was
 there. History older than 400 days is pruned, and decommissioning a device deletes its history
-and its components with it. The change
+and its components with it. A development or UAT database that already holds a Mac's Homebrew rows
+from an earlier build (not a supported starting point: a fresh database baselines instead) records
+one `remove` and one `install` for each of that Mac's Homebrew formula and cask rows, at an
+unchanged version, on its first sync from the build that fills `install_location`, because the
+location is part of a row's identity. The pair is recognisable (the same device, facet
+`pkg_inventory.packages`, name and version, one `observed_at`; there is no cause label), happens
+once per Mac and is pruned with the rest of the history after 400 days; see
+[Upgrading](upgrading.md), section 4. The change
 history is read through `GET /api/v1/inventory/software/changes` and the components through
 `GET /api/v1/inventory/software/components` (see the REST API reference; the MCP tool
 `query_software_components` answers the same question); the dashboard shows
@@ -1655,12 +1671,50 @@ could not be read for a reason other than the product not having it (or, as
 `windows:msi_prop:oversized`, the value was implausibly long); it behaves the same
 way. A token is cut at 64 bytes and characters outside `A-Z a-z 0-9 _ . : = , -` become `_`, so a long
 list of constraint tokens is shortened. The server keeps the latest status and token of each source
-per device; no server page or API returns them yet, so read the cause from the agent's own log. Fix
+per device and returns them through `GET /api/v1/inventory/software/plugin-health` (which facets
+fail) and `/hosts/{agent_id}` (the device's token per facet), described above under "Collection
+health, hosts and the change feed"; the full token list of a facet whose token was cut is the
+action's own status row, in the agent's log. Fix
 the failing action, or remove its plugin, and the next daily sync recovers; `timeout` and `busy`
 are the exception: a worker that never returns holds its plugin's flag across passes and
 reconnects, so recovery is the worker returning or an agent restart, and that restart is the
 3-second drain and exit code 3 described under "Sections and deltas" (expect the critical
 `collector worker(s) still inside a plugin` journal line).
+
+**A Mac's Homebrew software is marked unconfirmed, and the `pkg_inventory.packages` token names a
+user prefix (`macos:user_homes:...`, `macos:homebrew_user_prefix:...`,
+`macos:homebrew_user_cellar:...` or `macos:homebrew_user_caskroom:...`).**
+The agent also walks the `~/homebrew` and `~/.homebrew` prefixes of each home under `/Users`, and a
+failed read of any of them makes the whole `packages` answer constrained: the server keeps the
+device's stored Homebrew rows, shown as unconfirmed, and no other source is affected. Find the
+affected device from its unconfirmed Homebrew row (`GET /api/v1/inventory/software/plugin-health` shows
+only whether the facet is affected across the fleet and lists the ten slowest devices), read the
+token on `/hosts/{agent_id}`, and look
+the detail up here and in the plugin's README (`agents/plugins/pkg_inventory/README.md`, caveats 1
+and 4). The tokens never name a user or a path.
+
+| Token (after `macos:`) | Meaning | Remedy |
+|---|---|---|
+| `user_homes:mounts_unreadable` | The mount table could not be read, so no home is opened. | Clears when the table reads again. |
+| `user_homes:network_mount`, `homebrew_user_prefix:network_mount` | `/Users`, a home or a candidate prefix is on a network mount and is never touched. | None while it is mounted. |
+| `user_homes:not_a_directory` | `/Users` is a symlink and was refused. It constrains every run. (A symlinked home under `/Users` is skipped silently, as "not a home".) | Make `/Users` a real directory. |
+| `user_homes:permission_denied` | The agent cannot open `/Users` or a home: a non-root agent against another account's home (unless its group or an ACL admits it). | Run the agent as root, or remove the prefix (the section stays unconfirmed until then). |
+| `homebrew_user_prefix:owner_mismatch` | The prefix is not owned by its home's owner; nothing under it is opened. | Fix the ownership, or remove the prefix. |
+| `homebrew_user_prefix:owner_name_unsupported` | A home whose directory name has a non-ASCII, control, pipe or backslash character (or is over 255 bytes) holds a Cellar or Caskroom. | Rename the home, or remove the prefix. It never clears on its own. |
+| `homebrew_user_cellar:not_a_directory`, `homebrew_user_caskroom:not_a_directory` | The Cellar or Caskroom is a symlink or a file. | Replace it with a real directory, or remove it. |
+| `user_homes`, `homebrew_user_prefix`, `homebrew_user_cellar` or `homebrew_user_caskroom` with `permission_denied`, `symlink_refused` or `io_error` | The directory could not be opened. | Correct its permissions or links. |
+| the same four with `entry_cap`, `enumeration_error`, `row_cap`, `byte_cap` or `walk_budget` | A size or time bound stopped the walk (4,096 names per directory, 20,000 rows, 1 MiB of rows, 200,000 entries or 10 seconds per action). | Reduce what the prefix holds. |
+
+A local account can hold its own Homebrew section at "unconfirmed" this way; that is an accepted
+trade-off (README caveat 1). There is no switch for the user-prefix walk alone. The collection
+setting `plugins.pkg_inventory=false` and the plugin-wide kill switch each switch off all three
+`pkg_inventory` facets of the scheduled collection; an on-demand `pkg_inventory.packages` dispatch still
+walks the user homes unless the plugin kill switch is set (a kill switch set for one operating system or one action does not stop the
+daily collection; see [Collection settings](#collection-settings)); otherwise remove or re-own the
+prefix. A `timeout` or `busy` token recovers when the worker returns or the agent restarts (the
+paragraph above). The first sync of a build that fills `install_location` can also add one `remove`
+and one `install` per Homebrew row to a carried database's change feed; see [Upgrading](upgrading.md),
+section 4.
 
 **A device's Python (or IBM MQ, .NET or Java) rows are marked unconfirmed, but the rest of its
 software is still reported; the log shows `sync: runtimes.python constrained (<tokens>) — reported
