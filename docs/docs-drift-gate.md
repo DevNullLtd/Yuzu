@@ -134,7 +134,7 @@ to paste exemptions without thinking. That is why `gateway/**` is not in the see
 
 | Where | What |
 |---|---|
-| `docs-lint.yml` → `changelog-order` job (required) | fact parity + self-test, every PR and every push to dev/main |
+| `docs-lint.yml` → `docs-lint-changelog-docs` job (aggregated into the required "CHANGELOG order" check) | fact parity + self-test, every PR and every push to dev/main |
 | `doc-coupling.yml` → `doc-coupling-touch-rule` job | touch rule, pull requests only, re-run when the body is edited; advisory until made a required check |
 | meson `docs` suite | `docs drift gate`, `docs drift gate self-test` |
 | Claude Code `PreToolUse` hook (`scripts/hooks/docs-drift-pr-guard.py`) | both layers, when a Bash call runs `gh pr create` in command position; it reads `--base` and the body from `--body`/`--body-file`, and fails open on any error. PRs opened another way (the GitHub UI, the API, an MCP tool) rely on CI |
