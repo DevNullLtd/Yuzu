@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""Tripwire: the file_search plugin never reads a file's bytes, writes, or syncs; and the one-approval
-cover of a multi-slice read keeps its single production caller.
+"""Tripwire: the file_search plugin's sources spell no call that reads a matched file's bytes, writes,
+syncs or creates a file; and the one-approval cover of a multi-slice read keeps its single production
+caller.
 
-PART 1, the plugin sources. "A matched file is opened and never read, and a search never writes" is
-the plugin's first catastrophic clause. A unit test sees the pure request value (`fiemap_request()`),
+PART 1, the plugin sources. "A matched file is opened and never read, and a search never writes a file"
+is the plugin's first catastrophic clause (the plugin does write its output rows, through
+`write_output(`, which is not a file write). A unit test sees the pure request value (`fiemap_request()`),
 not the statement that copies it into the ioctl, and an open flag set is checked for set bits only
 (`O_RDONLY` is 0, so a bit test cannot see a write flag added beside it). Pinned lexically over
-`agents/plugins/file_search/src/*` and `agents/shared/file_search_*.hpp` (comments stripped):
+`agents/plugins/file_search/src/**` and `agents/shared/file_search_*` (comments stripped), as EXACT
+spellings, never a `write*` or `read_file*` prefix, so the plugin's own `write_output(` and
+`read_file_extents(` do not count:
 
-  - forbidden spellings: `FIEMAP_FLAG_SYNC` (it writes dirty pages back), `O_RDWR`, `O_WRONLY`, `pread`,
-    `mmap`, and `read(` as a call (not `thread(`, not `read_mounts(`);
+  - forbidden: `FIEMAP_FLAG_SYNC` (it writes dirty pages back); the open flags `O_RDWR`, `O_WRONLY`,
+    `O_CREAT`, `O_TRUNC`, `O_APPEND`; the calls `write`, `pwrite`, `pwrite64`, `writev`, `pwritev`,
+    `creat`; `fsync`, `fdatasync`, `syncfs`, `msync`, `sync`; `pread*` and `mmap*`; `fopen`, `fread`,
+    `fgets` and `[io]?fstream`; `readv`, `recv`, `recvfrom`, `recvmsg`; and the shared bounded readers
+    of posix_secure_read.hpp (`read_open_fd`, `read_file`, `read_file_at`, `read_file_no_follow`,
+    `read_file_no_follow_at`);
   - exactly one `read(` call, the `::read(` of the mount table reader in file_search_posix.cpp;
   - the extents request is built as `m->fm_flags = want.flags;` and that is the ONLY assignment to
     `fm_flags` in scope (the value is the pure builder's, which is flags 0).
@@ -17,18 +25,25 @@ not the statement that copies it into the ioctl, and an open flag set is checked
 PART 2, the cover. `ApprovalManager::covers_continuation` lets one spent ticket cover every later slice of
 a read. Its one production caller is the MCP `execute_instruction` arm, and the flag it sets
 (`approval_covers_continuation`) is read in two places in the same file. Pinned lexically over
-`server/core/src` (comments stripped): `covers_continuation(` occurs once each in approval_manager.hpp (the
-declaration), approval_manager.cpp (the definition) and mcp_server.cpp (the call), and in no other file;
+`server/core/src` and `server/core/include` (comments stripped): `covers_continuation(` occurs once each in
+approval_manager.hpp (the declaration), approval_manager.cpp (the definition) and mcp_server.cpp (the call);
+the bare name occurs 1, 2 (the definition, and a log line that names it) and 1 times in those three files, so
+a member pointer or a macro naming it is counted too; the name appears in no other file;
 `approval_covers_continuation` is named only in mcp_server.cpp, declared `false` once and assigned `true`
 once. A second caller is a security decision: see the #1398 row of .claude/routed-concerns-access-control.md.
 
-GREP LIMIT: lexical. The match open itself is in component_fs_posix.cpp (`open_match_file`), which also
-holds the scan leg's `pread_range`, so it is outside the scope above; the facts tests of that file and
-`tests/unit/test_posix_secure_read.cpp` (the open flags are read-only, checked with `O_ACCMODE`) cover
-it. The gate cannot see a call built at run time, a function pointer to `read`, or a syscall reached by
-number. `--selftest` appends each forbidden spelling, deletes each required statement and adds a second
-`::read(`, a second `fm_flags` write, a second `covers_continuation(` call and a second `= true` in
-memory, and requires the gate to name each.
+GREP LIMIT: lexical. The match open is `PosixFs::match_facts` in component_fs_posix.cpp, which opens the
+leaf through `shared::open_file_no_follow_at` (`kFileFlags` in posix_secure_read.hpp); that file also holds
+the scan leg's `PosixFs::open_file` and `pread_range`, so it is outside the scope above, and the facts
+tests of that file and `tests/unit/test_posix_secure_read.cpp` (the open flags are read-only, checked with
+`O_ACCMODE`) cover it. The gate cannot see a call built at run time, a function pointer to `read`, a
+syscall reached by number (the plugin's own `syscall(SYS_ioprio_set)` is one), an aliased store to
+`fm_flags` (a pointer to the field, then a store through it) or a byte-wise overwrite of the extent request
+(`memset`, `std::fill`, a struct assignment): the request buffer is value-initialised in
+file_search_extents_linux.cpp, written by the one counted statement, and the builder's value is pinned by
+the unit test of `fiemap_request()`. `--selftest` appends each forbidden spelling, deletes each required
+statement and adds a second `::read(`, a second `fm_flags` write, a second `covers_continuation(` call, a
+member pointer to it and a second `= true` in memory, and requires the gate to name each.
 
 Usage: python3 -I tests/test_file_search_source_tripwire.py [--selftest]
 """
@@ -38,21 +53,24 @@ import importlib.util
 import os
 import re
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 PLUGIN_SRC = os.path.join("agents", "plugins", "file_search", "src")
 SHARED = os.path.join("agents", "shared")
 SERVER_SRC = os.path.join("server", "core", "src")
+SERVER_INCLUDE = os.path.join("server", "core", "include")
 EXTENTS_LINUX = os.path.join(PLUGIN_SRC, "file_search_extents_linux.cpp")
 POSIX_CPP = os.path.join(PLUGIN_SRC, "file_search_posix.cpp")
 APPROVAL_HPP = os.path.join(SERVER_SRC, "approval_manager.hpp")
 APPROVAL_CPP = os.path.join(SERVER_SRC, "approval_manager.cpp")
 MCP_CPP = os.path.join(SERVER_SRC, "mcp_server.cpp")
-SRC_HINT = (" (this gate pins that the file_search plugin never reads a matched file, writes or syncs; "
-            "if a rule was legitimately changed, a content or hash read is a NEW action with its own "
-            "catalogue row: update agents/plugins/file_search/README.md and the routed-concerns "
-            "file_search row first, then tests/test_file_search_source_tripwire.py)")
+SRC_HINT = (" (this gate pins that the file_search plugin spells no call that reads a matched file's bytes, "
+            "writes, syncs or creates a file, the forbidden spellings listed in its docstring; if a rule was "
+            "legitimately changed, a content or hash read is a NEW action with its own catalogue row: update "
+            "agents/plugins/file_search/README.md and the routed-concerns file_search row first, then "
+            "tests/test_file_search_source_tripwire.py)")
 COVER_HINT = (" (this gate pins the one production caller of ApprovalManager::covers_continuation, the MCP "
               "execute_instruction arm; a second caller is a security decision recorded in the #1398 row of "
               ".claude/routed-concerns-access-control.md (Dispatch-caller approval provenance): update that "
@@ -68,7 +86,7 @@ sys.modules[_spec.name] = _sib
 _spec.loader.exec_module(_sib)
 canonical = _sib.canonical
 
-_SRC_EXTS = (".cpp", ".hpp", ".h", ".cc")
+_SRC_EXTS = (".cpp", ".hpp", ".h", ".cc", ".c", ".mm", ".inl")
 _ID = r"(?<![A-Za-z0-9_])"
 
 # ---- part 1 ----
@@ -77,12 +95,22 @@ _ID = r"(?<![A-Za-z0-9_])"
 SRC_FORBIDDEN: list[tuple[str, str, str]] = [
     ("fiemap-sync", _ID + r"FIEMAP_FLAG_SYNC\b",
      "the sync flag writes dirty pages back: a search must never cause a write"),
-    ("open-write-flag", _ID + r"O_RDWR\b|" + _ID + r"O_WRONLY\b",
-     "a file or directory is opened read-only, never for writing"),
+    ("open-write-flag", _ID + r"(?:O_RDWR|O_WRONLY|O_CREAT|O_TRUNC|O_APPEND)\b",
+     "a file or directory is opened read-only, never for writing, creating, truncating or appending"),
+    ("write-call", _ID + r"(?:write|pwrite|pwrite64|writev|pwritev|creat)\(",
+     "a search writes no file or descriptor (its rows go out through write_output(), which does not count)"),
+    ("sync-call", _ID + r"(?:fsync|fdatasync|syncfs|msync|sync)\(",
+     "a search never forces data to disk"),
     ("positional-read", _ID + r"pread\w*",
      "a matched file is opened and never read"),
     ("mapped-read", _ID + r"mmap\w*",
      "a matched file is opened and never mapped"),
+    ("stream-read", _ID + r"(?:fopen|fread|fgets)\(|" + _ID + r"[io]?fstream\b",
+     "a matched file is opened and never read through stdio or a stream"),
+    ("vector-read", _ID + r"(?:readv|recv|recvfrom|recvmsg)\(",
+     "a matched file is opened and never read"),
+    ("bounded-reader", _ID + r"(?:read_open_fd|read_file|read_file_at|read_file_no_follow|read_file_no_follow_at)\b",
+     "the shared bounded readers read a file's bytes: a matched file is opened and never read"),
 ]
 READ_CALL = re.compile(_ID + r"read\(")
 FM_FLAGS_WRITE = re.compile(_ID + r"fm_flags(?:<<|>>|[|&^+\-])?=(?!=)")
@@ -96,13 +124,13 @@ SRC_REQUIRED: list[tuple[str, str, str, str]] = [
 
 def _scope_files(root: str) -> list[str]:
     out: list[str] = []
-    plugin = os.path.join(root, PLUGIN_SRC)
-    for name in sorted(os.listdir(plugin)):
-        if name.endswith(_SRC_EXTS):
-            out.append(os.path.join(PLUGIN_SRC, name))
+    for dirpath, _dirs, files in sorted(os.walk(os.path.join(root, PLUGIN_SRC))):
+        for name in sorted(files):
+            if name.endswith(_SRC_EXTS):
+                out.append(os.path.relpath(os.path.join(dirpath, name), root))
     shared = os.path.join(root, SHARED)
     for name in sorted(os.listdir(shared)):
-        if name.startswith("file_search_") and name.endswith(".hpp"):
+        if name.startswith("file_search_") and name.endswith(_SRC_EXTS):
             out.append(os.path.join(SHARED, name))
     return out
 
@@ -150,20 +178,23 @@ NAME = re.compile(_ID + r"covers_continuation\b")
 FLAG = re.compile(_ID + r"approval_covers_continuation\b")
 FLAG_ASSIGN = re.compile(_ID + r"approval_covers_continuation=(?!=)(\w+)")
 CALL_SITES = {APPROVAL_HPP: 1, APPROVAL_CPP: 1, MCP_CPP: 1}
+# The bare name, string literals included (canonical() strips comments only): the cpp also names it in a log line.
+NAME_SITES = {APPROVAL_HPP: 1, APPROVAL_CPP: 2, MCP_CPP: 1}
 
 
 def load_server(root: str = REPO_ROOT) -> dict[str, str]:
-    """{path relative to the repo: canonical text} for every server source that mentions either name."""
+    """{path relative to the repo: canonical text} for every server source (src and include) that mentions either name."""
     out: dict[str, str] = {}
-    for dirpath, _dirs, files in os.walk(os.path.join(root, SERVER_SRC)):
-        for name in files:
-            if not name.endswith(_SRC_EXTS):
-                continue
-            full = os.path.join(dirpath, name)
-            with open(full, encoding="utf-8", errors="replace") as fh:
-                raw = fh.read()
-            if "covers_continuation" in raw:
-                out[os.path.relpath(full, root)] = canonical(raw)
+    for tree in (SERVER_SRC, SERVER_INCLUDE):
+        for dirpath, _dirs, files in os.walk(os.path.join(root, tree)):
+            for name in files:
+                if not name.endswith(_SRC_EXTS):
+                    continue
+                full = os.path.join(dirpath, name)
+                with open(full, encoding="utf-8", errors="replace") as fh:
+                    raw = fh.read()
+                if "covers_continuation" in raw:
+                    out[os.path.relpath(full, root)] = canonical(raw)
     return out
 
 
@@ -184,6 +215,13 @@ def cover_problems(texts: dict[str, str]) -> list[tuple[str, str]]:
             found.append(("cover-call-count", f"{path} holds {have} covers_continuation( occurrence(s); "
                           f"it must hold exactly {want} (the declaration, the definition, the one MCP "
                           f"call){COVER_HINT}"))
+    for path, want in NAME_SITES.items():
+        text = texts.get(path)
+        have = 0 if text is None else len(NAME.findall(text))
+        if have != want:
+            found.append(("cover-name-count", f"{path} names covers_continuation {have} time(s); it must name "
+                          f"it exactly {want} (a member pointer or a macro naming it is a second "
+                          f"caller){COVER_HINT}"))
     assigned = FLAG_ASSIGN.findall(texts.get(MCP_CPP, ""))
     if assigned != ["false", "true"]:
         found.append(("cover-flag-assign", f"{MCP_CPP} must declare approval_covers_continuation = false "
@@ -207,7 +245,7 @@ def selftest() -> int:
     src, srv = load_sources(), load_server()
     base = problems(src, srv)
     expect(base == [], "the real tree must pass the gate: " + "; ".join(m for _, m in base))
-    expect(len(SRC_FORBIDDEN) >= 4 and len(SRC_REQUIRED) >= 1, "the rule lists must not shrink silently")
+    expect(len(SRC_FORBIDDEN) >= 9 and len(SRC_REQUIRED) >= 1, "the rule lists must not shrink silently")
 
     def src_ids(extra_path: str, spelling: str, replace: dict[str, str] | None = None) -> set[str]:
         texts = dict(src, **(replace or {}))
@@ -216,9 +254,49 @@ def selftest() -> int:
 
     driver = os.path.join(PLUGIN_SRC, "file_search_driver.hpp")
     shared = os.path.join(SHARED, "file_search_governor.hpp")
+    expect(driver in src and shared in src, "scope: the driver and the shared governor header must be scanned")
+    with tempfile.TemporaryDirectory() as tmp:  # the scan walks subdirectories and reads every source extension
+        for rel in (os.path.join(PLUGIN_SRC, "sub", "deep.mm"), os.path.join(PLUGIN_SRC, "x.inl"),
+                    os.path.join(SHARED, "file_search_y.c"), os.path.join(SHARED, "other.hpp")):
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+            open(os.path.join(tmp, rel), "w").close()
+        scanned = set(_scope_files(tmp))
+        expect(scanned == {os.path.join(PLUGIN_SRC, "sub", "deep.mm"), os.path.join(PLUGIN_SRC, "x.inl"),
+                           os.path.join(SHARED, "file_search_y.c")},
+               f"scope: a subdirectory, .mm, .inl and .c source must be scanned, others not; scanned {sorted(scanned)}")
     for rid, spelling in (("fiemap-sync", "auto f = FIEMAP_FLAG_SYNC;"),
                           ("open-write-flag", "int a = O_RDWR;"),
                           ("open-write-flag", "int a = O_WRONLY | O_CLOEXEC;"),
+                          ("open-write-flag", "int a = O_RDONLY | O_CREAT;"),
+                          ("open-write-flag", "int a = O_RDONLY | O_TRUNC;"),
+                          ("open-write-flag", "int a = O_RDONLY | O_APPEND;"),
+                          ("write-call", "auto n = write(fd, b, 4);"),
+                          ("write-call", "auto n = ::pwrite(fd, b, 4, 0);"),
+                          ("write-call", "auto n = pwrite64(fd, b, 4, 0);"),
+                          ("write-call", "auto n = writev(fd, v, 2);"),
+                          ("write-call", "auto n = pwritev(fd, v, 2, 0);"),
+                          ("write-call", "int f = creat(p, 0600);"),
+                          ("write-call", "out.write(b, 4);"),
+                          ("sync-call", "fsync(fd);"),
+                          ("sync-call", "::fdatasync(fd);"),
+                          ("sync-call", "syncfs(fd);"),
+                          ("sync-call", "msync(p, 4, 0);"),
+                          ("sync-call", "sync();"),
+                          ("stream-read", "FILE* f = fopen(p, \"r\");"),
+                          ("stream-read", "auto n = fread(b, 1, 4, f);"),
+                          ("stream-read", "char* l = fgets(b, 4, f);"),
+                          ("stream-read", "std::ifstream in(p);"),
+                          ("stream-read", "std::ofstream out(p);"),
+                          ("stream-read", "std::fstream io(p);"),
+                          ("vector-read", "auto n = readv(fd, v, 2);"),
+                          ("vector-read", "auto n = recv(fd, b, 4, 0);"),
+                          ("vector-read", "auto n = recvfrom(fd, b, 4, 0, 0, 0);"),
+                          ("vector-read", "auto n = recvmsg(fd, &m, 0);"),
+                          ("bounded-reader", "auto r = sh::read_open_fd(fd, 4);"),
+                          ("bounded-reader", "auto r = sh::read_file(p, 4);"),
+                          ("bounded-reader", "auto r = sh::read_file_at(d, n, 4);"),
+                          ("bounded-reader", "auto r = sh::read_file_no_follow(p, 4);"),
+                          ("bounded-reader", "auto r = sh::read_file_no_follow_at(d, n, 4);"),
                           ("positional-read", "auto n = pread(fd, b, 4, 0);"),
                           ("positional-read", "auto n = pread64(fd, b, 4, 0);"),
                           ("mapped-read", "void* p = mmap(0, 4, 1, 1, fd, 0);"),
@@ -249,6 +327,11 @@ def selftest() -> int:
            "read-call: `thread(`, `read_mounts(` and a comparison of fm_flags must not count")
     expect("positional-read" not in src_ids(driver, "", {driver: src[driver] + canonical("spread(1); lpread = 2;")}),
            "positional-read: an identifier that merely contains `pread` must not count")
+    # The plugin's own names that begin with a pinned one are not the pinned call: exact spellings only.
+    own = canonical("write_output(a); write_row = 1; read_file_extents(p); sync_state(1); recv_buf = 2; "
+                    "fwrite_x(1); ifstream_like = 3; O_CREATED = 1; async(f); prewrite(1);")
+    own_ids = {r for r, _ in source_problems(dict(src, **{driver: src[driver] + own}))}
+    expect(own_ids == set(), f"scope: write_output(, read_file_extents( and the like must not count: {sorted(own_ids)}")
 
     # The required statement: deleted, or only mentioned in a comment, is named.
     for rid, path, snippet, _why in SRC_REQUIRED:
@@ -283,6 +366,13 @@ def selftest() -> int:
            "cover-caller-outside: a comment mention must not count")
     expect("cover-call-count" in srv_ids(dict(srv, **{MCP_CPP: mcp + canonical("auto c = approval_manager->covers_continuation(id, p);")})),
            "cover-call-count: a second call in mcp_server.cpp was NOT detected")
+    for what, spelling in (("a member pointer", "auto f = &ApprovalManager::covers_continuation;"),
+                           ("a macro", "#define COVER covers_continuation")):
+        for path in (MCP_CPP, APPROVAL_HPP, APPROVAL_CPP):
+            expect("cover-name-count" in srv_ids(dict(srv, **{path: srv.get(path, "") + canonical(spelling)})),
+                   f"cover-name-count: {what} naming covers_continuation in {path} was NOT detected")
+    expect(srv_ids(dict(srv, **{MCP_CPP: mcp + canonical("auto f = &ApprovalManager::covers_continuation;")})) == {"cover-name-count"},
+           "cover-name-count: a member pointer must be named by the name-count rule alone (the call count cannot see it)")
     expect("cover-call-count" in srv_ids(dict(srv, **{MCP_CPP: CALL.sub("covers_continuation_x(", mcp, count=1)})),
            "cover-call-count: deleting the one MCP call was NOT detected")
     for path in (APPROVAL_HPP, APPROVAL_CPP):

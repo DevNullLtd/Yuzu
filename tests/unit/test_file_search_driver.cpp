@@ -1141,6 +1141,72 @@ TEST_CASE("file_search driver: a listing that turns slow lengthens the next nap"
     CHECK(std::ranges::count_if(r.rows, [](const std::string& row) { return starts(row, "match|"); }) == 2);
 }
 
+namespace {
+
+std::size_t match_rows(const SliceResult& r) {
+    return static_cast<std::size_t>(std::ranges::count_if(r.rows, [](const std::string& row) { return starts(row, "match|"); }));
+}
+
+} // namespace
+
+TEST_CASE("file_search driver: the re-listings of a resumed slice are each paced by the duty cycle",
+          "[file_search][file_search_driver][pacing]") {
+    // MUTATION: deleting the gov.pace() call in the list wrapper leaves ONE nap (240 ms) for all four
+    // listings: a resumed slice lists its ancestors with no visit between them, so the visitor's own
+    // pace cannot take their naps.
+    Rig rig;
+    for (int i = 1; i <= 3; ++i)
+        rig.fs.add_file("/r/a/b/c/yuzu-fs-control-" + std::to_string(i) + ".bin", "");
+    rig.b.limits.max_entries = 4; // a, b, c and the first control: the first slice ends inside /r/a/b/c
+    const SliceResult first = checked_slice(make_request(kCtl), rig.b);
+    REQUIRE(first.status == Status::ok);
+    REQUIRE_FALSE(first.cursor.empty());
+    CHECK(match_rows(first) == 1);
+
+    rig.b.limits.max_entries = fsr::GovernorLimits{}.max_entries;
+    rig.fs.list_step = std::chrono::milliseconds{60}; // every listing is a whole work quantum (50 ms) of work
+    rig.fs.listed.clear();
+    std::vector<std::chrono::milliseconds> sleeps;
+    rig.b.sleep = [&rig, &sleeps](std::chrono::milliseconds d) {
+        sleeps.push_back(d);
+        rig.fs.clock += d;
+    };
+    const SliceResult second = checked_slice(make_request(kCtl, "/r", "files", first.cursor), rig.b);
+    CHECK(second.status == Status::ok);
+    CHECK(match_rows(second) == 2);
+    CHECK(rig.fs.listed == Strs{"/r", "/r/a", "/r/a/b", "/r/a/b/c"}); // the whole path back to the resume point
+    // Three naps before the re-listings of /r/a, /r/a/b and /r/a/b/c, one at the first entry after them: the
+    // plain duty nap of 60 ms each, with no back-off (the listings are evenly fast).
+    CHECK(sleeps == std::vector<std::chrono::milliseconds>(4, std::chrono::milliseconds{60}));
+}
+
+TEST_CASE("file_search driver: slow re-listings of a resumed slice do not use up the slice before it reaches new work",
+          "[file_search][file_search_driver][pacing]") {
+    // MUTATION: handing every listing to the governor (dropping the `resumed`/`visited` test in the list
+    // wrapper) lets eleven 300 ms listings double the back-off to its cap and sleep the slice away before
+    // the first new entry: the second slice finds nothing and the search can only stall.
+    Rig rig;
+    const std::string deep = "/r/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10";
+    for (int i = 1; i <= 3; ++i)
+        rig.fs.add_file(deep + "/yuzu-fs-control-" + std::to_string(i) + ".bin", "");
+    rig.b.limits.max_entries = 11; // d1..d10 and the first control: the first slice ends inside d10
+    const SliceResult first = checked_slice(make_request(kCtl), rig.b);
+    REQUIRE(first.status == Status::ok);
+    REQUIRE_FALSE(first.cursor.empty());
+    CHECK(match_rows(first) == 1);
+
+    rig.b.limits.max_entries = fsr::GovernorLimits{}.max_entries;
+    rig.list_hook = [&rig](const std::string&) {
+        rig.fs.clock += std::chrono::milliseconds{300}; // over the hard bound (250 ms): every listing is slow
+    };
+    rig.fs.listed.clear();
+    const SliceResult second = checked_slice(make_request(kCtl, "/r", "files", first.cursor), rig.b);
+    CHECK(rig.fs.listed.size() == 11); // /r and the ten below it
+    CHECK(second.status == Status::ok);
+    CHECK(match_rows(second) == 2);
+    CHECK(second.reason == "none");
+}
+
 TEST_CASE("file_search driver: no name the walk visited appears in an emitted cursor row",
           "[file_search][file_search_driver]") {
     const std::vector<std::string> names = {"home", "alice-smith", "tax-return-2025.pdf"};

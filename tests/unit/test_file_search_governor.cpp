@@ -402,7 +402,7 @@ TEST_CASE("governor: the pause never exceeds the cap, the deadline or half of th
 }
 
 TEST_CASE("governor: a healthy disk paces exactly as the duty cycle always has", "[file_search][governor]") {
-    // Every listing here is over slow_list_floor, within slow_list_ratio of the fastest so far and under
+    // Every listing here is over slow_list_floor, within slow_list_ratio of the fastest in the ring and under
     // slow_list_hard, so none is slow by the rule. That is what a healthy disk means: no listing is slow.
     const std::vector<milliseconds> took = {milliseconds{30}, milliseconds{40}, milliseconds{25},
                                             milliseconds{35}, milliseconds{45}, milliseconds{28},

@@ -5485,11 +5485,13 @@ test('file_search read tier tripwire selftest',
   timeout: 60,
 )
 
-# The file_search plugin sources never read a matched file, write or sync (no FIEMAP sync flag, no write
-# open flag, no pread, mmap or read call beyond the mount table reader, one fm_flags assignment), and
-# ApprovalManager::covers_continuation keeps its one production caller, the MCP execute_instruction arm.
-# The self-test mutates the sources in memory and requires each mutation to be named. Both also run in
-# .github/workflows/docs-lint.yml on every PR.
+# The file_search plugin sources spell no call that reads a matched file's bytes, writes, syncs or creates
+# a file (the pinned spellings are listed in the script's docstring: the FIEMAP sync flag, the write,
+# create, truncate and append open flags, write, sync, stdio, stream, vectored, receive, pread and mmap
+# calls, the shared bounded readers, any read call beyond the mount table reader, and a second fm_flags
+# assignment), and ApprovalManager::covers_continuation keeps its one production caller, the MCP
+# execute_instruction arm. The self-test mutates the sources in memory and requires each mutation to be
+# named. Both also run in .github/workflows/docs-lint.yml on every PR.
 test('file_search source tripwire',
   _python3_test,
   args: [files('test_file_search_source_tripwire.py')],

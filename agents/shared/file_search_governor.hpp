@@ -8,7 +8,10 @@
  * a per-entry call is cheap and a 50,000-entry flat listing is paced like any other work.
  *
  * What is measured: the driver times each directory listing with the same injected clock and hands
- * the span to note_listing(). Nothing else is measured, and nothing is read from the clock there.
+ * the span to note_listing(). Nothing else is measured, and nothing is read from the clock there. The
+ * driver does not hand over the listings of a resumed slice that only retrace the path back to its
+ * resume point (no entry has been visited yet, so they reach nothing new): those are paced by the plain
+ * duty cycle, and the back-off judges the listings of new work.
  * The rule: a listing is slow when it takes at least slow_list_hard, or when it takes at least
  * slow_list_floor and at least slow_list_ratio times the fastest of this slice's last kLatencyRing
  * listings (the baseline adapts: a slow listing is stored too, so an evenly slow disk stops counting
@@ -23,7 +26,7 @@
  * What "healthy" means here: a disk on which no listing is slow by the rule above, and nothing more.
  * The span is the whole listing, not divided by its entry count, and the baseline includes listings
  * served from cache, so a very large directory, or a cold listing after cached ones, can read as slow
- * on a disk that is not saturated. The cost is bounded: one work_quantum added to a nap after an
+ * on a disk that is not saturated. The cost is bounded: at most one work_quantum added to a nap after an
  * isolated slow listing, dropped by the next listing that is not slow (one quantum halves to less
  * than a quantum); a run of slow listings doubles it up to max_backoff_pause. On seek-bound media
  * with a cold cache that could hold a search well under half duty. Reasoned, not measured.

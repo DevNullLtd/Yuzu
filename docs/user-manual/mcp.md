@@ -1334,9 +1334,10 @@ other tool or action nothing below applies: one approval, one call.
   the ticket can repeat an earlier token while the cover lasts and so re-run that slice, and the
   approver's role is not checked again for each slice.
 - **A spent approval cannot be withdrawn.** Nothing reviews, expires or revokes a ticket once it is
-  spent. The cover ends early only when the plugin's kill switch is turned off or the caller loses
-  the permission to dispatch (every call re-checks `Execution:Execute`); withdrawal is tracked in
-  #8501.
+  spent. Turning the plugin's kill switch off, or removing the caller's `Execution:Execute` (every
+  call re-checks it), refuses each slice while it lasts but does not end the cover: restoring either
+  before the cover's own end (24 hours from first use, or the approval's 7-day lifetime) lets the
+  same ticket cover slices again. Withdrawal is tracked in #8501.
 - **The next token reaches only a reader of the Forensics tier.** The agent's next token comes
   back to a caller only as the stored `cursor` row, which is in the Forensics read tier, and the
   live output publishes nothing for a Forensics-tier plugin. A non-administrator who holds the
