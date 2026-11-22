@@ -8710,7 +8710,7 @@ groups:
       # `increase`, not `delta`: it is a counter, and increase() handles the reset a restart
       # causes. The server pre-seeds the counter to 0 at boot, so the first quarantine reads as
       # an increase from 0; a series whose first sample is already 1 shows no increase (pinned by
-      # case D), so the pre-seed is load-bearing. A replica that goes stale and returns at 0
+      # CORRUPTION CASE 5), so the pre-seed is load-bearing. A replica that goes stale and returns at 0
       # (a rolling restart) adds nothing, so no uptime guard is needed. `sum by (job)` makes one
       # alert per job however many replicas recorded one. `for: 0m`: a quarantine is an event; a
       # sustained condition would never clear. Warning, not critical: the value is

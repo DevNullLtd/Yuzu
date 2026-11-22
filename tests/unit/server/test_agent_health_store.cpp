@@ -2933,12 +2933,15 @@ TEST_CASE("EchoCorruptionAuditGate: a throwing lookup releases only its own agen
     REQUIRE(gate.should_log("b", "2:g")); // b holds its slot across a's failing lookup
     REQUIRE_THROWS_AS(gate.should_log("a", "1:f"), std::runtime_error);
     CHECK_FALSE(inner_b);
-    CHECK_FALSE(gate.should_log("b", "2:g")); // b's slot is untouched by a's throw
+    CHECK_FALSE(gate.should_log("b", "2:g")); // refused by the window a's throw opened
     // A throwing store opens the degraded window like a degraded answer, so it is not retried
     // on every heartbeat: with the clock unchanged a is refused ...
     CHECK_FALSE(gate.should_log("a", "1:f"));
-    // ... and a's slot was released, not stranded: admitted again once the window ends.
     clock += kEchoCorruptionAuditDegradedRetry;
+    // ... once the window ends only b's held slot can refuse b: a's throw released a's slot
+    // alone ...
+    CHECK_FALSE(gate.should_log("b", "2:g"));
+    // ... and a's slot was released, not stranded.
     CHECK(gate.should_log("a", "1:f"));
     gate.mark_logged("a", "1:f");
     gate.mark_logged("b", "2:g");
