@@ -17,6 +17,12 @@
 /// rather than risk destroying evidence. Only the main file's name is claimed this way; a
 /// sidecar's quarantine name is derived from that exclusively claimed name (`<claimed>-wal`), so
 /// the plain exists-then-rename step used for sidecars cannot collide with another recovery.
+/// A sidecar that cannot be renamed is copied only when no directory entry of any kind (a
+/// dangling link included, examined without following it) is at its quarantine name. At a
+/// quarantine name the sidecar step deletes only a partial copy it just wrote there, at a name
+/// that was free when checked, subject to the by-name residual below: the removal acts on
+/// whatever entry is at the name when it runs. (The rename itself replaces a dangling link found
+/// at the name: such a link reads as absent to the exists check before the rename.)
 /// An interruption between the link and the remove (a crash, or a failed undo) leaves the file
 /// under both names: a POSIX open quarantines it again under the next free name, while the
 /// Windows Echo open refuses until the `.corrupt-<epoch>` name is removed (the second link reads
@@ -43,11 +49,31 @@
 /// the claim: a replaced regular file is a recorded residual on that platform (SQLite holds its
 /// files without FILE_SHARE_DELETE, so a live database another process has open cannot lose its
 /// name there; unproven until the MSVC leg runs).
-/// Three residuals remain on POSIX. The original is re-examined and then dropped by name, and
+/// Five residuals remain on POSIX. The original is re-examined and then dropped by name, and
 /// POSIX has no unlink-if-same-inode, so a second recovery that drops the name AND creates a new
 /// file at it inside that gap loses its file (two agent processes on one data directory are
 /// unsupported). The release of a claim that is not the judged file is also by name, so a file a
 /// third party put at the claimed name between the re-check and the release loses that name.
+/// The sidecar copy is by descriptor on POSIX: the sidecar is opened `O_NOFOLLOW` (a link
+/// swapped in at its live name is refused, never copied through) and must be a regular file, and
+/// the bytes go to a temporary beside the quarantine name (`<name>.partial-<pid>-<n>`, outside the
+/// name grammar below, so it is never counted or pruned) and are linked into
+/// place with `link(2)` only when complete: an entry of any kind that appears at the quarantine
+/// name (a link included) is neither overwritten nor written through, and a process that dies
+/// mid-copy leaves at most a stray temporary, never a truncated file at the quarantine name (the
+/// stray is not swept, and it is not evidence: it never holds the whole sidecar. The one exception
+/// is a publish refused by anything but an existing entry, which KEEPS the complete copy at its
+/// temporary name and logs where). What stays by name is the publish (the `link(2)` from
+/// the temporary to the quarantine name is by name at both ends, so a writer who replaces the
+/// temporary between its creation and the link has their entry published, and on macOS `link(2)` follows a
+/// link at its source), the removal of the temporary after a failed copy (a unique name this call
+/// created; a third party who swaps a link or an empty directory in at it between the failure and
+/// the removal loses it; a failed removal of the temporary after the link is not reported and leaves
+/// a second, inert name for the same file) and the final drop of the original sidecar. On Windows
+/// the copy is the standard library's `copy_file`, by name at both ends: it follows a link at the
+/// source, and a file put at the destination inside the gap is not proven safe (unverified until
+/// the Windows leg runs), and a crash mid-copy there can leave a truncated file at the quarantine
+/// name. All of it needs write access to the data directory.
 /// A HARD link planted at the name is a regular file with its target's identity,
 /// so it is judged, claimed and secured as that target: the open that judged it had already used
 /// it as the database (pre-existing; Linux protected_hardlinks refuses a link to a file the
@@ -63,6 +89,7 @@
 /// Names have the exact form `<file><suffix><epoch>[-<n>]` (suffix `.corrupt-` or `.planted-`),
 /// which `parse_quarantine_name` / `prune_old_quarantines` (below) rely on.
 
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -81,8 +108,12 @@
 
 #ifndef _WIN32
 #include <fcntl.h>
+#include <posix_secure_read.hpp> // yuzu::shared::ScopedFile: the fd owner (agents/shared has no core edge)
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
+
+#include <cerrno>
 #endif
 
 namespace yuzu::shared::sqlite_quarantine {
@@ -146,7 +177,216 @@ struct FsOps {
     /// Drop a name: the original after a claim, or the claim itself when it is given back
     /// (default: `std::filesystem::remove`).
     std::function<void(const std::filesystem::path& name, std::error_code&)> remove;
+    /// Copy a sidecar when it could not be moved. Default on POSIX: a copy by descriptor (the source
+    /// opened `O_NOFOLLOW`, the bytes written at mode 0600 to a temporary beside the destination,
+    /// fsynced and linked into place only when complete; a failed read, write or publish removes the
+    /// temporary, a failed flush keeps the complete copy and the note says so); default on Windows:
+    /// `std::filesystem::copy_file` with `copy_options::none`, which fails rather than overwrite.
+    /// When set it replaces the whole default. It is only called when no directory entry of any
+    /// kind, a dangling link included, exists at `to`. When it fails with anything but
+    /// `file_exists` and leaves a regular file at `to`, that partial file is removed, best effort,
+    /// and the note says whether it was.
+    std::function<void(const std::filesystem::path& from, const std::filesystem::path& to,
+                       std::error_code&)>
+        copy;
 };
+
+namespace detail {
+
+/// The part of a failed-copy note that says what became of a partial copy at `where`.
+inline std::string removal_note(const std::error_code& removal, const std::filesystem::path& where) {
+    return removal ? std::format("; the partial copy could not be removed from {} ({})",
+                                 where.string(), removal.message())
+                   : std::string{"; the partial copy was removed"};
+}
+
+/// The note for a sidecar that could not be preserved. `kept_as` is non-empty when the copy was
+/// complete and only its publish failed: that copy is kept under that name and the note says so.
+inline std::string failed_copy_note(const std::filesystem::path& side,
+                                    const std::filesystem::path& side_dest, const std::string& cause,
+                                    const std::string& partial_note, const std::string& kept_as) {
+    if (!kept_as.empty())
+        return std::format("could not publish {} as {} ({}); the complete copy was kept as {}",
+                           side.string(), side_dest.string(), cause, kept_as);
+    return std::format("could not preserve {} as {} ({}); its content is not kept{}", side.string(),
+                       side_dest.string(), cause, partial_note);
+}
+
+} // namespace detail
+
+#ifndef _WIN32
+namespace detail {
+
+/// The infix of a copy's temporary name (`<destination>.partial-<pid>-<n>`); outside the quarantine
+/// name grammar, so `parse_quarantine_name` never matches it.
+inline constexpr std::string_view kPartialInfix = ".partial-";
+
+/// What a descriptor copy left behind: `created` is true when THIS call made a file (the `O_EXCL`
+/// create of the temporary succeeded; false again when the publish found an entry that is not
+/// ours at the destination), and `removal` is the result of removing that temporary by name after
+/// a failure. `unsynced` is true when every byte was written but flushing the file to disk
+/// failed: the complete copy is KEPT (`sync_error` says why) and the call still succeeds.
+struct PartialCopy {
+    bool created = false;
+    std::error_code removal;
+    bool unsynced = false;
+    std::error_code sync_error;
+    std::filesystem::path temporary; // the temporary's path, set once it is created
+    bool kept = false; // the copy is complete but its publish failed: it is KEPT at `temporary`
+};
+
+/// Removes the temporary of a descriptor copy when it leaves scope unless dismissed, and records the
+/// result in `out`. Constructed right after the exclusive create (it neither throws nor allocates)
+/// so that no path out of the copy, an exception included, can leave the temporary behind. The
+/// armed rule: the create succeeded, so this call made the file.
+class TemporaryRemoval {
+public:
+    TemporaryRemoval(const std::filesystem::path& path, std::error_code& out) noexcept
+        : path_(path), out_(out) {}
+    TemporaryRemoval(const TemporaryRemoval&) = delete;
+    TemporaryRemoval& operator=(const TemporaryRemoval&) = delete;
+    ~TemporaryRemoval() {
+        if (armed_)
+            std::filesystem::remove(path_, out_);
+    }
+    void dismiss() noexcept { armed_ = false; }
+
+private:
+    const std::filesystem::path& path_;
+    std::error_code& out_;
+    bool armed_ = true;
+};
+
+/// The default publish: a hard link, which fails with `file_exists` for any entry at `link`.
+inline void hard_link(const std::filesystem::path& target, const std::filesystem::path& link,
+                      std::error_code& ec) noexcept {
+    std::filesystem::create_hard_link(target, link, ec);
+}
+
+/// Copy `from` to `to` by descriptor. `from` is opened `O_NOFOLLOW` (a link at the name fails with
+/// ELOOP) and must be a regular file. The bytes go to a TEMPORARY file beside `to`
+/// (`<to>.partial-<pid>-<n>`, created `O_EXCL|O_NOFOLLOW` at mode 0600; a name outside the
+/// quarantine grammar, so `parse_quarantine_name` and `prune_old_quarantines` never count it) in
+/// bounded chunks (EINTR retried, short writes continued), then the temporary is fsynced (EINTR
+/// retried) and published with `link(2)`, which fails with `file_exists` for an entry of ANY kind at
+/// `to`, a link included, and never follows one: nothing is overwritten or written through, and a
+/// file appears at `to` only when it is COMPLETE, so a process that dies mid-copy leaves at most a
+/// stray temporary, never a truncated file at the quarantine name. A failure to read, write or
+/// publish removes the temporary, which this call provably made, by name and `partial` says so; a
+/// failed fsync does NOT: the complete copy is kept and `partial.unsynced` reports it, because the
+/// earlier `copy_file` never flushed and a finished copy is better evidence than none. The temporary's
+/// create is by descriptor but the publish and the removals are by name (a writer of the data
+/// directory could replace the temporary between its creation and the link; see the banner). A link
+/// that fails with anything but `file_exists` keeps the complete copy (`partial.kept`).
+/// `write_fn`, `fsync_fn` and `link_fn` are test seams.
+inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
+                                       const std::filesystem::path& to, std::error_code& ec,
+                                       PartialCopy& partial,
+                                       ssize_t (*write_fn)(int, const void*, std::size_t) = &::write,
+                                       int (*fsync_fn)(int) = &::fsync,
+                                       void (*link_fn)(const std::filesystem::path&,
+                                                       const std::filesystem::path&,
+                                                       std::error_code&) = &hard_link) {
+    ec.clear();
+    partial = {};
+    // O_NONBLOCK: a FIFO swapped in at the name must fail the regular-file check, not block the open.
+    const int in = ::open(from.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (in < 0) {
+        ec.assign(errno, std::generic_category());
+        return;
+    }
+    const yuzu::shared::ScopedFile src{in};
+    struct stat st {};
+    if (::fstat(src.fd(), &st) != 0) {
+        ec.assign(errno, std::generic_category());
+        return;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        ec = std::make_error_code(std::errc::not_supported); // not a regular file: nothing created
+        return;
+    }
+    // Never create the file at its final name: a crash mid-copy would leave a truncated file there
+    // that reads as the real evidence. A counter and the pid make the temporary's name unique; a
+    // collision (a stale temporary of an earlier crash) just takes the next counter value.
+    // The suffix adds 12 to 30 bytes to the name: a quarantine name within that many bytes of the
+    // filesystem's component limit fails with ENAMETOOLONG here (the two callers' names are about
+    // 30 to 43 bytes, so it is unreachable in tree).
+    static std::atomic<unsigned> counter{0};
+    std::filesystem::path tmp;
+    int out = -1;
+    for (int attempt = 0; attempt < 8 && out < 0; ++attempt) {
+        tmp = to;
+        tmp += std::format("{}{}-{}", kPartialInfix, ::getpid(), counter.fetch_add(1));
+        out = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (out < 0 && errno != EEXIST)
+            break;
+    }
+    if (out < 0) {
+        ec.assign(errno, std::generic_category());
+        return;
+    }
+    partial.created = true;
+    TemporaryRemoval cleanup{tmp, partial.removal};
+    bool ok = true;
+    {
+        const yuzu::shared::ScopedFile dst{out};
+        partial.temporary = tmp; // allocates: after both owners exist, so nothing leaks on bad_alloc
+        char buf[64 * 1024];
+        for (;;) {
+            const ssize_t n = ::read(src.fd(), buf, sizeof buf);
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0) {
+                ec.assign(errno, std::generic_category());
+                ok = false;
+                break;
+            }
+            if (n == 0)
+                break;
+            for (ssize_t off = 0; off < n;) {
+                const ssize_t w = write_fn(dst.fd(), buf + off, static_cast<std::size_t>(n - off));
+                if (w < 0 && errno == EINTR)
+                    continue;
+                if (w <= 0) { // an error, or a write that made no progress
+                    ec.assign(w < 0 ? errno : ENOSPC, std::generic_category());
+                    ok = false;
+                    break;
+                }
+                off += w;
+            }
+            if (!ok)
+                break;
+        }
+        if (ok) {
+            int rc = 0;
+            do {
+                rc = fsync_fn(dst.fd());
+            } while (rc != 0 && errno == EINTR);
+            if (rc != 0) { // keep the complete copy; the caller's note says it may not be durable
+                partial.unsynced = true;
+                partial.sync_error.assign(errno, std::generic_category());
+            }
+        }
+    }
+    if (!ok)
+        return; // `cleanup` removes the temporary
+    // Publish: a hard link fails with EEXIST for an entry of any kind at `to` and follows none.
+    link_fn(tmp, to, ec);
+    if (ec) {
+        if (ec == std::errc::file_exists) {
+            partial.created = false; // not ours: nothing of this call's is at the quarantine name
+        } else {
+            // The copy is complete and synced and the original sidecar is dropped next: keep it.
+            cleanup.dismiss();
+            partial.kept = true;
+        }
+    }
+    // On success `cleanup` removes the temporary name; a failure there is not reported and
+    // leaves a second, inert name for the same file (recorded in the banner).
+}
+
+} // namespace detail
+#endif
 
 struct QuarantineResult {
     /// The main file's new path, or nullopt when the main file was NOT quarantined (the caller
@@ -296,10 +536,14 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
 /// cannot be renamed is COPIED to its quarantine name (never over an existing file) and the
 /// original then removed, so the fresh database can neither replay a stale WAL nor lose the
 /// evidence; if even the copy fails the original is still removed (a note says the evidence was
-/// lost) because replaying it is worse. If that remove also fails a stale sidecar survives
-/// beside the fresh file: the Echo caller's post-reopen integrity check is the backstop. The
-/// moved files are then set owner-only, best effort (0600 on POSIX; a read-only-attribute
-/// toggle on Windows).
+/// lost) because replaying it is worse. The copy runs only when NO directory entry of any kind
+/// (a dangling link included, examined without following it) exists at the quarantine name;
+/// otherwise nothing is copied or removed there. A copy that ran and failed part-way has its
+/// partial file at that name removed where possible (it was free when checked, so it is not
+/// another recovery's evidence); the note says whether it was. If the removal of the original
+/// also fails a stale sidecar survives beside the fresh file: the Echo caller's post-reopen
+/// integrity check is the backstop. The moved files are then set owner-only, best effort (0600
+/// on POSIX; a read-only-attribute toggle on Windows).
 /// Two recorded limits of the sidecar step. It is exists-then-rename on the derived name, so a
 /// writer of the directory who squats `<claimed>-wal` ahead of time makes the rename and the copy
 /// fail and the sidecar is removed under the rule above, its content not kept. And on Windows the
@@ -308,7 +552,7 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
 /// the directory's inherited ACL makes it. A caller that protects its database with its own DACL
 /// re-applies it to the quarantine set itself, as the Echo caller does (echo_db.cpp,
 /// secure_quarantined_sidecars); this header does not. A sidecar that is a link is never copied
-/// (`copy_file` would read its target): it is removed and its content not kept, like a failed
+/// (its target is not the evidence): it is removed and its content not kept, like a failed
 /// copy. `judged` is the main file's identity the caller read at the name right after it opened
 /// the file (BINDING above); nullopt reads it here.
 [[nodiscard]] inline QuarantineResult
@@ -398,19 +642,77 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
             continue;
         }
         // Rename failed: preserve by copy (fails rather than overwrite), then drop the original.
-        // Never through a link: copy_file follows one, and a link's target is not the evidence.
+        // Never through a link: a link's target is not the evidence.
+        // The copy runs only when no entry of any kind (a dangling link included) is at the
+        // destination, examined without following a link. That keeps a link out of an injected
+        // copy and of Windows' copy_file (its own exists check follows one); the POSIX descriptor
+        // copy also refuses it itself (its link(2) publish fails with EEXIST for any entry at the
+        // name). A link's target is not ours to write.
         std::error_code cec = std::make_error_code(std::errc::not_supported);
-        if (is_regular_file_no_follow(side))
-            fs::copy_file(side, side_dest, fs::copy_options::none, cec);
+        bool copy_ran = false;
+#ifndef _WIN32
+        detail::PartialCopy by_fd; // set only when the default (descriptor) copy ran
+#endif
+        if (is_regular_file_no_follow(side)) {
+            std::error_code dec;
+            const auto dest_status = fs::symlink_status(side_dest, dec);
+            if (dest_status.type() != fs::file_type::not_found) {
+                // Something is at the name, or it could not be examined: either way it is not
+                // ours to write or remove. An examination that failed outright (type none) says
+                // so rather than reporting a file that may not exist.
+                cec = fs::status_known(dest_status)
+                          ? std::make_error_code(std::errc::file_exists)
+                          : (dec ? dec : std::make_error_code(std::errc::io_error));
+            } else {
+                cec.clear();
+                copy_ran = true;
+                if (ops.copy)
+                    ops.copy(side, side_dest, cec);
+#ifndef _WIN32
+                else
+                    detail::copy_sidecar_by_descriptor(side, side_dest, cec, by_fd);
+#else
+                else
+                    fs::copy_file(side, side_dest, fs::copy_options::none, cec);
+#endif
+            }
+        }
         if (cec) {
-            result.notes.push_back(std::format(
-                "could not preserve {} as {} ({}); its content is not kept", side.string(),
-                side_dest.string(), cec.message()));
+            std::string partial_note;
+            std::string kept_as;
+            // A copy that failed part-way (disk full) can leave a truncated file at the name that
+            // was free when this call checked it; a truncated sidecar is not evidence and would
+            // pass for the real one. file_exists means the entry is not ours: never removed.
+#ifndef _WIN32
+            if (copy_ran && !ops.copy) {
+                // The descriptor copy cleaned up after itself, or kept the complete copy.
+                if (by_fd.kept)
+                    kept_as = by_fd.temporary.string();
+                else if (by_fd.created)
+                    partial_note = detail::removal_note(by_fd.removal, by_fd.temporary);
+            } else
+#endif
+                if (copy_ran && cec != std::errc::file_exists &&
+                    is_regular_file_no_follow(side_dest)) {
+                std::error_code pec;
+                fs::remove(side_dest, pec);
+                partial_note = detail::removal_note(pec, side_dest);
+            }
+            result.notes.push_back(detail::failed_copy_note(side, side_dest, cec.message(),
+                                                            partial_note, kept_as));
         } else {
             secure(side_dest);
+            std::string sync_note;
+#ifndef _WIN32
+            if (copy_ran && !ops.copy && by_fd.unsynced)
+                sync_note = std::format("; flushing it to disk failed ({}), so it may not be "
+                                        "durable",
+                                        by_fd.sync_error.message());
+#endif
             result.notes.push_back(std::format("copied {} to {} because it could not be renamed "
-                                               "({})",
-                                               side.string(), side_dest.string(), mec.message()));
+                                               "({}){}",
+                                               side.string(), side_dest.string(), mec.message(),
+                                               sync_note));
         }
         std::error_code rm;
         fs::remove(side, rm);
