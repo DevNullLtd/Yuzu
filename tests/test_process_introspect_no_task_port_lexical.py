@@ -101,6 +101,19 @@ def self_check() -> list[str]:
     for bad in bad_shapes:
         if not findings("self", bad):
             errs.append(f"self-check: did not flag {bad!r}")
+    # Every banned name, spelled out here and not read back from the regexes above, so a typo in
+    # any one regex alternative leaves its name unflagged and fails (mach_vm_ stands for the family).
+    banned_names = (
+        "task_for_pid", "task_read_for_pid", "task_inspect_for_pid", "task_name_for_pid",
+        "processor_set_tasks", "mach_vm_region", "mach_vm_read", "vm_region_64",
+        "vm_region_recurse_64", "vm_read", "vm_read_overwrite", "task_threads", "task_info",
+        "dlsym", "dlopen", "ptrace", "ReadProcessMemory", "run_bounded_subprocess",
+        "subprocess_runner", "proc_pidpath", "proc_name", "proc_regionfilename",
+        "proc_pidfdinfo", "proc_listpids", "proc_pid_rusage", "sysctlnametomib",
+    )
+    for name in banned_names:
+        if not findings("self", f"{name}(x);"):
+            errs.append(f"self-check: did not flag the banned name {name!r}")
     good_shapes = (
         'proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &pbi, PROC_PIDTBSDINFO_SIZE);',
         'struct proc_bsdinfo pbi;',

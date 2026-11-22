@@ -1153,7 +1153,7 @@ TEST_CASE("process_introspect macOS: nice value edges", "[process_introspect]") 
 
 TEST_CASE("process_introspect macOS: no fault ever reads as supported or torn", "[process_introspect]") {
     static const std::regex shape{R"(^[a-z_]+(\|[a-z0-9_.,:-]+)*$)"};
-    std::vector<MacFake> fakes(8);
+    std::vector<MacFake> fakes(12);
     fakes[1].info.err = ESRCH;
     fakes[2].info.err = EPERM;
     fakes[3].info.err = EIO;
@@ -1161,19 +1161,28 @@ TEST_CASE("process_introspect macOS: no fault ever reads as supported or torn", 
     fakes[5].boot = io(EPERM);
     fakes[6].boot = ok("zzzzzzzz");
     fakes[7].info.nice = 99;
-    for (const auto& fk : fakes) {
-        for (const auto& name : kFacetNames) {
-            const auto f = parse_facet(name);
-            REQUIRE(f.has_value());
-            const auto r = run_mac(fk, *f);
-            INFO(name);
-            CHECK(r.status != StatusState::supported);
-            CHECK(r.reason.find("torn_read") == std::string::npos);
-            if (r.status != StatusState::unavailable && r.status != StatusState::permission_denied &&
-                r.status != StatusState::unsupported)
-                CHECK_FALSE(r.rows.empty());
-            for (const auto& row : r.rows)
-                CHECK(std::regex_match(row, shape));
+    fakes[8].info.err = EACCES;
+    fakes[9].info.err = EINVAL;
+    fakes[10].info.start_usec = 1000000;
+    fakes[11].boot = io(EIO);
+    // "" is no guard; the well-formed token "0123abcd.1" never matches a fake's own, so it
+    // sweeps the pid_reused branch.
+    for (const std::string& start_time : {std::string{}, std::string{"0123abcd.1"}}) {
+        for (const auto& fk : fakes) {
+            for (const auto& name : kFacetNames) {
+                const auto f = parse_facet(name);
+                REQUIRE(f.has_value());
+                const auto r = run_mac(fk, *f, start_time);
+                INFO(name);
+                INFO(start_time);
+                CHECK(r.status != StatusState::supported);
+                CHECK(r.reason.find("torn_read") == std::string::npos);
+                if (r.status != StatusState::unavailable && r.status != StatusState::permission_denied &&
+                    r.status != StatusState::unsupported)
+                    CHECK_FALSE(r.rows.empty());
+                for (const auto& row : r.rows)
+                    CHECK(std::regex_match(row, shape));
+            }
         }
     }
 }
