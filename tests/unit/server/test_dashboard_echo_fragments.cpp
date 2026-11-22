@@ -2312,6 +2312,26 @@ TEST_CASE("fragment purge/reenable (#2532): a repeat inside the 30 s window answ
         // Another source is its own window.
         CHECK(h.post(request_path, "device_id=dev-A&source=tcp")->status == 200);
         CHECK(h.calls.size() == calls_before + 2);
+
+        // A repeat that arrives while a request is still in flight is refused too: the key is
+        // held from the gate's admission. The dispatch hook posts the same pair from inside the
+        // first request.
+        const auto calls_in_flight = h.calls.size();
+        bool nested = false;
+        std::unique_ptr<httplib::Response> during;
+        h.on_dispatch = [&] {
+            if (nested)
+                return;
+            nested = true;
+            during = h.post(request_path, "device_id=dev-A&source=service");
+        };
+        CHECK(h.post(request_path, "device_id=dev-A&source=service")->status == 200);
+        h.on_dispatch = nullptr; // after the post: clearing it inside the running hook frees it
+        REQUIRE(during != nullptr);
+        CHECK(during->status == 429);
+        CHECK(during->get_header_value("Retry-After") ==
+              std::to_string(echo_source::EchoActionCooldown::kWindowSec));
+        CHECK(h.calls.size() == calls_in_flight + 1); // only the first request dispatched
     }
 }
 
@@ -2431,6 +2451,23 @@ TEST_CASE("echo action cooldown (#2532): a request holds its key, a dispatch sta
         }
         CHECK(c.try_acquire("new", 110) == kWindow);
         CHECK_FALSE(c.try_acquire("new", 130).has_value());
+    }
+    SECTION("a deadline more than one window ahead of now was stamped before the clock stepped "
+            "back and counts as ended") {
+        EchoActionCooldown c;
+        REQUIRE_FALSE(c.try_acquire("k", 0).has_value());
+        c.commit("k", 100000);
+        CHECK(c.try_acquire("k", 100000) == kWindow); // exactly one window ahead is live
+        CHECK_FALSE(c.try_acquire("k", 96400).has_value());
+    }
+    SECTION("a full map of deadlines stamped before a clock step back admits a new key") {
+        EchoActionCooldown c;
+        for (std::size_t i = 0; i < EchoActionCooldown::kCap; ++i) {
+            const auto key = "ahead-" + std::to_string(i);
+            REQUIRE_FALSE(c.try_acquire(key, 0).has_value());
+            c.commit(key, 100000);
+        }
+        CHECK_FALSE(c.try_acquire("new", 0).has_value());
     }
 }
 

@@ -26,7 +26,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <utility>
 
 namespace yuzu::server::echo_source {
 
@@ -176,7 +175,9 @@ static_assert(refusal_detail(ScopedGateOutcome::RbacReadDegraded, true)
 /// the dispatch. `Slot` ends the hold in its destructor.
 ///
 /// The clock is a parameter and the class never reads one. The mutex guards map operations only
-/// and is never held across an audit write or a dispatch.
+/// and is never held across an audit write or a dispatch. The callers pass the wall clock, so a
+/// deadline more than one window ahead of `now` was stamped before the clock stepped back and
+/// counts as ended.
 ///
 /// State is per server process and lost on restart: N replicas allow N dispatches per window.
 /// The map is bounded: with `kCap` keys held or inside their window, every further purge and
@@ -196,14 +197,14 @@ public:
         if (const auto it = slots_.find(key); it != slots_.end()) {
             if (it->second == kHeld)
                 return kWindowSec;
-            if (now < it->second)
+            if (live(it->second, now))
                 return std::max<std::int64_t>(1, it->second - now);
             it->second = kHeld; // the window ended: this caller holds it now
             return std::nullopt;
         }
         if (slots_.size() >= kCap) {
             std::erase_if(slots_, [now](const auto& kv) {
-                return kv.second != kHeld && kv.second <= now;
+                return kv.second != kHeld && !live(kv.second, now);
             });
             if (slots_.size() >= kCap)
                 return kWindowSec;
@@ -228,8 +229,15 @@ public:
     /// recorded and by `release` otherwise. Construct it on the line after the acquire.
     class Slot {
     public:
-        Slot(EchoActionCooldown& cooldown, std::string key)
-            : cooldown_(cooldown), key_(std::move(key)) {}
+        Slot(EchoActionCooldown& cooldown, const std::string& key) : cooldown_(cooldown) {
+            // A failed construction runs no destructor, so it releases the hold itself.
+            try {
+                key_ = key;
+            } catch (...) {
+                cooldown_.release(key);
+                throw;
+            }
+        }
         Slot(const Slot&) = delete;
         Slot& operator=(const Slot&) = delete;
         Slot(Slot&&) = delete;
@@ -255,6 +263,11 @@ public:
 private:
     /// A request holds the key. Never an epoch second.
     static constexpr std::int64_t kHeld = std::numeric_limits<std::int64_t>::max();
+
+    /// A committed deadline still binds: ahead of @p now by no more than one window.
+    static constexpr bool live(std::int64_t deadline, std::int64_t now) {
+        return now < deadline && deadline - now <= kWindowSec;
+    }
 
     std::mutex mu_;
     std::unordered_map<std::string, std::int64_t> slots_; ///< kHeld, or the second the window ends

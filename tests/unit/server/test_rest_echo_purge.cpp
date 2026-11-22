@@ -587,7 +587,9 @@ TEST_CASE("REST purge: every refusal and outage counts under its own result on s
     h.revoke_on_requested = true;
     h.scope_refusal = ScopedGateOutcome::Unavailable;
     expect("unavailable at the recheck", "infra_unavailable", 503);
+    CHECK(h.audits.back().result == "failure");
     CHECK(h.audits.back().detail.rfind("scoped_gate_unavailable device=dev-A source=process cid=", 0) == 0);
+    CHECK(h.calls.empty()); // fail closed: nothing was dispatched
     reset();
     h.revoke_on_requested = true;
     h.scope_refusal = ScopedGateOutcome::MgmtGroupReadDegraded;
@@ -595,12 +597,15 @@ TEST_CASE("REST purge: every refusal and outage counts under its own result on s
     CHECK(h.audits.back().result == "failure");
     CHECK(h.audits.back().detail.rfind(
               "store_unavailable store=mgmt_group_store device=dev-A source=process cid=", 0) == 0);
+    CHECK(h.calls.empty());
     reset();
     h.revoke_on_requested = true;
     h.scope_refusal = ScopedGateOutcome::RbacReadDegraded;
     expect("RBAC read degraded at the recheck", "store_unavailable", 403);
+    CHECK(h.audits.back().result == "failure");
     CHECK(h.audits.back().detail.rfind(
               "store_unavailable store=rbac_store device=dev-A source=process cid=", 0) == 0);
+    CHECK(h.calls.empty());
     reset();
 
     // The caller stops resolving after the requested row.
