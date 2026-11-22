@@ -32,7 +32,7 @@
 #include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
-#include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "live_model.hpp" // the ONE live-read kind table + wire-format parsers (pure; #2146)
 #include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
@@ -713,7 +713,7 @@ static std::string reply_dispatch_denied(httplib::Response& res, const std::stri
 
 // Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
 // The wire-format parsing (kind table + field extraction) is shared with the
-// dashboard HTML path via live_kinds.hpp so the two cannot drift (governance S2);
+// dashboard HTML path via live_model.hpp so the two cannot drift (governance S2);
 // this only maps the parsed fields to JSON. The agent sanitizes '|'/CR/LF out of
 // every field, and the parser is bounds-safe on any input regardless.
 std::string live_result_json(const std::string& kind, const std::string& output) {
@@ -4457,8 +4457,8 @@ void RestApiV1::register_routes(
     // POST /api/v1/bundles — dispatch (async). Returns the correlation id; poll
     // GET /api/v1/bundles/{id} for the collated result.
     sink.Post("/api/v1/bundles",
-              [auth_fn, scoped_perm_fn, audit_fn, bundle_orch,
-               exec_visible_fn](const httplib::Request& req, httplib::Response& res) {
+              [auth_fn, scoped_perm_fn, audit_fn, bundle_orch, exec_visible_fn,
+               metrics_registry](const httplib::Request& req, httplib::Response& res) {
                   // K-R6-01/CDX-R5-02: a bundle targets ONE device, so
                   // authorization is the per-target scoped gate on agent_id
                   // (below, once parsed) -- NOT the targetless global
@@ -4506,10 +4506,16 @@ void RestApiV1::register_routes(
                       res.set_content(detail::a4_error(res, "steps is required"), "application/json");
                       return;
                   }
-                  auto specs = validate_bundle_steps(body["steps"].dump());
+                  auto specs = validate_bundle_steps_typed(body["steps"].dump());
                   if (!specs) {
+                      if (specs.error().kind == BundleStepsError::Kind::kParamKeyInvalid) {
+                          // sg10 / UP-1: counted and audited like every other ingress refusal.
+                          count_param_key_invalid(metrics_registry, "bundle");
+                          (void)audit_fn(req, "bundle.dispatch", "denied", "Execution", "",
+                                         std::string("reason=") + std::string(kReasonParamKeyInvalid));
+                      }
                       res.status = 400;
-                      res.set_content(detail::a4_error(res, "steps: " + specs.error()), "application/json");
+                      res.set_content(detail::a4_error(res, "steps: " + specs.error().message), "application/json");
                       return;
                   }
                   auto session = auth_fn(req, res);
@@ -19907,7 +19913,7 @@ void RestApiV1::register_routes(
             // The label is the closed set {uptime, processes, unknown} (docs/user-manual/metrics.md):
             // `kind` is caller-chosen text, so an unresolved one is recorded as `unknown`, never as
             // itself (one series per distinct string a caller sends).
-            const auto lk = live::resolve_kind(kind);
+            const auto lk = live::resolve_rest_kind(kind);
             const std::string kind_label = lk ? kind : "unknown";
             struct OutcomeRecorder {
                 yuzu::MetricsRegistry* reg;

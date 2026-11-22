@@ -32,7 +32,7 @@ spec:
       expected_hash:
         type: string
         displayName: Expected SHA256 Hash
-        description: Optional SHA256 hash for verification.
+        description: Optional SHA256 hash (hex, case-insensitive) the downloaded body must match before anything is written. Without it the response must declare its length (Content-Length, or chunked framing) so a truncated transfer is refused.
   result:
     columns:
       - name: status
@@ -47,12 +47,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: size
         type: int64
-        description: 'Size in bytes of the downloaded file on disk, read back with std::filesystem::file_size after the write completes. Values: non-negative integer, bytes.'
+        description: 'Size in bytes of the downloaded body, which is the size of the file now at the destination (the body is held in memory, verified, then written in one atomic replace). Values: non-negative integer, bytes.'
         example: 559
         platforms: [windows, linux, darwin]
       - name: hash
         type: string
-        description: 'Lowercase hex SHA-256 digest of the downloaded file, computed via BCrypt on Windows and OpenSSL EVP on Linux/macOS. Values: 64-character lowercase hex string.'
+        description: 'Lowercase hex SHA-256 digest of the downloaded body (the shared in-memory SHA-256, identical on every OS), the value compared with expected_hash before anything is written. Values: 64-character lowercase hex string.'
         example: ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d
         platforms: [windows, linux, darwin]
   approval:
@@ -100,8 +100,18 @@ spec:
         platforms: [windows, linux, darwin]
       - name: body
         type: string
-        description: 'Response body text; a body over the 100 MiB cap is replaced with an error string, though the full response is already received over the wire before that check runs. Values: free text, or an error string on failure.'
+        description: 'Response body text, at most the first 1 MiB (a longer body is cut at a character boundary and a truncated row follows); NUL, LF, CR, any other control byte below 0x20 except TAB, and invalid UTF-8 bytes are replaced with ? and a constrained row reports how many. Values: free text, or an error string on failure.'
         example: '<!doctype html><html lang="en"><head><title>Example Domain</title>...'
+        platforms: [windows, linux, darwin]
+      - name: constrained
+        type: string
+        description: 'Present only when body bytes were replaced: body_bytes_replaced:<count> of NUL, LF, CR, other control bytes below 0x20 except TAB, or invalid UTF-8 bytes. Values: body_bytes_replaced:<count>.'
+        example: 'body_bytes_replaced:3'
+        platforms: [windows, linux, darwin]
+      - name: truncated
+        type: int64
+        description: 'Present only when the body was cut at the cap: the cap in bytes (1048576). The status is still the peer status and the exit code is unchanged. Values: 1048576.'
+        example: 1048576
         platforms: [windows, linux, darwin]
   approval:
     mode: auto
