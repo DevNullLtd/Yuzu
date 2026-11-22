@@ -81,8 +81,8 @@
 /// (`delete_set`, `gc_sweep`) writes nothing: its header is gone and every cached copy reads
 /// `NotFound`. The constructor checks that the four triggers are present, ENABLE ALWAYS, of v7's
 /// shape and bound to v7's function bodies; when they are not, or the check cannot be read, it
-/// retains nothing, so every read takes the joined read, and logs an error when caching is
-/// enabled (a nonzero budget).
+/// retains nothing, so every read takes the joined read. The status check logs database errors;
+/// the constructor also reports unusable triggers when the cache budget is nonzero.
 /// A writer that bypasses triggers (`ALTER TABLE ... DISABLE TRIGGER`, `pg_restore
 /// --disable-triggers`), or that writes `membership_generation` directly, while servers are
 /// running breaks the invariant; every replica must then be restarted
@@ -247,8 +247,9 @@ struct PendingSet {
 };
 
 /// Typed failure surface; the REST layer maps these to the error taxonomy
-/// (RESULT_SET_NOT_FOUND, RESULT_SET_NOT_OWNER, RESULT_SET_QUOTA, PIN_LIMIT,
-/// RESULT_SET_EXPIRED) and the corresponding HTTP status.
+/// (RESULT_SET_NOT_FOUND, RESULT_SET_NOT_OWNER, RESULT_SET_QUOTA, PIN_LIMIT)
+/// and the corresponding HTTP status. RESULT_SET_EXPIRED is reserved; scope use of an
+/// expired set returns NotFound.
 enum class ResultSetError {
     NotFound,
     NotOwner,
@@ -340,7 +341,7 @@ public:
     /// migration on a pinned lease. `is_open()` is false if the lease was
     /// empty or the migration failed. Zero cache budget disables retention.
     /// The clock supplies replica wall time in Unix seconds. Tests can supply a clock
-    /// independent of PostgreSQL to exercise TTL boundaries.
+    /// independent of PostgreSQL to exercise TTL boundaries. An empty callback uses the system clock.
     explicit ResultSetStore(pg::PgPool& pool,
                             std::size_t member_cache_bytes = kDefaultMemberCacheBytes,
                             std::function<int64_t()> epoch_seconds = system_epoch_seconds);

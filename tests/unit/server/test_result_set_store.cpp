@@ -1274,6 +1274,27 @@ TEST_CASE("ResultSetStore: a store opened without the re-stamp triggers in force
                  "result_set_store.result_set_members_restamp(); " +
                  always + "result_set_members_restamp_trunc";
     }
+    SECTION("a conditional INSERT trigger") {
+        exec_sql(db.dsn(), "DROP TRIGGER result_set_members_restamp_ins ON "
+                           "result_set_store.result_set_members; "
+                           "CREATE TRIGGER result_set_members_restamp_ins AFTER INSERT ON "
+                           "result_set_store.result_set_members REFERENCING NEW TABLE AS added "
+                           "FOR EACH STATEMENT WHEN (false) EXECUTE FUNCTION "
+                           "result_set_store.result_set_members_restamp(); " +
+                               always + "result_set_members_restamp_ins");
+        repair = "UPDATE public.schema_meta SET version = 6 WHERE store = 'result_set_store'";
+    }
+    SECTION("an UPDATE trigger with different transition names") {
+        exec_sql(db.dsn(), "DROP TRIGGER result_set_members_restamp_upd ON "
+                           "result_set_store.result_set_members; "
+                           "CREATE TRIGGER result_set_members_restamp_upd AFTER UPDATE ON "
+                           "result_set_store.result_set_members "
+                           "REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows "
+                           "FOR EACH STATEMENT EXECUTE FUNCTION "
+                           "result_set_store.result_set_members_restamp(); " +
+                               always + "result_set_members_restamp_upd");
+        repair = "UPDATE public.schema_meta SET version = 6 WHERE store = 'result_set_store'";
+    }
     SECTION("a DELETE trigger recreated with a WHEN clause that never fires") {
         exec_sql(db.dsn(), "DROP TRIGGER result_set_members_restamp_del ON "
                            "result_set_store.result_set_members; "
@@ -1476,12 +1497,14 @@ TEST_CASE("ResultSetStore: membership and GC agree when the server and PostgreSQ
 }
 
 TEST_CASE("ResultSetStore: admission and its quota preflight agree at the replica TTL boundary",
-          "[pg][result_set][member_cache][clock_skew]") {
+          "[pg][result_set][clock_skew]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     const auto database_now = std::stoll(
         query_scalar(db.dsn(), "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint"));
-    int64_t server_now = database_now + GENERATE(-86400, 86400);
+    const int skew_seconds = GENERATE(-86400, 86400);
+    CAPTURE(skew_seconds);
+    int64_t server_now = database_now + skew_seconds;
     ResultSetStore store{pool, ResultSetStore::kDefaultMemberCacheBytes,
                          [&server_now] { return server_now; }};
     exec_sql(db.dsn(), "INSERT INTO result_set_store.result_sets "
@@ -2101,8 +2124,9 @@ TEST_CASE("ResultSetStore: GC sweep stops a pass at the member-row budget",
             "INSERT INTO result_set_store.result_sets "
             "(id, owner_principal, created_at, ttl_at, last_used_at, source_kind, "
             "source_payload, device_count) VALUES "
+            "('rs_budget0', 'alice', 1, 2, 1, 'manual_curate', '{}', -1000000), "
+            "('rs_budget2', 'alice', 1, 2, 1, 'manual_curate', '{}', 3000000), "
             "('rs_budget1', 'alice', 1, 2, 1, 'manual_curate', '{}', 3000000), "
-            "('rs_budget2', 'alice', 1, 3, 1, 'manual_curate', '{}', 3000000), "
             "('rs_budget3', 'alice', 1, 4, 1, 'manual_curate', '{}', 2000000), "
             "('rs_budget4', 'alice', 1, 5, 1, 'manual_curate', '{}', 9000000), "
             "('rs_budget5', 'alice', 1, 6, 1, 'manual_curate', '{}', 0)")};
@@ -2110,7 +2134,12 @@ TEST_CASE("ResultSetStore: GC sweep stops a pass at the member-row budget",
         REQUIRE(r.ok());
     }
 
-    CHECK(store.gc_sweep() == 1); // 3M fits; 3M + 3M does not
+    // A malformed out-of-band negative count gives no extra budget. On equal TTL the
+    // smaller ID wins, even though budget2 was inserted before budget1.
+    CHECK(store.gc_sweep() == 2);
+    CHECK_FALSE(get_ok(store, "rs_budget0").has_value());
+    CHECK_FALSE(get_ok(store, "rs_budget1").has_value());
+    CHECK(get_ok(store, "rs_budget2").has_value());
     CHECK(store.gc_sweep() == 2); // 3M + 2M is exactly the budget (inclusive); adding 9M is not
     CHECK_FALSE(get_ok(store, "rs_budget1").has_value());
     CHECK_FALSE(get_ok(store, "rs_budget2").has_value());

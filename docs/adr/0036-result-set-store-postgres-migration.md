@@ -446,5 +446,10 @@ the triggers.
 Also in this change: an unpinned set past `ttl_at` is refused (`NotFound`) by `member_set_owned`
 before `gc_sweep` deletes it, judged on the serving replica's clock (the clock that writes
 `ttl_at` and that `gc_sweep` deletes by). The admission quota and its preflight count pinned
-sets and unexpired sets on that same clock. `get`, `members`, `list_by_owner` and `resolve_alias`
+sets and unexpired sets on that same clock. Clock synchronization between replicas still matters:
+preflight and admission on different replicas can disagree near expiry. A forward step can make
+old sets stop counting before the collector's clock guard permits deletion; repeated jumps can
+grow that backlog. A backward step can keep sets in the count longer. The quota remains a soft
+admission guard. Moving the store's clock authority to PostgreSQL is tracked in
+[#2914](https://github.com/DevNullLtd/Yuzu/issues/2914). `get`, `members`, `list_by_owner` and `resolve_alias`
 continue to return an expired, unswept set.

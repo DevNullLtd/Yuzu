@@ -51,11 +51,9 @@ All of these are RAII and scoped to a test case:
 - Pool leases (`pool.acquire()`).
 - Per-statement `PgResult`.
 
-`std::vector<std::thread> readers` in the parallel-reader case is joined in a loop before the
-assertions. A `std::system_error` from a later `emplace_back` would `std::terminate` while earlier
-threads are still joinable. That is test-process only, in the same class as cs9-1, and recorded
-in the run ledger as `corr-2`.
-
+`std::vector<std::jthread> readers` in the parallel-reader case joins before the assertions.
+Each captured local outlives the vector. If a later thread cannot start, earlier threads join
+during unwinding (commit `4c6b286b68`, finding `corr-2`).
 
 ## Later commits
 
@@ -72,3 +70,35 @@ in the run ledger as `corr-2`.
 - **`07eb23ab56`, `e084d7b0cf`, `d3e45ade99`, and this corrections pass.** In
   `server/core/src/result_set_store.cpp` these change comments only. `e084d7b0cf` also changes
   test data and assertions. None of them adds or changes a resource.
+
+- **`a274e5cdd8` and `4c6b286b68`.** Each store owns its copied or moved epoch callback. Production uses a stateless function. The skew tests declare their clock variable before the stores, which destroy their callbacks before that variable leaves scope. The concurrency test at `4c6b286b68` uses `std::vector<std::jthread>` and joins before examining the results. During unwinding each constructed thread is joined before the captured inputs, expected sets, atomics, store and pool go out of scope (closing `corr-2`).
+
+The quota check binds an owned string containing replica time. Its query result and pool
+lease retain their existing RAII owners. An empty clock callback selects the stateless system
+clock. The quota regression's local two-connection pool outlives the store, and its
+`server_now` outlives the store's borrowed capture. The SQL helpers' `PgConn` and `PgResult`
+objects release on return or unwinding. The extra trigger-shape sections use the same pool and
+statement wrappers as the existing trigger fixtures.
+
+## Review and test evidence
+
+The historical JSONL entries that cite scratch files under `/private/tmp/yuzu-gov-fix-cache12` refer to these preserved reports. Each covers the commits identified inside it.
+
+- [Initial run report](d3e45ade99-result-set-membership-cache.8zrqzB.evidence/run-report.md)
+- [Gate 8 coverage addendum](d3e45ade99-result-set-membership-cache.8zrqzB.evidence/gate8-final-coverage-addendum-2026-11-21.md)
+- [Corrections review](d3e45ade99-result-set-membership-cache.8zrqzB.evidence/final-corrections-review.md)
+- [Earlier Linux PostgreSQL and Meson runs](d3e45ade99-result-set-membership-cache.8zrqzB.evidence/linux-test-evidence.md)
+
+On 2026-11-22 Big Tam built the normal GCC 15 Meson `yuzu_server_tests` target from `580a0b8ba7` and exercised live PostgreSQL with the following commands. The database connection string was supplied via `YUZU_TEST_POSTGRES_DSN`.
+
+```sh
+ninja -C build-linux -j12 tests/yuzu_server_tests
+build-linux/tests/yuzu_server_tests '[clock_skew]' --reporter compact
+build-linux/tests/yuzu_server_tests --filenames-as-tags '[#test_result_set_store]' --reporter compact
+meson test -C build-linux -j4 --suite server --print-errorlogs
+```
+
+| Source revision | Clock skew | Complete result-set store file | Meson server suite |
+|---|---|---|---|
+| `580a0b8ba7` | 1 case, 40 assertions passed | 58 cases, 1,497 assertions passed | 26 passed, 0 failed, 5 Node-dependent entries skipped |
+| `4c6b286b68` | 2 cases, 74 assertions passed | 59 cases, 1,531 assertions passed | All 31 passed, zero failed or skipped, with Node available |

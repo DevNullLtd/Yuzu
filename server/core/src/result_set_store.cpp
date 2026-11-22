@@ -1104,8 +1104,8 @@ std::expected<int, ResultSetError> ResultSetStore::count_for_owner_checked(
     // OVER-counts relative to the authoritative check and could reject a
     // dispatch the authoritative check would have allowed (a stalled GC
     // sweep converting GC debt into a spurious operator quota failure).
-    // Keeping the two predicates identical means this pre-check predicts the
-    // authoritative check exactly.
+    // Both calls use the same predicate and replica clock. Time or the rows may change
+    // before admission performs its own authoritative read.
     pg::PgResult res = pg::exec_params(
         lease.get(), kCountActiveForOwner,
         std::vector<std::string>{owner, std::to_string(epoch_seconds_())});
@@ -1772,7 +1772,7 @@ int ResultSetStore::gc_sweep() {
             conn,
             "DELETE FROM result_set_store.result_sets WHERE id IN ("
             "SELECT id FROM ("
-            "SELECT id, row_number() OVER w AS n, sum(device_count) OVER w AS rows_through "
+            "SELECT id, row_number() OVER w AS n, sum(GREATEST(device_count, 0)) OVER w AS rows_through "
             "FROM (SELECT id, ttl_at, device_count FROM result_set_store.result_sets "
             "WHERE pinned = false AND ttl_at < $1::bigint "
             "ORDER BY ttl_at ASC, id ASC LIMIT $2) cohort "

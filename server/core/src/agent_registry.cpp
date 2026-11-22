@@ -2388,10 +2388,11 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                                         "failed");
                     const bool owner_check_failed = mem.error() == ResultSetError::NotFound ||
                                                     mem.error() == ResultSetError::NotOwner;
-                    spdlog::error("AgentRegistry::evaluate_scope: member_set_owned {} for "
-                                  "result-set '{}' (owner={}) — aborting scope evaluation",
-                                  owner_check_failed ? "owner-check failed" : "degraded", rsid,
-                                  owner);
+                    spdlog::log(owner_check_failed ? spdlog::level::warn : spdlog::level::err,
+                                "AgentRegistry::evaluate_scope: member_set_owned {} for "
+                                "result-set '{}' (owner={}) — aborting scope evaluation",
+                                owner_check_failed ? "not found, not owned or expired" : "degraded",
+                                rsid, owner);
                     return std::unexpected(
                         ScopeEvalError{owner_check_failed ? ScopeEvalError::Kind::OwnerCheckFailed
                                                           : ScopeEvalError::Kind::StoreDegraded,
