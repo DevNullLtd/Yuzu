@@ -1471,7 +1471,7 @@ TEST_CASE("group-from-results: a Search term needs the results table's Response:
         // Filters alone are unaffected by the missing gate.
         CHECK(h.post(GroupFromResultsHarness::form_body("unwired-filters"))->status == 200);
     }
-    SECTION("admitted: the gate runs once per request on the Search path, and scoping still applies") {
+    SECTION("admitted: one gate call on the preview, two on the POST; scoping still applies") {
         h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
             return std::set<std::string>{"agent-A"};
         };
@@ -1483,7 +1483,8 @@ TEST_CASE("group-from-results: a Search term needs the results table's Response:
 
         auto res = h.post(q_form_body("q-admitted", "&q=a"));
         CHECK(res->status == 200);
-        CHECK(h.fleet_read_calls == 2);
+        // The POST decides it before the attempted row and again after it (#7112).
+        CHECK(h.fleet_read_calls == 3);
         auto group = h.mg.find_group_by_name("q-admitted");
         REQUIRE(group.has_value());
         CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
