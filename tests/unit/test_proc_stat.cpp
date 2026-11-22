@@ -3,6 +3,7 @@
 
 #include "proc_stat.hpp"
 
+#include <sstream>
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
@@ -14,6 +15,7 @@
 using yuzu::shared::classify_pid;
 using yuzu::shared::is_sha256_digest;
 using yuzu::shared::parse_stat_start_ticks;
+using yuzu::shared::read_stat_start_ticks;
 using yuzu::shared::PidState;
 using yuzu::shared::same_process;
 using yuzu::shared::settle_row_for;
@@ -39,6 +41,17 @@ TEST_CASE("parse_stat_start_ticks: a command name holding a newline still yields
     CHECK(parse_stat_start_ticks("9 (a\n) S 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 77 1 1\n") == 77u);
     // The first line alone has no closing ')' and is refused: why reading one line was wrong.
     CHECK_FALSE(parse_stat_start_ticks("9 (evil").has_value());
+}
+
+TEST_CASE("read_stat_start_ticks: reads past a newline in the command name",
+          "[proc_stat][processes]") {
+    // The reader, not the parser, is what once stopped at the first line.
+    std::istringstream with_newline("9 (a\nb) S 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 31337 1 1\n");
+    CHECK(read_stat_start_ticks(with_newline) == 31337u);
+    std::istringstream two_newlines("9 (\n\n) S 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5 1 1\n");
+    CHECK(read_stat_start_ticks(two_newlines) == 5u);
+    std::istringstream empty("");
+    CHECK_FALSE(read_stat_start_ticks(empty).has_value());
 }
 
 TEST_CASE("same_process: only an equal, known start time keeps a row", "[proc_stat][processes]") {

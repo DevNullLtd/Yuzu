@@ -129,7 +129,9 @@ TEST_CASE("egress parity: IPv6 prefixes, embedded-IPv4 forms and the AWS IMDS ad
     add({0x20, 0x01, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});    // benchmarking (non-global)
     add({0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});
     // SIIT (::ffff:0:a.b.c.d) and IPv4-compatible (::a.b.c.d) addresses: both twins decode the embedded
-    // address (never wider than non-global), so the rows are unconditional and a lost decode fails here.
+    // address (never wider than non-global), so the rows are unconditional: a decode lost by ONE twin
+    // fails parity here, and one lost by both is caught by the pinned expectations below and in
+    // test_local_path_policy.cpp / test_oidc_egress_policy.cpp.
     add({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 169, 254, 169, 254});       // ::a9fe:a9fe
     add({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1});             // ::7f00:1
     add({0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 169, 254, 169, 254}); // SIIT ::ffff:0:a9fe:a9fe
@@ -138,6 +140,14 @@ TEST_CASE("egress parity: IPv6 prefixes, embedded-IPv4 forms and the AWS IMDS ad
     for (const auto& a : table)
         agree_v6(a);
     CHECK(agt::classify_ipv6(table[13]) == agt::AddressClass::Private); // fc00::1
+    CHECK(agt::classify_ipv6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 169, 254, 169, 254}) ==
+          agt::AddressClass::LinkLocal);
+    CHECK(srv::classify_ipv6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 169, 254, 169, 254}) ==
+          srv::AddressClass::LinkLocal);
+    CHECK(agt::classify_ipv6({0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 169, 254, 169, 254}) ==
+          agt::AddressClass::LinkLocal);
+    CHECK(srv::classify_ipv6({0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 169, 254, 169, 254}) ==
+          srv::AddressClass::LinkLocal);
     CHECK(agt::classify_ipv6(table[14]) == agt::AddressClass::CloudMetadata);
     CHECK(srv::classify_ipv6(table[14]) == srv::AddressClass::CloudMetadata);
 }

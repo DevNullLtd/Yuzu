@@ -26,6 +26,14 @@ import sys
 AGENT = pathlib.Path(__file__).resolve().parent.parent / "agents/core/src/agent.cpp"
 
 
+_COMMENT_OR_STRING = re.compile(r'"(?:\\.|[^"\\\n])*"|//[^\n]*|/\*.*?\*/', re.S)
+
+
+def strip_comments(src):
+    """Source with C++ comments blanked; string literals are kept whole, so a '//' inside one stays."""
+    return _COMMENT_OR_STRING.sub(lambda m: m.group(0) if m.group(0).startswith('"') else " ", src)
+
+
 def check(src):
     defects = []
     if re.search(r"std::this_thread::sleep_for\(\s*std::chrono::seconds\(\s*total_delay\s*\)\s*\)", src):
@@ -43,14 +51,19 @@ def check(src):
     # run()'s teardown guard closes the start gate before any plugin is shut down, on EVERY exit.
     if not re.search(r"ShutdownDeadlineGuard watchdog\{kShutdownDeadlineGrace\};[^;]*(?:;\s*//[^\n]*|\n\s*//[^\n]*)*\s*command_pool_closing_\.store\(true", src):
         defects.append("run()'s teardown guard does not set command_pool_closing_ before shutting plugins down")
-    # The reserved lane: both pool constructions (the first start and the reconnect re-creation).
-    pools = re.findall(r"std::make_unique<ThreadPool>\(([^;]*?)\);", src, re.S)
+    # The reserved lane (ADR-2005). Matched on comment-stripped source so a comment cannot satisfy a pin.
+    code = strip_comments(src)
+    pools = re.findall(r"std::make_unique<ThreadPool>\(([^;]*?)\);", code, re.S)
     if len(pools) != 2 or not all(re.search(r"kCommandQueueDepth\s*,\s*kReservedProtectiveWorkers\s*,", p) for p in pools):
         defects.append("a command-pool construction does not pass kReservedProtectiveWorkers "
                        "(expected exactly two make_unique<ThreadPool>, both reserving the protective lane)")
-    if not re.search(r"const bool protective_lane\s*=\s*yuzu::protective::is_protective_action\(\s*cmd\.plugin\(\)\s*,\s*cmd\.action\(\)\s*\);", src):
+    lane = re.search(r"const bool protective_lane\s*=\s*yuzu::protective::is_protective_action\(\s*cmd\.plugin\(\)\s*,\s*cmd\.action\(\)\s*\);", code)
+    if not lane:
         defects.append("protective_lane is not computed from is_protective_action(cmd.plugin(), cmd.action())")
-    if len(re.findall(r"thread_pool_->submit\(", src)) != 1 or not re.search(r"\}\s*,\s*protective_lane\s*\)\s*;", src):
+    submits = [m.start() for m in re.finditer(r"thread_pool_\s*->\s*submit\(", code)]
+    if len(submits) != 1 or not lane or submits[0] < lane.end():
+        defects.append("the single command submit site is missing or precedes protective_lane")
+    elif not re.search(r"\}\s*,\s*protective_lane\s*\)\s*;", code[submits[0]:submits[0] + 4000]):
         defects.append("the single command submit site does not pass protective_lane")
     body = re.search(r"void execute_command_task\([^)]*\)\s*\{(.*?)Stagger/delay", src, re.S)
     if (not body or not re.search(r"command_may_start\(\s*cmd\.plugin\(\)\s*,\s*cmd\.action\(\)\s*,\s*command_pool_closing\(\)\s*\)", body.group(1))
@@ -92,6 +105,8 @@ def selftest(src):
         "reconnect pool drops the reserved lane": replace_last(src, "kReservedProtectiveWorkers, pool_gauge_);", "0, pool_gauge_);"),
         "submit drops protective_lane": src.replace("}, protective_lane);", "});", 1),
         "lane not from is_protective_action": src.replace("yuzu::protective::is_protective_action(cmd.plugin(), cmd.action());", "false;", 1),
+        "lane pin satisfied only by a comment": src.replace("}, protective_lane);", "}); // }, protective_lane);", 1),
+        "lane computed only in a comment": src.replace("const bool protective_lane =", "const bool protective_lane_x = false; // const bool protective_lane =", 1),
         "no start check": src.replace("if (!command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())) {", "if (false) {", 1),
         "reject drops the claim release": drop_release_in_reject(src),
         "protective exemption dropped": src.replace("command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())", "command_pool_closing()", 1),

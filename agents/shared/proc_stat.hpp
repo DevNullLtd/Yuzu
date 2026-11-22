@@ -4,8 +4,11 @@
 #pragma once
 
 #include <cstdint>
+#include <istream>
+#include <iterator>
 #include <limits>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace yuzu::shared {
@@ -44,6 +47,16 @@ namespace yuzu::shared {
         stat = sp == std::string_view::npos ? std::string_view{} : stat.substr(sp);
     }
     return std::nullopt;
+}
+
+/// The start time from an open /proc/<pid>/stat stream. Reads the WHOLE stream, never one line: a
+/// process names itself with prctl and the name may hold a newline, which would leave a first line
+/// without its closing ')'. nullopt when the stream is unreadable or off-shape.
+[[nodiscard]] inline std::optional<std::uint64_t> read_stat_start_ticks(std::istream& in) {
+    if (!in)
+        return std::nullopt;
+    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    return parse_stat_start_ticks(text);
 }
 
 /// A row is trustworthy only when the process start time seen at enumeration equals the one seen
