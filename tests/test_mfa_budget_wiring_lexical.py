@@ -157,7 +157,8 @@ def check_gate_order(t, hpp="", server=""):
 
 
 GATE1 = "const SsoOnlyGateResult gate1 = sso_only_local_password_gate(entry.username);"
-GATE2 = "const SsoOnlyGateResult gate2 = sso_only_local_password_gate(entry.username);"
+GATE2 = ("const SsoOnlyGateResult gate2 =\n                "
+         "sso_only_local_password_gate(entry.username, SsoOnlyArmRead::kOwnFreshRead);")
 ADMIT_SET = "return state == SsoOnlyLocalGate::kOpen || state == SsoOnlyLocalGate::kBreakGlassArmed;"
 
 
@@ -353,7 +354,34 @@ def check_arm_recheck(files):
             bad.append("a refresh_busy answer must re-read the last armed id and the last-not-armed "
                        "time under the mutex after the failed CAS")
         if gate.count("bg_last_not_armed_at_ =") != 1:
-            bad.append("bg_last_not_armed_at_ must be written in exactly one place (a not-armed read)")
+            bad.append("the gate must write bg_last_not_armed_at_ in exactly one place (a not-armed read)")
+        own_a = t.find("SsoOnlyGateResult AuthRoutes::break_glass_arm_own_read(")
+        own = t[own_a:b] if 0 <= own_a < b else ""
+        if not own:
+            bad.append("break_glass_arm_own_read must be defined before the gate")
+        else:
+            if own.count("bg_last_not_armed_at_ =") != 1:
+                bad.append("the own read must write bg_last_not_armed_at_ in exactly one place "
+                           "(a successful not-armed read)")
+            for forbidden in ("bg_arm_armed_ =", "bg_arm_at_ =", "bg_arm_deadline_ =", "bg_arm_started_ =",
+                              "bg_arm_id_ =", "bg_arm_valid_ = true", "compare_exchange_strong"):
+                if forbidden in own:
+                    bad.append(f"the second re-check's own read must not write the armed cache or "
+                               f"take the single flight (`{forbidden}`)")
+            for needed in ("const bool too_old = armed_now && !arm_observation_fresh(started, finished);",
+                           "if (read.ok && !armed_now) {",
+                           "if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < finished)"):
+                if needed not in own:
+                    bad.append(f"the second re-check's own read must contain `{needed}`")
+            if not (0 <= own.find("const auto started = arm_clock_now();") < own.find("read = hook();")):
+                bad.append("the own read must sample `started` before the read")
+            # The two "last" facts are copied into the answer AFTER the read.
+            if not (0 <= own.find("const auto finished = arm_clock_now();")
+                    < own.find("out.last_not_armed_at = bg_last_not_armed_at_;")):
+                bad.append("the own read must copy the last facts into its answer after the read")
+        if t.count("SsoOnlyArmRead::kOwnFreshRead") != 2:
+            bad.append("SsoOnlyArmRead::kOwnFreshRead must appear exactly twice in auth_routes.cpp "
+                       "(the gate's dispatch and the second re-check)")
     if "break_glass_login = gate.admits_password_evaluation();" not in t:
         bad.append("POST /login must decide the break-glass admit with admits_password_evaluation()")
     bad += check_for_test_callers(files)
@@ -580,6 +608,17 @@ def selftest(files):
                 "    [[nodiscard]] bool admits_password_evaluation() const noexcept {", key="auth_routes.hpp"))
     mut("the comparison static_assert term removed",
         sub_cpp("!SsoGateNeComparable<SsoOnlyGateResult, SsoOnlyLocalGate> &&", "", key="auth_routes.hpp"))
+    mut("the second re-check back on the shared cache and single flight",
+        sub_cpp("sso_only_local_password_gate(entry.username, SsoOnlyArmRead::kOwnFreshRead);",
+                "sso_only_local_password_gate(entry.username, SsoOnlyArmRead::kCachedSingleFlight);"))
+    mut("the own read without the cap",
+        sub_cpp("const bool too_old = armed_now && !arm_observation_fresh(started, finished);",
+                "const bool too_old = false;"))
+    mut("the own read writes the armed cache",
+        sub_cpp("            bg_last_armed_id_ = read.armed_until;\n        }\n        out.arm_id = bg_last_armed_id_;",
+                "            bg_last_armed_id_ = read.armed_until;\n            bg_arm_valid_ = true;\n            bg_arm_armed_ = true;\n        }\n        out.arm_id = bg_last_armed_id_;"))
+    mut("a failed own read records not armed",
+        sub_cpp("if (read.ok && !armed_now) {", "if (!armed_now) {"))
     mut("refresh_busy answers with the facts from before the failed CAS",
         sub_cpp("        {\n            std::lock_guard lk(bg_arm_mu_);\n            out.arm_id = bg_last_armed_id_;\n            out.last_not_armed_at = bg_last_not_armed_at_;\n        }\n        out.state = SsoOnlyLocalGate::kTransient;",
                 "        out.state = SsoOnlyLocalGate::kTransient;"))

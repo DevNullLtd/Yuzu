@@ -2581,7 +2581,88 @@ PasswordVerifyFn AuthRoutes::password_change_verify_fn() {
     };
 }
 
-SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& username) {
+void AuthRoutes::count_arm_gate(const char* result) {
+    if (auto* m = auth_mgr_.metrics_registry())
+        m->counter("yuzu_auth_break_glass_arm_gate_total", {{"result", result}}).increment();
+}
+
+// The MFA step's second re-check reads the arm state ITSELF. It runs after a code was verified
+// (for a recovery code: consumed), so it must not be refused because another request holds the
+// shared refresh or because the shared cache is old. It is reached only by a caller holding the
+// password and a valid second factor, so it cannot be driven by a flood. Because this read can
+// overlap the shared refresher's, everything it writes to shared state is on the refusing side:
+//  - it NEVER writes the armed cache (no other request is told "armed" by it);
+//  - "not armed" drops the cache (the next caller reads again) and records the last-not-armed
+//    time as the END of this read, never earlier than what is already recorded;
+//  - "armed" records only the arm id (so a transient answer after a re-arm carries the new window);
+//  - a failed read, or an armed read older than the cap, writes NOTHING.
+// The two "last" facts are copied into the answer AFTER the read, under the mutex, so a
+// not-armed read another request recorded while this one was in flight is in the answer.
+SsoOnlyGateResult AuthRoutes::break_glass_arm_own_read(const std::string& username) {
+    SsoOnlyGateResult out;
+    std::function<BreakGlassArmRead()> hook;
+    {
+        std::lock_guard lk(bg_arm_mu_);
+        hook = bg_arm_read_hook_for_test_;
+    }
+    BreakGlassArmRead read;
+    read.ok = false;
+    const auto started = arm_clock_now(); // BEFORE the read (see the gate)
+    if (hook) {
+        read = hook();
+    } else if (auto* db = auth_mgr_.auth_db_ptr()) {
+        if (auto bg = db->break_glass_status(username)) {
+            read.ok = true;
+            read.armed = bg->armed;
+            read.armed_until = bg->armed_until;
+            read.remaining_ms = bg->remaining_ms;
+        }
+    }
+    const auto finished = arm_clock_now();
+    const auto deadline = started + std::chrono::milliseconds(read.remaining_ms);
+    const bool armed_now = read.ok && read.armed && read.remaining_ms > 0 && finished < deadline;
+    const bool too_old = armed_now && !arm_observation_fresh(started, finished);
+    if (!read.ok)
+        spdlog::warn("break-glass arm-state read failed; the arm state is unknown and the gate "
+                     "admits nothing on it until a read succeeds");
+    {
+        std::lock_guard lk(bg_arm_mu_);
+        if (read.ok && !armed_now) {
+            bg_arm_valid_ = false;
+            if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < finished)
+                bg_last_not_armed_at_ = finished;
+        } else if (armed_now && !too_old) {
+            bg_last_armed_id_ = read.armed_until;
+        }
+        out.arm_id = bg_last_armed_id_;
+        out.last_not_armed_at = bg_last_not_armed_at_;
+    }
+    if (!read.ok) {
+        out.state = SsoOnlyLocalGate::kTransient;
+        out.cause = SsoOnlyTransientCause::kReadFailed;
+        count_arm_gate("read_failed");
+        return out;
+    }
+    if (too_old) {
+        out.state = SsoOnlyLocalGate::kTransient;
+        out.cause = SsoOnlyTransientCause::kStaleRead;
+        count_arm_gate("stale_read");
+        return out;
+    }
+    if (armed_now) {
+        out.state = SsoOnlyLocalGate::kBreakGlassArmed;
+        out.arm_id = read.armed_until;
+        out.deadline = deadline;
+        out.read_at = started;
+        return out;
+    }
+    out.state = SsoOnlyLocalGate::kRefused;
+    out.why = read.armed_until.empty() ? SsoOnlyRefusedWhy::kDisarmed : SsoOnlyRefusedWhy::kWindowEnded;
+    return out;
+}
+
+SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& username,
+                                                           SsoOnlyArmRead read_mode) {
     SsoOnlyGateResult out;
     if (cfg_.auth_mode != "sso-only") {
         out.state = SsoOnlyLocalGate::kOpen;
@@ -2589,6 +2670,8 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
     }
     if (cfg_.break_glass_user.empty() || username != cfg_.break_glass_user)
         return out; // kRefused / kNotBreakGlass: every other name, no database read at all
+    if (read_mode == SsoOnlyArmRead::kOwnFreshRead)
+        return break_glass_arm_own_read(username);
     // The break-glass name: the arm state is a database read, and this gate runs for EVERY
     // request naming that user, before any slot. So the answer is cached and refreshed by ONE
     // request at a time (single flight); every other request is answered at once. The gate
@@ -3728,6 +3811,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // may already be spent here, so the three answers are kept apart:
         //  - armed: mint;
         //  - a definitive "not armed": refuse (the refusal is honest about a spent code);
+        // This check reads the arm state ITSELF (no shared cache, no single flight), so a refresh
+        // held by another request, or an old cache, cannot refuse a login whose code is spent.
         //  - unreadable: mint ONLY inside the bound the first re-check's read gives: before that
         //    window's own end, at most kArmSnapshotMaxAge after that read STARTED, the same arm
         //    window, and no "not armed" read on this server since. Otherwise refuse.
@@ -3735,7 +3820,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // as a bounded read), and both time checks use it. A login with no snapshot from the
         // first re-check never mints, whatever the gate says now.
         if (entry.break_glass) {
-            const SsoOnlyGateResult gate2 = sso_only_local_password_gate(entry.username);
+            const SsoOnlyGateResult gate2 =
+                sso_only_local_password_gate(entry.username, SsoOnlyArmRead::kOwnFreshRead);
             const auto now2 = arm_clock_now();
             const bool transient_ok =
                 arm1.has_value() && gate2.state == SsoOnlyLocalGate::kTransient &&

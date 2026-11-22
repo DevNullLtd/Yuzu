@@ -254,6 +254,14 @@ static_assert(!SsoGateEqComparable<SsoOnlyGateResult, SsoOnlyLocalGate> &&
               !std::is_constructible_v<SsoOnlyLocalGate, SsoOnlyGateResult>,
               "SsoOnlyGateResult must not compare with or convert to SsoOnlyLocalGate");
 
+/// How `AuthRoutes::sso_only_local_password_gate` obtains the break-glass arm state.
+enum class SsoOnlyArmRead : std::uint8_t {
+    kCachedSingleFlight, ///< the shared 1 s cache, refreshed by one request at a time
+    kOwnFreshRead,       ///< this call reads the database itself: no cache, no single flight.
+                         ///< ONLY the MFA step's second re-check uses it (it is reached only
+                         ///< after a code was verified, so it cannot be driven by a flood)
+};
+
 /// One break-glass arm-state read, as the gate consumes it (test seam shape; production fills it
 /// from `AuthDB::break_glass_status`). `ok == false` is a failed read.
 struct BreakGlassArmRead {
@@ -883,7 +891,11 @@ public:
     /// `yuzu_auth_break_glass_arm_gate_total{result}` and logs a failed read. Each caller keeps
     /// its own response (`/login` its generic 401 + `yuzu_auth_local_disabled_total`; the
     /// password route its 403 `sso_only_local_disabled`).
-    [[nodiscard]] SsoOnlyGateResult sso_only_local_password_gate(const std::string& username);
+    /// With `kOwnFreshRead` the call reads the arm state itself and never answers from, or
+    /// writes "armed" into, the shared cache (see `break_glass_arm_own_read`).
+    [[nodiscard]] SsoOnlyGateResult
+    sso_only_local_password_gate(const std::string& username,
+                                 SsoOnlyArmRead read = SsoOnlyArmRead::kCachedSingleFlight);
 
     /// The clock the arm gate and the MFA step's re-checks read (`steady_clock`, or the frozen
     /// test clock).
@@ -1413,6 +1425,9 @@ private:
     std::optional<std::chrono::steady_clock::time_point> bg_last_not_armed_at_;
     std::atomic<bool> bg_arm_refreshing_{false};
     std::function<BreakGlassArmRead()> bg_arm_read_hook_for_test_; ///< guarded by bg_arm_mu_
+    /// The MFA step's second re-check: one bounded read of the arm state by THIS request.
+    [[nodiscard]] SsoOnlyGateResult break_glass_arm_own_read(const std::string& username);
+    void count_arm_gate(const char* result);
     std::function<void()> bg_arm_after_cache_miss_hook_for_test_;  ///< guarded by bg_arm_mu_
     std::atomic<std::int64_t> arm_clock_test_ms_{-1};
     /// Most requests allowed to WAIT for a stripe at once (server.cpp: max(2, pool/8)).
