@@ -10,7 +10,7 @@
  */
 
 #include "result_set_matcher.hpp"
-#include "live_kinds.hpp"
+#include "live_model.hpp"
 #include "result_parsing.hpp"
 #include "unverified_frame_registry.hpp"
 
