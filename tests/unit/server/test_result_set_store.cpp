@@ -870,7 +870,9 @@ TEST_CASE("ResultSetStore: per-set member cap is enforced", "[pg][result_set][ca
     for (int i = 0; i <= ResultSetStore::kMaxMembersPerSet; ++i)
         members.push_back("dev-" + std::to_string(i));
 
-    auto rs = store.create_materialized(req("alice", "toobig"), members);
+    auto request = req("alice", "toobig");
+    request.source_kind = "criteria_run"; // Generic create accepts an arbitrary client label.
+    auto rs = store.create_materialized(request, members);
     REQUIRE_FALSE(rs.has_value());
     CHECK(rs.error() == ResultSetError::TooManyMembers);
 }

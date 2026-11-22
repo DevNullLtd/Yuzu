@@ -1,0 +1,1 @@
+- Asynchronous result sets now enforce the same 100,000 distinct-device limit as synchronous sets. An oversized fill records a failure and stores no partial membership.

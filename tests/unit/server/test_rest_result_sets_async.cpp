@@ -436,6 +436,70 @@ TEST_CASE("from-echo-query: 202 pending, dispatch to __all__ when no parent",
     REQUIRE(row->matcher.find("echo_rows_ge") != std::string::npos);
 }
 
+TEST_CASE("An authorized async producer enforces the distinct member cap at fill",
+          "[pg][result_set][async][member_cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AsyncHarness h(pool);
+    int status = 0;
+    const auto created = h.post("/api/v1/result-sets/from-echo-query",
+                                R"({"sql":"SELECT pid FROM $Process_Hourly"})", status);
+    REQUIRE(status == 202);
+    const auto id = created["data"]["id"].get<std::string>();
+    std::vector<std::string> ids;
+    for (int i = 0; i < ResultSetStore::kMaxMembersPerSet; ++i)
+        ids.push_back(std::format("dev-{}", i));
+    ids.emplace_back("");
+    ids.emplace_back("dev-0");
+
+    SECTION("duplicates and empty IDs do not consume the boundary slot") {
+        REQUIRE(h.store->materialize(id, ids).has_value());
+        const auto row = get_ok(*h.store, id);
+        REQUIRE(row.has_value());
+        CHECK(row->status == ResultSetStatus::Materialized);
+        CHECK(row->device_count == ResultSetStore::kMaxMembersPerSet);
+        const auto members = h.store->member_set_owned(id, "operator-1");
+        REQUIRE(members.has_value());
+        CHECK(members->size() == ResultSetStore::kMaxMembersPerSet);
+        CHECK(members->contains("dev-0"));
+        CHECK_FALSE(members->contains(""));
+    }
+    SECTION("a failure to record the refusal stays retryable") {
+        ids.emplace_back("one-too-many");
+        exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets ADD CHECK (status <> 'failed')");
+        const auto fill = h.store->materialize(id, ids);
+        REQUIRE_FALSE(fill.has_value());
+        CHECK(fill.error() == ResultSetError::DbError);
+        const auto row = get_ok(*h.store, id);
+        REQUIRE(row.has_value());
+        CHECK(row->status == ResultSetStatus::Pending);
+        CHECK(row->device_count == 0);
+        REQUIRE(h.store->materialize(id, {"retry"}).has_value());
+    }
+    SECTION("one extra distinct ID records a terminal refusal and publishes no members") {
+        ids.emplace_back("one-too-many");
+        const auto fill = h.store->materialize(id, ids);
+        REQUIRE_FALSE(fill.has_value());
+        CHECK(fill.error() == ResultSetError::TooManyMembers);
+        const auto row = get_ok(*h.store, id);
+        REQUIRE(row.has_value());
+        CHECK(row->status == ResultSetStatus::Failed);
+        CHECK(nlohmann::json::parse(row->source_payload)["failure"] == "RESULT_SET_TOO_MANY_MEMBERS");
+        std::string cursor;
+        CHECK(h.store->members(id, "", 1, cursor).empty());
+        const auto members = h.store->member_set_owned(id, "operator-1");
+        REQUIRE_FALSE(members.has_value());
+        CHECK(members.error() == ResultSetError::Failed);
+
+        const auto read = h.sink.dispatch("GET", "/api/v1/result-sets/" + id, "");
+        REQUIRE(read);
+        REQUIRE(read->status == 200);
+        const auto detail = nlohmann::json::parse(read->body)["data"];
+        CHECK(detail["status"] == "failed");
+        CHECK(detail["device_count"] == 0);
+    }
+}
+
 TEST_CASE("from-echo-query: parent_id scopes dispatch via from_result_set:",
           "[pg][result_set][async][echo]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);

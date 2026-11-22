@@ -480,7 +480,8 @@ public:
     std::vector<PendingSet> list_pending();
     /// Populate members, flip status → materialized, set device_count, and ADD `agents_failed` /
     /// `agents_unanswered` to the counters the pending row already carries (inherited from its
-    /// parent at create time), in the same status-guarded statement.
+    /// parent at create time), in the same status-guarded statement. An oversized distinct
+    /// membership commits a failed set with no members and returns TooManyMembers.
     std::expected<void, ResultSetError> materialize(const std::string& id,
                                                     const std::vector<std::string>& members,
                                                     int64_t agents_failed = 0,
