@@ -4578,10 +4578,14 @@ static const ToolDef kTools[] = {
      "never echoed back by any tool — only has_credential (bool) is ever readable afterward "
      "(ADR-0010). url must be http:// or https://; batch_size 1 delivers each event "
      "immediately, >1 accumulates up to that many events per POST. Additive (mints a new "
-     "target, overwrites nothing) but a duplicate name is rejected. url is NOT restricted "
-     "to external hosts - a caller with Infrastructure:Write can point deliveries at any "
-     "reachable address, including the server's own loopback/internal network (no SSRF "
-     "guard on this field today, same posture as REST's twin). Requires "
+     "target, overwrites nothing) but a duplicate name is rejected. Open-world: the server "
+     "POSTs to url. A url whose host is a link-local/cloud-metadata, unspecified, multicast or "
+     "reserved address (or a numeric spelling of one, e.g. 2852039166) is refused with -32602 "
+     "(audited as destination_refused); at delivery a host name is resolved once, every answer "
+     "is vetted and the connect is pinned to a vetted address, and a declined delivery is "
+     "logged destination_refused or destination_unresolved. Loopback and private ranges are NOT "
+     "refused: a caller with Infrastructure:Write can still point deliveries at the server's "
+     "own loopback or internal network (opt-in policy: #4816). Requires "
      "Infrastructure:Write.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique target name; a duplicate is rejected"},)j"
@@ -7191,7 +7195,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // mint_upload_grant above). A duplicate name/license_key is REJECTED,
     // never silently reused -> each successful call mints a distinct id ->
     // not idempotent.
-    {"create_offload_target", {ToolEffect::Additive, false, "Create offload target"}},
+    // openWorldHint is true: the server POSTs fleet events to the administrator-supplied url (an
+    // outbound reach beyond Yuzu's own stores, like the CRL-source registration tools below).
+    {"create_offload_target",
+     {ToolEffect::Additive, false, "Create offload target", /*open_world=*/true}},
     {"activate_platform_license", {ToolEffect::Additive, false, "Activate platform license"}},
     // create_software_deployment is ALSO a pure INSERT (same shape as the two
     // above), but its kToolSecurityRows operation is Execute (matching the
@@ -17379,14 +17386,24 @@ McpServer::HandlerFn McpServer::build_handler(
                             return true;
                     return false;
                 };
+            // Denied `result_set.create` row for a refused request. Returns the error.data to
+            // attach: empty when the row persisted (or audit is off), `audit_persisted:false`
+            // when it was lost or the sink threw (the MCP counterpart of REST's
+            // Sec-Audit-Failed). The SQL text never enters the row.
+            const auto rs_audit_refusal = [&](std::string_view rs_reason, std::string_view rs_kind,
+                                              const std::string& rs_target) -> std::string {
+                const bool rs_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "result_set.create", "denied", "ResultSet", rs_target,
+                    "reason=" + std::string(rs_reason) + " source_kind=" + audit_token(rs_kind));
+                return rs_ok ? std::string{} : std::string{R"({"audit_persisted":false})"};
+            };
             auto rs_refuse_nul = [&](std::string_view rs_what, std::string_view rs_kind) {
-                (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                               "reason=field_contains_nul source_kind=" + audit_token(rs_kind));
                 // retry-hint-exempt: caller-input rejection (a NUL byte), not a transient fault.
                 res.set_content(
                     error_response(id, kInvalidParams,
                                    "RESULT_SET_BAD_REQUEST: " + std::string(rs_what) +
-                                       " must not contain a NUL byte"),
+                                       " must not contain a NUL byte",
+                                   rs_audit_refusal("field_contains_nul", rs_kind, "")),
                     "application/json");
             };
 
@@ -18604,14 +18621,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string sql = param_str(args, "sql");
                 if (sql.empty()) {
                     res.set_content(
-                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required"),
+                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required",
+                                       rs_audit_refusal("sql_missing", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
                 if (sql.size() > 100000) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB",
+                                       rs_audit_refusal("sql_too_large", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
@@ -18626,7 +18645,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                       rs_audit_refusal("stale_source", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
@@ -18845,7 +18865,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         args.value("params", nlohmann::json::object()), def.parameter_schema)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                       rs_audit_refusal("stale_source", source_kind::kInstructionResult, "")),
                         "application/json");
                     return;
                 }
@@ -19035,7 +19056,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (sql.empty()) {
                         res.set_content(
                             error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: original carries no SQL"),
+                                           "RESULT_SET_BAD_REQUEST: original carries no SQL",
+                                           rs_audit_refusal("sql_missing", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19050,7 +19072,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (sql.size() > 100000) {
                         res.set_content(
                             error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB",
+                                           rs_audit_refusal("sql_too_large", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19060,7 +19083,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(
                                 id, kInvalidParams,
-                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                rs_audit_refusal("stale_source", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19165,7 +19189,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(
                                 id, kInvalidParams,
-                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                rs_audit_refusal("stale_source", source_kind::kInstructionResult, orig->id)),
                             "application/json");
                         return;
                     }
@@ -23620,6 +23645,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             too_large("param_count", std::format("params must have at most {} keys", kExecInstrParamCountMax));
                             return;
                         }
+                        if (auto bad = yuzu::server::check_params_key_shape(p)) {
+                            too_large(bad->reason, bad->message);
+                            return;
+                        }
                         for (const auto& [k, v] : p.items()) {
                             // Key length is NOT expressible in the served schema
                             // (the subset has no propertyNames/maxProperties), so
@@ -25957,9 +25986,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto specs = validate_bundle_steps(args["steps"].dump());
+                auto specs = validate_bundle_steps_typed(args["steps"].dump());
                 if (!specs) {
-                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error()),
+                    if (specs.error().kind == BundleStepsError::Kind::kParamKeyInvalid) {
+                        // sg10 / UP-1: counted and audited like every other ingress refusal.
+                        count_param_key_invalid(metrics, "bundle");
+                        (void)audit_fn(req, "bundle.dispatch", "denied", "Execution", "",
+                                       std::string("reason=") + std::string(kReasonParamKeyInvalid));
+                    }
+                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error().message),
                                     "application/json");
                     return;
                 }
@@ -29206,7 +29241,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // store_unavailable/db_error are store/infra degradation
                     // (kInternalError + retry_after_ms) — distinct in the
                     // audit record even where the outcome collapses.
-                    if (result.error() == OffloadWriteError::invalid_input) {
+                    if (result.error() == OffloadWriteError::destination_refused) {
+                        (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
+                                 "destination_refused");
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "target rejected: url host is a link-local, cloud-metadata, "
+                                     "unspecified, multicast or reserved address (or a numeric "
+                                     "spelling of one); offload destinations may not be in those "
+                                     "address classes"),
+                            "application/json");
+                    } else if (result.error() == OffloadWriteError::invalid_input) {
                         (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
                                  "validation_failed");
                         res.set_content(

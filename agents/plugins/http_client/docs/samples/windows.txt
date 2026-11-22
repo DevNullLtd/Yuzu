@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 6e02e2f89c34
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 60b58499489d
 == action=download url=https://www.example.com/ path=C:\WINDOWS\TEMP\yuzu_capture_87gld9cd/yuzu_capture_download.html
 status|ok
 path|C:\Windows\Temp\yuzu_capture_87gld9cd\yuzu_capture_download.html
