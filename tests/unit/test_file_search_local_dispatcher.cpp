@@ -221,11 +221,14 @@ bool fixture_was_searched(const Search& s) {
     return false;
 }
 
-/// What the OS itself says about the fixture root's filesystem, independent of the rows under test:
-/// true when it is a type the plan's allow-list admits (macOS: the allow-list itself over the statfs type
-/// name; Linux: ext4, xfs or btrfs by magic number). No runner-specific flag is needed or trusted: a host
-/// whose workspace is on another filesystem keeps the refused branch below, and a host whose workspace is
-/// on one of these must have searched it.
+/// What the OS itself says about the fixture root's filesystem, independent of the rows under
+/// test: true when it is a type the plan's allow-list admits. That allow-list is
+/// `is_searchable_local_fstype` in agents/shared/network_fstype.hpp. macOS calls it over the statfs
+/// type name. Linux statfs returns no type name, so the Linux branch spells ext4, xfs and btrfs by
+/// magic number: a hand-kept subset of that allow-list, which must stay inside it (0xEF53 covers
+/// ext2, ext3 and ext4). No runner-specific flag is needed or trusted: a host whose workspace is on
+/// another filesystem keeps the refused branch below, and a host whose workspace is on one of
+/// these must have searched it.
 bool filesystem_is_searchable(const fs::path& root) {
     struct statfs sf {};
     if (::statfs(root.c_str(), &sf) != 0)

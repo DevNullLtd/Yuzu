@@ -13,11 +13,20 @@
  * slow_list_floor and at least slow_list_ratio times the fastest of this slice's last kLatencyRing
  * listings (the baseline adapts: a slow listing is stored too, so an evenly slow disk stops counting
  * once the ring holds only its listings). A slow listing starts or doubles a back-off, capped at
- * max_backoff_pause; a listing that is not slow halves it, and one below a work_quantum is dropped.
+ * max_backoff_pause; a listing that is not slow halves the back-off, and a back-off below one
+ * work_quantum is dropped.
  * pace() adds the back-off to the duty nap, never more than half of the slice's remaining room, so
  * the back-off alone cannot sleep a slice to its deadline, and the total never reaches it. With no
  * back-off pace() is the plain duty cycle, call for call. The back-off only lengthens a nap: it can
  * slow a search down, never speed it up.
+ *
+ * What "healthy" means here: a disk on which no listing is slow by the rule above, and nothing more.
+ * The span is the whole listing, not divided by its entry count, and the baseline includes listings
+ * served from cache, so a very large directory, or a cold listing after cached ones, can read as slow
+ * on a disk that is not saturated. The cost is bounded: one work_quantum added to a nap after an
+ * isolated slow listing, dropped by the next listing that is not slow (one quantum halves to less
+ * than a quantum); a run of slow listings doubles it up to max_backoff_pause. On seek-bound media
+ * with a cold cache that could hold a search well under half duty. Reasoned, not measured.
  *
  * State is per slice: a slice builds a new governor, so the ring and the back-off start empty each
  * time and nothing is carried in a cursor. Nothing is reported: no row, tag or log field carries it.
@@ -101,8 +110,8 @@ public:
         using std::chrono::microseconds;
         using std::chrono::milliseconds;
         // Every limit is read through this clamp: an unvalidated one can neither overflow nor go negative.
-        const auto bounded = [](milliseconds m) { return (std::min)((std::max)(m, milliseconds{0}), kMaxSlice); };
-        const auto span = (std::min)((std::max)(took, Clock::duration::zero()),
+        const auto bounded = [](milliseconds m) { return std::clamp(m, milliseconds{0}, kMaxSlice); };
+        const auto span = std::clamp(took, Clock::duration::zero(),
                                      std::chrono::duration_cast<Clock::duration>(kMaxSlice));
         const std::int64_t us = std::chrono::duration_cast<microseconds>(span).count();
 
