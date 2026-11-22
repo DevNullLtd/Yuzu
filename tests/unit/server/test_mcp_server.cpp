@@ -990,6 +990,7 @@ struct McpTestServer {
     std::string audit_throw_action_result_;
     bool audit_throw_nonstd_{false};
     bool audit_throws_{false};          // true → AuditFn throws (bad_alloc-class) (#1647)
+    bool audit_unwired_for_test{false}; // true -> the handler is built with no AuditFn (audit off)
     bool read_only_mode_{false};        // captured by ref by build_handler
     bool mcp_disabled_{false};          // captured by ref by build_handler
 
@@ -2113,7 +2114,9 @@ private:
             mcp.set_crypto_access_fn(crypto_access_fn_for_test);
 
         handler = mcp.build_handler(
-            std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
+            std::move(auth_fn), std::move(perm_fn),
+            audit_unwired_for_test ? yuzu::server::mcp::McpServer::AuditFn{} : std::move(audit_fn),
+            std::move(agents_fn),
             /*rbac_store=*/rbac_store_for_test,
             /*instruction_store=*/instruction_store_for_test,
             /*execution_tracker=*/execution_tracker_for_test,
@@ -55132,6 +55135,202 @@ TEST_CASE("MCP reevaluate_result_set: a NUL in the stored sql or parameters is r
     }
 }
 
+// The SQL refusals of the three echo-query result-set tools write a denied `result_set.create` row
+// like their REST twins (fixed reason token, never the SQL text), and a row the sink loses or
+// throws on is reported to the caller as error.data audit_persisted:false (the refusal itself
+// is unchanged). On re-evaluate the target id is the stored set's own id.
+TEST_CASE("MCP result-sets: refused echo SQL writes a denied row and reports a lost row as "
+          "error.data audit_persisted:false",
+          "[pg][mcp][integration][result-sets][validation][audit]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-rs-refusal"};
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const auto seed = [&](const std::string& kind, const nlohmann::json& payload) {
+        CreateRequest cr;
+        cr.owner_principal = "test-user"; // McpTestServer's default session principal
+        cr.name = "seed";
+        cr.source_kind = kind;
+        cr.source_payload = payload.dump();
+        auto seeded = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(seeded.has_value());
+        return seeded->id;
+    };
+    const auto stale_definition = [&] {
+        yuzu::server::InstructionDefinition def;
+        def.name = "Canned echo query";
+        def.version = "1.0";
+        def.plugin = "echo";
+        def.action = "sql";
+        def.type = "question";
+        def.description = "canned";
+        def.parameter_schema =
+            R"({"type":"object","properties":{"sql":{"type":"string","default":"SELECT 1 FROM $TCP_Live"}}})";
+        def.enabled = true;
+        auto created = instr.create_definition(def);
+        REQUIRE(created.has_value());
+        return *created;
+    };
+    const auto call = [&](const std::string& tool, const nlohmann::json& arguments) {
+        auto res = ts.call(rs_tool_call_body(tool, arguments));
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+
+    struct Refusal {
+        std::string label;
+        std::string message_part; // a fragment of the unchanged message
+        std::string reason;       // the fixed token in the row
+        std::string kind;         // source_kind in the row
+        std::function<std::pair<nlohmann::json, std::string>()> run; // body, expected target id
+    };
+    const std::string echo_kind(source_kind::kEchoQuery);
+    const std::string instr_kind(source_kind::kInstructionResult);
+    const std::string huge_sql = "SELECT '" + std::string(100001, 'x') + "'";
+    const std::string stale_sql = "SELECT pid FROM $Process_Live";
+    const std::string create_echo = "create_result_set_from_echo_query";
+    const auto reeval_of = [&](const std::string& kind, const nlohmann::json& payload) {
+        const auto rs_id = seed(kind, payload);
+        return std::pair{call("reevaluate_result_set", {{"id", rs_id}}), rs_id};
+    };
+    const std::vector<Refusal> refusals{
+        {"create echo: sql missing", "'sql' is required", "sql_missing", echo_kind,
+         [&] { return std::pair{call(create_echo, nlohmann::json::object()), std::string{}}; }},
+        {"create echo: sql too large", "exceeds 100 KiB", "sql_too_large", echo_kind,
+         [&] { return std::pair{call(create_echo, {{"sql", huge_sql}}), std::string{}}; }},
+        {"create echo: raw capture table", "RESULT_SET_REEVAL_STALE_SOURCE", "stale_source",
+         echo_kind, [&] { return std::pair{call(create_echo, {{"sql", stale_sql}}), std::string{}}; }},
+        {"create instruction_result: stale source", "RESULT_SET_REEVAL_STALE_SOURCE",
+         "stale_source", instr_kind,
+         [&] {
+             return std::pair{call("create_result_set_from_instruction_result",
+                                   {{"instruction_id", stale_definition()}}),
+                              std::string{}};
+         }},
+        {"reevaluate echo: stored sql missing", "original carries no SQL", "sql_missing",
+         echo_kind, [&] { return reeval_of(echo_kind, {{"include_empty", false}}); }},
+        {"reevaluate echo: stored sql too large", "exceeds 100 KiB", "sql_too_large", echo_kind,
+         [&] { return reeval_of(echo_kind, {{"sql", huge_sql}, {"include_empty", false}}); }},
+        {"reevaluate echo: stored sql over a raw capture table", "RESULT_SET_REEVAL_STALE_SOURCE",
+         "stale_source", echo_kind,
+         [&] { return reeval_of(echo_kind, {{"sql", stale_sql}, {"include_empty", false}}); }},
+        {"reevaluate instruction_result: stale source", "RESULT_SET_REEVAL_STALE_SOURCE",
+         "stale_source", instr_kind,
+         [&] {
+             return reeval_of(instr_kind, {{"instruction_id", stale_definition()},
+                                           {"params", nlohmann::json::object()}});
+         }},
+    };
+
+    // Runs every refusal: unchanged code and message, no dispatch, exactly one denied row with the
+    // fixed detail (never the SQL) and the expected target, and the expected error.data.
+    const auto check_all = [&](bool expect_data) {
+        for (const auto& r : refusals) {
+            INFO(r.label);
+            const auto before = ts.audit_log.size();
+            const auto [body, target] = r.run();
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find(r.message_part) !=
+                  std::string::npos);
+            if (expect_data) {
+                REQUIRE(body["error"].contains("data"));
+                CHECK(body["error"]["data"] == nlohmann::json{{"audit_persisted", false}});
+            } else {
+                CHECK_FALSE(body["error"].contains("data"));
+            }
+            CHECK(sends == 0);
+            std::vector<std::size_t> idx;
+            for (std::size_t i = before; i < ts.audit_log.size(); ++i)
+                if (ts.audit_log[i] == "result_set.create|denied")
+                    idx.push_back(i);
+            REQUIRE(idx.size() == 1);
+            CHECK(ts.audit_details[idx.front()] ==
+                  "reason=" + r.reason + " source_kind=" + r.kind);
+            CHECK(ts.audit_details[idx.front()].find("SELECT") == std::string::npos);
+            CHECK(ts.audit_target_ids[idx.front()] == target);
+            CHECK(ts.audit_target_types[idx.front()] == "ResultSet");
+        }
+    };
+
+    SECTION("a persisting sink: one denied row per refusal and no data member") {
+        check_all(false);
+    }
+    SECTION("a sink that returns false: same refusal plus audit_persisted:false") {
+        ts.audit_fail_action_result_ = "result_set.create|denied";
+        check_all(true);
+    }
+    SECTION("a sink that throws: nothing escapes, same refusal plus audit_persisted:false") {
+        ts.audit_throw_action_result_ = "result_set.create|denied";
+        check_all(true);
+    }
+    SECTION("an unwired sink (audit off): the refusals carry no data member and no row") {
+        // The handler is rebuilt without an AuditFn; the refusal contract is unchanged.
+        McpTestServer off;
+        off.audit_unwired_for_test = true;
+        off.execution_tracker_for_test = tracker_bundle.get();
+        off.result_set_store_for_test = rs_bundle.get();
+        off.start_with_dispatch(dispatch, "operator");
+        auto res = off.call(rs_tool_call_body(create_echo, nlohmann::json::object()));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() == "RESULT_SET_BAD_REQUEST: 'sql' is required");
+        CHECK_FALSE(body["error"].contains("data"));
+        CHECK(off.audit_log.empty());
+    }
+    SECTION("a refusal for another reason still writes no row; a success writes its own row") {
+        const auto before = ts.audit_log.size();
+        const auto bad = call(create_echo, {{"sql", "SELECT 1"}, {"include_empty", "yes"}});
+        REQUIRE(bad.contains("error"));
+        CHECK(wf_rows_since(ts, before, "result_set.create|denied").empty());
+        const auto ok = call(create_echo, {{"sql", "SELECT 1"}});
+        CHECK_FALSE(ok.contains("error"));
+        CHECK(wf_rows_since(ts, before, "result_set.create|denied").empty());
+        CHECK(wf_rows_since(ts, before, "result_set.create|success").size() == 1);
+    }
+    SECTION("the NUL refusal carries the same data member when its row is lost or throws") {
+        const std::string with_nul("a\0b", 3);
+        for (const bool throws : {false, true}) {
+            ts.audit_log.clear();
+            ts.audit_details.clear();
+            ts.audit_target_ids.clear();
+            ts.audit_target_types.clear();
+            ts.audit_principals.clear();
+            ts.audit_fail_action_result_ = throws ? "" : "result_set.create|denied";
+            ts.audit_throw_action_result_ = throws ? "result_set.create|denied" : "";
+            const auto body = call(create_echo, {{"sql", "SELECT 1" + with_nul}});
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["message"].get<std::string>() ==
+                  "RESULT_SET_BAD_REQUEST: parameters must not contain a NUL byte");
+            REQUIRE(body["error"].contains("data"));
+            CHECK(body["error"]["data"] == nlohmann::json{{"audit_persisted", false}});
+            const auto denied = wf_rows_since(ts, 0, "result_set.create|denied");
+            REQUIRE(denied.size() == 1);
+            CHECK(denied.front() == "reason=field_contains_nul source_kind=echo_query");
+        }
+    }
+}
+
 // ── management-group member and role tools: input refusal, missing group, store fault ──────────
 //
 // A control byte in an id is invalid params with a denied row carrying a fixed token (the value is
@@ -57335,6 +57534,8 @@ TEST_CASE("MCP SAM-35 reads: the payload equals the REST route's data object for
         INFO(std::string(confined ? "confined caller" : "unfiltered caller"));
         Sam35ReadRig rig(confined ? VisibleSet{std::unordered_set<std::string>{"a1"}}
                                   : VisibleSet{});
+        // One row with a product code, one without.
+        rig.fakes.installs[0].entry.package_id = "{PID-1}";
         CHECK(rig.mcp_data("list_software_hosts") ==
               rig.rest_data("/api/v1/inventory/software/hosts"));
         CHECK(rig.mcp_data("list_software_hosts", R"({"q":"web"})") ==
@@ -57351,6 +57552,10 @@ TEST_CASE("MCP SAM-35 reads: the payload equals the REST route's data object for
         }
         CHECK(rig.mcp_data("get_software_host", R"({"agent_id":"a1"})") ==
               rig.rest_data("/api/v1/inventory/software/hosts/a1"));
+        const auto host = rig.mcp_data("get_software_host", R"({"agent_id":"a1"})");
+        REQUIRE(host["software"].size() == 2);
+        CHECK(host["software"][0]["package_id"] == "{PID-1}");
+        CHECK(host["software"][1]["package_id"] == "");
         CHECK(rig.mcp_data("get_software_host", R"({"agent_id":"a1","limit":1})") ==
               rig.rest_data("/api/v1/inventory/software/hosts/a1?limit=1"));
         CHECK(rig.mcp_data("list_software_changes") ==
@@ -59194,6 +59399,7 @@ TEST_CASE("MCP query_installed_software: structuredContent is the lookup core's 
           "confined caller; both representations are kept",
           "[mcp][inventory][software][sam21]") {
     Sam21Reads fakes;
+    fakes.installs[0].entry.package_id = "{PID-MCP}";
     const auto rq = swl::parse_list_params(swl::Params{{"name", "git"}});
     REQUIRE(rq);
     for (const bool confined : {false, true}) {
@@ -59234,6 +59440,7 @@ TEST_CASE("MCP query_installed_software: structuredContent is the lookup core's 
         CHECK(row["status"] == "current");
         CHECK(row["last_confirmed_at"] == 1'700'000'100);
         CHECK(row["purl"] == "pkg:brew/git@1.0");
+        CHECK(row["package_id"] == "{PID-MCP}");
         if (confined) {
             CHECK(structured["count"] == 1);
             CHECK(structured["totals"].is_null());
@@ -59245,8 +59452,10 @@ TEST_CASE("MCP query_installed_software: structuredContent is the lookup core's 
             CHECK_FALSE(structured.contains("totals_omitted"));
         }
         // The other row (a2) has no roster entry: null, never "".
-        if (!confined)
+        if (!confined) {
             CHECK(structured["software"][1]["hostname"].is_null());
+            CHECK(structured["software"][1]["package_id"] == "");
+        }
     }
 }
 
@@ -59665,8 +59874,12 @@ TEST_CASE("MCP lookup tools: tools/list serves both new tools read-only with typ
                 CHECK(out.contains(key));
             for (const char* key : {"hostname", "last_seen", "status", "last_confirmed_at",
                                     "install_type", "install_scope", "install_location",
-                                    "instance_key", "purl"})
+                                    "instance_key", "purl", "package_id"})
                 CHECK(out["software"]["items"]["properties"].contains(key));
+            const auto& item = out["software"]["items"];
+            CHECK(item["properties"]["package_id"]["type"] == "string");
+            CHECK(std::find(item["required"].begin(), item["required"].end(), "package_id") !=
+                  item["required"].end());
         }
         if (name == "sync_hardware_software") {
             CHECK(t["inputSchema"]["properties"]["confirm"]["type"] == "boolean");

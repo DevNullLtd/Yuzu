@@ -50,13 +50,14 @@ using Params = software_catalogue::Params;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// kInstallsCsvHeader (14 columns) + the eight lookup columns + purl.
+/// The first 14 columns of kInstallsCsvHeader + the eight lookup columns + purl + package_id
+/// (package_id trails by decision, so positions 0-22 are unchanged).
 inline constexpr std::string_view kListCsvHeader =
     "agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,"
     "signature_status,distro_id,distro_version,source,"
     "hostname,last_seen,status,last_confirmed_at,install_type,install_scope,install_location,"
-    "instance_key,purl";
-inline constexpr std::size_t kListCsvColumns = 23;
+    "instance_key,purl,package_id";
+inline constexpr std::size_t kListCsvColumns = 24;
 static_assert(static_cast<std::size_t>(std::ranges::count(kListCsvHeader, ',')) + 1 ==
                   kListCsvColumns,
               "kListCsvColumns must equal the number of columns in kListCsvHeader");
@@ -265,7 +266,7 @@ struct TotalsOutcome {
 
 // ── JSON / CSV ───────────────────────────────────────────────────────────────
 
-/// device_row_json fields (unchanged) + purl (null when empty) + hostname (null when the roster does not know the
+/// device_row_json fields (incl. package_id) + purl (null when empty) + hostname (null when the roster does not know the
 /// device), last_seen (null when never synced), status, last_confirmed_at (null when 0),
 /// install_type, install_scope, install_location, instance_key.
 [[nodiscard]] nlohmann::json list_row_json(const SoftwareFleetRow& r, const DeviceFacts& facts);

@@ -1,0 +1,1 @@
+- **The release pre-tag acceptance check takes the grype acceptance file as a required third argument.** Run `python3 -I scripts/ci/image-vuln-gate-checks.py pending .trivyignore.yaml scripts/ci/image-vuln-gate-not-covered.txt .grypeignore.yaml`; the two-argument form now exits 2 with its usage text (both release skill copies carry the new command).

@@ -241,7 +241,7 @@ the declared rung-2 `journalctl` pre-split-argv fallback registered above
 as `event_logs/run_journalctl_fallback#1`; the macOS `log show` argv sites
 registered as `event_logs/do_errors#1` / `event_logs/do_query#1`. The
 grandfather-list entry is removed and will not return).
-**No spawn (WP13/F19):** the macOS `installed_apps` `list_per_user` action runs no subprocess and has no row here: the macOS agent is root and a Homebrew prefix is owned by the installing user, so executing its `brew` would run a user-controlled file as root. Homebrew inventory is `pkg_inventory`, which reads directories only.
+**No spawn (WP13/F19):** the macOS `installed_apps` `list_per_user` action runs no subprocess and has no row here: the macOS agent is root and a Homebrew prefix is owned by the installing user, so executing its `brew` would run a user-controlled file as root. Homebrew inventory is `pkg_inventory`, which reads directories and install receipts only.
 **Migrated off raw spawn (Wave 4, PR4.3a):** `installed_apps` (Linux
 dpkg-query/rpm/pacman/apk and macOS system_profiler/pkgutil all moved
 from popen()/command_exists() to the shared bounded argv runner + probe_tool_path,

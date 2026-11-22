@@ -132,6 +132,7 @@ jobs:
         run: |
           python3 -I tests/test_plugin_allowlist_wiring_lexical.py
           python3 -I tests/test_installed_apps_no_brew_lexical.py
+          python3 -I tests/test_pkg_inventory_no_brew_lexical.py
           python3 -I tests/test_agent_installer_no_file_caps.py
           python3 -I tests/test_proc_access_status_lexical.py
           python3 -I tests/cpp_lex_helper.py
