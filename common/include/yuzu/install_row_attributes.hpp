@@ -22,8 +22,9 @@
 //   - Validator bytes: a validator must reject every byte the canonical form uses as a separator
 //     (`;`, `=`) and every byte the field step would strip, so it accepts only bytes the field
 //     step leaves unchanged. The agent's clamp_field strips 0x1F, 0x1E and NUL (after scrubbing
-//     invalid UTF-8) and the server's scrub-and-clamp strips nothing, so a value holding one would
-//     read differently on the two ends of the hash. The screen in canonical_attributes and
+//     invalid UTF-8), while the server's scrub-and-clamp repairs invalid UTF-8 and length but
+//     strips none of those bytes, so a value holding one would read differently on the two ends of
+//     the hash. The screen in canonical_attributes and
 //     make_attributes already refuses these bytes in every value; keep it ahead of any validator.
 //   - Key side: a key name is joined into the field unescaped, so a name holds no `;`, `=` or
 //     control byte, and make_attributes joins the caller's key before it checks it (a pair whose

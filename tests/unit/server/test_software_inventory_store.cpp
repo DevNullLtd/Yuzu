@@ -4728,8 +4728,8 @@ TEST_CASE("canonical_section_hash pins a row carrying an install-row attribute (
 TEST_CASE("canonical_section_hash sorts attributes after install_location and before package_id "
           "(SAM-46 order pin)",
           "[software_inventory][v3][hash][attributes]") {
-    // The real server entry_less is not reachable from a test, but the section hash is taken over
-    // the rows in its order. Two rows whose attributes and package_id disagree about which sorts
+    // canonical_section_hash sorts the rows with the server's entry_less, so the section hash is
+    // taken over the rows in that order. Two rows whose attributes and package_id disagree about which sorts
     // first pin the position: attributes decide, so the row with the smaller attributes (and the
     // larger package_id) is written first. Moving attributes after package_id in entry_less or in
     // the record form changes these bytes, and so this digest. Recipe (the agent's slot order):
