@@ -498,8 +498,8 @@ remembers up to 16 failing devices, each until its own lookup finds the row or i
 write succeeds, with no time limit. With more than 16 devices failing and none
 succeeding it forgets the one whose wait ends earliest, and a forgotten device's
 next failure opens the back-off again, so other devices' rows are delayed, not
-lost. While the audit store itself is failing, each remembered device still tries
-once per 60 s. The back-off is dated from the failure and a later failure never
+lost. While the audit store itself is failing, each remembered device tries at
+most once per 60 s. The back-off is dated from the failure and a later failure never
 shortens it; there is no separate probe, so when it ends, up to 4 devices look up
 at once and the first failure by a device that is not remembered re-opens it. Each
 failure is counted in `yuzu_server_echo_corruption_audit_degraded_total{reason}`
