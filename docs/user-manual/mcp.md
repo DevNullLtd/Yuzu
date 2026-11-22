@@ -1078,7 +1078,9 @@ What runs first, and what differs:
 service-tag guard, the per-device permission check and any audit row that names the key. This is a size and
 control-byte check only; it does not apply the tag-key character rules, so `delete_tag` can still
 reach a stored key with other characters. `delete_tag` is approval-gated: on a gated tier the key
-check runs when the approved ticket is redeemed, not when it is minted.
+check runs when the approved ticket is redeemed, not when it is minted: the ticket
+subject and the pending row hold the key exactly as sent (control bytes JSON-escaped), no audit row names it,
+and approving a ticket whose key the floor then refuses spends that ticket, so request a new one with a valid key.
 
 For **approval-gated tools**, arguments are additionally validated against the
 tool's published `inputSchema` (from `tools/list`) *before* any approval-ticket
