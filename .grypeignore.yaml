@@ -37,6 +37,25 @@
 #     docs/ci-architecture.md "Recording an approval".
 #   - Remove the entry as soon as the image no longer carries the finding.
 #
+# PROVIDER WAIVERS (optional `provider_waivers:` section, same parser and
+# shape rules; each entry starts with `- provider:`). One lets the gate pass
+# DEGRADED when that grype DB provider's capture is older than 72 hours
+# because its upstream source has stalled, and waives NOTHING else: never a
+# finding, a missing provider, an unreadable or future capture time, the DB's
+# own age, checksum, status or schema, coverage or the gateway's erlang.
+#   - `provider`, first: nvd, alpine, debian or ubuntu, at most one entry each.
+#   - `statement`: why the release cannot wait, with the evidence of the stall.
+#   - `expired_at`: an unquoted date at most 14 days out. An EXPIRED waiver
+#     refuses this whole file (remove it), unlike an expired entry.
+#   - `approved_by`, `approval_ref`, `approved_on`: as for an entry; a
+#     `pending` waiver is not honoured by the release gate.
+#   - No flag, workflow input or variable enables one on GitHub Actions
+#     (the gate reads only this committed file there). Each image judged
+#     with one says `DEGRADED: provider waiver in force` in its grype
+#     .gate.txt and the step summary. Remove the waiver as soon as the
+#     provider is current. Procedure: docs/ci-architecture.md "A
+#     grype DB provider is stale".
+#
 # Example (not in force: it is a comment):
 #   - id: CVE-2026-0000
 #     package_name: erlang
@@ -48,5 +67,15 @@
 #     approved_by: some-login
 #     approved_on: 2026-11-18
 #     approval_ref: "#1234"
+#
+# Provider waiver example (not in force: it is a comment):
+#   provider_waivers:
+#     - provider: nvd
+#       statement: >-
+#         Why the release cannot wait, and the evidence that NVD is stalled.
+#       expired_at: 2026-12-01
+#       approved_by: some-login
+#       approved_on: 2026-11-21
+#       approval_ref: "#1234"
 
 vulnerabilities:

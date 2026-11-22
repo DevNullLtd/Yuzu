@@ -1124,7 +1124,11 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   grype (grype also sees the gateway's Erlang/OTP runtime, which Trivy does not), before the push
   and refuses a fixable CRITICAL from either that is not accepted, a stale or not-freshly-downloaded DB, an
   image whose OS release has no demonstrable advisory data, and an unlisted image whose OS
-  packages the scanner cannot see. The push carries no release tag (the agent bundle's carries a
+  packages the scanner cannot see.
+  The one exception to a freshness refusal is a reviewed provider waiver in `.grypeignore.yaml`
+  (at most 14 days), which admits one named grype DB provider whose capture is older than 72
+  hours; every image judged with it says `DEGRADED: provider waiver in force` in its grype
+  `.gate.txt` (sample with `grep -H '^DEGRADED:' grype-*.attempt-*.gate.txt`). The push carries no release tag (the agent bundle's carries a
   `:candidate-<run>-<N>` tag, never a release tag); the tags move only after the
   pushed digest is verified to be the scanned image, signed and attested, and a write-ahead publish
   journal (`publish-<image>.attempt-<N>.txt`) records each step before it runs. What is kept: every
@@ -1137,7 +1141,7 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   Not kept: anything from an attempt whose runner was killed (SIGKILL, a lost runner) before the
   upload, or whose report upload and its one retry both failed, which leaves no record at all; and a refusal never followed by a release, which exists only
   as the 90-day artifact, shorter than a Type II window: export it if the period needs it.
-- *Acceptances:* `.trivyignore.yaml`, `.grypeignore.yaml` and `scripts/ci/image-vuln-gate-not-covered.txt` entries
+- *Acceptances:* `.trivyignore.yaml`, `.grypeignore.yaml` (its acceptances and provider waivers) and `scripts/ci/image-vuln-gate-not-covered.txt` entries
   carry an approver, a date and a pull-request reference, which the gate checks for FORMAT ONLY;
   the control is the pull-request review of changes to those files, the gate scripts and the
   workflows (`docs/ci-architecture.md` "What the approval fields are, and what the control is").
