@@ -37,7 +37,7 @@ download-miss warnings in the job logs.
 | Target | Parses | Why it's fuzzed |
 |---|---|---|
 | `fuzz_preflight_parse` | pipe-delimited plugin output → pre-flight verdicts | agent/plugin-controlled bytes decide go/no-go |
-| `fuzz_file_search_cursor` | the file search resume cursor (`fs1:` token) | caller-supplied bytes choose where a walk resumes; a forged cursor must be refused before any filesystem call |
+| `fuzz_file_search_cursor` | the file search resume cursor (`fs1:` token) | caller-supplied bytes choose where a walk resumes; a malformed cursor must be refused before any filesystem call; forgery is refused by the `fsv1` token that wraps it |
 | `fuzz_file_search_names` | the reversible name encoding of result rows | file names are attacker-chosen bytes and must round-trip exactly |
 | `fuzz_file_search_glob` | the leaf-name pattern compiler and matcher | operator patterns meet attacker-chosen file names; matching must stay bounded |
 | `fuzz_file_search_volume_cursor` | the search's volume cursor (`fsv1` token, wrapping the `fs1:` cursor) | caller-supplied bytes choose which mount a search resumes on; a forged token must be refused before any filesystem call |
@@ -50,7 +50,7 @@ download-miss warnings in the job logs.
 | `fuzz_binary_header_macho` | a Mach-O thin or universal file's headers and load commands | same: a planted file decides what the agent reads |
 | `fuzz_component_native` | an ELF shared object's SONAME and a Mach-O (thin or fat) library's install name | a planted library's bytes decide what the agent reads and lists |
 
-Every target is deliberately **closure-light** (STL + nlohmann only) so this
+Every target is deliberately **closure-light** (in-tree sources, the STL, and nlohmann where a target parses JSON) so this
 container needs no meson/vcpkg. The same sources build two ways:
 
 - `build.sh` (here) — direct `$CXX` compile against `$LIB_FUZZING_ENGINE`.

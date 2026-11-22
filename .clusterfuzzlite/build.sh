@@ -2,7 +2,7 @@
 # ClusterFuzzLite build script — compiles each libFuzzer harness directly with
 # the OSS-Fuzz-provided instrumented toolchain ($CC/$CXX/$CXXFLAGS/
 # $LIB_FUZZING_ENGINE). Deliberately NO meson/vcpkg in here: the fuzz targets
-# are closure-light (STL + nlohmann only), and a from-source vcpkg bootstrap
+# are closure-light (in-tree sources, the STL, and nlohmann where a target parses JSON), and a from-source vcpkg bootstrap
 # inside this container would be minutes of fragility for zero extra coverage.
 #
 # KEEP IN SYNC with tests/fuzz/meson.build (same harness list, same extra

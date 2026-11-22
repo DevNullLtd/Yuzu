@@ -149,7 +149,7 @@ spec:
   readablePayload: "Search {{root}} for names matching {{pattern}}"
 
   gather:
-    # The response window for the one slice, not a cache.
+    # Stored and served with the definition. Nothing in dispatch reads it today, so it does not time a slice out (issue #8352); the plugin bounds each slice itself.
     ttlSeconds: 300
 
   approval:
