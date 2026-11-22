@@ -134,6 +134,7 @@ struct EchoHarness {
     struct AuditRow {
         std::string action, result, target_id, detail;
         std::string principal; ///< stamped by the session-bound writer (the push); empty otherwise
+        std::string session;   ///< the live session_user when the plain writer recorded the row; else empty
     };
     std::vector<AuditRow> audit_log;
     /// Whether the audit store persists a given row (read live per row), applied after
@@ -297,7 +298,7 @@ struct EchoHarness {
             // DexRoutes::AuditFn (aliased by EchoTreeRoutes) is bool-returning (#1549); #1647:
             // record_audit records the row before the throw, so the shared helper's catch-arm
             // is exercised.
-            return record_audit({a, r, tid, d, {}});
+            return record_audit({a, r, tid, d, {}, session_user});
         };
         routes.register_routes(sink, auth, perm, scoped, devices, lookup,
                                wire_dispatch ? EchoTreeRoutes::DispatchFn{dispatch}
@@ -1427,6 +1428,46 @@ TEST_CASE("echo routes: /device-net audits the DNS and ARP rows it renders", "[e
     }
 }
 
+// #1578: the poll is bound to the session's device scope, not to the principal that dispatched, so a
+// second principal polling the first one's command ids reads under its own session and the rows say so.
+TEST_CASE("echo routes: /device-net polled by a second principal audits its DNS and ARP reads under it",
+          "[echo][routes][audit]") {
+    EchoHarness h;
+    h.dns_output = std::string(kDnsSchema) + "7200|a.test|A|1.1.1.1|1|0\n__total__|1\n";
+    h.arp_output = std::string(kArpSchema) + "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n";
+    const std::string base = "/fragments/echo/process-tree/device-net?device=dev-A&hour=7200";
+
+    // The first principal dispatches (no command ids yet) and holds the ids the page then polls with.
+    auto first = h.sink.Get(base);
+    REQUIRE(first);
+    CHECK(h.last_dispatch_caller.principal == "alice");
+    const auto* dns_sent = h.find_audit("echo.dns.read", "dispatched");
+    REQUIRE(dns_sent != nullptr);
+    CHECK(dns_sent->session == "alice");
+    const auto* arp_sent = h.find_audit("echo.arp.read", "dispatched");
+    REQUIRE(arp_sent != nullptr);
+    CHECK(arp_sent->session == "alice");
+    CHECK(h.find_audit("echo.dns.read", "success") == nullptr);
+    CHECK(h.find_audit("echo.arp.read", "success") == nullptr);
+
+    // A second principal, same scope and Execute, replays those ids (as the /detail replay case does).
+    h.session_user = "bob";
+    auto polled = h.sink.Get(base + "&dcmd=" + kDnsCmd + "&acmd=" + kArpCmd + "&n=1");
+    REQUIRE(polled);
+    CHECK(polled->status == 200);
+    CHECK(polled->body.find("a.test") != std::string::npos);
+    CHECK(h.dispatch_calls == 2); // the poll dispatched nothing
+
+    const auto* dns = h.find_audit("echo.dns.read", "success");
+    REQUIRE(dns != nullptr);
+    CHECK(dns->target_id == "dev-A");
+    CHECK(dns->session == "bob");
+    const auto* arp = h.find_audit("echo.arp.read", "success");
+    REQUIRE(arp != nullptr);
+    CHECK(arp->target_id == "dev-A");
+    CHECK(arp->session == "bob");
+}
+
 TEST_CASE("echo routes: a DNS or ARP failure is an error in the panel and never an empty note",
           "[echo][routes][skew]") {
     const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
@@ -2472,23 +2513,4 @@ TEST_CASE("echo routes: a 256-byte printable device id passes the validator and 
     REQUIRE(r);
     CHECK(r->status == 403);
     CHECK(r->body.find("Invalid device id.") == std::string::npos);
-}
-
-// #1578: the poll is bound to the session's device scope, not to the principal that dispatched, so
-// a second principal polling the first one's command ids writes its own read rows.
-TEST_CASE("echo routes: /device-net polled by a second principal writes its own DNS and ARP read rows",
-          "[echo][routes][audit]") {
-    EchoHarness h;
-    h.dns_output = std::string(kDnsSchema) + "7200|a.test|A|1.1.1.1|1|0\n__total__|1\n";
-    h.arp_output = std::string(kArpSchema) + "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n";
-    h.session_user = "bob";
-    auto r = h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
-                        "&acmd=" + kArpCmd + "&n=1&hour=7200");
-    REQUIRE(r);
-    const auto* dns = h.find_audit("echo.dns.read", "success");
-    REQUIRE(dns != nullptr);
-    CHECK(dns->target_id == "dev-A");
-    const auto* arp = h.find_audit("echo.arp.read", "success");
-    REQUIRE(arp != nullptr);
-    CHECK(arp->target_id == "dev-A");
 }
