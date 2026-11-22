@@ -1972,9 +1972,12 @@ single-flight mode (its snapshot is what the second check's bounded rule relies 
 the pending token back on a transient answer; the second check reads the arm state itself
 (`SsoOnlyArmRead::kOwnFreshRead`), never writes the armed cache, and may admit on a failed read
 only inside that bounded rule (before the first snapshot's window end, at most 4.5 s after that
-read started, the same non-empty arm id, and no "not armed" read recorded on this server
-since), with one clock sample taken after the gate returns. The steady clock does not advance
-while the host is suspended, so these bounds are measured on it, not on wall time. Operator
+read started, the same non-empty arm id, no "not armed" read recorded on this server
+since, and at most 4.5 s of WALL time since the first check), with one clock sample taken after
+the gate returns. The steady clock does not advance while the host is suspended, so the bounds
+above are measured on it and cannot see a suspend; the wall clock is therefore sampled once at
+the first check and once after the second gate call, ONLY to refuse (a wall clock that moved
+backward changes nothing, and wall time never admits). Operator
 text: [Authentication](user-manual/authentication.md) and the break-glass runbook.
 
 Implementation: gate at `auth_routes.cpp` `POST /login` (between the lockout

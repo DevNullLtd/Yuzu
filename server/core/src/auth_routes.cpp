@@ -3586,6 +3586,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             std::string arm_id;
             std::chrono::steady_clock::time_point deadline;
             std::chrono::steady_clock::time_point read_at;
+            std::chrono::system_clock::time_point wall_at{}; ///< wall time when this snapshot was taken
         };
         std::optional<ArmSnapshot> arm1;
         bool admitted_under_transient = false;
@@ -3599,6 +3600,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             const SsoOnlyGateResult gate1 = sso_only_local_password_gate(entry.username);
             if (gate1.state == SsoOnlyLocalGate::kBreakGlassArmed) {
                 arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at};
+                arm1->wall_at = arm_wall_clock_now();
             } else if (gate1.state == SsoOnlyLocalGate::kTransient) {
                 const std::string uname = entry.username;
                 const auto urole = entry.role;
@@ -3819,13 +3821,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // `now2` is sampled ONCE, AFTER the gate call returns (that call can itself take as long
         // as a bounded read), and both time checks use it. A login with no snapshot from the
         // first re-check never mints, whatever the gate says now.
+        // The monotonic clock does not advance while the host is suspended, so those checks cannot
+        // see a suspend between the two re-checks. The wall clock is sampled with `now2` (and when
+        // the first snapshot was taken) ONLY to refuse: if more than kArmSnapshotMaxAge of wall
+        // time passed, an unreadable arm state is not admitted. A wall clock that moved backward
+        // changes nothing; it is never evidence for admitting.
         if (entry.break_glass) {
             const SsoOnlyGateResult gate2 =
                 sso_only_local_password_gate(entry.username, SsoOnlyArmRead::kOwnFreshRead);
             const auto now2 = arm_clock_now();
+            const auto wall2 = arm_wall_clock_now();
             const bool transient_ok =
                 arm1.has_value() && gate2.state == SsoOnlyLocalGate::kTransient &&
                 now2 < arm1->deadline && arm_observation_fresh(arm1->read_at, now2) &&
+                wall2 - arm1->wall_at <= kArmSnapshotMaxAge &&
                 !arm1->arm_id.empty() && gate2.arm_id == arm1->arm_id &&
                 !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at);
             const bool admit =

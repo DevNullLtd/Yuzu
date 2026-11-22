@@ -735,6 +735,7 @@ TEST_CASE("break-glass: the MFA step still mints while the account stays armed",
 namespace {
 
 constexpr std::int64_t kT0 = 1'000'000; // ms on the frozen arm clock
+constexpr std::int64_t kW0 = 2'000'000'000'000; // ms on the frozen WALL clock (about year 2033)
 
 /// What the hooked arm-state read answers. All fields are atomics so a request thread and the
 /// test thread may touch them.
@@ -1132,6 +1133,45 @@ TEST_CASE("break-glass MFA step: a definitive disarm at the second re-check refu
     h.auth_routes->advance_arm_clock_for_test(1100);
     auto again = login_step2(h, login_step1(h), mfa.codes[0]);
     CHECK(again->status == 401);
+}
+
+// UP-1 (governance round 11). `steady_clock` does not advance while the host is suspended, so after a
+// suspend of any length a failed read at the second check looks, on the monotonic clock, like the
+// few hundred milliseconds the bound allows. The wall clock is read only to notice that, and only to
+// REFUSE: a wall clock that moved backward changes nothing.
+TEST_CASE("break-glass MFA step: a suspend between the two checks refuses an unreadable arm state at the second",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    // Wall time that passes between the two checks while the monotonic clock moves 1.1 s.
+    const std::int64_t wall_ms = GENERATE(1100, -60000, 4400, 4500, 4600, 60000);
+    const bool refuses = wall_ms > 4500;
+    INFO("wall clock moved " << wall_ms << " ms, monotonic 1100 ms");
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    h.auth_routes->set_arm_wall_clock_for_test(kW0);
+    const auto pending = login_step1(h);
+    h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        h.auth_routes->advance_arm_clock_for_test(1100); // past the 1 s cache, well inside 4.5 s
+        h.auth_routes->advance_arm_wall_clock_for_test(wall_ms);
+        ctl.mode = ArmCtl::kFail; // the re-read fails
+    });
+    auto res = login_step2(h, pending, mfa.codes[0]);
+    if (refuses) {
+        CHECK(res->status == 401);
+        CHECK(res->get_header_value("Set-Cookie").empty());
+        CHECK(refused(h, "transient", "pre_mint") == 1.0);
+        CHECK(refused_total(h) == 1.0);
+        CHECK(transient_admitted(h) == 0.0);
+        CHECK(rows_containing(audit_rows(h, "auth.login"),
+                              "reason=break_glass_arm_state_unreadable_before_mint;method=password+recovery") == 1);
+        CHECK(rows_containing(audit_rows(h, "auth.login"), "arm_recheck=transient_admitted") == 0);
+    } else {
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Set-Cookie").find("yuzu_session=") != std::string::npos);
+        CHECK(transient_admitted(h) == 1.0);
+        CHECK(refused_total(h) == 0.0);
+    }
 }
 
 // T2 (and T7)

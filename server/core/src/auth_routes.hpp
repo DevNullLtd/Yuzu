@@ -340,6 +340,17 @@ public:
     /// threads run. Never set in production (a negative value means the real clock).
     void set_arm_clock_for_test(std::int64_t ms) { arm_clock_test_ms_.store(ms); }
     void advance_arm_clock_for_test(std::int64_t ms) { arm_clock_test_ms_.fetch_add(ms); }
+    /// Test seam: freeze the WALL clock the MFA step's second re-check reads (see
+    /// `arm_wall_clock_now`) at `ms` after the system-clock epoch (a value of 0 or more; a
+    /// negative value means the real clock), and move it by hand. Never set in production.
+    void set_arm_wall_clock_for_test(std::int64_t ms) { arm_wall_clock_test_ms_.store(ms); }
+    /// Moves a FROZEN wall clock; a no-op while the wall clock is the real one, so it cannot
+    /// freeze it by accident.
+    void advance_arm_wall_clock_for_test(std::int64_t ms) {
+        auto t = arm_wall_clock_test_ms_.load();
+        while (t >= 0 && !arm_wall_clock_test_ms_.compare_exchange_weak(t, t + ms)) {
+        }
+    }
     /// Test seams: the stripe a name maps to (so a test can hold it) and its index.
     std::size_t login_stripe_index_for_test(const std::string& username) const {
         return login_stripe_index(username);
@@ -904,6 +915,19 @@ public:
         return t < 0 ? std::chrono::steady_clock::now()
                      : std::chrono::steady_clock::time_point(std::chrono::milliseconds(t));
     }
+    /// The WALL clock (`system_clock`, or the frozen test clock). It is read ONLY by the MFA step's
+    /// second re-check, once when the first re-check's snapshot is taken and once after the second
+    /// gate call returns, to notice that the host was suspended or stepped forward in between:
+    /// `steady_clock` does not advance while the host is suspended, so every bound measured on it
+    /// is blind to that. One-sided on purpose: a wall clock that moved BACKWARD changes nothing,
+    /// and wall time is never used to admit, only to refuse.
+    [[nodiscard]] std::chrono::system_clock::time_point arm_wall_clock_now() const {
+        const auto t = arm_wall_clock_test_ms_.load();
+        return t < 0 ? std::chrono::system_clock::now()
+                     : std::chrono::system_clock::time_point(
+                           std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                               std::chrono::milliseconds(t)));
+    }
     /// The longest an "armed" database read is honoured, measured from the START of that read.
     /// The ONE comparison: the gate applies it to a cache hit and to its own fresh read, and the
     /// MFA step's second re-check applies it to the snapshot the first re-check took.
@@ -1430,6 +1454,7 @@ private:
     void count_arm_gate(const char* result);
     std::function<void()> bg_arm_after_cache_miss_hook_for_test_;  ///< guarded by bg_arm_mu_
     std::atomic<std::int64_t> arm_clock_test_ms_{-1};
+    std::atomic<std::int64_t> arm_wall_clock_test_ms_{-1}; ///< -1: the real wall clock
     /// Most requests allowed to WAIT for a stripe at once (server.cpp: max(2, pool/8)).
     std::atomic<int> stripe_waiter_cap_{4};
     /// Most requests that may wait for ONE stripe at once, so a flood on one stripe cannot use

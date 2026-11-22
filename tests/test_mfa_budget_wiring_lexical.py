@@ -278,6 +278,9 @@ def check_arm_recheck(files):
         bad.append("/login/mfa: the first arm re-check must have exactly two refusals, each ending in return;")
     if "arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at};" not in body[g1:res]:
         bad.append("/login/mfa: the first arm re-check must record arm1 from the armed answer")
+    if "arm1->wall_at = arm_wall_clock_now();" not in body[g1:res]:
+        bad.append("/login/mfa: the first arm re-check must record the wall time of arm1 "
+                   "(arm1->wall_at = arm_wall_clock_now();)")
     # Re-check #2: the gate, then ONE clock sample, then the decision, then the mint.
     if not calls[-1] < g2 < mint:
         bad.append("/login/mfa: the second arm re-check must be after the verifiers and before the mint")
@@ -286,10 +289,17 @@ def check_arm_recheck(files):
         bad.append("/login/mfa: now2 must be sampled on the statement after the second gate call")
     if seg.count("arm_clock_now()") != 1:
         bad.append("/login/mfa: exactly one clock sample between the second gate call and the mint")
+    # The wall clock (suspend detection) is sampled once, right after now2, and appears only in the
+    # refusing clause: wall time is never evidence for admitting.
+    if not re.search(r"const auto now2 = arm_clock_now\(\);\s*const auto wall2 = arm_wall_clock_now\(\);", seg):
+        bad.append("/login/mfa: wall2 must be sampled on the statement after now2")
+    if seg.count("arm_wall_clock_now()") != 1 or seg.count("wall2") != 2:
+        bad.append("/login/mfa: exactly one wall-clock sample, used only in the transient admit rule")
     for clause in ("gate2.state == SsoOnlyLocalGate::kTransient",
                    "!arm1->arm_id.empty()",
                    "now2 < arm1->deadline",
                    "arm_observation_fresh(arm1->read_at, now2)",
+                   "wall2 - arm1->wall_at <= kArmSnapshotMaxAge",
                    "gate2.arm_id == arm1->arm_id",
                    "!(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at)"):
         if clause not in seg:
@@ -553,10 +563,21 @@ def selftest(files):
         mut("a second clock sample in the second re-check",
             sub_cpp("now2 < arm1->deadline", "arm_clock_now() < arm1->deadline"))
         for clause in ("now2 < arm1->deadline &&", "arm_observation_fresh(arm1->read_at, now2) &&",
+                       "wall2 - arm1->wall_at <= kArmSnapshotMaxAge &&",
                        "gate2.arm_id == arm1->arm_id &&",
                        "!(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at)"):
             mut(f"transient admit clause removed: {clause}",
                 sub_cpp(clause, "true &&" if clause.endswith("&&") else "true"))
+        mut("wall time of arm1 not recorded at the first re-check",
+            sub_cpp("arm1->wall_at = arm_wall_clock_now();", ""))
+        mut("a second wall sample in the second re-check",
+            sub_cpp("wall2 - arm1->wall_at", "arm_wall_clock_now() - arm1->wall_at"))
+        mut("wall2 sampled before now2",
+            sub_cpp("const auto now2 = arm_clock_now();\n            const auto wall2 = arm_wall_clock_now();",
+                    "const auto wall2 = arm_wall_clock_now();\n            const auto now2 = arm_clock_now();"))
+        mut("wall time used to admit",
+            sub_cpp("(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);",
+                    "(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok || wall2 < arm1->wall_at);"))
         mut("arm1.has_value() dropped from admit",
             sub_cpp("const bool admit =\n                arm1.has_value() &&", "const bool admit ="))
         mut("arm1.has_value() only inside the transient rule",
