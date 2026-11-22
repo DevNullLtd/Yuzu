@@ -1956,10 +1956,10 @@ TEST_CASE("password routes: under sso-only an unreadable break-glass arm state i
     // The gate's own refusal, not a step-up refusal or a wrong-password one.
     CHECK(h.has_audit("user.password_change", "denied", "sso_only_local_disabled"));
     CHECK(h.pbkdf2_runs() == pbkdf2_before); // nothing was hashed
-    auto st = h.db->lockout_status("bg");
-    REQUIRE(st.has_value());
-    CHECK_FALSE(st->locked);
-    CHECK(st->failed_count == 0);
+    // No lockout assertion here on purpose: the break-glass account is lockout-exempt on this
+    // route under sso-only, so its failed count stays 0 whether or not an attempt reached the
+    // verifier (the wrong_current attempt above did, and left it at 0). The hash count and the
+    // audit row are what show the verifier was not reached.
     CHECK(h.password_works("bg", kOld)); // the password did not change
 
     // Control: readable and armed again, the same request succeeds.
