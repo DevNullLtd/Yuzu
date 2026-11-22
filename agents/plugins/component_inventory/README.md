@@ -225,7 +225,7 @@ For `native`, `archive_changed` means a library changed or vanished between bein
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-22 · euid 501 (application and library names in the native rows redacted) · leg-hash f0b0b7eb29ce
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-22 · euid 501 (application and library names in the native rows and application, scope and package names in the node rows outside npm redacted) · leg-hash f0b0b7eb29ce
 
 ```
 == action=scan
@@ -258,9 +258,9 @@ comp|python|PyYAML|6.0.3|metadata|/opt/homebrew/lib/python3.14/site-packages/pyy
 == action=node
 status|node|constrained|macos:component_inventory:budget_entries
 comp|node|npm|11.19.0|package_json|/opt/homebrew/lib/node_modules/npm/package.json|6597|1787233796|npm
-comp|node|@anthropic-ai/claude-code|2.1.323|package_json|/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/package.json|1476|1794573006|@anthropic-ai
-comp|node|@moonshot-ai/kimi-code|0.38.0|package_json|/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/package.json|4363|1787235407|@moonshot-ai
-comp|node|@openai/codex|0.153.4|package_json|/opt/homebrew/lib/node_modules/@openai/codex/package.json|1082|1788883177|@openai
+comp|node|@scope1/pkg1|2.1.323|package_json|/opt/homebrew/lib/node_modules/@scope1/pkg1/package.json|1476|1794573006|@scope1
+comp|node|@scope2/pkg2|0.38.0|package_json|/opt/homebrew/lib/node_modules/@scope2/pkg2/package.json|4363|1787235407|@scope2
+comp|node|@scope3/pkg3|0.153.4|package_json|/opt/homebrew/lib/node_modules/@scope3/pkg3/package.json|1082|1788883177|@scope3
 comp|node|abbrev|4.0.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/abbrev/package.json|1232|1787233796|npm
 comp|node|agent-base|7.1.4|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/agent-base/package.json|1059|1787233796|npm
 comp|node|aproba|2.1.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/aproba/package.json|740|1787233796|npm

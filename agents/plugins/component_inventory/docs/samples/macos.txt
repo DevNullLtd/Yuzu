@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-22 · euid 501 (application and library names in the native rows redacted) · leg-hash f0b0b7eb29ce
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-22 · euid 501 (application and library names in the native rows and application, scope and package names in the node rows outside npm redacted) · leg-hash f0b0b7eb29ce
 == action=scan
 status|scan|constrained|macos:component_inventory:budget_entries
 comp|java|test||unreadable|/opt/homebrew/Library/Homebrew/test/support/fixtures/test.jar|397|1787153877|Library
@@ -212,9 +212,9 @@ comp|python|PyYAML|6.0.3|metadata|/opt/homebrew/lib/python3.14/site-packages/pyy
 == action=node
 status|node|constrained|macos:component_inventory:budget_entries
 comp|node|npm|11.19.0|package_json|/opt/homebrew/lib/node_modules/npm/package.json|6597|1787233796|npm
-comp|node|@anthropic-ai/claude-code|2.1.323|package_json|/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/package.json|1476|1794573006|@anthropic-ai
-comp|node|@moonshot-ai/kimi-code|0.38.0|package_json|/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/package.json|4363|1787235407|@moonshot-ai
-comp|node|@openai/codex|0.153.4|package_json|/opt/homebrew/lib/node_modules/@openai/codex/package.json|1082|1788883177|@openai
+comp|node|@scope1/pkg1|2.1.323|package_json|/opt/homebrew/lib/node_modules/@scope1/pkg1/package.json|1476|1794573006|@scope1
+comp|node|@scope2/pkg2|0.38.0|package_json|/opt/homebrew/lib/node_modules/@scope2/pkg2/package.json|4363|1787235407|@scope2
+comp|node|@scope3/pkg3|0.153.4|package_json|/opt/homebrew/lib/node_modules/@scope3/pkg3/package.json|1082|1788883177|@scope3
 comp|node|abbrev|4.0.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/abbrev/package.json|1232|1787233796|npm
 comp|node|agent-base|7.1.4|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/agent-base/package.json|1059|1787233796|npm
 comp|node|aproba|2.1.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/aproba/package.json|740|1787233796|npm
@@ -328,8 +328,8 @@ comp|node|walk-up-path|4.0.0|package_json|/opt/homebrew/lib/node_modules/npm/nod
 comp|node|which|6.0.1|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/which/package.json|1245|1787233796|npm
 comp|node|write-file-atomic|7.0.1|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/write-file-atomic/package.json|1380|1787233796|npm
 comp|node|yallist|5.0.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/yallist/package.json|1618|1787233796|npm
-comp|node|node-addon-api|7.1.1|package_json|/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/node_modules/node-addon-api/package.json|10784|1787235405|@moonshot-ai
-comp|node|node-pty|1.1.0|package_json|/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/node_modules/node-pty/package.json|1615|1787235405|@moonshot-ai
+comp|node|pkg4|7.1.1|package_json|/opt/homebrew/lib/node_modules/@scope2/pkg2/node_modules/pkg4/package.json|10784|1787235405|@scope2
+comp|node|pkg5|1.1.0|package_json|/opt/homebrew/lib/node_modules/@scope2/pkg2/node_modules/pkg5/package.json|1615|1787235405|@scope2
 comp|node|@gar/promise-retry|1.0.3|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/@gar/promise-retry/package.json|1099|1787233796|npm
 comp|node|@isaacs/fs-minipass|4.0.1|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/@isaacs/fs-minipass/package.json|1675|1787233796|npm
 comp|node|@isaacs/string-locale-compare|1.1.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/@isaacs/string-locale-compare/package.json|696|1787233796|npm
@@ -356,25 +356,25 @@ comp|node|@sigstore/tuf|4.0.2|package_json|/opt/homebrew/lib/node_modules/npm/no
 comp|node|@sigstore/verify|3.1.1|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/@sigstore/verify/package.json|878|1787233796|npm
 comp|node|@tufjs/canonical-json|2.0.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/@tufjs/canonical-json/package.json|771|1787233796|npm
 comp|node|@tufjs/models|4.1.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/@tufjs/models/package.json|872|1787233796|npm
-comp|node|@anthropic-ai/claude-code-darwin-arm64|2.1.323|package_json|/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-darwin-arm64/package.json|277|1794573008|@anthropic-ai
-comp|node|@mariozechner/clipboard|0.3.9|package_json|/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/node_modules/@mariozechner/clipboard/package.json|1606|1787235405|@moonshot-ai
-comp|node|@mariozechner/clipboard-darwin-arm64|0.3.9|package_json|/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/node_modules/@mariozechner/clipboard-darwin-arm64/package.json|381|1787235405|@moonshot-ai
-comp|node|@mariozechner/clipboard-darwin-universal|0.3.9|package_json|/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/node_modules/@mariozechner/clipboard-darwin-universal/package.json|365|1787235405|@moonshot-ai
-comp|node|@openai/codex|0.153.4-darwin-arm64|package_json|/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/package.json|517|1788883178|@openai
+comp|node|@scope1/pkg6|2.1.323|package_json|/opt/homebrew/lib/node_modules/@scope1/pkg1/node_modules/@scope1/pkg6/package.json|277|1794573008|@scope1
+comp|node|@scope4/pkg7|0.3.9|package_json|/opt/homebrew/lib/node_modules/@scope2/pkg2/node_modules/@scope4/pkg7/package.json|1606|1787235405|@scope2
+comp|node|@scope4/pkg8|0.3.9|package_json|/opt/homebrew/lib/node_modules/@scope2/pkg2/node_modules/@scope4/pkg8/package.json|381|1787235405|@scope2
+comp|node|@scope4/pkg9|0.3.9|package_json|/opt/homebrew/lib/node_modules/@scope2/pkg2/node_modules/@scope4/pkg9/package.json|365|1787235405|@scope2
+comp|node|@scope3/pkg3|0.153.4-darwin-arm64|package_json|/opt/homebrew/lib/node_modules/@scope3/pkg3/node_modules/@scope3/pkg10/package.json|517|1788883178|@scope3
 comp|node|minipass|3.3.6|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/minipass-pipeline/node_modules/minipass/package.json|1187|1787233796|npm
 comp|node|yallist|4.0.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/minipass-pipeline/node_modules/yallist/package.json|652|1787233796|npm
 comp|node|fdir|6.5.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/tinyglobby/node_modules/fdir/package.json|2694|1787233796|npm
 comp|node|picomatch|4.0.4|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/tinyglobby/node_modules/picomatch/package.json|1896|1787233796|npm
-comp|node|shell-quote|1.12.0|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/shell-quote/package.json|2062|1794247018|Visual Studio Code.app
-comp|node|vsda|1.4.4|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/vsda/package.json|1430|1794900808|Visual Studio Code.app
-comp|node|zod|4.4.3|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/zod/package.json|3796|1794247004|Visual Studio Code.app
-comp|node|typescript|6.0.3|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/node_modules/typescript/package.json|3527|1794247008|Visual Studio Code.app
-comp|node|@pondwader/socks5-server|1.0.10|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/@pondwader/socks5-server/package.json|890|1794247012|Visual Studio Code.app
-comp|node|@vscode/sandbox-runtime|0.0.1|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/@vscode/sandbox-runtime/package.json|2344|1794247004|Visual Studio Code.app
-comp|node|@github/copilot|1.0.73|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/copilot/node_modules/@github/copilot/package.json|1196|1794901016|Visual Studio Code.app
-comp|node|@vscode/copilot-typescript-server-plugin|1.0.0|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/copilot/node_modules/@vscode/copilot-typescript-server-plugin/package.json|486|1794901016|Visual Studio Code.app
-comp|node|@vscode/fs-copyfile|2.0.0|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/git/node_modules/@vscode/fs-copyfile/package.json|524|1794247010|Visual Studio Code.app
-comp|node|commander|12.1.0|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/@vscode/sandbox-runtime/node_modules/commander/package.json|2174|1794247018|Visual Studio Code.app
-comp|node|zod|3.25.76|package_json|/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/@vscode/sandbox-runtime/node_modules/zod/package.json|3284|1794247016|Visual Studio Code.app
+comp|node|pkg11|1.12.0|package_json|/Applications/App13.app/Contents/Resources/app/node_modules/pkg11/package.json|2062|1794247018|App13.app
+comp|node|pkg12|1.4.4|package_json|/Applications/App13.app/Contents/Resources/app/node_modules/pkg12/package.json|1430|1794900808|App13.app
+comp|node|pkg13|4.4.3|package_json|/Applications/App13.app/Contents/Resources/app/node_modules/pkg13/package.json|3796|1794247004|App13.app
+comp|node|pkg14|6.0.3|package_json|/Applications/App13.app/Contents/Resources/app/extensions/node_modules/pkg14/package.json|3527|1794247008|App13.app
+comp|node|@scope5/pkg15|1.0.10|package_json|/Applications/App13.app/Contents/Resources/app/node_modules/@scope5/pkg15/package.json|890|1794247012|App13.app
+comp|node|@scope6/pkg16|0.0.1|package_json|/Applications/App13.app/Contents/Resources/app/node_modules/@scope6/pkg16/package.json|2344|1794247004|App13.app
+comp|node|@scope7/pkg17|1.0.73|package_json|/Applications/App13.app/Contents/Resources/app/extensions/ext1/node_modules/@scope7/pkg17/package.json|1196|1794901016|App13.app
+comp|node|@scope6/pkg18|1.0.0|package_json|/Applications/App13.app/Contents/Resources/app/extensions/ext1/node_modules/@scope6/pkg18/package.json|486|1794901016|App13.app
+comp|node|@scope6/pkg19|2.0.0|package_json|/Applications/App13.app/Contents/Resources/app/extensions/ext2/node_modules/@scope6/pkg19/package.json|524|1794247010|App13.app
+comp|node|pkg20|12.1.0|package_json|/Applications/App13.app/Contents/Resources/app/node_modules/@scope6/pkg16/node_modules/pkg20/package.json|2174|1794247018|App13.app
+comp|node|pkg13|3.25.76|package_json|/Applications/App13.app/Contents/Resources/app/node_modules/@scope6/pkg16/node_modules/pkg13/package.json|3284|1794247016|App13.app
 [result_status] CONSTRAINED / PARTIAL / macos:component_inventory:budget_entries
 
