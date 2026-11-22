@@ -105,6 +105,10 @@ breaks any of them is outside this ADR and needs its own threat model.
   `yuzu-fw-snapshot.socket` (`/run/yuzu-fw-snapshot.sock`, `root:yuzu-agent`, `0660`). A host can
   opt out with `systemctl mask --now yuzu-fw-snapshot.socket`, after which the plugin reads
   `unknown` on that unit, as it did before.
+- On a host the installer provisioned (no packaged socket), the plugin reads the same listing from the
+  root helper's `snapshot` word through `sudo -n --`, a rung-3 site registered in the manifest
+  (`firewall/try_snapshot#1`); a sudo that refuses is a silent decline. It is not an OS-activated helper
+  and is outside this contract; it is recorded here only because it feeds the same parser.
 - The agent account can now read the host's full nftables ruleset and the iptables listings. That
   is the cost, and `docs/user-manual/security-hardening.md` says so.
 - The units are designed for systemd 239 and later; the plugin README names the versions the

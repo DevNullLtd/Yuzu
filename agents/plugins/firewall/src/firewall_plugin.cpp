@@ -40,7 +40,10 @@
  *                 neither nftables nor iptables itself, so the broker's
  *                 fixed read-only script does, and the pure parsers frame
  *                 and decide its reply (parse_fw_snapshot and
- *                 linux_snapshot_*_rows in firewall_parsers.hpp).
+ *                 linux_snapshot_*_rows in firewall_parsers.hpp). With no
+ *                 socket, a non-root agent not under NoNewPrivileges reads
+ *                 the same listing from the root helper's `snapshot` word
+ *                 through sudo (rung 3, site firewall/try_snapshot#1).
  *               ufw / iptables: rung 2, run_bounded_subprocess argv, each
  *                 backend now emitting STRUCTURED rows via its own pure
  *                 parser (parse_ufw_rules / parse_iptables_save) — replacing
@@ -1281,13 +1284,16 @@ bool try_nftables_rules(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
     return true;
 }
 
+[[nodiscard]] std::optional<std::string_view> privilege_refusal();
+
 // ── root snapshot broker (rung 1, AF_UNIX; docs/adr/3007-os-activated-read-helpers.md) ─────
 //
 // The packaged agent has neither CAP_NET_ADMIN nor a way to escalate, so the root-owned systemd
 // socket unit yuzu-fw-snapshot.socket runs one fixed read-only script per connection and writes the
 // listing to it. The agent connects, sends NOTHING and reads to end of stream: no process is
 // spawned here (rung 1), and the reply is untrusted text that the pure parsers frame and decide.
-// A host without the broker has no socket file (RemoveOnStop=yes), which declines silently.
+// A host without the broker has no socket file (RemoveOnStop=yes), which declines silently, or
+// reads the installer helper's `snapshot` word instead (read_fw_snapshot_via_helper below).
 
 /// One read of the broker: the reply text, or the token that says why there is none. An EMPTY token
 /// means the broker is not installed (ENOENT) and is not reported. Tokens: connect:eacces,
@@ -1348,11 +1354,39 @@ read_fw_snapshot(std::chrono::steady_clock::time_point deadline) {
     }
 }
 
+/// The second transport of the same listing, for a host the installer provisioned (no packaged
+/// socket): the root helper's `snapshot` word through `sudo -n --`. It is used only by a non-root
+/// agent that is not under NoNewPrivileges (the packaged unit, where sudo cannot elevate, has the
+/// broker instead). The helper's snapshot always exits 0 (a tool that failed is marked inside the
+/// reply), so a run that is not complete with exit 0 is sudo refusing or failing to exec: the
+/// transport is not provisioned here, and that is a silent decline with no row, as for an absent
+/// socket. Only a complete run that exited 0 is returned, and the caller parses it through the same
+/// strict framing as the socket's reply. Spawn site firewall/try_snapshot#1 (rung 3: the helper is
+/// a `#!/bin/sh` script).
+[[nodiscard]] std::optional<std::string> read_fw_snapshot_via_helper() {
+    // privilege_refusal() (defined with the containment shell below) is the one reading of
+    // NoNewPrivileges: it refuses a non-root agent under it, which cannot sudo.
+    if (::geteuid() == 0 || privilege_refusal())
+        return std::nullopt;
+    const auto res = run_bounded_subprocess(
+        yuzu::shared::sudo_wrap({std::string{fq::kFwHelperPath}, "snapshot"}),
+        SubprocessOptions{.deadline = kAcqDeadline, .output_cap_bytes = 2 * 1024 * 1024});
+    if (!subprocess_complete(res))
+        return std::nullopt;
+    return res.output;
+}
+
 /// true iff the snapshot answered (dispatch stops); false means the next rung runs. A broker that
-/// is not installed says nothing; one that is but could not be read says why in an
-/// `error|snapshot:<token>` row. `rules` selects the action; the rows are the pure decision's.
+/// is not installed says nothing (and the helper transport is tried); one that is but could not be
+/// read says why in an `error|snapshot:<token>` row. `rules` selects the action; the rows are the
+/// pure decision's.
 bool try_snapshot(yuzu::CommandContext& ctx, bool tables_seen, bool rules) {
-    const auto reply = read_fw_snapshot(std::chrono::steady_clock::now() + kAcqDeadline);
+    auto reply = read_fw_snapshot(std::chrono::steady_clock::now() + kAcqDeadline);
+    if (!reply && reply.error().empty()) {
+        // No socket file: not the packaged unit. The installer's helper is the other transport.
+        if (auto via_helper = read_fw_snapshot_via_helper())
+            reply = std::move(*via_helper);
+    }
     if (!reply) {
         if (!reply.error().empty())
             ctx.write_output(yuzu::firewall::snapshot_error_row(reply.error()));

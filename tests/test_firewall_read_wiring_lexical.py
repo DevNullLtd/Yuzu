@@ -25,7 +25,10 @@ wiring around them, per OS class below:
                      and iptables in that order; only the netlink table-dump row is deferred (to
                      the decline path), never the socket-open diagnostics; the broker reader opens
                      a close-on-exec non-blocking ScopedFd socket, checks SO_PEERCRED for root,
-                     bounds its wait and its size, and never writes to the socket.
+                     bounds its wait and its size, and never writes to the socket. The installer
+                     helper's `snapshot` word is the second transport, tried only when the socket
+                     is absent: only a complete run that exited 0 is parsed, and anything else is
+                     a silent decline.
 
   BrokerUnits        the shipped socket, template service and snapshot script are exactly the
                      reviewed directive sets, agree with the plugin's socket path and with what the
@@ -410,6 +413,33 @@ def linux_problems(plugin_src):
                            "broker reads no input" % pat)
         if "::close(" in text:
             out.append("read_fw_snapshot closes a descriptor by hand: ScopedFd is the single release path")
+    helper = function_body(live, r"\[\[nodiscard\]\] std::optional<std::string> read_fw_snapshot_via_helper\(\) ?(?=\{)")
+    if helper is None:
+        out.append("firewall_plugin.cpp no longer defines read_fw_snapshot_via_helper()")
+    else:
+        text = squash(helper)
+        for what, pat in (
+                ("the refusal to run for root or under NoNewPrivileges (sudo cannot elevate there)",
+                 r"if \( ?::geteuid\( ?\) == 0 \|\| privilege_refusal\( ?\) ?\) return std::nullopt;"),
+                ("the sudo-wrapped helper snapshot word as its only argv, with the deadline and the 2 MiB cap",
+                 r"run_bounded_subprocess\( ?yuzu::shared::sudo_wrap\(\{std::string\{fq::kFwHelperPath\}, \"snapshot\"\}\), "
+                 r"SubprocessOptions\{\.deadline = kAcqDeadline, \.output_cap_bytes = 2 \* 1024 \* 1024\}\)"),
+                ("the rule that only a complete run that exited 0 is returned (subprocess_complete, a silent decline otherwise)",
+                 r"if \( ?!subprocess_complete\(res\) ?\) return std::nullopt; return res\.output;")):
+            if not re.search(pat, text):
+                out.append(f"read_fw_snapshot_via_helper no longer has {what}")
+        if "merge_stderr" in text or "sudo_runner(" in text:
+            out.append("read_fw_snapshot_via_helper merges stderr: sudo's message would be read as listing")
+        if "exit_code" in text or "write_output" in text:
+            out.append("read_fw_snapshot_via_helper decides on an exit code itself or writes a row: "
+                       "subprocess_complete is the one rule and the decline is silent")
+    snapshot = function_body(live, r"bool try_snapshot\(yuzu::CommandContext& ctx, bool tables_seen, bool rules\) ?(?=\{)")
+    if snapshot is None:
+        out.append("firewall_plugin.cpp no longer defines try_snapshot(ctx, tables_seen, rules)")
+    elif not re.search(r"if \( ?!reply && reply\.error\(\)\.empty\(\) ?\) \{[^{}]*read_fw_snapshot_via_helper\(\)",
+                       squash(snapshot)):
+        out.append("try_snapshot no longer tries the helper transport only when the socket is absent "
+                   "(an empty token): a reported socket failure must not fall to sudo")
     if len(re.findall(r"else the root snapshot broker over AF_UNIX \(packaged systemd socket\)", squash(live))) != 2:
         out.append("the Linux state and rules descriptors no longer both name the root snapshot broker")
     return out
@@ -451,6 +481,21 @@ LINUX_MUTATIONS = [
     (_lmut(r"(char buf\[16 \* 1024\];)", r"\1 (void)::write(sock.get(), &buf[0], 1);"), "writes to the socket"),
     # a hand-written close beside the ScopedFd
     (_lmut(r"(char buf\[16 \* 1024\];)", r"\1 ::close(sock.get());"), "closes a descriptor by hand"),
+    # the helper transport: the exit rule, the guard, the cap, the stderr, the token condition
+    (_lmut(r"if \(!subprocess_complete\(res\)\)\s*return std::nullopt;\s*return res\.output;", "return res.output;"),
+     "complete run that exited 0"),
+    (_lmut(r"if \(!subprocess_complete\(res\)\)", "if (!res.tool_ran)"), "complete run that exited 0"),
+    (_lmut(r"if \(::geteuid\(\) == 0 \|\| privilege_refusal\(\)\)\s*return std::nullopt;\s*const auto res = run_bounded_subprocess",
+           "const auto res = run_bounded_subprocess"),
+     "refusal to run for root or under NoNewPrivileges"),
+    (_lmut(r"if \(::geteuid\(\) == 0 \|\| privilege_refusal\(\)\)", "if (::geteuid() == 0)"),
+     "refusal to run for root or under NoNewPrivileges"),
+    (_lmut(r", \.output_cap_bytes = 2 \* 1024 \* 1024", ""), "deadline and the 2 MiB cap"),
+    (_lmut(r"\.output_cap_bytes = 2 \* 1024 \* 1024\}", ".output_cap_bytes = 2 * 1024 * 1024, .merge_stderr = true}"),
+     "deadline and the 2 MiB cap"),
+    (_lmut(r"if \(!reply && reply\.error\(\)\.empty\(\)\)", "if (!reply)"), "only when the socket is absent"),
+    (_lmut(r"\{std::string\{fq::kFwHelperPath\}, \"snapshot\"\}", '{std::string{fq::kFwHelperPath}, "snapshot", "x"}'),
+     "helper snapshot word as its only argv"),
     # a descriptor without the broker
     (_lmut(r"else the root snapshot broker over AF_UNIX \(packaged systemd socket\), ", "", count=1),
      "descriptors no longer both name"),

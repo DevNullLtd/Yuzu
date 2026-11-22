@@ -305,6 +305,18 @@ constexpr fr::Os kThisOs = fr::Os::lin;
     return ::access(std::string{yuzu::firewall::kFwSnapshotSocketPath}.c_str(), F_OK) == 0;
 }
 
+/// A non-root agent has a snapshot transport on this host: the broker socket (the packaged unit's
+/// account) or the installer's helper (an installer-provisioned account, whose baseline was read
+/// through it). With either, `state` and `rules` must answer with a real read.
+[[nodiscard, maybe_unused]] bool installer_helper_present() {
+    std::error_code ec;
+    return fs::exists(std::string{fq::kFwHelperPath}, ec) && !ec;
+}
+
+[[nodiscard, maybe_unused]] bool snapshot_transport_present() {
+    return broker_socket_present() || installer_helper_present();
+}
+
 /// The broker's whole reply, read the way the agent reads it: connect, send NOTHING, read to end of
 /// stream, within `budget`. nullopt when it could not be read (no socket, not permitted, a timeout,
 /// or more than 2 MiB, which the broker never sends). The descriptor is a ScopedFd, so every return
@@ -1832,9 +1844,10 @@ TEST_CASE("live: state reports what the OS tool reports, and the host is left as
         for (const auto& line : rows_of(*ipt))
             appended += line.rfind("-A ", 0) == 0 ? 1 : 0;
         CHECK(*ruleset == std::to_string(appended));
-    } else if (!running_as_root() && broker_socket_present()) {
-        // Answered through the root snapshot broker (the agent cannot read the ruleset itself): the
-        // state is a real answer, no error row says otherwise, and the count is the baseline's.
+    } else if (!running_as_root() && snapshot_transport_present()) {
+        // Answered through the root snapshot broker or the installer helper's snapshot word (the
+        // agent cannot read the ruleset itself): the state is a real answer, no error row says
+        // otherwise, and the count is the baseline's.
         CHECK(*state != "unknown");
         CHECK_FALSE(has_prefix(r.captured, "error|"));
         if (*backend == "nftables") {
@@ -1918,8 +1931,9 @@ TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it 
         const auto n = fr::count_nft_rules(*nft);
         CHECK(*ruleset == std::to_string(n));
         CHECK(count_prefixed(r.captured, "rule|nftables|") >= n); // the rule handles, plus the base chains
-    } else if (!running_as_root() && broker_socket_present()) {
-        // Answered through the root snapshot broker: a real count, no error row, and the baseline's.
+    } else if (!running_as_root() && snapshot_transport_present()) {
+        // Answered through the root snapshot broker or the installer helper: a real count, no error
+        // row, and the baseline's.
         CHECK_FALSE(has_prefix(r.captured, "error|"));
         CHECK(is_integer(*ruleset));
         if (*backend == "nftables") {
@@ -1957,7 +1971,7 @@ TEST_CASE("live (linux, agent account): the helper's snapshot word answers throu
     LIVE_OR_SKIP(env);
     if (running_as_root())
         SKIP("runs as the agent account: a root run does not go through the helper");
-    if (broker_socket_present() && !fs::exists(std::string{fq::kFwHelperPath}))
+    if (broker_socket_present() && !installer_helper_present())
         SKIP("the packaged account: no installer helper on this host, the listing is read from the broker socket");
     const auto snap = capture_result(harness_sudo({std::string{fq::kFwHelperPath}, "snapshot"}), 60s,
                                      /*merge_stderr=*/false);
