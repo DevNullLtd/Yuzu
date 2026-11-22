@@ -27,7 +27,7 @@ extension list: any list is a bypass list):
      KERN_ARGMAX token (the argv and environment read);
   5. non-vacuity: process_introspect_macos.cpp exists and contains proc_pidinfo and
      PROC_PIDTBSDINFO, so a rename cannot make the gate pass on nothing;
-  6. in process_introspect_macos.cpp only: the include set stays within its six headers and
+  6. in process_introspect_macos.cpp only: the include set stays within MACOS_INCLUDES and
      proc_pidinfo is called exactly once.
 """
 import pathlib
@@ -61,7 +61,6 @@ SYSCTL_BANS = re.compile(r"\bsysctl\s*\(|\bsysctlnametomib\b|\bKERN_PROC\w*|\bKE
 INCLUDE = re.compile(r"#\s*include\s*([<\"][^>\"\n]+[>\"])")
 MACOS_INCLUDES = {'"process_introspect_legs.hpp"', "<libproc.h>", "<sys/proc_info.h>",
                   "<sys/sysctl.h>", "<cerrno>", "<cstring>"}
-PROC_PIDINFO_CALLS = re.compile(r"\bproc_pidinfo\s*\(")
 
 
 def findings(name: str, src: str) -> list[str]:
@@ -97,8 +96,8 @@ def findings(name: str, src: str) -> list[str]:
     if name == MACOS_TU:
         for m in INCLUDE.finditer(code):
             if m.group(1) not in MACOS_INCLUDES:
-                out.append(f"{name}: includes {m.group(1)}, outside its six headers")
-        if len(PROC_PIDINFO_CALLS.findall(ident)) != 1:
+                out.append(f"{name}: includes {m.group(1)}, outside its include allow-list")
+        if len(PROC_PIDINFO.findall(ident)) != 1:
             out.append(f"{name}: proc_pidinfo must be called exactly once")
     return out
 
