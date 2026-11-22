@@ -4709,14 +4709,13 @@ void RestApiV1::register_routes(
             // #7110: the `requested` row is stored, so decide the per-device gate AGAIN: a
             // grant or a JIT elevation withdrawn while the row was being written dispatches
             // nothing. The gate has already written its own refusal; the row that already
-            // exists gets its outcome: `permission_revoked`, or, when an authorization read was
-            // degraded (the gate's 403 deny-on-degrade), the shared `store_unavailable
-            // store=<mgmt_group_store|rbac_store>` token, so the row says why.
+            // exists gets its outcome: `permission_revoked`, `scoped_gate_unavailable` when the gate
+            // itself answered 503, or, when an authorization read was degraded (the gate's 403
+            // deny-on-degrade), the shared `store_unavailable store=<mgmt_group_store|rbac_store>`
+            // token, so the row says why.
             if (const auto recheck = scoped_gate_fn(req, res, "Infrastructure", "Delete", device_id);
                 recheck != ScopedGateOutcome::Admitted) {
-                fail(degraded_store(recheck).empty()
-                         ? std::string("permission_revoked")
-                         : std::string(echo_source::refusal_detail(recheck, true)));
+                fail(std::string(echo_source::refusal_detail(recheck, true)));
                 bump(echo_source::refusal_result(recheck, true));
                 return;
             }

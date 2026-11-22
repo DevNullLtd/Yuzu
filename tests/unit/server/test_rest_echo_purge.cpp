@@ -574,7 +574,7 @@ TEST_CASE("REST purge: every refusal and outage counts under its own result on s
     reset();
 
     // The recheck, after the requested row. The failure row's detail is the shared token for a
-    // degraded read and `permission_revoked` for every other refusal.
+    // degraded read, `scoped_gate_unavailable` for a gate 503 and `permission_revoked` otherwise.
     h.revoke_on_requested = true;
     expect("denied at the recheck", "denied", 403);
     CHECK(h.audits.back().detail.rfind("permission_revoked device=dev-A source=process cid=", 0) == 0);
@@ -587,7 +587,7 @@ TEST_CASE("REST purge: every refusal and outage counts under its own result on s
     h.revoke_on_requested = true;
     h.scope_refusal = ScopedGateOutcome::Unavailable;
     expect("unavailable at the recheck", "infra_unavailable", 503);
-    CHECK(h.audits.back().detail.rfind("permission_revoked device=dev-A source=process cid=", 0) == 0);
+    CHECK(h.audits.back().detail.rfind("scoped_gate_unavailable device=dev-A source=process cid=", 0) == 0);
     reset();
     h.revoke_on_requested = true;
     h.scope_refusal = ScopedGateOutcome::MgmtGroupReadDegraded;

@@ -144,7 +144,7 @@ The dashboard writes that are audit-first (the console send `command.dispatch`, 
 SELECT a.action, a.principal, a.timestamp, a.detail
 FROM audit_store.audit_events a
 WHERE a.result = 'attempted'
-  AND a.action IN ('echo.source.purge', 'echo.source.reenable', 'group.create_from_results')
+  AND a.action IN ('command.dispatch', 'echo.source.purge', 'echo.source.reenable', 'group.create_from_results')
   AND a.timestamp >= extract(epoch from now() - interval '24 hours')::bigint
   AND a.timestamp <  extract(epoch from now() - interval '1 minute')::bigint
   AND NOT EXISTS (
