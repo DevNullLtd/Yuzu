@@ -287,7 +287,8 @@ the case cannot arise for a registered device: only a hand-built URL reaches thi
 DEX per-device fragments, the device-page fragments, the REST purge
 (`POST /api/v1/echo/retention-paused/purge`) and the two retention-paused posts on the Echo page
 (`POST /fragments/echo/retention-paused/reenable` and `.../purge`, which answer
-"Invalid device id." and count the refusal as `invalid_input`) refuse the same ids the same way.
+"Invalid device id." and count the refusal as `invalid_input`) refuse the same ids with a 400 before
+the per-device permission check.
 
 ### 5.5 Permissions & audit
 
