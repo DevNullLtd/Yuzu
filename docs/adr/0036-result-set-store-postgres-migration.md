@@ -423,17 +423,19 @@ with the trigger took 3.1 to 4.1 s across runs on scratch PostgreSQL 16 on 2026-
 server filled can no longer make a pass exceed the 30 s statement timeout, roll back and retry the
 same sets forever (a defect the set cap alone already had). The budget reads the
 server-maintained `device_count`: member rows written out of band are not counted, so for them
-the bound is best-effort and the 5,000-set cap still applies. A full-budget pass that follows a
-checkpoint wrote 824 MB of WAL with 12-character device IDs and 939 MB with 36-character ones
-(PostgreSQL 16.16, 2026-11-22). Each server runs at most one pass per 5-minute tick, so one server
-drains at most 60M server-counted member rows an hour; passes from several servers never overlap
-(the advisory lock) but each server takes its own. For sets of more than 1,000 members
-(5,000,000 / 5,000) a capped pass deletes fewer rows than the uncapped query did whenever that
-query fitted inside the timeout. It fitted at 20M rows (13.35 s, 2026-11-21) and not at 40M
-(5,000 sets of 8,000 members: 87 s and 7.5 GB of WAL, 2026-11-22), so the regression covers sets
-of more than 1,000 and at most 4,000 to 8,000 members; above that the uncapped query deleted
-nothing and the cap is a pure gain. Running further passes in the same tick is an open follow-up
-with no tracking issue yet (no issue was authorized in this change).
+the bound is best-effort and the 5,000-set cap still applies. A full-budget pass of 36-character
+device IDs that follows a checkpoint wrote 939 MB of WAL (PostgreSQL 16.16, in two separate
+measurements on 2026-11-21 and 2026-11-22); shorter IDs write less. Each server runs at most one
+pass per 5-minute tick, so one server drains at most 60M server-counted member rows an hour; passes
+from several servers never overlap (the advisory lock) but each server takes its own. A capped pass
+deletes fewer rows than the uncapped query did whenever that query's pass, of up to 5,000 sets,
+fitted inside the timeout. That depends on the rows in the pass, not on set size alone, so the cap
+drains less whenever the oldest 5,000 expired sets hold more than 5,000,000 rows (for example 200
+sets of 100,000) and the uncapped query's pass over them would still have finished inside the
+timeout; it did at 20M rows (13.35 s, a Gate 8 measurement on PostgreSQL 16, 2026-11-21). Where that
+pass would have exceeded the timeout, the uncapped query deleted nothing and the cap is a pure gain;
+the row count at which that starts was not independently measured. Running further passes in the
+same tick is an open follow-up with no tracking issue yet (no issue was authorized in this change).
 At open the store checks that the four triggers are present,
 `ENABLE ALWAYS`, of v7's shape and bound to v7's function bodies; otherwise, or if the check cannot be read, it
 logs an error and serves membership uncached. A writer that disables the triggers while servers run, or writes

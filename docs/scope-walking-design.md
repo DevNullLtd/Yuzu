@@ -403,7 +403,7 @@ The chip dropdown lists the operator's active result sets plus the standard scop
 
 ## 9. Audit and observability
 
-The codes below are written as `AuditEvent`s per `docs/observability-conventions.md`; the background fill pass and the GC sweep write no audit row. Action codes:
+Action codes, written as `AuditEvent`s per `docs/observability-conventions.md` except where a row says the verb is not written; the background fill pass and the GC sweep write no audit row:
 
 | Action | Result | Notes |
 |---|---|---|
