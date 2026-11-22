@@ -102,7 +102,7 @@ version reports and acts on nothing (D1).
 | `ClickHouseSink` is write-only, plain `INSERT ... FORMAT JSONEachRow`, with no deduplication token. | `server/core/src/analytics_sinks.cpp:38`, `:61`; `deploy/clickhouse/init.sql:27-30` |
 | ADR-0006 says ClickHouse is the analytics sink, not the substrate. | `docs/adr/0006-server-postgresql-substrate.md:72-75` |
 | No `vers:` comparator exists in the server. The VERS specification lists `generic` but says its comparison algorithm "will be specified later", likely "similar to libversion". | `server/core/src/` (none); `package-url/vers-spec@be215c54ee`, `docs/types/vers-types.md:60-63` |
-| At the pinned vcpkg baseline, the registry has a `libversion` port: version 3.0.4, port-version 1, MIT, source fixed by SHA512. It declares `supports: "!(windows & static)"`, because a static build produces a `version.lib` that clashes with the Windows SDK. The Windows triplet links dynamically except for the grpc stack, so on Windows it would build as a DLL. | `vcpkg.json:8`; `microsoft/vcpkg@9eec002df1`, `ports/libversion/vcpkg.json`, `ports/libversion/portfile.cmake`; `triplets/x64-windows.cmake:3`, `:83-85` |
+| At the pinned vcpkg baseline, the registry has a `libversion` port: version 3.0.4, port-version 1, MIT, source fixed by SHA512. It declares `supports: "!(windows & static)"`, because a static build produces a `version.lib` that clashes with the Windows SDK. The Windows triplet links dynamically except for the grpc stack, so on Windows it would build as a DLL. | `vcpkg.json:8`; microsoft/vcpkg at the `vcpkg.json` `builtin-baseline`, `ports/libversion/vcpkg.json`, `ports/libversion/portfile.cmake`; `triplets/x64-windows.cmake:3`, `:83-85` |
 
 ## Vocabulary
 
@@ -312,7 +312,7 @@ keep (D48). Where it differs, the old result is not preserved.
       - *A reimplementation.* The algorithm and libversion's test corpus are pinned to one libversion
         commit SHA.
     - **The corpus runs as a Yuzu conformance test under either route.** The vcpkg port applies a
-      `disable-test.patch` (`microsoft/vcpkg@9eec002df1`, `ports/libversion/portfile.cmake:6-7`),
+      `disable-test.patch` (microsoft/vcpkg at the `vcpkg.json` `builtin-baseline`, `ports/libversion/portfile.cmake:6-7`),
       so libversion's own tests do not run in a vcpkg build; the corpus diff a pin change needs
       (below) exists only if Yuzu runs the corpus itself.
     - **Changing the pin is a breaking change**, because it can change which devices match the same
