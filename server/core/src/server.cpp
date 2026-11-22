@@ -25026,6 +25026,16 @@ private:
                     };
             }
             tool_deps.crypto_access_fn = crypto_access_cb;
+            // Fleet application usage (get_dex_apps_usage): a pure forward of the same DexApi
+            // GET /api/v1/dex/apps/usage calls. Empty when the deployment has no DexApi.
+            if (dex_api) {
+                tool_deps.dex_apps_usage_fn =
+                    [dex_api](const std::string& window, const std::string& platform_scope,
+                              const DexUsageSlice& slice, std::int64_t floor,
+                              const authz::VisibleSet& visible) {
+                        return dex_api->apps_usage(window, platform_scope, slice, floor, visible);
+                    };
+            }
             // #6087: get/set/reset_dex_score_policy. The read closure is the REST GET's
             // reader; the apply closure is a pure forward of apply_dex_score_policy, the one
             // audit-first write path REST PUT/DELETE also call, with the per-request audit

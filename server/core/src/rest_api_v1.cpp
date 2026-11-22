@@ -21645,34 +21645,22 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(dex_apps_usage_json(*r)), "application/json");
             return;
         }
-        const DexUsageRefusal& f = r.error();
-        if (f.reason == "invalid_slice") {
-            bad_request(f.detail == "unknown_group" ? "unknown management group" : "invalid slice");
+        // The one refusal table (dex_usage_json.hpp), shared with the MCP twin. Tokens only,
+        // never caller text.
+        const DexUsageRefusalClass c = dex_usage_refusal_class(r.error());
+        if (c.kind == DexUsageRefusalKind::CallerError) {
+            bad_request(c.message);
             return;
         }
-        // Tokens only, never caller text.
-        const std::string message = "fleet application usage unavailable (" + f.reason +
-                                    (f.detail.empty() || f.detail == f.reason ? "" : ": " + f.detail) +
-                                    ")";
         res.status = 503;
-        if (f.reason == "usage_unavailable" && f.detail == "fleet_too_large") {
-            // Sustained statement timeouts: retrying does not help.
-            res.set_content(
-                detail::error_json_a4(
-                    503, message, cid,
-                    detail::A4ErrorOpts{
-                        .remediation = "the usage read no longer fits its time bound for this fleet; "
-                                       "retrying does not help, only a narrower platform scope "
-                                       "reduces the read, and the state clears on the first "
-                                       "successful read (see 'Fleet usage per application' in the "
-                                       "DEX guide, docs/dex/app-usage.md)"}),
-                "application/json");
-        } else if (f.reason == "no_population" || f.reason == "invalid_request") {
-            res.set_content(detail::error_json_a4(503, message, cid), "application/json");
-        } else {
-            res.set_content(detail::error_json_a4(503, message, cid, 2000, "retry shortly"),
-                            "application/json");
-        }
+        res.set_content(
+            detail::error_json_a4(
+                503, c.message, cid,
+                detail::A4ErrorOpts{.retry_after_ms = c.retry_after_ms >= 0
+                                                          ? std::optional<std::int64_t>(c.retry_after_ms)
+                                                          : std::nullopt,
+                                    .remediation = c.remediation}),
+            "application/json");
     });
 
     // ── GET / PUT / DELETE /api/v1/dex/score-policy (#6086) ──
