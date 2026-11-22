@@ -2678,14 +2678,15 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
     const auto finished = arm_clock_now();
     const auto deadline = started + std::chrono::milliseconds(read.remaining_ms);
     const bool armed_now = read.ok && read.armed && read.remaining_ms > 0 && finished < deadline;
+    if (!read.ok) // logged before the lock every request naming the user takes
+        spdlog::warn("break-glass arm-state read failed; the arm state is unknown and the gate "
+                     "admits nothing on it until a read succeeds");
     std::lock_guard lk(bg_arm_mu_);
     out.arm_id = bg_last_armed_id_;
     out.last_not_armed_at = bg_last_not_armed_at_;
     if (!read.ok) {
         // A failed read (or no auth store) caches nothing, so the next call reads again.
         bg_arm_valid_ = false;
-        spdlog::warn("break-glass arm-state read failed; the arm state is unknown and the gate "
-                     "admits nothing on it until a read succeeds");
         out.state = SsoOnlyLocalGate::kTransient;
         out.cause = SsoOnlyTransientCause::kReadFailed;
         count("read_failed");
