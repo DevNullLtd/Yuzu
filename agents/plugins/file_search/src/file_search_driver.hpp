@@ -211,15 +211,16 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
         ops.now = in.now; // one clock for the governor's deadline and the walk's reads of it
         // A resumed slice re-lists every ancestor of its resume point before it visits an entry, and
         // those listings reach nothing new: they are paced like any work but not judged by the back-off,
-        // or a slow disk would spend the slice on the way back to where the last one stopped.
-        const bool resumed = !in.resume.dirs.empty();
-        bool visited = false;
-        ops.list = [&gov, &visited, resumed, now = in.now, list = in.leg.ops.list](const std::string& dir, std::size_t cap) {
+        // or a slow disk would spend the slice on the way back to where the last one stopped. `judge`
+        // starts true only for a slice with no resume position at all (a cursor that stopped in the root
+        // has `after` set and no `dirs`) and turns true when the walk visits its first entry.
+        bool judge = in.resume.dirs.empty() && in.resume.after.empty();
+        ops.list = [&gov, &judge, now = in.now, list = in.leg.ops.list](const std::string& dir, std::size_t cap) {
             gov.pace();
             const auto before = now();
             auto listed = list(dir, cap);
             const auto took = now() - before;
-            if (!resumed || visited)
+            if (judge)
                 gov.note_listing(took); // the governor's back-off baseline: the search's own new listings
             return listed;
         };
@@ -232,7 +233,7 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
 
         const ci::OrderedVisit visit = [&](const std::string& dir, const ci::DirEntry& e, std::uint64_t dir_dev) {
             gov.pace();
-            visited = true;
+            judge = true;
             const bool is_dir = e.type == Type::dir;
             if (is_dir ? in.kinds == fsr::Kinds::files : in.kinds == fsr::Kinds::directories)
                 return false;

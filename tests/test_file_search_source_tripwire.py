@@ -14,7 +14,8 @@ spellings, never a `write*` or `read_file*` prefix, so the plugin's own `write_o
 
   - forbidden: `FIEMAP_FLAG_SYNC` (it writes dirty pages back); the open flags `O_RDWR`, `O_WRONLY`,
     `O_CREAT`, `O_TRUNC`, `O_APPEND`; the calls `write`, `pwrite`, `pwrite64`, `writev`, `pwritev`,
-    `creat`; `fsync`, `fdatasync`, `syncfs`, `msync`, `sync`; `pread*` and `mmap*`; `fopen`, `fread`,
+    `pwritev2`, `fwrite`, `creat`, `ftruncate`, `fallocate`, `posix_fallocate`; `fsync`, `fdatasync`,
+    `syncfs`, `msync`, `sync_file_range`, `sync`; `pread*` and `mmap*`; `fopen`, `fdopen`, `fread`,
     `fgets` and `[io]?fstream`; `readv`, `recv`, `recvfrom`, `recvmsg`; and the shared bounded readers
     of posix_secure_read.hpp (`read_open_fd`, `read_file`, `read_file_at`, `read_file_no_follow`,
     `read_file_no_follow_at`);
@@ -32,9 +33,10 @@ a member pointer or a macro naming it is counted too; the name appears in no oth
 `approval_covers_continuation` is named only in mcp_server.cpp, declared `false` once and assigned `true`
 once. A second caller is a security decision: see the #1398 row of .claude/routed-concerns-access-control.md.
 
-GREP LIMIT: lexical. The match open is `PosixFs::match_facts` in component_fs_posix.cpp, which opens the
-leaf through `shared::open_file_no_follow_at` (`kFileFlags` in posix_secure_read.hpp); that file also holds
-the scan leg's `PosixFs::open_file` and `pread_range`, so it is outside the scope above, and the facts
+GREP LIMIT: lexical, and the forbidden list is exact spellings, not the whole class: a write, sync or read
+call spelled any other way is not seen. The match open is `PosixFs::match_facts` in component_fs_posix.cpp,
+which opens the leaf through `shared::open_file_no_follow_at` (`kFileFlags` in posix_secure_read.hpp); that
+file also holds the scan leg's `PosixFs::open_file` and `pread_range`, so it is outside the scope above, and the facts
 tests of that file and `tests/unit/test_posix_secure_read.cpp` (the open flags are read-only, checked with
 `O_ACCMODE`) cover it. The gate cannot see a call built at run time, a function pointer to `read`, a
 syscall reached by number (the plugin's own `syscall(SYS_ioprio_set)` is one), an aliased store to
@@ -97,15 +99,15 @@ SRC_FORBIDDEN: list[tuple[str, str, str]] = [
      "the sync flag writes dirty pages back: a search must never cause a write"),
     ("open-write-flag", _ID + r"(?:O_RDWR|O_WRONLY|O_CREAT|O_TRUNC|O_APPEND)\b",
      "a file or directory is opened read-only, never for writing, creating, truncating or appending"),
-    ("write-call", _ID + r"(?:write|pwrite|pwrite64|writev|pwritev|creat)\(",
+    ("write-call", _ID + r"(?:write|pwrite|pwrite64|writev|pwritev|pwritev2|fwrite|creat|ftruncate|fallocate|posix_fallocate)\(",
      "a search writes no file or descriptor (its rows go out through write_output(), which does not count)"),
-    ("sync-call", _ID + r"(?:fsync|fdatasync|syncfs|msync|sync)\(",
+    ("sync-call", _ID + r"(?:fsync|fdatasync|syncfs|msync|sync_file_range|sync)\(",
      "a search never forces data to disk"),
     ("positional-read", _ID + r"pread\w*",
      "a matched file is opened and never read"),
     ("mapped-read", _ID + r"mmap\w*",
      "a matched file is opened and never mapped"),
-    ("stream-read", _ID + r"(?:fopen|fread|fgets)\(|" + _ID + r"[io]?fstream\b",
+    ("stream-read", _ID + r"(?:fopen|fdopen|fread|fgets)\(|" + _ID + r"[io]?fstream\b",
      "a matched file is opened and never read through stdio or a stream"),
     ("vector-read", _ID + r"(?:readv|recv|recvfrom|recvmsg)\(",
      "a matched file is opened and never read"),
@@ -255,7 +257,7 @@ def selftest() -> int:
     driver = os.path.join(PLUGIN_SRC, "file_search_driver.hpp")
     shared = os.path.join(SHARED, "file_search_governor.hpp")
     expect(driver in src and shared in src, "scope: the driver and the shared governor header must be scanned")
-    with tempfile.TemporaryDirectory() as tmp:  # the scan walks subdirectories and reads every source extension
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_fs_tripwire_") as tmp:  # the scan walks subdirectories and reads every source extension
         for rel in (os.path.join(PLUGIN_SRC, "sub", "deep.mm"), os.path.join(PLUGIN_SRC, "x.inl"),
                     os.path.join(SHARED, "file_search_y.c"), os.path.join(SHARED, "other.hpp")):
             os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
@@ -275,6 +277,11 @@ def selftest() -> int:
                           ("write-call", "auto n = pwrite64(fd, b, 4, 0);"),
                           ("write-call", "auto n = writev(fd, v, 2);"),
                           ("write-call", "auto n = pwritev(fd, v, 2, 0);"),
+                          ("write-call", "auto n = pwritev2(fd, v, 2, 0, 0);"),
+                          ("write-call", "auto n = fwrite(b, 1, 4, f);"),
+                          ("write-call", "int r = ftruncate(fd, 0);"),
+                          ("write-call", "int r = fallocate(fd, 0, 0, 4);"),
+                          ("write-call", "int r = posix_fallocate(fd, 0, 4);"),
                           ("write-call", "int f = creat(p, 0600);"),
                           ("write-call", "out.write(b, 4);"),
                           ("sync-call", "fsync(fd);"),
@@ -282,7 +289,9 @@ def selftest() -> int:
                           ("sync-call", "syncfs(fd);"),
                           ("sync-call", "msync(p, 4, 0);"),
                           ("sync-call", "sync();"),
+                          ("sync-call", "sync_file_range(fd, 0, 4, 0);"),
                           ("stream-read", "FILE* f = fopen(p, \"r\");"),
+                          ("stream-read", "FILE* f = fdopen(fd, \"r\");"),
                           ("stream-read", "auto n = fread(b, 1, 4, f);"),
                           ("stream-read", "char* l = fgets(b, 4, f);"),
                           ("stream-read", "std::ifstream in(p);"),

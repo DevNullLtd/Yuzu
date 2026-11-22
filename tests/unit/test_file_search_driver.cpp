@@ -32,6 +32,7 @@
  *    emitting the walk position's names readable in a cursor row fails the no-name case.
  */
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "component_fixture_tree.hpp"
 #include "file_search_driver.hpp"
@@ -1138,16 +1139,64 @@ TEST_CASE("file_search driver: a listing that turns slow lengthens the next nap"
     // 300 ms of listing at 50 % duty is a 300 ms nap; the slow listing adds one quantum (50 ms) of back-off.
     CHECK(sleeps == std::vector<std::chrono::milliseconds>{std::chrono::milliseconds{350}});
     // and the two found files are both reported: pacing changes when a search finishes, never what it finds
-    CHECK(std::ranges::count_if(r.rows, [](const std::string& row) { return starts(row, "match|"); }) == 2);
+    CHECK(count_rows(Run{{r}}, "match|") == 2);
 }
 
-namespace {
-
-std::size_t match_rows(const SliceResult& r) {
-    return static_cast<std::size_t>(std::ranges::count_if(r.rows, [](const std::string& row) { return starts(row, "match|"); }));
+TEST_CASE("file_search driver: the first slice judges its root listing",
+          "[file_search][file_search_driver][pacing]") {
+    // MUTATION: starting `judge` false in the driver (judging only after the first visit) leaves the plain
+    // duty nap (300 ms): no listing precedes a visit in a slice with no resume position, so nothing judges
+    // the root listing.
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.list_hook = [&rig](const std::string& dir) {
+        if (dir == "/r")
+            rig.fs.clock += std::chrono::milliseconds{300}; // at or over the hard bound (250 ms)
+    };
+    std::vector<std::chrono::milliseconds> sleeps;
+    rig.b.sleep = [&rig, &sleeps](std::chrono::milliseconds d) {
+        sleeps.push_back(d);
+        rig.fs.clock += d;
+    };
+    const SliceResult r = checked_slice(make_request(kCtl), rig.b);
+    CHECK(r.status == Status::ok);
+    // 300 ms of listing at 50 % duty is a 300 ms nap; the slow root listing adds one quantum (50 ms) of back-off.
+    CHECK(sleeps == std::vector<std::chrono::milliseconds>{std::chrono::milliseconds{350}});
+    CHECK(count_rows(Run{{r}}, "match|") == 1);
 }
 
-} // namespace
+TEST_CASE("file_search driver: a slice resumed from the root re-lists it unjudged and judges the new work below",
+          "[file_search][file_search_driver][pacing]") {
+    // MUTATION: never setting `judge` in the visitor gives {300, 300} (the listing of `z` is new work and
+    // is not judged); dropping the `after` term from the start test gives {350, 400} (the root re-listing
+    // is judged too); starting `judge` true gives the same {350, 400}.
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.fs.add_file("/r/z/yuzu-fs-control-2.bin", "");
+    rig.b.limits.max_entries = 1; // the first control: the first slice ends in the root itself
+    const SliceResult first = checked_slice(make_request(kCtl), rig.b);
+    REQUIRE(first.status == Status::ok);
+    REQUIRE_FALSE(first.cursor.empty());
+    CHECK(count_rows(Run{{first}}, "match|") == 1);
+
+    rig.b.limits.max_entries = fsr::GovernorLimits{}.max_entries;
+    rig.list_hook = [&rig](const std::string&) {
+        rig.fs.clock += std::chrono::milliseconds{300}; // at or over the hard bound (250 ms): every listing is slow
+    };
+    rig.fs.listed.clear();
+    std::vector<std::chrono::milliseconds> sleeps;
+    rig.b.sleep = [&rig, &sleeps](std::chrono::milliseconds d) {
+        sleeps.push_back(d);
+        rig.fs.clock += d;
+    };
+    const SliceResult second = checked_slice(make_request(kCtl, "/r", "files", first.cursor), rig.b);
+    CHECK(second.status == Status::ok);
+    CHECK(count_rows(Run{{second}}, "match|") == 1);
+    CHECK(rig.fs.listed == Strs{"/r", "/r/z"});
+    // The nap at the entry `z` is the plain duty nap for the unjudged root re-listing (300 ms); the listing
+    // of `z` is new work, judged slow, so the nap at its entry adds one quantum of back-off (300 + 50 ms).
+    CHECK(sleeps == std::vector<std::chrono::milliseconds>{std::chrono::milliseconds{300}, std::chrono::milliseconds{350}});
+}
 
 TEST_CASE("file_search driver: the re-listings of a resumed slice are each paced by the duty cycle",
           "[file_search][file_search_driver][pacing]") {
@@ -1161,7 +1210,7 @@ TEST_CASE("file_search driver: the re-listings of a resumed slice are each paced
     const SliceResult first = checked_slice(make_request(kCtl), rig.b);
     REQUIRE(first.status == Status::ok);
     REQUIRE_FALSE(first.cursor.empty());
-    CHECK(match_rows(first) == 1);
+    CHECK(count_rows(Run{{first}}, "match|") == 1);
 
     rig.b.limits.max_entries = fsr::GovernorLimits{}.max_entries;
     rig.fs.list_step = std::chrono::milliseconds{60}; // every listing is a whole work quantum (50 ms) of work
@@ -1173,7 +1222,7 @@ TEST_CASE("file_search driver: the re-listings of a resumed slice are each paced
     };
     const SliceResult second = checked_slice(make_request(kCtl, "/r", "files", first.cursor), rig.b);
     CHECK(second.status == Status::ok);
-    CHECK(match_rows(second) == 2);
+    CHECK(count_rows(Run{{second}}, "match|") == 2);
     CHECK(rig.fs.listed == Strs{"/r", "/r/a", "/r/a/b", "/r/a/b/c"}); // the whole path back to the resume point
     // Three naps before the re-listings of /r/a, /r/a/b and /r/a/b/c, one at the first entry after them: the
     // plain duty nap of 60 ms each, with no back-off (the listings are evenly fast).
@@ -1182,18 +1231,22 @@ TEST_CASE("file_search driver: the re-listings of a resumed slice are each paced
 
 TEST_CASE("file_search driver: slow re-listings of a resumed slice do not use up the slice before it reaches new work",
           "[file_search][file_search_driver][pacing]") {
-    // MUTATION: handing every listing to the governor (dropping the `resumed`/`visited` test in the list
-    // wrapper) lets eleven 300 ms listings double the back-off to its cap and sleep the slice away before
-    // the first new entry: the second slice finds nothing and the search can only stall.
+    // MUTATION: handing every listing to the governor (starting `judge` true in the driver) lets eleven
+    // 300 ms listings double the back-off to its cap and sleep the slice away before the first new entry:
+    // the second slice finds nothing and the search can only stall. The first slice ends on entering d10
+    // (budget 10: the cursor holds all ten `dirs` and no `after`) or inside it after one match (budget 11:
+    // `after` is set too); dropping the `dirs` term from the driver's start test fails the first form.
+    const std::size_t first_budget = static_cast<std::size_t>(GENERATE(10, 11));
+    const std::size_t first_matches = first_budget - 10;
     Rig rig;
     const std::string deep = "/r/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10";
     for (int i = 1; i <= 3; ++i)
         rig.fs.add_file(deep + "/yuzu-fs-control-" + std::to_string(i) + ".bin", "");
-    rig.b.limits.max_entries = 11; // d1..d10 and the first control: the first slice ends inside d10
+    rig.b.limits.max_entries = first_budget; // d1..d10, and with 11 the first control
     const SliceResult first = checked_slice(make_request(kCtl), rig.b);
     REQUIRE(first.status == Status::ok);
     REQUIRE_FALSE(first.cursor.empty());
-    CHECK(match_rows(first) == 1);
+    CHECK(count_rows(Run{{first}}, "match|") == first_matches);
 
     rig.b.limits.max_entries = fsr::GovernorLimits{}.max_entries;
     rig.list_hook = [&rig](const std::string&) {
@@ -1203,7 +1256,7 @@ TEST_CASE("file_search driver: slow re-listings of a resumed slice do not use up
     const SliceResult second = checked_slice(make_request(kCtl, "/r", "files", first.cursor), rig.b);
     CHECK(rig.fs.listed.size() == 11); // /r and the ten below it
     CHECK(second.status == Status::ok);
-    CHECK(match_rows(second) == 2);
+    CHECK(count_rows(Run{{second}}, "match|") == 3 - first_matches);
     CHECK(second.reason == "none");
 }
 
