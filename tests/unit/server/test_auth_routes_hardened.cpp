@@ -742,6 +742,7 @@ struct ArmCtl {
     enum Mode : int { kArmed = 0, kNotArmed = 1, kFail = 2 };
     std::atomic<int> mode{kArmed};
     std::atomic<int> id{1};                         // armed_until text is "arm-<id>"
+    std::atomic<bool> empty_id{false};              // an armed read whose armed_until text is empty
     std::atomic<std::int64_t> remaining_ms{3'600'000};
     std::atomic<std::int64_t> advance_in_read_ms{0}; // the read itself takes this long
     std::atomic<bool> window_ended_in_db{false};     // a not-armed read keeps the ended window's text
@@ -781,7 +782,7 @@ void install_arm_hook(HardenedHarness& h, ArmCtl& ctl) {
         r.ok = mode != ArmCtl::kFail;
         r.armed = mode == ArmCtl::kArmed;
         if (r.armed) {
-            r.armed_until = "arm-" + std::to_string(ctl.id.load());
+            r.armed_until = ctl.empty_id.load() ? std::string{} : "arm-" + std::to_string(ctl.id.load());
             r.remaining_ms = ctl.remaining_ms.load();
         } else if (mode == ArmCtl::kNotArmed && ctl.window_ended_in_db.load()) {
             // What the database returns once a window has ended: not armed, the text kept.
@@ -1630,4 +1631,28 @@ TEST_CASE("break-glass MFA step: an unreadable arm state does not use up one of 
     rows = audit_rows(h, "mfa.login.failed");
     CHECK(rows_containing(rows, "totp code rejected") == 4);
     CHECK(rows_containing(rows, "attempts exhausted") == 1);
+}
+
+// Code review F6: the transient admit compares arm ids, and an EMPTY id is never a match. An
+// armed read always carries the window's text in production; if one ever did not, two empty ids
+// must not be read as "the same arm window".
+TEST_CASE("break-glass MFA step: an unreadable arm state never admits on an empty arm id",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    ctl.empty_id = true;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        h.auth_routes->advance_arm_clock_for_test(1100);
+        ctl.mode = ArmCtl::kFail;
+    });
+    auto res = login_step2(h, pending, mfa.codes[0]);
+    // Inside the age bound, before the deadline, no not-armed read, and the two ids are EQUAL
+    // (both empty): only the non-empty requirement can refuse (mutation: clause removed -> 200).
+    CHECK(res->status == 401);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(refused(h, "transient", "pre_mint") == 1.0);
+    CHECK(transient_admitted(h) == 0.0);
 }

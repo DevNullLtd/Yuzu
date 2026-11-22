@@ -179,6 +179,72 @@ def _block_end(t, open_idx):
     return -1
 
 
+FOR_TEST_DECL = re.compile(r"\b(\w+_for_test)\s*\(")
+PRODUCTION_TREES = ("server", "agents", "common", "sdk", "enterprise")
+
+
+_PROD_CACHE = {}
+_SEAM_SCAN_CACHE = {}
+
+
+def load_production_sources():
+    """Every C++ source and header outside tests/ that mentions `_for_test` (comment-stripped),
+    keyed by repo-relative path. Read once per run."""
+    if "files" in _PROD_CACHE:
+        return _PROD_CACHE["files"]
+    root = SRC.parent.parent.parent
+    out = {}
+    for tree in PRODUCTION_TREES:
+        base = root / tree
+        if not base.is_dir():
+            continue
+        for p in sorted(base.rglob("*")):
+            if p.suffix not in (".cpp", ".hpp", ".h", ".cc", ".mm") or not p.is_file():
+                continue
+            rel = p.relative_to(root).as_posix()
+            if "/tests/" in "/" + rel or "vcpkg_installed" in rel or p.name == "server.cpp":
+                continue
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            if "_for_test" in raw:
+                out[rel] = strip_comments(raw)
+    # server.cpp is read raw (see load()); a *_for_test( call in it is a call either way.
+    sp = root / "server" / "core" / "src" / "server.cpp"
+    if sp.is_file():
+        out["server/core/src/server.cpp"] = sp.read_text(encoding="utf-8", errors="replace")
+    _PROD_CACHE["files"] = out
+    return out
+
+
+def check_for_test_callers(files):
+    """No file outside tests/ calls a *_for_test member of AuthRoutes. The names are read from
+    auth_routes.hpp; auth_routes.hpp declares them and auth_routes.cpp may DEFINE them
+    (`AuthRoutes::name(`), nothing else may spell `name(`."""
+    hpp = files.get("auth_routes.hpp", "")
+    names = sorted(set(FOR_TEST_DECL.findall(hpp)))
+    if not names:
+        return ["no *_for_test member found in auth_routes.hpp (the pin has nothing to check)"]
+    prod = files.get("__production__")
+    key = None
+    if prod is None:
+        key = tuple(names)
+        if key in _SEAM_SCAN_CACHE:  # the real tree does not change between selftest mutants
+            return list(_SEAM_SCAN_CACHE[key])
+        prod = load_production_sources()
+    bad = []
+    for rel, text in prod.items():
+        if rel.endswith("server/core/src/auth_routes.hpp"):
+            continue
+        for n in names:
+            for m in re.finditer(r"\b" + re.escape(n) + r"\s*\(", text):
+                if rel.endswith("server/core/src/auth_routes.cpp") and \
+                        text[max(0, m.start() - 12):m.start()].endswith("AuthRoutes::"):
+                    continue  # the out-of-line definition
+                bad.append(f"{rel}: calls AuthRoutes test seam {n}( outside tests/")
+    if key is not None:
+        _SEAM_SCAN_CACHE[key] = list(bad)
+    return bad
+
+
 def check_arm_recheck(files):
     """WP03: the break-glass arm state at the MFA step and the tri-state gate (see the module
     docstring's second list). Token level, like the rest of this file."""
@@ -220,6 +286,7 @@ def check_arm_recheck(files):
     if seg.count("arm_clock_now()") != 1:
         bad.append("/login/mfa: exactly one clock sample between the second gate call and the mint")
     for clause in ("gate2.state == SsoOnlyLocalGate::kTransient",
+                   "!arm1->arm_id.empty()",
                    "now2 < arm1->deadline",
                    "arm_observation_fresh(arm1->read_at, now2)",
                    "gate2.arm_id == arm1->arm_id",
@@ -249,6 +316,8 @@ def check_arm_recheck(files):
         bad.append("yuzu_auth_break_glass_pending_refused_total must carry reason and stage labels")
     # The gate result cannot be compared with, or converted to, the bare state.
     for name, text in files.items():
+        if name.startswith("__"):
+            continue
         if "!= SsoOnlyLocalGate::kRefused" in text:
             bad.append(f"{name}: `!= SsoOnlyLocalGate::kRefused` admits kTransient; name the admitted states")
     if re.search(r"operator\s*[!=]=\s*\([^)]*SsoOnlyGateResult", hpp) or \
@@ -285,6 +354,9 @@ def check_arm_recheck(files):
                        "time under the mutex after the failed CAS")
         if gate.count("bg_last_not_armed_at_ =") != 1:
             bad.append("bg_last_not_armed_at_ must be written in exactly one place (a not-armed read)")
+    if "break_glass_login = gate.admits_password_evaluation();" not in t:
+        bad.append("POST /login must decide the break-glass admit with admits_password_evaluation()")
+    bad += check_for_test_callers(files)
     if "kArmSnapshotMaxAge{4500}" not in hpp or "return now - read_at <= kArmSnapshotMaxAge;" not in hpp:
         bad.append("kArmSnapshotMaxAge must be 4500 ms and arm_observation_fresh must compare against it")
     return bad
@@ -294,7 +366,7 @@ def check(files):
     bad = []
     sites = {}
     for name, t in files.items():
-        if name.startswith("auth_db."):
+        if name.startswith("auth_db.") or name.startswith("__"):
             continue
         for m in CALL.finditer(t):
             sites.setdefault(name, []).append(m.start())
@@ -474,6 +546,25 @@ def selftest(files):
                     "admitted_under_transient = gate2.state == SsoOnlyLocalGate::kTransient; (void)db->mfa_status(entry.username);"))
         mut("pending_refused counter without labels",
             sub_cpp('"yuzu_auth_break_glass_pending_refused_total",', '"yuzu_auth_break_glass_pending_refused_total").increment(); (void)(0,'))
+    mut("/login decides the break-glass admit without the one admit set",
+        sub_cpp("break_glass_login = gate.admits_password_evaluation();",
+                "break_glass_login = gate.state == SsoOnlyLocalGate::kBreakGlassArmed || gate.state == SsoOnlyLocalGate::kTransient;"))
+    mut("the non-empty arm id requirement dropped", sub_cpp("!arm1->arm_id.empty() && ", ""))
+    # A production file calling a test seam must be caught (the real tree is scanned once; the
+    # mutant adds one rogue production file to that scan).
+    prod = load_production_sources()
+    m = dict(files)
+    m["__production__"] = dict(prod)
+    m["__production__"]["server/core/src/rogue_seam_caller.cpp"] = \
+        "void f(yuzu::server::AuthRoutes& r) { r.set_arm_clock_for_test(0); }"
+    if not check(m):
+        failures.append("MUTATION NOT DETECTED: a production file calls an AuthRoutes test seam")
+    m = dict(files)
+    m["__production__"] = dict(prod)
+    m["__production__"]["server/core/src/auth_routes.cpp"] = \
+        prod.get("server/core/src/auth_routes.cpp", "") + "\nvoid g(AuthRoutes& r) { r.reset_break_glass_arm_cache_for_test(); }"
+    if not check(m):
+        failures.append("MUTATION NOT DETECTED: auth_routes.cpp itself calls a test seam")
     mut("password-change gate back to != kRefused",
         sub_cpp("return sso_only_local_password_gate(username).admits_password_evaluation();",
                 "return sso_only_local_password_gate(username).state != SsoOnlyLocalGate::kRefused;"))

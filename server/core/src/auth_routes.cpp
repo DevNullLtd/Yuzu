@@ -2886,7 +2886,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             const auto gate = sso_only_local_password_gate(username);
             if (gate.state == SsoOnlyLocalGate::kOpen)
                 return true;
-            break_glass_login = gate.state == SsoOnlyLocalGate::kBreakGlassArmed;
+            // Not open, so the one admit set leaves exactly "armed": a definitive refusal and
+            // an unreadable arm state are both refused below.
+            break_glass_login = gate.admits_password_evaluation();
             if (!break_glass_login) {
                 res.status = 401;
                 res.set_content(detail::a4_error(res, "Invalid username or password"),
