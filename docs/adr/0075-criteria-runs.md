@@ -658,6 +658,28 @@ prerequisites:
 4. **The response store moves to ClickHouse under its own ADR** before slice 3, carrying
    `ResponseTierFilter` (#4990) and per-device scoping (#1634) into every query.
 
+#### Bulk responses and incident dispatch (approved 2026-11-22)
+
+At admission, persist the dispatch policy, response destination, frozen authorized cohort and
+deadline. Ordinary and incident bulk live inputs both stream through authenticated core ingest
+to ClickHouse. Incident mode selects a budgeted higher dispatch rate. Scope, approvals,
+per-delivery authority checks, read filtering and plugin completeness apply in both modes.
+PostgreSQL retains transactional state and R11's bounded warm verdicts.
+
+Reserve response capacity across all operators and replicas before fan-out, independently of
+the PostgreSQL verdict reservation. Dispatch bounded waves, size the in-flight buffer for work
+already sent and advance only with acknowledged sink capacity. Retry batches idempotently.
+A stalled sink pauses new waves. Never spool bulk responses to PostgreSQL. At buffer exhaustion,
+loss or deadline, expose the affected devices and incomplete coverage within the reader's scope.
+An unretained answer cannot prove absence. Show the selected profile, destination, pause reason,
+acknowledged progress and outstanding coverage on the run.
+
+Packet 3C specifies batch identity, durability, tier-filtered reads, retention and cutover.
+3D implements the response path. The incident dispatch policy follows 3D and general delivery
+(3F), before live criteria inputs (3G). Acceptance includes concurrent ordinary and incident
+traffic, a stalled sink mid-wave, restart, duplicate acknowledgements, recovery without duplicate
+answers, and a deadline with outstanding devices.
+
 ### R14. Consuming a run's result (D37, D46, D54)
 
 1. **`from_result_set:<run>` resolves to the run's `matched` members only** (D46). Members carry
@@ -773,7 +795,7 @@ criteria-run surface changes.
 Live inputs (R3.6, R3.7), deliver-on-connect and `unanswered` (R13), transient answers settling as
 final (R7.2), per-step visibility and token checks (R9.5, R9.8), and the two refusals (R12.4,
 R12.5). Prerequisites: deliver-on-connect, the token store's durable generation, #4166, the
-response-store ADR and ADR-1013's digest.
+response-store cutover, bounded incident dispatch and ADR-1013's digest.
 
 ## Consequences
 
@@ -809,7 +831,7 @@ response-store ADR and ADR-1013's digest.
     same criteria. The excluded count makes this visible.
   - A run abandoned before its deadline holds its set until the deadline plus 20 minutes, counted
     against the 10,000-per-owner limit.
-  - A long ClickHouse outage grows Postgres by about 300 MB per fleet-wide run until it recovers.
+  - During a cold-export outage, outstanding verdicts consume their reserved warm capacity. Admission closes at the configured limit (R11). A bulk response sink outage pauses live waves (R13).
   - Where the cold tier is on, ClickHouse is a required, stateful service in SOC 2 scope.
   - After 90 days only the run's summary remains, not any device's verdict (R11.8).
   - In the two-valued mode, "not a member" can mean "does not match" or "unknown"; only K3 tells

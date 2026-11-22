@@ -954,6 +954,12 @@ consumer audit (`docs/adr/1010-evidence/consumer-audit.md`, not yet in the tree)
 for which readers of an evaluation must change before any agent-side lever is enabled for data that
 feeds a walk.
 
+For bulk live runs, an ingest pause preserves the frozen cohort. Keep the selected and
+reached counts distinct from the count of devices whose answers were durably received.
+At the deadline, incomplete coverage cannot support inversion or a claim of absence.
+[ADR-0075 R13](0075-criteria-runs.md#r13-live-delivery-from-slice-3-d17-d23-d25-d30)
+owns dispatch pacing and response retention.
+
 ### 11.3 One "fleet-wide" test — form before resolution, count after
 
 ADR-1011 D1 classifies a dispatch as fleet-wide **by target form, before resolution** — scope
