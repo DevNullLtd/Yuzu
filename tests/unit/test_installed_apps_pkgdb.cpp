@@ -1722,7 +1722,7 @@ TEST_CASE("pkgdb mapping: rpm publisher, signature, epoch and date", "[installed
         }
         p.vendor = "%{vendor}";
         p.packager = "P";
-        CHECK(inv::inv_record_from_rpm(p, tm_of).publisher == "P"); // not the macro, as the review found
+        CHECK(inv::inv_record_from_rpm(p, tm_of).publisher == "P"); // the packager, never the unexpanded macro
     }
     SECTION("signed when either stored tag has bytes, unsigned when neither") {
         CHECK(inv::inv_record_from_rpm(p, tm_of).signature_status == "unsigned");

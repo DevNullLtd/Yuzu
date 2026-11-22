@@ -706,8 +706,8 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
             // not an absent database: say so, so that `list` never answers "no applications found" as
             // if that were authoritative. lstat tells it from a link (handled below) and from a path
             // that is simply missing (its lstat fails, an ancestor that is not a directory included).
-            if (struct stat ls {}; ::lstat(dir_path.c_str(), &ls) == 0 && !S_ISDIR(ls.st_mode) &&
-                                       !S_ISLNK(ls.st_mode)) {
+            if (struct stat entry {}; ::lstat(dir_path.c_str(), &entry) == 0 && !S_ISDIR(entry.st_mode) &&
+                                          !S_ISLNK(entry.st_mode)) {
                 out.found = true;
                 out.failure = failure_token("rpmdb", PkgDbCause::not_regular);
                 return out;

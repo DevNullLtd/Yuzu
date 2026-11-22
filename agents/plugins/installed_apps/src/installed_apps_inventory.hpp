@@ -227,8 +227,8 @@ inline std::string parse_os_release(std::string_view content, std::string_view k
 // publisher falls through to the next source instead of carrying the format string. This is the old
 // CLI path's guard (rpm_text_value in tests/unit/installed_apps_old_path_oracle.hpp); the stored tag
 // bytes are otherwise used as they are.
-[[nodiscard]] inline std::string rpm_text_or_empty(const std::string& v) {
-    return (v == "(none)" || v.rfind("%{", 0) == 0) ? std::string{} : v;
+[[nodiscard]] inline std::string rpm_text_or_empty(std::string_view v) {
+    return (v == "(none)" || v.starts_with("%{")) ? std::string{} : std::string{v};
 }
 
 // One installed rpm package -> its `inv|` record. `to_local_tm` turns the stored INSTALLTIME into a

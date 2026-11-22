@@ -916,6 +916,25 @@ TEST_CASE("bdb hostile: edited real file with a bad magic, version, page size, c
                 CHECK(cause(f) == PkgDbCause::corrupt);
             }
         }
+        SECTION("a free page (type 0) is skipped: a long-lived host's file carries them") {
+            // Neither fixture holds one (their pages are only hash 13 and overflow 7), so append a
+            // zeroed page, which BDB marks P_INVALID, and count it in last_pgno: the read must still
+            // deliver every header the original did, neither refused nor short.
+            std::size_t before = 0;
+            {
+                auto b = generous();
+                REQUIRE(run_bdb(good, b, &before).has_value());
+            }
+            Bytes f = good;
+            f.resize(f.size() + v.pagesize, 0);
+            put32(f, 32, v.last_pgno + 1, be);
+            REQUIRE(f[std::size_t{v.last_pgno + 1} * v.pagesize + 25] == 0);
+            std::size_t after = 0;
+            auto b = generous();
+            REQUIRE(run_bdb(f, b, &after).has_value());
+            CHECK(after == before);
+            CHECK(after > 0);
+        }
         SECTION("edited record number repeated: one key overwritten with another's is corrupt") {
             const auto keys = bdb_key_offsets(good, v);
             REQUIRE(keys.size() >= 2);

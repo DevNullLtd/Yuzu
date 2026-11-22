@@ -2009,7 +2009,8 @@ does not, or the reverse.
   which `dpkg-query` never read) now reports them: new install rows and install events for that host. Each
   package there is a control file with no `Status` field, plus a `.md5sums` sibling that is skipped; a present
   file is read as installed, and a file that does carry a `Status` is held to the same three-word rule. The
-  converse is also new: a host with a healthy status file and one unparseable regular file in `status.d` is
+  converse is also new: a host with a healthy status file and one `status.d` control file that is not exactly one installed stanza
+  (unparseable, zero-byte, comment-only, two stanzas, or a lone not-installed stanza) is
   degraded (`dpkg_status_d:corrupt`, no rows) where `dpkg-query` ignored the directory, and the status file's own
   packages are withheld with it, because a roster without the `status.d`-only packages would be published as the
   host's complete one. The remedy is to remove the file or give it a leading dot (hidden names are skipped).
@@ -2018,10 +2019,12 @@ does not, or the reverse.
   An rpm candidate DIRECTORY that is a symlink is never followed and is skipped; when a database file exists behind
   such a link, the read is `rpmdb:symlink_refused` (a stat only; nothing is opened through the link) instead of an
   empty list, unless the link resolves, by device and inode, to a directory whose database this reader read itself (an
-  empty one counts). That is decided once every candidate has been tried, because on the older layout the sysimage
-  link is seen before the `/var/lib/rpm` directory it points at. The current Fedora, RHEL and SUSE layout
+  empty one counts). That is decided when a database is about to be accepted and, if none was, once every candidate has been tried, because on
+  the older layout the sysimage link is seen before the `/var/lib/rpm` directory it points at; a populated directory read
+  after a link that hides a different database is refused too. The current Fedora, RHEL and SUSE layout
   (`/var/lib/rpm` linking to the sysimage copy, which is read first) and the older one are unaffected; a link to a
-  populated directory elsewhere, beside an emptied database, is refused.
+  populated directory elsewhere, beside an emptied or a populated database, is refused. A regular file where an rpm
+  candidate directory belongs is `rpmdb:not_regular`, not an absent database.
 - An rpm sqlite database without its WAL sidecars is readable by an unprivileged account (measured on one
   AlmaLinux 9 image: `rpm -qa` fails there as `nobody`).
 - **A running rpm transaction answers `locked` on ndb and Berkeley DB.** rpm rewrites those two files in place and
