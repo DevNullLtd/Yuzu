@@ -2686,25 +2686,18 @@ bool read_pending_row(PGresult* res, int row, auth::PendingAgent& out) {
     return true;
 }
 
-/// True if `s` contains a byte that could corrupt a plain-string audit
-/// `detail` field or the comma-joined `bulk_audit_detail` list this store's
-/// caller (`settings_routes.cpp`) builds from `agent_id`s it reads back: any
-/// ASCII control character (0x00-0x1F, 0x7F — this subsumes `has_embedded_nul`;
-/// `\n`/`\r` in particular can forge additional log/audit lines) or a literal
-/// comma (the `bulk_audit_detail` delimiter). `agent_id` is the one field this
-/// store hard-rejects rather than sanitises (see `sanitize_enrollment_text`'s
-/// doc comment for why descriptive fields differ), so this is the single
-/// chokepoint — extend it, never add per-call-site escaping.
-bool has_audit_unsafe_byte(std::string_view s) {
-    for (const unsigned char c : s) {
-        if (c <= 0x1FU || c == 0x7FU || c == ',')
-            return true;
-    }
-    return false;
-}
-
+/// The one `agent_id` chokepoint of this store. The length and control-byte floor is the shared
+/// `auth::agent_id_is_audit_safe` (at most `auth::kMaxAgentIdLength` bytes, no byte below 0x20:
+/// this subsumes an embedded NUL, and `\n`/`\r` in particular can forge additional log/audit
+/// lines). On top of it this store hard-rejects an empty id, DEL (0x7F) and a literal comma,
+/// the `bulk_audit_detail` delimiter of the comma-joined list this store's caller
+/// (`settings_routes.cpp`) builds from `agent_id`s it reads back. `agent_id` is the one field
+/// this store hard-rejects rather than sanitises (see `sanitize_enrollment_text`'s doc comment
+/// for why descriptive fields differ), so this is the single chokepoint: extend it, never add
+/// per-call-site escaping.
 bool agent_id_ok(const std::string& id) {
-    return !id.empty() && id.size() <= auth::kMaxAgentIdLength && !has_audit_unsafe_byte(id);
+    return !id.empty() && auth::agent_id_is_audit_safe(id) &&
+           id.find_first_of("\x7f,") == std::string::npos;
 }
 
 bool pending_fields_ok(const auth::PendingAgent& a) {

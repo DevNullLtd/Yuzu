@@ -276,8 +276,14 @@ in-panel error and caches nothing rather than minting a weak token.
 | `GET /fragments/echo/process-tree/detail?token=&node=` | Render one node's detail from the cache (re-checks scope **+ Execute + originating principal**) |
 
 A `device` longer than 256 bytes or containing a byte below 0x20 (a control character) is
-refused with status 400 and the note "Invalid device id." on `run`, `result`, `device-net` and
-the capture-sources load and push routes, before any permission check, dispatch or audit row.
+refused with status 400 on `run`, `result`, `device-net` and the capture-sources load and push
+routes, before any permission check, dispatch or audit row. The routes answer with the note
+"Invalid device id."; the capture-sources push also raises the error toast "Invalid device id.",
+which is the only signal visible there, because the dashboard's htmx drops a 4xx body. Agent
+registration and enrolment already refuse such an id (over 256 bytes, or a control byte), so
+the case cannot arise for a registered device: only a hand-built URL reaches this refusal. The
+DEX per-device fragments, the device-page fragments and the Echo purge refuse the same ids the
+same way.
 
 ### 5.5 Permissions & audit
 

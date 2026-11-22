@@ -2678,6 +2678,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // -- Per-device drill-down (signal history; behavioral PII → audit each open). ?id=<agent_id> --
     sink.Get("/fragments/dex/device", [this](const httplib::Request& req, httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        if (detail::refuse_unsafe_device_id(res, id)) // before the scoped check and any audit row
+            return;
         // Per-device scope (tier + management group), not just global Read — an
         // operator can only drill a device inside their scope (mirrors /device; a
         // cross-tenant read of another team's per-device DEX history was the gap).
@@ -2716,6 +2718,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
                  const std::string event_id =
                      req.has_param("event_id") ? req.get_param_value("event_id") : "";
+                 if (detail::refuse_unsafe_device_id(res, id)) // before the scoped check and any audit row
+                     return;
                  // Same per-device scope as /fragments/dex/device: an operator can
                  // only drill an event on a device inside their scope.
                  if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
@@ -3211,6 +3215,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                             pending_div](const httplib::Request& req,
                                                          httplib::Response& res) {
         const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+        if (detail::refuse_unsafe_device_id(res, id)) // before the scoped check and any audit row
+            return;
         // Per-device scoped Read floor + Execute probe (mirrors /device live).
         if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
                             : !perm_fn_(req, res, "GuaranteedState", "Read"))
@@ -3254,6 +3260,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         const std::string command_id =
             req.has_param("command_id") ? req.get_param_value("command_id") : "";
         const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+        if (detail::refuse_unsafe_device_id(res, id)) // before the scoped check and any audit row
+            return;
         // Per-device scoped Read floor + Execute probe (same scope as the dispatch;
         // stops a principal polling another team's command_id through this route).
         if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
@@ -3350,6 +3358,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                                          httplib::Response& res) {
                  const std::string id =
                      req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 if (detail::refuse_unsafe_device_id(res, id)) // before the scoped check and any audit row
+                     return;
                  // Per-device scoped Read floor + Execute probe (mirrors /device live).
                  if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
                                      : !perm_fn_(req, res, "GuaranteedState", "Read"))
@@ -3398,6 +3408,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      req.has_param("command_id") ? req.get_param_value("command_id") : "";
                  const std::string id =
                      req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 if (detail::refuse_unsafe_device_id(res, id)) // before the scoped check and any audit row
+                     return;
                  // Per-device scoped Read floor + Execute probe (same scope as the
                  // dispatch; stops polling another team's command_id through this route).
                  if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)
@@ -3480,6 +3492,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
              [this](const httplib::Request& req, httplib::Response& res) {
                  const std::string id =
                      req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+                 if (detail::refuse_unsafe_device_id(res, id)) // before the scoped check and any audit row
+                     return;
                  // Per-device scoped Read floor (tier + management group). Mirrors the
                  // sibling fallback so a deployment without scoped_perm_fn still gates.
                  if (scoped_perm_fn_ ? !scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)

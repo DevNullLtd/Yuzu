@@ -127,6 +127,7 @@ struct EchoHarness {
     bool dispatch_throws_other = false; ///< the dispatch throws something that is no std::exception
     bool caller_throws = false; ///< deriving the dispatch caller throws
     int write_probes = 0; ///< scoped-gate calls for Write, which this stub always refuses
+    int scoped_calls = 0; ///< scoped-gate calls of any operation: the permission check, and in production its denial audit
     /// "audit:<action>/<result>" and "dispatch", in call order: proves the `attempted` row
     /// precedes every dispatch it covers.
     std::vector<std::string> order;
@@ -206,6 +207,7 @@ struct EchoHarness {
         // counted and refused: no route here may probe it (the dispatch chokepoint decides Write).
         auto scoped = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                              const std::string& op, const std::string& dev) {
+            ++scoped_calls;
             if (op == "Write")
                 ++write_probes;
             bool ok = (op == "Execute") ? allow_execute : (op != "Write" && allow_read);
@@ -2473,10 +2475,14 @@ TEST_CASE("capture-sources push: every result series exists before the first pus
 
 // #7811: a device id reaches target_id on every audit row and the permission-denial audit, so
 // the fragment routes refuse an over-long or control-byte id before any check, audit or dispatch.
+// Every harness below holds `scope_device = "dev-A"`, so the scoped gate would answer 403 for any
+// id used here: a 400 with `scoped_calls == 0` proves the id check runs first (the permission
+// check, and in production the denial audit that carries the id, never ran), where the empty
+// audit log and the zero dispatches alone are also true of a route that never audits or sends.
 TEST_CASE("echo routes: a fragment route refuses an unsafe device id before any audit or dispatch",
           "[echo][routes][audit]") {
     const std::string kLong(257, 'a');
-    const std::vector<std::string> bad = {kLong, "dev%00A", "dev%0D%0AA", "dev%0AA"};
+    const std::vector<std::string> bad = {kLong, "dev%00A", "dev%0D%0AA", "dev%0AA", "dev%09A"};
     const std::string tail = "&dcmd=" + kDnsCmd + "&acmd=" + kArpCmd + "&scmd=" + kStatusCmd +
                              "&ccmd=" + kCompatCmd + "&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd +
                              "&hcmd=" + kHoursCmd + "&n=1&hour=7200&preset=24h";
@@ -2487,17 +2493,21 @@ TEST_CASE("echo routes: a fragment route refuses an unsafe device id before any 
               "/fragments/echo/process-tree/device-net", "/fragments/echo/capture-sources/load"}) {
             INFO(route);
             EchoHarness h;
+            h.scope_device = "dev-A";
             auto r = h.sink.Get(std::string(route) + "?device=" + id + tail);
             REQUIRE(r);
             CHECK(r->status == 400);
             CHECK(r->body.find("Invalid device id.") != std::string::npos);
+            CHECK(h.scoped_calls == 0);
             CHECK(h.audit_log.empty());
             CHECK(h.dispatch_calls == 0);
         }
         EchoHarness h;
+        h.scope_device = "dev-A";
         auto p = h.sink.Post("/fragments/echo/capture-sources/push?device=" + id + "&changes=process%3Don", "");
         REQUIRE(p);
         CHECK(p->status == 400);
+        CHECK(h.scoped_calls == 0);
         CHECK(h.audit_log.empty());
         CHECK(h.dispatch_calls == 0);
     }
@@ -2513,4 +2523,5 @@ TEST_CASE("echo routes: a 256-byte printable device id passes the validator and 
     REQUIRE(r);
     CHECK(r->status == 403);
     CHECK(r->body.find("Invalid device id.") == std::string::npos);
+    CHECK(h.scoped_calls >= 1); // the same harness does reach the permission check for a safe id
 }

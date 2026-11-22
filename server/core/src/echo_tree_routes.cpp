@@ -5,12 +5,13 @@
 #include "echo_tree_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
-#include "hardware_list_model.hpp" // id_is_audit_safe (#7811)
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial, detail::a4_error, make_correlation_id
 #include "rest_audit.hpp"     // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "secure_random.hpp" // random_hex (CSPRNG cache token, #801)
 #include "web_utils.hpp"      // html_escape, audit_token, now_epoch_seconds
+
+#include <yuzu/server/auth.hpp> // auth::agent_id_is_audit_safe (#7811)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -64,8 +65,10 @@ void note(httplib::Response& res, const std::string& text) {
 }
 
 // The DNS / ARP panels live outside `#echo-tree`, so a tree swap does not clear them. This
-// empty out-of-band replacement clears them; every answer that is not a finished tree for the
-// device carries it, so one host's tables never sit under another host's view.
+// empty out-of-band replacement clears them; the tree frame's notes (`tree_note`) and its
+// loading placeholder carry it, so one host's tables never sit under another host's view. The
+// 4xx refusals (the scoped 403 and the unsafe-device 400) do not: the dashboard's htmx drops a
+// 4xx body, so nothing is swapped and no panel changes.
 const char* const kDevnetReset = "<div id=\"echo-devnet\" hx-swap-oob=\"true\"></div>";
 
 // The capture-sources page pushes with htmx.ajax(swap:'none'), so a response body is never
@@ -103,7 +106,7 @@ std::string get_param(const httplib::Request& req, const char* k) {
 // over-long or control-byte id is refused with a 400 before any scoped check or audit write
 // (#7811). Returns true when refused; the same shape as hardware_routes.cpp's id floor.
 bool refuse_unsafe_device(httplib::Response& res, const std::string& device) {
-    if (id_is_audit_safe(device))
+    if (auth::agent_id_is_audit_safe(device))
         return false;
     res.status = 400;
     note(res, "Invalid device id.");
@@ -1315,7 +1318,7 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             push_refusal(res, "No device selected.", "No device selected.");
             return;
         }
-        if (!id_is_audit_safe(device)) {
+        if (!auth::agent_id_is_audit_safe(device)) {
             push_refusal(res, "Invalid device id.", "Invalid device id.");
             res.status = 400;
             return;

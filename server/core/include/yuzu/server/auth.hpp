@@ -575,6 +575,23 @@ inline constexpr std::size_t kMaxEnrollmentTokenLength = 256;
 /// hostname-derived or UUID-derived agent_id fits in well under 100 chars.
 inline constexpr std::size_t kMaxAgentIdLength = 256;
 
+/// The one audit-trail floor for an agent/device id taken raw from a URL, form field, JSON
+/// body or tool argument. An id reaches `target_id` on every audit row a surface writes and on
+/// the permission-denial audit, and the audit store scrubs NUL and invalid UTF-8 but keeps CR,
+/// LF and TAB, so a handler refuses an id that is over `kMaxAgentIdLength` bytes or carries a
+/// byte below 0x20 BEFORE any permission check or audit write. An empty id passes (each caller
+/// decides whether empty is a refusal of its own). Never copy this predicate into a route:
+/// call it.
+[[nodiscard]] inline bool agent_id_is_audit_safe(std::string_view id) noexcept {
+    if (id.size() > kMaxAgentIdLength)
+        return false;
+    for (const char ch : id) {
+        if (static_cast<unsigned char>(ch) < 0x20)
+            return false;
+    }
+    return true;
+}
+
 /// Charset a NEW agent_id must use at first registration: `[A-Za-z0-9._:-]`,
 /// not made only of dots. The agent daemon generates a UUID v4
 /// (`identity_store.cpp`, hex + `-`); an operator `--agent-id` is typically a

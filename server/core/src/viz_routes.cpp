@@ -375,19 +375,14 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     // C0 control bytes, so an unfloored agent_id let any Response:Read
     // holder write raw control bytes/CR-LF into the audit trail. Same floor
     // as GET /guaranteed-state/events and this file's own MCP twin,
-    // get_host_topology (auth::kMaxAgentIdLength).
-    if (agent_id.size() > auth::kMaxAgentIdLength) {
+    // get_host_topology (auth::agent_id_is_audit_safe). The size compare only picks the message.
+    if (!auth::agent_id_is_audit_safe(agent_id)) {
         res.status = 400;
-        res.set_content(error_envelope(res, "agent_id is too long"), "application/json");
+        res.set_content(error_envelope(res, agent_id.size() > auth::kMaxAgentIdLength
+                                                ? "agent_id is too long"
+                                                : "agent_id contains control characters"),
+                        "application/json");
         return;
-    }
-    for (unsigned char c : agent_id) {
-        if (c < 0x20) {
-            res.status = 400;
-            res.set_content(error_envelope(res, "agent_id contains control characters"),
-                            "application/json");
-            return;
-        }
     }
 
     // ── 1. Kill switch (tier-before-permission) ──────────────────────────

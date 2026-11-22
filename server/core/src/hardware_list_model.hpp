@@ -111,12 +111,6 @@ struct HardwareListQuery {
 [[nodiscard]] std::pair<std::vector<InventoryDeviceRow>, std::size_t>
 scoped_roster(const InventoryDevicesResult& all, const authz::VisibleSet& scope);
 
-/// Audit-trail floor for a device id taken raw from a URL or an argument: a device id reaches
-/// `target_id` on every audit row these surfaces write and on the permission-denial audit, so
-/// an id over `auth::kMaxAgentIdLength` bytes or carrying a byte below 0x20 (CR/LF) is refused
-/// before any audit write. Mirrors viz_routes.cpp's agent_id floor.
-[[nodiscard]] bool id_is_audit_safe(const std::string& id);
-
 /// Lowercased, whitespace-split, deduplicated-by-position search tokens, capped at 8.
 [[nodiscard]] std::vector<std::string> hw_search_tokens(std::string_view q);
 

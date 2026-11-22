@@ -99,6 +99,8 @@
 
 #include "web_utils.hpp" // audit_token — CWE-117 neutralisation for a hostile target_id (#4665)
 
+#include <yuzu/server/auth.hpp> // auth::agent_id_is_audit_safe
+
 #include <exception>
 #include <string>
 #include <type_traits>
@@ -222,6 +224,20 @@ template <class AuditFn>
     if (!persisted && !res.has_header("Sec-Audit-Failed"))
         res.set_header("Sec-Audit-Failed", "true");
     return persisted;
+}
+
+/// Refusal for a device id that fails the audit-trail floor (`auth::agent_id_is_audit_safe`) on
+/// an HTML fragment route: answers 400 with a static `Invalid device id.` note and returns true
+/// (the handler then returns). Call it FIRST, before the scoped permission check and before any
+/// audit write, because the id reaches `target_id` on the permission-denial audit and on every
+/// row the route writes, and the audit store keeps CR, LF and TAB. It writes no audit row
+/// itself, so a refused id leaves no row at all. Never put request data in the note.
+[[nodiscard]] inline bool refuse_unsafe_device_id(httplib::Response& res, const std::string& id) {
+    if (auth::agent_id_is_audit_safe(id))
+        return false;
+    res.status = 400;
+    res.set_content("<div class=\"gp-note\">Invalid device id.</div>", "text/html; charset=utf-8");
+    return true;
 }
 
 } // namespace yuzu::server::detail

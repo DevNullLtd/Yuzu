@@ -7,8 +7,6 @@
 #include "device_ci_kinds.hpp" // the section registry: kind order and declared columns (constexpr only)
 #include "tag_store.hpp" // TagStore::validate_key - the .cpp only; the header stays store-free (#6558)
 
-#include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -454,11 +452,6 @@ scoped_roster(const InventoryDevicesResult& all, const authz::VisibleSet& scope)
         out.push_back(row);
     }
     return {std::move(out), dropped};
-}
-
-bool id_is_audit_safe(const std::string& id) {
-    return id.size() <= auth::kMaxAgentIdLength &&
-           std::none_of(id.begin(), id.end(), [](unsigned char c) { return c < 0x20; });
 }
 
 HardwareCiRead classify_hardware_ci_read(const HardwareCiDetail& detail) {

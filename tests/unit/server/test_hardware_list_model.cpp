@@ -17,7 +17,7 @@
 ///  - hardware_row_json / hardware_list_json: JSON-null normalisation for
 ///    blank/sentinel fields, never an empty string/array/-1.
 ///  - agent_supports_sync_now: the >= 0.13.1 semver-3 floor, exact boundary.
-///  - hardware_query_from_args / scoped_roster / id_is_audit_safe / classify_hardware_ci_read:
+///  - hardware_query_from_args / scoped_roster / auth::agent_id_is_audit_safe / classify_hardware_ci_read:
 ///    the shared read core the REST handlers and the MCP twin both call.
 ///  - hardware_ci_json: ci_state discrimination (found/absent/degraded) and
 ///    the independent nullopt-vs-present-empty signal for software/tags.
@@ -31,6 +31,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 #include <yuzu/metrics.hpp>
+#include <yuzu/server/auth.hpp> // auth::agent_id_is_audit_safe
 
 #include "../test_log_capture.hpp"
 
@@ -1237,7 +1238,7 @@ TEST_CASE("hardware_query_from_args: the reason names the argument and the query
     CHECK_FALSE(normalise_hardware_query(*q).has_value());
 }
 
-// ── scoped_roster / id_is_audit_safe (lifted out of hardware_routes.cpp) ──
+// ── scoped_roster / auth::agent_id_is_audit_safe (the one audit floor every device-id route calls) ──
 
 TEST_CASE("scoped_roster: TOP keeps every row, a set keeps members, empty drops all",
           "[hardware][model][scope]") {
@@ -1260,15 +1261,19 @@ TEST_CASE("scoped_roster: TOP keeps every row, a set keeps members, empty drops 
     CHECK(none_dropped == 3);
 }
 
-TEST_CASE("id_is_audit_safe: bounded length and no control bytes", "[hardware][model][scope]") {
-    CHECK(id_is_audit_safe("agent-1"));
-    CHECK(id_is_audit_safe(std::string(256, 'a')));
-    CHECK_FALSE(id_is_audit_safe(std::string(257, 'a')));
-    CHECK_FALSE(id_is_audit_safe("agent\n1"));
-    CHECK_FALSE(id_is_audit_safe("agent\r1"));
-    CHECK_FALSE(id_is_audit_safe(std::string("a\0b", 3)));
-    CHECK_FALSE(id_is_audit_safe(std::string("\x1f", 1)));
-    CHECK(id_is_audit_safe("agent 1")); // 0x20 itself is not a control byte
+TEST_CASE("agent_id_is_audit_safe: bounded length and no control bytes", "[hardware][model][scope]") {
+    using auth::agent_id_is_audit_safe;
+    CHECK(agent_id_is_audit_safe("agent-1"));
+    CHECK(agent_id_is_audit_safe(std::string(256, 'a')));
+    CHECK_FALSE(agent_id_is_audit_safe(std::string(257, 'a')));
+    CHECK_FALSE(agent_id_is_audit_safe("agent\n1"));
+    CHECK_FALSE(agent_id_is_audit_safe("agent\r1"));
+    CHECK_FALSE(agent_id_is_audit_safe("agent\t1")); // the audit store keeps TAB, CR and LF
+    CHECK_FALSE(agent_id_is_audit_safe(std::string("a\0b", 3)));
+    CHECK_FALSE(agent_id_is_audit_safe(std::string("\x1f", 1)));
+    CHECK(agent_id_is_audit_safe("agent 1")); // 0x20 itself is not a control byte
+    CHECK(agent_id_is_audit_safe("agent\x7f" "1")); // DEL passes the floor; the store's own check refuses it
+    CHECK(agent_id_is_audit_safe(""));        // empty is each caller's own refusal
 }
 
 // ── classify_hardware_ci_read (the single-record decision, shared by every transport) ──

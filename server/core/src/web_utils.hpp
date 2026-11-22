@@ -1050,6 +1050,7 @@ inline int64_t now_epoch_seconds() {
 /// (253402300799) on every platform, and past year 3000 (32535215999) on Windows, where the
 /// platform conversion fails.
 inline std::string format_iso_utc(int64_t epoch_secs) {
+    static_assert(sizeof(std::time_t) >= 8, "the year-9999 bound makes the time_t cast lossless only on a 64-bit time_t");
     if (epoch_secs <= 0 || epoch_secs > 253402300799LL) return "—";
     std::time_t t = static_cast<std::time_t>(epoch_secs);
     std::tm tm_val{};
