@@ -1226,6 +1226,22 @@ public:
         return 1;
     }
 
+    // The database closed at run time (a failed rollback, #8099) while the plugin stays online:
+    // answer the actions that would otherwise report a healthy empty store with the offline error
+    // and tell the caller not to run them. Which actions, and why the others are left alone, is
+    // refused_on_closed_store's contract. Only reads the lock-free liveness probes, so a long
+    // `echo sql` or a rollup holding the database mutex cannot stall a tick here.
+    bool refuse_on_closed_store(yuzu::CommandContext& ctx, std::string_view action) {
+        if (!db_)
+            return false;
+        const auto line = yuzu::echo::format_closed_store_refusal(action, db_->is_open(),
+                                                                 db_->query_engine_available());
+        if (!line)
+            return false;
+        ctx.write_output(*line);
+        return true;
+    }
+
     int execute_dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
         if (!online_.load(std::memory_order_acquire)) {
             OfflineState offline;
@@ -1256,10 +1272,14 @@ public:
             return 1;
         }
 
-        if (action == "collect_fast")
-            return do_collect_fast(ctx);
+        // collect_slow first: it reconciles the storage-offline tag, which a closed store still
+        // needs published, and then applies the same closed-store refusal itself.
         if (action == "collect_slow")
             return do_collect_slow(ctx);
+        if (refuse_on_closed_store(ctx, action))
+            return 1;
+        if (action == "collect_fast")
+            return do_collect_fast(ctx);
         if (action == "collect_perf")
             return do_collect_perf(ctx);
         if (action == "collect_software")
@@ -3178,6 +3198,15 @@ private:
     }
 
     int do_collect_slow(yuzu::CommandContext& ctx) {
+        // Return, never fall through to a reconcile that would read a missing store as closed: a
+        // null db_ (the plugin's EchoDatabase, which a wedge leaves in place) would publish
+        // rollback_wedged. The online_ gate makes this unreachable in a running agent (teardown
+        // stops the triggers before it resets db_); the check is parity with
+        // reconcile_db_health_publish.
+        if (!db_) {
+            ctx.write_output("error|Echo database not initialized");
+            return 1;
+        }
         {
             yuzu::PluginContext pctx{plugin_ctx_};
             reconcile_db_health_publish(pctx);
@@ -3210,6 +3239,10 @@ private:
                 break;
             }
         }
+        // After the reconcile, so a closed store still publishes its tag; nothing below may run on
+        // it (the mapdrive retry and the collect read every source as unreadable).
+        if (refuse_on_closed_store(ctx, "collect_slow"))
+            return 1;
         // §3.8 bounded mapdrive-backfill retry (related issue #5291): above collect_mu_, same as
         // init()'s call site, so hive I/O never runs under the shared lock. Cheap when nothing is
         // due (phase A's own short lock-and-check) — see retry_pending_mapdrive_backfill's banner.

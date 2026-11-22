@@ -14,6 +14,7 @@
 #include "test_bounded_return.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -189,6 +190,7 @@ TEST_CASE("online_offline_tag_action: publish for a store closed at run time, cl
     // closed store: no key, or another reason's value, is (re)published as rollback_wedged
     CHECK(online_offline_tag_action(false, false, "") == OfflineTagAction::publish_wedged);
     CHECK(online_offline_tag_action(false, true, "open_failed") == OfflineTagAction::publish_wedged);
+    CHECK(online_offline_tag_action(false, true, "") == OfflineTagAction::publish_wedged); // key set, value empty
     // closed store already tagged: left, so a stuck tick does not rewrite the key
     CHECK(online_offline_tag_action(false, true, "rollback_wedged") == OfflineTagAction::leave);
     // open store: a key (the previous run's, or a failed delete replayed) is cleared ...
@@ -196,6 +198,44 @@ TEST_CASE("online_offline_tag_action: publish for a store closed at run time, cl
     CHECK(online_offline_tag_action(true, true, "") == OfflineTagAction::clear);
     // ... and no key is left alone
     CHECK(online_offline_tag_action(true, false, "") == OfflineTagAction::leave);
+}
+
+TEST_CASE("refused_on_closed_store: the five actions that answer wrongly on a closed store, no others",
+          "[echo][open_retry]") {
+    // The closed set the plugin shell refuses while the write connection is closed (#8099). Each name
+    // here is an echo.yaml action; the honest ones are listed so a new action has to be placed on one
+    // side or the other (its comment in echo_status_format.hpp says which and why).
+    const std::string refused = GENERATE(as<std::string>{}, "collect_fast", "collect_slow", "configure",
+                                         "fleet_snapshot", "rollup");
+    CHECK(refused_on_closed_store(refused));
+}
+
+TEST_CASE("refused_on_closed_store: the honest actions and unknown names are left to answer for themselves",
+          "[echo][open_retry]") {
+    const std::string left = GENERATE(as<std::string>{}, "status", "sql", "compatibility", "query", "export",
+                                      "purge_source", "snapshot", "collect_perf", "collect_software",
+                                      "no_such_action", "");
+    CHECK_FALSE(refused_on_closed_store(left));
+}
+
+TEST_CASE("format_closed_store_refusal: line 0 of the offline status reply, only for a refused action on a "
+          "closed store",
+          "[echo][open_retry]") {
+    // read path present: the line promises `echo sql`; absent: it must not
+    for (const bool query_engine : {true, false}) {
+        const auto line0 = format_storage_offline_lines(query_engine).front();
+        const auto refusal = format_closed_store_refusal("collect_fast", false, query_engine);
+        REQUIRE(refusal.has_value());
+        CHECK(*refusal == line0);
+        CHECK(refusal->starts_with("error|"));
+        CHECK((refusal->find("remains readable via `echo sql`") != std::string::npos) == query_engine);
+    }
+    // an open store runs every action, refused or not
+    CHECK_FALSE(format_closed_store_refusal("collect_fast", true, true));
+    CHECK_FALSE(format_closed_store_refusal("rollup", true, false));
+    // a closed store still lets the honest actions answer
+    CHECK_FALSE(format_closed_store_refusal("status", false, true));
+    CHECK_FALSE(format_closed_store_refusal("sql", false, true));
 }
 
 TEST_CASE("format_storage_refused_lines: error| first, then the reason token, with the retry wait",

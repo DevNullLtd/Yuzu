@@ -515,7 +515,13 @@ break the all-or-nothing rule and re-enable every source an operator had paused.
   slow tick sets it) reaches the server as the status tag `yuzu.plugin.echo.storage_offline`;
   the server publishes `yuzu_fleet_echo_storage_offline{reason}` and the alert `YuzuEchoStorageOffline`
   (warning, 30 minutes) fires on it. The tokens are duplicated literals on the two sides, each pinned
-  by a test.
+  by a test, and `tests/test_echo_storage_offline_reconcile_lexical.py` compares the two sets.
+- **Closed store at run time.** A wedge closes the write connection but leaves `online_` set, so
+  dispatch keeps running every action. `refused_on_closed_store` (`echo_status_format.hpp`) names the
+  actions that would answer as if nothing were wrong and `EchoPlugin::refuse_on_closed_store` refuses
+  them with line 0 of the offline status reply; the rest already answer honestly, and the header says
+  which and why. A new action that reads or writes through the write connection must be classified
+  there, with a case in `test_echo_aggregator.cpp` beside the wedge cases.
 
 ---
 

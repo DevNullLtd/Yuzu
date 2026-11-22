@@ -12,10 +12,18 @@ Background: `docs/user-manual/echo.md` "The retention clock guard", issue #2361.
 > - **Wedged rollback** (`storage_state|offline|rollback_wedged`, the rest of this runbook). The
 >   database opened and collected, then was closed at run time after a rollback failed. It is not
 >   retried: only an agent restart recovers. The tag appears at the next slow collect tick after the
->   close (the tick period is `slow_interval_seconds`, 300 seconds by default, so within five minutes
->   unless an operator changed it; the alert then holds 30 minutes from the server first seeing the tag), and it is cleared
->   the same way once the agent has restarted with a healthy database. The device's own `echo status`
->   and its Capture-sources frame show the same state.
+>   close. The tick period is `slow_interval_seconds`: 300 seconds by default, so within five
+>   minutes, and at most 7200 seconds, so within about two hours on a host where an operator raised
+>   it to the maximum. The alert then holds 30 minutes from the server first seeing the tag. The tag
+>   is cleared the same way once the agent has restarted with a healthy database. The device's own
+>   `echo status` and its Capture-sources frame show the same state.
+>
+> **The tag may not publish on a full volume.** It travels through the agent's plugin key-value
+> store (`kv_store.db`), which sits in the agent data directory beside `echo.db`, so on the same
+> volume. A full volume is the most likely cause of the failed rollback, and the same fault can stop the tag
+> being written: the agent then logs `failed to publish the storage-offline heartbeat tag` at every
+> slow tick and no alert fires. `echo status` and the agent log still report the state, so check
+> them on a device that has stopped sending Echo data with no alert raised.
 
 ## Offline at open: the agent retries
 
@@ -61,10 +69,16 @@ fails closed.
 **Impact while offline:**
 - Collection has stopped. No new Echo data for this device.
 - Retention has stopped. The device's retention commitment is NOT being met.
-- `echo configure` will not persist.
+- `echo collect_fast`, `collect_slow`, `rollup`, `configure` and `fleet_snapshot` are refused
+  with the same `error|` line as `echo status`, so a tick or a configure is never read as a
+  success. Nothing a `configure` asked for persists.
+- `echo query` and `echo export` fail with `error|database not open`: they read through the
+  closed connection.
 - Historical data is usually still READABLE through `echo sql`, which uses a
   separate read-only connection. The `error|` line tells you whether that is
   true on this device - do not assume it.
+- The write that was in flight when the rollback failed was never committed. Its rows are not
+  recovered by the restart.
 
 ## Recovery
 

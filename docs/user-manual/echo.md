@@ -744,8 +744,13 @@ still query what was already collected. The error line says which of those two
 cases you are in -- the read-only connection is itself optional at open time, and
 on the rare endpoint where it never opened, `echo sql` cannot read the history
 either, so the line says that instead of promising a read path that is not there.
-This needs a disk-level fault to reach, but read `storage_state` before trusting
-any other line in that output.
+While the database is closed, `collect_fast`, `collect_slow`, `rollup`, `configure` and
+`fleet_snapshot` fail with that same `error|` line, because each would otherwise answer as
+if nothing were wrong (an empty success, a snapshot that shows the process and tcp sources
+paused by an operator, or a `configure` that reports `status|ok` with nothing written).
+`query` and `export` fail with `error|database not open`; `echo sql` is the one action that
+keeps answering. This needs a disk-level fault to reach, but read `storage_state` before
+trusting any other line in that output.
 
 In the dashboard, the capture-sources frame surfaces that error line verbatim
 rather than a generic failure, so the reason and the recovery advice reach the

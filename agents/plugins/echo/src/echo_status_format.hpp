@@ -197,6 +197,39 @@ enum class OfflineTagAction { leave, publish_wedged, clear };
     return key_present ? OfflineTagAction::clear : OfflineTagAction::leave;
 }
 
+/// Whether `action` is refused while the write connection is closed (EchoDatabase::is_open() is
+/// false: a failed rollback closed it at run time, #8099). Dispatch gates only on `online_`, which
+/// that close never clears, so every action still runs. Traced against the code, these five answer
+/// WRONG on a closed store and are refused:
+///   collect_fast, collect_slow  every source's enable flag reads as unreadable, each leg is skipped
+///                               and the tick answers `echo|collect_*|0|events_recorded`, rc 0: the
+///                               reply of an idle healthy host
+///   fleet_snapshot              process and tcp read as disabled, so the snapshot carries
+///                               `process_source_paused` and `tcp_source_paused`, a pause no operator made
+///   rollup                      retention and the byte budget are skipped (logged) and it answers
+///                               `echo|rollup|0|rows_aggregated`, rc 0
+///   configure                   writes fail and say so, except a `usage_enabled=true` re-assert: the
+///                               closed store returns the default, no change is seen, and it answers
+///                               `status|ok` with nothing written
+/// The rest answer honestly and are left as they are: status (the offline lines), sql (the read-only
+/// connection, which the status reply promises), compatibility (static), query and export
+/// (`error|database not open`), purge_source (`error|config_unreadable`), snapshot (partial, every
+/// source named), collect_perf and collect_software (`state_unreadable`). A new action that reads
+/// or writes through the write connection must be classified here.
+[[nodiscard]] constexpr bool refused_on_closed_store(std::string_view action) noexcept {
+    return action == "collect_fast" || action == "collect_slow" || action == "configure" ||
+           action == "fleet_snapshot" || action == "rollup";
+}
+
+/// The one line a refused action answers with: line 0 of the offline status reply, so the two read
+/// the same. `nullopt` = the action runs (the store is open, or the action answers honestly).
+[[nodiscard]] inline std::optional<std::string>
+format_closed_store_refusal(std::string_view action, bool store_open, bool query_engine_available) {
+    if (store_open || !refused_on_closed_store(action))
+        return std::nullopt;
+    return format_storage_offline_lines(query_engine_available).front();
+}
+
 /// `db_health|<ok|quarantined>|<epoch>` (#1567). `quarantined` iff THIS open
 /// quarantined a corrupt echo.db (epoch = when); otherwise `ok` with the epoch of
 /// the last persisted quarantine (0 = never).

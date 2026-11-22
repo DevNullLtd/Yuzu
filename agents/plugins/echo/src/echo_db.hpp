@@ -572,7 +572,11 @@ struct OpenSeams {
     /// test returns an error WITHOUT rolling back, which leaves the connection inside the
     /// transaction and takes the real close path; one that rolls back and then reports an error
     /// takes the benign branch. Copied into the database by open() before the schema steps, so it
-    /// covers the open itself. Empty = the real ROLLBACK; production never sets it.
+    /// covers the open itself. Covers those two sites only: the open-time helpers (the DDL batch,
+    /// the rename step and the v3 to v8 ladder) issue their own plain ROLLBACK, and a failure there
+    /// is an open failure, never a run-time wedge. The production sites test the result code before
+    /// they ask for autocommit, so a seam returning SQLITE_OK with the transaction still open is
+    /// not caught. Empty = the real ROLLBACK; production never sets it.
     std::function<int(sqlite3*)> rollback;
 };
 
