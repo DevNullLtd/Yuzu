@@ -4214,6 +4214,15 @@ test('plugin readme gate',
   timeout: 120,
 )
 
+# #4398: every captured firewall state and rules block carries one ruleset row, and a privileged
+# (Linux, Windows) capture carries a count and no error row. Parser-only, well under a second.
+test('firewall sample shape gate',
+  _python3_test,
+  args: [files('test_firewall_sample_shape.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
 # workflow runs, so self-hosted legs and /test exercise the same code path CI
 # does -- WHEREVER A USABLE PROMTOOL IS PRESENT. No CI leg sets the opt-in below

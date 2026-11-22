@@ -118,7 +118,7 @@
         },
         "macos": {
           "fallback": "",
-          "mechanism": "pfctl via run_bounded_subprocess",
+          "mechanism": "socketfilterfw/pfctl via run_bounded_subprocess",
           "rung": "2",
           "support": "supported"
         },
@@ -354,7 +354,7 @@
     "gathered": true,
     "mutating": true
   },
-  "leg_hash": "4731564d9d1d",
+  "leg_hash": "c22be087dd70",
   "manifest_version": 1,
   "name": "firewall",
   "outputs": [
@@ -683,10 +683,11 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 2,
+          "row_count": 3,
           "rows": [
             "backend|nftables",
-            "state|active"
+            "state|active",
+            "ruleset|1"
           ],
           "truncated": false
         },
@@ -700,13 +701,12 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 55,
+          "row_count": 4,
           "rows": [
             "backend|nftables",
-            "rule|nftables|ip|filter|OUTPUT|output|accept",
-            "rule|nftables|ip|filter|FORWARD|forward|accept",
-            "rule|nftables|ip6|filter|OUTPUT|output|accept",
-            "rule|nftables|ip6|filter|FORWARD|forward|accept"
+            "rule|nftables|inet|fwcap|input|input|accept",
+            "rule|nftables|inet|fwcap|input|handle|2",
+            "ruleset|1"
           ],
           "truncated": false
         },
@@ -752,12 +752,12 @@
         }
       ],
       "stamp": {
-        "date": "2026-09-06",
-        "host_class": "container",
-        "leg_hash": "4731564d9d1d",
+        "date": "2026-11-22",
+        "host_class": "vm",
+        "leg_hash": "c22be087dd70",
         "os": "linux",
-        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
-        "privilege": "euid 0 with CAP_NET_ADMIN in the host network namespace"
+        "os_version": "Ubuntu 26.04.1 LTS x86_64",
+        "privilege": "euid 0"
       }
     },
     "macos": {
@@ -846,7 +846,7 @@
       "stamp": {
         "date": "2026-11-21",
         "host_class": "bare-metal",
-        "leg_hash": "4731564d9d1d",
+        "leg_hash": "c22be087dd70",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -937,7 +937,7 @@
       "stamp": {
         "date": "2026-09-15",
         "host_class": "bare-metal",
-        "leg_hash": "4731564d9d1d",
+        "leg_hash": "c22be087dd70",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "interactive user (elevated)"
@@ -1026,6 +1026,7 @@
       "tests/test_firewall_containment_ceremony.py",
       "tests/test_firewall_privilege_refusal_wiring_lexical.py",
       "tests/test_firewall_release_guard_wiring_lexical.py",
+      "tests/test_firewall_sample_shape.py",
       "tests/unit/test_firewall_local_dispatcher.cpp",
       "tests/unit/test_firewall_parsers.cpp",
       "tests/unit/test_firewall_quarantine_live.cpp",

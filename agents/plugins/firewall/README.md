@@ -166,7 +166,7 @@ An `error|nftables:table:<reason>` row can appear next to a later successful `ba
 | `quarantine_allow` | ✅ supported · rung 1 · INetFwPolicy2 COM: new generation's rules added first, stale ones removed last | 🟡 constrained · rung 3 · sh: the root-owned yuzu-fw-helper, sudo yuzu-fw-helper pf load: atomic reload of the own sub-anchor, then a global pf state flush (sudo pfctl -F states) | 🟡 constrained · rung 3 · sh: the root-owned yuzu-fw-helper, atomic nft reload / iptables build-then-swap of a new generation |
 | `quarantine_status` | ✅ supported · rung 1 · INetFwPolicy2 COM rule group presence + per-profile default actions | ✅ supported · rung 2 · sudo pfctl reads: info, main-ruleset anchor reference, own anchor rules, sibling anchors under com.apple, enable references | 🟡 constrained · rung 3 · own nftables table over NETLINK_NETFILTER (rung 1), else sudo nft list table (rung 2); iptables chain listings through sh: the root-owned yuzu-fw-helper |
 | `release` | ✅ supported · rung 1 · INetFwPolicy2 COM rule-group removal, prior-policy restore, disabled rules re-enabled | ✅ supported · rung 2 · sudo pfctl: empty own anchor (-F rules, -F nat), release the enable token (-X) | 🟡 constrained · rung 3 · sh: the root-owned yuzu-fw-helper for the iptables chain removal; sudo nft delete table directly |
-| `rules` | ✅ supported · rung 1 · INetFwPolicy2 COM (INetFwRules enumeration) | ✅ supported · rung 2 · pfctl via run_bounded_subprocess | ✅ supported · rung 1 · firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) |
+| `rules` | ✅ supported · rung 1 · INetFwPolicy2 COM (INetFwRules enumeration) | ✅ supported · rung 2 · socketfilterfw/pfctl via run_bounded_subprocess | ✅ supported · rung 1 · firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) |
 | `state` | ✅ supported · rung 1 · INetFwPolicy2 COM (per-profile FirewallEnabled) | ✅ supported · rung 2 · socketfilterfw/pfctl via run_bounded_subprocess | ✅ supported · rung 1 · firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), else ufw/iptables via run_bounded_subprocess (rung 2) |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
@@ -337,7 +337,7 @@ The second field of `status|<token>|<reason>` and the `note|<k>=<v>` rows carry 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash 4731564d9d1d
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash c22be087dd70
 
 ```
 == action=state
@@ -376,7 +376,7 @@ rule|Microsoft Store|enabled|in|allow|7
 [not captured] Mutating/Reversible: not executed on a live host (changes the allow set of a containment in force)
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-21 · euid 501 · leg-hash 4731564d9d1d
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-21 · euid 501 · leg-hash c22be087dd70
 
 ```
 == action=state
@@ -416,28 +416,20 @@ error|pf:rules:exit:1
 [not captured] Mutating/Reversible: not executed on a live host (changes the allow set of a containment in force)
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 with CAP_NET_ADMIN in the host network namespace · leg-hash 4731564d9d1d
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-22 · euid 0 · leg-hash c22be087dd70
 
 ```
 == action=state
 backend|nftables
 state|active
+ruleset|1
 [result_status] UNDECLARED / UNKNOWN
 
 == action=rules
 backend|nftables
-rule|nftables|ip|filter|OUTPUT|output|accept
-rule|nftables|ip|filter|FORWARD|forward|accept
-rule|nftables|ip6|filter|OUTPUT|output|accept
-rule|nftables|ip6|filter|FORWARD|forward|accept
-rule|nftables|ip|nat|PREROUTING|prerouting|accept
-rule|nftables|ip|nat|OUTPUT|output|accept
-rule|nftables|ip|nat|POSTROUTING|postrouting|accept
-rule|nftables|ip6|nat|PREROUTING|prerouting|accept
-rule|nftables|ip6|nat|OUTPUT|output|accept
-rule|nftables|ip|raw|PREROUTING|prerouting|accept
-rule|nftables|ip|filter|DOCKER-USER|handle|2
-… 12 of 55 rows shown
+rule|nftables|inet|fwcap|input|input|accept
+rule|nftables|inet|fwcap|input|handle|2
+ruleset|1
 [result_status] UNDECLARED / UNKNOWN
 
 == action=quarantine
@@ -468,7 +460,7 @@ rule|nftables|ip|filter|DOCKER-USER|handle|2
 - Plugin: `agents/plugins/firewall/src/firewall_parsers.hpp` · `agents/plugins/firewall/src/firewall_plugin.cpp` · `agents/plugins/firewall/src/firewall_quarantine_parsers.hpp`
 - Definitions: `content/definitions/firewall.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
-- Tests: `tests/test_firewall_containment_ceremony.py` · `tests/test_firewall_privilege_refusal_wiring_lexical.py` · `tests/test_firewall_release_guard_wiring_lexical.py` · `tests/unit/test_firewall_local_dispatcher.cpp` · `tests/unit/test_firewall_parsers.cpp` · `tests/unit/test_firewall_quarantine_live.cpp` · `tests/unit/test_firewall_quarantine_parsers.cpp` · `tests/unit/test_firewall_restore_compare.cpp`
+- Tests: `tests/test_firewall_containment_ceremony.py` · `tests/test_firewall_privilege_refusal_wiring_lexical.py` · `tests/test_firewall_release_guard_wiring_lexical.py` · `tests/test_firewall_sample_shape.py` · `tests/unit/test_firewall_local_dispatcher.cpp` · `tests/unit/test_firewall_parsers.cpp` · `tests/unit/test_firewall_quarantine_live.cpp` · `tests/unit/test_firewall_quarantine_parsers.cpp` · `tests/unit/test_firewall_restore_compare.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 - Changelog: `changelog.d/2026-11-09-firewall-containment-actions.added.md` · `changelog.d/2026-11-11-firewall-only-containment.changed.md` · `changelog.d/2026-11-11-firewall-only-containment.removed.md` · `changelog.d/2026-11-21-firewall-lab-readiness.changed.md` · `changelog.d/2026-11-21-firewall-lab-readiness.fixed.md` · `changelog.d/2026-11-21-firewall-lab-readiness.security.md` · `changelog.d/7530-firewall-protective-set.changed.md`
 <!-- END GENERATED -->
