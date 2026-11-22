@@ -9302,13 +9302,16 @@ tests:
               job: yuzu
             exp_annotations:
               summary: "An agent quarantined its Echo database in the last hour"
-              description: "The server recorded at least one new Echo database quarantine in the last hour: an agent's echo.db failed its integrity check and was moved aside. Open the echo.db.corruption_quarantined audit rows to see which agents, then check each agent's log for the cause (disk fault, full disk, unclean shutdown). Each row is a new quarantine identity, so an agent returning from offline, a failover and a reconnect wave add none. Any increase in an hour fires: that is a starting default, not sized from fleet data. The count is the server's own audit-row writes, so a row pruned by audit retention and reported again, or two HA replicas racing on one identity, counts twice, and a crash between a write and the next scrape loses that count; the audit rows stay the record. The signal is agent-self-reported, so one agent can raise it; treat it as a ticket, not a page."
+              description: "The server recorded at least one new Echo database quarantine in the last hour: an agent's echo.db failed its integrity check and was moved aside. Open the echo.db.corruption_quarantined audit rows to see which agents, then check each agent's log for the cause (disk fault, full disk, unclean shutdown). Each row is a new quarantine identity, so an agent returning from offline, a failover and a reconnect wave add none. Any increase in an hour fires: that is a starting default, not sized from fleet data. The count is the server's own audit-row writes, so a row pruned by audit retention and reported again, or two HA replicas racing on one identity, counts twice, and a crash between a write and the next scrape loses that count; the audit rows stay the record. No alert does not mean no quarantine: a quarantine a replica records before Prometheus has scraped it once can be missed (the first sample is already above 0), and no row is written, so none is counted, while the audit store is closed or the gate is waiting out a failed audit lookup or write (every agent after a first failure; only the failing agent when it fails again). The signal is agent-self-reported, so one agent can raise it; treat it as a ticket, not a page."
               runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
 
   # CORRUPTION CASE 7 -- a replica restarts (its counter was 5, back to 0) and then records a new
   # quarantine: still fires, and is gone once the window passes it. RED if `increase` becomes
   # `delta` (1 - 5 reads as a fall, so a real quarantine after a restart is missed) and RED if
-  # the window is shortened to [5m] (the 0 sample at 40m is out of reach by 46m).
+  # the window is shortened to [5m]: the series is 5 for 0-30m, absent 31-33m, 0 for 34-41m and 1
+  # from 42m, so the last 0 sample is at 41m and the 46m window, (41m, 46m] under the pinned
+  # promtool's left-open range windows, holds only 1s. That holds by one sample: re-apply the [5m]
+  # mutation to confirm this case reddens after any change to this series or the eval time.
   - interval: 1m
     name: echo quarantine a new quarantine after a replica restart still fires
     input_series:

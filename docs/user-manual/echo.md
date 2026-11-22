@@ -488,11 +488,14 @@ that hits many devices at once writes the rows over successive heartbeats while
 the audit store is healthy, not all on the first. A report is deferred to a later
 heartbeat if the same device's lookup is already in flight, if 4 devices are
 already in flight, or if it arrives inside the server-wide 60 s back-off that
-follows any failed lookup (including one that throws) or failed write. The
-back-off is dated from the failure and a later failure never shortens it; there
-is no separate probe, so when it ends up to 4 devices look up at once and the
-first failure re-opens it. Each opening is counted in
-`yuzu_server_echo_corruption_audit_degraded_total{reason}` and logged. A plugin that
+follows a failed lookup (including one that throws) or failed write. The one
+exception is a device whose own lookup or write failed last time and fails again:
+that repeat makes only that device wait, so one device with a persistently failing
+audit write cannot hold back the others. The back-off is dated from the failure
+and a later failure never shortens it; there is no separate probe, so when it
+ends, up to 4 devices look up at once and the first failure re-opens it. Each
+failure is counted in `yuzu_server_echo_corruption_audit_degraded_total{reason}`
+and logged. A plugin that
 failed to initialise (including Echo when the corrupt file cannot be moved
 aside) is reported in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
 which distinguishes "failed to load" from "not installed". An Echo that loads

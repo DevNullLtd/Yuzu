@@ -2866,9 +2866,11 @@ public:
                           "counter");
         metrics_.counter("yuzu_server_echo_db_quarantines_total");
         metrics_.describe("yuzu_server_echo_corruption_audit_degraded_total",
-                          "Times the echo.db corruption audit gate opened its degraded window, by "
-                          "reason (lookup_degraded, lookup_threw, write_failed); while it is open "
-                          "new quarantines are not audited and are retried afterwards",
+                          "Failed echo.db corruption audit lookups and writes, by reason "
+                          "(lookup_degraded, lookup_threw, write_failed). Each opens a 60 s window "
+                          "in which no agent is audited, except a repeat failure by the same "
+                          "agent, which only that agent waits out; quarantines not audited are "
+                          "retried afterwards",
                           "counter");
         for (const char* reason : {"lookup_degraded", "lookup_threw", "write_failed"})
             metrics_.counter("yuzu_server_echo_corruption_audit_degraded_total",
@@ -6808,15 +6810,17 @@ public:
                         return std::optional<std::string>{};
                     return detail::decode_echo_quarantine_from_detail(rows->front().detail);
                 };
-                // #5066: every opening of the gate's degraded window is counted by reason and
-                // logged once (the reason token is a closed set, safe to log verbatim).
+                // #5066: every lookup or write failure is counted by reason and logged once (the
+                // reason token is a closed set, safe to log verbatim). A repeat failure by the
+                // same agent opens no gate-wide window; the observer still hears it.
                 auto on_degraded = [this](detail::DegradedCause cause) {
                     const char* reason = detail::echo_corruption_degraded_cause_token(cause);
                     metrics_.counter("yuzu_server_echo_corruption_audit_degraded_total",
                                      {{"reason", reason}})
                         .increment();
-                    spdlog::warn("echo.db corruption audit degraded ({}): new quarantines are not "
-                                 "audited until the window ends",
+                    spdlog::warn("echo.db corruption audit failed ({}): new quarantines are not "
+                                 "audited until the retry wait ends (every agent, or only the "
+                                 "failing one when it fails again)",
                                  reason);
                 };
                 auto gate = std::make_shared<detail::EchoCorruptionAuditGate>(

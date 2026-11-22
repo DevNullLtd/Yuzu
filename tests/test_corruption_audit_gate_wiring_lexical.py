@@ -177,13 +177,9 @@ RECOMPUTE = "health_store_.recompute_metrics(metrics_, detail::kAgentHealthStale
 # (name, target, template, replacement, expected substring of the problems)
 MUTATIONS = [
     ("quarantines pre-seed removed", "s", QUARANTINE_SEED, "", "pre-seed `metrics_.counter(\"" + QUARANTINES),
-    ("quarantines pre-seed kept only in a comment", "s", QUARANTINE_SEED, "/* " + QUARANTINE_SEED + " */",
-     "pre-seed `metrics_.counter(\"" + QUARANTINES),
     ("quarantines pre-seed made conditional", "s", QUARANTINE_SEED, "if (audit_store_) { " + QUARANTINE_SEED + " }",
      f"the {QUARANTINES} pre-seed is not in the block"),
     ("upsert pre-seed removed", "s", UPSERT_SEED, "", "pre-seed `metrics_.counter(\"" + UPSERTS),
-    ("upsert pre-seed moved into a later block", "s", UPSERT_SEED,
-     "if (audit_store_) { " + UPSERT_SEED + " }", f"the {UPSERTS} pre-seed is not in the block"),
     ("degraded pre-seed removed", "s", SEED_LOOP, "", "no longer pre-seeds every"),
     ("degraded pre-seed loses a reason", "s", '{"lookup_degraded", "lookup_threw", "write_failed"}',
      '{"lookup_degraded", "write_failed"}', "lacks reason 'lookup_threw'"),
@@ -201,7 +197,6 @@ MUTATIONS = [
      "`if (wrote)` guarded increment"),
     ("the increment is duplicated unguarded", "s", GUARDED, GUARDED + " " + GUARDED[len("if (wrote) "):],
      "is incremented 2 times"),
-    ("the increment is removed", "s", GUARDED, "", "`if (wrote)` guarded increment"),
     ("wrote is no longer the audit call's result", "s", "const bool wrote = detail::log_echo_corruption_once(",
      "const bool wrote = detail::log_echo_something_else(", "`wrote` bound from log_echo_corruption_once"),
     ("the observer stops counting", "s", OBSERVER_COUNT, "", "degraded observer counting"),

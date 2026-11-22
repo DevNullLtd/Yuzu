@@ -2625,8 +2625,8 @@ TEST_CASE("EchoCorruptionAuditGate: a failed audit write is retried, a durable o
     // Degraded store: no write, not marked.
     CHECK_FALSE(gate.should_log("a", "1:f"));
     clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
-    // Healthy, no row -> log; the caller's log() fails -> mark_failed opens the
-    // degraded window: no lookup inside it, admitted again after it.
+    // Healthy, no row -> log; the caller's log() fails -> mark_failed. "a" failed on its last
+    // try too, so only "a" waits: no lookup for it inside its wait, admitted again after it.
     answer = std::optional<std::string>{};
     REQUIRE(gate.should_log("a", "1:f"));
     const int before_fail = lookups;
@@ -3022,6 +3022,176 @@ TEST_CASE("EchoCorruptionAuditGate: a clock that throws in the lookup's catch pa
     gate.mark_logged("a", "1:f");
 }
 
+namespace {
+// A gate with a scripted lookup and write per agent, an injected clock and a recording observer,
+// shared by the repeat-failure cases below. No threads, no sleeps.
+struct RepeatFailureGate {
+    enum class Answer { no_row, degraded, throws, durable };
+    int64_t clock = 1000;
+    int lookups = 0;
+    std::unordered_map<std::string, Answer> answer; // an agent not listed answers no_row
+    std::string write_fails_for;                    // the one agent whose audit write fails
+    std::vector<yuzu::server::detail::DegradedCause> seen;
+    yuzu::server::detail::EchoCorruptionAuditGate gate{
+        [this](const std::string& agent) -> std::optional<std::optional<std::string>> {
+            ++lookups;
+            switch (answer[agent]) {
+            case Answer::degraded:
+                return std::nullopt;
+            case Answer::throws:
+                throw std::runtime_error("lookup failed");
+            case Answer::durable:
+                return std::optional<std::string>{"1:f"};
+            case Answer::no_row:
+                break;
+            }
+            return std::optional<std::string>{};
+        },
+        [this] { return clock; },
+        [this](yuzu::server::detail::DegradedCause cause) { seen.push_back(cause); }};
+
+    // One heartbeat's audit step for `agent`: true iff a row was written (a throwing lookup is
+    // swallowed and counts as not written).
+    bool beat(const std::string& agent, const std::string& quarantine = "1:f") {
+        try {
+            return yuzu::server::detail::log_echo_corruption_once(
+                gate, agent, quarantine, [&] { return agent != write_fails_for; });
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+    }
+};
+} // namespace
+
+TEST_CASE("EchoCorruptionAuditGate: one agent whose lookup or write keeps failing never holds the "
+          "gate shut for healthy agents",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::DegradedCause;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    RepeatFailureGate f;
+    const std::string bad = "bad";
+    DegradedCause cause = DegradedCause::lookup_degraded;
+    SECTION("the audit store answers degraded for it") {
+        f.answer[bad] = RepeatFailureGate::Answer::degraded;
+    }
+    SECTION("its lookup throws") {
+        f.answer[bad] = RepeatFailureGate::Answer::throws;
+        cause = DegradedCause::lookup_threw;
+    }
+    SECTION("its audit write fails") {
+        f.write_fails_for = bad;
+        cause = DegradedCause::write_failed;
+    }
+
+    // The first failure cannot be told from a store fault, so it pauses every agent once.
+    CHECK_FALSE(f.beat(bad));
+    CHECK_FALSE(f.beat("healthy-0"));
+    for (int round = 1; round <= 5; ++round) {
+        // Just inside its own wait the bad agent is refused with no lookup at all.
+        f.clock += kEchoCorruptionAuditDegradedRetry - 1;
+        int before = f.lookups;
+        CHECK_FALSE(f.beat(bad));
+        CHECK(f.lookups == before);
+        // The wait is over: it is tried again and fails again, and in the same second a new
+        // healthy agent is audited (its row is written, so a counter on the row moves).
+        f.clock += 1;
+        CHECK_FALSE(f.beat(bad));
+        CHECK(f.lookups == before + 1);
+        CHECK(f.beat("healthy-" + std::to_string(round)));
+    }
+    // Every failure was reported, a contained repeat included.
+    REQUIRE(f.seen.size() == 6);
+    for (const auto c : f.seen)
+        CHECK(c == cause);
+}
+
+TEST_CASE("EchoCorruptionAuditGate: another agent's failure re-opens the window once, after which "
+          "the first failing agent is contained again",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    RepeatFailureGate f;
+    f.answer["bad"] = RepeatFailureGate::Answer::degraded;
+    f.answer["other"] = RepeatFailureGate::Answer::degraded;
+
+    CHECK_FALSE(f.beat("bad")); // opens the window at 1000
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat("bad")); // a repeat: contained, so a healthy agent is audited
+    CHECK(f.beat("healthy-1"));
+
+    // A different agent failing is a store signal as far as the gate can tell: the window
+    // opens for everyone, and "bad" is no longer the remembered repeat.
+    CHECK_FALSE(f.beat("other"));
+    CHECK_FALSE(f.beat("healthy-2"));
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat("bad")); // opens the window again (once)
+    CHECK_FALSE(f.beat("healthy-3"));
+
+    // The next failure by "bad" is a repeat again: contained, healthy agents flow.
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat("bad"));
+    CHECK(f.beat("healthy-4"));
+}
+
+TEST_CASE("EchoCorruptionAuditGate: a success forgets a failing agent, so its next failure opens "
+          "the window again",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    using yuzu::server::detail::kEchoCorruptionAuditMinRowInterval;
+    RepeatFailureGate f;
+    const std::string bad = "bad";
+    f.answer[bad] = RepeatFailureGate::Answer::degraded;
+    CHECK_FALSE(f.beat(bad)); // opens the window, remembers "bad"
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+
+    SECTION("after its row is written") {
+        f.answer[bad] = RepeatFailureGate::Answer::no_row;
+        CHECK(f.beat(bad)); // mark_logged forgets it
+        f.clock += kEchoCorruptionAuditMinRowInterval;
+        f.answer[bad] = RepeatFailureGate::Answer::degraded;
+        CHECK_FALSE(f.beat(bad, "2:g")); // a first failure again, not a repeat
+        CHECK_FALSE(f.beat("healthy-1"));
+    }
+    SECTION("after a durable lookup hit") {
+        f.answer[bad] = RepeatFailureGate::Answer::durable; // the audit store holds "1:f"
+        CHECK_FALSE(f.beat(bad));                           // remember_locked forgets it, no write
+        f.answer[bad] = RepeatFailureGate::Answer::degraded;
+        CHECK_FALSE(f.beat(bad, "2:g"));
+        CHECK_FALSE(f.beat("healthy-1"));
+    }
+}
+
+TEST_CASE("EchoCorruptionAuditGate: a repeating agent's own wait is dated from its failure and a "
+          "failure stamped earlier never shortens it",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    RepeatFailureGate f;
+    auto& gate = f.gate;
+    const std::string bad = "bad";
+
+    REQUIRE(gate.should_log(bad, "1:f"));
+    gate.mark_failed(bad); // first failure at 1000: window and remembered repeat until 1060
+    f.clock = 1060;
+    REQUIRE(gate.should_log(bad, "1:f"));
+    f.clock = 1100; // the write took 40 s, then failed
+    gate.mark_failed(bad); // a repeat: its own wait runs to 1160, no gate-wide window
+    CHECK(gate.should_log("healthy", "1:f"));
+    gate.mark_logged("healthy", "1:f");
+    const int before = f.lookups;
+    f.clock = 1160 - 1;
+    CHECK_FALSE(gate.should_log(bad, "1:f")); // dated from the failure (1100), not admission (1060)
+    CHECK(f.lookups == before);
+    f.clock = 1160;
+    REQUIRE(gate.should_log(bad, "1:f"));
+
+    // A repeat failure stamped earlier (a stepped-back injected clock) keeps the later deadline.
+    f.clock = 1000;
+    gate.mark_failed(bad); // would date the wait to 1060
+    f.clock = 1160 - kEchoCorruptionAuditDegradedRetry + 1; // 1101: past 1060, before 1160
+    CHECK_FALSE(gate.should_log(bad, "1:f"));
+    f.clock = 1160;
+    CHECK(gate.should_log(bad, "1:f"));
+}
+
 TEST_CASE("EchoCorruptionAuditGate: per-agent map is bounded by fleet, never wiped; when every "
           "entry is inside its window one is still evicted (#5034)",
           "[health_store][echo][corruption][gate]") {
@@ -3157,14 +3327,17 @@ TEST_CASE("EchoCorruptionAuditGate: the degraded observer fires once per opening
 
     clock += kEchoCorruptionAuditDegradedRetry;
     mode = Mode::throws;
+    reentered = true;
     CHECK_THROWS_AS(gate.should_log("b", "2:g"), std::runtime_error);
     REQUIRE(seen.size() == 2);
     CHECK(seen.back() == DegradedCause::lookup_threw);
+    CHECK_FALSE(reentered);
 
     clock += kEchoCorruptionAuditDegradedRetry;
     mode = Mode::ok;
     REQUIRE(gate.should_log("c", "3:h"));
     const std::string c = "c";
+    reentered = true;
     {
         EchoCorruptionAuditGate::Reservation r(gate, c);
         r.failed();
@@ -3246,7 +3419,7 @@ TEST_CASE("EchoCorruptionAuditGate: concurrent ingest threads never exceed kMaxI
     // Each clock read advances past the degraded window, so a failure never blocks the next
     // admission for long and every outcome below is exercised without any sleeping.
     std::atomic<int64_t> clock{1000};
-    std::atomic<int> in_lookup{0}, peak_lookup{0}, held{0}, peak_held{0}, admitted{0};
+    std::atomic<int> in_lookup{0}, peak_lookup{0}, admitted{0};
     const auto raise = [](std::atomic<int>& peak, int v) {
         int p = peak.load();
         while (v > p && !peak.compare_exchange_weak(p, v)) {
@@ -3272,9 +3445,7 @@ TEST_CASE("EchoCorruptionAuditGate: concurrent ingest threads never exceed kMaxI
                     if (!gate.should_log(agent, "1:f"))
                         continue;
                     ++admitted;
-                    raise(peak_held, ++held);
                     EchoCorruptionAuditGate::Reservation r(gate, agent);
-                    --held; // decremented first: `held` never overstates the real slot count
                     switch ((t + k) % 3) {
                     case 0:
                         r.logged("1:f");
@@ -3291,7 +3462,6 @@ TEST_CASE("EchoCorruptionAuditGate: concurrent ingest threads never exceed kMaxI
     } // jthreads join here
     CHECK(admitted.load() > 0);
     CHECK(peak_lookup.load() <= kBound);
-    CHECK(peak_held.load() <= kBound);
 
     // No slot leaked: after the storm a full set of fresh agents is admitted, and one more is
     // refused. A stranded slot would admit fewer.

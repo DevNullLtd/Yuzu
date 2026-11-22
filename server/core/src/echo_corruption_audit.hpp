@@ -26,9 +26,9 @@
  * restart or another HA node opens a fresh window). Intermediate quarantines
  * inside one window collapse to the newest identity, which persists in the
  * agent's `last` tag and logs on the first heartbeat after the window. Once a
- * lookup or write has reported the audit store degraded, no lookup runs until
- * kEchoCorruptionAuditDegradedRetry seconds have passed (gate-wide: a degraded
- * store is a store property). Three things open the window: a lookup that answers
+ * lookup or write has failed, no lookup runs until
+ * kEchoCorruptionAuditDegradedRetry seconds have passed (gate-wide: a failing
+ * store is a store property). Three failures open the window: a lookup that answers
  * "degraded", a lookup that THROWS (so a throwing store is not retried on every
  * heartbeat; the exception still propagates to the caller), and a failed audit
  * write. The window is dated from the failure, not from admission (a lookup that
@@ -36,8 +36,17 @@
  * extends: a late completion never shortens a window a newer failure opened. There
  * is no separate half-open probe: the probes that follow a window are at most
  * kMaxInFlight (below), which is already a bound, and the first one to fail
- * re-opens the window. Every opening is reported to the optional DegradedFn
- * observer (after the lock is released), so a gate that degrades is not silent.
+ * re-opens the window.
+ *
+ * One exception bounds the blast radius of a single bad agent. A failure by the SAME
+ * agent as the previous failure (no other agent has failed since, and it has not
+ * succeeded) opens no gate-wide window: only that agent waits out its own window, so
+ * an agent whose lookup or write fails every time cannot hold the gate shut for the
+ * healthy ones. Its first failure cannot be told from a store fault, so it still
+ * pauses every agent once. Any other agent's failure opens the window as above, so a
+ * real store outage still closes the gate. Every failure, a contained repeat
+ * included, is reported to the optional DegradedFn observer (after the lock is
+ * released), so a gate that fails is not silent.
  *
  * Reservation contract: a true from should_log() reserves that AGENT's
  * in-flight slot (a set of agent ids, bounded by kMaxInFlight: at the bound a
@@ -54,7 +63,8 @@
  * synchronously on the calling thread, each holding one lease of the shared
  * PostgreSQL pool (default 16, --postgres-pool-size), so the gate holds at most
  * four leases however many ingest threads race a mass quarantine; the rest are
- * refused and retried on their next heartbeat. A pool-exhaustion failure still feeds the gate-wide degraded window.
+ * refused and retried on their next heartbeat. A pool-exhaustion failure is a
+ * lookup or write failure like any other, so it opens the window.
  *
  * Durability choice, stated for a future third case: this gate round-trips
  * the audit store itself so dedup survives a restart/HA switch, unlike the
@@ -65,12 +75,13 @@
  * set there) -- pick per-case, don't copy whichever file you find first.
  *
  * A throw between a true should_log() and its completion is turned into
- * mark_failed(agent_id), which itself takes a lock. Inside ~Reservation an
- * exceedingly rare failure there (OS mutex-resource exhaustion) terminates the
- * process rather than silently stranding the slot; on the direct mark_failed(),
- * logged() and failed() calls and the lookup-catch paths it would propagate and
- * strand that agent's slot until restart. Not producible on the supported
- * platforms.
+ * mark_failed(agent_id), which itself takes a lock and reads the injected clock.
+ * Inside ~Reservation an exceedingly rare failure there (OS mutex-resource
+ * exhaustion, or an injected clock that throws, which the production steady clock
+ * never does) terminates the process rather than silently stranding the slot; on
+ * the direct mark_failed(), logged() and failed() calls and the lookup-catch paths
+ * it would propagate (a mutex failure would also strand that agent's slot until
+ * restart). Not producible on the supported platforms.
  *
  * The lookup and the write are synchronous audit-store calls on the heartbeat
  * ingest thread, outside AgentHealthStore's mutex. Once the row is durable the
@@ -168,7 +179,9 @@ decode_echo_quarantine_from_detail(std::string_view detail) {
     return std::string(detail.substr(pos + kKey.size()));
 }
 
-/// Why the gate opened its degraded window (closed set; the token is a metric label).
+/// Why the gate recorded a failure (closed set; the token is a metric label). Each one opens
+/// the degraded window, except a repeat by the agent that failed last, which only that agent
+/// waits out.
 enum class DegradedCause : uint8_t { lookup_degraded, lookup_threw, write_failed };
 
 [[nodiscard]] inline const char* echo_corruption_degraded_cause_token(DegradedCause c) noexcept {
@@ -190,8 +203,9 @@ public:
     using LatestFn =
         std::function<std::optional<std::optional<std::string>>(const std::string& agent_id)>;
     using NowFn = std::function<int64_t()>;
-    /// Observer called every time the gate opens its degraded window. Runs on the calling
-    /// thread after the gate's lock is released; an exception from it is swallowed.
+    /// Observer called on every lookup or write failure, a contained repeat included (which
+    /// opens no gate-wide window). Runs on the calling thread after the gate's lock is
+    /// released; an exception from it is swallowed.
     using DegradedFn = std::function<void(DegradedCause)>;
 
     /// Most agents that may hold a lookup/write slot at once. The lookup and the write run on
@@ -221,6 +235,8 @@ public:
             std::lock_guard lock(mu_);
             if (now < degraded_until_)
                 return false; // degraded store: no lookup until the window ends
+            if (repeat_ == agent_id && now < repeat_until_)
+                return false; // this agent failed on its last try: it alone waits out its window
             if (in_flight_.contains(agent_id))
                 return false; // this agent's lookup is in flight; retried next heartbeat
             if (const auto it = agents_.find(agent_id); it != agents_.end()) {
@@ -251,7 +267,7 @@ public:
             {
                 std::lock_guard lock(mu_); // never strand the slot on a throwing lookup
                 in_flight_.erase(agent_id);
-                open_window_locked(failed_at);
+                note_failure_locked(agent_id, failed_at);
             }
             notify_degraded(DegradedCause::lookup_threw);
             throw;
@@ -259,7 +275,7 @@ public:
         std::unique_lock lock(mu_);
         if (!latest) {
             in_flight_.erase(agent_id);
-            open_window_locked(now_s_());
+            note_failure_locked(agent_id, now_s_());
             lock.unlock();
             notify_degraded(DegradedCause::lookup_degraded);
             return false; // no write, not marked -> retried after the window
@@ -322,13 +338,14 @@ public:
         remember_locked(agent_id, quarantine, now_s_(), true);
     }
 
-    /// The caller's audit write failed: release the agent's slot and open the
-    /// (gate-wide: a degraded store is a store property) degraded window.
+    /// The caller's audit write failed: release the agent's slot and record the failure: the
+    /// (gate-wide: a failing store is a store property) degraded window opens, unless this
+    /// agent also failed last time, when only it waits.
     void mark_failed(const std::string& agent_id) {
         {
             std::lock_guard lock(mu_);
             in_flight_.erase(agent_id);
-            open_window_locked(now_s_());
+            note_failure_locked(agent_id, now_s_());
         }
         notify_degraded(DegradedCause::write_failed);
     }
@@ -338,10 +355,26 @@ private:
         std::string identity;
         std::optional<int64_t> last_row_at; // set only for rows this process wrote
     };
-    /// The one place the degraded window opens. max(): a late completion stamped earlier than
-    /// a newer failure never shortens the window that failure opened.
-    void open_window_locked(int64_t at) {
-        degraded_until_ = std::max(degraded_until_, at + kEchoCorruptionAuditDegradedRetry);
+    /// The one place a failure is recorded. A failure by the agent that failed last (and has not
+    /// succeeded since) only extends that agent's own wait; any other opens the gate-wide window.
+    /// max(): a late completion stamped earlier than a newer failure never shortens the wait that
+    /// failure set.
+    void note_failure_locked(const std::string& agent_id, int64_t at) noexcept {
+        // ponytail: one remembered agent. Two or more agents failing alternately still re-open the
+        // gate-wide window on each failure (the behaviour before this); a small bounded table
+        // keyed on agent id is the upgrade if that is ever seen.
+        const int64_t until = at + kEchoCorruptionAuditDegradedRetry;
+        if (repeat_ == agent_id) {
+            repeat_until_ = std::max(repeat_until_, until);
+            return;
+        }
+        degraded_until_ = std::max(degraded_until_, until);
+        try {
+            repeat_ = agent_id;
+            repeat_until_ = until;
+        } catch (...) {
+            repeat_.reset(); // an allocation failure forgets the repeat; the window is already open
+        }
     }
     void notify_degraded(DegradedCause cause) noexcept {
         if (!on_degraded_)
@@ -355,6 +388,8 @@ private:
     /// when the identity was only found durable by the lookup (no window).
     void remember_locked(const std::string& agent_id, const std::string& quarantine, int64_t now,
                          bool wrote_row) {
+        if (repeat_ == agent_id)
+            repeat_.reset(); // a success forgets the agent: its next failure opens the window again
         if (agents_.size() >= kMaxAgents && !agents_.contains(agent_id)) {
             // Prefer an entry whose rate-limit window has elapsed (or that never had one), so
             // an agent still inside its window keeps its limit; fall back to the first entry
@@ -379,6 +414,10 @@ private:
     std::mutex mu_;
     std::unordered_map<std::string, Entry> agents_;
     int64_t degraded_until_{0};
+    // The agent whose lookup or write failed last, until it succeeds or another agent fails, and
+    // when its own wait ends. Optional so an empty agent id is never "the repeat".
+    std::optional<std::string> repeat_;
+    int64_t repeat_until_{0};
     // Agents holding a true should_log() that is awaiting mark_logged / mark_failed.
     std::unordered_set<std::string> in_flight_;
 };
