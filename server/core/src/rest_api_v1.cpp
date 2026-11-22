@@ -4501,6 +4501,9 @@ void RestApiV1::register_routes(
                           "application/json");
                       return;
                   }
+                  // Before the scoped gate and any audit row: the id reaches target_id on both.
+                  if (detail::refuse_unsafe_device_id_a4(res, body["agent_id"].get<std::string>()))
+                      return;
                   if (!body.contains("steps")) {
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "steps is required"), "application/json");
@@ -8388,6 +8391,9 @@ void RestApiV1::register_routes(
         auto agent_id = body.value("agent_id", "");
         auto reason = body.value("reason", "");
         auto whitelist = body.value("whitelist", "");
+        // Before the scoped gate and any audit row (every failure row below carries the id).
+        if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+            return;
 
         // CDX-P1-02: the per-target authorization, applied once agent_id
         // is known — a management-group-confined operator with Security:Execute
@@ -8525,6 +8531,10 @@ void RestApiV1::register_routes(
             // the target agent_id in its audit row (gov-fix compliance-officer
             // C-2) instead of the audit call being skipped for lack of one.
             auto agent_id = req.matches[1].str();
+            // Before the store-outage row (which carries the id), the scoped gate and any
+            // other audit row.
+            if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                return;
             if (!quarantine_store || !quarantine_store->is_open()) {
                 res.status = 503;
                 // gov-fix(consistency-auditor, Gate 8): see the POST route's
@@ -9986,6 +9996,10 @@ void RestApiV1::register_routes(
             res.set_content(detail::a4_error(res, "agent_id and key required"), "application/json");
             return;
         }
+        // Before the service-tag guard, the scoped gate and any audit row: the id reaches
+        // target_id (agent_id:key) on every row of this route.
+        if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+            return;
 
         // #3289: a service-scoped token authorizing this write via
         // scoped_perm_fn below reads the PRE-WRITE `service` tag to decide
@@ -10072,6 +10086,9 @@ void RestApiV1::register_routes(
 
             auto agent_id = req.matches[1].str();
             auto key = req.matches[2].str();
+            // Before the service-tag guard, the scoped gate and any audit row (see the PUT twin).
+            if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                return;
             // #3289: same TOCTOU guard as PUT above — a service-scoped
             // token must not delete its own confinement key.
             if (!authz::service_scope_may_mutate_tag_key(session->token_scope_service, key)) {
@@ -17697,6 +17714,9 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            // The control-byte half of the floor: device_id is the failure rows' target_id.
+            if (detail::refuse_unsafe_device_id_a4(res, device_id))
+                return;
 
             auto result = device_token_store->create_token(name, session->username, device_id,
                                                            definition_id, expires_at);
@@ -19741,6 +19761,9 @@ void RestApiV1::register_routes(
             // same posture as /api/v1/events — agentic callers correlate the header
             // with the body's correlation_id (A3).
             res.set_header("X-Correlation-Id", cid);
+            // Before the scoped gate and any audit row: the id reaches target_id on both.
+            if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                return;
             // Per-device scope is mandatory — fail CLOSED if the gate is unwired
             // rather than silently widening to a global Read (production always wires
             // it from server.cpp; sibling DeviceRoutes likewise refuses without it).
@@ -19826,6 +19849,9 @@ void RestApiV1::register_routes(
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
+            // Before the scoped gate and any audit row: the id reaches target_id on both.
+            if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                return;
             if (!scoped_perm_fn) { // fail CLOSED if the scope gate is unwired
                 res.status = 500;
                 res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
@@ -19929,6 +19955,10 @@ void RestApiV1::register_routes(
                             .increment();
                 }
             } outcome{metrics_registry, kind_label, res};
+            // Before the scoped gate and any audit row: the id reaches target_id on both. After the
+            // outcome recorder, so the refusal is counted under its 400.
+            if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                return;
             std::string plugin, action, audit_action;
             if (lk) {
                 plugin = lk->plugin;
@@ -22006,6 +22036,9 @@ void RestApiV1::register_routes(
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
+            // Before the scoped gate and any audit row: the id reaches target_id on both.
+            if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                return;
             if (!scoped_perm_fn) {
                 res.status = 500;
                 res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
@@ -22057,6 +22090,9 @@ void RestApiV1::register_routes(
             const std::string event_id = req.matches[2].str();
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
+            // Before the scoped gate and any audit row: the id reaches target_id on both.
+            if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                return;
             if (!scoped_perm_fn) {
                 res.status = 500;
                 res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),

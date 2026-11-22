@@ -2,6 +2,7 @@
 
 #include "http_route_sink.hpp"
 #include "json_extract.hpp"
+#include "rest_audit.hpp" // detail::refuse_unsafe_device_id_a4: the device-id audit floor
 #include "tag_store.hpp"
 
 #include <nlohmann/json.hpp>
@@ -77,6 +78,11 @@ void register_tag_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+
+        // Before the service-tag guard, the scoped gate and any audit row: the id reaches
+        // target_id (agent_id:key) on every row of this route.
+        if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+            return;
 
         if (!TagStore::validate_key(key)) {
             res.status = 400;
@@ -194,6 +200,11 @@ void register_tag_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+
+        // Before the service-tag guard, the scoped gate and any audit row: the id reaches
+        // target_id (agent_id:key) on every row of this route.
+        if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+            return;
 
         // Gate 4/#3289 hardening round: normalize category keys to
         // lowercase, matching the /api/tags/set twin above — without

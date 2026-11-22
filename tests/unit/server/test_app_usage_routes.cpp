@@ -147,6 +147,31 @@ TEST_CASE("app-usage: demands exactly Forensics:Read via the scoped gate", "[app
     CHECK(h.scoped_calls[0] == "Forensics|Read|agent-77");
 }
 
+// #7811: the id reaches the scoped gate's denial audit and `target_id` on the per-open row, so an
+// over-long or control-byte id is refused with a 400 before the gate and any audit row. The gate
+// admits every device, so a 400 with no gate call proves the id check runs first.
+TEST_CASE("app-usage: an unsafe agent id answers 400 before the scoped gate or any audit row",
+          "[app_usage_routes][audit]") {
+    AppUsageHarness h;
+    h.allow_scoped_all = true;
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        auto res = h.sink.Get("/api/v1/forensics/agents/" + id + "/app-usage");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(json::parse(res->body)["error"]["message"] == "Invalid device id.");
+    }
+    CHECK(h.scoped_calls.empty());
+    CHECK(h.audits.empty());
+
+    // A 256-byte printable id is safe and reaches the gate.
+    CHECK(h.sink.Get("/api/v1/forensics/agents/" + std::string(256, 'a') + "/app-usage")->status ==
+          200);
+    CHECK(h.scoped_calls.size() == 1);
+}
+
 TEST_CASE("app-usage: scoped gate — in-scope 200, out-of-scope 403", "[app_usage_routes]") {
     AppUsageHarness h;
     h.scoped_agents = {"agent-in"};

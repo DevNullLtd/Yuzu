@@ -2284,6 +2284,8 @@ Quarantine a device.
 
 **Permission:** `Security:Execute`, scoped per-device (see the note above)
 
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
+
 > **Audit-before-change (ADR-0033 §9).** After authorisation and validation the
 > route writes a `quarantine.enable` row with `result=attempt` **before** it
 > changes the record. If that row cannot be written the request is refused
@@ -2537,6 +2539,8 @@ record whose release is not yet confirmed reads `releasing` in the list, stays l
 dispatch refusal; the server's reconciler finishes the release when the device is reachable.
 
 **Permission:** `Security:Execute`, scoped per-device (see the note above)
+
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
 
 Like `POST`, the release writes a `quarantine.disable` row with `result=attempt`
 before the change and answers `503` (`Sec-Audit-Failed: true`) without releasing
@@ -3977,6 +3981,8 @@ Set a tag on an agent. Creates the tag if it does not exist, or updates the valu
 
 **Permission:** `Tag:Write`
 
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
+
 **Request body:**
 
 ```json
@@ -4023,6 +4029,8 @@ admits it (#3289). The `service` tag defines the token's own confinement boundar
 Delete a tag from an agent.
 
 **Permission:** `Tag:Delete`
+
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
 
 **Service-scoped tokens:** cannot delete the `service` key on any agent, for the same reason as
 `PUT` above -- `403`, no `Tag:Delete` grant admits it (#3289).
@@ -6581,6 +6589,8 @@ is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
 below for a degraded properties-store read.
 
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
+
 **Error (503) -- store degraded:** `custom_properties_store` is a migrated Postgres store
 (authoritative posture); a transient database read failure returns `503` rather than an
 empty/partial property list, so automation never mistakes a degraded read for "this agent has no
@@ -6629,6 +6639,8 @@ the agent's management group / an ancestor, **or** a service-scoped API token wh
 is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
 below for a degraded properties-store write.
+
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
 
 **Request body:** `type` is optional (default `"string"`) and IS persisted, but a schema on this
 key (below) takes precedence — if one exists, its own `type` overrides whatever the request sent
@@ -6695,6 +6707,8 @@ is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403` -- distinct from the `404`
 degrade conflation noted below, which is a property-store issue on the delete path itself, not the
 authorization check.
+
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
 
 **Response:** flat, unwrapped (same family caveat as `GET`/`PUT` above).
 
@@ -10193,6 +10207,8 @@ One device's per-executable last-used projection — the per-agent drill. Becaus
 
 **Permission:** `Forensics:Read` — **per-device scoped** (management-group confinement; `403` for an in-fleet device outside your scope).
 
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
+
 **Response (200):**
 
 ```json
@@ -10234,6 +10250,8 @@ One device's detected licences — the per-agent drill. This is the **only** sur
 
 **Permission:** `SoftwareLicensing:Read` — **per-device scoped** (management-group confinement; `403` for an in-fleet device outside your scope).
 
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
+
 **Response (200):**
 
 ```json
@@ -10272,6 +10290,8 @@ A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` m
 **Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **the nine stores in the cascade** (generic inventory, installed-software, device-CI, app-perf, detected-licence, app-usage, the `endpoint_state` presence row that holds the device's last-known hostname, OS, agent version and architecture, the fleet certificate inventory, and the Guardian guaranteed-state store under the key `guaranteed_state`), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired whole-device erasure path for eight of those nine stores (GDPR Art. 17); the ninth, `guaranteed_state`, is erased only in part (census rows, the per-agent emit-order row and pending evidence, with the event log and DEX observations left to retention, see below); per-agent stores outside the cascade are not erased by it, and row-level / per-subject DSAR erasure is a stated gap (#1666). For `guaranteed_state`, `deleted` means the device's compliance-census rows (the per-agent, per-rule state behind `errored_rules` and `uncertain_rules`) and its per-agent emit-order row (`guardian_agent_order`, the row behind `unordered_agents`) were erased and its pending census evidence retired, all in one transaction; the Guardian event log and DEX observations are **not** erased by the decommission and are kept until retention expires (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire; widening that needs a separate decision). The method is not a rule mutation: it does not bump the policy generation or push anything to agents. Read access to the census is governed by `GuaranteedState:Read`. Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
 
 **Permission:** a single **per-device-scoped `Decommission:Delete`** securable (ADR-0024 Decision 9, amended Wave 7 PR7.2) — one grant authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction. A role lacking it is `403`'d, naming `Decommission:Delete` (the seeded Administrator/ITServiceOwner roles hold it by default; a custom role that had assembled the old per-store `Delete` grants must be granted this securable too — the three old grants no longer suffice).
+
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
 
 Two durable audit events: `sle.agent.decommission|attempt` is written **before** the erasure and **fails closed** — if it cannot persist, nothing is erased (`503` + `Sec-Audit-Failed`); the outcome row (`success`/`partial`) follows with the per-store breakdown.
 
@@ -10499,6 +10519,8 @@ Dispatch a bundle. Returns the correlation id immediately; poll `GET /api/v1/bun
 
 **Permission:** `Execution:Execute`, scoped per-device (management-group-confined operators are admitted for devices in their own group(s)). The caller's derived visibility is also enforced a second time at dispatch (#1788, defense-in-depth) — a target outside it is treated as unreached (`result=no_agents`, `state=dispatch_failed` on collate) rather than reaching the device.
 
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
+
 **Request body:**
 
 | Field | Type | Required | Description |
@@ -10661,6 +10683,8 @@ List all device tokens.
 Create a device-scoped token. The raw token value is returned exactly once at creation time.
 
 **Permission:** `DeviceToken:Write`
+
+**Device id:** a `device_id` with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the store and writes no audit row; one over 256 bytes answers `400` `invalid_input_length`, also with no audit row.
 
 **Request body:**
 
@@ -11782,6 +11806,8 @@ Mint a one-time upload grant for an agent. Operator-facing.
 
 **Permission:** `UploadGrant:Write`
 
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
+
 **Request body:**
 
 | Field | Type | Required | Description |
@@ -12506,6 +12532,7 @@ Per-device DEX read model — the machine-readable equivalent of the **DEX** len
 
 - **Permission:** `GuaranteedState:Read`, scoped to the device's management group (a REST worker is held to the same per-device scope as the dashboard lens).
 - **Path parameter:** `id` — the agent's `agent_id`.
+- **Device id:** an `id` over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the scope check and writes no audit row.
 - **Query parameters:** `window` — one of `24h` / `7d` / `30d` / `all` (default `7d`); an off-enum value is rejected with `400`.
 - **Response:** `data` object `{agent_id, window, score, signals[]}` — `score` is the device's DEX experience score (0–100; `-1` = n/a, treat as "no data", **not** a low score); `signals[]` each `{obs_type, count, distinct_devices, last_seen}` for the window. An unknown `agent_id` returns `200` with `score:-1` and empty `signals` (the scope gate, not existence, decides access). `403` when the device is outside the operator's management scope. `503` when the store is unavailable, `503` with header `Sec-Audit-Failed: true` when the audit row cannot persist (see Audit below), **or** `503` (`retry_after_ms: 2000`, no `Sec-Audit-Failed`) when the underlying signal-summary read **degraded** (store closed / pool-acquire timeout / query error, #4855) — a degrade is a retryable error, never a `200` with a fabricated `score:0`/`100` and no signals. This is a NAMED exception to the general "#2659 DEX reads degrade to empty" posture described in [guaranteed-state.md](guaranteed-state.md) — this one read fails closed instead.
 - **Headers:** `X-Correlation-Id` is echoed on **every** response path (matches `/api/v1/events`); the value also appears as `correlation_id` in error bodies.
@@ -12517,6 +12544,7 @@ One device's retained per-`(app, version, day)` performance history (B1) — the
 
 - **Permission:** `GuaranteedState:Read`, scoped to the device's management group.
 - **Path parameter:** `id` — the agent's `agent_id`.
+- **Device id:** an `id` over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the scope check and writes no audit row.
 - **Query parameter:** `app` — optional display filter applied **in memory** to the device's returned rows (not a bound query parameter — the device's retained rows are fetched by `agent_id`, then narrowed by `app`), so there is no length/charset gate or `400` on it. Omitted = every resource-significant app-version on the device.
 - **Response:** `data` object `{agent_id, rows[]}` where each row is one retained daily summary `{app_name, version, day, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes}`. An unknown `agent_id` returns `200` with empty `rows`. `403` outside the operator's scope; `503` when the store is unavailable, or `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (serving **no** data).
 - **Headers:** `X-Correlation-Id` echoed on every response path.
@@ -12528,6 +12556,7 @@ Per-device raw signal history — the distinct signal-**history** capability fro
 
 - **Permission:** `GuaranteedState:Read`, scoped to the device's management group.
 - **Path parameter:** `id` — the agent's `agent_id`.
+- **Device id:** an `id` over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the scope check and writes no audit row.
 - **Query parameter:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
 - **Response:** `data` object `{agent_id, window, crashes, hangs, signals, distinct_apps, last_seen, history[]}` — `history[]` each `{event_id, observed_at, obs_type, subject, reason, symbolic, component, metric}` (raw facts; no pre-formatted display string — derive your own summary from the fields, the fragment's "what happened" column is presentation-only). `403` outside scope; `503` on store unavailable or a dropped audit row (`Sec-Audit-Failed: true`).
 - **Audit:** emits **`dex.device.view`** — the SAME verb `GET /api/v1/dex/devices/{id}` uses (a deliberate reuse: the dashboard fragment audits this exact signal-history capability under this exact verb too). Fail-closed as above.
@@ -12538,6 +12567,7 @@ Single-observation detail — every captured projection field for one event (the
 
 - **Permission:** `GuaranteedState:Read`, scoped to the device's management group.
 - **Path parameters:** `id` (agent_id), `event_id`.
+- **Device id:** an `id` over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the scope check and writes no audit row.
 - **Response:** `data` object `{event_id, agent_id, observed_at, obs_type, subject, reason, symbolic, component, version, metric, platform}`. `404` when the event does not exist **or** belongs to a different device — same response either way (a foreign/guessed `event_id` reveals nothing beyond what the scope gate already allowed, matching the dashboard fragment's oracle-closed contract).
 - **Audit:** emits **`dex.observation.view`** (`target_type=Agent`, `target_id=<agent_id>`). Fail-closed as above.
 
@@ -12717,6 +12747,7 @@ Dispatches a read-only instruction to the live agent **now** and synchronously r
 
 - **Permission:** `GuaranteedState:Read` **and** `Execution:Execute`, both scoped to the device's management group.
 - **Path parameter:** `id` — the agent's `agent_id`.
+- **Device id:** an `id` over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the scope check and writes no audit row, and dispatches nothing.
 - **Query parameter:** `kind` — **required**. `uptime` dispatches `os_info/uptime`; `processes` dispatches `processes/list_hashed` (`proc|pid|name|sha256|path`; the SHA-256 is of each on-disk executable, resolved from the kernel, not argv[0], bounded at 512 MiB per image).
 - **Dashboard-only kinds:** the dashboard **"Get live info"** grid renders ten additional card kinds (`process_tree`, `services`, `users`, `netconfig`, `arp`, `dns_cache`, `listening`, `connections`, `capture_sources`, `disk`). These are **not yet available on this REST endpoint** — passing any of them returns `400`. REST/JSON parity for all ten is deferred to [#1649](https://github.com/Tr3kkR/Yuzu/issues/1649); to probe e.g. the process tree via REST today, dispatch `processes/list_tree` directly through the async execution surface.
 - **Response:** `data` object — `kind=uptime` → `{kind, uptime_display, uptime_seconds}`; `kind=processes` → `{kind, processes[].pid/name/sha256/path}`.
@@ -14541,11 +14572,14 @@ Get tags for an agent. Requires `agent_id` query parameter. Returns tags as an a
 Set a tag on an agent. Request body: `{"agent_id": "...", "key": "...", "value": "..."}`. A
 service-scoped token cannot set the `service` key on any agent -- `403` (#3289); see
 [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
+An `agent_id` over 256 bytes or with a byte below `0x20` is `400` (`Invalid device id.`) before the
+service-tag guard, the scoped gate and any audit row.
 
 #### `POST /api/tags/delete`
 
 Delete a tag from an agent. Request body: `{"agent_id": "...", "key": "..."}`. A service-scoped
 token cannot delete the `service` key on any agent -- `403` (#3289).
+An `agent_id` over 256 bytes or with a byte below `0x20` is `400` (`Invalid device id.`), as on `POST /api/tags/set`.
 
 #### `POST /api/tags/query`
 

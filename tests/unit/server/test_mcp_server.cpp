@@ -34805,6 +34805,87 @@ TEST_CASE("MCP 2405: wrong-typed argument is rejected before the gate",
     CHECK(h.appr->pending_count() == 0);
 }
 
+// #7811: an `agent_id` argument over 256 bytes or with a byte below 0x20 reaches the permission
+// denial's target_id, an approval ticket's pending row or a domain audit row, and the audit store
+// keeps CR, LF and TAB. Every tool that takes one refuses it with -32602 before the scoped gate, the
+// approval mint and any audit write. The scoped gate here admits every device, so -32602 with the
+// gate never asked proves the floor runs first (a tool that refused late would reach the gate).
+TEST_CASE("MCP: an unsafe agent_id is refused with -32602 before the scoped gate or any audit row, "
+          "on every ungated tool that takes one",
+          "[mcp][audit]") {
+    int scoped_calls = 0;
+    McpTestServer ts;
+    ts.scoped_perm_fn_for_test = [&scoped_calls](const httplib::Request&, httplib::Response&,
+                                                 const std::string&, const std::string&,
+                                                 const std::string&) -> bool {
+        ++scoped_calls;
+        return true;
+    };
+    ts.start("operator");
+
+    const auto call_tool = [&ts](const std::string& tool, const std::string& agent_id) {
+        nlohmann::json args = {{"agent_id", agent_id}};
+        if (tool == "get_dex_observation")
+            args["event_id"] = "o1";
+        const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                    {"method", "tools/call"},
+                                    {"id", 1},
+                                    {"params", {{"name", tool}, {"arguments", args}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const char* tool :
+         {"get_dex_device_score", "get_dex_device_app_perf", "get_dex_device_history",
+          "get_dex_observation", "get_guardian_device_guards", "get_guardian_agent_status",
+          "get_agent_app_usage", "query_software_licenses",
+          "get_software_host_collection_settings"}) {
+        for (const auto& id : bad) {
+            INFO(std::string(tool) + " " + id.substr(0, 16));
+            const auto body = call_tool(tool, id);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        }
+    }
+    CHECK(scoped_calls == 0);
+    CHECK(ts.audit_log.empty());
+
+    // A 256-byte printable id is safe: the same tool reaches the scoped gate.
+    call_tool("get_dex_device_score", std::string(256, 'a'));
+    CHECK(scoped_calls == 1);
+}
+
+// The approval-gated tools: on a gated tier the generic mint covers every one of them, so an unsafe
+// id mints no ticket and writes no pending row. set_tag, delete_tag and quarantine_device stand for
+// the class (the mint is one block for all of them).
+TEST_CASE("MCP: an unsafe agent_id mints no approval ticket and writes no audit row (#7811)",
+          "[pg][mcp][integration][approval][audit]") {
+    SchemaGateHarness h("supervised");
+
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const char* tool : {"set_tag", "delete_tag", "quarantine_device"}) {
+        for (const auto& id : bad) {
+            INFO(std::string(tool) + " " + id.substr(0, 16));
+            nlohmann::json args = {{"agent_id", id}, {"key", "role"}, {"value", "web"}};
+            const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                        {"method", "tools/call"},
+                                        {"id", 1},
+                                        {"params", {{"name", tool}, {"arguments", args}}}};
+            const auto body = h.call(req.dump());
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(body["error"]["message"] ==
+                  "agent_id must be at most 256 bytes with no byte below 0x20");
+        }
+    }
+    CHECK(h.appr->pending_count() == 0);
+    CHECK(h.ts.audit_log.empty());
+}
+
 TEST_CASE("MCP 2405: non-string approval_id is rejected on declaring and non-declaring tools",
           "[pg][mcp][integration][approval][schema]") {
     // approval_id is control-plane: only delete_tag/quarantine_device declare

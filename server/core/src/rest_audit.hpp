@@ -97,6 +97,7 @@
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 
+#include "rest_a4_envelope_http.hpp" // a4_error — the JSON refusal of refuse_unsafe_device_id_a4
 #include "web_utils.hpp" // audit_token — CWE-117 neutralisation for a hostile target_id (#4665)
 
 #include <yuzu/server/auth.hpp> // auth::agent_id_is_audit_safe
@@ -237,6 +238,19 @@ template <class AuditFn>
         return false;
     res.status = 400;
     res.set_content("<div class=\"gp-note\">Invalid device id.</div>", "text/html; charset=utf-8");
+    return true;
+}
+
+/// The JSON twin of `refuse_unsafe_device_id` for `/api` and `/api/v1` routes: the same floor,
+/// answered with a 400 A4 envelope whose message is the static `Invalid device id.` (the
+/// `X-Correlation-Id` header is reused when the handler already set one). Call it right after the
+/// id is read from the path, query or body, before the permission check and before any audit
+/// write; it writes no audit row. Never put request data in the message.
+[[nodiscard]] inline bool refuse_unsafe_device_id_a4(httplib::Response& res, const std::string& id) {
+    if (auth::agent_id_is_audit_safe(id))
+        return false;
+    res.status = 400;
+    res.set_content(a4_error(res, "Invalid device id."), "application/json");
     return true;
 }
 

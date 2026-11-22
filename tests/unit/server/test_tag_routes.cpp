@@ -467,6 +467,37 @@ TEST_CASE("POST /api/tags/set: missing agent_id/key is a 400 before any gate",
     CHECK(h.deny_calls.empty());
 }
 
+// #7811: the id reaches `target_id` (agent_id:key) on every audit row of these routes, and the
+// service-tag guard and the scoped gate write denial rows from it, so an over-long or control-byte
+// id is refused with a 400 before either and before any audit row. The gates here admit every
+// caller, so a 400 with no gate call proves the id check runs first.
+TEST_CASE("POST /api/tags/set and /delete: an unsafe agent id is a 400 before the service-tag "
+          "guard, the scoped gate or any audit row",
+          "[server][routes][tag_routes][rest][pg][audit]") {
+    PgHarness h;
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        for (const char* route : {"/api/tags/set", "/api/tags/delete"}) {
+            auto r = h.sink.Post(
+                route, json{{"agent_id", id}, {"key", "role"}, {"value", "eng"}}.dump());
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(json::parse(r->body)["error"]["message"] == "Invalid device id.");
+        }
+    }
+    CHECK(h.deny_calls.empty());
+    CHECK(h.scoped_perm_fn_calls == 0);
+    CHECK(h.audits.empty());
+
+    // A 256-byte printable id is safe and reaches the gates.
+    h.sink.Post("/api/tags/set",
+                json{{"agent_id", std::string(256, 'a')}, {"key", "role"}, {"value", "eng"}}.dump());
+    CHECK(h.deny_calls.size() == 1);
+    CHECK(h.scoped_perm_fn_calls == 1);
+}
+
 // ── POST /api/tags/delete: gate ordering + audit ────────────────────────────
 
 TEST_CASE("POST /api/tags/delete: deny_service_scoped_tag_mutation_fn is called BEFORE "

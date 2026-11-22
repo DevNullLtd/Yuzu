@@ -256,6 +256,8 @@ The per-device page is the shared entity view reached from any dashboard, organi
 
 Every per-device route is scoped to the device's management group (a global grant **or** a role assigned on the device's group / an ancestor): opening a device outside your scope returns *forbidden*, never its data.
 
+A device id longer than 256 bytes or containing a byte below `0x20` answers `400` ("Invalid device id.") on every per-device route and fragment, before the scope check and before any audit row, so such an id never reaches an audit record. Registered devices are not affected: registration refuses those ids, so only a hand-built URL is refused (see [Upgrading](upgrading.md)).
+
 | Tab | Contents | Gate |
 |---|---|---|
 | **Device info** | Identity (agent ID, OS, arch, version), tags, group membership. | `Infrastructure:Read`, scoped to the device |

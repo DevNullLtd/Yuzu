@@ -1042,6 +1042,21 @@ does not fit saturates (`9223372036854775807`, or the `int` range where a tool n
 instead of wrapping, so an oversized `limit` reaches that tool's own ceiling instead of becoming
 `0` or the default page.
 
+**A device id is bounded and clean (#7811).** An `agent_id` argument over 256 bytes or with a byte
+below `0x20` (a tab, CR, LF or NUL among them) is refused with `-32602`
+("agent_id must be at most 256 bytes with no byte below 0x20") before the per-device permission
+check, the approval mint and any audit row, so a refused id leaves no audit row and no pending
+approval. It applies to `get_dex_device_score`, `get_dex_device_app_perf`, `get_dex_device_history`,
+`get_dex_observation`, `get_guardian_device_guards`, `get_guardian_agent_status`,
+`get_agent_app_usage`, `get_agent_inventory`, `query_software_licenses`,
+`get_software_host_collection_settings`, `get_tags`, `set_tag`, `delete_tag`, `quarantine_device`,
+`execute_bundle` and `mint_upload_grant`, and, for every approval-gated tool, to the approval mint
+itself. `get_hardware_ci` shares the same check. The two Guardian drills keep their own
+"agent_id is too long" answer for an over-long id and add the control-byte refusal; a tool that
+already refused such an id through its own check (`get_host_topology`, `list_guardian_events`,
+`get_guardian_device_compliance`, `get_execution_statistics_by_agent` and the management-group
+member tools) keeps it.
+
 For **approval-gated tools**, arguments are additionally validated against the
 tool's published `inputSchema` (from `tools/list`) *before* any approval-ticket
 work (#2405): a call with missing, mistyped, or out-of-bounds arguments (per

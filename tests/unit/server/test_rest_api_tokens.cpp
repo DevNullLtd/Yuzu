@@ -807,6 +807,32 @@ TEST_CASE("REST POST /api/v1/device-tokens: oversized device_id (>256 chars) rej
     CHECK(h.audit_log.empty());
 }
 
+// #7811: device_id is the `target_id` of the failure rows, and the audit store keeps CR, LF and
+// TAB, so a device id carrying a byte below 0x20 is refused with a 400 before the store and any
+// audit row (the length half stays the invalid_input_length refusal above).
+TEST_CASE("REST POST /api/v1/device-tokens: a device_id with a control byte is a 400 before the "
+          "store and any audit row (#7811)",
+          "[pg][rest][token][audit]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    const std::vector<std::string> bad = {std::string("dev\0A", 5), "dev\r\nA", "dev\nA",
+                                          "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        auto res = h.sink.Post("/api/v1/device-tokens",
+                               nlohmann::json{{"name", "dev-token"},
+                                              {"device_id", id},
+                                              {"definition_id", "d"}}
+                                   .dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "Invalid device id.");
+    }
+    CHECK(h.audit_log.empty());
+}
+
 TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure increments "
           "yuzu_secure_random_failure_total{site=api_token} (sre-1)",
           "[pg][rest][token][csprng][metrics][sre1]") {
