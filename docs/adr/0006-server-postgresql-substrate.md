@@ -141,6 +141,7 @@ responses requires its own response-store decision.
 |---|---|
 | Transactional state, authorization, pending work and export progress | PostgreSQL. Core owns the transaction that marks an export complete. |
 | Finalized records within a feature's cold retention period | ClickHouse. Core owns the credentials for these tables and mediates every read, including counts and aggregates, under the feature's existing authorization rules. Grafana receives no datasource for these tables. |
+| Bulk live command responses after the response-store cutover | ClickHouse, written directly by authenticated core ingest in both ordinary and incident dispatch. |
 | Analytics and dashboards | Existing analytics feeds retain their own access and retention policies. |
 
 For criteria runs, a creator with the required read grant can retrieve retained evidence
@@ -182,3 +183,14 @@ and thresholds using measured storage and WAL growth before enabling this featur
 The implementing change enables that guarantee when cold export ships. A release containing
 only the warm implementation documents its warm-only retention in the operator manual and
 upgrade notes (ADR-0075 R11.9).
+
+### Bulk live instruction responses (approved design, 2026-11-22)
+
+For bulk live instructions, ClickHouse is the standard first durable destination for response
+payloads through authenticated core ingest. Ordinary and incident dispatch use that same path.
+Core owns the credentials and enforces device scope and Forensics tier on detail, facet and
+aggregate reads. PostgreSQL owns admission, cohort, deadline, run status, audit and bounded
+warm verdicts. Never spill raw responses into PostgreSQL when the sink stalls. Account for
+bounded in-flight response bytes separately from the warm verdict reservation above. Release
+database leases before sink waits. The response-store cutover requires its own migration and
+rollback contract. ADR-0039 records the currently deployed response store.
