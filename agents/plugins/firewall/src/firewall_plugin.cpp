@@ -2852,10 +2852,11 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
     // address is refused whatever that read returned. A refusal changes nothing: no record is
     // written, no leg is built, and an existing record and its containment are left as they
     // were, so a contained device that has since become its own server stays contained
-    // (repair, the boot re-apply and release never check and keep working; quarantine_allow
-    // never reaches this line). The token alone does not say whether the device is contained.
-    // allow_set_unchanged_note (firewall_quarantine_parsers.hpp) says when the refusal also
-    // carries the allow-set note; its KV read happens only on this path.
+    // (repair, the boot re-apply and release never run this check, so they keep working;
+    // quarantine_allow never reaches this line). The refusal reason alone does not say
+    // whether the device is contained. allow_set_unchanged_note
+    // (firewall_quarantine_parsers.hpp) says when the refusal also carries the allow-set
+    // note; the extra KV read for it is made only on this path.
     if (const auto why =
             fq::self_host_refusal(allow->control, yuzu::agent::enumerate_own_addresses())) {
         auto o = fq::refused(std::string{*why});
