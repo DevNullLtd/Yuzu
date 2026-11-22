@@ -35,17 +35,29 @@
  * blocked for a minute and then threw still opens a full window), and it only ever
  * extends: a late completion never shortens a window a newer failure opened. There
  * is no separate half-open probe: the probes that follow a window are at most
- * kMaxInFlight (below), which is already a bound, and the first one to fail
- * re-opens the window.
+ * kMaxInFlight (below), which is already a bound, and the first one to fail that
+ * is not a remembered agent (next paragraph) re-opens the window.
  *
- * One exception bounds the blast radius of a single bad agent. A failure by the SAME
- * agent as the previous failure (no other agent has failed since, and it has not
- * succeeded) opens no gate-wide window: only that agent waits out its own window, so
- * an agent whose lookup or write fails every time cannot hold the gate shut for the
- * healthy ones. Its first failure cannot be told from a store fault, so it still
- * pauses every agent once. Any other agent's failure opens the window as above, so a
- * real store outage still closes the gate. Every failure, a contained repeat
- * included, is reported to the optional DegradedFn observer (after the lock is
+ * One exception bounds the blast radius of agents whose own lookup or write keeps
+ * failing. The gate remembers each agent whose last lookup or write failed, up to
+ * kMaxFailing (16) of them, until that agent succeeds (its row is written, or its
+ * lookup finds the row durable). A failure by a remembered agent opens no gate-wide
+ * window: only that agent waits out its own window, dated from its failure. So an
+ * agent that fails every time pauses every agent once, on its first failure (which
+ * cannot be told from a store fault), and not again while it is remembered, however
+ * many other agents fail in between. A failure by an agent that is not remembered
+ * opens the window as above, so a real store outage still closes the gate. Two
+ * limits follow from the bound. More than kMaxFailing agents failing with none of
+ * them succeeding cannot be told from a store fault: at the cap the remembered agent
+ * whose wait ends earliest is forgotten to make room, a forgotten agent's next
+ * failure opens the window again, and with that many failing the gate behaves as it
+ * did before it remembered anyone (healthy agents are audited only between windows;
+ * their rows are delayed, not lost). And while the store really is failing, each
+ * remembered agent still tries once per retry period, so a failing store sees up to
+ * kMaxFailing such lookups per period beside those that follow a window (never more
+ * than kMaxInFlight at once). An entry has no time limit: an agent that stops
+ * reporting stays remembered until the cap forgets it. Every failure, a contained
+ * one included, is reported to the optional DegradedFn observer (after the lock is
  * released), so a gate that fails is not silent.
  *
  * Reservation contract: a true from should_log() reserves that AGENT's
@@ -180,8 +192,8 @@ decode_echo_quarantine_from_detail(std::string_view detail) {
 }
 
 /// Why the gate recorded a failure (closed set; the token is a metric label). Each one opens
-/// the degraded window, except a repeat by the agent that failed last, which only that agent
-/// waits out.
+/// the degraded window, except a failure by an agent the gate already remembers as failing,
+/// which only that agent waits out.
 enum class DegradedCause : uint8_t { lookup_degraded, lookup_threw, write_failed };
 
 [[nodiscard]] inline const char* echo_corruption_degraded_cause_token(DegradedCause c) noexcept {
@@ -214,6 +226,10 @@ public:
     static constexpr std::size_t kMaxInFlight = 4;
     /// Bound on the per-agent identity map (one entry is evicted at the cap).
     static constexpr std::size_t kMaxAgents = 65536;
+    /// Most failing agents remembered at once: a remembered agent's failure opens no gate-wide
+    /// window. At the cap the one whose wait ends earliest is forgotten. It is also the most
+    /// contained lookups a failing store sees per retry period.
+    static constexpr std::size_t kMaxFailing = 16;
 
     /// The production clock (the default NowFn): monotonic seconds.
     static int64_t steady_seconds() {
@@ -235,7 +251,7 @@ public:
             std::lock_guard lock(mu_);
             if (now < degraded_until_)
                 return false; // degraded store: no lookup until the window ends
-            if (repeat_ == agent_id && now < repeat_until_)
+            if (const auto it = failing_.find(agent_id); it != failing_.end() && now < it->second)
                 return false; // this agent failed on its last try: it alone waits out its window
             if (in_flight_.contains(agent_id))
                 return false; // this agent's lookup is in flight; retried next heartbeat
@@ -339,8 +355,8 @@ public:
     }
 
     /// The caller's audit write failed: release the agent's slot and record the failure: the
-    /// (gate-wide: a failing store is a store property) degraded window opens, unless this
-    /// agent also failed last time, when only it waits.
+    /// (gate-wide: a failing store is a store property) degraded window opens, unless the gate
+    /// already remembers this agent as failing, when only it waits.
     void mark_failed(const std::string& agent_id) {
         {
             std::lock_guard lock(mu_);
@@ -355,25 +371,28 @@ private:
         std::string identity;
         std::optional<int64_t> last_row_at; // set only for rows this process wrote
     };
-    /// The one place a failure is recorded. A failure by the agent that failed last (and has not
-    /// succeeded since) only extends that agent's own wait; any other opens the gate-wide window.
-    /// max(): a late completion stamped earlier than a newer failure never shortens the wait that
-    /// failure set.
+    /// The one place a failure is recorded. A failure by a remembered agent (failing_) only extends
+    /// that agent's own wait; any other opens the gate-wide window and is remembered. max(): a late
+    /// completion stamped earlier than a newer failure never shortens the wait that failure set.
     void note_failure_locked(const std::string& agent_id, int64_t at) noexcept {
-        // ponytail: one remembered agent. Two or more agents failing alternately still re-open the
-        // gate-wide window on each failure (the behaviour before this); a small bounded table
-        // keyed on agent id is the upgrade if that is ever seen.
         const int64_t until = at + kEchoCorruptionAuditDegradedRetry;
-        if (repeat_ == agent_id) {
-            repeat_until_ = std::max(repeat_until_, until);
+        if (const auto it = failing_.find(agent_id); it != failing_.end()) {
+            it->second = std::max(it->second, until);
             return;
         }
         degraded_until_ = std::max(degraded_until_, until);
         try {
-            repeat_ = agent_id;
-            repeat_until_ = until;
+            // ponytail: kMaxFailing remembered agents, O(kMaxFailing) scan under mu_ at the cap
+            // only. More agents than that failing at once re-open the window whenever a forgotten
+            // one fails (the behaviour before the table); raising the cap is the upgrade if that is
+            // ever seen, at the price of more lookups against a store that really is failing.
+            if (failing_.size() >= kMaxFailing)
+                failing_.erase(std::min_element(
+                    failing_.begin(), failing_.end(),
+                    [](const auto& a, const auto& b) { return a.second < b.second; }));
+            failing_.emplace(agent_id, until);
         } catch (...) {
-            repeat_.reset(); // an allocation failure forgets the repeat; the window is already open
+            // An allocation failure leaves the agent unremembered; the window is already open.
         }
     }
     void notify_degraded(DegradedCause cause) noexcept {
@@ -388,8 +407,7 @@ private:
     /// when the identity was only found durable by the lookup (no window).
     void remember_locked(const std::string& agent_id, const std::string& quarantine, int64_t now,
                          bool wrote_row) {
-        if (repeat_ == agent_id)
-            repeat_.reset(); // a success forgets the agent: its next failure opens the window again
+        failing_.erase(agent_id); // a success forgets it: its next failure opens the window again
         if (agents_.size() >= kMaxAgents && !agents_.contains(agent_id)) {
             // Prefer an entry whose rate-limit window has elapsed (or that never had one), so
             // an agent still inside its window keeps its limit; fall back to the first entry
@@ -414,10 +432,9 @@ private:
     std::mutex mu_;
     std::unordered_map<std::string, Entry> agents_;
     int64_t degraded_until_{0};
-    // The agent whose lookup or write failed last, until it succeeds or another agent fails, and
-    // when its own wait ends. Optional so an empty agent id is never "the repeat".
-    std::optional<std::string> repeat_;
-    int64_t repeat_until_{0};
+    // Agents whose last lookup or write failed (each until it succeeds), with the end of each
+    // one's own wait. Bounded by kMaxFailing.
+    std::unordered_map<std::string, int64_t> failing_;
     // Agents holding a true should_log() that is awaiting mark_logged / mark_failed.
     std::unordered_set<std::string> in_flight_;
 };

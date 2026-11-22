@@ -8741,8 +8741,9 @@ groups:
             quarantine a replica records before Prometheus has scraped it once can be missed (the
             first sample is already above 0), and no row is written, so none is counted, while the
             audit store is closed or the gate is waiting out a failed audit lookup or write (every
-            agent after a first failure; only the failing agent when it fails again). The signal is
-            agent-self-reported, so one agent can raise it; treat it as a ticket, not a page.
+            agent after an agent's first failure; only that agent when it fails again, for up to
+            16 failing agents the gate remembers). The signal is agent-self-reported, so one agent
+            can raise it; treat it as a ticket, not a page.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
 
       # DECISION (#6696): one generic rule keyed on the plugin label, not an Echo-only twin; the

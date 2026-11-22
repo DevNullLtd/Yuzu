@@ -3105,31 +3105,103 @@ TEST_CASE("EchoCorruptionAuditGate: one agent whose lookup or write keeps failin
         CHECK(c == cause);
 }
 
-TEST_CASE("EchoCorruptionAuditGate: another agent's failure re-opens the window once, after which "
-          "the first failing agent is contained again",
+TEST_CASE("EchoCorruptionAuditGate: agents that fail in turn each pause every agent once, after "
+          "which all of them are contained",
           "[health_store][echo][corruption][gate]") {
     using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
     RepeatFailureGate f;
     f.answer["bad"] = RepeatFailureGate::Answer::degraded;
     f.answer["other"] = RepeatFailureGate::Answer::degraded;
 
-    CHECK_FALSE(f.beat("bad")); // opens the window at 1000
+    CHECK_FALSE(f.beat("bad")); // its first failure opens the window at 1000
     f.clock += kEchoCorruptionAuditDegradedRetry;
-    CHECK_FALSE(f.beat("bad")); // a repeat: contained, so a healthy agent is audited
+    CHECK_FALSE(f.beat("bad")); // it is remembered: contained, so a healthy agent is audited
     CHECK(f.beat("healthy-1"));
 
-    // A different agent failing is a store signal as far as the gate can tell: the window
-    // opens for everyone, and "bad" is no longer the remembered repeat.
+    // A first failure by another agent is a store signal as far as the gate can tell: the window
+    // opens once more, and that agent is remembered beside the first.
     CHECK_FALSE(f.beat("other"));
     CHECK_FALSE(f.beat("healthy-2"));
-    f.clock += kEchoCorruptionAuditDegradedRetry;
-    CHECK_FALSE(f.beat("bad")); // opens the window again (once)
-    CHECK_FALSE(f.beat("healthy-3"));
 
-    // The next failure by "bad" is a repeat again: contained, healthy agents flow.
+    // From here neither re-opens the window, in whichever order they fail: each is tried once a
+    // retry period, and a healthy agent is audited in the same second as each failure.
+    for (int round = 0; round < 6; ++round) {
+        f.clock += kEchoCorruptionAuditDegradedRetry;
+        const std::string first = round % 2 ? "bad" : "other";
+        const std::string second = round % 2 ? "other" : "bad";
+        const int before = f.lookups;
+        CHECK_FALSE(f.beat(first));
+        CHECK(f.beat("healthy-a" + std::to_string(round)));
+        CHECK_FALSE(f.beat(second));
+        CHECK(f.beat("healthy-b" + std::to_string(round)));
+        CHECK(f.lookups == before + 4);
+        CHECK_FALSE(f.beat(first)); // inside its own wait: no lookup
+        CHECK_FALSE(f.beat(second));
+        CHECK(f.lookups == before + 4);
+    }
+}
+
+TEST_CASE("EchoCorruptionAuditGate: kMaxFailing failing agents are contained; one more re-opens "
+          "the window and the agent whose wait ends earliest is forgotten",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    constexpr int kCap = static_cast<int>(EchoCorruptionAuditGate::kMaxFailing);
+    RepeatFailureGate f;
+    const auto bad = [](int i) { return "bad-" + std::to_string(i); };
+    for (int i = 0; i <= kCap; ++i)
+        f.answer[bad(i)] = RepeatFailureGate::Answer::degraded;
+
+    // Each agent's first failure pauses every agent once.
+    for (int i = 0; i < kCap; ++i) {
+        CHECK_FALSE(f.beat(bad(i)));
+        CHECK_FALSE(f.beat("healthy-w" + std::to_string(i)));
+        f.clock += kEchoCorruptionAuditDegradedRetry + 1;
+    }
+    // All are remembered: a whole round of failures (1 s apart, so their waits end in order)
+    // opens no window, and a healthy agent is audited straight after.
+    for (int i = 0; i < kCap; ++i) {
+        CHECK_FALSE(f.beat(bad(i)));
+        f.clock += 1;
+    }
+    CHECK(f.beat("healthy-all"));
+
+    // One more failing agent than the table holds: its first failure opens the window, and the
+    // table forgets the agent whose wait ends earliest (bad-0).
     f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat(bad(kCap)));
+    CHECK_FALSE(f.beat("healthy-x"));
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat(bad(1))); // still remembered: contained
+    CHECK(f.beat("healthy-y"));
+    CHECK_FALSE(f.beat(bad(0))); // forgotten: a first failure again, so the window re-opens
+    CHECK_FALSE(f.beat("healthy-z"));
+}
+
+TEST_CASE("EchoCorruptionAuditGate: a success forgets only the agent that succeeded",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    using yuzu::server::detail::kEchoCorruptionAuditMinRowInterval;
+    RepeatFailureGate f;
+    f.answer["bad"] = RepeatFailureGate::Answer::degraded;
+    f.answer["other"] = RepeatFailureGate::Answer::degraded;
     CHECK_FALSE(f.beat("bad"));
-    CHECK(f.beat("healthy-4"));
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat("other")); // both remembered now
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+
+    f.answer["other"] = RepeatFailureGate::Answer::no_row;
+    CHECK(f.beat("other"));     // its row is written: forgotten
+    CHECK_FALSE(f.beat("bad")); // still remembered: contained
+    CHECK(f.beat("healthy-1"));
+
+    f.clock += kEchoCorruptionAuditMinRowInterval;
+    f.answer["other"] = RepeatFailureGate::Answer::degraded;
+    CHECK_FALSE(f.beat("other", "2:g")); // a first failure again: the window opens
+    CHECK_FALSE(f.beat("healthy-2"));
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat("bad")); // and "bad" was never forgotten
+    CHECK(f.beat("healthy-3"));
 }
 
 TEST_CASE("EchoCorruptionAuditGate: a success forgets a failing agent, so its next failure opens "
@@ -3169,7 +3241,7 @@ TEST_CASE("EchoCorruptionAuditGate: a repeating agent's own wait is dated from i
     const std::string bad = "bad";
 
     REQUIRE(gate.should_log(bad, "1:f"));
-    gate.mark_failed(bad); // first failure at 1000: window and remembered repeat until 1060
+    gate.mark_failed(bad); // first failure at 1000: the window opens and "bad" is remembered
     f.clock = 1060;
     REQUIRE(gate.should_log(bad, "1:f"));
     f.clock = 1100; // the write took 40 s, then failed
@@ -3291,7 +3363,7 @@ TEST_CASE("EchoCorruptionAuditGate: a rotating identity is rate-limited per agen
     CHECK(lookups == before + 2);
 }
 
-TEST_CASE("EchoCorruptionAuditGate: the degraded observer fires once per opening, outside the "
+TEST_CASE("EchoCorruptionAuditGate: the degraded observer fires on every failure, outside the "
           "lock, and a throwing observer is swallowed (#5066)",
           "[health_store][echo][corruption][gate]") {
     using namespace yuzu::server::detail;

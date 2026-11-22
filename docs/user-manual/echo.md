@@ -489,11 +489,19 @@ the audit store is healthy, not all on the first. A report is deferred to a late
 heartbeat if the same device's lookup is already in flight, if 4 devices are
 already in flight, or if it arrives inside the server-wide 60 s back-off that
 follows a failed lookup (including one that throws) or failed write. The one
-exception is a device whose own lookup or write failed last time and fails again:
-that repeat makes only that device wait, so one device with a persistently failing
-audit write cannot hold back the others. The back-off is dated from the failure
-and a later failure never shortens it; there is no separate probe, so when it
-ends, up to 4 devices look up at once and the first failure re-opens it. Each
+exception is a device the server already remembers as failing: the first failure
+by a device it does not remember opens the back-off for every device and the
+server remembers that device, and a later failure by a remembered device makes
+only that device wait 60 s from its failure. So a device whose own lookup or
+write fails every time pauses the others once, not on every retry. The server
+remembers up to 16 failing devices, each until its own lookup finds the row or its
+write succeeds, with no time limit. With more than 16 devices failing and none
+succeeding it forgets the one whose wait ends earliest, and a forgotten device's
+next failure opens the back-off again, so other devices' rows are delayed, not
+lost. While the audit store itself is failing, each remembered device still tries
+once per 60 s. The back-off is dated from the failure and a later failure never
+shortens it; there is no separate probe, so when it ends, up to 4 devices look up
+at once and the first failure by a device that is not remembered re-opens it. Each
 failure is counted in `yuzu_server_echo_corruption_audit_degraded_total{reason}`
 and logged. A plugin that
 failed to initialise (including Echo when the corrupt file cannot be moved
