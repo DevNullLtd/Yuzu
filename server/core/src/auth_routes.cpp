@@ -5792,8 +5792,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 spdlog::critical("elevation for '{}' committed but eligibility {} AND the "
                                  "compensating revoke FAILED ({}) - elevation is LIVE; manual "
                                  "revocation required",
-                                 session->username, post ? "was revoked" : "could not be re-read",
-                                 undo.error());
+                                 ::yuzu::log_key_token(session->username),
+                                 post ? "was revoked" : "could not be re-read", undo.error());
                 audit_log_for_principal(req, "role.elevation.denied", "error", session->username,
                                         auth::role_to_string(session->role), "User",
                                         session->username,
