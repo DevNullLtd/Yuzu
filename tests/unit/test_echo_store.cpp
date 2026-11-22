@@ -13,6 +13,7 @@
 #include "echo_netqual_boot.hpp"
 #include "echo_sql_executor.hpp"
 #include "echo_sqlite_progress.hpp"
+#include "echo_status_format.hpp" // format_schema_status_lines (#2626)
 #include "test_helpers.hpp"
 #include "test_log_capture.hpp"
 
@@ -1667,6 +1668,54 @@ TEST_CASE("EchoDatabase: create_warehouse_tables joins a transaction the caller 
     CHECK(boot_tables() == "1");
     auto q = t.db.execute_query("SELECT COUNT(*) FROM netqual_boot");
     REQUIRE(q.has_value());
+}
+
+TEST_CASE("EchoDatabase: a failed warehouse table create opens the store and says so (#2626)",
+          "[echo][store][lifecycle][ddl-batch]") {
+    // open() tolerates a failed create_warehouse_tables (config and state still work), but used
+    // to log a warning and report a healthy store. A table that exists with the wrong columns
+    // makes the registry's `CREATE INDEX ... ON <table>(ts)` fail the whole batch on every open.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_2626_");
+    auto ok_tmp = yuzu::test::unique_temp_path("yuzu_test_echo_2626_ok_");
+    {
+        auto seeded = EchoDatabase::open(tmp);
+        REQUIRE(seeded.has_value());
+        CHECK(seeded->warehouse_tables_ok()); // a healthy open reports true
+        REQUIRE(seeded->execute_query("DROP TABLE netqual_boot").has_value());
+        REQUIRE(seeded->execute_query("CREATE TABLE netqual_boot (id INTEGER PRIMARY KEY)")
+                    .has_value());
+    }
+
+    {
+        auto db = EchoDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->is_open());
+        CHECK(db->schema_version() == 10);
+        CHECK_FALSE(db->warehouse_tables_ok());
+
+        // The flag survives both moves, so the plugin's stored handle still reports it.
+        EchoDatabase moved{std::move(*db)};
+        CHECK_FALSE(moved.warehouse_tables_ok());
+        EchoDatabase assigned = std::move(moved);
+        CHECK_FALSE(assigned.warehouse_tables_ok());
+        auto healthy = EchoDatabase::open(ok_tmp);
+        REQUIRE(healthy.has_value());
+        healthy = std::move(assigned);
+        CHECK_FALSE(healthy->warehouse_tables_ok());
+    }
+
+    std::error_code ec;
+    for (const auto& base : {tmp, ok_tmp})
+        for (const char* suffix : {"", "-wal", "-shm", "-journal"})
+            fs::remove(fs::path{base.string() + suffix}, ec);
+}
+
+TEST_CASE("format_schema_status_lines: the two always-present config lines, in order (#2626)",
+          "[echo][store][status]") {
+    CHECK(yuzu::echo::format_schema_status_lines(10, true) ==
+          std::vector<std::string>{"config|schema_version|10", "config|warehouse_tables_ok|true"});
+    CHECK(yuzu::echo::format_schema_status_lines(10, false) ==
+          std::vector<std::string>{"config|schema_version|10", "config|warehouse_tables_ok|false"});
 }
 
 TEST_CASE("EchoDatabase: a v3 database with pre-version procperf tables upgrades to the roll-up tiers",

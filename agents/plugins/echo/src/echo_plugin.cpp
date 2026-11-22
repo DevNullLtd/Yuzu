@@ -3341,6 +3341,9 @@ private:
             const auto q = db_->quarantined_this_open();
             ctx.write_output(yuzu::echo::format_db_health_line(q.has_value(), q ? *q : last_q));
         }
+        for (const auto& line : yuzu::echo::format_schema_status_lines(
+                 db_->schema_version(), db_->warehouse_tables_ok()))
+            ctx.write_output(line);
         auto s = db_->stats();
         ctx.write_output(std::format("record_count|{}", s.record_count));
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));
@@ -4604,7 +4607,7 @@ private:
                 const bool tcp_prev_enabled = (src_name == "tcp") && cursor_prev_canon == "true";
                 transition_ok = yuzu::echo::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
-                if (transition_ok && v == "false") {
+                if (transition_ok && yuzu::echo::interval_baseline_reset_due(cursor_prev_canon, v)) {
                     // The interval samplers (perf / procperf) keep their previous
                     // reading in memory, not in a diff-state row, so the
                     // diff_state_key clear inside apply_source_enabled_transition
@@ -4617,7 +4620,11 @@ private:
                     // "re-enabling starts from a clean baseline" promise in
                     // docs/user-manual/echo.md). default-constructed → valid=false,
                     // which derive_sample/derive_proc_samples treat as "no baseline"
-                    // (records nothing on the next tick).
+                    // (records nothing on the next tick). The same reset covers
+                    // recovery from a corrupt ("errored") flag (#1624): a skipped
+                    // tick leaves the reading untouched, so the first tick after
+                    // the recovery would otherwise diff against the pre-error
+                    // reading and record the errored interval's activity.
                     if (src_name == "perf")
                         prev_perf_ = yuzu::echo::PerfCounters{};
                     else if (src_name == "procperf")
