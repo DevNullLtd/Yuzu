@@ -371,10 +371,12 @@ cadences.
 
   - **`status.d`.** A host whose packages live only there (minimal images with no
     shell) now reports them, as new install rows; and a host with a healthy status
-    file and one unparseable regular file in `status.d` is degraded
+    file and one `status.d` control file that is not exactly one installed stanza
+    (unparseable, zero-byte, comment-only, or holding two stanzas) is degraded
     (`dpkg_status_d:corrupt`, no rows, the server keeps its stored ones) where
-    `dpkg-query` ignored the directory. Remove that file or give it a leading dot,
-    which is skipped.
+    `dpkg-query` ignored the directory. The token does not name the file: list
+    `/var/lib/dpkg/status.d` and look for a zero-byte or hand-edited one, then fix
+    or remove it, or give it a leading dot, which is skipped.
   - **Which manager is read.** It is chosen by its database file, not its binary.
     A dpkg status with no installed package (empty, or only config-files and
     half-installed stanzas) falls through to rpm, and an rpm database that holds no
@@ -389,9 +391,11 @@ cadences.
     file is refused (`symlink_refused`) where the tools followed the link. A
     symlinked rpm directory is skipped, never followed; when a database file sits
     behind such a link in a directory this reader did not read, the read is
-    `rpmdb:symlink_refused` rather than an empty list (the current Fedora, RHEL
-    and SUSE layout, where `/var/lib/rpm` links to the directory that is read, is
-    unaffected).
+    `rpmdb:symlink_refused` rather than an empty list, and so is a populated
+    directory read after such a link that hides a different database (a link on
+    a later candidate is not examined). The current Fedora, RHEL and SUSE layout,
+    where `/var/lib/rpm` links to the directory that is read, is unaffected. A
+    regular file where an rpm database directory belongs is `rpmdb:not_regular`.
   - **A writer is running.** On a host that keeps an ndb or Berkeley DB rpm
     database, a running rpm transaction answers `locked` (the reader asks whether
     rpm's transaction lock is held and never takes it); and on any host with a
@@ -421,8 +425,8 @@ cadences.
   `unsupported_format` (a database layout the reader does not decode, for example
   an LMDB rpm database or a Berkeley DB hash version other than 9),
   `oversized`, `row_cap`, `byte_cap`, `timeout` and `busy` (a limit was reached),
-  `symlink_refused` and `not_regular` (the database is a link or not a regular
-  file), and `unreadable` (a permission or I/O error). The daily sync's own
+  `symlink_refused` and `not_regular` (the database or its directory is a link,
+  or not a regular file or directory), and `unreadable` (a permission or I/O error). The daily sync's own
   constrained token does not carry the reason yet; read it from the agent log
   (where that is, `--log-file` or the console and your service manager, is under
   "Where the lines go" in the Guardian `T_*` log-lines entry of

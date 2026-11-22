@@ -382,7 +382,7 @@ TEST_CASE("pkgdb sqlite hostile: not sqlite, no Packages table, wrong column typ
         root.put_text("var/lib/rpm/rpmdb.sqlite", noise);
         CHECK(failure_of(root) == "rpm_sqlite:corrupt");
     }
-    SECTION("a file shorter than a sqlite header is truncated, not corrupt") {
+    SECTION("a file shorter than the 20 header bytes the reader needs is truncated, not corrupt") {
         // The file ends inside the header: a genuine short read. (An interrupted pread is retried and
         // never reaches here, so this is the only way to see the cause.)
         Root root;
@@ -1723,6 +1723,15 @@ TEST_CASE("pkgdb mapping: rpm publisher, signature, epoch and date", "[installed
         p.vendor = "%{vendor}";
         p.packager = "P";
         CHECK(inv::inv_record_from_rpm(p, tm_of).publisher == "P"); // the packager, never the unexpanded macro
+    }
+    SECTION("a stored (none) vendor lists as a dash, as the old path's parse_rpm_list read it") {
+        const auto old_rows = parsers::parse_rpm_list("pkg|1.0-2.el9|(none)|\n");
+        REQUIRE(old_rows.size() == 1);
+        CHECK(old_rows[0].publisher == "-");
+        p.vendor = "(none)";
+        CHECK(parsers::app_record_from_rpm(p, tm_of).publisher == old_rows[0].publisher);
+        p.vendor = "V";
+        CHECK(parsers::app_record_from_rpm(p, tm_of).publisher == "V");
     }
     SECTION("signed when either stored tag has bytes, unsigned when neither") {
         CHECK(inv::inv_record_from_rpm(p, tm_of).signature_status == "unsigned");

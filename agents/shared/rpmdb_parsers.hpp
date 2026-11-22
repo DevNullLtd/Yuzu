@@ -431,7 +431,8 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
  * of type 2 (P_HASH_UNSORTED, the pre-sort layout an in-place upgrade of an older file can leave
  * inside a version 9 file) holds real key/data pairs this reader does not decode, so it answers
  * `unsupported_format` rather than being skipped: a shorter roster must never pass as complete.
- * Every other non-hash page type holds no package record and is skipped. An overflow chain is
+ * A free page (type 0) and an overflow page (type 7) are skipped; any other non-hash page type is `corrupt`,
+ * never skipped (a hash page has no checksum, so a type byte damaged into 0 or 7 goes unseen). An overflow chain is
  * followed with a step counter bounded by last_pgno, so a self-loop or a two-page loop ends as
  * `corrupt`, never as a hang.
  */

@@ -525,9 +525,10 @@ struct StmtFinalizer {
 // A note on `fd`: it is the raw no-follow descriptor the caller keeps for the header read and the change
 // stamp; sqlite opens the path itself. POSIX fcntl locks belong to the process per inode, so closing
 // `fd` (when the caller's scope ends, after this connection is closed) would drop the main-file locks of
-// any OTHER in-process connection to the same inode. The exposure is near nil: nothing else in this
-// process opens rpmdb.sqlite, rpm's own sqlite backend runs in WAL mode (header bytes 18 and 19 are
-// 02 02, as in both fixtures), and the change stamp backstops a read torn by a writer.
+// any OTHER in-process connection to the same inode. The exposure is near nil: the only such connection is an
+// overlapping read by this same reader (an abandoned bounded worker can outlive its call), every connection
+// here is read-only, rpm's own sqlite backend runs in WAL mode (header bytes 18 and 19 are 02 02, as in
+// both fixtures) so no main-file lock is held across reads, and the change stamp backstops a torn read.
 [[nodiscard]] inline std::expected<std::vector<RpmPackage>, PkgDbCause>
 read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd, const Limits& lim,
                 PkgDbBudget& budget) {
@@ -689,7 +690,8 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
 }
 
 /// Reads the rpm database in `rel_dir`, if there is one. `found == false` with no failure means this
-/// directory holds no database (try the next); a failure is final.
+/// directory holds no database (try the next); a link with a database behind it is remembered in
+/// `symlinked_db`, a regular file where the directory belongs is `rpmdb:not_regular`, and a failure is final.
 [[nodiscard]] inline RpmRead read_rpm_dir(const std::string& root, std::string_view rel_dir,
                                           const Limits& lim, const std::function<bool()>& expired) {
     RpmRead out;
@@ -837,6 +839,8 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
     // a database is about to be ACCEPTED (its own directory is then in read_dirs) and once more when
     // the loop ends with none: `rpm -qa` would have followed %_dbpath to the link's directory, so a
     // different, populated directory must not be published as the roster while a link hides another.
+    // Only links recorded BEFORE the accepted directory count; a link on a later candidate is not
+    // examined (#8574).
     const auto was_read = [&read_dirs](const detail::DirId& id) {
         return std::find(read_dirs.begin(), read_dirs.end(), id) != read_dirs.end();
     };

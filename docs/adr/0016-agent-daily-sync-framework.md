@@ -2023,7 +2023,8 @@ does not, or the reverse.
   the older layout the sysimage link is seen before the `/var/lib/rpm` directory it points at; a populated directory read
   after a link that hides a different database is refused too. The current Fedora, RHEL and SUSE layout
   (`/var/lib/rpm` linking to the sysimage copy, which is read first) and the older one are unaffected; a link to a
-  populated directory elsewhere, beside an emptied or a populated database, is refused. A regular file where an rpm
+  populated directory elsewhere, seen before an emptied or a populated database is accepted, is refused. A link on a
+  candidate later than the accepted directory is not examined (#8574). A regular file where an rpm
   candidate directory belongs is `rpmdb:not_regular`, not an absent database.
 - An rpm sqlite database without its WAL sidecars is readable by an unprivileged account (measured on one
   AlmaLinux 9 image: `rpm -qa` fails there as `nobody`).

@@ -807,6 +807,9 @@ std::vector<std::size_t> bdb_key_offsets(const Bytes& f, const BdbView& v) {
 TEST_CASE("bdb hostile: edited real file with a bad magic, version, page size, count, offset or chain",
           "[rpmdb][pkgdb]") {
     for (const char* name : {"alma8", "alma8-s390x"}) {
+        // One dynamic section per fixture: a plain SECTION repeated in a loop is run for the first
+        // fixture only, so the big-endian copy would never reach the hostile cases below.
+        DYNAMIC_SECTION("fixture " << name) {
         INFO(name);
         const Bytes good = read_bytes(pkgdb_fixture(name, "Packages"));
         const BdbView v = view_of(good);
@@ -1020,6 +1023,7 @@ TEST_CASE("bdb hostile: edited real file with a bad magic, version, page size, c
             const auto r = read_rpm_bdb(flaky, b, [](std::span<const std::uint8_t>) -> PkgDbVoid { return {}; });
             REQUIRE_FALSE(r.has_value());
             CHECK(r.error() == PkgDbCause::unreadable);
+        }
         }
     }
 }
