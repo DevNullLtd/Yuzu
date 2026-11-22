@@ -903,6 +903,19 @@ TEST_CASE("bdb hostile: edited real file with a bad magic, version, page size, c
             f[page_base + 25] = 2;
             CHECK(cause(f) == PkgDbCause::unsupported_format);
         }
+        SECTION("edited hash page type to one that is not skipped is corrupt, never skipped") {
+            // Only a free page (0) and an overflow page (7) are skipped. A damaged type byte on a
+            // populated bucket must not drop its packages from a roster that is still reported
+            // complete: 1, 3, 5, 8 (a meta type past page 0), 12 and 99 are all refused.
+            REQUIRE(good[page_base + 25] == 13);
+            for (const std::uint8_t t : {std::uint8_t{1}, std::uint8_t{3}, std::uint8_t{5}, std::uint8_t{8},
+                                         std::uint8_t{12}, std::uint8_t{99}}) {
+                INFO("type " << static_cast<int>(t));
+                Bytes f = good;
+                f[page_base + 25] = t;
+                CHECK(cause(f) == PkgDbCause::corrupt);
+            }
+        }
         SECTION("edited record number repeated: one key overwritten with another's is corrupt") {
             const auto keys = bdb_key_offsets(good, v);
             REQUIRE(keys.size() >= 2);

@@ -382,10 +382,17 @@ TEST_CASE("pkgdb sqlite hostile: not sqlite, no Packages table, wrong column typ
         root.put_text("var/lib/rpm/rpmdb.sqlite", noise);
         CHECK(failure_of(root) == "rpm_sqlite:corrupt");
     }
-    SECTION("a file shorter than a sqlite header is corrupt") {
+    SECTION("a file shorter than a sqlite header is truncated, not corrupt") {
+        // The file ends inside the header: a genuine short read. (An interrupted pread is retried and
+        // never reaches here, so this is the only way to see the cause.)
         Root root;
         root.put_text("var/lib/rpm/rpmdb.sqlite", "SQLite");
-        CHECK(failure_of(root) == "rpm_sqlite:corrupt");
+        CHECK(failure_of(root) == "rpm_sqlite:truncated");
+    }
+    SECTION("an empty file is truncated") {
+        Root root;
+        root.put_text("var/lib/rpm/rpmdb.sqlite", "");
+        CHECK(failure_of(root) == "rpm_sqlite:truncated");
     }
     SECTION("a real sqlite database without a Packages table is corrupt") {
         Root root;
@@ -561,6 +568,45 @@ TEST_CASE("pkgdb detection: usr/lib/sysimage/rpm wins over var/lib/rpm; a symlin
         REQUIRE(h.failure.empty());
         CHECK(h.ecosystem == Eco::rpm);
         CHECK(h.rpm.size() == 4);
+    }
+    {
+        // A populated var/lib/rpm AFTER a link that hides a DIFFERENT database: `rpm -qa` would have
+        // followed %_dbpath to the link's directory, so the populated directory is not the roster. The
+        // refusal is decided when a database is about to be accepted, not only when none was.
+        Root root;
+        root.put("elsewhere/rpmdb.sqlite", fedora);
+        root.put("var/lib/rpm/rpmdb.sqlite", alma9);
+        fs::create_directories(root.at("usr/lib/sysimage"));
+        fs::create_directory_symlink("../../../elsewhere", root.at("usr/lib/sysimage/rpm"));
+        const auto h = read_root(root);
+        CHECK(h.failure == "rpmdb:symlink_refused");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+}
+
+TEST_CASE("pkgdb detection: a regular file where an rpm database directory belongs is not_regular, never absence",
+          "[installed_apps][pkgdb]") {
+    const fs::path fedora = default_fixture_root() / "fedora41" / "rpmdb.sqlite";
+    SECTION("var/lib/rpm is a regular file") {
+        Root root;
+        root.put_text("var/lib/rpm", "not a directory");
+        const auto h = read_root(root);
+        CHECK(h.failure == "rpmdb:not_regular");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+    SECTION("the sysimage directory is a regular file, whatever var/lib/rpm holds") {
+        Root root;
+        root.put_text("usr/lib/sysimage/rpm", "not a directory");
+        root.put("var/lib/rpm/rpmdb.sqlite", fedora);
+        CHECK(read_root(root).failure == "rpmdb:not_regular");
+    }
+    SECTION("a path that is simply missing is still silent") {
+        Root root;
+        const auto h = read_root(root);
+        CHECK(h.failure.empty());
+        CHECK(h.ecosystem == Eco::none);
     }
 }
 
@@ -804,6 +850,42 @@ TEST_CASE("pkgdb status.d: a .md5sums entry is skipped, a Status-less stanza is 
         const auto h = read_root(root);
         REQUIRE(h.failure.empty());
         CHECK(h.dpkg.size() == 1);
+    }
+}
+
+TEST_CASE("pkgdb status.d: a control file that is not exactly one stanza is corrupt, never a shorter roster",
+          "[installed_apps][pkgdb]") {
+    // The real minimal-image capture is three packages, one stanza per file. Damage ONE file and the
+    // read must fail by name: publishing the other two as the complete roster would let daily sync drop
+    // the damaged package's stored row (ADR-0016, 2026-11-20: never silently left out of a roster
+    // published as complete).
+    const auto with_base_files = [](const std::string& content) {
+        Root root;
+        put_status_d_capture(root);
+        root.put_text("var/lib/dpkg/status.d/base-files", content);
+        return read_root(root);
+    };
+    const std::string netbase = read_text(kStatusDCapture / "netbase");
+    const auto refused = [](const pkgdb::HostPackages& h) {
+        CHECK(h.failure == "dpkg_status_d:corrupt");
+        CHECK(h.dpkg.empty());
+        CHECK(h.ecosystem == Eco::none);
+    };
+    SECTION("the undamaged file still reads: three packages") {
+        const auto h = with_base_files(read_text(kStatusDCapture / "base-files"));
+        REQUIRE(h.failure.empty());
+        CHECK(h.dpkg.size() == 3);
+    }
+    SECTION("a zero-byte file (a truncated write)") { refused(with_base_files("")); }
+    SECTION("a file of comments and blank lines only") { refused(with_base_files("# nothing here\n\n\n")); }
+    SECTION("two stanzas in one file") { refused(with_base_files(netbase + "\n" + netbase)); }
+    SECTION("a stanza whose own Status is not-installed parses to nothing") {
+        refused(with_base_files(netbase + "Status: install ok not-installed\n"));
+    }
+    SECTION("an empty status FILE is still accepted: it falls through, as before") {
+        Root root;
+        root.put_text("var/lib/dpkg/status", "");
+        CHECK(read_root(root).failure.empty());
     }
 }
 
@@ -1619,6 +1701,29 @@ TEST_CASE("pkgdb mapping: rpm publisher, signature, epoch and date", "[installed
         p.vendor = "V";
         CHECK(parsers::app_record_from_rpm(p, tm_of).publisher == "V");
     }
+    SECTION("an unexpanded %{...} or (none) tag reads as empty, pinned against the old path's rpm_text_value") {
+        // The old path mapped VENDOR or PACKAGER to empty when it was "(none)" or began "%{", then fell
+        // through to the next source. Its query line carries VENDOR as tab 8 and PACKAGER as tab 9, so
+        // the oracle answers for the same two values the stored tags hold.
+        const auto oracle_publisher = [](const std::string& vendor, const std::string& packager) {
+            const auto r = inv::parse_rpm_inv_line("pkg\t(none)\t1.0\t2.el9\tx86_64\t(none)\t(none)\t(none)\t" +
+                                                   vendor + "\t" + packager);
+            REQUIRE(r.has_value());
+            return r->publisher;
+        };
+        const std::pair<const char*, const char*> cases[] = {
+            {"%{vendor}", "P"},          {"(none)", "P"}, {"%{vendor}", "%{packager}"}, {"V", "%{packager}"},
+            {"", "P"},                   {"%{vendor}", ""}, {"(none)", "(none)"},        {"V", "P"}};
+        for (const auto& [vendor, packager] : cases) {
+            INFO(vendor << " / " << packager);
+            p.vendor = vendor;
+            p.packager = packager;
+            CHECK(inv::inv_record_from_rpm(p, tm_of).publisher == oracle_publisher(vendor, packager));
+        }
+        p.vendor = "%{vendor}";
+        p.packager = "P";
+        CHECK(inv::inv_record_from_rpm(p, tm_of).publisher == "P"); // not the macro, as the review found
+    }
     SECTION("signed when either stored tag has bytes, unsigned when neither") {
         CHECK(inv::inv_record_from_rpm(p, tm_of).signature_status == "unsigned");
         p.sigpgp = true;
@@ -1661,7 +1766,7 @@ TEST_CASE("pkgdb degraded contract: a named reason reaches the typed status and 
           "[installed_apps][pkgdb]") {
     // What the plugin does with a reader failure, driven through the same templates with a recording context.
     Root root;
-    root.put_text("var/lib/rpm/rpmdb.sqlite", "SQLite");
+    root.put_text("var/lib/rpm/rpmdb.sqlite", std::string(64, 'x')); // long enough for a header, not sqlite
     const auto host = read_root(root);
     REQUIRE(host.failure == "rpm_sqlite:corrupt");
     const std::string provenance = "installed_apps:" + host.failure;

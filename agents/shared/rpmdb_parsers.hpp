@@ -442,6 +442,7 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
     constexpr std::uint32_t kHashMagic = 0x00061561;
     constexpr std::size_t kMetaRead = 512; // the smallest legal page, so always inside a legal file
     constexpr std::size_t kPageOverhead = 26;
+    constexpr std::uint8_t kPageInvalid = 0; // BDB P_INVALID: a free page
     constexpr std::uint8_t kPageHash = 13;
     constexpr std::uint8_t kPageHashUnsorted = 2;
     constexpr std::uint8_t kPageOverflow = 7;
@@ -491,16 +492,22 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
         return on_blob(bytes);
     };
 
-    for (std::uint32_t pg = 1; pg <= last_pgno; ++pg) {
+    // 64-bit: a uint32_t `pg` could never pass last_pgno == UINT32_MAX, so the bound must not rely on the size check.
+    for (std::uint64_t pg = 1; pg <= last_pgno; ++pg) {
         if ((pg & 0xFFu) == 1)
             if (auto t = budget.check_time(); !t)
                 return t;
-        if (!src.read_at(std::uint64_t{pg} * pagesize, page))
+        if (!src.read_at(pg * pagesize, page))
             return std::unexpected(PkgDbCause::unreadable);
         if (page[25] == kPageHashUnsorted)
             return std::unexpected(PkgDbCause::unsupported_format); // records we cannot decode
+        if (page[25] == kPageInvalid || page[25] == kPageOverflow)
+            continue; // a free page, or an overflow page (reached through its owner's off-page item)
+        // Any other type is a damaged byte on a page that may hold a bucket; skipping it would drop that
+        // bucket from a roster still reported complete. No page checksum exists, so this narrows the
+        // class (a flip to a skipped type goes unseen) rather than closing it.
         if (page[25] != kPageHash)
-            continue;
+            return std::unexpected(PkgDbCause::corrupt);
 
         const std::size_t n = load_u16(page, 20, be);
         if ((n & 1u) != 0 || kPageOverhead + 2 * n > pagesize)

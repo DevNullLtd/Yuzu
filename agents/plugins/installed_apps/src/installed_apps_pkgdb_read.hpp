@@ -342,6 +342,14 @@ read_dpkg_status_d(const std::string& root, const Limits& lim, PkgDbBudget& budg
             out.failure = failure_token(kSource, parsed.error());
             return out;
         }
+        // A status.d control file holds exactly one stanza (one package). A zero-byte or comment-only
+        // file, or one that parses to nothing or to several, is a damaged record: carrying on would
+        // publish a roster one package short as complete (ADR-0016, 2026-11-20: a package is never
+        // silently left out of a roster published as complete). The status FILE may still be empty.
+        if (parsed->size() != 1) {
+            out.failure = failure_token(kSource, PkgDbCause::corrupt);
+            return out;
+        }
         collected.insert(collected.end(), std::make_move_iterator(parsed->begin()),
                          std::make_move_iterator(parsed->end()));
     }
@@ -514,13 +522,28 @@ struct StmtFinalizer {
     return S_ISREG(st.st_mode) && st.st_size == 0;
 }
 
+// A note on `fd`: it is the raw no-follow descriptor the caller keeps for the header read and the change
+// stamp; sqlite opens the path itself. POSIX fcntl locks belong to the process per inode, so closing
+// `fd` (when the caller's scope ends, after this connection is closed) would drop the main-file locks of
+// any OTHER in-process connection to the same inode. The exposure is near nil: nothing else in this
+// process opens rpmdb.sqlite, rpm's own sqlite backend runs in WAL mode (header bytes 18 and 19 are
+// 02 02, as in both fixtures), and the change stamp backstops a read torn by a writer.
 [[nodiscard]] inline std::expected<std::vector<RpmPackage>, PkgDbCause>
 read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd, const Limits& lim,
                 PkgDbBudget& budget) {
     // The first bytes decide the open mode and refuse a file that is not sqlite at all.
     std::array<std::uint8_t, 20> head{};
-    if (::pread(fd, head.data(), head.size(), 0) != static_cast<ssize_t>(head.size()))
-        return std::unexpected(PkgDbCause::corrupt);
+    for (std::size_t done = 0; done < head.size();) {
+        const ssize_t n = ::pread(fd, head.data() + done, head.size() - done, static_cast<off_t>(done));
+        if (n < 0) {
+            if (errno == EINTR)
+                continue; // an interrupted syscall is not a damaged database (compare fd_source)
+            return std::unexpected(PkgDbCause::unreadable);
+        }
+        if (n == 0)
+            return std::unexpected(PkgDbCause::truncated); // the file ends inside the header
+        done += static_cast<std::size_t>(n);
+    }
     if (std::memcmp(head.data(), "SQLite format 3\0", 16) != 0)
         return std::unexpected(PkgDbCause::corrupt);
     const bool wal_mode = head[18] == 2 && head[19] == 2;
@@ -614,7 +637,9 @@ using LockQueryFn = int (*)(int, struct flock*);
 /// cause, never "not locked". Residual: rpm's lock path is configurable (%_rpmlock_path); one moved
 /// out of the database directory is not seen. The stamp stays as the second line of defence: with
 /// the lock free after the first stamp, a writer already running has finished and a later one moves
-/// the stamp.
+/// the stamp. Second residual, of that second line: the stamp is size plus mtime and ctime, so it has
+/// the filesystem's timestamp granularity; an in-place rewrite that keeps the size, starts after the
+/// lock probe and lands in the same timestamp tick as the first stamp is not detected.
 ///
 /// The probe is a WRITE lock on purpose, so it also reports a SHARED holder. rpm 4.14's rpmlock.c only
 /// ever asks for a write lock on the file, but rpm 4.20's rpmts.c takes a read lock for a transaction
@@ -677,6 +702,16 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
         // list, unless that directory's database was read. Anything else (a permission refusal) is a
         // database we cannot show absent.
         if (dir.err == ENOENT || dir.err == ENOTDIR || dir.err == ELOOP) {
+            // A regular file (or any non-directory that is not a link) where the directory belongs is
+            // not an absent database: say so, so that `list` never answers "no applications found" as
+            // if that were authoritative. lstat tells it from a link (handled below) and from a path
+            // that is simply missing (its lstat fails, an ancestor that is not a directory included).
+            if (struct stat ls {}; ::lstat(dir_path.c_str(), &ls) == 0 && !S_ISDIR(ls.st_mode) &&
+                                       !S_ISLNK(ls.st_mode)) {
+                out.found = true;
+                out.failure = failure_token("rpmdb", PkgDbCause::not_regular);
+                return out;
+            }
             out.symlinked_db = symlink_hides_database(dir_path);
             return out;
         }
@@ -795,6 +830,19 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
                                                     "usr/share/rpm"};
     std::vector<detail::DirId> read_dirs; // directories whose database was read, even an empty one
     std::vector<detail::DirId> link_dirs; // directories behind the skipped links that hide a database
+    // A database that exists behind a link this reader never follows is a refusal, not an empty list,
+    // unless the link resolves to a directory whose database was read here: on current Fedora, RHEL and
+    // SUSE /var/lib/rpm links to the sysimage directory just read, and on the older layout the sysimage
+    // link points at var/lib/rpm, which is read AFTER the link is seen. So the comparison is made when
+    // a database is about to be ACCEPTED (its own directory is then in read_dirs) and once more when
+    // the loop ends with none: `rpm -qa` would have followed %_dbpath to the link's directory, so a
+    // different, populated directory must not be published as the roster while a link hides another.
+    const auto was_read = [&read_dirs](const detail::DirId& id) {
+        return std::find(read_dirs.begin(), read_dirs.end(), id) != read_dirs.end();
+    };
+    const auto a_link_is_unresolved = [&] {
+        return !std::all_of(link_dirs.begin(), link_dirs.end(), was_read);
+    };
     for (const auto dir : kRpmDirs) {
         auto rpm = detail::read_rpm_dir(root, dir, lim, expired);
         if (!rpm.failure.empty()) {
@@ -805,6 +853,10 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
             if (rpm.opened)
                 read_dirs.push_back(*rpm.opened);
             if (!rpm.packages.empty()) {
+                if (a_link_is_unresolved()) {
+                    out.failure = detail::failure_token("rpmdb", PkgDbCause::symlink_refused);
+                    return out;
+                }
                 out.ecosystem = HostPackages::Ecosystem::rpm;
                 out.rpm = std::move(rpm.packages);
                 return out;
@@ -814,15 +866,7 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
         if (rpm.symlinked_db)
             link_dirs.push_back(*rpm.symlinked_db);
     }
-    // A database that exists behind a link this reader never follows is a refusal, not an empty list,
-    // unless the link resolves to a directory whose database was read here: on current Fedora, RHEL and
-    // SUSE /var/lib/rpm links to the sysimage directory just read, and on the older layout the sysimage
-    // link points at var/lib/rpm, which is read AFTER the link is seen. So the comparison is made once
-    // the loop is done.
-    const auto was_read = [&read_dirs](const detail::DirId& id) {
-        return std::find(read_dirs.begin(), read_dirs.end(), id) != read_dirs.end();
-    };
-    if (!std::all_of(link_dirs.begin(), link_dirs.end(), was_read))
+    if (a_link_is_unresolved())
         out.failure = detail::failure_token("rpmdb", PkgDbCause::symlink_refused);
     return out; // otherwise neither: the plugin's pacman and apk legs run
 }
