@@ -3,11 +3,11 @@
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
 | | |
 |---|---|
-| **What it does** | Installed software components found in application trees (Java archives, native libraries) |
-| **Version** | 1.1.0 |
-| **Kind** | Collector · read-only · gathered (crossplatform.components.scan, crossplatform.components.native) |
+| **What it does** | Installed software components found in application trees (Java archives, native libraries, Python distributions, Node packages) |
+| **Version** | 1.2.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.components.scan, crossplatform.components.native, crossplatform.components.python, crossplatform.components.node) |
 | **Platforms** | Windows 🟡 planned · macOS ✅ · Linux ✅ |
-| **Actions** | `native` (definition `crossplatform.components.native`) · `scan` (definition `crossplatform.components.scan`) |
+| **Actions** | `native` (definition `crossplatform.components.native`) · `node` (definition `crossplatform.components.node`) · `python` (definition `crossplatform.components.python`) · `scan` (definition `crossplatform.components.scan`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
@@ -86,6 +86,8 @@ What a result proves. `supported` means the scan finished: no bound was reached 
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `native` | 🟡 planned · rung 1 · bounded Program Files walk with the same library reads | ✅ supported · rung 1 · bounded read-only walk of /Applications, /usr/local and /opt/homebrew for .dylib files, at most 5,000 rows; no link followed at any path component; the Mach-O header, load commands and LC_ID_DYLIB (thin, fat or fat64) read in-process within fixed bounds; /usr/local/Cellar and /opt/homebrew/Cellar excluded and counted; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of /opt and /usr/local/lib for .so and .so.<version> files, at most 5,000 rows; no link followed at any path component; the ELF program headers, dynamic section and SONAME read in-process within fixed bounds; network mounts skipped via /proc/<pid>/mountinfo |
+| `node` | 🟡 planned · rung 1 · bounded walk of the Node install roots with the same package.json reads | ✅ supported · rung 1 · bounded read-only walk of /opt/homebrew/lib/node_modules, /usr/local/lib/node_modules and /Applications for the package.json of each package under node_modules, at most 64 KiB read in-process; a package's own source tree is not listed; no link followed at any path component; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of /usr/lib/node_modules, /usr/local/lib/node_modules and /opt for the package.json of each package under node_modules, at most 64 KiB read in-process; a package's own source tree is not listed; no link followed at any path component; network mounts skipped via /proc/<pid>/mountinfo |
+| `python` | 🟡 planned · rung 1 · bounded walk of the Python install roots with the same metadata reads | ✅ supported · rung 1 · bounded read-only walk of /Library/Frameworks/Python.framework/Versions and of the python3.<digits> directories under /opt/homebrew/lib and /usr/local/lib for METADATA, PKG-INFO and .egg-info files, the first 16 KiB of each read in-process; package source trees inside site-packages are not listed; no link followed at any path component; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of the python3 and python3.<digits> directories under /usr/local/lib and of /opt for METADATA, PKG-INFO and .egg-info files, the first 16 KiB of each read in-process; package source trees inside site-packages are not listed; no link followed at any path component; network mounts skipped via /proc/<pid>/mountinfo |
 | `scan` | 🟡 planned · rung 1 · bounded Program Files walk with the same archive reads | ✅ supported · rung 1 · bounded read-only walk of /Applications, /Library/Java, /usr/local and /opt/homebrew; no link followed at any path component; archive central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of /opt, /usr/share/java, /usr/lib/jvm, /usr/local/lib, /usr/local/share and /usr/share/maven; no link followed at any path component; archive central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped via /proc/<pid>/mountinfo |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
@@ -93,6 +95,12 @@ What a result proves. `supported` means the scan finished: no bound was reached 
 - **`native` / Windows** — not read yet: one unsupported status row, windows:planned
 - **`native` / macOS** — versioned dynamic libraries inside applications only: extension-less framework binaries are not read; machine roots only; the server refuses it until an operator switches it on; any budget, unreadable directory or changed file answers constrained
 - **`native` / Linux** — versioned shared libraries inside applications only: package-owned trees (/usr/lib and friends) are not walked; machine roots only; the server refuses it until an operator switches it on; any budget, unreadable directory or changed file answers constrained
+- **`node` / Windows** — not read yet: one unsupported status row, windows:planned
+- **`node` / macOS** — Node packages under those roots only; machine roots only (per-user installs are not read); a package.json that is too large or not a JSON object is a row with an unreadable version; any budget, unreadable directory or changed file answers constrained
+- **`node` / Linux** — Node packages under those roots only; machine roots only (per-user installs are not read); a package.json that is too large or not a JSON object is a row with an unreadable version; any budget, unreadable directory or changed file answers constrained
+- **`python` / Windows** — not read yet: one unsupported status row, windows:planned
+- **`python` / macOS** — Python distributions in those library directories only; machine roots only (per-user installs are not read); any budget, unreadable directory or changed file answers constrained
+- **`python` / Linux** — Python distributions installed outside the package manager only (/usr/lib is not walked); machine roots only (per-user installs are not read); any budget, unreadable directory or changed file answers constrained
 - **`scan` / Windows** — not read yet: one unsupported status row, windows:planned
 - **`scan` / macOS** — Java archives only; machine roots only (per-user installs are not read); any budget, unreadable directory or unenumerable archive answers constrained
 - **`scan` / Linux** — Java archives only; machine roots only (per-user installs are not read); any budget, unreadable directory or unenumerable archive answers constrained
@@ -113,7 +121,7 @@ No external binaries, no subprocesses, no network use: the plugin lists director
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-Neither action takes parameters.
+No action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -134,6 +142,34 @@ Every row is pipe-delimited. The first row is always `status|<action>|<level>|<t
 | `size` | int64 | - | macOS, Linux | `3086784` | Size of the library file in bytes. |
 | `mtime` | int64 | - | macOS, Linux | `1700000000` | Modification time of the library file as Unix seconds. |
 | `anchor_app` | string | - | macOS, Linux | `app` | First path component below the scanned root: the application folder the library sits under (the file name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?. |
+
+**`crossplatform.components.node` — `row_kind|kind|name|version|version_source|path|size|mtime|anchor_app`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `comp` | macOS, Linux | `comp` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), comp (one per package found). |
+| `kind` | string | - | macOS, Linux | `node` | Component kind. Values: node. Status rows: the action name (node). |
+| `name` | string | - | macOS, Linux | `express` | Package name from its package.json, else the directory name (scoped packages keep their @scope/). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported). |
+| `version` | string | - | macOS, Linux | `4.19.2` | The version field of its package.json. Empty when none gives one. Status rows: the comma-joined cause tokens, or -. |
+| `version_source` | string | `package_json` `unreadable` | macOS, Linux | `package_json` | Where the version came from. Values: package_json (the file was read and parsed; the version may still be empty when it declares none), unreadable (the file could not be read in full, is not a JSON object or nests too deep; the row is still listed, named from the directory, and the scan is not made incomplete by it). |
+| `path` | string | - | macOS, Linux | `/usr/local/lib/node_modules/express/package.json` | Absolute path of the package.json. A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?. |
+| `size` | int64 | - | macOS, Linux | `1800` | Size of the package.json in bytes. |
+| `mtime` | int64 | - | macOS, Linux | `1700000000` | Modification time of the package.json as Unix seconds. |
+| `anchor_app` | string | - | macOS, Linux | `express` | First path component below the scanned root: the application folder the package.json sits under (the folder name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?. |
+
+**`crossplatform.components.python` — `row_kind|kind|name|version|version_source|path|size|mtime|anchor_app`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `comp` | macOS, Linux | `comp` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), comp (one per distribution found). |
+| `kind` | string | - | macOS, Linux | `python` | Component kind. Values: python. Status rows: the action name (python). |
+| `name` | string | - | macOS, Linux | `requests` | Distribution name from its metadata (Name: of a METADATA or PKG-INFO), else the name in the .dist-info or .egg-info directory name, else that directory or file name itself. A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported). |
+| `version` | string | - | macOS, Linux | `2.31.0` | The Version: of its metadata, else the version in the .dist-info or .egg-info directory name (requests-2.31.0.dist-info reads 2.31.0). Empty when none gives one. Status rows: the comma-joined cause tokens, or -. |
+| `version_source` | string | `metadata` `filename` `unreadable` | macOS, Linux | `metadata` | Where the version came from. Values: metadata (the Version: header), filename (the directory name carried it), unreadable (neither gave a version; the row is still listed and the scan is not made incomplete by it). |
+| `path` | string | - | macOS, Linux | `/usr/local/lib/python3.12/site-packages/requests-2.31.0.dist-info/METADATA` | Absolute path of the distribution metadata file. A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?. |
+| `size` | int64 | - | macOS, Linux | `6300` | Size of the distribution metadata file in bytes. |
+| `mtime` | int64 | - | macOS, Linux | `1700000000` | Modification time of the distribution metadata file as Unix seconds. |
+| `anchor_app` | string | - | macOS, Linux | `site-packages` | First path component below the scanned root: the application folder the distribution metadata file sits under (the folder name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?. |
 
 **`crossplatform.components.scan` — `row_kind|kind|name|version|version_source|path|size|mtime|anchor_app`**
 
@@ -189,7 +225,7 @@ For `native`, `archive_changed` means a library changed or vanished between bein
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-17 · euid 501 (application and library names in the native rows redacted) · leg-hash 80173557ecbf
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-22 · euid 501 (application and library names in the native rows redacted) · leg-hash f0b0b7eb29ce
 
 ```
 == action=scan
@@ -200,10 +236,10 @@ comp|java|concurrent_ruby||unreadable|/opt/homebrew/Library/Homebrew/vendor/bund
 
 == action=native
 status|native|constrained|macos:component_inventory:budget_entries
-comp|native|libredacted1|1.0.0|macho|/Applications/App1.app/Contents/Frameworks/libredacted1.dylib|1667840|1792752729|App1.app
-comp|native|libredacted2|6.2.1|macho|/Applications/App1.app/Contents/Frameworks/libredacted2.18.dylib|3298736|1792752729|App1.app
+comp|native|libredacted1|1.0.0|macho|/Applications/App1.app/Contents/Frameworks/libredacted1.dylib|1667840|1794983369|App1.app
+comp|native|libredacted2|7.1.1|macho|/Applications/App1.app/Contents/Frameworks/libredacted2.dylib|3298656|1794983369|App1.app
 comp|native|libredacted1|1.0.0|macho|/Applications/App2.app/Contents/Frameworks/libredacted1.dylib|1667840|1792608728|App2.app
-comp|native|libredacted1|1.0.0|macho|/Applications/App3.app/Contents/Frameworks/libredacted1.dylib|1667840|1794388203|App3.app
+comp|native|libredacted1|1.0.0|macho|/Applications/App3.app/Contents/Frameworks/libredacted1.dylib|1667840|1795062596|App3.app
 comp|native|libredacted3||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted3.dylib|8679504|1793040832|App4.app
 comp|native|libredacted4||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted4.dylib|717216|1793040832|App4.app
 comp|native|libredacted5||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted5.dylib|22244352|1793040832|App4.app
@@ -211,11 +247,32 @@ comp|native|libredacted6||unreadable|/Applications/App4.app/Contents/Frameworks/
 comp|native|libredacted7||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted7.dylib|383520|1793705004|App4.app
 comp|native|libredacted8||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted8.dylib|79632352|1793705004|App4.app
 comp|native|libredacted9||unreadable|/Applications/App4.app/Contents/Frameworks/libredacted9.dylib|865040|1793705004|App4.app
-… 12 of 170 rows shown
+… 12 of 196 rows shown
+[result_status] CONSTRAINED / PARTIAL / macos:component_inventory:budget_entries
+
+== action=python
+status|python|supported|macos:component_inventory:link_skipped
+comp|python|PyYAML|6.0.3|metadata|/opt/homebrew/lib/python3.14/site-packages/pyyaml-6.0.3.dist-info/METADATA|2351|1787235380|site-packages
+[result_status] OK / FULL
+
+== action=node
+status|node|constrained|macos:component_inventory:budget_entries
+comp|node|npm|11.19.0|package_json|/opt/homebrew/lib/node_modules/npm/package.json|6597|1787233796|npm
+comp|node|@anthropic-ai/claude-code|2.1.323|package_json|/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/package.json|1476|1794573006|@anthropic-ai
+comp|node|@moonshot-ai/kimi-code|0.38.0|package_json|/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/package.json|4363|1787235407|@moonshot-ai
+comp|node|@openai/codex|0.153.4|package_json|/opt/homebrew/lib/node_modules/@openai/codex/package.json|1082|1788883177|@openai
+comp|node|abbrev|4.0.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/abbrev/package.json|1232|1787233796|npm
+comp|node|agent-base|7.1.4|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/agent-base/package.json|1059|1787233796|npm
+comp|node|aproba|2.1.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/aproba/package.json|740|1787233796|npm
+comp|node|archy|1.0.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/archy/package.json|978|1787233796|npm
+comp|node|balanced-match|4.0.4|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/balanced-match/package.json|1596|1787233796|npm
+comp|node|bin-links|6.0.2|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/bin-links/package.json|1478|1787233796|npm
+comp|node|binary-extensions|3.1.0|package_json|/opt/homebrew/lib/node_modules/npm/node_modules/binary-extensions/package.json|827|1787233796|npm
+… 12 of 166 rows shown
 [result_status] CONSTRAINED / PARTIAL / macos:component_inventory:budget_entries
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-18 · euid 0 · leg-hash 80173557ecbf
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-22 · euid 0 · leg-hash f0b0b7eb29ce
 
 ```
 == action=scan
@@ -242,6 +299,36 @@ comp|native|asn1rt_nif||unreadable|/opt/erlang/OTP-28.5.0.7/lib/asn1-5.4.3.1/pri
 comp|native|crypto||unreadable|/opt/erlang/OTP-28.5.0.7/lib/crypto-5.8.3.3/priv/lib/crypto.so|448152|1790067435|erlang
 … 12 of 19 rows shown
 [result_status] OK / FULL
+
+== action=python
+status|python|constrained|linux:component_inventory:depth
+comp|python|meson|1.12.1|metadata|/usr/local/lib/python3.14/dist-packages/meson-1.12.1.dist-info/METADATA|1732|1791900866|dist-packages
+comp|python|colorlog|6.10.1|metadata|/opt/gcovr-venv/lib/python3.14/site-packages/colorlog-6.10.1.dist-info/METADATA|11202|1791929246|gcovr-venv
+comp|python|gcovr|8.6|metadata|/opt/gcovr-venv/lib/python3.14/site-packages/gcovr-8.6.dist-info/METADATA|12158|1791929246|gcovr-venv
+comp|python|Jinja2|3.1.6|metadata|/opt/gcovr-venv/lib/python3.14/site-packages/jinja2-3.1.6.dist-info/METADATA|2871|1791929246|gcovr-venv
+comp|python|lxml|6.1.0|metadata|/opt/gcovr-venv/lib/python3.14/site-packages/lxml-6.1.0.dist-info/METADATA|3953|1791929246|gcovr-venv
+comp|python|MarkupSafe|3.0.3|metadata|/opt/gcovr-venv/lib/python3.14/site-packages/markupsafe-3.0.3.dist-info/METADATA|2690|1791929246|gcovr-venv
+comp|python|meson|1.12.0|metadata|/opt/gcovr-venv/lib/python3.14/site-packages/meson-1.12.0.dist-info/METADATA|1732|1791929245|gcovr-venv
+comp|python|pip|25.1.1|metadata|/opt/gcovr-venv/lib/python3.14/site-packages/pip-25.1.1.dist-info/METADATA|3649|1791929243|gcovr-venv
+comp|python|Pygments|2.20.0|metadata|/opt/gcovr-venv/lib/python3.14/site-packages/pygments-2.20.0.dist-info/METADATA|2476|1791929245|gcovr-venv
+comp|python|PyYAML|6.0.3|metadata|/opt/gcovr-venv/lib/python3.14/site-packages/pyyaml-6.0.3.dist-info/METADATA|2351|1791929245|gcovr-venv
+[result_status] CONSTRAINED / PARTIAL / linux:component_inventory:depth
+
+== action=node
+status|node|supported|linux:component_inventory:link_skipped
+comp|node|corepack|0.34.6|package_json|/usr/local/lib/node_modules/corepack/package.json|2897|1769666419|corepack
+comp|node|npm|10.8.2|package_json|/usr/local/lib/node_modules/npm/package.json|6609|1774310434|npm
+comp|node|abbrev|2.0.0|package_json|/usr/local/lib/node_modules/npm/node_modules/abbrev/package.json|1002|1774310434|npm
+comp|node|agent-base|7.1.1|package_json|/usr/local/lib/node_modules/npm/node_modules/agent-base/package.json|1106|1774310434|npm
+comp|node|aggregate-error|3.1.0|package_json|/usr/local/lib/node_modules/npm/node_modules/aggregate-error/package.json|694|1774310434|npm
+comp|node|ansi-regex|5.0.1|package_json|/usr/local/lib/node_modules/npm/node_modules/ansi-regex/package.json|841|1774310434|npm
+comp|node|ansi-styles|6.2.1|package_json|/usr/local/lib/node_modules/npm/node_modules/ansi-styles/package.json|1022|1774310434|npm
+comp|node|aproba|2.0.0|package_json|/usr/local/lib/node_modules/npm/node_modules/aproba/package.json|740|1774310434|npm
+comp|node|archy|1.0.0|package_json|/usr/local/lib/node_modules/npm/node_modules/archy/package.json|978|1665485975|npm
+comp|node|balanced-match|1.0.2|package_json|/usr/local/lib/node_modules/npm/node_modules/balanced-match/package.json|1069|1774310434|npm
+comp|node|bin-links|4.0.4|package_json|/usr/local/lib/node_modules/npm/node_modules/bin-links/package.json|1379|1774310434|npm
+… 12 of 204 rows shown
+[result_status] OK / FULL
 ```
 <!-- END GENERATED -->
 
@@ -256,7 +343,7 @@ comp|native|crypto||unreadable|/opt/erlang/OTP-28.5.0.7/lib/crypto-5.8.3.3/priv/
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/component_inventory/src/component_fs_posix.cpp` · `agents/plugins/component_inventory/src/component_inventory_plugin.cpp` · `agents/plugins/component_inventory/src/component_java_parsers.hpp` · `agents/plugins/component_inventory/src/component_legs.hpp` · `agents/plugins/component_inventory/src/component_native_parsers.hpp` · `agents/plugins/component_inventory/src/component_native_scan.hpp` · `agents/plugins/component_inventory/src/component_scan.hpp` · `agents/plugins/component_inventory/src/component_walk.hpp` · `agents/plugins/component_inventory/src/zip_directory.hpp`
+- Plugin: `agents/plugins/component_inventory/src/component_fs_posix.cpp` · `agents/plugins/component_inventory/src/component_inventory_plugin.cpp` · `agents/plugins/component_inventory/src/component_java_parsers.hpp` · `agents/plugins/component_inventory/src/component_legs.hpp` · `agents/plugins/component_inventory/src/component_native_parsers.hpp` · `agents/plugins/component_inventory/src/component_native_scan.hpp` · `agents/plugins/component_inventory/src/component_node_parsers.hpp` · `agents/plugins/component_inventory/src/component_pkg_scan.hpp` · `agents/plugins/component_inventory/src/component_python_parsers.hpp` · `agents/plugins/component_inventory/src/component_scan.hpp` · `agents/plugins/component_inventory/src/component_walk.hpp` · `agents/plugins/component_inventory/src/zip_directory.hpp`
 - Definitions: `content/definitions/component_inventory.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_component_inventory.hpp`
 - Tests: `tests/test_component_inventory_definition.py` · `tests/unit/test_component_inventory_local_dispatcher.cpp`
