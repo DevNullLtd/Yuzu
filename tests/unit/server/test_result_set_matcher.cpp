@@ -437,9 +437,17 @@ const char* kFindByHash030Schema =
 const char* kSearchSchema =
     R"({"columns":[{"name":"line_number","type":"int32"},{"name":"content","type":"string"},)"
     R"({"name":"total_matches","type":"int32"}]})";
+// search_dir 0.4.0 as an upgraded server still stores it: no discriminator.
 const char* kSearchDirSchema =
     R"({"columns":[{"name":"path","type":"string"},{"name":"entry_type","type":"string"},)"
     R"({"name":"total_matches","type":"int32"}]})";
+// search_dir 0.5.0 (#6478): the find_by_hash column shape. A literal copy; the shipped definition is
+// pinned to the same names, types, row_kind values, `discriminator` and `partialWhenConstrained` by
+// tests/test_filesystem_definition.py.
+const char* kSearchDir050Schema =
+    R"({"partialWhenConstrained":true,)"
+    R"("columns":[{"name":"row_kind","type":"string","discriminator":true},)"
+    R"({"name":"path","type":"string"},{"name":"entry_type","type":"string"}]})";
 
 // The verbatim trailer filesystem_find_by_hash.hpp writes (nine fields).
 const char* kTrailer = "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|"
@@ -563,6 +571,226 @@ TEST_CASE("matcher: real search and search_dir rows never bind one position off 
     CHECK_FALSE(matches(kSearchDirSchema, "path", "eq", "/tmp/foo", search_dir));
     CHECK_FALSE(matches(kSearchDirSchema, "entry_type", "eq", "/tmp/foo", search_dir));
     CHECK_FALSE(matches(kSearchDirSchema, "entry_type", "eq", "directory", search_dir));
+}
+
+TEST_CASE("matcher: search_dir 0.5.0 result rows are data rows; trailer, count and guard rows never are",
+          "[result_set][matcher]") {
+    const std::string out = "result|/tmp/foo|directory\n"
+                            "network_mount_guard|unavailable\n"
+                            "truncated|deadline|visited=5|hashed=0|skipped_unreadable=1|"
+                            "skipped_symlink=0|skipped_not_regular=0|skipped_oversize=0|"
+                            "skipped_network_mount=0\n"
+                            "total_matches|1";
+    CHECK(matches(kSearchDir050Schema, "path", "eq", "/tmp/foo", out));
+    CHECK(matches(kSearchDir050Schema, "entry_type", "eq", "directory", out));
+    CHECK_FALSE(matches(kSearchDir050Schema, "entry_type", "eq", "file", out));
+    // none of the non-data rows is a row of the three declared columns
+    CHECK_FALSE(matches(kSearchDir050Schema, "path", "eq", "deadline", out));
+    CHECK_FALSE(matches(kSearchDir050Schema, "path", "eq", "unavailable", out));
+    CHECK_FALSE(matches(kSearchDir050Schema, "path", "eq", "1", out));
+    // a device whose only rows are the trailer and the count has no data row
+    const std::string none = "truncated|none|visited=5|hashed=0|skipped_unreadable=0|"
+                             "skipped_symlink=1|skipped_not_regular=0|skipped_oversize=0|"
+                             "skipped_network_mount=0\n"
+                             "total_matches|0";
+    CHECK_FALSE(matches(kSearchDir050Schema, "path", "exists", "", none));
+    // the stored 0.4.0 schema keeps the old never-match behaviour (case above)
+}
+
+TEST_CASE("matcher: partialWhenConstrained is bound from the definition only and marks only a "
+          "CONSTRAINED answer unresolved (#6478)",
+          "[result_set][matcher]") {
+    nlohmann::json m{{"column", "path"}, {"op", "eq"}, {"value", "/tmp/absent"}};
+    bind_declared_columns(m, kSearchDir050Schema, "filesystem");
+    CHECK(m["partial_when_constrained"] == true);
+    // Who matches is unchanged; only a CONSTRAINED (4) answer is unresolved. 0 is a row with no
+    // typed status (an agent older than the bounded walk, a legacy row), 1 OK, 2 and 3 the others.
+    CHECK_FALSE(response_matches(m.dump(), kOk, "total_matches|0"));
+    CHECK(kPluginResultConstrained == 4);
+    CHECK(constrained_answer_is_unresolved(m.dump(), 4));
+    for (int status : {0, 1, 2, 3, 5}) {
+        CAPTURE(status);
+        CHECK_FALSE(constrained_answer_is_unresolved(m.dump(), status));
+    }
+
+    // Not opted in: find_by_hash, a stored search_dir 0.4.0, a value that is not the boolean true,
+    // and the key on a column or in the array form (it is read from the schema object only).
+    for (const char* schema :
+         {kFindByHashSchema, kSearchDirSchema,
+          R"({"partialWhenConstrained":"true","columns":[{"name":"path","type":"string"}]})",
+          R"({"partialWhenConstrained":false,"columns":[{"name":"path","type":"string"}]})",
+          R"({"columns":[{"name":"path","type":"string","partialWhenConstrained":true}]})",
+          R"([{"name":"path","type":"string","partialWhenConstrained":true}])"}) {
+        CAPTURE(schema);
+        nlohmann::json other{{"column", "path"}, {"op", "exists"}};
+        bind_declared_columns(other, schema, "filesystem");
+        REQUIRE(other.contains("declared_columns"));
+        CHECK_FALSE(other.contains("partial_when_constrained"));
+        CHECK_FALSE(constrained_answer_is_unresolved(other.dump(), 4));
+    }
+    // A matcher that was never bound carries no key: the default, a kind, text that is not JSON.
+    for (const char* unbound : {"", R"({"kind":"any_response"})", R"({"column":"path"})", "{"})
+        CHECK_FALSE(constrained_answer_is_unresolved(unbound, 4));
+
+    // A caller may not supply it; a wrong-typed stored value matches nobody and marks nothing.
+    const auto refused =
+        validate_matcher(R"({"column":"path","op":"exists","partial_when_constrained":true})");
+    REQUIRE(refused.has_value());
+    CHECK(refused->find("partial_when_constrained") != std::string::npos);
+    m["value"] = "/tmp/foo";
+    CHECK(response_matches(m.dump(), kOk, "result|/tmp/foo|file"));
+    m["partial_when_constrained"] = "yes";
+    CHECK_FALSE(response_matches(m.dump(), kOk, "result|/tmp/foo|file"));
+    CHECK_FALSE(constrained_answer_is_unresolved(m.dump(), 4));
+}
+
+TEST_CASE("matcher: admission refuses a matcher over the size bound (#6478)",
+          "[result_set][matcher]") {
+    // The bound is on the compact JSON text the routes pass in: a matcher exactly at it passes.
+    // One value_set entry carries the size: an entry has no bound of its own.
+    nlohmann::json m{{"column", "c"}, {"op", "in"}, {"value_set", nlohmann::json::array({""})}};
+    m["value_set"][0] = std::string(kMatcherMaxBytes - m.dump().size(), 'v');
+    REQUIRE(m.dump().size() == kMatcherMaxBytes);
+    CHECK_FALSE(validate_matcher_object(m));
+    m["value_set"][0] = m["value_set"][0].get<std::string>() + "v";
+    const auto over = validate_matcher_object(m);
+    REQUIRE(over);
+    CHECK(*over == "matcher exceeds 65536 bytes as compact JSON");
+    // value_set is the part that grows: its entries count together, however short each is.
+    nlohmann::json set{{"column", "sha256"}, {"op", "in"}, {"value_set", nlohmann::json::array()}};
+    for (int i = 0; i < 900; ++i)
+        set["value_set"].push_back(std::string(64, 'a'));
+    CHECK_FALSE(validate_matcher_object(set));
+    for (int i = 0; i < 100; ++i)
+        set["value_set"].push_back(std::string(64, 'a'));
+    CHECK(validate_matcher_object(set));
+    // A key the matcher does not read counts too, and the text check refuses on length alone.
+    CHECK(validate_matcher_object(
+        {{"column", "c"}, {"op", "exists"}, {"note", std::string(kMatcherMaxBytes, 'n')}}));
+    CHECK(validate_matcher(std::string(kMatcherMaxBytes + 1, ' ')));
+}
+
+TEST_CASE("matcher: admission refuses a column, op or value over its byte bound (#6478)",
+          "[result_set][matcher]") {
+    using nlohmann::json;
+    const std::optional<std::string> refused{
+        "a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)"};
+    struct Field {
+        const char* key;
+        std::size_t bound;
+    };
+    for (const Field& f : {Field{"column", kMatcherColumnMaxBytes}, Field{"op", kMatcherOpMaxBytes},
+                           Field{"value", kMatcherValueMaxBytes}}) {
+        INFO(f.key);
+        json m{{"column", "c"}, {"op", "eq"}, {"value", "v"}};
+        m[f.key] = std::string(f.bound, 'x');
+        CHECK_FALSE(validate_matcher_object(m));
+        m[f.key] = std::string(f.bound + 1, 'x');
+        CHECK(validate_matcher_object(m) == refused);
+        // The object's own three keys are bounded whatever its kind: either known kind, an
+        // unknown one and one that is not a string.
+        for (const json& kind : {json("any_response"), json("echo_rows_ge"), json("x"), json(5)}) {
+            m["kind"] = kind;
+            CHECK(validate_matcher_object(m) == refused);
+        }
+    }
+    // The bounds count the bytes of the parsed string, not its characters: U+00E9 is two bytes
+    // and U+20AC three, so a field can be over its bound with fewer characters than the bound.
+    const auto of = [](std::string_view character, std::size_t count) {
+        std::string text;
+        while (count-- > 0)
+            text += character;
+        return text;
+    };
+    CHECK_FALSE(validate_matcher_object(json{{"column", of("\xc3\xa9", 64)}}));
+    CHECK(validate_matcher_object(json{{"column", of("\xc3\xa9", 65)}}) == refused);
+    CHECK_FALSE(validate_matcher_object(json{{"value", of("\xc3\xa9", 256)}}));
+    CHECK(validate_matcher_object(json{{"value", of("\xc3\xa9", 257)}}) == refused);
+    CHECK(validate_matcher_object(json{{"column", of("\xe2\x82\xac", 128)}}) == refused);
+    // Only those three: a value_set entry and a key the matcher does not read have no bound of
+    // their own, and a nested object is not searched.
+    const std::string big(kMatcherValueMaxBytes + 1, 'x');
+    CHECK_FALSE(validate_matcher_object(
+        json{{"column", "c"}, {"op", "in"}, {"value_set", json::array({big, big})}}));
+    CHECK_FALSE(validate_matcher_object(
+        json{{"column", "c"}, {"op", "exists"}, {"note", json::object({{"value", big}})}}));
+    // A field over its bound is reported ahead of the whole-matcher bound, as the MCP tool did.
+    CHECK(validate_matcher_object(
+              json{{"column", big}, {"note", std::string(kMatcherMaxBytes, 'n')}}) ==
+          std::string(kMatcherFieldTooLargeMessage));
+}
+
+TEST_CASE("matcher: one parsed matcher answers every row as the one-shot predicates do (#6478)",
+          "[result_set][matcher]") {
+    nlohmann::json bound{{"column", "path"}, {"op", "eq"}, {"value", "/tmp/foo"}};
+    bind_declared_columns(bound, kSearchDir050Schema, "filesystem"); // the four stored keys
+    const std::vector<std::string> matchers{
+        "", "{}", "{", "[]", R"({"kind":"any_response"})", R"({"kind":"echo_rows_ge","n":2})",
+        R"({"kind":"echo_rows_ge","n":"2"})", R"({"kind":5})", R"({"column":"pid"})",
+        R"({"column":"pid","op":"exists"})", R"({"column":"pid","op":"eq","value":"1001"})",
+        R"({"column":"pid","op":"contains","value":"00"})",
+        R"({"column":"sha256","op":"in","value_set":["x",5,null]})",
+        R"({"column":"sha256","op":"in","value_set":[]})",
+        R"({"column":"sha256","op":"in","value_set":"x"})", bound.dump()};
+    const std::vector<std::string> outputs{
+        "", "error|boom", echo_rows(2), "__schema__|name\nx\n__total__|1", R"([{"sha256":"x"}])",
+        "result|/tmp/foo|file\ntotal_matches|1", "total_matches|0"};
+    int members = 0, lacking = 0, unresolved = 0;
+    for (const auto& text : matchers) {
+        const ParsedMatcher parsed(text); // built once, asked about every row below
+        for (const auto& out : outputs) {
+            CAPTURE(text, out);
+            for (int status : {0, kOk, kFail}) {
+                CHECK(parsed.response_matches(status, out) == response_matches(text, status, out));
+                members += parsed.response_matches(status, out);
+            }
+            CHECK(parsed.answer_lacks_matcher_column(out) ==
+                  answer_lacks_matcher_column(text, out));
+            lacking += parsed.answer_lacks_matcher_column(out);
+        }
+        for (int status = 0; status <= 5; ++status) {
+            CHECK(parsed.constrained_answer_is_unresolved(status) ==
+                  constrained_answer_is_unresolved(text, status));
+            unresolved += parsed.constrained_answer_is_unresolved(status);
+        }
+    }
+    // The table is not one-sided: each question is answered yes somewhere in it, and no elsewhere.
+    CHECK(members == 49);
+    CHECK(lacking == 12);
+    CHECK(unresolved == 1);
+}
+
+TEST_CASE("matcher: `in` matches a cell equal to a value_set entry byte for byte (#6478)",
+          "[result_set][matcher]") {
+    using namespace std::string_literals;
+    struct Row {
+        const char* value_set;
+        std::string cell;
+        bool member;
+    };
+    // A prefix is not a match either way; an empty entry matches an empty cell; an entry given
+    // twice is one entry; a NUL is a byte like any other, in an entry and in a cell. Letter case
+    // and a space at either end count, and any entry of several matches, not only the smallest.
+    // Empty matches only empty; a space at either end of an entry counts, and so does a NUL, CR
+    // or TAB ending a cell; two entries that differ only in an inner byte are both entries.
+    for (const Row& r : {Row{R"(["xy"])", "x", false}, Row{R"(["x"])", "xy", false},
+                         Row{R"([""])", "", true}, Row{R"(["x","x"])", "x", true},
+                         Row{R"(["a\u0000b"])", "a\0b"s, true},
+                         Row{R"(["a\u0000b"])", "a", false}, Row{R"(["x"])", "X", false},
+                         Row{R"(["x"])", "x ", false}, Row{R"(["x"])", " x", false},
+                         Row{R"(["a","b"])", "b", true}, Row{R"(["xay","xby"])", "xby", true},
+                         Row{R"([""])", "x", false}, Row{R"(["x"])", "", false},
+                         Row{R"([" x "])", "x", false}, Row{R"(["x"])", "x\0"s, false},
+                         Row{R"(["x"])", "x\r", false}, Row{R"(["x"])", "x\t", false}}) {
+        const std::string m = R"({"column":"c","op":"in","value_set":)"s + r.value_set + "}";
+        // The echo pipe shape (the cell is the first of two, so it may be empty) and the JSON one.
+        const std::string echo = "__schema__|c|d\n" + r.cell + "|d\n__total__|1";
+        const auto rows = nlohmann::json::array({nlohmann::json::object({{"c", r.cell}})});
+        for (const std::string& out : {echo, rows.dump()}) {
+            CAPTURE(r.value_set, out);
+            CHECK(response_matches(m, kOk, out) == r.member);
+        }
+    }
 }
 
 TEST_CASE("matcher: a stored find_by_hash 0.3.0 definition keeps the old never-match behaviour",

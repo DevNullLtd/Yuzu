@@ -219,7 +219,8 @@ metadata:
     HKEY_USERS\<SID> hive when that user is logged in, falling back to an
     offline mount of their NTUSER.DAT only when it is not loaded.
     On Linux, reports system-wide packages (dpkg/rpm). On macOS, reports
-    system apps plus per-user Homebrew packages. Output includes the
+    system apps only (Homebrew packages are listed by pkg_inventory.packages;
+    this action no longer executes brew). Output includes the
     username (or "system") alongside each application record.
   tags: [software, inventory, per-user, compliance]
 
@@ -240,7 +241,7 @@ spec:
     columns:
       - name: username
         type: string
-        description: 'The resolved local profile name on Windows (never the SID), the literal "system" for the machine-scope Linux/macOS leg, or "brew" for macOS per-user Homebrew formulae. Values: profile name, "system", "brew", or "-".'
+        description: 'The resolved local profile name on Windows (never the SID), the literal "system" for the machine-scope Linux/macOS leg, or "-". Values: profile name, "system", or "-".'
         example: "jsmith"
         platforms: [windows, linux, darwin]
       - name: name
@@ -255,12 +256,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: publisher
         type: string
-        description: 'The vendor or maintainer name; always "-" on macOS and for Homebrew rows. Values: free text or "-".'
+        description: 'The vendor or maintainer name; always "-" on macOS. Values: free text or "-".'
         example: "Signal Messenger, LLC"
         platforms: [windows, linux]
       - name: install_date
         type: string
-        description: "Install date in the OS's native format; \"-\" when the source reports none, which dpkg-based Linux hosts and Homebrew rows always do. Values: free text or \"-\"."
+        description: "Install date in the OS's native format; \"-\" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or \"-\"."
         example: "20260714"
         platforms: [windows, darwin]
     aggregation:
