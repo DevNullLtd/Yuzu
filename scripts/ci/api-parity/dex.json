@@ -58,6 +58,17 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/dex/apps/usage",
+    "capability_id": "get.fragments-dex-apps-usage",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/apps/usage"
+    },
+    "mcp_twin": null,
+    "status": "twinned-rest-only"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/dex/catalogue",
     "capability_id": "get.fragments-dex-catalogue",
     "rest_v1_twin": {
