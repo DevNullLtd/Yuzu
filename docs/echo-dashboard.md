@@ -190,8 +190,8 @@ No changes to the `echo.sql` agent action; the change is purely server-side scop
   an answer at that count is flagged ("Results were cut at 10,000 rows for this hour"). A
   long answer arrives as several response frames; the page reads every frame of the
   command, and keeps polling until the command has finished. A row with the wrong number
-  of cells is dropped and counted ("N rows unreadable"); a failed read or a device whose
-  agent has no roll-up store says so ("upgrade the agent") instead of showing an empty
+  of cells is dropped and counted ("N rows unreadable"); a failed read says so, showing the
+  device's own error ("The device reported an error: ..."), instead of showing an empty
   tree. The agent writes each cell raw, joined by `|`, so a process name that itself
   contains `|` or a newline can still shift cells or forge a row until the agent escapes
   them (the server cannot tell a forged row with the right cell count from a real one).

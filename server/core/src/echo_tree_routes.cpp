@@ -5,6 +5,7 @@
 #include "echo_tree_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "hardware_list_model.hpp" // id_is_audit_safe (#7811)
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial, detail::a4_error, make_correlation_id
 #include "rest_audit.hpp"     // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
@@ -96,6 +97,17 @@ void tree_note(httplib::Response& res, const std::string& text) {
 
 std::string get_param(const httplib::Request& req, const char* k) {
     return req.has_param(k) ? req.get_param_value(k) : std::string{};
+}
+
+// A device id reaches `target_id` on every audit row and on the permission-denial audit, so an
+// over-long or control-byte id is refused with a 400 before any scoped check or audit write
+// (#7811). Returns true when refused; the same shape as hardware_routes.cpp's id floor.
+bool refuse_unsafe_device(httplib::Response& res, const std::string& device) {
+    if (id_is_audit_safe(device))
+        return false;
+    res.status = 400;
+    note(res, "Invalid device id.");
+    return true;
 }
 // parse_ts_param lives in echo_process_tree.{hpp,cpp} (pure + unit-tested).
 
@@ -697,6 +709,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             tree_note(res, "Select a host to see its process tree.");
             return;
         }
+        if (refuse_unsafe_device(res, device))
+            return;
         // Per-device scoped Read floor (tier + management group).
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
             return;
@@ -787,6 +801,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         const std::string pcmd = get_param(req, "pcmd");
         const std::string tcmd = get_param(req, "tcmd");
         const std::string hcmd = get_param(req, "hcmd");
+        if (refuse_unsafe_device(res, device))
+            return;
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
             return;
         if (!can_execute(req, device)) {
@@ -984,6 +1000,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             res.set_content("", "text/html; charset=utf-8"); // no host picked yet
             return;
         }
+        if (refuse_unsafe_device(res, device))
+            return;
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
             return;
         if (!can_execute(req, device)) {
@@ -1188,6 +1206,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                             "text/html; charset=utf-8");
             return;
         }
+        if (refuse_unsafe_device(res, device))
+            return;
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
             return;
         if (!can_execute(req, device)) {
@@ -1293,6 +1313,11 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         const std::string device = get_param(req, "device");
         if (device.empty()) {
             push_refusal(res, "No device selected.", "No device selected.");
+            return;
+        }
+        if (!id_is_audit_safe(device)) {
+            push_refusal(res, "Invalid device id.", "Invalid device id.");
+            res.status = 400;
             return;
         }
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device)) {

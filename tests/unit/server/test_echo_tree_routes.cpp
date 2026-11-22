@@ -1029,15 +1029,14 @@ TEST_CASE("echo routes: /result shows the resolved hour and an Hour selector for
     }
 }
 
-TEST_CASE("echo routes: an agent without the roll-up store gets the upgrade note for the tree",
+TEST_CASE("echo routes: an agent without the roll-up store gets the plain error for the tree",
           "[echo][routes][skew]") {
     EchoHarness h;
     h.proc_output = "error|no such column: parent_name";
     auto r = h.run_result();
     REQUIRE(r);
-    CHECK(r->body.find("This device runs an agent without the roll-up store: upgrade the agent") !=
-          std::string::npos);
-    CHECK(r->body.find("parent_name") == std::string::npos); // the raw SQLite text is not the message
+    CHECK(r->body.find("The device reported an error: no such column: parent_name") != std::string::npos);
+    CHECK(r->body.find("upgrade the agent") == std::string::npos);
     CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
 
     SECTION("any other agent error keeps its reason") {
@@ -1054,7 +1053,9 @@ TEST_CASE("echo routes: an agent without the roll-up store gets the upgrade note
         h.frames_override[kProcCmd] = {f};
         auto failed = h.run_result();
         REQUIRE(failed);
-        CHECK(failed->body.find("upgrade the agent") != std::string::npos);
+        CHECK(failed->body.find("The device reported an error: no such table: process_hourly") !=
+              std::string::npos);
+        CHECK(failed->body.find("upgrade the agent") == std::string::npos);
     }
     SECTION("an answer with no schema is unreadable and never an empty tree") {
         h.proc_output = "7200|bash|systemd|alice|3|3|1\n";
@@ -1074,7 +1075,9 @@ TEST_CASE("echo routes: the tree names why connections are missing", "[echo][rou
         REQUIRE(r);
         CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos); // tree kept
         CHECK(r->body.find("Connection data was unavailable for this host") != std::string::npos);
-        CHECK(r->body.find("upgrade the agent") != std::string::npos);
+        CHECK(r->body.find("The device reported an error: no such column: failed_count") !=
+              std::string::npos);
+        CHECK(r->body.find("upgrade the agent") == std::string::npos);
     }
     SECTION("an answer with no schema") {
         h.tcp_output = "";
@@ -1428,14 +1431,16 @@ TEST_CASE("echo routes: a DNS or ARP failure is an error in the panel and never 
           "[echo][routes][skew]") {
     const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
                              "&acmd=" + kArpCmd + "&n=1&hour=7200";
-    const std::string upgrade = "This device runs an agent without the roll-up store: upgrade the agent";
     SECTION("an old agent, both panels") {
         EchoHarness h;
         h.dns_output = "error|query failed: no such column: negative_count";
         h.arp_output = "error|unknown table: $ARP_Hourly";
         auto r = h.sink.Get(poll);
         REQUIRE(r);
-        CHECK(count_occurrences(r->body, upgrade) == 2);
+        CHECK(r->body.find("The device reported an error: query failed: no such column: negative_count") !=
+              std::string::npos);
+        CHECK(r->body.find("The device reported an error: unknown table: $ARP_Hourly") != std::string::npos);
+        CHECK(r->body.find("upgrade the agent") == std::string::npos);
         CHECK(r->body.find("recorded for this hour") == std::string::npos);
         CHECK(r->body.find("may be disabled") == std::string::npos);
     }
@@ -2423,4 +2428,67 @@ TEST_CASE("capture-sources push: every result series exists before the first pus
                                "dispatch_denied", "dispatch_exception"})
         CHECK(text.find(std::string("yuzu_echo_sources_push_total{result=") + '"' + result + '"' +
                         "}") != std::string::npos);
+}
+
+// #7811: a device id reaches target_id on every audit row and the permission-denial audit, so
+// the fragment routes refuse an over-long or control-byte id before any check, audit or dispatch.
+TEST_CASE("echo routes: a fragment route refuses an unsafe device id before any audit or dispatch",
+          "[echo][routes][audit]") {
+    const std::string kLong(257, 'a');
+    const std::vector<std::string> bad = {kLong, "dev%00A", "dev%0D%0AA", "dev%0AA"};
+    const std::string tail = "&dcmd=" + kDnsCmd + "&acmd=" + kArpCmd + "&scmd=" + kStatusCmd +
+                             "&ccmd=" + kCompatCmd + "&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd +
+                             "&hcmd=" + kHoursCmd + "&n=1&hour=7200&preset=24h";
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        for (const char* route :
+             {"/fragments/echo/process-tree/run", "/fragments/echo/process-tree/result",
+              "/fragments/echo/process-tree/device-net", "/fragments/echo/capture-sources/load"}) {
+            INFO(route);
+            EchoHarness h;
+            auto r = h.sink.Get(std::string(route) + "?device=" + id + tail);
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(r->body.find("Invalid device id.") != std::string::npos);
+            CHECK(h.audit_log.empty());
+            CHECK(h.dispatch_calls == 0);
+        }
+        EchoHarness h;
+        auto p = h.sink.Post("/fragments/echo/capture-sources/push?device=" + id + "&changes=process%3Don", "");
+        REQUIRE(p);
+        CHECK(p->status == 400);
+        CHECK(h.audit_log.empty());
+        CHECK(h.dispatch_calls == 0);
+    }
+}
+
+TEST_CASE("echo routes: a 256-byte printable device id passes the validator and reaches the scoped check",
+          "[echo][routes][authz]") {
+    EchoHarness h;
+    h.scope_device = "dev-A"; // the scoped gate denies any other device with a 403
+    const std::string id(256, 'a');
+    auto r = h.sink.Get("/fragments/echo/process-tree/device-net?device=" + id + "&dcmd=" + kDnsCmd +
+                        "&acmd=" + kArpCmd + "&n=1&hour=7200");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+    CHECK(r->body.find("Invalid device id.") == std::string::npos);
+}
+
+// #1578: the poll is bound to the session's device scope, not to the principal that dispatched, so
+// a second principal polling the first one's command ids writes its own read rows.
+TEST_CASE("echo routes: /device-net polled by a second principal writes its own DNS and ARP read rows",
+          "[echo][routes][audit]") {
+    EchoHarness h;
+    h.dns_output = std::string(kDnsSchema) + "7200|a.test|A|1.1.1.1|1|0\n__total__|1\n";
+    h.arp_output = std::string(kArpSchema) + "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n";
+    h.session_user = "bob";
+    auto r = h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                        "&acmd=" + kArpCmd + "&n=1&hour=7200");
+    REQUIRE(r);
+    const auto* dns = h.find_audit("echo.dns.read", "success");
+    REQUIRE(dns != nullptr);
+    CHECK(dns->target_id == "dev-A");
+    const auto* arp = h.find_audit("echo.arp.read", "success");
+    REQUIRE(arp != nullptr);
+    CHECK(arp->target_id == "dev-A");
 }

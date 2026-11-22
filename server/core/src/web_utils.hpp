@@ -1046,15 +1046,16 @@ inline int64_t now_epoch_seconds() {
 
 /// Format epoch seconds as RFC 3339 / ISO 8601 in UTC: "YYYY-MM-DDTHH:MM:SSZ".
 /// Used in `title=` attributes so operators can copy a precise timestamp.
-/// Returns "—" for non-positive input (sentinel "never").
+/// Returns "—" for non-positive input, for a value past year 9999 (253402300799), and when the
+/// platform conversion reports failure (sentinel "never").
 inline std::string format_iso_utc(int64_t epoch_secs) {
-    if (epoch_secs <= 0) return "—";
+    if (epoch_secs <= 0 || epoch_secs > 253402300799LL) return "—";
     std::time_t t = static_cast<std::time_t>(epoch_secs);
     std::tm tm_val{};
 #ifdef _WIN32
-    gmtime_s(&tm_val, &t);
+    if (gmtime_s(&tm_val, &t) != 0) return "—";
 #else
-    gmtime_r(&t, &tm_val);
+    if (gmtime_r(&t, &tm_val) == nullptr) return "—";
 #endif
     return std::format("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
                         tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
