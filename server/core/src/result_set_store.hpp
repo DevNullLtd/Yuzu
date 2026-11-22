@@ -544,9 +544,6 @@ public:
     int gc_sweep();
 
 private:
-    std::expected<MembersPage, ResultSetError>
-    read_members_page(const std::string& id, const std::string& cursor, int limit,
-                      const authz::VisibleSet& filter);
     pg::PgPool& pool_;
     bool open_{false};
 

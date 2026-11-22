@@ -104,7 +104,7 @@ requests. A failed continuation is a degraded read.
 
 The REST and MCP inventory-query producers check parent ownership and readiness and reject
 truncated inventory reads. They evaluate the scoped inventory and intersect its distinct matching
-IDs with the parent in PostgreSQL, reading up to 1,000 matches at a time. Server memory depends
+IDs with the parent in PostgreSQL, reading up to 1,000 matches at a time in one read-only, repeatable-read transaction. Server memory depends
 on the bounded inventory candidates and one page even when the parent is fleet-sized. Normal
 materialized membership is immutable. A page failure discards the accumulated matches. The
 child insert references the parent through a foreign key, so a parent removed before insertion

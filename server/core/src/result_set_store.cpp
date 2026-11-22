@@ -540,54 +540,17 @@ MembersPageSql build_members_page_sql(const std::string& id, const std::string& 
     return out;
 }
 
-std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::members_checked(
-    const std::string& id, const std::string& cursor, int limit,
+static std::expected<ResultSetStore::MembersPage, ResultSetError> read_members_page(
+    PGconn* conn, const std::string& id, const std::string& cursor, int limit,
     const authz::VisibleSet& visible) {
-    if (!open_)
-        return std::unexpected(ResultSetError::DbError);
-    if (limit <= 0)
-        limit = 1000;
-    if (visible && visible->empty())
-        return MembersPage{}; // deny-all: nothing to read, nothing to disclose
-    return read_members_page(id, cursor, limit, visible);
-}
-
-std::expected<std::vector<std::string>, ResultSetError>
-ResultSetStore::matching_parent_members(const std::string& id,
-                                       std::unordered_set<std::string> candidates) {
-    if (!open_)
-        return std::unexpected(ResultSetError::DbError);
-    const authz::VisibleSet filter{std::move(candidates)};
-    std::vector<std::string> matches;
-    std::string cursor;
-    do {
-        // Even with zero matches, verify the parent membership table is readable (#4306).
-        auto page = read_members_page(id, cursor, 1000, filter);
-        if (!page)
-            return std::unexpected(page.error());
-        matches.insert(matches.end(), std::make_move_iterator(page->device_ids.begin()),
-                       std::make_move_iterator(page->device_ids.end()));
-        cursor = std::move(page->next_cursor);
-    } while (!cursor.empty());
-    return matches;
-}
-
-std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::read_members_page(
-    const std::string& id, const std::string& cursor, int limit, const authz::VisibleSet& visible) {
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease) {
-        spdlog::error("ResultSetStore::members_checked: no connection ({})", pool_.last_error());
-        return std::unexpected(ResultSetError::DbError);
-    }
-
     const auto built = build_members_page_sql(id, cursor, limit, visible);
-    pg::PgResult res = pg::exec_params(lease.get(), built.sql.c_str(), built.params);
+    pg::PgResult res = pg::exec_params(conn, built.sql.c_str(), built.params);
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::members_checked: query failed: {}",
-                      PQerrorMessage(lease.get()));
+                      PQerrorMessage(conn));
         return std::unexpected(ResultSetError::DbError);
     }
-    MembersPage page;
+    ResultSetStore::MembersPage page;
     const int rows = PQntuples(res.get());
     page.device_ids.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
@@ -598,6 +561,51 @@ std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::read_
         page.next_cursor = page.device_ids.back();
     }
     return page;
+}
+
+std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::members_checked(
+    const std::string& id, const std::string& cursor, int limit,
+    const authz::VisibleSet& visible) {
+    if (!open_)
+        return std::unexpected(ResultSetError::DbError);
+    if (limit <= 0)
+        limit = 1000;
+    if (visible && visible->empty())
+        return MembersPage{}; // deny-all: nothing to read, nothing to disclose
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::members_checked: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
+    }
+    return read_members_page(lease.get(), id, cursor, limit, visible);
+}
+
+std::expected<std::vector<std::string>, ResultSetError>
+ResultSetStore::matching_parent_members(const std::string& id,
+                                        std::unordered_set<std::string> candidates) {
+    if (!open_)
+        return std::unexpected(ResultSetError::DbError);
+    const authz::VisibleSet filter{std::move(candidates)};
+    std::vector<std::string> matches;
+    const bool ok = pool_.with_txn_for(kReadTimeout, [&](PGconn* conn) {
+        pg::PgResult iso{PQexec(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")};
+        if (iso.status() != PGRES_COMMAND_OK)
+            return false;
+        std::string cursor;
+        do {
+            // Even with zero matches, verify the membership table is readable (#4306).
+            auto page = read_members_page(conn, id, cursor, 1000, filter);
+            if (!page)
+                return false;
+            matches.insert(matches.end(), std::make_move_iterator(page->device_ids.begin()),
+                           std::make_move_iterator(page->device_ids.end()));
+            cursor = std::move(page->next_cursor);
+        } while (!cursor.empty());
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(ResultSetError::DbError);
+    return matches;
 }
 
 std::vector<std::string> ResultSetStore::members(const std::string& id, const std::string& cursor,
