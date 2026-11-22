@@ -96,8 +96,9 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
             break;
         }
         for (const auto& r : *rows) {
-            if (!matcher.response_matches(r.status, r.output)) {
-                if (r.status != rs_matcher::kStatusSuccess || r.output.starts_with("error|") ||
+            const auto verdict = matcher.evaluate(r.status, r.output, r.plugin_result_status);
+            if (verdict != rs_matcher::RowMatch::True) {
+                if (verdict != rs_matcher::RowMatch::False || r.status != rs_matcher::kStatusSuccess || r.output.starts_with("error|") ||
                     matcher.answer_lacks_matcher_column(r.output) ||
                     matcher.constrained_answer_is_unresolved(r.plugin_result_status))
                     failed.insert(r.agent_id);

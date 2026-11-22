@@ -308,6 +308,8 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
     // A closed set: an unknown kind would be admitted and then match nobody at evaluation
     // (below), so a stale client still sending the pre-rename `tar_rows_ge` would get a 202 and
     // an empty set indistinguishable from "no device matched". Refuse it at admission instead.
+    if (is_quantified_matcher(m))
+        return validate_quantified_matcher(m);
     if (kind == "any_response")
         return std::nullopt;
     // log_id_token is used here for its control-byte fold + length cap on caller input echoed
@@ -340,8 +342,9 @@ std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher
 
 void bind_declared_columns(nlohmann::json& matcher, const std::string& result_schema_json,
                            const std::string& plugin) {
-    if (!matcher.is_object() || matcher.contains("kind") || !matcher.contains("column") ||
-        !matcher["column"].is_string())
+    const bool quantified = is_quantified_matcher(matcher);
+    if (!quantified && (!matcher.is_object() || matcher.contains("kind") ||
+                        !matcher.contains("column") || !matcher["column"].is_string()))
         return;
     // Same source as the dashboard's resolve_render_columns: only a definition that DECLARES a
     // result_schema (the plugin-default fallback is a display list, not the wire layout).
@@ -351,9 +354,11 @@ void bind_declared_columns(nlohmann::json& matcher, const std::string& result_sc
     const auto& cols = tmpl.columns;
     if (cols.empty())
         return;
-    const auto column = matcher["column"].get<std::string>();
-    if (std::find(cols.begin(), cols.end(), column) == cols.end())
-        return;
+    if (!quantified) {
+        const auto& column = matcher["column"].get_ref<const std::string&>();
+        if (std::find(cols.begin(), cols.end(), column) == cols.end())
+            return;
+    }
     matcher[kDeclaredColumnsKey] = cols;
     matcher[kPluginKey] = plugin;
     if (declares_row_discriminator(result_schema_json))
@@ -395,6 +400,8 @@ ParsedMatcher::ParsedMatcher(std::string_view matcher_json)
           nlohmann::json::parse(matcher_json, nullptr, false))) {
     // `value_set` is walked here, once. An entry that is not a string never matched: left out.
     const auto& m = *matcher_;
+    if (is_quantified_matcher(m) && !validate_quantified_matcher(m) && !column_shape_defect(m))
+        quantified_ = std::make_unique<const QuantifiedMatcher>(m);
     if (m.is_object() && m.contains("value_set") && m["value_set"].is_array())
         for (const auto& v : m["value_set"])
             if (v.is_string())
@@ -416,7 +423,21 @@ bool ParsedMatcher::constrained_answer_is_unresolved(int plugin_result_status) c
            flag_is_true(*matcher_, kPartialWhenConstrainedKey);
 }
 
+RowMatch ParsedMatcher::evaluate(int status, std::string_view output, int plugin_result_status) const {
+    if (status != kStatusSuccess)
+        return RowMatch::False;
+    if (quantified_)
+        return quantified_->evaluate(output, !constrained_answer_is_unresolved(plugin_result_status));
+    if (is_quantified_matcher(*matcher_))
+        return RowMatch::MalformedValue;
+    return legacy_matches(status, output) ? RowMatch::True : RowMatch::False;
+}
+
 bool ParsedMatcher::response_matches(int status, std::string_view output) const {
+    return evaluate(status, output) == RowMatch::True;
+}
+
+bool ParsedMatcher::legacy_matches(int status, std::string_view output) const {
     // A non-success response is never a hit, whatever the matcher says.
     if (status != kStatusSuccess)
         return false;

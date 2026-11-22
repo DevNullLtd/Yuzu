@@ -1691,7 +1691,7 @@ static const ToolDef kTools[] = {
      "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
-     R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string","maxLength":256}},"required":["sql"]})j",
+     R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"matcher":{"type":"object","description":"A row quantifier has kind any, none, all or count_where and a where predicate. Compose predicates with and/or arrays and not. A count_where also takes op (eq/lt/le/gt/ge) and nonnegative integer n. Unknown at the outermost level selects no device. Limit 65536 compact JSON bytes. Overrides include_empty."},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string","maxLength":256}},"required":["sql"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
      R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
@@ -1739,7 +1739,7 @@ static const ToolDef kTools[] = {
      "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
-     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647. At most 65536 bytes as compact JSON"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"A row quantifier has kind any, none, all or count_where and a where predicate. Compose predicates with and/or arrays and not. A count_where also takes op (eq/lt/le/gt/ge) and nonnegative integer n. Unknown at the outermost level selects no device. Limit 65536 compact JSON bytes. Omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647. At most 65536 bytes as compact JSON"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
      R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
@@ -18615,6 +18615,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            const auto rs_matcher_valid = [&] {
+                if (!args.contains("matcher")) return true;
+                const auto error = rs_matcher::validate_matcher_object(args.at("matcher"));
+                if (!error) return true;
+                if (*error == rs_matcher::kMatcherFieldTooLargeMessage)
+                    reject_field_too_large(*error);
+                else if (*error == rs_matcher::kMatcherTooLargeMessage)
+                    reject_field_too_large("RESULT_SET_BAD_REQUEST: " + *error);
+                else
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "RESULT_SET_BAD_REQUEST: " + *error),
+                                    "application/json");
+                return false;
+            };
+
             if (tool_name == "create_result_set_from_echo_query") {
                 if (!perm_fn(req, res, "Execution", "Execute"))
                     return;
@@ -18691,6 +18706,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                if (!rs_matcher_valid()) return;
                 const bool include_empty = args.value("include_empty", false);
                 nlohmann::json matcher = include_empty
                                              ? nlohmann::json{{"kind", "any_response"}}
@@ -18699,6 +18715,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 nlohmann::json payload;
                 payload["sql"] = sql;
                 payload["include_empty"] = include_empty;
+                if (args.contains("matcher")) {
+                    matcher = args.at("matcher");
+                    payload["matcher"] = matcher;
+                }
                 if (args.contains("parent_id") && args["parent_id"].is_string())
                     payload["scope_input_id"] = args["parent_id"];
                 std::unordered_map<std::string, std::string> params{{"sql", sql}};
@@ -18757,27 +18777,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // anything is dispatched or stored, like the REST twin.
                     // A PRESENT matcher that is not a JSON object used to be dropped silently
                     // ("accept every responder"); it is refused now. Absent stays the default.
-                    if (args.contains("matcher")) {
-                        if (const auto bad =
-                                yuzu::server::rs_matcher::validate_matcher_object(args["matcher"])) {
-                            // A field or the whole matcher over its size bound is an input bound
-                            // like the fields above: counted and audited by the same responder.
-                            // The REST twin refuses both through this same check.
-                            if (*bad == yuzu::server::rs_matcher::kMatcherFieldTooLargeMessage) {
-                                reject_field_too_large(*bad);
-                                return;
-                            }
-                            if (*bad == yuzu::server::rs_matcher::kMatcherTooLargeMessage) {
-                                reject_field_too_large("RESULT_SET_BAD_REQUEST: " + *bad);
-                                return;
-                            }
-                            res.set_content(
-                                error_response(id, kInvalidParams,
-                                               "RESULT_SET_BAD_REQUEST: " + *bad),
-                                "application/json");
-                            return;
-                        }
-                    }
+                    if (!rs_matcher_valid()) return;
                     if (args.contains("params") && args["params"].is_object()) {
                         const auto& p = args["params"];
                         // #4353 follow-up, Gate 3 cpp-expert finding: this

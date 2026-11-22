@@ -290,6 +290,32 @@ widening it is a separate, reviewed decision).
 
 Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT`, `RESULT_SET_EXPIRED`, and (ADR-0036, 2026-07-25) `RESULT_SET_STORE_UNAVAILABLE` (**503**) — returned when the store itself (not the requested row) could not answer, e.g. a Postgres error mid-read on `get`/`resolve_alias`. This list is illustrative, not exhaustive: #4306 widened the same 503 to also cover a degraded `members`/`list_by_owner`/`lineage` page read and the async producers' pre-dispatch per-owner quota check (a post-dispatch store fault after that quota check maps to `500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH` instead, not a 503) — the exhaustive per-route list lives in `docs/user-manual/rest-api.md`. This is deliberately **type-distinguishable from 404**: a `RESULT_SET_NOT_FOUND`/404 tells the caller "there is definitely no such row, or it is not yours" (safe to treat as a clean not-found for retry/UI purposes), while a 503 tells the caller "we could not determine the answer at all" — collapsing the two would let a transient database blip on an authorization-relevant read (ownership check, alias resolution, `from_result_set:` membership) masquerade as a confident "not found," which for a `NOT`-combined scope expression is a fail-open (see `docs/postgres-store-playbook.md` "Authoritative reads must be type-distinguishable").
 
+### Row quantifiers on asynchronous producers
+
+The Echo and instruction-result REST producers and their MCP tools accept an explicit
+`matcher`. On Echo it takes precedence over `include_empty`. Omitting it preserves the
+producer's default. A matcher can test successive rows with `kind` set to `any`, `none`,
+`all` or `count_where`. For example:
+
+```json
+{"kind":"none","where":{"and":[{"column":"name","op":"eq","value":"alpha"},{"not":{"column":"state","op":"eq","value":"inactive"}}]}}
+```
+
+A leaf supports `eq`, `contains`, `exists` and `in` (use `value_set` for the latter).
+An `and` or `or` array contains one or more predicates. `not` takes one predicate.
+Expressions are limited to 16 levels, and the existing 65,536-byte matcher limit and field
+bounds apply. `count_where` takes an additional comparison `op` (`eq`, `lt`, `le`,
+`gt`, `ge`) and a nonnegative integer `n`.
+
+Missing or null fields produce `missing_value`; unusable values produce `malformed_value`.
+An evaluator reads at most 10,000 rows per answer. More rows than read give an open upper
+bound (`row_bound`). A declared constrained, partial answer likewise leaves the upper bound
+open. A true disjunct or a false conjunct can decide a row that also has unknown fields.
+A count compares the range from known matches to known matches plus unknown rows; an open
+upper end represents additional possible matches. Only a comparison true for the entire
+range selects the device. `none` and `all` over an empty complete row set are true. Unknown
+folds to false only after evaluation of the whole matcher.
+
 ## 7. YAML DSL surface
 
 The DSL must make scope-walking *obvious*, not a footnote. Every place that takes a `scope:` block today gains a new mutually-exclusive form:

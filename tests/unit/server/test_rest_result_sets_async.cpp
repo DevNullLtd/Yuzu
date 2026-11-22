@@ -28,6 +28,7 @@
 #include "rest_api_v1.hpp"
 #include "result_set_members.hpp"
 #include "result_set_store.hpp"
+#include "result_set_matcher.hpp"
 #include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
@@ -434,6 +435,29 @@ TEST_CASE("from-echo-query: 202 pending, dispatch to __all__ when no parent",
     REQUIRE(row.has_value());
     REQUIRE(row->status == ResultSetStatus::Pending);
     REQUIRE(row->matcher.find("echo_rows_ge") != std::string::npos);
+}
+
+TEST_CASE("from-echo-query: a row quantifier selects only definite matches",
+          "[pg][result_set][async][echo][quantified]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AsyncHarness h(pool);
+    int status{};
+    const auto created = h.post("/api/v1/result-sets/from-echo-query",
+        R"({"sql":"SELECT name FROM $Process_Hourly","matcher":{"kind":"none","where":{"column":"name","op":"eq","value":"alpha"}}})", status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+    const auto row = get_ok(*h.store, created["data"]["id"].get<std::string>());
+    REQUIRE(row.has_value());
+    const yuzu::server::rs_matcher::ParsedMatcher matcher(row->matcher);
+    CHECK(matcher.response_matches(yuzu::server::rs_matcher::kStatusSuccess,
+                                   "__schema__|name\n__total__|0"));
+    CHECK_FALSE(matcher.response_matches(yuzu::server::rs_matcher::kStatusSuccess,
+                                         R"([{"different":"column"}])"));
+    h.post("/api/v1/result-sets/from-echo-query",
+        R"({"sql":"SELECT 1","matcher":{"kind":"none","where":{"and":[]}}})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.size() == 1);
 }
 
 TEST_CASE("from-echo-query: parent_id scopes dispatch via from_result_set:",

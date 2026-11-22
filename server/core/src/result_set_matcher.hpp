@@ -1,5 +1,7 @@
 #pragma once
 
+#include "quantified_matcher.hpp"
+
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
@@ -101,6 +103,8 @@ public:
     ~ParsedMatcher();
 
     [[nodiscard]] bool response_matches(int status, std::string_view output) const;
+    [[nodiscard]] RowMatch evaluate(int status, std::string_view output,
+                                    int plugin_result_status = 0) const;
     [[nodiscard]] bool answer_lacks_matcher_column(std::string_view output) const;
     [[nodiscard]] bool constrained_answer_is_unresolved(int plugin_result_status) const;
 
@@ -112,6 +116,8 @@ private:
     /// there could all hash alike and turn each lookup into a walk of every entry; an ordered
     /// set's lookup does not degrade with the keys it holds. Views into `*matcher_`.
     std::set<std::string_view> in_set_;
+    std::unique_ptr<const QuantifiedMatcher> quantified_;
+    bool legacy_matches(int status, std::string_view output) const;
 };
 // A copied `in_set_` would point into the source's `*matcher_`, and a moved-from object would
 // have no `*matcher_` for its members to read: the class offers neither, and this keeps it so.
