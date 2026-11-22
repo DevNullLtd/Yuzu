@@ -1153,11 +1153,15 @@ protection.**
 **`gateway-base-index` job (#6711).** The same workflow also runs one plain (non-matrix)
 job, "Gateway builder index matches runtime Alpine", whenever the classifier says the
 image surface changed. It runs `scripts/ci/check-gateway-base-index.py` on a hosted
-runner with no Docker: it fetches the pinned `erlang:28-alpine` index from Docker Hub
+runner with no Docker: it fetches the pinned `hexpm/erlang` builder index from Docker Hub
 (anonymous, retried, body hashed against the pinned digest) and fails when a platform
 on `Dockerfile.gateway`'s `# yuzu:gateway-platforms` marker (today `linux/amd64`) is not
-annotated as built on the runtime stage's Alpine release. That is the early check on a
-Dependabot digest refresh; the build's abi-guard stays the build-time enforcement.
+shown as built on the runtime stage's Alpine release, or when the builder tag names
+another Alpine release. The evidence is the entry's base-name annotation when the
+publisher sets one, otherwise the first history entry of the entry's image config
+(`ADD alpine-minirootfs-<X.Y.Z>-<arch>.tar.gz /`; hexpm sets no annotation), the
+per-platform manifest and config each hashed against the digest that names it. That is
+the early check on a builder re-pin; the build's abi-guard stays the build-time enforcement.
 Exit 1 is a mismatch, 2 an unreadable registry or a body that is not the pinned digest (the
 log says whether a re-run can help), 3 an input the script does not understand. A skipped
 plain job satisfies a required check, so it needs no stub. To disable the networked
@@ -1175,10 +1179,12 @@ so the push hits BuildKit's own solver cache and rebuilds nothing.
 ### Release image vulnerability gate (`scripts/ci/image-vuln-gate.sh`, WP15/S9)
 
 **What it checks.** Every image `release.yml` publishes (server, gateway, postgres, the three
-chisel variants and the agent bundle) is scanned with a pinned Trivy **before it is pushed**.
-The gate fails when an image has a CRITICAL vulnerability that has a fix available and is not
-accepted in `.trivyignore.yaml`. HIGH findings and unfixed CRITICALs are printed for the record
-and do not fail it. It also fails, rather than pass a scan that could not mean anything:
+chisel variants and the agent bundle) is scanned with two pinned scanners, Trivy and grype,
+**before it is pushed**. The gate fails when either reports a CRITICAL vulnerability that has a
+fix available and is not accepted in that scanner's acceptance file (`.trivyignore.yaml` for
+Trivy, `.grypeignore.yaml` for grype; "The second scanner" below). HIGH findings and unfixed
+CRITICALs are printed for the record and do not fail it. It also fails, rather than pass a scan
+that could not mean anything:
 
 - a scan that cannot complete (Trivy error, DB download failure, wrong Trivy version, missing
   ignore file);
@@ -1223,7 +1229,8 @@ and do not fail it. It also fails, rather than pass a scan that could not mean a
   three chisel images and the agent bundle. They are assembled FROM scratch from chisel slices,
   which leave no dpkg database (and no chisel manifest, because they do not cut
   `base-files_chisel`), so Trivy 0.70.0 reports "No OS package is detected". **Their libc6,
-  libssl3t64, zlib1g and other slices ship unscanned.** The gate learns an image's name from
+  libssl3t64, zlib1g and other slices ship unscanned by Trivy** (grype matches some of them, best
+  effort: "What it does not see" below). The gate learns an image's name from
   `NAME=IMAGE` (release.yml) or the tag (pre-release.yml); a bare image ID can never match the list.
 - an ignore file that `scripts/ci/image-vuln-gate-checks.py` does not accept (below).
 
@@ -1231,16 +1238,110 @@ The environment cannot steer the scan: the script clears every inherited `TRIVY_
 (`TRIVY_CACHE_DIR` included), names the DB repositories explicitly, and gives Trivy an empty
 config file so a `trivy.yaml` in the working directory is not read. `TRIVY_BIN` (use another trivy
 binary) is for local runs and tests and is refused on GitHub Actions. `YUZU_TRIVYIGNORE` (another
-ignore file) goes through the same parser, and Trivy never reads the named file at all: it reads
+ignore file, which on GitHub Actions may name only the repository's `.trivyignore.yaml`) goes
+through the same parser, and Trivy never reads the named file at all: it reads
 the checker's canonical YAML copy of the entries in force, so a plain-format file or an entry the
 parser did not see cannot reach it. Trivy's temporary files go under the script's own work
 directory.
 
+**The second scanner: grype (WP15).** Trivy does not identify the Erlang/OTP runtime the gateway
+image bundles (its ERTS), so OTP CVEs never reached its report: the gateway shipped OTP 28.5.0.2,
+which grype reports with 1 CRITICAL and 22 HIGH fixed CVEs, through a Trivy-only gate. grype
+matches the runtime from `beam.smp`'s version string, and each scanner has matchers and data the
+other lacks, so the gate runs both and a fixable CRITICAL from EITHER refuses the image. Per image,
+after Trivy:
+
+- grype scans the image in the local daemon only. The gate resolves the reference to its local
+  image ID (`docker image inspect`; a missing image, or an answer that is not an ID, fails),
+  `docker save`s that ID into its work directory and scans the archive (`docker-archive:`). It
+  never uses grype's `docker:` source, which asks the daemon to PULL an image it does not have
+  and would scan, and pass, a same-named image from a registry. Neither `docker image inspect` nor
+  `docker save` pulls.
+- A record scan writes `grype-<image>[.attempt-<N>].json` (every match, every severity, and the
+  accepted ones as `ignoredMatches`) and `.txt` (the table) in one run, plus a CycloneDX list of
+  every component grype catalogued (kept in the work directory, not published); a scan that cannot
+  complete, a report that is not grype's, or an empty table fails the image. The gate scan then
+  runs `--only-fixed --fail-on critical`: exit 0 passes, 2 is a finding, anything else is an
+  error and fails closed. A pass also fails the image when the record of the same archive lists a
+  fixable CRITICAL no acceptance covers (`grype's record and gate scans disagree`), so a pass is
+  never published beside a report that contradicts it. grype's `.gate.txt` records the grype
+  version, the DB (below), the image ID (as the gate resolved it and as grype read it), the distro
+  grype detected, the matches not accepted and the accepted ones (`ignoredMatches`, as the record
+  scan applies the acceptances) with the fixable CRITICALs among each, the required components
+  (below), the provider waivers it used (or `provider waiver: none used`), the acceptance file's
+  hash and what was in force, and the result. The two IDs are recorded, not
+  compared: on a daemon with the containerd image store `docker image inspect` returns the image's
+  manifest or index digest and grype the config digest, so they legitimately differ there (checked
+  on Docker 29.10 with the containerd store: `docker save` of the index digest of a partly pulled
+  multi-platform image succeeds, and grype reads it).
+- **OS cross-check.** When Trivy scanned the image's OS packages (`coverage: covered`), grype must
+  have detected the same OS family; otherwise it matched none of those packages and the image
+  fails (`grype did not detect the OS (<family>)`). An image listed as not covered has no OS
+  packages Trivy could see, so there is nothing to cross-check. This check can only refuse an
+  image; Trivy's report stays the only coverage reader.
+- **Required components.** grype's JSON lists matches only, so a runtime grype did not recognise
+  would read as clean. For `yuzu-gateway` and `yuzu-gateway-chisel`, whose Erlang/OTP runtime is
+  the reason grype runs, the image fails unless grype itself identified `erlang` (purl
+  `pkg:generic/erlang@<version>`, not an OS package of that name) at exactly the OTP version the
+  image's Dockerfile pins (`grype did not catalogue erlang`, or `erlang <version> (expected ...)`
+  for a version grype misread). Both images were checked to show `erlang 28.5.0.8` on 2026-11-20.
+  The table is `GRYPE_REQUIRED_COMPONENTS` in the script; `tests/test_image_vuln_gate.py` fails when
+  its versions differ from the OTP that `Dockerfile.gateway` and `Dockerfile.gateway.chisel` pin, so
+  a builder bump updates the table in the same change (and runs the real gate, "grype" below).
+- **The grype DB** is set up once per run: the gate fetches grype's v6 listing
+  (`https://grype.anchore.io/databases/v6/latest.json`, grype 0.121.3's default, named explicitly),
+  refuses it unless its status is `active`, its schema is v6, its `path` is a bare archive name,
+  its checksum is a sha256, and its `built` time is at most 72 hours old and not more than an hour
+  in the future; downloads the archive it names into its work directory; checks the archive's
+  sha256 against the listing; has grype import it; and then requires `grype db status` to report
+  the DB valid with the listing's build time and schema, and `grype db providers` to list `nvd`
+  captured at most 72 hours ago (the DB's `built` time says when it was assembled, not how fresh each
+  source in it is; NVD supplies the OTP runtime's matches). Each image whose OS packages Trivy scanned
+  also needs that OS family's provider (`alpine`, `debian` or `ubuntu`) captured within 72 hours, or
+  that image fails (`grype DB provider <family> is stale`); a lagging provider refuses only the images
+  on its OS. A missing provider, or a capture time that is unreadable or more than an hour in the
+  future, always fails; a capture that is only older than 72 hours fails unless a reviewed provider
+  waiver for that provider is in force ("Provider waivers" below), and then the image passes
+  DEGRADED.
+  Every scan runs with DB updates and the
+  update check off and grype's own 72-hour age check on, so grype never fetches a DB of its own.
+  **The listing is not signed upstream:** TLS to its host and the recorded URL and checksum are
+  the only evidence of which DB was used, exactly as for Trivy's DB.
+- grype reads only a config the checker generates from `.grypeignore.yaml` (`-c`, holding nothing
+  but the `ignore:` rules in force), from a working directory and `HOME` of the run, so a
+  `.grype.yaml` in the repository, the working directory or a user's home is never read; every
+  inherited `GRYPE_*` variable is cleared (grype reads its whole config from the environment too:
+  `GRYPE_EXCLUDE`, `GRYPE_ONLY_FIXED`, `GRYPE_DB_*`, ...). `GRYPE_BIN` is for local runs and tests
+  and is refused on GitHub Actions, like `TRIVY_BIN`; `YUZU_GRYPEIGNORE` names another acceptance
+  file, which goes through the same parser, and on GitHub Actions it may name only the repository's
+  `.grypeignore.yaml` (so no workflow variable can supply a provider waiver or an acceptance).
+
+Disk: the imported grype DB takes about 3.3 GB and each image's `docker save` archive the image's
+size, both under the run's work directory (removed on exit; the archive after each image), on top
+of Trivy's DB.
+
+`tests/test_image_vuln_gate.py` runs the gate against a stub grype and a stub docker for each of
+these rules, and requires each rule's mutant (grype's exit 2 read as a pass, grype not run, the
+archive checksum or the imported DB's status not checked, the DB age not checked, the OS
+cross-check dropped, a pending acceptance honoured in a release) to give the wrong answer on its
+scenario. The provider waivers have their own mutants (a waiver admitting a missing provider, an
+unreadable or future capture time, or another provider than the one it names; an expired, a
+more-than-14-day or a pending waiver honoured in a release; an unknown or duplicate provider, or a
+waiver with no statement or approval, accepted; the waiver lines dropped from the report or the
+summary; another acceptance file honoured on GitHub Actions), and the tests check that a waiver
+changes no other verdict: a finding from either scanner, the DB's age, checksum, status or schema,
+Trivy's DB download, the OS cross-check, coverage and the gateway's `erlang` all still refuse. The tests use stubs; the real scanners run only in `release.yml` and in the pre-release
+QA scan.
+
 **Time budget.** Every long call runs under `timeout`, bounded by its own deadline and by what is
 left of the gate's overall budget: the DB digest lookup 60 s per source, the whole Trivy download
 (all of curl's retries) 180 s, each DB download 420 s per source, each scan 600 s (with Trivy's own
-`--timeout` 10 s inside it; Trivy's default is 5 minutes). The network calls alone are at most
-2 x 60 + 180 + 2 x 420 = 1140 s (19 minutes) with both DB sources failing slowly. The budget is 1500 s
+`--timeout` 10 s inside it; Trivy's default is 5 minutes); for grype, its download 180 s, its DB
+listing 60 s, its DB archive 420 s, the import 300 s, each `docker image inspect` 60 s, each
+`docker save` 600 s and each scan 600 s. Trivy's network calls alone are at most
+2 x 60 + 180 + 2 x 420 = 1140 s (19 minutes) with both DB sources failing slowly; with grype's
+download, listing, archive and import (960 s more) the worst case exceeds the budget, which then
+stops the gate. The budget is 1500 s
 (25 minutes) by default (`GATE_BUDGET`; `--budget SECONDS` overrides it, 1 to 3600): when it runs
 out the gate stops, writes `gate: FAIL: gate stopped before this image was judged: the gate ran out
 of its <N>s budget` for every image not yet judged, and exits 1. So the gate ends by itself, with its
@@ -1267,8 +1368,9 @@ diff IDs, OS, every package, the HIGH/CRITICAL findings and the accepted ones),
 `trivy-<image>.attempt-<N>.txt` (the table) and `trivy-<image>.attempt-<N>.gate.txt` (mode, run
 attempt, Trivy version, the DB's `repository@digest`, `UpdatedAt` and `DownloadedAt`, image ID, OS,
 OS package count, coverage, the advisory canary's result, the ignore-file hash with how many entries
-were in force and pending, and the result). A `.gate.txt` is written for every image on every exit
-the script reaches after reading its arguments: a refused image's says `gate: FAIL: <reason>`, when
+were in force and pending, and the result), and grype's three, `grype-<image>.attempt-<N>.json`,
+`.txt` and `.gate.txt` ("The second scanner" above). A `.gate.txt` of each scanner is written for
+every image on every exit the script reaches after reading its arguments: a refused image's says `gate: FAIL: <reason>`, when
 the gate stops before judging an image (a refused ignore file, a stale DB) each image's says why, and
 a SIGINT or SIGTERM (a cancelled run or a job timeout) writes `gate: FAIL: cancelled (SIGINT) before
 this image was judged` (or `(SIGTERM)`). The step `exec`s the script so the runner's signal reaches
@@ -1294,12 +1396,13 @@ image SBOMs. `scripts/check-release-artifacts.sh` refuses a release in which a g
 journal is not named per attempt, any journal is not a legal prefix (below) or sits beside a gate
 report that does not record exactly `gate: pass`, or, for one of the six images, no attempt's journal
 ends `tagged`, an attempt above the published one ends `tagging`, or the published attempt lacks
-Trivy's three non-empty reports. Earlier and later attempts' reports may record a failure; they are
+Trivy's or grype's three non-empty reports. Earlier and later attempts' reports may record a failure; they are
 kept as the evidence. The agent bundle's job runs after the release exists, so its reports cannot be
 inside `SHA256SUMS`; `attach-bundle-gate-report` attaches them to the GitHub Release afterwards. It
 runs whenever the bundle job ran at all (`needs.docker-publish-agent-bundle.result != 'skipped'`),
-downloads every attempt's bundle gate artifact the same way, fails when there is none, and attaches,
-per attempt, its reports, its journal and a checksum list
+downloads every attempt's bundle gate artifact the same way, fails when there is none, refuses an
+attempt with no Trivy `.gate.txt`, or one with a publish journal but no grype `.gate.txt`, and
+attaches, per attempt, its reports, its journal and a checksum list
 `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` signed keyless by the same
 `release.yml` identity and verified in-job. Each run of it converges: after the last one, every
 attempt's files are on the release.
@@ -1315,7 +1418,7 @@ digest was announced at `push-started`, and no tag names it yet.) The contract:
   its LAST line is the state. The only legal contents are a prefix of exactly this sequence, with
   one digest throughout:
   1. `publish: none`, written when the gate passed (the script refuses unless every
-     `<scanner>-<image>.attempt-<N>.gate.txt`, Trivy's and any future scanner's, records exactly
+     `<scanner>-<image>.attempt-<N>.gate.txt`, Trivy's and grype's (both must exist), records exactly
      `gate: pass`);
   2. `publish: push-started <candidate>`, appended BEFORE the push (`<candidate>` is the
      repository for a push by digest, or `<repository>:candidate-<run id>-<N>` for the agent
@@ -1571,7 +1674,8 @@ Do not attach the report by hand: a hand upload has no signed checksum list. If 
 uploaded a report there is nothing to attach; its job log is the record. The report globs
 in the release job, `SHA256SUMS`, the release upload, the pre-release upload and the bundle
 attachment take every scanner's files (`trivy-*` and `grype-*`), while the coverage check reads
-Trivy's JSON report only (it refuses any other). The script also writes a step summary table,
+Trivy's JSON report only (it refuses any other); grype's report feeds only grype's own verdict and
+the OS cross-check, which can only refuse an image. The script also writes a step summary table,
 including the rows of a run that stopped early.
 
 **Scanning the right image.** Four Big Tam runners share one Docker daemon, so a tag is not a
@@ -1621,6 +1725,18 @@ pinned; re-verify on a bump). It installs into `RUNNER_TEMP` and keeps its DB th
 `$HOME`: the four Big Tam runners share one OS identity (#1871). No marketplace action is used.
 Trivy (Apache-2.0) is a CI-time tool only; it ships in no image.
 
+**grype.** The script downloads grype `0.121.3` (the newest release at least seven days old when
+pinned, the Dependabot cooldown) and checks the tarball against a sha256 pinned in the script,
+taken from the release's checksums file, whose signature was verified with `cosign verify-blob`
+(identity `anchore/grype` `release.yaml@refs/heads/main`) when pinned; re-verify on a bump. It
+installs into the same per-run directory and keeps its DB and the image archive there. grype
+(Apache-2.0) is a CI-time tool only; it ships in no image. A bump also runs the real gate once by
+hand on a locally built image and on one with a known fixable CRITICAL, because the CI tests use a
+stub grype; the pin was checked that way on 2026-11-20 (the rebuilt gateway passed; the OTP
+28.5.0.2 builder base failed on CVE-2026-89422; a generated `ignore:` rule for that CVE, package
+`erlang` `28.5.0.2` `binary`, moved exactly that match to `ignoredMatches`, and the same rule with
+another version suppressed nothing).
+
 **Accepting a finding.** Add an entry to `.trivyignore.yaml` with a scope, a `statement` (why it
 does not apply, with the evidence), an unquoted `expired_at` at most 92 days out, `approved_by`
 (the GitHub login of the person who accepted it), and `approval_ref` (the pull request in which
@@ -1641,9 +1757,97 @@ decoy line cannot satisfy it), the gate refuses a file that breaks any rule, and
 the checker's canonical copy of the entries in force. It warns 21 days before an entry expires. An
 expired entry is not in force, so the next release fails on that finding again. Today there is one
 entry: the Go standard library CVE-2025-68121 in the upstream postgres image's `gosu` (gosu does not
-link `crypto/tls`), with `approval_ref: pending`, as are the four not-covered listings: until an
-approval is recorded in them, a release fails at the postgres and chisel legs. The entry is a
-commit, so it is in the tag a release builds: it can only help a release cut after it.
+link `crypto/tls`); it and the four not-covered listings record their approval as `"#8315"`. An
+entry is a commit, so it is in the tag a release builds: it can only help a release cut after it.
+
+A grype finding is accepted in `.grypeignore.yaml`, which the same checker parses with the same
+shape, statement, expiry and approval rules; only the scope differs, because grype matches a
+package rather than a path or a purl: `package_name` and `package_version` are both required
+(exactly as grype reports them, the NAME and INSTALLED columns of its table), `package_type` is
+optional, and none may hold whitespace or a glob character, so an entry never hides a
+vulnerability in every package or in every version of one. grype reads the package NAME as an
+anchored regular expression (checked with grype 0.121.3: `er+lang`, `erl[a]ng` and `erlang|zzz`
+each suppressed package `erlang`), so a name may also hold no regular-expression character: no
+`+`, brackets, `|`, `\`, `^`, `$`, `*`, `?`, parentheses or braces (`.` is read literally). A
+package whose name needs one, such as `libstdc++`, cannot be accepted: its finding fails the gate
+until it is fixed. The file is not a grype config and is
+not named `.grype.yaml`, so a grype run in the repository does not pick it up; grype reads only the
+generated `ignore:` rules of the entries in force. A finding both scanners report needs an entry in
+each file. Today `.grypeignore.yaml` has no entry.
+
+**Provider waivers (a degraded pass).** grype's DB is rebuilt daily, but each provider in it is
+captured from its upstream source, and one can stall upstream (an NVD API outage, an OS feed that
+stops publishing) while the DB around it stays fresh. The gate then refuses every image that needs
+that provider, and re-running does not help until upstream recovers. For a release that cannot
+wait, `.grypeignore.yaml` may hold a `provider_waivers:` section beside `vulnerabilities:`, parsed by
+the same parser under the same shape rules:
+
+```yaml
+provider_waivers:
+  - provider: nvd
+    statement: >-
+      Why the release cannot wait, and the evidence that the upstream source is stalled.
+    expired_at: 2026-12-01
+    approved_by: some-login
+    approved_on: 2026-11-21
+    approval_ref: "#1234"
+```
+
+- `provider` is one of `nvd`, `alpine`, `debian`, `ubuntu` (the providers the gate requires), at
+  most one waiver each; `statement` is required; `expired_at` is an unquoted date at most **14**
+  days out; the approval fields follow the same rules as an acceptance, and `approval_ref: pending`
+  is not honoured by a release (`--release`).
+- A waiver admits exactly one thing: that provider's capture when it reads as a time and is older
+  than 72 hours. It does not admit a missing provider, a capture time that is unreadable or in the
+  future, a DB whose own build time is stale or that does not match its listing's checksum or
+  grype's status, a retired DB schema, a Trivy DB that is stale or not this run's download, a
+  finding from either scanner, the gateway's `erlang` not catalogued, grype not detecting the OS,
+  or an image whose OS packages were not scanned. A waiver for one provider admits no other.
+- An expired waiver, one more than 14 days out, an unknown or duplicate provider, or a waiver
+  missing a field refuses the whole file, like any malformed entry: the gate stops before any scan
+  (an expired acceptance is only not in force, but an expired waiver must be removed).
+- Nothing else enables one: no workflow input, environment variable or option of the gate does
+  (`YUZU_GRYPEIGNORE` is limited to the repository's file on GitHub Actions, above). A waiver is a
+  commit, so it is in the tag a release builds.
+- An image judged with a waiver passes DEGRADED, and says so: its grype `.gate.txt` keeps
+  `gate: pass` (so the publish journal opens) and adds `provider waiver: provider <name> captured
+  <time>, <N> hours old (over the 72-hour limit), admitted by the provider waiver at
+  .grypeignore.yaml:<line>: expires ..., approved_by ..., approval_ref ..., approved_on ...` and
+  `DEGRADED: provider waiver in force (<name>)`; the step summary opens with **DEGRADED: provider
+  waiver in force** (an `nvd` waiver, which every image judged while it is in force uses) and marks
+  each degraded row; the log
+  prints a `::warning::` per waiver used. A report that used none says `provider waiver: none used`.
+  A waiver in force for a provider that is current is not used and changes nothing.
+- **Decision record (2026-11-21).** The project owner decided that a release must be able to
+  ship through a stalled upstream grype provider, under the bounds above (one named provider, at
+  most 14 days, the committed file only, every use reported DEGRADED), and fixed that design for
+  this change; the routed-concern row states the bound. Revisit it if a waiver is ever needed for
+  more than one release in a row, or if grype adds per-provider freshness of its own.
+- The waiver bounds how long it is in force, not how old the capture it admits may be: a
+  capture of any age is admitted while it is in force, and its age is printed on the
+  `provider waiver:` line. Its approval fields are, as for an acceptance, a recorded reference
+  checked for format only ("What the approval fields are" below).
+- Nothing warns about a waiver between releases (the same tracked gap as for acceptances): the
+  pre-tag `pending` check refuses one expiring within two days, and an expired one refuses the
+  whole file wherever it is read, the repository's own tests of that file included, so remove a
+  waiver before it expires. The pre-tag check's 21-day warning fires for every waiver (none is
+  ever more than 14 days out), so it gives no early notice.
+- What a degraded pass means: grype matched that provider's packages (for `nvd`, the gateway's
+  Erlang/OTP runtime and other binaries grype identifies by version) against advisories as old as
+  the capture, so a fixable CRITICAL published upstream since then can be missed. Remove the waiver
+  as soon as the provider is current again. The post-release scan (`pre-release.yml`) reads the
+  `.grypeignore.yaml` of the commit it checks out, which is the default branch's tip on its
+  automatic run (the dispatched ref on a manual one), not the release tag: a waiver there degrades
+  that scan the same way, and a release scanned with a waiver that is no longer on that branch
+  turns that scan red while the provider is still stale.
+- A run that starts on an `nvd` waiver re-checks it for each image, before the image's own
+  provider check, so an image judged after the waiver lapsed (a run crossing UTC midnight on its
+  expiry day) fails (`provider waiver lapsed during the run`; its report names only the lapsed
+  waiver as lapsed and says nothing DEGRADED), and a waivers file that cannot be read again fails
+  it as `provider waivers unreadable`. An image the gate never judged (a stop or a cancel) records
+  `provider waiver: in force for this run (...), but the image was not judged` (or `lapsed during
+  this run (...), and the image was not judged`) instead of DEGRADED, and the `ignore file:` line
+  counts the waivers in force and those pending approval (and how many of them were not honoured).
 
 **What the approval fields are, and what the control is.** `approved_by`, `approved_on` and
 `approval_ref` are a RECORDED REFERENCE: the gate checks that they are present and well formed (a
@@ -1651,7 +1855,7 @@ GitHub login, a past date, `#N` or a pull-request URL) and nothing else. It does
 whether that pull request exists, was merged, or was approved by `approved_by`, so a typed `"#9999"`
 with a date passes it exactly like a real approval. They are not a verified approval and no
 document may present them as one. The control is human review of every change to
-`.trivyignore.yaml`, `scripts/ci/image-vuln-gate-not-covered.txt`, the gate scripts
+`.trivyignore.yaml`, `.grypeignore.yaml`, `scripts/ci/image-vuln-gate-not-covered.txt`, the gate scripts
 (`scripts/ci/image-vuln-gate.sh`, `scripts/ci/image-vuln-gate-checks.py`,
 `scripts/ci/image-identity.sh`, `scripts/ci/image-publish.sh`, `scripts/check-release-artifacts.sh`) and the workflows that run them
 (`release.yml`, `pre-release.yml`): the approval is the review of the pull request that adds or
@@ -1671,7 +1875,7 @@ recorded in `approved_by` may be the change's own author. By practice, when one 
 writes an entry, the other approves it; a reviewer of these paths checks that the named approver
 actually approved.
 
-**Recording an approval.** For an acceptance or a not-covered listing:
+**Recording an approval.** For an acceptance, a provider waiver or a not-covered listing:
 
 1. Open a pull request that adds (or changes) the entry with `approved_by: <the approver's login>`
    and `approval_ref: pending` (no `approved_on`; in the not-covered list, `approved_on=-
@@ -1684,9 +1888,9 @@ actually approved.
    `approved_on=<YYYY-MM-DD> approval_ref=#N`). A push after an approval may dismiss it under the
    branch rules; then the approver re-approves the final diff, and `approved_on` is that date.
 4. Merge. Before tagging, the release skills run `python3 -I scripts/ci/image-vuln-gate-checks.py
-   pending .trivyignore.yaml scripts/ci/image-vuln-gate-not-covered.txt`, which fails while any
-   entry in force is still pending, and while any entry or listing has expired or expires today or
-   tomorrow (each publish leg re-reads the date, so one that lapses during the release fails the legs
+   pending .trivyignore.yaml scripts/ci/image-vuln-gate-not-covered.txt .grypeignore.yaml`, which fails while any
+   entry or provider waiver in force is still pending, and while any entry, waiver or listing has
+   expired or expires today or tomorrow (each publish leg re-reads the date, so one that lapses during the release fails the legs
    that run after it); it warns for one expiring within 21 days.
 
 Steps 1 and 3 are alternatives for when the reference is filled in: in the same pull request after
@@ -1712,7 +1916,8 @@ except the agent bundle:
   check whether the mirror or Trivy's DB publishing is broken before anything else.
 - **OS packages not scanned** (an image newly showing 0 OS packages): something removed the
   package database from an image that used to have one. Fix the image; listing it in
-  `image-vuln-gate-not-covered.txt` is a reviewed decision that its OS packages ship unscanned.
+  `image-vuln-gate-not-covered.txt` is a reviewed decision that its OS packages ship unscanned by
+  Trivy.
   Either is a commit, so re-tag. On a listed image the log says why the listing is not in force:
   it expired (re-review it), or its `approval_ref` is `pending` (record the approval, above).
 - **An acceptance `NOT IN FORCE`**: its `approval_ref` is `pending`. Record the approval as
@@ -1733,17 +1938,80 @@ except the agent bundle:
 - **A fix that is not in the distro yet, or in a binary the base image ships** (a Go tool, an
   upstream-built binary): refresh the base image digest if upstream has rebuilt it; otherwise
   accept it in `.trivyignore.yaml` with the evidence. Either is a commit, so re-tag.
+- **grype found a fixable CRITICAL** (`grype found a fixable CRITICAL`; Trivy may be clean): the
+  same choices, and an acceptance goes in `.grypeignore.yaml` (by grype's package name and
+  version). For the gateway's Erlang/OTP runtime the fix is a newer OTP in `Dockerfile.gateway`'s
+  pinned `hexpm/erlang` builder. Either is a commit, so re-tag.
+- **A stale or unverifiable grype DB** (`grype DB listing`, `does not match the listing`,
+  `grype db status`): wait and "Re-run failed jobs". When the log says the listing's status is not
+  `active`, the pinned grype's DB schema is retired: re-running will not help; bump grype (a commit,
+  so re-tag). grype's DB has one source (no mirror to fall
+  back to, unlike Trivy's) and the gate has no override for the DB itself (a provider waiver covers
+  one stale provider, never the DB), so while grype's DB publishing is down or stale no release leg
+  passes; check that publishing before anything else.
+- **A scanner could not be installed, fetch or import its DB, or scan** (`could not download`,
+  `could not import`, `could not scan the image`, `Trivy exited`, `grype exited`): a network or
+  runner fault, or a scanner error on that image. "Re-run failed jobs"; if it recurs on the same
+  image, read the scanner's error in the step log (grype's is printed above the gate's line).
+- **The image could not be exported for grype** (`could not export ... for grype`, `not an image in
+  the local Docker daemon`): `docker save` failed, usually a full disk under `RUNNER_TEMP` or a
+  daemon fault. "Re-run failed jobs"; if it recurs, check the runner's free disk.
+- **grype did not detect the OS** (`grype did not detect the OS`): the image's OS release is one
+  the pinned grype does not recognise; a newer grype or a supported OS release is a commit, so re-tag.
+- **grype did not catalogue erlang** (`grype did not catalogue erlang`, or `erlang <version>
+  (expected ...)`): grype no longer recognises the gateway's bundled OTP runtime, or reads another
+  version than the table pins (a grype bump, a builder change that moved or stripped `beam.smp`, or
+  a builder bump without the table). Find which change did it; a fix is a commit, so re-tag. Do not drop the requirement
+  to pass: without it the runtime ships unscanned.
+- **grype's record and gate scans disagree** (`grype's record and gate scans disagree`): the gate
+  scan passed while the record lists a fixable CRITICAL no acceptance covers. Treat it as a
+  finding: read the record (`grype-<image>.attempt-<N>.txt`), and fix or accept it.
+- **A grype DB provider is stale** (`provider ... is not in the DB`, `provider ... built ... hours
+  ago`, `grype DB provider <family> is stale`): the log names the provider and how old its capture
+  is. A missing one (`is not in the DB`): the DB may have renamed it, so re-running will not help;
+  update `GRYPE_REQUIRED_PROVIDERS` or bump grype (a commit, so re-tag); a waiver never admits it.
+  An old one, as for a stale DB: wait and "Re-run failed jobs". When the upstream source itself is
+  stalled and the release cannot wait for it:
+  1. Confirm the stall upstream (the provider's own status, or grype's and vunnel's issue trackers)
+     and that the rest of the DB is current. Reaching the provider check means the DB's own build
+     time already passed its 72-hour check; to see every provider's capture time, run the pinned
+     grype's `grype db providers -o json` against the same DB. A stale DB, or a provider whose
+     capture time is unreadable, is not a stall and no waiver helps.
+  2. Open a pull request adding a provider waiver for exactly that provider to
+     `.grypeignore.yaml` ("Provider waivers" above): the evidence of the stall in `statement`, an
+     `expired_at` as short as the release needs but at least two days past the tag, with headroom
+     for re-runs (at most 14 days; the pre-tag check refuses one expiring today or tomorrow, and
+     a re-run after it expires refuses the whole file), and the approval recorded as
+     "Recording an approval" above describes. A pending waiver is not honoured by the release.
+  3. Merge, run the pre-tag `pending` check, and re-tag (the waiver is a commit). Every image that
+     needed the provider passes DEGRADED; check that each grype `.gate.txt` names the waiver, and
+     say in the release notes that the release was scanned degraded (which provider, its capture
+     age, the waiver's expiry and `approval_ref`), linking
+     `docs/user-manual/release-verification.md` "A degraded pass". After the publish legs,
+     `grep -H '^DEGRADED:' grype-*.attempt-*.gate.txt` over the run's reports shows which images
+     were scanned degraded; nothing enforces the release-notes statement but this procedure.
+  4. Remove the waiver in a follow-up pull request as soon as the provider is current again (on
+     the default branch too, which the post-release scan reads); once it expires the gate refuses
+     the whole file until it is removed. Then dispatch `pre-release.yml` for the degraded release
+     (`gh workflow run pre-release.yml --repo DevNullLtd/Yuzu -f tag=vX.Y.Z`), so its images are
+     scanned again with the
+     provider current: a fixable CRITICAL the stale capture hid surfaces there, and is then handled
+     as a CRITICAL in a published release (a patch release; the security policy's advisory path
+     if it is exploitable).
 
 **When the agent bundle's gate fails, never re-tag.** `docker-publish-agent-bundle` runs after
 the `release` job has published the GitHub Release, so the tag is already a published release:
 re-tagging it is forbidden (#5282), and `release-guard` refuses a fresh run of it. The gate runs
-from the tag's own checkout, so a fix that needs a commit (a new `.trivyignore.yaml` entry, a new
-base digest, a list entry) cannot reach this release's bundle at all. So:
+from the tag's own checkout, so a fix that needs a commit (a new `.trivyignore.yaml` or
+`.grypeignore.yaml` entry, a new base digest, a list entry) cannot reach this release's bundle at
+all. So:
 
 - **A distro package with a fix, a stale DB, the gate's budget running out, or a cancel**: "Re-run
   failed jobs" on that run (the only recovery the release skill allows for this job); the chisel
   cut takes the current archive.
-- **Anything that needs a commit**: this version ships without the agent-bundle image. The
+- **Anything that needs a commit** (including a provider waiver for a stalled grype provider, and
+  a waiver in the tag that has expired since, which refuses the whole file on a re-run): this
+  version ships without the agent-bundle image. The
   release itself is complete and its other images are signed; say so in the release notes or
   announcement, land the fix, and cut the next version (a patch release) to deliver the bundle.
   Publishing a bundle outside `release.yml` bypasses the gate and journal (Release tag policy,
@@ -1756,8 +2024,13 @@ published images (a tracked gap).
 
 **What it does not see.**
 
-- **The chisel images' and the agent bundle's OS packages** (above): listed as not covered, so
-  their CVEs in libc6, libssl3t64, zlib1g and the other slices never reach this gate.
+- **The chisel images' and the agent bundle's OS packages, to Trivy** (above): listed as not
+  covered, so Trivy matches none of their CVEs in libc6, libssl3t64, zlib1g and the other slices.
+  grype does match some of them (on `yuzu-gateway-chisel` it matched Ubuntu 26.04 advisories to
+  `deb` packages such as busybox and openssl, checked 2026-11-20), and a fixable CRITICAL it reports
+  there fails the image like any other; but the gate proves nothing about that coverage for these
+  images (no canary, no OS cross-check, and the `ubuntu` provider's freshness is checked only for
+  images Trivy covers), so treat it as best effort.
 - **PostgreSQL itself.** In `yuzu-postgres` Trivy lists `postgresql-18`, `libpq5` and
   `postgresql-common` as packages but matches no vulnerability to them: they come from the PGDG
   repository, and Trivy's Debian advisories cover Debian's own packages only. And the image holds
@@ -1766,12 +2039,15 @@ published images (a tracked gap).
   held package with a newer version available (`kept back (held PGDG package)`), so a kept-back
   fix is visible in the publish job; reading it, and the PostgreSQL security announcements, is a
   release-time task for the release engineer.
-- **The gateway's Erlang/OTP runtime.** Trivy does not identify the OTP runtime in the gateway's
-  bundled ERTS, so OTP CVEs pass this gate (grype does report them).
+- **The gateway's Erlang/OTP runtime, to Trivy.** Trivy does not identify the OTP runtime in the
+  gateway's bundled ERTS. grype does (from `beam.smp`'s version), so a fixable CRITICAL in it fails
+  the gate through grype; a CVE grype's data does not attribute to that version is seen by neither.
 - **Statically linked code.** Nothing in a statically linked C++ binary (the server and agent) is
   visible to either scanner.
-- **A tampered DB.** The DB is unsigned upstream (above). The canary catches a DB with no
-  advisories for the image's OS release, not one whose individual advisories were edited.
+- **A tampered DB.** Neither DB is signed upstream (above). The canary catches a Trivy DB with no
+  advisories for the image's OS release, not one whose individual advisories were edited; grype's
+  archive is checked against a listing fetched over TLS from the same publisher, which an attacker
+  able to replace the archive there can replace too.
 
 **Routed-concern invariants** (the `.claude/routed-concerns.md` row points here). Every publish
 job gates its pinned image ID with `--release` BEFORE any push, and checks the pushed layers
@@ -1789,10 +2065,23 @@ SIGTERM/SIGINT included, writes a report that the upload keeps, named per run at
 never replaces a refusal's. An acceptance is in force only when its scope is concrete (a path inside
 the image, containing a `/` and naming no Trivy target, or a full purl with its version), it has not
 expired, and, in a release, its approval fields are filled in and well formed (not `pending`); the
-same holds for a not-covered listing. Those fields are a recorded reference, checked for format only;
+same holds for a not-covered listing. A grype provider waiver admits ONE named provider (`nvd`,
+`alpine`, `debian` or `ubuntu`) whose capture is only older than 72 hours, for at most 14 days, on
+GitHub Actions from the committed `.grypeignore.yaml` only, on the same approval terms; it waives no
+finding, no missing provider or unreadable capture time, no DB age, checksum, status or schema check, no coverage or
+component check, and an image judged with one says DEGRADED in its grype `.gate.txt` and the step
+summary. Those fields are a recorded reference, checked for format only;
 the review of the change is the control. Trivy reads only the checker's canonical copy of the ignore
-file, and the DB only from this run's fresh cache, pinned by digest. Widening any of these (a glob
-or one-word scope, a bare id, an honoured pending approval, an inherited cache, a second coverage
+file, and the DB only from this run's fresh cache, pinned by digest. A grype acceptance is in force on
+the same terms with a package name AND version as its scope; grype reads only the generated `ignore:`
+config, the DB only from this run's import of the archive checked against the listing, and the image
+only from a `docker save` of its local ID, and a fixable CRITICAL from either scanner refuses the image;
+grype must catalogue the gateway images' `erlang`, and the published attempt must carry both scanners'
+reports.
+Widening any of these (a glob, one-word or versionless scope, a bare id, an honoured pending approval,
+a provider waiver that admits anything beyond one named stale provider or is enabled on GitHub Actions
+by anything but the committed file,
+an inherited cache, a grype source that can pull, a grype finding that does not refuse, a second coverage
 reader that is not Trivy's report, an overwritten or clobbered report, a push that carries a
 release tag, a second journal writer or reader, a consumer that accepts an illegal sequence, a
 tool or documented procedure that deletes an image or moves a release tag by hand) is a security

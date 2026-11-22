@@ -1163,12 +1163,14 @@ jobs:
 
   # ── Security scanning ───────────────────────────────────────────────
   security-scan:
-    name: "Security scan (Trivy)"
+    name: "Security scan (Trivy + grype)"
     needs: resolve
     runs-on: ubuntu-24.04
-    # Seven images, each pulled and scanned twice (report + gate; the second
-    # scan reuses the first's layer cache) plus one Trivy DB download. About
-    # 3 minutes locally for six images; 30 leaves room for a slow registry.
+    # Seven images, each pulled, scanned twice by Trivy (report + gate; the
+    # second scan reuses the first's layer cache), exported once (`docker
+    # save`) and scanned twice by grype, plus one DB download per scanner.
+    # About 3 minutes locally for six images with Trivy alone; the gate's
+    # --budget below bounds the whole scan inside this timeout.
     timeout-minutes: 30
     env:
       REGISTRY: ${{ needs.resolve.outputs.registry }}
@@ -1188,7 +1190,7 @@ jobs:
           username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      # Scope: Trivy is used here ONLY for vulnerability scanning of
+      # Scope: Trivy and grype are used here ONLY for vulnerability scanning of
       # published container images. SBOM generation is NOT done here —
       # the authoritative SBOMs ship from release.yml via
       # `anchore/sbom-action` (Syft). Two generators would produce two
@@ -1197,10 +1199,11 @@ jobs:
       # Every image release.yml publishes is scanned (WP15/S9): server,
       # gateway, postgres, the three chisel variants and the agent bundle.
       # release.yml already ran the same gate on each image BEFORE pushing it
-      # (scripts/ci/image-vuln-gate.sh); this re-run, with a fresher Trivy DB,
+      # (scripts/ci/image-vuln-gate.sh); this re-run, with fresher DBs,
       # catches a CRITICAL disclosed after the push. Like the rest of this
       # workflow it is detective: a fixable CRITICAL not accepted in
-      # .trivyignore.yaml fails this job, which cannot unpublish anything.
+      # .trivyignore.yaml (Trivy) or .grypeignore.yaml (grype) fails this job,
+      # which cannot unpublish anything.
       - name: Pull images for scanning
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
@@ -1233,8 +1236,8 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-scan
-          # Every scanner's reports (trivy-*, and grype-* once a second scanner
-          # writes them): the JSON, the table and the .gate.txt verdict.
+          # Every scanner's reports (trivy-* and grype-*): the JSON, the table
+          # and the .gate.txt verdict.
           path: |
             trivy-*
             grype-*
@@ -1701,7 +1704,7 @@ jobs:
           | Windows installer (silent) | $(cell "$R_WINDOWS") |
           | macOS .pkg install | $(cell "$R_MACOS") |
           | Artifact verification | $(cell "$R_ARTIFACT") |
-          | Security scan (Trivy) | $(cell "$R_SECURITY") |
+          | Security scan (Trivy + grype) | $(cell "$R_SECURITY") |
           | Soak test (10 min) | $(cell "$R_SOAK") |
           | Upgrade test | ${UPGRADE_CELL} |
 
