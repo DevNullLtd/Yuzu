@@ -1254,9 +1254,29 @@ TEST_CASE("ResultSetStore: inventory parent intersection spans keyset pages",
     }
     auto parent = store.create_materialized(req("alice"), parent_ids);
     REQUIRE(parent.has_value());
-    auto intersection = store.matching_parent_members(parent->id, std::move(candidates));
-    REQUIRE(intersection.has_value());
-    CHECK(*intersection == expected);
+    // Each section uses its disposable database. The view observes the actual production
+    // connection, without sleeps, thread scheduling or a test hook in the paging loop.
+    exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_set_members RENAME TO source_members");
+    SECTION("read every page using repeatable read") {
+        exec_sql(db.dsn(), "CREATE VIEW result_set_store.result_set_members AS "
+                           "SELECT * FROM result_set_store.source_members "
+                           "WHERE current_setting('transaction_isolation') = 'repeatable read'");
+        auto intersection = store.matching_parent_members(parent->id, std::move(candidates));
+        REQUIRE(intersection.has_value());
+        CHECK(*intersection == expected);
+    }
+    SECTION("a database fault after the first page discards the accumulated matches") {
+        // The uncorrelated scalar subquery requests one sequence value per SELECT. Only the
+        // first page can obtain one; the next statement hits MAXVALUE and fails in PostgreSQL.
+        exec_sql(db.dsn(), "CREATE SEQUENCE result_set_store.page_attempt MINVALUE 1 MAXVALUE 2 "
+                           "START WITH 2 NO CYCLE");
+        exec_sql(db.dsn(), "CREATE VIEW result_set_store.result_set_members AS "
+                           "SELECT * FROM result_set_store.source_members "
+                           "WHERE (SELECT nextval('result_set_store.page_attempt')) > 0");
+        auto intersection = store.matching_parent_members(parent->id, std::move(candidates));
+        REQUIRE_FALSE(intersection.has_value());
+        CHECK(intersection.error() == ResultSetError::DbError);
+    }
 }
 
 TEST_CASE("ResultSetStore: members paginate past the page size", "[pg][result_set][pagination]") {

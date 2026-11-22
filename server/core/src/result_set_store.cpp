@@ -587,10 +587,17 @@ ResultSetStore::matching_parent_members(const std::string& id,
         return std::unexpected(ResultSetError::DbError);
     const authz::VisibleSet filter{std::move(candidates)};
     std::vector<std::string> matches;
-    const bool ok = pool_.with_txn_for(kReadTimeout, [&](PGconn* conn) {
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::matching_parent_members: no connection");
+        return std::unexpected(ResultSetError::DbError);
+    }
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* conn) {
         pg::PgResult iso{PQexec(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")};
-        if (iso.status() != PGRES_COMMAND_OK)
+        if (iso.status() != PGRES_COMMAND_OK) {
+            spdlog::error("ResultSetStore::matching_parent_members: could not establish read snapshot");
             return false;
+        }
         std::string cursor;
         do {
             // Even with zero matches, verify the membership table is readable (#4306).
