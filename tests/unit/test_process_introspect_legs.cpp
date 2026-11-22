@@ -26,8 +26,8 @@
 #include <regex>
 #include <set>
 #include <stdexcept>
-#include <type_traits>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 

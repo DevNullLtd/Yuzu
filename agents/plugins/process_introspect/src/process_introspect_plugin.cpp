@@ -41,11 +41,12 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "constrained: of the six facets only sched is read, and of it only the nice value "
          "(policy, realtime priority and CPU list read as a dash); resource_limits, sigmasks and "
          "oom are not exposed by libproc and caps and seccomp have no macOS equivalent, so each "
-         "answers one unsupported status row and reads nothing; these answers are permanent, not "
-         "a degraded read; a process of another account answers permission_denied unless the "
-         "agent runs as root; a supplied start_time that no longer matches is refused as "
-         "pid_reused; the start time survives an exec, so the token does not tell a program from "
-         "the one it exec'd into"},
+         "answers one unsupported status row and reads nothing; these answers and the constrained "
+         "sched status are permanent, not a degraded read: do not retry them; a process of "
+         "another account answers permission_denied unless the agent runs as root (root not "
+         "measured); a supplied start_time that no longer matches is refused as pid_reused; the "
+         "start time survives an exec, so the token does not tell a program from the one it "
+         "exec'd into"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1, "NtQueryInformationProcess and toolhelp snapshots",
          "not read yet: one unsupported status row, windows:planned"},
