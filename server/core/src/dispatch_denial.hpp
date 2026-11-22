@@ -8,6 +8,8 @@
 // without including the registry. agent_registry.hpp includes this header, so
 // every existing consumer of the names below compiles unchanged.
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -95,5 +97,27 @@ struct DispatchDenial {
     }
     return "";
 }
+
+/// Every `DispatchDenialReason`, in declaration order, so a caller that pre-seeds one metric series
+/// per reason cannot miss a reason added later. The two assertions below fail the build when an
+/// enumerator is added without a row here (its `to_string` is then not empty past the list), or when
+/// the list is reordered or holds a duplicate.
+inline constexpr std::array<DispatchDenialReason, 6> kAllDispatchDenialReasons{
+    DispatchDenialReason::Unclassified,       DispatchDenialReason::Ambiguous,
+    DispatchDenialReason::AnonymousOperator,  DispatchDenialReason::Forbidden,
+    DispatchDenialReason::ApprovalRequired,   DispatchDenialReason::KillSwitched,
+};
+static_assert(
+    [] {
+        for (std::size_t i = 0; i < kAllDispatchDenialReasons.size(); ++i) {
+            if (static_cast<std::size_t>(kAllDispatchDenialReasons[i]) != i)
+                return false;
+        }
+        return true;
+    }(),
+    "kAllDispatchDenialReasons must list the DispatchDenialReason enumerators in declaration order");
+static_assert(
+    to_string(static_cast<DispatchDenialReason>(kAllDispatchDenialReasons.size())).empty(),
+    "kAllDispatchDenialReasons is missing a DispatchDenialReason enumerator");
 
 } // namespace yuzu::server::detail

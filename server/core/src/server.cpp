@@ -18073,6 +18073,17 @@ private:
                                      const std::string& agent_id) -> bool {
             return require_scoped_permission(req, res, type, op, agent_id);
         };
+        // The SAME per-device scoped gate, returning its refusal class (admit, deny, "could not
+        // evaluate", or a degraded authorization read) instead of a bool. It is the one body the
+        // Boolean gate above compares with Admitted, so the response, audit row and metric are the
+        // gate's own either way. Wired into the two Echo purge surfaces that must tell a denial
+        // from an outage (the dashboard fragments and the REST purge); every other consumer keeps
+        // scoped_perm_fn.
+        auto scoped_gate_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& type, const std::string& op,
+                                     const std::string& agent_id) -> yuzu::server::ScopedGateOutcome {
+            return auth_routes_->require_scoped_permission_outcome(req, res, type, op, agent_id);
+        };
         // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
         // The fleet guaranteed-state status route's SOLE authorization gate, and the MCP
         // get_guardian_status / list_plugin_config tools' — never stacked with perm_fn (see
@@ -22774,7 +22785,8 @@ private:
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
         // #2540: the Echo purge/re-enable POSTs authorize through the SAME per-device scoped
         // gate as the REST purge twin (set before register_routes, per the ordering note above).
-        dashboard_routes_->set_scoped_perm_fn(scoped_perm_fn);
+        // The typed lambda: a degraded authorization read is answered 503, not collapsed into the 404.
+        dashboard_routes_->set_scoped_perm_fn(scoped_gate_fn);
         dashboard_routes_->set_forensics_plugin_set(forensics_plugins()); // #4990
         dashboard_routes_->set_forensics_visibility_fn(forensics_visibility_fn);
         // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
@@ -24030,6 +24042,11 @@ private:
         // register_routes() (captured by value at registration), same timing as the setters above.
         rest_api_v1_->set_forensics_plugin_set(forensics_plugins());
         rest_api_v1_->set_forensics_visibility_fn(forensics_visibility_fn);
+        // The Echo retention-paused purge route's typed scoped gate. The route copies the function
+        // by value when routes register, so this MUST stay above register_routes() (a call after
+        // it leaves the purge on its fail-closed 500 for good); tests/test_echo_security_wiring_lexical.py
+        // pins the order.
+        rest_api_v1_->set_scoped_gate_fn(scoped_gate_fn);
         // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
         // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
         // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT

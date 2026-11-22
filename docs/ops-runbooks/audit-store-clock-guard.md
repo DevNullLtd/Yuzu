@@ -136,6 +136,28 @@ A returned ticket is suspect, not proven: an outcome row was lost, or the server
 the ticket's real status. See [Audit Log](../user-manual/audit-log.md) (`approval.approve` /
 `approval.reject`).
 
+### Pairing a dashboard `attempted` row with its outcome (correlation id)
+
+The dashboard writes that are audit-first (the console send `command.dispatch`, `group.create_from_results`, and the Echo `echo.source.reenable` and `echo.source.purge` fragments) store an `attempted` row before they act and an outcome row after. They have no id of their own to pair the two by (the `attempted` row has an empty `target_id`, since the command or group does not exist yet), so every `detail` from the `attempted` row on ends in the SAME correlation id, as the last token: ` cid=<id>` on the group and Echo rows, ` correlation_id=<id>` on the console's `command.dispatch`. Rows written before the `attempted` row (a refused request) carry none. To find the attempts that never got an outcome, group by that token instead of matching on principal and time:
+
+```sql
+SELECT a.action, a.principal, a.timestamp, a.detail
+FROM audit_store.audit_events a
+WHERE a.result = 'attempted'
+  AND a.action IN ('echo.source.purge', 'echo.source.reenable', 'group.create_from_results')
+  AND a.timestamp >= extract(epoch from now() - interval '24 hours')::bigint
+  AND a.timestamp <  extract(epoch from now() - interval '1 minute')::bigint
+  AND NOT EXISTS (
+        SELECT 1 FROM audit_store.audit_events o
+        WHERE o.action = a.action AND o.result <> 'attempted'
+          AND substring(o.detail from '[^ ]+$') = substring(a.detail from '[^ ]+$'))
+ORDER BY a.timestamp;
+```
+
+For an Echo purge the outcome row is the dispatch result of the SERVER (`success`, or a `failure` with the reason); what the device then did (rows deleted, `source_not_paused`) is in the command's response record, so confirm a purge on the device itself, not from these rows.
+
+An `attempted` row with no outcome row can mean the outcome row was lost, **or that the mutation itself failed**. They are not independent: the audit store and the management-group store share one connection pool, so pool exhaustion that fails `create_group` is likely to lose its `create_failed` row as well. Check the group (or the device) before concluding either way. An `attempted` row alone is evidence that the action was reached, never that it ran.
+
 **If behavioural-data routes are returning 503 but this counter is FLAT**, look
 for a `bad_alloc`-class throw in the audit pipeline instead. That path fails
 closed the same way but is only warn-logged, never counted, so the counter
