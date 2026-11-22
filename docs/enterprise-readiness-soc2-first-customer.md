@@ -846,6 +846,14 @@ that ended `error`; the row definitions are in
 | Fleet visualization cache | `FleetTopologyStore` (in-memory) | Aggregated `echo.fleet_snapshot` topology — per-machine process records (pid, ppid, process name, OS user, category) and connection edges | **60 s TTL, LRU-of-2 cache slots** (one per `include_vuln` value) | Time-based eviction in-process; never persisted to disk | `--viz-disable` to disable entirely; `echo.configure process_enabled=false` per-agent to suppress process collection upstream |
 
 
+**Planned protected ClickHouse records (design approved 2026-11-21/22).** Packet 1.13
+will store finalized per-device verdicts as working data for 90 days. The separate bulk
+response cutover must define its payload retention and scope and Forensics-tier gates.
+The [ADR-0006 amendment](adr/0006-server-postgresql-substrate.md#amendment-2026-11-21--retention-bound-cold-records)
+requires core-only access, a denied dashboard query, and a tested restore that respects
+expiry. Each implementation must update this inventory with its deployed retention,
+disposal verification and audit controls. The counts-only run summary follows audit retention.
+
 **Audit capacity ceiling (Workstream D + G).** The audit trail's paced drain (see the PostgreSQL-stores table below) is now single-sweeper fleet-wide (advisory lease), so the cap is one drain rate, never `N replicas × 25,000`. It paces at TWO cadences, not one — do not quote only the first figure to a prospect, it understates real capacity by roughly three orders of magnitude: a quiet-operation threshold of **~6.9 audit events/second** (25,000 rows/hourly pass, ~600,000 rows/day, `yuzu_server_audit_retention_cap_reached_total` stays at 0 below this), and a backlog-recovery ceiling of **up to ~5,000 audit events/second** once that counter starts moving (the guard re-arms every 5 seconds instead of hourly while a backlog persists, still capped at 25,000 rows/pass). The audit store only grows WITHOUT BOUND above the second, much higher figure — a rising `cap_reached_total` alone means the guard is draining faster, not falling behind; sustained capping with `rows_deleted_total` not keeping pace is the actual signal. At the 365-day default the QUIET threshold alone is also a **storage** commitment on the order of 219M rows / ~44 GB. Both cadences are engineering constants, not configuration, so a prospect whose SUSTAINED audit rate exceeds the backlog-recovery ceiling needs a scoping conversation; one that merely exceeds the quiet threshold does not. The storage figure is an ESTIMATE built on an assumed ~200 bytes/row and varies with principal, action and detail length -- quote rates as limits, the size as an order of magnitude. Derivation, both cadences' full reasoning, and the caveats on every figure here: `docs/user-manual/audit-log.md` ("Capacity") — this paragraph is a summary, that section is the one home.
 
 ### Data Inventory — server-side PostgreSQL stores (ADR-0006/0008)

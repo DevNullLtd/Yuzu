@@ -68,11 +68,14 @@ this — *"If the server outgrows SQLite, the storage layer can be swapped to Po
   store outgrows SQLite.
 - **Per-store engine choice / polyglot persistence.** Rejected — one server substrate. A
   single HA story, a single backup story, and a single migration mechanism beat
-  best-fit-per-store.
+  best-fit-per-store. The [November amendment](#amendment-2026-11-21--retention-bound-cold-records)
+  assigns the separate recovery contract for retention-bound data.
 - **A columnar engine (ClickHouse / Timescale) as the *server* substrate.** Rejected by
   ADR-0003 — the high-cardinality flow firehose stays at the agent edge, so the server
   holds only small, derived, joinable state that plain Postgres serves. (ClickHouse remains
-  the *analytics* sink, fed separately; it is not the OLTP substrate.)
+  the *analytics* sink, fed separately; it is not the OLTP substrate.) The
+  [November amendment](#amendment-2026-11-21--retention-bound-cold-records) adds two
+  bounded exceptions and assigns their recovery and access-control obligations.
 
 ## Consequences
 
@@ -131,24 +134,67 @@ persistent authentication store" and `.claude/agents/authdb.md`; ladder entry:
 
 ## Amendment (2026-11-21) — retention-bound cold records
 
-**Design approved by the platform owner on 2026-11-21.** This amendment permits ClickHouse to serve as the cold store of
-record for append-only, retention-bound records. A feature using the exception must specify
-the record, retention period, authorized reads, export acknowledgement and safe reap rule.
-The first proposed use is finalized criteria-run verdicts (ADR-0075 R11). Migrating command
-responses requires its own response-store decision.
+Nathan Dornbrook approved the criteria-run retention design on 2026-11-21 and the bulk
+response destination on 2026-11-22. This narrows the rejection of a columnar server store
+above. Each feature must specify its records, authorized reads, retention, durable
+acknowledgement, recovery, and safe deletion. [ADR-0075 R11 and R13](0075-criteria-runs.md)
+define the criteria-run requirements. The [response-store ADR](0039-response-store-postgres-migration.md)
+describes the PostgreSQL implementation and the design required before its cutover.
 
 | Responsibility | Storage and access |
 |---|---|
-| Transactional state, authorization, pending work and export progress | PostgreSQL. Core owns the transaction that marks an export complete. |
-| Finalized records within a feature's cold retention period | ClickHouse. Core owns the credentials for these tables and mediates every read, including counts and aggregates, under the feature's existing authorization rules. Grafana receives no datasource for these tables. |
-| Bulk live command responses after the response-store cutover | ClickHouse, written directly by authenticated core ingest in both ordinary and incident dispatch. |
-| Analytics and dashboards | Existing analytics feeds retain their own access and retention policies. |
+| Run admission, ownership, authorization, pending work and export progress | PostgreSQL. Core owns the transaction that records a complete export. |
+| Finalized per-device verdicts within cold retention | ClickHouse after packet 1.13. Core mediates every detail, count and aggregate under the same rules as warm reads. |
+| Bulk live instruction response payloads | PostgreSQL until the response-store cutover. Ordinary and incident dispatch will then write directly to ClickHouse through authenticated core ingest. |
+| Analytics and dashboards | The separate analytics feeds retain their existing access and retention policies. |
 
-For criteria runs, a creator with the required read grant can retrieve retained evidence
-through core after the warm copy expires. A caller denied on the warm read receives the
-same denial on the cold read. Failed or partially acknowledged exports leave the warm
-evidence readable under the same gates. Core retries idempotently and permits the warm
-reaper to remove the records only after the retention deadline and confirmed export.
+Before enabling either protected dataset, provision a dedicated ClickHouse database with
+grants restricted to its core service identity. Grafana and analytics users must lack
+access, including through views and distributed tables. Verify a denied query using the
+deployed dashboard and analytics identities. Give only core the application credentials,
+use verified TLS and source credentials from server secret configuration. ADR-0010
+governs any persistent server secret. Document credential rotation and
+backup coverage before enabling either protected dataset. Test a coordinated restore of
+the protected data and its PostgreSQL access metadata. Reapply the retention deadline when restoring either copy.
+
+For the 90-day cold verdict period (ADR-0075 R11), keep a compact PostgreSQL run header
+with its creator, stored kind, input specifications (including definition digests) and
+lineage through cold expiry.
+Authorize reads against that header and the caller's current grants before querying
+ClickHouse. Re-runs use the stored inputs under R12's current-authority checks. Warm
+member deletion must preserve the header. Account for its space until reclaimed.
+A revoked `CriteriaRun:Read` grant denies detail and count requests before and after warm expiry.
+Fail closed when ownership or authority cannot be established. If an authorized cold read
+cannot verify its data, return an availability error for the whole query, including counts.
+At finalization record the expected count of distinct device verdicts and one cold expiry
+instant, final plus 90 days. For a confirmed export, bound header and verdict visibility
+to that instant, independently of physical TTL cleanup. Preserve full cold retention through partition boundaries. The export manifest records each deterministic batch number, device count and digest
+of its ordered verdict records. Verify the complete export against that manifest in
+the same snapshot as the read,
+before filtering or paginating. A missing or divergent batch fails the read even when the
+sink is reachable. Verify both copies after restore before serving or resuming reaping.
+If the warm source survives, retry missing batches. Otherwise recover the cold backup.
+
+Route reads using the durable header state. Switch to the complete cold copy atomically
+before deleting any warm member. A reader must observe one complete generation. Use the
+existing `gc_sweep` as the sole automatic reclamation path. Its regenerable-scratch
+exemption in the [clock-guard register](../clock-guarded-retention.md) does not cover
+criteria-run members or headers. Packet 1.13 must add their distinct part-6 decision
+to the register and the background-job annotation. Under the advisory lock, decline
+and establish the shared anchor on a missing anchor before reclaiming those records. Bound and
+charge retained headers across the entire cold period, separately from the warm members.
+
+Export deterministic batches at finalization. Record `exported_at` only after **every**
+batch has completed successfully to the destination's documented durability policy,
+including any required replication acknowledgements. A transport status or a queued
+insert alone cannot establish completion. Retry ambiguous or partial delivery with the
+same batch identities, including across restart and upgrade. Record an empty final
+run as a complete zero-batch export. Verify exact counts before merges. Re-check
+PostgreSQL `ttl_at` and confirmed export inside the warm-reap transaction. Keep a failed export readable warm.
+An outage extending beyond the full cold retention period leaves two requirements in
+tension: retaining the only copy pending confirmation and disposing of per-device data at
+day 90. The terminal disposition of an unexported run in that case awaits an owner ruling.
+Per-device verdicts are working data. The counts-only audit event follows audit retention.
 
 ### PostgreSQL capacity during an export outage
 
@@ -158,39 +204,70 @@ before writing cohort members or scheduling collection. Use a conservative byte 
 admitted cohort, including its largest permitted terminal representation and indexes. Charge
 existing warm records and outstanding reservations, including runs still gathering. Keep the
 charge through export acknowledgement until the warm storage is reaped and reusable. Recover
-reservations after restart and reconcile existing warm runs before opening admission on upgrade.
+reservations from durable run state after a restart or replica loss. Reconcile abandoned
+and empty-run reservations without discarding charges for data still retained. Reconcile
+existing warm runs before opening admission on upgrade.
 
 Keep separate operational headroom for ordinary PostgreSQL transactions, WAL and maintenance.
-If the request cannot fit even with an empty backlog, report the supported size limit. If the
+If the request cannot fit even with an empty backlog, return a permanent size-limit error with the supported bound. If the
 backlog consumes the budget, headroom is low, or capacity cannot be established, refuse new
 criteria work before materialization with a retryable capacity error. Ordinary reads and
 unrelated writes continue. Admitted runs have room to finish, and unexported verdicts remain
 available. Resume admission after pressure falls below a recovery threshold.
 
-Page export work from PostgreSQL with bounded batches and concurrency. Release database
+Bound export batch size, concurrent work and recovery throughput across replicas. Release database
 transactions and connections before waiting on ClickHouse. On a sink outage, back off retries
 with jitter and bound recovery throughput. Report charged bytes, available headroom, oldest
 unexported age and admission refusals so an operator can distinguish a backlog from an
-oversized request.
+oversized request. Alert before the measured headroom for unrelated work is exhausted.
 
 Verify with ClickHouse offline, concurrent fleet-sized create and re-run requests on multiple
 core replicas, a core restart and ordinary PostgreSQL traffic. The acceptance criteria are
 bounded warm usage and retry load, completion of previously admitted runs, and continued
-unrelated database service within its operating targets. Restore ClickHouse and verify exact
+unrelated database service against the documented latency and error budgets measured
+with the same workload before the outage. Restore ClickHouse and verify exact
 export counts, safe reaping and automatic resumption of admission. Size the default budget
 and thresholds using measured storage and WAL growth before enabling this feature.
 
-The implementing change enables that guarantee when cold export ships. A release containing
-only the warm implementation documents its warm-only retention in the operator manual and
-upgrade notes (ADR-0075 R11.9).
+Packet 1.13 owns export, cold reads and the outage tests. Its implementation must
+classify the exporter in the background-job registry and fence work across replicas.
+It must document the recovery-time bound for abandoned reservations and the headroom
+thresholds before testing. Verify explicit deletion during export: fence outstanding batches, revoke read access
+and ensure restore cannot resurrect the deleted run. Verify relational and cold-store
+restore and the same authorization-denial audit policy on both tiers. Ordinary successful
+criteria-run reads add no per-device audit event (ADR-0075 R11.7).
+Retain the access-grant review, disposal evidence and outage alert test with that packet. A release between packets 1.10
+and 1.13 documents warm-only retention in its operator manual, changelog and upgrade notes
+(ADR-0075 R11.9). A cold-store outage degrades those operations independently of core's
+PostgreSQL startup and readiness contract.
+
+### Notifying operators when a configured ClickHouse store goes offline
+
+On 2026-11-22 Nathan required an outage notice at login and an MCP request for agentic
+workers to notify their human operators. Surface the failure when core detects it. Keep
+the notice visible while the configured store is offline, including when PostgreSQL can
+still serve requests. Name ClickHouse and the affected functions without exposing data,
+credentials or connection strings. Clear the notice after core confirms recovery.
+A deployment with ClickHouse intentionally disabled has no outage to report.
+
+Packet 1.13 owns the shared datastore-health signal and its first protected-store outage
+test. Wire it to the authenticated dashboard landing page after sign-in, MCP
+`initialize.instructions` and the existing `yuzu://server/health` resource. An agentic
+worker opening an MCP session during the outage must receive an explicit request to
+notify its human operator. A connected worker must also receive that request on its
+next interaction. In the outage test, sign in and exercise both new and existing MCP
+sessions, then recover the store and verify both notices clear. Reuse this signal for
+the bulk response store at cutover. Preserve unrelated PostgreSQL service during the test.
 
 ### Bulk live instruction responses (approved design, 2026-11-22)
 
-For bulk live instructions, ClickHouse is the standard first durable destination for response
-payloads through authenticated core ingest. Ordinary and incident dispatch use that same path.
+After the response-store cutover, authenticated core ingest will write ordinary and incident
+bulk live response payloads to ClickHouse as their first durable destination.
 Core owns the credentials and enforces device scope and Forensics tier on detail, facet and
 aggregate reads. PostgreSQL owns admission, cohort, deadline, run status, audit and bounded
 warm verdicts. Never spill raw responses into PostgreSQL when the sink stalls. Account for
-bounded in-flight response bytes separately from the warm verdict reservation above. Release
+in-flight response bytes across operators and replicas separately from the warm verdict
+reservation above. Pause new waves on a sink stall, expose the pause and outstanding
+coverage, and settle missing responses as incomplete at deadline. Release
 database leases before sink waits. The response-store cutover requires its own migration and
 rollback contract. ADR-0039 records the currently deployed response store.
