@@ -691,6 +691,21 @@ TEST_CASE("break-glass: a disarm or the end of the arm window between the passwo
         CHECK(step2->status == 401);
         CHECK(step2->get_header_value("Set-Cookie").empty());
         CHECK(step2->get_header_value("Retry-After").empty());
+        // The refusal is labelled by what the DATABASE said: a window that ended keeps its
+        // armed_until text (window_ended); an un-arm writes NULL (disarmed).
+        const yuzu::Labels want{{"reason", window_ends ? "window_ended" : "disarmed"},
+                                {"stage", "pre_verify"}};
+        const yuzu::Labels other{{"reason", window_ends ? "disarmed" : "window_ended"},
+                                 {"stage", "pre_verify"}};
+        CHECK(h.counter("yuzu_auth_break_glass_pending_refused_total", want) == 1.0);
+        CHECK(h.counter("yuzu_auth_break_glass_pending_refused_total", other) == 0.0);
+        AuditQuery q;
+        q.action = "mfa.login.failed";
+        auto rows = h.audit_store->query(q);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK(rows->front().detail == (window_ends ? "break-glass no longer armed: window ended"
+                                                   : "break-glass no longer armed: disarmed"));
     }
 }
 
@@ -729,6 +744,7 @@ struct ArmCtl {
     std::atomic<int> id{1};                         // armed_until text is "arm-<id>"
     std::atomic<std::int64_t> remaining_ms{3'600'000};
     std::atomic<std::int64_t> advance_in_read_ms{0}; // the read itself takes this long
+    std::atomic<bool> window_ended_in_db{false};     // a not-armed read keeps the ended window's text
     std::atomic<int> reads{0};
     std::atomic<bool> block{false};
     std::atomic<int> blocked{0};
@@ -764,6 +780,9 @@ void install_arm_hook(HardenedHarness& h, ArmCtl& ctl) {
         if (r.armed) {
             r.armed_until = "arm-" + std::to_string(ctl.id.load());
             r.remaining_ms = ctl.remaining_ms.load();
+        } else if (mode == ArmCtl::kNotArmed && ctl.window_ended_in_db.load()) {
+            // What the database returns once a window has ended: not armed, the text kept.
+            r.armed_until = "arm-" + std::to_string(ctl.id.load());
         }
         return r;
     });
@@ -1515,4 +1534,34 @@ TEST_CASE("break-glass gate: a refresh_busy answer carries a not-armed read reco
     CHECK(*x.last_not_armed_at ==
           std::chrono::steady_clock::time_point(std::chrono::milliseconds(kT0 + 1100)));
     CHECK(x.arm_id == "arm-1");
+}
+
+// Code review F5: "window ended" as the DATABASE reports it (not armed, the window's text kept),
+// as opposed to the local deadline passing.
+TEST_CASE("break-glass: a read that finds an ended window is labelled window_ended, an un-arm disarmed",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    const bool ended = GENERATE(true, false);
+    INFO((ended ? "the database keeps the ended window's text" : "the database holds no window"));
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    // The local deadline is an hour away, so only the database's answer can end this login.
+    h.auth_routes->advance_arm_clock_for_test(1100);
+    ctl.mode = ArmCtl::kNotArmed;
+    ctl.window_ended_in_db = ended;
+    const auto g = h.auth_routes->sso_only_local_password_gate("admin");
+    CHECK(g.state == SsoOnlyLocalGate::kRefused);
+    CHECK(g.why == (ended ? SsoOnlyRefusedWhy::kWindowEnded : SsoOnlyRefusedWhy::kDisarmed));
+    // The cached answer keeps the same reason.
+    const auto cached = h.auth_routes->sso_only_local_password_gate("admin");
+    CHECK(cached.why == g.why);
+    auto res = login_step2(h, pending, HardenedHarness::totp_next(mfa.secret));
+    CHECK(res->status == 401);
+    CHECK(refused(h, ended ? "window_ended" : "disarmed", "pre_verify") == 1.0);
+    CHECK(refused_total(h) == 1.0);
+    CHECK(rows_containing(audit_rows(h, "mfa.login.failed"),
+                          ended ? "break-glass no longer armed: window ended"
+                                : "break-glass no longer armed: disarmed") == 1);
 }
