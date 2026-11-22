@@ -9212,16 +9212,22 @@ tests:
 
   # -- YuzuEchoDbCorruptionDetected / YuzuPluginInitFailed (#5065, #6696; alert half of #5033) --
   #
-  # Mutation-checked, YuzuEchoDbCorruptionDetected (counter rule, #7486): [1h] -> [5m] reddens
-  # cases 1, 6 and 7; [1h] -> [2h] reddens case 1 (90m); [59m] or [61m] redden case 1 (the 89m and
-  # 90m evals pin the window to the minute); the bare counter (`sum by (job)
-  # (yuzu_server_echo_db_quarantines_total) > 0`) reddens cases 1, 2, 3 and 5 (a flat or restarted
-  # counter fires); `increase` -> `delta` reddens case 7 (a restart from 5 followed by a new
-  # quarantine reads as -4); dropping `sum by (job)` or keeping `instance` reddens case 6 (one
-  # alert per replica). The shipped annotations are pinned by case 6.
-  # Mutation-checked, YuzuPluginInitFailed: `for:` 5m or 16m, the bare gauge, a [1m], [4m] or [6m]
+  # Mutation-run, YuzuEchoDbCorruptionDetected (counter rule, #7486), against the pinned promtool
+  # (prom/prometheus:v3.13.1); each mutant changed only the counter expression, and the cases that
+  # went RED (by case number below) were: [1h] -> [5m] reddens cases 1 (89m), 6 (45m) and 7 (46m);
+  # [1h] -> [2h] reddens case 1 only (90m); [59m] reddens case 1 only (89m) and [61m] case 1 only
+  # (90m), so those two evals pin the window to the minute; the bare counter (`sum by (job)
+  # (yuzu_server_echo_db_quarantines_total) > 0`) reddens cases 1 (90m), 2, 3 (35m and 65m) and 5
+  # (a flat or restarted counter fires); `increase` -> `delta` reddens case 7 only (a restart from
+  # 5 followed by a new quarantine reads as -4); dropping `sum by (job)` or keeping `instance`
+  # each redden cases 1 (31m and 89m), 6 (45m) and 7 (46m): the surviving `instance` label breaks
+  # the expected label set, and case 6 additionally shows two alerts, one per replica. Case 4 is
+  # not reddened by any mutant above (it guards an absent series). The shipped annotations are
+  # pinned by case 6.
+  # YuzuPluginInitFailed: the mutations `for:` 5m or 16m, the bare gauge, a [1m], [4m] or [6m]
   # window, `sum by` keeping `instance` or dropping `plugin`, `max by` for `sum by` (case F has two
-  # replicas reporting), and an Echo-only selector each redden at least one case.
+  # replicas reporting), and an Echo-only selector were reasoned to redden at least one case, not
+  # mutation-run.
 
   # CORRUPTION CASE 1 -- a pre-seeded counter steps 0 -> 1 at minute 31. Quiet at 30m, fires from
   # the first eval after the step (31m) and still at 89m (the last eval whose window reaches back
@@ -9348,7 +9354,8 @@ tests:
   # `delta` (1 - 5 reads as a fall, so a real quarantine after a restart is missed) and RED if
   # the window is shortened to [5m]: the series is 5 for 0-30m, absent 31-33m, 0 for 34-41m and 1
   # from 42m, so the last 0 sample is at 41m and the 46m window, (41m, 46m] under the pinned
-  # promtool's left-open range windows, holds only 1s. That holds by one sample: re-apply the [5m]
+  # promtool's left-open range windows, holds only 1s. Executed: the [5m] mutant reddens the 46m
+  # eval (as it does case 1 at 89m and case 6 at 45m). That holds by one sample: re-apply the [5m]
   # mutation to confirm this case reddens after any change to this series or the eval time.
   - interval: 1m
     name: echo quarantine a new quarantine after a replica restart still fires
