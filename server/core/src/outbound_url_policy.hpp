@@ -24,6 +24,13 @@
 
 namespace yuzu::server {
 
+/// Bound on the connect fallback shared by webhook and offload-target delivery (PERF-1): a name that
+/// resolves to many vetted addresses is tried at most `kMaxDeliveryConnectAddresses` of them (the
+/// first four, IPv4 first), so one unreachable receiver holds a delivery worker for at most four
+/// 5 s connect timeouts (20 s), not N x 5 s on a pool shared by every webhook and target. Addresses
+/// past the cap are not tried: the truncation is logged and counted by the delivery stores.
+inline constexpr std::size_t kMaxDeliveryConnectAddresses = 4;
+
 /// True if `s` contains any byte below 0x20 or DEL.
 [[nodiscard]] inline bool url_has_control_bytes(std::string_view s) noexcept {
     for (char c : s) {

@@ -21,7 +21,7 @@ namespace yuzu::processes {
 // field ending in '\' (a comm of `x\`, a path ending in `\`) would glue onto the
 // '|' delimiter and merge with the next column, shifting the hash and path
 // columns. Other backslashes are kept: Windows paths contain them and other
-// consumers (live_kinds.hpp, device_routes.cpp) split these rows on a raw '|'.
+// consumers (the parsers in live_model.cpp) split these rows on a raw '|'.
 // No `\|` escape grammar is introduced here (#5208).
 [[nodiscard]] inline std::string sanitize_field(std::string s) {
     for (char& c : s)

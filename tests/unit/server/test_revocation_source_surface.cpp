@@ -1223,10 +1223,11 @@ TEST_CASE("revocation source MCP: the annotations are truthful and openWorld is 
         CHECK(pin["maxLength"] == 64);
         CHECK(pin["pattern"] == "^[0-9a-f]{64}$");
     }
-    // No OTHER tool in the catalogue became open-world.
+    // No OTHER tool in the catalogue became open-world: besides these two, only create_offload_target
+    // is (the server POSTs fleet events to its url; its destination guard is #4816).
     for (const auto& t : tools) {
         const std::string name = t["name"];
-        const bool expected = name == kRegister || name == kUpdate;
+        const bool expected = name == kRegister || name == kUpdate || name == "create_offload_target";
         INFO(name);
         CHECK(t["annotations"]["openWorldHint"].get<bool>() == expected);
     }
