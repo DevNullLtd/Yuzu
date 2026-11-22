@@ -218,10 +218,36 @@ static_assert(!is_valid_plugin_name(std::string_view{"nul\0byte", 8}));
 [[nodiscard]] YUZU_EXPORT std::string sha256_file(const std::filesystem::path& path,
                                                   std::size_t max_bytes = SIZE_MAX);
 
+/// Outcome of loading a plugin allowlist. Three-state on purpose (WP13/F52): "no allowlist
+/// configured" must be distinguishable from "configured but unusable", because an empty map
+/// cannot say which of the two it is.
+enum class AllowlistStatus {
+    NotConfigured,  ///< empty path: the operator did not ask for an allowlist
+    Loaded,         ///< at least one valid entry parsed
+    Missing,        ///< configured path does not exist
+    Unreadable,     ///< exists but cannot be opened / stat'd (permission, I/O, not a file)
+    NoValidEntries, ///< readable but zero parseable entries (empty, comments only, all malformed)
+};
+
+struct PluginAllowlistLoad {
+    AllowlistStatus status{AllowlistStatus::NotConfigured};
+    std::unordered_map<std::string, std::string> entries; ///< filename -> expected sha256
+    std::string detail;                                   ///< cause text for a failure
+};
+
 /// Load a plugin allowlist file (one "sha256  filename" per line, like sha256sum output).
-/// Returns a map of filename -> expected hash. Empty map on failure or missing file.
-[[nodiscard]] std::unordered_map<std::string, std::string>
+/// Never throws (error_code filesystem overloads). Lines that are individually malformed are
+/// skipped with a warning as long as at least one valid entry remains.
+[[nodiscard]] YUZU_EXPORT PluginAllowlistLoad
 load_plugin_allowlist(const std::filesystem::path& allowlist_path);
+
+/// Startup decision (pure, unit-testable): a configured allowlist that did not load usable
+/// entries must stop the agent, never degrade to "load every plugin unverified". Returns the
+/// refusal reason, or nullopt when startup may proceed. Mirrors the --plugin-require-signature
+/// guard (governance UP-7).
+[[nodiscard]] YUZU_EXPORT std::optional<std::string>
+evaluate_allowlist_startup(const std::filesystem::path& configured_path,
+                           const PluginAllowlistLoad& load);
 
 /**
  * PluginHandle owns a loaded plugin shared library and its descriptor.
@@ -267,10 +293,15 @@ public:
     /// hash on this host*, signing binds *this file content to a CA-issued
     /// signing identity*. Operators with internal builds typically enable
     /// both.
+    ///
+    /// `allowlist_required` (WP13/F52): the operator configured an allowlist. With an empty
+    /// map this enforces an EMPTY allowlist (every library refused) instead of treating the
+    /// empty map as "no allowlist". Defence in depth behind evaluate_allowlist_startup.
     [[nodiscard]] static ScanResult scan(
         const std::filesystem::path& plugin_dir,
         const std::unordered_map<std::string, std::string>& allowlist = {},
-        const PluginSigningPolicy& signing = {});
+        const PluginSigningPolicy& signing = {},
+        bool allowlist_required = false);
 };
 
 } // namespace yuzu::agent

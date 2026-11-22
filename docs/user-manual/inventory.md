@@ -106,7 +106,7 @@ cadences.
   | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — | — | — | — | — |
   | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | ✓ | — |
   | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the `PythonCore` registry tag (Windows), else `via:python` (always on Linux and macOS) | `IBM` | `Microsoft` | the build's self-reported `IMPLEMENTOR`, else `via:jvm` | `via:chocolatey` | `via:winget` | `via:appx` | provider, else signer, else `via:windows`; Linux `via:kernel_module` |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — | — | — | — | ✓ (Windows driver date) |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | epoch seconds (the receipt's install time; formulae only) | — | — | — | — | — | — | — | — | — | — | — | — | ✓ (Windows driver date) |
   | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — | — | — | — | `signed`/`unsigned`; empty = unknown |
   | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
@@ -134,13 +134,21 @@ cadences.
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
   verification. `distro_id`/`distro_version` are host-level (`/etc/os-release`
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
-  packages (they are installed). Machine-scope Homebrew
+  packages (they are installed). Machine-prefix Homebrew
   is collected through `pkg_inventory` with `ecosystem` `brew`: each formula is
   `kind` `pkg`, each cask `kind` `app` (`source` `pkg_inventory.packages`), plus
   one `kind` `app` row named `homebrew` (`publisher` `Homebrew`) with `source`
   `pkg_inventory.managers` that records Homebrew itself is present — one row however many prefixes
-  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
-  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew,
+  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). The formula and cask rows
+  are one per prefix, so a formula under both prefixes is two rows, each with its own
+  `install_location`; a formula row's `install_date` is its receipt's install time (a claim the
+  installing account wrote). A Homebrew a user installed in their own home (`~/homebrew`,
+  `~/.homebrew`) is listed by `pkg_inventory.packages` as a `user`-scope row that the sync never
+  collects: the sync is machine-scope. A user row carries the package, its version, the home
+  directory's name as its owner and the `~/` prefix only: its install time, tap and requested
+  flag are always `-`, because the agent opens no receipt under a user-owned prefix. The owner name
+  is command output: whoever can dispatch the action sees it, and every `Response:Read` holder sees
+  the stored rows for the response retention window, with no per-user erasure. Only Homebrew,
   Chocolatey and winget are mapped from `managers`: the Linux manager rows (dpkg,
   apt, rpm, dnf, pacman, apk, snap, flatpak) are read but not collected as
   software, and a
@@ -213,7 +221,7 @@ cadences.
   rather than a product silently disappearing. The same product normally also has an `app`/`windows`
   row from `installed_apps`' registry walk, so a Windows host normally carries
   two rows per MSI product. The `msi` row adds the product code (stored as
-  `package_id`; the REST and MCP software routes do not return that column yet)
+  `package_id`, which the REST and MCP software routes return on each row)
   and the machine-context guarantee. Install location and uninstall string are
   not collected (wire slots 13-14 stay reserved and empty, #5186). If the
   enumeration itself fails the source is reported `constrained` (see Troubleshooting).
@@ -383,7 +391,7 @@ cadences.
   every cycle. The sectioned v3 blob stores `install_location` and keeps
   `uninstall_string` reserved (see "Install type, scope and location, and the
   sectioned report" below). This build's agent sends `install_location` (the Windows
-  `InstallLocation`, the macOS `.app` path) and never `uninstall_string`; since a path under a
+  `InstallLocation`, the macOS `.app` path, a Homebrew machine prefix) and never `uninstall_string`; since a path under a
   user's profile names an account, the location is an allowlist: the agent canonicalises the
   value (quotes, padding, doubled separators, `.` and `..` segments, the `\\?\` prefix and the
   macOS `/System/Volumes/Data` spelling) and keeps it, in one spelling (case is kept), only when it sits under a
@@ -480,14 +488,60 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   between archives, so one blocked read is not interrupted. On the packaged Linux unit the agent
   holds `CAP_DAC_READ_SEARCH`, so permission-restricted directories are readable there and
   `dir_unreadable` is rare.
-- **Switching it off.** The per-plugin kill switch (`component_inventory/scan`,
-  `PUT /api/v1/plugin-config/component_inventory/kill-switch`) turns the action off. The permanent
+- **Switching it off.** The kill switch (`PUT /api/v1/plugin-config/component_inventory/kill-switch`,
+  with `action` set to `scan`) turns the action off. The permanent
   customer opt-out of ADR-0028 Decisions 2 and 8 is still open (#7737).
 - **What the rows reveal.** Names, versions, paths and application folder names as they appear on
   disk, which is a detailed software inventory for the device; the names of nested libraries can
   reveal a customer's internal dependency names.
 - **When it runs.** On demand only, as an instruction. The daily report does not carry these rows
   yet, so they do not appear in the software inventory views.
+
+### Native libraries (`component_inventory`, `native`)
+
+The `component_inventory` plugin's `native` action (instruction `crossplatform.components.native`)
+lists the versioned shared libraries shipped inside applications: ELF `.so` files on Linux and
+Mach-O `.dylib` files on macOS. It reads each library's header in-process; no process is started.
+**It is switched off until an operator enables it** (below).
+
+- **Switching it on.** The server refuses the action until an operator lifts its kill-switch row:
+  `PUT /api/v1/plugin-config/component_inventory/kill-switch` with `action` set to `native` and
+  `enabled` true. The row is separate from `scan`, which stays on. A server restart never overwrites
+  an operator's own setting.
+- **Where.** Linux: `/opt` and `/usr/local/lib`. macOS: `/Applications`, `/usr/local` and
+  `/opt/homebrew`. The package manager's own trees are not read: on Linux `/usr/lib` and the other
+  system library directories are not roots, and on macOS the Homebrew Cellar trees
+  (`/usr/local/Cellar`, `/opt/homebrew/Cellar`) are not entered. Windows is not read yet: it answers
+  one `unsupported` status row (`windows:planned`). Extension-less macOS framework binaries are not
+  listed.
+- **What a row holds.** Kind (`native`), name (the SONAME on Linux or the install name on macOS,
+  without its suffix and version), version, where the version came from (`filename`, `elf`, `macho`
+  or `unreadable`), path, size, modification time and the application folder it sits under.
+- **How the version is read.** On Linux, from the file name's `.so.<version>` suffix
+  (`libssl.so.3.0.13` reads `3.0.13`), else from the SONAME's suffix. On macOS, from the library's
+  Mach-O `current_version` when it is not `0.0.0`, else from the file name's version
+  (`libfoo.1.2.dylib` reads `1.2`). A library whose header cannot be read inside the fixed
+  bounds, or that names no version, is still listed from its file name with `version_source`
+  `unreadable`; that is a gap in one row and does not make the scan incomplete. A file whose name
+  looks like a library but whose header says it is not one is not listed.
+- **Bounds.** The scan's (400,000 directory entries, 45 seconds, 32 levels, 50,000 entries per
+  directory, 3,000 rows per application folder) with 5,000 rows in all. Per library, at most 128
+  ELF program headers, 4,096 dynamic entries, a 255-byte name, 16 fat slices and 1,024 load
+  commands in 512 KiB; a count past one of those makes that library `unreadable`, never a partial
+  answer. A universal Mach-O file is read through its first slice that has no error and is a
+  dynamic library.
+- **When the list may be incomplete.** The status row reads `constrained` for the same causes as
+  `scan` (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`, `dir_unreadable`,
+  `dir_truncated`, `mount_table_unreadable`), and `archive_changed` when a library changed or
+  vanished while it was read. On a `supported` answer, the Homebrew Cellar trees the scan did not
+  enter are named by the informational token `package_tree_skipped`, beside the `scan` tokens.
+  A Mac with very large application bundles can use the whole entry budget in `/Applications`, so
+  read a `budget_entries` answer as the part of the host reached.
+- **What it costs, and who can run it.** The same roles and `Inventory` read grant as `scan`; a live
+  read of up to 45 seconds on one device that cannot be cancelled once started. `native` publishes
+  no heartbeat cost counters.
+- **When it runs.** On demand only, as an instruction, once enabled. The daily report does not
+  carry these rows yet.
 
 ### Install type, scope and location, and the sectioned report
 
@@ -510,7 +564,8 @@ database.
 - **`install_location`** is the folder the software was installed into, when the collector reports
   one. It is stored only from the v3 blob (the v2 blob's slot is ignored), so a device that has not
   yet sent a v3 report has none. The agent fills it for Windows applications (the registry's
-  `InstallLocation`) and macOS applications (the `.app` path); Linux packages, MSI products, store
+  `InstallLocation`), macOS applications (the `.app` path) and Homebrew formulae and casks (the
+  machine prefix, `/opt/homebrew` or `/usr/local`); Linux packages, MSI products, store
   packages and the other sources have no single install folder, so it is empty for them. Only a
   folder under a known machine root is sent (the allowlist above); a location outside those roots
   is blanked, and the row is still reported with its name, version and publisher.
@@ -564,7 +619,14 @@ section hash (an out-of-band change to the table) set the starting point and pro
 the last case is logged as a warning and, by decision, no counter or alert counts it. Removed
 software is simply deleted from the device's list; the history entry is the record that it was
 there. History older than 400 days is pruned, and decommissioning a device deletes its history
-and its components with it. The change
+and its components with it. A development or UAT database that already holds a Mac's Homebrew rows
+from an earlier build (not a supported starting point: a fresh database baselines instead) records
+one `remove` and one `install` for each of that Mac's Homebrew formula and cask rows, at an
+unchanged version, on its first sync from the build that fills `install_location`, because the
+location is part of a row's identity. The pair is recognisable (the same device, facet
+`pkg_inventory.packages`, name and version, one `observed_at`; there is no cause label), happens
+once per Mac and is pruned with the rest of the history after 400 days; see
+[Upgrading](upgrading.md), section 4. The change
 history is read through `GET /api/v1/inventory/software/changes` and the components through
 `GET /api/v1/inventory/software/components` (see the REST API reference; the MCP tool
 `query_software_components` answers the same question); the dashboard shows
@@ -996,15 +1058,17 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   [rest-api.md](rest-api.md); `format`, `purl` and `vers` are REST-only (the MCP tool takes
   every other parameter).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
-  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 23 fields: the 14
+  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 24 fields: the 15
   package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
-  release, arch, signature_status, distro_id, distro_version, source}` — `""` where the
+  release, arch, signature_status, distro_id, distro_version, source, package_id}` — `""` where the
   ecosystem does not store them (see the availability matrix above); `source` is the
-  `<plugin>.<action>` that produced the row — plus the lookup fields `hostname`, `last_seen`
+  `<plugin>.<action>` that produced the row; `package_id` is the source's own package
+  identifier (the Windows Installer product code on `msi_packages.list_inventory` rows, an
+  empty string when the source sets none) — plus the lookup fields `hostname`, `last_seen`
   (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
   `last_confirmed_at`, `install_type`, `install_scope`, `install_location`,
   `instance_key` and `purl` (the canonical Package URL, `null` when the row has none). The MCP
-  tool's rows carry the same 23 fields.
+  tool's rows carry the same 24 fields.
 - **Searching by Package URL and by `vers:` range.** `purl=` returns the rows whose stored
   purl equals the value byte for byte (no prefix or case matching, and it must start `pkg:`),
   so give the full canonical purl as the row shows it, URL-encoded; it needs no `name`, and it
@@ -1077,7 +1141,7 @@ a statement timeout there degrades the page to a 503 (tracked in #5698). A conti
 
 `GET /api/v1/inventory/software/export?format=jsonl|csv|xlsx` writes every installed-software row
 that matches your filters as one download, with no paging: JSONL is one JSON object per line,
-CSV is the 23 columns of the list under a single header row, and XLSX is the same 23 columns as a
+CSV is the 24 columns of the list under a single header row, and XLSX is the same 24 columns as a
 one-sheet workbook you can open directly (a bold, frozen header row, every cell text). It takes the filters of the
 route above (`format=json` is not accepted, and `cursor` and `limit` are refused). It is
 confined to your scope like the rest of the Inventory reads; a wide scope is filtered on the
@@ -1607,12 +1671,50 @@ could not be read for a reason other than the product not having it (or, as
 `windows:msi_prop:oversized`, the value was implausibly long); it behaves the same
 way. A token is cut at 64 bytes and characters outside `A-Z a-z 0-9 _ . : = , -` become `_`, so a long
 list of constraint tokens is shortened. The server keeps the latest status and token of each source
-per device; no server page or API returns them yet, so read the cause from the agent's own log. Fix
+per device and returns them through `GET /api/v1/inventory/software/plugin-health` (which facets
+fail) and `/hosts/{agent_id}` (the device's token per facet), described above under "Collection
+health, hosts and the change feed"; the full token list of a facet whose token was cut is the
+action's own status row, in the agent's log. Fix
 the failing action, or remove its plugin, and the next daily sync recovers; `timeout` and `busy`
 are the exception: a worker that never returns holds its plugin's flag across passes and
 reconnects, so recovery is the worker returning or an agent restart, and that restart is the
 3-second drain and exit code 3 described under "Sections and deltas" (expect the critical
 `collector worker(s) still inside a plugin` journal line).
+
+**A Mac's Homebrew software is marked unconfirmed, and the `pkg_inventory.packages` token names a
+user prefix (`macos:user_homes:...`, `macos:homebrew_user_prefix:...`,
+`macos:homebrew_user_cellar:...` or `macos:homebrew_user_caskroom:...`).**
+The agent also walks the `~/homebrew` and `~/.homebrew` prefixes of each home under `/Users`, and a
+failed read of any of them makes the whole `packages` answer constrained: the server keeps the
+device's stored Homebrew rows, shown as unconfirmed, and no other source is affected. Find the
+affected device from its unconfirmed Homebrew row (`GET /api/v1/inventory/software/plugin-health` shows
+only whether the facet is affected across the fleet and lists the ten slowest devices), read the
+token on `/hosts/{agent_id}`, and look
+the detail up here and in the plugin's README (`agents/plugins/pkg_inventory/README.md`, caveats 1
+and 4). The tokens never name a user or a path.
+
+| Token (after `macos:`) | Meaning | Remedy |
+|---|---|---|
+| `user_homes:mounts_unreadable` | The mount table could not be read, so no home is opened. | Clears when the table reads again. |
+| `user_homes:network_mount`, `homebrew_user_prefix:network_mount` | `/Users`, a home or a candidate prefix is on a network mount and is never touched. | None while it is mounted. |
+| `user_homes:not_a_directory` | `/Users` is a symlink and was refused. It constrains every run. (A symlinked home under `/Users` is skipped silently, as "not a home".) | Make `/Users` a real directory. |
+| `user_homes:permission_denied` | The agent cannot open `/Users` or a home: a non-root agent against another account's home (unless its group or an ACL admits it). | Run the agent as root, or remove the prefix (the section stays unconfirmed until then). |
+| `homebrew_user_prefix:owner_mismatch` | The prefix is not owned by its home's owner; nothing under it is opened. | Fix the ownership, or remove the prefix. |
+| `homebrew_user_prefix:owner_name_unsupported` | A home whose directory name has a non-ASCII, control, pipe or backslash character (or is over 255 bytes) holds a Cellar or Caskroom. | Rename the home, or remove the prefix. It never clears on its own. |
+| `homebrew_user_cellar:not_a_directory`, `homebrew_user_caskroom:not_a_directory` | The Cellar or Caskroom is a symlink or a file. | Replace it with a real directory, or remove it. |
+| `user_homes`, `homebrew_user_prefix`, `homebrew_user_cellar` or `homebrew_user_caskroom` with `permission_denied`, `symlink_refused` or `io_error` | The directory could not be opened. | Correct its permissions or links. |
+| the same four with `entry_cap`, `enumeration_error`, `row_cap`, `byte_cap` or `walk_budget` | A size or time bound stopped the walk (4,096 names per directory, 20,000 rows, 1 MiB of rows, 200,000 entries or 10 seconds per action). | Reduce what the prefix holds. |
+
+A local account can hold its own Homebrew section at "unconfirmed" this way; that is an accepted
+trade-off (README caveat 1). There is no switch for the user-prefix walk alone. The collection
+setting `plugins.pkg_inventory=false` and the plugin-wide kill switch each switch off all three
+`pkg_inventory` facets of the scheduled collection; an on-demand `pkg_inventory.packages` dispatch still
+walks the user homes unless the plugin kill switch is set (a kill switch set for one operating system or one action does not stop the
+daily collection; see [Collection settings](#collection-settings)); otherwise remove or re-own the
+prefix. A `timeout` or `busy` token recovers when the worker returns or the agent restarts (the
+paragraph above). The first sync of a build that fills `install_location` can also add one `remove`
+and one `install` per Homebrew row to a carried database's change feed; see [Upgrading](upgrading.md),
+section 4.
 
 **A device's Python (or IBM MQ, .NET or Java) rows are marked unconfirmed, but the rest of its
 software is still reported; the log shows `sync: runtimes.python constrained (<tokens>) — reported
@@ -1963,7 +2065,7 @@ The server keeps the dates after which a software title or an operating system v
 - **A corrected date.** Both dates stay stored, each with its own last-seen time. While hosts keep repeating the old date it stays current; once they stop and 48 hours pass, the old date is stale, never wins again and raises no conflict. A declaration that no host repeats falls below every rule.
 - **The shipped rules.** The server ships rules for PostgreSQL, Python, Node.js, .NET (runtime and SDK), Ubuntu, Debian and Red Hat Enterprise Linux, each row naming the public page its date came from, in `content/software-lifecycle/rules.csv`. The shipped dates were read from those pages in November 2026. A release whose date could not be confirmed is left out and reads `unknown`; Windows and macOS releases are not covered yet. At every start the server replaces its stored shipped rules with the ones in the binary, so a newer server's rules always apply. Rule files are limited to 256 KiB, 5000 rows and 256 bytes per field, and a file with any defect is refused whole.
 - **If the store cannot open.** The schema is created at start, so the database role needs `CREATE` on the database. The server refuses to start, like the other Postgres stores, when the store cannot open or when the shipped rules cannot be parsed, are empty or cannot be loaded; the log line (`[PG] Refusing to start: software lifecycle ...`) states which and why, and `/readyz` lists `software_lifecycle_store` among its checks. An unparseable or empty shipped rule set is a defective build; a failed open or a failed load is a database fault, so check the role's `CREATE` right and then the Postgres log. A read that cannot be answered is reported as unavailable, never as an empty or `supported` answer. The two counters are in [Metrics](metrics.md#software-lifecycle-store-metrics).
-- **Importing rules.** An administrator loads a rule file with `POST /api/v1/inventory/software/lifecycle/rules` (global `Inventory:Write`), lists the stored rules of a source with `GET` (`Inventory:Read`) and removes the imported set with `DELETE` ([REST API](rest-api.md#software-lifecycle-rules)). The formats are `csv` and `cle` only. `csv` is the rule-file grammar above. `cle` is a Common Lifecycle Enumeration document (ECMA-428 1st edition, schema 1.0.0). An import **replaces the whole `imported` set** and never touches the `shipped` or `external` rules. The file is read all or nothing: a `csv` body of at most 256 KiB, a `cle` body of at most 4 MiB, and at most 5000 rules either way. An imported CLE rule applies to every version of its product: a CLE record that names one exact version, or a version range, is skipped and counted in the answer's `skipped` list, never stored as a prefix, because the rule model matches by dot-component prefix (a stored `3.8` would also claim `3.8.10`). A CLE identifier that lists more than 5000 aliases is refused. Because `imported` outranks `shipped` for the same event, an imported rule overrides the shipped date for the versions it covers. OpenEoX import is not offered yet: its published schema does not name a product (follow-up: #8000). The same three operations are MCP tools, `list_software_lifecycle_rules`, `import_software_lifecycle_rules` and `delete_software_lifecycle_rules`: each calls the same function as its route, under the same global grant, limits, refusals and audit rows, and is available to a supervised-tier MCP token ([MCP tools](mcp.md)); the whole JSON-RPC request is also capped at 4 MiB before routing, so a large `cle` file whose JSON-escaped form plus the envelope passes that cap is refused by the transport. The catalogue identity and `package_id` half of the lifecycle surface is not part of this and is not built yet (#6090).
+- **Importing rules.** An administrator loads a rule file with `POST /api/v1/inventory/software/lifecycle/rules` (global `Inventory:Write`), lists the stored rules of a source with `GET` (`Inventory:Read`) and removes the imported set with `DELETE` ([REST API](rest-api.md#software-lifecycle-rules)). The formats are `csv` and `cle` only. `csv` is the rule-file grammar above. `cle` is a Common Lifecycle Enumeration document (ECMA-428 1st edition, schema 1.0.0). An import **replaces the whole `imported` set** and never touches the `shipped` or `external` rules. The file is read all or nothing: a `csv` body of at most 256 KiB, a `cle` body of at most 4 MiB, and at most 5000 rules either way. An imported CLE rule applies to every version of its product: a CLE record that names one exact version, or a version range, is skipped and counted in the answer's `skipped` list, never stored as a prefix, because the rule model matches by dot-component prefix (a stored `3.8` would also claim `3.8.10`). A CLE identifier that lists more than 5000 aliases is refused. Because `imported` outranks `shipped` for the same event, an imported rule overrides the shipped date for the versions it covers. OpenEoX import is not offered yet: its published schema does not name a product (follow-up: #8000). The same three operations are MCP tools, `list_software_lifecycle_rules`, `import_software_lifecycle_rules` and `delete_software_lifecycle_rules`: each calls the same function as its route, under the same global grant, limits, refusals and audit rows, and is available to a supervised-tier MCP token ([MCP tools](mcp.md)); the whole JSON-RPC request is also capped at 4 MiB before routing, so a large `cle` file whose JSON-escaped form plus the envelope passes that cap is refused by the transport. The catalogue identity and `package_id` half of the lifecycle surface is not part of this and is not built yet (#8357).
 - **What is not kept.** Superseded declared dates are not deleted yet; nothing writes them until hosts report support-end dates, and their retention ships with that reporting.
 
 ## Device-identity inventory (`device_ci`)

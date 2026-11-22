@@ -696,7 +696,7 @@ A policy sees the plugin's whole output as ONE text value, `result.output` (the 
 
 #### macOS Homebrew coverage
 
-On macOS, `vuln_scan` reads applications from `system_profiler` only. Homebrew formulae and casks are not scanned (Homebrew CVE matching is tracked in #8256), so a macOS result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed; it says nothing about Homebrew packages, and matched Homebrew CVEs are not available. `pkg_inventory.packages` lists Homebrew packages (machine scope) but does not match them against CVE rules.
+On macOS, `vuln_scan` reads applications from `system_profiler` only. Homebrew formulae and casks are not scanned (Homebrew CVE matching is tracked in #8256), so a macOS result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed; it says nothing about Homebrew packages, and matched Homebrew CVEs are not available. `pkg_inventory.packages` lists Homebrew packages (the machine prefixes and the user-owned prefixes) but does not match them against CVE rules.
 
 The scan says so in its own output: every coverage problem the agent detects is an `UNREADABLE` row or an `INFO` Coverage row, and these rows mark the cases that mean "not assessed". Problems the agent cannot detect remain (see the notes after the list):
 
@@ -948,7 +948,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `crossplatform.process.query` | query | Q | WLM | name:string (req) | found:bool, pid:int64, name:string |
 | `crossplatform.service.list` | list | Q | WLM | *(none)* | name:string, display_name:string, status:string, startup_type:string |
 | `crossplatform.service.running` | running | Q | WLM | *(none)* | name:string, display_name:string, status:string, startup_type:string |
-| `crossplatform.service.set_start_mode` | set_start_mode | A | WLM | name:string (req), mode:enum (req) | status:string, service:string, mode:string |
+| `crossplatform.service.set_start_mode` | set_start_mode | A | WLM | name:string (req), mode:enum (req) | status:string, service:string, mode:string (Linux also writes state:string, and note:string for static, indirect, alias or generated units) |
 
 ### User & Session
 
