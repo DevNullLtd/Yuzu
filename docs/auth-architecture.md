@@ -6268,8 +6268,11 @@ typed `ScopedGateOutcome` (`scoped_gate_outcome.hpp`: `Denied`, `Unauthenticated
 Boolean `require_scoped_permission` is that function compared with `Admitted`,
 so every other caller is unchanged and the response stays a fail-closed 403
 whatever the class. The two typed callers today are the Echo purge and re-enable
-fragments and the REST Echo purge, which use the class to tell an outage from a
-denial (503 and `store_unavailable`, not the 404 and `scope_violation`). The
+fragments and the REST Echo purge. The fragments use the class to tell an outage
+from a denial (503 and `store_unavailable`, not the 404 and `scope_violation`).
+The REST purge keeps the gate's own status (the fail-closed 403 for a degraded
+read) and uses the class only for the metric result and, at the recheck, the
+failure row's detail. The
 engine-principal branch of the gate deliberately keeps the unchecked read, so an
 engine caller's degraded read is the plain `Denied` class. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
 under SQLite a corrupt/unreadable RBAC store could fall through to an engaged
