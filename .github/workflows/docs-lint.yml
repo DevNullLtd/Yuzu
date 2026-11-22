@@ -127,12 +127,14 @@ jobs:
         run: python3 -I tests/test_execution_owner_key_tripwire.py
 
       # WP13 (agent privilege and trust): installer file capabilities (none set, any found are
-      # stripped, --check status), plugin-allowlist refusal wiring, no brew as root, /proc refusal status.
+      # stripped, --check status), plugin-allowlist refusal wiring, no brew as root, no task port
+      # (process_introspect), /proc refusal status.
       - name: WP13 agent privilege lint
         run: |
           python3 -I tests/test_plugin_allowlist_wiring_lexical.py
           python3 -I tests/test_installed_apps_no_brew_lexical.py
           python3 -I tests/test_pkg_inventory_no_brew_lexical.py
+          python3 -I tests/test_process_introspect_no_task_port_lexical.py
           python3 -I tests/test_agent_installer_no_file_caps.py
           python3 -I tests/test_proc_access_status_lexical.py
           python3 -I tests/cpp_lex_helper.py

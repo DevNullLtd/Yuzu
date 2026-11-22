@@ -133,7 +133,7 @@ static_assert(kFacetNames.size() == 6, "rule every new facet for macOS in mac_fa
     case Facet::seccomp:
         return MacFacetAnswer::no_os_equivalent;
     }
-    // Unreachable; reads nothing, so it fails closed.
+    // Reached only for a facet with no arm above (a -Wswitch warning); fails closed.
     return MacFacetAnswer::not_exposed_by_libproc;
 }
 

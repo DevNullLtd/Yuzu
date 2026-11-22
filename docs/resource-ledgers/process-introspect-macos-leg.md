@@ -32,5 +32,15 @@ early return, `bad_alloc` unwind) releases exactly the resource listed.
 ## Not introduced
 No file descriptor, handle, socket, thread, subprocess, temp path, library handle or Mach port
 (`task_for_pid` and every Mach VM call are banned and pinned by
-`tests/test_process_introspect_no_task_port_lexical.py`). Neither call takes the target's VM map
-lock, so no deadline wrapper is needed.
+`tests/test_process_introspect_no_task_port_lexical.py`).
+
+No deadline wrapper, and none can be added from the plugin. Neither call takes the target's VM
+map lock. `proc_pidinfo` does take a reference on the target through `proc_find`, which waits
+uninterruptibly while the target is inside the exec switch (after the new image is loaded), so a
+third thread that holds a reference on the target and is itself blocked at that instant could stall
+the call. That is read from the public XNU source (xnu-12377.1.9: `kern_proc.c`
+`proc_ref_wait_for_exec`, `kern_exec.c` `proc_exec_switch_task`), not the kernel on a test host,
+and was not reproduced. The wait is shared by every `proc_find` caller (`ps`, `kill`). A bounded
+call from plugin text is forbidden by the tree: a detached thread in a plugin that can be unloaded
+is a use-after-unload (`agents/core/include/yuzu/agent/passwd_lookup.hpp`), so a wrapper needs an
+agent-core primitive, which is a separate change.

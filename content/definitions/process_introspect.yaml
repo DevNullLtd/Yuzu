@@ -25,11 +25,12 @@
 ##   sched            /proc/<pid>/stat (policy, nice, rt priority) and status (Cpus_allowed_list)
 ##   macOS:           libproc only (one proc_pidinfo(PROC_PIDTBSDINFO) call and the
 ##                    kern.bootsessionuuid sysctl), never a task port. sched answers the nice
-##                    value only (CONSTRAINED, macos:process_introspect:sched:nice_only);
+##                    value only (CONSTRAINED, macos:process_introspect:sched:nice_only, or
+##                    sched:malformed for a nice value outside -20 to 20);
 ##                    resource_limits, sigmasks and oom answer `unsupported`
 ##                    (not_exposed_by_libproc) and caps and seccomp answer `unsupported`
-##                    (no_os_equivalent). These three answers are PERMANENT, not a degraded
-##                    read: do not retry or alert on them. torn_read is Linux only.
+##                    (no_os_equivalent). The nice_only and unsupported answers are PERMANENT,
+##                    not a degraded read: do not retry or alert on them. torn_read is Linux only.
 ##   Windows:         PLANNED, not read yet; one `unsupported` status row, windows:planned.
 ##
 ## NEVER emitted, on any facet: file or memory contents, environment values, socket payloads,
@@ -52,10 +53,11 @@ metadata:
     status row stating whether the read was complete. On Linux the read is made through
     /proc, so on a host that mounts /proc with hidepid 2 or above another account's process
     reads as no_such_process_or_hidden. On macOS only sched is read, and of it only the nice
-    value through libproc (always CONSTRAINED, sched:nice_only); the other five facets always
-    answer unsupported (not_exposed_by_libproc or no_os_equivalent), and these answers are
-    permanent and must not be retried; torn_read is Linux only. Windows is planned and not yet
-    read.
+    value through libproc (a completed read answers CONSTRAINED: sched:nice_only, or
+    sched:malformed for a nice value outside -20 to 20); the other five facets always answer
+    unsupported (not_exposed_by_libproc or no_os_equivalent). The nice_only and unsupported
+    answers are permanent, not a degraded read: do not retry or alert on them. torn_read is
+    Linux only. Windows is planned and not yet read.
     Take the pid from crossplatform.process.list; a degraded read is returned as CONSTRAINED,
     never as an empty OK, and no_such_process, no_such_process_or_hidden and pid_reused are
     terminal while torn_read can be retried. Needs Forensics:Read, and a non-administrator
@@ -98,7 +100,8 @@ spec:
           Optional identity guard. The token is field 2 of the `target` row of an earlier
           inspect of the same pid; no other plugin or action emits it, so the first inspect of
           a pid is always unguarded and the guard only links one inspect to the next. If the
-          pid now belongs to a different process the request is refused as pid_reused. Leave
+          pid now belongs to a different process the request is refused as pid_reused (on macOS
+          for sched only; the other five facets answer unsupported without checking it). Leave
           empty for no guard.
         validation:
           pattern: "^([0-9a-f]{8}\\.[0-9]{1,20})?$"

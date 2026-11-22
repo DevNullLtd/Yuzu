@@ -10,20 +10,25 @@ Best-effort text pins over the plugin's C/C++ sources, read through cpp_lex_help
 removed, adjacent string literals joined): a name built at run time or reached by indirection is
 not caught. Checks, over every regular file under agents/plugins/process_introspect/src (no
 extension list: any list is a bypass list):
-  1. no whole-word task or Mach VM call (task_for_pid and its variants, mach_vm_*, vm_read*,
-     vm_region*, task_threads, task_info, processor_set_tasks*, ...);
+  1. no whole-word task or Mach VM call (task_for_pid and its variants, every (mach_)vm_*
+     identifier, task_threads, task_info, processor_set_tasks*, ...);
   2. no #include <mach/...>, no dlsym or dlopen, no ptrace, no ReadProcessMemory, no subprocess
-     runner, no string literal ending /mem;
-  3. libproc allow-list: the only PROC_PID* tokens are PROC_PIDTBSDINFO and
-     PROC_PIDTBSDINFO_SIZE; every proc_pidinfo is a call of the form
+     runner, no kill, syscall or __proc_info, no pbi_comm or pbi_name (the process name in
+     proc_bsdinfo is never stored), no string literal ending /mem. Raw spawns (popen, system,
+     fork, exec*, posix_spawn) are gated over every plugin by
+     scripts/ci/check-plugin-spawn-lexical.sh, not here;
+  3. libproc allow-list: every proc_* identifier is one of proc_pidinfo, proc_bsdinfo, proc_info
+     (the include path) or proc_visibility (the Linux helper), and the only PROC_PID* tokens are
+     PROC_PIDTBSDINFO and PROC_PIDTBSDINFO_SIZE; every proc_pidinfo is a call of the form
      proc_pidinfo(<pid>, PROC_PIDTBSDINFO, ...) (a numeric or variable flavour, or the bare name,
-     fails; the pid argument holds no comma or parenthesis); and no proc_pidpath, proc_name,
-     proc_regionfilename, proc_pidfdinfo, proc_listpids or proc_pid_rusage;
-  4. sysctl allow-list: the only sysctlbyname name is kern.bootsessionuuid, no MIB-form
-     sysctl( call, no sysctlnametomib, no KERN_PROC* / KERN_ARGMAX token (the argv and
-     environment read);
+     fails; the pid argument holds no comma or parenthesis);
+  4. sysctl allow-list: the only sysctlbyname name is kern.bootsessionuuid, no bare
+     (uncalled) sysctlbyname, no MIB-form sysctl( call, no sysctlnametomib, no KERN_PROC* /
+     KERN_ARGMAX token (the argv and environment read);
   5. non-vacuity: process_introspect_macos.cpp exists and contains proc_pidinfo and
-     PROC_PIDTBSDINFO, so a rename cannot make the gate pass on nothing.
+     PROC_PIDTBSDINFO, so a rename cannot make the gate pass on nothing;
+  6. in process_introspect_macos.cpp only: the include set stays within its six headers and
+     proc_pidinfo is called exactly once.
 """
 import pathlib
 import re
@@ -38,20 +43,25 @@ MACOS_TU = "process_introspect_macos.cpp"
 
 TASK_CALLS = re.compile(
     r"\b(task_for_pid|task_read_for_pid|task_inspect_for_pid|task_name_for_pid|"
-    r"processor_set_tasks\w*|mach_vm_\w+|vm_region\w*|vm_read\w*|task_threads|task_info)\b")
+    r"processor_set_tasks\w*|(?:mach_)?vm_\w+|task_threads|task_info)\b")
 MACH_INCLUDE = re.compile(r"#\s*include\s*[<\"]mach/")
 OTHER_BANS = re.compile(r"\b(dlsym|dlopen|ptrace|ReadProcessMemory|run_bounded_subprocess|"
-                        r"subprocess_runner)\b")
+                        r"subprocess_runner|kill|syscall|__proc_info|pbi_comm|pbi_name)\b")
 MEM_LITERAL = re.compile(r'"[^"\n]*/mem"')
 PROC_PID_TOKEN = re.compile(r"\bPROC_PID\w*")
 PROC_PID_ALLOWED = {"PROC_PIDTBSDINFO", "PROC_PIDTBSDINFO_SIZE"}
 PROC_PIDINFO = re.compile(r"\bproc_pidinfo\b")
 PROC_PIDINFO_CALL = re.compile(r"proc_pidinfo\s*\(\s*[^,()]*,\s*PROC_PIDTBSDINFO\s*,")
-LIBPROC_BANS = re.compile(r"\b(proc_pidpath|proc_name|proc_regionfilename|proc_pidfdinfo|"
-                          r"proc_listpids|proc_pid_rusage)\b")
+PROC_IDENT = re.compile(r"\bproc_\w+")
+PROC_ALLOWED = {"proc_pidinfo", "proc_bsdinfo", "proc_info", "proc_visibility"}
 SYSCTLBYNAME = re.compile(r"\bsysctlbyname\s*\(\s*(\"[^\"\n]*\"|[^,)]*)")
+SYSCTLBYNAME_BARE = re.compile(r"\bsysctlbyname\b(?!\s*\()")
 SYSCTL_ALLOWED = '"kern.bootsessionuuid"'
 SYSCTL_BANS = re.compile(r"\bsysctl\s*\(|\bsysctlnametomib\b|\bKERN_PROC\w*|\bKERN_ARGMAX\b")
+INCLUDE = re.compile(r"#\s*include\s*([<\"][^>\"\n]+[>\"])")
+MACOS_INCLUDES = {'"process_introspect_legs.hpp"', "<libproc.h>", "<sys/proc_info.h>",
+                  "<sys/sysctl.h>", "<cerrno>", "<cstring>"}
+PROC_PIDINFO_CALLS = re.compile(r"\bproc_pidinfo\s*\(")
 
 
 def findings(name: str, src: str) -> list[str]:
@@ -74,13 +84,22 @@ def findings(name: str, src: str) -> list[str]:
         if not PROC_PIDINFO_CALL.match(ident, m.start()):
             out.append(f"{name}: proc_pidinfo is not called as "
                        "proc_pidinfo(pid, PROC_PIDTBSDINFO, ...)")
-    for m in LIBPROC_BANS.finditer(ident):
-        out.append(f"{name}: names {m.group(0)} (not on the libproc allow-list)")
+    for m in PROC_IDENT.finditer(ident):
+        if m.group(0) not in PROC_ALLOWED:
+            out.append(f"{name}: names {m.group(0)} (not on the libproc allow-list)")
     for m in SYSCTLBYNAME.finditer(code):
         if m.group(1).strip() != SYSCTL_ALLOWED:
             out.append(f"{name}: sysctlbyname({m.group(1).strip()}...) is not kern.bootsessionuuid")
+    for m in SYSCTLBYNAME_BARE.finditer(ident):
+        out.append(f"{name}: sysctlbyname is named without being called")
     for m in SYSCTL_BANS.finditer(ident):
         out.append(f"{name}: uses {m.group(0).strip()} (only sysctlbyname of kern.bootsessionuuid)")
+    if name == MACOS_TU:
+        for m in INCLUDE.finditer(code):
+            if m.group(1) not in MACOS_INCLUDES:
+                out.append(f"{name}: includes {m.group(1)}, outside its six headers")
+        if len(PROC_PIDINFO_CALLS.findall(ident)) != 1:
+            out.append(f"{name}: proc_pidinfo must be called exactly once")
     return out
 
 
@@ -101,10 +120,28 @@ def self_check() -> list[str]:
         'sysctl(mib, 4, b, &n, nullptr, 0);',
         'int m[2] = {CTL_KERN, KERN_PROC};',
         'int m = KERN_ARGMAX;',
+        'proc_terminate(pid, &rc, &sig);',
+        'int n = proc_listallpids(buf, size);',
+        'syscall(SYS_kill, pid, 9);',
+        'kill(pid, SIGKILL);',
+        '__proc_info(2, pid, 0, 0, buf, n);',
+        'auto f = &sysctlbyname;',
+        'auto n = pbi.pbi_comm;',
+        'auto n = pbi.pbi_name;',
+        'vm_write(task, a, d, n);',
+        'vm_protect(task, a, n, 0, prot);',
     )
     for bad in bad_shapes:
         if not findings("self", bad):
             errs.append(f"self-check: did not flag {bad!r}")
+    # Rules that apply to the macOS TU only: an extra include, and a second proc_pidinfo call.
+    macos_call = "proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &pbi, PROC_PIDTBSDINFO_SIZE);\n"
+    for bad in ('#include <unistd.h>\n' + macos_call,
+                '#include "macos_socket_walk.hpp"\n' + macos_call,
+                macos_call + macos_call,
+                "int x;"):
+        if not findings(MACOS_TU, bad):
+            errs.append(f"self-check: did not flag {bad!r} as the macOS TU")
     # Every banned name, spelled out here and not read back from the regexes above, so a typo in
     # any one regex alternative leaves its name unflagged and fails (a prefix such as mach_vm_
     # stands for its family).
@@ -113,9 +150,11 @@ def self_check() -> list[str]:
         "processor_set_tasks", "processor_set_tasks_with_flavor", "mach_vm_region", "mach_vm_read",
         "vm_region", "vm_region_64", "vm_region_recurse", "vm_region_recurse_64", "vm_read",
         "vm_read_list", "vm_read_overwrite", "task_threads", "task_info",
-        "dlsym", "dlopen", "ptrace", "ReadProcessMemory", "run_bounded_subprocess",
-        "subprocess_runner", "proc_pidpath", "proc_name", "proc_regionfilename",
-        "proc_pidfdinfo", "proc_listpids", "proc_pid_rusage", "sysctlnametomib",
+        "vm_write", "vm_protect", "dlsym", "dlopen", "ptrace", "ReadProcessMemory",
+        "run_bounded_subprocess", "subprocess_runner", "kill", "syscall", "__proc_info",
+        "pbi_comm", "pbi_name", "proc_pidpath", "proc_name", "proc_regionfilename",
+        "proc_pidfdinfo", "proc_listpids", "proc_listallpids", "proc_terminate", "proc_pid_rusage",
+        "sysctlnametomib",
     )
     for name in banned_names:
         if not findings("self", f"{name}(x);"):
@@ -129,11 +168,19 @@ def self_check() -> list[str]:
         'auto d = "libproc proc_pidinfo, no task port";',
         'auto t = "task_for_pid in a descriptor string";',
         '#include <libproc.h>\n#include <sys/sysctl.h>',
+        'auto m = "kill the process";\nint kill_switched = 1;',
+        'bool v = proc_visibility(m) == ProcVisibility::visible;',
     )
     for good in good_shapes:
         got = findings("self", good)
         if got:
             errs.append(f"self-check: flagged {good!r}: {got}")
+    macos_good = ('#include "process_introspect_legs.hpp"\n#include <libproc.h>\n'
+                  '#include <sys/proc_info.h>\n#include <sys/sysctl.h>\n#include <cerrno>\n'
+                  '#include <cstring>\n' + macos_call)
+    got = findings(MACOS_TU, macos_good)
+    if got:
+        errs.append(f"self-check: flagged the macOS TU's own shape: {got}")
     return errs
 
 

@@ -1000,12 +1000,15 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "Per-process introspection of one pid, one facet per request (resource_limits, "
          "sigmasks, caps, seccomp, oom, sched): numbers, masks and fixed tokens only, never "
          "file or memory contents, environment values or command-line arguments; Linux and macOS, "
-         "Windows is planned; on macOS sched reads only the nice value and always answers "
-         "CONSTRAINED (sched:nice_only) and the other facets answer unsupported; both are "
-         "permanent, so do not retry them; read-only, default-off, "
-         "Forensics:Read single-target (a non-admin also needs approval); pid from "
+         "Windows is planned; on macOS sched reads only the nice value and a completed read "
+         "answers CONSTRAINED (sched:nice_only; sched:malformed for a nice value outside -20 to "
+         "20) while the other facets answer unsupported; the nice_only and unsupported answers "
+         "are permanent, not a degraded read: do not retry or alert on them; read-only, "
+         "default-off, Forensics:Read single-target (a non-admin also needs approval); pid from "
          "crossplatform.process.list; a degraded read is CONSTRAINED, never an empty OK; "
-         "no_such_process* and pid_reused terminal, torn_read (Linux) retryable"},
+         "no_such_process* and pid_reused terminal, torn_read (Linux) retryable; on macOS "
+         "permission_denied means a process of another account, a retry does not help unless "
+         "the agent runs as root"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},

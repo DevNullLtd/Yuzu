@@ -12,7 +12,15 @@
  * re-read exists because facet files are read after identity). Only three numbers leave the
  * stack struct; the process name bytes in proc_bsdinfo die with the stack frame, never copied.
  *
- * No deadline wrapper: neither call takes the target's VM map lock.
+ * No deadline wrapper, and none can be added from this plugin. Neither call takes the target's VM
+ * map lock. proc_pidinfo does take a reference on the target through proc_find, which waits
+ * uninterruptibly while the target is inside the exec switch (proc_exec_switch_task, after the
+ * new image is loaded), so a third thread that holds a reference on the target and is itself
+ * blocked at that instant could stall this call, as it would ps and kill on that pid. That is
+ * read from the public XNU source (xnu-12377.1.9: kern_proc.c proc_ref_wait_for_exec,
+ * kern_exec.c proc_exec_switch_task), not the kernel on a test host, and not reproduced. A
+ * bounded wrapper needs an agent-core primitive, because a detached thread in a plugin that can
+ * be dlclose()d is a use-after-unload (agents/core/include/yuzu/agent/passwd_lookup.hpp).
  */
 #if defined(__APPLE__)
 

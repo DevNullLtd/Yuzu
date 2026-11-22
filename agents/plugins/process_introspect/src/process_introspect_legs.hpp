@@ -1,12 +1,13 @@
 /**
- * process_introspect_legs.hpp -- the seam between the plugin TU and the Linux shell TU.
+ * process_introspect_legs.hpp -- the seam between the plugin TU and the per-OS shell TUs
+ * (process_introspect_linux.cpp, process_introspect_macos.cpp).
  *
  * Holds the request grammar check (parse_request), the pure errno classification (the ONLY place
- * an errno is interpreted), the injected /proc boundary (ProcSource), the OS-free decision
- * (inspect_linux), report (the SINGLE writer of the `status|inspect|...` row) and execute_inspect
- * (the plugin's whole execute() body and its ONE try/catch). Everything here compiles on every
- * OS so the decisions are unit-tested on every OS over an in-memory fake ProcSource; the shell
- * (process_introspect_linux.cpp) only binds syscalls.
+ * an errno is interpreted), the injected /proc and libproc boundaries (ProcSource, MacSource),
+ * the OS-free decisions (inspect_linux, inspect_macos), report (the SINGLE writer of the
+ * `status|inspect|...` row) and execute_inspect (the plugin's whole execute() body and its ONE
+ * try/catch). Everything here compiles on every OS so the decisions are unit-tested on every OS
+ * over an in-memory fake source; the shells only bind syscalls.
  *
  * What is read, in order (Linux): /proc/<pid> is opened ONCE as a directory descriptor; every
  * per-process read is openat on that descriptor, so a recycled pid cannot be read. The only
@@ -87,7 +88,8 @@ struct RawRead {
 
 enum class ReadState { ok, not_found, denied, oversized, io };
 
-/// A not-found open is NOT proof the process is gone; see inspect_linux.
+/// On Linux a not-found open is NOT proof the process is gone, see inspect_linux; on macOS ESRCH
+/// is the kernel's own answer for a pid that does not exist, see inspect_macos.
 [[nodiscard]] constexpr ReadState classify_open_errno(int err) noexcept {
     if (err == 0)
         return ReadState::ok;
@@ -171,7 +173,7 @@ inline void report(yuzu::CommandContext& ctx, const Inspection& r) {
 }
 
 // ---------------------------------------------------------------------------
-// The Linux decision (OS-free)
+// Shared helpers and the Linux decision (OS-free)
 // ---------------------------------------------------------------------------
 
 namespace detail {
@@ -429,11 +431,8 @@ struct MacSource {
     using detail::refuse;
     const Facet f = req.facet;
     const MacFacetAnswer a = mac_facet_answer(f);
-    switch (a) {
-    case MacFacetAnswer::nice_only:
-        break;
-    case MacFacetAnswer::not_exposed_by_libproc:
-    case MacFacetAnswer::no_os_equivalent:
+    // Anything but the one read facet answers unsupported, so an unlisted enumerator fails closed.
+    if (a != MacFacetAnswer::nice_only)
         return Inspection{StatusState::unsupported,
                           detail::facet_token(f,
                                               a == MacFacetAnswer::no_os_equivalent
@@ -441,7 +440,6 @@ struct MacSource {
                                                   : "not_exposed_by_libproc",
                                               kMacTok),
                           {}};
-    }
 
     const MacBsdInfo b = src.bsdinfo();
     switch (classify_open_errno(b.err)) {

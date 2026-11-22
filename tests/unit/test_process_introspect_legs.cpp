@@ -1,13 +1,15 @@
 /**
  * test_process_introspect_legs.cpp -- the OS-free decision seam of the process_introspect plugin:
  * the pure errno classifiers, inspect_linux over an in-memory fake /proc that returns RAW errnos
- * (so the real classification arms run), report's status/result pairing and execute_inspect's
+ * (so the real classification arms run), inspect_macos over an in-memory fake libproc and sysctl
+ * (the MacFake cases at the end), report's status/result pairing and execute_inspect's
  * validation and containment. Compiles and runs on every OS; no host file is read and nothing
  * is spawned.
  *
- * The fake is the injected boundary: it records every read name and whether boot_id and
- * mountinfo were called, so the read-order rules (identity first, stat last, mount table only on
- * the not-found open path) are asserted, not assumed.
+ * The fakes are the injected boundary: the /proc fake records every read name and whether
+ * boot_id and mountinfo were called, so the read-order rules (identity first, stat last, mount
+ * table only on the not-found open path) are asserted, not assumed; MacFake counts its two
+ * calls, so the one-snapshot rule is asserted too.
  *
  * Tagged [process_introspect] ONLY: a carved tag would move a case to another shard.
  */
@@ -1029,6 +1031,9 @@ TEST_CASE("process_introspect macOS: the other five facets answer unsupported an
         {Facet::caps, "caps:no_os_equivalent"},
         {Facet::seccomp, "seccomp:no_os_equivalent"},
     };
+    // These five plus sched are every facet: a facet added without a macOS ruling fails here
+    // rather than answering a permanent unsupported by default.
+    CHECK(std::size(cases) + 1 == kFacetNames.size());
     for (const auto& c : cases) {
         for (const std::string& st : {std::string{}, kMacToken}) {
             const MacFake fk;
@@ -1104,6 +1109,16 @@ TEST_CASE("process_introspect macOS: identity that cannot be built is identity_u
         fk.boot = ok("0123ABCG-4567");
         CHECK(run_mac(fk, Facet::sched).reason == unreadable);
     }
+    // A boot-session read that fails, is empty, or is refused for a too-small buffer (ENOMEM,
+    // what a value over the 64-byte buffer gives) never builds an identity.
+    for (const RawRead& boot : {io(ENOENT), ok(""), io(ENOMEM)}) {
+        MacFake fk;
+        fk.boot = boot;
+        const auto r = run_mac(fk, Facet::sched);
+        CHECK(r.status == StatusState::unavailable);
+        CHECK(r.reason == unreadable);
+        CHECK(r.rows.empty());
+    }
     {
         MacFake fk;
         fk.boot = ok("ABCDEF01-4567");
@@ -1129,6 +1144,14 @@ TEST_CASE("process_introspect macOS: the start_time guard", "[process_introspect
         CHECK(r.rows.empty());
         CHECK(fk.bsd_calls == 1);
         CHECK(fk.boot_calls == 1);
+    }
+    {
+        // The same start number under another boot session is another process.
+        const MacFake fk;
+        const auto r = run_mac(fk, Facet::sched, "ffffffff.1700000000123456");
+        CHECK(r.status == StatusState::unavailable);
+        CHECK(r.reason == kMacTokPrefix + "pid_reused");
+        CHECK(r.rows.empty());
     }
 }
 
@@ -1177,6 +1200,9 @@ TEST_CASE("process_introspect macOS: no fault ever reads as supported or torn", 
                 INFO(start_time);
                 CHECK(r.status != StatusState::supported);
                 CHECK(r.reason.find("torn_read") == std::string::npos);
+                // refuse and facet_token default to the Linux prefix, so a forgotten argument
+                // would compile and emit a linux: token on macOS.
+                CHECK(r.reason.starts_with(kMacTokPrefix));
                 if (r.status != StatusState::unavailable && r.status != StatusState::permission_denied &&
                     r.status != StatusState::unsupported)
                     CHECK_FALSE(r.rows.empty());

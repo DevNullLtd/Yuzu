@@ -1,7 +1,8 @@
 /**
  * test_process_introspect_parsers.cpp -- the pure core of the process_introspect plugin: request
  * grammar, start-time token, /proc/<pid>/stat, the /proc mount-table hidepid check,
- * /proc/<pid>/status, /proc/<pid>/limits, the oom values and the row formatters.
+ * /proc/<pid>/status, /proc/<pid>/limits, the oom values and the row formatters, plus the macOS
+ * pure functions (the per-facet answer, boot-session prefix, start number, nice, sched row).
  *
  * FIXTURES. Each is labelled where it is declared, in one of two kinds.
  *   REAL CAPTURE     -- pasted byte for byte, never edited, from a throwaway root-owned `sleep 600`

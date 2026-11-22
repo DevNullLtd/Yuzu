@@ -8,6 +8,9 @@
  * never host values: which capabilities and limits a CI runner holds is unknown. Shape includes
  * the facet's row kinds and counts, and a fully readable own process answering supported: a
  * process always reads its own five /proc files, so a constrained answer there is a defect.
+ * The macOS cases also use the test's own pid: sched is compared with getpriority for this
+ * process (no value pinned), the five other facets answer one unsupported row, the start_time
+ * token links one inspect to the next, and a pid that cannot exist answers no_such_process.
  *
  * Tagged [process_introspect] ONLY: a carved tag would move a case to another shard.
  */
@@ -31,6 +34,11 @@
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
+#endif
+#if defined(__APPLE__)
+#include <sys/resource.h>
+
+#include <cerrno>
 #endif
 
 namespace fs = std::filesystem;
@@ -298,7 +306,7 @@ TEST_CASE("process_introspect plugin (macOS): sched of the test's own pid answer
         require_plugin_or_skip();
         return;
     }
-    static const std::regex sched_shape{R"(^sched\|-\|-?[0-9]{1,2}\|-\|-$)"};
+    static const std::regex sched_shape{R"(^sched\|-\|(-?[0-9]{1,2})\|-\|-$)"};
     const auto r = inspect(*plugin, own_pid(), "sched");
     CHECK(r.rc == 0);
     const auto rows = captured_rows(r.captured);
@@ -307,7 +315,15 @@ TEST_CASE("process_introspect plugin (macOS): sched of the test's own pid answer
     const std::string expect_prefix = "target|" + own_pid() + "|";
     CHECK(rows[1].starts_with(expect_prefix));
     CHECK(rows[1].ends_with("|sched"));
-    CHECK(std::regex_match(rows[2], sched_shape));
+    std::smatch nice;
+    REQUIRE(std::regex_match(rows[2], nice, sched_shape));
+    // The shell is the only code that maps pbi_nice to a number, so compare it with the kernel's
+    // own answer for this process: any nice setting passes and no value is pinned. A legitimate
+    // -1 return leaves errno at 0.
+    errno = 0;
+    const int own_nice = getpriority(PRIO_PROCESS, 0);
+    REQUIRE(errno == 0);
+    CHECK(std::stoi(nice[1].str()) == own_nice);
     CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
 }
