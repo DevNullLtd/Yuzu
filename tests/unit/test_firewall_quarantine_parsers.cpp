@@ -5146,8 +5146,9 @@ TEST_CASE("allow_set_unchanged_note: the shared condition and text, from the sto
     }
     SECTION("on the wire a self_host refusal carries the note as its last row") {
         auto o = refused("self_host");
-        o.notes.emplace_back(*allow_set_unchanged_note(stored(StateLoad::Kind::ok, Phase::active),
-                                                       {}));
+        const auto n = allow_set_unchanged_note(stored(StateLoad::Kind::ok, Phase::active), {});
+        REQUIRE(n.has_value());
+        o.notes.emplace_back(*n);
         const std::vector<std::string> expected{"status|refused|self_host", "refused|self_host",
                                                 "note|allow_set_unchanged_use_quarantine_allow=1"};
         CHECK(render_rows(o) == expected);

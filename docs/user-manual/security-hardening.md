@@ -624,7 +624,7 @@ whitelist leaves IPv6 fully contained.
 - A device that cannot reach the server needs out-of-band recovery. When in doubt, whitelist both
   families for the management server.
 
-### A device that is its own server is never contained
+### A device that is its own server refuses new containment
 
 A `firewall.quarantine` apply to a device whose server or gateway address is one of its own
 addresses, loopback included, is refused and changes nothing. A device that held no containment
@@ -661,38 +661,41 @@ override. The refusal is visible in the
   is released wherever the agent can elevate; on the packaged Linux unit a release is refused too
   (`privilege_unavailable`), so only a forced end ends the record. `firewall.release` and the console
   steps (in "Known limit: addresses only") still lift a containment on a device that refuses.
-- **The record of a refused device stays unconfirmed.** The server keeps re-dispatching to a
-  device that refuses, so a record that was never confirmed never confirms (the device holds no
-  containment) and `YuzuQuarantineEndpointUnconfirmed` fires after 15 minutes. Operator commands to the
-  device stay refused while the record exists. End it with `DELETE /api/v1/quarantine/{agent_id}`, with
-  `?force=true` where the device refuses the release (the packaged Linux unit).
+- **The record of a refused device that held no containment stays unconfirmed.** The server keeps
+  re-dispatching to a device that refuses, so a record for a device that held no containment never
+  confirms and `YuzuQuarantineEndpointUnconfirmed` fires after 15 minutes. Operator commands to the
+  device stay refused while the record exists. End it with `DELETE /api/v1/quarantine/{agent_id}`,
+  with `?force=true` where the device refuses the release (the packaged Linux unit).
 - **A contained device that became its own server stays contained.** A refusal changes nothing, so a
   device that was contained and has since come to share its server's address (the server moved onto
-  the host, or the server name now resolves to one of the host's own addresses) answers every new
-  apply `refused|self_host` and keeps the containment and its record as they were; the agent's repair
-  and its boot re-apply keep the stored containment too. `firewall.quarantine_status` says what is in
-  force, because the refusal token does not. `firewall.release`, and the console steps in "Known limit:
-  addresses only" below, still lift it. On such a device, release then quarantine again is not a way
-  to change the whitelist (the new quarantine is refused): use `firewall.quarantine_allow`.
-- **Known limit: addresses only.** The check compares addresses. A server that runs in a
-  container or a VM on the same host and is reached at a bridge address (for example `172.17.0.2`
-  behind `docker0`) is not one of the host's own addresses, so that host can still be contained.
-  NAT, floating and port-forwarded addresses (a cloud elastic IP, a Linux `local` route) are not
-  seen on any OS either, and a host that holds one of the addresses its server name resolves to is
-  never contained: the resolved set is read once at agent start, so restart the agent after the
-  server's address changes. A host contained this way has `forward` at policy drop with no rules, so
-  forwarded traffic is dropped and the server's published ports vanish for the whole fleet while the
-  containment stands; a server apply carries no time limit (`ttl_seconds`), and the 60-second repair
-  puts back a table removed by hand. A host that runs the server while its agent reaches a remote
-  gateway or VIP passes the check the same way, and its new inbound connections are dropped. The
-  exits are `DELETE /api/v1/quarantine/{agent_id}` while the API is reachable, otherwise console
-  recovery: stop the agent service first, then remove the containment by hand (Linux:
-  `sudo nft delete table inet yuzu_quarantine`, or without nft delete the `yuzu-fwq-*` chains and
-  the jumps to them, in iptables and ip6tables; macOS:
+  the host, or, after an agent restart, the server name resolves to one of the host's own addresses)
+  answers every new apply `refused|self_host` and keeps the containment and its record as they were;
+  the agent's repair and its boot re-apply keep the stored containment too.
+  `firewall.quarantine_status` says what is in force, because the refusal token does not.
+  `firewall.release`, and the console steps in "Known limit: addresses only" below, still lift it. A
+  time limit set on the device (by a `firewall.quarantine` dispatch outside the quarantine routes; a
+  server apply carries none) still ends that containment, and the server cannot then contain it
+  again. Do not release and quarantine again to change the whitelist on such a device: the release
+  lifts the containment and the new quarantine is refused, so the device ends uncontained; use
+  `firewall.quarantine_allow`.
+- **Known limit: addresses only.** The check compares addresses. A server that runs in a container
+  or a VM on the same host and is reached at a bridge address (for example `172.17.0.2` behind
+  `docker0`) is not one of the host's own addresses, so that host can still be contained. NAT,
+  floating and port-forwarded addresses (a cloud elastic IP, a Linux `local` route) are not seen on
+  any OS either, and a host that holds one of the addresses its server name resolves to is refused
+  (never newly contained): the resolved set is read once at agent start, so restart the agent after
+  the server's address changes. A host contained this way has `forward` at policy drop with no
+  rules, so forwarded traffic is dropped and the server's published ports vanish for the whole fleet
+  while the containment stands; a server apply carries no time limit (`ttl_seconds`), and the
+  60-second repair puts back a table removed by hand. A host that runs the server while its agent
+  reaches a remote gateway or VIP passes the check the same way, and its new inbound connections are
+  dropped. The exits are `DELETE /api/v1/quarantine/{agent_id}` while the API is reachable,
+  otherwise console recovery: stop the agent service first, then remove the containment by hand
+  (Linux: `sudo nft delete table inet yuzu_quarantine`, or without nft delete the `yuzu-fwq-*`
+  chains and the jumps to them, in iptables and ip6tables; macOS:
   `sudo pfctl -a com.apple/000.yuzu_quarantine -F rules -F nat`). Keep the agent stopped until the
   record is ended with `?force=true`: a restarted agent re-applies a stored containment, and the
-  release the server then owes lifts it. Put the server on a separate host when containment
-  matters.
+  release the server then owes lifts it. Put the server on a separate host when containment matters.
 
 ### Reading the result honestly
 
@@ -740,22 +743,27 @@ verified proof confirms). Confirmed means **the device reports its rules in forc
   `firewall.quarantine_allow` sent outside the quarantine routes changes the device and not the record,
   and the record still reads confirmed;
 - the one difference the device itself reports is on a **new record for a device that is already
-  contained**. `firewall.quarantine` to a contained device keeps the exceptions already in force, and
-  when the request's exceptions differ from them (as a set, order aside) the reply carries
+  contained**. `firewall.quarantine` to a contained device keeps the exceptions already in force,
+  and when the request's exceptions differ from them (as a set, order aside) the reply carries
   `note|allow_set_unchanged_use_quarantine_allow=1`. For a record that has never been confirmed the
-  server then does **not** confirm it and does not read status: the device is contained, but not under
-  this record's whitelist. The record stays unconfirmed, one `quarantine.reapply` failure row
-  (`allow_set_not_applied record_id=<id> command_id=<id>`, one per record, and one more after a server
-  restart) is written, and
-  `YuzuQuarantineEndpointUnconfirmed` fires after its usual delay. **The new whitelist is still not on
-  the device.** To get it there, release the device and quarantine it again (the release ends the record
-  once the device confirms, and the new quarantine then applies the whitelist to a device that holds no
-  earlier exceptions). The note rides a refusal too: on a device whose record is active, a refusal
-  (`refused|self_host` or `refused|own_addresses_unreadable`) carries it when the request's exceptions
-  differ from those in force (as a set, same rule and text as a retry that is not refused), and a
-  never-confirmed record then stays unconfirmed the same way (`allow_set_not_applied`). With equal
-  exceptions there is no note and the status read confirms. On such a device that refuses, release
-  then quarantine again is not a way to change the whitelist (the new quarantine is refused): use
+  server then does **not** confirm it and does not read status: the device is contained, but not
+  under this record's whitelist. The record stays unconfirmed, one `quarantine.reapply` failure row
+  (`allow_set_not_applied record_id=<id> command_id=<id>`, one per record, and one more after a
+  server restart) is written, and `YuzuQuarantineEndpointUnconfirmed` fires after its usual delay.
+  **The new whitelist is still not on the device.** To get it there, release the device and
+  quarantine it again (the release ends the record once the device confirms, and the new quarantine
+  then applies the whitelist to a device that holds no earlier exceptions). Not where the apply was
+  refused (the reply stored under the row's `command_id` reads `status|refused|self_host` or
+  `status|refused|own_addresses_unreadable`): there the release lifts the containment and a new
+  quarantine cannot put it back, so change the device's exceptions with `firewall.quarantine_allow`
+  until they equal the record's whitelist (the next apply then carries no note and the status read
+  confirms). The note rides a refusal too: on a device whose own record (the one the plugin keeps on
+  the device) is active, a refusal (`refused|self_host` or `refused|own_addresses_unreadable`)
+  carries it when the request's exceptions differ from those in force (as a set, same rule and text
+  as a retry that is not refused), and a never-confirmed record then stays unconfirmed the same way
+  (`allow_set_not_applied`). With equal exceptions there is no note and the status read confirms. Do
+  not release and quarantine again to change the whitelist on a device that refuses: the release
+  lifts the containment and the new quarantine is refused, so the device ends uncontained; use
   `firewall.quarantine_allow`. A record that was confirmed once keeps the behaviour above: later
   allow-list drift is not detected.
 
@@ -929,8 +937,11 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   fresh apply. A confirm is checked against the session that was live when the verifying status was
   sent. A restarted server applies first (its in-memory state starts empty), then reads status.
 - **A new record on a contained device.** See "What confirmed means": when the device says it kept
-  other exceptions, a record that was never confirmed is left unconfirmed, audited and alerted, and the
-  remedy is a release followed by a new quarantine.
+  other exceptions, a record that was never confirmed is left unconfirmed, audited and alerted, and
+  the remedy is a release followed by a new quarantine, except where the apply was refused
+  (`status|refused|self_host` or `status|refused|own_addresses_unreadable`): there the release lifts
+  the containment and a new quarantine cannot put it back, so change the device's exceptions with
+  `firewall.quarantine_allow` until they equal the record's whitelist.
 - **Release driving.** See "Releasing a device" above.
 - **The owed release.** A record ended by force before the device confirmed stays on a list until the
   device does. Per agent session the reconciler reads status (`inactive` clears it, audited

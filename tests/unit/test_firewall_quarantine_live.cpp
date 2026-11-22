@@ -1218,6 +1218,7 @@ TEST_CASE("quarantine: a retry on a device that became its own server is refused
         const auto r = retry("203.0.113.20");
         check_refused(r, "self_host");
         CHECK(has_row(r.captured, kNoteRow));
+        CHECK_FALSE(has_prefix(r.captured, "allow|")); // a refusal carries no state rows
         CHECK(raw_record() == active);
     }
     {

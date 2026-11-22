@@ -265,17 +265,18 @@ metadata:
     DHCP, DNS to the host's configured resolvers, IPv6 neighbour discovery and
     any exceptions listed. An optional time limit ends the containment on the
     device's own clock (a host the server holds a record for is contained
-    again by the server); an optional probe target proves the block. On Windows
-    the block is a rule group plus a per-profile default-block; on Linux an own
-    nftables table (iptables generation chain without nft); on macOS an own pf
-    sub-anchor. Reports active only when the block is verified and
+    again by the server, unless it refuses the apply); an optional probe
+    target proves the block. On Windows the block is a rule group plus a
+    per-profile default-block; on Linux an own nftables table (iptables
+    generation chain without nft); on macOS an own pf sub-anchor. Reports
+    active only when the block is verified and
     active_unproven when it could not be proven. Waits up to 2s for any other
     in-flight containment change on this device. The Linux packaged unit
     refuses every containment action (privilege_unavailable). A device whose
     control endpoint is one of its own addresses (loopback included), or whose
     own addresses cannot be read, answers refused|self_host or
     refused|own_addresses_unreadable to every apply that is not a repair,
-    whoever sent it and an apply to an already-contained device included, before
+    whoever sent it, an apply to an already-contained device included, before
     the privilege check; the refusal changes nothing, so no leg is built, no
     record is stored and an existing record and its containment are left as they
     were. The token alone does not say whether the device is contained: one that
@@ -310,8 +311,8 @@ spec:
           Optional, 60 to 2592000. The containment ends by itself on the
           device's clock when it passes (the clock is not synchronised while
           contained). A device the server holds a quarantine record for is
-          contained again: the server reads that end as drift and re-applies
-          the stored allow set.
+          contained again (unless it refuses the apply): the server reads that
+          end as drift and re-applies the stored allow set.
       probe_target:
         type: string
         displayName: Probe Target

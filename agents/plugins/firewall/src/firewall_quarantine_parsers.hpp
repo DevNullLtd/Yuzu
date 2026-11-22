@@ -4164,9 +4164,11 @@ inline Outcome roll_back(Env& env, QuarantineState st, std::string reason, std::
 /// set and the resolvers are re-read, so those differ on a healthy retry. Any other record
 /// (applying, releasing, unreadable, absent) has no stored set to keep, so no note. The
 /// server keys on this note to learn that a new record's whitelist was not applied (the
-/// stored set was kept), so it must ride every answer to such an apply, a refusal included:
-/// the `active` branch of apply_and_verify and the self-host refusal in do_quarantine both
-/// call this, so the condition and the text cannot drift apart.
+/// stored set was kept). It rides the two answers that call this helper, the `active` branch
+/// of apply_and_verify and the self-host refusal in do_quarantine, so the condition and the
+/// text cannot drift apart; the other refusals of an apply to an active record (the allow-set
+/// errors, `privilege_unavailable`, `unsupported_platform`, `staging_unavailable`) do not
+/// carry it (#8519).
 [[nodiscard]] inline std::optional<std::string_view>
 allow_set_unchanged_note(const StateLoad& stored,
                          const std::vector<Endpoint>& requested_exceptions) {

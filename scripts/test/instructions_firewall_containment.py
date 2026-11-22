@@ -58,7 +58,7 @@ endpoint staying reachable while it is contained; the time limit (--ttl-seconds)
 
 Exit codes: 0 passed; 1 a check failed; 2 precondition or usage error (nothing changed);
 3 release could not be confirmed: clear the firewall by hand (see docs/user-manual/security-hardening.md,
-"A device that is its own server is never contained").
+"A device that is its own server refuses new containment").
 
 --agent-id is required with --apply-containment (it never contains "the first agent listed") and must be
 registered exactly once under one of this machine's hostnames (full name, case-insensitive; a first-label
