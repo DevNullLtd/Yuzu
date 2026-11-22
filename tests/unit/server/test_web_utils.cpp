@@ -706,7 +706,13 @@ TEST_CASE("format_iso_utc: a value past year 9999 or beyond the platform range i
     REQUIRE(format_iso_utc(INT64_MAX) == "—");
     REQUIRE(format_iso_utc(INT64_MIN) == "—");
     REQUIRE(format_iso_utc(12345678901234567LL) == "—"); // 17 digits
+#ifdef _WIN32
+    // MSVC's gmtime_s fails past year 3000 (32535215999), so 3001-9999 is the sentinel there.
+    REQUIRE(format_iso_utc(32535215999LL) == "3000-12-31T23:59:59Z");
+    REQUIRE(format_iso_utc(253402300799LL) == "—");
+#else
     REQUIRE(format_iso_utc(253402300799LL) == "9999-12-31T23:59:59Z");
+#endif
     REQUIRE(format_iso_utc(253402300800LL) == "—");
 }
 

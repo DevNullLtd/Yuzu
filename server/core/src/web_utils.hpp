@@ -1046,8 +1046,9 @@ inline int64_t now_epoch_seconds() {
 
 /// Format epoch seconds as RFC 3339 / ISO 8601 in UTC: "YYYY-MM-DDTHH:MM:SSZ".
 /// Used in `title=` attributes so operators can copy a precise timestamp.
-/// Returns "—" for non-positive input, for a value past year 9999 (253402300799), and when the
-/// platform conversion reports failure (sentinel "never").
+/// Returns "—" (sentinel "never") for non-positive input and for a value past year 9999
+/// (253402300799) on every platform, and past year 3000 (32535215999) on Windows, where the
+/// platform conversion fails.
 inline std::string format_iso_utc(int64_t epoch_secs) {
     if (epoch_secs <= 0 || epoch_secs > 253402300799LL) return "—";
     std::time_t t = static_cast<std::time_t>(epoch_secs);
