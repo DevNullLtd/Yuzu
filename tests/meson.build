@@ -1889,6 +1889,7 @@ if build_server
       'unit/server/test_dex_app_perf_failures.cpp', # pure per-version crash/hang join + shared versions[] serializer - no store, no PG
       'unit/server/test_dex_apps_stability.cpp', # pure application/version stability assembly + shared apps JSON serializer - no store, no PG
       'unit/server/test_dex_usage_model.cpp', # pure fleet usage read model: matching, cells, disclosure, exposure rate, builder - no store, no PG
+      'unit/server/test_dex_apps_usage_ui.cpp', # Apps tab Usage view: pure renderer, payload parity, gates, audit and refusals - no store, no PG
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_dex_app_perf_version_table.cpp', # per-version crash/hang table renderer + fragment route over the FnDexPerfApi double - no store, no PG
@@ -3600,8 +3601,12 @@ test('image vulnerability gate',
   # Many cases each run the gate script with its stubs. Before the grype path
   # it took 41 s on an idle workstation and 68-92 s on a loaded CI runner (CI
   # hit 60.02 s on PR #8315 with the old limit of 60); with it (WP15), 86 s on
-  # the same workstation, so a loaded runner can need about 190 s.
-  timeout: 480,
+  # the same workstation, so a loaded runner can need about 190 s. With the
+  # provider-waiver cases and their mutants, 167 s on that workstation, so a
+  # loaded runner can need about 370 s. Started early so the long serial run
+  # overlaps the shorter tests of the suite.
+  timeout: 720,
+  priority: 10,
 )
 
 # WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
@@ -4975,6 +4980,13 @@ test('plugin allowlist startup wiring lexical gate',
 test('installed_apps no-brew lexical gate',
   _python3_test,
   args: [files('test_installed_apps_no_brew_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# The pkg_inventory plugin (which reads Homebrew prefixes, user-owned ones included, as root) never runs brew or any subprocess (source-text only).
+test('pkg_inventory no-brew lexical gate',
+  _python3_test,
+  args: [files('test_pkg_inventory_no_brew_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
