@@ -275,6 +275,10 @@ in-panel error and caches nothing rather than minting a weak token.
 | `GET /fragments/echo/process-tree/device-net?device=&dcmd=&acmd=&hour=&n=` | Dispatch and poll the hourly DNS and ARP queries, render the device network panels for the hour |
 | `GET /fragments/echo/process-tree/detail?token=&node=` | Render one node's detail from the cache (re-checks scope **+ Execute + originating principal**) |
 
+A `device` longer than 256 bytes or containing a byte below 0x20 (a control character) is
+refused with status 400 and the note "Invalid device id." on `run`, `result`, `device-net` and
+the capture-sources load and push routes, before any permission check, dispatch or audit row.
+
 ### 5.5 Permissions & audit
 
 - Viewing the frame: `Infrastructure:Read`.
