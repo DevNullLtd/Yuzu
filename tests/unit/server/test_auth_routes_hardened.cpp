@@ -47,9 +47,16 @@
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <filesystem>
 #include <future>
 #include <memory>
@@ -538,7 +545,7 @@ TEST_CASE("break-glass arm-state gate: one request reads the database, the rest 
     h.enroll_mfa("admin");
     h.arm("admin");
     h.auth_routes->reset_break_glass_arm_cache_for_test();
-    REQUIRE(h.auth_routes->sso_only_local_password_gate("admin") ==
+    REQUIRE(h.auth_routes->sso_only_local_password_gate("admin").state ==
             SsoOnlyLocalGate::kBreakGlassArmed); // warm the cache
     std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // past the 1 s TTL
     // Make the arm-state read SLOW: another connection holds an exclusive lock on auth.users.
@@ -582,27 +589,29 @@ TEST_CASE("break-glass gate: a stale armed value is never served past the TTL wh
           "[pg][auth][hardened][routes][concurrency][stripe][fail-closed]") {
     HardenedHarness h("sso-only", "admin");
     h.enroll_mfa("admin");
-    h.arm("admin", 2); // a 2 s arm window
-    REQUIRE(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kBreakGlassArmed);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2300)); // the window has ended
+    h.arm("admin", 4); // a 4 s arm window
+    REQUIRE(h.auth_routes->sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
+    std::this_thread::sleep_for(std::chrono::milliseconds(4300)); // the window has ended
     UsersTableLock lock(h.auth_db.dsn()); // the refresh will be stuck on this lock
     std::vector<SsoOnlyLocalGate> results(4, SsoOnlyLocalGate::kBreakGlassArmed);
     std::atomic<int> done{0};
     std::vector<yuzu::test::JoiningThread> callers;
     for (int i = 0; i < 4; ++i)
         callers.emplace_back([&, i] {
-            results[i] = h.auth_routes->sso_only_local_password_gate("admin");
+            results[i] = h.auth_routes->sso_only_local_password_gate("admin").state;
             ++done;
         });
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
     const int finished = done.load(); // everyone except the stuck refresher
     lock.release();
     callers.clear();
-    // The three non-refreshers answer at once and REFUSE (mutation: serving the stale armed
-    // value -> they answer kBreakGlassArmed past the end of the window).
+    // The three non-refreshers answer at once and are NOT admitted (mutation: serving the stale
+    // armed value -> they answer kBreakGlassArmed past the end of the window). Their answer is
+    // kTransient (the arm state could not be established); the refresher, once its read
+    // completes, has a definitive kRefused (the window ended).
     CHECK(finished == 3);
-    for (const auto r : results)
-        CHECK(r == SsoOnlyLocalGate::kRefused);
+    CHECK(std::count(results.begin(), results.end(), SsoOnlyLocalGate::kTransient) == 3);
+    CHECK(std::count(results.begin(), results.end(), SsoOnlyLocalGate::kRefused) == 1);
     // The refusals for "a refresh is in flight and the cache is stale" are counted.
     CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "refresh_busy"}}) == 3.0);
 }
@@ -615,7 +624,7 @@ TEST_CASE("break-glass gate: a stuck refresh fails closed within the bound, neve
     UsersTableLock lock(h.auth_db.dsn());
     std::promise<SsoOnlyLocalGate> p;
     auto f = p.get_future();
-    yuzu::test::JoiningThread t([&] { p.set_value(h.auth_routes->sso_only_local_password_gate("admin")); });
+    yuzu::test::JoiningThread t([&] { p.set_value(h.auth_routes->sso_only_local_password_gate("admin").state); });
     // The read is bounded (lock and statement timeouts), so the gate answers on its own, REFUSING
     // although the account is armed. (Mutation: no timeouts -> it parks until the lock ends.)
     const bool in_time = f.wait_for(std::chrono::milliseconds(2000)) == std::future_status::ready;
@@ -623,7 +632,7 @@ TEST_CASE("break-glass gate: a stuck refresh fails closed within the bound, neve
     t.join();
     CHECK(in_time);
     if (in_time) {
-        CHECK(f.get() == SsoOnlyLocalGate::kRefused);
+        CHECK(f.get() == SsoOnlyLocalGate::kTransient); // not a definitive "not armed"
         CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "read_failed"}}) == 1.0);
     }
 }
@@ -631,23 +640,23 @@ TEST_CASE("break-glass gate: a stuck refresh fails closed within the bound, neve
 TEST_CASE("break-glass gate: the arm window ends locally, with no refresh, from the database clock",
           "[pg][auth][hardened][routes][stripe][fail-closed]") {
     HardenedHarness h("sso-only", "admin");
-    h.arm("admin", 2);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500)); // ~0.5 s of the window left
+    h.arm("admin", 4);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3300)); // ~0.7 s of the window left
     h.auth_routes->reset_break_glass_arm_cache_for_test();
-    CHECK(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kBreakGlassArmed);
-    std::this_thread::sleep_for(std::chrono::milliseconds(700)); // cache still fresh (< 1 s), window over
+    CHECK(h.auth_routes->sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
+    std::this_thread::sleep_for(std::chrono::milliseconds(900)); // cache still fresh (< 1 s), window over
     // Mutation: no local deadline check -> still armed from the fresh cache.
-    CHECK(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kRefused);
+    CHECK(h.auth_routes->sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kRefused);
 }
 
 TEST_CASE("break-glass gate: a disarm propagates within the cache TTL",
           "[pg][auth][hardened][routes][stripe]") {
     HardenedHarness h("sso-only", "admin");
     h.arm("admin");
-    CHECK(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kBreakGlassArmed);
+    CHECK(h.auth_routes->sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
     REQUIRE(h.auth_db->disarm_break_glass("admin").has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // past the 1 s TTL
-    CHECK(h.auth_routes->sso_only_local_password_gate("admin") == SsoOnlyLocalGate::kRefused);
+    CHECK(h.auth_routes->sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kRefused);
 }
 
 TEST_CASE("break-glass: a disarm or the end of the arm window between the password step and the "
@@ -657,7 +666,7 @@ TEST_CASE("break-glass: a disarm or the end of the arm window between the passwo
         INFO(std::string(window_ends ? "the arm window ends" : "an operator disarms"));
         HardenedHarness h("sso-only", "admin");
         const auto secret = h.enroll_mfa("admin");
-        h.arm("admin", window_ends ? 2 : 3600);
+        h.arm("admin", window_ends ? 4 : 3600);
         auto step1 = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
                                  kFormCt);
         REQUIRE(step1);
@@ -667,7 +676,7 @@ TEST_CASE("break-glass: a disarm or the end of the arm window between the passwo
         const std::string pending = body.value("mfa_pending_token", "");
         REQUIRE_FALSE(pending.empty());
         if (window_ends) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2300)); // past the 2 s window
+            std::this_thread::sleep_for(std::chrono::milliseconds(4300)); // past the 4 s window
         } else {
             REQUIRE(h.auth_db->disarm_break_glass("admin").has_value());
         }
@@ -702,4 +711,766 @@ TEST_CASE("break-glass: the MFA step still mints while the account stays armed",
         kFormCt);
     REQUIRE(step2);
     CHECK(step2->status == 200);
+}
+
+// ── WP03: the tri-state arm gate at the MFA step ─────────────────────────────────────────────
+// These cases drive the gate's ONE database read through `set_break_glass_status_hook_for_test`
+// and its clock through `set_arm_clock_for_test`, so no case depends on a sleep or on how fast
+// the machine is. The clock is frozen at kT0 and moved by hand.
+namespace {
+
+constexpr std::int64_t kT0 = 1'000'000; // ms on the frozen arm clock
+
+/// What the hooked arm-state read answers. All fields are atomics so a request thread and the
+/// test thread may touch them.
+struct ArmCtl {
+    enum Mode : int { kArmed = 0, kNotArmed = 1, kFail = 2 };
+    std::atomic<int> mode{kArmed};
+    std::atomic<int> id{1};                         // armed_until text is "arm-<id>"
+    std::atomic<std::int64_t> remaining_ms{3'600'000};
+    std::atomic<std::int64_t> advance_in_read_ms{0}; // the read itself takes this long
+    std::atomic<int> reads{0};
+    std::atomic<bool> block{false};
+    std::atomic<int> blocked{0};
+    std::mutex mu;
+    std::condition_variable cv;
+    bool released{false};
+
+    void release() {
+        {
+            std::lock_guard lk(mu);
+            released = true;
+        }
+        cv.notify_all();
+    }
+};
+
+void install_arm_hook(HardenedHarness& h, ArmCtl& ctl) {
+    h.auth_routes->set_arm_clock_for_test(kT0);
+    AuthRoutes* routes = h.auth_routes.get();
+    h.auth_routes->set_break_glass_status_hook_for_test([routes, &ctl]() {
+        ++ctl.reads;
+        if (const auto adv = ctl.advance_in_read_ms.load(); adv > 0)
+            routes->advance_arm_clock_for_test(adv);
+        if (ctl.block.load()) {
+            ++ctl.blocked;
+            std::unique_lock lk(ctl.mu);
+            ctl.cv.wait(lk, [&] { return ctl.released; });
+        }
+        BreakGlassArmRead r;
+        const int mode = ctl.mode.load();
+        r.ok = mode != ArmCtl::kFail;
+        r.armed = mode == ArmCtl::kArmed;
+        if (r.armed) {
+            r.armed_until = "arm-" + std::to_string(ctl.id.load());
+            r.remaining_ms = ctl.remaining_ms.load();
+        }
+        return r;
+    });
+    h.auth_routes->reset_break_glass_arm_cache_for_test();
+}
+
+struct Enrolled {
+    std::string secret;
+    std::vector<std::string> codes;
+};
+
+Enrolled enroll_with_codes(HardenedHarness& h, const std::string& name) {
+    auto init = h.auth_db->mfa_init_enrollment(name, "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    auto done = h.auth_db->mfa_verify_enrollment(name, code, std::nullopt);
+    REQUIRE(done.has_value());
+    REQUIRE(done->recovery_codes.size() >= 4);
+    return {init->secret_base32, done->recovery_codes};
+}
+
+/// A 6-digit code that is NOT the valid next code.
+std::string wrong_totp(const std::string& secret) {
+    std::string c = HardenedHarness::totp_next(secret);
+    c.back() = c.back() == '9' ? '0' : static_cast<char>(c.back() + 1);
+    return c;
+}
+
+std::string login_step1(HardenedHarness& h) {
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}), kFormCt);
+    REQUIRE(step1);
+    REQUIRE(step1->status == 202);
+    const auto body = nlohmann::json::parse(step1->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    const std::string pending = body.value("mfa_pending_token", "");
+    REQUIRE_FALSE(pending.empty());
+    return pending;
+}
+
+auto login_step2(HardenedHarness& h, const std::string& pending, const std::string& code) {
+    auto r = h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", code}}),
+                         kFormCt);
+    REQUIRE(r);
+    return r;
+}
+
+double refused(HardenedHarness& h, const char* reason, const char* stage) {
+    return h.counter("yuzu_auth_break_glass_pending_refused_total",
+                     {{"reason", reason}, {"stage", stage}});
+}
+double refused_total(HardenedHarness& h) {
+    double n = 0;
+    for (const char* reason : {"disarmed", "window_ended", "transient"})
+        for (const char* stage : {"pre_verify", "pre_mint"})
+            n += refused(h, reason, stage);
+    return n;
+}
+double transient_admitted(HardenedHarness& h) {
+    return h.counter("yuzu_auth_break_glass_pending_transient_admitted_total");
+}
+
+/// "result|detail" of every audit row for `action`.
+std::vector<std::string> audit_rows(HardenedHarness& h, const std::string& action) {
+    AuditQuery q;
+    q.action = action;
+    auto res = h.audit_store->query(q);
+    REQUIRE(res.has_value());
+    std::vector<std::string> out;
+    for (const auto& e : *res)
+        out.push_back(e.result + "|" + e.detail);
+    return out;
+}
+int rows_containing(const std::vector<std::string>& rows, const std::string& needle) {
+    int n = 0;
+    for (const auto& r : rows)
+        n += r.find(needle) != std::string::npos ? 1 : 0;
+    return n;
+}
+
+/// Body with every correlation id removed, so two refusals can be compared byte for byte.
+std::string masked_body(const std::string& body) {
+    auto j = nlohmann::json::parse(body, nullptr, false);
+    REQUIRE_FALSE(j.is_discarded());
+    std::function<void(nlohmann::json&)> strip = [&](nlohmann::json& n) {
+        if (n.is_object()) {
+            for (auto it = n.begin(); it != n.end();) {
+                if (it.key().find("correlation") != std::string::npos)
+                    it = n.erase(it);
+                else {
+                    strip(it.value());
+                    ++it;
+                }
+            }
+        } else if (n.is_array()) {
+            for (auto& e : n)
+                strip(e);
+        }
+    };
+    strip(j);
+    return j.dump();
+}
+/// Header names and values, minus any that carry a correlation id.
+template <class Res> std::vector<std::pair<std::string, std::string>> masked_headers(const Res& r) {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto& [k, v] : r->headers) {
+        std::string lk = k;
+        for (auto& c : lk)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lk.find("correlation") != std::string::npos)
+            continue;
+        out.emplace_back(lk, v);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+int mfa_failed_count(HardenedHarness& h, const std::string& name) {
+    auto st = h.auth_db->mfa_lockout_status(name);
+    REQUIRE(st.has_value());
+    return st->failed_count;
+}
+
+} // namespace
+
+// T10
+TEST_CASE("break-glass gate: a definitive answer is kRefused and an unreadable arm state is kTransient",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    auto& r = *h.auth_routes;
+
+    SECTION("another name is refused with no read") {
+        const auto g = r.sso_only_local_password_gate("alice");
+        CHECK(g.state == SsoOnlyLocalGate::kRefused);
+        CHECK(g.why == SsoOnlyRefusedWhy::kNotBreakGlass);
+        CHECK(ctl.reads == 0);
+    }
+    SECTION("armed: the id, the deadline and the START of the read") {
+        ctl.advance_in_read_ms = 200; // the read takes 200 ms
+        ctl.remaining_ms = 60'000;
+        const auto g = r.sso_only_local_password_gate("admin");
+        CHECK(g.state == SsoOnlyLocalGate::kBreakGlassArmed);
+        CHECK(g.arm_id == "arm-1");
+        // read_at is the clock BEFORE the read (mutation: sampled after -> kT0 + 200).
+        CHECK(g.read_at == std::chrono::steady_clock::time_point(std::chrono::milliseconds(kT0)));
+        CHECK(g.deadline ==
+              std::chrono::steady_clock::time_point(std::chrono::milliseconds(kT0 + 60'000)));
+        CHECK_FALSE(g.last_not_armed_at.has_value());
+    }
+    SECTION("a read that says not armed is definitive") {
+        ctl.mode = ArmCtl::kNotArmed;
+        const auto g = r.sso_only_local_password_gate("admin");
+        CHECK(g.state == SsoOnlyLocalGate::kRefused);
+        CHECK(g.why == SsoOnlyRefusedWhy::kDisarmed);
+        REQUIRE(g.last_not_armed_at.has_value());
+        CHECK(*g.last_not_armed_at ==
+              std::chrono::steady_clock::time_point(std::chrono::milliseconds(kT0)));
+    }
+    SECTION("the local deadline passing is a definitive window end, with no read") {
+        ctl.remaining_ms = 500;
+        REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
+        r.advance_arm_clock_for_test(600); // inside the 1 s cache, past the window
+        const auto g = r.sso_only_local_password_gate("admin");
+        CHECK(g.state == SsoOnlyLocalGate::kRefused);
+        CHECK(g.why == SsoOnlyRefusedWhy::kWindowEnded);
+        CHECK(ctl.reads == 1);
+    }
+    SECTION("a failed read is transient, caches nothing and keeps what was last seen") {
+        REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
+        r.advance_arm_clock_for_test(1100);
+        ctl.mode = ArmCtl::kFail;
+        const auto g = r.sso_only_local_password_gate("admin");
+        CHECK(g.state == SsoOnlyLocalGate::kTransient);
+        CHECK(g.cause == SsoOnlyTransientCause::kReadFailed);
+        CHECK(g.arm_id == "arm-1"); // the last definitive armed id survives the failed read
+        CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "read_failed"}}) == 1.0);
+        // Nothing was cached: the next call reads again.
+        const int before = ctl.reads;
+        (void)r.sso_only_local_password_gate("admin");
+        CHECK(ctl.reads == before + 1);
+    }
+    SECTION("a not-armed read sets the last-not-armed time and leaves the last armed id") {
+        REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
+        r.advance_arm_clock_for_test(1100);
+        ctl.mode = ArmCtl::kNotArmed;
+        REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kRefused);
+        r.advance_arm_clock_for_test(1100);
+        ctl.mode = ArmCtl::kFail;
+        const auto g = r.sso_only_local_password_gate("admin");
+        CHECK(g.state == SsoOnlyLocalGate::kTransient);
+        CHECK(g.arm_id == "arm-1");
+        REQUIRE(g.last_not_armed_at.has_value()); // survives the failed read too
+        CHECK(*g.last_not_armed_at ==
+              std::chrono::steady_clock::time_point(std::chrono::milliseconds(kT0 + 1100)));
+    }
+    SECTION("an old cache while another request refreshes is transient") {
+        REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
+        r.advance_arm_clock_for_test(1100);
+        ctl.block = true;
+        yuzu::test::JoiningThread refresher([&] { (void)r.sso_only_local_password_gate("admin"); });
+        while (ctl.blocked.load() == 0)
+            std::this_thread::yield();
+        const auto g = r.sso_only_local_password_gate("admin");
+        ctl.release();
+        CHECK(g.state == SsoOnlyLocalGate::kTransient);
+        CHECK(g.cause == SsoOnlyTransientCause::kRefreshBusy);
+        CHECK(g.arm_id == "arm-1");
+        CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "refresh_busy"}}) == 1.0);
+    }
+    SECTION("admits_password_evaluation is true for open and armed only") {
+        SsoOnlyGateResult g;
+        g.state = SsoOnlyLocalGate::kOpen;
+        CHECK(g.admits_password_evaluation());
+        g.state = SsoOnlyLocalGate::kBreakGlassArmed;
+        CHECK(g.admits_password_evaluation());
+        g.state = SsoOnlyLocalGate::kRefused;
+        CHECK_FALSE(g.admits_password_evaluation());
+        g.state = SsoOnlyLocalGate::kTransient;
+        CHECK_FALSE(g.admits_password_evaluation());
+    }
+}
+
+TEST_CASE("break-glass gate: with no auth store the arm state is transient (read_failed)",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    h.auth_mgr.set_auth_db(nullptr);
+    h.auth_routes->reset_break_glass_arm_cache_for_test();
+    const auto g = h.auth_routes->sso_only_local_password_gate("admin");
+    h.auth_mgr.set_auth_db(h.auth_db.get());
+    CHECK(g.state == SsoOnlyLocalGate::kTransient);
+    CHECK(g.cause == SsoOnlyTransientCause::kReadFailed);
+    CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "read_failed"}}) == 1.0);
+}
+
+// T17: the gate-level cap
+TEST_CASE("break-glass gate: an armed read is never honoured more than 4.5 s after it started",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    auto& r = *h.auth_routes;
+
+    SECTION("a read that itself took 4.6 s is transient, on the gate and at /login") {
+        ctl.advance_in_read_ms = 4600;
+        const auto g = r.sso_only_local_password_gate("admin");
+        CHECK(g.state == SsoOnlyLocalGate::kTransient);
+        CHECK(g.cause == SsoOnlyTransientCause::kStaleRead);
+        // Not a not-armed observation (mutation: the cap records one -> has_value()).
+        CHECK_FALSE(g.last_not_armed_at.has_value());
+        CHECK(g.arm_id.empty()); // an over-age armed read is not recorded as the last armed id
+        CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "stale_read"}}) == 1.0);
+        auto res = h.sink.Post("/login",
+                               form({{"username", "admin"}, {"password", "adminpassword1"}}), kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(res->get_header_value("Set-Cookie").empty());
+        CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "stale_read"}}) == 2.0);
+    }
+    SECTION("a read that took 4.4 s is honoured") {
+        ctl.advance_in_read_ms = 4400;
+        const auto g = r.sso_only_local_password_gate("admin");
+        CHECK(g.state == SsoOnlyLocalGate::kBreakGlassArmed);
+        CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "stale_read"}}) == 0.0);
+    }
+    SECTION("a cache hit is held to the same bound") {
+        // The read took 4.0 s, so the cache is 0 s old by the time it was stored but the
+        // observation is already 4.0 s old. 0.6 s later the cache is still inside its 1 s life.
+        ctl.advance_in_read_ms = 4000;
+        REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
+        ctl.advance_in_read_ms = 0;
+        r.advance_arm_clock_for_test(600);
+        const auto g = r.sso_only_local_password_gate("admin");
+        CHECK(ctl.reads == 1); // answered from the cache, not by a new read
+        CHECK(g.state == SsoOnlyLocalGate::kTransient);
+        CHECK(g.cause == SsoOnlyTransientCause::kStaleRead);
+        CHECK_FALSE(g.last_not_armed_at.has_value());
+    }
+}
+
+// T1 (and T7: both code shapes)
+TEST_CASE("break-glass MFA step: an unreadable arm state at the second re-check admits inside the bound",
+          "[pg][auth][hardened][routes][wp03]") {
+    const bool recovery = GENERATE(false, true);
+    INFO((recovery ? "recovery code" : "TOTP"));
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    int barrier_calls = 0;
+    h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        ++barrier_calls;
+        h.auth_routes->advance_arm_clock_for_test(1100); // past the 1 s cache
+        ctl.mode = ArmCtl::kFail;                         // the re-read fails
+    });
+    auto res = login_step2(h, pending, recovery ? mfa.codes[0] : HardenedHarness::totp_next(mfa.secret));
+    CHECK(barrier_calls == 1);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Set-Cookie").find("yuzu_session=") != std::string::npos);
+    CHECK(transient_admitted(h) == 1.0);
+    CHECK(refused_total(h) == 0.0);
+    const auto rows = audit_rows(h, "auth.login");
+    CHECK(rows_containing(rows, std::string("method=password+") + (recovery ? "recovery" : "totp") +
+                                    ";arm_recheck=transient_admitted") == 1);
+}
+
+// T1 control
+TEST_CASE("break-glass MFA step: a definitive disarm at the second re-check refuses, and says so",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        h.auth_routes->advance_arm_clock_for_test(1100);
+        ctl.mode = ArmCtl::kNotArmed;
+    });
+    auto res = login_step2(h, pending, mfa.codes[0]);
+    CHECK(res->status == 401);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(refused(h, "disarmed", "pre_mint") == 1.0);
+    CHECK(refused_total(h) == 1.0);
+    CHECK(transient_admitted(h) == 0.0);
+    CHECK(rows_containing(audit_rows(h, "auth.login"),
+                          "reason=break_glass_disarmed_before_mint;method=password+recovery") == 1);
+    // The recovery code WAS consumed (the refusal is honest about a spent code).
+    h.auth_routes->set_mfa_verify_barrier_for_test(nullptr);
+    ctl.mode = ArmCtl::kArmed;
+    h.auth_routes->advance_arm_clock_for_test(1100);
+    auto again = login_step2(h, login_step1(h), mfa.codes[0]);
+    CHECK(again->status == 401);
+}
+
+// T2 (and T7)
+TEST_CASE("break-glass MFA step: an unreadable arm state after the window's end refuses as window_ended",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    const bool recovery = GENERATE(false, true);
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    ctl.remaining_ms = 3000;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        // 3.5 s: past the 3 s window, INSIDE the 4.5 s age bound, so the deadline is the only
+        // clause that can refuse (mutation: deadline clause removed -> 200).
+        h.auth_routes->advance_arm_clock_for_test(3500);
+        ctl.mode = ArmCtl::kFail;
+    });
+    auto res = login_step2(h, pending, recovery ? mfa.codes[0] : HardenedHarness::totp_next(mfa.secret));
+    CHECK(res->status == 401);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(refused(h, "window_ended", "pre_mint") == 1.0);
+    CHECK(refused_total(h) == 1.0);
+    CHECK(rows_containing(audit_rows(h, "auth.login"),
+                          std::string("reason=break_glass_window_ended_before_mint;method=password+") +
+                              (recovery ? "recovery" : "totp")) == 1);
+}
+
+// T16
+TEST_CASE("break-glass MFA step: a definitive window end at the second re-check is labelled window_ended",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    ctl.remaining_ms = 500;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        h.auth_routes->advance_arm_clock_for_test(600); // cache still fresh, window over
+    });
+    const int reads_before = ctl.reads;
+    auto res = login_step2(h, pending, HardenedHarness::totp_next(mfa.secret));
+    CHECK(ctl.reads == reads_before); // a cache hit, so the answer is definitive
+    CHECK(res->status == 401);
+    CHECK(refused(h, "window_ended", "pre_mint") == 1.0);
+    CHECK(refused_total(h) == 1.0);
+}
+
+// T3
+TEST_CASE("break-glass MFA step: an unreadable arm state after a re-arm with another window refuses",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        ctl.id = 2; // a new arm window
+        h.auth_routes->advance_arm_clock_for_test(1100);
+        REQUIRE(h.auth_routes->sso_only_local_password_gate("admin").arm_id == "arm-2");
+        h.auth_routes->advance_arm_clock_for_test(1100);
+        ctl.mode = ArmCtl::kFail;
+    });
+    auto res = login_step2(h, pending, mfa.codes[0]);
+    CHECK(res->status == 401);
+    CHECK(refused(h, "transient", "pre_mint") == 1.0);
+    CHECK(refused_total(h) == 1.0);
+    CHECK(rows_containing(
+              audit_rows(h, "auth.login"),
+              "reason=break_glass_arm_state_unreadable_before_mint;method=password+recovery") == 1);
+}
+
+// T11 (F1), both orders
+TEST_CASE("break-glass MFA step: an unreadable arm state after this server saw the arm removed refuses",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    const bool then_failed_read = GENERATE(false, true);
+    INFO((then_failed_read ? "then a failed read" : "then a refresh in flight"));
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    std::optional<yuzu::test::JoiningThread> refresher;
+    std::string id_at_recheck;
+    h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        auto& r = *h.auth_routes;
+        // Another request reads the arm state after it was removed: a definitive not-armed.
+        ctl.mode = ArmCtl::kNotArmed;
+        r.advance_arm_clock_for_test(1100);
+        REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kRefused);
+        // That cache entry ages out, and the next read cannot complete.
+        r.advance_arm_clock_for_test(1100);
+        if (then_failed_read) {
+            ctl.mode = ArmCtl::kFail;
+        } else {
+            ctl.block = true;
+            refresher.emplace([&] { (void)r.sso_only_local_password_gate("admin"); });
+            while (ctl.blocked.load() == 0)
+                std::this_thread::yield();
+        }
+    });
+    auto res = login_step2(h, pending, mfa.codes[0]);
+    ctl.release();
+    refresher.reset();
+    // 2.2 s after the read behind the first re-check: inside the age bound, before the deadline,
+    // and the last armed id is still the one the first re-check saw. Only the "this server has
+    // seen the arm removed since" clause can refuse (mutation: clause removed -> 200).
+    CHECK(res->status == 401);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(refused(h, "disarmed", "pre_mint") == 1.0);
+    CHECK(refused_total(h) == 1.0);
+    CHECK(transient_admitted(h) == 0.0);
+    h.auth_routes->set_mfa_verify_barrier_for_test(nullptr);
+    ctl.block = false;
+    ctl.mode = ArmCtl::kFail;
+    h.auth_routes->advance_arm_clock_for_test(1100);
+    const auto g = h.auth_routes->sso_only_local_password_gate("admin");
+    CHECK(g.state == SsoOnlyLocalGate::kTransient);
+    CHECK(g.arm_id == "arm-1"); // the id equality could not have been the refusing clause
+}
+
+// T12
+TEST_CASE("break-glass MFA step: an unreadable arm state is admitted only inside the 4.5 s bound",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+
+    SECTION("4.6 s after the read behind the first re-check: refused, labelled transient") {
+        const auto pending = login_step1(h);
+        h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+            h.auth_routes->advance_arm_clock_for_test(4600);
+            ctl.mode = ArmCtl::kFail;
+        });
+        auto res = login_step2(h, pending, mfa.codes[0]);
+        CHECK(res->status == 401);
+        CHECK(refused(h, "transient", "pre_mint") == 1.0);
+        CHECK(refused_total(h) == 1.0);
+    }
+    SECTION("4.4 s: admitted") {
+        const auto pending = login_step1(h);
+        h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+            h.auth_routes->advance_arm_clock_for_test(4400);
+            ctl.mode = ArmCtl::kFail;
+        });
+        auto res = login_step2(h, pending, mfa.codes[0]);
+        CHECK(res->status == 200);
+        CHECK(transient_admitted(h) == 1.0);
+    }
+    SECTION("the bound counts from the START of the read: a 0.2 s read plus 4.4 s is refused") {
+        ctl.advance_in_read_ms = 200; // the password step's read takes 0.2 s
+        const auto pending = login_step1(h);
+        ctl.advance_in_read_ms = 0;
+        h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+            h.auth_routes->advance_arm_clock_for_test(4400);
+            ctl.mode = ArmCtl::kFail;
+        });
+        auto res = login_step2(h, pending, mfa.codes[0]);
+        // Mutation: read_at sampled after the read -> the age is 4.4 s -> 200.
+        CHECK(res->status == 401);
+        CHECK(refused(h, "transient", "pre_mint") == 1.0);
+    }
+}
+
+// T4 (and T7)
+TEST_CASE("break-glass MFA step: an unreadable arm state at the first re-check spends nothing and keeps the token",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    const bool recovery = GENERATE(false, true);
+    INFO((recovery ? "recovery code" : "TOTP"));
+    // The reference: a wrong TOTP on an armed account, in its own harness.
+    std::string ref_body;
+    std::vector<std::pair<std::string, std::string>> ref_headers;
+    int ref_status = 0;
+    {
+        HardenedHarness ref("sso-only", "admin");
+        const auto m = enroll_with_codes(ref, "admin");
+        ArmCtl c;
+        install_arm_hook(ref, c);
+        auto wrong = login_step2(ref, login_step1(ref), wrong_totp(m.secret));
+        ref_status = wrong->status;
+        ref_body = masked_body(wrong->body);
+        ref_headers = masked_headers(wrong);
+    }
+    REQUIRE(ref_status == 401);
+
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    const std::string code = recovery ? mfa.codes[0] : HardenedHarness::totp_next(mfa.secret);
+    const int failed_before = mfa_failed_count(h, "admin");
+    h.auth_routes->advance_arm_clock_for_test(1100);
+    ctl.mode = ArmCtl::kFail;
+    auto res = login_step2(h, pending, code);
+    CHECK(res->status == 401);
+    CHECK(masked_body(res->body) == ref_body);
+    CHECK(masked_headers(res) == ref_headers);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(res->get_header_value("Retry-After").empty());
+    CHECK(refused(h, "transient", "pre_verify") == 1.0);
+    CHECK(refused_total(h) == 1.0); // in particular no "disarmed" series moved
+    CHECK(mfa_failed_count(h, "admin") == failed_before);
+    const auto rows = audit_rows(h, "mfa.login.failed");
+    CHECK(rows.size() == 1);
+    CHECK(rows_containing(rows, "break-glass arm state unreadable") == 1);
+    CHECK(h.counter("yuzu_auth_mfa_logins_total",
+                    {{"method", recovery ? "recovery" : "totp"}, {"result", "failure"}}) == 0.0);
+    // The pending token is back and the code was neither consumed nor marked as used: the same
+    // token and the same code complete the login once the arm state reads again.
+    ctl.mode = ArmCtl::kArmed;
+    auto ok = login_step2(h, pending, code);
+    CHECK(ok->status == 200);
+    CHECK(ok->get_header_value("Set-Cookie").find("yuzu_session=") != std::string::npos);
+}
+
+// T5 (and T7), T8
+TEST_CASE("break-glass MFA step: a definitive refusal at the first re-check spends nothing and ends the token",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    const bool recovery = GENERATE(false, true);
+    const bool window_ended = GENERATE(false, true);
+    INFO((recovery ? "recovery code" : "TOTP") << (window_ended ? ", window ended" : ", arm removed"));
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    if (window_ended)
+        ctl.remaining_ms = 500;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    const std::string code = recovery ? mfa.codes[0] : HardenedHarness::totp_next(mfa.secret);
+    const int failed_before = mfa_failed_count(h, "admin");
+    if (window_ended) {
+        h.auth_routes->advance_arm_clock_for_test(600); // the cached window is over
+    } else {
+        h.auth_routes->advance_arm_clock_for_test(1100);
+        ctl.mode = ArmCtl::kNotArmed;
+    }
+    auto res = login_step2(h, pending, code);
+    CHECK(res->status == 401);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(res->get_header_value("Retry-After").empty());
+    CHECK(refused(h, window_ended ? "window_ended" : "disarmed", "pre_verify") == 1.0);
+    CHECK(refused_total(h) == 1.0);
+    CHECK(mfa_failed_count(h, "admin") == failed_before);
+    const auto rows = audit_rows(h, "mfa.login.failed");
+    CHECK(rows.size() == 1);
+    CHECK(rows_containing(rows, window_ended ? "break-glass no longer armed: window ended"
+                                             : "break-glass no longer armed: disarmed") == 1);
+    // The token stays consumed: the same token is now unknown.
+    ctl.mode = ArmCtl::kArmed;
+    ctl.remaining_ms = 3'600'000;
+    h.auth_routes->advance_arm_clock_for_test(1100);
+    auto gone = login_step2(h, pending, code);
+    CHECK(gone->status == 401);
+    CHECK(rows_containing(audit_rows(h, "mfa.login.failed"), "pending token invalid or expired") == 1);
+    // Nothing was spent: no verifier ran, so the SAME code completes a fresh login.
+    auto ok = login_step2(h, login_step1(h), code);
+    CHECK(ok->status == 200);
+}
+
+// T6
+TEST_CASE("break-glass MFA step: a recovery-code login completes while a refresh is held in flight",
+          "[pg][auth][hardened][routes][concurrency][wp03]") {
+    const bool window_over = GENERATE(false, true);
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    if (window_over)
+        ctl.remaining_ms = 1000;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    std::optional<yuzu::test::JoiningThread> refresher;
+    std::vector<SsoOnlyLocalGate> others(8, SsoOnlyLocalGate::kOpen);
+    h.auth_routes->set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        auto& r = *h.auth_routes;
+        r.advance_arm_clock_for_test(1100); // the cache is now older than its 1 s life
+        // ONE request takes the refresh and is held inside the read.
+        ctl.block = true;
+        refresher.emplace([&] { (void)r.sso_only_local_password_gate("admin"); });
+        while (ctl.blocked.load() == 0)
+            std::this_thread::yield();
+        // Eight more requests naming the user arrive and RETURN while it is held.
+        std::vector<yuzu::test::JoiningThread> flood;
+        for (int i = 0; i < 8; ++i)
+            flood.emplace_back([&, i] { others[i] = r.sso_only_local_password_gate("admin").state; });
+        flood.clear(); // joined
+    });
+    auto res = login_step2(h, pending, mfa.codes[0]); // re-check #2 runs while the read is held
+    ctl.release();
+    refresher.reset();
+    for (const auto s : others)
+        CHECK(s == SsoOnlyLocalGate::kTransient);
+    CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "refresh_busy"}}) == 9.0);
+    if (window_over) {
+        // The window (1 s) ended before the re-check (1.1 s): the spent code is an honest refusal.
+        CHECK(res->status == 401);
+        CHECK(refused(h, "window_ended", "pre_mint") == 1.0);
+    } else {
+        // The code was consumed AND the session was minted.
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Set-Cookie").find("yuzu_session=") != std::string::npos);
+        CHECK(transient_admitted(h) == 1.0);
+        CHECK(refused_total(h) == 0.0);
+    }
+}
+
+// T13: the armed control (real database, real clock, no hooks)
+TEST_CASE("break-glass MFA step: an armed login spends for real and mints",
+          "[pg][auth][hardened][routes][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    h.arm("admin");
+    // A wrong code is counted against the account's second-factor budget.
+    const int failed_before = mfa_failed_count(h, "admin");
+    auto wrong = login_step2(h, login_step1(h), wrong_totp(mfa.secret));
+    CHECK(wrong->status == 401);
+    CHECK(mfa_failed_count(h, "admin") == failed_before + 1);
+    // A recovery code works once.
+    auto rec = login_step2(h, login_step1(h), mfa.codes[0]);
+    CHECK(rec->status == 200);
+    CHECK(rec->get_header_value("Set-Cookie").find("yuzu_session=") != std::string::npos);
+    auto rec_again = login_step2(h, login_step1(h), mfa.codes[0]);
+    CHECK(rec_again->status == 401);
+    // A TOTP code works once.
+    const auto totp = HardenedHarness::totp_next(mfa.secret);
+    auto ok = login_step2(h, login_step1(h), totp);
+    CHECK(ok->status == 200);
+    auto replay = login_step2(h, login_step1(h), totp);
+    CHECK(replay->status == 401);
+    // No break-glass refusal or transient series moved, and the success row has the plain detail.
+    CHECK(refused_total(h) == 0.0);
+    CHECK(transient_admitted(h) == 0.0);
+    for (const char* r : {"read_failed", "refresh_busy", "stale_read"})
+        CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", r}}) == 0.0);
+    CHECK(rows_containing(audit_rows(h, "auth.login"), "arm_recheck") == 0);
+}
+
+// T15
+TEST_CASE("sso-only: an unreadable arm state at /login is the same generic 401 as a not-armed account",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    std::string ref_body;
+    std::vector<std::pair<std::string, std::string>> ref_headers;
+    {
+        HardenedHarness ref("sso-only", "admin");
+        ref.enroll_mfa("admin");
+        ArmCtl c;
+        c.mode = ArmCtl::kNotArmed;
+        install_arm_hook(ref, c);
+        auto r = ref.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                               kFormCt);
+        REQUIRE(r);
+        REQUIRE(r->status == 401);
+        ref_body = masked_body(r->body);
+        ref_headers = masked_headers(r);
+    }
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    ArmCtl ctl;
+    ctl.mode = ArmCtl::kFail;
+    install_arm_hook(h, ctl);
+    auto res =
+        h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}), kFormCt);
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(masked_body(res->body) == ref_body);
+    CHECK(masked_headers(res) == ref_headers);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(h.counter("yuzu_auth_local_disabled_total", {{"target", "break_glass"}}) == 1.0);
+    CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "read_failed"}}) == 1.0);
+    CHECK(h.counter("yuzu_auth_break_glass_login_total") == 0.0);
 }

@@ -10,6 +10,18 @@ deliberately not budgeted and must call neither) must, in this order and inside 
   2. `mfa_budget_reserve(`,
   3. only then call a verifier (exactly two verifier calls per handler),
   4. settle the reservation (`mfa_budget_note_failure(` and `mfa_budget_refund(`).
+It also pins the break-glass arm state at `/login/mfa` and the tri-state gate (WP03):
+  a. the pending token records `break_glass`; exactly two gate calls, each first in its own
+     `if (entry.break_glass) {`;
+  b. re-check #1 precedes the reservation and every verifier, records `arm1` from an armed
+     answer, and both of its refusals return;
+  c. re-check #2 samples ONE clock value on the statement after its gate call, admits only with
+     `arm1` set and (armed, or the bounded transient rule with all four clauses), returns on a
+     refusal, and nothing but the MintDenial declaration sits between it and the mint;
+  d. the gate result has no comparison operator and no conversion, nothing spells
+     `!= SsoOnlyLocalGate::kRefused`, and the password-change gate uses the one admit set;
+  e. the gate applies the 4.5 s cap on both of its armed return paths and writes the
+     last-not-armed time in one place only.
 The script also runs a SELFTEST that deletes each of those anchors from an in-memory copy and
 requires the check to fail, so a tripwire that stops tripping is itself a failure. Not proof: the
 unit tests drive the behaviour.
@@ -69,18 +81,6 @@ def check_routes(t):
         for tok in ("mfa_budget_note_failure(", "mfa_budget_refund("):
             if tok not in body:
                 bad.append(f"{name}: {tok} missing")
-        if name == "/login/mfa":
-            # The break-glass arm state is re-checked after the pending token is consumed: before
-            # the first verifier call and again before the mint (create_local_session).
-            n_check = len(re.findall(
-                r"if \(entry\.break_glass &&\s*sso_only_local_password_gate\(entry\.username\) !=\s*SsoOnlyLocalGate::kBreakGlassArmed\)",
-                body))
-            if n_check != 2:
-                bad.append(f"/login/mfa: expected 2 break-glass arm re-checks, found {n_check}")
-            mint = body.find("create_local_session(")
-            last = body.rfind("entry.break_glass &&")
-            if mint < 0 or not last < mint:
-                bad.append("/login/mfa: the last break-glass re-check must precede the mint")
     return bad
 
 
@@ -156,6 +156,134 @@ def check_gate_order(t, hpp="", server=""):
     return bad
 
 
+GATE1 = "const SsoOnlyGateResult gate1 = sso_only_local_password_gate(entry.username);"
+GATE2 = "const SsoOnlyGateResult gate2 = sso_only_local_password_gate(entry.username);"
+ADMIT_SET = "return state == SsoOnlyLocalGate::kOpen || state == SsoOnlyLocalGate::kBreakGlassArmed;"
+
+
+def _ws(t):
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _block_end(t, open_idx):
+    """Index just past the brace block that opens at t[open_idx] == '{' (no string awareness;
+    the pinned blocks hold no brace inside a literal)."""
+    depth = 0
+    for i in range(open_idx, len(t)):
+        if t[i] == "{":
+            depth += 1
+        elif t[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
+def check_arm_recheck(files):
+    """WP03: the break-glass arm state at the MFA step and the tri-state gate (see the module
+    docstring's second list). Token level, like the rest of this file."""
+    bad = []
+    t = files.get("auth_routes.cpp", "")
+    hpp = files.get("auth_routes.hpp", "")
+    sp = handler(t, 'sink.Post("/login/mfa",', 'sink.Post("/login/mfa/enroll"')
+    if sp is None:
+        return ["handler /login/mfa not found (arm re-check)"]
+    body = t[sp[0]:sp[1]]
+    # The pending token records that the password step was the armed break-glass account's.
+    if not re.search(r"entry\.break_glass = break_glass_login;", t):
+        bad.append("the pending token must record break_glass (entry.break_glass = break_glass_login;)")
+    # Exactly two gate calls, each inside `if (entry.break_glass) {`.
+    if body.count("sso_only_local_password_gate(") != 2:
+        bad.append(f"/login/mfa: expected 2 arm-gate calls, found {body.count('sso_only_local_password_gate(')}")
+    for g in (GATE1, GATE2):
+        if not re.search(r"if \(entry\.break_glass\) \{\s*" + re.escape(g), body):
+            bad.append(f"/login/mfa: `{g}` must be the first statement of `if (entry.break_glass) {{`")
+    g1, g2 = body.find(GATE1), body.find(GATE2)
+    res = body.find("mfa_budget_reserve(")
+    calls = [m.start() for m in CALL.finditer(body)]
+    mint = body.find("create_local_session(")
+    if min(g1, g2, res, mint) < 0 or not calls:
+        return bad + ["/login/mfa: arm re-check anchors missing"]
+    # Re-check #1 is before the reservation and before any verifier, and both of its refusals return.
+    if not g1 < res or not g1 < calls[0]:
+        bad.append("/login/mfa: the first arm re-check must precede mfa_budget_reserve( and the first verifier")
+    if g1 < res and body[g1:res].count("return;") != 2:
+        bad.append("/login/mfa: the first arm re-check must have exactly two refusals, each ending in return;")
+    if "arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at};" not in body[g1:res]:
+        bad.append("/login/mfa: the first arm re-check must record arm1 from the armed answer")
+    # Re-check #2: the gate, then ONE clock sample, then the decision, then the mint.
+    if not calls[-1] < g2 < mint:
+        bad.append("/login/mfa: the second arm re-check must be after the verifiers and before the mint")
+    seg = body[g2:mint] if g2 < mint else ""
+    if not re.search(re.escape(GATE2) + r"\s*const auto now2 = arm_clock_now\(\);", body):
+        bad.append("/login/mfa: now2 must be sampled on the statement after the second gate call")
+    if seg.count("arm_clock_now()") != 1:
+        bad.append("/login/mfa: exactly one clock sample between the second gate call and the mint")
+    for clause in ("gate2.state == SsoOnlyLocalGate::kTransient",
+                   "now2 < arm1->deadline",
+                   "arm_observation_fresh(arm1->read_at, now2)",
+                   "gate2.arm_id == arm1->arm_id",
+                   "!(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at)"):
+        if clause not in seg:
+            bad.append(f"/login/mfa: the transient admit rule must contain `{clause}`")
+    if not re.search(r"const bool admit =\s*arm1\.has_value\(\) &&\s*"
+                     r"\(gate2\.state == SsoOnlyLocalGate::kBreakGlassArmed \|\| transient_ok\);", seg):
+        bad.append("/login/mfa: admit must be `arm1.has_value() && (armed || transient_ok)` "
+                   "(a login with no first-re-check snapshot never mints)")
+    refuse = seg.find("if (!admit) {")
+    if refuse < 0:
+        bad.append("/login/mfa: `if (!admit) {` missing")
+    else:
+        end = _block_end(seg, refuse + len("if (!admit) "))
+        blk = seg[refuse:end] if end > 0 else ""
+        if "return;" not in blk:
+            bad.append("/login/mfa: the second arm re-check's refusal must return")
+        tail = _ws(seg[end:]) if end > 0 else ""
+        want = ("admitted_under_transient = gate2.state == SsoOnlyLocalGate::kTransient; } "
+                "auth::AuthManager::MintDenial denial = auth::AuthManager::MintDenial::kNone; "
+                "auto token = auth_mgr_.")
+        if tail != want:
+            bad.append("/login/mfa: nothing but the transient marker and the MintDenial declaration "
+                       "may sit between the second arm re-check and the mint")
+    if 'counter("yuzu_auth_break_glass_pending_refused_total")' in t:
+        bad.append("yuzu_auth_break_glass_pending_refused_total must carry reason and stage labels")
+    # The gate result cannot be compared with, or converted to, the bare state.
+    for name, text in files.items():
+        if "!= SsoOnlyLocalGate::kRefused" in text:
+            bad.append(f"{name}: `!= SsoOnlyLocalGate::kRefused` admits kTransient; name the admitted states")
+    if re.search(r"operator\s*[!=]=\s*\([^)]*SsoOnlyGateResult", hpp) or \
+            re.search(r"operator\s+SsoOnlyLocalGate\b", hpp):
+        bad.append("SsoOnlyGateResult must have no comparison operator and no conversion")
+    for term in ("!SsoGateEqComparable<SsoOnlyGateResult, SsoOnlyLocalGate>",
+                 "!SsoGateNeComparable<SsoOnlyGateResult, SsoOnlyLocalGate>",
+                 "!std::is_convertible_v<SsoOnlyGateResult, SsoOnlyLocalGate>"):
+        if term not in hpp:
+            bad.append(f"auth_routes.hpp: the static_assert term `{term}` is missing")
+    if ADMIT_SET not in hpp:
+        bad.append("admits_password_evaluation() must admit exactly kOpen and kBreakGlassArmed")
+    a = t.find("PasswordVerifyFn AuthRoutes::password_change_verify_fn()")
+    b = t.find("SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(")
+    if a < 0 or b < a:
+        bad.append("password_change_verify_fn / the gate definition not found")
+    else:
+        if "return sso_only_local_password_gate(username).admits_password_evaluation();" not in t[a:b]:
+            bad.append("the password-change gate must be `...admits_password_evaluation()`")
+        gate_end = t.find("void AuthRoutes::register_routes(", b)
+        gate = t[b:gate_end]
+        for stmt in ("if (!arm_observation_fresh(bg_arm_started_, now)) {",
+                     "if (armed_now && !arm_observation_fresh(started, finished)) {"):
+            if stmt not in gate:
+                bad.append(f"the gate must apply the cap as `{stmt}`")
+        if "const auto started = arm_clock_now();" not in gate or \
+                gate.find("const auto started = arm_clock_now();") > gate.find("read = hook();"):
+            bad.append("the gate must sample `started` before the read")
+        if gate.count("bg_last_not_armed_at_ =") != 1:
+            bad.append("bg_last_not_armed_at_ must be written in exactly one place (a not-armed read)")
+    if "kArmSnapshotMaxAge{4500}" not in hpp or "return now - read_at <= kArmSnapshotMaxAge;" not in hpp:
+        bad.append("kArmSnapshotMaxAge must be 4500 ms and arm_observation_fresh must compare against it")
+    return bad
+
+
 def check(files):
     bad = []
     sites = {}
@@ -170,6 +298,7 @@ def check(files):
         bad += check_routes(files["auth_routes.cpp"])
         bad += check_gate_order(files["auth_routes.cpp"], files.get("auth_routes.hpp", ""),
                                 files.get("server.cpp", ""))
+        bad += check_arm_recheck(files)
     else:
         bad.append("auth_routes.cpp missing")
     return bad
@@ -267,7 +396,106 @@ def selftest(files):
     mut("try_lock() first dropped", sub_cpp("if (!login_lk.try_lock()) {", "if (true) {"))
     mut("over-length shortcut back on the ordinary slot", sub_cpp("if (!break_glass_attempt) {\n        const bool login_route", "if (!break_glass_attempt && !auth::password_exceeds_max(password)) {\n        const bool login_route"))
     mut("over-length shortcut back on the break-glass slot", sub_cpp("if (break_glass_attempt) {\n        pbkdf2_slot.emplace", "if (break_glass_attempt && !auth::password_exceeds_max(password)) {\n        pbkdf2_slot.emplace"))
-    mut("break-glass MFA re-check dropped", sub_cpp("if (entry.break_glass &&", "if (false && entry.break_glass &&", count=2))
+    # WP03 arm re-check and tri-state gate: each pin has a mutant.
+    def move_text(m, text, before, key="auth_routes.cpp"):
+        """Cut the first occurrence of `text` and paste it just before `before`."""
+        src = m[key]
+        if text not in src or before not in src.replace(text, "", 1):
+            return False
+        src = src.replace(text, "", 1)
+        m[key] = src.replace(before, text + " " + before, 1)
+        return True
+
+    hsp = handler(base, 'sink.Post("/login/mfa",', 'sink.Post("/login/mfa/enroll"')
+    hbody = base[hsp[0]:hsp[1]] if hsp else ""
+    g1 = hbody.find(GATE1)
+    r1 = hbody.find("mfa_budget_reserve(")
+    blk1 = ""
+    if g1 >= 0 and r1 > g1:
+        o = hbody.rfind("if (entry.break_glass) {", 0, g1)
+        e = _block_end(hbody, o + len("if (entry.break_glass) "))
+        blk1 = hbody[o:e] if o >= 0 and e > 0 else ""
+    g2 = hbody.find(GATE2)
+    blk2 = ""
+    if g2 >= 0:
+        o = hbody.rfind("if (entry.break_glass) {", 0, g2)
+        e = _block_end(hbody, o + len("if (entry.break_glass) "))
+        blk2 = hbody[o:e] if o >= 0 and e > 0 else ""
+    if not blk1 or not blk2:
+        failures.append("selftest cannot find the two arm re-check blocks")
+    else:
+        mut("pending token never records break_glass", sub_cpp("entry.break_glass = break_glass_login;", ""))
+        mut("pending token records break_glass = false", sub_cpp("entry.break_glass = break_glass_login;", "entry.break_glass = false;"))
+        mut("both arm re-checks disabled", sub_cpp("if (entry.break_glass) {", "if (false && entry.break_glass) {", count=2))
+        mut("first arm re-check removed", sub_cpp(blk1, ""))
+        mut("second arm re-check removed", sub_cpp(blk2, ""))
+        mut("a third arm re-check", sub_cpp(blk2, blk2 + " if (entry.break_glass) { (void)sso_only_local_password_gate(entry.username); }"))
+        for i, pos in enumerate([m_.start() for m_ in re.finditer(r"return;", blk1)]):
+            mut(f"first re-check refusal {i} without return",
+                sub_cpp(blk1, blk1[:pos] + blk1[pos + len("return;"):]))
+        mut("first re-check moved after the reserve",
+            lambda m: move_text(m, blk1, "bool matched = false;"))
+        mut("first re-check moved after the first verifier",
+            lambda m: move_text(m, blk1, "if (store_unavailable) {"))
+        mut("first re-check does not record arm1",
+            sub_cpp("arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at};", ""))
+        mut("second re-check moved after the mint",
+            lambda m: move_text(m, blk2, "if (token.empty()) {"))
+        mut("now2 sampled before the second gate call",
+            sub_cpp(GATE2 + "\n            const auto now2 = arm_clock_now();",
+                    "const auto now2 = arm_clock_now();\n            " + GATE2))
+        mut("a second clock sample in the second re-check",
+            sub_cpp("now2 < arm1->deadline", "arm_clock_now() < arm1->deadline"))
+        for clause in ("now2 < arm1->deadline &&", "arm_observation_fresh(arm1->read_at, now2) &&",
+                       "gate2.arm_id == arm1->arm_id &&",
+                       "!(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at)"):
+            mut(f"transient admit clause removed: {clause}",
+                sub_cpp(clause, "true &&" if clause.endswith("&&") else "true"))
+        mut("arm1.has_value() dropped from admit",
+            sub_cpp("const bool admit =\n                arm1.has_value() &&", "const bool admit ="))
+        mut("arm1.has_value() only inside the transient rule",
+            sub_cpp("arm1.has_value() &&\n                (gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);",
+                    "(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || (arm1.has_value() && transient_ok));"))
+        r2 = blk2.find("if (!admit) {")
+        ret2 = blk2.find("return;", r2)
+        if r2 < 0 or ret2 < 0:
+            failures.append("selftest cannot find the second re-check's refusal")
+        else:
+            mut("second re-check refusal without return",
+                sub_cpp(blk2, blk2[:ret2] + blk2[ret2 + len("return;"):]))
+        mut("a call between the second re-check and the mint",
+            sub_cpp("admitted_under_transient = gate2.state == SsoOnlyLocalGate::kTransient;",
+                    "admitted_under_transient = gate2.state == SsoOnlyLocalGate::kTransient; (void)db->mfa_status(entry.username);"))
+        mut("pending_refused counter without labels",
+            sub_cpp('"yuzu_auth_break_glass_pending_refused_total",', '"yuzu_auth_break_glass_pending_refused_total").increment(); (void)(0,'))
+    mut("password-change gate back to != kRefused",
+        sub_cpp("return sso_only_local_password_gate(username).admits_password_evaluation();",
+                "return sso_only_local_password_gate(username).state != SsoOnlyLocalGate::kRefused;"))
+    mut("kTransient added to the admit set",
+        sub_cpp(ADMIT_SET, ADMIT_SET[:-1] + " || state == SsoOnlyLocalGate::kTransient;", key="auth_routes.hpp"))
+    mut("an operator!= on the gate result",
+        sub_cpp("    [[nodiscard]] bool admits_password_evaluation() const noexcept {",
+                "    friend bool operator!=(const SsoOnlyGateResult& r, SsoOnlyLocalGate s) { return r.state != s; }\n"
+                "    [[nodiscard]] bool admits_password_evaluation() const noexcept {", key="auth_routes.hpp"))
+    mut("a conversion operator on the gate result",
+        sub_cpp("    [[nodiscard]] bool admits_password_evaluation() const noexcept {",
+                "    operator SsoOnlyLocalGate() const { return state; }\n"
+                "    [[nodiscard]] bool admits_password_evaluation() const noexcept {", key="auth_routes.hpp"))
+    mut("the comparison static_assert term removed",
+        sub_cpp("!SsoGateNeComparable<SsoOnlyGateResult, SsoOnlyLocalGate> &&", "", key="auth_routes.hpp"))
+    mut("the gate cap dropped from the cache hit",
+        sub_cpp("if (!arm_observation_fresh(bg_arm_started_, now)) {", "if (false) {"))
+    mut("the gate cap dropped from its own read",
+        sub_cpp("if (armed_now && !arm_observation_fresh(started, finished)) {", "if (false) {"))
+    mut("started sampled after the read",
+        sub_cpp("    const auto started = arm_clock_now();", "").__call__ and (lambda m: (
+            m.__setitem__("auth_routes.cpp", m["auth_routes.cpp"].replace("    const auto started = arm_clock_now();", "", 1).replace(
+                "    const auto finished = arm_clock_now();", "    const auto started = arm_clock_now();\n    const auto finished = arm_clock_now();", 1)) or True)
+        if "    const auto started = arm_clock_now();" in m["auth_routes.cpp"] else False))
+    mut("kArmSnapshotMaxAge raised", sub_cpp("kArmSnapshotMaxAge{4500}", "kArmSnapshotMaxAge{450000}", key="auth_routes.hpp"))
+    mut("the cap records a not-armed observation",
+        sub_cpp("out.cause = SsoOnlyTransientCause::kStaleRead;",
+                "out.cause = SsoOnlyTransientCause::kStaleRead; bg_last_not_armed_at_ = started;"))
     mut("server.cpp: set_stripe_waiter_cap commented out", sub_cpp("    auth_routes_->set_stripe_waiter_cap(sz.stripe_waiters);", "    // auth_routes_->set_stripe_waiter_cap(sz.stripe_waiters);", key="server.cpp"))
     mut("server.cpp: set_pbkdf2_cap only inside a string literal", sub_cpp("    auth_routes_->set_pbkdf2_cap(sz.cap);", '    const char* x = "auth_routes_->set_pbkdf2_cap(sz.cap);";', key="server.cpp"))
     mut("server.cpp: set_pbkdf2_cap altered argument", sub_cpp("auth_routes_->set_pbkdf2_cap(sz.cap);", "auth_routes_->set_pbkdf2_cap(4);", key="server.cpp"))

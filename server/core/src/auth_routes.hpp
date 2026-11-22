@@ -34,6 +34,7 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -197,14 +198,69 @@ struct PasswordCheckOptions {
 using PasswordVerifyFn = std::function<PasswordCheckResult(
     const std::string& username, const std::string& password, const httplib::Request& req)>;
 
-/// Verdict of `AuthRoutes::sso_only_local_password_gate` (#5342 Gate 7, C8):
+/// State of `AuthRoutes::sso_only_local_password_gate` (#5342 Gate 7, C8):
 /// may a LOCAL password be evaluated for this username right now?
 enum class SsoOnlyLocalGate : std::uint8_t {
     kOpen,            ///< not in `--auth-mode=sso-only`: local passwords are live
-    kBreakGlassArmed, ///< sso-only, but this is the configured break-glass account AND
-                      ///< it is currently armed — the one local password that is live
-    kRefused,         ///< sso-only and not an armed break-glass account (or the arm
-                      ///< state could not be read — fail CLOSED): never evaluate PBKDF2
+    kBreakGlassArmed, ///< sso-only, this is the configured break-glass account AND a database
+                      ///< read at most kArmSnapshotMaxAge old says it is armed
+    kRefused,         ///< a DEFINITIVE answer: not the break-glass name, or the arm state was read
+                      ///< and the account is not armed, or its window has ended
+    kTransient,       ///< the arm state could NOT be established (a refresh in flight with an old
+                      ///< cache, a failed read, an armed read that is too old). Never an admission
+                      ///< on its own: every caller refuses, except the MFA step's second re-check
+                      ///< under its bounded rule
+};
+
+/// Why the gate answered `kRefused`.
+enum class SsoOnlyRefusedWhy : std::uint8_t { kNotBreakGlass, kDisarmed, kWindowEnded };
+
+/// Why the gate answered `kTransient`.
+enum class SsoOnlyTransientCause : std::uint8_t { kNone, kRefreshBusy, kReadFailed, kStaleRead };
+
+/// What `AuthRoutes::sso_only_local_password_gate` returns. It has NO comparison operator and NO
+/// conversion to `SsoOnlyLocalGate` on purpose (the assertion below): a caller must name the
+/// states it admits, so `gate(...) != kRefused`, which would admit `kTransient`, does not compile.
+struct SsoOnlyGateResult {
+    SsoOnlyLocalGate state{SsoOnlyLocalGate::kRefused};
+    SsoOnlyRefusedWhy why{SsoOnlyRefusedWhy::kNotBreakGlass};         ///< kRefused only
+    SsoOnlyTransientCause cause{SsoOnlyTransientCause::kNone};        ///< kTransient only
+    /// kBreakGlassArmed: the `armed_until` text of the arm window this answer is about.
+    /// kTransient: the id of the last DEFINITIVE armed read on this server ("" when none).
+    std::string arm_id;
+    std::chrono::steady_clock::time_point deadline{}; ///< kBreakGlassArmed: local end of the window
+    /// kBreakGlassArmed: when the database read behind this answer STARTED (the snapshot it saw is
+    /// at or after this instant).
+    std::chrono::steady_clock::time_point read_at{};
+    /// When the last successful read that said NOT armed started (unset when there was none).
+    std::optional<std::chrono::steady_clock::time_point> last_not_armed_at;
+
+    /// The ONE admit set for "evaluate a local password": open mode or an armed break-glass
+    /// account. `kRefused` and `kTransient` are both refusals.
+    [[nodiscard]] bool admits_password_evaluation() const noexcept {
+        return state == SsoOnlyLocalGate::kOpen || state == SsoOnlyLocalGate::kBreakGlassArmed;
+    }
+};
+// (Concepts, because a requires-expression outside a template is ill-formed when it fails.)
+template <class A, class B>
+concept SsoGateEqComparable = requires(const A& a, const B& b) { a == b; };
+template <class A, class B>
+concept SsoGateNeComparable = requires(const A& a, const B& b) { a != b; };
+static_assert(!SsoGateEqComparable<SsoOnlyGateResult, SsoOnlyLocalGate> &&
+              !SsoGateNeComparable<SsoOnlyGateResult, SsoOnlyLocalGate> &&
+              !SsoGateEqComparable<SsoOnlyLocalGate, SsoOnlyGateResult> &&
+              !SsoGateNeComparable<SsoOnlyLocalGate, SsoOnlyGateResult> &&
+              !std::is_convertible_v<SsoOnlyGateResult, SsoOnlyLocalGate> &&
+              !std::is_constructible_v<SsoOnlyLocalGate, SsoOnlyGateResult>,
+              "SsoOnlyGateResult must not compare with or convert to SsoOnlyLocalGate");
+
+/// One break-glass arm-state read, as the gate consumes it (test seam shape; production fills it
+/// from `AuthDB::break_glass_status`). `ok == false` is a failed read.
+struct BreakGlassArmRead {
+    bool ok{true};
+    bool armed{false};
+    std::string armed_until;
+    std::int64_t remaining_ms{0};
 };
 
 /// Whether a probe may withhold this caller's denial rows. Only an interactive cookie session
@@ -252,7 +308,22 @@ public:
     void reset_break_glass_arm_cache_for_test() {
         std::lock_guard lk(bg_arm_mu_);
         bg_arm_valid_ = false;
+        bg_arm_id_.clear();
+        bg_last_armed_id_.clear();
+        bg_last_not_armed_at_.reset();
     }
+    /// Test seam: replace the ONE database read inside the gate's refresh. The hook returns the
+    /// read's result (`ok == false` is a failed read) and may block. Set it before any thread
+    /// calls the gate, or from the request thread itself; never set in production.
+    void set_break_glass_status_hook_for_test(std::function<BreakGlassArmRead()> fn) {
+        std::lock_guard lk(bg_arm_mu_);
+        bg_arm_read_hook_for_test_ = std::move(fn);
+    }
+    /// Test seam: freeze the clock the arm gate and the MFA step's re-checks read, at `ms` after
+    /// the steady-clock epoch, and move it by hand. Atomic, so a test may advance it while request
+    /// threads run. Never set in production (a negative value means the real clock).
+    void set_arm_clock_for_test(std::int64_t ms) { arm_clock_test_ms_.store(ms); }
+    void advance_arm_clock_for_test(std::int64_t ms) { arm_clock_test_ms_.fetch_add(ms); }
     /// Test seams: the stripe a name maps to (so a test can hold it) and its index.
     std::size_t login_stripe_index_for_test(const std::string& username) const {
         return login_stripe_index(username);
@@ -795,13 +866,32 @@ public:
     /// The ONE "may a local password be evaluated for `username`" decision
     /// under `--auth-mode=sso-only` (#5342 Gate 7, C8 — extracted from POST
     /// /login's hardened-mode gate so the self-service password change cannot
-    /// drift from it). Reads the break-glass arm state from AuthDB and fails
-    /// CLOSED (`kRefused`) on a read error or with no AuthDB: unlike lockout,
-    /// this gate IS the credential path. Pure decision — writes no response,
-    /// metric, log or audit; each caller keeps its own (`/login` its generic
-    /// 401 + `yuzu_auth_local_disabled_total`; the password route its 403
-    /// `sso_only_local_disabled`).
-    [[nodiscard]] SsoOnlyLocalGate sso_only_local_password_gate(const std::string& username);
+    /// drift from it). Reads the break-glass arm state from AuthDB (cached, single flight) and
+    /// fails CLOSED: unlike lockout, this gate IS the credential path. A definitive "not armed"
+    /// is `kRefused`; an arm state that could not be established (a failed read, no AuthDB, a
+    /// refresh in flight with an old cache, an armed read that is too old) is `kTransient`, which
+    /// every caller treats as a refusal except the MFA step's second re-check under its bounded
+    /// rule. Writes no response and no audit row; it counts its transient answers in
+    /// `yuzu_auth_break_glass_arm_gate_total{result}` and logs a failed read. Each caller keeps
+    /// its own response (`/login` its generic 401 + `yuzu_auth_local_disabled_total`; the
+    /// password route its 403 `sso_only_local_disabled`).
+    [[nodiscard]] SsoOnlyGateResult sso_only_local_password_gate(const std::string& username);
+
+    /// The clock the arm gate and the MFA step's re-checks read (`steady_clock`, or the frozen
+    /// test clock).
+    [[nodiscard]] std::chrono::steady_clock::time_point arm_clock_now() const {
+        const auto t = arm_clock_test_ms_.load();
+        return t < 0 ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point(std::chrono::milliseconds(t));
+    }
+    /// The longest an "armed" database read is honoured, measured from the START of that read.
+    /// The ONE comparison: the gate applies it to a cache hit and to its own fresh read, and the
+    /// MFA step's second re-check applies it to the snapshot the first re-check took.
+    static constexpr std::chrono::milliseconds kArmSnapshotMaxAge{4500};
+    [[nodiscard]] static bool arm_observation_fresh(std::chrono::steady_clock::time_point read_at,
+                                                    std::chrono::steady_clock::time_point now) {
+        return now - read_at <= kArmSnapshotMaxAge;
+    }
 
     /// Construct an AuditEvent from HTTP request context.
     AuditEvent make_audit_event(const httplib::Request& req, const std::string& action,
@@ -1300,7 +1390,15 @@ private:
     bool bg_arm_armed_{false};
     std::chrono::steady_clock::time_point bg_arm_at_{};
     std::chrono::steady_clock::time_point bg_arm_deadline_{}; ///< local monotonic end of the arm window
+    std::chrono::steady_clock::time_point bg_arm_started_{};  ///< when the cached read STARTED
+    std::string bg_arm_id_;                                    ///< `armed_until` of the cached read
+    /// Kept across failed reads and across not-armed reads: the id of the last definitive armed
+    /// read, and when the last definitive not-armed read started.
+    std::string bg_last_armed_id_;
+    std::optional<std::chrono::steady_clock::time_point> bg_last_not_armed_at_;
     std::atomic<bool> bg_arm_refreshing_{false};
+    std::function<BreakGlassArmRead()> bg_arm_read_hook_for_test_; ///< guarded by bg_arm_mu_
+    std::atomic<std::int64_t> arm_clock_test_ms_{-1};
     /// Most requests allowed to WAIT for a stripe at once (server.cpp: max(2, pool/8)).
     std::atomic<int> stripe_waiter_cap_{4};
     /// Most requests that may wait for ONE stripe at once, so a flood on one stripe cannot use

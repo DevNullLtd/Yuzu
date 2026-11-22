@@ -4096,17 +4096,29 @@ public:
                           "counter");
         metrics_.counter("yuzu_auth_break_glass_login_total");
         metrics_.describe("yuzu_auth_break_glass_pending_refused_total",
-                          "Break-glass logins refused at the MFA step because the account was no "
-                          "longer armed (disarmed or the arm window ended after the password step)",
+                          "Break-glass logins refused at the MFA step, by reason (disarmed: the arm "
+                          "was removed; window_ended; transient: the arm state could not be read) "
+                          "and stage (pre_verify: before a code was verified; pre_mint: after "
+                          "verification, before the session)",
                           "counter");
-        metrics_.counter("yuzu_auth_break_glass_pending_refused_total");
+        for (const char* reason : {"disarmed", "window_ended", "transient"})
+            for (const char* stage : {"pre_verify", "pre_mint"})
+                metrics_.counter("yuzu_auth_break_glass_pending_refused_total",
+                                 {{"reason", reason}, {"stage", stage}});
+        metrics_.describe("yuzu_auth_break_glass_pending_transient_admitted_total",
+                          "Break-glass logins completed at the MFA step while the arm state could "
+                          "not be re-read, inside the bound taken from the read made before "
+                          "verification",
+                          "counter");
+        metrics_.counter("yuzu_auth_break_glass_pending_transient_admitted_total");
         metrics_.describe("yuzu_auth_break_glass_arm_gate_total",
-                          "Break-glass arm-state gate outcomes that were refusals for a reason other "
-                          "than the account being unarmed: read_failed (the bounded database read "
-                          "failed) and refresh_busy (a refresh was in flight and the cache was older "
-                          "than 1 s)",
+                          "Break-glass arm-state gate answers where the arm state could not be "
+                          "established: read_failed (the bounded database read failed or there is "
+                          "no auth store), refresh_busy (a refresh was in flight and the cache was "
+                          "older than 1 s) and stale_read (a read said armed but started more than "
+                          "4.5 s earlier)",
                           "counter");
-        for (const char* r : {"read_failed", "refresh_busy"})
+        for (const char* r : {"read_failed", "refresh_busy", "stale_read"})
             metrics_.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", r}});
         // HA WS-1(1b), ADR-2002 section 5, and #4990: the dispatch-record
         // table's retention (ExecutionTracker's PG-backed command_execution

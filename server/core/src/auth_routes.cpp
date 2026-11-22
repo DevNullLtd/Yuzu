@@ -2573,7 +2573,7 @@ PasswordVerifyFn AuthRoutes::password_change_verify_fn() {
         // account (no record_failed_login). The route answers kGateRejected
         // with 403 sso_only_local_disabled; this lambda writes nothing.
         opts.pre_verify_gate = [this, &username]() {
-            return sso_only_local_password_gate(username) != SsoOnlyLocalGate::kRefused;
+            return sso_only_local_password_gate(username).admits_password_evaluation();
         };
         opts.metric_route = "password_change";
         opts.cleared_detail = "reset_on_password_change";
@@ -2581,67 +2581,146 @@ PasswordVerifyFn AuthRoutes::password_change_verify_fn() {
     };
 }
 
-SsoOnlyLocalGate AuthRoutes::sso_only_local_password_gate(const std::string& username) {
-    if (cfg_.auth_mode != "sso-only")
-        return SsoOnlyLocalGate::kOpen;
+SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& username) {
+    SsoOnlyGateResult out;
+    if (cfg_.auth_mode != "sso-only") {
+        out.state = SsoOnlyLocalGate::kOpen;
+        return out;
+    }
     if (cfg_.break_glass_user.empty() || username != cfg_.break_glass_user)
-        return SsoOnlyLocalGate::kRefused; // every other name: no database read at all
+        return out; // kRefused / kNotBreakGlass: every other name, no database read at all
     // The break-glass name: the arm state is a database read, and this gate runs for EVERY
     // request naming that user, before any slot. So the answer is cached and refreshed by ONE
-    // request at a time (single flight); every other request is answered at once, FAILING CLOSED:
-    //  - an `armed` answer is honoured only while the cache is younger than
-    //    kBreakGlassArmCacheTtl AND the LOCAL monotonic deadline derived from the database
-    //    clock's remaining arm time has not passed (never the replica's wall clock), so an arm
-    //    window that ends is enforced locally with no refresh at all;
-    //  - a request that arrives while a refresh is in flight and finds a cache that is older than
-    //    the TTL is REFUSED (a stale refusal is harmless; a stale arm never is);
-    //  - the refresh itself is bounded in time (break_glass_status caps the lock wait and the
-    //    statement), and a failed refresh caches nothing, so the next answer is a refusal.
-    // A disarm therefore propagates within kBreakGlassArmCacheTtl (1 second), an arm likewise.
-    const auto now = std::chrono::steady_clock::now();
+    // request at a time (single flight); every other request is answered at once. The gate
+    // FAILS CLOSED and says which kind of answer it gives:
+    //  - kBreakGlassArmed only from a read that said armed, while the cache is younger than
+    //    kBreakGlassArmCacheTtl, the LOCAL monotonic deadline derived from the database clock's
+    //    remaining arm time has not passed (never the replica's wall clock), AND the read
+    //    STARTED at most kArmSnapshotMaxAge ago (the cap; it holds for a cache hit and for this
+    //    call's own read, however long that read took);
+    //  - kRefused only for a definitive answer: a read that said not armed, or the local
+    //    deadline passing (an arm window that ends is enforced locally with no refresh at all);
+    //  - kTransient when the arm state could not be established: a refresh is in flight and the
+    //    cache is older than the TTL (refresh_busy), the bounded read failed or there is no auth
+    //    store (read_failed), or an armed read is older than the cap (stale_read). A transient
+    //    answer is never cached and is never recorded as "not armed".
+    // The refresh itself is bounded in time (break_glass_status caps the pool acquire, the lock
+    // wait and the statement). Two facts are kept across failed reads for the MFA step's second
+    // re-check: the id of the last definitive armed read and when the last definitive not-armed
+    // read started.
+    auto* metrics = auth_mgr_.metrics_registry();
+    const auto count = [metrics](const char* result) {
+        if (metrics)
+            metrics->counter("yuzu_auth_break_glass_arm_gate_total", {{"result", result}})
+                .increment();
+    };
+    const auto now = arm_clock_now();
+    std::function<BreakGlassArmRead()> hook;
     {
         std::lock_guard lk(bg_arm_mu_);
-        if (bg_arm_valid_ && now - bg_arm_at_ < kBreakGlassArmCacheTtl)
-            return (bg_arm_armed_ && now < bg_arm_deadline_) ? SsoOnlyLocalGate::kBreakGlassArmed
-                                                           : SsoOnlyLocalGate::kRefused;
+        out.last_not_armed_at = bg_last_not_armed_at_;
+        if (bg_arm_valid_ && now - bg_arm_at_ < kBreakGlassArmCacheTtl) {
+            if (!bg_arm_armed_) {
+                out.state = SsoOnlyLocalGate::kRefused;
+                out.why = bg_arm_id_.empty() ? SsoOnlyRefusedWhy::kDisarmed
+                                             : SsoOnlyRefusedWhy::kWindowEnded;
+                return out;
+            }
+            if (now >= bg_arm_deadline_) {
+                out.state = SsoOnlyLocalGate::kRefused;
+                out.why = SsoOnlyRefusedWhy::kWindowEnded;
+                return out;
+            }
+            if (!arm_observation_fresh(bg_arm_started_, now)) {
+                out.state = SsoOnlyLocalGate::kTransient;
+                out.cause = SsoOnlyTransientCause::kStaleRead;
+                out.arm_id = bg_last_armed_id_;
+                count("stale_read");
+                return out;
+            }
+            out.state = SsoOnlyLocalGate::kBreakGlassArmed;
+            out.arm_id = bg_arm_id_;
+            out.deadline = bg_arm_deadline_;
+            out.read_at = bg_arm_started_;
+            return out;
+        }
+        out.arm_id = bg_last_armed_id_; // what a transient answer carries
+        hook = bg_arm_read_hook_for_test_;
     }
     bool expected = false;
     if (!bg_arm_refreshing_.compare_exchange_strong(expected, true)) {
-        if (auto* m = auth_mgr_.metrics_registry())
-            m->counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "refresh_busy"}})
-                .increment();
-        return SsoOnlyLocalGate::kRefused; // a refresh is in flight and the cache is stale
+        // A refresh is in flight and the cache is older than the TTL (a stale arm is never
+        // served; this is not a "not armed" answer either).
+        out.state = SsoOnlyLocalGate::kTransient;
+        out.cause = SsoOnlyTransientCause::kRefreshBusy;
+        count("refresh_busy");
+        return out;
     }
     struct Done {
         std::atomic<bool>& f;
         ~Done() { f.store(false); }
     } done{bg_arm_refreshing_};
-    bool ok = false, armed = false;
-    std::int64_t remaining_ms = 0;
-    const auto started = std::chrono::steady_clock::now(); // conservative: the deadline counts from here
-    if (auto* db = auth_mgr_.auth_db_ptr()) {
-        // Fail CLOSED on a read error: unlike lockout (which guards against wrong passwords and
-        // so fails open), this gate is the credential path itself.
+    BreakGlassArmRead read;
+    read.ok = false;
+    // BEFORE the read: the database snapshot it sees is at or after this instant, so the arm
+    // deadline and the age of the observation both count from the conservative side.
+    const auto started = arm_clock_now();
+    if (hook) {
+        read = hook();
+    } else if (auto* db = auth_mgr_.auth_db_ptr()) {
         if (auto bg = db->break_glass_status(username)) {
-            ok = true;
-            armed = bg->armed && bg->remaining_ms > 0;
-            remaining_ms = bg->remaining_ms;
-        }
-        if (!ok) {
-            spdlog::warn("break-glass arm-state read failed; the gate refuses (fail closed) until a "
-                         "read succeeds");
-            if (auto* m = auth_mgr_.metrics_registry())
-                m->counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "read_failed"}})
-                    .increment();
+            read.ok = true;
+            read.armed = bg->armed;
+            read.armed_until = bg->armed_until;
+            read.remaining_ms = bg->remaining_ms;
         }
     }
+    const auto finished = arm_clock_now();
+    const auto deadline = started + std::chrono::milliseconds(read.remaining_ms);
+    const bool armed_now = read.ok && read.armed && read.remaining_ms > 0 && finished < deadline;
     std::lock_guard lk(bg_arm_mu_);
-    bg_arm_valid_ = ok;
-    bg_arm_armed_ = armed;
-    bg_arm_at_ = std::chrono::steady_clock::now();
-    bg_arm_deadline_ = started + std::chrono::milliseconds(remaining_ms);
-    return (armed && bg_arm_at_ < bg_arm_deadline_) ? SsoOnlyLocalGate::kBreakGlassArmed
-                                                     : SsoOnlyLocalGate::kRefused;
+    out.arm_id = bg_last_armed_id_;
+    out.last_not_armed_at = bg_last_not_armed_at_;
+    if (!read.ok) {
+        // A failed read (or no auth store) caches nothing, so the next call reads again.
+        bg_arm_valid_ = false;
+        spdlog::warn("break-glass arm-state read failed; the arm state is unknown and the gate "
+                     "admits nothing on it until a read succeeds");
+        out.state = SsoOnlyLocalGate::kTransient;
+        out.cause = SsoOnlyTransientCause::kReadFailed;
+        count("read_failed");
+        return out;
+    }
+    if (armed_now && !arm_observation_fresh(started, finished)) {
+        // The read said armed but took longer than the cap: too old to honour, and not evidence
+        // that the account is not armed. Treated like a failed read (nothing cached or recorded).
+        bg_arm_valid_ = false;
+        out.state = SsoOnlyLocalGate::kTransient;
+        out.cause = SsoOnlyTransientCause::kStaleRead;
+        count("stale_read");
+        return out;
+    }
+    bg_arm_valid_ = true;
+    bg_arm_armed_ = armed_now;
+    bg_arm_at_ = finished;
+    bg_arm_started_ = started;
+    bg_arm_deadline_ = deadline;
+    bg_arm_id_ = read.armed_until;
+    if (armed_now) {
+        bg_last_armed_id_ = read.armed_until;
+        out.state = SsoOnlyLocalGate::kBreakGlassArmed;
+        out.arm_id = read.armed_until;
+        out.deadline = deadline;
+        out.read_at = started;
+        return out;
+    }
+    // A definitive "not armed". The last armed id is left in place on purpose.
+    bg_last_not_armed_at_ = started;
+    out.last_not_armed_at = bg_last_not_armed_at_;
+    out.state = SsoOnlyLocalGate::kRefused;
+    out.why = read.armed_until.empty() ? SsoOnlyRefusedWhy::kDisarmed
+                                       : SsoOnlyRefusedWhy::kWindowEnded;
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -2793,9 +2872,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // below stay HERE, at the /login site.
         check_opts.pre_verify_gate = [&]() -> bool {
             const auto gate = sso_only_local_password_gate(username);
-            if (gate == SsoOnlyLocalGate::kOpen)
+            if (gate.state == SsoOnlyLocalGate::kOpen)
                 return true;
-            break_glass_login = gate == SsoOnlyLocalGate::kBreakGlassArmed;
+            break_glass_login = gate.state == SsoOnlyLocalGate::kBreakGlassArmed;
             if (!break_glass_login) {
                 res.status = 401;
                 res.set_content(detail::a4_error(res, "Invalid username or password"),
@@ -2818,7 +2897,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                         .increment();
                 }
                 spdlog::warn("Local-password login blocked (auth-mode=sso-only){} from source {}",
-                             probed_break_glass ? " [break-glass account, not armed]" : "",
+                             !probed_break_glass ? ""
+                             : gate.state == SsoOnlyLocalGate::kTransient
+                                 ? " [break-glass account, arm state unreadable]"
+                                 : " [break-glass account, not armed]",
                              req.remote_addr);
                 return false;
             }
@@ -3395,20 +3477,57 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
         }
         // A break-glass login is authorised by the ARM WINDOW, not just by the password step: the
-        // pending token outlives that step (mfa_login_pending_secs), so a disarm or the end of the
-        // window in between must end the login. The gate is cached and fail-closed (a failed read
-        // is a refusal); the answer is the SAME generic 401 as every other failure here, spending
-        // nothing (no TOTP attempt, no recovery code).
-        if (entry.break_glass &&
-            sso_only_local_password_gate(entry.username) != SsoOnlyLocalGate::kBreakGlassArmed) {
-            res.status = 401;
-            res.set_content(kFailureBody(res), "application/json");
-            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
-                                    auth::role_to_string(entry.role), "User", entry.username,
-                                    "break-glass no longer armed");
+        // pending token outlives that step (mfa_login_pending_secs), so the arm state is checked
+        // again here, before anything is spent, and once more before the mint. Every refusal is
+        // the SAME generic 401 as any other failure here and spends nothing (no attempt counted,
+        // no code verified or consumed):
+        //  - a definitive "not armed" (the arm was removed or its window ended) ends the login;
+        //  - an arm state that could not be read is not evidence of either, so the pending token
+        //    is put back (inside its TTL, attempts unchanged) and the caller may retry.
+        // An armed answer is kept in `arm1` for the second re-check.
+        struct ArmSnapshot {
+            std::string arm_id;
+            std::chrono::steady_clock::time_point deadline;
+            std::chrono::steady_clock::time_point read_at;
+        };
+        std::optional<ArmSnapshot> arm1;
+        bool admitted_under_transient = false;
+        const auto count_bg_refused = [this](const char* reason, const char* stage) {
             if (auto* m = auth_mgr_.metrics_registry())
-                m->counter("yuzu_auth_break_glass_pending_refused_total").increment();
-            return;
+                m->counter("yuzu_auth_break_glass_pending_refused_total",
+                           {{"reason", reason}, {"stage", stage}})
+                    .increment();
+        };
+        if (entry.break_glass) {
+            const SsoOnlyGateResult gate1 = sso_only_local_password_gate(entry.username);
+            if (gate1.state == SsoOnlyLocalGate::kBreakGlassArmed) {
+                arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at};
+            } else if (gate1.state == SsoOnlyLocalGate::kTransient) {
+                const std::string uname = entry.username;
+                const auto urole = entry.role;
+                if (std::chrono::steady_clock::now() < entry.expires_at) {
+                    std::lock_guard lock(mfa_pending_mu_);
+                    mfa_pending_[pending] = std::move(entry);
+                }
+                res.status = 401;
+                res.set_content(kFailureBody(res), "application/json");
+                audit_log_for_principal(req, "mfa.login.failed", "error", uname,
+                                        auth::role_to_string(urole), "User", uname,
+                                        "break-glass arm state unreadable (nothing verified or "
+                                        "spent)");
+                count_bg_refused("transient", "pre_verify");
+                return;
+            } else {
+                const bool window_ended = gate1.why == SsoOnlyRefusedWhy::kWindowEnded;
+                res.status = 401;
+                res.set_content(kFailureBody(res), "application/json");
+                audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                        auth::role_to_string(entry.role), "User", entry.username,
+                                        window_ended ? "break-glass no longer armed: window ended"
+                                                     : "break-glass no longer armed: disarmed");
+                count_bg_refused(window_ended ? "window_ended" : "disarmed", "pre_verify");
+                return;
+            }
         }
 
         // WP03 F15: RESERVE a durable per-account attempt BEFORE verifying (one DB statement:
@@ -3591,18 +3710,53 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // or change committed since the pending /login denies this mint.
         if (mfa_verify_barrier_for_test_) // test seam, empty in production
             mfa_verify_barrier_for_test_("/login/mfa", proof);
-        // Re-check the arm state once more at the mint (the code verification took time): the
-        // window may have ended meanwhile. The same uniform 401, no session.
-        if (entry.break_glass &&
-            sso_only_local_password_gate(entry.username) != SsoOnlyLocalGate::kBreakGlassArmed) {
-            res.status = 401;
-            res.set_content(kFailureBody(res), "application/json");
-            audit_log_for_principal(req, "auth.login", "failure", entry.username,
-                                    auth::role_to_string(entry.role), "User", entry.username,
-                                    "reason=break_glass_disarmed_before_mint");
-            if (auto* m = auth_mgr_.metrics_registry())
-                m->counter("yuzu_auth_break_glass_pending_refused_total").increment();
-            return;
+        // Re-check the arm state once more at the mint (the code verification took time). A code
+        // may already be spent here, so the three answers are kept apart:
+        //  - armed: mint;
+        //  - a definitive "not armed": refuse (the refusal is honest about a spent code);
+        //  - unreadable: mint ONLY inside the bound the first re-check's read gives: before that
+        //    window's own end, at most kArmSnapshotMaxAge after that read STARTED, the same arm
+        //    window, and no "not armed" read on this server since. Otherwise refuse.
+        // `now2` is sampled ONCE, AFTER the gate call returns (that call can itself take as long
+        // as a bounded read), and both time checks use it. A login with no snapshot from the
+        // first re-check never mints, whatever the gate says now.
+        if (entry.break_glass) {
+            const SsoOnlyGateResult gate2 = sso_only_local_password_gate(entry.username);
+            const auto now2 = arm_clock_now();
+            const bool transient_ok =
+                arm1.has_value() && gate2.state == SsoOnlyLocalGate::kTransient &&
+                now2 < arm1->deadline && arm_observation_fresh(arm1->read_at, now2) &&
+                !arm1->arm_id.empty() && gate2.arm_id == arm1->arm_id &&
+                !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at);
+            const bool admit =
+                arm1.has_value() &&
+                (gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);
+            if (!admit) {
+                const char* reason = "transient";
+                const char* detail = "reason=break_glass_arm_state_unreadable_before_mint";
+                const bool seen_removed =
+                    arm1.has_value() && gate2.last_not_armed_at &&
+                    *gate2.last_not_armed_at >= arm1->read_at;
+                if ((arm1.has_value() && now2 >= arm1->deadline) ||
+                    (gate2.state == SsoOnlyLocalGate::kRefused &&
+                     gate2.why == SsoOnlyRefusedWhy::kWindowEnded)) {
+                    reason = "window_ended";
+                    detail = "reason=break_glass_window_ended_before_mint";
+                } else if (gate2.state == SsoOnlyLocalGate::kRefused || seen_removed) {
+                    reason = "disarmed";
+                    detail = "reason=break_glass_disarmed_before_mint";
+                }
+                res.status = 401;
+                res.set_content(kFailureBody(res), "application/json");
+                audit_log_for_principal(req, "auth.login", "failure", entry.username,
+                                        auth::role_to_string(entry.role), "User", entry.username,
+                                        std::string(detail) +
+                                            (used_recovery ? ";method=password+recovery"
+                                                           : ";method=password+totp"));
+                count_bg_refused(reason, "pre_mint");
+                return;
+            }
+            admitted_under_transient = gate2.state == SsoOnlyLocalGate::kTransient;
         }
         auth::AuthManager::MintDenial denial = auth::AuthManager::MintDenial::kNone;
         auto token = auth_mgr_.create_local_session(entry.username, entry.role, entry.hash_hex,
@@ -3639,9 +3793,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // stay correct (Gate 4 architect S2 + happy-path S1 + S2).
         audit_log_for_principal(req, "auth.login", "ok", entry.username,
                                 auth::role_to_string(entry.role), "User", entry.username,
-                                used_recovery ? "method=password+recovery"
-                                              : "method=password+totp");
+                                std::string(used_recovery ? "method=password+recovery"
+                                                          : "method=password+totp") +
+                                    (admitted_under_transient ? ";arm_recheck=transient_admitted"
+                                                              : ""));
+        if (admitted_under_transient)
+            spdlog::warn("break-glass login for '{}' completed while the arm state could not be "
+                         "re-read (inside the bound from the read made before verification)",
+                         ::yuzu::log_key_token(entry.username));
         if (auto* m = auth_mgr_.metrics_registry()) {
+            if (admitted_under_transient)
+                m->counter("yuzu_auth_break_glass_pending_transient_admitted_total").increment();
             m->counter("yuzu_auth_mfa_logins_total",
                        {{"method", used_recovery ? "recovery" : "totp"},
                         {"result", "success"}})
