@@ -54,6 +54,24 @@ MIXED = {  # the shape #6711 was filed against
 }
 AGREE = {"manifests": [entry("amd64", "alpine:3.23"), entry("arm64", "alpine:3.23")]}
 
+D_AMD, D_ARM = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+
+
+def config(first="ADD alpine-minirootfs-3.23.8-x86_64.tar.gz / # buildkit", *more):
+    return {"architecture": "amd64", "history": [{"created_by": first}] + [{"created_by": m} for m in more]}
+
+
+def unannotated(arch, digest):
+    e = entry(arch)
+    e["digest"] = digest
+    return e
+
+
+HEXPM = {  # the shape of the hexpm/erlang index: no base.name annotation, an attestation entry
+    "manifests": [unannotated("amd64", D_AMD), entry("unknown", None, os_="unknown"), unannotated("arm64", D_ARM)]
+}
+HEXPM_CONFIGS = {D_AMD: config(), D_ARM: config("ADD alpine-minirootfs-3.23.8-aarch64.tar.gz / # buildkit")}
+
 
 class CheckTests(unittest.TestCase):
     def test_unsupported_divergent_platform_is_a_note_not_a_failure(self):
@@ -134,6 +152,80 @@ class CheckTests(unittest.TestCase):
                 mod.check(idx, ["linux/amd64"], "3.23")
 
 
+class ConfigEvidenceTests(unittest.TestCase):
+    """An entry with no annotation is judged by its image config's first history entry (WP15)."""
+
+    def test_minirootfs_history_on_the_runtime_release_passes(self):
+        self.assertEqual(mod.check(HEXPM, ["linux/amd64", "linux/arm64"], "3.23", HEXPM_CONFIGS)[0], [])
+
+    def test_minirootfs_history_on_another_release_fails(self):
+        cfgs = dict(HEXPM_CONFIGS, **{D_AMD: config("ADD alpine-minirootfs-3.24.1-x86_64.tar.gz / # buildkit")})
+        failures, _ = mod.check(HEXPM, ["linux/amd64"], "3.23", cfgs)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("3.24", failures[0])
+        self.assertIn("image config", failures[0])
+
+    def test_no_config_for_an_unannotated_entry_fails_closed(self):
+        failures, _ = mod.check(HEXPM, ["linux/amd64"], "3.23", {})
+        self.assertEqual(len(failures), 1)
+        self.assertIn("minirootfs", failures[0])
+
+    def test_minirootfs_of_another_architecture_fails(self):
+        # An amd64 entry whose base layer is the aarch64 rootfs is not evidence for amd64.
+        cfgs = {D_AMD: config("ADD alpine-minirootfs-3.23.8-aarch64.tar.gz / # buildkit")}
+        self.assertEqual(len(mod.check(HEXPM, ["linux/amd64"], "3.23", cfgs)[0]), 1)
+
+    def test_only_the_first_history_entry_counts(self):
+        decoy = config("ADD alpine-minirootfs-3.24.1-x86_64.tar.gz / # buildkit",
+                       "ADD alpine-minirootfs-3.23.8-x86_64.tar.gz / # buildkit")
+        self.assertEqual(len(mod.check(HEXPM, ["linux/amd64"], "3.23", {D_AMD: decoy})[0]), 1)
+        late = config("ADD file:abc in / ", "ADD alpine-minirootfs-3.23.8-x86_64.tar.gz / # buildkit")
+        self.assertEqual(len(mod.check(HEXPM, ["linux/amd64"], "3.23", {D_AMD: late})[0]), 1)
+
+    def test_a_history_line_that_only_contains_the_pattern_fails(self):
+        for first in ("RUN echo ADD alpine-minirootfs-3.23.8-x86_64.tar.gz / # buildkit",
+                      "ADD alpine-minirootfs-3.23.8-x86_64.tar.gz /evil # buildkit",
+                      "ADD alpine-minirootfs-3.23-x86_64.tar.gz / # buildkit"):
+            with self.subTest(first=first):
+                self.assertEqual(len(mod.check(HEXPM, ["linux/amd64"], "3.23", {D_AMD: config(first)})[0]), 1)
+
+    def test_mis_shaped_configs_are_verdicts_not_crashes(self):
+        for cfg in (None, [], "x", {"history": None}, {"history": []}, {"history": ["x"]},
+                    {"history": [{"created_by": 7}]}):
+            with self.subTest(cfg=cfg):
+                self.assertEqual(len(mod.check(HEXPM, ["linux/amd64"], "3.23", {D_AMD: cfg})[0]), 1)
+
+    def test_an_annotation_is_used_when_present_and_the_config_is_not_consulted(self):
+        e = entry("amd64", "alpine:3.24")
+        e["digest"] = D_AMD
+        failures, _ = mod.check({"manifests": [e]}, ["linux/amd64"], "3.23", {D_AMD: config()})
+        self.assertEqual(len(failures), 1)
+        self.assertIn("annotated as Alpine 3.24", failures[0])
+
+    def test_unannotated_unsupported_platform_is_a_note(self):
+        failures, notes = mod.check(HEXPM, ["linux/amd64"], "3.23", HEXPM_CONFIGS)
+        self.assertEqual(failures, [])
+        self.assertTrue(any("linux/arm64" in n and "no " in n for n in notes), notes)
+
+
+class TagTests(unittest.TestCase):
+    def b(self, tag):
+        return {"repo": "hexpm/erlang", "tag": tag, "digest": "sha256:" + "a" * 64}
+
+    def test_tag_naming_the_runtime_release_passes(self):
+        self.assertEqual(mod.tag_failures(self.b("28.5.0.8-alpine-3.23.8"), "3.23"), [])
+
+    def test_tag_naming_another_release_fails(self):
+        for tag in ("28.5.0.8-alpine-3.24.1", "28.5.0.8-alpine-3.22.4", "28-alpine3.24"):
+            with self.subTest(tag=tag):
+                self.assertEqual(len(mod.tag_failures(self.b(tag), "3.23")), 1)
+
+    def test_tag_naming_no_release_is_not_judged(self):
+        for tag in ("28-alpine", "28", "28.5.0.8"):
+            with self.subTest(tag=tag):
+                self.assertEqual(mod.tag_failures(self.b(tag), "3.23"), [])
+
+
 class MainTests(unittest.TestCase):
     """main() exit codes through the hermetic --index-file path."""
 
@@ -180,6 +272,37 @@ class MainTests(unittest.TestCase):
         for name, text in cases.items():
             with self.subTest(name), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(self.run_main(text, MIXED)[0], 3)
+
+    def test_tag_on_another_alpine_release_is_1(self):
+        text = self.GOOD.replace("erlang:28-alpine", "hexpm/erlang:28.5.0.8-alpine-3.24.1")
+        rc, _, err = self.run_main(text, MIXED)
+        self.assertEqual(rc, 1)
+        self.assertIn("names Alpine 3.24", err)
+
+    def run_main_cfg(self, index, configs):
+        df = self.dir / "Dockerfile"
+        df.write_text(self.GOOD.replace("erlang:28-alpine", "hexpm/erlang:28.5.0.8-alpine-3.23.8"),
+                      encoding="utf-8")
+        idx, cfg = self.dir / "index.json", self.dir / "configs.json"
+        idx.write_text(json.dumps(index), encoding="utf-8")
+        cfg.write_text(configs if isinstance(configs, str) else json.dumps(configs), encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = mod.main(["--dockerfile", str(df), "--index-file", str(idx), "--configs-file", str(cfg)])
+        return rc, err.getvalue()
+
+    def test_configs_file_supplies_the_evidence_offline(self):
+        self.assertEqual(self.run_main_cfg(HEXPM, HEXPM_CONFIGS)[0], 0)
+        self.assertEqual(self.run_main_cfg(HEXPM, {})[0], 1)
+
+    def test_a_bad_configs_file_is_3(self):
+        self.assertEqual(self.run_main_cfg(HEXPM, "[]")[0], 3)
+        self.assertEqual(self.run_main_cfg(HEXPM, "{not json")[0], 3)
+
+    def test_configs_file_without_index_file_is_3(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            mod.main(["--configs-file", str(self.dir / "c.json")])
+        self.assertEqual(cm.exception.code, 3)
 
     def test_non_index_and_bad_json_are_3(self):
         self.assertEqual(self.run_main(self.GOOD, {"layers": []})[0], 3)
@@ -487,6 +610,54 @@ class FetchTests(unittest.TestCase):
                 with self.assertRaises(mod.RegistryError):
                     mod.fetch_index("erlang", "sha256:" + "0" * 64)
 
+    def fake_registry(self, blobs):
+        """_get answering the token URL and /manifests|blobs/<digest> from `blobs` (raw bytes)."""
+        calls = []
+
+        def fake(url, headers, attempts=4):
+            calls.append(url)
+            if "auth.docker.io" in url:
+                return b'{"token": "t"}'
+            return blobs[url.rsplit("/", 1)[1]]
+
+        mod._get = fake
+        return calls
+
+    def test_fetch_configs_follows_manifest_to_config_and_verifies_both(self):
+        cfg = json.dumps(config()).encode()
+        cd = "sha256:" + hashlib.sha256(cfg).hexdigest()
+        man = json.dumps({"config": {"digest": cd}}).encode()
+        md = "sha256:" + hashlib.sha256(man).hexdigest()
+        idx = {"manifests": [unannotated("amd64", md), unannotated("arm64", D_ARM),
+                             entry("amd64", "alpine:3.23", variant="v2")]}
+        calls = self.fake_registry({md: man, cd: cfg})
+        got = mod.fetch_configs("hexpm/erlang", idx, ["linux/amd64"])
+        self.assertEqual(got, {md: config()})
+        # arm64 is unsupported and the annotated entry needs no config: neither is fetched.
+        self.assertFalse(any(D_ARM in c for c in calls), calls)
+        self.assertTrue(any(c.endswith("/v2/hexpm/erlang/blobs/" + cd) for c in calls), calls)
+
+    def test_fetch_configs_refuses_a_body_that_is_not_the_named_digest(self):
+        cfg = json.dumps(config()).encode()
+        cd = "sha256:" + hashlib.sha256(cfg).hexdigest()
+        man = json.dumps({"config": {"digest": cd}}).encode()
+        md = "sha256:" + hashlib.sha256(man).hexdigest()
+        for blobs in ({md: man + b" ", cd: cfg}, {md: man, cd: cfg + b" "}):
+            with self.subTest(tampered=[k for k in blobs if blobs[k].endswith(b" ")]):
+                self.fake_registry(blobs)
+                with self.assertRaisesRegex(mod.RegistryError, "not the pinned"):
+                    mod.fetch_configs("hexpm/erlang", {"manifests": [unannotated("amd64", md)]}, ["linux/amd64"])
+
+    def test_fetch_configs_bad_digests_are_input_defects(self):
+        self.fake_registry({})
+        with self.assertRaises(mod.InputDefect):
+            mod.fetch_configs("hexpm/erlang", {"manifests": [unannotated("amd64", "sha256:XYZ")]}, ["linux/amd64"])
+        man = json.dumps({"config": {"digest": "md5:1"}}).encode()
+        md = "sha256:" + hashlib.sha256(man).hexdigest()
+        self.fake_registry({md: man})
+        with self.assertRaises(mod.InputDefect):
+            mod.fetch_configs("hexpm/erlang", {"manifests": [unannotated("amd64", md)]}, ["linux/amd64"])
+
     def test_does_not_retry_a_client_error(self):
         calls = []
         orig = mod.urllib.request.urlopen
@@ -523,8 +694,23 @@ class DockerfileContractTests(unittest.TestCase):
     def test_lint_can_parse_the_real_dockerfile(self):
         supported, builder, runtime = mod.parse_dockerfile(self.text)
         self.assertTrue(supported)
-        self.assertEqual(builder["repo"], "erlang")
+        self.assertEqual(builder["repo"], "hexpm/erlang")
         self.assertRegex(runtime, r"^[0-9]+\.[0-9]+$")
+        # The builder tag names the runtime stage's Alpine release (WP15).
+        self.assertRegex(builder["tag"], r"-alpine-[0-9]+\.[0-9]+\.[0-9]+$")
+        self.assertEqual(mod.tag_failures(builder, runtime), [])
+
+    def test_rebar3_is_pinned_by_checksum_and_its_version_is_checked(self):
+        deps = self.text.split(" AS deps", 1)[1].split("FROM deps AS builder", 1)[0]
+        m = re.search(r"^ADD --checksum=sha256:[0-9a-f]{64} --chmod=755 \\\n\s+"
+                      r"https://github\.com/erlang/rebar3/releases/download/([0-9.]+)/rebar3 /usr/local/bin/rebar3$",
+                      deps, re.M)
+        self.assertIsNotNone(m, "rebar3 must come from one checksum-pinned ADD of the release asset")
+        version = m.group(1)
+        self.assertIn(f"RUN rebar3 version | grep -q '^rebar {re.escape(version)} on Erlang/OTP 28 '", deps)
+        # No other route installs rebar3 or pipes a download into a shell.
+        self.assertNotRegex(deps, r"(curl|wget)[^\n]*\|\s*(ba)?sh")
+        self.assertEqual(deps.count("/usr/local/bin/rebar3"), 1)
 
     @unittest.skipUnless(HAVE_SH, "needs a POSIX sh")
     def test_guard_admits_exactly_the_marker_platforms_and_refuses_the_rest(self):

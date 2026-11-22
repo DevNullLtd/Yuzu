@@ -290,7 +290,8 @@ std::optional<std::string> strict_args_error(const nlohmann::json& args) {
 std::optional<std::string> installed_software_args_error(const nlohmann::json& args) {
     if (!args.is_object())
         return std::nullopt;
-    for (const char* key : {"agent_id", "name", "version", "cursor"})
+    for (const char* key : {"agent_id", "name", "version", "cursor", "q", "kind", "ecosystem",
+                            "source", "match", "version_min", "version_max", "status"})
         if (args.contains(key) && !args[key].is_string())
             return std::string(key) + " must be a JSON string";
     if (args.contains("limit")) {
@@ -597,6 +598,7 @@ nlohmann::json device_row_json(const SoftwareFleetRow& r) {
         {"distro_id", e.distro_id},
         {"distro_version", e.distro_version},
         {"source", e.source},
+        {"package_id", e.package_id},
     };
 }
 
@@ -631,7 +633,7 @@ std::string installs_csv(const std::vector<SoftwareFleetRow>& rows) {
         const auto& e = r.entry;
         append_row(out, {r.agent_id, e.name, e.version, e.publisher, e.install_date, e.kind,
                          e.ecosystem, e.epoch, e.release, e.arch, e.signature_status, e.distro_id,
-                         e.distro_version, e.source});
+                         e.distro_version, e.source, e.package_id});
     }
     return out;
 }

@@ -1028,11 +1028,20 @@ so "private range" is not the same predicate as "inside my trust zone" (`CONTEXT
 cluster" term already states clusters must not span a DMZ or a WAN) — the cookie is the actual security
 boundary and should be strengthened directly rather than proxied through an address-range heuristic that
 doesn't track the real one. Migrating the distribution protocol itself to `-proto_dist inet_tls` over the
-internal CA is filed as a follow-up, not this slice's scope. `#4555` also pins
+internal CA is a design item, not this slice's scope and not yet shipped: gateway distribution
+remains unencrypted, outside the PKI, and relies on a trusted, firewalled cluster network. `#4555` also pins
 `inet_dist_listen_min`/`inet_dist_listen_max` in the kernel config (today the distribution port is
 randomly chosen per boot and therefore unfirewallable on a bare-VM deployment) and documents that fixed
 range as what an operator firewalls alongside the existing mgmt-plane (`:50063`) and agent-edge
 (`:50051`) guidance.
+
+**Update (2026-11-17, WP09 / security scan finding F24).** The paragraph above is kept as history. Today:
+no `vm.args.src` fallback cookie exists; the container entrypoint and the systemd unit's `ExecStartPre`
+(one shared policy, `deploy/docker/gateway-cookie-policy.sh`) refuse an unset, published-default, short
+(< 32), over-long (> 255) or unsafe-character cookie before the VM starts; and `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`
+does not mean "run with the published default": the entrypoint substitutes a random per-boot cookie, so
+replicas on the override are singletons that cannot cluster. The `inet_tls` migration is tracked as #8158
+(decision pending; owner: Fraser Jarvis; review by 2027-02-17).
 
 **Decision: `#4555` ships a scale-capable reference Compose rig alongside the mechanism (Fable design
 review finding).** Per the correction above, no shipped Compose file can actually exercise `--scale

@@ -90,3 +90,53 @@ TEST_CASE("tcp_tick_status: a failed nstat lifecycle insert wins over the poll l
     CHECK(tcp_tick_status(true, "state_save_failed") == "insert_failed");
     CHECK(tcp_tick_status(false, "events_recorded") == "events_recorded");
 }
+
+TEST_CASE("source health: a source in backoff prints its next retry time after its three usual lines",
+          "[echo][health]") {
+    SourceHealthLedger l;
+    const auto& srcs = capture_sources();
+    l.record("registry", "capture_incomplete", 100);
+    l.record("registry", "capture_incomplete", 160);
+    l.set_next_retry("registry", 460);
+    const auto lines = format_source_health_lines(l, srcs);
+    REQUIRE(lines.size() == srcs.size() * 3 + 1);
+    std::size_t at = 0;
+    for (std::size_t i = 0; i < lines.size(); ++i)
+        if (lines[i] == "config|registry_last_status|capture_incomplete")
+            at = i;
+    REQUIRE(at > 0);
+    CHECK(lines[at + 1] == "config|registry_consecutive_failures|2");
+    CHECK(lines[at + 2] == "config|registry_last_status_at|160");
+    CHECK(lines[at + 3] == "config|registry_next_retry_at|460");
+}
+
+TEST_CASE("source health: a source not in backoff prints no retry line and exactly one failure "
+          "counter line",
+          "[echo][health]") {
+    SourceHealthLedger l;
+    l.record("registry", "capture_incomplete", 100);
+    const auto lines = format_source_health_lines(l, capture_sources());
+    std::size_t retry = 0, counters = 0;
+    for (const auto& line : lines) {
+        retry += line.find("_next_retry_at|") != std::string::npos;
+        counters += line.starts_with("config|registry_") &&
+                    line.find("_consecutive_failures|") != std::string::npos;
+    }
+    CHECK(retry == 0);
+    CHECK(counters == 1);
+}
+
+TEST_CASE("source health: clearing the next retry removes the line and leaves the failure counter "
+          "as recorded",
+          "[echo][health]") {
+    SourceHealthLedger l;
+    l.record("registry", "capture_incomplete", 100);
+    l.record("registry", "capture_incomplete", 160);
+    l.set_next_retry("registry", 460);
+    REQUIRE(l.next_retry("registry") == 460);
+    l.clear_next_retry("registry");
+    CHECK_FALSE(l.next_retry("registry").has_value());
+    CHECK(l.get("registry")->consecutive_failures == 2);
+    CHECK(format_source_health_lines(l, capture_sources()).size() ==
+          capture_sources().size() * 3);
+}

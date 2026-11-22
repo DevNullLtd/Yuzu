@@ -172,7 +172,17 @@ public:
     /// dev tip, so composing both lands the true count at 25, one over the
     /// prior ceiling with zero headroom. 32 restores real headroom rather
     /// than bumping to the bare minimum again.
-    static constexpr std::size_t kMaxSources = 32;
+    /// Raised 32 to 48 (2026-11-17): dev already composed exactly 32 sources, so
+    /// the ceiling had zero headroom again, and process_introspect's fragment
+    /// made the 33rd. The constructor threw and the server could not start. No
+    /// compile caught it, because an overflow is a runtime throw. It surfaced
+    /// only on the first Linux server run of that change (the server is Linux-only,
+    /// ADR-0035). 48 restores real headroom, and capability_fragments.hpp now
+    /// static_asserts that the production composition leaves at least two slots
+    /// free, so a composition of 47 or more sources (for example two overlapping
+    /// PRs off one dev tip, the pattern behind both earlier raises) fails the
+    /// build before it can fail a boot.
+    static constexpr std::size_t kMaxSources = 48;
 
     explicit CommandCapabilityRegistry(
         std::initializer_list<std::span<const CommandCapability>> sources) {

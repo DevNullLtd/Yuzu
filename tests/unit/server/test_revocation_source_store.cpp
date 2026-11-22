@@ -21,6 +21,8 @@
 #include <libpq-fe.h>
 
 #include <atomic>
+#include <expected>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -91,6 +93,17 @@ NewRevocationSource at_version(NewRevocationSource n, std::int64_t version) {
 
 using RKind = RevocationSourceStoreError::Kind;
 
+namespace {
+// `create` returns the stored record; most cases only need its id.
+std::expected<std::int64_t, RevocationSourceStoreError>
+create_id(RevocationSourceStore& store, const NewRevocationSource& src, const std::string& who) {
+    auto r = store.create(src, who);
+    if (!r)
+        return std::unexpected(r.error());
+    return r->id;
+}
+} // namespace
+
 TEST_CASE("RevocationSourceStore: migration creates the whole design schema",
           "[revocation_source_store][pg][migration]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
@@ -124,8 +137,13 @@ TEST_CASE("RevocationSourceStore: create then get and list round-trip a source",
     RS_STORE(store);
     auto n = make_source("Corp CA", '1', {'a', 'b'}, {"http://crl.example.com/a.crl", "https://pki.corp/b.crl"});
     n.urls[1].confirmed_address_classes = {"private", "public"};
-    const auto id = store.create(n, "alice");
-    REQUIRE(id.has_value());
+    const auto created = store.create(n, "alice");
+    REQUIRE(created.has_value());
+    const auto id = std::optional<std::int64_t>(created->id);
+    CHECK(created->name == "Corp CA");
+    CHECK(created->config_version == 1);
+    CHECK(created->urls.size() == 2);
+    CHECK(created->keys.size() == 2);
 
     const auto got = store.get(*id);
     REQUIRE(got.has_value());
@@ -176,15 +194,34 @@ TEST_CASE("RevocationSourceStore: an unknown id is not found, an empty store lis
 TEST_CASE("RevocationSourceStore: one source per CA, the conflict names the existing id",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto first = store.create(make_source("Corp CA", '1'), "alice");
+    const auto first = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(first.has_value());
-    const auto again = store.create(make_source("Another label", '1'), "bob");
+    const auto again = create_id(store, make_source("Another label", '1'), "bob");
     REQUIRE_FALSE(again.has_value());
     CHECK(again.error().kind == RKind::kConflict);
     CHECK(again.error().existing_id == *first);
     // A different CA is fine.
-    CHECK(store.create(make_source("Other CA", '2'), "bob").has_value());
+    CHECK(create_id(store, make_source("Other CA", '2'), "bob").has_value());
     CHECK(store.list()->size() == 2);
+}
+
+TEST_CASE("RevocationSourceStore: a failed read-back inside create commits nothing",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    store.set_read_fault_for_test([](std::string_view op) -> std::optional<RKind> {
+        if (op == "create.reread")
+            return RKind::kQueryError;
+        return std::nullopt;
+    });
+    const auto failed = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(failed.error().kind == RKind::kQueryError);
+    store.set_read_fault_for_test(nullptr);
+    // Rolled back: nothing is listed, and a retry is a fresh registration, not a conflict.
+    CHECK(store.list()->empty());
+    const auto retry = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE(retry.has_value());
+    CHECK(store.list()->size() == 1);
 }
 
 TEST_CASE("RevocationSourceStore: at most 64 sources", "[revocation_source_store][pg]") {
@@ -194,11 +231,11 @@ TEST_CASE("RevocationSourceStore: at most 64 sources", "[revocation_source_store
         h.append(64 - h.size(), 'f');
         auto n = make_source("ca" + std::to_string(i), '1');
         n.ca_subject_name_sha256 = h;
-        REQUIRE(store.create(n, "alice").has_value());
+        REQUIRE(create_id(store, n, "alice").has_value());
     }
     auto over = make_source("one too many", '1');
     over.ca_subject_name_sha256 = hex64('e');
-    const auto r = store.create(over, "alice");
+    const auto r = create_id(store, over, "alice");
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().kind == RKind::kLimitReached);
     CHECK(store.list()->size() == 64);
@@ -208,26 +245,26 @@ TEST_CASE("RevocationSourceStore: the store re-checks what it must to stay consi
           "[revocation_source_store][pg]") {
     RS_STORE(store);
     auto bad_name = make_source("", '1');
-    CHECK(store.create(bad_name, "alice").error().kind == RKind::kInvalidInput);
+    CHECK(create_id(store, bad_name, "alice").error().kind == RKind::kInvalidInput);
     auto long_name = make_source(std::string(129, 'n'), '1');
-    CHECK(store.create(long_name, "alice").error().kind == RKind::kInvalidInput);
+    CHECK(create_id(store, long_name, "alice").error().kind == RKind::kInvalidInput);
     auto nul_name = make_source(std::string("a\0b", 3), '1');
-    CHECK(store.create(nul_name, "alice").error().kind == RKind::kInvalidInput);
+    CHECK(create_id(store, nul_name, "alice").error().kind == RKind::kInvalidInput);
     auto bad_utf8 = make_source("\xff\xfe", '1');
-    CHECK(store.create(bad_utf8, "alice").error().kind == RKind::kInvalidInput);
+    CHECK(create_id(store, bad_utf8, "alice").error().kind == RKind::kInvalidInput);
     auto no_keys = make_source("x", '1');
     no_keys.keys.clear();
-    CHECK(store.create(no_keys, "alice").error().kind == RKind::kInvalidInput);
+    CHECK(create_id(store, no_keys, "alice").error().kind == RKind::kInvalidInput);
     auto no_urls = make_source("x", '1');
     no_urls.urls.clear();
-    CHECK(store.create(no_urls, "alice").error().kind == RKind::kInvalidInput);
+    CHECK(create_id(store, no_urls, "alice").error().kind == RKind::kInvalidInput);
     auto nine_urls = make_source("x", '1');
     for (int i = 0; i < 9; ++i)
         nine_urls.urls.push_back({"http://h" + std::to_string(i) + ".example.com/", "h", {"public"}});
-    CHECK(store.create(nine_urls, "alice").error().kind == RKind::kInvalidInput);
+    CHECK(create_id(store, nine_urls, "alice").error().kind == RKind::kInvalidInput);
     auto dup_url = make_source("x", '1', {'a'}, {"http://a/", "http://a/"});
-    CHECK(store.create(dup_url, "alice").error().kind == RKind::kInvalidInput);
-    CHECK(store.create(make_source("x", '1'), "").error().kind == RKind::kInvalidInput);
+    CHECK(create_id(store, dup_url, "alice").error().kind == RKind::kInvalidInput);
+    CHECK(create_id(store, make_source("x", '1'), "").error().kind == RKind::kInvalidInput);
     // Nothing was written by any refusal.
     CHECK(store.list()->empty());
 }
@@ -235,7 +272,7 @@ TEST_CASE("RevocationSourceStore: the store re-checks what it must to stay consi
 TEST_CASE("RevocationSourceStore: a full replace; an equal body changes nothing",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto id = store.create(make_source("Corp CA", '1', {'a'}, {"http://crl.example.com/a.crl"}),
+    const auto id = create_id(store, make_source("Corp CA", '1', {'a'}, {"http://crl.example.com/a.crl"}),
                                  "alice");
     REQUIRE(id.has_value());
 
@@ -266,7 +303,7 @@ TEST_CASE("RevocationSourceStore: a replace that drops a URL or a key deletes it
           "[revocation_source_store][pg]") {
     RS_STORE(store);
     // Key 'a' has SPKI 1.., key 'b' has SPKI 2... Two URLs.
-    const auto id = store.create(
+    const auto id = create_id(store,
         make_source("Corp CA", '1', {'a', 'b'},
                     {"http://crl.example.com/a.crl", "http://crl2.example.com/b.crl"}),
         "alice");
@@ -326,7 +363,7 @@ TEST_CASE("RevocationSourceStore: a replace that drops a URL or a key deletes it
 TEST_CASE("RevocationSourceStore: a changing replace that names no version is refused",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto id = store.create(make_source("Corp CA", '1'), "alice");
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     const auto r = store.replace(*id, make_source("Renamed", '1')); // no expected_config_version
     REQUIRE_FALSE(r.has_value());
@@ -342,7 +379,7 @@ TEST_CASE("RevocationSourceStore: a changing replace that names no version is re
 TEST_CASE("RevocationSourceStore: a replace naming a different CA subject is refused",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto id = store.create(make_source("Corp CA", '1'), "alice");
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     const auto r = store.replace(*id, make_source("Corp CA", '2'));
     REQUIRE_FALSE(r.has_value());
@@ -353,7 +390,7 @@ TEST_CASE("RevocationSourceStore: a replace naming a different CA subject is ref
 TEST_CASE("RevocationSourceStore: remove cascades, the high-water mark survives",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto id = store.create(make_source("Corp CA", '1'), "alice");
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     // A mark exists for the CA (as the fetcher or a reset would leave it).
     REQUIRE(store.reset_high_water(*id, "").has_value());
@@ -373,13 +410,13 @@ TEST_CASE("RevocationSourceStore: remove cascades, the high-water mark survives"
     CHECK(std::string(PQgetvalue(gone.get(), 0, 1)) == "0");
 
     // Re-registering the CA is allowed and the mark is still there (the fetcher reads it).
-    CHECK(store.create(make_source("Corp CA again", '1'), "alice").has_value());
+    CHECK(create_id(store, make_source("Corp CA again", '1'), "alice").has_value());
 }
 
 TEST_CASE("RevocationSourceStore: reset_high_water sets a floor and discards held CRLs",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto id = store.create(make_source("Corp CA", '1'), "alice");
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     const auto src = store.get(*id);
     RS_EXEC(rs_db_fx_, ("INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, "
@@ -422,7 +459,7 @@ TEST_CASE("RevocationSourceStore: reset_high_water sets a floor and discards hel
 TEST_CASE("RevocationSourceStore: reset_at later than the server clock, or unparseable, is refused",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto id = store.create(make_source("Corp CA", '1'), "alice");
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     const auto future = store.reset_high_water(*id, "2999-01-01T00:00:00Z");
     REQUIRE_FALSE(future.has_value());
@@ -440,7 +477,7 @@ TEST_CASE("RevocationSourceStore: reset_at later than the server clock, or unpar
 TEST_CASE("RevocationSourceStore: crl_past_next_update counts CRL scopes past nextUpdate",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto id = store.create(make_source("Corp CA", '1'), "alice");
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     CHECK(store.crl_past_next_update_count().value() == 0);
     const auto src = store.get(*id);
@@ -475,7 +512,7 @@ TEST_CASE("RevocationSourceStore: two registrations of one CA race to exactly on
     std::vector<std::thread> ts;
     for (int i = 0; i < 4; ++i)
         ts.emplace_back([&, i] {
-            const auto r = store.create(make_source("racer" + std::to_string(i), '1'), "alice");
+            const auto r = create_id(store, make_source("racer" + std::to_string(i), '1'), "alice");
             if (r.has_value())
                 ++won;
             else if (r.error().kind == RKind::kConflict)
@@ -495,7 +532,7 @@ TEST_CASE("RevocationSourceStore: a held pool is a typed degrade, never an empty
     REQUIRE(pool.valid());
     RevocationSourceStore store{pool};
     REQUIRE(store.is_open());
-    REQUIRE(store.create(make_source("Corp CA", '1'), "alice").has_value());
+    REQUIRE(create_id(store, make_source("Corp CA", '1'), "alice").has_value());
     store.set_acquire_timeout_for_test(std::chrono::milliseconds(50));
     auto l1 = pool.acquire();
     auto l2 = pool.acquire();
@@ -506,14 +543,14 @@ TEST_CASE("RevocationSourceStore: a held pool is a typed degrade, never an empty
     CHECK(listed.error().kind == RKind::kPoolAcquireTimeout);
     CHECK(store.get(1).error().kind == RKind::kPoolAcquireTimeout);
     CHECK(store.crl_past_next_update_count().error().kind == RKind::kPoolAcquireTimeout);
-    CHECK(store.create(make_source("x", '2'), "alice").error().kind == RKind::kPoolAcquireTimeout);
+    CHECK(create_id(store, make_source("x", '2'), "alice").error().kind == RKind::kPoolAcquireTimeout);
     CHECK(store.remove(1).error().kind == RKind::kPoolAcquireTimeout);
 }
 
 TEST_CASE("RevocationSourceStore: replace honours expected_config_version under the row lock",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto id = store.create(make_source("Corp CA", '1'), "alice");
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     auto stale = make_source("Renamed", '1');
     stale.expected_config_version = 5;
@@ -544,7 +581,7 @@ TEST_CASE("RevocationSourceStore: replace honours expected_config_version under 
 TEST_CASE("RevocationSourceStore: a reset records the pin and keeps the floor permanently",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto id = store.create(make_source("Corp CA", '1'), "alice");
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     const std::string pin(64, 'b');
     const auto r = store.reset_high_water(*id, "2020-01-02T03:04:05Z", pin);
@@ -567,7 +604,7 @@ TEST_CASE("RevocationSourceStore: a reset records the pin and keeps the floor pe
 TEST_CASE("RevocationSourceStore: crl_entry.serial is pinned to the canonical byte form",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
-    const auto id = store.create(make_source("Corp CA", '1'), "alice");
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     const auto src = store.get(*id);
     RS_EXEC(rs_db_fx_, ("INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, "

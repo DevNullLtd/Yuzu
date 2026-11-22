@@ -5,6 +5,7 @@
  */
 
 #include "echo_software_core.hpp"
+#include "echo_wire_scrub.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -22,7 +23,7 @@ std::string software_state_to_json(const std::vector<SoftwareInfo>& apps) {
                        {"publisher", a.publisher},
                        {"install_date", a.install_date}});
     }
-    return arr.dump();
+    return arr.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 std::vector<SoftwareInfo> software_state_from_json(const std::string& s) {
@@ -52,6 +53,10 @@ SoftwareCollectResult software_collect_core(const std::string& prev_json,
                                             std::vector<SoftwareInfo> enumerated,
                                             int64_t timestamp, int64_t snapshot_id) {
     SoftwareCollectResult r;
+
+    // Well-formed UTF-8 at collection so the dump(replace) baseline round-trips losslessly
+    // (otherwise a name with a bad byte diffs as installed+removed every tick).
+    scrub_wire_strings(enumerated);
 
     // Cold start: no prior state row. Seed the baseline silently — an 'installed'
     // event must mean "installed now", not "already present when the agent began

@@ -1196,9 +1196,15 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
             for (SourceOutcome* o : {&run_hku, &runonce_hku, &startup_approved,
                                      &startup_folder_user})
                 note_constraint(*o, "profile_list_unreadable");
+        } else if (const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+                   !hku.error.empty()) {
+            // A failed or unstable HKEY_USERS listing is not "no hives loaded": the same
+            // constraint as an unreadable ProfileList, never a per-user pass on a guess.
+            for (SourceOutcome* o : {&run_hku, &runonce_hku, &startup_approved,
+                                     &startup_folder_user})
+                note_constraint(*o, "hku_list_incomplete");
         } else {
-            const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
-            const auto profiles = yuzu::profiles::build_profile_list(records, hku_subkeys);
+            const auto profiles = yuzu::profiles::build_profile_list(records, hku.names);
 
             for (const auto& profile : profiles) {
                 const std::string_view user =

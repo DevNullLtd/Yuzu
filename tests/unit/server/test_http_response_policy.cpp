@@ -229,3 +229,13 @@ TEST_CASE("with_response_policy: every case that must stay untouched is left alo
         CHECK(res.body == page);
     }
 }
+
+// Security floor (docs/build-guide.md, "Security dependency pins"): vcpkg.json overrides brotli to
+// 1.2.1 for CVE-2026-111497, a decoder overflow reached through every httplib client that
+// decompresses a response. BrotliDecoderVersion() packs MAJOR << 24 | MINOR << 12 | PATCH, so
+// 1.2.1 is 0x1002001. Raise the number when the pin moves; never lower it.
+TEST_CASE("brotli: linked decoder is at least the security-pinned 1.2.1", "[deps][security]") {
+    const std::uint32_t v = BrotliDecoderVersion();
+    INFO("BrotliDecoderVersion() = " << (v >> 24) << '.' << ((v >> 12) & 0xFFF) << '.' << (v & 0xFFF));
+    CHECK(v >= 0x1002001u);
+}

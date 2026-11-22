@@ -38,6 +38,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -1667,6 +1668,64 @@ TEST_CASE("revocation source: embedded IPv4 forms of the server's own address ar
     CHECK(v.has_value());
 }
 
+TEST_CASE("revocation source: SIIT and IPv4-compatible forms are judged by the embedded address",
+          "[revocation_source][pg]") {
+    auto dns = rstest::default_dns();
+    dns["siit-meta.example.com"] = {"::ffff:0:a9fe:a9fe"}; // SIIT of 169.254.169.254
+    dns["compat-meta.example.com"] = {"::a9fe:a9fe"};      // IPv4-compatible of the same
+    dns["siit-loop.example.com"] = {"::ffff:0:7f00:1"};    // SIIT of 127.0.0.1
+    dns["compat-loop.example.com"] = {"::7f00:2"};         // IPv4-compatible of 127.0.0.2
+    dns["siit-self.example.com"] = {"::ffff:0:a09:909"};   // SIIT of this server's 10.9.9.9
+    dns["compat-self.example.com"] = {"::a09:909"};        // IPv4-compatible of the same
+    Fx fx(rstest::fake_env(dns));
+    for (const auto* h : {"siit-meta.example.com", "compat-meta.example.com",
+                          "siit-loop.example.com", "compat-loop.example.com",
+                          "siit-self.example.com", "compat-self.example.com"}) {
+        INFO(h);
+        const auto e = refused(fx, with_url(std::string("http://") + h + "/a.crl",
+                                            {"public", "private", "carrier-grade-nat", "unique-local",
+                                             "non-global"}));
+        CHECK_THAT(e.message, ContainsSubstring("always refused"));
+    }
+    // A public embedded address in these blocks is classified non-global, not public.
+    dns["siit-public.example.com"] = {"::ffff:0:808:808"};
+    Fx fx2(rstest::fake_env(dns));
+    const auto e = refused(fx2, with_url("http://siit-public.example.com/a.crl", {"public"}));
+    CHECK_THAT(e.message, ContainsSubstring("non-global"));
+    CHECK(fx2.svc.validate_registration(
+                     with_url("http://siit-public.example.com/a.crl", {"non-global"}))
+              .has_value());
+}
+
+TEST_CASE("revocation source: a local-use NAT64 address is refused unless its prefix is declared",
+          "[revocation_source][pg]") {
+    auto dns = rstest::default_dns();
+    dns["local-meta.example.com"] = {"64:ff9b:1::a9fe:a9fe"};
+    dns["local-public.example.com"] = {"64:ff9b:1::808:808"};
+    dns["local-wide.example.com"] = {"64:ff9b:1:abcd::1"};
+    Fx fx(rstest::fake_env(dns));
+    for (const auto* h :
+         {"local-meta.example.com", "local-public.example.com", "local-wide.example.com"}) {
+        INFO(h);
+        const auto e = refused(fx, with_url(std::string("http://") + h + "/a.crl",
+                                            {"public", "private", "carrier-grade-nat", "unique-local",
+                                             "non-global"}));
+        CHECK_THAT(e.message, ContainsSubstring("64:ff9b:1::/48"));
+        CHECK_THAT(e.message, ContainsSubstring("--oidc-nat64-prefix"));
+    }
+    // With the network's /96 declared, the address is decoded and judged like any NAT64 address.
+    const auto pref = yuzu::server::oidc::egress::parse_nat64_prefix("64:ff9b:1::/96");
+    REQUIRE(pref.has_value());
+    Fx fx2(rstest::fake_env(dns, {.nat64 = {*pref}}));
+    const auto meta = refused(fx2, with_url("http://local-meta.example.com/a.crl", {"non-global"}));
+    CHECK_THAT(meta.message, ContainsSubstring("always refused"));
+    CHECK(fx2.svc.validate_registration(with_url("http://local-public.example.com/a.crl", {"public"}))
+              .has_value());
+    // A declared prefix that does not cover the address leaves it refused.
+    const auto narrow = refused(fx2, with_url("http://local-wide.example.com/a.crl", {"non-global"}));
+    CHECK_THAT(narrow.message, ContainsSubstring("64:ff9b:1::/48"));
+}
+
 TEST_CASE("revocation source: an observed class set mixing classes needs all confirmed and stores them",
           "[revocation_source][pg]") {
     Fx fx;
@@ -2058,6 +2117,56 @@ TEST_CASE("RevocationSource: an unknown write outcome is a retryable 503 / -3260
     fx.store.set_write_fault_for_test(nullptr);
     CHECK(fx.store.get(id).has_value());
     CHECK(fx.store.list()->size() == 1);
+}
+
+TEST_CASE("RevocationSource: a committed registration is answered from its own transaction, not a "
+          "later read",
+          "[revocation_source][mcp][pg]") {
+    // Every store READ fails as if the pool were exhausted. Registration must still answer 201
+    // (MCP: the record) and audit `success`: the new source is read back inside the INSERT's own
+    // transaction, so no separate read after the commit can turn a committed registration into a
+    // reported failure.
+    using SK = RevocationSourceStoreError::Kind;
+    Fx fx;
+    fx.admin(false);
+    std::vector<std::string> reads;
+    fx.store.set_read_fault_for_test([&](std::string_view op) -> std::optional<SK> {
+        if (op == "create.reread")
+            return std::nullopt; // the read-back inside create's own transaction is the fix
+        reads.emplace_back(op);
+        return SK::kPoolAcquireTimeout;
+    });
+
+    auto rest_body = rstest::valid_body("Committed CA");
+    rest_body["name"] = "Committed CA";
+    auto r = fx.rest_post(rest_body);
+    REQUIRE(r->status == 201);
+    const auto src = data_of(*r)["data"];
+    CHECK(src["name"] == "Committed CA");
+    CHECK(src["config_version"] == 1);
+    const auto rest_id = src["id"].get<std::int64_t>();
+    auto mcp_body = rstest::valid_body("Committed MCP CA");
+    mcp_body["name"] = "Committed MCP CA";
+    auto m = fx.h.mcp_call_tool_approved(kRegister, mcp_body);
+    const auto msrc = mcp_payload(*m);
+    CHECK(msrc["name"] == "Committed MCP CA");
+    CHECK(msrc["id"].get<std::int64_t>() != rest_id);
+    CHECK(reads.empty()); // no read was attempted on either path
+    const auto res = fx.results("crypto.revocation_source.register");
+    // Each registration writes an `attempted` row and then its outcome: two successes, no failure.
+    CHECK(std::ranges::count(res, std::string("success")) == 2);
+    CHECK(std::ranges::count(res, std::string("failure")) == 0);
+    CHECK(res.back() == "success");
+
+    // The registrations really are stored.
+    fx.store.set_read_fault_for_test(nullptr);
+    CHECK(fx.store.get(rest_id).has_value());
+    CHECK(fx.store.list()->size() == 2);
+    // The seam itself works, so `reads.empty()` above is meaningful.
+    fx.store.set_read_fault_for_test(
+        [](std::string_view) -> std::optional<SK> { return SK::kPoolAcquireTimeout; });
+    CHECK(fx.store.get(rest_id).error().kind == SK::kPoolAcquireTimeout);
+    fx.store.set_read_fault_for_test(nullptr);
 }
 
 // ─── round 7: the kind -> status table ─────────────────────────────────────────────────────

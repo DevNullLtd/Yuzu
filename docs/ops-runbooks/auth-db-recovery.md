@@ -103,7 +103,10 @@ sudo -u _yuzu psql "$YUZU_POSTGRES_DSN" -c 'SELECT 1'
 Work the usual causes in order: Postgres service down; `pg_hba.conf` rejecting
 the host/user; TLS requirement mismatch; network path (firewall, security
 group, DNS); credential rotation that did not reach Yuzu; connection limit
-exhausted (`FATAL: sorry, too many clients already`).
+exhausted (`FATAL: sorry, too many clients already`). The Yuzu server log names the
+connect-phase cause only as a fixed phrase (for example `no free connection slots ...`,
+`authentication failed ...`, `server not reachable ...`), never libpq's own text; the
+`psql` check above and the PostgreSQL server log carry the detail.
 
 Yuzu restarts cleanly once Postgres is reachable — no Yuzu-side repair is
 needed, and **no auth data is lost by the outage itself**. Sessions are

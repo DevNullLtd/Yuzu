@@ -49,6 +49,7 @@
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "capability_decls/plugin_action_catalogue_virtualization.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
+#include "capability_decls/plugin_action_catalogue_process_introspect.hpp"
 #include "command_capability.hpp"
 #include "forensics_plugin_set.hpp"
 
@@ -174,6 +175,7 @@ struct LabeledSpan {
         {"mgmt_posture", capdecls::plugin_action_catalogue_mgmt_posture(), false},
         {"shares", capdecls::plugin_action_catalogue_shares(), false},
         {"remote_access_audit", capdecls::plugin_action_catalogue_remote_access_audit(), false},
+        {"process_introspect", capdecls::plugin_action_catalogue_process_introspect(), false},
         {"middleware", capdecls::plugin_action_catalogue_middleware(), false},
         {"virtualization", capdecls::plugin_action_catalogue_virtualization(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
@@ -184,7 +186,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, thirty-one sources exactly as a live composition site would use.
+    // literally, thirty-three sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -215,6 +217,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_mgmt_posture(),
         capdecls::plugin_action_catalogue_shares(),
         capdecls::plugin_action_catalogue_remote_access_audit(),
+        capdecls::plugin_action_catalogue_process_introspect(),
         capdecls::plugin_action_catalogue_middleware(),
         capdecls::plugin_action_catalogue_virtualization(),
         capdecls::core_dispatch_capabilities(),
@@ -599,6 +602,32 @@ TEST_CASE("capability catalogue: remote_access_audit.list pins its exact classif
     check_row(*classified);
 }
 
+/// Exact-row pin for `process_introspect.inspect` (Forensics-class): the security posture of one
+/// named process on one named machine, the same Forensics/AdminOrApproval boundary as
+/// remote_access_audit, checked on the fragment AND as the composed registry classifies it. One
+/// row covers every facet at the top tier; data above that contract is a new action, not a facet.
+TEST_CASE("capability catalogue: process_introspect.inspect pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_process_introspect();
+    REQUIRE(rows.size() == 1);
+    const auto check_row = [](const CommandCapability& r) {
+        CHECK(r.plugin == "process_introspect");
+        CHECK(r.action == "inspect");
+        CHECK(r.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(r.mutability == Mutability::None);
+        CHECK(r.securable == "Forensics");
+        CHECK(r.operation == authz::Operation::Read);
+        CHECK(r.risk_tier == authz::RiskTier::High);
+        CHECK(r.execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK_FALSE(r.system_reserved);
+    };
+    check_row(rows.front());
+    auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("process_introspect", "inspect");
+    REQUIRE(classified.has_value());
+    check_row(*classified);
+}
+
 TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across every "
           "source",
           "[server][dispatch][capability]") {
@@ -759,23 +788,29 @@ TEST_CASE("capability catalogue: runtimes.dotnet, runtimes.jvm and runtimes.pyth
     }
 }
 
-/// Exact-row pin for `component_inventory.scan`, the only row of its fragment. `Inventory`
-/// (a software-inventory fact), not `Infrastructure`: both are seeded securables, so the
-/// generic invariants accept either and only this pin catches a silent re-typing.
-TEST_CASE("capability catalogue: component_inventory.scan pins its exact classification",
+/// Exact-row pin for `component_inventory.scan` and `component_inventory.native`, the two rows of
+/// its fragment. `Inventory` (a software-inventory fact), not `Infrastructure`: both are seeded
+/// securables, so the generic invariants accept either and only this pin catches a silent
+/// re-typing. `native` ships off through an action-level kill-switch seed, so its gate stays None:
+/// a gate here would be a second, different off-switch.
+TEST_CASE("capability catalogue: component_inventory.scan and .native pin their exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_component_inventory();
-    REQUIRE(rows.size() == 1);
-    const auto& row = rows[0];
-    CHECK(row.plugin == "component_inventory");
-    CHECK(row.action == "scan");
-    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
-    CHECK(row.mutability == Mutability::None);
-    CHECK(row.securable == "Inventory");
-    CHECK(row.operation == authz::Operation::Read);
-    CHECK(row.risk_tier == authz::RiskTier::Low);
-    CHECK_FALSE(row.system_reserved);
-    CHECK(row.execute_gate == ExecuteGate::None);
+    REQUIRE(rows.size() == 2);
+    const char* const kActions[] = {"scan", "native"};
+    for (std::size_t i = 0; i < 2; ++i) {
+        const auto& row = rows[i];
+        INFO("action " << kActions[i]);
+        CHECK(row.plugin == "component_inventory");
+        CHECK(row.action == kActions[i]);
+        CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(row.mutability == Mutability::None);
+        CHECK(row.securable == "Inventory");
+        CHECK(row.operation == authz::Operation::Read);
+        CHECK(row.risk_tier == authz::RiskTier::Low);
+        CHECK_FALSE(row.system_reserved);
+        CHECK(row.execute_gate == ExecuteGate::None);
+    }
 }
 
 /// Exact-row pin for `platform_security` (Wave 8): both rows read fixed boot-integrity
@@ -913,7 +948,7 @@ TEST_CASE("capability catalogue: every Forensics-securable plugin is in the resp
     // The row count is pinned too: a new Forensics ACTION on an existing plugin changes no plugin
     // name, so the set below would not notice it, but it widens what the tier's audit and error
     // handling must cover. Update this number in the same change that adds the row.
-    CHECK(forensics_rows == 10);
+    CHECK(forensics_rows == 11);
 
     // A NEW Forensics plugin must be acknowledged HERE (and in test_response_tier_filter.cpp):
     // its stored rows become Forensics-tier on every operator read, which is a user-visible
@@ -922,7 +957,8 @@ TEST_CASE("capability catalogue: every Forensics-securable plugin is in the resp
     // dispatch record is stored under it and is Forensics-tier everywhere.
     CHECK(set->names() == std::vector<std::string>{"app_usage", "browser_inventory",
                                                    "execution_artifacts", "privacy_permissions",
-                                                   "remote_access_audit", "~unverified"});
+                                                   "process_introspect", "remote_access_audit",
+                                                   "~unverified"});
     CHECK(set->contains(kUnverifiedProvenanceLabel));
 }
 

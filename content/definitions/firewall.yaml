@@ -240,7 +240,8 @@ metadata:
     traffic except loopback, the agent's own control channel to the Yuzu server,
     DHCP, DNS to the host's configured resolvers, IPv6 neighbour discovery and
     any exceptions listed. An optional time limit ends the containment on the
-    device's own clock; an optional probe target proves the block. On Windows
+    device's own clock (a host the server holds a record for is contained
+    again by the server); an optional probe target proves the block. On Windows
     the block is a rule group plus a per-profile default-block; on Linux an own
     nftables table (iptables generation chain without nft); on macOS an own pf
     sub-anchor. Reports active only when the block is verified and
@@ -274,7 +275,9 @@ spec:
         description: >
           Optional, 60 to 2592000. The containment ends by itself on the
           device's clock when it passes (the clock is not synchronised while
-          contained).
+          contained). A device the server holds a quarantine record for is
+          contained again: the server reads that end as drift and re-applies
+          the stored allow set.
       probe_target:
         type: string
         displayName: Probe Target

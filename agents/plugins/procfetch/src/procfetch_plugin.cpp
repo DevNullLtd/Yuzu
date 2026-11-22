@@ -22,6 +22,9 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <proc_access.hpp> // WP13 UP14: /proc refusal tally
+
+#include "procfetch_row.hpp"
 
 #include <cstdio>
 #include <filesystem>
@@ -59,20 +62,6 @@
 #endif
 
 namespace {
-
-// Escape pipe characters in strings so they don't break the delimiter.
-std::string escape_pipes(std::string_view sv) {
-    std::string out;
-    out.reserve(sv.size());
-    for (char c : sv) {
-        if (c == '|') {
-            out += "\\|";
-        } else {
-            out += c;
-        }
-    }
-    return out;
-}
 
 // -- POSIX (Linux + macOS) shared SHA-1 ---------------------------------------
 #if defined(__linux__) || defined(__APPLE__)
@@ -131,17 +120,16 @@ std::string read_first_line(const std::filesystem::path& path) {
     return line;
 }
 
-std::string resolve_exe(const std::filesystem::path& link) {
-    try {
-        return std::filesystem::read_symlink(link).string();
-    } catch (const std::filesystem::filesystem_error&) {
-        return {};
-    }
+// WP13 UP14: one readlink; a refusal (EACCES/EPERM, no CAP_SYS_PTRACE) is counted from that
+// same call's errno, ENOENT/ESRCH (an exited process) is not.
+std::string resolve_exe(const std::filesystem::path& link, yuzu::shared::ProcAccessTally& tally) {
+    return yuzu::shared::readlink_noting(tally, link.c_str());
 }
 
 void enumerate_and_stream(yuzu::CommandContext& ctx) {
     std::unordered_map<std::string, std::string> sha_cache;
     std::error_code ec;
+    yuzu::shared::ProcAccessTally tally; // WP13 UP14
 
     for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
         if (!entry.is_directory(ec))
@@ -159,7 +147,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         if (name.empty())
             continue;
 
-        std::string exe_path = resolve_exe(entry.path() / "exe");
+        std::string exe_path = resolve_exe(entry.path() / "exe", tally);
         std::string sha1;
         if (!exe_path.empty()) {
             std::error_code fe;
@@ -175,8 +163,13 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         }
 
         ctx.write_output(
-            std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
+            yuzu::procfetch::format_row(pid, name, exe_path, sha1));
     }
+    // A refused /proc/<pid>/exe (no CAP_SYS_PTRACE) renders as an empty path/hash exactly as a
+    // kernel thread does; declare the gap instead of a clean OK list.
+    if (tally.constrained())
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "procfetch:exe_unreadable");
 }
 
 // -- macOS implementation -----------------------------------------------------
@@ -236,8 +229,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
             }
         }
 
-        ctx.write_output(std::format("{}|{}|{}|{}", static_cast<int>(pid), escape_pipes(name),
-                                     escape_pipes(exe_path), sha1));
+        ctx.write_output(yuzu::procfetch::format_row(static_cast<int>(pid), name, exe_path, sha1));
     }
 }
 
@@ -342,7 +334,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         }
 
         ctx.write_output(
-            std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
+            yuzu::procfetch::format_row(pid, name, exe_path, sha1));
     } while (Process32NextW(snap, &pe));
 
     BCryptCloseAlgorithmProvider(alg, 0);
@@ -357,7 +349,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "procfetch_fetch",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + OpenSSL EVP SHA-1", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + OpenSSL EVP SHA-1",
+         "CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no "
+         "CAP_SYS_PTRACE): procfetch:exe_unreadable"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1",
          nullptr},

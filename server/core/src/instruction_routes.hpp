@@ -171,10 +171,12 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace yuzu::server {
 class HttpRouteSink;
 class InstructionStore;
+struct InstructionDefinition;
 } // namespace yuzu::server
 
 namespace yuzu::server::instruction {
@@ -228,5 +230,11 @@ struct Deps {
 /// Register all 13 Instruction Definitions + Instruction Sets API routes
 /// against `sink`.
 void register_instruction_routes(HttpRouteSink& sink, Deps deps);
+
+/// Render the editor fragment template in ONE pass over the original template (never
+/// rescanning substituted text), HTML-escaping every stored value. `def == nullptr` renders
+/// the new-definition form. Security: stored fields containing `{{TOKEN}}` stay literal.
+std::string render_instruction_editor(std::string_view tmpl,
+                                      const InstructionDefinition* def);
 
 } // namespace yuzu::server::instruction

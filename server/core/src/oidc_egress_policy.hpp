@@ -20,7 +20,13 @@
 //     and IPv6 benchmarking, except the sub-ranges the IANA registry marks globally reachable).
 // An IPv6 address that embeds an IPv4 address (IPv4-mapped ::ffff:0:0/96, NAT64 64:ff9b::/96, 6to4
 // 2002::/16) is classified by the embedded IPv4 address, so `::ffff:169.254.169.254` is
-// link-local, not "public IPv6". A public embedded address stays public.
+// link-local, not "public IPv6". A public embedded address stays public. SIIT ::ffff:0:0:0/96 and
+// IPv4-compatible ::/96 are classified by the embedded address too, but never wider than
+// "non-global": `::ffff:0:a9fe:a9fe` and `::a9fe:a9fe` are link-local, `::808:808` stays
+// non-global. The local-use NAT64 prefix 64:ff9b:1::/48 is not decoded without a known prefix
+// (`in_local_use_nat64`); each consumer refuses an address there that none of its known prefixes
+// covers. For the cleartext rule below, a SIIT or IPv4-compatible address embedding a public
+// IPv4 address counts as public (`embeds_public_ipv4`).
 //
 // Third rule, on the TRANSPORT rather than the address: plain http (`cleartext`) to a PUBLIC
 // address is refused outright, with no switch. That is the realistic internet man-in-the-middle
@@ -103,6 +109,12 @@ constexpr bool never_allowed(AddressClass c) {
     }
 }
 
+/// An embedded-address class that may only narrow: a public embedded address in a block that is
+/// not itself global unicast stays non-global.
+constexpr AddressClass no_wider_than_non_global(AddressClass embedded) {
+    return embedded == AddressClass::Public ? AddressClass::OtherNonGlobal : embedded;
+}
+
 } // namespace detail
 
 /// Classify an IPv4 address given in network byte order.
@@ -157,7 +169,18 @@ constexpr AddressClass classify_ipv6(const Ipv6& a) {
     // 64:ff9b::/96 NAT64 well-known prefix: a translator forwards to the embedded IPv4 address.
     if (a[0] == 0x00 && a[1] == 0x64 && a[2] == 0xff && a[3] == 0x9b && zeros(4, 12))
         return classify_ipv4(embedded(12));
-    // The rest of ::/8 (IPv4-compatible, reserved): never global unicast.
+    // ::ffff:0:0:0/96 (SIIT, RFC 2765 IPv4-translated) and ::/96 (IPv4-compatible, deprecated by
+    // RFC 4291): neither is global unicast, but a translator or a host stack may still deliver
+    // either to the embedded IPv4 address. Classified by that address, never more permissively
+    // than "non-global": an embedded public address stays non-global, an embedded link-local,
+    // metadata or loopback address takes that class.
+    if (zeros(0, 8) && a[8] == 0xff && a[9] == 0xff && a[10] == 0 && a[11] == 0)
+        return detail::no_wider_than_non_global(classify_ipv4(embedded(12)));
+    if (zeros(0, 12))
+        return detail::no_wider_than_non_global(classify_ipv4(embedded(12)));
+    // The rest of ::/8 (reserved, including the local-use NAT64 prefix 64:ff9b:1::/48, whose
+    // embedded position depends on a prefix length this address does not carry): never global
+    // unicast.
     if (a[0] == 0)
         return AddressClass::OtherNonGlobal;
     // fe80::/10 link-local.
@@ -366,6 +389,31 @@ constexpr std::optional<Ipv4> embedded_ipv4(const Ipv6& a, const Nat64Prefix& p)
     default:
         return std::nullopt;
     }
+}
+
+/// True when `a` is inside 64:ff9b:1::/48, the RFC 8215 local-use NAT64 prefix. A network carves
+/// its own translation prefix (/48 to /96) out of it, and where the IPv4 address sits depends on
+/// that length, so an address here cannot be decoded unless a declared or discovered prefix says
+/// how. A caller that must refuse every translated destination it cannot check refuses such an
+/// address unless one of its known prefixes matches it.
+constexpr bool in_local_use_nat64(const Ipv6& a) {
+    return a[0] == 0x00 && a[1] == 0x64 && a[2] == 0xff && a[3] == 0x9b && a[4] == 0x00 &&
+           a[5] == 0x01;
+}
+
+/// True when `a` is a SIIT (::ffff:0:0:0/96) or IPv4-compatible (::/96) address whose embedded
+/// IPv4 address is PUBLIC. `classify_ipv6` narrows such an address to non-global, because the
+/// block is not global unicast, but a translator that carries the request delivers it to that
+/// public address across the internet. The cleartext rule therefore treats it as public: plain
+/// http to it is refused exactly as plain http to the embedded address is.
+constexpr bool embeds_public_ipv4(const Ipv6& a) {
+    for (std::size_t i = 0; i < 8; ++i)
+        if (a[i] != 0)
+            return false;
+    const bool siit = a[8] == 0xff && a[9] == 0xff && a[10] == 0 && a[11] == 0;
+    const bool compat = a[8] == 0 && a[9] == 0 && a[10] == 0 && a[11] == 0;
+    return (siit || compat) &&
+           classify_ipv4(Ipv4{a[12], a[13], a[14], a[15]}) == AddressClass::Public;
 }
 
 /// Classify an IPv6 address, also decoding the NAT64 prefixes in `extra`: an address inside one is

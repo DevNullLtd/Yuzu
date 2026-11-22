@@ -350,6 +350,9 @@ TEST_CASE("REST inventory/software: the 200 body is typed in the OpenAPI spec an
         required.insert(k.get<std::string>());
     CHECK(properties == served);
     CHECK(required == served);
+    CHECK(properties.contains("package_id"));
+    CHECK(required.contains("package_id"));
+    CHECK(schemas["InstalledSoftwareRow"]["properties"]["package_id"]["type"] == "string");
 
     // The row's ecosystem description points at the generated filter enum rather than carrying a
     // hand-typed list that drifts behind the vocabulary table (it once named nine of seventeen).
@@ -1465,7 +1468,7 @@ TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad forma
     CHECK(csv->status == 200);
     CHECK(csv->get_header_value("Content-Type").find("text/csv") == 0);
     CHECK(csv->get_header_value("Content-Disposition").find("software-installs.csv") != std::string::npos);
-    CHECK(csv->body.starts_with(std::string(software_list::kListCsvHeader) + "\n")); // 23 columns
+    CHECK(csv->body.starts_with(std::string(software_list::kListCsvHeader) + "\n")); // 24 columns
     CHECK(csv->get_header_value("X-Result-Truncated-By-Cap").empty());
 
     // An uncapped export carries neither the continuation header nor the trailer.
@@ -1768,7 +1771,9 @@ TEST_CASE("REST inventory/software: lookup rows carry hostname, last_seen, statu
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
-    seed_v3(store, "dev-a", V3Status::kFull, {lookup_entry("git", "2.1", "amd64")});
+    auto seeded = lookup_entry("git", "2.1", "amd64");
+    seeded.package_id = "{PID-REST}";
+    seed_v3(store, "dev-a", V3Status::kFull, {seeded});
     InvHarness h{&store};
     h.hostnames["dev-a"] = "host-a";
     h.hostnames["dev-elsewhere"] = "host-elsewhere"; // on the roster, not on this page
@@ -1791,7 +1796,8 @@ TEST_CASE("REST inventory/software: lookup rows carry hostname, last_seen, statu
     CHECK(r["install_scope"] == "machine");
     CHECK(r.contains("install_location"));
     CHECK(r["instance_key"].get<std::string>().size() == 64);
-    // The original 14 fields are unchanged.
+    CHECK(r["package_id"] == "{PID-REST}");
+    // The 15 package fields are unchanged by the lookup.
     CHECK(r["name"] == "git");
     CHECK(r["version"] == "2.1");
     CHECK(r["source"] == kLookupFacet);
@@ -2205,11 +2211,11 @@ TEST_CASE("REST inventory/software: rows carry purl (null when empty); purl= sel
     CHECK(error_message(get_lookup(h, "?purl=" + enc("PKG" + purl_a.substr(3)), 400))
               .find("invalid purl") != std::string::npos);
 
-    // A purl filter in the export: the last cell of the row is the purl.
+    // A purl filter in the export: the purl is the second-to-last cell (package_id trails).
     auto csv = h.sink.Get("/api/v1/inventory/software?format=csv&purl=" + enc(purl_a));
     REQUIRE(csv);
     CHECK(csv->status == 200);
-    CHECK(csv->body.find("," + purl_a + "\n") != std::string::npos);
+    CHECK(csv->body.find("," + purl_a + ",\n") != std::string::npos);
 
     // Malformed purl: a 400 that writes no audit row.
     h.audit_log.clear();

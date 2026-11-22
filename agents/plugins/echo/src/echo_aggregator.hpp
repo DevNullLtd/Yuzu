@@ -17,6 +17,7 @@
 #include <yuzu/agent/process_enum.hpp> // ProcessInfo -- the process baseline codec
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -357,9 +358,11 @@ bool scrub_process_baseline(EchoDatabase& db);
  * explicit "errored" sentinel — never coerced/guessed — so the dashboard can
  * render a value-error badge instead of silently omitting the source.
  *
- * Both the collect-time gate (`source_enabled`, echo_plugin.cpp) and
- * `run_retention` gate on this canonical value, so a non-canonical value fails
- * closed: collection stops AND the source's rows are preserved (not pruned).
+ * The collect-time gate (`source_enabled`, echo_plugin.cpp) gates on this
+ * canonical value, so a non-canonical value fails closed: collection stops.
+ * `run_retention` and the budget pass decide through `source_retention_exempt`
+ * (#1572): a paused source, or one errored while paused, keeps its rows; an
+ * unreadable flag is preserved.
  */
 [[nodiscard]] std::string_view canonical_source_enabled(std::string_view stored_value);
 
@@ -379,10 +382,18 @@ bool scrub_process_baseline(EchoDatabase& db);
 
 /**
  * Collect-time gate: `source_enabled_state(...).value_or(false)`, so an unreadable flag skips.
- * Collect/retention gate only (false = skip); drain/discard/purge sites use
- * `source_enabled_state()`.
+ * Collect gate only (false = skip); retention and the budget pass use
+ * `source_retention_exempt()`; drain/discard/purge sites use `source_enabled_state()`.
  */
 [[nodiscard]] bool source_enabled(EchoDatabase& db, std::string_view source);
+
+/**
+ * Retention/budget exemption (#1572): true when a source's rows must be preserved. A paused
+ * source ("false") and an unreadable flag are exempt. An "errored" flag is exempt only when
+ * `<source>_paused_at` is > 0, unreadable or malformed; absent or exactly "0" means the
+ * source was never paused, so the normal retention ceiling and budget eviction apply.
+ */
+[[nodiscard]] bool source_retention_exempt(EchoDatabase& db, std::string_view source);
 
 // ── Byte budget (echo.db size cap) ────────────────────────────────────────────
 //
@@ -391,9 +402,9 @@ bool scrub_process_baseline(EchoDatabase& db);
 // journal_size_limit only truncates the WAL when a checkpoint resets it, and a long echo.sql
 // read on the read-only query connection can pin it, so data + WAL can sit above the budget
 // until that reader ends. Rows that are never evicted (the newest 48 h of hourly rows, 5 d for
-// per-app performance; daily and monthly rows; the usage tables and netqual_boot; paused or
-// errored sources) can hold used pages above the target. The overage is measured whenever
-// `status` runs and surfaced as `budget_over_bytes`, never hidden.
+// per-app performance; daily and monthly rows; the usage tables and netqual_boot; paused
+// sources and errored sources that were paused) can hold used pages above the target. The
+// overage is measured whenever `status` runs and surfaced as `budget_over_bytes`, never hidden.
 //
 // Only the HOURLY tier is ever evicted. There is no raw tier: the fold stores the roll-ups
 // only, so there is nothing "cheaper to lose" to take first, and the daily and monthly tiers
@@ -442,7 +453,8 @@ struct BudgetPassResult {
  *
  * The oldest hourly bucket of the table holding the most rows goes first; an hourly row newer
  * than 48 h (5 d for procperf_hourly, kBudgetProcPerfHourlyFloorSec) is never eligible. Daily,
- * monthly, `usage_*` and netqual_boot are never touched. Paused and errored sources are exempt.
+ * monthly, `usage_*` and netqual_boot are never touched. Paused sources and errored-while-paused
+ * sources are exempt (source_retention_exempt).
  *
  * Each batch (kBudgetBatchRows) is one transaction that also bumps the persisted eviction
  * counter, so a crash never loses a count. `time_left` is consulted before every batch.
@@ -573,5 +585,22 @@ budget_from_config(const std::expected<std::optional<std::string>, std::string>&
 /// for a reason other than a failed read): the caller says so in the log and in `status`.
 [[nodiscard]] bool
 budget_setting_invalid(const std::expected<std::optional<std::string>, std::string>& stored);
+
+/// The dictionary sweep's schedule (run_dictionary_gc). A finished pass is next due a week after
+/// `last_done_ts`; a marker ahead of `now` (written during a forward clock excursion) is stale,
+/// never a reason to wait. A pass whose live-set scan outran its deadline ("starved") deleted
+/// nothing: it is retried daily rather than every maintenance pass, and its deadline doubles per
+/// consecutive starved pass up to 8 s, so a database whose scan is slow neither holds the
+/// database lock for 2 s of every pass nor can never finish. Pure: the caller reads the markers.
+/// ponytail: the 8 s ceiling is the bound; a scan that needs longer starves forever, and the
+/// upgrade path is to resume the scan across passes.
+inline constexpr int64_t kDictGcIntervalSec = 7 * 86400;
+inline constexpr int64_t kDictGcStarvedRetrySec = 86400;
+struct DictGcPlan {
+    bool due{false};
+    std::chrono::seconds deadline{2};
+};
+[[nodiscard]] DictGcPlan dict_gc_plan(int64_t now, int64_t last_done_ts, int64_t last_attempt_ts,
+                                      int64_t starved_streak) noexcept;
 
 } // namespace yuzu::echo

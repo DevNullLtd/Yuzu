@@ -1036,6 +1036,81 @@ TEST_CASE("OIDC egress: the strict vet mode refuses a mixed answer the pinning m
     }
 }
 
+TEST_CASE("OIDC egress: SIIT and IPv4-compatible answers are vetted by the embedded address",
+          "[oidc][oidc_egress][security]") {
+    namespace egress = yuzu::server::oidc::egress;
+    Nat64CacheReset cache;
+    const std::string refused_text = OidcProvider::kEgressRefused;
+    const auto vet = [](std::vector<std::string> answer, bool allow_private,
+                        std::span<const egress::Nat64Prefix> prefixes = {},
+                        bool cleartext = false) {
+        ResolverGuard resolver([answer = std::move(answer)](const std::string&) { return answer; });
+        return OidcProvider::vet_egress_target_for_test("embedded.test", allow_private, cleartext,
+                                                        1000, prefixes, false);
+    };
+
+    SECTION("an embedded metadata or link-local address is refused even with the switch on") {
+        for (const char* a : {"::ffff:0:a9fe:a9fe", "::a9fe:a9fe", "::ffff:0:6464:64c8"}) {
+            CAPTURE(a);
+            const auto r = vet({a}, true);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == refused_text);
+        }
+    }
+    SECTION("an embedded loopback address keeps OIDC's loopback contract: allowed only with the "
+            "switch") {
+        for (const char* a : {"::ffff:0:7f00:1", "::7f00:1"}) {
+            CAPTURE(a);
+            CHECK_FALSE(vet({a}, false).has_value());
+            const auto r = vet({a}, true);
+            REQUIRE(r.has_value());
+            CHECK(*r == std::vector<std::string>{a});
+        }
+    }
+    SECTION("an embedded public address is not public over https: refused without the switch") {
+        CHECK_FALSE(vet({"::ffff:0:808:808"}, false).has_value());
+        CHECK(vet({"::ffff:0:808:808"}, true).has_value());
+        CHECK(vet({"::808:808"}, true).has_value());
+    }
+    SECTION("plain http to an embedded public address is plain http to a public address") {
+        const std::string cleartext_text = OidcProvider::kEgressCleartextPublicRefused;
+        for (const char* a : {"::ffff:0:808:808", "::808:808"}) {
+            CAPTURE(a);
+            for (const bool allow_private : {false, true}) {
+                const auto r = vet({a}, allow_private, {}, true);
+                REQUIRE_FALSE(r.has_value());
+                CHECK(r.error() == cleartext_text);
+            }
+        }
+        // An embedded private address over plain http stays behind the switch alone.
+        CHECK(vet({"::ffff:0:a00:5"}, true, {}, true).has_value());
+        CHECK_FALSE(vet({"::ffff:0:a00:5"}, false, {}, true).has_value());
+    }
+    SECTION("a local-use NAT64 address is refused unless a known prefix covers it") {
+        // Uncovered: refused even with the switch on (the embedded destination is unknowable).
+        for (const char* a : {"64:ff9b:1::a9fe:a9fe", "64:ff9b:1::808:808"}) {
+            CAPTURE(a);
+            CHECK_FALSE(vet({a}, false).has_value());
+            const auto r = vet({a}, true);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == refused_text);
+        }
+        // In a mixed answer the uncovered member is dropped, a public member is still pinned.
+        const auto mixed = vet({"64:ff9b:1::808:808", "8.8.8.8"}, true);
+        REQUIRE(mixed.has_value());
+        CHECK(*mixed == std::vector<std::string>{"8.8.8.8"});
+        // Declared: decoded. The embedded metadata address is refused, a public one is permitted.
+        const std::vector<egress::Nat64Prefix> declared{
+            *egress::parse_nat64_prefix("64:ff9b:1::/96")};
+        CHECK_FALSE(vet({"64:ff9b:1::a9fe:a9fe"}, true, declared).has_value());
+        CHECK(vet({"64:ff9b:1::808:808"}, false, declared).has_value());
+        // A declared prefix that does not cover the address does not rescue it.
+        const std::vector<egress::Nat64Prefix> other{
+            *egress::parse_nat64_prefix("64:ff9b:1:ab::/96")};
+        CHECK_FALSE(vet({"64:ff9b:1::808:808"}, true, other).has_value());
+    }
+}
+
 TEST_CASE("OIDC egress: the token POST's pre-check - pinned where the connect is pinned, strict "
           "where it cannot be",
           "[oidc][oidc_egress][security]") {
@@ -1200,6 +1275,7 @@ struct LookupState {
     std::atomic<int> others{0};
     net::ResolveStatus other_status{net::ResolveStatus::kOk}; // set before the lookup is installed
     std::string other_answer{"93.184.216.34"};
+    std::vector<std::string> other_extra; // further addresses in the same answer
 };
 
 net::LookupFn make_lookup(std::shared_ptr<LookupState> st) {
@@ -1228,7 +1304,9 @@ net::LookupFn make_lookup(std::shared_ptr<LookupState> st) {
         st->others.fetch_add(1);
         if (st->other_status != net::ResolveStatus::kOk)
             return resolve_result(st->other_status, {});
-        return resolve_result(net::ResolveStatus::kOk, {st->other_answer});
+        std::vector<std::string> all{st->other_answer};
+        all.insert(all.end(), st->other_extra.begin(), st->other_extra.end());
+        return resolve_result(net::ResolveStatus::kOk, std::move(all));
     };
 }
 
@@ -1653,6 +1731,53 @@ TEST_CASE("OIDC resolver: a probe refused by a full pool is not remembered - the
     // The answered probe is cached again.
     CHECK_FALSE(vet_name(kLiteralTarget).has_value());
     CHECK(st->probes.load() == 2);
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: a local-use address refused only because the prefix probe could not "
+          "start is a busy refusal, never a remembered policy refusal",
+          "[oidc][oidc_egress][oidc_resolver][oidc_nat64]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    st->other_answer = "64:ff9b:1::808:808"; // uncovered local-use NAT64
+    st->probe_mode = kProbeBusy;
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    const auto vet = [] {
+        return OidcProvider::vet_egress_target_for_test("local-use.example", true, false, 2000, {},
+                                                        false);
+    };
+
+    // The probe never started: the address might be decodable once it does, so the refusal is
+    // the lookup-busy reason (which discovery does not remember), not the policy refusal.
+    const auto busy = vet();
+    REQUIRE_FALSE(busy.has_value());
+    CHECK(busy.error() == kBusyReason);
+    CHECK(st->probes.load() == 1);
+
+    // The probe answers and learns no local-use prefix: now it is a policy refusal.
+    st->probe_mode = kProbeAnswer;
+    const auto refused = vet();
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == OidcProvider::kEgressRefused);
+    CHECK(st->probes.load() == 2);
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: a busy local-use refusal does not mask a policy refusal in the same "
+          "answer",
+          "[oidc][oidc_egress][oidc_resolver][oidc_nat64]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    st->other_answer = "64:ff9b:1::808:808";
+    st->other_extra = {"169.254.169.254"};
+    st->probe_mode = kProbeBusy;
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    const auto mixed = OidcProvider::vet_egress_target_for_test("mixed.example", true, false, 2000,
+                                                                {}, false);
+    REQUIRE_FALSE(mixed.has_value());
+    CHECK(mixed.error() == OidcProvider::kEgressRefused); // the metadata address is the reason
     CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
 }
 

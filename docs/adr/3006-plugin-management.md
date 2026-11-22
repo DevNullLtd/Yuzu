@@ -736,7 +736,7 @@ The following existing behaviour is replaced or brought into line. The list is t
 point for the roadmap, which decides order and grouping.
 
 - The plugins seeded off at server start (three when this ADR was written; four since
-  `remote_access_audit`, 2026-10-17), the tests and documents that pin that state,
+  `remote_access_audit`, 2026-10-17; five since `process_introspect`, 2026-11-16), the tests and documents that pin that state,
   and the invariants that cite "default-off" as a safeguard.
 - Every document, definition and statement that describes a source as opt-in, off by default or
   a deploy-time opt-out: the Echo implementer guide and dashboard (including the

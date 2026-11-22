@@ -90,7 +90,18 @@ register_checked(Ctx, RegisterReq0) ->
     %% passing the agent's own value through would let an agent choose the
     %% address its registration is attributed to.
     Origin = origin_text(Ctx),
-    RegisterReq = RegisterReq0#{gateway_observed_peer => Origin},
+    %% WP01: the client certificate the agent presented in the TLS handshake, as the
+    %% gateway witnessed it (PEM, empty when none), and whether THIS LISTENER can
+    %% witness at all (yuzu_grpc:witnessing/1: TLS with witness_client_cert). Both are gateway-authoritative on the same terms
+    %% as gateway_observed_peer: set here UNCONDITIONALLY, so whatever the agent put
+    %% in them is discarded (an agent must not be able to name a certificate or
+    %% claim an attestation), and the marker is what lets the server tell "a
+    %% witnessing listener saw no certificate" from "a listener that never asked"
+    %% (plaintext, or TLS without witness_client_cert). The
+    %% value is evidence, not a verdict: the server checks it against its own CA.
+    RegisterReq = RegisterReq0#{gateway_observed_peer => Origin,
+                                gateway_attested_peer_cert_pem => peer_cert_pem(Ctx),
+                                gateway_attests_peer_cert => yuzu_grpc:witnessing(Ctx)},
     PeerAddr = case Origin of
         <<>> -> <<"unknown">>;
         _ -> Origin
@@ -152,6 +163,15 @@ reservation_guard(Watched, Reservation) ->
             yuzu_gw_registry:release_session(Reservation)
     end.
 
+%% The DER certificate the agent presented on this connection as PEM text, or <<>>.
+peer_cert_pem(Ctx) ->
+    case yuzu_grpc:peer_cert(Ctx) of
+        Der when is_binary(Der), byte_size(Der) > 0 ->
+            public_key:pem_encode([{'Certificate', Der, not_encrypted}]);
+        _ ->
+            <<>>
+    end.
+
 %% The origin address of a call as text (a bare IP), or <<>> when it has none.
 origin_text(Ctx) ->
     case yuzu_grpc:origin(Ctx) of
@@ -161,6 +181,21 @@ origin_text(Ctx) ->
 
 register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
     case yuzu_gw_upstream:proxy_register(RegisterReq, upstream_opts(Ctx)) of
+        {ok, #{accepted := false} = Response} ->
+            %% The server refused this Register (denied, pending approval,
+            %% invalid token) with gRPC OK and accepted=false, and minted no
+            %% session. Nothing is stored: a pending row here would let an empty
+            %% or guessed x-yuzu-session-id complete a registration the server
+            %% rejected (F29). The agent still gets the server's answer verbatim.
+            yuzu_gw_safe_call:warn_limited(
+              register_rejected, "Register not accepted by the server; nothing stored", []),
+            {ok, Response, Ctx};
+        {ok, #{session_id := Sid}} when not is_binary(Sid); Sid =:= <<>> ->
+            %% accepted but no server-minted session id: unusable as a key.
+            yuzu_gw_safe_call:warn_limited(
+              register_failed, "Upstream Register failed: answer carries no session id", []),
+            {grpc_error, {?GRPC_STATUS_INTERNAL,
+                          <<"Upstream registration failed: malformed response">>}};
         {ok, Response} when is_map(Response) ->
             %% Stash the session_id and agent_info; the agent process is
             %% created when Subscribe arrives (matched by session_id).
@@ -204,7 +239,13 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
                     {grpc_error, {?GRPC_STATUS_INTERNAL,
                                   <<"Registration failed: registry unavailable">>}};
                 {error, session_limit} ->
-                    session_limit_error()
+                    session_limit_error();
+                {error, invalid_session} ->
+                    yuzu_gw_safe_call:warn_limited(
+                      register_invalid_session,
+                      "Register failed: the registry refused the session id as a pending key", []),
+                    {grpc_error, {?GRPC_STATUS_INTERNAL,
+                                  <<"Upstream registration failed: malformed response">>}}
             end;
 
         {ok, _NotAMap} ->
@@ -244,7 +285,8 @@ subscribe(Ref, State) ->
     SessionId = maps:get(<<"x-yuzu-session-id">>, Headers, undefined),
 
     case SessionId of
-        undefined ->
+        Missing when Missing =:= undefined; Missing =:= <<>> ->
+            %% An empty value is as good as no header: it can name no session.
             logger:warning("Subscribe: missing x-yuzu-session-id header"),
             throw({grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT,
                                 <<"Missing x-yuzu-session-id header">>}});

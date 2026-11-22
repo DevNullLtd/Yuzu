@@ -37,6 +37,8 @@ registry_test_() ->
       {"lookup dead process returns error", fun lookup_dead_process/0},
       %% Pending registration tests
       {"store_pending and take_pending round-trip", fun pending_store_take/0},
+      {"an empty session id is never stored or taken as a pending key",
+       fun pending_empty_key_refused/0},
       {"take_pending returns undefined for unknown session", fun pending_take_unknown/0},
       {"take_pending deletes entry atomically", fun pending_take_deletes/0},
       {"take_pending: exactly one winner under concurrent racers (PR #4299 round 6)",
@@ -340,6 +342,15 @@ lookup_dead_process() ->
 %%%===================================================================
 %%% Pending registration tests
 %%%===================================================================
+
+pending_empty_key_refused() ->
+    Info = #{agent_id => <<"a-empty">>, agent_info => #{}, peer_addr => <<"1.2.3.4">>},
+    ?assertEqual({error, invalid_session}, yuzu_gw_registry:store_pending(<<>>, Info)),
+    ?assertEqual(undefined, yuzu_gw_registry:take_pending(<<>>)),
+    %% even a row planted directly under <<>> is not handed out
+    ets:insert(yuzu_gw_pending, {<<>>, Info, erlang:monotonic_time(millisecond)}),
+    ?assertEqual(undefined, yuzu_gw_registry:take_pending(<<>>)),
+    ets:delete(yuzu_gw_pending, <<>>).
 
 pending_store_take() ->
     Info = #{agent_id => <<"pending-1">>, peer_addr => <<"1.2.3.4">>},

@@ -15,6 +15,7 @@
  * the platform-guarded "enabled-but-fails" tests are skipped there.
  */
 
+#include <yuzu/log_token.hpp>
 #include "auth_routes.hpp"
 #include "saml_principal.hpp"
 #include "saml_provider.hpp"
@@ -31,6 +32,7 @@
 
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp" // LogCapture / stray_control_bytes
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
@@ -231,7 +233,8 @@ struct SamlTestFixture {
         const std::string& recipient           = {},
         bool               inject_extra_assertion = false,
         const std::string* signing_priv_key    = nullptr,
-        const std::string& attribute_statement_xml = {}) const
+        const std::string& attribute_statement_xml = {},
+        const std::string& status_value_xml    = "urn:oasis:names:tc:SAML:2.0:status:Success") const
     {
         const auto& aud = audience.empty()  ? sp_entity_id : audience;
         const auto& rec = recipient.empty() ? sp_acs_url   : recipient;
@@ -344,7 +347,7 @@ struct SamlTestFixture {
               " Destination=\"" + sp_acs_url + "\">"
               "<samlp:Status>"
                 "<samlp:StatusCode"
-                  " Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/>"
+                  " Value=\"" + status_value_xml + "\"/>"
               "</samlp:Status>"
               + assertion_xml
               + evil_assertion_xml +
@@ -2404,3 +2407,100 @@ TEST_CASE("SAML ACS — rbac_store absent skips reconcile; coarse --saml-admin-g
 }
 
 #endif // !_WIN32
+
+TEST_CASE("SAML ACS failure path: hostile StatusCode text never reaches the log or the audit detail raw (F72)",
+          "[saml][auth_routes][log_injection][pg]") {
+#if defined(_WIN32)
+    SKIP("SamlProvider always disabled on Windows (N4)");
+#else
+    const auto& f = saml_test_fixture();
+    SamlProvider provider(f.make_config());
+    REQUIRE(provider.is_enabled());
+    SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id;
+
+    auto start_res = fix.sink.Get("/auth/saml/start");
+    REQUIRE(start_res != nullptr);
+    REQUIRE(start_res->status == 302);
+    std::string binding_secret;
+    {
+        const auto sc = start_res->get_header_value("Set-Cookie");
+        const std::string pfx = "__Host-yuzu_saml_bind=";
+        const auto pos = sc.find(pfx);
+        REQUIRE(pos != std::string::npos);
+        const auto end = sc.find(';', pos + pfx.size());
+        binding_secret = sc.substr(pos + pfx.size(),
+                                   end == std::string::npos ? std::string::npos : end - pos - pfx.size());
+    }
+    const auto request_id = extract_authn_request_id(start_res->get_header_value("Location"));
+    REQUIRE_FALSE(request_id.empty());
+
+    // XML character references decode to a real LF, the C1 CSI (U+009B) and U+2028 inside the
+    // UNSIGNED StatusCode Value, which the provider echoes into its error string.
+    const std::string hostile = "urn:x&#10;[ERROR] forged&#x9B;31m&#x2028;k=v;z";
+    const auto response_b64 = f.make_response(request_id, "user@example.com", 3600, {}, {}, false,
+                                              nullptr, {}, hostile);
+    std::string enc;
+    for (unsigned char c : response_b64)
+        enc += (c == '+') ? "%2B" : std::string(1, static_cast<char>(c));
+
+    yuzu::test::LogCapture cap{spdlog::level::warn};
+    auto acs_res = fix.sink.dispatch("POST", "/saml/acs", "SAMLResponse=" + enc + "&RelayState=%2F",
+                                     "application/x-www-form-urlencoded",
+                                     {{"Cookie", "__Host-yuzu_saml_bind=" + binding_secret}});
+    cap.stop();
+    REQUIRE(acs_res != nullptr);
+    CHECK(acs_res->status == 302);
+
+    const std::string text = cap.text();
+    INFO(text);
+    // The failure line is emitted, and carries the neutralised text.
+    CHECK(text.find("SAML ACS validation failed") != std::string::npos);
+    CHECK(text.find("forged") != std::string::npos);
+    CHECK(yuzu::test::stray_control_bytes(text) == 0);
+    CHECK(text.find("\xC2\x9B") == std::string::npos);
+    CHECK(text.find("\xE2\x80\xA8") == std::string::npos);
+    // stray_control_bytes skips '\n': the hostile LF must not split the failure line either.
+    {
+        const auto p = text.find("SAML ACS validation failed");
+        const auto q = text.find("forged", p);
+        REQUIRE(p != std::string::npos);
+        REQUIRE(q != std::string::npos);
+        CHECK(text.substr(p, q - p).find('\n') == std::string::npos);
+    }
+
+    const auto events = fix.audit_events();
+    const auto* ev = find_event(events, "auth.saml_login_failed");
+    REQUIRE(ev != nullptr);
+    CHECK(ev->detail.find("forged") != std::string::npos);
+    CHECK(ev->detail.find_first_of("\r\n;=") == std::string::npos);
+    CHECK(ev->detail.find("\xC2\x9B") == std::string::npos);
+    CHECK(ev->detail.find("\xE2\x80\xA8") == std::string::npos);
+#endif
+}
+
+TEST_CASE("SAML ACS error text is neutralised for the log line and the audit detail (F72)",
+          "[saml][auth_routes][log_injection]") {
+    // An XML character reference (&#10;) in an unsigned attribute decodes to a real line feed and
+    // lands in the SamlProvider error string; C1 CSI and ESC ride along.
+    const std::string raw = "SAML status is not Success: urn:x\nforged\x1b[2J\xC2\x9B" "31m;k=v";
+    const std::string safe = yuzu::server::detail::neutralise_saml_error(raw);
+    CHECK(safe.find_first_of("\r\n\x1b") == std::string::npos);
+    CHECK(safe.find("\xC2\x9B") == std::string::npos);
+    CHECK(safe.find(';') == std::string::npos);
+    CHECK(safe.find("forged") != std::string::npos);
+    // Bounded: a megabyte of attacker text cannot reach the audit row whole.
+    // The audit detail / event keeps exactly 128 bytes (head only, no marker); the log keeps 256.
+    const std::string big(1 << 20, 'a');
+    CHECK(yuzu::server::detail::neutralise_saml_error(big).size() == 128);
+    CHECK(yuzu::log_key_token(big).size() == 256);
+    CHECK(yuzu::server::detail::neutralise_saml_error(std::string(128, 'a')).size() == 128);
+    CHECK(yuzu::server::detail::neutralise_saml_error(std::string(127, 'a')).size() == 127);
+    // Separates > from >=: 129 bytes clip to 128, and the audit keeps the HEAD.
+    CHECK(yuzu::server::detail::neutralise_saml_error(std::string(129, 'a')).size() == 128);
+    CHECK(yuzu::server::detail::neutralise_saml_error(std::string(100, 'h') + std::string(100, 't')) ==
+          std::string(100, 'h') + std::string(28, 't'));
+    // The log copy: 256 passes whole, 257 is shortened to the 256 cap.
+    CHECK(yuzu::log_key_token(std::string(256, 'a')).size() == 256);
+    CHECK(yuzu::log_key_token(std::string(257, 'a')).size() == 256);
+}

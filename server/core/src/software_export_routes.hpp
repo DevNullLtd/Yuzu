@@ -3,7 +3,7 @@
 /// @file software_export_routes.hpp
 /// REST route for the streamed installed-software export (SAM-36, roadmap 3.3):
 ///
-///   GET /api/v1/inventory/software/export?format=jsonl|csv[&<list filters>]
+///   GET /api/v1/inventory/software/export?format=jsonl|csv|xlsx[&<list filters>]
 ///
 /// Authorization is `fleet_read_fn(req, res, "Inventory", "Read")` and nothing else (ADR-0017
 /// admit-then-filter; never stacked with a permission gate, which would make the confined branch
@@ -29,6 +29,36 @@
 /// sees a truncated transfer: after the headers are sent that is the only failure signal there is.
 /// There is no trailer record; the size limits are Deps::limits. No second audit row is written
 /// at stream end.
+///
+/// XLSX (`format=xlsx`) is NOT a stream. A workbook cannot be sent before it is finished, so the
+/// route builds it COMPLETELY, into a temporary file under Deps::xlsx_tmp_dir, and only then sends
+/// it as a sized response (Content-Length). Consequences, all deliberate: every failure before the
+/// first byte is a normal HTTP error with the standard envelope (413 for a limit, 503 for a
+/// degraded read, the deadline, a closing server, a full volume or a writer failure), the audit row
+/// is written once, after the build, with the row count and size (`stream=false`), and a 200
+/// whose body reaches its Content-Length is a whole workbook. The sequence for XLSX is
+/// gate -> parse (400) -> lease -> version range -> disk grant -> build -> audit -> headers ->
+/// file provider. There is ONE deadline (kExportMaxSeconds from admission) covering the build
+/// and the delivery together, checked again on every provider call along with the server's
+/// closing signal, so a slow reader cannot hold the HTTP worker, the lease, the disk grant or the
+/// file past it; the lease, the worker and the grant are held from admission to the last byte or
+/// the deadline, whichever comes first. A transfer ended by the deadline or by shutdown stops short
+/// of its Content-Length, which a client reports as a failed download.
+///
+/// XLSX LIMITS: `--inventory-export-max-rows` and the format's own row limit
+/// (software_export::kXlsxMaxDataRows) bound the rows; `--inventory-export-max-bytes` bounds the
+/// UNCOMPRESSED SHEET as accounted by software_export_xlsx.hpp (markup and escaping included),
+/// not the cell text and not the finished file.
+///
+/// XLSX DISK BOUND: one export holds at most kXlsxPeakDiskFactor x its sheet bytes of the data
+/// volume, so at most 3 x max-bytes per export and 3 x that x concurrency in all (6 GiB at the
+/// defaults). It is enforced twice: by accounting (no row is written past the sheet-byte limit, so
+/// the ceiling holds for any cell content) and by measurement (every export asks the one
+/// XlsxDiskBudget for sheet bytes in kXlsxDiskGrantBytes steps, and a grant is refused when it
+/// would leave the volume under kXlsxDiskReserveBytes free once every live export reached its
+/// peak). Temporary files are named from the server's own correlation id, created exclusively and
+/// owner-only, removed on every path and swept from the directory at registration (a process
+/// killed mid-build leaves one; the next boot deletes it).
 ///
 /// ADMISSION (ADR-0034): the stream pins an HTTP worker for up to 900 s, so it is one lease from the
 /// server's ONE StreamBudget (`SseSurface::kSoftwareExport`), like every other held-open response.
@@ -58,6 +88,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -81,6 +112,8 @@ public:
     using RosterFn = std::function<std::optional<OfflineRoster>()>;
     /// Monotonic seconds for the stream deadline; empty = std::chrono::steady_clock.
     using SecondsFn = std::function<std::int64_t()>;
+    /// Free bytes on the volume that holds Deps::xlsx_tmp_dir; nullopt = unreadable (refuses).
+    using DiskFreeFn = std::function<std::optional<std::uintmax_t>()>;
 
     /// The store reads, injectable so the route logic is testable without Postgres. Every member a
     /// caller leaves empty is bound to `Deps::store` at registration; with no store the route
@@ -110,6 +143,15 @@ public:
         int concurrency{software_export::kDefaultConcurrency}; ///< --inventory-export-concurrency
         /// --inventory-export-max-rows / --inventory-export-max-bytes (clamped at registration).
         software_export::Limits limits{};
+        /// Where `format=xlsx` builds its workbooks (server.cpp passes `<data dir>/export-tmp`, on
+        /// the data volume, not the system temporary directory, which is often memory-backed in a
+        /// container). register_routes creates it owner-only and removes every regular file in
+        /// it. A path that exists but is not a real directory (a link, a file), or that cannot be
+        /// created, leaves xlsx unconfigured (503) and sweeps nothing; the other formats are
+        /// unaffected. Empty = xlsx unconfigured.
+        std::filesystem::path xlsx_tmp_dir;
+        /// Empty = std::filesystem::space(xlsx_tmp_dir).available.
+        DiskFreeFn disk_free_fn;
     };
 
     void register_routes(HttpRouteSink& sink, Deps deps);

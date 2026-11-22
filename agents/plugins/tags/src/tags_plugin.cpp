@@ -22,6 +22,7 @@
 #include <spdlog/spdlog.h>
 
 #include <filesystem>
+#include <mutex>
 #include <format>
 #include <fstream>
 #include <string>
@@ -35,6 +36,10 @@ namespace fs = std::filesystem;
 YuzuPluginContext* g_ctx = nullptr;
 std::unordered_map<std::string, std::string> g_tags;
 fs::path g_tags_path;
+// Guards g_tags and g_tags_path. Actions run concurrently on the agent's dispatch pool, so every
+// read and every mutate-and-persist sequence holds it (asset_tags' g_mu is the sibling pattern).
+// load_tags()/save_tags()/persist_after_mutation() expect the caller to hold it.
+std::mutex g_mu;
 
 void load_tags() {
     g_tags.clear();
@@ -148,7 +153,10 @@ public:
             g_tags_path = fs::path(std::string{data_dir}) / "tags.json";
         }
 
-        load_tags();
+        {
+            std::lock_guard lk(g_mu);
+            load_tags();
+        }
         return {};
     }
 
@@ -194,8 +202,11 @@ private:
             return 1;
         }
 
-        g_tags[key_str] = val_str;
-        persist_after_mutation(ctx);
+        {
+            std::lock_guard lk(g_mu);
+            g_tags[key_str] = val_str;
+            persist_after_mutation(ctx);
+        }
         ctx.write_output(std::format("tag_set|{}|{}", key_str, val_str));
         return 0;
     }
@@ -207,20 +218,28 @@ private:
             return 1;
         }
         std::string key_str{key};
-        auto it = g_tags.find(key_str);
-        if (it == g_tags.end()) {
-            ctx.write_output(std::format("tag|{}|", key_str));
-        } else {
-            ctx.write_output(std::format("tag|{}|{}", key_str, it->second));
+        std::string found_value;
+        {
+            std::lock_guard lk(g_mu);
+            auto it = g_tags.find(key_str);
+            if (it != g_tags.end())
+                found_value = it->second;
         }
+        ctx.write_output(std::format("tag|{}|{}", key_str, found_value));
         return 0;
     }
 
     int do_get_all(yuzu::CommandContext& ctx) {
-        for (const auto& [key, value] : g_tags) {
+        // Snapshot under the lock, write after releasing it.
+        std::unordered_map<std::string, std::string> snap;
+        {
+            std::lock_guard lk(g_mu);
+            snap = g_tags;
+        }
+        for (const auto& [key, value] : snap) {
             ctx.write_output(std::format("tag|{}|{}", key, value));
         }
-        ctx.write_output(std::format("count|{}", g_tags.size()));
+        ctx.write_output(std::format("count|{}", snap.size()));
         return 0;
     }
 
@@ -231,8 +250,12 @@ private:
             return 1;
         }
         std::string key_str{key};
-        bool found = g_tags.erase(key_str) > 0;
-        persist_after_mutation(ctx);
+        bool found = false;
+        {
+            std::lock_guard lk(g_mu);
+            found = g_tags.erase(key_str) > 0;
+            persist_after_mutation(ctx);
+        }
         ctx.write_output(std::format("tag_deleted|{}|{}", key_str, found ? "true" : "false"));
         return 0;
     }
@@ -244,21 +267,34 @@ private:
             return 1;
         }
         std::string key_str{key};
-        bool exists = g_tags.contains(key_str);
+        bool exists = false;
+        {
+            std::lock_guard lk(g_mu);
+            exists = g_tags.contains(key_str);
+        }
         ctx.write_output(std::format("tag_exists|{}|{}", key_str, exists ? "true" : "false"));
         return 0;
     }
 
     int do_clear(yuzu::CommandContext& ctx) {
-        auto count = g_tags.size();
-        g_tags.clear();
-        persist_after_mutation(ctx);
+        std::size_t count = 0;
+        {
+            std::lock_guard lk(g_mu);
+            count = g_tags.size();
+            g_tags.clear();
+            persist_after_mutation(ctx);
+        }
         ctx.write_output(std::format("tags_cleared|{}", count));
         return 0;
     }
 
     int do_count(yuzu::CommandContext& ctx) {
-        ctx.write_output(std::format("count|{}", g_tags.size()));
+        std::size_t n = 0;
+        {
+            std::lock_guard lk(g_mu);
+            n = g_tags.size();
+        }
+        ctx.write_output(std::format("count|{}", n));
         return 0;
     }
 };

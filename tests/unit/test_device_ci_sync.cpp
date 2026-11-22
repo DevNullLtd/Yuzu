@@ -1081,15 +1081,87 @@ TEST_CASE("build_device_ci_record tolerates appended cpu/dimm columns", "[sync][
 
 TEST_CASE("build_device_ci_record keeps the raw pipe split of the frozen v1 positions",
           "[sync][device_ci][pipe]") {
-    // The v2 projections split on an UNESCAPED pipe; the 22 v1 positions deliberately do not, because
-    // their bytes (and so the hash of every fielded device) are frozen. A disk model holding an
-    // escaped pipe is therefore still cut at it here. Switching the v1 loops to the unescaped split
-    // would change disks_summary for such a device and must be a coordinated, versioned change.
+    // The v2 projections split on an UNESCAPED pipe, and since #7040 so do the v1 cpu and dimm
+    // aggregations. The other v1 positions deliberately do not, because their bytes (and so the hash
+    // of every fielded device) are frozen. A disk model holding an escaped pipe is therefore still
+    // cut at it here. Switching the disk loop to the unescaped split would change disks_summary for
+    // such a device and must be a coordinated, versioned change.
     using yuzu::agent::build_device_ci_record;
     using yuzu::agent::CiPluginOutputs;
     CiPluginOutputs o;
     o.disks = "disk|0|Model\\|X|512|SSD|NVMe";
     CHECK(build_device_ci_record(o).disks_summary == "Model\\ X 512");
+}
+
+TEST_CASE("build_device_ci_record: a pipe inside a CPU model or DIMM locator shifts no column (#7040)",
+          "[sync][device_ci][pipe]") {
+    using yuzu::agent::build_device_ci_record;
+    using yuzu::agent::CiPluginOutputs;
+
+    SECTION("an escaped pipe in a CPU model keeps cores and threads and unescapes the model") {
+        CiPluginOutputs o;
+        o.processors = "cpu|0|Foo \\| Bar CPU|4|8|2800|-|-\ncpu|1|Foo \\| Bar CPU|4|8|2800|-|-";
+        auto r = build_device_ci_record(o);
+        CHECK(r.cpu_model == "Foo | Bar CPU");
+        CHECK(r.cpu_cores == "8");   // 4 + 4, not 0
+        CHECK(r.cpu_threads == "16"); // 8 + 8, not the core count
+    }
+
+    SECTION("an escaped pipe in a DIMM locator keeps its size in the RAM total") {
+        CiPluginOutputs o;
+        o.memory = "dimm|A \\| B|8192|DDR4|3200|-|-|-\ndimm|DIMM1|8192|DDR4|3200|-|-|-";
+        auto r = build_device_ci_record(o);
+        CHECK(r.ram_bytes == std::to_string(16384LL * 1024 * 1024)); // not 8192 MB
+    }
+
+    SECTION("a model and a locator with no pipe or backslash give the same record as before") {
+        // The frozen-seam pin: nothing here contains an escape, so the unescaped split and the
+        // raw split see the same tokens and every v1 byte, and so the hash, is unchanged.
+        CiPluginOutputs o;
+        o.processors = "cpu|0|Intel(R) Core(TM) i7-1185G7 @ 3.00GHz|4|8|3000|-|-";
+        o.memory = "dimm|ChannelA-DIMM0|16384|DDR4|3200|-|-|-\ndimm|total|unknown|unknown|0|-|-|-";
+        auto r = build_device_ci_record(o);
+        CHECK(r.cpu_model == "Intel(R) Core(TM) i7-1185G7 @ 3.00GHz");
+        CHECK(r.cpu_cores == "4");
+        CHECK(r.cpu_threads == "8");
+        CHECK(r.ram_bytes == std::to_string(16384LL * 1024 * 1024));
+    }
+
+    SECTION("a literal backslash that is not before a pipe is left alone") {
+        CiPluginOutputs o;
+        o.processors = "cpu|0|Odd\\Model|2|4|2000|-|-";
+        auto r = build_device_ci_record(o);
+        CHECK(r.cpu_model == "Odd\\Model");
+        CHECK(r.cpu_cores == "2");
+    }
+}
+
+TEST_CASE("build_device_ci_record: a pipe-free device still hashes to the frozen cross-pin (#7040)",
+          "[sync][device_ci][pipe][hash]") {
+    // The byte-level frozen-seam proof: plugin rows with no pipe, backslash or newline in the model
+    // or locators go through the REAL builder and must reproduce the cross-pin record, blob and
+    // hash, exactly. A change to the v1 cpu/dimm aggregation that moves one byte fails here.
+    using yuzu::agent::build_device_ci_record;
+    using yuzu::agent::CiPluginOutputs;
+    CiPluginOutputs o;
+    o.manufacturer = "manufacturer|Dell Inc.";
+    o.model = "model|Latitude 7420";
+    o.system = "serial|ABC123\nsystem_uuid|4C4C4544-0042-1234-5678-AABBCCDDEEFF";
+    o.bios = "bios_vendor|Dell Inc.\nbios_version|1.27.0\nbios_date|2024-03-15";
+    o.processors = "cpu|0|Intel(R) Core(TM) i7-1185G7|4|8|2800|-|-";
+    o.memory = "dimm|ChannelA-DIMM0|8192|DDR4|3200|-|-|-\ndimm|ChannelB-DIMM0|8192|DDR4|3200|-|-|-";
+    o.disks = "disk|0|Samsung SSD 980|512|SSD|NVMe";
+    o.device_name = "device_name|WS-001";
+    o.domain = "domain|corp.example";
+    o.ou = "ou|OU=Laptops,DC=corp,DC=example";
+    o.os_name = "os_name|Windows 11 Pro";
+    o.os_version = "os_version|10.0.22631";
+    o.os_build = "os_build|22631";
+    o.os_arch = "os_arch|x86_64";
+    o.adapters = "adapter|eth0|00:11:22:33:44:55|1000|up\nadapter|eth1|aa:bb:cc:dd:ee:ff|1000|up";
+    const auto r = build_device_ci_record(o);
+    CHECK(device_ci_canonical_blob(r) == device_ci_canonical_blob(sample()));
+    CHECK(sha256_hex(device_ci_canonical_blob(r)) == kCrossPinHash);
 }
 
 TEST_CASE("build_device_ci_record parses + aggregates plugin outputs", "[sync][device_ci]") {
