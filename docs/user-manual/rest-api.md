@@ -9063,12 +9063,12 @@ Omit `name` and `agent_id` for a fleet-wide scan. A parameter that is not valid 
        "install_location": "", "instance_key": "3f1c9a0e5b7d2c48a1e6f0d9b4c7a2e5d8f1b3c6a9e2d5f8b1c4e7a0d3f6b9c2",
        "purl": "pkg:rpm/fedora/bash@5.2.21-3.fc40?arch=x86_64&distro=fedora-40", "package_id": ""},
       {"agent_id": "agent-002", "name": "bash", "version": "5.2.26", "publisher": "via:brew",
-       "install_date": "2026-01-15", "kind": "package", "ecosystem": "brew", "epoch": "",
-       "release": "", "arch": "arm64", "signature_status": "", "distro_id": "", "distro_version": "",
+       "install_date": "1767225600", "kind": "pkg", "ecosystem": "brew", "epoch": "",
+       "release": "", "arch": "", "signature_status": "", "distro_id": "", "distro_version": "",
        "source": "pkg_inventory.packages",
        "hostname": null, "last_seen": 1767139200, "status": "unconfirmed",
-       "last_confirmed_at": null, "install_type": "package", "install_scope": "machine",
-       "install_location": "/opt/homebrew/Cellar/bash/5.2.26", "instance_key": "9b2e4d7a1c6f3e8b5a0d2c7f4e1b8a3d6c9f2e5b8a1d4c7f0e3b6a9d2c5f8e1b",
+       "last_confirmed_at": null, "install_type": "package_manager", "install_scope": "machine",
+       "install_location": "/opt/homebrew", "instance_key": "9b2e4d7a1c6f3e8b5a0d2c7f4e1b8a3d6c9f2e5b8a1d4c7f0e3b6a9d2c5f8e1b",
        "purl": null, "package_id": ""}
     ],
     "count": 2,
@@ -12571,7 +12571,7 @@ App-centric stability list — every application with a crash/hang signal in the
 
 #### `GET /api/v1/dex/apps/usage`
 
-Fleet usage per application (Digital Employee Experience). For each application on the `GET /api/v1/dex/apps` list (the same rows, in the same order, at most 100), how many devices ran it, its run time and launches over a 30-day basis, and its exposure rate (crashes plus hangs per process-hour of use), split into the cells of the chosen slice. Every figure is an estimate: the agent reports a trailing 30-day total, and the response says so in `basis` (`estimated_from_30_day_usage`). The dashboard does not show it yet and there is no MCP tool yet. See [app usage](../dex/app-usage.md#fleet-usage-per-application) for how to read it.
+Fleet usage per application (Digital Employee Experience). For each application on the `GET /api/v1/dex/apps` list (the same rows, in the same order, at most 100), how many devices ran it, its run time and launches over a 30-day basis, and its exposure rate (crashes plus hangs per process-hour of use), split into the cells of the chosen slice. Every figure is an estimate: the agent reports a trailing 30-day total, and the response says so in `basis` (`estimated_from_30_day_usage`). The Apps tab Usage view in the dashboard (`GET /fragments/dex/apps/usage`) shows it (see [using it in the dashboard](../dex/app-usage.md#using-it-in-the-dashboard-the-apps-tab-usage-view)); there is no MCP tool yet. See [app usage](../dex/app-usage.md#fleet-usage-per-application) for how to read it.
 
 - **Permission:** BOTH `GuaranteedState:Read` and `Forensics:Read`. While RBAC is off, `Forensics:Read` is administrator-only, so only an administrator can call it. A principal holding only `Forensics:Read` (the ForensicsAnalyst role) is refused, because the body names the applications that crash. Under RBAC the permissions are checked across all of a principal's roles, so the route is open to the Administrator role and to a principal assigned both the Viewer role (`GuaranteedState:Read`) and the ForensicsAnalyst role (`Forensics:Read`). A service-scoped API token is refused (`403`). The usage figures are computed over the caller's visible devices only: the route hands the caller's device scope to the model, which filters its device list before the figures are built. The application list is the fleet list that `GuaranteedState:Read` already serves, so it is not filtered. The filter is inert for every caller admitted today, so this is not per-group confinement.
 - **Query parameters:** `window` — `24h`/`7d`/`30d`/`all` (default `7d`); `platform` — `all`/`windows`/`macos`/`linux` (default `all`); `slice` — `fleet`/`platform`/`group`/`tag` (default `fleet`); `group` — a management group id, at most 256 bytes of text with no control characters (valid UTF-8), required with `slice=group` and refused otherwise; `tag_key` — a device tag key (default `model`), refused unless `slice=tag`; `floor` — an integer from 1 to 10000 (default `1`). An off-enum or out-of-range value, a parameter outside its slice and a `group` that cannot name a group (empty, over 256 bytes, a control character or invalid UTF-8) are `400`, refused before the audit row and the read. A well-formed `group` that names no management group is `400` (`unknown management group`), never a `200` with the whole population in `other`; it leaves its audit row.
