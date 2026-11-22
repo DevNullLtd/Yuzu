@@ -3356,7 +3356,7 @@ groups:
       - alert: YuzuDispatchTargetRejected
         expr: |
           sum by (route, reason) (
-            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os"}[15m])
+            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os|param_key_invalid"}[15m])
           ) > 3
         labels:
           severity: warning
@@ -3401,7 +3401,12 @@ groups:
             reason="kill_switched_os" (#5294) are excluded for the same reason:
             a withheld dispatch to a plugin absent from the target, or to an OS
             whose switch is off, is the control working, audited as
-            command.dispatch_withheld. reason values
+            command.dispatch_withheld. reason="param_key_invalid" (a params key with a control
+            byte, NUL or invalid UTF-8, or a NUL value, refused at the ingress) is excluded
+            for a different reason: it is a refused malformed request, never a request that
+            named no device, and one client looping on it must not page as a targeting
+            near-miss (the audit row `reason=param_key_invalid` and the counter are the
+            evidence). reason values
             "query_truncated"/"poison_excluded"/"parse_error_excluded" (#4496 + follow-up,
             route="result_set_inventory_query") are NOT excluded from the
             expression, unlike quarantined above: a well-formed, correctly-targeted
@@ -5640,8 +5645,9 @@ groups:
       # per-device unrepresented-pending read and the per-device order read:
       # their degrade is a REST 503 / MCP error, never an empty result, and
       # does not touch either gauge; dex_usage covers the fleet application usage
-      # read behind GET /api/v1/dex/apps/usage: its degrade is a 503, never zero
-      # figures), each
+      # read behind GET /api/v1/dex/apps/usage and the dashboard Apps tab Usage
+      # view (GET /fragments/dex/apps/usage): its degrade is a 503 on REST and a
+      # 200 panel on the dashboard, never zero figures), each
       # keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
       # on guardian_state for the Apps list's in-flight budget, and
@@ -5725,8 +5731,12 @@ groups:
             retryable 503 because four were already running; look for a
             caller polling it in parallel.
             source="dex_usage" means the fleet application usage read behind
-            GET /api/v1/dex/apps/usage is degrading. It fails closed: the
-            request is a 503 naming the reason, never a 200 with zero figures.
+            GET /api/v1/dex/apps/usage and the dashboard Apps tab Usage view
+            (GET /fragments/dex/apps/usage), which share one read, is degrading.
+            It fails closed and never shows zero figures: the REST request is a
+            503 naming the reason, and the dashboard answers a 200 panel that
+            says the usage could not be read, so yuzu_http_requests_total does
+            not show a dashboard degrade.
             reason="concurrency_budget" is the same in-flight budget refusal
             (four at once, retryable). reason="statement_timeout" is the read
             running past its 10 s bound; three in a row spanning two minutes with

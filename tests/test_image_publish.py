@@ -477,11 +477,13 @@ class Rig:
             shutil.rmtree(rep, ignore_errors=True)
             rep.mkdir(parents=True)
             line, outcome = GATES[gate]
-            stem = f"trivy-{name}.attempt-{attempt}"
-            if outcome == "success":
-                (rep / f"{stem}.json").write_text('{"SchemaVersion": 2}\n')
-                (rep / f"{stem}.txt").write_text("Report Summary\n")
-            (rep / f"{stem}.gate.txt").write_text(f"image: {name}\nrun attempt: {attempt}\n{line}\n")
+            # As image-vuln-gate.sh does: both scanners' reports on every exit.
+            for scanner in ("trivy", "grype"):
+                stem = f"{scanner}-{name}.attempt-{attempt}"
+                if outcome == "success":
+                    (rep / f"{stem}.json").write_text('{"SchemaVersion": 2}\n')
+                    (rep / f"{stem}.txt").write_text("Report Summary\n")
+                (rep / f"{stem}.gate.txt").write_text(f"image: {name}\nrun attempt: {attempt}\n{line}\n")
             return outcome
         uses = st.get("uses") or ""
         if uses:
