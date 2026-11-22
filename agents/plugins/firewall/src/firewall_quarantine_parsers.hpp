@@ -4157,6 +4157,28 @@ inline Outcome roll_back(Env& env, QuarantineState st, std::string reason, std::
 
 } // namespace detail
 
+/// The note an apply carries when the device kept its stored allow set instead of applying
+/// the requested one: the device's own record is `active` and the requested operator
+/// EXCEPTIONS differ from the ones in force, as a set (order is not a difference). Not when
+/// only the control peer or the resolvers differ: the live peer leads a new request's control
+/// set and the resolvers are re-read, so those differ on a healthy retry. Any other record
+/// (applying, releasing, unreadable, absent) has no stored set to keep, so no note. The
+/// server keys on this note to learn that a new record's whitelist was not applied (the
+/// stored set was kept), so it must ride every answer to such an apply, a refusal included:
+/// the `active` branch of apply_and_verify and the self-host refusal in do_quarantine both
+/// call this, so the condition and the text cannot drift apart.
+[[nodiscard]] inline std::optional<std::string_view>
+allow_set_unchanged_note(const StateLoad& stored,
+                         const std::vector<Endpoint>& requested_exceptions) {
+    if (stored.kind != StateLoad::Kind::ok || stored.state.phase != Phase::active)
+        return std::nullopt;
+    const auto& in_force = stored.state.allow.exceptions;
+    if (std::is_permutation(in_force.begin(), in_force.end(), requested_exceptions.begin(),
+                            requested_exceptions.end()))
+        return std::nullopt;
+    return "allow_set_unchanged_use_quarantine_allow=1";
+}
+
 struct ApplyRequest {
     AllowSet allow;
     std::string probe_target; // "ip:port" | "[v6]:port" | empty
@@ -4213,14 +4235,8 @@ struct ApplyRequest {
                 if (o.status != "degraded")
                     o.notes.emplace_back("already_active=1");
             }
-            // Said when the operator EXCEPTIONS differ, as a set (order is not a difference).
-            // Not when only the control peer or the resolvers differ: the live peer leads a
-            // new request's control set and the resolvers are re-read, so those differ on a
-            // healthy retry. The server keys on this note to learn that a new record's
-            // whitelist was not applied (the stored set was kept).
-            if (!std::is_permutation(cur.allow.exceptions.begin(), cur.allow.exceptions.end(),
-                                     req.allow.exceptions.begin(), req.allow.exceptions.end()))
-                o.notes.emplace_back("allow_set_unchanged_use_quarantine_allow=1");
+            if (const auto note = allow_set_unchanged_note(loaded, req.allow.exceptions))
+                o.notes.emplace_back(*note);
             // Same rule for the TTL: a retry never rewrites a contained host's expiry.
             if (req.ttl_seconds != 0)
                 o.notes.emplace_back("ttl_unchanged_release_then_quarantine=1");

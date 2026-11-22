@@ -2270,18 +2270,27 @@ gate and the same `503` on a degraded read apply to them. **Any other value, an 
 > again.
 >
 > **A device that refuses (`refused|self_host`, `refused|own_addresses_unreadable`).** Every
-> `firewall.quarantine` apply is checked, whoever sent it: an operator's dispatch, the reconciler's
-> apply (a record created over REST is only ever applied by the reconciler) or an MCP re-apply. A
-> device whose control endpoint is one of its own addresses, loopback included, or whose own
-> addresses it cannot read, answers the apply with that refusal and is never contained, so the record
-> never confirms (`last_confirmed_at` stays `0`) and `YuzuQuarantineEndpointUnconfirmed` fires after
-> 15 minutes. The device changes nothing and stores no record; the refusal is in the apply's stored
-> reply (the `status|refused|<token>` row, `GET /api/v1/responses/{command_id}`; the `command_id` is in the
-> device's `quarantine.reapply` audit row) and in the agent log.
+> `firewall.quarantine` apply that is not `repair=1` is checked, whoever sent it: an operator's
+> dispatch, the reconciler's apply (a record created over REST is only ever applied by the reconciler)
+> or an MCP re-apply, an apply to an already-contained device included. A device whose control
+> endpoint is one of its own addresses, loopback included, or whose own addresses it cannot read,
+> answers the apply with that refusal. The refusal changes nothing: no leg is built, no record is
+> stored, and an existing record and its containment are left as they were; it is in the apply's
+> stored reply (the `status|refused|<token>` row, `GET /api/v1/responses/{command_id}`; the
+> `command_id` is in the device's `quarantine.reapply` audit row) and in the agent log. So the token
+> alone does not say whether the device is contained; `firewall.quarantine_status` does. A device that
+> held no containment stays uncontained, so a record that was never confirmed never confirms
+> (`last_confirmed_at` stays `0`) and `YuzuQuarantineEndpointUnconfirmed` fires after 15 minutes. A
+> device that was already contained stays contained: its repair and its boot re-apply keep the stored
+> containment, and the server's re-apply is refused there. On a device whose record is active, the
+> refusal carries `note|allow_set_unchanged_use_quarantine_allow=1` when the request's exceptions
+> differ as a set from those in force (the same rule and text as a retry that is not refused), and a
+> never-confirmed record then stays unconfirmed (`allow_set_not_applied`); with equal exceptions
+> there is no note and the status read confirms. On such a device, release then quarantine again is
+> not a way to change the whitelist (the new quarantine is refused): use `firewall.quarantine_allow`.
 > `own_addresses_unreadable` is permanent where the agent cannot read its interfaces (for example a
 > unit or seccomp profile that denies `AF_NETLINK`): allow `AF_NETLINK` for the agent, the agent log
-> names the errno. An apply when the record the plugin keeps on the device is already active is not checked (it keeps
-> its stored set and answers as described above). The record still refuses operator commands to the
+> names the errno. The record still refuses operator commands to the
 > device. The server keeps re-dispatching, so nothing ends the record by itself: end it with
 > `DELETE /api/v1/quarantine/{agent_id}`. A device that was never contained holds no rules, so it
 > answers a release with `status|inactive` and a plain `DELETE` ends the record; where the device

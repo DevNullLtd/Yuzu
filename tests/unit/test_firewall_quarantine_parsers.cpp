@@ -5089,6 +5089,71 @@ TEST_CASE("quarantine on an active record names the allow-set note only when the
     }
 }
 
+TEST_CASE("allow_set_unchanged_note: the shared condition and text, from the stored record alone",
+          "[agent][firewall_quarantine]") {
+    constexpr std::string_view note = "allow_set_unchanged_use_quarantine_allow=1";
+    const std::vector<Endpoint> in_force{ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out")};
+    const auto stored = [&](StateLoad::Kind kind, Phase phase) {
+        StateLoad l;
+        l.kind = kind;
+        l.state.phase = phase;
+        l.state.allow = make_set({"203.0.113.53"}, in_force);
+        return l;
+    };
+    const std::vector<std::vector<Endpoint>> differing{
+        {ex("10.0.0.5:22/tcp/in"), ex("10.9.9.9:22/tcp/in")}, // one different
+        {ex("10.0.0.5:22/tcp/in")},                           // fewer
+        {ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out"), ex("10.9.9.9:22/tcp/in")}, // more
+        {},                                                                               // none
+    };
+
+    SECTION("an ok and active record: the note exactly when the exceptions differ as a set") {
+        const auto active = stored(StateLoad::Kind::ok, Phase::active);
+        CHECK_FALSE(allow_set_unchanged_note(active, in_force).has_value());
+        const std::vector<Endpoint> reordered{in_force[1], in_force[0]};
+        CHECK_FALSE(allow_set_unchanged_note(active, reordered).has_value());
+        for (const auto& requested : differing) {
+            INFO("exceptions requested: " << requested.size());
+            const auto n = allow_set_unchanged_note(active, requested);
+            REQUIRE(n.has_value());
+            CHECK(*n == note);
+        }
+        // and the other way: a record holding none, a request naming some
+        auto none_held = active;
+        none_held.state.allow = make_set({"203.0.113.53"}, {});
+        const auto n = allow_set_unchanged_note(none_held, in_force);
+        REQUIRE(n.has_value());
+        CHECK(*n == note);
+        CHECK_FALSE(allow_set_unchanged_note(none_held, {}).has_value());
+    }
+    SECTION("an applying or releasing record has no stored set to keep: no note") {
+        for (const auto phase : {Phase::applying, Phase::releasing}) {
+            INFO(to_string(phase));
+            for (const auto& requested : differing)
+                CHECK_FALSE(
+                    allow_set_unchanged_note(stored(StateLoad::Kind::ok, phase), requested)
+                        .has_value());
+        }
+    }
+    SECTION("an unreadable or absent record is never read as active, whatever its state holds") {
+        // The default phase is `applying`, so the state is set to active by hand: only the
+        // kind check keeps these two from answering the note.
+        for (const auto kind : {StateLoad::Kind::unreadable, StateLoad::Kind::absent}) {
+            for (const auto& requested : differing)
+                CHECK_FALSE(allow_set_unchanged_note(stored(kind, Phase::active), requested)
+                                .has_value());
+        }
+    }
+    SECTION("on the wire a self_host refusal carries the note as its last row") {
+        auto o = refused("self_host");
+        o.notes.emplace_back(*allow_set_unchanged_note(stored(StateLoad::Kind::ok, Phase::active),
+                                                       {}));
+        const std::vector<std::string> expected{"status|refused|self_host", "refused|self_host",
+                                                "note|allow_set_unchanged_use_quarantine_allow=1"};
+        CHECK(render_rows(o) == expected);
+    }
+}
+
 TEST_CASE("quarantine on an active record says when a new ttl_seconds was ignored",
           "[agent][firewall_quarantine]") {
     NftRig rig;

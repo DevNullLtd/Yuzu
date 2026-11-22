@@ -2844,26 +2844,30 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
         return emit_refusal(ctx, allow.error());
     // A host whose control endpoint is one of its own addresses (loopback included) cannot
     // be contained: the server it must keep reaching is itself, so the apply could never
-    // be released from outside. Checked on every firewall.quarantine apply whoever sent it
-    // (an operator, the server's reconciler, an MCP re-apply), before any leg is built; the
+    // be released from outside. Checked on every firewall.quarantine apply that is not
+    // repair=1, whoever sent it (an operator, the server's reconciler, an MCP re-apply) and
+    // an apply to an already-contained device included, before any leg is built; the
     // host's addresses are read before the call, and a loopback or unspecified control
-    // address is refused whatever that read returned. The stored record (a KV read only) is
-    // read first: an apply to a device whose own record is already active is exempt,
-    // because that branch of apply_and_verify only keeps or repairs the STORED set (what
-    // repair=1 and the boot re-apply already do unchecked) and is the only emitter of the
-    // `allow_set_unchanged_use_quarantine_allow=1` note the server keys on, so a refusal
-    // there would let the server confirm a record whose set the device never applied. An
-    // applying, releasing, unreadable or absent record is checked, so on a host that became
-    // its own server while a record sat `applying` a retried apply is refused and does not
-    // finish it; a release, or the unchecked boot re-apply, ends that state. repair, boot
-    // re-apply, release and quarantine_allow never reach this line.
-    const auto stored = KvStateStore{raw}.load();
-    const bool already_active =
-        stored.kind == fq::StateLoad::Kind::ok && stored.state.phase == fq::Phase::active;
-    if (!already_active) {
-        if (const auto why =
-                fq::self_host_refusal(allow->control, yuzu::agent::enumerate_own_addresses()))
-            return emit_refusal(ctx, std::string{*why}, "quarantine");
+    // address is refused whatever that read returned. A refusal changes nothing: no record
+    // is written and an existing record and its containment are left as they were, so a
+    // contained device that has since become its own server stays contained (repair, the
+    // boot re-apply and release never check, and keep working). The token alone does not
+    // say whether the device is contained. When the device's own record is active and the
+    // requested exceptions differ from the ones in force, the refusal carries the
+    // allow-set note the active branch of apply_and_verify would have carried (one shared
+    // helper owns the condition and the text), because the server keys on that note to
+    // leave a never-confirmed record unconfirmed instead of reading the device's status
+    // and confirming an allow list the device never applied. The one KV read happens only
+    // on this refusal path. repair, boot re-apply, release and quarantine_allow never
+    // reach this line.
+    if (const auto why =
+            fq::self_host_refusal(allow->control, yuzu::agent::enumerate_own_addresses())) {
+        auto o = fq::refused(std::string{*why});
+        if (const auto note =
+                fq::allow_set_unchanged_note(KvStateStore{raw}.load(), allow->exceptions))
+            o.notes.emplace_back(*note);
+        emit(ctx, o, "quarantine");
+        return o.rc();
     }
     // The packaged Linux unit cannot elevate: refuse before any record exists,
     // rather than write `applying` and fail every tool call after it.

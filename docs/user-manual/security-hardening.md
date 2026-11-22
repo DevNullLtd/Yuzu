@@ -626,20 +626,26 @@ whitelist leaves IPv6 fully contained.
 
 ### A device that is its own server is never contained
 
-No containment is applied to a device whose server or gateway address is one of its own
-addresses, loopback included; one stored earlier is still re-applied (see "Which applies are
-checked"). Every `firewall.quarantine` apply is checked, whoever sent it (an operator's
-dispatch, the server's reconciler or an MCP re-apply): the agent compares the control addresses (the
-address it is connected through, plus every address the configured server name resolved to at agent
-start) with every address the host answers to, and answers `refused|self_host` when one matches, or
-when a control address is loopback or unspecified. Containing such a host would cut the agent off
-from the very server that has to release it. A read of the host's own addresses that fails is refused
-too (`refused|own_addresses_unreadable`): an unknown is not "not this host". That read fails for good
-where the agent cannot read its interfaces, for example a unit or seccomp profile that denies
-`AF_NETLINK`: every checked apply is refused there until the agent is allowed `AF_NETLINK` (the agent
-log names the errno). Either answer changes nothing on the device and stores no record, and there is
-no override. The refusal is visible in the `status|refused|<token>` row of the command's stored reply
-(the `command_id` is in the device's `quarantine.reapply` audit row) and in the agent log (`firewall: quarantine -> refused:self_host`).
+A `firewall.quarantine` apply to a device whose server or gateway address is one of its own
+addresses, loopback included, is refused and changes nothing. A device that held no containment
+therefore stays uncontained and its record never confirms; one that was already contained stays
+contained (the agent's repair and its boot re-apply keep the stored containment, and the server's
+re-apply is refused there). The token alone does not say which: `firewall.quarantine_status` does. A
+containment stored earlier is still re-applied (see "Which applies are checked"). Every `firewall.quarantine` apply that is not
+`repair=1` is checked, whoever sent it (an operator's dispatch, the server's reconciler or an MCP
+re-apply) and an apply to an already-contained device included: the agent compares the control
+addresses (the address it is connected through, plus every address the configured server name
+resolved to at agent start) with every address the host answers to, and answers `refused|self_host`
+when one matches, or when a control address is loopback or unspecified. Containing such a host would
+cut the agent off from the very server that has to release it. A read of the host's own addresses
+that fails is refused too (`refused|own_addresses_unreadable`): an unknown is not "not this host".
+That read fails for good where the agent cannot read its interfaces, for example a unit or seccomp
+profile that denies `AF_NETLINK`: every checked apply is refused there until the agent is allowed
+`AF_NETLINK` (the agent log names the errno). Either answer changes nothing: no rules are built, no
+record is stored, and an existing record and its containment are left as they were; there is no
+override. The refusal is visible in the
+`status|refused|<token>` row of the command's stored reply (the `command_id` is in the device's
+`quarantine.reapply` audit row) and in the agent log (`firewall: quarantine -> refused:self_host`).
 
 - **A single-host stack cannot apply a containment.** An agent that talks to a server on the
   same machine, such as a one-machine evaluation stack or a loopback test rig, answers
@@ -648,18 +654,26 @@ no override. The refusal is visible in the `status|refused|<token>` row of the c
   is the host itself (the unit's default) answers `self_host`, not `privilege_unavailable`. Each
   refused apply counts as a failed command, so `YuzuHighCommandFailureRate` can fire on an otherwise
   idle server while the record stands.
-- **Which applies are checked.** Every `firewall.quarantine` apply is checked, whoever sent it. Not
-  checked: an apply when the record the plugin keeps on the device is already active (it is answered from the stored
-  set: it only keeps or repairs the stored allow set and says when the requested set was not applied,
-  see "A new record on a contained device"), the agent's 60-second repair, its boot-time re-apply,
-  `firewall.release` and `firewall.quarantine_allow`. A containment that is already stored is
-  therefore still re-applied, and is released wherever the agent can elevate; on the packaged Linux
-  unit a release is refused too (`privilege_unavailable`), so only a forced end ends the record.
+- **Which applies are checked.** Every `firewall.quarantine` apply that is not `repair=1` is
+  checked, whoever sent it, an apply to a device that is already contained included. Not checked: the
+  agent's 60-second repair, its boot-time re-apply, `firewall.release` and
+  `firewall.quarantine_allow`. A containment that is already stored is therefore still re-applied, and
+  is released wherever the agent can elevate; on the packaged Linux unit a release is refused too
+  (`privilege_unavailable`), so only a forced end ends the record. `firewall.release` and the console
+  steps (in "Known limit: addresses only") still lift a containment on a device that refuses.
 - **The record of a refused device stays unconfirmed.** The server keeps re-dispatching to a
-  device that refuses, so the record never confirms and `YuzuQuarantineEndpointUnconfirmed` fires
-  after 15 minutes. Operator commands to the device stay refused while the record exists. End it
-  with `DELETE /api/v1/quarantine/{agent_id}`, with `?force=true` where the device refuses the
-  release (the packaged Linux unit).
+  device that refuses, so a record that was never confirmed never confirms (the device holds no
+  containment) and `YuzuQuarantineEndpointUnconfirmed` fires after 15 minutes. Operator commands to the
+  device stay refused while the record exists. End it with `DELETE /api/v1/quarantine/{agent_id}`, with
+  `?force=true` where the device refuses the release (the packaged Linux unit).
+- **A contained device that became its own server stays contained.** A refusal changes nothing, so a
+  device that was contained and has since come to share its server's address (the server moved onto
+  the host, or the server name now resolves to one of the host's own addresses) answers every new
+  apply `refused|self_host` and keeps the containment and its record as they were; the agent's repair
+  and its boot re-apply keep the stored containment too. `firewall.quarantine_status` says what is in
+  force, because the refusal token does not. `firewall.release`, and the console steps in "Known limit:
+  addresses only" below, still lift it. On such a device, release then quarantine again is not a way
+  to change the whitelist (the new quarantine is refused): use `firewall.quarantine_allow`.
 - **Known limit: addresses only.** The check compares addresses. A server that runs in a
   container or a VM on the same host and is reached at a bridge address (for example `172.17.0.2`
   behind `docker0`) is not one of the host's own addresses, so that host can still be contained.
@@ -736,8 +750,14 @@ verified proof confirms). Confirmed means **the device reports its rules in forc
   `YuzuQuarantineEndpointUnconfirmed` fires after its usual delay. **The new whitelist is still not on
   the device.** To get it there, release the device and quarantine it again (the release ends the record
   once the device confirms, and the new quarantine then applies the whitelist to a device that holds no
-  earlier exceptions). A record that was confirmed once keeps the behaviour above: later allow-list
-  drift is not detected.
+  earlier exceptions). The note rides a refusal too: on a device whose record is active, a refusal
+  (`refused|self_host` or `refused|own_addresses_unreadable`) carries it when the request's exceptions
+  differ from those in force (as a set, same rule and text as a retry that is not refused), and a
+  never-confirmed record then stays unconfirmed the same way (`allow_set_not_applied`). With equal
+  exceptions there is no note and the status read confirms. On such a device that refuses, release
+  then quarantine again is not a way to change the whitelist (the new quarantine is refused): use
+  `firewall.quarantine_allow`. A record that was confirmed once keeps the behaviour above: later
+  allow-list drift is not detected.
 
 ### Releasing a device
 

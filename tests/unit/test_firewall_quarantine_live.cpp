@@ -1145,15 +1145,20 @@ TEST_CASE("quarantine: a control endpoint at one of this host's own addresses is
     CHECK_FALSE(rig.record().has_value());
 }
 
-TEST_CASE("quarantine: the self_host check is skipped for a device whose own record is already active",
+TEST_CASE("quarantine: a retry on a device that became its own server is refused self_host, "
+          "whatever its record holds",
           "[agent][firewall_quarantine]") {
-    // An apply to a device whose record is active only keeps or repairs the STORED set, and
-    // its answer is what tells the server the requested set was not applied; a refusal
-    // there would let the server confirm a record whose set the device never applied. Any
-    // other record (applying, releasing, unreadable) is checked. The probe_target does not
-    // parse, so no case here reaches the OS: apply_and_verify refuses it before it loads the
-    // store.
+    // Every apply that is not repair=1 is checked, an apply to an already-contained device
+    // included. A refusal changes nothing: the record is left byte for byte as it was (or
+    // not written), so a contained device stays contained. Only a device whose record is
+    // active carries the allow-set note, and only when the requested exceptions differ from
+    // the ones in force as a set: it is what keeps the server from confirming a record whose
+    // allow list the device never applied. The probe_target does not parse, so no case here
+    // would reach the OS even without the refusal. The address-read-unreadable refusal
+    // (`own_addresses_unreadable`) cannot be forced at this boundary (the real enumeration is
+    // read) and takes the same code path.
     PLUGIN_RIG_AT_OR_RETURN(rig, "127.0.0.1:50051", "127.0.0.1");
+    constexpr const char* kNoteRow = "note|allow_set_unchanged_use_quarantine_allow=1";
     const auto stored = [&](fq::Phase phase) {
         fq::QuarantineState st;
         st.phase = phase;
@@ -1164,13 +1169,23 @@ TEST_CASE("quarantine: the self_host check is skipped for a device whose own rec
         return st;
     };
     const auto raw_record = [&] { return rig.kv->get("firewall", std::string{fq::kStateKey}); };
+    // The unparseable probe target keeps every dispatch off the OS. `exceptions` empty means
+    // the parameter is not sent.
+    const auto retry = [&](const std::string& exceptions) {
+        std::vector<std::pair<std::string, std::string>> params{{"probe_target", "nope"}};
+        if (!exceptions.empty())
+            params.emplace_back("exceptions", exceptions);
+        return rig.run("quarantine", std::move(params));
+    };
 
     for (const auto phase : {fq::Phase::applying, fq::Phase::releasing}) {
         INFO(fq::to_string(phase));
         rig.put_record(stored(phase));
         const auto before = raw_record();
         REQUIRE(before.has_value());
-        check_refused(rig.run("quarantine", {{"probe_target", "nope"}}), "self_host");
+        const auto r = retry("203.0.113.20");
+        check_refused(r, "self_host");
+        CHECK_FALSE(has_row(r.captured, kNoteRow));
         CHECK(raw_record() == before); // the refusal leaves the record as it was
     }
 
@@ -1178,19 +1193,45 @@ TEST_CASE("quarantine: the self_host check is skipped for a device whose own rec
     REQUIRE(rig.kv->set("firewall", std::string{fq::kStateKey}, "not a record"));
     const auto garbage = raw_record();
     REQUIRE(garbage.has_value());
-    check_refused(rig.run("quarantine", {{"probe_target", "nope"}}), "self_host");
-    CHECK(raw_record() == garbage);
+    {
+        const auto r = retry("203.0.113.20");
+        check_refused(r, "self_host");
+        CHECK_FALSE(has_row(r.captured, kNoteRow));
+        CHECK(raw_record() == garbage);
+    }
 
+    // an absent record: refused, and no record is written
+    REQUIRE(rig.kv->del("firewall", std::string{fq::kStateKey}));
+    {
+        const auto r = retry("203.0.113.20");
+        check_refused(r, "self_host");
+        CHECK_FALSE(has_row(r.captured, kNoteRow));
+        CHECK_FALSE(rig.record().has_value());
+    }
+
+    // an active record: refused, and the note says the requested exceptions were not applied
+    // when they differ from the ones in force (stored: 203.0.113.10); equal ones carry none
     rig.put_record(stored(fq::Phase::active));
-    const auto before = raw_record();
-    REQUIRE(before.has_value());
-    const auto r = rig.run("quarantine", {{"probe_target", "nope"}, {"exceptions", "203.0.113.20"}});
-    INFO(r.captured);
-    CHECK(r.rc == 1);
-    CHECK(has_prefix(r.captured, "status|refused|")); // the apply was answered, not skipped
-    CHECK_FALSE(has_row(r.captured, "status|refused|self_host"));
-    CHECK_FALSE(has_row(r.captured, "status|refused|own_addresses_unreadable"));
-    CHECK(raw_record() == before);
+    const auto active = raw_record();
+    REQUIRE(active.has_value());
+    {
+        const auto r = retry("203.0.113.20");
+        check_refused(r, "self_host");
+        CHECK(has_row(r.captured, kNoteRow));
+        CHECK(raw_record() == active);
+    }
+    {
+        const auto r = retry("");
+        check_refused(r, "self_host");
+        CHECK(has_row(r.captured, kNoteRow)); // no exceptions against one in force
+        CHECK(raw_record() == active);
+    }
+    {
+        const auto r = retry("203.0.113.10");
+        check_refused(r, "self_host");
+        CHECK_FALSE(has_row(r.captured, kNoteRow)); // the same set: nothing to say
+        CHECK(raw_record() == active);
+    }
 }
 
 TEST_CASE("release and quarantine_allow: a loopback rig never answers self_host",

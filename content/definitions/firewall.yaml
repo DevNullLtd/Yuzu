@@ -273,11 +273,15 @@ metadata:
     in-flight containment change on this device. The Linux packaged unit
     refuses every containment action (privilege_unavailable). A device whose
     control endpoint is one of its own addresses (loopback included), or whose
-    own addresses cannot be read, is never contained: every apply is checked,
-    whoever sent it, before the privilege check, and it answers
-    refused|self_host or refused|own_addresses_unreadable and changes nothing.
-    An apply when the record the plugin keeps on the device is already active
-    is not checked.
+    own addresses cannot be read, answers refused|self_host or
+    refused|own_addresses_unreadable to every apply that is not a repair,
+    whoever sent it and an apply to an already-contained device included, before
+    the privilege check; the refusal changes nothing, so no leg is built, no
+    record is stored and an existing record and its containment are left as they
+    were. The token alone does not say whether the device is contained: one that
+    held no containment stays uncontained and its record never confirms, one
+    that was already contained stays contained (the repair and the boot
+    re-apply keep it), and quarantine_status says which.
   tags: [security, quarantine, incident-response, network]
 
 spec:

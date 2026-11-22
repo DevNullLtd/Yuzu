@@ -3241,20 +3241,34 @@ groups:
             or "drift status=..." when a re-verify no longer confirms).
             This alert also fires when the device refuses the apply.
             status|refused|self_host: the device's control endpoint is one of
-            its own addresses, so it is never contained and never confirms; the
-            way out is DELETE /api/v1/quarantine/{agent_id} (a device that was
-            never contained answers the release with inactive; add ?force=true
-            if the record stays releasing, as it does on the packaged Linux
-            unit). status|refused|own_addresses_unreadable: the agent could not
+            its own addresses, so every apply that is not a repair is refused,
+            an apply to an already-contained device included, and the refusal
+            changes nothing: no rules are built, no record is stored and an
+            existing record and its containment are left as they were. The
+            token alone does not say whether the device is contained; read
+            firewall.quarantine_status. A device that held no containment stays
+            uncontained and never confirms; the way out is DELETE
+            /api/v1/quarantine/{agent_id} (a device that was never contained
+            answers the release with inactive; add ?force=true if the record
+            stays releasing, as it does on the packaged Linux unit). A device
+            that was already contained stays contained: its repair and its boot
+            re-apply keep the stored containment, the server's re-apply is
+            refused there, and the release or the console steps lift it. On a
+            device whose record is active the refusal carries
+            note|allow_set_unchanged_use_quarantine_allow=1 when the request's
+            exceptions differ from those in force, and a never-confirmed record
+            then stays unconfirmed (allow_set_not_applied); with equal
+            exceptions there is no note and the status read confirms. Release
+            then quarantine again is not a way to change the whitelist on such
+            a device (the new quarantine is refused): use quarantine_allow.
+            status|refused|own_addresses_unreadable: the agent could not
             read its own addresses, so fix the read rather than delete the
             record (a unit or seccomp profile that denies AF_NETLINK makes it
             permanent: allow AF_NETLINK for the agent; the agent log names the
             errno). The token is in the apply's reply under the command_id of
             the quarantine.reapply row, and in the agent log
             (firewall: quarantine -> refused:<token>). The record still blocks
-            operator commands to the device while it exists. A device whose own
-            stored containment (the record the plugin keeps on the device) is
-            already active is not refused this way.
+            operator commands to the device while it exists.
             This alert also fires when the device's agent lacks the
             firewall plugin: the dispatch is accepted but never
             confirmed. An agent without the firewall plugin comes from an
