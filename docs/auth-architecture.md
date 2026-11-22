@@ -1958,6 +1958,25 @@ account policy)"* — this ships **both** halves.
   break-glass`. Refuses to arm — and exits non-zero — if any check fails or the
   audit row can't persist.
 
+The gate is tri-state (`SsoOnlyGateResult`: `kOpen`, `kBreakGlassArmed`, `kRefused` for a
+definitive answer, `kTransient` when the arm state could not be established) and has four
+callers: `POST /login`, the password-change verify function, and the MFA step
+(`POST /login/mfa`) before a code is spent and again before the session is minted.
+Standing invariants, pinned by `tests/test_mfa_budget_wiring_lexical.py`: (1) the ONE admit set
+is `SsoOnlyGateResult::admits_password_evaluation()` (open or armed), and `kTransient` is a
+refusal for every caller except the MFA step's second check; (2) a failed, stale or
+in-flight read is never recorded as "not armed" and never cached; (3) no "armed" read is
+honoured more than `kArmSnapshotMaxAge` (4.5 s) after it started, one comparison
+(`arm_observation_fresh`) at every site; (4) the first MFA check uses the cached
+single-flight mode (its snapshot is what the second check's bounded rule relies on) and puts
+the pending token back on a transient answer; the second check reads the arm state itself
+(`SsoOnlyArmRead::kOwnFreshRead`), never writes the armed cache, and may admit on a failed read
+only inside that bounded rule (before the first snapshot's window end, at most 4.5 s after that
+read started, the same non-empty arm id, and no "not armed" read recorded on this server
+since), with one clock sample taken after the gate returns. The steady clock does not advance
+while the host is suspended, so these bounds are measured on it, not on wall time. Operator
+text: [Authentication](user-manual/authentication.md) and the break-glass runbook.
+
 Implementation: gate at `auth_routes.cpp` `POST /login` (between the lockout
 pre-check and `verify_password`); accessors `AuthDB::break_glass_status` /
 `arm_break_glass` (single `UPDATE ... RETURNING`, no `sqlite3_changes()` —
