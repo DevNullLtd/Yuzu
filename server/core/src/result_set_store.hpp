@@ -339,6 +339,8 @@ public:
     /// Borrows the shared pool and runs the `result_set_store` schema
     /// migration on a pinned lease. `is_open()` is false if the lease was
     /// empty or the migration failed. Zero cache budget disables retention.
+    /// The clock supplies replica wall time in Unix seconds. Tests can supply a clock
+    /// independent of PostgreSQL to exercise TTL boundaries.
     explicit ResultSetStore(pg::PgPool& pool,
                             std::size_t member_cache_bytes = kDefaultMemberCacheBytes,
                             std::function<int64_t()> epoch_seconds = system_epoch_seconds);

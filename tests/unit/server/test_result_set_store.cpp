@@ -1444,6 +1444,7 @@ TEST_CASE("ResultSetStore: membership and GC agree when the server and PostgreSQ
     // A younger live set makes expiry of the first an ordinary, non-wipe sweep.
     auto younger = warm.create_materialized(req("alice"), {"dev-2"});
     REQUIRE(younger.has_value());
+    REQUIRE(warm.count_for_owner_checked("alice").value() == 2);
     auto first = warm.member_set_owned(set->id, "alice");
     REQUIRE(first.has_value());
     auto hit = warm.member_set_owned(set->id, "alice");
@@ -1458,9 +1459,45 @@ TEST_CASE("ResultSetStore: membership and GC agree when the server and PostgreSQ
         REQUIRE_FALSE(expired.has_value());
         CHECK(expired.error() == ResultSetError::NotFound);
     }
+    REQUIRE(cold.count_for_owner_checked("alice").value() == 1);
     REQUIRE(cold.gc_sweep() == 1);
     CHECK_FALSE(get_ok(cold, set->id).has_value());
-    CHECK(get_ok(cold, younger->id).has_value());
+
+    cold.touch(younger->id);
+    const auto touched = get_ok(cold, younger->id);
+    REQUIRE(touched.has_value());
+    CHECK(touched->last_used_at == server_now);
+    CHECK(touched->ttl_at == server_now + ResultSetStore::kDefaultTtlSeconds);
+    REQUIRE(cold.pin(younger->id).has_value());
+    ++server_now;
+    const auto unpinned = cold.unpin(younger->id);
+    REQUIRE(unpinned.has_value());
+    CHECK(unpinned->ttl_at == server_now + ResultSetStore::kDefaultTtlSeconds);
+}
+
+TEST_CASE("ResultSetStore: admission and its quota preflight agree at the replica TTL boundary",
+          "[pg][result_set][member_cache][clock_skew]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    const auto database_now = std::stoll(
+        query_scalar(db.dsn(), "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint"));
+    int64_t server_now = database_now + GENERATE(-86400, 86400);
+    ResultSetStore store{pool, ResultSetStore::kDefaultMemberCacheBytes,
+                         [&server_now] { return server_now; }};
+    exec_sql(db.dsn(), "INSERT INTO result_set_store.result_sets "
+                       "(id, owner_principal, created_at, ttl_at, last_used_at, source_kind, "
+                       "source_payload) SELECT 'rs_quota_' || g, 'alice', 1, " +
+                           std::to_string(server_now) +
+                           ", 1, 'manual_curate', '{}' FROM generate_series(1, " +
+                           std::to_string(ResultSetStore::kMaxPerOwner) + ") AS g");
+    REQUIRE(store.count_for_owner_checked("alice").value() == ResultSetStore::kMaxPerOwner);
+    auto full = store.create_materialized(req("alice"), {});
+    REQUIRE_FALSE(full.has_value());
+    CHECK(full.error() == ResultSetError::QuotaExceeded);
+
+    ++server_now;
+    REQUIRE(store.count_for_owner_checked("alice").value() == 0);
+    REQUIRE(store.create_materialized(req("alice"), {}).has_value());
 }
 
 TEST_CASE("ResultSetStore: expiry, pinning and readiness are judged on the live header, "
@@ -1541,7 +1578,7 @@ TEST_CASE("ResultSetStore: concurrent readers share the member cache under evict
     }
     std::atomic<int> wrong{0};
     std::atomic<int> failed{0};
-    std::vector<std::thread> readers;
+    std::vector<std::jthread> readers;
     for (int t = 0; t < 6; ++t)
         readers.emplace_back([&, t] {
             for (int i = 0; i < 40; ++i) {

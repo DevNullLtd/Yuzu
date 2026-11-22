@@ -477,6 +477,11 @@ std::vector<std::string_view> as_views(const std::vector<std::string>& v) {
     return out;
 }
 
+// Admission and its preflight count expiry against the same clock that authors ttl_at.
+constexpr char kCountActiveForOwner[] =
+    "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
+    "AND (pinned OR ttl_at >= $2::bigint)";
+
 // Shared by pin() (same connection, no extra round trip) and the public
 // count_pinned_for_owner(). Returns -1 on query error so callers can
 // distinguish "zero pinned" from "could not determine" (authoritative posture
@@ -498,7 +503,8 @@ int count_pinned_on(PGconn* conn, const std::string& owner) {
 
 ResultSetStore::ResultSetStore(pg::PgPool& pool, std::size_t member_cache_bytes,
                                std::function<int64_t()> epoch_seconds)
-    : pool_(pool), epoch_seconds_(std::move(epoch_seconds)), member_cache_budget_(member_cache_bytes) {
+    : pool_(pool), epoch_seconds_(epoch_seconds ? std::move(epoch_seconds) : system_epoch_seconds),
+      member_cache_budget_(member_cache_bytes) {
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("ResultSetStore: no database connection at construction ({}) — result-set "
@@ -578,10 +584,8 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
         // UP-6): a stalled gc sweep would otherwise convert GC debt into
         // spurious operator Quota failures. Still soft-guard-grade.
         pg::PgResult qc = pg::exec_params(
-            conn,
-            "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
-            "AND (pinned OR ttl_at >= extract(epoch from now())::bigint)",
-            std::vector<std::string>{req.owner_principal});
+            conn, kCountActiveForOwner,
+            std::vector<std::string>{req.owner_principal, std::to_string(row.created_at)});
         if (qc.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResultSetStore::insert_row_impl: quota check failed: {}",
                           PQerrorMessage(conn));
@@ -966,7 +970,7 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
     // (insert_row_impl, touch, unpin) and that gc_sweep deletes by, so a set is refused here
     // exactly when this replica's GC would treat it as expired. A comparison against the
     // database clock would refuse a set up to the skew before its expiry on a replica whose
-    // clock runs behind the database. (The quota counts still use the database clock.)
+    // clock runs behind the database.
     static constexpr std::string_view columns =
         "SELECT (r.owner_principal = $2) AS owned, r.status, r.agents_failed, "
         "r.agents_unanswered, r.membership_generation ";
@@ -1103,10 +1107,8 @@ std::expected<int, ResultSetError> ResultSetStore::count_for_owner_checked(
     // Keeping the two predicates identical means this pre-check predicts the
     // authoritative check exactly.
     pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
-        "AND (pinned OR ttl_at >= extract(epoch from now())::bigint)",
-        std::vector<std::string>{owner});
+        lease.get(), kCountActiveForOwner,
+        std::vector<std::string>{owner, std::to_string(epoch_seconds_())});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::count_for_owner_checked: query failed: {}",
                       PQerrorMessage(lease.get()));

@@ -445,7 +445,6 @@ the triggers.
 
 Also in this change: an unpinned set past `ttl_at` is refused (`NotFound`) by `member_set_owned`
 before `gc_sweep` deletes it, judged on the serving replica's clock (the clock that writes
-`ttl_at` and that `gc_sweep` deletes by). `get`, `members`, `list_by_owner` and `resolve_alias`
-are unchanged and still return an expired, unswept set. That and moving `ttl_at` authoring and
-the quota counts onto one clock are follow-ups with no tracking issue yet (no issue was
-authorized in this change).
+`ttl_at` and that `gc_sweep` deletes by). The admission quota and its preflight count pinned
+sets and unexpired sets on that same clock. `get`, `members`, `list_by_owner` and `resolve_alias`
+continue to return an expired, unswept set.
