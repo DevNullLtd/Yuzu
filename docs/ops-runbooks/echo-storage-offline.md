@@ -13,7 +13,7 @@ Background: `docs/user-manual/echo.md` "The retention clock guard", issue #2361.
 >   database opened and collected, then was closed at run time after a rollback failed. It is not
 >   retried: only an agent restart recovers. The tag appears at the next slow collect tick after the
 >   close (the tick period is `slow_interval_seconds`, 300 seconds by default, so within five minutes
->   unless an operator changed it; the alert then holds 30 minutes from the tag), and it is cleared
+>   unless an operator changed it; the alert then holds 30 minutes from the server first seeing the tag), and it is cleared
 >   the same way once the agent has restarted with a healthy database. The device's own `echo status`
 >   and its Capture-sources frame show the same state.
 

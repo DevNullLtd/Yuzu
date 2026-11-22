@@ -102,7 +102,8 @@ inline std::string json_escape(std::string_view in) {
 /// operator's recovery instruction mid-sentence; too large and it runs past the
 /// newline and renders the head of the NEXT record as debris -- `echo status`'s
 /// offline reply is `error|...` followed by `storage_state|offline|rollback_wedged`, and a
-/// 300-byte window ends in a trailing `storage_stat`. Bounding the FIRST LINE is
+/// byte window long enough to pass the first line ends mid-way through that second record.
+/// Bounding the FIRST LINE is
 /// the property that holds whatever the message length becomes.
 ///
 /// `max_bytes` is a display bound, so it is walked back off a UTF-8

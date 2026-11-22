@@ -2330,6 +2330,26 @@ TEST_CASE("Echo #8099: a ROLLBACK that rolled back and then reported an error le
     CHECK(db.get_config("k") == "v");
 }
 
+TEST_CASE("Echo #8099: a batch ROLLBACK that rolled back and then reported an error leaves the store open",
+          "[echo][store][rollback-wedge]") {
+    // The same benign shape as the checked_transaction case above, through the batch path's own
+    // discriminator: the two paths are separate code and must each keep the store open.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_abok_"};
+    OpenSeams seams;
+    seams.rollback = [](sqlite3* raw) {
+        sqlite3_exec(raw, "ROLLBACK", nullptr, nullptr, nullptr);
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+
+    const auto batch = db.execute_atomic_batch({"SELECT zeroblob(2000000000)"});
+    CHECK(batch.began);
+    CHECK_FALSE(batch.committed);
+    CHECK(db.is_open());
+    CHECK(db.set_config("k", "v")); // a connection still inside a transaction would refuse this
+    CHECK(db.get_config("k") == "v");
+}
+
 TEST_CASE("Echo #8099: a failed rollback during the v10 step is an open failure, not a runtime wedge",
           "[echo][store][rollback-wedge]") {
     // The open-time counterpart, already reported as migration_failed: the step fails (here the
