@@ -1145,8 +1145,8 @@ TEST_CASE("file_search driver: a listing that turns slow lengthens the next nap"
 TEST_CASE("file_search driver: the first slice judges its root listing",
           "[file_search][file_search_driver][pacing]") {
     // MUTATION: starting `judge` false in the driver (judging only after the first visit) leaves the plain
-    // duty nap (300 ms): no listing precedes a visit in a slice with no resume position, so nothing judges
-    // the root listing.
+    // duty nap (300 ms): the root listing precedes the first visit, so in a slice with no resume position
+    // nothing judges it.
     Rig rig;
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.list_hook = [&rig](const std::string& dir) {

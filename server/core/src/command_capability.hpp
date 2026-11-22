@@ -121,7 +121,7 @@ struct CommandCapability {
     /// designated-initializer row value-initializes to `Unspecified` (the
     /// zero enumerator), which every fragment's compile-time sweep rejects.
     ExecuteGate execute_gate{ExecuteGate::Unspecified};
-    /// See `StoredRowTier`. Defaulted and last, so every existing designated-initializer row is
+    /// See `StoredRowTier`. Defaulted, so every existing designated-initializer row is
     /// unchanged and only the one fragment that needs the Forensics read tier names it.
     StoredRowTier stored_rows{StoredRowTier::Ordinary};
     /// The request parameter that carries an AGENT-ISSUED resume token, so one approval can cover
@@ -131,7 +131,7 @@ struct CommandCapability {
     /// did not issue for these same arguments before doing any work, because the server never
     /// reads the token: it only sees that a non-empty one is present. A declaration is honoured
     /// only for a ReadOnly/None row gated `None` or `AdminOrApproval` (`covered_param`); on any
-    /// other row it is ignored. Defaulted and last, so omitting it fails closed.
+    /// other row it is ignored. Defaulted, so omitting it fails closed.
     std::string_view continuation_param{};
     /// OPTIONAL parameter-dependent securable (sg10). When BOTH are non-empty and the dispatch's
     /// parameters carry a NON-EMPTY value under `param_escalation_key`, the RBAC check (and the
