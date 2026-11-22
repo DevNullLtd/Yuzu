@@ -1228,6 +1228,14 @@ public:
     /// `server/core/src/**` references it.
     void expire_mfa_pending_for_test(const std::string& pending_token,
                                      std::chrono::milliseconds elapsed);
+    /// Test seam: how many pending MFA tokens are held right now, with NO reap first (a lookup
+    /// reaps expired entries before it uses the map, so only this shows an expired entry that
+    /// was put back).
+    std::size_t mfa_pending_count_for_test() {
+        std::lock_guard lock(mfa_pending_mu_);
+        return mfa_pending_.size();
+    }
+
     /// Override the service-scope global-safe allow-list for a test
     /// (`kServiceScopeGlobalSafe` is seeded EMPTY in production, #2298 PR 3 —
     /// see `service_scope_policy.hpp` — so `require_permission`'s

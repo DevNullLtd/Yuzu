@@ -745,6 +745,7 @@ struct ArmCtl {
     std::atomic<std::int64_t> remaining_ms{3'600'000};
     std::atomic<std::int64_t> advance_in_read_ms{0}; // the read itself takes this long
     std::atomic<bool> window_ended_in_db{false};     // a not-armed read keeps the ended window's text
+    std::atomic<int> real_sleep_in_read_ms{0};       // the read blocks this long in REAL time
     std::atomic<int> reads{0};
     std::atomic<bool> block{false};
     std::atomic<int> blocked{0};
@@ -768,6 +769,8 @@ void install_arm_hook(HardenedHarness& h, ArmCtl& ctl) {
         ++ctl.reads;
         if (const auto adv = ctl.advance_in_read_ms.load(); adv > 0)
             routes->advance_arm_clock_for_test(adv);
+        if (const int ms = ctl.real_sleep_in_read_ms.load(); ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
         if (ctl.block.load()) {
             ++ctl.blocked;
             std::unique_lock lk(ctl.mu);
@@ -1564,4 +1567,67 @@ TEST_CASE("break-glass: a read that finds an ended window is labelled window_end
     CHECK(rows_containing(audit_rows(h, "mfa.login.failed"),
                           ended ? "break-glass no longer armed: window ended"
                                 : "break-glass no longer armed: disarmed") == 1);
+}
+
+// Code review F6: the pending token is put back on an unreadable arm state only while it is
+// inside its lifetime.
+TEST_CASE("break-glass MFA step: an unreadable arm state does not revive a pending token past its lifetime",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    // 2 s of the token's life are left, and the failing arm-state read takes 2.3 s of real time:
+    // the token is looked up alive and is past its lifetime when the refusal is written.
+    h.auth_routes->expire_mfa_pending_for_test(pending, std::chrono::milliseconds(118'000));
+    REQUIRE(h.auth_routes->mfa_pending_count_for_test() == 1);
+    h.auth_routes->advance_arm_clock_for_test(1100);
+    ctl.mode = ArmCtl::kFail;
+    ctl.real_sleep_in_read_ms = 2300;
+    auto res = login_step2(h, pending, HardenedHarness::totp_next(mfa.secret));
+    ctl.real_sleep_in_read_ms = 0;
+    CHECK(res->status == 401);
+    // The first re-check was reached (so the token was alive at lookup) ...
+    REQUIRE(rows_containing(audit_rows(h, "mfa.login.failed"), "break-glass arm state unreadable") == 1);
+    CHECK(refused(h, "transient", "pre_verify") == 1.0);
+    // ... and the token was NOT put back. A later lookup would reap an expired entry before
+    // using it, so the map itself is read (mutation: put back unconditionally -> 1 here).
+    CHECK(h.auth_routes->mfa_pending_count_for_test() == 0);
+    ctl.mode = ArmCtl::kArmed;
+    auto again = login_step2(h, pending, HardenedHarness::totp_next(mfa.secret));
+    CHECK(again->status == 401);
+    CHECK(rows_containing(audit_rows(h, "mfa.login.failed"), "pending token invalid or expired") == 1);
+}
+
+// Code review F6: "attempts unchanged", observed through the per-token cap of 5.
+TEST_CASE("break-glass MFA step: an unreadable arm state does not use up one of the token's attempts",
+          "[pg][auth][hardened][routes][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    h.cfg.auth_lockout_threshold = 50; // keep the account's own budget out of the way
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    const auto pending = login_step1(h);
+    const auto wrong = wrong_totp(mfa.secret);
+    for (int i = 0; i < 3; ++i)
+        CHECK(login_step2(h, pending, wrong)->status == 401); // attempts 1, 2, 3
+    // Two unreadable answers in between: neither is an attempt.
+    for (int i = 0; i < 2; ++i) {
+        h.auth_routes->advance_arm_clock_for_test(1100);
+        ctl.mode = ArmCtl::kFail;
+        CHECK(login_step2(h, pending, wrong)->status == 401);
+        ctl.mode = ArmCtl::kArmed;
+    }
+    CHECK(refused(h, "transient", "pre_verify") == 2.0);
+    // The fourth wrong code is still an ordinary rejection; the fifth exhausts the token.
+    // (Mutation: the unreadable answer counts as an attempt -> the fourth is already "exhausted".)
+    CHECK(login_step2(h, pending, wrong)->status == 401);
+    auto rows = audit_rows(h, "mfa.login.failed");
+    CHECK(rows_containing(rows, "totp code rejected") == 4);
+    CHECK(rows_containing(rows, "attempts exhausted") == 0);
+    CHECK(login_step2(h, pending, wrong)->status == 401);
+    rows = audit_rows(h, "mfa.login.failed");
+    CHECK(rows_containing(rows, "totp code rejected") == 4);
+    CHECK(rows_containing(rows, "attempts exhausted") == 1);
 }
