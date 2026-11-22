@@ -11,8 +11,9 @@
 /// THE RULE. A row that declares a continuation parameter (and passes `covered_param`) binds its
 /// ticket to the call WITHOUT that parameter (`ticket_subject`). The first use spends the ticket as
 /// for any other call. A later call that carries a token (`carries_token`), from the same principal
-/// with the same arguments, rides the already-spent ticket for `kCoverSeconds`
-/// (`ApprovalManager::covers_continuation`). A call without a token always needs an unspent ticket.
+/// with the same arguments, rides the already-spent ticket for `kCoverSeconds`, or until the
+/// approval's 7-day lifetime ends, whichever comes first (`ApprovalManager::covers_continuation`).
+/// A call without a token always needs an unspent ticket.
 ///
 /// WHAT KEEPS IT SAFE. The server never reads the token: it only sees that a non-empty one is
 /// present. The AGENT is what refuses a token it did not issue for these same arguments, before any
@@ -32,8 +33,10 @@
 namespace yuzu::server::approval_continuation {
 
 /// How long after its FIRST use a ticket still covers continuation calls (database time, measured
-/// from `consumed_at`). Part of the ticket subject (`ticket_subject`), so a build that changes it
-/// never lets a ticket minted under another window cover anything.
+/// from `consumed_at`), or until the approval's own 7-day lifetime ends, whichever comes first (the
+/// lifetime is the ticket-liveness predicate, applied by `covers_continuation`; this constant only
+/// sets the window from first use). Part of the ticket subject (`ticket_subject`), so a build that
+/// changes it never lets a ticket minted under another window cover anything.
 inline constexpr std::int64_t kCoverSeconds = 24 * 3600;
 
 /// The continuation parameter this row declares AND may use, else empty. Honoured only for a

@@ -844,13 +844,15 @@ public:
 
     /// Does the already-SPENT ticket `id` still cover a continuation call (`approval_continuation.hpp`)
     /// by `principal` on the `expected_origin` surface, for exactly `definition_id` and
-    /// `scope_expression`? ONE read-only SELECT, no write, on the database's wall clock. True only
+    /// `scope_expression`? ONE read-only SELECT, no write, on the database clock. True only
     /// when ALL hold: status approved; origin, definition_id and scope_expression equal; submitted_by
     /// and consumed_by both equal `principal` (a non-empty one); reviewed_by non-empty and not the
     /// submitter; request_json, request_digest and excluded_roots all empty (an UNBOUND ticket only:
     /// a four-eyes ticket binds one request and never covers a second); consumed_at is set, no
     /// older than `approval_continuation::kCoverSeconds` and not ahead of now by more than
-    /// `kApprovalReviewedAtSlackSeconds`. Anything else is `false`, never an error: a caller that
+    /// `kApprovalReviewedAtSlackSeconds`; and the ticket is still inside its own 7-day lifetime
+    /// (the `ticket_is_live()` predicate), so the cover ends at whichever of the two comes first.
+    /// Anything else is `false`, never an error: a caller that
     /// is refused learns nothing about WHICH condition failed. An empty argument or an origin that
     /// names no concrete surface is `false` too. A store failure is an error, never `false`, so the
     /// caller can answer it as it answers any other store fault on the lookup (fail closed, retry).

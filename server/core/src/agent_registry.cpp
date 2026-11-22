@@ -1015,7 +1015,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "on the same cursor; bad_cursor, max_slices, mount_table_changed terminal; each slice "
          "is its own dispatch, and a non-admin on the supervised MCP tier needs ONE approval "
          "for the whole search (the first slice spends it, later slices that carry the cursor "
-         "ride it for 24 hours)"},
+         "ride it for 24 hours, or until the approval's 7-day lifetime ends, whichever comes "
+         "first)"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},

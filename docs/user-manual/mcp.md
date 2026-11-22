@@ -1310,12 +1310,13 @@ other tool or action nothing below applies: one approval, one call.
   (another root, pattern, kinds, action or target set, including one device widened to a group or
   the fleet) is a different subject and needs its own approval.
 - **First use.** Spends the ticket exactly as for any other call (steps 1 to 6 above), and is the
-  call that starts the 24-hour window. The window runs from the first use, not from the approval,
-  so the last slice can fall up to 24 hours after the approval's own 7-day lifetime.
+  call that starts the 24-hour window. The cover lasts 24 hours from the first use, or until the
+  approval's own 7-day lifetime ends, whichever comes first.
 - **Later slices.** A call that carries a token (a non-empty string of printable ASCII, no space,
   in `params.cursor`) and the `approval_id` rides the already-spent ticket, with no new approval,
   when ALL hold: the same principal who submitted and consumed it makes the call; the arguments
-  match; it is within 24 hours of the first use (database time); the ticket is approved, was
+  match; it is within 24 hours of the first use and the approval's 7-day lifetime has not ended
+  (database time); the ticket is approved, was
   reviewed by someone other than its submitter, and is an ordinary (unbound) ticket. The call
   is dispatched as an approved call. Nothing is consumed on a slice, so the ticket stays spent.
 - **Refusals.** Every other case answers `-32003` `PermissionDenied`, "approval already used
@@ -1330,7 +1331,7 @@ other tool or action nothing below applies: one approval, one call.
 - **The agent decides whether a token is real.** The server only sees that a non-empty token is
   present; it never reads it. The agent refuses (`bad_cursor`), before it reads anything, a token
   it did not issue for the same arguments, so a made-up token starts nothing. A caller who holds
-  the ticket can repeat an earlier token inside the 24 hours and so re-run that slice, and the
+  the ticket can repeat an earlier token while the cover lasts and so re-run that slice, and the
   approver's role is not checked again for each slice.
 - **Audit.** The first use writes `mcp.execute_instruction` `approved` with `consumed
   approval_id=<id>`; each later slice writes `approved` with `continuation approval_id=<id>`.

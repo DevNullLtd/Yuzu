@@ -208,7 +208,8 @@ diff against a documented list, not a silent addition:
    human approved: the ticket's subject is the canonical arguments minus the
    continuation parameter, so a different root, pattern, action or target set
    matches no ticket; the cover requires the same principal who submitted and
-   consumed the ticket, a window of 24 hours from its first use, an UNBOUND ticket
+   consumed the ticket, a window of 24 hours from its first use that also ends with the
+   approval's own 7-day lifetime (whichever comes first), an UNBOUND ticket
    reviewed by someone other than its submitter (`ApprovalManager::
    covers_continuation`, one read-only lookup), and a row that is `ReadOnly`/`None`
    and gated `None` or `AdminOrApproval` (a mutating or `AlwaysApproval` row is

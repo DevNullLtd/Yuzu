@@ -39,7 +39,8 @@ metadata:
     Only local filesystem types on the allow-list are searched; every other mount under the
     root is named by its own volume row with the reason. A search of more than one slice is not
     a snapshot. Off until enabled; a non-administrator needs one approval for the whole search (the first
-    slice spends it, and each later slice that carries the cursor rides it for 24 hours). What is
+    slice spends it, and each later slice that carries the cursor rides it for 24 hours, or
+    until the approval's 7-day lifetime ends, whichever comes first). What is
     stored is readable only with Forensics:Read. The Windows leg is planned and answers one
     unsupported status row.
   tags: [filesystem, search, inventory, extents]

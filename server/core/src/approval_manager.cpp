@@ -88,11 +88,12 @@ constexpr const char* kDbNowEpochSql = "EXTRACT(EPOCH FROM now())::bigint";
 constexpr const char* kDbWallEpochSql = "EXTRACT(EPOCH FROM clock_timestamp())::bigint";
 
 // THE ticket-liveness predicate, as a SQL boolean over `reviewed_at`. ONE definition of the
-// window, used by the consume CAS, its diagnostic read, submit()'s approved-ticket sweep and
-// `ticket_is_live()` (which ScheduleRunner calls), so those four cannot drift apart about
-// the bounds of when an approved ticket may still be redeemed or fired. The clock the bounds
-// are measured on is chosen by the caller (`wall_clock`, below): the consume statements read
-// the wall clock, the other two sites the transaction start.
+// window, used by the consume CAS, its diagnostic read, submit()'s approved-ticket sweep,
+// `ticket_is_live()` (which ScheduleRunner calls) and the continuation cover
+// (`covers_continuation`), so those five cannot drift apart about the bounds of when an
+// approved ticket may still be redeemed, fired or ridden. The clock the bounds are measured on
+// is chosen by the caller (`wall_clock`, below): the consume statements read the wall clock,
+// the other three sites the transaction start.
 //   lower bound: reviewed_at >= now - kApprovalTicketTtlSeconds   (the 7-day lifetime)
 //   upper bound: reviewed_at <= now + kApprovalReviewedAtSlackSeconds
 // The upper bound is what makes the lower one safe: a `reviewed_at` far in the future
@@ -1759,8 +1760,10 @@ ApprovalManager::covers_continuation(const std::string& id, const std::string& p
                                               "(pool exhausted)"});
     // The DATABASE's clock (kDbNowEpochSql), read in this one statement, as ticket_is_live() does:
     // the cover is bounded from the instant of FIRST USE, `consumed_at`, which consume stamped from
-    // this same database clock, and no replica's own clock is consulted. One autocommit statement,
-    // so the reading is the statement's own, never a caller's long transaction start.
+    // this same database clock, and no replica's own clock is consulted. It also ends with the
+    // approval's own lifetime (the ticket-liveness predicate), so a ticket first used near the end
+    // of its 7 days covers no slice after them. One autocommit statement, so the reading is the
+    // statement's own, never a caller's long transaction start.
     const std::string db_epoch = kDbNowEpochSql;
     const std::string sql =
         "SELECT 1 FROM approval_manager.approvals WHERE id = $1 AND status = 'approved'"
@@ -1772,7 +1775,8 @@ ApprovalManager::covers_continuation(const std::string& id, const std::string& p
         " AND consumed_at >= (" + db_epoch + " - " +
         std::to_string(approval_continuation::kCoverSeconds) + ")"
         " AND consumed_at <= (" + db_epoch + " + " +
-        std::to_string(kApprovalReviewedAtSlackSeconds) + ")";
+        std::to_string(kApprovalReviewedAtSlackSeconds) + ")"
+        " AND " + ticket_live_sql();
     pg::PgResult res = pg::exec_params(
         lease.get(), sql.c_str(),
         std::vector<std::string>{id, to_string(expected_origin), definition_id, scope_expression,

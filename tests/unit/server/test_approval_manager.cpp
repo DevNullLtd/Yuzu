@@ -2927,6 +2927,18 @@ TEST_CASE("ApprovalManager: covers_continuation refuses a ticket whose reviewer 
         backdate(pool, id, "consumed_at", 2 * 3600);
         CHECK_FALSE(covers(mgr, id));
     }
+    SECTION("the cover ends with the approval's own lifetime") {
+        const auto id = spent_cover_ticket(mgr);
+        REQUIRE(covers(mgr, id));
+        // First used an hour ago, approved six days ago: inside both windows, still covered.
+        backdate(pool, id, "consumed_at", 3600);
+        backdate(pool, id, "reviewed_at", 6 * 24 * 3600);
+        CHECK(covers(mgr, id));
+        // Approved eight days ago: past the 7-day lifetime while the first use is still inside the
+        // 24-hour window. Not covered, and no error.
+        backdate(pool, id, "reviewed_at", 2 * 24 * 3600);
+        CHECK_FALSE(covers(mgr, id));
+    }
     SECTION("a use dated in the future beyond the slack is not covered") {
         const auto id = spent_cover_ticket(mgr);
         backdate(pool, id, "consumed_at", -3600); // an hour ahead of now
