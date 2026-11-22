@@ -356,9 +356,9 @@ TEST_CASE("expiry alert constants", "[normalize]") {
 // -- SAM-51: the normaliser defects found by the proxy -----------------------------------
 //
 // tests/unit/fixtures/software-estate/normaliser/normaliser_cases.tsv holds the real titles and
-// vendors (provenance.txt next to it says where each came from) with the output each must give. A row
-// per defect 1 to 7 plus controls for the neighbouring forms that must not move. The rows are
-// the committed reproduction evidence, so they are read from the file once, through a static;
+// vendors (provenance.txt next to it says where each came from) with the output each must give.
+// A row per defect 1 to 7 plus controls for the neighbouring forms that must not move. The rows
+// are the committed reproduction evidence, so they are read from the file once, through a static;
 // there is no temp file, process or timing dependence.
 
 namespace {
