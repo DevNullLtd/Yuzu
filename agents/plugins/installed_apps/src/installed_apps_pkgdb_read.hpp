@@ -527,8 +527,7 @@ struct StmtFinalizer {
 // `fd` (when the caller's scope ends, after this connection is closed) would drop the main-file locks of
 // any OTHER in-process connection to the same inode. The exposure is near nil: the only such connection is an
 // overlapping read by this same reader (an abandoned bounded worker can outlive its call), every connection
-// here is read-only, rpm's own sqlite backend runs in WAL mode (header bytes 18 and 19 are 02 02, as in
-// both fixtures) so no main-file lock is held across reads, and the change stamp backstops a torn read.
+// here is read-only, and the change stamp backstops a read torn by a writer.
 [[nodiscard]] inline std::expected<std::vector<RpmPackage>, PkgDbCause>
 read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd, const Limits& lim,
                 PkgDbBudget& budget) {

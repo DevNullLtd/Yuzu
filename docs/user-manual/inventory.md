@@ -371,12 +371,16 @@ cadences.
 
   - **`status.d`.** A host whose packages live only there (minimal images with no
     shell) now reports them, as new install rows; and a host with a healthy status
-    file and one `status.d` control file that is not exactly one installed stanza
-    (unparseable, zero-byte, comment-only, or holding two stanzas) is degraded
+    file and one `status.d` control file that does not hold exactly one installed
+    stanza (unparseable, zero-byte, comment-only, holding two installed stanzas, or
+    only a not-installed one) is degraded
     (`dpkg_status_d:corrupt`, no rows, the server keeps its stored ones) where
     `dpkg-query` ignored the directory. The token does not name the file: list
-    `/var/lib/dpkg/status.d` and look for a zero-byte or hand-edited one, then fix
-    or remove it, or give it a leading dot, which is skipped.
+    `/var/lib/dpkg/status.d` and look for a zero-byte, comment-only or hand-edited
+    one, or one holding two installed stanzas. Restore it (reinstall the package
+    that owns it) rather than delete it: a deleted control file drops its package
+    from the roster, which is then read as complete. A name with a leading dot is
+    skipped.
   - **Which manager is read.** It is chosen by its database file, not its binary.
     A dpkg status with no installed package (empty, or only config-files and
     half-installed stanzas) falls through to rpm, and an rpm database that holds no
@@ -425,8 +429,8 @@ cadences.
   `unsupported_format` (a database layout the reader does not decode, for example
   an LMDB rpm database or a Berkeley DB hash version other than 9),
   `oversized`, `row_cap`, `byte_cap`, `timeout` and `busy` (a limit was reached),
-  `symlink_refused` and `not_regular` (the database or its directory is a link,
-  or not a regular file or directory), and `unreadable` (a permission or I/O error). The daily sync's own
+  `symlink_refused` and `not_regular` (the database, its directory or its
+  `.rpm.lock` is a link, or not a regular file or directory), and `unreadable` (a permission or I/O error). The daily sync's own
   constrained token does not carry the reason yet; read it from the agent log
   (where that is, `--log-file` or the console and your service manager, is under
   "Where the lines go" in the Guardian `T_*` log-lines entry of

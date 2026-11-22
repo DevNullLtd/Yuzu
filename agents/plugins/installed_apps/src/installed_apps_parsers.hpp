@@ -118,7 +118,7 @@ inline void strip_trailing_cr(std::string& line) {
 }
 
 // An rpm package for `list`: version is VERSION-RELEASE, the publisher the VENDOR ("-" when unset, or the
-// "(none)" rpm printed for an absent tag, as the old parse_rpm_list read it),
+// "(none)" rpm printed for an absent tag, as the old CLI path read it),
 // the install date rpm's C-locale `%c` form of INSTALLTIME (empty when the tag is absent).
 // `to_local_tm` is injected (localtime_r in the plugin) so this stays timezone-free and pure.
 [[nodiscard]] inline AppRecord app_record_from_rpm(const yuzu::shared::RpmPackage& p,

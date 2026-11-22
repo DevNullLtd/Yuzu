@@ -2009,8 +2009,8 @@ does not, or the reverse.
   which `dpkg-query` never read) now reports them: new install rows and install events for that host. Each
   package there is a control file with no `Status` field, plus a `.md5sums` sibling that is skipped; a present
   file is read as installed, and a file that does carry a `Status` is held to the same three-word rule. The
-  converse is also new: a host with a healthy status file and one `status.d` control file that is not exactly one installed stanza
-  (unparseable, zero-byte, comment-only, two stanzas, or a lone not-installed stanza) is
+  converse is also new: a host with a healthy status file and one `status.d` control file that does not hold exactly one installed stanza
+  (unparseable, zero-byte, comment-only, two installed stanzas, or only a not-installed one) is
   degraded (`dpkg_status_d:corrupt`, no rows) where `dpkg-query` ignored the directory, and the status file's own
   packages are withheld with it, because a roster without the `status.d`-only packages would be published as the
   host's complete one. The remedy is to remove the file or give it a leading dot (hidden names are skipped).
@@ -2023,7 +2023,8 @@ does not, or the reverse.
   the older layout the sysimage link is seen before the `/var/lib/rpm` directory it points at; a populated directory read
   after a link that hides a different database is refused too. The current Fedora, RHEL and SUSE layout
   (`/var/lib/rpm` linking to the sysimage copy, which is read first) and the older one are unaffected; a link to a
-  populated directory elsewhere, seen before an emptied or a populated database is accepted, is refused. A link on a
+  populated directory elsewhere is refused when it is seen before a populated database is accepted, or whatever
+  candidate it is on when no candidate yields a package (an emptied database does not end the search). A link on a
   candidate later than the accepted directory is not examined (#8574). A regular file where an rpm
   candidate directory belongs is `rpmdb:not_regular`, not an absent database.
 - An rpm sqlite database without its WAL sidecars is readable by an unprivileged account (measured on one
@@ -2073,7 +2074,7 @@ so the writer's status-only section keeps the server's stored rows (the `v3:` he
 file and `status.d`; 32 MiB per rpm header; 1 GiB of rpm headers read; and 8 MiB of text KEPT across the rpm headers
 in total, charged apart from the bytes read because one stored string can be named by several fields of a hostile
 header, so what a record keeps is a multiple of what it was charged for reading) and every damaged record
-degrades the whole read instead of returning a shorter roster. Reading rpm signer data and non-installed dpkg
+degrades the whole read instead of returning a shorter roster (except a Berkeley DB hash page that is zeroed or retyped to free or overflow, which has no checksum: #8545). Reading rpm signer data and non-installed dpkg
 states onto the wire (slot 14 of the v3 record, which the server consumes without keeping) is NOT part of this
 change; it needs a server change and is tracked as SAM-45b (#8361).
 
