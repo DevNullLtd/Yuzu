@@ -638,7 +638,12 @@ prerequisites:
    every deterministic batch has a durable completion acknowledgement under the ADR-0006
    amendment and its per-batch manifest verifies. An HTTP success alone cannot authorize reap.
    `gc_sweep` reaps warm `criteria_run` members only when their TTL has passed
-   **and** `exported_at` is set. An unexported set stays warm and readable. Retry eligible batches with
+   **and** `exported_at` is set, until terminal expiry at final plus 90 days. Until then
+   an unexported set stays warm and readable. At terminal expiry an unconfirmed export
+   expires with one durable counts-only loss audit, disposal and a single reservation
+   release as specified by [ADR-0006](0006-server-postgresql-substrate.md#terminal-expiry-during-an-outage).
+   An audit or commit failure hides the expired verdicts and preserves the charge until a
+   successful retry. Fence competing export completion. Retry eligible batches with
    bounded concurrency, jittered backoff and bounded recovery throughput. Release PostgreSQL
    transactions and connections before waiting for ClickHouse.
 
@@ -670,7 +675,7 @@ prerequisites:
    If an act phase needs per-device evidence, that is the act phase's decision. Accepted cost: after
    90 days the record says what the run asked, over how many devices, and how many matched, but
    not which devices were in the cohort or what any device's verdict was, because the summary event
-   carries counts only (R11.7).
+   carries counts only (R11.7). A terminal export-loss event under R11.4 also carries counts only.
 9. **A release may ship runs before the cold copy exists** (D61). Runs land in PR 1.10 and the
    export and reap guard in PR 1.13 (*Slices*). A release tagged between the two keeps a run's
    verdicts only for the warm window, final plus 20 minutes by default (R11.2); after that only the
@@ -859,7 +864,7 @@ writer (D34; `sync_source_installed_software.cpp:1099-1111`).
 | 1.10 | Criteria runs: the `CriteriaRun` securable and its mirrors, class 2 reworded and `CriteriaRun:Read` floored (R9.1, R9.2; D19, D39); the operator-tier and supervised-tier rows (D58, D59); `POST /api/v1/criteria-runs` and MCP `create_criteria_run` with named-input combinators, `"logic":"k3"` and the verdict mapping (R4.4, R4.6); the `criteria_run` kind, cohort and excluded count (R9.3, R9.4); the read at start and settling at the deadline (R6.1 to R6.3, R6.6); `kMaxRunWindow` and its refusal (R6.8; D67); write-once verdict and cause columns (R7.1); the status table and counts (R8; D56); the creation audit verb and the summary event at final (R11.7); `ttl_at` from creation and the warm setting (R11.1, R11.2), with the warm-only retention stated in the user manual, the `changelog.d/` fragment and the upgrade note (R11.9; D61); the matched-only atom and incomplete-set marking (R14.1 to R14.3; D54). | 1.2 to 1.5, 1.9 | authentication and RBAC; authorization-topology floor; service-scoped confinement (the new route refuses a service-scoped token); MCP server (`mcp_policy.hpp`); headless platform (a new REST route and MCP tool); agentic-first; pre-auth body cap and MFA step-up (a new mutating route must be classified in both tables); scope walking (`agent_registry.cpp`); Postgres substrate (member columns); clock-guarded retention (`ttl_at` for the new kind); observability and data architecture (the audit verb and event) |
 | 1.11 | The read on a device's first `ReportInventory` or `ProxyInventory` receipt in the window (R6.4): the durable waiter rows, their replica-local index and the reconciliation pass (R6.5; D65); the receipt claim, the deadline claim and the drain of in-flight claims (R7.5); the fail-closed authority recheck at the receipt read and its acceptance test (R9.5). | 1.10 | agent daily-sync (the two handlers); gateway-upstream peer authorization (`gateway_service_impl.*`); Postgres substrate (the waiter table); fenced leader election (two new background loops in `background_jobs.hpp`); authentication and RBAC (a fail-closed recheck) |
 | 1.12 | Re-eval of `criteria_run` sets: the floor on either securable, `load_owned`, the gate by stored kind, the MCP row, the approval pre-check and the ticket bound to the kind and the input-spec digest; the route description; a test that a service-scoped re-run is refused (R12.1, R12.2, R12.6, R12.7, R9.9; D42, D53, D58, D59). | 1.10 | MCP server (the approval pre-check); authentication and RBAC; service-scoped confinement; headless platform (a changed approval gate); agentic-first A5; scope walking |
-| 1.13 | Export at final to the ClickHouse cold store: the `ReplacingMergeTree` table, the deterministic batches and `insert_deduplication_token` on `ClickHouseSink`, `exported_at`, the reap guard in `gc_sweep`, cross-replica admission reservations, bounded retries, and capacity metrics and alerts (R11.3 to R11.6); retain the authorization header, route verified cold reads, reap warm members and expire headers in the single clock-guarded sweep (R11.1 and the ADR-0006 amendment); verify restore, disposal, authorization, the authenticated login warning and MCP outage notification; removes PR 1.10's warm-only retention statement from the user manual, in the same change (R11.9; D61). | 1.1, 1.10 | Authentication and RBAC (warm/cold read parity); Postgres substrate (the exception; `deploy/` for `release-deploy`); clock-guarded retention (`gc_sweep`'s predicate); observability (the metric and the shipped alert rule); data architecture |
+| 1.13 | Export at final to the ClickHouse cold store: the `ReplacingMergeTree` table, the deterministic batches and `insert_deduplication_token` on `ClickHouseSink`, `exported_at`, the reap guard in `gc_sweep`, cross-replica admission reservations, bounded retries, and capacity metrics and alerts (R11.3 to R11.6); retain the authorization header, route verified cold reads, reap warm members and expire headers in the single clock-guarded sweep (R11.1 and the ADR-0006 amendment); verify restore, terminal outage expiry and loss audit, single release, disposal, authorization, the authenticated login warning and MCP outage notification; removes PR 1.10's warm-only retention statement from the user manual, in the same change (R11.9; D61). | 1.1, 1.10 | Authentication and RBAC (warm/cold read parity); Postgres substrate (the exception; `deploy/` for `release-deploy`); clock-guarded retention (`gc_sweep`'s predicate); observability (the metric and the shipped alert rule); data architecture |
 
 Every PR that changes C++ also triggers the C++ conventions and resource-ownership rows, and
 `docs-writer` reviews every PR. These are the rows this design reaches; each PR's governance run
@@ -935,7 +940,9 @@ response-store cutover, bounded incident dispatch and ADR-1013's digest.
     limit of its own if `kMaxPerOwner` counts `criteria_run` sets separately (*Not decided here*).
   - During a cold-export outage, outstanding verdicts consume their reserved warm capacity. Admission closes at the configured limit (R11). A bulk response sink outage pauses live waves (R13).
   - Where the cold tier is on, ClickHouse is a required, stateful service in SOC 2 scope.
-  - After 90 days only the run's summary remains, not any device's verdict (R11.8).
+  - At final plus 90 days no device verdict remains visible. The counts-only audit summary
+    survives (R11.8). If export was unconfirmed, verify one loss audit and one reservation
+    release across retries (R11.4).
   - In the two-valued mode, "not a member" can mean "does not match" or "unknown"; only K3 tells
     them apart, and the documentation must say so.
 - **Neutral.** Config criteria that need live inputs (`config A OR config B`) wait for slice 3.

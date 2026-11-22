@@ -167,11 +167,11 @@ A revoked `CriteriaRun:Read` grant denies detail and count requests before and a
 Fail closed when ownership or authority cannot be established. If an authorized cold read
 cannot verify its data, return an availability error for the whole query, including counts.
 At finalization record the expected count of distinct device verdicts and one cold expiry
-instant, final plus 90 days. For a confirmed export, bound header and verdict visibility
-to that instant, independently of physical TTL cleanup. Preserve full cold retention through partition boundaries. The export manifest records each deterministic batch number, device count and digest
-of its ordered verdict records. Verify the complete export against that manifest in
-the same snapshot as the read,
-before filtering or paginating. A missing or divergent batch fails the read even when the
+instant, final plus 90 days. Bound header and verdict visibility to that instant, independently of
+physical TTL cleanup. Preserve full cold retention through partition boundaries. The export
+manifest records each deterministic batch number, device count and digest of its ordered
+verdict records. Verify the complete export against that manifest in the same snapshot as
+the read, before filtering or paginating. A missing or divergent batch fails the read even when the
 sink is reachable. Verify both copies after restore before serving or resuming reaping.
 If the warm source survives, retry missing batches. Otherwise recover the cold backup.
 
@@ -190,11 +190,29 @@ including any required replication acknowledgements. A transport status or a que
 insert alone cannot establish completion. Retry ambiguous or partial delivery with the
 same batch identities, including across restart and upgrade. Record an empty final
 run as a complete zero-batch export. Verify exact counts before merges. Re-check
-PostgreSQL `ttl_at` and confirmed export inside the warm-reap transaction. Keep a failed export readable warm.
-An outage extending beyond the full cold retention period leaves two requirements in
-tension: retaining the only copy pending confirmation and disposing of per-device data at
-day 90. The terminal disposition of an unexported run in that case awaits an owner ruling.
-Per-device verdicts are working data. The counts-only audit event follows audit retention.
+PostgreSQL `ttl_at` and confirmed export inside the warm-reap transaction. Until terminal
+expiry, keep a failed export readable warm. Per-device verdicts are working data. The counts-only audit event follows audit retention.
+
+### Terminal expiry during an outage
+
+On 2026-11-22 Nathan decided that a run without a confirmed export expires at final
+plus 90 days, including when ClickHouse remains offline. At that deadline, stop serving
+its verdicts and fence its exporter. Serialize the terminal transition with export
+acknowledgement on the PostgreSQL run record, using the same guarded database clock.
+A confirmed export follows normal expiry. An incomplete or unconfirmed export produces
+one durable, counts-only loss event keyed by run and terminal transition. Record the run,
+expiry time, reason, expected verdict count and count with confirmed durable receipts,
+without device IDs. This event supplements the ordinary summary emitted at final.
+
+Commit the loss audit, removal of retained warm data and release of its actual reservation
+as one recoverable outcome. A failed audit or commit must leave the expired data
+inaccessible and still charged for retry. Restart, simultaneous replicas or an ambiguous
+commit must produce one audit and one release. In-flight or retried batches cannot revive
+the expired run; partial cold copies remain inaccessible and subject to the original TTL.
+A restored database must reconcile expiry before serving or resuming export. Packet 1.13
+tests an outage across day 90 with a partly acknowledged run, competing expiry and
+acknowledgement, audit failure, restart and retry. Verify the loss event, disposal,
+released capacity, refusal of reads, and absence of resurrection after recovery.
 
 ### PostgreSQL capacity during an export outage
 
@@ -213,7 +231,7 @@ If the request cannot fit even with an empty backlog, return a permanent size-li
 backlog consumes the budget, headroom is low, or capacity cannot be established, refuse new
 criteria work before materialization with a retryable capacity error. Ordinary reads and
 unrelated writes continue. Admitted runs have room to finish, and unexported verdicts remain
-available. Resume admission after pressure falls below a recovery threshold.
+available until terminal expiry. Resume admission after pressure falls below a recovery threshold.
 
 Bound export batch size, concurrent work and recovery throughput across replicas. Release database
 transactions and connections before waiting on ClickHouse. On a sink outage, back off retries
