@@ -428,16 +428,18 @@ struct MacSource {
     using detail::kMacTok;
     using detail::refuse;
     const Facet f = req.facet;
-    switch (mac_facet_answer(f)) {
+    const MacFacetAnswer a = mac_facet_answer(f);
+    switch (a) {
     case MacFacetAnswer::nice_only:
         break;
     case MacFacetAnswer::not_exposed_by_libproc:
-        return Inspection{StatusState::unsupported,
-                          detail::facet_token(f, "not_exposed_by_libproc", kMacTok),
-                          {}};
     case MacFacetAnswer::no_os_equivalent:
         return Inspection{StatusState::unsupported,
-                          detail::facet_token(f, "no_os_equivalent", kMacTok),
+                          detail::facet_token(f,
+                                              a == MacFacetAnswer::no_os_equivalent
+                                                  ? "no_os_equivalent"
+                                                  : "not_exposed_by_libproc",
+                                              kMacTok),
                           {}};
     }
 

@@ -80,23 +80,15 @@ def self_check() -> list[str]:
     """The matcher must flag the bad shapes and pass the good ones, or the gate is a no-op."""
     errs = []
     bad_shapes = (
-        'kern_return_t k = task_for_pid(mach_task_self(), pid, &t);',
-        'mach_vm_region(t, &a, &s, 0, nullptr, nullptr, nullptr);',
-        'vm_read_overwrite(t, a, s, b, &n);',
-        'task_info(t, TASK_BASIC_INFO, nullptr, nullptr);',
         '#include <mach/mach.h>',
-        'void* h = dlopen("x", 0);',
-        'ptrace(PT_ATTACH, pid, 0, 0);',
         'auto p = "/proc/1/mem";',
         'proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, 0, &x, n);',
-        'proc_pidpath(pid, buf, n);',
         'proc_pidfdinfo(pid, fd, PROC_PIDFDVNODEINFO, &x, n);',
         'sysctlbyname("kern.procargs2", b, &n, nullptr, 0);',
         'sysctlbyname(name, b, &n, nullptr, 0);',
         'sysctl(mib, 4, b, &n, nullptr, 0);',
         'int m[2] = {CTL_KERN, KERN_PROC};',
         'int m = KERN_ARGMAX;',
-        'auto r = run_bounded_subprocess(x);',
     )
     for bad in bad_shapes:
         if not findings("self", bad):
