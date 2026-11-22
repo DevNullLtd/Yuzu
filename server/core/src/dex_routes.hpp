@@ -357,17 +357,27 @@ public:
     /// `RestApiV1`/`McpServer`'s own unwired contract for the identical seam,
     /// adapted to this dashboard surface's 200-not-503 fragment posture since
     /// htmx drops 4xx/5xx bodies).
+    ///
+    /// It is also the SECOND gate of the Apps tab's Usage view (`/fragments/dex/apps/usage`),
+    /// called as `Forensics:Read` after `GuaranteedState:Read`, in the order of
+    /// GET /api/v1/dex/apps/usage, against a throwaway response (the gate still writes its own
+    /// denial row). The view then writes one `dex.apps.usage.view` audit row, before the read and
+    /// failing closed, and passes the gate's scope to `DexApi::apps_usage`. Unwired, the Usage
+    /// view answers the Stability page with "the permission check could not be completed".
     using FleetReadFn =
         std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
                                            const std::string& securable_type,
                                            const std::string& operation)>;
 
-    /// The DexApi the Apps tab reads (`apps()`), the same model GET /api/v1/dex/apps serves.
+    /// The DexApi the Apps tab reads (`apps()`), the same model GET /api/v1/dex/apps serves, and
+    /// that its Usage view reads (`apps_usage()`, behind `FleetReadFn`'s Forensics:Read gate and the
+    /// `dex.apps.usage.view` audit row), the same model GET /api/v1/dex/apps/usage serves.
     /// A setter, not a `register_routes` parameter: server.cpp registers this object before
     /// it builds the DexApi. It follows the convention of `McpServer::set_dex_api` and
     /// `SettingsRoutes::set_dex_apps_fn`: set once before the listener starts, read
     /// unsynchronised per request. Unset: the Apps tab answers an error panel with reason
-    /// `not_wired` and logs it (one line per interval). The wiring is pinned by
+    /// `not_wired` and logs it (one line per interval); the Usage view answers its own
+    /// `usage_unavailable` panel with detail `not_wired`. The wiring is pinned by
     /// tests/test_dex_apps_wiring_lexical.py: server.cpp must hand this route its DexApi.
     void set_dex_api(std::shared_ptr<const DexApi> api) { dex_api_ = std::move(api); }
 

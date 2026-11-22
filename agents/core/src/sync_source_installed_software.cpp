@@ -117,8 +117,9 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
     std::optional<yuzu::shared::StatusLevel> level;
     std::string reason;
     for_each_line(out, [&](std::string_view line) {
-        // One more than the widest row (store rows are nine tokens, driver rows ten) so an
-        // over-wide row fails the `!= N` width checks instead of being truncated to a valid width.
+        // Each caller passes its widest row plus one (store rows are nine tokens, driver rows ten,
+        // Homebrew package rows eleven) so an over-wide row fails the `!= N` width checks instead
+        // of being truncated to a valid width.
         const auto tok = split_tokens(line, max_tokens, escaped);
         if (yuzu::shared::is_status_line(tok)) {
             if (auto row = yuzu::shared::parse_status_row(tok, action)) {
@@ -166,6 +167,15 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
 constexpr std::string_view kActionManagers = "managers";
 constexpr std::string_view kActionPackages = "packages";
 constexpr std::string_view kActionStorePackages = "store_packages";
+
+// The `packages` row widths and the Homebrew field positions (parse_pkg_inventory_packages_output
+// holds the grammar): the five-token row every manager can emit, and the eleven-token Homebrew
+// row that adds install_time|tap|on_request|scope|owner|prefix after the kind.
+constexpr std::size_t kPkgRowTokens = 5;
+constexpr std::size_t kHomebrewRowTokens = 11;
+constexpr std::size_t kHomebrewInstallTimeTok = 5; // epoch seconds, or `-`
+constexpr std::size_t kHomebrewScopeTok = 8;       // `machine` or `user`
+constexpr std::size_t kHomebrewPrefixTok = 10;     // `/opt/homebrew`, `~/homebrew`, ...
 
 struct ManagerEcosystem {
     std::string_view manager;
@@ -323,18 +333,33 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
 }
 
 AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
-    // package|homebrew|<id>|<version>|<formula|cask>
+    // package|homebrew|<id>|<version>|<formula|cask>|<install_time or ->|<tap or ->|<on_request or ->|<machine|user>|<owner or ->|<prefix>
+    // package|homebrew|<id>|<version>|<formula|cask>            (the five-token shape, kept: see below)
     // package|chocolatey|<id>|<version or ->|pkg
-    // A row whose id carries an escaped `\|` splits wider than five tokens, fails the width
+    // A row whose id carries an escaped `\|` splits wider than its grammar, fails the width
     // check below and is dropped (a gap, never a shifted row); this adapter does not unescape.
+    // Only the EXISTING columns take the extended fields: install_time -> install_date and the
+    // prefix -> install_location (still gated by machine_install_location in the v3 writer).
+    // tap, installed_on_request and the owner have no column and are not mapped. A `user`-scope
+    // row (or any scope other than `machine`) is seen and not mapped: a user's own prefix is
+    // never machine software.
+    // Five or eleven tokens are accepted for either manager ON PURPOSE: five is the width this
+    // adapter has always accepted, kept as it was. A wrong-width row is dropped under a
+    // `supported` status, and a supported answer with fewer rows is an authoritative section,
+    // so narrowing the accepted widths would delete the device's stored Homebrew rows. A
+    // five-token Homebrew row maps as it always did, with empty install_date and
+    // install_location.
     return adapt_pkg_inventory(out, kActionPackages,
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
-        if (tok[0] != "package" || tok.size() != 5)
+        if (tok[0] != "package" ||
+            (tok.size() != kPkgRowTokens && tok.size() != kHomebrewRowTokens))
             return false;
         const ManagerEcosystem* m = find_manager(tok[1]);
         if (!m || m->package_action != kActionPackages)
             return false;
+        if (tok.size() == kHomebrewRowTokens && tok[kHomebrewScopeTok] != "machine")
+            return true;
         SwEntry e;
         e.name = clamp_field(tok[2], kV3MaxFieldLen);
         if (e.name.empty())
@@ -351,9 +376,19 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
         // Chocolatey package whose nuspec was unreadable.
         e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kV3MaxFieldLen);
         e.ecosystem = std::string(m->ecosystem);
+        if (tok.size() == kHomebrewRowTokens) {
+            const auto digits = [](std::string_view v) {
+                return !v.empty() && std::all_of(v.begin(), v.end(),
+                                                 [](char c) { return c >= '0' && c <= '9'; });
+            };
+            if (digits(tok[kHomebrewInstallTimeTok]))
+                e.install_date = clamp_field(tok[kHomebrewInstallTimeTok], kV3MaxFieldLen);
+            if (tok[kHomebrewPrefixTok] != "-")
+                e.install_location = clamp_field(tok[kHomebrewPrefixTok], kV3MaxFieldLen);
+        }
         entries.push_back(std::move(e));
         return true;
-    });
+    }, /*escaped=*/false, /*max_tokens=*/kHomebrewRowTokens + 1); // the widest row, plus one
 }
 
 AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out) {

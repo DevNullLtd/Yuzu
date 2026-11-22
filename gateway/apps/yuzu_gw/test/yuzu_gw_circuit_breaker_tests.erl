@@ -29,6 +29,9 @@ circuit_breaker_test_() ->
       {"answers that blame the request never open the breaker", fun request_faults_do_not_trip/0},
       {"a request-fault answer from a half-open probe leaves the breaker half open", fun request_fault_probe_leaves_half_open/0},
       {"a request-fault answer neither resets nor extends the run of failures", fun request_fault_leaves_the_run/0},
+      {"the uniform re-registration refusal (UNAUTHENTICATED) never opens the breaker", fun reregistration_refusal_does_not_trip/0},
+      {"the re-registration refusal leaves a half-open breaker half open and the run of failures alone", fun reregistration_refusal_is_neutral/0},
+      {"any other UNAUTHENTICATED answer still counts (the peer guard refusing the gateway)", fun other_unauthenticated_still_trips/0},
       {"calls ended by one lost connection count as one failure", fun one_lost_connection_is_one_failure/0},
       {"each lost connection counts, so a server dropping every connection still opens the breaker",
        fun each_lost_connection_counts/0},
@@ -179,6 +182,40 @@ request_faults_do_not_trip() ->
          ?assertEqual(closed, yuzu_gw_upstream:circuit_state())
      end || Status <- [<<"3">>, <<"5">>, <<"6">>, <<"9">>, <<"11">>]],
     ok.
+
+-define(REFUSAL, <<"re-registration requires proof of the agent identity">>).
+
+%% WP01: far more refusals than the threshold (3): the breaker stays closed.
+reregistration_refusal_does_not_trip() ->
+    meck:expect(yuzu_grpc_client, unary,
+                fun(_, _, _, _, _) -> {error, {<<"16">>, ?REFUSAL}, #{}} end),
+    [?assertMatch({error, {<<"16">>, _}}, yuzu_gw_upstream:proxy_register(#{info => #{}}))
+     || _ <- lists:seq(1, 10)],
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
+
+reregistration_refusal_is_neutral() ->
+    Fail = fun() ->
+               meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, connection_refused} end),
+               yuzu_gw_upstream:proxy_register(#{info => #{}})
+           end,
+    Refuse = fun() ->
+                 meck:expect(yuzu_grpc_client, unary,
+                             fun(_, _, _, _, _) -> {error, {<<"16">>, ?REFUSAL}, #{}} end),
+                 yuzu_gw_upstream:proxy_register(#{info => #{}})
+             end,
+    Fail(), Fail(), Refuse(),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    Fail(), %% the refusal neither reset nor extended the run: the third failure opens it
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(half_open, await_state(half_open)),
+    Refuse(), %% a refused probe leaves it half open (no proof of recovery)
+    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()).
+
+other_unauthenticated_still_trips() ->
+    meck:expect(yuzu_grpc_client, unary,
+                fun(_, _, _, _, _) -> {error, {<<"16">>, <<"gateway peer not authorized">>}, #{}} end),
+    [yuzu_gw_upstream:proxy_register(#{info => #{}}) || _ <- lists:seq(1, 3)],
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
 
 server_fault_trips(Status) ->
     meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, {Status, <<"x">>}, #{}} end),
