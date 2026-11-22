@@ -203,7 +203,7 @@ Every state reads in words and never as a number:
   printed escaped, so a tag value of `other` or `(untagged)` prints as that value.
 - **Refusals.** One panel per cause, naming the lever that helps: busy, a read
   that does not fit its time limit (`fleet_too_large`, where only a single
-  platform helps), an application list or group or tag read that failed, no fleet
+  platform shrinks the read; the first successful read clears the state), an application list or group or tag read that failed, no fleet
   source, an unknown group, a slice that does not fit together, and an audit
   record that could not be stored. A refusal prints the page chrome and the
   controls and nothing derived from a model.
@@ -318,9 +318,10 @@ for every caller admitted today (with RBAC off only an administrator passes, and
 
 ### Cache, budget and failure
 
-- A built answer is reused for 30 seconds for an identical request and an
-  identical visible device set, so `as_of` can be up to 30 seconds old. A failure
-  is never cached.
+- A built answer is reused for 30 seconds after its build completes, for an
+  identical request and an identical visible device set. `as_of` is the build
+  snapshot time, taken when the build began, so a slow build can leave a cached
+  answer older than 30 seconds. A failure is never cached.
 - At most 4 fleet usage reads run at once. A request over that is a `503` with
   `concurrency_budget`, retryable. A usage request also takes one slot of the
   Apps list's own read budget, so heavy use of one can make the other answer
