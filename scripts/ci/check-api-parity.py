@@ -521,6 +521,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # v1-keyed `exception:#8096` row. Its MCP twin is owed; the row is retired when that tool lands.
 # 197 -> 196 (fleet application usage over MCP): get_dex_apps_usage twins GET /api/v1/dex/apps/usage,
 # so the v1-keyed exception row and its pin are removed.
+# The DEX Apps tab usage view row (GET /fragments/dex/apps/usage) is `twinned` with mcp_twin
+# get_dex_apps_usage, so it adds nothing to the baseline.
 BASELINE_UNTWINNED = 196
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only

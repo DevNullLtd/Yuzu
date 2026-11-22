@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """#7520 / #7519 wiring pins for the DEX Apps page (lexical, no build required).
 
-Three properties the C++ unit tests cannot see, because each is a property of which source line
+Five properties the C++ unit tests cannot see, because each is a property of which source line
 hands what to whom, not of behaviour:
 
   1. THE PAGE HAS ITS API. server.cpp must call `dex_routes_->set_dex_api(<x>)` with the very
@@ -28,8 +28,14 @@ hands what to whom, not of behaviour:
      missing one is a refused slice or an `invalid_request` on a healthy server. And the group
      closure reads the members BEFORE the group's existence, so a group deleted between the two
      reads is an `unknown_group` 400 and never a cached whole-population 200.
+  5. THE DASHBOARD USAGE VIEW HAS ITS TWO CLOSURES. The `dex_routes_->register_routes(` call must
+     be handed `dex_group_list_fn` and `fleet_read_fn`. Both parameters default to empty, so
+     dropping either one compiles: GET /fragments/dex/apps/usage then answers "the permission
+     check could not be completed" (no `fleet_read_fn`) or shows no group list (no
+     `dex_group_list_fn`) on a healthy server, while every route test still passes, since each
+     builds its own DexRoutes and passes its own closures. No unit test compiles server.cpp.
 
-  5. THE MCP TOOL HAS ITS READ. `tool_deps.dex_apps_usage_fn` must capture the very object
+  6. THE MCP TOOL HAS ITS READ. `tool_deps.dex_apps_usage_fn` must capture the very object
      `make_local_dex_api` returned. Without it get_dex_apps_usage answers an internal error on a
      healthy server, and every handler test still passes because each injects its own closure.
 
@@ -103,6 +109,17 @@ def problems(server_text: str) -> list:
         found.append("server.cpp: the four dex_usage degrade reasons (pool_acquire_timeout, query_error, "
                      "statement_timeout, concurrency_budget) are not pre-seeded on "
                      "yuzu_server_guardian_read_degrade_total with source dex_usage")
+    regs = list(call_args(code, "dex_routes_->register_routes("))
+    if len(regs) != 1:
+        found.append("server.cpp: expected exactly one dex_routes_->register_routes( call, "
+                     f"found {len(regs)}")
+    else:
+        for name, why in (("dex_group_list_fn", "the Apps tab Usage view and its scope selector would "
+                                                "have no management-group list"),
+                          ("fleet_read_fn", "the Apps tab Usage view would answer \"the permission "
+                                            "check could not be completed\" on a healthy server")):
+            if not re.search(rf"\b{name}\b", regs[0]):
+                found.append(f"server.cpp: dex_routes_->register_routes( is not handed `{name}` ({why})")
     sets = [a.strip() for a in call_args(code, "dex_routes_->set_dex_api(")]
     if not sets:
         found.append("server.cpp: no call to dex_routes_->set_dex_api( (the Apps tab would answer not_wired)")
@@ -155,6 +172,10 @@ class DexAppsWiring(unittest.TestCase):
         cases["MCP usage closure captures another object"] = mutated(
             "[dex_api](const std::string& window, const std::string& platform_scope,",
             "[other_api](const std::string& window, const std::string& platform_scope,")
+        cases["register_routes not handed the group list fn"] = mutated(
+            "dex_perf_api, dex_group_list_fn,", "dex_perf_api, {},")
+        cases["register_routes not handed the fleet read fn"] = mutated(
+            "            fleet_read_fn);\n\n        // NetworkRoutes", "            {});\n\n        // NetworkRoutes")
         i, j = base.index("dex_usage.group_members = [this]"), base.index("dex_usage.tag_values = [this]")
         region = (base[i:j].replace("get_members_checked", "@@").replace("get_group_checked", "get_members_checked")
                   .replace("@@", "get_group_checked"))
