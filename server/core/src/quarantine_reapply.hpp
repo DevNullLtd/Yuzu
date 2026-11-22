@@ -19,10 +19,12 @@
 ///
 /// Two layers, split by I/O:
 ///
-/// LAYER A (this header, inline, PURE — no I/O, standard library only; the one
-/// out-of-line helper, `combined_output`, takes a forward-declared
-/// `StoredResponse`): the whitelist mapper, the params builder, and the
-/// agent-side status-reply parser. Mirrors `quarantine_dispatch_decision.hpp`'s
+/// LAYER A (this header, PURE — no I/O, standard library only; most of it is
+/// inline, but `map_whitelist_to_exceptions`, `build_quarantine_reapply_params`,
+/// `parse_containment_reply` and `combined_output` are defined out of line in
+/// `quarantine_reapply.cpp`, which includes the store and response-store headers
+/// for Layer B; `combined_output` takes a forward-declared `StoredResponse`): the
+/// whitelist mapper, the params builder, and the agent-side status-reply parser. Mirrors `quarantine_dispatch_decision.hpp`'s
 /// "pure on purpose" discipline — a unit test can exhaust every branch
 /// without a store, an agent, or a build dir.
 ///
@@ -34,7 +36,7 @@
 /// thin adapter closing over their own dispatch shape — MCP's 7-param
 /// caller-typed `DispatchFn` (`DispatchCaller` + audit + response shaping
 /// stay in `mcp_server.cpp`) and the reconciler's 6-param
-/// `command_dispatch_fn` (`server.cpp:16466`) — so this file stays
+/// `command_dispatch_fn` (wired in `server.cpp`) — so this file stays
 /// transport-agnostic. Each caller keeps its OWN error strings, audit calls,
 /// and response envelope; this function only owns "what to dispatch and
 /// whether the stored row was safe to dispatch at all".
@@ -61,6 +63,26 @@
 /// dispatch refusal), but dispatching `firewall.quarantine` for it would put
 /// containment back under a release that is in flight. The chokepoint refuses
 /// it (`release_pending`), reading the row it is about to dispatch for.
+///
+/// WHY THE APPLY IS CLAIMED (#7613): a release is confirmed by the device's `inactive`
+/// answer, and an apply sent while that answer is on its way changes the state the answer
+/// described. Ending the record on the stale answer would leave a contained device with no
+/// record and nothing owed. So this chokepoint calls `QuarantineStore::claim_apply` before the
+/// dispatch (the claim moves the record's apply generation and marks an apply in progress). A
+/// dispatch that returned is NOT a delivery (the gateway path only queues the command) and a
+/// delivered command is NOT a run (the agent executes commands on a thread pool, and the plugin's
+/// own gate orders them by the order workers reach it). So when the dispatch reached an agent the
+/// claim is KEPT, and handed back in `ContainmentReapplyResult::held_claim_gen`: it stays live
+/// until the caller has consumed the apply's terminal reply (then it drops it with
+/// `release_apply_claim`) or until `kApplyClaimTtlSecs` passes. While it is live
+/// `apply_fence_token` reads empty, so a confirmed end, whether it rests on a release's `inactive`
+/// answer or on a status read, fails closed. A dispatch that threw or reached nobody delivered
+/// nothing, and the claim is dropped here. The GENERATION outlives the claim: whoever will act on
+/// a device's `inactive` answer reads the token (`apply_fence_token`) BEFORE it sends the command
+/// whose answer it will use, and the write that ends the record presents it; an apply claimed
+/// after the read moves the generation and the end is refused. This relies on commands to one
+/// device arriving in the order one server dispatched them; the residuals are in
+/// `quarantine_containment_reconciler.hpp`.
 ///
 /// WHAT "CONFIRMED" MEANS: the device reports its rules in force and
 /// enforcing (`status|active`, or `status|active_unproven` when no probe
@@ -98,6 +120,15 @@ inline constexpr std::string_view kContainmentExceptionsParam{"exceptions"};
 /// each address is sent twice (`/out` and `/in`), so the server allows 32.
 inline constexpr std::size_t kContainmentMaxAddresses = 32;
 inline constexpr std::size_t kQuarantineWhitelistMaxLen = 512;
+/// The two 400 / invalid-params texts for a refused whitelist, shared by `POST /api/v1/quarantine`
+/// and MCP `quarantine_device` so the twins cannot say different things (#7639). The length text
+/// is checked first: a list that is only too long is told so, instead of sending the caller to
+/// count addresses. Both numbers are pinned against the constants above in
+/// `test_quarantine_reapply.cpp`.
+inline constexpr std::string_view kWhitelistTooLongMessage{"whitelist exceeds 512 characters"};
+inline constexpr std::string_view kWhitelistInvalidMessage{
+    "whitelist must be comma-separated IPv4 or IPv6 addresses, at most 32 and 512 characters in "
+    "total"};
 
 /// Maps a stored (or request) whitelist onto the firewall plugin's `exceptions`
 /// parameter: each comma-separated address becomes `<ip>/out,<ip>/in`, order kept,
@@ -203,9 +234,9 @@ struct ContainmentReply {
 /// to retry against.
 enum class ContainmentReapplyErrorKind {
     store_error,       // get_status failed (pool/query failure)
-    no_active_record,  // get_status succeeded but returned nothing (released
-                        // between the caller's read and this call — a narrow
-                        // race, not a store failure)
+    no_active_record,  // get_status succeeded but returned nothing, or the apply claim was
+                        // refused because the record changed since the read or another apply
+                        // holds a live claim (a narrow race, not a store failure)
     whitelist_invalid, // the stored whitelist could not be mapped to exceptions
     release_pending,   // the row has a release requested: containment is not re-applied under it
 };
@@ -213,7 +244,8 @@ enum class ContainmentReapplyErrorKind {
 struct ContainmentReapplyError {
     ContainmentReapplyErrorKind kind;
     // The store's raw error message for `store_error`; a fixed human string
-    // ("quarantine record not found on retry read") for `no_active_record`;
+    // ("quarantine record not found on retry read", or "quarantine record changed or
+    // another apply is in flight") for `no_active_record`;
     // empty for `whitelist_invalid` and `release_pending` — callers that want a
     // message for those cases supply their own fixed text (the recipe
     // intentionally does not echo the rejected value back).
@@ -224,6 +256,12 @@ struct ContainmentReapplyResult {
     bool dispatch_threw{false};
     std::string command_id;
     int agents_reached{0};
+    /// The apply generation whose claim is STILL HELD, non-zero only when the dispatch reached an
+    /// agent. A dispatch that returned is not a delivery and a delivered command is not a run
+    /// (the agent executes commands on a thread pool), so the claim stays live until the caller
+    /// has consumed the apply's terminal reply and drops it with `release_apply_claim`, or until
+    /// `kApplyClaimTtlSecs` passes. A caller with no reply to wait for leaves it to expire.
+    std::int64_t held_claim_gen{0};
 };
 
 /// Caller-supplied dispatch adapter: pre-bound to plugin `firewall`, action
@@ -237,8 +275,10 @@ using ReapplyDispatchFn =
     std::function<std::pair<std::string, int>(const std::unordered_map<std::string, std::string>&)>;
 
 /// The shared recipe: `store.get_status(agent_id)` -> refuse a releasing row -> map the
-/// stored whitelist -> invoke `dispatch_fn(params)`. `out_record` receives the stored
-/// row on success (the caller typically needs `quarantined_by`/`reason`/
+/// stored whitelist -> claim the apply (`claim_apply`) -> invoke `dispatch_fn(params)` -> drop the
+/// claim (`release_apply_claim`) unless the dispatch reached an agent, in which case it is kept and
+/// returned in `held_claim_gen` for the caller to drop once the reply is consumed. `out_record`
+/// receives the stored row on success (the caller typically needs `quarantined_by`/`reason`/
 /// `quarantined_at` for its own response/audit shaping, which this function does not
 /// interpret). Returns `unexpected` without ever calling `dispatch_fn` on any
 /// `ContainmentReapplyError`.

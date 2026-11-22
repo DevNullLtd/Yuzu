@@ -4,8 +4,9 @@
 /// The pure model behind the SAM-17 lookup reads: `GET /api/v1/inventory/software` (installs) and
 /// `GET /api/v1/inventory/software/components`. It answers "how many installs, on which devices,
 /// last polled when, in what status" for an application or a component in one call. No httplib,
-/// no libpq: the route handlers inject the store reads, and the same functions can back an MCP
-/// twin later without a second copy of any rule.
+/// no libpq: the route handlers inject the store reads, and the same functions back the MCP
+/// tools query_installed_software and query_software_components (`lookup_installs` /
+/// `lookup_components`), so no rule has a second copy.
 ///
 /// Rules this file owns (each stated once, here):
 ///  * VERSION RANGE: `version_min`/`version_max` (inclusive bounds) and `vers` (a `vers:` range,
@@ -32,6 +33,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -48,13 +50,14 @@ using Params = software_catalogue::Params;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// kInstallsCsvHeader (14 columns) + the eight lookup columns + purl.
+/// The first 14 columns of kInstallsCsvHeader + the eight lookup columns + purl + package_id
+/// (package_id trails by decision, so positions 0-22 are unchanged).
 inline constexpr std::string_view kListCsvHeader =
     "agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,"
     "signature_status,distro_id,distro_version,source,"
     "hostname,last_seen,status,last_confirmed_at,install_type,install_scope,install_location,"
-    "instance_key,purl";
-inline constexpr std::size_t kListCsvColumns = 23;
+    "instance_key,purl,package_id";
+inline constexpr std::size_t kListCsvColumns = 24;
 static_assert(static_cast<std::size_t>(std::ranges::count(kListCsvHeader, ',')) + 1 ==
                   kListCsvColumns,
               "kListCsvColumns must equal the number of columns in kListCsvHeader");
@@ -263,7 +266,7 @@ struct TotalsOutcome {
 
 // ── JSON / CSV ───────────────────────────────────────────────────────────────
 
-/// device_row_json fields (unchanged) + purl (null when empty) + hostname (null when the roster does not know the
+/// device_row_json fields (incl. package_id) + purl (null when empty) + hostname (null when the roster does not know the
 /// device), last_seen (null when never synced), status, last_confirmed_at (null when 0),
 /// install_type, install_scope, install_location, instance_key.
 [[nodiscard]] nlohmann::json list_row_json(const SoftwareFleetRow& r, const DeviceFacts& facts);
@@ -283,8 +286,82 @@ void set_totals(nlohmann::json& body, const TotalsOutcome& t, bool components);
 /// `totals: null, totals_omitted: <reason>`.
 void set_totals_omitted(nlohmann::json& body, std::string_view reason);
 
+/// The row's kListCsvColumns raw cells, in kListCsvHeader's order, before any CSV escaping. The ONE
+/// projection of a list row into columns: list_csv and the XLSX export both read it, so the two
+/// formats carry the same columns from one function.
+[[nodiscard]] std::array<std::string, kListCsvColumns> list_row_cells(const SoftwareFleetRow& r,
+                                                                      const DeviceFacts& facts);
+
 [[nodiscard]] std::string list_csv(const std::vector<SoftwareFleetRow>& rows, const DeviceFacts& facts);
 [[nodiscard]] std::string components_csv(const std::vector<SoftwareComponentRow>& rows,
                                          const DeviceFacts& facts);
+
+// ── The lookup core (REST and MCP) ───────────────────────────────────────────
+
+/// Every store read one lookup call makes, bound once. The REST routes and the MCP lookup tools
+/// both call lookup_installs / lookup_components over one of these, so the version-range
+/// resolve, the scoped page, the device facts and the totals read are the same code on both
+/// surfaces (docs/api-twin-recipe.md section 4).
+struct LookupReads {
+    software_catalogue::DevicesReader installs;
+    ComponentsReader components;
+    /// Distinct versions of a title, LIVE, over the caller's scope (`scope_ids`).
+    std::function<std::optional<std::vector<std::string>>(
+        std::string_view, const std::optional<std::vector<std::string>>&)>
+        install_versions;
+    /// Distinct versions of a component (kind may be empty), LIVE, over the caller's scope.
+    std::function<std::optional<std::vector<std::string>>(
+        std::string_view, std::string_view, const std::optional<std::vector<std::string>>&)>
+        component_versions;
+    FactsReads facts;
+    TotalsReads totals;
+};
+
+/// The ONE production binding of LookupReads: the typed software store plus the device table's
+/// roster (`hostnames`, not the connected-agent registry; empty = hostnames unknown). The store
+/// must outlive every copy of the result.
+[[nodiscard]] LookupReads
+bind_lookup_reads(SoftwareInventoryStore& store,
+                  std::function<std::unordered_map<std::string, std::string>()> hostnames);
+
+enum class LookupFault { kBadRequest, kUnavailable };
+
+/// A refused lookup. `message` is the wire text (REST 400 / 503 body, MCP error message);
+/// `audit_detail` is the failure audit detail of a kUnavailable ("version read degraded" |
+/// "store degraded" | "device facts degraded" | "totals degraded") and empty for a kBadRequest.
+/// The core writes no audit row: each surface writes its own.
+struct LookupError {
+    LookupFault fault{LookupFault::kUnavailable};
+    std::string message;
+    std::string audit_detail;
+};
+
+/// One served lookup page with the facts and totals decided for it. `totals` is meaningful only
+/// when the lookup was asked for totals and `decision.serve` is true.
+template <class Row>
+struct LookupData {
+    software_catalogue::ScopedPage<Row> page;
+    DeviceFacts facts;
+    TotalsDecision decision;
+    TotalsOutcome totals;
+};
+
+/// The lookup, in the order both surfaces always ran it: version-range resolve over the caller's
+/// scope, the scoped page read, the device facts, the totals decision (`!scope.has_value()` is
+/// the gate's AdmitAll) and, when `want_totals`, the totals read. A degraded read is a
+/// kUnavailable, never an empty Ok. `rq.base.query.versions` / `rq.query.versions` are set from
+/// the resolved range here.
+[[nodiscard]] std::expected<LookupData<SoftwareFleetRow>, LookupError>
+lookup_installs(const LookupReads& io, ListRequest rq, const authz::VisibleSet& scope,
+                bool want_totals);
+[[nodiscard]] std::expected<LookupData<SoftwareComponentRow>, LookupError>
+lookup_components(const LookupReads& io, ComponentsRequest rq, const authz::VisibleSet& scope,
+                  bool want_totals);
+
+/// The JSON object both surfaces serve: list_response_json / components_response_json plus
+/// `totals` (served) or `totals: null` + `totals_omitted`. For data looked up with
+/// `want_totals` = true.
+[[nodiscard]] nlohmann::json lookup_body(const LookupData<SoftwareFleetRow>& d);
+[[nodiscard]] nlohmann::json lookup_body(const LookupData<SoftwareComponentRow>& d);
 
 } // namespace yuzu::server::software_list

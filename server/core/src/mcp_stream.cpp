@@ -128,7 +128,7 @@ void count_poison_close_failed(yuzu::MetricsRegistry* metrics) {
 
 // SSE is a line protocol: a newline in `event_type` would terminate the field and
 // let the rest of the string forge SSE lines. `data` is safe (format_sse re-prefixes
-// every line), but the type is not — strip rather than trust. The producer seam
+// every line, breaking on LF, CR and CRLF alike), but the type is not — strip rather than trust. The producer seam
 // (`publish`) is the only way a type reaches the wire.
 std::string sanitize_event_type(std::string type) {
     for (char& c : type) {

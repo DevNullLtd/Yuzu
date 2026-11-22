@@ -235,3 +235,23 @@ TEST_CASE("CVE matching: unrelated product does not match", "[vuln][match]") {
     }
     CHECK(match_count == 0);
 }
+
+// ── a numeric segment too large for long long must not overflow (UBSan-clean) ──────────────────
+
+TEST_CASE("compare_versions: an oversized segment saturates instead of overflowing", "[vuln][version]") {
+    CHECK(compare_versions("1.99999999999999999999999", "2.0") < 0);
+    CHECK(compare_versions("1.99999999999999999999999", "1.5") > 0); // saturated: larger than 5
+    CHECK(compare_versions("1.18446744073709551616", "1.0") > 0);      // 2^64 saturates, not wraps to 0
+    CHECK(compare_versions("1.99999999999999999999999", "1.99999999999999999999999") == 0);
+    CHECK(compare_versions("3.9.6", "3.10.0") < 0); // ordinary versions are unchanged
+}
+
+TEST_CASE("version_has_overflowing_segment", "[vuln][version]") {
+    CHECK_FALSE(version_has_overflowing_segment("1.2.3"));
+    CHECK_FALSE(version_has_overflowing_segment(""));
+    CHECK_FALSE(version_has_overflowing_segment("999999999999999999")); // 18 digits
+    CHECK(version_has_overflowing_segment("1000000000000000000"));     // 19 digits
+    CHECK(version_has_overflowing_segment("1.2.99999999999999999999"));
+    CHECK_FALSE(version_has_overflowing_segment("000000000000000000000001")); // leading zeros
+    CHECK_FALSE(version_has_overflowing_segment("1.99999999999999999999x")); // not all digits
+}

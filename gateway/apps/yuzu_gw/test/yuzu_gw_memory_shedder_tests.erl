@@ -54,7 +54,10 @@ validate_config_test_() ->
 %% Inactive / disabled
 %%--------------------------------------------------------------------
 
-disabled_is_inactive_test() ->
+disabled_is_inactive_test_() ->
+    {timeout, 60, fun disabled_is_inactive/0}.
+
+disabled_is_inactive() ->
     setup_apps(),
     {ok, Pid} = yuzu_gw_memory_shedder:start_link(
                   #{register => false, config => #{enabled => false}, listener_refs => []}),
@@ -71,7 +74,10 @@ system_memory_bytes_is_sane_test() ->
         N when is_integer(N), N > 0 -> ok
     end.
 
-fraction_config_does_not_crash_test() ->
+fraction_config_does_not_crash_test_() ->
+    {timeout, 60, fun fraction_config_does_not_crash/0}.
+
+fraction_config_does_not_crash() ->
     setup_apps(),
     %% A fraction-only config: active where system memory is readable (Linux CI),
     %% inactive where it is not (macOS). Either way it answers status, never fails
@@ -86,7 +92,10 @@ fraction_config_does_not_crash_test() ->
 %% Boot refuses this pair (boot_guard_test_/0); a shedder started with it all
 %% the same (a test, or a config changed under a running node) stays inactive
 %% and says so on yuzu_gw_memory_shedding_inactive.
-low_not_below_high_is_inactive_test() ->
+low_not_below_high_is_inactive_test_() ->
+    {timeout, 60, fun low_not_below_high_is_inactive/0}.
+
+low_not_below_high_is_inactive() ->
     setup_apps(),
     {ok, Pid} = yuzu_gw_memory_shedder:start_link(
                   #{register => false,
@@ -210,7 +219,10 @@ check_config_against_limit_test_() ->
 
 %% A shedder that started with high_water_bytes alone is ACTIVE with the
 %% derived low mark (it used to be inactive).
-high_only_is_active_test() ->
+high_only_is_active_test_() ->
+    {timeout, 60, fun high_only_is_active/0}.
+
+high_only_is_active() ->
     setup_apps(),
     D = fixture_dir(),
     put_file(D, "meminfo", ?MEMINFO),
@@ -561,7 +573,8 @@ memory_limit_test_() ->
       fun(D) -> {"no cgroup and no host memory: unknown", fun() -> nothing(D) end} end,
       fun(D) -> {"a cgroup path outside the namespace reads the root only",
                  fun() -> outside_namespace(D) end} end,
-      fun(D) -> {"the marks are fractions of the cgroup limit", fun() -> marks_from_cgroup(D) end} end]}.
+      fun(D) -> {"the marks are fractions of the cgroup limit",
+                 {timeout, 60, fun() -> marks_from_cgroup(D) end}} end]}.
 
 v2_container(D) ->
     put_file(D, "proc_cgroup", "0::/\n"),
@@ -673,6 +686,10 @@ darwin_host_memory_test() ->
 %% Helpers
 %%--------------------------------------------------------------------
 
+%% The first test to run in a cold VM starts gun, cowboy, telemetry and prometheus here, which can
+%% pass eunit's 5 s default test timeout and cancel the rest of the module (#7586). Every test that
+%% calls this carries its own 60 s timeout.
+%%
 %% Start the apps the shedder and listeners need, WITHOUT attaching the global
 %% prometheus telemetry handler (the plain tests do not read metrics, and a
 %% dangling handler leaks into later test modules — #336).

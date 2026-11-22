@@ -1,5 +1,6 @@
 # component_inventory -- installed software components found in application trees (Java archives
-# and the libraries nested in them). Read-only, zero subprocess. Multi-TU shape follows
+# and the libraries nested in them, and native shared libraries: ELF and Mach-O). Read-only, zero
+# subprocess. Multi-TU shape follows
 # agents/plugins/runtimes/meson.build: one portable plugin TU plus the POSIX filesystem leg, which
 # is #if-gated internally so it is listed unconditionally. The Windows leg is a later change.
 #

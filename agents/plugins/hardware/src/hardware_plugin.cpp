@@ -379,7 +379,7 @@ int do_system(yuzu::CommandContext& ctx) {
 #ifdef __linux__
     // /sys/class/dmi/id/product_serial and product_uuid are 0400 (root-owned) and the agent
     // runs unprivileged. The packaged unit grants CAP_DAC_READ_SEARCH as an ambient
-    // capability (the dev install script uses setcap on the binary instead); this in-process
+    // capability (the dev/UAT launcher uses setpriv --ambient-caps instead; no file capability, WP13/F21); this in-process
     // ifstream reads with the effective set. The agent clears its inheritable and ambient
     // sets at start, so an exec'd child such as dmidecode does NOT get it, which is why the
     // read stays in-process. Without the capability (opt-out, dev/manual launch) both

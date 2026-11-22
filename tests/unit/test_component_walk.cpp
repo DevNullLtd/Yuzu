@@ -22,9 +22,11 @@
 #include "component_fixture_tree.hpp"
 #include "component_walk.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -476,4 +478,64 @@ TEST_CASE("component walk: default limits are the roadmap values", "[runtime][co
     CHECK(l.max_rows == 20000);
     CHECK(l.max_depth == 32);
     CHECK(l.max_dir_entries == 50000);
+}
+
+TEST_CASE("component walk: the default policy is the Java scan's; a policy changes what is a candidate and what is entered",
+          "[runtime][component_walk][component_inventory]") {
+    const auto build = [](MemTree& fs) {
+        dir(fs, "/opt", {D("app"), D("Cellar"), F("libtop.so.1"), F("a.jar")});
+        dir(fs, "/opt/app", {F("libx.so"), F("b.war"), F("libx.dylib")});
+        dir(fs, "/opt/Cellar", {F("libhidden.so.1"), F("c.jar")});
+    };
+
+    SECTION("an explicit default policy gives the same result as none") {
+        MemTree a, b;
+        build(a);
+        build(b);
+        auto oa = a.ops();
+        auto ob = b.ops();
+        const auto implicit = walk(std::vector<std::string>{"/opt"}, {}, oa, a.clock + 1h);
+        const auto explicit_default = walk(std::vector<std::string>{"/opt"}, {}, ob, b.clock + 1h, WalkPolicy{});
+        CHECK(paths(implicit) == paths(explicit_default));
+        CHECK(paths(implicit) == std::vector<std::string>{"/opt/a.jar", "/opt/app/b.war", "/opt/Cellar/c.jar"});
+        CHECK(implicit.stop == Stop::complete);
+        CHECK(implicit.stats.dirs_excluded == 0);
+        CHECK(explicit_default.stats.entries == implicit.stats.entries);
+    }
+    SECTION("a candidate predicate replaces the Java names") {
+        MemTree fs;
+        build(fs);
+        WalkPolicy p;
+        p.is_candidate = [](std::string_view leaf) { return leaf.ends_with(".so") || leaf.find(".so.") != std::string_view::npos; };
+        auto ops = fs.ops();
+        const auto r = walk(std::vector<std::string>{"/opt"}, {}, ops, fs.clock + 1h, p);
+        CHECK(paths(r) == std::vector<std::string>{"/opt/libtop.so.1", "/opt/app/libx.so", "/opt/Cellar/libhidden.so.1"});
+        CHECK(r.stop == Stop::complete);
+    }
+    SECTION("skip_dir keeps the walk out of a directory by full path and counts it") {
+        MemTree fs;
+        build(fs);
+        WalkPolicy p;
+        p.skip_dir = [](const std::string& d) { return d == "/opt/Cellar"; };
+        auto ops = fs.ops();
+        const auto r = walk(std::vector<std::string>{"/opt"}, {}, ops, fs.clock + 1h, p);
+        CHECK(paths(r) == std::vector<std::string>{"/opt/a.jar", "/opt/app/b.war"});
+        CHECK(r.stats.dirs_excluded == 1);
+        CHECK(r.stop == Stop::complete); // the exclusion is reported by the scan's token, not a stop cause
+        CHECK(std::ranges::find(fs.listed, "/opt/Cellar") == fs.listed.end());
+        CHECK(r.stats.entries == 4 + 3); // the excluded directory is one entry; nothing inside it was seen
+    }
+    SECTION("skip_dir matches the whole path: a same-named directory elsewhere is walked") {
+        MemTree fs;
+        dir(fs, "/opt", {D("Cellar"), D("app")});
+        dir(fs, "/opt/Cellar", {F("x.jar")});
+        dir(fs, "/opt/app", {D("Cellar")});
+        dir(fs, "/opt/app/Cellar", {F("y.jar")});
+        WalkPolicy p;
+        p.skip_dir = [](const std::string& d) { return d == "/opt/Cellar"; };
+        auto ops = fs.ops();
+        const auto r = walk(std::vector<std::string>{"/opt"}, {}, ops, fs.clock + 1h, p);
+        CHECK(paths(r) == std::vector<std::string>{"/opt/app/Cellar/y.jar"});
+        CHECK(r.stats.dirs_excluded == 1);
+    }
 }

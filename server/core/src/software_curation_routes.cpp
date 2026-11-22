@@ -6,6 +6,7 @@
 #include "list_keyset.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, a4_denial, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
+#include "software_curation_api.hpp"
 #include "software_normalization_pack.hpp"
 #include "web_utils.hpp" // audit_token
 
@@ -99,17 +100,9 @@ std::optional<CurationCursor> decode_cursor(std::string_view token) {
 
 } // namespace curation_keys
 
+namespace api = software_curation_api;
+
 namespace {
-
-constexpr int kDefaultQueueLimit = 100;
-
-// Audit verbs. The two read verbs appear only as a `denied` row (a service-scoped token's
-// refusal); an admitted read is never audited.
-constexpr const char* kVerbStatus = "inventory.software.curation.status";
-constexpr const char* kVerbQueue = "inventory.software.curation.queue";
-constexpr const char* kVerbAlias = "inventory.software.curation.alias";
-constexpr const char* kVerbReject = "inventory.software.curation.reject";
-constexpr const char* kVerbPack = "inventory.software.curation.pack";
 
 std::string dump_safe(const nlohmann::json& j) {
     // Raw titles come from agents and may not be valid UTF-8: replace, never throw.
@@ -126,8 +119,45 @@ void fail(httplib::Response& res, int status, std::string_view message,
     res.set_content(detail::a4_error(res, message, opts), "application/json");
 }
 
-void unavailable(httplib::Response& res, std::string_view message) {
-    fail(res, 503, message, {.retry_after_ms = 5000, .remediation = "retry the request"});
+// Maps an API reply onto the response.
+void respond(httplib::Response& res, const api::Reply& r) {
+    using Kind = api::Reply::Kind;
+    switch (r.kind) {
+    case Kind::Ok:
+        res.set_content(ok_body(r.body), "application/json");
+        return;
+    case Kind::Created:
+        res.status = 201;
+        res.set_content(ok_body(r.body), "application/json");
+        return;
+    case Kind::BadRequest:
+        fail(res, 400, r.message);
+        return;
+    case Kind::NotFound:
+        fail(res, 404, r.message);
+        return;
+    case Kind::Conflict:
+        fail(res, 409, r.message);
+        return;
+    case Kind::Unavailable:
+        fail(res, 503, r.message, {.retry_after_ms = r.retry_after_ms, .remediation = r.remediation});
+        return;
+    }
+}
+
+// A refusal row is plain; the `requested` row ahead of a write flags a lost row on the response
+// (Sec-Audit-Failed) and carries the correlation id.
+api::AuditSink audit_for(const SoftwareCurationRoutes::Deps& deps, const httplib::Request& req,
+                         httplib::Response& res) {
+    return [&deps, &req, &res](const char* verb, const char* result, const std::string& target,
+                               const std::string& detail_text, bool signal_failure) {
+        if (!signal_failure)
+            return detail::try_persist_audit(deps.audit_fn, req, verb, result, api::kTargetType,
+                                             target, detail_text);
+        const auto cid = detail::ensure_correlation_id(res);
+        return detail::emit_behavioral_audit(deps.audit_fn, req, res, verb, result, api::kTargetType,
+                                             target, detail_text + "; cid=" + cid);
+    };
 }
 
 } // namespace
@@ -170,49 +200,19 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         return session;
     };
-    // Audit BEFORE the write; fail closed on a persist failure.
-    auto audit_first = [deps](const httplib::Request& req, httplib::Response& res,
-                              const char* verb, const std::string& target_id,
-                              const std::string& detail_text) -> bool {
-        const auto cid = detail::ensure_correlation_id(res);
-        if (detail::emit_behavioral_audit(deps.audit_fn, req, res, verb, "requested", "Inventory",
-                                          target_id, detail_text + "; cid=" + cid))
-            return true;
-        fail(res, 503, "audit subsystem unavailable - request not served",
-             {.retry_after_ms = 5000});
-        return false;
-    };
-    auto deny_400 = [deps](const httplib::Request& req, httplib::Response& res, const char* verb,
-                           const std::string& reason) {
-        (void)detail::try_persist_audit(deps.audit_fn, req, verb, "denied", "Inventory", "", reason);
-        fail(res, 400, reason);
-    };
 
     // -- GET status -----------------------------------------------------------------------
     sink.Get("/api/v1/inventory/software/normalization/status",
              [deps, admit](const httplib::Request& req, httplib::Response& res) {
-                 if (!admit(req, res, "Read", kVerbStatus))
+                 if (!admit(req, res, "Read", api::kVerbStatus))
                      return;
-                 const auto st = deps.registry->normalization_status();
-                 if (!st) {
-                     unavailable(res, "normalisation status read degraded");
-                     return;
-                 }
-                 res.set_content(
-                     ok_body({{"pack_version", st->pack_version},
-                              {"loaded_at", st->loaded_at},
-                              {"loaded_by", st->loaded_by},
-                              {"titles_normalized", st->titles_normalized},
-                              {"titles_unnormalized", st->titles_unnormalized},
-                              {"queue_open", st->queue_open},
-                              {"queue_rejected", st->queue_rejected}}),
-                     "application/json");
+                 respond(res, api::status(deps.registry));
              });
 
     // -- GET queue ------------------------------------------------------------------------
     sink.Get("/api/v1/inventory/software/normalization/queue", [deps, admit](const httplib::Request& req,
                                                           httplib::Response& res) {
-        if (!admit(req, res, "Read", kVerbQueue))
+        if (!admit(req, res, "Read", api::kVerbQueue))
             return;
         for (const char* name : {"status", "limit", "cursor"}) {
             if (req.get_param_value_count(name) > 1) {
@@ -220,179 +220,41 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
         }
-        std::string status = req.has_param("status") ? req.get_param_value("status") : "open";
-        if (status != "open" && status != "rejected" && status != "all") {
-            fail(res, 400, "status must be open, rejected or all");
-            return;
-        }
-        if (status == "all")
-            status.clear();
-        std::int64_t limit = kDefaultQueueLimit;
-        if (req.has_param("limit")) {
-            const auto v = keyset::parse_int(req.get_param_value("limit"), 1, kCurationQueueMaxLimit);
-            if (!v) {
-                fail(res, 400, "limit must be an integer from 1 to " +
-                                   std::to_string(kCurationQueueMaxLimit));
-                return;
-            }
-            limit = *v;
-        }
-        CurationCursor after;
-        if (req.has_param("cursor") && !req.get_param_value("cursor").empty()) {
-            auto c = curation_keys::decode_cursor(req.get_param_value("cursor"));
-            if (!c) {
-                fail(res, 400, "invalid cursor");
-                return;
-            }
-            after = std::move(*c);
-        }
-        const auto page = deps.registry->list_curation_queue(status, static_cast<int>(limit), after);
-        if (!page) {
-            unavailable(res, "curation queue read degraded");
-            return;
-        }
-        nlohmann::json items = nlohmann::json::array();
-        for (const auto& r : page->rows) {
-            const auto key = curation_keys::encode_key({r.raw_name, r.raw_publisher, r.ecosystem});
-            items.push_back({{"key", key ? nlohmann::json(*key) : nlohmann::json(nullptr)},
-                             {"raw_name", r.raw_name},
-                             {"raw_publisher", r.raw_publisher},
-                             {"ecosystem", r.ecosystem},
-                             {"device_count", r.device_count},
-                             {"status", r.status},
-                             {"first_queued_at", r.first_queued_at},
-                             {"last_seen_at", r.last_seen_at}});
-        }
-        nlohmann::json next = nullptr;
-        if (page->has_more && !page->rows.empty()) {
-            const auto& last = page->rows.back();
-            if (const auto tok = curation_keys::encode_cursor(
-                    {true, last.device_count, last.raw_name, last.raw_publisher, last.ecosystem}))
-                next = *tok;
-        }
-        res.set_content(ok_body({{"items", std::move(items)},
-                                 {"count", page->rows.size()},
-                                 {"next_cursor", std::move(next)}}),
-                        "application/json");
+        const std::string status_text = req.get_param_value("status");
+        const std::string limit_text = req.get_param_value("limit");
+        const std::string cursor_text = req.get_param_value("cursor");
+        std::optional<std::string_view> status;
+        if (req.has_param("status"))
+            status = status_text;
+        std::optional<std::string_view> limit;
+        if (req.has_param("limit"))
+            limit = limit_text;
+        respond(res, api::queue(deps.registry, status, limit, cursor_text));
     });
 
     // -- POST aliases (curate a title) ----------------------------------------------------
-    sink.Post("/api/v1/inventory/software/normalization/aliases", [deps, admit, audit_first, deny_400](
-                                                   const httplib::Request& req,
-                                                   httplib::Response& res) {
-        static constexpr const char* kVerb = kVerbAlias;
-        if (!admit(req, res, "Write", kVerb))
-            return;
-        const auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded() || !body.is_object()) {
-            deny_400(req, res, kVerb, "body must be a JSON object");
-            return;
-        }
-        // Every field is a string of at most kMaxFieldBytes with no NUL.
-        const auto field = [&](const char* name, bool required,
-                               std::string& out) -> std::optional<std::string> {
-            const auto it = body.find(name);
-            if (it == body.end() || it->is_null()) {
-                if (required)
-                    return std::string{name} + " is required";
-                return std::nullopt;
-            }
-            if (!it->is_string())
-                return std::string{name} + " must be a string";
-            out = it->get<std::string>();
-            if (out.size() > kMaxFieldBytes)
-                return std::string{name} + " exceeds " + std::to_string(kMaxFieldBytes) + " bytes";
-            if (out.find('\0') != std::string::npos)
-                return std::string{name} + " holds a NUL byte";
-            if (required && out.empty())
-                return std::string{name} + " is required";
-            return std::nullopt;
-        };
-        std::string eco, raw_name, raw_pub, vendor, product, edition, category, cpe;
-        for (const auto& err : {field("ecosystem", true, eco), field("raw_name", true, raw_name),
-                                field("raw_publisher", false, raw_pub), field("vendor", true, vendor),
-                                field("product", true, product), field("edition", false, edition),
-                                field("category", false, category),
-                                field("cpe_product", false, cpe)}) {
-            if (err) {
-                deny_400(req, res, kVerb, *err);
-                return;
-            }
-        }
-        if (!known_ecosystem(eco)) {
-            deny_400(req, res, kVerb, "unknown ecosystem");
-            return;
-        }
-        // An omitted category is passed through empty: the store keeps an existing product's
-        // category and gives a new product "other".
-        if (!category.empty() &&
-            std::find(kCategories.begin(), kCategories.end(), category) == kCategories.end()) {
-            deny_400(req, res, kVerb, "unknown category");
-            return;
-        }
-        if (!valid_cpe_product(cpe) || reserved_cpe_product(cpe)) {
-            deny_400(req, res, kVerb, "cpe_product has an invalid character or is a reserved value");
-            return;
-        }
-        const auto keys = derive_curated_alias(eco, raw_name, raw_pub, vendor, product, edition);
-        if (!keys) {
-            deny_400(req, res, kVerb, keys.error());
-            return;
-        }
-        if (!audit_first(req, res, kVerb, keys->norm_key,
-                         "ecosystem=" + audit_token(eco) + " alias=" + audit_token(keys->alias_key) +
-                             " publisher=" + audit_token(keys->alias_publisher)))
-            return;
-        const auto pid = deps.registry->curate_alias(eco, *keys, category, cpe);
-        if (!pid) {
-            spdlog::warn("SoftwareCurationRoutes: curate_alias failed: {}", pid.error());
-            unavailable(res, "curation write failed");
-            return;
-        }
-        res.status = 201;
-        res.set_content(ok_body({{"product_id", *pid},
-                                 {"norm_key", keys->norm_key},
-                                 {"alias_source", keys->source},
-                                 {"alias_key", keys->alias_key},
-                                 {"alias_publisher", keys->alias_publisher}}),
-                        "application/json");
-    });
+    sink.Post("/api/v1/inventory/software/normalization/aliases",
+              [deps, admit](const httplib::Request& req, httplib::Response& res) {
+                  if (!admit(req, res, "Write", api::kVerbAlias))
+                      return;
+                  const auto body = nlohmann::json::parse(req.body, nullptr, false);
+                  respond(res, api::curate_alias(deps.registry, body, audit_for(deps, req, res)));
+              });
 
     // -- POST queue/{key}/reject ----------------------------------------------------------
     sink.Post(R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)",
-              [deps, admit, audit_first, deny_400](const httplib::Request& req,
-                                                   httplib::Response& res) {
-                  static constexpr const char* kVerb = kVerbReject;
-                  if (!admit(req, res, "Write", kVerb))
+              [deps, admit](const httplib::Request& req, httplib::Response& res) {
+                  if (!admit(req, res, "Write", api::kVerbReject))
                       return;
-                  const auto t = curation_keys::decode_key(req.matches[1].str());
-                  if (!t) {
-                      deny_400(req, res, kVerb, "invalid queue key");
-                      return;
-                  }
-                  if (!audit_first(req, res, kVerb, audit_token(t->ecosystem),
-                                   "ecosystem=" + audit_token(t->ecosystem) +
-                                       " raw_name=" + audit_token(t->raw_name) +
-                                       " raw_publisher=" + audit_token(t->raw_publisher)))
-                      return;
-                  const auto done =
-                      deps.registry->reject_curation(t->raw_name, t->raw_publisher, t->ecosystem);
-                  if (!done) {
-                      unavailable(res, "curation write failed");
-                      return;
-                  }
-                  if (!*done) {
-                      fail(res, 404, "no open queue entry for that key");
-                      return;
-                  }
-                  res.set_content(ok_body({{"rejected", true}}), "application/json");
+                  respond(res, api::reject(deps.registry, req.matches[1].str(),
+                                           audit_for(deps, req, res)));
               });
 
     // -- POST pack ------------------------------------------------------------------------
-    sink.Post("/api/v1/inventory/software/normalization/pack", [deps, admit, audit_first, deny_400](
+    sink.Post("/api/v1/inventory/software/normalization/pack", [deps, admit](
                                                 const httplib::Request& req,
                                                 httplib::Response& res) {
-        static constexpr const char* kVerb = kVerbPack;
+        static constexpr const char* kVerb = api::kVerbPack;
         const auto session = admit(req, res, "Write", kVerb);
         if (!session)
             return;
@@ -411,31 +273,8 @@ void SoftwareCurationRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             fail(res, 415, "Content-Type must be text/csv or text/plain");
             return;
         }
-        // The parser is the trust boundary: its caps (bytes, rows, fields, NUL) apply here.
-        auto pack = parse_normalization_pack(req.body);
-        if (!pack) {
-            deny_400(req, res, kVerb, pack.error());
-            return;
-        }
-        if (!audit_first(req, res, kVerb, audit_token(pack->pack_version),
-                         "pack_version=" + audit_token(pack->pack_version) +
-                             " sha256=" + audit_token(pack->sha256) +
-                             " rows=" + std::to_string(pack->rows.size())))
-            return;
-        const auto out = deps.registry->replace_pack(*pack, session->username);
-        if (!out) {
-            spdlog::warn("SoftwareCurationRoutes: replace_pack failed: {}", out.error());
-            unavailable(res, "pack replace failed");
-            return;
-        }
-        if (*out == PackReplaceOutcome::same_version) {
-            fail(res, 409, "the stored pack already has version " + pack->pack_version);
-            return;
-        }
-        res.set_content(ok_body({{"pack_version", pack->pack_version},
-                                 {"sha256", pack->sha256},
-                                 {"rows", pack->rows.size()}}),
-                        "application/json");
+        respond(res, api::replace_pack(deps.registry, req.body, session->username,
+                                       audit_for(deps, req, res)));
     });
 }
 

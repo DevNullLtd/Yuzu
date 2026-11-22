@@ -42,7 +42,8 @@
         {
           "name": "drogon",
           "default-features": false
-        }
+        },
+        "libxlsxwriter"
       ]
     },
     "agent": {
@@ -58,5 +59,9 @@
       ]
     }
   },
-  "overrides": []
+  "$overrides-comment": "Security pins above the baseline (WP14): brotli 1.2.1 (CVE-2026-111497) and sqlite3 3.54.1 (the 3.54.0 CVE batch). An override is an exact pin that also holds a port BACK, so delete each entry once the baseline reaches that version; see docs/build-guide.md (vcpkg).",
+  "overrides": [
+    { "name": "brotli", "version": "1.2.1" },
+    { "name": "sqlite3", "version": "3.54.1" }
+  ]
 }

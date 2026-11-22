@@ -180,15 +180,22 @@ inline std::string format_sse(const SseEvent& ev) {
     if (d.empty()) {
         out += "data: \n";
     } else {
+        // The SSE grammar ends a line at LF, CR OR CRLF (WHATWG HTML §9.2.6), so a
+        // lone CR in agent-supplied data would otherwise start a forged field line
+        // (F69). Treat all three as one line break.
         std::size_t pos = 0;
-        while (pos < d.size()) {
-            auto nl = d.find('\n', pos);
+        while (pos <= d.size()) {
+            const auto nl = d.find_first_of("\r\n", pos);
             out += "data: ";
             out.append(d.substr(pos, (nl == std::string_view::npos ? d.size() : nl) - pos));
             out += '\n';
             if (nl == std::string_view::npos)
                 break;
             pos = nl + 1;
+            if (d[nl] == '\r' && pos < d.size() && d[pos] == '\n')
+                ++pos; // CRLF is ONE break
+            if (pos == d.size())
+                break; // a trailing terminator adds no empty data line
         }
     }
     out += '\n'; // blank line terminates the event

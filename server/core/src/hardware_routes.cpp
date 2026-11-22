@@ -698,41 +698,25 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto read = deps_.sync_status_fn(req.matches[1].str());
-        if (!read) {
-            res.status = 503;
-            res.set_content(detail::a4_error(res, "sync status is unavailable right now",
-                                             {.retry_after_ms = 5000}),
-                            "application/json");
-            return;
-        }
-        const bool unfiltered = deps_.sync_unfiltered_fn && deps_.sync_unfiltered_fn(*session);
-        // Visibility is ownership by the owner key (a service-scoped session owns nothing), or an
-        // unfiltered Execution:Execute. Everything else answers as an unknown id would.
-        if (!*read || (*read)->definition_id != ss::kSyncDefinitionId ||
-            !(unfiltered || execution_owner_key(*session).owns(**read))) {
+        const bool unfiltered =
+            read && deps_.sync_unfiltered_fn && deps_.sync_unfiltered_fn(*session);
+        // Visibility and the body are software_sync::sync_status's, the same function the MCP
+        // tool get_software_sync_status calls.
+        const bool owned = read && *read && execution_owner_key(*session).owns(**read);
+        const auto status = ss::sync_status(read, owned, unfiltered);
+        if (!status) {
+            if (status.error() == ss::SyncStatusFault::kUnavailable) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "sync status is unavailable right now",
+                                                 {.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
             res.status = 404;
             res.set_content(detail::a4_error(res, "sync run not found"), "application/json");
             return;
         }
-        const Execution& e = **read;
-        std::int64_t delay_max_s = 0;
-        const auto params = nlohmann::json::parse(e.parameter_values, nullptr, false);
-        if (params.is_object())
-            if (const auto it = params.find("delay_max_s");
-                it != params.end() && it->is_number_integer() && it->get<std::int64_t>() > 0)
-                delay_max_s = it->get<std::int64_t>();
-        const nlohmann::json body = {
-            {"data",
-             {{"execution_id", e.id},
-              {"state", e.status},
-              {"targeted", e.agents_targeted},
-              {"acknowledged", e.agents_success},
-              {"failed", e.agents_failure},
-              {"dispatched_at", e.dispatched_at},
-              {"delay_max_s", delay_max_s},
-              // An estimate (see the route comment): the dispatch time plus the spread.
-              {"estimated_completion_at", e.dispatched_at + delay_max_s}}},
-            {"meta", {{"api_version", "v1"}}}};
+        const nlohmann::json body = {{"data", *status}, {"meta", {{"api_version", "v1"}}}};
         res.status = 200;
         res.set_content(body.dump(), "application/json");
     });

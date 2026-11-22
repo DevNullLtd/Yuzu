@@ -17,7 +17,7 @@ The gateway's Erlang/OTP needs no activation step: Meson resolves the pinned rel
 
 ## Agent-only vcpkg install
 
-`vcpkg.json` defaults to the `server` and `tests` features (libpq, xmlsec, drogon, catch2), so a plain `vcpkg install --triplet x64-windows --x-manifest-root=.` installs the server ports too. A Windows build is always agent-only (ADR-0035), so it opts out and skips them (`libpq` is a from-source PostgreSQL build, `drogon` pulls trantor and jsoncpp):
+`vcpkg.json` defaults to the `server` and `tests` features (libpq, xmlsec, drogon, libxlsxwriter, catch2), so a plain `vcpkg install --triplet x64-windows --x-manifest-root=.` installs the server ports too. A Windows build is always agent-only (ADR-0035), so it opts out and skips them (`libpq` is a from-source PostgreSQL build, `drogon` pulls trantor and jsoncpp):
 
 ```bash
 vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features
@@ -159,3 +159,102 @@ ladder step 3 the release install is agent-only, so the server ports' DLLs
 shipped, and `release.yml`'s `build-windows` step "Verify the agent runs from
 the packaged archive" fails if any of them appears in the archive. That step
 has not yet run on a real release tag.
+
+Both the release zip and `YuzuAgentSetup` also carry the Microsoft Visual C++
+runtime app-local in `bin`: `release.yml`'s "Package archive" step runs
+`deploy/packaging/windows/stage-msvc-runtime.ps1`, which copies every
+`vcruntime140*.dll` and `msvcp140*.dll` (`vcruntime140.dll`,
+`vcruntime140_1.dll`, `msvcp140.dll` and `msvcp140_atomic_wait.dll` are
+required) from the build machine's Visual Studio redistributable directory
+into the zip's `bin` and into `build-windows\msvc-runtime`, which
+`yuzu-agent.iss` installs into `{app}\bin`. Before copying, it removes any
+`vcruntime140*.dll` or `msvcp140*.dll` already in those two staging
+directories; the installer does not remove runtime DLLs from `{app}\bin`. The
+redistributable directory comes from
+`VCToolsRedistDir` (set by `ilammy/msvc-dev-cmd`) or else from `vswhere`; the
+script never runs `vcvars64.bat`, and on Windows it refuses a DLL that is not
+validly signed by Microsoft. It also refuses a release whose toolset
+(`VCToolsVersion`, major.minor) differs from
+`deploy/packaging/windows/msvc-toolset.pin` (14.44, the toolset in the table
+above): agent self-update replaces only `yuzu-agent.exe`, never the runtime
+already on a device (#8219), so the release toolset moves only by a reviewed
+change to that file, whose comment says what such a change must announce.
+Without a readable `VCToolsVersion` the script fails in GitHub Actions.
+Outside GitHub Actions the pin check is skipped with a warning whenever
+`VCToolsVersion` is unset (or not a version), including under
+`setup_msvc_env.sh`, which does not export it. The staged DLLs and their file
+versions are written to the job's step summary, which covers that workflow run
+only; the shipped version is the file version of the Microsoft-signed DLLs in
+the payload.
+
+Two steps later, after "Verify the agent runs from the packaged archive",
+"Check the DLL import closure of both payloads" runs
+`scripts/ci/check-windows-payload-imports.py`: every DLL that a shipped `.exe`
+or `.dll` imports must be in that payload's `bin`, be an API set, or be an
+operating-system DLL in `System32`, except the Visual C++ runtime, which
+counts as missing unless the payload carries it (the runner has it in
+`System32`; a customer machine need not). A local
+`deploy/packaging/windows/build-installer.sh` run stages the runtime the same
+way and needs `pwsh`. Neither step has run on a real release tag yet.
+
+## Decision record: app-local Visual C++ runtime (2026-11-18)
+
+**Decision.** Owner ruling (fjarvis), 2026-11-18: both Windows agent payloads,
+the release archive `yuzu-agent-windows-x64.zip` and the installer
+`YuzuAgentSetup-<version>.exe`, carry the Microsoft Visual C++ runtime
+app-local in the agent's `bin` directory, staged as described in the section
+above. `NOTICE` records the redistribution terms.
+
+**Reason.** Each payload must be self-contained. The archive is sideloaded:
+it is unpacked and run with no installer, so nothing installs a prerequisite
+for it. The installer carries the same files rather than requiring, or
+installing, Microsoft's Visual C++ Redistributable. Up to 0.15.0 neither
+payload carried the runtime, and the agent did not start on a machine without
+a recent enough Redistributable.
+
+**Accepted residual (governance finding UP-3).** Every DLL loaded into the
+agent process shares the agent's copy of the runtime: the Windows loader
+binds a DLL's import of `vcruntime140.dll` or `msvcp140.dll` to the module of
+that name already loaded in the process, not to the copy in `System32`. That
+includes third-party code. The `sccm` plugin creates the Configuration
+Manager client's COM objects in-process (`CoCreateInstance` of
+`Microsoft.SMS.Client` with `CLSCTX_INPROC_SERVER`,
+`agents/plugins/sccm/src/sccm_plugin.cpp`), so the ConfigMgr client DLL runs
+on the agent's runtime; a Winsock namespace provider loaded by name
+resolution does too. A vendor DLL built with a NEWER MSVC toolset than the
+release's pinned one may fail to load or misbehave, up to stopping the agent.
+The ConfigMgr client DLL's own imports have not been inspected. The owner
+accepted this residual in the same ruling. The user manual discloses it
+(`docs/user-manual/README.md`, "Windows agent: Visual C++ runtime").
+
+**Mitigation, and its limits.** The release builds with one pinned MSVC
+toolset (`deploy/packaging/windows/msvc-toolset.pin`, introduced in commit
+0f23a273e4; the release fails on any other), so the runtime a release ships
+is known. Before each release, a step in the release skill
+(`.claude/skills/release/SKILL.md` and `.codex/skills/release/SKILL.md`,
+Phase 0) has the release manager compare the pin with the newest toolset of
+the Visual Studio installed on Wee Tam, the runner that builds the release,
+and bump to it. The step is manual: `release-preflight.sh` does not check it
+and nothing enforces it. It can reach only the newest toolset of the Visual
+Studio on Wee Tam, which is Visual Studio 2022 Build Tools (the cl.exe row
+of the toolchain table above). The pinned 14.44 is the toolset of Visual
+Studio 2022 17.14, and later toolsets ship with Visual Studio 2026 (this is
+Microsoft's release cadence; nothing in the repository checks it). So while
+Wee Tam has Visual Studio 2022 the step finds nothing newer, and the bump
+does not narrow the gap: the mitigation is then only that the shipped
+runtime is known. Moving past 14.44 means upgrading Wee Tam's Visual Studio
+(`deploy/windows/README.md`), a separate, reviewed change that this decision
+does not make. Even a bump narrows the gap and does not close it: a vendor
+DLL built after a release can still need a newer runtime, and agent
+self-update does not replace the runtime on a device (#8219). How much the
+mitigation is worth has not been measured, because the ConfigMgr client
+DLL's imports have not been inspected.
+
+**Review and follow-ups.** The acceptance is to be reviewed by 2027-05-18,
+the review date of the project's other acceptances of 2026-11-18 (#8228
+tracks those, not this one). The owner who accepted it is also the change's
+author. Running the `sccm` plugin's ConfigMgr calls outside the agent
+process is #8311; refreshing the runtime through agent self-update is #8219
+(decision #8218). The SOC 2 plan records it as a risk-register entry
+(`docs/enterprise-readiness-soc2-first-customer.md`, "Accepted risk: third-party
+code shares the Windows agent's Visual C++ runtime (CC9.2)").

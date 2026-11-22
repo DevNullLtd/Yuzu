@@ -20,6 +20,7 @@
  *   -> compute diff -> insert events -> save current state
  */
 
+#include "echo_wire_scrub.hpp" // scrub identity strings at collection (baseline round-trip)
 #include "echo_capture_status.hpp" // yuzu::echo::collect_or_retain
 #include "echo_collectors.hpp"
 #include "echo_cursor.hpp" // yuzu::echo::CursorSource, make_cursor_sources
@@ -1325,7 +1326,11 @@ public:
             if (pid_name_.size() >= kPidNameCap)
                 pid_name_.clear(); // wholesale flush, as the ETW consumer's cache does
         }
-        pid_name_[pid] = yuzu::echo::PidName{name, 0};
+        // The stream leg's image names are raw OS bytes; this map labels connection rows that
+        // are then diffed and dumped with replace, so keep it well-formed (see echo_wire_scrub.hpp).
+        std::string clean = name;
+        yuzu::echo::scrub_wire_strings(clean);
+        pid_name_[pid] = yuzu::echo::PidName{std::move(clean), 0};
     }
     // A stop never erases: loads and sockets of a just-exited process still resolve inside
     // kPidNameGraceSec, while a reused pid whose start was missed resolves to "" after it.
@@ -1802,6 +1807,10 @@ private:
                     pe.ppid = e.ppid;
                     pe.name = e.image_name;
                     pe.user = e.user;
+                    // Stream-leg image names/users are raw OS bytes (ETW / ES): well-formed UTF-8 at
+                    // collection, like every other Echo identity string (echo_wire_scrub.hpp).
+                    yuzu::echo::scrub_wire_strings(pe.name);
+                    yuzu::echo::scrub_wire_strings(pe.user);
                     pe.exit_code = e.exit_code;
                     pe.parent_name = yuzu::echo::pid_name_lookup(pid_name_, e.ppid, e.ts_unix);
                     typed.push_back(std::move(pe));
@@ -1865,6 +1874,7 @@ private:
                     // since the fallback. (Mirrors the poll branch's enumerate +
                     // stabilization-exclusion filter, minus the diff/insert.)
                     auto current = yuzu::agent::enumerate_processes();
+                    yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
                     note_pid_names(current, ts);
                     if (!stab_excl.empty()) {
                         std::erase_if(current, [&](const auto& p) {
@@ -1886,6 +1896,7 @@ private:
                 // No active stream (poll-only platform, or stream unavailable):
                 // snapshot-diff poll.
                 auto current = yuzu::agent::enumerate_processes();
+                yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
                 // Before the exclusions: a noisy process still names its sockets.
                 note_pid_names(current, ts);
 
@@ -1977,6 +1988,7 @@ private:
             // Label sockets the collector could not name (TIME_WAIT sockets have pid 0 and stay
             // unnamed; the rest resolve through the process source's pid -> name map).
             yuzu::echo::fill_process_names(current, pid_name_, ts);
+            yuzu::echo::scrub_wire_strings(current); // AFTER the fill: baseline round-trips losslessly
 
             // macOS (roadmap 2.2): nstat is the PRIMARY tcp lifecycle source
             // when the plugin's NstatClient is live and system-wide — its
@@ -2148,7 +2160,7 @@ private:
             // otherwise persist the full snapshot as before (the poll owns
             // both protocols). Events + baseline commit in ONE transaction.
             const std::string state_json =
-                connections_to_json(nstat_primary ? *diff_current : current).dump();
+                connections_to_json(nstat_primary ? *diff_current : current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state(net_key, state_json)
                                 : db_->fold_network_events(
@@ -2264,12 +2276,13 @@ private:
                 }
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 auto previous = json_to_arp(db_->get_state("arp"));
                 auto typed = yuzu::echo::compute_arp_events(previous, *current, ts, snap_id);
                 // Events + baseline in one transaction (#1654); non-fatal, so a
                 // failure emits no `error|` line (the tick's events_recorded
                 // contract holds) and the ledger records the token.
-                const std::string state_json = arp_to_json(*current).dump();
+                const std::string state_json = arp_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state("arp", state_json)
                                     : db_->fold_arp_events(
@@ -2295,9 +2308,10 @@ private:
         const auto dns_state = yuzu::echo::source_enabled_state(*db_, "dns");
         if (dns_state.value_or(false)) {
             auto current = dns_pre ? std::move(*dns_pre) : yuzu::echo::enumerate_dns();
+            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
             auto previous = json_to_dns(db_->get_state("dns"));
             auto typed = yuzu::echo::compute_dns_events(previous, current, ts, snap_id);
-            const std::string state_json = dns_to_json(current).dump();
+            const std::string state_json = dns_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state("dns", state_json)
                                 : db_->fold_dns_events(
@@ -2380,6 +2394,12 @@ private:
                 r.signed_state = std::string{yuzu::echo::module_signed_token(e.signed_state)};
                 r.signer = e.signer;
                 r.is_kernel = e.is_kernel;
+                // Module-load identity strings are raw OS bytes (ETW / ES): well-formed UTF-8 at
+                // collection, like every other Echo identity sink (echo_wire_scrub.hpp).
+                yuzu::echo::scrub_wire_strings(r.process_name);
+                yuzu::echo::scrub_wire_strings(r.module_name);
+                yuzu::echo::scrub_wire_strings(r.module_dir);
+                yuzu::echo::scrub_wire_strings(r.signer);
                 mrows.push_back(std::move(r));
             }
             if (!mrows.empty()) {
@@ -2686,13 +2706,14 @@ private:
                 note_health("service", "capture_incomplete");
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 const std::string svc_key{yuzu::echo::diff_state_key("service")}; // #538
                 auto prev_json = db_->get_state(svc_key);
                 auto previous = json_to_services(prev_json);
 
                 auto typed = yuzu::echo::compute_service_events(previous, *current, ts, snap_id);
                 // Events + baseline in ONE transaction (#1654).
-                const std::string state_json = services_to_json(*current).dump();
+                const std::string state_json = services_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state(svc_key, state_json)
                                     : db_->fold_service_events(
@@ -2717,12 +2738,13 @@ private:
         if (user_state.value_or(false)) {
             const std::string usr_key{yuzu::echo::diff_state_key("user")}; // #538
             auto current = yuzu::echo::enumerate_users();
+            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
             auto prev_json = db_->get_state(usr_key);
             auto previous = json_to_users(prev_json);
 
             auto typed = yuzu::echo::compute_user_events(previous, current, ts, snap_id);
             // Events + baseline in ONE transaction (#1654).
-            const std::string state_json = users_to_json(current).dump();
+            const std::string state_json = users_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state(usr_key, state_json)
                                 : db_->fold_user_events(
@@ -2827,10 +2849,11 @@ private:
                 note_health("mapdrive", "capture_incomplete");
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 const std::string md_key{yuzu::echo::diff_state_key("mapdrive")}; // #538
                 auto previous = json_to_mapdrive(db_->get_state(md_key));
                 auto typed = yuzu::echo::compute_mapdrive_events(previous, *current, ts, snap_id);
-                const std::string state_json = mapdrive_to_json(*current).dump();
+                const std::string state_json = mapdrive_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state(md_key, state_json)
                                     : db_->fold_mapdrive_events(
@@ -3868,7 +3891,7 @@ private:
             arr.push_back(std::move(obj));
         }
 
-        ctx.write_output(arr.dump());
+        ctx.write_output(arr.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
         return 0;
     }
 
@@ -4027,6 +4050,13 @@ private:
             // nothing to widen it with and `fleet_snapshot_window_seconds` no longer has an effect.
             connections = std::move(live);
         }
+        // The snapshot carries identity strings (host name, process names/users/command lines,
+        // socket owners, local addresses) as raw OS bytes: well-formed UTF-8 at collection, like
+        // every other Echo identity sink (echo_wire_scrub.hpp).
+        yuzu::echo::scrub_wire_strings(processes);
+        yuzu::echo::scrub_wire_strings(connections);
+        yuzu::echo::scrub_wire_strings(hostname);
+        yuzu::echo::scrub_wire_strings(local_ips);
 
         // Redaction defaults are now unioned inside load_redaction_patterns (so
         // every collect path — collect_fast, procperf, and this snapshot — is

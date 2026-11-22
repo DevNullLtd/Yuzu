@@ -10,13 +10,14 @@
 /// CHECKS a CRL against; it is never a trust anchor, an issuer, or a TLS root for any Yuzu
 /// decision path.
 ///
-/// This PR (2b-1a) WRITES only `source`, `source_ca_key` and `source_url`. The schema is created
-/// whole, so the fetcher (2b-1b) adds no migration: `fetch_status`, `crl`, `crl_entry` and
-/// `rollback_high_water` exist, are READ here (a source's fetch status, its held-CRL count) and
-/// are deleted with their source / URL / key, but nothing in this PR inserts into `crl` or
-/// `crl_entry`. The one exception is `rollback_high_water`, which `reset_high_water` upserts:
-/// that mark is keyed by the CA, never by the source, so it survives `remove` (a remove and
-/// re-register cannot accept an older CRL).
+/// This PR (2b-1a) WRITES only `source`, `source_ca_key` and `source_url`. v1 creates the tables
+/// the fetcher (2b-1b) reads and writes; `cert_signature_check` (2b-2) is not created here. The
+/// #6590 rulings (2026-11-18: reset key list, `scope_key` encoding, canonical URLs) land as
+/// migration v2 before 2b-1b. `fetch_status`, `crl`, `crl_entry` and `rollback_high_water` exist,
+/// are READ here (a source's fetch status, its held-CRL count) and are deleted with their source /
+/// URL / key, but nothing in this PR inserts into `crl` or `crl_entry`. The one exception is
+/// `rollback_high_water`, which `reset_high_water` upserts: that mark is keyed by the CA, never by
+/// the source, so it survives `remove` (a remove and re-register cannot accept an older CRL).
 ///
 /// Posture (ADR-0012 §1): construction is fail-CLOSED. A store that cannot migrate/open sets
 /// the server's `startup_failed_`, and the store is in the `/readyz` conjunction: it holds the
