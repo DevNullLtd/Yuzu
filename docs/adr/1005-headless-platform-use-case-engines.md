@@ -2054,13 +2054,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **Exception and baseline.** The v1-keyed `exception:#8096` row
        `get.api-v1-dex-apps-usage` is removed from
        `scripts/ci/api-parity/dex.json` and its `STRICT_EXCEPTION_PINS` entry
-       is deleted; `BASELINE_UNTWINNED` falls from 197 to 196. A v1-keyed row may
-       only be an `exception:` row, so the route is not re-keyed as `twinned`;
-       the pair is carried by the registry (the tool, its expected-twin row
-       and the shrink-only ledger backfill list in
-       `tests/unit/server/test_twin_completeness.cpp`, which gains
-       `get_dex_apps_usage`, cap 4 to 5, until a ledger row can name the tool;
-       #6700 decides the ledger row shape that retires the list).
+       is deleted. A v1-keyed row may only be an `exception:` row, so the route
+       is not re-keyed as `twinned`; the pair is ledgered through the dashboard
+       Usage view row `get.fragments-dex-apps-usage`, whose REST twin is the
+       route and whose `mcp_twin` is now `get_dex_apps_usage` with status
+       `twinned`. `BASELINE_UNTWINNED` falls from 198 (the exception row plus
+       the Usage view row, `twinned-rest-only` until now) to 196. The shrink-only
+       ledger backfill list in `tests/unit/server/test_twin_completeness.cpp`
+       is unchanged (4 names), because a ledger row names the tool.
        The 2026-11-17 entry above is history and is not edited.
      - **Declared pair and second gate.** The record declares
        `GuaranteedState:Read`, the pair the route's first gate asks, because

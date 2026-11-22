@@ -519,10 +519,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # `exception:#7955` row. It streams a file, which is not a tool call, so it has no MCP twin by design.
 # 196 -> 197 (fleet application usage, ADR-1005 2026-11-17 entry): GET /api/v1/dex/apps/usage is a
 # v1-keyed `exception:#8096` row. Its MCP twin is owed; the row is retired when that tool lands.
-# 197 -> 196 (fleet application usage over MCP): get_dex_apps_usage twins GET /api/v1/dex/apps/usage,
-# so the v1-keyed exception row and its pin are removed.
-# The DEX Apps tab usage view row (GET /fragments/dex/apps/usage) is `twinned` with mcp_twin
-# get_dex_apps_usage, so it adds nothing to the baseline.
+# 197 -> 198 (DEX Apps tab usage view): GET /fragments/dex/apps/usage is a `twinned-rest-only` row.
+# 198 -> 196 (fleet application usage over MCP): get_dex_apps_usage is that row's mcp_twin (the row is
+# now `twinned`), and the v1-keyed exception row and its pin are removed.
 BASELINE_UNTWINNED = 196
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
