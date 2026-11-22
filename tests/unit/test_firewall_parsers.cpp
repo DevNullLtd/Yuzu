@@ -11,6 +11,7 @@
  */
 
 #include "firewall_parsers.hpp"
+#include "firewall_restore_compare.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -18,6 +19,9 @@
 #include <chrono>
 #include <cstring>
 #include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 using namespace yuzu::firewall;
 
@@ -1574,4 +1578,443 @@ TEST_CASE("#4402 iptables_shape_ok: no policy line, or an unknown line, does not
     CHECK_FALSE(iptables_shape_ok(parse_iptables_save("Permission denied (you must be root)\n")));
     CHECK(unrecognised_output_row("ufw") == "error|ufw:unrecognised_output");
     CHECK(unrecognised_output_row("iptables") == "error|iptables:unrecognised_output");
+}
+
+// ── Linux: the root snapshot broker (framing, nft text, iptables family, decision table) ────
+
+namespace {
+
+/// A broker reply from three section bodies, each already newline-terminated or empty.
+std::string snap(std::string_view nft, std::string_view ipt, std::string_view ip6t) {
+    return "== nft -a list ruleset\n" + std::string{nft} + "== iptables -S\n" + std::string{ipt} +
+           "== ip6tables -S\n" + std::string{ip6t} + "== end\n";
+}
+
+// `nft -a list ruleset`: one table, one base chain, handles 4 and 5 (a real listing's shape).
+constexpr std::string_view kNftOne =
+    "table inet filter { # handle 1\n"
+    "\tchain input { # handle 1\n"
+    "\t\ttype filter hook input priority filter; policy accept;\n"
+    "\t\ttcp dport 22 counter packets 41 bytes 3120 accept # handle 4\n"
+    "\t\tct state established,related accept # handle 5\n"
+    "\t}\n"
+    "}\n";
+
+// sets, maps, a flowtable, a multi-line set element list, a multi-line rule and two tables
+constexpr std::string_view kNftBig =
+    "# Warning: table ip nat is managed by iptables-nft, do not touch!\n"
+    "table inet filter { # handle 1\n"
+    "\tset blocked { # handle 2\n"
+    "\t\ttype ipv4_addr\n"
+    "\t\tflags interval\n"
+    "\t\telements = { 192.0.2.0/24, 198.51.100.0/24 }\n"
+    "\t}\n"
+    "\tmap m { # handle 3\n"
+    "\t\ttype ipv4_addr : verdict\n"
+    "\t}\n"
+    "\tflowtable ft { # handle 4\n"
+    "\t\thook ingress priority filter\n"
+    "\t}\n"
+    "\tchain input { # handle 5\n"
+    "\t\ttype filter hook input priority filter; policy accept;\n"
+    "\t\ttcp dport 22 accept # handle 6\n"
+    "\t\tip saddr @blocked drop # handle 7\n"
+    "\t\ttcp dport {\n"
+    "\t\t\t80, 443\n"
+    "\t\t} accept # handle 8\n"
+    "\t\tcounter packets 4 bytes 8 # handle 9\n"
+    "\t}\n"
+    "\tchain forward { # handle 10\n"
+    "\t\ttype filter hook forward priority filter; policy drop;\n"
+    "\t}\n"
+    "}\n"
+    "table ip6 filter { # handle 2\n"
+    "\tchain input { # handle 1\n"
+    "\t\ticmpv6 type echo-request accept comment \"ping\" # handle 2\n"
+    "\t}\n"
+    "}\n";
+
+constexpr std::string_view kIptClean = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n";
+constexpr std::string_view kIptV6Rules =
+    "-P INPUT DROP\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT\n";
+constexpr std::string_view kAbsent = "[absent]\n";
+constexpr std::string_view kFailed = "-P INPUT ACC\n\n[failed]\n"; // partial output, then the marker
+
+using Rows = std::vector<std::string>;
+
+Rows state_rows(std::string_view nft, std::string_view ipt, std::string_view ip6t, bool tables_seen = false) {
+    const auto parsed = parse_fw_snapshot(snap(nft, ipt, ip6t));
+    REQUIRE(parsed.has_value());
+    return linux_snapshot_state_rows(*parsed, tables_seen);
+}
+
+Rows rules_rows(std::string_view nft, std::string_view ipt, std::string_view ip6t, bool tables_seen = false) {
+    const auto parsed = parse_fw_snapshot(snap(nft, ipt, ip6t));
+    REQUIRE(parsed.has_value());
+    return linux_snapshot_rules_rows(*parsed, tables_seen);
+}
+
+} // namespace
+
+TEST_CASE("parse_fw_snapshot: the three headed sections in order, then the end line", "[firewall]") {
+    const auto got = parse_fw_snapshot(snap(kNftOne, kIptClean, kAbsent));
+    REQUIRE(got.has_value());
+    CHECK(got->nft.kind == FwSectionKind::text);
+    CHECK(got->nft.text == kNftOne);
+    CHECK(got->iptables.kind == FwSectionKind::text);
+    CHECK(got->iptables.text == kIptClean);
+    CHECK(got->ip6tables.kind == FwSectionKind::absent); // body is exactly [absent]
+    CHECK(got->ip6tables.text.empty());
+    // an empty body is a text section with no text (an empty nft ruleset prints nothing)
+    const auto empty_nft = parse_fw_snapshot(snap("", kIptClean, kIptClean));
+    REQUIRE(empty_nft.has_value());
+    CHECK(empty_nft->nft.kind == FwSectionKind::text);
+    CHECK(empty_nft->nft.text.empty());
+}
+
+TEST_CASE("parse_fw_snapshot: a [failed] line makes the section failed whatever came before it", "[firewall]") {
+    const auto got = parse_fw_snapshot(snap(kNftOne, kFailed, kIptClean));
+    REQUIRE(got.has_value());
+    CHECK(got->iptables.kind == FwSectionKind::failed);
+    CHECK(got->iptables.text.empty()); // the partial text is not kept
+    CHECK(got->nft.kind == FwSectionKind::text);
+    // [absent] plus other lines is text, not absent; the marker must be a whole line
+    const auto not_absent = parse_fw_snapshot(snap(kNftOne, "[absent]\n-P INPUT ACCEPT\n", kIptClean));
+    REQUIRE(not_absent.has_value());
+    CHECK(not_absent->iptables.kind == FwSectionKind::text);
+    const auto not_failed = parse_fw_snapshot(snap(kNftOne, "-A INPUT -m comment --comment [failed] -j ACCEPT\n", kIptClean));
+    REQUIRE(not_failed.has_value());
+    CHECK(not_failed->iptables.kind == FwSectionKind::text);
+}
+
+TEST_CASE("parse_fw_snapshot: zero bytes is empty, a missing end line is truncated, anything else malformed",
+          "[firewall]") {
+    const auto token = [](std::string_view reply) {
+        const auto r = parse_fw_snapshot(reply);
+        REQUIRE_FALSE(r.has_value());
+        return std::string{r.error()};
+    };
+    CHECK(token("") == "empty");
+    // the reply as far as it got: no end line, or an end line cut before its newline
+    const auto whole = snap(kNftOne, kIptClean, kIptClean);
+    CHECK(token(whole.substr(0, whole.size() - std::string_view{"== end\n"}.size())) == "truncated");
+    CHECK(token(whole.substr(0, whole.size() - 1)) == "truncated"); // `== end` without its newline
+    CHECK(token(whole.substr(0, whole.size() - 4)) == "truncated"); // `== e`
+    CHECK(token("== nft -a list ruleset\ntable inet filter { # handle 1\n") == "truncated");
+    // wrong order, a missing section, a repeated header, an unknown header, text after the end
+    CHECK(token("== iptables -S\n== nft -a list ruleset\n== ip6tables -S\n== end\n") == "malformed");
+    CHECK(token("== nft -a list ruleset\n== ip6tables -S\n== iptables -S\n== end\n") == "malformed");
+    CHECK(token("== nft -a list ruleset\n== iptables -S\n== end\n") == "malformed");
+    CHECK(token("== nft -a list ruleset\n== iptables -S\n== iptables -S\n== ip6tables -S\n== end\n") == "malformed");
+    CHECK(token("== nft -a list ruleset\n== iptables -S\n== ip6tables -S\n== surprise\n== end\n") == "malformed");
+    CHECK(token(snap("", "", "") + "== nft -a list ruleset\n") == "malformed");
+    CHECK(token(snap("", "", "") + "\n") == "malformed");
+    // garbage, and a reply that does not start with the first header
+    CHECK(token("hello\nworld\n") == "malformed");
+    CHECK(token("garbage") == "malformed");
+    CHECK(token("\n") == "malformed");
+    CHECK(token("== iptables -S\n== ip6tables -S\n== end\n") == "malformed");
+}
+
+TEST_CASE("parse_nft_ruleset_text: a real listing is tables, chains with hook and policy, and rules by handle",
+          "[firewall]") {
+    const auto r = parse_nft_ruleset_text(kNftOne);
+    REQUIRE(r.has_value());
+    REQUIRE(r->tables.size() == 1);
+    CHECK(r->tables[0].family == nft_raw::kNfprotoInet);
+    CHECK(r->tables[0].name == "filter");
+    REQUIRE(r->chains.size() == 1);
+    CHECK(r->chains[0].name == "input");
+    CHECK(r->chains[0].table == "filter");
+    CHECK(r->chains[0].is_base_chain);
+    CHECK(r->chains[0].hooknum == std::optional<std::uint32_t>{1});
+    CHECK(r->chains[0].policy == std::optional<std::uint32_t>{nft_raw::kNftPolicyAccept});
+    REQUIRE(r->rules.size() == 2);
+    CHECK(r->rules[0].handle == std::optional<std::uint64_t>{4});
+    CHECK(r->rules[1].handle == std::optional<std::uint64_t>{5});
+    CHECK(r->rules[0].chain == "input");
+    CHECK(r->rules[0].table == "filter");
+    CHECK(r->rules[0].family == nft_raw::kNfprotoInet);
+    // two independent counters agree
+    CHECK(r->rules.size() == yuzu::test::fwrestore::count_nft_rules(kNftOne));
+}
+
+TEST_CASE("parse_nft_ruleset_text: sets, maps, a flowtable and a multi-line rule are not rules, and the count "
+          "agrees with the independent line counter",
+          "[firewall]") {
+    const auto r = parse_nft_ruleset_text(kNftBig);
+    REQUIRE(r.has_value());
+    REQUIRE(r->tables.size() == 2);
+    CHECK(r->tables[1].family == nft_raw::kNfprotoIpv6);
+    // handles 6, 7, 8 (one rule over three lines), 9 and the ip6 rule 2: five, and no header counted
+    REQUIRE(r->rules.size() == 5);
+    CHECK(r->rules[2].handle == std::optional<std::uint64_t>{8});
+    CHECK(r->rules[4].table == "filter");
+    CHECK(r->rules[4].family == nft_raw::kNfprotoIpv6);
+    CHECK(r->rules.size() == yuzu::test::fwrestore::count_nft_rules(kNftBig));
+    // chains: input, forward (a policy drop base chain), and the ip6 input; the sets are not chains
+    REQUIRE(r->chains.size() == 3);
+    CHECK(r->chains[1].name == "forward");
+    CHECK(r->chains[1].policy == std::optional<std::uint32_t>{nft_raw::kNftPolicyDrop});
+    CHECK(r->chains[1].hooknum == std::optional<std::uint32_t>{2});
+    CHECK_FALSE(r->chains[2].is_base_chain); // a regular chain carries no hook
+    // attribution: the rules of the first table are in `input`, none in `forward`
+    CHECK(r->rules[0].chain == "input");
+    for (const auto& rule : r->rules)
+        CHECK(rule.chain == "input");
+}
+
+TEST_CASE("parse_nft_ruleset_text: empty text is no tables, and a listing it cannot read is nullopt", "[firewall]") {
+    const auto none = parse_nft_ruleset_text("");
+    REQUIRE(none.has_value());
+    CHECK(none->tables.empty());
+    const auto only_comments = parse_nft_ruleset_text("# Warning: nothing here\n\n   \n");
+    REQUIRE(only_comments.has_value());
+    CHECK(only_comments->tables.empty());
+    // cut mid-block
+    CHECK_FALSE(parse_nft_ruleset_text("table inet filter { # handle 1\n\tchain input { # handle 1\n"));
+    CHECK_FALSE(parse_nft_ruleset_text(kNftOne.substr(0, kNftOne.size() - 2))); // the closing brace gone
+    // an unknown family, top-level junk, a table header that is not one
+    CHECK_FALSE(parse_nft_ruleset_text("table nonsense filter { # handle 1\n}\n"));
+    CHECK_FALSE(parse_nft_ruleset_text("junk\n"));
+    CHECK_FALSE(parse_nft_ruleset_text("table inet filter\n"));
+    CHECK_FALSE(parse_nft_ruleset_text("table inet filter extra { # handle 1\n}\n"));
+    // a rule line without a handle (a listing without -a must never undercount)
+    CHECK_FALSE(parse_nft_ruleset_text("table inet filter {\n\tchain input {\n\t\ttype filter hook input priority "
+                                       "filter; policy accept;\n\t\ttcp dport 22 accept\n\t}\n}\n"));
+    // a multi-line rule that closes without a handle
+    CHECK_FALSE(parse_nft_ruleset_text("table inet filter { # handle 1\n\tchain input { # handle 1\n"
+                                       "\t\ttcp dport {\n\t\t\t80, 443\n\t\t} accept\n\t}\n}\n"));
+    // an unknown object header or a chain header of another shape fails closed
+    CHECK_FALSE(parse_nft_ruleset_text("table inet filter { # handle 1\n\tmystery thing { # handle 2\n\t}\n}\n"));
+    CHECK_FALSE(parse_nft_ruleset_text("table inet filter { # handle 1\n\tchain a b { # handle 2\n\t}\n}\n"));
+    // more closing braces than opening ones
+    CHECK_FALSE(parse_nft_ruleset_text("}\n"));
+    CHECK_FALSE(parse_nft_ruleset_text("table inet filter { # handle 1\n}\n}\n"));
+    // a quote that never closes, and a handle that does not fit 64 bits
+    CHECK_FALSE(parse_nft_ruleset_text("table inet filter { # handle 1\n\tchain input { # handle 1\n"
+                                       "\t\tiif \"lo accept # handle 4\n\t}\n}\n"));
+    CHECK_FALSE(parse_nft_ruleset_text("table inet filter { # handle 1\n\tchain input { # handle 1\n"
+                                       "\t\ttcp dport 22 accept # handle 99999999999999999999999\n\t}\n}\n"));
+}
+
+TEST_CASE("parse_nft_ruleset_text: a brace or a handle inside a quoted comment changes nothing", "[firewall]") {
+    const auto r = parse_nft_ruleset_text(
+        "table inet filter { # handle 1\n"
+        "\tchain input { # handle 1\n"
+        "\t\ttype filter hook input priority filter; policy accept;\n"
+        "\t\ttcp dport 22 accept comment \"open { brace # handle 9\" # handle 4\n"
+        "\t\ttcp dport 80 accept comment \"} close\" # handle 5\n"
+        "\t}\n"
+        "}\n");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rules.size() == 2);
+    CHECK(r->rules[0].handle == std::optional<std::uint64_t>{4});
+    CHECK(r->rules[1].handle == std::optional<std::uint64_t>{5});
+    // a quoted name is a name, with its spaces
+    const auto q = parse_nft_ruleset_text("table inet \"my table\" { # handle 1\n}\n");
+    REQUIRE(q.has_value());
+    REQUIRE(q->tables.size() == 1);
+    CHECK(q->tables[0].name == "my table");
+}
+
+TEST_CASE("parse_nft_ruleset_text: arp and netdev chains parse and leave the verdict to policy and rules",
+          "[firewall]") {
+    const auto r = parse_nft_ruleset_text(
+        "table arp filter { # handle 1\n"
+        "\tchain input { # handle 1\n"
+        "\t\ttype filter hook input priority filter; policy accept;\n"
+        "\t}\n"
+        "}\n"
+        "table netdev filter { # handle 2\n"
+        "\tchain ingress { # handle 1\n"
+        "\t\ttype filter hook ingress device \"lo\" priority filter; policy accept;\n"
+        "\t}\n"
+        "}\n");
+    REQUIRE(r.has_value());
+    REQUIRE(r->tables.size() == 2);
+    CHECK(r->tables[0].family == nft_raw::kNfprotoArp);
+    CHECK(r->tables[1].family == nft_raw::kNfprotoNetdev);
+    REQUIRE(r->chains.size() == 2);
+    CHECK(r->chains[1].is_base_chain);
+    CHECK_FALSE(r->chains[1].hooknum.has_value()); // ingress is not one of the five inet hooks
+    CHECK(nft_decide_state(true, true, r->chains, r->rules) == NftVerdict::inactive);
+    // a drop policy on any of them is content, whatever its hook is called
+    const auto drop = parse_nft_ruleset_text(
+        "table netdev filter { # handle 2\n\tchain ingress { # handle 1\n"
+        "\t\ttype filter hook ingress device \"lo\" priority filter; policy drop;\n\t}\n}\n");
+    REQUIRE(drop.has_value());
+    CHECK(nft_decide_state(true, true, drop->chains, drop->rules) == NftVerdict::active);
+}
+
+TEST_CASE("iptables_summary and format_iptables_rule_row: content, shape and the IPv4 and IPv6 row forms",
+          "[firewall]") {
+    const auto clean = iptables_summary(kIptClean);
+    CHECK(clean.shaped);
+    CHECK_FALSE(clean.has_content);
+    CHECK(clean.append_count == 0);
+    CHECK(iptables_summary(kIptV6Rules).has_content); // a DROP policy
+    CHECK(iptables_summary(kIptV6Rules).append_count == 1);
+    CHECK(iptables_summary("-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N chain\n").has_content);
+    CHECK(iptables_summary("-P INPUT ACCEPT\n-A INPUT -j ACCEPT\n").has_content);
+    // an unknown line is content and is not in a known shape
+    const auto odd = iptables_summary("-P INPUT ACCEPT\nsurprise\n");
+    CHECK_FALSE(odd.shaped);
+    CHECK(odd.has_content);
+    CHECK_FALSE(iptables_summary("").shaped);
+
+    const auto rules = parse_iptables_save("-P INPUT DROP\n-N c\n-A INPUT -p tcp -j c\nsurprise|x\n");
+    REQUIRE(rules.size() == 4);
+    // today's bytes for IPv4
+    CHECK(format_iptables_rule_row(rules[0], false) == "rule|policy|INPUT|DROP");
+    CHECK(format_iptables_rule_row(rules[1], false) == "rule|new_chain|c|");
+    CHECK(format_iptables_rule_row(rules[2], false) == "rule|append|INPUT|-p tcp -j c");
+    CHECK(format_iptables_rule_row(rules[3], false) == "rule|unknown||surprise_x");
+    // IPv6 carries `ip6` ahead of the kind, which is none of the four kinds
+    CHECK(format_iptables_rule_row(rules[0], true) == "rule|ip6|policy|INPUT|DROP");
+    CHECK(format_iptables_rule_row(rules[2], true) == "rule|ip6|append|INPUT|-p tcp -j c");
+}
+
+TEST_CASE("iptables family: both address families are read together, and a member that could not be read "
+          "never reads as nothing",
+          "[firewall]") {
+    // IPv4 clean and IPv6 with a DROP policy and one rule: active, with the IPv6 count
+    CHECK(state_rows("", kIptClean, kIptV6Rules) ==
+          Rows{"backend|iptables", "state|active", "ruleset|1"});
+    CHECK(rules_rows("", kIptClean, kIptV6Rules) ==
+          Rows{"backend|iptables", "rule|policy|INPUT|ACCEPT", "rule|policy|FORWARD|ACCEPT",
+               "rule|policy|OUTPUT|ACCEPT", "rule|ip6|policy|INPUT|DROP", "rule|ip6|policy|FORWARD|ACCEPT",
+               "rule|ip6|policy|OUTPUT|ACCEPT", "rule|ip6|append|INPUT|-p tcp -m tcp --dport 22 -j ACCEPT",
+               "ruleset|1"});
+    // one member failed and neither shows content: unknown, with its error row and no count
+    CHECK(state_rows(kAbsent, kFailed, kIptClean) ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown", "error|iptables:snapshot:failed"});
+    CHECK(state_rows(kAbsent, kIptClean, kFailed) ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown", "error|ip6tables:snapshot:failed"});
+    // one member failed and the other has content: active, the count unknown
+    CHECK(state_rows(kAbsent, kFailed, kIptV6Rules) ==
+          Rows{"backend|iptables", "state|active", "ruleset|unknown", "error|iptables:snapshot:failed"});
+    // a listing that is not in the known shape is untrusted and says so
+    CHECK(state_rows(kAbsent, "surprise\n", kIptClean) ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown", "error|iptables:unrecognised_output"});
+    // `rules` lists the text members and says unknown when none was text
+    CHECK(rules_rows(kAbsent, kFailed, kFailed) ==
+          Rows{"backend|iptables", "rules|unknown", "ruleset|unknown", "error|iptables:snapshot:failed",
+               "error|ip6tables:snapshot:failed"});
+    // ip6tables absent and IPv4 clean is inactive, a count of zero
+    CHECK(state_rows(kAbsent, kIptClean, kAbsent) == Rows{"backend|iptables", "state|inactive", "ruleset|0"});
+    // both absent is no family at all: with nft absent too the rung declines
+    CHECK(state_rows(kAbsent, kAbsent, kAbsent).empty());
+    CHECK(rules_rows(kAbsent, kAbsent, kAbsent).empty());
+}
+
+TEST_CASE("linux_snapshot rows, branch 1: nft text it cannot read is unknown with the error row", "[firewall]") {
+    const std::string cut = "table inet filter { # handle 1\n"; // not closed
+    const Rows state{"backend|nftables", "state|unknown", "ruleset|unknown", "error|nftables:unrecognised_output"};
+    const Rows rules{"backend|nftables", "rules|unknown", "ruleset|unknown", "error|nftables:unrecognised_output"};
+    // whatever the iptables sections say: an unread nft ruleset is not an empty one
+    CHECK(state_rows(cut, kIptClean, kIptClean) == state);
+    CHECK(rules_rows(cut, kIptClean, kIptClean) == rules);
+    CHECK(state_rows(cut, kIptV6Rules, kAbsent) == state);
+}
+
+TEST_CASE("linux_snapshot rows, branch 2: nft with content answers for itself", "[firewall]") {
+    CHECK(state_rows(kNftOne, kIptClean, kIptClean) == Rows{"backend|nftables", "state|active", "ruleset|2"});
+    CHECK(rules_rows(kNftOne, kIptClean, kIptClean) ==
+          Rows{"backend|nftables", "rule|nftables|inet|filter|input|input|accept",
+               "rule|nftables|inet|filter|input|handle|4", "rule|nftables|inet|filter|input|handle|5",
+               "ruleset|2"});
+    // a base chain with a drop policy and no rule is content
+    const std::string drop =
+        "table inet filter { # handle 1\n\tchain input { # handle 1\n"
+        "\t\ttype filter hook input priority filter; policy drop;\n\t}\n}\n";
+    CHECK(state_rows(drop, kAbsent, kAbsent) == Rows{"backend|nftables", "state|active", "ruleset|0"});
+    // content stands with tables_seen set: an active reading is never downgraded
+    CHECK(state_rows(kNftOne, kIptClean, kIptClean, true) == Rows{"backend|nftables", "state|active", "ruleset|2"});
+    // a hostile name echoed into a row is sanitised
+    const std::string hostile =
+        "table inet \"a|b\" { # handle 1\n\tchain \"c|d\" { # handle 1\n"
+        "\t\ttype filter hook input priority filter; policy accept;\n"
+        "\t\taccept # handle 7\n\t}\n}\n";
+    const auto rows = rules_rows(hostile, kAbsent, kAbsent);
+    REQUIRE(rows.size() == 4);
+    CHECK(rows[1] == "rule|nftables|inet|a_b|c_d|input|accept");
+    CHECK(rows[2] == "rule|nftables|inet|a_b|c_d|handle|7");
+}
+
+TEST_CASE("linux_snapshot rows, branch 3: nft with no content defers to an iptables family that has some "
+          "or could not be read",
+          "[firewall]") {
+    const std::string tables_no_content =
+        "table inet filter { # handle 1\n\tchain input { # handle 1\n"
+        "\t\ttype filter hook input priority filter; policy accept;\n\t}\n}\n";
+    // no nft table at all, IPv4 three ACCEPT policies, IPv6-only rules: active (the review's H1 case)
+    CHECK(state_rows("", kIptClean, kIptV6Rules) == Rows{"backend|iptables", "state|active", "ruleset|1"});
+    // nft tables with no content beside legacy rules: active, through iptables
+    CHECK(state_rows(tables_no_content, kIptV6Rules, kIptClean) ==
+          Rows{"backend|iptables", "state|active", "ruleset|1"});
+    // an iptables member that could not be read: unknown, never inactive
+    CHECK(state_rows(tables_no_content, kFailed, kIptClean) ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown", "error|iptables:snapshot:failed"});
+    // family inactive or absent: nft answers inactive with a count of zero
+    CHECK(state_rows(tables_no_content, kIptClean, kIptClean) ==
+          Rows{"backend|nftables", "state|inactive", "ruleset|0"});
+    CHECK(state_rows("", kIptClean, kAbsent) == Rows{"backend|nftables", "state|inactive", "ruleset|0"});
+    CHECK(state_rows("", kAbsent, kAbsent) == Rows{"backend|nftables", "state|inactive", "ruleset|0"});
+    // rules: the base chains nft lists, no rule rows, a count of zero
+    CHECK(rules_rows(tables_no_content, kIptClean, kIptClean) ==
+          Rows{"backend|nftables", "rule|nftables|inet|filter|input|input|accept", "ruleset|0"});
+    CHECK(rules_rows("", kAbsent, kAbsent) == Rows{"backend|nftables", "ruleset|0"});
+    CHECK(rules_rows("", kIptClean, kIptV6Rules).front() == "backend|iptables");
+}
+
+TEST_CASE("linux_snapshot rows, branch 4: nft absent leaves the iptables family, or declines", "[firewall]") {
+    CHECK(state_rows(kAbsent, kAbsent, kAbsent).empty());
+    CHECK(state_rows(kAbsent, kIptClean, kIptClean) == Rows{"backend|iptables", "state|inactive", "ruleset|0"});
+    CHECK(state_rows(kAbsent, kIptV6Rules, kIptClean) == Rows{"backend|iptables", "state|active", "ruleset|1"});
+    CHECK(rules_rows(kAbsent, kIptClean, kAbsent) ==
+          Rows{"backend|iptables", "rule|policy|INPUT|ACCEPT", "rule|policy|FORWARD|ACCEPT",
+               "rule|policy|OUTPUT|ACCEPT", "ruleset|0"});
+}
+
+TEST_CASE("linux_snapshot rows, branch 5: nft that failed is reported and never read as empty", "[firewall]") {
+    // a family with content still answers, beside the error row
+    CHECK(state_rows(kFailed, kIptV6Rules, kIptClean) ==
+          Rows{"error|nftables:snapshot:failed", "backend|iptables", "state|active", "ruleset|1"});
+    // otherwise unknown: an unread nft ruleset hides anything, so a clean family does not make it inactive
+    CHECK(state_rows(kFailed, kIptClean, kIptClean) ==
+          Rows{"error|nftables:snapshot:failed", "backend|nftables", "state|unknown", "ruleset|unknown"});
+    CHECK(state_rows(kFailed, kAbsent, kAbsent) ==
+          Rows{"error|nftables:snapshot:failed", "backend|nftables", "state|unknown", "ruleset|unknown"});
+    CHECK(rules_rows(kFailed, kIptClean, kIptClean) ==
+          Rows{"error|nftables:snapshot:failed", "backend|nftables", "rules|unknown", "ruleset|unknown"});
+}
+
+TEST_CASE("linux_snapshot rows, branch 6: inactive reads unknown when the netlink leg saw a table", "[firewall]") {
+    const Rows unknown{"backend|nftables", "state|unknown", "ruleset|unknown"};
+    CHECK(state_rows("", kAbsent, kAbsent, true) == unknown);
+    CHECK(state_rows("", kIptClean, kIptClean, true) == unknown);
+    CHECK(rules_rows("", kAbsent, kAbsent, true) ==
+          Rows{"backend|nftables", "rules|unknown", "ruleset|unknown"});
+    // the iptables family's inactive answer is clamped the same way, and carries no count
+    CHECK(state_rows(kAbsent, kIptClean, kIptClean, true) ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown"});
+    CHECK(rules_rows(kAbsent, kIptClean, kIptClean, true) ==
+          Rows{"backend|iptables", "rules|unknown", "ruleset|unknown"});
+    // and the same snapshot without a table seen is inactive
+    CHECK(state_rows(kAbsent, kIptClean, kIptClean, false) ==
+          Rows{"backend|iptables", "state|inactive", "ruleset|0"});
+}
+
+TEST_CASE("snapshot_connect_token and snapshot_error_row", "[firewall]") {
+    CHECK(snapshot_connect_token(ENOENT).empty()); // no broker installed: silent
+    CHECK(snapshot_connect_token(EACCES) == "connect:eacces");
+    CHECK(snapshot_connect_token(ECONNREFUSED) == "connect:refused");
+    CHECK(snapshot_connect_token(EAGAIN) == "connect:busy");
+    CHECK(snapshot_connect_token(EMFILE) == "connect:errno:" + std::to_string(EMFILE));
+    CHECK(snapshot_connect_token(0) == "connect:errno:0");
+    CHECK(snapshot_error_row("timeout") == "error|snapshot:timeout");
+    CHECK(snapshot_error_row("empty") == "error|snapshot:empty");
+    CHECK(kFwSnapshotSocketPath == "/run/yuzu-fw-snapshot.sock");
+    CHECK(kFwSnapshotMaxBytes == 1048576);
 }

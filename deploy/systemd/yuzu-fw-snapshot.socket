@@ -1,0 +1,31 @@
+# yuzu-fw-snapshot.socket: the root-owned socket the Yuzu agent reads the host firewall through.
+#
+# The agent unit (NoNewPrivileges, one capability) can read neither the nftables ruleset nor
+# iptables, and sudo cannot elevate under it. systemd, as root, owns this socket and starts one
+# yuzu-fw-snapshot@.service per connection; that service runs one fixed read-only script
+# (yuzu-fw-snapshot.sh) and writes its listing to the connection. The contract is
+# docs/adr/3007-os-activated-read-helpers.md. Disable it with `systemctl mask --now
+# yuzu-fw-snapshot.socket`: the agent then reads no firewall state on this unit and says so.
+# The unit is designed for systemd 239 and later; the agent's README names the versions it has
+# been measured on.
+[Unit]
+Description=Yuzu agent read-only firewall snapshot socket
+Documentation=https://github.com/DevNullLtd/Yuzu
+# Stops and restarts with the agent; the agent unit pulls it in (Wants=), so there is no [Install].
+PartOf=yuzu-agent.service
+
+[Socket]
+# The path the agent connects to (kFwSnapshotSocketPath in firewall_parsers.hpp).
+ListenStream=/run/yuzu-fw-snapshot.sock
+# Who may connect is this owner, group and mode: root owns it, the agent's group may use it, and
+# nobody else may. The agent also refuses a socket whose creator is not root (SO_PEERCRED).
+SocketUser=root
+SocketGroup=yuzu-agent
+SocketMode=0660
+# One service instance per connection, at most four at once; a fifth connect is refused and the
+# agent reports connect:busy.
+Accept=yes
+MaxConnections=4
+# A stopped or masked broker leaves no socket file, so the agent declines silently instead of
+# reporting connect:refused on a socket nothing listens on.
+RemoveOnStop=yes

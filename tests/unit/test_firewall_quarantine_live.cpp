@@ -126,6 +126,12 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
+#if defined(__linux__)
+#include <poll.h>
+#include <sys/un.h>
+
+#include <yuzu/agent/scoped_fd.hpp>
+#endif
 
 namespace fq = yuzu::firewall::quarantine;
 namespace fr = yuzu::test::fwrestore;
@@ -291,6 +297,62 @@ constexpr fr::Os kThisOs = fr::Os::mac;
 constexpr fr::Os kThisOs = fr::Os::lin;
 #endif
 
+#if defined(__linux__)
+/// Whether the root snapshot broker's socket file is there (the packaged systemd socket unit, which
+/// the agent account reaches through its group). Its absence is not an error: an installer-provisioned
+/// host has the sudo helper instead.
+[[nodiscard, maybe_unused]] bool broker_socket_present() {
+    return ::access(std::string{yuzu::firewall::kFwSnapshotSocketPath}.c_str(), F_OK) == 0;
+}
+
+/// The broker's whole reply, read the way the agent reads it: connect, send NOTHING, read to end of
+/// stream, within `budget`. nullopt when it could not be read (no socket, not permitted, a timeout,
+/// or more than 2 MiB, which the broker never sends). The descriptor is a ScopedFd, so every return
+/// closes it and nothing else does.
+[[nodiscard, maybe_unused]] std::optional<std::string> broker_snapshot_text(std::chrono::seconds budget = 60s) {
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    constexpr auto path = yuzu::firewall::kFwSnapshotSocketPath;
+    static_assert(path.size() < sizeof(addr.sun_path));
+    std::memcpy(addr.sun_path, path.data(), path.size());
+    yuzu::agent::ScopedFd sock(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (!sock || ::connect(sock.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0)
+        return std::nullopt;
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    std::string text;
+    char buf[16 * 1024];
+    for (;;) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+        if (left.count() <= 0)
+            return std::nullopt;
+        pollfd pfd{sock.get(), POLLIN, 0};
+        const int ready = ::poll(&pfd, 1, static_cast<int>(left.count()));
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0)
+            return std::nullopt;
+        const ssize_t n = ::read(sock.get(), buf, sizeof(buf));
+        if (n < 0 && (errno == EINTR || errno == EAGAIN))
+            continue;
+        if (n < 0)
+            return std::nullopt;
+        if (n == 0)
+            return text;
+        text.append(buf, static_cast<std::size_t>(n));
+        if (text.size() > 2 * 1048576)
+            return std::nullopt;
+    }
+}
+
+/// The `-A` lines (rules) of an `iptables -S` or `ip6tables -S` snapshot section.
+[[nodiscard, maybe_unused]] std::size_t count_appended(const std::string& section) {
+    std::size_t appended = 0;
+    for (const auto& line : rows_of(section))
+        appended += line.rfind("-A ", 0) == 0 ? 1 : 0;
+    return appended;
+}
+#endif
+
 /// A snapshot whose one read failed: it can never compare equal to anything, itself included.
 [[nodiscard, maybe_unused]] std::string failed_snapshot() {
     std::string out;
@@ -328,7 +390,15 @@ constexpr fr::Os kThisOs = fr::Os::lin;
         // ahead of the first header, and the helper already drops its tools' stderr.
         const auto res = capture_result(harness_sudo({std::string{fq::kFwHelperPath}, "snapshot"}), 60s,
                                         /*merge_stderr=*/false);
-        return yuzu::firewall::subprocess_complete(res) ? res.output : failed_snapshot();
+        if (yuzu::firewall::subprocess_complete(res))
+            return res.output;
+        // No installer grant (the packaged account, which has no sudoers file): the same listing,
+        // read from the broker socket the way the agent reads it. Used only when the helper's read
+        // did not complete and the socket is there; otherwise the snapshot is the failed form.
+        if (broker_socket_present())
+            if (auto text = broker_snapshot_text())
+                return *std::move(text);
+        return failed_snapshot();
     }
     // Root: the same three tools with the helper's labels and arguments. A tool that is not
     // executable is `[absent]`.
@@ -1762,6 +1832,21 @@ TEST_CASE("live: state reports what the OS tool reports, and the host is left as
         for (const auto& line : rows_of(*ipt))
             appended += line.rfind("-A ", 0) == 0 ? 1 : 0;
         CHECK(*ruleset == std::to_string(appended));
+    } else if (!running_as_root() && broker_socket_present()) {
+        // Answered through the root snapshot broker (the agent cannot read the ruleset itself): the
+        // state is a real answer, no error row says otherwise, and the count is the baseline's.
+        CHECK(*state != "unknown");
+        CHECK_FALSE(has_prefix(r.captured, "error|"));
+        if (*backend == "nftables") {
+            const auto nft = fr::section(before, fr::label::kNft);
+            REQUIRE(nft.has_value());
+            CHECK(*ruleset == std::to_string(fr::count_nft_rules(*nft)));
+        } else if (*backend == "iptables") {
+            const auto ipt = fr::section(before, fr::label::kIptables);
+            const auto ip6t = fr::section(before, fr::label::kIp6tables);
+            REQUIRE((ipt.has_value() || ip6t.has_value()));
+            CHECK(*ruleset == std::to_string(count_appended(ipt.value_or("")) + count_appended(ip6t.value_or(""))));
+        }
     } else if (!running_as_root() && *state == "unknown") {
         // The agent account cannot read the ruleset itself (netlink dumps and iptables need root):
         // an honest unknown is the right answer, and it must say why, unless the backend that
@@ -1833,6 +1918,22 @@ TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it 
         const auto n = fr::count_nft_rules(*nft);
         CHECK(*ruleset == std::to_string(n));
         CHECK(count_prefixed(r.captured, "rule|nftables|") >= n); // the rule handles, plus the base chains
+    } else if (!running_as_root() && broker_socket_present()) {
+        // Answered through the root snapshot broker: a real count, no error row, and the baseline's.
+        CHECK_FALSE(has_prefix(r.captured, "error|"));
+        CHECK(is_integer(*ruleset));
+        if (*backend == "nftables") {
+            const auto nft = fr::section(before, fr::label::kNft);
+            REQUIRE(nft.has_value());
+            CHECK(*ruleset == std::to_string(fr::count_nft_rules(*nft)));
+        } else if (*backend == "iptables") {
+            const auto ipt = fr::section(before, fr::label::kIptables);
+            const auto ip6t = fr::section(before, fr::label::kIp6tables);
+            REQUIRE((ipt.has_value() || ip6t.has_value()));
+            CHECK(*ruleset == std::to_string(count_appended(ipt.value_or("")) + count_appended(ip6t.value_or(""))));
+            // an IPv6 entry is listed under its own form
+            CHECK((count_appended(ip6t.value_or("")) == 0 || has_prefix(r.captured, "rule|ip6|")));
+        }
     } else if (!running_as_root()) {
         CHECK((*ruleset == "unknown" || is_integer(*ruleset))); // honest, never a fabricated count
     }
@@ -1856,6 +1957,8 @@ TEST_CASE("live (linux, agent account): the helper's snapshot word answers throu
     LIVE_OR_SKIP(env);
     if (running_as_root())
         SKIP("runs as the agent account: a root run does not go through the helper");
+    if (broker_socket_present() && !fs::exists(std::string{fq::kFwHelperPath}))
+        SKIP("the packaged account: no installer helper on this host, the listing is read from the broker socket");
     const auto snap = capture_result(harness_sudo({std::string{fq::kFwHelperPath}, "snapshot"}), 60s,
                                      /*merge_stderr=*/false);
     INFO(snap.output.substr(0, 2000));

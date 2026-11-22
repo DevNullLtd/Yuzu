@@ -106,6 +106,32 @@ Run each component under its own system user:
 - `yuzu-agent` — agent process
 - `yuzu-gw` — gateway process
 
+### Firewall snapshot broker (Linux packages)
+
+The packaged agent unit keeps `NoNewPrivileges=true` and a bounding set of one capability, so it
+cannot read the nftables ruleset or `iptables` itself. The `.deb` and `.rpm` ship a root-owned
+socket unit for that, and the agent unit pulls it in (`Wants=yuzu-fw-snapshot.socket`):
+
+- `yuzu-fw-snapshot.socket` listens on `/run/yuzu-fw-snapshot.sock`, owned by root with group
+  `yuzu-agent` and mode `0660`, so only that group can connect.
+- Each connection starts `yuzu-fw-snapshot@.service`, which runs one fixed script as root with no
+  input and a read-only file system (apart from the iptables lock file). The script runs `nft -a list ruleset`,
+  `iptables -S` and `ip6tables -S` with those literal arguments and nothing else; the reply is cut
+  at 1 MiB. The agent sends nothing, checks that root created the socket and treats the reply as
+  untrusted text.
+- **What the agent account can now read:** the host's full nftables ruleset, rule handles and rule
+  comments included, and the `iptables` and `ip6tables` listings. It can change nothing through the
+  broker, and the agent unit's own sandbox is unchanged. Anyone who can run code as the agent can
+  read those listings; treat the ruleset as readable by that account.
+- The service unit has its own sandbox (its own two capabilities, a system call filter, address
+  families, a read-only file system). Its IP egress filter takes effect only on hosts with the
+  unified cgroup hierarchy; the address-family list is what bounds its sockets.
+- To opt out, run `systemctl mask --now yuzu-fw-snapshot.socket`. The firewall plugin then reads
+  `unknown` for `state` and `rules` on that unit, with no error row (a masked socket leaves no
+  socket file).
+
+The design and its limits are in `docs/adr/3007-os-activated-read-helpers.md`.
+
 ## Gateway TLS (if you deploy the Erlang gateway)
 
 > **⚠ The gateway agent listener (`:50051`) is plaintext in every shipped compose except the reference gateway compose.**

@@ -806,6 +806,117 @@ class SnapshotRuns(unittest.TestCase):
             self.assertIn('"%s"' % marker, header, marker)
 
 
+BROKER_SCRIPT = "deploy/systemd/yuzu-fw-snapshot.sh"
+PARSERS_HEADER = "agents/plugins/firewall/src/firewall_parsers.hpp"
+
+
+def broker_script_text():
+    """The shipped broker script (run by yuzu-fw-snapshot@.service), exactly as packaged."""
+    text = read_text(BROKER_SCRIPT)
+    if text is None:
+        raise AssertionError("the broker script is gone: " + BROKER_SCRIPT)
+    return text
+
+
+def sh_function(text, name):
+    """The text of one shell function, from `name() {` to its closing `}` on a line of its own."""
+    m = re.search(r"^%s\(\) \{\n.*?\n\}\n" % re.escape(name), text, re.S | re.M)
+    if not m:
+        raise AssertionError("no function %s" % name)
+    return m.group(0)
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the broker script under a POSIX shell")
+class BrokerSnapshotScriptRuns(SnapshotRuns):
+    """The shipped broker script (deploy/systemd/yuzu-fw-snapshot.sh), run the way SnapshotRuns runs
+    the helper's `snapshot` word: with its three tool paths replaced by stubs, under every POSIX
+    shell found. The script is the helper's snapshot text with one difference, the call: it takes NO
+    argument at all (the helper's word has no counterpart), so the helper's one-word call is the
+    script's bare call here, and anything on its command line is refused having run nothing."""
+
+    def make_helper(self, bodies):
+        type(self).counter += 1
+        d = os.path.join(self.tmp.name, "case%d" % self.counter)
+        os.mkdir(d)
+        text = broker_script_text()
+        for _label, tool, _args in self.TOOLS:
+            body = bodies.get(tool, STUB_ECHO)
+            stub = os.path.join(d, "stub-" + os.path.basename(tool))
+            if body is not None:
+                with open(stub, "w") as f:
+                    f.write("#!/bin/sh\n" + body)
+                os.chmod(stub, 0o755)
+            text = text.replace(tool, stub)
+        path = os.path.join(d, "yuzu-fw-snapshot.sh")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        for _label, tool, _args in cls.TOOLS:
+            assert broker_script_text().count(tool) == 1, "the script must name %s exactly once" % tool
+
+    def run_helper(self, shell, path, args, env=None):
+        # the inherited cases call the word `snapshot`; the script's counterpart is the bare call
+        args = [] if list(args) == ["snapshot"] else list(args)
+        return subprocess.run([shell, path] + args, capture_output=True, text=True, timeout=30, env=env)
+
+    def test_a_listing_longer_than_the_cap_is_cut_and_has_no_end_line(self):
+        big = "head -c 1100000 /dev/zero | tr '\\000' 'a'\n"
+        for shell in available_shells():
+            r = subprocess.run([shell, self.make_helper({"/usr/sbin/nft": big})],
+                               capture_output=True, timeout=60)
+            self.assertEqual(r.returncode, 0, shell)
+            self.assertEqual(len(r.stdout), self.CAP, shell)
+            self.assertNotIn(b"== end", r.stdout, shell)
+            self.assertTrue(r.stdout.startswith(b"== nft -a list ruleset\naaaa"), shell)
+
+    # The helper's "exactly the one word" case does not apply: for this script the bare call is the
+    # only call that runs, and every call with an argument is the next case.
+    test_anything_but_exactly_the_one_word_exits_non_zero_having_run_nothing = None
+
+    def test_any_argument_at_all_exits_64_having_run_nothing_and_printed_nothing(self):
+        bad = ([""], ["snapshot"], ["x"], ["-a"], ["snapshot", "extra"], ["list", "ruleset"], ["--help"], [" "])
+        script = self.make_helper({})
+        for shell in available_shells():
+            for args, r in zip(bad, run_all([[shell, script] + list(a) for a in bad])):
+                self.assertEqual((r.returncode, r.stdout, r.stderr), (64, "", ""), (shell, args))
+
+    def test_it_reads_nothing_from_its_standard_input(self):
+        # A script that read its input would take what is written to it: a closed stdin, /dev/null and
+        # a stream of bytes all give the same listing.
+        want = self.expected_listing(["stub-nft", "stub-iptables", "stub-ip6tables"])
+        script = self.make_helper({})
+        for shell in available_shells():
+            for stdin in (b"", b"junk\n" * 1000, b"snapshot\n"):
+                r = subprocess.run([shell, script], input=stdin, capture_output=True, timeout=30)
+                self.assertEqual((r.returncode, r.stdout.decode()), (0, want), (shell, stdin[:10]))
+
+    def test_the_assignments_and_the_two_functions_are_byte_identical_to_the_helpers(self):
+        script, helper = broker_script_text(), helper_text()
+        assignments = "IPT=/usr/sbin/iptables\nIP6T=/usr/sbin/ip6tables\nNFT=/usr/sbin/nft\n"
+        self.assertIn(assignments, script)
+        self.assertIn(assignments, helper)
+        for name in ("snap_one", "host_snapshot"):
+            self.assertEqual(sh_function(script, name), sh_function(helper, name), name)
+        for line in ("set -u", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", "export PATH LC_ALL"):
+            self.assertIn("\n%s\n" % line, script, line)
+            self.assertIn("\n%s\n" % line, helper, line)
+        self.assertTrue(script.startswith("#!/bin/sh\n"))
+
+    def test_the_labels_and_markers_are_the_string_literals_of_the_plugin_header_too(self):
+        header = read_text(PARSERS_HEADER)
+        self.assertIsNotNone(header, PARSERS_HEADER)
+        for label, _tool, _args in self.TOOLS:
+            self.assertIn('"%s"' % label, header, label)
+        for marker in ("[absent]", "[failed]", "== end"):
+            self.assertIn('"%s"' % marker, header, marker)
+        self.assertIn('kFwSnapshotSocketPath = "/run/yuzu-fw-snapshot.sock"', header)
+        self.assertIn("kFwSnapshotMaxBytes = 1048576", header)
+
+
 # What the stub tools run by default: print its own name, then each argument it was handed.
 STUB_ECHO = 'printf "RAN %s\\n" "${0##*/}"\nfor a; do printf "%s\\n" "$a"; done\n'
 

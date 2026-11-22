@@ -16,12 +16,13 @@
  * Acquisition ladder (ADR-3002):
  *   Windows — rung 1, native INetFwPolicy2 COM (agents/shared/win_com.hpp),
  *             replacing both former `netsh` shell-outs.
- *   macOS   — rung 2, run_bounded_subprocess argv (socketfilterfw/pfctl) —
- *             same 3 sites as before, only the acquisition mechanism
- *             changed (popen -> bounded runner); the pure parsers in
- *             firewall_parsers.hpp are untouched.
- *   Linux   — backend probe order: firewalld -> nftables -> ufw -> iptables
- *             -> none.
+ *   macOS   — rung 2, run_bounded_subprocess argv (socketfilterfw; the pf
+ *             reads as `sudo -n -- /sbin/pfctl -s <word>` on the installer's
+ *             exact read-only grants, direct when root) — only the
+ *             acquisition mechanism changed (popen -> bounded runner); the
+ *             pure parsers in firewall_parsers.hpp are untouched.
+ *   Linux   — backend probe order: firewalld -> nftables -> root snapshot
+ *             broker -> ufw -> iptables -> none.
  *               firewalld: rung 1, bounded sd-bus (org.fedoraproject.
  *                 FirewallD1), mirroring guardian_state_reader.cpp's
  *                 timeout-budget-re-arm pattern across sequential calls.
@@ -32,6 +33,14 @@
  *                 backend probe here; a mutating nftables leg is explicitly
  *                 out of scope (ADR-3002 Decision 8). Pure decode lives in
  *                 firewall_parsers.hpp's nft_raw namespace / parse_nft_*.
+ *               root snapshot broker: rung 1, an AF_UNIX connection to the
+ *                 root-owned systemd socket yuzu-fw-snapshot.socket (the
+ *                 agent spawns nothing and sends nothing; ADR-3007). The
+ *                 packaged unit (NoNewPrivileges, one capability) can read
+ *                 neither nftables nor iptables itself, so the broker's
+ *                 fixed read-only script does, and the pure parsers frame
+ *                 and decide its reply (parse_fw_snapshot and
+ *                 linux_snapshot_*_rows in firewall_parsers.hpp).
  *               ufw / iptables: rung 2, run_bounded_subprocess argv, each
  *                 backend now emitting STRUCTURED rows via its own pure
  *                 parser (parse_ufw_rules / parse_iptables_save) — replacing
@@ -125,6 +134,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 #endif
 
@@ -1079,6 +1089,10 @@ struct NftFallthroughInfo {
     bool tables_seen = false;
     std::vector<yuzu::firewall::NftFailedDump> failed;
     unsigned churn_streak = 0;
+    /// Rows the dispatcher writes only when no later rung answers: the table dump's own row waits
+    /// here, because the snapshot rung that follows may read the very ruleset the dump was refused,
+    /// and an EPERM row beside a successful read would mislead.
+    std::vector<std::string> pending_rows;
 };
 
 /// Consecutive probes whose last pass still ended in torn or generation_changed. A trusted
@@ -1175,10 +1189,12 @@ struct NftProbeResult {
             // discard table_res silently, making the documented troubleshooting token unreachable).
             // An error| row, not fallthrough|: nftables has not committed as the live backend yet.
             // On a re-run this is the same path: the earlier pass's churn is superseded.
+            // The socket-open diagnostics (fd_exhausted, a refused open) are written at once, as ever;
+            // the table-dump row is deferred to the dispatcher (NftFallthroughInfo::pending_rows).
             for (const auto& row : yuzu::firewall::nft_open_diag_rows(open_errnos))
                 ctx.write_output(row);
             if (!table.open_errno)
-                ctx.write_output(yuzu::firewall::nft_diag_row("table", table.res));
+                info.pending_rows.push_back(yuzu::firewall::nft_diag_row("table", table.res));
             note_probe_end(/*ended_in_churn=*/false);
             return std::nullopt; // unreachable -- fall through
         }
@@ -1263,6 +1279,105 @@ bool try_nftables_rules(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
         ctx.write_output(yuzu::firewall::format_nft_rule_handle_row(r));
     ctx.write_output(std::format("ruleset|{}", rules.size()));
     return true;
+}
+
+// ── root snapshot broker (rung 1, AF_UNIX; docs/adr/3007-os-activated-read-helpers.md) ─────
+//
+// The packaged agent has neither CAP_NET_ADMIN nor a way to escalate, so the root-owned systemd
+// socket unit yuzu-fw-snapshot.socket runs one fixed read-only script per connection and writes the
+// listing to it. The agent connects, sends NOTHING and reads to end of stream: no process is
+// spawned here (rung 1), and the reply is untrusted text that the pure parsers frame and decide.
+// A host without the broker has no socket file (RemoveOnStop=yes), which declines silently.
+
+/// One read of the broker: the reply text, or the token that says why there is none. An EMPTY token
+/// means the broker is not installed (ENOENT) and is not reported. Tokens: connect:eacces,
+/// connect:refused, connect:busy, connect:errno:<n>, peer_not_root, timeout, oversized, io_error.
+[[nodiscard]] std::expected<std::string, std::string>
+read_fw_snapshot(std::chrono::steady_clock::time_point deadline) {
+    sockaddr_un addr{};
+    static_assert(yuzu::firewall::kFwSnapshotSocketPath.size() < sizeof(addr.sun_path),
+                  "the broker socket path must fit sockaddr_un::sun_path with its NUL");
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, yuzu::firewall::kFwSnapshotSocketPath.data(),
+                yuzu::firewall::kFwSnapshotSocketPath.size());
+
+    // Non-blocking from creation and owned by a ScopedFd: every return below closes it, and
+    // nothing else closes it (the single release path, as in open_nft_socket).
+    yuzu::agent::ScopedFd sock(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+    if (!sock)
+        return std::unexpected(std::string{"io_error"});
+    if (::connect(sock.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0)
+        return std::unexpected(yuzu::firewall::snapshot_connect_token(errno));
+
+    // The socket must have been made by root: for a connected unix socket SO_PEERCRED is the
+    // credentials of the process that listen()ed, so a socket file an unprivileged account put at
+    // this path is refused before a byte of it is read.
+    ucred cred{};
+    socklen_t cred_len = sizeof(cred);
+    if (::getsockopt(sock.get(), SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) < 0 || cred_len != sizeof(cred))
+        return std::unexpected(std::string{"io_error"});
+    if (cred.uid != 0)
+        return std::unexpected(std::string{"peer_not_root"});
+
+    std::string text;
+    char buf[16 * 1024];
+    for (;;) {
+        const auto left = remaining_ms(deadline);
+        if (left.count() <= 0)
+            return std::unexpected(std::string{"timeout"});
+        pollfd pfd{sock.get(), POLLIN, 0};
+        const int ready = ::poll(&pfd, 1, static_cast<int>(left.count()));
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            return std::unexpected(std::string{"io_error"});
+        }
+        if (ready == 0)
+            return std::unexpected(std::string{"timeout"});
+        const ssize_t n = ::read(sock.get(), buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN)
+                continue;
+            return std::unexpected(std::string{"io_error"});
+        }
+        if (n == 0)
+            return text; // end of stream: the broker has sent everything it will
+        text.append(buf, static_cast<std::size_t>(n));
+        if (text.size() > yuzu::firewall::kFwSnapshotMaxBytes)
+            return std::unexpected(std::string{"oversized"});
+    }
+}
+
+/// true iff the snapshot answered (dispatch stops); false means the next rung runs. A broker that
+/// is not installed says nothing; one that is but could not be read says why in an
+/// `error|snapshot:<token>` row. `rules` selects the action; the rows are the pure decision's.
+bool try_snapshot(yuzu::CommandContext& ctx, bool tables_seen, bool rules) {
+    const auto reply = read_fw_snapshot(std::chrono::steady_clock::now() + kAcqDeadline);
+    if (!reply) {
+        if (!reply.error().empty())
+            ctx.write_output(yuzu::firewall::snapshot_error_row(reply.error()));
+        return false;
+    }
+    const auto snapshot = yuzu::firewall::parse_fw_snapshot(*reply);
+    if (!snapshot) {
+        ctx.write_output(yuzu::firewall::snapshot_error_row(snapshot.error()));
+        return false;
+    }
+    const auto rows = rules ? yuzu::firewall::linux_snapshot_rules_rows(*snapshot, tables_seen)
+                            : yuzu::firewall::linux_snapshot_state_rows(*snapshot, tables_seen);
+    if (rows.empty())
+        return false; // no nft and no iptables on this host: nothing the snapshot can say
+    for (const auto& row : rows)
+        ctx.write_output(row);
+    return true;
+}
+
+bool try_snapshot_state(yuzu::CommandContext& ctx, bool tables_seen) {
+    return try_snapshot(ctx, tables_seen, /*rules=*/false);
+}
+
+bool try_snapshot_rules(yuzu::CommandContext& ctx, bool tables_seen) {
+    return try_snapshot(ctx, tables_seen, /*rules=*/true);
 }
 
 // ── ufw (rung 2, argv) ───────────────────────────────────────────────────
@@ -1360,23 +1475,12 @@ bool try_iptables_state(yuzu::CommandContext& ctx, bool tables_seen) {
         ctx.write_output("ruleset|unknown");
         return true;
     }
-    auto rules = yuzu::firewall::parse_iptables_save(res.output);
     // iptables has no on/off concept the way ufw/firewalld do: any policy
     // other than the default ACCEPT, or any non-policy entry, counts as
     // "active"; three bare ACCEPT policies and nothing else is "inactive" —
-    // matches this leg's pre-migration semantics.
-    bool has_content = false;
-    int append_count = 0;
-    for (const auto& r : rules) {
-        if (r.type == yuzu::firewall::IptablesEntryType::policy) {
-            if (r.spec != "ACCEPT")
-                has_content = true;
-        } else {
-            has_content = true;
-        }
-        if (r.type == yuzu::firewall::IptablesEntryType::append)
-            ++append_count;
-    }
+    // matches this leg's pre-migration semantics (the loop is iptables_summary, shared with the
+    // snapshot rung).
+    const auto summary = yuzu::firewall::iptables_summary(res.output);
     // state| is gated on subprocess_complete(), the same completeness check
     // ruleset| already used -- exit_code==0 alone doesn't rule out a
     // timed-out or output-capped read, and a parsed verdict off a partial
@@ -1386,15 +1490,15 @@ bool try_iptables_state(yuzu::CommandContext& ctx, bool tables_seen) {
     // Output that completed but is not in the shape the parser knows (#4402) reads the same way,
     // plus a row that says why.
     const bool complete = subprocess_complete(res);
-    const bool shaped = yuzu::firewall::iptables_shape_ok(rules);
+    const bool shaped = summary.shaped;
     auto state = yuzu::firewall::gate_state_on_completeness(
         complete && shaped, tables_seen,
-        has_content ? yuzu::firewall::FwState::enabled : yuzu::firewall::FwState::disabled);
+        summary.has_content ? yuzu::firewall::FwState::enabled : yuzu::firewall::FwState::disabled);
     ctx.write_output(std::format(
         "state|{}", state == yuzu::firewall::FwState::enabled    ? "active"
                     : state == yuzu::firewall::FwState::disabled ? "inactive"
                                                                   : "unknown"));
-    ctx.write_output(complete && shaped ? std::format("ruleset|{}", append_count)
+    ctx.write_output(complete && shaped ? std::format("ruleset|{}", summary.append_count)
                                         : std::string("ruleset|unknown"));
     if (complete && !shaped)
         ctx.write_output(yuzu::firewall::unrecognised_output_row("iptables"));
@@ -1415,23 +1519,14 @@ bool try_iptables_rules(yuzu::CommandContext& ctx) {
         ctx.write_output("ruleset|unknown");
         return true;
     }
-    int append_count = 0;
-    const auto parsed = yuzu::firewall::parse_iptables_save(res.output);
-    for (const auto& r : parsed) {
-        const char* type_s = r.type == yuzu::firewall::IptablesEntryType::policy      ? "policy"
-                             : r.type == yuzu::firewall::IptablesEntryType::new_chain ? "new_chain"
-                             : r.type == yuzu::firewall::IptablesEntryType::append    ? "append"
-                                                                                       : "unknown";
-        ctx.write_output(std::format("rule|{}|{}|{}", type_s, sanitize_field(r.chain),
-                                     sanitize_field(r.spec)));
-        if (r.type == yuzu::firewall::IptablesEntryType::append)
-            ++append_count;
-    }
+    const auto summary = yuzu::firewall::iptables_summary(res.output);
+    for (const auto& r : summary.entries)
+        ctx.write_output(yuzu::firewall::format_iptables_rule_row(r, /*ip6=*/false));
     // The rule rows already written stay; only the count is withheld (#4402), with the row that
     // says why, when the output is not in a shape the parser knows.
     const bool complete = subprocess_complete(res);
-    const bool shaped = yuzu::firewall::iptables_shape_ok(parsed);
-    ctx.write_output(complete && shaped ? std::format("ruleset|{}", append_count)
+    const bool shaped = summary.shaped;
+    ctx.write_output(complete && shaped ? std::format("ruleset|{}", summary.append_count)
                                         : std::string("ruleset|unknown"));
     if (complete && !shaped)
         ctx.write_output(yuzu::firewall::unrecognised_output_row("iptables"));
@@ -1452,6 +1547,14 @@ void do_state_linux(yuzu::CommandContext& ctx) {
     NftFallthroughInfo info;
     if (try_nftables_state(ctx, info))
         return;
+
+    // The packaged unit cannot read nftables or iptables itself: the root snapshot broker can. When
+    // it answers, the table dump's deferred row is dropped (the read succeeded, so the EPERM row
+    // would mislead); when it does not, the row is written and the ladder goes on as before.
+    if (try_snapshot_state(ctx, info.tables_seen))
+        return;
+    for (const auto& row : info.pending_rows)
+        ctx.write_output(row);
 
     if (info.tables_seen) {
         // GETTABLE succeeded (something IS managing nftables here) but the
@@ -1496,6 +1599,12 @@ void do_rules_linux(yuzu::CommandContext& ctx) {
     NftFallthroughInfo info;
     if (try_nftables_rules(ctx, info))
         return;
+
+    // The root snapshot broker, as in do_state_linux.
+    if (try_snapshot_rules(ctx, info.tables_seen))
+        return;
+    for (const auto& row : info.pending_rows)
+        ctx.write_output(row);
 
     if (try_ufw_rules(ctx))
         return;
@@ -3051,6 +3160,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), "
+         "else the root snapshot broker over AF_UNIX (packaged systemd socket), "
          "else ufw/iptables via run_bounded_subprocess (rung 2)",
          nullptr},
         /* .macos_leg   = */
@@ -3066,6 +3176,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), "
+         "else the root snapshot broker over AF_UNIX (packaged systemd socket), "
          "else ufw/iptables via run_bounded_subprocess (rung 2)",
          nullptr},
         /* .macos_leg   = */

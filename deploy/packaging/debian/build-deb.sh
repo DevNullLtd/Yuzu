@@ -102,6 +102,13 @@ cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent.service" "$PKG/usr/lib/system
 mkdir -p "$PKG/usr/share/yuzu/scripts"
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent-dmi-snapshot.sh" "$PKG/usr/share/yuzu/scripts/"
 chmod 0755 "$PKG/usr/share/yuzu/scripts/yuzu-agent-dmi-snapshot.sh"
+# Read-only firewall snapshot broker (ADR-3007): the socket unit and its per-connection service
+# unit (the agent unit pulls the socket in with Wants=), and the fixed script the service runs.
+cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-fw-snapshot.socket" "$PKG/usr/lib/systemd/system/"
+cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-fw-snapshot@.service" "$PKG/usr/lib/systemd/system/"
+chmod 0644 "$PKG/usr/lib/systemd/system/yuzu-fw-snapshot.socket" "$PKG/usr/lib/systemd/system/yuzu-fw-snapshot@.service"
+cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-fw-snapshot.sh" "$PKG/usr/share/yuzu/scripts/"
+chmod 0755 "$PKG/usr/share/yuzu/scripts/yuzu-fw-snapshot.sh"
 
 # Agent core shared library (plugins link against it)
 AGENT_CORE_FOUND=0

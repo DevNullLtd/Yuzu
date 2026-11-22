@@ -19,13 +19,16 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <expected>
 #include <format>
 #include <optional>
 #include <span>
@@ -1518,6 +1521,634 @@ win_rules_trailer_rows(int count, bool truncated, bool enum_failed, std::uint32_
 /// The row that says a backend's output was complete but not in the shape this plugin knows.
 [[nodiscard]] inline std::string unrecognised_output_row(std::string_view backend) {
     return std::format("error|{}:unrecognised_output", backend);
+}
+
+// ── Linux: the iptables summary and the one row form every iptables source shares ───────────
+
+/// What one `iptables -S` (or `ip6tables -S`) listing says: its entries, whether it is in the shape
+/// this plugin knows (iptables_shape_ok), whether it holds any content, and its `-A` count.
+/// Content is any policy other than ACCEPT or any entry that is not a policy: iptables has no on/off
+/// concept, so three bare ACCEPT policies and nothing else is "no content". An unrecognised line
+/// counts as content (it is something, and unknown is never read as nothing).
+struct IptablesSummary {
+    std::vector<IptablesRule> entries;
+    bool shaped = false;
+    bool has_content = false;
+    int append_count = 0;
+};
+
+[[nodiscard]] inline IptablesSummary iptables_summary(std::string_view output) {
+    IptablesSummary sum;
+    sum.entries = parse_iptables_save(output);
+    for (const auto& r : sum.entries) {
+        if (r.type == IptablesEntryType::policy) {
+            if (r.spec != "ACCEPT")
+                sum.has_content = true;
+        } else {
+            sum.has_content = true;
+        }
+        if (r.type == IptablesEntryType::append)
+            ++sum.append_count;
+    }
+    sum.shaped = iptables_shape_ok(sum.entries);
+    return sum;
+}
+
+/// One iptables entry as a row: `rule|<kind>|<chain>|<spec>`, or `rule|ip6|<kind>|<chain>|<spec>`
+/// for an ip6tables entry. `ip6` is none of the kinds (policy, new_chain, append, unknown), so
+/// the two forms cannot be confused. Chain and spec are echoed, so they are sanitised.
+[[nodiscard]] inline std::string format_iptables_rule_row(const IptablesRule& r, bool ip6) {
+    const char* kind = r.type == IptablesEntryType::policy      ? "policy"
+                       : r.type == IptablesEntryType::new_chain ? "new_chain"
+                       : r.type == IptablesEntryType::append    ? "append"
+                                                                : "unknown";
+    return std::format("rule|{}{}|{}|{}", ip6 ? "ip6|" : "", kind, sanitize_field(r.chain),
+                       sanitize_field(r.spec));
+}
+
+// ── Linux: the root snapshot broker (docs/adr/3007-os-activated-read-helpers.md) ─────────────
+//
+// The packaged agent (NoNewPrivileges, one capability) can read neither the nft ruleset nor
+// iptables, and sudo cannot elevate under it. A root-owned systemd socket unit
+// (yuzu-fw-snapshot.socket) runs one fixed read-only script per connection
+// (yuzu-fw-snapshot.sh, the same text as the root helper's `snapshot` word) and writes it to the
+// connection; the agent connects, sends nothing and reads to end of stream. Everything below is
+// pure: the framing, the whole-ruleset text parser, the iptables family and the decision table.
+// The reply is untrusted text from a socket: strict framing, fail closed, and never a false-safe
+// value (`inactive` only when every section that was read shows no content).
+
+inline constexpr std::string_view kFwSnapshotSocketPath = "/run/yuzu-fw-snapshot.sock";
+/// The script cuts its whole reply here (`head -c`), so a reply that is longer than this was not
+/// produced by it, and one cut at this size has no end line.
+inline constexpr std::size_t kFwSnapshotMaxBytes = 1048576;
+inline constexpr std::string_view kFwSnapshotNftLabel = "nft -a list ruleset";
+inline constexpr std::string_view kFwSnapshotIptablesLabel = "iptables -S";
+inline constexpr std::string_view kFwSnapshotIp6tablesLabel = "ip6tables -S";
+inline constexpr std::string_view kFwSnapshotAbsentMarker = "[absent]";
+inline constexpr std::string_view kFwSnapshotFailedMarker = "[failed]";
+inline constexpr std::string_view kFwSnapshotEndLine = "== end";
+
+enum class FwSectionKind {
+    text,   // the tool ran and exited 0: `text` is its whole output
+    absent, // the tool is not installed (the section body is exactly `[absent]`)
+    failed, // the tool ran and exited non-zero (a line of the body is `[failed]`): its text is not kept
+};
+
+struct FwSnapshotSection {
+    FwSectionKind kind = FwSectionKind::failed;
+    std::string text; // empty unless kind == text
+};
+
+struct FwSnapshot {
+    FwSnapshotSection nft;
+    FwSnapshotSection iptables;
+    FwSnapshotSection ip6tables;
+};
+
+/// Frames a broker reply: exactly the three headed sections in order, then `== end` as the last
+/// line, every line newline-terminated. The error token is `empty` (zero bytes: the broker
+/// accepted the connection and sent nothing, as when MaxConnections is reached or the service could
+/// not start), `truncated` (a reply that starts as one but has no end line, or whose end line was
+/// cut) or `malformed` (anything else: text that does not start with the first header, a header
+/// out of order, missing or repeated, and text after the end line).
+[[nodiscard]] inline std::expected<FwSnapshot, std::string_view> parse_fw_snapshot(std::string_view reply) {
+    if (reply.empty())
+        return std::unexpected{std::string_view{"empty"}};
+    std::vector<std::string_view> lines;
+    for (std::size_t pos = 0; pos < reply.size();) {
+        const auto nl = reply.find('\n', pos);
+        lines.push_back(reply.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos));
+        pos = nl == std::string_view::npos ? reply.size() : nl + 1;
+    }
+    const std::array<std::string, 3> headers{"== " + std::string{kFwSnapshotNftLabel},
+                                             "== " + std::string{kFwSnapshotIptablesLabel},
+                                             "== " + std::string{kFwSnapshotIp6tablesLabel}};
+    if (lines.front() != headers[0])
+        return std::unexpected{std::string_view{"malformed"}};
+    const auto end = std::find(lines.begin(), lines.end(), kFwSnapshotEndLine);
+    if (end == lines.end() || reply.back() != '\n')
+        return std::unexpected{std::string_view{"truncated"}};
+    if (end + 1 != lines.end())
+        return std::unexpected{std::string_view{"malformed"}}; // text after the end line
+
+    FwSnapshot snap;
+    FwSnapshotSection* const slots[3] = {&snap.nft, &snap.iptables, &snap.ip6tables};
+    int section = -1;
+    std::string body;
+    bool failed = false;
+    const auto close = [&] {
+        if (section < 0)
+            return;
+        auto& slot = *slots[section];
+        if (failed) {
+            slot = FwSnapshotSection{FwSectionKind::failed, {}};
+        } else if (body == std::string{kFwSnapshotAbsentMarker} + "\n") {
+            slot = FwSnapshotSection{FwSectionKind::absent, {}};
+        } else {
+            slot = FwSnapshotSection{FwSectionKind::text, std::move(body)};
+        }
+        body.clear();
+        failed = false;
+    };
+    for (auto it = lines.begin(); it != end; ++it) {
+        if (it->starts_with("== ")) {
+            if (section == 2 || *it != headers[static_cast<std::size_t>(section + 1)])
+                return std::unexpected{std::string_view{"malformed"}};
+            close();
+            ++section;
+            continue;
+        }
+        body.append(*it);
+        body += '\n';
+        failed = failed || *it == kFwSnapshotFailedMarker;
+    }
+    if (section != 2)
+        return std::unexpected{std::string_view{"malformed"}}; // a section is missing
+    close();
+    return snap;
+}
+
+/// An `nft -a list ruleset` listing read as text: its tables, its chains (with the base-chain hook
+/// and policy) and its rules, in the same records the netlink dumps decode to, so the state
+/// verdict (nft_has_content) and the row formatters are the ones the netlink leg uses.
+struct NftTextRuleset {
+    std::vector<NftTableInfo> tables;
+    std::vector<NftChainInfo> chains;
+    std::vector<NftRuleInfo> rules;
+};
+
+namespace detail {
+
+/// One listing line after the comment is split off: the code before the first `#` outside quotes,
+/// whether the comment was `# handle <digits>` and that handle, and the braces of the code outside
+/// quotes. nullopt when a quote is not closed on the line or a handle does not fit 64 bits.
+struct NftTextLine {
+    std::string_view code;
+    bool has_handle = false;
+    std::uint64_t handle = 0;
+    int opens = 0;
+    int closes = 0;
+    [[nodiscard]] bool ends_open() const noexcept { return !code.empty() && code.back() == '{'; }
+    [[nodiscard]] int delta() const noexcept { return opens - closes; }
+};
+
+[[nodiscard]] inline std::optional<NftTextLine> nft_text_line(std::string_view raw) {
+    const auto is_blank = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
+    while (!raw.empty() && is_blank(raw.back()))
+        raw.remove_suffix(1);
+    while (!raw.empty() && is_blank(raw.front()))
+        raw.remove_prefix(1);
+    NftTextLine out;
+    bool quoted = false;
+    std::size_t comment = std::string_view::npos;
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        const char c = raw[i];
+        if (quoted) {
+            if (c == '\\')
+                ++i;
+            else if (c == '"')
+                quoted = false;
+            continue;
+        }
+        if (c == '"') {
+            quoted = true;
+        } else if (c == '#') {
+            comment = i;
+            break;
+        } else if (c == '{') {
+            ++out.opens;
+        } else if (c == '}') {
+            ++out.closes;
+        }
+    }
+    if (quoted)
+        return std::nullopt;
+    out.code = raw.substr(0, comment);
+    while (!out.code.empty() && is_blank(out.code.back()))
+        out.code.remove_suffix(1);
+    if (comment != std::string_view::npos) {
+        auto note = raw.substr(comment + 1);
+        while (!note.empty() && is_blank(note.front()))
+            note.remove_prefix(1);
+        constexpr std::string_view kHandle = "handle ";
+        if (note.starts_with(kHandle)) {
+            const auto digits = note.substr(kHandle.size());
+            if (!digits.empty() && std::all_of(digits.begin(), digits.end(), [](char d) { return d >= '0' && d <= '9'; })) {
+                const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), out.handle);
+                if (ec != std::errc{} || ptr != digits.data() + digits.size())
+                    return std::nullopt;
+                out.has_handle = true;
+            }
+        }
+    }
+    return out;
+}
+
+/// The whitespace-separated tokens of a line, a quoted string being one token (quotes kept).
+[[nodiscard]] inline std::vector<std::string_view> nft_text_tokens(std::string_view code) {
+    std::vector<std::string_view> out;
+    std::size_t start = std::string_view::npos;
+    bool quoted = false;
+    for (std::size_t i = 0; i <= code.size(); ++i) {
+        const bool end = i == code.size();
+        const char c = end ? ' ' : code[i];
+        if (quoted) {
+            if (c == '\\')
+                ++i;
+            else if (c == '"')
+                quoted = false;
+            continue;
+        }
+        if (!end && c == '"')
+            quoted = true;
+        if (c == ' ' || c == '\t') {
+            if (start != std::string_view::npos)
+                out.push_back(code.substr(start, i - start));
+            start = std::string_view::npos;
+        } else if (start == std::string_view::npos) {
+            start = i;
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] inline std::string nft_text_name(std::string_view token) {
+    if (token.size() >= 2 && token.front() == '"' && token.back() == '"')
+        token = token.substr(1, token.size() - 2);
+    return std::string{token};
+}
+
+[[nodiscard]] inline std::optional<std::uint8_t> nft_text_family(std::string_view name) {
+    using namespace nft_raw;
+    if (name == "ip")
+        return kNfprotoIpv4;
+    if (name == "ip6")
+        return kNfprotoIpv6;
+    if (name == "inet")
+        return kNfprotoInet;
+    if (name == "arp")
+        return kNfprotoArp;
+    if (name == "bridge")
+        return kNfprotoBridge;
+    if (name == "netdev")
+        return kNfprotoNetdev;
+    return std::nullopt;
+}
+
+} // namespace detail
+
+/// Parses `nft -a list ruleset` text into tables, chains and rules; nullopt when it is not a
+/// listing this parser fully understands. It is written against real `nft -a` output, where the
+/// table, chain, set, map and flowtable headers end `{ # handle N` and every rule ends
+/// `# handle N` (a listing without -a has no handles, so a rule cannot be told from a property
+/// line and every rule line fails: a listing must never UNDERCOUNT). Per line the comment is split
+/// off first (quote-aware, so a `# handle 9` or a brace inside a quoted comment changes nothing),
+/// then: at top level only blank lines, comments and `table <family> <name> {`; inside a table
+/// `chain <name> {` opens a chain, a `set`, `map`, `flowtable` or other object header is only
+/// brace-counted, and a `...;` or `comment ...` line is a property; inside a chain a
+/// `type ... hook <h> ...; policy <p>;` line makes it a base chain, a line that carries a handle
+/// and does not open a block is one rule, a line that opens a block starts a multi-line rule
+/// that must close on a line carrying a handle, and any other line returns nullopt. Unbalanced
+/// text (a listing cut mid-block) returns nullopt. Empty text is an empty ruleset: 0 tables.
+[[nodiscard]] inline std::optional<NftTextRuleset> parse_nft_ruleset_text(std::string_view text) {
+    enum class Where { top, table, chain, block, rule };
+    NftTextRuleset out;
+    Where where = Where::top;
+    int depth = 0;
+    std::uint8_t family = 0;
+    std::string table;
+    std::string chain;
+    for (std::size_t pos = 0; pos < text.size();) {
+        const auto nl = text.find('\n', pos);
+        const auto raw = text.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
+        pos = nl == std::string_view::npos ? text.size() : nl + 1;
+        const auto scanned = detail::nft_text_line(raw);
+        if (!scanned)
+            return std::nullopt;
+        const auto& line = *scanned;
+        const auto tokens = detail::nft_text_tokens(line.code);
+        switch (where) {
+        case Where::top: {
+            if (line.code.empty())
+                break; // a blank line or a comment (`# Warning: table ip nat is managed by ...`)
+            const auto fam = tokens.size() == 4 ? detail::nft_text_family(tokens[1]) : std::nullopt;
+            if (!fam || tokens[0] != "table" || tokens[3] != "{" || line.delta() != 1)
+                return std::nullopt;
+            family = *fam;
+            table = detail::nft_text_name(tokens[2]);
+            out.tables.push_back(NftTableInfo{family, table});
+            depth = 1;
+            where = Where::table;
+            break;
+        }
+        case Where::table: {
+            if (line.code.empty())
+                break;
+            if (line.code == "}") {
+                depth = 0;
+                where = Where::top;
+            } else if (line.ends_open()) {
+                if (tokens[0] == "chain") {
+                    if (tokens.size() != 3 || tokens[2] != "{" || line.delta() != 1)
+                        return std::nullopt;
+                    chain = detail::nft_text_name(tokens[1]);
+                    out.chains.push_back(NftChainInfo{family, table, chain, false, std::nullopt, std::nullopt});
+                    depth = 2;
+                    where = Where::chain;
+                } else {
+                    // an object that holds no rules; unknown headers fail closed
+                    static constexpr std::string_view kObjects[] = {"set",   "map",     "flowtable", "counter",
+                                                                    "quota", "limit",   "ct",        "synproxy",
+                                                                    "secmark"};
+                    if (std::find(std::begin(kObjects), std::end(kObjects), tokens[0]) == std::end(kObjects) ||
+                        line.delta() < 1)
+                        return std::nullopt;
+                    depth += line.delta();
+                    where = Where::block;
+                }
+            } else if (!(line.delta() == 0 && !line.has_handle && (line.code.back() == ';' || tokens[0] == "comment"))) {
+                return std::nullopt; // a table property (`flags dormant;`, `comment "..."`) is the only other line
+            }
+            break;
+        }
+        case Where::block:
+            depth += line.delta();
+            if (depth < 1)
+                return std::nullopt;
+            if (depth == 1)
+                where = Where::table;
+            break;
+        case Where::chain: {
+            if (line.code.empty())
+                break;
+            if (line.code == "}") {
+                depth = 1;
+                where = Where::table;
+            } else if (!line.has_handle && tokens[0] == "type" && line.code.back() == ';') {
+                // `type filter hook input priority filter; policy accept;`
+                auto& info = out.chains.back();
+                for (std::size_t i = 0; i + 1 < tokens.size(); ++i) {
+                    const auto next = [&](std::size_t at) {
+                        auto t = tokens[at];
+                        if (!t.empty() && t.back() == ';')
+                            t.remove_suffix(1);
+                        return t;
+                    };
+                    if (tokens[i] == "hook") {
+                        info.is_base_chain = true;
+                        const auto h = next(i + 1);
+                        info.hooknum = h == "prerouting"    ? std::optional<std::uint32_t>{0}
+                                       : h == "input"       ? std::optional<std::uint32_t>{1}
+                                       : h == "forward"     ? std::optional<std::uint32_t>{2}
+                                       : h == "output"      ? std::optional<std::uint32_t>{3}
+                                       : h == "postrouting" ? std::optional<std::uint32_t>{4}
+                                                            : std::nullopt;
+                    } else if (tokens[i] == "policy") {
+                        const auto p = next(i + 1);
+                        info.policy = p == "accept" ? std::optional<std::uint32_t>{nft_raw::kNftPolicyAccept}
+                                      : p == "drop" ? std::optional<std::uint32_t>{nft_raw::kNftPolicyDrop}
+                                                    : std::nullopt;
+                    }
+                }
+            } else if (line.has_handle && !line.ends_open() && line.delta() == 0) {
+                out.rules.push_back(NftRuleInfo{family, table, chain, line.handle}); // one rule
+            } else if (line.ends_open() && line.delta() >= 1) {
+                depth += line.delta(); // a rule over several lines, which closes on a line with a handle
+                where = Where::rule;
+            } else if (!(line.delta() == 0 && !line.has_handle && (line.code.back() == ';' || tokens[0] == "comment"))) {
+                return std::nullopt; // fail closed: a line that is none of the above could be a rule
+            }
+            break;
+        }
+        case Where::rule:
+            depth += line.delta();
+            if (depth < 2)
+                return std::nullopt;
+            if (depth == 2) {
+                if (!line.has_handle)
+                    return std::nullopt;
+                out.rules.push_back(NftRuleInfo{family, table, chain, line.handle});
+                where = Where::chain;
+            }
+            break;
+        }
+    }
+    if (depth != 0 || where != Where::top)
+        return std::nullopt;
+    return out;
+}
+
+/// The two iptables sections of a snapshot read together (`iptables -S` and `ip6tables -S`).
+/// A member is TRUSTED when it is text and shaped; an absent member (no binary) adds nothing; a
+/// failed or unshaped member is untrusted and what it printed is ignored for the verdict.
+enum class FwFamilyState { active, inactive, unknown };
+
+namespace detail {
+
+struct IptablesMember {
+    std::string_view tool; // "iptables" or "ip6tables"
+    bool ip6 = false;
+    FwSectionKind kind = FwSectionKind::absent;
+    IptablesSummary summary; // meaningful for kind == text
+    [[nodiscard]] bool trusted() const noexcept { return kind == FwSectionKind::text && summary.shaped; }
+};
+
+struct IptablesFamily {
+    std::array<IptablesMember, 2> members;
+    [[nodiscard]] bool absent() const noexcept {
+        return members[0].kind == FwSectionKind::absent && members[1].kind == FwSectionKind::absent;
+    }
+    /// active when any trusted member has content; else unknown when any member is untrusted; else
+    /// inactive (every present member is trusted and shows no content).
+    [[nodiscard]] FwFamilyState state() const noexcept {
+        bool untrusted = false;
+        for (const auto& m : members) {
+            if (m.trusted() && m.summary.has_content)
+                return FwFamilyState::active;
+            untrusted = untrusted || (m.kind != FwSectionKind::absent && !m.trusted());
+        }
+        return untrusted ? FwFamilyState::unknown : FwFamilyState::inactive;
+    }
+    /// The sum of -A entries when every present member is trusted, else nullopt.
+    [[nodiscard]] std::optional<int> count() const noexcept {
+        int sum = 0;
+        for (const auto& m : members) {
+            if (m.kind == FwSectionKind::absent)
+                continue;
+            if (!m.trusted())
+                return std::nullopt;
+            sum += m.summary.append_count;
+        }
+        return sum;
+    }
+};
+
+[[nodiscard]] inline IptablesFamily iptables_family(const FwSnapshot& snap) {
+    IptablesFamily f;
+    const FwSnapshotSection* const sections[2] = {&snap.iptables, &snap.ip6tables};
+    for (std::size_t i = 0; i < 2; ++i) {
+        f.members[i].tool = i == 0 ? "iptables" : "ip6tables";
+        f.members[i].ip6 = i == 1;
+        f.members[i].kind = sections[i]->kind;
+        if (sections[i]->kind == FwSectionKind::text)
+            f.members[i].summary = iptables_summary(sections[i]->text);
+    }
+    return f;
+}
+
+enum class SnapshotMode { state, rules };
+
+[[nodiscard]] inline std::string_view fw_family_state_name(FwFamilyState s) noexcept {
+    return s == FwFamilyState::active ? "active" : s == FwFamilyState::inactive ? "inactive" : "unknown";
+}
+
+/// `backend|iptables` and what follows for `state` (state, count) or `rules` (the rows of every
+/// text member, IPv4 then IPv6, or `rules|unknown` when none was text; then the count), then one
+/// row per untrusted member. `clamp` turns `inactive` into `unknown` (the netlink leg saw a table
+/// this snapshot did not explain): the state is `unknown`, `rules` lists nothing and says
+/// `rules|unknown`, and neither carries a count (an unknown answer never carries one).
+[[nodiscard]] inline std::vector<std::string> iptables_family_rows(const IptablesFamily& f, SnapshotMode mode,
+                                                                   bool clamp) {
+    std::vector<std::string> rows{"backend|iptables"};
+    const bool clamped = clamp && f.state() == FwFamilyState::inactive;
+    const auto state = clamped ? FwFamilyState::unknown : f.state();
+    const auto count = f.count();
+    if (mode == SnapshotMode::state) {
+        rows.push_back(std::format("state|{}", fw_family_state_name(state)));
+    } else {
+        bool any_text = false;
+        for (const auto& m : f.members) {
+            if (m.kind != FwSectionKind::text || clamped)
+                continue;
+            any_text = true;
+            for (const auto& entry : m.summary.entries)
+                rows.push_back(format_iptables_rule_row(entry, m.ip6));
+        }
+        if (!any_text)
+            rows.emplace_back("rules|unknown");
+    }
+    rows.push_back(count && !clamped ? std::format("ruleset|{}", *count) : std::string{"ruleset|unknown"});
+    for (const auto& m : f.members) {
+        if (m.kind == FwSectionKind::failed)
+            rows.push_back(std::format("error|{}:snapshot:failed", m.tool));
+        else if (m.kind == FwSectionKind::text && !m.summary.shaped)
+            rows.push_back(unrecognised_output_row(m.tool));
+    }
+    return rows;
+}
+
+[[nodiscard]] inline std::vector<std::string> nft_snapshot_rows(const NftTextRuleset& nft, NftVerdict verdict,
+                                                                SnapshotMode mode) {
+    std::vector<std::string> rows{"backend|nftables"};
+    if (verdict == NftVerdict::unknown) {
+        rows.emplace_back(mode == SnapshotMode::state ? "state|unknown" : "rules|unknown");
+        rows.emplace_back("ruleset|unknown");
+        return rows;
+    }
+    if (mode == SnapshotMode::state) {
+        rows.push_back(std::format("state|{}", nft_verdict_name(verdict)));
+    } else {
+        for (const auto& c : nft.chains)
+            if (c.is_base_chain)
+                rows.push_back(format_nft_chain_rule_row(c));
+        for (const auto& r : nft.rules)
+            rows.push_back(format_nft_rule_handle_row(r));
+    }
+    rows.push_back(std::format("ruleset|{}", nft.rules.size()));
+    return rows;
+}
+
+[[nodiscard]] inline std::vector<std::string> linux_snapshot_rows(const FwSnapshot& snap, bool tables_seen,
+                                                                  SnapshotMode mode) {
+    const auto family = iptables_family(snap);
+    const auto nft_unknown = [&] {
+        return std::vector<std::string>{"backend|nftables",
+                                        mode == SnapshotMode::state ? "state|unknown" : "rules|unknown",
+                                        "ruleset|unknown"};
+    };
+    const auto append = [](std::vector<std::string> head, const std::vector<std::string>& tail) {
+        head.insert(head.end(), tail.begin(), tail.end());
+        return head;
+    };
+    switch (snap.nft.kind) {
+    case FwSectionKind::absent:
+        // 4. no nft: the iptables family answers, or the rung declines
+        return family.absent() ? std::vector<std::string>{} : iptables_family_rows(family, mode, tables_seen);
+    case FwSectionKind::failed:
+        // 5. nft was there and could not be read: say so, and let a family that shows content answer;
+        //    anything else is unknown (an unread nft ruleset is not an empty one)
+        return append({"error|nftables:snapshot:failed"},
+                      family.state() == FwFamilyState::active ? iptables_family_rows(family, mode, tables_seen)
+                                                              : nft_unknown());
+    case FwSectionKind::text:
+        break;
+    }
+    const auto nft = parse_nft_ruleset_text(snap.nft.text);
+    if (!nft) // 1. a listing this parser does not fully understand
+        return append(nft_unknown(), {unrecognised_output_row("nftables")});
+    const auto verdict = nft_decide_state(/*chains_ok=*/true, /*rules_ok=*/true, nft->chains, nft->rules);
+    if (verdict == NftVerdict::active) // 2.
+        return nft_snapshot_rows(*nft, verdict, mode);
+    // 3. nft shows no content: a family with content, or one that could not be read, answers instead
+    if (!family.absent() && family.state() != FwFamilyState::inactive)
+        return iptables_family_rows(family, mode, tables_seen);
+    // 6. and `inactive` is only answered when no table was seen by the netlink leg either
+    return nft_snapshot_rows(*nft, nft_fallthrough_clamp(tables_seen, FwState::disabled) == FwState::unknown
+                                       ? NftVerdict::unknown
+                                       : NftVerdict::inactive,
+                             mode);
+}
+
+} // namespace detail
+
+/// The `state` rows a snapshot answers with, or no rows when the rung declines (no nft and no
+/// iptables on the host). `tables_seen` is true when the netlink leg saw a table it could not
+/// read. The decision table:
+///  1. nft text that does not parse: backend|nftables, state|unknown, ruleset|unknown and
+///     error|nftables:unrecognised_output.
+///  2. nft parsed with content: backend|nftables, state|active, ruleset|<rules>.
+///  3. nft parsed with no content (no table, or tables with no rule and accept policies): when the
+///     iptables family is active or unknown its rows; when it is absent or inactive,
+///     backend|nftables, state|inactive, ruleset|0.
+///  4. nft absent: the iptables family's rows, or no rows when it is absent too.
+///  5. nft failed: error|nftables:snapshot:failed, then the family's rows when it is active, else
+///     backend|nftables, state|unknown, ruleset|unknown.
+///  6. last, every `inactive` reads unknown when the netlink leg saw a table, with no count (an
+///     unknown state never carries one): `inactive` is answered only when every section that was
+///     read shows no content.
+[[nodiscard]] inline std::vector<std::string> linux_snapshot_state_rows(const FwSnapshot& snap, bool tables_seen) {
+    return detail::linux_snapshot_rows(snap, tables_seen, detail::SnapshotMode::state);
+}
+
+/// The `rules` rows: the same branch and the same backend row as linux_snapshot_state_rows, with
+/// the rule rows (nft base chains then rule handles; iptables entries, `rule|ip6|...` for IPv6)
+/// where `state` has its verdict, and `rules|unknown` where the verdict is unknown.
+[[nodiscard]] inline std::vector<std::string> linux_snapshot_rules_rows(const FwSnapshot& snap, bool tables_seen) {
+    return detail::linux_snapshot_rows(snap, tables_seen, detail::SnapshotMode::rules);
+}
+
+/// The token for a failed connect(2) to the broker socket: empty for ENOENT (no broker is
+/// installed, which is not an error to report), else `connect:eacces` (the agent account is not in
+/// the socket's group), `connect:refused` (the socket file exists and nothing listens),
+/// `connect:busy` (MaxConnections is reached) or `connect:errno:<n>`.
+[[nodiscard]] inline std::string snapshot_connect_token(int err) {
+    switch (err) {
+    case ENOENT:
+        return {};
+    case EACCES:
+        return "connect:eacces";
+    case ECONNREFUSED:
+        return "connect:refused";
+    case EAGAIN:
+        return "connect:busy";
+    default:
+        return std::format("connect:errno:{}", err);
+    }
+}
+
+/// The row a failed broker read writes: `error|snapshot:<token>`.
+[[nodiscard]] inline std::string snapshot_error_row(std::string_view token) {
+    return std::format("error|snapshot:{}", token);
 }
 
 } // namespace yuzu::firewall

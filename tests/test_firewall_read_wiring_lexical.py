@@ -20,6 +20,18 @@ wiring around them, per OS class below:
                      be obtained is written as an all-unknown row and counted (neither skip site
                      reaches `continue` without a row), and the trailer carries the property tally.
 
+  LinuxSnapshotWiring
+                     both Linux dispatchers try firewalld, nftables, the root snapshot broker, ufw
+                     and iptables in that order; only the netlink table-dump row is deferred (to
+                     the decline path), never the socket-open diagnostics; the broker reader opens
+                     a close-on-exec non-blocking ScopedFd socket, checks SO_PEERCRED for root,
+                     bounds its wait and its size, and never writes to the socket.
+
+  BrokerUnits        the shipped socket, template service and snapshot script are exactly the
+                     reviewed directive sets, agree with the plugin's socket path and with what the
+                     deb and rpm packaging install, the script reads nothing, and the agent unit's
+                     NoNewPrivileges and single capability are untouched.
+
 Matching runs on tests/cpp_lex_helper.live_text(): comments, backslash-continued comments and
 `#if 0` blocks are removed first (string contents kept), so a pin cannot be satisfied by commented-out
 or disabled text. Lexical only: it cannot see a relocation that keeps the tokens but changes control
@@ -29,6 +41,8 @@ no longer matches fails loudly (stale pattern) rather than passing vacuously.
 Usage: python3 -I tests/test_firewall_read_wiring_lexical.py
 """
 import re
+import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -313,6 +327,381 @@ class WindowsRuleReadWiring(unittest.TestCase):
         mutated = self.hpp.replace("win_rule_row(const WinRuleRead& r)", "win_rule_row(std::string_view r)", 1)
         self.assertNotEqual(mutated, self.hpp)
         self.assertTrue(any("no longer takes a WinRuleRead" in m for m in windows_problems(self.cpp, mutated)))
+
+
+# ── Linux ───────────────────────────────────────────────────────────────────────────────────────
+
+LINUX_ORDER = {
+    "do_state_linux": ("try_firewalld_state", "try_nftables_state", "try_snapshot_state", "try_ufw_state",
+                       "try_iptables_state"),
+    "do_rules_linux": ("try_firewalld_rules", "try_nftables_rules", "try_snapshot_rules", "try_ufw_rules",
+                       "try_iptables_rules"),
+}
+# calls that would write to the broker socket (the agent sends nothing)
+WRITE_CALLS = (r"::write\(", r"::send\(", r"::sendto\(", r"::sendmsg\(", r"::writev\(", r"::pwrite\(",
+               r"\bwrite\(sock", r"\bsend\(sock")
+
+
+def linux_problems(plugin_src):
+    out = []
+    live = lexh.live_text(plugin_src)
+    for fn, rungs in LINUX_ORDER.items():
+        body = function_body(live, r"void " + fn + r"\(yuzu::CommandContext& ctx\) ?(?=\{)")
+        if body is None:
+            out.append(f"firewall_plugin.cpp no longer defines void {fn}(yuzu::CommandContext&)")
+            continue
+        text = squash(body)
+        pos = [text.find(r + "(") for r in rungs]
+        if -1 in pos:
+            out.append(f"{fn} no longer calls {rungs[pos.index(-1)]}(")
+        elif pos != sorted(pos):
+            out.append(f"{fn} no longer tries {', '.join(rungs)} in that order (the snapshot sits after "
+                       "nftables and before ufw)")
+        snap = rungs[2]
+        if not re.search(r"if \( ?%s\(ctx, info\.tables_seen\) ?\) return;" % snap, text):
+            out.append(f"{fn} no longer returns when {snap}(ctx, info.tables_seen) answers")
+        # the deferred table-dump row is written after the snapshot declines and before the next rung
+        written = re.search(r"for \( ?const auto& row : info\.pending_rows ?\) ctx\.write_output\(row\);", text)
+        at = text.find(snap + "(")
+        if not written or at < 0 or written.start() < at or written.start() > text.find(rungs[3] + "("):
+            out.append(f"{fn} no longer writes info.pending_rows after {snap} declines and before "
+                       f"{rungs[3]} (the deferred table-dump row would be lost)")
+
+    probe = function_body(live, r"\[\[nodiscard\]\] std::optional<NftProbeResult> run_nft_probe\(yuzu::CommandContext& ctx,\s*"
+                                r"NftFallthroughInfo& info\) ?(?=\{)")
+    if probe is None:
+        out.append("firewall_plugin.cpp no longer defines run_nft_probe(ctx, info)")
+    else:
+        text = squash(probe)
+        if len(re.findall(r"pending_rows\.push_back\(", text)) != 1 or not re.search(
+                r'info\.pending_rows\.push_back\( ?yuzu::firewall::nft_diag_row\( ?"table",', text):
+            out.append("run_nft_probe no longer defers exactly the table-dump row "
+                       '(info.pending_rows.push_back(nft_diag_row("table", ...)))')
+        if re.search(r'ctx\.write_output\( ?yuzu::firewall::nft_diag_row\( ?"table"', text):
+            out.append("run_nft_probe writes the table-dump row at once again (an EPERM row beside a "
+                       "successful snapshot read would mislead)")
+        opens = len(re.findall(r"for \( ?const auto& row : yuzu::firewall::nft_open_diag_rows\(open_errnos\) ?\) "
+                               r"ctx\.write_output\(row\);", text))
+        if opens != 2:
+            out.append(f"run_nft_probe writes the socket-open diagnostic rows (error|fd_exhausted, "
+                       f"error|nftables:socket:eperm) at {opens} sites, expected 2: they are never deferred")
+
+    reader = function_body(live, r"\[\[nodiscard\]\] std::expected<std::string, std::string>\s+"
+                                 r"read_fw_snapshot\(std::chrono::steady_clock::time_point deadline\) ?(?=\{)")
+    if reader is None:
+        out.append("firewall_plugin.cpp no longer defines read_fw_snapshot(deadline)")
+    else:
+        text = squash(reader)
+        for what, pat in (
+                ("an AF_UNIX stream socket that is close-on-exec and non-blocking, owned by a ScopedFd",
+                 r"yuzu::agent::ScopedFd sock\(::socket\(AF_UNIX, SOCK_STREAM \| SOCK_CLOEXEC \| SOCK_NONBLOCK, 0\)\)"),
+                ("the peer-credential check (SO_PEERCRED)", r"SO_PEERCRED"),
+                ("the refusal of a peer that is not root", r"cred\.uid != 0\) return std::unexpected\(std::string\{\"peer_not_root\"\}\)"),
+                ("the socket path bound (static_assert on sun_path)", r"static_assert\( ?yuzu::firewall::kFwSnapshotSocketPath\.size\(\) < sizeof\(addr\.sun_path\)"),
+                ("the deadline (remaining_ms and a timeout token)", r"remaining_ms\(deadline\)"),
+                ("the poll before every read", r"::poll\("),
+                ("the size cap", r"text\.size\(\) > yuzu::firewall::kFwSnapshotMaxBytes"),
+                ("a retry of EINTR", r"errno == EINTR")):
+            if not re.search(pat, text):
+                out.append(f"read_fw_snapshot no longer has {what}")
+        for pat in WRITE_CALLS:
+            if re.search(pat, text):
+                out.append("read_fw_snapshot writes to the socket (/%s/): the agent sends nothing, the "
+                           "broker reads no input" % pat)
+        if "::close(" in text:
+            out.append("read_fw_snapshot closes a descriptor by hand: ScopedFd is the single release path")
+    if len(re.findall(r"else the root snapshot broker over AF_UNIX \(packaged systemd socket\)", squash(live))) != 2:
+        out.append("the Linux state and rules descriptors no longer both name the root snapshot broker")
+    return out
+
+
+def _lmut(pattern, repl, count=1):
+    return lambda raw: re.subn(pattern, repl, raw, count=count, flags=re.S)
+
+
+LINUX_MUTATIONS = [
+    # the snapshot rung dropped from the state ladder
+    (_lmut(r"\s*if \(try_snapshot_state\(ctx, info\.tables_seen\)\)\s*return;", ""), "do_state_linux"),
+    # ... and from the rules ladder
+    (_lmut(r"\s*if \(try_snapshot_rules\(ctx, info\.tables_seen\)\)\s*return;", ""), "do_rules_linux"),
+    # moved after ufw: the snapshot must come before it
+    (_lmut(r"(if \(try_snapshot_rules\(ctx, info\.tables_seen\)\)\s*return;)(\s*for \(const auto& row : info\.pending_rows\)\s*ctx\.write_output\(row\);)(\s*if \(try_ufw_rules\(ctx\)\)\s*return;)",
+           r"\3\1\2"), "in that order"),
+    # the deferred rows never written (state)
+    (_lmut(r"for \(const auto& row : info\.pending_rows\)\s*ctx\.write_output\(row\);", ""), "info.pending_rows"),
+    # the table-dump row written at once again
+    (_lmut(r'info\.pending_rows\.push_back\(yuzu::firewall::nft_diag_row\("table", table\.res\)\);',
+           'ctx.write_output(yuzu::firewall::nft_diag_row("table", table.res));'), "defers exactly the table-dump row"),
+    # a socket-open diagnostic deferred as well
+    (_lmut(r"(for \(const auto& row : yuzu::firewall::nft_open_diag_rows\(open_errnos\)\)\s*)ctx\.write_output\(row\);",
+           r"\1info.pending_rows.push_back(row);"), "never deferred"),
+    # the reader: no root check
+    (_lmut(r"if \(cred\.uid != 0\)\s*return std::unexpected\(std::string\{\"peer_not_root\"\}\);", ""),
+     "refusal of a peer that is not root"),
+    (_lmut(r"cred\.uid != 0", "cred.uid != 1"), "refusal of a peer that is not root"),
+    # the reader: blocking, inheritable socket
+    (_lmut(r"SOCK_STREAM \| SOCK_CLOEXEC \| SOCK_NONBLOCK", "SOCK_STREAM"), "close-on-exec and non-blocking"),
+    # the reader: no deadline
+    (_lmut(r"const auto left = remaining_ms\(deadline\);", "const auto left = std::chrono::milliseconds{1000};"),
+     "the deadline"),
+    # the reader: unbounded
+    (_lmut(r"if \(text\.size\(\) > yuzu::firewall::kFwSnapshotMaxBytes\)\s*return std::unexpected\(std::string\{\"oversized\"\}\);", ""),
+     "the size cap"),
+    # the reader: writes to the socket
+    (_lmut(r"(char buf\[16 \* 1024\];)", r"\1 (void)::write(sock.get(), &buf[0], 1);"), "writes to the socket"),
+    # a hand-written close beside the ScopedFd
+    (_lmut(r"(char buf\[16 \* 1024\];)", r"\1 ::close(sock.get());"), "closes a descriptor by hand"),
+    # a descriptor without the broker
+    (_lmut(r"else the root snapshot broker over AF_UNIX \(packaged systemd socket\), ", "", count=1),
+     "descriptors no longer both name"),
+]
+
+
+class LinuxSnapshotWiring(unittest.TestCase):
+    def setUp(self):
+        self.cpp = PLUGIN_CPP.read_text(encoding="utf-8")
+
+    def test_source_is_clean(self):
+        p = linux_problems(self.cpp)
+        for m in p:
+            print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+        self.assertEqual(p, [])
+
+    def test_mutations_are_caught(self):
+        for i, (mutate, expected) in enumerate(LINUX_MUTATIONS, 1):
+            with self.subTest(mutation=i, expected=expected):
+                mutated, n = mutate(self.cpp)
+                self.assertEqual(n, 1, "mutation changed nothing (stale pattern)")
+                p = linux_problems(mutated)
+                self.assertTrue(p, "mutation was NOT detected by the gate")
+                self.assertTrue(any(expected in m for m in p), f"expected {expected!r} in {p}")
+
+
+# ── the broker units, the script and what the packages install ──────────────────────────────────
+
+SYSTEMD = ROOT / "deploy" / "systemd"
+PACKAGING = ROOT / "deploy" / "packaging"
+
+SOCKET_UNIT = {
+    "Unit": {"Description": "Yuzu agent read-only firewall snapshot socket",
+             "Documentation": "https://github.com/DevNullLtd/Yuzu",
+             "PartOf": "yuzu-agent.service"},
+    "Socket": {"ListenStream": "/run/yuzu-fw-snapshot.sock", "SocketUser": "root", "SocketGroup": "yuzu-agent",
+               "SocketMode": "0660", "Accept": "yes", "MaxConnections": "4", "RemoveOnStop": "yes"},
+}
+SERVICE_UNIT = {
+    "Unit": {"Description": "Yuzu agent read-only firewall snapshot (one connection)",
+             "Documentation": "https://github.com/DevNullLtd/Yuzu",
+             "CollectMode": "inactive-or-failed"},
+    "Service": {"User": "root",
+                "ExecStart": "/bin/sh /usr/share/yuzu/scripts/yuzu-fw-snapshot.sh",
+                "StandardInput": "null", "StandardOutput": "socket", "StandardError": "null",
+                "RuntimeMaxSec": "30", "TasksMax": "16", "NoNewPrivileges": "true",
+                "CapabilityBoundingSet": "CAP_NET_ADMIN CAP_NET_RAW",
+                "RestrictAddressFamilies": "AF_UNIX AF_NETLINK AF_INET AF_INET6",
+                "IPAddressDeny": "any", "SystemCallFilter": "@system-service", "SystemCallErrorNumber": "EPERM",
+                "SystemCallArchitectures": "native", "LockPersonality": "true", "MemoryDenyWriteExecute": "true",
+                "ProtectSystem": "strict", "ReadWritePaths": "-/run/xtables.lock", "ProtectHome": "true",
+                "PrivateTmp": "true", "PrivateDevices": "true", "ProtectKernelModules": "true",
+                "ProtectKernelTunables": "true", "ProtectControlGroups": "true", "RestrictNamespaces": "true"},
+}
+
+
+def parse_unit(text):
+    """{section: {key: value}} of a unit file; a key given twice is a problem the caller sees as a
+    list of values, comments and blank lines are skipped."""
+    out, section = {}, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            out.setdefault(section, {})
+            continue
+        key, _, value = line.partition("=")
+        cur = out.setdefault(section, {})
+        cur[key.strip()] = cur[key.strip()] + [value.strip()] if key.strip() in cur and isinstance(cur[key.strip()], list) \
+            else ([cur[key.strip()], value.strip()] if key.strip() in cur else value.strip())
+    return out
+
+
+def code_lines(text):
+    return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+
+def broker_problems(sources):
+    """`sources` maps a short name to file text: socket, service, script, agent, deb, rpm, spec,
+    parsers."""
+    out = []
+    for name, want in (("socket", SOCKET_UNIT), ("service", SERVICE_UNIT)):
+        got = parse_unit(sources[name])
+        if "Install" in got:
+            out.append(f"the {name} unit has an [Install] section: nothing enables it, the agent unit's Wants= pulls it in")
+        for section, directives in want.items():
+            have = got.get(section, {})
+            for key, value in directives.items():
+                if have.get(key) != value:
+                    out.append(f"the {name} unit's {section} {key} is {have.get(key)!r}, expected {value!r}")
+            for key in have:
+                if key not in directives:
+                    out.append(f"the {name} unit has a directive the review did not cover: {section} {key}")
+        for section in got:
+            if section not in want:
+                out.append(f"the {name} unit has a section the review did not cover: [{section}]")
+    # the socket path is the one the plugin connects to
+    m = re.search(r'kFwSnapshotSocketPath = "([^"]+)"', sources["parsers"])
+    if not m or m.group(1) != SOCKET_UNIT["Socket"]["ListenStream"]:
+        out.append("kFwSnapshotSocketPath in firewall_parsers.hpp is not the socket's ListenStream")
+    # the script path the service runs is the path the packages install it to, with the modes
+    script = "/usr/share/yuzu/scripts/yuzu-fw-snapshot.sh"
+    deb, rpm, spec = sources["deb"], sources["rpm"], sources["spec"]
+    if "deploy/systemd/yuzu-fw-snapshot.sh" not in deb or '"$PKG/usr/share/yuzu/scripts/"' not in deb or \
+            'chmod 0755 "$PKG/usr/share/yuzu/scripts/yuzu-fw-snapshot.sh"' not in deb:
+        out.append(f"build-deb.sh does not install the script to {script} with mode 0755")
+    for unit in ("yuzu-fw-snapshot.socket", "yuzu-fw-snapshot@.service"):
+        if f"deploy/systemd/{unit}" not in deb or '"$PKG/usr/lib/systemd/system/"' not in deb:
+            out.append(f"build-deb.sh does not copy {unit} to usr/lib/systemd/system")
+    if "chmod 0644 \"$PKG/usr/lib/systemd/system/yuzu-fw-snapshot.socket\" \"$PKG/usr/lib/systemd/system/yuzu-fw-snapshot@.service\"" not in deb:
+        out.append("build-deb.sh does not set mode 0644 on the two broker units")
+    for f in ("yuzu-fw-snapshot.socket", "yuzu-fw-snapshot@.service", "yuzu-fw-snapshot.sh"):
+        if f'deploy/systemd/{f}" "$TOPDIR/SOURCES/"' not in rpm:
+            out.append(f"build-rpm.sh does not copy {f} into SOURCES")
+    spec_lines = [l.strip() for l in spec.splitlines()]
+    files_at = spec_lines.index("%files") if "%files" in spec_lines else len(spec_lines)
+    for line in (
+            "install -D -m 0644 %{_sourcedir}/yuzu-fw-snapshot.socket %{buildroot}%{_unitdir}/yuzu-fw-snapshot.socket",
+            "install -D -m 0644 %{_sourcedir}/yuzu-fw-snapshot@.service %{buildroot}%{_unitdir}/yuzu-fw-snapshot@.service",
+            "install -D -m 0755 %{_sourcedir}/yuzu-fw-snapshot.sh %{buildroot}%{_datadir}/yuzu/scripts/yuzu-fw-snapshot.sh"):
+        if line not in spec_lines[:files_at]:
+            out.append(f"yuzu-agent.spec no longer has in %install: {line}")
+    for line in ("%{_unitdir}/yuzu-fw-snapshot.socket", "%{_unitdir}/yuzu-fw-snapshot@.service",
+                 "%{_datadir}/yuzu/scripts/yuzu-fw-snapshot.sh"):
+        if line not in spec_lines[files_at:]:
+            out.append(f"yuzu-agent.spec no longer lists in %files: {line}")
+    # the script reads nothing and runs nothing it was not given
+    code = "\n".join(code_lines(sources["script"]))
+    for what, pat in (("read", r"\bread\b"), ("eval", r"\beval\b"), ("sh -c", r"\bsh -c\b"),
+                      ("a command substitution", r"\$\(|`"), ("cat", r"\bcat\b"), ("stdin", r"/dev/stdin|<&0|< /dev/")):
+        if re.search(pat, code):
+            out.append(f"yuzu-fw-snapshot.sh uses {what}: it reads no input")
+    if "[ $# -eq 0 ] || exit 64" not in code:
+        out.append("yuzu-fw-snapshot.sh no longer refuses an argument with exit 64")
+    # the agent unit is untouched where it matters
+    agent = sources["agent"]
+    agent_code = "\n".join(code_lines(agent))
+    caps = [l for l in agent_code.splitlines() if re.match(r"\s*(Ambient|Capability|Secure)\w*=", l)
+            or re.match(r"\s*(AmbientCapabilities|CapabilityBoundingSet)=", l)]
+    if sorted(caps) != ["AmbientCapabilities=CAP_DAC_READ_SEARCH", "CapabilityBoundingSet=CAP_DAC_READ_SEARCH"]:
+        out.append(f"the agent unit's capability lines are {caps}: exactly AmbientCapabilities and "
+                   "CapabilityBoundingSet=CAP_DAC_READ_SEARCH are allowed")
+    if not re.search(r"^NoNewPrivileges=true$", agent_code, re.M):
+        out.append("the agent unit no longer has NoNewPrivileges=true")
+    unit = parse_unit(agent).get("Unit", {})
+    wants = unit.get("Wants")
+    after = unit.get("After")
+    for key, val in (("Wants", wants), ("After", after)):
+        vals = val if isinstance(val, list) else [val]
+        if "yuzu-fw-snapshot.socket" not in vals:
+            out.append(f"the agent unit's {key}= no longer names yuzu-fw-snapshot.socket")
+    return out
+
+
+BROKER_FILES = {
+    "socket": SYSTEMD / "yuzu-fw-snapshot.socket",
+    "service": SYSTEMD / "yuzu-fw-snapshot@.service",
+    "script": SYSTEMD / "yuzu-fw-snapshot.sh",
+    "agent": SYSTEMD / "yuzu-agent.service",
+    "deb": PACKAGING / "debian" / "build-deb.sh",
+    "rpm": PACKAGING / "rpm" / "build-rpm.sh",
+    "spec": PACKAGING / "rpm" / "yuzu-agent.spec",
+    "parsers": ROOT / "agents" / "plugins" / "firewall" / "src" / "firewall_parsers.hpp",
+}
+
+
+def _set(name, old, new):
+    def mutate(sources):
+        if old not in sources[name]:
+            return sources, 0
+        changed = dict(sources)
+        changed[name] = sources[name].replace(old, new, 1)
+        return changed, 1
+    return mutate
+
+
+BROKER_MUTATIONS = [
+    (_set("socket", "RemoveOnStop=yes", "RemoveOnStop=no"), "RemoveOnStop"),
+    (_set("socket", "SocketMode=0660", "SocketMode=0666"), "SocketMode"),
+    (_set("socket", "MaxConnections=4", "MaxConnections=40"), "MaxConnections"),
+    (_set("socket", "SocketGroup=yuzu-agent", "SocketGroup=users"), "SocketGroup"),
+    (_set("socket", "[Socket]\n", "[Install]\nWantedBy=sockets.target\n\n[Socket]\n"), "[Install]"),
+    (_set("socket", "Accept=yes", "Accept=yes\nBind=0.0.0.0"), "a directive the review did not cover"),
+    (_set("service", "NoNewPrivileges=true", "NoNewPrivileges=false"), "NoNewPrivileges"),
+    (_set("service", "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", "CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN"),
+     "CapabilityBoundingSet"),
+    (_set("service", "StandardInput=null", "StandardInput=socket"), "StandardInput"),
+    (_set("service", "RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6", "RestrictAddressFamilies=AF_UNIX AF_NETLINK"),
+     "RestrictAddressFamilies"),
+    (_set("service", "ProtectSystem=strict", "ProtectSystem=full"), "ProtectSystem"),
+    (_set("service", "SystemCallFilter=@system-service\n", ""), "SystemCallFilter"),
+    (_set("service", "RuntimeMaxSec=30\n", ""), "RuntimeMaxSec"),
+    (_set("service", "ExecStart=/bin/sh /usr/share/yuzu/scripts/yuzu-fw-snapshot.sh",
+          "ExecStart=/bin/sh /usr/share/yuzu/scripts/other.sh"), "ExecStart"),
+    (_set("script", "[ $# -eq 0 ] || exit 64", "true"), "exit 64"),
+    (_set("script", "host_snapshot\n", "read line\nhost_snapshot\n"), "uses read"),
+    (_set("script", "host_snapshot\n", "eval \"$line\"\nhost_snapshot\n"), "uses eval"),
+    (_set("script", "host_snapshot\n", "x=$(cat)\nhost_snapshot\n"), "command substitution"),
+    (_set("agent", "CapabilityBoundingSet=CAP_DAC_READ_SEARCH", "CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_NET_ADMIN"),
+     "capability lines"),
+    (_set("agent", "AmbientCapabilities=CAP_DAC_READ_SEARCH", "AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_NET_ADMIN"),
+     "capability lines"),
+    (_set("agent", "NoNewPrivileges=true", "NoNewPrivileges=false"), "NoNewPrivileges"),
+    (_set("agent", "Wants=yuzu-fw-snapshot.socket\n", ""), "Wants="),
+    (_set("agent", "After=yuzu-fw-snapshot.socket\n", ""), "After="),
+    (_set("parsers", 'kFwSnapshotSocketPath = "/run/yuzu-fw-snapshot.sock"', 'kFwSnapshotSocketPath = "/run/other.sock"'),
+     "kFwSnapshotSocketPath"),
+    (_set("deb", 'chmod 0755 "$PKG/usr/share/yuzu/scripts/yuzu-fw-snapshot.sh"\n', ""), "build-deb.sh"),
+    (_set("rpm", 'cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-fw-snapshot.sh" "$TOPDIR/SOURCES/"\n', ""), "build-rpm.sh"),
+    (_set("spec", "%{_datadir}/yuzu/scripts/yuzu-fw-snapshot.sh\n%dir", "%dir"), "yuzu-agent.spec"),
+]
+
+
+class BrokerUnits(unittest.TestCase):
+    def setUp(self):
+        self.sources = {k: v.read_text(encoding="utf-8") for k, v in BROKER_FILES.items()}
+
+    def test_source_is_clean(self):
+        p = broker_problems(self.sources)
+        for m in p:
+            print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+        self.assertEqual(p, [])
+
+    def test_mutations_are_caught(self):
+        for i, (mutate, expected) in enumerate(BROKER_MUTATIONS, 1):
+            with self.subTest(mutation=i, expected=expected):
+                mutated, n = mutate(self.sources)
+                self.assertEqual(n, 1, "mutation changed nothing (stale pattern)")
+                p = broker_problems(mutated)
+                self.assertTrue(p, "mutation was NOT detected by the gate")
+                self.assertTrue(any(expected in m for m in p), f"expected {expected!r} in {p}")
+
+    def test_the_script_and_units_have_the_modes_the_packages_install(self):
+        import os
+        self.assertTrue(os.access(BROKER_FILES["script"], os.X_OK), "the script is shipped 0755")
+        for name in ("socket", "service"):
+            self.assertFalse(os.access(BROKER_FILES[name], os.X_OK), f"the {name} unit is not executable")
+
+    @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze is not installed")
+    def test_systemd_accepts_the_directives_of_the_units(self):
+        # Only a directive systemd does not know or cannot parse fails this: the units refer to a
+        # script, an agent unit and a group that do not exist on a build host, and verify says so.
+        bad = re.compile(r"Unknown (?:key|section|lvalue)|Failed to parse|Invalid argument|Unknown assignment|"
+                         r"Invalid|unsupported|not a valid")
+        for name in ("socket", "service"):
+            r = subprocess.run(["systemd-analyze", "verify", "--man=no", str(BROKER_FILES[name])],
+                               capture_output=True, text=True, timeout=60)
+            findings = [l for l in (r.stdout + r.stderr).splitlines() if bad.search(l)]
+            self.assertEqual(findings, [], name)
 
 
 if __name__ == "__main__":

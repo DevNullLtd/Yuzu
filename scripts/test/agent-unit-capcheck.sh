@@ -38,6 +38,26 @@
 #       exit 1 (EXIT_FAILURE), the exact refusal line, no plugin loaded (the fail-closed path)
 #     * the real firmware tables, when the host has them, are copied byte-identically; on a
 #       host with none, a stale snapshot is removed and the agent still starts
+#   read-only firewall snapshot broker (the shipped yuzu-fw-snapshot.socket, the template
+#   yuzu-fw-snapshot@.service and the script, docs/adr/3007-os-activated-read-helpers.md):
+#     * the two shipped units are installed byte-for-byte under salted names with path-only
+#       drop-ins (the socket path and the script path are the only overrides; the script is
+#       staged in $run_dir, never under /usr/share), and the run dies if a rewritten line still
+#       names a real path
+#     * the script's path is the path build-deb.sh and yuzu-agent.spec install it to (with its mode)
+#     * a client run as the yuzu-agent account connects, sends junk bytes (which nothing reads) and
+#       reads to the end: the reply starts `== nft -a list ruleset`, ends `== end`, is at most
+#       1 MiB and its nft section is not `[failed]` when /usr/sbin/nft exists; a connection reset
+#       counts only after the end line arrived. Section names and byte counts are printed, never
+#       the ruleset (CI logs are public)
+#     * a control copy of the template whose ExecStart prints /proc/self/status shows the sandbox
+#       the shipped service has: CapBnd = CapEff = 0x3000 (CAP_NET_ADMIN, CAP_NET_RAW),
+#       NoNewPrivs = 1, Seccomp = 2
+#     * an account outside the socket's group cannot connect (EACCES), and the socket file is
+#       root:yuzu-agent 0660
+#     * the real yuzu-fw-snapshot.socket is left in the state it was found in: the salted agent
+#       unit is the shipped file and carries Wants=yuzu-fw-snapshot.socket, which a drop-in cannot
+#       reset, so a host that has the package installed starts the real socket with it
 #
 # NOT RUN, AND WHY. No child process is exec'd by the agent here: the check is server-less, so
 # no instruction can be dispatched to make it spawn one. A child's capabilities follow from the
@@ -48,7 +68,9 @@
 #
 # The test drop-ins override paths (and, for the refusal case, the seccomp filter and log file)
 # only. A guard asserts the path drop-ins contain no User/Group/NoNewPrivileges/Capability/
-# Protect/Private directive, so the shipped hardening is what runs.
+# Protect/Private directive (and, for the broker units, no Restrict/System/IPAddress/Memory/Lock/
+# Accept/Socket/MaxConn/Runtime/Tasks directive: the one ListenStream path is the only socket
+# override), so the shipped hardening is what runs.
 #
 # This prints PASS/FAIL lines and capability hex only. It never prints firmware bytes or
 # serial numbers (CI logs are public).
@@ -71,6 +93,10 @@ HELPER=$REPO_ROOT/deploy/systemd/yuzu-agent-dmi-snapshot.sh
 UPGRADING_DOC=$REPO_ROOT/docs/user-manual/upgrading.md
 DEB_SCRIPT=$REPO_ROOT/deploy/packaging/debian/build-deb.sh
 RPM_SPEC=$REPO_ROOT/deploy/packaging/rpm/yuzu-agent.spec
+SNAP_SOCKET_FILE=$REPO_ROOT/deploy/systemd/yuzu-fw-snapshot.socket
+SNAP_SERVICE_FILE=$REPO_ROOT/deploy/systemd/yuzu-fw-snapshot@.service
+SNAP_SCRIPT=$REPO_ROOT/deploy/systemd/yuzu-fw-snapshot.sh
+REAL_SNAP_SOCKET=yuzu-fw-snapshot.socket
 CAP_READ_SEARCH=0000000000000004
 CAP_NONE=0000000000000000
 SVC_USER=yuzu-agent
@@ -95,7 +121,8 @@ as_root() { ${SUDO[@]+"${SUDO[@]}"} "$@"; }
 
 [[ -x $AGENT ]] || { echo "FAIL: agent binary not found or not executable: $AGENT" >&2; exit 1; }
 [[ -d $PLUGINS ]] || { echo "FAIL: plugin dir not found: $PLUGINS" >&2; exit 1; }
-for f in "$UNIT_FILE" "$HELPER" "$UPGRADING_DOC" "$DEB_SCRIPT" "$RPM_SPEC"; do
+for f in "$UNIT_FILE" "$HELPER" "$UPGRADING_DOC" "$DEB_SCRIPT" "$RPM_SPEC" \
+         "$SNAP_SOCKET_FILE" "$SNAP_SERVICE_FILE" "$SNAP_SCRIPT"; do
     [[ -f $f ]] || { echo "FAIL: missing input file: $f" >&2; exit 1; }
 done
 
@@ -111,10 +138,21 @@ if [[ -z $LIB_DIR ]]; then
 fi
 [[ -n $LIB_DIR ]] || { echo "FAIL: libyuzu_agent_core.so not found; set YUZU_AGENT_LIB_DIR" >&2; exit 1; }
 
+# The real broker socket, if the package is installed, is pulled in by the salted agent unit's
+# Wants= (the shipped file is installed verbatim, and a drop-in cannot reset a Wants=). Record
+# whether it was active before this run so cleanup stops it only when this run started it.
+if as_root systemctl is-active --quiet "$REAL_SNAP_SOCKET" 2>/dev/null; then
+    real_snap_was_active=1
+else
+    real_snap_was_active=0
+fi
+
 # Unique names so concurrent runners on one box never collide (shared-identity CI pools).
 id=$(printf 'yuzu-capcheck-%s-%s-%s' "${GITHUB_RUN_ID:-local}" "${RUNNER_NAME:-host}" "$$" |
          tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')
 ctl="$id-ctl"
+snap="$id-fwsnap"       # the shipped broker units, salted, running the shipped script
+snapctl="$id-fwctl"     # a control copy of the broker service whose ExecStart prints its own status
 run_dir=/run/$id
 sysd=/run/systemd/system
 
@@ -123,10 +161,20 @@ cleanup() {
     set +e
     if [[ -n $id ]]; then
         as_root systemctl stop "$id.service" "$ctl.service" >/dev/null 2>&1
+        # The salted broker sockets first (so no new instance starts), then their instances.
+        as_root systemctl stop "$snap.socket" "$snapctl.socket" >/dev/null 2>&1
+        as_root systemctl stop "$snap@*.service" "$snapctl@*.service" >/dev/null 2>&1
         as_root rm -rf "$sysd/$id.service" "$sysd/$id.service.d" \
-                       "$sysd/$ctl.service" "$sysd/$ctl.service.d"
+                       "$sysd/$ctl.service" "$sysd/$ctl.service.d" \
+                       "$sysd/$snap.socket" "$sysd/$snap.socket.d" "$sysd/$snap@.service" "$sysd/$snap@.service.d" \
+                       "$sysd/$snapctl.socket" "$sysd/$snapctl.socket.d" "$sysd/$snapctl@.service" "$sysd/$snapctl@.service.d"
         as_root systemctl daemon-reload >/dev/null 2>&1
-        as_root systemctl reset-failed "$id.service" "$ctl.service" >/dev/null 2>&1
+        as_root systemctl reset-failed "$id.service" "$ctl.service" "$snap.socket" "$snapctl.socket" >/dev/null 2>&1
+        # The real broker socket is left as it was found: stopped only if this run started it.
+        if [[ ${real_snap_was_active:-1} -eq 0 ]] &&
+           as_root systemctl is-active --quiet "$REAL_SNAP_SOCKET" >/dev/null 2>&1; then
+            as_root systemctl stop "$REAL_SNAP_SOCKET" >/dev/null 2>&1
+        fi
         as_root rm -rf "$run_dir" "/var/lib/$id" "/var/lib/$ctl"
     fi
     exit $rc
@@ -531,6 +579,177 @@ fi
 as_root systemctl stop "$id.service" >/dev/null 2>&1 || true
 as_root rm -f "$sysd/$id.service.d/60-capset-deny.conf"
 as_root systemctl daemon-reload
+
+# --- the read-only firewall snapshot broker ------------------------------------------------
+# The SHIPPED socket and template units are installed byte-for-byte under salted names. The only
+# overrides are paths: the socket path (so it never collides with a real broker) and the script
+# path (the script is staged in $run_dir, never under /usr/share). The service's own sandbox and
+# the socket's owner, group, mode, Accept= and MaxConnections= are the shipped ones.
+snap_unit_exec=$(grep '^ExecStart=' "$SNAP_SERVICE_FILE" || true)
+[[ $(printf '%s\n' "$snap_unit_exec" | grep -c .) -eq 1 ]] ||
+    die "the shipped broker service must have exactly one ExecStart line"
+snap_unit_script=$(sed -n 's|^ExecStart=/bin/sh \([^ ]*\)$|\1|p' "$SNAP_SERVICE_FILE")
+snap_unit_listen=$(sed -n 's|^ListenStream=\(.*\)$|\1|p' "$SNAP_SOCKET_FILE")
+[[ $snap_unit_script == /usr/share/*/yuzu-fw-snapshot.sh && $snap_unit_listen == /run/yuzu-fw-snapshot.sock ]] ||
+    die "the shipped broker units do not name /usr/share/yuzu/scripts/yuzu-fw-snapshot.sh and /run/yuzu-fw-snapshot.sock"
+snap_exec_rewritten=$(printf '%s\n' "$snap_unit_exec" | sub_paths "$ctl")
+[[ $snap_exec_rewritten == "ExecStart=/bin/sh $run_dir/yuzu-fw-snapshot.sh" ]] ||
+    die "the broker ExecStart line still names a real path after the path rewrite ('$snap_exec_rewritten'); the test would run the real script"
+
+# The package installs the script where the unit runs it, with its mode (the dmi helper's check).
+snap_rpm_script="%{_datadir}${snap_unit_script#/usr/share}"
+snap_deb_cp="deploy/systemd/${snap_unit_script##*/}\" \"\$PKG${snap_unit_script%/*}/\""
+snap_deb_chmod="chmod 0755 \"\$PKG$snap_unit_script\""
+if [[ $deb_code == *"$snap_deb_cp"* && $deb_code == *"$snap_deb_chmod"* ]]; then
+    pass "broker script path ($snap_unit_script) is copied and installed 0755 by build-deb.sh"
+else
+    fail "broker script path ('$snap_unit_script') is not copied and installed 0755 by build-deb.sh"
+fi
+if grep -qF "install -D -m 0755 %{_sourcedir}/${snap_unit_script##*/} %{buildroot}$snap_rpm_script" "$RPM_SPEC" &&
+   grep -qxF "$snap_rpm_script" "$RPM_SPEC"; then
+    pass "broker script path ($snap_unit_script) is installed 0755 and listed by yuzu-agent.spec"
+else
+    fail "broker script path ('$snap_unit_script') is not installed 0755 and listed by yuzu-agent.spec"
+fi
+
+# install_broker NAME EXEC_LINE: the shipped socket and template service under NAME, with path-only
+# drop-ins (the socket path, and the one ExecStart line).
+install_broker() {
+    local name=$1 exec_line=$2
+    as_root install -m 0644 "$SNAP_SOCKET_FILE" "$sysd/$name.socket"
+    as_root install -m 0644 "$SNAP_SERVICE_FILE" "$sysd/$name@.service"
+    as_root install -d -m 0755 "$sysd/$name.socket.d" "$sysd/$name@.service.d"
+    as_root tee "$sysd/$name.socket.d/00-capcheck-paths.conf" >/dev/null <<EOF
+[Socket]
+ListenStream=
+ListenStream=$run_dir/$name.sock
+EOF
+    as_root tee "$sysd/$name@.service.d/00-capcheck-paths.conf" >/dev/null <<EOF
+[Service]
+ExecStart=
+$exec_line
+EOF
+}
+as_root install -m 0755 "$SNAP_SCRIPT" "$run_dir/${snap_unit_script##*/}"
+printf '#!/bin/sh\ngrep -E "^(CapBnd|CapEff|NoNewPrivs|Seccomp):" /proc/self/status\n' |
+    as_root tee "$run_dir/fwctl.sh" >/dev/null
+as_root chmod 0755 "$run_dir/fwctl.sh"
+install_broker "$snap" "$snap_exec_rewritten"
+install_broker "$snapctl" "ExecStart=/bin/sh $run_dir/fwctl.sh"
+as_root systemctl daemon-reload
+
+# Guard: the drop-ins override paths only, so the shipped sandbox and socket permissions are what run.
+for u in "$snap" "$snapctl"; do
+    if as_root grep -Eqi '^(User|Group|NoNewPrivileges|Capabilit|Ambient|Protect|Private|Restrict|System|IPAddress|Memory|Lock|Accept|Socket|MaxConn|Runtime|Tasks)' \
+            "$sysd/$u.socket.d/00-capcheck-paths.conf" "$sysd/$u@.service.d/00-capcheck-paths.conf"; then
+        fail "drop-in guard: $u drop-ins override more than paths"
+    else
+        pass "drop-in guard: $u drop-ins override paths only"
+    fi
+    if as_root cmp -s "$SNAP_SOCKET_FILE" "$sysd/$u.socket" && as_root cmp -s "$SNAP_SERVICE_FILE" "$sysd/$u@.service"; then
+        pass "shipped broker units installed verbatim as $u"
+    else
+        fail "shipped broker units installed verbatim as $u"
+    fi
+done
+
+# The client: connect, send junk (nothing reads it), read to the end, print names and counts only.
+read -r -d '' SNAP_CLIENT <<'PYEOF' || true
+import socket, sys
+path, junk, mode = sys.argv[1], sys.argv[2] == "1", sys.argv[3]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(40)
+try:
+    s.connect(path)
+except OSError as e:
+    print("connect_errno=%d" % e.errno)
+    sys.exit(3)
+if junk:
+    try:
+        s.sendall(b"junk bytes that nothing reads\n" * 50)
+    except OSError:
+        pass
+buf, reset = b"", False
+while len(buf) <= 2 * 1048576:
+    try:
+        chunk = s.recv(65536)
+    except ConnectionResetError:
+        reset = True
+        break
+    except OSError as e:
+        print("read_errno=%d" % e.errno)
+        break
+    if not chunk:
+        break
+    buf += chunk
+if mode == "status":
+    for line in buf.decode("ascii", "replace").splitlines():
+        if line.split(":")[0] in ("CapBnd", "CapEff", "NoNewPrivs", "Seccomp"):
+            print("status_" + line.split(":")[0] + "=" + line.split(":", 1)[1].strip())
+    sys.exit(0)
+print("bytes=%d" % len(buf))
+print("reset=%d" % reset)
+print("starts=%d" % buf.startswith(b"== nft -a list ruleset\n"))
+print("ends=%d" % (buf.endswith(b"\n== end\n") or buf == b"== end\n"))
+name, sizes, failed = None, {}, set()
+for line in buf.split(b"\n"):
+    if line.startswith(b"== "):
+        name = line[3:].decode("ascii", "replace")
+        sizes[name] = 0
+    elif name is not None:
+        sizes[name] += len(line) + 1
+        if line == b"[failed]":
+            failed.add(name)
+for n, c in sizes.items():
+    print("section=%s %d%s" % (n, c, " FAILED" if n in failed else ""))
+PYEOF
+snap_client() { # $1 = account, $2 = socket, $3 = send junk (1/0), $4 = mode (listing | status)
+    as_root runuser -u "$1" -- python3 -c "$SNAP_CLIENT" "$2" "$3" "$4" 2>&1
+}
+kv() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1; }
+command -v python3 >/dev/null || precondition "python3 is required for the broker client"
+command -v runuser >/dev/null || precondition "runuser is required for the broker client"
+
+as_root systemctl start "$snap.socket" || fail "broker socket failed to start"
+eq "broker socket: active" "$(as_root systemctl is-active "$snap.socket" 2>/dev/null)" "active"
+eq "broker socket: owner, group and mode" \
+   "$(as_root stat -c '%U:%G %a' "$run_dir/$snap.sock" 2>/dev/null || echo missing)" "root:$SVC_USER 660"
+
+reply=$(snap_client "$SVC_USER" "$run_dir/$snap.sock" 1 listing) || true
+eq "broker reply: starts with the nft section header" "$(kv "$reply" starts)" "1"
+# A reset after the junk is acceptable only once the end line has arrived: ends=1 is that proof.
+eq "broker reply: ends with the end line" "$(kv "$reply" ends)" "1"
+bytes=$(kv "$reply" bytes)
+if [[ $bytes =~ ^[0-9]+$ && $bytes -gt 0 && $bytes -le 1048576 ]]; then
+    pass "broker reply: $bytes bytes, within 1 MiB"
+else
+    fail "broker reply: size '$bytes' is not within 1 MiB"
+fi
+printf '%s\n' "$reply" | grep '^section=' | sed 's/^/NOTE: /' || true
+if [[ -x /usr/sbin/nft ]]; then
+    if printf '%s\n' "$reply" | grep -q '^section=nft -a list ruleset .*FAILED'; then
+        fail "broker reply: the nft section is [failed] although /usr/sbin/nft exists"
+    else
+        pass "broker reply: the nft section is not [failed]"
+    fi
+else
+    echo "NOTE: no /usr/sbin/nft on this host; the nft section is expected [absent]"
+fi
+
+as_root systemctl start "$snapctl.socket" || fail "broker control socket failed to start"
+status=$(snap_client "$SVC_USER" "$run_dir/$snapctl.sock" 0 status) || true
+eq "broker service: CapBnd" "$(kv "$status" status_CapBnd)" "0000000000003000"
+eq "broker service: CapEff" "$(kv "$status" status_CapEff)" "0000000000003000"
+eq "broker service: NoNewPrivs" "$(kv "$status" status_NoNewPrivs)" "1"
+eq "broker service: Seccomp (filter)" "$(kv "$status" status_Seccomp)" "2"
+
+if getent passwd nobody >/dev/null && ! id -nG nobody | tr ' ' '\n' | grep -qx "$SVC_USER"; then
+    outside=$(snap_client nobody "$run_dir/$snap.sock" 0 listing) || true
+    eq "broker socket: an account outside the group cannot connect (errno)" "$(kv "$outside" connect_errno)" "13"
+else
+    echo "NOTE: no account outside the $SVC_USER group to test the group gate with"
+fi
+as_root systemctl stop "$snap.socket" "$snapctl.socket" >/dev/null 2>&1 || true
 
 if [[ $FAILS -ne 0 ]]; then
     echo "agent-unit-capcheck: $FAILS check(s) FAILED" >&2
