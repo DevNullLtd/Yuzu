@@ -471,17 +471,28 @@ common case) and `heartbeat.db_quarantine_last` (`<epoch>:<file>`) in its plugin
 storage, which the
 agent forwards on every heartbeat as `yuzu.plugin.echo.db_corruption_total` /
 `yuzu.plugin.echo.db_quarantine_last`. The server exposes
-`yuzu_fleet_echo_db_corruption_agents` (see the metrics reference) and writes a
+`yuzu_fleet_echo_db_corruption_agents` (agents that have ever quarantined: a
+population, which rises when an agent with an old quarantine reconnects) and
+`yuzu_server_echo_db_quarantines_total` (new quarantines: one per audit row
+written; the `YuzuEchoDbCorruptionDetected` alert watches its increase over an
+hour, and any increase fires, a starting default not sized from fleet data) — see
+the metrics reference — and writes a
 `echo.db.corruption_quarantined` audit row per (agent, quarantine identity),
 deduplicated against the audit store and bounded to one row per agent per 10
 minutes per server process (intermediate quarantines inside that window collapse
 to the newest identity; another HA node can add a second row for the same
 identity) — see the audit-log reference. Devices are not queued behind one
-another, so a quarantine that hits many devices at once writes each device's
-audit row on the heartbeat that reports it while the audit store is healthy. A
-report is deferred to a later heartbeat if the same device's lookup is already
-in flight, if it arrives inside the server-wide 60 s back-off that follows any
-failed lookup or write, or if the in-flight set is at capacity. A plugin that
+another, but at most 4 are admitted at a time: each holds one connection of the
+shared PostgreSQL pool (default 16) for its lookup and write, so a quarantine
+that hits many devices at once writes the rows over successive heartbeats while
+the audit store is healthy, not all on the first. A report is deferred to a later
+heartbeat if the same device's lookup is already in flight, if 4 devices are
+already in flight, or if it arrives inside the server-wide 60 s back-off that
+follows any failed lookup (including one that throws) or failed write. The
+back-off is dated from the failure and a later failure never shortens it; there
+is no separate probe, so when it ends up to 4 devices look up at once and the
+first failure re-opens it. Each opening is counted in
+`yuzu_server_echo_corruption_audit_degraded_total{reason}` and logged. A plugin that
 failed to initialise (including Echo when the corrupt file cannot be moved
 aside) is reported in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
 which distinguishes "failed to load" from "not installed". An Echo that loads

@@ -480,6 +480,9 @@ struct AgentSession {
     std::string agent_version;
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
+    /// True when the inventory reported the retired plugin name `tar` and no `echo` (set once in
+    /// register_agent, before the session is published). Counted by retired_tar_only_count().
+    bool retired_tar_only = false;
     std::unordered_map<std::string, std::string> scopable_tags;
     std::string gateway_node; // Non-empty if agent is connected via gateway
     /// HA WS-4 4.3: the gateway cluster this session's most recent CONNECTED
@@ -1075,6 +1078,11 @@ public:
         grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) const;
 
     std::size_t agent_count() const;
+
+    /// Server-held sessions whose agent reports the retired `tar` plugin and no `echo` (not an
+    /// Echo agent: its corruption signal is never read). A count over this replica's sessions,
+    /// so a true zero; published by the health sweep as yuzu_fleet_retired_tar_plugin_agents.
+    std::size_t retired_tar_only_count() const;
 
     // Map a session_id to an agent_id (called when Subscribe completes handshake).
     void map_session(const std::string& session_id, const std::string& agent_id);

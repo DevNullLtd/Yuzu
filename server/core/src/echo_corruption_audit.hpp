@@ -7,8 +7,10 @@
  * heartbeat tags. AgentHealthStore SURFACES a candidate on every heartbeat whose tags
  * parse (valid tag pair); the gate provides the dedup: ONE map entry per agent
  * (agent_id -> last known quarantine identity + time of the last row this
- * process wrote), bounded by kMaxAgents (one arbitrary entry is evicted at the
- * cap, never a wholesale clear), and, on a miss, ONE lookup of the newest
+ * process wrote), bounded by kMaxAgents (one entry is evicted at the cap, never a
+ * wholesale clear: the first whose rate-limit window has already elapsed, so an
+ * agent still inside its window keeps its limit; an arbitrary entry only when every
+ * entry is still inside its window), and, on a miss, ONE lookup of the newest
  * `echo.db.corruption_quarantined` audit row for the agent. Net effect: exactly
  * one audit row per (agent, quarantine identity) across store prunes, server
  * restarts and HA node switches (per server process: another HA node ingesting
@@ -26,23 +28,33 @@
  * agent's `last` tag and logs on the first heartbeat after the window. Once a
  * lookup or write has reported the audit store degraded, no lookup runs until
  * kEchoCorruptionAuditDegradedRetry seconds have passed (gate-wide: a degraded
- * store is a store property). The probes that follow the window are per admitted
- * agent, bounded by the ingest threads, and the first one to fail re-opens the
- * window.
+ * store is a store property). Three things open the window: a lookup that answers
+ * "degraded", a lookup that THROWS (so a throwing store is not retried on every
+ * heartbeat; the exception still propagates to the caller), and a failed audit
+ * write. The window is dated from the failure, not from admission (a lookup that
+ * blocked for a minute and then threw still opens a full window), and it only ever
+ * extends: a late completion never shortens a window a newer failure opened. There
+ * is no separate half-open probe: the probes that follow a window are at most
+ * kMaxInFlight (below), which is already a bound, and the first one to fail
+ * re-opens the window. Every opening is reported to the optional DegradedFn
+ * observer (after the lock is released), so a gate that degrades is not silent.
  *
  * Reservation contract: a true from should_log() reserves that AGENT's
- * in-flight slot (a set of agent ids, bounded by kMaxAgents: at the bound a
+ * in-flight slot (a set of agent ids, bounded by kMaxInFlight: at the bound a
  * new agent is refused, never an in-flight entry evicted); the caller completes
  * it with exactly one of mark_logged() (row durable) or mark_failed(agent_id)
  * (write failed) -- or, more safely, via the nested Reservation RAII type, whose
  * destructor completes an abandoned reservation as failed() so a throw between
- * the reservation and the write cannot strand the slot. While an agent's slot
+ * the reservation and the write cannot strand the slot, and whose logged() and
+ * failed() are idempotent (the first completion wins). While an agent's slot
  * is held every other should_log() for THAT agent returns false (retried on a
  * later heartbeat); other agents are admitted, so a burst of distinct agents
  * (a mass quarantine) is not serialised to one row per heartbeat (#5033).
- * Concurrency is bounded by the heartbeat ingest threads, since the lookup and
- * the write run synchronously on the calling thread, and a pool-exhaustion
- * failure still feeds the gate-wide degraded window.
+ * Concurrency is bounded by kMaxInFlight (4): the lookup and the write run
+ * synchronously on the calling thread, each holding one lease of the shared
+ * PostgreSQL pool (default 16, --postgres-pool-size), so the gate holds at most
+ * four leases however many ingest threads race a mass quarantine; the rest are
+ * refused and retried on their next heartbeat. A pool-exhaustion failure still feeds the gate-wide degraded window.
  *
  * Durability choice, stated for a future third case: this gate round-trips
  * the audit store itself so dedup survives a restart/HA switch, unlike the
@@ -55,9 +67,10 @@
  * A throw between a true should_log() and its completion is turned into
  * mark_failed(agent_id), which itself takes a lock. Inside ~Reservation an
  * exceedingly rare failure there (OS mutex-resource exhaustion) terminates the
- * process rather than silently stranding the slot; on the direct mark_failed()
- * and the lookup-catch paths it would propagate and strand that agent's slot
- * until restart. Not producible on the supported platforms.
+ * process rather than silently stranding the slot; on the direct mark_failed(),
+ * logged() and failed() calls and the lookup-catch paths it would propagate and
+ * strand that agent's slot until restart. Not producible on the supported
+ * platforms.
  *
  * The lookup and the write are synchronous audit-store calls on the heartbeat
  * ingest thread, outside AgentHealthStore's mutex. Once the row is durable the
@@ -67,7 +80,9 @@
  * Pure: the audit-store query and the clock are injected.
  */
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -153,6 +168,21 @@ decode_echo_quarantine_from_detail(std::string_view detail) {
     return std::string(detail.substr(pos + kKey.size()));
 }
 
+/// Why the gate opened its degraded window (closed set; the token is a metric label).
+enum class DegradedCause : uint8_t { lookup_degraded, lookup_threw, write_failed };
+
+[[nodiscard]] inline const char* echo_corruption_degraded_cause_token(DegradedCause c) noexcept {
+    switch (c) {
+    case DegradedCause::lookup_degraded:
+        return "lookup_degraded";
+    case DegradedCause::lookup_threw:
+        return "lookup_threw";
+    case DegradedCause::write_failed:
+        return "write_failed";
+    }
+    return "unknown";
+}
+
 class EchoCorruptionAuditGate {
 public:
     /// Newest logged quarantine identity for the agent. Outer nullopt = the
@@ -160,9 +190,28 @@ public:
     using LatestFn =
         std::function<std::optional<std::optional<std::string>>(const std::string& agent_id)>;
     using NowFn = std::function<int64_t()>;
+    /// Observer called every time the gate opens its degraded window. Runs on the calling
+    /// thread after the gate's lock is released; an exception from it is swallowed.
+    using DegradedFn = std::function<void(DegradedCause)>;
 
-    explicit EchoCorruptionAuditGate(LatestFn latest, NowFn now_s = &steady_seconds)
-        : latest_(std::move(latest)), now_s_(std::move(now_s)) {}
+    /// Most agents that may hold a lookup/write slot at once. The lookup and the write run on
+    /// the ingest thread with one lease of the shared PostgreSQL pool each, so this bounds the
+    /// leases the gate can take from the pool; an agent refused here is retried next heartbeat.
+    static constexpr std::size_t kMaxInFlight = 4;
+    /// Bound on the per-agent identity map (one entry is evicted at the cap).
+    static constexpr std::size_t kMaxAgents = 65536;
+
+    /// The production clock (the default NowFn): monotonic seconds.
+    static int64_t steady_seconds() {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    explicit EchoCorruptionAuditGate(LatestFn latest, NowFn now_s = &steady_seconds,
+                                     DegradedFn on_degraded = {})
+        : latest_(std::move(latest)), now_s_(std::move(now_s)),
+          on_degraded_(std::move(on_degraded)) {}
 
     /// True iff a new audit row should be written for (agent, quarantine).
     /// A true return holds the agent's in-flight slot: complete it with mark_logged or mark_failed.
@@ -181,7 +230,7 @@ public:
                     now - *it->second.last_row_at < kEchoCorruptionAuditMinRowInterval)
                     return false; // rotating identity: rate-limited, retried later
             }
-            if (in_flight_.size() >= kMaxAgents)
+            if (in_flight_.size() >= kMaxInFlight)
                 return false; // bounded: refuse, never evict an in-flight entry
             // The only allocation on the admit path. Inside the lock and before the slot
             // counts as held: a throw here leaves nothing inserted (strong guarantee).
@@ -191,19 +240,33 @@ public:
         try {
             latest = latest_(agent_id); // outside mu_: a store round-trip
         } catch (...) {
-            std::lock_guard lock(mu_); // never strand the slot on a throwing lookup
-            in_flight_.erase(agent_id);
+            // Date the window from the failure, not from admission: the lookup may have
+            // blocked for a long time before it threw. If the clock itself throws, fall back
+            // to the entry time so the lookup's own exception is the one that propagates.
+            int64_t failed_at = now;
+            try {
+                failed_at = now_s_();
+            } catch (...) {
+            }
+            {
+                std::lock_guard lock(mu_); // never strand the slot on a throwing lookup
+                in_flight_.erase(agent_id);
+                open_window_locked(failed_at);
+            }
+            notify_degraded(DegradedCause::lookup_threw);
             throw;
         }
-        std::lock_guard lock(mu_);
+        std::unique_lock lock(mu_);
         if (!latest) {
             in_flight_.erase(agent_id);
-            degraded_until_ = now_s_() + kEchoCorruptionAuditDegradedRetry;
+            open_window_locked(now_s_());
+            lock.unlock();
+            notify_degraded(DegradedCause::lookup_degraded);
             return false; // no write, not marked -> retried after the window
         }
         if (*latest && **latest == quarantine) {
             in_flight_.erase(agent_id);
-            remember_locked(agent_id, quarantine, std::nullopt); // durable (prior run / other node)
+            remember_locked(agent_id, quarantine, now, false); // durable (prior run / other node)
             return false;
         }
         return true; // slot stays held for the caller's write
@@ -215,7 +278,9 @@ public:
     /// runs — including a throw unwinding through the reservation's scope —
     /// the destructor completes it as failed(), so an exception between the
     /// reservation and the write can never strand the agent's in-flight slot (which
-    /// would otherwise wedge should_log() false for that agent forever).
+    /// would otherwise wedge should_log() false for that agent forever). The
+    /// first completion wins: a second logged()/failed() is a no-op, and a
+    /// completion that throws is not retried by the destructor.
     ///
     /// Lifetime rule: `agent_id` is referenced, not copied (the constructor stays
     /// noexcept and non-allocating), so it must outlive the Reservation. At the one
@@ -234,16 +299,16 @@ public:
         Reservation(Reservation&&) = delete;
         Reservation& operator=(Reservation&&) = delete;
         ~Reservation() {
-            if (gate_)
-                gate_->mark_failed(*agent_);
+            if (auto* gate = std::exchange(gate_, nullptr))
+                gate->mark_failed(*agent_);
         }
         void logged(const std::string& quarantine) {
-            gate_->mark_logged(*agent_, quarantine);
-            gate_ = nullptr;
+            if (auto* gate = std::exchange(gate_, nullptr))
+                gate->mark_logged(*agent_, quarantine);
         }
         void failed() {
-            gate_->mark_failed(*agent_);
-            gate_ = nullptr;
+            if (auto* gate = std::exchange(gate_, nullptr))
+                gate->mark_failed(*agent_);
         }
 
     private:
@@ -253,42 +318,90 @@ public:
 
     void mark_logged(const std::string& agent_id, const std::string& quarantine) {
         std::lock_guard lock(mu_);
-        in_flight_.erase(agent_id);
-        remember_locked(agent_id, quarantine, now_s_());
+        in_flight_.erase(agent_id); // released first: a throwing clock still frees the slot
+        remember_locked(agent_id, quarantine, now_s_(), true);
     }
 
     /// The caller's audit write failed: release the agent's slot and open the
     /// (gate-wide: a degraded store is a store property) degraded window.
     void mark_failed(const std::string& agent_id) {
-        std::lock_guard lock(mu_);
-        in_flight_.erase(agent_id);
-        degraded_until_ = now_s_() + kEchoCorruptionAuditDegradedRetry;
+        {
+            std::lock_guard lock(mu_);
+            in_flight_.erase(agent_id);
+            open_window_locked(now_s_());
+        }
+        notify_degraded(DegradedCause::write_failed);
     }
 
 private:
-    static constexpr std::size_t kMaxAgents = 65536;
     struct Entry {
         std::string identity;
         std::optional<int64_t> last_row_at; // set only for rows this process wrote
     };
-    static int64_t steady_seconds() {
-        return std::chrono::duration_cast<std::chrono::seconds>(
-                   std::chrono::steady_clock::now().time_since_epoch())
-            .count();
+    /// The one place the degraded window opens. max(): a late completion stamped earlier than
+    /// a newer failure never shortens the window that failure opened.
+    void open_window_locked(int64_t at) {
+        degraded_until_ = std::max(degraded_until_, at + kEchoCorruptionAuditDegradedRetry);
     }
-    void remember_locked(const std::string& agent_id, const std::string& quarantine,
-                         std::optional<int64_t> row_at) {
-        if (agents_.size() >= kMaxAgents && !agents_.contains(agent_id))
-            agents_.erase(agents_.begin()); // bounded; the audit-store lookup backs it
-        agents_[agent_id] = Entry{quarantine, row_at};
+    void notify_degraded(DegradedCause cause) noexcept {
+        if (!on_degraded_)
+            return;
+        try {
+            on_degraded_(cause);
+        } catch (...) {
+        }
+    }
+    /// `wrote_row`: this process wrote the row (starts the rate-limit window at `now`); false
+    /// when the identity was only found durable by the lookup (no window).
+    void remember_locked(const std::string& agent_id, const std::string& quarantine, int64_t now,
+                         bool wrote_row) {
+        if (agents_.size() >= kMaxAgents && !agents_.contains(agent_id)) {
+            // Prefer an entry whose rate-limit window has elapsed (or that never had one), so
+            // an agent still inside its window keeps its limit; fall back to the first entry
+            // only when every entry is inside its window. The lookup backs an evicted entry.
+            // ponytail: O(n) scan under mu_, at the cap only; an LRU list if the cap is hit
+            // routinely.
+            auto victim = agents_.begin();
+            for (auto it = agents_.begin(); it != agents_.end(); ++it) {
+                const auto& at = it->second.last_row_at;
+                if (!at || now - *at >= kEchoCorruptionAuditMinRowInterval) {
+                    victim = it;
+                    break;
+                }
+            }
+            agents_.erase(victim);
+        }
+        agents_[agent_id] = Entry{quarantine, wrote_row ? std::optional<int64_t>{now} : std::nullopt};
     }
     LatestFn latest_;
     NowFn now_s_;
+    DegradedFn on_degraded_;
     std::mutex mu_;
     std::unordered_map<std::string, Entry> agents_;
     int64_t degraded_until_{0};
     // Agents holding a true should_log() that is awaiting mark_logged / mark_failed.
     std::unordered_set<std::string> in_flight_;
 };
+
+/// The corruption sink's whole decision in one pure place (#7486): admit via the gate, write,
+/// complete the reservation. `write` returns true iff the audit row is durable. Returns true
+/// iff a row was written, i.e. once per (agent, quarantine identity) this process records, so
+/// a caller counting quarantines counts exactly the rows. A refusal (rate limit, durable
+/// lookup hit, degraded window, cap) and a failed write return false. A throw from `write`
+/// completes the reservation as failed and propagates.
+template <typename WriteFn>
+[[nodiscard]] bool log_echo_corruption_once(EchoCorruptionAuditGate& gate,
+                                            const std::string& agent_id,
+                                            const std::string& quarantine, WriteFn&& write) {
+    if (!gate.should_log(agent_id, quarantine))
+        return false;
+    EchoCorruptionAuditGate::Reservation res(gate, agent_id);
+    if (!write()) {
+        res.failed();
+        return false;
+    }
+    res.logged(quarantine);
+    return true;
+}
 
 } // namespace yuzu::server::detail

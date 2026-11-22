@@ -120,8 +120,10 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     // An agent that reports the retired name `tar` and no `echo` is not an Echo agent: Echo
     // commands are refused for it and its `yuzu.plugin.tar.*` heartbeat tags (the corruption
     // signal) are not read. The fleet is meant to be one build, so say so rather than let it pass.
-    if (std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end() &&
-        std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end()) {
+    session->retired_tar_only =
+        std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end() &&
+        std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end();
+    if (session->retired_tar_only) {
         spdlog::warn("AgentRegistry::register_agent({}): inventory reports the retired plugin name "
                      "'tar' and no 'echo' - not an Echo agent; upgrade it to the current build",
                      safe_agent_id);
@@ -1870,6 +1872,12 @@ std::string AgentRegistry::find_agent_by_stream(
 std::size_t AgentRegistry::agent_count() const {
     std::lock_guard lock(mu_);
     return agents_.size();
+}
+
+std::size_t AgentRegistry::retired_tar_only_count() const {
+    std::lock_guard lock(mu_);
+    return static_cast<std::size_t>(
+        std::ranges::count_if(agents_, [](const auto& kv) { return kv.second->retired_tar_only; }));
 }
 
 void AgentRegistry::map_session(const std::string& session_id, const std::string& agent_id) {

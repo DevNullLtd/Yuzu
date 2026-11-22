@@ -14,6 +14,7 @@
 #include "../test_log_capture.hpp"
 
 #include <algorithm>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -560,6 +561,40 @@ TEST_CASE("an agent reporting only the retired `tar` plugin does not count as ha
     REQUIRE(session);
     CHECK(std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end());
     CHECK(std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end());
+}
+
+// #7429: the count behind yuzu_fleet_retired_tar_plugin_agents covers sessions this replica holds
+// that report `tar` and no `echo`; a session that leaves or re-registers with `echo` drops out.
+TEST_CASE("retired_tar_only_count counts only tar-without-echo sessions",
+          "[server][registry][echo_rename]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    const auto register_with = [&](const std::string& id, std::initializer_list<const char*> names) {
+        auto info = make_presence_test_info(id);
+        for (const char* n : names)
+            info.add_plugins()->set_name(n);
+        (void)registry.register_agent(info);
+    };
+    CHECK(registry.retired_tar_only_count() == 0);
+
+    register_with("dev-echo", {"os_info", "echo"});
+    register_with("dev-both", {"echo", "tar"}); // mid-upgrade inventories carry both
+    register_with("dev-none", {"os_info"});
+    CHECK(registry.retired_tar_only_count() == 0);
+
+    register_with("dev-tar", {"os_info", "tar"});
+    CHECK(registry.retired_tar_only_count() == 1);
+
+    register_with("dev-tar-2", {"tar"});
+    CHECK(registry.retired_tar_only_count() == 2);
+
+    // Re-registering with echo clears the flag (the new session replaces the old one) ...
+    register_with("dev-tar", {"os_info", "echo"});
+    CHECK(registry.retired_tar_only_count() == 1);
+    // ... and a removed session no longer counts.
+    registry.remove_agent("dev-tar-2");
+    CHECK(registry.retired_tar_only_count() == 0);
 }
 
 TEST_CASE("an agent reporting `echo` has it and send_to / send_to_all write `echo` to the wire",
