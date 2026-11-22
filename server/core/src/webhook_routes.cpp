@@ -25,6 +25,8 @@ std::string_view audit_detail_for(WebhookWriteError err) {
     switch (err) {
     case WebhookWriteError::invalid_url:
         return "invalid_url";
+    case WebhookWriteError::destination_refused:
+        return "destination_refused";
     case WebhookWriteError::store_unavailable:
         return "store_unavailable";
     case WebhookWriteError::db_error:
@@ -115,7 +117,20 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  if (!result) {
                      // #3097 classification: caller error (bad URL) is 400,
                      // never conflated with a store/DB degradation (503).
-                     if (result.error() == WebhookWriteError::invalid_url) {
+                     if (result.error() == WebhookWriteError::destination_refused) {
+                         // Distinct from a typo (`invalid_url`): an attempt to aim deliveries at a
+                         // link-local / cloud-metadata / unspecified / multicast / reserved address
+                         // (or a numeric spelling of one) is a security-relevant event of its own.
+                         (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create", "denied", "webhook", "", "destination_refused");
+                         res.status = 400;
+                         res.set_content(
+                             detail::a4_error(res, "url host is a link-local, cloud-metadata, "
+                                                   "unspecified, multicast or reserved address "
+                                                   "(or a numeric spelling of one); webhook "
+                                                   "destinations may not be in those address "
+                                                   "classes"),
+                             "application/json");
+                     } else if (result.error() == WebhookWriteError::invalid_url) {
                          (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create", "failure", "webhook", "", "invalid_url");
                          res.status = 400;
                          res.set_content(
