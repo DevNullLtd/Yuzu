@@ -1806,6 +1806,9 @@ TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it 
     // At most 100 rule rows; `ruleset|100` and `truncated|true` exactly when the host has more.
     const auto rule_rows = count_prefixed(r.captured, "rule|");
     CHECK(rule_rows <= 100);
+    // The live Windows run is elevated, and every per-rule property read of an elevated run
+    // succeeds: a rule row with an `unknown` field here would be a read that was refused or failed.
+    CHECK_FALSE(has_prefix(r.captured, "error|rule_property:"));
     const auto after = firewall_snapshot();
     REQUIRE(fr::readable(kThisOs, after));
     const auto host_rules = std::max(section_lines(before, fr::label::kRules).value_or(0),

@@ -1181,27 +1181,134 @@ TEST_CASE("#4375 win_rule_count_row: the count, or the HRESULT of the step that 
     CHECK(win_rule_count_row(false, 1, false, 0x80004005u, 0) == "error|rules_count:0x00000001");
 }
 
-TEST_CASE("#4375 win_rule_row: field order, enabled/disabled words and a sanitised name",
-          "[firewall]") {
-    CHECK(win_rule_row("Core Networking - DNS (UDP-Out)", true, "out", "allow", 2147483647) ==
-          "rule|Core Networking - DNS (UDP-Out)|enabled|out|allow|2147483647");
-    CHECK(win_rule_row("x", false, "in", "block", 7) == "rule|x|disabled|in|block|7");
-    CHECK(win_rule_row("a|b\r\nc", true, "unknown", "unknown", 0) ==
-          "rule|a_b__c|enabled|unknown|unknown|0");
+namespace {
+
+constexpr std::uint32_t kAccessDenied = 0x80070005u; // E_ACCESSDENIED
+constexpr std::uint32_t kSFalse = 1;                 // passes SUCCEEDED(), means "not found"
+
+/// A rule whose five reads all returned S_OK: the DNS rule of #4375's capture.
+WinRuleRead dns_rule() {
+    return WinRuleRead{.name = "Core Networking - DNS (UDP-Out)",
+                       .enabled = true,
+                       .dir = 2,
+                       .action = 1,
+                       .profiles = 2147483647};
 }
 
-TEST_CASE("#4375 win_rules_trailer_rows: count, truncation, and a failed enumeration", "[firewall]") {
+} // namespace
+
+TEST_CASE("win_rule_row: every read S_OK is the row byte for byte, whatever the field values",
+          "[firewall]") {
+    CHECK(win_rule_row(dns_rule()) == "rule|Core Networking - DNS (UDP-Out)|enabled|out|allow|2147483647");
+    CHECK(win_rule_row(WinRuleRead{.name = "x", .enabled = false, .dir = 1, .action = 0, .profiles = 7}) ==
+          "rule|x|disabled|in|block|7");
+    // the name is echoed, so it is sanitised; an S_OK empty name is an empty name
+    CHECK(win_rule_row(WinRuleRead{.name = "a|b\r\nc", .enabled = true, .dir = 0, .action = 0, .profiles = 0}) ==
+          "rule|a_b__c|enabled|unknown|block|0");
+    CHECK(win_rule_row(WinRuleRead{.name = "", .enabled = true, .dir = 1, .action = 1, .profiles = 1}) ==
+          "rule||enabled|in|allow|1");
+    // a value the plugin does not know is unknown even when its read succeeded
+    CHECK(win_rule_row(WinRuleRead{.name = "n", .enabled = true, .dir = 3, .action = 2, .profiles = 0}) ==
+          "rule|n|enabled|unknown|unknown|0");
+    CHECK(win_rule_row(WinRuleRead{.name = "n", .enabled = true, .dir = -1, .action = -1, .profiles = 0}) ==
+          "rule|n|enabled|unknown|unknown|0");
+}
+
+TEST_CASE("win_rule_row: a property that failed reads unknown in that field only, never a default",
+          "[firewall]") {
+    // The out-parameters keep what the caller initialised them to (empty name, disabled, 0, 0, 0)
+    // when a read fails. None of that may reach the row: `disabled` and `block` and profiles 0 are
+    // all plausible, false-safe words.
+    auto failed = [](auto set) {
+        auto r = dns_rule();
+        set(r);
+        r.name = {};
+        r.enabled = false;
+        r.dir = 0;
+        r.action = 0;
+        r.profiles = 0;
+        return win_rule_row(r);
+    };
+    CHECK(failed([](WinRuleRead& r) { r.name_hr = kAccessDenied; }) ==
+          "rule|unknown|disabled|unknown|block|0");
+    CHECK(failed([](WinRuleRead& r) { r.enabled_hr = kAccessDenied; }) == "rule||unknown|unknown|block|0");
+    CHECK(failed([](WinRuleRead& r) { r.dir_hr = kAccessDenied; }) == "rule||disabled|unknown|block|0");
+    CHECK(failed([](WinRuleRead& r) { r.action_hr = kAccessDenied; }) == "rule||disabled|unknown|unknown|0");
+    CHECK(failed([](WinRuleRead& r) { r.profiles_hr = kAccessDenied; }) ==
+          "rule||disabled|unknown|block|unknown");
+    // with the other four intact and carrying real values, only the failed field changes
+    auto only = dns_rule();
+    only.enabled_hr = kAccessDenied;
+    CHECK(win_rule_row(only) == "rule|Core Networking - DNS (UDP-Out)|unknown|out|allow|2147483647");
+    only = dns_rule();
+    only.profiles_hr = kAccessDenied;
+    CHECK(win_rule_row(only) == "rule|Core Networking - DNS (UDP-Out)|enabled|out|allow|unknown");
+    only = dns_rule();
+    only.name_hr = kAccessDenied;
+    CHECK(win_rule_row(only) == "rule|unknown|enabled|out|allow|2147483647");
+}
+
+TEST_CASE("win_rule_row: S_FALSE is not success, on every property (an action is never `block`)",
+          "[firewall]") {
+    auto r = dns_rule();
+    r.name_hr = r.enabled_hr = r.dir_hr = r.action_hr = r.profiles_hr = kSFalse;
+    r.action = 0; // what a read that left the out-parameter alone holds: NET_FW_ACTION_BLOCK
+    CHECK(win_rule_row(r) == "rule|unknown|unknown|unknown|unknown|unknown");
+    r = dns_rule();
+    r.action_hr = kSFalse;
+    r.action = 0;
+    CHECK(win_rule_row(r) == "rule|Core Networking - DNS (UDP-Out)|enabled|out|unknown|2147483647");
+    r = dns_rule();
+    r.dir_hr = kSFalse;
+    CHECK(win_rule_row(r) == "rule|Core Networking - DNS (UDP-Out)|enabled|unknown|allow|2147483647");
+}
+
+TEST_CASE("win_rule_unobtained and win_rule_first_failure: the row of a rule with no object, and the "
+          "first failed read",
+          "[firewall]") {
+    // every property failed: the all-unknown row, whatever the other members hold
+    const auto none = win_rule_unobtained(0x80020005u); // DISP_E_TYPEMISMATCH
+    CHECK(win_rule_row(none) == "rule|unknown|unknown|unknown|unknown|unknown");
+    CHECK(win_rule_first_failure(none) == 0x80020005u);
+    // all five read: no failure
+    CHECK(win_rule_first_failure(dns_rule()) == 0);
+    // the first failure in field order wins (name, enabled, direction, action, profiles)
+    auto r = dns_rule();
+    r.profiles_hr = 3;
+    r.action_hr = 2;
+    CHECK(win_rule_first_failure(r) == 2);
+    r.dir_hr = kAccessDenied;
+    CHECK(win_rule_first_failure(r) == kAccessDenied);
+    r.enabled_hr = 4;
+    CHECK(win_rule_first_failure(r) == 4);
+    r.name_hr = kSFalse;
+    CHECK(win_rule_first_failure(r) == kSFalse);
+}
+
+TEST_CASE("#4375 win_rules_trailer_rows: count, truncation, a failed enumeration and rule-property "
+          "failures",
+          "[firewall]") {
     using Rows = std::vector<std::string>;
-    CHECK(win_rules_trailer_rows(37, false, false, 0) == Rows{"ruleset|37"});
+    CHECK(win_rules_trailer_rows(37, false, false, 0, 0, 0) == Rows{"ruleset|37"});
     // exactly 100 rules, none cut off
-    CHECK(win_rules_trailer_rows(100, false, false, 0) == Rows{"ruleset|100"});
+    CHECK(win_rules_trailer_rows(100, false, false, 0, 0, 0) == Rows{"ruleset|100"});
     // a 101st rule exists: the cap row follows the count
-    CHECK(win_rules_trailer_rows(100, true, false, 0) == Rows{"ruleset|100", "truncated|true"});
+    CHECK(win_rules_trailer_rows(100, true, false, 0, 0, 0) == Rows{"ruleset|100", "truncated|true"});
     // a partial tally is never a count
-    CHECK(win_rules_trailer_rows(42, false, true, 0x80004005u) ==
+    CHECK(win_rules_trailer_rows(42, false, true, 0x80004005u, 0, 0) ==
           Rows{"error|enum_next:0x80004005", "ruleset|unknown"});
-    CHECK(win_rules_trailer_rows(100, true, true, 0x8007000eu) ==
+    CHECK(win_rules_trailer_rows(100, true, true, 0x8007000eu, 0, 0) ==
           Rows{"error|enum_next:0x8007000e", "ruleset|unknown"});
+
+    // rules with an unreadable property: the row is first, names how many rules and the first
+    // HRESULT, and the count is unchanged (those rows were written and count)
+    CHECK(win_rules_trailer_rows(37, false, false, 0, 2, kAccessDenied) ==
+          Rows{"error|rule_property:2:0x80070005", "ruleset|37"});
+    CHECK(win_rules_trailer_rows(100, true, false, 0, 1, kSFalse) ==
+          Rows{"error|rule_property:1:0x00000001", "ruleset|100", "truncated|true"});
+    // combined with a failed enumeration: both rows, the property row first
+    CHECK(win_rules_trailer_rows(42, false, true, 0x80004005u, 3, kAccessDenied) ==
+          Rows{"error|rule_property:3:0x80070005", "error|enum_next:0x80004005", "ruleset|unknown"});
 }
 
 // ── nftables generation, re-run and failure list (#4400, #4401, #4402) ──────

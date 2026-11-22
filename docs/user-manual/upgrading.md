@@ -11,20 +11,22 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
-## Behaviour change: the firewall `state` and `rules` reads answer through granted privilege on macOS
+## Behaviour change: the firewall `state` and `rules` reads answer through granted privilege on macOS, and a Windows rule property that cannot be read is `unknown`
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
 
-**In short.** Affected: anyone who reads the `firewall` plugin's `state` or `rules` rows from a macOS agent that does not run as root (the opt-in `_yuzu` least-privilege account, or a developer run). To do: provision the account with this build's `scripts/install-agent-user.sh`, which writes one new sudoers line.
+**In short.** Affected: anyone who reads the `firewall` plugin's `state` or `rules` rows from a macOS agent that does not run as root (the opt-in `_yuzu` least-privilege account, or a developer run), and anyone who parses the Windows `rules` rows. To do: provision the macOS account with this build's `scripts/install-agent-user.sh`, which writes one new sudoers line; accept `unknown` in the Windows `enabled`, `direction`, `action` and `profiles` fields and a rule named `unknown`.
 
 **What changed.**
 
 - **macOS.** The pf reads (`pfctl -s info`, `-s Anchors`, `-s rules`) now run as `sudo -n -- /sbin/pfctl -s <word>` on three exact read-only NOPASSWD lines, and directly when the agent is root. `-s info` and `-s rules` were already granted for the containment status read; `-s Anchors` (the top-level anchor list, not the `-a com.apple -s Anchors` line the containment path uses) is a new line, with no wildcard. With them the `_yuzu` account reads `pf|enabled` or `pf|disabled`, the anchors, the pf rule rows and the true `ruleset|<n>`; without them (no line, no root) it reads `pf|unknown`, `ruleset|unknown` and the `error|pf:...:exit:1` rows, never a false-safe value. On a non-root agent `exit:1` means sudo refused the grant or `pfctl` failed: stderr is dropped, so the two read alike. `install-agent-user.sh --check` reports a sudoers file that lacks the line.
+- **Windows.** The `rules` rows read each rule's name, enabled flag, direction, action and profile mask separately, and a value is used only when its own read succeeded (`S_OK`). A property that fails or is refused now reads `unknown` in its field instead of an empty name, `disabled`, profile `0` or (for `S_FALSE` on the action) `block`: the `enabled` column gains the value `unknown`, `profiles` can be `unknown`, and a rule whose name could not be read is named `unknown`. One `error|rule_property:<rules>:0x<hresult>` row, written before `ruleset|<n>`, says how many of the rule rows are affected and the first HRESULT; a rule the enumerator returned but whose object could not be obtained is an all-`unknown` row and is counted. The rows, their order and the count are otherwise unchanged. On an elevated administrator or LocalSystem agent every read succeeds and none of this appears.
 - Each refused `sudo -n` attempt is recorded by sudo: a macOS agent that is not root and has no grant makes up to three refused attempts per `state` read and two per `rules` read.
 
 **What to do.**
 - Run this build's `install-agent-user.sh` on each macOS host that runs the agent as `_yuzu`; check the host first (`--check`) so no existing account state is overwritten unseen.
 - Read `error|pf:...:exit:1` on a non-root macOS agent as "the grant is missing or `pfctl` failed", not as "pf is off".
+- Treat a Windows rule row with an `unknown` field, or a rule named `unknown` beside an `error|rule_property:` row, as a rule that was not fully read, not as a disabled, blocking or unnamed rule.
 
 ## Behaviour change: the installed-software read routes return `package_id` (#6090)
 

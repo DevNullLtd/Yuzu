@@ -248,6 +248,14 @@ void do_state_windows(yuzu::CommandContext& ctx) {
         static_cast<uint32_t>(count_hr), static_cast<long long>(rule_count)));
 }
 
+// win_rule_row maps the raw enum values (direction 1 in / 2 out, action 0 block / 1 allow); pin
+// them to the OS header so a renumbering could never relabel a rule (cf. the nft UAPI checks in
+// the Linux block below).
+static_assert(NET_FW_RULE_DIR_IN == 1 && NET_FW_RULE_DIR_OUT == 2,
+              "win_rule_row's direction values must be INetFwRule's");
+static_assert(NET_FW_ACTION_BLOCK == 0 && NET_FW_ACTION_ALLOW == 1,
+              "win_rule_row's action values must be INetFwRule's");
+
 void do_rules_windows(yuzu::CommandContext& ctx) {
     ComInit com;
     if (!com.ok()) {
@@ -283,6 +291,20 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
     int count = 0;
     bool truncated = false;
     bool enum_failed = false;
+    // Rules with at least one property that could not be read, and the first HRESULT among them.
+    int property_failures = 0;
+    std::uint32_t first_property_hr = 0;
+    // One `rule|` row (the pure builder's) and its tally: every rule the enumerator returned is
+    // written and counted, with `unknown` in each field whose read did not return S_OK.
+    const auto emit_rule = [&](const yuzu::firewall::WinRuleRead& read) {
+        ctx.write_output(yuzu::firewall::win_rule_row(read));
+        if (const auto failed_hr = yuzu::firewall::win_rule_first_failure(read); failed_hr != 0) {
+            if (property_failures == 0)
+                first_property_hr = failed_hr;
+            ++property_failures;
+        }
+        ++count;
+    };
     for (;;) {
         VARIANT v;
         VariantInit(&v);
@@ -321,16 +343,22 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
             truncated = true;
             break;
         }
+        // The enumerator returned an item, so the count must not lose it: one that is not a rule
+        // object is an all-unknown row, not a skipped one.
         if (v.vt != VT_DISPATCH || !v.pdispVal) {
             VariantClear(&v);
+            emit_rule(yuzu::firewall::win_rule_unobtained(static_cast<std::uint32_t>(DISP_E_TYPEMISMATCH)));
             continue;
         }
         ComPtr<INetFwRule> rule;
         HRESULT qhr = v.pdispVal->QueryInterface(__uuidof(INetFwRule),
                                                  reinterpret_cast<void**>(rule.put()));
         VariantClear(&v);
-        if (FAILED(qhr) || !rule)
+        if (FAILED(qhr) || !rule) {
+            emit_rule(yuzu::firewall::win_rule_unobtained(
+                static_cast<std::uint32_t>(FAILED(qhr) ? qhr : E_NOINTERFACE)));
             continue;
+        }
 
         // RAII over the raw BSTR out-param: the shared win_com.hpp BStr type
         // only constructs by ALLOCATING a new BSTR, so it can't adopt one
@@ -354,46 +382,39 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
             RuleNameBstr(const RuleNameBstr&) = delete;
             RuleNameBstr& operator=(const RuleNameBstr&) = delete;
         } name_bstr;
-        rule->get_Name(&name_bstr.b);
-        std::wstring name_w = name_bstr.b ? name_bstr.b : L"";
-
+        // Every property is read with its own HRESULT kept: an out-parameter left at its default by
+        // a refused or failed read (an empty name, `disabled`, action 0 = BLOCK, profiles 0) is a
+        // plausible, false-safe rule, so the pure builder uses a value only when its read is S_OK.
+        const HRESULT name_hr = rule->get_Name(&name_bstr.b);
+        const std::string name_utf8 = yuzu::win::from_wide(name_bstr.b); // null-safe: a null BSTR is ""
         VARIANT_BOOL enabled = VARIANT_FALSE;
-        rule->get_Enabled(&enabled);
-
-        // Direction/Action are read as explicitly failure-checked (rather
-        // than relying on a sentinel initial value that "happens" not to
-        // collide with a real enumerator) so an unreadable field reports
-        // honestly as unknown regardless of the underlying enum's numbering.
+        const HRESULT enabled_hr = rule->get_Enabled(&enabled);
         NET_FW_RULE_DIRECTION dir{};
-        HRESULT dir_hr = rule->get_Direction(&dir);
-        std::string dir_s = FAILED(dir_hr)          ? "unknown"
-                            : (dir == NET_FW_RULE_DIR_IN)  ? "in"
-                            : (dir == NET_FW_RULE_DIR_OUT) ? "out"
-                                                            : "unknown";
-
+        const HRESULT dir_hr = rule->get_Direction(&dir);
         NET_FW_ACTION action{};
-        HRESULT action_hr = rule->get_Action(&action);
-        std::string action_s = FAILED(action_hr)            ? "unknown"
-                               : (action == NET_FW_ACTION_ALLOW) ? "allow"
-                               : (action == NET_FW_ACTION_BLOCK) ? "block"
-                                                                  : "unknown";
-
+        const HRESULT action_hr = rule->get_Action(&action);
         long profiles_mask = 0;
-        rule->get_Profiles(&profiles_mask);
+        const HRESULT profiles_hr = rule->get_Profiles(&profiles_mask);
 
-        // The row, with the name sanitised, is the pure builder's.
-        ctx.write_output(yuzu::firewall::win_rule_row(yuzu::win::from_wide(name_w.c_str()),
-                                                      enabled != VARIANT_FALSE, dir_s, action_s,
-                                                      profiles_mask));
-        ++count;
+        emit_rule(yuzu::firewall::WinRuleRead{.name_hr = static_cast<std::uint32_t>(name_hr),
+                                              .enabled_hr = static_cast<std::uint32_t>(enabled_hr),
+                                              .dir_hr = static_cast<std::uint32_t>(dir_hr),
+                                              .action_hr = static_cast<std::uint32_t>(action_hr),
+                                              .profiles_hr = static_cast<std::uint32_t>(profiles_hr),
+                                              .name = name_utf8,
+                                              .enabled = enabled != VARIANT_FALSE,
+                                              .dir = static_cast<int>(dir),
+                                              .action = static_cast<int>(action),
+                                              .profiles = profiles_mask});
     }
     // A mid-enumeration COM failure means `count` is a PARTIAL tally, not
     // the ruleset size -- report it as such (error| + ruleset|unknown)
     // rather than presenting a truncated count as though it were complete.
     // Every `rule|` row already emitted above stayed emitted; this only
     // changes what the trailing summary claims about them.
-    for (const auto& row : yuzu::firewall::win_rules_trailer_rows(count, truncated, enum_failed,
-                                                                  static_cast<uint32_t>(hr)))
+    for (const auto& row : yuzu::firewall::win_rules_trailer_rows(
+             count, truncated, enum_failed, static_cast<uint32_t>(hr), property_failures,
+             first_property_hr))
         ctx.write_output(row);
 }
 

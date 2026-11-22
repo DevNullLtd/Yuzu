@@ -1383,22 +1383,73 @@ macos_rules_rows(const yuzu::agent::SubprocessResult& listapps, const yuzu::agen
     return std::format("ruleset|{}", count);
 }
 
-/// One `rule|` row of the Windows `rules` action. The name is echoed, so it is sanitised here.
-[[nodiscard]] inline std::string win_rule_row(std::string_view name, bool enabled, std::string_view dir,
-                                              std::string_view action, long profiles) {
-    return std::format("rule|{}|{}|{}|{}|{}", sanitize_field(name), enabled ? "enabled" : "disabled",
-                       dir, action, profiles);
+/// The five COM property reads of one Windows rule, each with the HRESULT it returned. A value is
+/// used ONLY when its HRESULT is S_OK (0): a refused or failed read, and S_FALSE (which passes
+/// SUCCEEDED() but means "not found"), leave the out-parameter at whatever the caller initialised
+/// it to, and that default (an empty name, `disabled`, direction 0, action 0 = BLOCK, profiles 0)
+/// would read as a plausible, false-safe rule. `dir` and `action` carry the raw enum values
+/// (NET_FW_RULE_DIR_IN 1, NET_FW_RULE_DIR_OUT 2; NET_FW_ACTION_BLOCK 0, NET_FW_ACTION_ALLOW 1;
+/// the plugin static_asserts those against the OS header).
+struct WinRuleRead {
+    std::uint32_t name_hr = 0;
+    std::uint32_t enabled_hr = 0;
+    std::uint32_t dir_hr = 0;
+    std::uint32_t action_hr = 0;
+    std::uint32_t profiles_hr = 0;
+    std::string_view name;
+    bool enabled = false;
+    int dir = 0;
+    int action = 0;
+    long profiles = 0;
+};
+
+/// The read of a rule whose object could not be obtained from the enumerator: every property
+/// failed with `hr`, so the row is all `unknown` and the rule still counts.
+[[nodiscard]] constexpr WinRuleRead win_rule_unobtained(std::uint32_t hr) noexcept {
+    return WinRuleRead{.name_hr = hr, .enabled_hr = hr, .dir_hr = hr, .action_hr = hr, .profiles_hr = hr};
+}
+
+/// The first property HRESULT that is not S_OK, in field order (name, enabled, direction, action,
+/// profiles); 0 when every property was read.
+[[nodiscard]] constexpr std::uint32_t win_rule_first_failure(const WinRuleRead& r) noexcept {
+    for (const auto hr : {r.name_hr, r.enabled_hr, r.dir_hr, r.action_hr, r.profiles_hr})
+        if (hr != 0)
+            return hr;
+    return 0;
+}
+
+/// One `rule|` row of the Windows `rules` action: name, enabled, direction, action, profile mask.
+/// Each field is its value only when its own read returned S_OK and the value is one the plugin
+/// knows; anything else is `unknown` (never `disabled`, `block`, 0 or an empty name). The name is
+/// echoed, so it is sanitised here.
+[[nodiscard]] inline std::string win_rule_row(const WinRuleRead& r) {
+    const std::string name = r.name_hr == 0 ? sanitize_field(r.name) : std::string{"unknown"};
+    const std::string_view enabled = r.enabled_hr != 0 ? "unknown" : (r.enabled ? "enabled" : "disabled");
+    const std::string_view dir = r.dir_hr != 0 ? "unknown" : r.dir == 1 ? "in" : r.dir == 2 ? "out" : "unknown";
+    const std::string_view action =
+        r.action_hr != 0 ? "unknown" : r.action == 1 ? "allow" : r.action == 0 ? "block" : "unknown";
+    const std::string profiles = r.profiles_hr == 0 ? std::to_string(r.profiles) : std::string{"unknown"};
+    return std::format("rule|{}|{}|{}|{}|{}", name, enabled, dir, action, profiles);
 }
 
 /// The rows that close the Windows `rules` action. A failed enumeration step means `count` is a
 /// partial tally, so it is reported as `error|enum_next` and `ruleset|unknown`, never as a count;
-/// otherwise the count, and `truncated|true` only when a rule past the cap really exists.
-[[nodiscard]] inline std::vector<std::string> win_rules_trailer_rows(int count, bool truncated,
-                                                                     bool enum_failed,
-                                                                     std::uint32_t hr) {
-    if (enum_failed)
-        return {std::format("error|enum_next:0x{:08x}", hr), "ruleset|unknown"};
-    std::vector<std::string> rows{std::format("ruleset|{}", count)};
+/// otherwise the count, and `truncated|true` only when a rule past the cap really exists. When
+/// `property_failures` rules had a property that could not be read (their rows say `unknown` for
+/// it), `error|rule_property:<rules affected>:0x<first HRESULT>` comes first: the rows were
+/// still written and still counted, and this row says some of them are not fully read.
+[[nodiscard]] inline std::vector<std::string>
+win_rules_trailer_rows(int count, bool truncated, bool enum_failed, std::uint32_t hr,
+                       int property_failures, std::uint32_t first_property_hr) {
+    std::vector<std::string> rows;
+    if (property_failures > 0)
+        rows.push_back(std::format("error|rule_property:{}:0x{:08x}", property_failures, first_property_hr));
+    if (enum_failed) {
+        rows.push_back(std::format("error|enum_next:0x{:08x}", hr));
+        rows.emplace_back("ruleset|unknown");
+        return rows;
+    }
+    rows.push_back(std::format("ruleset|{}", count));
     if (truncated)
         rows.emplace_back("truncated|true");
     return rows;

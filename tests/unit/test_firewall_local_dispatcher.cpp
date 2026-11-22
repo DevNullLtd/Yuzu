@@ -339,6 +339,7 @@ TEST_CASE("firewall Windows 'rules' lists at most 100 rules, with a count that m
     std::size_t rule_rows = 0;
     std::optional<std::size_t> count;
     bool ruleset_unknown = false, enum_error = false, truncated = false, com_error = false;
+    std::optional<std::size_t> property_error_rules;
     for (const auto& line : lines) {
         INFO(line);
         if (line.rfind("rule|", 0) == 0) {
@@ -353,6 +354,16 @@ TEST_CASE("firewall Windows 'rules' lists at most 100 rules, with a count that m
             truncated = true;
         } else if (line.rfind("error|enum_next:0x", 0) == 0) {
             enum_error = true;
+        } else if (line.rfind("error|rule_property:", 0) == 0) {
+            // Some rules had a property that could not be read: their rows say `unknown` for it.
+            // Not a COM-start failure (the rule rows are still expected), so it is classified
+            // before the generic `error|` branch: `error|rule_property:<rules>:0x<hr>`.
+            const auto rest = line.substr(std::string_view("error|rule_property:").size());
+            const auto colon = rest.find(':');
+            REQUIRE(colon != std::string::npos);
+            REQUIRE(is_non_negative_integer(rest.substr(0, colon)));
+            property_error_rules = static_cast<std::size_t>(std::stoull(rest.substr(0, colon)));
+            CHECK(rest.substr(colon + 1).rfind("0x", 0) == 0);
         } else if (line.rfind("error|", 0) == 0) {
             com_error = true; // com_init, policy2_create, rules_create, enum_create, enum_variant
         } else {
@@ -370,6 +381,9 @@ TEST_CASE("firewall Windows 'rules' lists at most 100 rules, with a count that m
         CHECK_FALSE(count.has_value());
         return;
     }
+    // the rows with a property that failed are still rows, and are counted
+    if (property_error_rules)
+        CHECK((*property_error_rules >= 1 && *property_error_rules <= rule_rows));
     REQUIRE(count.has_value());
     CHECK(*count == rule_rows); // the trailing count is the number of rows written
     // the cap row appears only when a rule past the cap exists, and then the count is the cap

@@ -4727,8 +4727,10 @@ test('firewall Windows release-guard wiring lexical gate',
 
 # Firewall state and rules reads: static lexical gate over the OS-specific wiring that only that OS
 # compiles. macOS: every pf read is run_bounded_subprocess(sudo_wrap(fq::pfctl_*_argv())) with stderr
-# unmerged and no /sbin/pfctl literal (a bare pfctl exits 1 for the least-privilege account). Carries
-# its own in-memory mutation self-test. No build required; well under a second.
+# unmerged and no /sbin/pfctl literal (a bare pfctl exits 1 for the least-privilege account).
+# Windows: every per-rule property read lands in an HRESULT that reaches the pure row builder (no
+# FAILED() decides a field) and neither skip site drops a rule without its row. Carries its own
+# in-memory mutation self-test. No build required; well under a second.
 test('firewall read-path wiring lexical gate',
   _python3_test,
   args: [files('test_firewall_read_wiring_lexical.py')],
