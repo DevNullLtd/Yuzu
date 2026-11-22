@@ -221,6 +221,27 @@ Request make_request(const std::string& pattern, const std::string& root = "/r",
     return std::move(*r);
 }
 
+/// Every driver answer has one shape, whatever happened: matches and the coverage block first, one
+/// `cursor` row when (and only when) a cursor is issued, and ONE `search` trailer, last. An invalid or busy
+/// answer is the trailer alone. Every slice in this file runs through here, so a rule that moves a row,
+/// doubles one or drops the coverage block fails whichever case ran it.
+SliceResult checked_slice(const Request& req, Boundaries& b) {
+    SliceResult r = run_slice(req, b);
+    const auto count = [&r](const std::string& prefix) {
+        return static_cast<std::size_t>(std::ranges::count_if(r.rows, [&](const std::string& row) { return starts(row, prefix); }));
+    };
+    REQUIRE_FALSE(r.rows.empty());
+    CHECK(starts(r.rows.back(), "search|"));
+    CHECK(count("search|") == 1);
+    CHECK(count("coverage|") == (r.rows.size() == 1 ? 0u : 1u)); // the trailer alone, or one coverage row
+    if (r.status == Status::invalid || r.status == Status::busy)
+        CHECK(r.rows.size() == 1);
+    CHECK(count("cursor|") == (r.cursor.empty() ? 0u : 1u));
+    if (!r.cursor.empty() && r.rows.size() >= 2)
+        CHECK(r.rows[r.rows.size() - 2] == "cursor|" + r.cursor); // the row before the trailer, with the token
+    return r;
+}
+
 struct Run {
     std::vector<SliceResult> slices;
     [[nodiscard]] const SliceResult& last() const { return slices.back(); }
@@ -234,7 +255,7 @@ Run search(Rig& rig, const std::string& pattern, const std::string& root = "/r",
     while (run.slices.size() < max_slices) {
         if (before)
             before(run.slices.size());
-        SliceResult r = run_slice(make_request(pattern, root, kinds, cursor), rig.b);
+        SliceResult r = checked_slice(make_request(pattern, root, kinds, cursor), rig.b);
         cursor = r.cursor;
         run.slices.push_back(std::move(r));
         if (run.last().status != Status::ok || cursor.empty())
@@ -364,7 +385,7 @@ TEST_CASE("file_search request: a canonicaliser that writes wildcards is refused
     Rig rig;
     rig.fs.add_file("/r/abc.txt", "");
     rig.fs.add_file("/r/abc" + std::string(252, 'z'), ""); // 255 bytes: 1275 canonical
-    const SliceResult res = run_slice(make_request("abc*", "/r", "files", "", expand), rig.b);
+    const SliceResult res = checked_slice(make_request("abc*", "/r", "files", "", expand), rig.b);
     CHECK(res.status == Status::ok);
     CHECK(row_of(res, "match|").find("/r/abc.txt") != std::string::npos);
     CHECK(res.rows.size() > 0);
@@ -445,6 +466,7 @@ TEST_CASE("file_search driver: the governor limits map to the walk limits in one
     const fsr::GovernorLimits defaults;
     const auto w = walk_limits_for(defaults);
     CHECK(w.max_depth == fsr::kMaxPositionDepth);
+    CHECK(w.max_dir_entries == 50000); // the per-directory listing cap the plan fixes: the mapping leaves it alone
     fsr::GovernorLimits small;
     small.max_entries = 7;
     small.max_rows = 3;
@@ -678,7 +700,7 @@ TEST_CASE("file_search driver: a root that is a link, missing or not a directory
     rig.fs.add_file("/r/plain.txt", "");
     const auto check = [&](const std::string& root, const std::string& token) {
         rig.fs.listed.clear();
-        const SliceResult r = run_slice(make_request(kCtl, root), rig.b);
+        const SliceResult r = checked_slice(make_request(kCtl, root), rig.b);
         INFO(root);
         CHECK(r.status == Status::invalid);
         CHECK(r.reason == token);
@@ -747,9 +769,9 @@ TEST_CASE("file_search driver: a second concurrent slice answers busy without ca
     int reads_during = -1;
     rig.during_run = [&] {
         reads_during = rig.mount_reads;
-        inner = run_slice(make_request(kCtl), rig.b);
+        inner = checked_slice(make_request(kCtl), rig.b);
     };
-    const SliceResult outer = run_slice(make_request(kCtl), rig.b);
+    const SliceResult outer = checked_slice(make_request(kCtl), rig.b);
     REQUIRE(inner.has_value());
     CHECK(inner->status == Status::busy);
     CHECK(inner->reason == "busy");
@@ -771,7 +793,7 @@ TEST_CASE("file_search driver: a timeout abandons its worker, the volume reads s
     const std::string key0 = plan.units[0].key();
 
     rig.mode = Rig::Mode::timeout;
-    const SliceResult t = run_slice(make_request(kCtl), rig.b);
+    const SliceResult t = checked_slice(make_request(kCtl), rig.b);
     CHECK(t.status == Status::failed);
     CHECK(t.reason == "timed_out");
     CHECK(t.cursor.empty());
@@ -786,7 +808,7 @@ TEST_CASE("file_search driver: a timeout abandons its worker, the volume reads s
     // the retry finds the volume stalled: emitted as such, one gap, on to the next volume, no runner call
     rig.mode = Rig::Mode::run;
     const int calls = rig.runner_calls;
-    const SliceResult skip = run_slice(make_request(kCtl), rig.b);
+    const SliceResult skip = checked_slice(make_request(kCtl), rig.b);
     CHECK(skip.status == Status::ok);
     CHECK(skip.reason == "stalled");
     CHECK(rig.runner_calls == calls);
@@ -794,7 +816,7 @@ TEST_CASE("file_search driver: a timeout abandons its worker, the volume reads s
     REQUIRE_FALSE(skip.cursor.empty());
     CHECK(skip.counters.stalled == 1);
 
-    const SliceResult next = run_slice(make_request(kCtl, "/r", "files", skip.cursor), rig.b);
+    const SliceResult next = checked_slice(make_request(kCtl, "/r", "files", skip.cursor), rig.b);
     CHECK(next.status == Status::ok);
     CHECK(row_of(next, "match|").find("/r/data/yuzu-fs-control-2.bin") != std::string::npos);
     CHECK(next.cursor.empty());
@@ -809,24 +831,24 @@ TEST_CASE("file_search driver: with two workers still abandoned every slice answ
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.fs.add_file("/r/data/yuzu-fs-control-2.bin", "");
     rig.mode = Rig::Mode::timeout;
-    CHECK(run_slice(make_request(kCtl), rig.b).reason == "timed_out");                 // volume 0
-    const SliceResult skip = run_slice(make_request(kCtl), rig.b);                       // skips to volume 1
+    CHECK(checked_slice(make_request(kCtl), rig.b).reason == "timed_out");                 // volume 0
+    const SliceResult skip = checked_slice(make_request(kCtl), rig.b);                       // skips to volume 1
     REQUIRE_FALSE(skip.cursor.empty());
-    CHECK(run_slice(make_request(kCtl, "/r", "files", skip.cursor), rig.b).reason == "timed_out"); // volume 1
+    CHECK(checked_slice(make_request(kCtl, "/r", "files", skip.cursor), rig.b).reason == "timed_out"); // volume 1
     REQUIRE(rig.state.abandoned_count() == 2);
 
     const int calls = rig.runner_calls;
     for (int i = 0; i < 3; ++i) {
-        const SliceResult busy = run_slice(make_request(kCtl), rig.b);
+        const SliceResult busy = checked_slice(make_request(kCtl), rig.b);
         CHECK(busy.status == Status::busy);
         CHECK_FALSE(rig.slot.load());
-        CHECK(run_slice(make_request("other-*.bin"), rig.b).status == Status::busy); // any search
+        CHECK(checked_slice(make_request("other-*.bin"), rig.b).status == Status::busy); // any search
     }
     CHECK(rig.runner_calls == calls);
 
     rig.state.abandoned()[0].done->store(true); // one comes back: there is room again
     rig.mode = Rig::Mode::run;
-    CHECK(run_slice(make_request(kCtl, "/r", "files", skip.cursor), rig.b).status == Status::ok);
+    CHECK(checked_slice(make_request(kCtl, "/r", "files", skip.cursor), rig.b).status == Status::ok);
 }
 
 TEST_CASE("file_search driver: an abandoned worker that completes late changes only its own flag",
@@ -836,9 +858,9 @@ TEST_CASE("file_search driver: an abandoned worker that completes late changes o
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.fs.add_file("/r/data/yuzu-fs-control-2.bin", "");
     rig.mode = Rig::Mode::timeout;
-    CHECK(run_slice(make_request(kCtl), rig.b).reason == "timed_out");
+    CHECK(checked_slice(make_request(kCtl), rig.b).reason == "timed_out");
     REQUIRE(rig.held != nullptr);
-    const SliceResult skip = run_slice(make_request(kCtl), rig.b);
+    const SliceResult skip = checked_slice(make_request(kCtl), rig.b);
     REQUIRE_FALSE(skip.cursor.empty());
 
     // The next slice holds the slot; while it runs, the old worker finally returns.
@@ -852,7 +874,7 @@ TEST_CASE("file_search driver: an abandoned worker that completes late changes o
         abandoned_during = rig.state.abandoned_count();
         flag_during = rig.state.abandoned()[0].done->load();
     };
-    const SliceResult r = run_slice(make_request(kCtl, "/r", "files", skip.cursor), rig.b);
+    const SliceResult r = checked_slice(make_request(kCtl, "/r", "files", skip.cursor), rig.b);
     CHECK(slot_during);              // the newer slice still holds the slot
     CHECK(abandoned_during == 1);    // the late worker removed nothing from the state
     CHECK(flag_during);              // it set its own flag, and only that
@@ -860,7 +882,7 @@ TEST_CASE("file_search driver: an abandoned worker that completes late changes o
     CHECK(found(Run{{r}}) == Strs{"/r/data/yuzu-fs-control-2.bin"});
     CHECK_FALSE(rig.slot.load());
     rig.during_run = nullptr;
-    const SliceResult again = run_slice(make_request(kCtl), rig.b); // the next slice drops it, volume 0 is searched
+    const SliceResult again = checked_slice(make_request(kCtl), rig.b); // the next slice drops it, volume 0 is searched
     CHECK(again.status == Status::ok);
     CHECK(found(Run{{again}}) == Strs{"/r/yuzu-fs-control-1.bin"});
     CHECK(rig.state.abandoned_count() == 0);
@@ -872,7 +894,7 @@ TEST_CASE("file_search driver: a refused worker abandons nothing and the third r
     rig.mounts.add("/r/data", "ext4", "8:2");
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.mode = Rig::Mode::reject;
-    const SliceResult one = run_slice(make_request(kCtl), rig.b);
+    const SliceResult one = checked_slice(make_request(kCtl), rig.b);
     CHECK(one.status == Status::failed);
     CHECK(one.reason == "rejected");
     CHECK(one.counters.rejected == 1);
@@ -882,8 +904,8 @@ TEST_CASE("file_search driver: a refused worker abandons nothing and the third r
     CHECK(starts(row_of(one, "volume|"), "volume|/|ext4|partial|stalled|"));
     const auto qh = fsr::query_hash(make_request(kCtl).query);
     CHECK(rig.state.carried(Lineage{qh, 0, 0}).consecutive_stalls == 1); // the failed-slice count rises
-    CHECK(run_slice(make_request(kCtl), rig.b).reason == "rejected");
-    const SliceResult three = run_slice(make_request(kCtl), rig.b);
+    CHECK(checked_slice(make_request(kCtl), rig.b).reason == "rejected");
+    const SliceResult three = checked_slice(make_request(kCtl), rig.b);
     CHECK(three.status == Status::failed);
     CHECK(three.reason == "stalled"); // final
     CHECK(three.counters.stalled == 1);
@@ -896,7 +918,7 @@ TEST_CASE("file_search driver: a worker that throws is a failed slice, never a t
     Rig rig;
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.facts_hook = [](const std::string&) { throw std::runtime_error("boom"); };
-    const SliceResult r = run_slice(make_request(kCtl), rig.b);
+    const SliceResult r = checked_slice(make_request(kCtl), rig.b);
     CHECK(r.status == Status::failed);
     CHECK(r.reason == "internal_error");
     CHECK(r.counters.timed_out == 0);
@@ -906,7 +928,7 @@ TEST_CASE("file_search driver: a worker that throws is a failed slice, never a t
     CHECK_FALSE(rig.slot.load());
     // and the worker still set its flag on the way out
     rig.facts_hook = nullptr;
-    CHECK(run_slice(make_request(kCtl), rig.b).status == Status::ok);
+    CHECK(checked_slice(make_request(kCtl), rig.b).status == Status::ok);
 }
 
 TEST_CASE("file_search driver: a search that ended stalled leaves no verdict for the next search of the same query",
@@ -915,9 +937,9 @@ TEST_CASE("file_search driver: a search that ended stalled leaves no verdict for
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.fs.add_file("/r/other.txt", ""); // a second entry, so a one-entry budget cuts the walk
     rig.mode = Rig::Mode::reject;
-    CHECK(run_slice(make_request(kCtl), rig.b).reason == "rejected");
-    CHECK(run_slice(make_request(kCtl), rig.b).reason == "rejected");
-    CHECK(run_slice(make_request(kCtl), rig.b).reason == "stalled"); // the third: final
+    CHECK(checked_slice(make_request(kCtl), rig.b).reason == "rejected");
+    CHECK(checked_slice(make_request(kCtl), rig.b).reason == "rejected");
+    CHECK(checked_slice(make_request(kCtl), rig.b).reason == "stalled"); // the third: final
     CHECK(rig.state.lineage_count() == 0);                          // delivered once, not kept
 
     // a fresh search of the same query starts at the same lineage: its first slice is cut by a budget, which
@@ -937,7 +959,7 @@ TEST_CASE("file_search driver: a stall count belongs to one cursor, and an evict
     rig.mode = Rig::Mode::reject;
     const auto attempt = [&](std::uint64_t seq, std::uint32_t gen = 0) {
         const std::string token = encode_volume_cursor(cursor_at(rig, 0, seq, gen), rig.b.cursor_key);
-        return run_slice(make_request(kCtl, "/r", "files", token), rig.b).reason;
+        return checked_slice(make_request(kCtl, "/r", "files", token), rig.b).reason;
     };
 
     CHECK(attempt(1) == "rejected");
@@ -959,7 +981,7 @@ TEST_CASE("file_search driver: a stop request ends the slice cancelled, carrying
     Rig rig;
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.b.stop_requested = [] { return true; };
-    const SliceResult r = run_slice(make_request(kCtl), rig.b);
+    const SliceResult r = checked_slice(make_request(kCtl), rig.b);
     CHECK(r.status == Status::failed);
     CHECK(r.reason == "cancelled");
     CHECK(r.cursor.empty());
@@ -1005,7 +1027,7 @@ TEST_CASE("file_search driver: a position no cursor can spell is never progress 
         w.walk.position.after = std::string(300, 'a'); // longer than a name can be: not a valid position
         return w;
     };
-    const SliceResult r = run_slice(make_request(kCtl), rig.b);
+    const SliceResult r = checked_slice(make_request(kCtl), rig.b);
     CHECK(r.status == Status::failed);
     CHECK(r.reason == "internal_error");
     CHECK(r.cursor.empty());
@@ -1024,7 +1046,7 @@ TEST_CASE("file_search driver: the slice maximum ends the search with its own re
         return encode_volume_cursor(cursor_at(rig, index, seq), rig.b.cursor_key);
     };
     // the next cursor would be number kMaxSlices: the first unit finishes, the second is never searched
-    const SliceResult end = run_slice(make_request(kCtl, "/r", "files", cursor_at_seq(0, kMaxSlices - 1)), rig.b);
+    const SliceResult end = checked_slice(make_request(kCtl, "/r", "files", cursor_at_seq(0, kMaxSlices - 1)), rig.b);
     CHECK(end.status == Status::failed);
     CHECK(end.reason == "max_slices");
     CHECK(end.cursor.empty());
@@ -1032,20 +1054,20 @@ TEST_CASE("file_search driver: the slice maximum ends the search with its own re
     CHECK(starts(row_of(end, "coverage|"), "coverage|partial|"));
 
     // a slice that finishes the last unit on that sequence is simply the end of the search
-    const SliceResult last = run_slice(make_request(kCtl, "/r", "files", cursor_at_seq(1, kMaxSlices - 1)), rig.b);
+    const SliceResult last = checked_slice(make_request(kCtl, "/r", "files", cursor_at_seq(1, kMaxSlices - 1)), rig.b);
     CHECK(last.status == Status::ok);
     CHECK(last.reason == "none");
     CHECK(starts(row_of(last, "coverage|"), "coverage|complete|"));
 
     // a budget stop on that sequence is max_slices on the volume
     rig.b.limits.max_entries = 1;
-    const SliceResult cut = run_slice(make_request(kCtl, "/r", "files", cursor_at_seq(1, kMaxSlices - 1)), rig.b);
+    const SliceResult cut = checked_slice(make_request(kCtl, "/r", "files", cursor_at_seq(1, kMaxSlices - 1)), rig.b);
     CHECK(cut.status == Status::failed);
     CHECK(cut.reason == "max_slices");
     CHECK(row_of(cut, "volume|/r/data|ext4|partial|max_slices|").size() > 0);
 
     // and a cursor at or past the maximum is not a cursor
-    const SliceResult past = run_slice(make_request(kCtl, "/r", "files", cursor_at_seq(0, kMaxSlices)), rig.b);
+    const SliceResult past = checked_slice(make_request(kCtl, "/r", "files", cursor_at_seq(0, kMaxSlices)), rig.b);
     CHECK(past.status == Status::invalid);
     CHECK(past.reason == "bad_cursor");
 }
@@ -1055,18 +1077,68 @@ TEST_CASE("file_search driver: invalid governor limits are refused before a gove
     Rig rig;
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.b.limits.max_stalls = 0;
-    const SliceResult a = run_slice(make_request(kCtl), rig.b);
+    const SliceResult a = checked_slice(make_request(kCtl), rig.b);
     CHECK(a.status == Status::failed);
     CHECK(a.reason == "internal_error");
     rig.b.limits = {};
     rig.b.limits.max_restarts = 0;
-    CHECK(run_slice(make_request(kCtl), rig.b).status == Status::failed);
+    CHECK(checked_slice(make_request(kCtl), rig.b).status == Status::failed);
     rig.b.limits = {};
     rig.b.limits.slice = std::chrono::milliseconds{0};
-    CHECK(run_slice(make_request(kCtl), rig.b).status == Status::failed);
+    CHECK(checked_slice(make_request(kCtl), rig.b).status == Status::failed);
+    rig.b.limits = {};
+    rig.b.limits.slow_list_ratio = 1; // a back-off limit that could never act is refused like any other
+    CHECK(checked_slice(make_request(kCtl), rig.b).status == Status::failed);
     CHECK(rig.mount_reads == 0);
     CHECK(rig.runner_calls == 0);
     CHECK(rig.legs.empty());
+}
+
+// ---- pacing ----
+
+TEST_CASE("file_search driver: a slice paces its own listings and entries",
+          "[file_search][file_search_driver][pacing]") {
+    // MUTATION: deleting the gov.pace() call in the list wrapper AND the one in the visitor leaves no nap.
+    Rig rig;
+    rig.fs.add_dir("/r/slow");
+    rig.fs.add_file("/r/slow/yuzu-fs-control-2.bin", "");
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.fs.list_step = std::chrono::milliseconds{60}; // every listing is a whole work quantum (50 ms) of work
+    std::vector<std::chrono::milliseconds> sleeps;
+    rig.b.sleep = [&rig, &sleeps](std::chrono::milliseconds d) {
+        sleeps.push_back(d);
+        rig.fs.clock += d;
+    };
+    const SliceResult r = checked_slice(make_request(kCtl), rig.b);
+    CHECK(r.status == Status::ok);
+    // Listing /r takes 60 ms; the next call (the entry `slow`) naps those 60 ms at 50 % duty. Listing
+    // /r/slow takes 60 ms and is no slower than the 60 ms before it, so the nap at its first entry is the
+    // plain duty nap again. Nothing after that has a whole quantum of work to pace.
+    CHECK(sleeps == std::vector<std::chrono::milliseconds>{std::chrono::milliseconds{60}, std::chrono::milliseconds{60}});
+}
+
+TEST_CASE("file_search driver: a listing that turns slow lengthens the next nap",
+          "[file_search][file_search_driver][pacing]") {
+    // MUTATION: deleting the gov.note_listing call in the list wrapper leaves the plain duty nap (300 ms).
+    Rig rig;
+    rig.fs.add_dir("/r/slow");
+    rig.fs.add_file("/r/slow/yuzu-fs-control-2.bin", "");
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.list_hook = [&rig](const std::string& dir) {
+        if (dir == "/r/slow")
+            rig.fs.clock += std::chrono::milliseconds{300}; // at or over the hard bound (250 ms)
+    };
+    std::vector<std::chrono::milliseconds> sleeps;
+    rig.b.sleep = [&rig, &sleeps](std::chrono::milliseconds d) {
+        sleeps.push_back(d);
+        rig.fs.clock += d;
+    };
+    const SliceResult r = checked_slice(make_request(kCtl), rig.b);
+    CHECK(r.status == Status::ok);
+    // 300 ms of listing at 50 % duty is a 300 ms nap; the slow listing adds one quantum (50 ms) of back-off.
+    CHECK(sleeps == std::vector<std::chrono::milliseconds>{std::chrono::milliseconds{350}});
+    // and the two found files are both reported: pacing changes when a search finishes, never what it finds
+    CHECK(std::ranges::count_if(r.rows, [](const std::string& row) { return starts(row, "match|"); }) == 2);
 }
 
 TEST_CASE("file_search driver: no name the walk visited appears in an emitted cursor row",
@@ -1146,7 +1218,7 @@ TEST_CASE("file_search driver: a forged cursor is refused before any boundary is
         good_token.substr(0, good_token.size() - 1),
     };
     for (const auto& c : forged) {
-        const SliceResult r = run_slice(make_request(kCtl, "/r", "files", c), rig.b);
+        const SliceResult r = checked_slice(make_request(kCtl, "/r", "files", c), rig.b);
         INFO(c);
         CHECK(r.status == Status::invalid);
         CHECK(r.reason == "bad_cursor");
@@ -1155,11 +1227,21 @@ TEST_CASE("file_search driver: a forged cursor is refused before any boundary is
     CHECK(rig.mount_reads == 0);
     CHECK(rig.runner_calls == 0);
 
+    // The cursor is judged BEFORE the slot is taken: a forged one answers bad_cursor even while another
+    // slice holds the slot, never busy, and it neither takes nor releases the slot.
+    rig.slot = true;
+    const SliceResult held = checked_slice(make_request(kCtl, "/r", "files", flipped_mac), rig.b);
+    CHECK(held.status == Status::invalid);
+    CHECK(held.reason == "bad_cursor");
+    CHECK(rig.slot.load());
+    CHECK(rig.mount_reads == 0);
+    rig.slot = false;
+
     // a well-formed cursor of a changed unit set ends the search once the table has been read
     VolumeCursor moved = good;
     moved.units_hash = "ffffffffffffffff";
     const SliceResult changed =
-        run_slice(make_request(kCtl, "/r", "files", encode_volume_cursor(moved, rig.b.cursor_key)), rig.b);
+        checked_slice(make_request(kCtl, "/r", "files", encode_volume_cursor(moved, rig.b.cursor_key)), rig.b);
     CHECK(changed.status == Status::failed);
     CHECK(changed.reason == "mount_table_changed");
     CHECK(changed.cursor.empty());
@@ -1169,7 +1251,7 @@ TEST_CASE("file_search driver: a forged cursor is refused before any boundary is
     // the right hashes with a unit index past the plan are refused too
     VolumeCursor past = good;
     past.index = 5;
-    CHECK(run_slice(make_request(kCtl, "/r", "files", encode_volume_cursor(past, rig.b.cursor_key)), rig.b).status ==
+    CHECK(checked_slice(make_request(kCtl, "/r", "files", encode_volume_cursor(past, rig.b.cursor_key)), rig.b).status ==
           Status::invalid);
 }
 
@@ -1195,7 +1277,7 @@ TEST_CASE("file_search driver: a cursor this agent did not issue cannot finish a
     const VolumeCursor last_unit = cursor_at(rig, 1, 1);
     rig.mount_reads = 0;
     rig.runner_calls = 0;
-    const SliceResult forged = run_slice(
+    const SliceResult forged = checked_slice(
         make_request(kCtl, "/r", "files", encode_volume_cursor(last_unit, test_key(0x43))), rig.b);
     CHECK(forged.status == Status::invalid);
     CHECK(forged.reason == "bad_cursor");
@@ -1205,7 +1287,7 @@ TEST_CASE("file_search driver: a cursor this agent did not issue cannot finish a
     CHECK(rig.runner_calls == 0);
 
     // Control: the same cursor signed with the agent's own key is believed. The key is the only barrier.
-    const SliceResult trusted = run_slice(
+    const SliceResult trusted = checked_slice(
         make_request(kCtl, "/r", "files", encode_volume_cursor(last_unit, rig.b.cursor_key)), rig.b);
     CHECK(trusted.status == Status::ok);
     CHECK(rig.mount_reads == 1);
@@ -1217,13 +1299,13 @@ TEST_CASE("file_search driver: a cursor from before an agent restart is refused 
     rig.mounts.add("/r/more", "ext4", "8:2");
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.fs.add_file("/r/more/yuzu-fs-control-2.bin", "");
-    const SliceResult first = run_slice(make_request(kCtl), rig.b);
+    const SliceResult first = checked_slice(make_request(kCtl), rig.b);
     REQUIRE(first.status == Status::ok);
     REQUIRE_FALSE(first.cursor.empty());
 
     rig.b.cursor_key = test_key(0x77); // a new process draws a new key
     rig.mount_reads = 0;
-    const SliceResult after = run_slice(make_request(kCtl, "/r", "files", first.cursor), rig.b);
+    const SliceResult after = checked_slice(make_request(kCtl, "/r", "files", first.cursor), rig.b);
     CHECK(after.status == Status::invalid);
     CHECK(after.reason == "bad_cursor");
     CHECK(rig.mount_reads == 0);
@@ -1242,7 +1324,7 @@ TEST_CASE("file_search driver: a cursor key nobody set is refused before a curso
     rig.b.cursor_key = CursorKey{}; // the default: all zero
     const std::vector<std::string> cursors = {"", "fsv1.0.0123456789abcdef.fedcba9876543210.fs1:AAAA.00000000000000000000000000000000"};
     for (const std::string& cursor : cursors) {
-        const SliceResult r = run_slice(make_request(kCtl, "/r", "files", cursor), rig.b);
+        const SliceResult r = checked_slice(make_request(kCtl, "/r", "files", cursor), rig.b);
         CHECK(r.status == Status::failed);
         CHECK(r.reason == "internal_error");
         CHECK(r.cursor.empty());
@@ -1257,7 +1339,7 @@ TEST_CASE("file_search driver: an unreadable or malformed mount table ends the s
     Rig rig;
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.b.read_mounts = [&](const std::string&) { return std::optional<yuzu::shared::MountTable>{}; };
-    const SliceResult none = run_slice(make_request(kCtl), rig.b);
+    const SliceResult none = checked_slice(make_request(kCtl), rig.b);
     CHECK(none.status == Status::failed);
     CHECK(none.reason == "mount_table_unreadable");
     CHECK(starts(row_of(none, "coverage|"), "coverage|partial|"));
@@ -1266,13 +1348,13 @@ TEST_CASE("file_search driver: an unreadable or malformed mount table ends the s
     rig.b.read_mounts = [&](const std::string&) {
         return std::optional<yuzu::shared::MountTable>(yuzu::shared::mount_entries("garbage line\n"));
     };
-    CHECK(run_slice(make_request(kCtl), rig.b).reason == "mount_table_unreadable");
+    CHECK(checked_slice(make_request(kCtl), rig.b).reason == "mount_table_unreadable");
 
     // a table with no mount that contains the root describes nothing
     rig.b.read_mounts = [&](const std::string&) {
         return std::optional<yuzu::shared::MountTable>(Mounts{}.add("/elsewhere", "ext4").table());
     };
-    CHECK(run_slice(make_request(kCtl), rig.b).reason == "mount_table_unreadable");
+    CHECK(checked_slice(make_request(kCtl), rig.b).reason == "mount_table_unreadable");
     CHECK(rig.runner_calls == 0);
 }
 
@@ -1354,10 +1436,10 @@ TEST_CASE("file_search driver: a changed unit set between slices ends the search
     rig.mounts.add("/r/data", "ext4", "8:2");
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.fs.add_file("/r/data/yuzu-fs-control-2.bin", "");
-    const SliceResult one = run_slice(make_request(kCtl), rig.b);
+    const SliceResult one = checked_slice(make_request(kCtl), rig.b);
     REQUIRE_FALSE(one.cursor.empty());
     rig.mounts.add("/r/more", "ext4", "8:3");
-    const SliceResult two = run_slice(make_request(kCtl, "/r", "files", one.cursor), rig.b);
+    const SliceResult two = checked_slice(make_request(kCtl, "/r", "files", one.cursor), rig.b);
     CHECK(two.status == Status::failed);
     CHECK(two.reason == "mount_table_changed");
     CHECK(two.cursor.empty());
@@ -1371,12 +1453,12 @@ TEST_CASE("file_search driver: a refused mount appearing between slices is repor
     rig.mounts.add("/r/a", "ext4", "8:2").add("/r/b", "ext4", "8:3");
     rig.fs.add_file("/r/a/yuzu-fs-control-1.bin", "");
     rig.fs.add_file("/r/b/yuzu-fs-control-2.bin", "");
-    const SliceResult one = run_slice(make_request(kCtl), rig.b);
+    const SliceResult one = checked_slice(make_request(kCtl), rig.b);
     REQUIRE_FALSE(one.cursor.empty());
     CHECK(count_rows(Run{{one}}, "volume|") == 1); // nothing refused yet
 
     rig.mounts.add("/r/tmpx", "tmpfs", "0:7", "/", "tmpfs"); // appears mid-search
-    const SliceResult two = run_slice(make_request(kCtl, "/r", "files", one.cursor), rig.b);
+    const SliceResult two = checked_slice(make_request(kCtl, "/r", "files", one.cursor), rig.b);
     CHECK(two.status == Status::ok);
     REQUIRE_FALSE(two.cursor.empty());
     CHECK(count_rows(Run{{two}}, "volume|/r/tmpx|tmpfs|not_searched|fstype_not_allowed|") == 1);
@@ -1386,7 +1468,7 @@ TEST_CASE("file_search driver: a refused mount appearing between slices is repor
     CHECK(next->inner.prior_gaps == 1); // the count rose
     CHECK(next->refused_hash == rig.plan().refused_hash);
 
-    const SliceResult three = run_slice(make_request(kCtl, "/r", "files", two.cursor), rig.b);
+    const SliceResult three = checked_slice(make_request(kCtl, "/r", "files", two.cursor), rig.b);
     CHECK(three.status == Status::ok);
     CHECK(three.cursor.empty());
     CHECK(count_rows(Run{{three}}, "volume|/r/tmpx|") == 0); // not re-emitted: the set did not change again
@@ -1401,7 +1483,7 @@ TEST_CASE("file_search driver: a resumed slice whose unit root can no longer be 
         rig.fs.add_file("/r/b/yuzu-fs-control-b" + std::to_string(i) + ".bin", "");
     }
     rig.b.limits.max_entries = 3; // the first slice stops inside the unit
-    const SliceResult one = run_slice(make_request(kCtl), rig.b);
+    const SliceResult one = checked_slice(make_request(kCtl), rig.b);
     REQUIRE(one.status == Status::ok);
     REQUIRE_FALSE(one.cursor.empty());
     const auto cursor = decode_volume_cursor(one.cursor, fsr::query_hash(make_request(kCtl).query), rig.b.cursor_key);
@@ -1409,7 +1491,7 @@ TEST_CASE("file_search driver: a resumed slice whose unit root can no longer be 
     REQUIRE_FALSE(cursor->inner.position == fsr::Position{}); // a position inside the unit, not a fresh start
 
     rig.fs.dirs.erase("/r"); // replaced by something unreadable between the slices
-    const SliceResult two = run_slice(make_request(kCtl, "/r", "files", one.cursor), rig.b);
+    const SliceResult two = checked_slice(make_request(kCtl, "/r", "files", one.cursor), rig.b);
     CHECK(two.status == Status::ok);
     CHECK(two.reason == "none");
     CHECK(two.cursor.empty()); // the slice completed, so the search is finished
@@ -1451,12 +1533,12 @@ TEST_CASE("file_search driver: lost-response replays and a throwing slice leave 
     std::string cursor;
     for (std::size_t i = 0; i < 100; ++i) {
         const Request req = make_request(kCtl, "/r", "files", cursor);
-        const SliceResult lost = run_slice(req, noisy.b);        // the response never arrives
+        const SliceResult lost = checked_slice(req, noisy.b);        // the response never arrives
         armed = true;
-        const SliceResult thrown = run_slice(req, noisy.b);      // the retry's worker throws
+        const SliceResult thrown = checked_slice(req, noisy.b);      // the retry's worker throws
         CHECK(thrown.status == Status::failed);
         CHECK(thrown.reason == "internal_error");
-        const SliceResult again = run_slice(req, noisy.b);       // and the next retry gets through
+        const SliceResult again = checked_slice(req, noisy.b);       // and the next retry gets through
         CHECK(again.rows == lost.rows);                          // a replay is the same answer
         CHECK(again.cursor == lost.cursor);
         cursor = again.cursor;

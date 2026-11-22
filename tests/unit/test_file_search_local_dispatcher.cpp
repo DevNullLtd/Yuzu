@@ -10,7 +10,10 @@
  * test helpers' salt, never under $TMPDIR: /var is a link on macOS and /tmp is often tmpfs or overlay on
  * Linux, neither of which the search would plan as local disk. Whether the fixture's filesystem is one the
  * plan searches decides which of two assertions runs, and the case prints which. It never skips: a volume
- * the plan refuses is asserted to be reported, with its reason, and to yield no match row.
+ * the plan refuses is asserted to be reported, with its reason, and to yield no match row. The refused
+ * branch is only taken on a filesystem the OS itself (statfs, independent of the rows under test) says the
+ * plan would refuse: a fixture on ext4, xfs, btrfs or an allow-listed macOS type that was not searched fails
+ * with the volume rows shown, so a green run on such a host has always made the positive control.
  *
  * Run it with MESON_BUILD_ROOT set (`meson test` always does); without it the plugin is not found and the
  * cases warn and return, which is a false green outside `meson test`.
@@ -24,7 +27,8 @@
  *  - real slice: a match without its extents row, an extents row whose key is not the match's identity, a
  *    link or FIFO reported as a match, a verdict that is not complete, a trailer without the semantics id,
  *    or a typed status other than OK/FULL fails the slice case.
- *  - name rule: comparing bytes on macOS, or folding on Linux, fails the name case.
+ *  - name rule: comparing bytes on macOS, or folding on Linux, fails the name case; on Linux the byte-exact
+ *    spelling of the pattern is planted beside the decomposed name and must be the only match.
  *  - root: a root that is a link walked instead of refused fails the root case.
  *  - heartbeat: an init that leaves the KV keys in place, or that does not zero the in-memory totals, fails
  *    the heartbeat case (a seeded key survives init, or the count after one slice is not 1).
@@ -46,6 +50,7 @@
 #include "test_helpers.hpp"
 
 #include <file_search_names.hpp>
+#include <network_fstype.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -61,6 +66,13 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/mount.h>
+#include <sys/param.h>
+#else
+#include <linux/magic.h>
+#include <sys/vfs.h>
+#endif
 #endif
 
 namespace fs = std::filesystem;
@@ -207,6 +219,37 @@ bool fixture_was_searched(const Search& s) {
                 return true;
         }
     return false;
+}
+
+/// What the OS itself says about the fixture root's filesystem, independent of the rows under test:
+/// true when it is a type the plan's allow-list admits (macOS: the allow-list itself over the statfs type
+/// name; Linux: ext4, xfs or btrfs by magic number). No runner-specific flag is needed or trusted: a host
+/// whose workspace is on another filesystem keeps the refused branch below, and a host whose workspace is
+/// on one of these must have searched it.
+bool filesystem_is_searchable(const fs::path& root) {
+    struct statfs sf {};
+    if (::statfs(root.c_str(), &sf) != 0)
+        return false;
+#if defined(__APPLE__)
+    return yuzu::shared::is_searchable_local_fstype(sf.f_fstypename);
+#else
+    const auto magic = static_cast<unsigned long>(sf.f_type);
+    return magic == static_cast<unsigned long>(EXT4_SUPER_MAGIC) || magic == static_cast<unsigned long>(XFS_SUPER_MAGIC) ||
+           magic == static_cast<unsigned long>(BTRFS_SUPER_MAGIC);
+#endif
+}
+
+/// The positive control made mandatory where the host can state it: a fixture on a searchable filesystem
+/// that the plan still did not search (refused for a path reason, say) is a host to look at, so it FAILS
+/// with the volume rows shown. Otherwise the refused branch of the caller stays.
+void require_searched_when_searchable(const fs::path& root, const Search& s, bool searched) {
+    if (searched || !filesystem_is_searchable(root))
+        return;
+    std::string volumes;
+    for (const auto& row : s.rows)
+        if (starts(row, "volume|"))
+            volumes += "\n  " + row;
+    FAIL("the fixture's filesystem is one the plan searches, yet no volume was searched; volume rows:" << volumes);
 }
 
 std::vector<std::string> found_paths(const Search& s) {
@@ -358,6 +401,7 @@ TEST_CASE("file_search plugin: one real search over a fixture finds the controls
     CHECK(last.rc == 0);
 
     const bool searched = fixture_was_searched(s);
+    require_searched_when_searchable(fx.root, s, searched);
     WARN(std::string{"file_search real slice: branch="} + (searched ? "allowed (the plan searched the fixture's filesystem)"
                                                                     : "refused (the plan reported the fixture's filesystem and did not search it)"));
     const auto trailer = captured_rows(last.captured).back();
@@ -432,15 +476,25 @@ TEST_CASE("file_search plugin: the name rule of the OS decides whether a differe
     // The name on disk: lower case, decomposed (e then a combining acute). The pattern: upper case, composed.
     const std::string on_disk = "cafe\xCC\x81-yuzu-fs-name.bin";
     write_file(fx.root / on_disk, "x");
+#if !defined(__APPLE__)
+    // The positive control, planted beside the decomposed name: the byte-exact spelling of the pattern. Not on
+    // macOS, where a case- and normalisation-insensitive volume holds both spellings as one file.
+    const std::string exact = "CAF\xC3\x89-yuzu-fs-name.bin";
+    write_file(fx.root / exact, "y");
+#endif
     const Search s = search_all(plugin->descriptor, {fx.root.string(), "CAF\xC3\x89-yuzu-fs-name.*", "", ""});
     REQUIRE_FALSE(s.slices.empty());
-    if (!fixture_was_searched(s)) {
+    const bool searched = fixture_was_searched(s);
+    require_searched_when_searchable(fx.root, s, searched);
+    if (!searched) {
         WARN("file_search name rule: the fixture's filesystem is not searched here; the spelling check is not made");
     } else {
 #if defined(__APPLE__)
         CHECK(found_paths(s) == std::vector<std::string>{(fx.root / on_disk).string()}); // NFC plus case folding
 #else
-        CHECK(found_paths(s).empty()); // byte for byte: another case and another normal form is another name
+        // byte for byte: another case and another normal form is another name, so the byte-exact spelling is
+        // the only match, and an empty answer would mean the search found nothing at all
+        CHECK(found_paths(s) == std::vector<std::string>{(fx.root / exact).string()});
 #endif
     }
 }
@@ -461,7 +515,9 @@ TEST_CASE("file_search plugin: a root that is a link is refused with its own tok
     fs::create_directory_symlink(fx.root / "real", fx.root / "lnk");
 
     const Search plain = search_all(plugin->descriptor, {(fx.root / "real").string(), "yuzu-fs-control-link-*.bin", "", ""});
-    if (!fixture_was_searched(plain)) {
+    const bool plain_searched = fixture_was_searched(plain);
+    require_searched_when_searchable(fx.root, plain, plain_searched);
+    if (!plain_searched) {
         WARN("file_search root check: the fixture's filesystem is not searched here; the link check is not reached");
     } else {
         const auto r = Call{(fx.root / "lnk").string(), "yuzu-fs-control-link-*.bin", "", ""}.run(plugin->descriptor);

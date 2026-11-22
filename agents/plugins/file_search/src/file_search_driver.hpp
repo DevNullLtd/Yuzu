@@ -209,9 +209,12 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
         fsr::SliceGovernor gov(in.limits, {in.now, in.sleep});
         ci::FsOps ops = in.leg.ops;
         ops.now = in.now; // one clock for the governor's deadline and the walk's reads of it
-        ops.list = [&gov, list = in.leg.ops.list](const std::string& dir, std::size_t cap) {
+        ops.list = [&gov, now = in.now, list = in.leg.ops.list](const std::string& dir, std::size_t cap) {
             gov.pace();
-            return list(dir, cap);
+            const auto before = now();
+            auto listed = list(dir, cap);
+            gov.note_listing(now() - before); // the governor's back-off baseline: the search's own listings
+            return listed;
         };
 
         yuzu::shared::RowByteBudget budget{.max_bytes = kMatchRowBudget}; // the match and extents rows of this slice

@@ -78,8 +78,9 @@ namespace fsr = yuzu::shared::file_search;
 using T = DirEntry::Type;
 using Cause = OrderedGap::Cause;
 
-// One default-cap listing of 255-byte names fits the default retained-bytes cap.
-static_assert(50000 * (255 + sizeof(DirEntry)) <= kMaxOrderedRetainedBytes);
+// One default-cap listing of 255-byte names fits the default retained-bytes cap (the default cap itself
+// is pinned at 50,000 in test_component_walk.cpp and in the file_search driver's limits mapping).
+static_assert(WalkLimits{}.max_dir_entries * (255 + sizeof(DirEntry)) <= kMaxOrderedRetainedBytes);
 
 namespace {
 

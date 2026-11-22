@@ -36,13 +36,16 @@ metadata:
     previous answer until a slice answers without one. Every answer ends with a search row
     stating whether the slice ran, and a coverage row stating whether everything under the
     root was searched, so an empty result is never confusable with a failed or partial one.
-    Only local filesystem types on the allow-list are searched; every other mount under the
-    root is named by its own volume row with the reason. A search of more than one slice is not
-    a snapshot. Off until enabled; a non-administrator needs one approval for the whole search (the first
-    slice spends it, and each later slice that carries the cursor rides it for 24 hours, or
-    until the approval's 7-day lifetime ends, whichever comes first). What is
-    stored is readable only with Forensics:Read. The Windows leg is planned and answers one
-    unsupported status row.
+    Only local filesystem types on the allow-list are searched; every other mount in the mount
+    table the slice read is named by its own volume row with the reason. A search of more than
+    one slice is not a snapshot. Off until enabled; a non-administrator needs an approval, and
+    over the MCP execute_instruction tool one approval covers the whole search (the first slice
+    spends it, and each later slice that carries the cursor rides it for 24 hours, or until the
+    approval's 7-day lifetime ends, whichever comes first); a bundle step, a workflow step and
+    a schedule need one approval per call or occurrence. What is stored is readable only with
+    Forensics:Read, and the next cursor reaches a caller only as a stored row, so a
+    non-administrator without Forensics:Read can start a search under an approval and cannot
+    continue it. The Windows leg is planned and answers one unsupported status row.
   tags: [filesystem, search, inventory, extents]
 
 spec:
@@ -117,7 +120,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_2
         type: string
-        description: 'match: file or directory. extents: ok, compressed (the filesystem keeps the file encoded and reports no extents), unsupported or failed. volume: the filesystem type. gap: the cause (depth, dir_unreadable, dir_truncated, other_device, network_mount, memory_cap, permission_denied, dataless, private_namespace, name_too_long, match_cap). coverage: slices=<n>, the slices of this search so far. search: the reason, a closed token (none, a coverage reason, a fault such as busy or timed_out, or a request error such as bad_kinds). status: unsupported.'
+        description: 'match: file or directory. extents: ok, compressed (the filesystem keeps the file encoded and reports no extents), unsupported or failed. volume: the filesystem type. gap: the cause (depth, dir_unreadable, dir_truncated, other_device, memory_cap, permission_denied, dataless, name_too_long, match_cap; network_mount and private_namespace are reserved and never written by this version). coverage: slices=<n>, the slices of this search so far. search: the reason, a closed token (none, a coverage reason, a fault such as busy or timed_out, or a request error such as bad_kinds). status: unsupported.'
         example: file
         platforms: [windows, linux, darwin]
       - name: field_3
@@ -127,12 +130,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_4
         type: string
-        description: 'match: the size in bytes, or "-" for a directory or a file that could not be opened. extents: the extents, each logical:physical:length:flags joined by commas, or "-" for none; flags are resident, delalloc, shared, compressed, encrypted, unwritten, unallocated and btrfs_logical joined by +, or "-". volume: the reason the volume was not fully searched (none, budget_entries, budget_time, budget_rows, cancelled, fstype_not_allowed, network_mount, mount_table_unreadable, permission_denied, private_namespace, other_device, stalled, unstable, unsupported, duplicate_mount, behind_network_mount, max_slices, mount_table_changed, firmlinks_only). coverage: consistency=single_pass or not_a_snapshot. search: seq=<n>, the slice number.'
+        description: 'match: the size in bytes, or "-" for a directory or a file that could not be opened. extents: the extents, each logical:physical:length:flags joined by commas, or "-" for none; flags are resident, delalloc, shared, compressed, encrypted, unwritten, unallocated and btrfs_logical joined by +, or "-". volume: the reason the volume was not fully searched (none, budget_entries, budget_time, budget_rows, cancelled, fstype_not_allowed, network_mount, private_namespace, stalled, unstable, duplicate_mount, behind_network_mount, max_slices, firmlinks_only; permission_denied, other_device and unsupported are reserved and never written by this version, and mount_table_unreadable and mount_table_changed appear only as the reason of the search row). coverage: consistency=single_pass or not_a_snapshot. search: seq=<n>, the slice number.'
         example: '48213'
         platforms: [windows, linux, darwin]
       - name: field_5
         type: string
-        description: 'match: the modification time in seconds since the epoch, or "-" when unknown. volume: extents=collected, not_collected or unsupported, whether the matches on this volume carry extents. search: q=<8 hex>, a short name for this query that reveals neither the pattern nor the root.'
+        description: 'match: the modification time in seconds since the epoch, or "-" when unknown. volume: extents=collected on the row of a unit of the plan (the slice asks for the extents of each matched file there; the answer for each file is its extents row), not_collected on a mount that is refused or not reached; unsupported is reserved and never written by this version. search: q=<8 hex>, a short name for this query that reveals neither the pattern nor the root.'
         example: '1763251200'
         platforms: [linux, darwin]
       - name: field_6

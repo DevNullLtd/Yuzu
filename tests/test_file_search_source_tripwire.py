@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Tripwire: the file_search plugin never reads a file's bytes, writes, or syncs; and the one-approval
+cover of a multi-slice read keeps its single production caller.
+
+PART 1, the plugin sources. "A matched file is opened and never read, and a search never writes" is
+the plugin's first catastrophic clause. A unit test sees the pure request value (`fiemap_request()`),
+not the statement that copies it into the ioctl, and an open flag set is checked for set bits only
+(`O_RDONLY` is 0, so a bit test cannot see a write flag added beside it). Pinned lexically over
+`agents/plugins/file_search/src/*` and `agents/shared/file_search_*.hpp` (comments stripped):
+
+  - forbidden spellings: `FIEMAP_FLAG_SYNC` (it writes dirty pages back), `O_RDWR`, `O_WRONLY`, `pread`,
+    `mmap`, and `read(` as a call (not `thread(`, not `read_mounts(`);
+  - exactly one `read(` call, the `::read(` of the mount table reader in file_search_posix.cpp;
+  - the extents request is built as `m->fm_flags = want.flags;` and that is the ONLY assignment to
+    `fm_flags` in scope (the value is the pure builder's, which is flags 0).
+
+PART 2, the cover. `ApprovalManager::covers_continuation` lets one spent ticket cover every later slice of
+a read. Its one production caller is the MCP `execute_instruction` arm, and the flag it sets
+(`approval_covers_continuation`) is read in two places in the same file. Pinned lexically over
+`server/core/src` (comments stripped): `covers_continuation(` occurs once each in approval_manager.hpp (the
+declaration), approval_manager.cpp (the definition) and mcp_server.cpp (the call), and in no other file;
+`approval_covers_continuation` is named only in mcp_server.cpp, declared `false` once and assigned `true`
+once. A second caller is a security decision: see the #1398 row of .claude/routed-concerns-access-control.md.
+
+GREP LIMIT: lexical. The match open itself is in component_fs_posix.cpp (`open_match_file`), which also
+holds the scan leg's `pread_range`, so it is outside the scope above; the facts tests of that file and
+`tests/unit/test_posix_secure_read.cpp` (the open flags are read-only, checked with `O_ACCMODE`) cover
+it. The gate cannot see a call built at run time, a function pointer to `read`, or a syscall reached by
+number. `--selftest` appends each forbidden spelling, deletes each required statement and adds a second
+`::read(`, a second `fm_flags` write, a second `covers_continuation(` call and a second `= true` in
+memory, and requires the gate to name each.
+
+Usage: python3 -I tests/test_file_search_source_tripwire.py [--selftest]
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(HERE)
+PLUGIN_SRC = os.path.join("agents", "plugins", "file_search", "src")
+SHARED = os.path.join("agents", "shared")
+SERVER_SRC = os.path.join("server", "core", "src")
+EXTENTS_LINUX = os.path.join(PLUGIN_SRC, "file_search_extents_linux.cpp")
+POSIX_CPP = os.path.join(PLUGIN_SRC, "file_search_posix.cpp")
+APPROVAL_HPP = os.path.join(SERVER_SRC, "approval_manager.hpp")
+APPROVAL_CPP = os.path.join(SERVER_SRC, "approval_manager.cpp")
+MCP_CPP = os.path.join(SERVER_SRC, "mcp_server.cpp")
+SRC_HINT = (" (this gate pins that the file_search plugin never reads a matched file, writes or syncs; "
+            "if a rule was legitimately changed, a content or hash read is a NEW action with its own "
+            "catalogue row: update agents/plugins/file_search/README.md and the routed-concerns "
+            "file_search row first, then tests/test_file_search_source_tripwire.py)")
+COVER_HINT = (" (this gate pins the one production caller of ApprovalManager::covers_continuation, the MCP "
+              "execute_instruction arm; a second caller is a security decision recorded in the #1398 row of "
+              ".claude/routed-concerns-access-control.md (Dispatch-caller approval provenance): update that "
+              "row and docs/security-reviews/1398-dispatch-approval-gate-design.md first, then "
+              "tests/test_file_search_source_tripwire.py)")
+
+# The comment-free, whitespace-collapsed text the sibling gates already use: one scanner, so a comment
+# that mentions a token can neither satisfy nor break a check here either.
+_spec = importlib.util.spec_from_file_location(
+    "forensics_tier_wiring_lexical", os.path.join(HERE, "test_forensics_tier_wiring_lexical.py"))
+_sib = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _sib
+_spec.loader.exec_module(_sib)
+canonical = _sib.canonical
+
+_SRC_EXTS = (".cpp", ".hpp", ".h", ".cc")
+_ID = r"(?<![A-Za-z0-9_])"
+
+# ---- part 1 ----
+
+# (id, pattern over canonical(), why). A pattern here may not occur in any file in scope.
+SRC_FORBIDDEN: list[tuple[str, str, str]] = [
+    ("fiemap-sync", _ID + r"FIEMAP_FLAG_SYNC\b",
+     "the sync flag writes dirty pages back: a search must never cause a write"),
+    ("open-write-flag", _ID + r"O_RDWR\b|" + _ID + r"O_WRONLY\b",
+     "a file or directory is opened read-only, never for writing"),
+    ("positional-read", _ID + r"pread\w*",
+     "a matched file is opened and never read"),
+    ("mapped-read", _ID + r"mmap\w*",
+     "a matched file is opened and never mapped"),
+]
+READ_CALL = re.compile(_ID + r"read\(")
+FM_FLAGS_WRITE = re.compile(_ID + r"fm_flags(?:<<|>>|[|&^+\-])?=(?!=)")
+
+# (id, file, a C++ snippet, why). The snippet is canonicalised like the text it is looked for in.
+SRC_REQUIRED: list[tuple[str, str, str, str]] = [
+    ("fiemap-flags", EXTENTS_LINUX, "m->fm_flags = want.flags;",
+     "the FIEMAP request carries the flags of the pure request builder (flags 0, no sync)"),
+]
+
+
+def _scope_files(root: str) -> list[str]:
+    out: list[str] = []
+    plugin = os.path.join(root, PLUGIN_SRC)
+    for name in sorted(os.listdir(plugin)):
+        if name.endswith(_SRC_EXTS):
+            out.append(os.path.join(PLUGIN_SRC, name))
+    shared = os.path.join(root, SHARED)
+    for name in sorted(os.listdir(shared)):
+        if name.startswith("file_search_") and name.endswith(".hpp"):
+            out.append(os.path.join(SHARED, name))
+    return out
+
+
+def load_sources(root: str = REPO_ROOT) -> dict[str, str]:
+    """{path relative to the repo: canonical text} for every file in the plugin-source scope."""
+    out: dict[str, str] = {}
+    for rel in _scope_files(root):
+        with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
+            out[rel] = canonical(fh.read())
+    return out
+
+
+def source_problems(texts: dict[str, str]) -> list[tuple[str, str]]:
+    """Every violated part-1 rule as (id, message); empty when the gate holds."""
+    found: list[tuple[str, str]] = []
+    for rid, pattern, why in SRC_FORBIDDEN:
+        for path, text in sorted(texts.items()):
+            if re.search(pattern, text):
+                found.append((rid, f"{path} spells a forbidden form: {why}{SRC_HINT}"))
+    sites = [(path, text[max(0, m.start() - 2):m.start()])
+             for path, text in sorted(texts.items()) for m in READ_CALL.finditer(text)]
+    if sites != [(POSIX_CPP, "::")]:
+        found.append(("read-call", f"expected exactly one read( call, the `::read(` of the mount table "
+                      f"reader in {POSIX_CPP}; found {sites or 'none'}: a matched file is opened and "
+                      f"never read{SRC_HINT}"))
+    writes = [(path, len(FM_FLAGS_WRITE.findall(text)))
+              for path, text in sorted(texts.items()) if FM_FLAGS_WRITE.search(text)]
+    if writes != [(EXTENTS_LINUX, 1)]:
+        found.append(("fm-flags-write", f"expected exactly one assignment to fm_flags, in {EXTENTS_LINUX}; "
+                      f"found {writes or 'none'}: the extent request carries no flags{SRC_HINT}"))
+    for rid, path, snippet, why in SRC_REQUIRED:
+        text = texts.get(path)
+        if text is None:
+            found.append((rid, f"{path} is missing: {why}{SRC_HINT}"))
+        elif canonical(snippet).strip() not in text:
+            found.append((rid, f"{path} no longer holds `{snippet}`: {why}{SRC_HINT}"))
+    return found
+
+
+# ---- part 2 ----
+
+CALL = re.compile(_ID + r"covers_continuation\(")
+NAME = re.compile(_ID + r"covers_continuation\b")
+FLAG = re.compile(_ID + r"approval_covers_continuation\b")
+FLAG_ASSIGN = re.compile(_ID + r"approval_covers_continuation=(?!=)(\w+)")
+CALL_SITES = {APPROVAL_HPP: 1, APPROVAL_CPP: 1, MCP_CPP: 1}
+
+
+def load_server(root: str = REPO_ROOT) -> dict[str, str]:
+    """{path relative to the repo: canonical text} for every server source that mentions either name."""
+    out: dict[str, str] = {}
+    for dirpath, _dirs, files in os.walk(os.path.join(root, SERVER_SRC)):
+        for name in files:
+            if not name.endswith(_SRC_EXTS):
+                continue
+            full = os.path.join(dirpath, name)
+            with open(full, encoding="utf-8", errors="replace") as fh:
+                raw = fh.read()
+            if "covers_continuation" in raw:
+                out[os.path.relpath(full, root)] = canonical(raw)
+    return out
+
+
+def cover_problems(texts: dict[str, str]) -> list[tuple[str, str]]:
+    """Every violated part-2 rule as (id, message); empty when the gate holds."""
+    found: list[tuple[str, str]] = []
+    for path, text in sorted(texts.items()):
+        if path not in CALL_SITES and NAME.search(text):
+            found.append(("cover-caller-outside", f"{path} names covers_continuation; only "
+                          f"approval_manager.hpp, approval_manager.cpp and mcp_server.cpp may{COVER_HINT}"))
+        if path != MCP_CPP and FLAG.search(text):
+            found.append(("cover-flag-outside", f"{path} names approval_covers_continuation; only "
+                          f"mcp_server.cpp may{COVER_HINT}"))
+    for path, want in CALL_SITES.items():
+        text = texts.get(path)
+        have = 0 if text is None else len(CALL.findall(text))
+        if have != want:
+            found.append(("cover-call-count", f"{path} holds {have} covers_continuation( occurrence(s); "
+                          f"it must hold exactly {want} (the declaration, the definition, the one MCP "
+                          f"call){COVER_HINT}"))
+    assigned = FLAG_ASSIGN.findall(texts.get(MCP_CPP, ""))
+    if assigned != ["false", "true"]:
+        found.append(("cover-flag-assign", f"{MCP_CPP} must declare approval_covers_continuation = false "
+                      f"once and assign it true once; its assignments read {assigned or 'none'}{COVER_HINT}"))
+    return found
+
+
+def problems(src: dict[str, str], srv: dict[str, str]) -> list[tuple[str, str]]:
+    return source_problems(src) + cover_problems(srv)
+
+
+def selftest() -> int:
+    """Mutate the real sources in memory (nothing on disk is touched) and require each mutation named."""
+    failures: list[str] = []
+
+    def expect(cond: bool, what: str) -> None:
+        if not cond:
+            failures.append(what)
+            print(f"FAIL: {what}", file=sys.stderr)
+
+    src, srv = load_sources(), load_server()
+    base = problems(src, srv)
+    expect(base == [], "the real tree must pass the gate: " + "; ".join(m for _, m in base))
+    expect(len(SRC_FORBIDDEN) >= 4 and len(SRC_REQUIRED) >= 1, "the rule lists must not shrink silently")
+
+    def src_ids(extra_path: str, spelling: str, replace: dict[str, str] | None = None) -> set[str]:
+        texts = dict(src, **(replace or {}))
+        texts[extra_path] = texts.get(extra_path, "") + canonical(spelling)
+        return {rid for rid, _ in source_problems(texts)}
+
+    driver = os.path.join(PLUGIN_SRC, "file_search_driver.hpp")
+    shared = os.path.join(SHARED, "file_search_governor.hpp")
+    for rid, spelling in (("fiemap-sync", "auto f = FIEMAP_FLAG_SYNC;"),
+                          ("open-write-flag", "int a = O_RDWR;"),
+                          ("open-write-flag", "int a = O_WRONLY | O_CLOEXEC;"),
+                          ("positional-read", "auto n = pread(fd, b, 4, 0);"),
+                          ("positional-read", "auto n = pread64(fd, b, 4, 0);"),
+                          ("mapped-read", "void* p = mmap(0, 4, 1, 1, fd, 0);"),
+                          ("read-call", "auto n = ::read(fd, b, 4);"),
+                          ("read-call", "auto n = read(fd, b, 4);"),
+                          ("read-call", "in.read(b, 4);"),
+                          ("fm-flags-write", "m->fm_flags = 1;"),
+                          ("fm-flags-write", "m->fm_flags |= 1;"),
+                          ("fm-flags-write", "const Fiemap f{.fm_flags = 1};")):
+        for where in (driver, shared):  # a plugin source and a shared search header: both in scope
+            expect(rid in src_ids(where, spelling), f"{rid}: `{spelling}` appended to {where} was NOT detected")
+        expect(rid not in {r for r, _ in source_problems(dict(src, **{driver: src[driver] + canonical("// " + spelling)}))},
+               f"{rid}: a comment spelling `{spelling}` must not count")
+
+    # The one allowed read( call: moving it, or adding one beside it, is named.
+    posix_text = src.get(POSIX_CPP, "")
+    expect("::read(" in posix_text, "read-call: the real mount table reader no longer holds `::read(` (stale gate)")
+    expect("read-call" in {r for r, _ in source_problems(dict(src, **{POSIX_CPP: posix_text.replace("::read(", "::recv(", 1)}))},
+           "read-call: removing the mount table reader's read call was NOT detected")
+    expect("read-call" in {r for r, _ in source_problems(dict(src, **{POSIX_CPP: posix_text + canonical("auto n = ::read(fd, b, 4);")}))},
+           "read-call: a second ::read( in the same file was NOT detected")
+
+    # Names that merely contain `read(` are not calls.
+    benign = canonical("std::thread t; t = std::thread(f); read_mounts(x); auto r = pthread_create(&t, 0, f, 0); "
+                       "x.fm_flags == 3; if (y.fm_flags != 3 || y.fm_flags <= 3) {} spread(1); lpread = 2;")
+    expect("read-call" not in src_ids(driver, "", {driver: src[driver] + benign}) and
+           "fm-flags-write" not in src_ids(driver, "", {driver: src[driver] + benign}),
+           "read-call: `thread(`, `read_mounts(` and a comparison of fm_flags must not count")
+    expect("positional-read" not in src_ids(driver, "", {driver: src[driver] + canonical("spread(1); lpread = 2;")}),
+           "positional-read: an identifier that merely contains `pread` must not count")
+
+    # The required statement: deleted, or only mentioned in a comment, is named.
+    for rid, path, snippet, _why in SRC_REQUIRED:
+        text = src.get(path, "")
+        needle = canonical(snippet).strip()
+        if needle not in text:
+            expect(False, f"{rid}: the statement no longer matches the real source (stale snippet)")
+            continue
+        ids = {r for r, _ in source_problems(dict(src, **{path: text.replace(needle, "", 1)}))}
+        expect(rid in ids, f"{rid}: deleting its statement was NOT detected")
+        expect("fm-flags-write" in ids, "fm-flags-write: deleting the only fm_flags write was NOT detected")
+        ids = {r for r, _ in source_problems(dict(src, **{path: canonical("// " + snippet + "\n")}))}
+        expect(rid in ids, f"{rid}: a comment mentioning its statement satisfied it")
+
+    # A file out of scope is not scanned: the match open and pread_range live in component_fs_posix.cpp.
+    expect(os.path.join("agents", "plugins", "component_inventory", "src", "component_fs_posix.cpp") not in src,
+           "scope: component_fs_posix.cpp must stay outside the lexical scope (it holds pread_range)")
+
+    # Part 2.
+    def srv_ids(texts: dict[str, str]) -> set[str]:
+        return {rid for rid, _ in cover_problems(texts)}
+
+    other = os.path.join(SERVER_SRC, "agent_registry.cpp")
+    mcp = srv.get(MCP_CPP, "")
+    expect(CALL.search(mcp) is not None and FLAG.search(mcp) is not None,
+           "cover: mcp_server.cpp no longer holds the call and the flag (stale gate)")
+    expect("cover-caller-outside" in srv_ids(dict(srv, **{other: canonical("auto c = mgr.covers_continuation(id, p);")})),
+           "cover-caller-outside: a second caller in another file was NOT detected")
+    expect("cover-caller-outside" in srv_ids(dict(srv, **{other: canonical("auto f = &ApprovalManager::covers_continuation;")})),
+           "cover-caller-outside: a pointer to the function in another file was NOT detected")
+    expect("cover-caller-outside" not in srv_ids(dict(srv, **{other: canonical("// mgr.covers_continuation(id, p)")})),
+           "cover-caller-outside: a comment mention must not count")
+    expect("cover-call-count" in srv_ids(dict(srv, **{MCP_CPP: mcp + canonical("auto c = approval_manager->covers_continuation(id, p);")})),
+           "cover-call-count: a second call in mcp_server.cpp was NOT detected")
+    expect("cover-call-count" in srv_ids(dict(srv, **{MCP_CPP: CALL.sub("covers_continuation_x(", mcp, count=1)})),
+           "cover-call-count: deleting the one MCP call was NOT detected")
+    for path in (APPROVAL_HPP, APPROVAL_CPP):
+        text = srv.get(path, "")
+        expect(CALL.search(text) is not None, f"cover-call-count: {path} no longer holds its occurrence (stale gate)")
+        expect("cover-call-count" in srv_ids(dict(srv, **{path: text + canonical("bool covers_continuation(int);")})),
+               f"cover-call-count: a second occurrence in {path} was NOT detected")
+    expect("cover-flag-outside" in srv_ids(dict(srv, **{other: canonical("bool approval_covers_continuation = true;")})),
+           "cover-flag-outside: the flag named in another file was NOT detected")
+    expect("cover-flag-assign" in srv_ids(dict(srv, **{MCP_CPP: mcp + canonical("approval_covers_continuation = true;")})),
+           "cover-flag-assign: a second `= true` was NOT detected")
+    expect("cover-flag-assign" in srv_ids(dict(srv, **{MCP_CPP: mcp + canonical("approval_covers_continuation = cover.value();")})),
+           "cover-flag-assign: an assignment from an expression was NOT detected")
+    expect("cover-flag-assign" in srv_ids(dict(srv, **{MCP_CPP: mcp.replace("approval_covers_continuation=true", "approval_covers_continuation=false", 1)})),
+           "cover-flag-assign: removing the one `= true` was NOT detected")
+    expect("cover-flag-assign" not in srv_ids(dict(srv, **{MCP_CPP: mcp + canonical("if (approval_covers_continuation == true) {}")})),
+           "cover-flag-assign: a comparison must not count as an assignment")
+    expect("#1398" in COVER_HINT and "routed-concerns-access-control.md" in COVER_HINT,
+           "the cover hint must point at the #1398 routed row")
+
+    print(f"selftest: {len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
+def main() -> int:
+    if "--selftest" in sys.argv[1:]:
+        return selftest()
+    found = problems(load_sources(), load_server())
+    for rid, msg in found:
+        print(f"FAIL [{rid}]: {msg}", file=sys.stderr)
+    if found:
+        return 1
+    print("test_file_search_source_tripwire: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

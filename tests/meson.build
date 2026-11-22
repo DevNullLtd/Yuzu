@@ -5485,6 +5485,24 @@ test('file_search read tier tripwire selftest',
   timeout: 60,
 )
 
+# The file_search plugin sources never read a matched file, write or sync (no FIEMAP sync flag, no write
+# open flag, no pread, mmap or read call beyond the mount table reader, one fm_flags assignment), and
+# ApprovalManager::covers_continuation keeps its one production caller, the MCP execute_instruction arm.
+# The self-test mutates the sources in memory and requires each mutation to be named. Both also run in
+# .github/workflows/docs-lint.yml on every PR.
+test('file_search source tripwire',
+  _python3_test,
+  args: [files('test_file_search_source_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('file_search source tripwire selftest',
+  _python3_test,
+  args: [files('test_file_search_source_tripwire.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # #4990: server.cpp must keep wiring the Forensics plugin set and the visibility resolver into every
 # surface that reads stored responses (a route class built without them fails CLOSED and would
 # silently lose Forensics rows for every caller). Lexical gate + a selftest that deletes each
