@@ -20,19 +20,19 @@ metadata:
     line is storage_state|ok. Offline means collection and retention are both
     stopped and every other field is withheld -- the
     reply is then just an error| line followed by
-    storage_state|offline|<reason>, where rollback_wedged means a failed
-    rollback closed the Echo database (recovery needs an agent restart),
-    free_space means the roll-up
+    storage_state|offline|<reason>, where free_space means the roll-up
     migration was refused because the volume held less than twice the database
     file plus its write-ahead log free (or its free space could not be read),
     migration_failed means the v10 roll-up step failed, ran out of its deadline
     or waited on an earlier step that had not finished, and open_failed means
-    any other failure seen on a later retry; in each case the file is untouched,
-    Echo loads without its database, and the agent retries the open by itself
+    any other failure seen on a later retry; in each of those three the file is
+    untouched, Echo loads without its database, and the agent retries the open by itself
     (1, 5 and 15 minutes after the first failure, then hourly), so no restart is
     needed once the cause is gone; the one exception is a collection start that
     fails after a late open, which is not retried, and the error| line then asks
-    for an agent restart. The action exits non-zero. The order is REVERSED on that path: error| comes
+    for an agent restart. The fourth reason, rollback_wedged, is different: the
+    database opened and was then closed at run time after a failed rollback, it
+    is not retried, and recovery needs an agent restart. The action exits non-zero. The order is REVERSED on that path: error| comes
     FIRST, because
     server and dashboard consumers key off the output starting with error|, so
     do not assume storage_state is always the first line. Historical data

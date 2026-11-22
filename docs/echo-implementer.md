@@ -479,7 +479,9 @@ break the all-or-nothing rule and re-enable every source an operator had paused.
 
 - **Reasons.** `free_space` (the pre-check refusal), `migration_failed` (the v10 step failed, ran past
   its deadline, or an earlier step had not finished), `open_failed` (any other failure seen on a later
-  retry). `classify_open_failure` tells them apart by the open error's text prefix
+  retry). A fourth reason, `rollback_wedged`, is not an open failure: the store opened and a failed
+  rollback closed it at run time (`echo_status_format.hpp`, set by the slow tick; never retried, a
+  restart recovers). `classify_open_failure` tells the three open reasons apart by the open error's text prefix
   (`echo_status_format.hpp`; `echo_db.cpp` builds the two refusals from the same constants). Every other
   first-open failure (a planted link, a corrupt file that cannot be moved aside, a busy or unreadable
   integrity check, an un-adopted `tar.db`) is still a plugin init failure.
@@ -509,7 +511,8 @@ break the all-or-nothing rule and re-enable every source an operator had paused.
   loop ends (a second start over a half-started source set would double-start sources) and `status`
   reports `open_failed`; a restart recovers.
 - **Fleet signal.** The plugin KV key `heartbeat.storage_offline` (set to the reason token while
-  offline, deleted when online) reaches the server as the status tag `yuzu.plugin.echo.storage_offline`;
+  offline, deleted when online; for `rollback_wedged` the plugin is online with a closed store and the
+  slow tick sets it) reaches the server as the status tag `yuzu.plugin.echo.storage_offline`;
   the server publishes `yuzu_fleet_echo_storage_offline{reason}` and the alert `YuzuEchoStorageOffline`
   (warning, 30 minutes) fires on it. The tokens are duplicated literals on the two sides, each pinned
   by a test.

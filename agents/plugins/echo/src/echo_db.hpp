@@ -1118,9 +1118,10 @@ private:
     bool refuse_open_transaction_locked(const char* what) const;
 
     // ATOMIC because it is written at RUNTIME, not only at open/close: the
-    // wedged-rollback path in execute_atomic_batch nulls it under mu_ while
-    // is_open() reads it WITHOUT mu_ from another thread (do_status runs on the
-    // command-dispatch thread, the wedge on the rollup thread). Before that
+    // wedged-rollback paths (execute_atomic_batch and checked_transaction) null it
+    // under mu_ while is_open() reads it WITHOUT mu_ from other threads (do_status
+    // runs on the command-dispatch thread and the slow collect tick reconciles the
+    // offline tag, the wedge on the rollup thread). Before that
     // runtime write existed the unlocked read was benign; adding it made this a
     // data race (#2361 governance Gate 2).
     //
