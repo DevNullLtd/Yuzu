@@ -418,14 +418,23 @@ expression per row (about 0.55 s instead of 0.45 s for a 1M-row cascade, measure
 PostgreSQL 16). Because the trigger adds that cost to every cascaded row, `gc_sweep` now also
 bounds each pass by member rows: within its 5,000-set cap it deletes only the oldest-first prefix
 whose summed `device_count` stays within 5,000,000 (the first set always goes; a 5M-row pass
-took 3.1 s measured on PostgreSQL 16 with the trigger), so a backlog of sets the server filled can
-no longer make a pass exceed the 30 s statement timeout, roll back and retry the same sets forever
-(a defect the set cap alone already had). The budget reads the server-maintained `device_count`:
-member rows written out of band are not counted, so for them the bound is best-effort and the
-5,000-set cap still applies. A full-budget pass writes about 650 MB of WAL (measured on PostgreSQL
-16), and a sustained backlog drains at most about 60M member rows an hour at the 5-minute cadence;
-for sets of 5,000 to 40,000 members that is below what an uncapped pass managed when it fit inside
-the timeout (perf-12, an open follow-up). At open the store checks that the four triggers are present,
+with the trigger took 3.1 to 4.1 s across runs on scratch PostgreSQL 16 on 2026-11-21 and
+2026-11-22, for 50 sets of 100,000 or 1,000 sets of 5,000 members), so a backlog of sets the
+server filled can no longer make a pass exceed the 30 s statement timeout, roll back and retry the
+same sets forever (a defect the set cap alone already had). The budget reads the
+server-maintained `device_count`: member rows written out of band are not counted, so for them
+the bound is best-effort and the 5,000-set cap still applies. A full-budget pass that follows a
+checkpoint wrote 824 MB of WAL with 12-character device IDs and 939 MB with 36-character ones
+(PostgreSQL 16.16, 2026-11-22). Each server runs at most one pass per 5-minute tick, so one server
+drains at most 60M server-counted member rows an hour; passes from several servers never overlap
+(the advisory lock) but each server takes its own. For sets of more than 1,000 members
+(5,000,000 / 5,000) a capped pass deletes fewer rows than the uncapped query did whenever that
+query fitted inside the timeout. It fitted at 20M rows (13.35 s, 2026-11-21) and not at 40M
+(5,000 sets of 8,000 members: 87 s and 7.5 GB of WAL, 2026-11-22), so the regression covers sets
+of more than 1,000 and at most 4,000 to 8,000 members; above that the uncapped query deleted
+nothing and the cap is a pure gain. Running further passes in the same tick is an open follow-up
+with no tracking issue yet (no issue was authorized in this change).
+At open the store checks that the four triggers are present,
 `ENABLE ALWAYS`, of v7's shape and bound to v7's function bodies; otherwise, or if the check cannot be read, it
 logs an error and serves membership uncached. A writer that disables the triggers while servers run, or writes
 `membership_generation` directly, breaks the

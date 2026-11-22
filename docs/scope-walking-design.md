@@ -403,7 +403,7 @@ The chip dropdown lists the operator's active result sets plus the standard scop
 
 ## 9. Audit and observability
 
-Every state transition writes an `AuditEvent` per `docs/observability-conventions.md`. Action codes:
+The codes below are written as `AuditEvent`s per `docs/observability-conventions.md`; the background fill pass and the GC sweep write no audit row. Action codes:
 
 | Action | Result | Notes |
 |---|---|---|
@@ -412,7 +412,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 | `result_set.heal` | `success` / `failure` | #4493: written by REST `/re-eval` and MCP `reevaluate_result_set` when the stored `source_payload` is found nested past `kMcpMaxJsonDepth`. `success` = `heal_poisoned_payload` discarded the poisoned payload; `failure` = the caller's own depth check found poison but `heal_poisoned_payload`'s return was `false` - a genuine write failure (row unchanged, still poisoned), a benign race where a concurrent caller already healed the row first (row unchanged, already healthy), or the row was deleted between heal's own SELECT and UPDATE (#4540: a concurrent `delete_set` or the TTL GC sweep, neither holding a shared lock) and no longer exists at all - the three are not currently distinguished (#4524). Not written on a row already healthy at the caller's own check (heal is a no-op there, nothing to audit). |
 | `result_set.pin` / `result_set.unpin` | `success` | |
 | `result_set.delete` | `success` | Pinned sets require explicit unpin first; `delete` of an unpinned set is single-action |
-| `result_set.gc_sweep` | `success` | Aggregate row, written once per sweep with the count |
+| `result_set.gc_sweep` | — | Not written: no code emits this verb. A GC pass writes no audit row; it is counted in `yuzu_result_set_gc_total` and logged at info |
 | `instruction.scope_resolution_failed` | `failure` | When invocation-time resolve fails (set absent, expired, or not owned). `detail` = `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<result-set id-or-alias> reason=...`; `target_id` = the ref. The `command_id` is the per-dispatch correlation id (joins to the execution/response records). Also increments `yuzu_scope_resolution_failed_total`. |
 
 Prometheus metrics:
