@@ -9643,6 +9643,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 return true;
             };
 
+            // The tag-key twin of `refuse_unsafe_agent_id` (auth::tag_key_is_audit_safe): a key
+            // over 64 bytes or with a byte below 0x20 reaches the `agent_id:key` text of the
+            // tag rows. `set_tag` and `delete_tag` call it BEFORE the service-tag guard, the
+            // scoped permission check and any audit write. A size and control-byte check only,
+            // never the key charset: `delete_tag` must still reach a stored key that
+            // `TagStore::validate_key` would refuse. An empty key passes (each tool answers its
+            // own "agent_id and key are required").
+            const auto refuse_unsafe_tag_key = [&](const std::string& key) -> bool {
+                if (auth::tag_key_is_audit_safe(key))
+                    return false;
+                // retry-hint-exempt: caller-input rejection
+                res.set_content(a4_error(kInvalidParams,
+                                         "key must be at most 64 bytes with no byte below 0x20",
+                                         "fix the argument and re-call"),
+                                "application/json");
+                return true;
+            };
+
             // A4 envelope that also carries the durable execution handle. Used by
             // the two streamed-POST 500s, which are the only refusals raised AFTER
             // dispatch - the work is running, so the client needs the id to find it
@@ -25181,7 +25199,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // Before the service-tag guard (its denial row carries agent_id:key), the
                 // scoped gate and every other audit row.
-                if (refuse_unsafe_agent_id(agent_id))
+                if (refuse_unsafe_agent_id(agent_id) || refuse_unsafe_tag_key(key))
                     return;
                 // #3289: value-blind TOCTOU guard, before the scoped gate.
                 if (deny_service_scoped_service_tag_mutation("mcp.set_tag", agent_id, key))
@@ -25251,7 +25269,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // Before the service-tag guard (its denial row carries agent_id:key), the
                 // scoped gate and every other audit row.
-                if (refuse_unsafe_agent_id(agent_id))
+                if (refuse_unsafe_agent_id(agent_id) || refuse_unsafe_tag_key(key))
                     return;
                 // #3289: value-blind TOCTOU guard, before the scoped gate.
                 if (deny_service_scoped_service_tag_mutation("mcp.delete_tag", agent_id, key))

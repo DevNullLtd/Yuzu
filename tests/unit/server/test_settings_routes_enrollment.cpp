@@ -989,6 +989,19 @@ TEST_CASE("settings pending: an over-long or control-byte agent id is a 400 with
     CHECK(h.audit_calls.empty());
     CHECK(h.attempt_calls.empty());
     CHECK(h.status_of("normal") == auth::PendingStatus::pending);
+
+    // A 256-byte printable id is safe: it reaches the store, and is approved there.
+    const std::string edge(256, 'a');
+    // (queued directly: `h.queue` derives a hostname from the id, which would be over its bound)
+    REQUIRE(h.auth_mgr.add_pending_agent(edge, "edge-host", "linux", "x86_64", "1.0").value());
+    h.audit_calls.clear();
+    auto ok = h.sink.Post("/api/settings/pending-agents/" + edge + "/approve", "", kForm);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto row = h.only("enrollment.approve");
+    CHECK(row.result == "success");
+    CHECK(row.target_id == edge);
+    CHECK(h.status_of(edge) == auth::PendingStatus::approved);
 }
 
 // An Active token is mild information, never the green OK colour: a credential that may be

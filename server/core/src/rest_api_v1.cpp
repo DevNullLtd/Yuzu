@@ -10000,6 +10000,9 @@ void RestApiV1::register_routes(
         // target_id (agent_id:key) on every row of this route.
         if (detail::refuse_unsafe_device_id_a4(res, agent_id))
             return;
+        // Same for the key: the failure row `set_tag_checked` leaves carries it in target_id.
+        if (detail::refuse_unsafe_tag_key_a4(res, key))
+            return;
 
         // #3289: a service-scoped token authorizing this write via
         // scoped_perm_fn below reads the PRE-WRITE `service` tag to decide
@@ -10088,6 +10091,9 @@ void RestApiV1::register_routes(
             auto key = req.matches[2].str();
             // Before the service-tag guard, the scoped gate and any audit row (see the PUT twin).
             if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                return;
+            // Same for the key: the `not_found` row below carries it in target_id.
+            if (detail::refuse_unsafe_tag_key_a4(res, key))
                 return;
             // #3289: same TOCTOU guard as PUT above — a service-scoped
             // token must not delete its own confinement key.

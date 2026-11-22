@@ -575,6 +575,18 @@ inline constexpr std::size_t kMaxEnrollmentTokenLength = 256;
 /// hostname-derived or UUID-derived agent_id fits in well under 100 chars.
 inline constexpr std::size_t kMaxAgentIdLength = 256;
 
+/// The byte rule both audit-trail floors below share: at most `max_len` bytes and no byte below
+/// 0x20. Handlers call a floor, never this.
+[[nodiscard]] inline bool is_audit_safe_bytes(std::string_view s, std::size_t max_len) noexcept {
+    if (s.size() > max_len)
+        return false;
+    for (const char ch : s) {
+        if (static_cast<unsigned char>(ch) < 0x20)
+            return false;
+    }
+    return true;
+}
+
 /// The one audit-trail floor for an agent/device id taken raw from a URL, form field, JSON
 /// body or tool argument. An id reaches `target_id` on every audit row a surface writes and on
 /// the permission-denial audit, and the audit store scrubs NUL and invalid UTF-8 but keeps CR,
@@ -583,13 +595,20 @@ inline constexpr std::size_t kMaxAgentIdLength = 256;
 /// decides whether empty is a refusal of its own). Never copy this predicate into a route:
 /// call it.
 [[nodiscard]] inline bool agent_id_is_audit_safe(std::string_view id) noexcept {
-    if (id.size() > kMaxAgentIdLength)
-        return false;
-    for (const char ch : id) {
-        if (static_cast<unsigned char>(ch) < 0x20)
-            return false;
-    }
-    return true;
+    return is_audit_safe_bytes(id, kMaxAgentIdLength);
+}
+
+/// The longest tag key `TagStore::validate_key` admits (a test pins the two together).
+inline constexpr std::size_t kMaxTagKeyLength = 64;
+
+/// The audit-trail floor for a tag KEY taken raw from a URL path, JSON body or tool argument:
+/// the key reaches `target_id` (`agent_id:key`) on every tag audit row, so a handler refuses a
+/// key that is over `kMaxTagKeyLength` bytes or carries a byte below 0x20 BEFORE any guard,
+/// permission check or audit write. A size and control-byte check ONLY, never the key charset:
+/// the delete paths must still reach a stored key that `TagStore::validate_key` would refuse.
+/// An empty key passes (each caller answers its own "key required").
+[[nodiscard]] inline bool tag_key_is_audit_safe(std::string_view key) noexcept {
+    return is_audit_safe_bytes(key, kMaxTagKeyLength);
 }
 
 /// Charset a NEW agent_id must use at first registration: `[A-Za-z0-9._:-]`,

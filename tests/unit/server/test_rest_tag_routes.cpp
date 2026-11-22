@@ -449,3 +449,45 @@ TEST_CASE("REST PUT and DELETE /api/v1/tags: an unsafe agent id is a 400 before 
     CHECK(edge->status == 403);
     CHECK(h.audit_events.size() == 1);
 }
+
+// #7811: the tag KEY reaches `target_id` (agent_id:key) on the failure row `set_tag_checked` leaves
+// and on a delete's `not_found` row, and the audit store keeps CR, LF and TAB, so a key over 64
+// bytes or with a byte below 0x20 is refused with a 400 before the service-tag guard, the scoped
+// gate and any audit row. The gate here admits every caller, so a 400 with the gate never asked
+// proves the key check runs first; a revert leaves a row carrying the key.
+TEST_CASE("REST PUT and DELETE /api/v1/tags: an unsafe tag key is a 400 before the service-tag "
+          "guard, the scoped gate or any audit row",
+          "[pg][rest][tag][authz][audit]") {
+    TagRouteHarness h;
+    h.token_scope_service = "ServiceA";
+    const std::vector<std::string> bad = {std::string(65, 'k'), std::string("k\0y", 3), "k\r\ny",
+                                          "k\ny", "k\ty"};
+    for (const auto& key : bad) {
+        INFO(key.substr(0, 16));
+        auto put =
+            h.put(nlohmann::json{{"agent_id", "agent-A"}, {"key", key}, {"value", "v"}}.dump());
+        REQUIRE(put);
+        CHECK(put->status == 400);
+        CHECK(nlohmann::json::parse(put->body)["error"]["message"] == "Invalid tag key.");
+        auto del = h.del("agent-A", key);
+        REQUIRE(del);
+        CHECK(del->status == 400);
+        CHECK(nlohmann::json::parse(del->body)["error"]["message"] == "Invalid tag key.");
+    }
+    CHECK_FALSE(h.scope_fn_called);
+    CHECK(h.audit_events.empty());
+
+    // A 64-byte printable key is safe: the write reaches the scoped gate and is stored, and the
+    // delete reaches the store.
+    const std::string edge(64, 'k');
+    auto put =
+        h.put(nlohmann::json{{"agent_id", "agent-A"}, {"key", edge}, {"value", "v"}}.dump());
+    REQUIRE(put);
+    CHECK(put->status == 200);
+    CHECK(h.scope_fn_called);
+    CHECK(tag_value(h.tag_store, "agent-A", edge) == "v");
+    auto del = h.del("agent-A", edge);
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(tag_value(h.tag_store, "agent-A", edge).empty());
+}

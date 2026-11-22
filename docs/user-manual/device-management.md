@@ -256,7 +256,11 @@ The per-device page is the shared entity view reached from any dashboard, organi
 
 Every per-device route is scoped to the device's management group (a global grant **or** a role assigned on the device's group / an ancestor): opening a device outside your scope returns *forbidden*, never its data.
 
-A device id longer than 256 bytes or containing a byte below `0x20` answers `400` ("Invalid device id.") on every per-device route and fragment, before the scope check and before any audit row, so such an id never reaches an audit record. Registered devices are not affected: registration refuses those ids, so only a hand-built URL is refused (see [Upgrading](upgrading.md)).
+A device id longer than 256 bytes or containing a byte below `0x20` answers `400` ("Invalid device id.") on the device-page, DEX and Echo fragments and on the other routes listed in [Upgrading](upgrading.md), before the scope check and before any audit row that names the id, so such an id never reaches an audit record there. Registered devices are not affected: registration refuses those ids, so only a hand-built URL is refused. Exceptions, so the rule is not read as covering every per-device route:
+
+- The hardware JSON routes (`GET /api/v1/hardware/{id}` and `POST /api/v1/hardware/{id}/sync`) answer `400` with the lowercase text `invalid device id`. `GET /api/v1/hardware/{id}` checks the fleet-read permission first, a global check that cannot see the id; a denial there leaves a row with an empty target.
+- The fleet-visualization host topology answers `400` with `agent_id is too long` or `agent_id contains control characters`.
+- `GET /api/v1/devices/{id}` writes no raw id to an audit row and has no id check; the software-host reads have none either and neutralise the id before it reaches a row.
 
 | Tab | Contents | Gate |
 |---|---|---|

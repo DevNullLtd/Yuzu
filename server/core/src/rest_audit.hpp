@@ -254,4 +254,18 @@ template <class AuditFn>
     return true;
 }
 
+/// The tag-key twin of `refuse_unsafe_device_id_a4`: the key reaches `target_id` (`agent_id:key`)
+/// on every tag audit row, so a key over 64 bytes or with a byte below `0x20`
+/// (`auth::tag_key_is_audit_safe`) answers 400 with the static message `Invalid tag key.`. A size
+/// and control-byte check only, never the key charset, so a delete route still reaches a stored
+/// key `TagStore::validate_key` would refuse. Call it right after the key is read, before the
+/// service-tag guard, the permission check and any audit write; it writes no audit row.
+[[nodiscard]] inline bool refuse_unsafe_tag_key_a4(httplib::Response& res, const std::string& key) {
+    if (auth::tag_key_is_audit_safe(key))
+        return false;
+    res.status = 400;
+    res.set_content(a4_error(res, "Invalid tag key."), "application/json");
+    return true;
+}
+
 } // namespace yuzu::server::detail

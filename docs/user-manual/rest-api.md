@@ -3983,6 +3983,8 @@ Set a tag on an agent. Creates the tag if it does not exist, or updates the valu
 
 **Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
 
+**Tag key:** a `key` over 64 bytes or with a byte below `0x20` answers `400` (`Invalid tag key.`, A4 envelope) before the service-tag guard and the permission check and writes no audit row. This is a size and control-byte check only; a key with characters outside `[a-zA-Z0-9_.:-]` is refused later by the tag store.
+
 **Request body:**
 
 ```json
@@ -4031,6 +4033,8 @@ Delete a tag from an agent.
 **Permission:** `Tag:Delete`
 
 **Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
+
+**Tag key:** a `key` over 64 bytes or with a byte below `0x20` answers `400` (`Invalid tag key.`, A4 envelope) before the service-tag guard and the permission check and writes no audit row. This is a size and control-byte check only, so a stored key with other characters can still be deleted.
 
 **Service-scoped tokens:** cannot delete the `service` key on any agent, for the same reason as
 `PUT` above -- `403`, no `Tag:Delete` grant admits it (#3289).
@@ -10684,7 +10688,7 @@ Create a device-scoped token. The raw token value is returned exactly once at cr
 
 **Permission:** `DeviceToken:Write`
 
-**Device id:** a `device_id` with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the store and writes no audit row; one over 256 bytes answers `400` `invalid_input_length`, also with no audit row.
+**Device id:** a `device_id` with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the store and writes no audit row; one over 256 bytes answers `400` `invalid_input_length`, also with no audit row. Both checks run after the sign-in and `DeviceToken:Write` checks, which are global and never see the id (it is read from the body afterwards), so a caller without that permission still gets `403`, and the denial row it leaves carries an empty `target_id`.
 
 **Request body:**
 
@@ -11806,7 +11810,7 @@ Mint a one-time upload grant for an agent. Operator-facing.
 
 **Permission:** `UploadGrant:Write`
 
-**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the permission check and writes no audit row. Registration refuses such an id, so a registered device is not affected.
+**Device id:** a device id over 256 bytes or with a byte below `0x20` answers `400` (`Invalid device id.`, A4 envelope) before the mint and writes no audit row. On this route the check runs after the sign-in and `UploadGrant:Write` checks: they are global and never see the id, which is read from the body afterwards, so a caller without that permission still gets `403`, and the denial row it leaves carries an empty `target_id`. Registration refuses such an id, so a registered device is not affected.
 
 **Request body:**
 
@@ -14574,12 +14578,14 @@ service-scoped token cannot set the `service` key on any agent -- `403` (#3289);
 [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
 An `agent_id` over 256 bytes or with a byte below `0x20` is `400` (`Invalid device id.`) before the
 service-tag guard, the scoped gate and any audit row.
+A `key` that fails the tag-key rules (over 64 bytes, a byte below `0x20`, or a character outside `[a-zA-Z0-9_.:-]`) is `400` (`invalid tag key`) before the same three.
 
 #### `POST /api/tags/delete`
 
 Delete a tag from an agent. Request body: `{"agent_id": "...", "key": "..."}`. A service-scoped
 token cannot delete the `service` key on any agent -- `403` (#3289).
 An `agent_id` over 256 bytes or with a byte below `0x20` is `400` (`Invalid device id.`), as on `POST /api/tags/set`.
+A `key` over 64 bytes or with a byte below `0x20` is `400` (`Invalid tag key.`) before the service-tag guard, the scoped gate and any audit row. This is a size and control-byte check only, so a stored key with other characters can still be deleted.
 
 #### `POST /api/tags/query`
 

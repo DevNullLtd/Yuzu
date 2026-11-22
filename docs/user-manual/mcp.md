@@ -1045,17 +1045,40 @@ instead of wrapping, so an oversized `limit` reaches that tool's own ceiling ins
 **A device id is bounded and clean (#7811).** An `agent_id` argument over 256 bytes or with a byte
 below `0x20` (a tab, CR, LF or NUL among them) is refused with `-32602`
 ("agent_id must be at most 256 bytes with no byte below 0x20") before the per-device permission
-check, the approval mint and any audit row, so a refused id leaves no audit row and no pending
-approval. It applies to `get_dex_device_score`, `get_dex_device_app_perf`, `get_dex_device_history`,
-`get_dex_observation`, `get_guardian_device_guards`, `get_guardian_agent_status`,
-`get_agent_app_usage`, `get_agent_inventory`, `query_software_licenses`,
-`get_software_host_collection_settings`, `get_tags`, `set_tag`, `delete_tag`, `quarantine_device`,
-`execute_bundle` and `mint_upload_grant`, and, for every approval-gated tool, to the approval mint
-itself. `get_hardware_ci` shares the same check. The two Guardian drills keep their own
-"agent_id is too long" answer for an over-long id and add the control-byte refusal; a tool that
-already refused such an id through its own check (`get_host_topology`, `list_guardian_events`,
-`get_guardian_device_compliance`, `get_execution_statistics_by_agent` and the management-group
-member tools) keeps it.
+check, the approval mint and any audit row that names the id, so a refused id leaves no pending
+approval and no audit row that carries it. It applies to `get_dex_device_score`,
+`get_dex_device_app_perf`, `get_dex_device_history`, `get_dex_observation`,
+`get_guardian_device_guards`, `get_guardian_agent_status`, `get_agent_app_usage`,
+`get_agent_inventory`, `query_software_licenses`, `get_software_host_collection_settings`,
+`get_tags`, `set_tag`, `delete_tag`, `quarantine_device`, `execute_bundle` and
+`mint_upload_grant`, and, for every approval-gated tool, to the approval mint itself.
+
+What runs first, and what differs:
+
+- Every tool's tier check runs before this one, and so does a global permission check where the
+  tool has one (`mint_upload_grant` also checks that the upload-grant store is available). A
+  denial there writes a row whose target is the tool name (or empty) and whose detail does not
+  carry the id.
+- `get_hardware_ci` keeps its own check after the fleet-read gate: it answers `-32602` with
+  "agent_id is required: a non-empty string of at most 256 bytes with no byte below 0x20" and
+  writes one `mcp.get_hardware_ci` row with result `denied` and detail
+  `invalid arguments: agent_id`. The row carries no id.
+- The two Guardian drills keep their own "agent_id is too long" answer for an over-long id and
+  add the control-byte refusal. `get_software_host_collection_settings` keeps its own
+  "1 to 128 characters" answer for an id over 128 bytes and applies this check to a shorter id
+  that has a control byte.
+- A tool that already refused such an id through its own check (`get_host_topology`,
+  `list_guardian_events`, `get_guardian_device_compliance`, `get_execution_statistics_by_agent`
+  and the management-group member tools) keeps it. Other tools that take an `agent_id`
+  (`get_agent_details`, `get_software_host`, `query_inventory`, `query_responses`) have no id
+  check: they neutralise the id before it reaches an audit row, or write none.
+
+`set_tag` and `delete_tag` also bound the tag `key`: a `key` over 64 bytes or with a byte below
+`0x20` is refused with `-32602` ("key must be at most 64 bytes with no byte below 0x20") before the
+service-tag guard, the per-device permission check and any audit row that names the key. This is a size and
+control-byte check only; it does not apply the tag-key character rules, so `delete_tag` can still
+reach a stored key with other characters. `delete_tag` is approval-gated: on a gated tier the key
+check runs when the approved ticket is redeemed, not when it is minted.
 
 For **approval-gated tools**, arguments are additionally validated against the
 tool's published `inputSchema` (from `tools/list`) *before* any approval-ticket

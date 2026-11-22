@@ -27,6 +27,7 @@
 #include "hardware_list_model.hpp"
 #include "hardware_section_integrity.hpp"
 #include "offline_endpoint_store.hpp" // kQueryRowCap vs the emitted roster_cap
+#include "tag_store.hpp"             // TagStore::validate_key vs the tag-key floor
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -1274,6 +1275,30 @@ TEST_CASE("agent_id_is_audit_safe: bounded length and no control bytes", "[hardw
     CHECK(agent_id_is_audit_safe("agent 1")); // 0x20 itself is not a control byte
     CHECK(agent_id_is_audit_safe("agent\x7f" "1")); // DEL passes the floor; the store's own check refuses it
     CHECK(agent_id_is_audit_safe(""));        // empty is each caller's own refusal
+}
+
+TEST_CASE("tag_key_is_audit_safe: size and control bytes only, never the key charset",
+          "[hardware][model][scope]") {
+    using auth::tag_key_is_audit_safe;
+    CHECK(tag_key_is_audit_safe("role"));
+    CHECK(tag_key_is_audit_safe(std::string(64, 'k')));
+    CHECK_FALSE(tag_key_is_audit_safe(std::string(65, 'k')));
+    CHECK_FALSE(tag_key_is_audit_safe("k\ny"));
+    CHECK_FALSE(tag_key_is_audit_safe("k\ry"));
+    CHECK_FALSE(tag_key_is_audit_safe("k\ty")); // the audit store keeps TAB, CR and LF
+    CHECK_FALSE(tag_key_is_audit_safe(std::string("k\0y", 3)));
+    CHECK_FALSE(tag_key_is_audit_safe(std::string("\x1f", 1)));
+    // The charset is the tag store's business: a key it refuses must stay deletable.
+    CHECK(tag_key_is_audit_safe("two words"));
+    CHECK(tag_key_is_audit_safe("k/y?x=1"));
+    CHECK(tag_key_is_audit_safe("")); // empty is each caller's own refusal
+
+    // The size bound is the one `TagStore::validate_key` enforces: the two must not drift apart.
+    for (const std::size_t n : {std::size_t{1}, std::size_t{64}, std::size_t{65}}) {
+        const std::string key(n, 'k');
+        INFO("key size " << n);
+        CHECK(tag_key_is_audit_safe(key) == yuzu::server::TagStore::validate_key(key));
+    }
 }
 
 // ── classify_hardware_ci_read (the single-record decision, shared by every transport) ──

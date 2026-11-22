@@ -831,6 +831,15 @@ TEST_CASE("REST POST /api/v1/device-tokens: a device_id with a control byte is a
         CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "Invalid device id.");
     }
     CHECK(h.audit_log.empty());
+
+    // A 256-byte printable device_id is safe (the length bound is inclusive): it reaches the store.
+    auto edge = h.sink.Post("/api/v1/device-tokens",
+                            nlohmann::json{{"name", "dev-token"},
+                                           {"device_id", std::string(256, 'D')},
+                                           {"definition_id", "d"}}
+                                .dump());
+    REQUIRE(edge);
+    CHECK(edge->status == 201);
 }
 
 TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure increments "
