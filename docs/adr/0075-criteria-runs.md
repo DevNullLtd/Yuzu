@@ -1,10 +1,10 @@
 # ADR-0075: Criteria runs: three-valued verdicts over several inputs, stored as a result set
 
-- **Status:** Proposed (draft 7)
-- **Date:** 2026-11-18 (draft 1); 2026-11-20 (drafts 2 and 3); 2026-11-21 (drafts 4 to 7)
+- **Status:** Proposed (draft 8)
+- **Date:** 2026-11-18 (draft 1); 2026-11-20 (drafts 2 and 3); 2026-11-21 (drafts 4 to 7); 2026-11-22 (draft 8)
 - **Owner:** Nathan Dornbrook / platform (block `0xxx`; see `docs/adr/README.md`)
-- **Deciders:** Nathan Dornbrook. The owner's decisions D1 to D61, made between 2026-11-07 and
-  2026-11-21 while reviewing a contributed criteria-run plan (version 4.1, 2026-11-06). This ADR
+- **Deciders:** Nathan Dornbrook. The owner's decisions D1 to D67, made between 2026-11-07 and
+  2026-11-22 while reviewing a contributed criteria-run plan (version 4.1, 2026-11-06). This ADR
   cites them by number in brackets, for example (D25). It writes them down; it does not reopen them.
   Where a later decision replaced part of an earlier one, the later one is cited.
 - **Builds on:**
@@ -118,7 +118,7 @@ version reports and acts on nothing (D1).
 - **Cause:** why a device is `not_assessed`, from a closed list (R4).
 - **Coverage:** whether a part of the installed-software inventory was read completely: Full,
   Partial or Unknown (R5).
-- **Window:** the time from creation to the run's deadline.
+- **Window:** the time from creation to the run's deadline, at most 26 h (R6.8).
 - **Final:** every cohort device has a verdict, or the deadline has passed.
 - **Warm copy and cold copy:** the run's verdicts in Postgres, and their exported copy in
   ClickHouse (R11).
@@ -146,7 +146,9 @@ It does not make the run itself act on anything (D46).
    does.
 4. ADR-0072's evaluation record (completeness, `evaluated_at`, members hash) is metadata on this
    result set, as ADR-0072 as amended by D15 states.
-5. Authoring a run is the run request itself. Nothing is stored that could be executed by id later.
+5. Authoring a run is the run request itself. No reusable definition is stored. The only thing
+   run by id later is a re-run of an existing run, which replays that run's own stored input specs
+   under the re-running operator's current authority (R12.1).
 
 ### R3. Inputs and entry points (D2, D3, D12, D33, D47, D48, D49, D55)
 
@@ -239,10 +241,10 @@ Forensics-sanitised (#4990). The closed list, by slice:
 | Cause | Meaning | From |
 |---|---|---|
 | `missing_value`, `malformed_value`, `row_bound` | the row test could not be decided | slice 1 |
-| `coverage_unproven` | `NONE` or `ALL` over a part that is not Full (R5) | slice 1 |
+| `coverage_unproven` | `NONE`, `ALL`, or an `ANY` that finds no qualifying row, over a part that is not Full; a `COUNT WHERE` range left open by such a part (R5.5, R4.13) | slice 1 |
 | `unconfirmed` | `ANY` rests on a row whose facet was last confirmed outside the freshness window (R5.4) | slice 1 |
 | `stale`, `no_inventory` | no fresh inventory by the deadline (R6) | slice 1 |
-| `withheld:<securable>` | an admitted device loses visibility under this input’s gate before the input is collected (R9) | slice 1 |
+| `withheld:<securable>` | an admitted device loses visibility under this input’s gate, or the creator loses run authority, before the input is collected (R9.5) | slice 1 |
 | `unanswered` | a live input was sent and no answer arrived (R13) | slice 3 |
 | `transient:<status>` | a live input answered with a transient plugin status (R7.2) | slice 3 |
 | `withheld:authority_withdrawn` | the creator's token was revoked or expired (R9) | slice 3 |
@@ -286,8 +288,10 @@ keep (D48). Where it differs, the old result is not preserved.
      refused at admission as an operand and settles as `not_assessed:malformed_value` as a stored
      value. The bounds are server constants in code, with no flag or configuration. A stored JSON
      float is compared by the value of its double and is not subject to the lexeme limit. 64 bytes
-     covers every int64 and uint64 and the full exact decimal expansion of a double written as a
-     string; an exponent of ±1000 covers every double, subnormals included. The bounds exist because
+     covers every int64 and uint64 and the shortest round-trip decimal form of every double (at most
+     24 characters). It does not cover the full exact decimal expansion of every double, which can run
+     to several hundred digits; such a string settles as `malformed_value`. An exponent of ±1000
+     covers every double, subnormals included. The bounds exist because
      the cost of an exact decimal comparison grows with its input.
    - Accepted cost: a single-input producer used without K3 folds unknown to false at the top
      (R4.3), so a device storing `"5 GB"` drops out of that set without a trace, as a device storing
@@ -339,6 +343,25 @@ keep (D48). Where it differs, the old result is not preserved.
     upgrade note. For example, a stored `"5 GB"` against `>` with the string operand `"4"` is a
     match today; under `gt` it is `malformed_value`.
 
+#### Counting (D67)
+
+13. **`COUNT WHERE` compares a range, not a number.** Over an input's rows, let `t` be the rows
+    on which the test is true and `u` the rows on which it is unknown. The count lies between `t`
+    and `t + u`.
+    - A row counts toward `t` only if it would prove presence under R5.4. A found row whose facet
+      was last confirmed outside the window counts toward `u`, with cause `unconfirmed`.
+    - The upper end is unbounded when the input reads any part that is not Full (R5), or when the
+      answer is over the row bound, because rows that were not read could add to the count.
+    - The count is compared with `eq`, `lt`, `le`, `gt` or `ge`, in the number domain only. The
+      comparison is true when it holds for every count in the range, false when it fails for every
+      count, and unknown otherwise.
+    - An unknown comparison takes `coverage_unproven` (or `row_bound`) when the unbounded upper end
+      decided it. Otherwise it takes the cause of the unknown rows, the first present in the order
+      `unconfirmed`, `missing_value`, `malformed_value`.
+    - Example: `COUNT WHERE(name eq "openssl") ge 1` over a Partial part with one confirmed row is
+      true, because the lower end is 1. With no row found it is unknown, `coverage_unproven`, as a
+      false `ANY` is (R5.5). `COUNT WHERE(...) eq 0` behaves as `NONE` does.
+
 ### R5. Coverage comes from the facet state (D34, D35, D43, D60)
 
 1. Coverage for each part of the installed-software inventory is read from `software_facet_state`,
@@ -358,7 +381,12 @@ keep (D48). Where it differs, the old result is not preserved.
 3. ADR-1012 adopts this mapping rather than adding a field of its own.
 4. **A found row proves presence (`ANY` true) only if its facet's `last_confirmed_at` is inside the
    R6 window** (resolved `interval_s` + 2 h; 26 h on the default) (D43). Under a Full facet this
-   always holds, because the cycle just confirmed it. Under a Partial facet a status-only section
+   holds for as long as the device keeps reporting. A rows-section sets `last_confirmed_at`, and
+   so does a hash-only report whose hash matches (D65), because a matched hash proves that the
+   stored rows are what the agent holds. Today the hash-only path moves only `last_seen`
+   (`software_inventory_store.cpp:1470-1475`). PR 1.9 makes the same statement also set
+   `last_confirmed_at` on every facet of that device whose status is `full` or `delta`, and on no
+   other facet. Under a Partial facet a status-only section
    leaves the last confirmed rows in place, unconfirmed (`software_inventory_store.cpp:1940-1960`);
    a row older than the window leaves the device `not_assessed:unconfirmed`.
    - **A run measures the window at run start**, with the interval resolved once (R6.3).
@@ -370,7 +398,13 @@ keep (D48). Where it differs, the old result is not preserved.
    - **Accepted cost** (D60, as for D50): without `"logic":"k3"`, these surfaces fold unknown to
      false at the top (R4.3), so a device left `not_assessed:unconfirmed` drops out of the set with
      no trace of why. With `"logic":"k3"` it shows, with its cause.
-5. `NONE` and `ALL` need Full; otherwise the device is `not_assessed:coverage_unproven`.
+5. **Absence needs Full coverage.** `NONE` and `ALL` need Full, and so does a false `ANY`. An
+   `ANY` that finds no qualifying row over a part that is not Full is
+   `not_assessed:coverage_unproven`, never `not_matched`, because a Partial or Unknown part cannot
+   prove absence (ADR-0072 §11.2). A v2 agent, which reads Unknown for every part (R5.2), therefore
+   reads `coverage_unproven` for "which devices have package Y" unless a confirmed row is found.
+   Only a found, confirmed row (R5.4) settles `ANY` without Full. Tests cover `ANY`, `NONE` and
+   `ALL` over a Full, a Partial and an Unknown part, with and without a matching row.
 6. Freshness (R6) never stands in for coverage.
 
 The agent side is already met: a constrained part is sent as a status-only section and never as
@@ -390,11 +424,36 @@ complete read. `last_confirmed_at` is already joined onto row reads
 4. A fresh device is read at start. Any other device is read on its first `ReportInventory` or
    `ProxyInventory` receipt inside the window (`agent_service_impl.cpp:1017`;
    `gateway_service_impl.cpp:1801`). A hash-only receipt counts, because it refreshes `last_seen`.
-5. The ingest hook checks an in-memory set of the devices waiting in open runs. It never queries the
-   database for each report.
+5. **Waiting devices are durable rows** (D64). Every cohort device not read at start has a waiter
+   row `(result_set_id, device_id)` in Postgres, written in the run's creation transaction and
+   deleted when the device settles. The waiter rows, not any one replica's memory, say who is
+   waiting, so a report landing on any replica, or after a restart, is never missed.
+   - **The ingest hook reads a replica-local index** of waiting device ids, built from the waiter
+     rows and kept current by a durable generation counter that every waiter insert and delete
+     bumps, the pattern RBAC and sessions use (ADR-2002). A report from a device that waits in no
+     run costs no database query. Until a replica's index is built, its hook looks up the waiter
+     rows for each report instead.
+   - **A reconciliation pass closes the propagation gap.** A report that lands on a replica
+     whose index has not yet seen a new waiter is ingested but not claimed. A periodic pass, and
+     the deadline settlement before it settles anything as `stale` (R7.5), reads every waiter whose
+     device has a server receipt (`last_seen`, DB clock) at or after the run's start. Each device
+     is still read once (R6.1).
+   - The pass and the deadline settlement are background loops, classified in
+     `background_jobs.hpp` like every other. They are safe on any replica, because every write
+     they make is the guarded claim of R7.5.
 6. A device with no receipt by the deadline settles as `not_assessed:stale`, or
    `not_assessed:no_inventory` when it has never reported.
 7. `kStaleWindowSecs` (48 h) stays the alerting threshold and is not reused here.
+8. **The window is at most 26 h** (D66): `kMaxRunWindow`, a server constant with no flag or
+   configuration, the default daily interval plus R6.2's 2 h allowance. Admission refuses a longer
+   window with a permanent A4 `400` that names the bound.
+   - This bounds what a run holds before the capacity reservation of R11.4 lands (PR 1.13): its
+     cohort's member rows for at most 26 h plus the warm setting (R11.1, R11.2), with the number of
+     such sets bounded by the per-owner cap.
+   - **Accepted cost:** in a group whose sync interval is longer than a day, a device that is not
+     fresh at start (R6.2) may not report inside the window, and settles as `stale`.
+   - From slice 3, a live input delivers only inside its run's window, so R13.1's 48 h gather
+     bound is capped by the run's deadline. Raising `kMaxRunWindow` is a change to this ADR.
 
 ### R7. Settling: read once, written once (D5, D18, D25, D44)
 
@@ -412,6 +471,22 @@ complete read. `last_confirmed_at` is already joined onto row reads
 4. The run page shows how many devices settled this way. The remedy is a whole-run re-run (R12.1);
    there is no filtered re-run, because sibling runs over different devices would not be
    comparable.
+
+5. **A receipt and the deadline are ordered by one claim, on the database clock.**
+   - **The receipt claim.** Before it reads, the ingest path claims the device's waiter row:
+     `received_at = now()`, guarded on `received_at IS NULL AND now() <= deadline`. A receipt that
+     loses this claim (another receipt won it, or the deadline has passed) reads nothing.
+   - **The verdict write** then follows R7.1, guarded on `verdict IS NULL`.
+   - **The deadline settlement** first runs the reconciliation of R6.5. It then settles as `stale`
+     or `no_inventory` only the waiters with `received_at IS NULL`, claiming each under
+     `received_at IS NULL AND now() > deadline`. A waiter that was claimed before the deadline but
+     has no verdict yet is in flight. The settlement waits for it for a bounded drain time, a server
+     constant, and then evaluates it itself from the stored inventory, which is what the claimed
+     receipt would have read. A crashed receipt therefore never leaves the run gathering, and never
+     turns a receipt made in time into `stale`.
+   - The run is `final` only when every waiter has a verdict.
+   - Tests cover both interleavings (a receipt claimed before the deadline and settled after it;
+     the deadline claimed before a late receipt), and a receipt that crashes after its claim.
 
 `docs/Instruction-Engine.md:765-770` describes a retry for transient plugin errors; no criteria-run
 path uses it.
@@ -489,10 +564,22 @@ path uses it.
 4. At creation, exclude any target device outside even one input's authorized scope. Only the
    aggregate excluded count is visible. Create no member row, input verdict or pending delivery
    for that device. Later grants cannot add it to this run.
-5. At each delivery from slice 3, recheck the admitted device against that input's gate. If access
-   has since been withdrawn, withhold the input, send nothing for it, and record
-   `withheld:<securable>` for the input. The device stays in the original cohort. R4 combines the
-   input results into its device verdict. R9.8 governs loss of the token itself.
+5. **Every collection after creation rechecks authority.** In slice 1 that is the receipt read
+   (R6.4); from slice 3 it is also each delivery. Before the input is collected, the admitted
+   device is rechecked, as the creator, first against the sessionless authority of R9.7 and then
+   against that input's own gate (scoped `Inventory:Read` in slice 1). A read at start needs no
+   recheck, because it runs inside the admitting request.
+   - If either has since been withdrawn, the input is withheld: nothing is read or sent for it,
+     and the input records `withheld:<securable>` naming the securable that failed
+     (`withheld:CriteriaRun` or `withheld:Inventory`). The device stays in the original cohort.
+     R4 combines the input results into its device verdict.
+   - **The recheck fails closed.** A degraded RBAC read (ADR-0041) reads nothing. The device stays
+     waiting and is rechecked on its next receipt in the window; one never proven by the deadline
+     settles as `withheld:<securable>`, never as `stale` and never with a verdict computed from
+     data its creator may no longer see.
+   - An acceptance test revokes the creator's scoped `Inventory:Read` on a waiting device between
+     admission and its receipt, and asserts `withheld:Inventory` with no read.
+   - R9.8 governs loss of the token itself, from slice 3.
 
    For example, target two devices with an inventory input and a live input. At creation, A is
    visible for inventory alone and B is visible for both. The run has one member (B) and an
@@ -548,7 +635,7 @@ prerequisites:
    bounded concurrency, jittered backoff and bounded recovery throughput. Release PostgreSQL
    transactions and connections before waiting for ClickHouse.
 
-   **Backpressure (owner decision, 2026-11-21).** Before enabling export-dependent reaping,
+   **Backpressure (D62, owner decision 2026-11-21).** Before enabling export-dependent reaping,
    enforce the ADR-0006 cold-record capacity policy on every create and re-run. Across replicas,
    atomically reserve a conservative byte bound for the authorized cohort, its terminal rows and
    indexes before materialization or scheduling. Charge through warm-space reclamation and
@@ -573,8 +660,9 @@ prerequisites:
    (`docs/enterprise-readiness-soc2-first-customer.md:836`), and fails like every other audit write.
 8. **Per-device verdicts are working data, not SOC 2 evidence.** The documentation says so plainly.
    If an act phase needs per-device evidence, that is the act phase's decision. Accepted cost: after
-   90 days the record can say "device D was in a cohort of N, of which M matched", but not D's own
-   verdict.
+   90 days the record says what the run asked, over how many devices, and how many matched, but
+   not which devices were in the cohort or what any device's verdict was, because the summary event
+   carries counts only (R11.7).
 9. **A release may ship runs before the cold copy exists** (D61). Runs land in PR 1.10 and the
    export and reap guard in PR 1.13 (*Slices*). A release tagged between the two keeps a run's
    verdicts only for the warm window, final plus 20 minutes by default (R11.2); after that only the
@@ -658,7 +746,7 @@ prerequisites:
 4. **The response store moves to ClickHouse under its own ADR** before slice 3, carrying
    `ResponseTierFilter` (#4990) and per-device scoping (#1634) into every query.
 
-#### Bulk responses and incident dispatch (approved 2026-11-22)
+#### Bulk responses and incident dispatch (D63, owner decision 2026-11-22)
 
 At admission, persist the dispatch policy, response destination, frozen authorized cohort and
 deadline. Ordinary and incident bulk live inputs both stream through authenticated core ingest
@@ -733,11 +821,12 @@ answers, and a deadline with outstanding devices.
    `source_payload` and `ttl_at` set from the deadline (R11.1).
 3. **Cohort.** The target intersected with the creator's visible devices under scoped
    `Inventory:Read` (R9.3). Excluded devices are counted.
-4. **Reads.** Fresh devices are read at start; the rest on their first receipt in the window (R6).
+4. **Reads.** Fresh devices are read at start; the rest on their first receipt in the window,
+   through a durable waiter row, a claim and an authority recheck (R6.5, R7.5, R9.5).
 5. **Verdicts.** Each device is evaluated in K3 once its read is in (R4, R5) and its verdict and
    cause written once (R7).
 6. **Final.** Every device settled, or the deadline passed; unread devices settle as `stale` or
-   `no_inventory`. The status becomes `final` (store `materialized`), `ttl_at` is reset, the summary
+   `no_inventory` through the deadline claim (R7.5). The status becomes `final` (store `materialized`), `ttl_at` is reset, the summary
    audit event is written and the export starts (R11).
 
 **Delivery: thirteen PRs.** Slice 1 is too large to review as one change, so it lands as the
@@ -754,12 +843,12 @@ writer (D34; `sync_source_installed_software.cpp:1099-1111`).
 | 1.3 | Member loads in keyset pages where a whole set is not needed (R10.2). | none | Postgres substrate; scope walking |
 | 1.4 | Member inserts by `COPY` or in chunks, not one `unnest` statement (R10.3). | none | Postgres substrate; scope walking |
 | 1.5 | `materialize()` enforces a per-kind cap, today's 100,000 for every existing kind; closes #7433 (R10.4). | none | Postgres substrate; scope walking; agentic-first (the refusal's A4 shape) |
-| 1.6 | The matcher evaluates in K3 and folds once, at the top; quantifiers and `and`/`or`/`not` over row tests; the `missing_value`, `malformed_value` and `row_bound` causes (R4.1 to R4.3, R4.5). Live at once for the matchers `echo_query` and `instruction_result` already accept. | none | scope walking; agentic-first A5 (the matcher's input schema in the producer tools) |
+| 1.6 | The matcher evaluates in K3 and folds once, at the top; quantifiers and `and`/`or`/`not` over row tests; `COUNT WHERE` as a range (R4.13; D67); the `missing_value`, `malformed_value` and `row_bound` causes (R4.1 to R4.3, R4.5). Live at once for the matchers `echo_query` and `instruction_result` already accept. | none | scope walking; agentic-first A5 (the matcher's input schema in the producer tools) |
 | 1.7 | `lt`, `le`, `gt`, `ge`; `"as"` on ordering, `eq` and `in`; the strict number domain with its bounds; no text ordering (R4.7 to R4.9, R4.11; D50, D52, D57). | 1.6 | scope walking; agentic-first A5 |
 | 1.8 | `"as":"version"`: the libversion order, its pin by content hash, and the libversion corpus as a Yuzu conformance test (R4.10; D51). | 1.7 | scope walking; agentic-first A5. No row covers vcpkg or `meson.build`: `build-ci` and `cross-platform` review it under their own triggers (the Windows DLL build and the `version.lib` clash) |
-| 1.9 | `inventory_query` moved onto the matcher, reading `installed_software` through `SoftwareInventoryStore` (with any per-device read beside `query_software`); the coverage mapping and the confirmation test (R5), with R5.4's window measured at request time on all three surfaces and a device left `unconfirmed` folding to false outside K3 (D60); the old `conditions[]` shape refused on all three surfaces; `POST /api/v1/inventory/evaluate` on the same evaluation (D55); `inventory_eval`'s grammar deleted; the cases re-pinned (R3.2, R3.3, R4.12; D47, D48). Breaking: `changelog.d/` fragment and upgrade note, which also state the fold-to-false cost. | 1.8 | agent daily-sync and installed-software inventory (`inventory_*`, `software_inventory_store.*`); Postgres substrate (a new store read); authentication and RBAC (a list read of per-agent data stays on `authorize_list_read`); agentic-first (the changed MCP input schema); scope walking |
-| 1.10 | Criteria runs: the `CriteriaRun` securable and its mirrors, class 2 reworded and `CriteriaRun:Read` floored (R9.1, R9.2; D19, D39); the operator-tier and supervised-tier rows (D58, D59); `POST /api/v1/criteria-runs` and MCP `create_criteria_run` with named-input combinators, `"logic":"k3"` and the verdict mapping (R4.4, R4.6); the `criteria_run` kind, cohort and excluded count (R9.3, R9.4); the read at start and settling at the deadline (R6.1 to R6.3, R6.6); write-once verdict and cause columns (R7.1); the status table and counts (R8; D56); the creation audit verb and the summary event at final (R11.7); `ttl_at` from creation and the warm setting (R11.1, R11.2), with the warm-only retention stated in the user manual, the `changelog.d/` fragment and the upgrade note (R11.9; D61); the matched-only atom and incomplete-set marking (R14.1 to R14.3; D54). | 1.2 to 1.5, 1.9 | authentication and RBAC; authorization-topology floor; service-scoped confinement (the new route refuses a service-scoped token); MCP server (`mcp_policy.hpp`); headless platform (a new REST route and MCP tool); agentic-first; pre-auth body cap and MFA step-up (a new mutating route must be classified in both tables); scope walking (`agent_registry.cpp`); Postgres substrate (member columns); clock-guarded retention (`ttl_at` for the new kind); observability and data architecture (the audit verb and event) |
-| 1.11 | The read on a device's first `ReportInventory` or `ProxyInventory` receipt in the window, through the in-memory waiting set (R6.4, R6.5). | 1.10 | agent daily-sync (the two handlers); gateway-upstream peer authorization (`gateway_service_impl.*`) |
+| 1.9 | `inventory_query` moved onto the matcher, reading `installed_software` through `SoftwareInventoryStore` (with any per-device read beside `query_software`); the coverage mapping and the confirmation test (R5), with a false `ANY` needing Full (R5.5), the hash-only path also confirming Full facets (R5.4; D65), R5.4's window measured at request time on all three surfaces and a device left `unconfirmed` folding to false outside K3 (D60); the old `conditions[]` shape refused on all three surfaces; `POST /api/v1/inventory/evaluate` on the same evaluation (D55); `inventory_eval`'s grammar deleted; the cases re-pinned (R3.2, R3.3, R4.12; D47, D48). Breaking: `changelog.d/` fragment and upgrade note, which also state the fold-to-false cost. | 1.8 | agent daily-sync and installed-software inventory (`inventory_*`, `software_inventory_store.*`); Postgres substrate (a new store read); authentication and RBAC (a list read of per-agent data stays on `authorize_list_read`); agentic-first (the changed MCP input schema); scope walking |
+| 1.10 | Criteria runs: the `CriteriaRun` securable and its mirrors, class 2 reworded and `CriteriaRun:Read` floored (R9.1, R9.2; D19, D39); the operator-tier and supervised-tier rows (D58, D59); `POST /api/v1/criteria-runs` and MCP `create_criteria_run` with named-input combinators, `"logic":"k3"` and the verdict mapping (R4.4, R4.6); the `criteria_run` kind, cohort and excluded count (R9.3, R9.4); the read at start and settling at the deadline (R6.1 to R6.3, R6.6); `kMaxRunWindow` and its refusal (R6.8; D66); write-once verdict and cause columns (R7.1); the status table and counts (R8; D56); the creation audit verb and the summary event at final (R11.7); `ttl_at` from creation and the warm setting (R11.1, R11.2), with the warm-only retention stated in the user manual, the `changelog.d/` fragment and the upgrade note (R11.9; D61); the matched-only atom and incomplete-set marking (R14.1 to R14.3; D54). | 1.2 to 1.5, 1.9 | authentication and RBAC; authorization-topology floor; service-scoped confinement (the new route refuses a service-scoped token); MCP server (`mcp_policy.hpp`); headless platform (a new REST route and MCP tool); agentic-first; pre-auth body cap and MFA step-up (a new mutating route must be classified in both tables); scope walking (`agent_registry.cpp`); Postgres substrate (member columns); clock-guarded retention (`ttl_at` for the new kind); observability and data architecture (the audit verb and event) |
+| 1.11 | The read on a device's first `ReportInventory` or `ProxyInventory` receipt in the window (R6.4): the durable waiter rows, their replica-local index and the reconciliation pass (R6.5; D64); the receipt claim, the deadline claim and the drain of in-flight claims (R7.5); the fail-closed authority recheck at the receipt read and its acceptance test (R9.5). | 1.10 | agent daily-sync (the two handlers); gateway-upstream peer authorization (`gateway_service_impl.*`); Postgres substrate (the waiter table); fenced leader election (two new background loops in `background_jobs.hpp`); authentication and RBAC (a fail-closed recheck) |
 | 1.12 | Re-eval of `criteria_run` sets: the floor on either securable, `load_owned`, the gate by stored kind, the MCP row, the approval pre-check and the ticket bound to the kind and the input-spec digest; the route description; a test that a service-scoped re-run is refused (R12.1, R12.2, R12.6, R12.7, R9.9; D42, D53, D58, D59). | 1.10 | MCP server (the approval pre-check); authentication and RBAC; service-scoped confinement; headless platform (a changed approval gate); agentic-first A5; scope walking |
 | 1.13 | Export at final to the ClickHouse cold store: the `ReplacingMergeTree` table, the deterministic batches and `insert_deduplication_token` on `ClickHouseSink`, `exported_at`, the reap guard in `gc_sweep`, cross-replica admission reservations, bounded retries, and capacity metrics and alerts (R11.3 to R11.6); removes PR 1.10's warm-only retention statement from the user manual, in the same change (R11.9; D61). | 1.1, 1.10 | Postgres substrate (the exception; `deploy/` for `release-deploy`); clock-guarded retention (`gc_sweep`'s predicate); observability (the metric and the shipped alert rule); data architecture |
 
@@ -818,9 +907,12 @@ response-store cutover, bounded incident dispatch and ADR-1013's digest.
   - A supervised-tier token cannot start a run over REST; it uses the MCP ticket flow, and an
     approver re-approves every re-run (R9.1, R12.7).
   - "Installed before a date" cannot be expressed until an `"as":"date"` domain exists (R4.11).
-  - Slice 1 is thirteen PRs, and a run cannot be created until ten of them have landed (1.2 to
+  - Slice 1 is thirteen PRs, and a run cannot be created until nine of them have landed (1.2 to
     1.10).
-  - Until every agent sends v3, `NONE` and `ALL` read `not_assessed:coverage_unproven` on old agents.
+  - Until every agent sends v3, `NONE`, `ALL` and an `ANY` that finds no row read
+    `not_assessed:coverage_unproven` on old agents (R5.5).
+  - A run's window is at most 26 h, so in a weekly group a device that is not fresh at start may
+    settle as `stale` (R6.8; D66).
   - Under a facet that stays Partial, `ANY` reads `not_assessed:unconfirmed` once its rows are older
     than the window. On the single-input `inventory_query` surfaces without `"logic":"k3"`, such a
     device drops out of the set silently (R5.4; D60).
@@ -829,8 +921,9 @@ response-store cutover, bounded incident dispatch and ADR-1013's digest.
   - From slice 3, an early transient answer settles a device for the whole window (R7.3).
   - A run's cohort depends on who started it, so two operators can get different answers to the
     same criteria. The excluded count makes this visible.
-  - A run abandoned before its deadline holds its set until the deadline plus 20 minutes, counted
-    against the 10,000-per-owner limit.
+  - A run abandoned before its deadline holds its set until the deadline (at most 26 h after
+    creation) plus 20 minutes. It counts against the per-owner limit of 10,000 sets, or against a
+    limit of its own if `kMaxPerOwner` counts `criteria_run` sets separately (*Not decided here*).
   - During a cold-export outage, outstanding verdicts consume their reserved warm capacity. Admission closes at the configured limit (R11). A bulk response sink outage pauses live waves (R13).
   - Where the cold tier is on, ClickHouse is a required, stateful service in SOC 2 scope.
   - After 90 days only the run's summary remains, not any device's verdict (R11.8).
@@ -932,10 +1025,12 @@ routed-concern row covers `vcpkg.json` or `meson.build`.
 - The canonical serialisation of the stored input specs over which R12.7's SHA-256 is taken.
 - How the single-input surfaces resolve each candidate device's sync interval at request time for
   R5.4's window (D60): per device or in one bulk read beside `query_software`.
+- The reconciliation pass's period and the deadline settlement's drain time (R6.5, R7.5).
 
 ## Open points
 
-No owner question remains open. The two points draft 5 raised are decided (D60, D61). What is left
+No owner question remains open. The two points draft 5 raised are decided (D60, D61), and so are
+the four the review of draft 7 raised (D64 to D67). What is left
 to the implementing PRs is mechanism only, listed under *Not decided here*.
 
 Settled since draft 1: run status and causes (R8, R4; D41), re-runs in slice 1 (R12.1; D42), a row
@@ -960,3 +1055,10 @@ Settled since draft 5: the single-input producer and `POST /api/v1/inventory/eva
 confirmation window measured at request time, with the two-valued fold-to-false cost (R5.4; D60),
 and a release between PRs 1.10 and 1.13 is allowed with warm-only retention documented and no
 release gate (R11.9; D61).
+
+Settled since draft 7 (review of 2026-11-22): the two owner decisions draft 7 carried without a
+number are numbered, backpressure (R11.4; D62) and incident dispatch (R13; D63); a false `ANY`
+needs Full coverage (R5.5); a receipt rechecks authority, failing closed (R9.5); waiting devices
+are durable rows (R6.5; D64); a receipt and the deadline are ordered by one claim (R7.5); a
+matched hash confirms Full facets (R5.4; D65); the window is at most 26 h (R6.8; D66); and
+`COUNT WHERE` compares a range (R4.13; D67).
