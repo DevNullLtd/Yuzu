@@ -277,6 +277,12 @@ def check_arm_recheck(files):
         if "const auto started = arm_clock_now();" not in gate or \
                 gate.find("const auto started = arm_clock_now();") > gate.find("read = hook();"):
             bad.append("the gate must sample `started` before the read")
+        busy = re.search(r"compare_exchange_strong\(expected, true\)\) \{(.*?)count\(\"refresh_busy\"\);", gate, re.S)
+        if not busy or "out.arm_id = bg_last_armed_id_;" not in busy.group(1) or \
+                "out.last_not_armed_at = bg_last_not_armed_at_;" not in busy.group(1) or \
+                "std::lock_guard lk(bg_arm_mu_);" not in busy.group(1):
+            bad.append("a refresh_busy answer must re-read the last armed id and the last-not-armed "
+                       "time under the mutex after the failed CAS")
         if gate.count("bg_last_not_armed_at_ =") != 1:
             bad.append("bg_last_not_armed_at_ must be written in exactly one place (a not-armed read)")
     if "kArmSnapshotMaxAge{4500}" not in hpp or "return now - read_at <= kArmSnapshotMaxAge;" not in hpp:
@@ -483,6 +489,9 @@ def selftest(files):
                 "    [[nodiscard]] bool admits_password_evaluation() const noexcept {", key="auth_routes.hpp"))
     mut("the comparison static_assert term removed",
         sub_cpp("!SsoGateNeComparable<SsoOnlyGateResult, SsoOnlyLocalGate> &&", "", key="auth_routes.hpp"))
+    mut("refresh_busy answers with the facts from before the failed CAS",
+        sub_cpp("        {\n            std::lock_guard lk(bg_arm_mu_);\n            out.arm_id = bg_last_armed_id_;\n            out.last_not_armed_at = bg_last_not_armed_at_;\n        }\n        out.state = SsoOnlyLocalGate::kTransient;",
+                "        out.state = SsoOnlyLocalGate::kTransient;"))
     mut("the gate cap dropped from the cache hit",
         sub_cpp("if (!arm_observation_fresh(bg_arm_started_, now)) {", "if (false) {"))
     mut("the gate cap dropped from its own read",

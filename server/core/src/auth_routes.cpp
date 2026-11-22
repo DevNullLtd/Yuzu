@@ -2616,6 +2616,7 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
     };
     const auto now = arm_clock_now();
     std::function<BreakGlassArmRead()> hook;
+    std::function<void()> after_cache_miss; // test seam, empty in production
     {
         std::lock_guard lk(bg_arm_mu_);
         out.last_not_armed_at = bg_last_not_armed_at_;
@@ -2646,11 +2647,21 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
         }
         out.arm_id = bg_last_armed_id_; // what a transient answer carries
         hook = bg_arm_read_hook_for_test_;
+        after_cache_miss = bg_arm_after_cache_miss_hook_for_test_;
     }
+    if (after_cache_miss)
+        after_cache_miss();
     bool expected = false;
     if (!bg_arm_refreshing_.compare_exchange_strong(expected, true)) {
         // A refresh is in flight and the cache is older than the TTL (a stale arm is never
-        // served; this is not a "not armed" answer either).
+        // served; this is not a "not armed" answer either). The two "last" facts are read AGAIN
+        // here: between this call's cache check and now, another request may have completed a
+        // whole refresh and recorded "not armed", and the MFA step's second re-check must see it.
+        {
+            std::lock_guard lk(bg_arm_mu_);
+            out.arm_id = bg_last_armed_id_;
+            out.last_not_armed_at = bg_last_not_armed_at_;
+        }
         out.state = SsoOnlyLocalGate::kTransient;
         out.cause = SsoOnlyTransientCause::kRefreshBusy;
         count("refresh_busy");

@@ -1474,3 +1474,45 @@ TEST_CASE("sso-only: an unreadable arm state at /login is the same generic 401 a
     CHECK(h.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", "read_failed"}}) == 1.0);
     CHECK(h.counter("yuzu_auth_break_glass_login_total") == 0.0);
 }
+
+// Code review F1: a refresh_busy answer carries the "last" facts as they are when it is given,
+// not as they were when this request looked at the cache. Between those two moments another
+// request can complete a whole refresh that records "not armed".
+TEST_CASE("break-glass gate: a refresh_busy answer carries a not-armed read recorded after its cache check",
+          "[pg][auth][hardened][routes][concurrency][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    auto& r = *h.auth_routes;
+    REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed);
+    r.advance_arm_clock_for_test(1100); // the cache is now older than its 1 s life
+
+    std::optional<yuzu::test::JoiningThread> second_refresher;
+    bool in_gap = false;
+    r.set_break_glass_after_cache_miss_hook_for_test([&] {
+        if (in_gap)
+            return; // only the outer call's gap is used
+        in_gap = true;
+        // (A) Another request refreshes inside the gap and reads "not armed".
+        ctl.mode = ArmCtl::kNotArmed;
+        REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kRefused);
+        // (B) That answer ages out and a third request takes the next refresh and is held in it.
+        r.advance_arm_clock_for_test(1100);
+        ctl.block = true;
+        second_refresher.emplace([&] { (void)r.sso_only_local_password_gate("admin"); });
+        while (ctl.blocked.load() == 0)
+            std::this_thread::yield();
+    });
+    // (X) This call saw the old cache before (A) and finds the refresh taken by (B).
+    const auto x = r.sso_only_local_password_gate("admin");
+    ctl.release();
+    second_refresher.reset();
+    r.set_break_glass_after_cache_miss_hook_for_test(nullptr);
+    REQUIRE(x.state == SsoOnlyLocalGate::kTransient);
+    REQUIRE(x.cause == SsoOnlyTransientCause::kRefreshBusy);
+    // (A)'s read started at kT0 + 1100 and was recorded before (X) answered.
+    REQUIRE(x.last_not_armed_at.has_value());
+    CHECK(*x.last_not_armed_at ==
+          std::chrono::steady_clock::time_point(std::chrono::milliseconds(kT0 + 1100)));
+    CHECK(x.arm_id == "arm-1");
+}

@@ -319,6 +319,14 @@ public:
         std::lock_guard lk(bg_arm_mu_);
         bg_arm_read_hook_for_test_ = std::move(fn);
     }
+    /// Test seam: run `fn` on the calling thread after the gate found its cache too old and
+    /// released the cache mutex, and BEFORE it tries to take the refresh. It lets a test put
+    /// another request's whole refresh inside that gap, which no ordinary scheduling can do
+    /// reliably. Same rules as the read hook; never set in production.
+    void set_break_glass_after_cache_miss_hook_for_test(std::function<void()> fn) {
+        std::lock_guard lk(bg_arm_mu_);
+        bg_arm_after_cache_miss_hook_for_test_ = std::move(fn);
+    }
     /// Test seam: freeze the clock the arm gate and the MFA step's re-checks read, at `ms` after
     /// the steady-clock epoch, and move it by hand. Atomic, so a test may advance it while request
     /// threads run. Never set in production (a negative value means the real clock).
@@ -1220,7 +1228,6 @@ public:
     /// `server/core/src/**` references it.
     void expire_mfa_pending_for_test(const std::string& pending_token,
                                      std::chrono::milliseconds elapsed);
-
     /// Override the service-scope global-safe allow-list for a test
     /// (`kServiceScopeGlobalSafe` is seeded EMPTY in production, #2298 PR 3 —
     /// see `service_scope_policy.hpp` — so `require_permission`'s
@@ -1398,6 +1405,7 @@ private:
     std::optional<std::chrono::steady_clock::time_point> bg_last_not_armed_at_;
     std::atomic<bool> bg_arm_refreshing_{false};
     std::function<BreakGlassArmRead()> bg_arm_read_hook_for_test_; ///< guarded by bg_arm_mu_
+    std::function<void()> bg_arm_after_cache_miss_hook_for_test_;  ///< guarded by bg_arm_mu_
     std::atomic<std::int64_t> arm_clock_test_ms_{-1};
     /// Most requests allowed to WAIT for a stripe at once (server.cpp: max(2, pool/8)).
     std::atomic<int> stripe_waiter_cap_{4};
