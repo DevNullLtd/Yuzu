@@ -1007,8 +1007,11 @@ static const ToolDef kTools[] = {
      "unconfirmed | disabled) and `version_min` / `version_max` (inclusive bounds compared under the "
      "catalogue's version order; they need `name` with match=exact and cannot be combined with "
      "`version`). Each row also carries hostname, last_seen, status, last_confirmed_at, "
-     "install_type, install_scope, install_location, instance_key and purl; null means not known, "
-     "never zero. `count` is the rows on the page. `totals` (installs, devices, as_of) is served "
+     "install_type, install_scope, install_location, instance_key and purl (null means not "
+     "known, never zero), and package_id, always a string (the source's own package identifier: "
+     "the Windows Installer product code on msi rows, an empty string when the source sets "
+     "none). `count` is the rows "
+     "on the page. `totals` (installs, devices, as_of) is served "
      "only to a caller whose read is fleet-wide and only for an exact `name` with at most one "
      "version filter or range; otherwise totals is null and totals_omitted says why (scope | filters "
      "| building). A degraded rows, device-facts or totals read is a retryable error, never an "
@@ -1016,7 +1019,7 @@ static const ToolDef kTools[] = {
      "object. The purl and vers filters are REST-only. For the fleet title rollup use "
      "query_software_catalogue; to list the devices carrying one title, filter here by `name`.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":1024,"description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","maxLength":256,"description":"Exact agent/device filter; omit for fleet-wide"},"version":{"type":"string","maxLength":1024,"description":"Exact version filter; an empty string selects the empty-version rows"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum rows returned"},"q":{"type":"string","maxLength":128,"description":"Substring search"},"kind":{"type":"string","maxLength":16,"description":"Restrict to one kind (package, app, pkg, feat or driver)"},"ecosystem":{"type":"string","maxLength":32,"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"match":{"type":"string","enum":["exact","prefix","contains"],"default":"exact","description":"How name is matched; prefix and contains need name"},"status":{"type":"string","enum":["current","unconfirmed","disabled"],"description":"Restrict to one install status"},"version_min":{"type":"string","maxLength":1024,"description":"Inclusive lower version bound; needs name with match=exact"},"version_max":{"type":"string","maxLength":1024,"description":"Inclusive upper version bound; needs name with match=exact"}}})j",
-     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"},"source":{"type":"string"},"hostname":{"type":["string","null"]},"last_seen":{"type":["integer","null"]},"status":{"type":"string","enum":["current","unconfirmed","disabled"]},"last_confirmed_at":{"type":["integer","null"]},"install_type":{"type":"string"},"install_scope":{"type":"string"},"install_location":{"type":"string"},"instance_key":{"type":"string"},"purl":{"type":["string","null"]}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version","source","hostname","last_seen","status","last_confirmed_at","install_type","install_scope","install_location","instance_key","purl"]}},"count":{"type":"integer","description":"Rows on this page"},"totals":{"type":["object","null"],"properties":{"installs":{"type":"integer"},"devices":{"type":"integer"},"as_of":{"type":["integer","null"]}},"description":"Install rows and distinct devices for an exact name; null when not shown (see totals_omitted)"},"totals_omitted":{"type":"string","enum":["scope","filters","building"],"description":"Present when totals is null: why"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows may exist (the page is full or, on a wide scope, the read was cut short)"},"devices_omitted":{"type":"integer","description":"Distinct devices hidden by the in-process scope post-filter within the scanned window (0 under SQL push-down)"},"next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when no more rows may exist. A wide-scope page can be empty with a non-null next_cursor"}},"required":["software","count","totals","devices_omitted","next_cursor"]})j"},
+     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"},"source":{"type":"string"},"package_id":{"type":"string","description":"The source's own package identifier: the Windows Installer product code on rows from msi_packages.list_inventory; empty when the source sets none"},"hostname":{"type":["string","null"]},"last_seen":{"type":["integer","null"]},"status":{"type":"string","enum":["current","unconfirmed","disabled"]},"last_confirmed_at":{"type":["integer","null"]},"install_type":{"type":"string"},"install_scope":{"type":"string"},"install_location":{"type":"string"},"instance_key":{"type":"string"},"purl":{"type":["string","null"]}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version","source","package_id","hostname","last_seen","status","last_confirmed_at","install_type","install_scope","install_location","instance_key","purl"]}},"count":{"type":"integer","description":"Rows on this page"},"totals":{"type":["object","null"],"properties":{"installs":{"type":"integer"},"devices":{"type":"integer"},"as_of":{"type":["integer","null"]}},"description":"Install rows and distinct devices for an exact name; null when not shown (see totals_omitted)"},"totals_omitted":{"type":"string","enum":["scope","filters","building"],"description":"Present when totals is null: why"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows may exist (the page is full or, on a wide scope, the read was cut short)"},"devices_omitted":{"type":"integer","description":"Distinct devices hidden by the in-process scope post-filter within the scanned window (0 under SQL push-down)"},"next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when no more rows may exist. A wide-scope page can be empty with a non-null next_cursor"}},"required":["software","count","totals","devices_omitted","next_cursor"]})j"},
 
     {"get_tags", "Get all tags for a specific agent.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
@@ -5475,7 +5478,7 @@ static const ToolDef kTools[] = {
     // software_curation_api.cpp behind /api/v1/inventory/software/normalization/*): the same
     // global gate, limits, refusals and audit rows. Every one takes the global Inventory grant and
     // keeps the default-denied service-scope class. The package_id and catalogue identity half of
-    // the lifecycle surface is held (#6090) and is not here. Appended at the VERY END of kTools[]
+    // the lifecycle surface is held (#8357) and is not here. Appended at the VERY END of kTools[]
     // per the standing governance note above.
     {"list_software_lifecycle_rules",
      "The imported software lifecycle rules (end-of-life, end-of-support and similar dated events "
@@ -17383,14 +17386,24 @@ McpServer::HandlerFn McpServer::build_handler(
                             return true;
                     return false;
                 };
+            // Denied `result_set.create` row for a refused request. Returns the error.data to
+            // attach: empty when the row persisted (or audit is off), `audit_persisted:false`
+            // when it was lost or the sink threw (the MCP counterpart of REST's
+            // Sec-Audit-Failed). The SQL text never enters the row.
+            const auto rs_audit_refusal = [&](std::string_view rs_reason, std::string_view rs_kind,
+                                              const std::string& rs_target) -> std::string {
+                const bool rs_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "result_set.create", "denied", "ResultSet", rs_target,
+                    "reason=" + std::string(rs_reason) + " source_kind=" + audit_token(rs_kind));
+                return rs_ok ? std::string{} : std::string{R"({"audit_persisted":false})"};
+            };
             auto rs_refuse_nul = [&](std::string_view rs_what, std::string_view rs_kind) {
-                (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                               "reason=field_contains_nul source_kind=" + audit_token(rs_kind));
                 // retry-hint-exempt: caller-input rejection (a NUL byte), not a transient fault.
                 res.set_content(
                     error_response(id, kInvalidParams,
                                    "RESULT_SET_BAD_REQUEST: " + std::string(rs_what) +
-                                       " must not contain a NUL byte"),
+                                       " must not contain a NUL byte",
+                                   rs_audit_refusal("field_contains_nul", rs_kind, "")),
                     "application/json");
             };
 
@@ -18608,14 +18621,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string sql = param_str(args, "sql");
                 if (sql.empty()) {
                     res.set_content(
-                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required"),
+                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required",
+                                       rs_audit_refusal("sql_missing", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
                 if (sql.size() > 100000) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB",
+                                       rs_audit_refusal("sql_too_large", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
@@ -18630,7 +18645,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                       rs_audit_refusal("stale_source", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
@@ -18849,7 +18865,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         args.value("params", nlohmann::json::object()), def.parameter_schema)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                       rs_audit_refusal("stale_source", source_kind::kInstructionResult, "")),
                         "application/json");
                     return;
                 }
@@ -19039,7 +19056,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (sql.empty()) {
                         res.set_content(
                             error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: original carries no SQL"),
+                                           "RESULT_SET_BAD_REQUEST: original carries no SQL",
+                                           rs_audit_refusal("sql_missing", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19054,7 +19072,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (sql.size() > 100000) {
                         res.set_content(
                             error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB",
+                                           rs_audit_refusal("sql_too_large", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19064,7 +19083,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(
                                 id, kInvalidParams,
-                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                rs_audit_refusal("stale_source", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19169,7 +19189,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(
                                 id, kInvalidParams,
-                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                rs_audit_refusal("stale_source", source_kind::kInstructionResult, orig->id)),
                             "application/json");
                         return;
                     }
