@@ -230,7 +230,7 @@ targets, Directory Read for directory sync), so a fragment is never wider than i
   a delivery history. You can create and delete a webhook; the create confirmation names the
   destination host and the data the chosen events carry. A destination with embedded
   `user:password@`, or with control characters in the URL or event types, is refused. The
-  signing secret is write-only. There is no restriction on the destination address, and the
+  signing secret is write-only. Link-local, cloud-metadata, unspecified, multicast and reserved addresses are refused, including numeric spellings; loopback and private ranges are not refused (see [upgrading](upgrading.md)). The
   confirmation is a click-through, not an approval step.
 - **Offload targets** lists the targets (destination host, events, batch size, last delivery),
   opens a delivery history, and creates and deletes targets under the same rules. The credential
@@ -6833,13 +6833,15 @@ including the F3 orphan grace and `~Agent`, as one bounded 20-second window,
 regardless of which specific phase `service_main` is actually in when the
 dispatcher returns; the log-teardown grace (2s) then runs separately, in
 `main()`, strictly after `run_service()` itself has already returned, adding
-to that 20s rather than being covered by it. Neither `deploy/systemd/yuzu-agent.service`
-nor `deploy/packaging/macos/com.yuzu.agent.plist` overrides its supervisor's
-own stop-timeout default (`TimeoutStopSec=` is absent from the unit;
-`ExitTimeOut` is absent from the plist); systemd's and launchd's own
-defaults apply on top of everything above, and this document does not assert
-what those defaults are. Check `systemd.service(5)`/`launchd.plist(5)` on
-your own host if you need the exact figure.
+to that 20s rather than being covered by it. `deploy/systemd/yuzu-agent.service` sets `TimeoutStopSec=60`: a stop still
+waiting at 60 s (a command blocked in the kernel holds the pool join, which the
+20-second watchdog above does not cover) ends in SIGKILL (`status=9/KILL`), and the unit is left `failed` (`Result=timeout`) and stopped:
+systemd does not restart a unit whose stop was requested, so it stays down until it is started again.
+A reconnect teardown has no such budget. A protective action (the `firewall` containment set) that runs while the pool closes is part of that wait: its drain is unbounded and, during a systemd stop, runs inside the same 60 s budget, so a long drain also ends in `status=9/KILL` (on a reconnect teardown there is no budget); `yuzu_agent_protective_commands_run_closing_total` (agent process only) and a WARN in the agent log count it. A command killed in the middle of execution, including by that 60 s timeout, leaves an in-flight dedup row that answers `RUNNING` for that command id until the agent's dedup database is removed (nothing evicts or sweeps an in-flight row; tracked as a follow-up issue, #3664). To clear it, stop the agent, remove `<data-dir>/command_dedup.db` (`/var/lib/yuzu-agent/command_dedup.db` under the packaged unit), then start it; this forfeits replay protection for commands issued before the removal; containment is re-dispatched under a fresh command id, and any other command is re-issued under a new id. `deploy/packaging/macos/com.yuzu.agent.plist`
+does not set `ExitTimeOut`, so launchd's own default applies there; check
+`launchd.plist(5)` on your own host for the exact figure. On Windows a stop that
+does not complete is ended by finding the process id with `sc.exe queryex YuzuAgent`
+and terminating it with `taskkill /F /PID <pid>`. `--install-service` configures three restart recovery actions (60 s apart, failure count reset after 24 h); once those are used up the service does not restart itself and stays stopped until `sc.exe start YuzuAgent` is run.
 
 **Stopping a wedged server (Linux/macOS, #3007).** Identical mechanism to the
 agent above, applied to the server. If a stop appears to hang: **send the
