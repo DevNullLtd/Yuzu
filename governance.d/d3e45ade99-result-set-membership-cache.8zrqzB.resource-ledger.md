@@ -19,7 +19,7 @@ through `PgConn` (RAII, `PQfinish` on destruction) and their own `PgPool` instan
 | `std::string generation` in try block | frame | constructed in try | scope exit | moved into `CachedMembership` | bad_alloc caught; `retain_members` restores fifo on index emplace failure (pre-existing) |
 | PG lease (`pool_.try_acquire_for`) | unchanged RAII lease | — | — | — | new early `return NotFound` on hit releases via RAII |
 
-Tests add `std::thread` x6, joined in scope.
+The original test revision used six `std::thread` readers. The subsequent ownership change is recorded below.
 
 **Fix 5 addendum (from the same summary).**
 - `PgResult begin` and `PgResult rollback` (x2) in the boot trigger check use block or function-frame
@@ -89,6 +89,8 @@ The historical JSONL entries that cite scratch files under `/private/tmp/yuzu-go
 - [Corrections review](d3e45ade99-result-set-membership-cache.8zrqzB.evidence/final-corrections-review.md)
 - [Earlier Linux PostgreSQL and Meson runs](d3e45ade99-result-set-membership-cache.8zrqzB.evidence/linux-test-evidence.md)
 
+[Per-entry Meson results, focused transcripts and SHA-256 digests](d3e45ade99-result-set-membership-cache.8zrqzB.evidence/integrated-server-results.md) preserve the evidence from the integration runs.
+
 On 2026-11-22 Big Tam built the normal GCC 15 Meson `yuzu_server_tests` target from `580a0b8ba7` and exercised live PostgreSQL with the following commands. The database connection string was supplied via `YUZU_TEST_POSTGRES_DSN`.
 
 ```sh
@@ -102,3 +104,35 @@ meson test -C build-linux -j4 --suite server --print-errorlogs
 |---|---|---|---|
 | `580a0b8ba7` | 1 case, 40 assertions passed | 58 cases, 1,497 assertions passed | 26 passed, 0 failed, 5 Node-dependent entries skipped |
 | `4c6b286b68` | 2 cases, 74 assertions passed | 59 cases, 1,531 assertions passed | All 31 passed, zero failed or skipped, with Node available |
+
+
+**`d36086b147`.** No new resource. The trigger-shape fixtures reuse the existing test pool
+and RAII SQL helpers; the log-level, clamped SQL expression, and test assertions allocate no
+new persistent resource. On Big Tam the normal GCC 15 test binary passed all 59 store cases
+(1,569 assertions) and the full Meson server suite passed all 31 entries with no skips or
+failures.
+
+### Why the cache invalidates each affected set
+
+On 2026-11-22, an isolated PostgreSQL 16 scratch database compared ordinary cascading deletes
+with a statement-level trigger updating one shared UUID. Deleting 1,000 parent rows and their
+1,000,000 members took 236 ms without that trigger and 225 ms with it, in a single comparison.
+The statement trigger fired once. Rolling back a direct member delete restored both the UUID and
+the member. This established feasibility; a single run does not establish a speed improvement.
+
+A deterministic simulation then replayed 1,800 previews at one per second of four sets charged
+one MiB each under the 16 MiB FIFO budget. Per-set generations hit on 99.8% of previews.
+A global UUID with an unrelated member delete every 300, 30 or 5 seconds hit on 98.7%, 86.7%
+or 20.0% respectively. In an eviction-heavy sequence of eight reads (A, B, A, D, A, B, A, C,
+with D charged 15 MiB and A/B/C one MiB each), the four rates were 49.9%, 49.7%, 45.8%
+and 27.5%. Those rates are scenarios, with no production traffic measurement implied.
+A global epoch would also serialize unrelated delete transactions on one row. The packet
+retains targeted invalidation. Direct member edits with the same generation produce a stale
+warm read if invalidation is removed; the PostgreSQL suite exercises that invariant.
+
+The ability of alternately skewed sweepers to replace the shared anomaly facts was present at
+dev `cce353e10d`. Both versions use the replica system clock in production, persist the same
+anchor and compute the same anomaly before selecting deletion candidates. The packet's row
+budget only changes the later candidate selection. The existing clock-authority issue is
+[#2914](https://github.com/DevNullLtd/Yuzu/issues/2914). The new per-pass drain ceiling
+remains an open packet finding (`perf-12`).
