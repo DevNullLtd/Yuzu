@@ -35,6 +35,8 @@ flowchart LR
 
 What a result proves. A row proves the installation is registered in `mqinst.ini` under that name and path. When its `version` is not `-`, it also proves a product tag carrying that version was in the installation's `swidtag` directory; a `-` version means the directory was absent or unreadable or held no product tag (caveat 4), and the row then proves the registration only. Neither proves the product is running or intact. `supported` with zero rows means no registered installation was found at the places this plugin reads; it does not mean none is installed (caveat 1), and a `supported` answer can omit an installation whose `mqinst.ini` stanza was unusable, which only the agent's log records (caveat 3). `constrained` means a read failed or was refused, so the rows may be incomplete, and the installed-software sync sends a status-only section that leaves the stored IBM MQ rows in place, shown as unconfirmed (caveat 5); read the reason tokens before trusting a negative. For the packaged-application view use `installed_apps`.
 
+On Linux the middleware leg judges a path against the mount table before opening it. The network types come from the shared list in `agents/shared/network_fstype.hpp`, which also names `ncpfs`, `coda`, `smb2` and the network-backed FUSE clients `gcsfuse`, `goofys`, `blobfuse`, `blobfuse2`, `ossfs`, `obsfs`, `cosfs`, `juicefs`, `mfsmount`, `moosefs`, `lizardfs`, `seaweedfs`, `weed`, `curlftpfs`, `httpfs2`, `s3ql`, `onedrive`, `google-drive-ocamlfuse`, `davfs2` and `fuse-nfs` (a mount of those types is treated as a network mount); an unlisted FUSE subtype and a stacked filesystem over a network mount are not detected by this list.
+
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->

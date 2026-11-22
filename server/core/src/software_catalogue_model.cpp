@@ -598,6 +598,7 @@ nlohmann::json device_row_json(const SoftwareFleetRow& r) {
         {"distro_id", e.distro_id},
         {"distro_version", e.distro_version},
         {"source", e.source},
+        {"package_id", e.package_id},
     };
 }
 
@@ -632,7 +633,7 @@ std::string installs_csv(const std::vector<SoftwareFleetRow>& rows) {
         const auto& e = r.entry;
         append_row(out, {r.agent_id, e.name, e.version, e.publisher, e.install_date, e.kind,
                          e.ecosystem, e.epoch, e.release, e.arch, e.signature_status, e.distro_id,
-                         e.distro_version, e.source});
+                         e.distro_version, e.source, e.package_id});
     }
     return out;
 }

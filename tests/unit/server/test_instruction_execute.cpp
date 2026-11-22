@@ -3312,3 +3312,37 @@ TEST_CASE("REST execute: a different principal re-derived after the row is permi
     CHECK(r.core.audits[1].result == "failure");
     CHECK(r.core.audits[1].detail.find("reason=permission_revoked") != std::string::npos);
 }
+
+// sg10 / UP-1: a params key the agent would truncate is a 400 param_key_invalid before any approval,
+// execution row or dispatch, on the one core every execute surface shares.
+TEST_CASE("execute: a params key with a NUL or control byte is refused param_key_invalid",
+          "[instruction_execute][security][sg10]") {
+    Rig r;
+    r.defs["d"] = make_def("d", "ping", "always");
+    for (const std::string& key : {std::string("targets\0x", 9), std::string("a\tb")}) {
+        json params = json::object();
+        params[key] = "v";
+        auto out = run(r.request("d", json{{"params", params}}, make_caller("u", true)), r.ports(), r.audit());
+        const auto* ref = as_refusal(out);
+        REQUIRE(ref);
+        CHECK(ref->kind == RefusalKind::kBadRequest);
+        CHECK(ref->reason == "param_key_invalid");
+    }
+    json valnul = json::object();
+    valnul["k"] = std::string("v\0w", 3);
+    auto out = run(r.request("d", json{{"params", valnul}}, make_caller("u", true)), r.ports(), r.audit());
+    REQUIRE(as_refusal(out));
+    CHECK(as_refusal(out)->reason == "param_key_invalid");
+    CHECK(r.calls.empty());
+    CHECK(r.approvals.empty());
+    // Audited and counted (route label of the surface) like every sibling targeting refusal.
+    int denied = 0;
+    for (const auto& a : r.audits)
+        if (a.result == "denied" && a.detail.find("reason=param_key_invalid") != std::string::npos)
+            ++denied;
+    CHECK(denied == 3);
+    CHECK(r.counter("yuzu_server_dispatch_target_rejected_total",
+                    {{"route", "instruction_execute"}, {"reason", "param_key_invalid"}}) +
+              r.counter("yuzu_server_dispatch_target_rejected_total",
+                        {{"route", "mcp"}, {"reason", "param_key_invalid"}}) >= 1);
+}

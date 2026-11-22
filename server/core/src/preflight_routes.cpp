@@ -105,7 +105,7 @@ std::optional<std::int64_t> form_int(const httplib::Request& req, const char* ke
 
 /// nullopt when `min_gib` is present but malformed or negative, or when a version threshold
 /// (`app_min`, `app_max`, `os_min`) is non-empty and not a dotted-numeric version with an optional
-/// pre-release suffix (the caller answers 400). An EMPTY version field means "no threshold" (the
+/// pre-release suffix, or `volume` is a UNC/device spelling or holds a control byte (the caller answers 400). An EMPTY version field means "no threshold" (the
 /// form always submits it): a malformed one used to compare as version 0, so a floor of `abc`
 /// passed every device.
 std::optional<preflight::PreflightConfig> config_from_req(const httplib::Request& req) {
@@ -123,6 +123,8 @@ std::optional<preflight::PreflightConfig> config_from_req(const httplib::Request
         return std::nullopt;
     c.min_free_gib = *min_gib;
     c.volume = param(req, "volume");
+    if (!preflight::is_valid_volume(c.volume)) // UNC / device spelling: refused (400)
+        return std::nullopt;
     c.reboot_block = param(req, "reboot") != "warn"; // default block
     return c;
 }

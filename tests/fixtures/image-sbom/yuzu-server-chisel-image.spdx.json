@@ -1,0 +1,203 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "ghcr.io/devnullltd/yuzu-server-chisel",
+  "documentNamespace": "https://anchore.com/syft/image/ghcr.io/devnullltd/yuzu-server-chisel-b6fc0446-49b8-4d3b-95af-83a0d3308332",
+  "creationInfo": {
+    "licenseListVersion": "3.29",
+    "creators": [
+      "Organization: Anchore, Inc",
+      "Tool: syft-1.57.2"
+    ],
+    "created": "2026-11-18T00:29:10Z"
+  },
+  "packages": [
+    {
+      "name": "busybox",
+      "SPDXID": "SPDXRef-Package-deb-busybox-7f1f2a16ef6da4ee",
+      "versionInfo": "1:1.37.0-7ubuntu1",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "sourceInfo": "acquired package info from DPKG DB: /usr/bin/busybox",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceType": "cpe23Type",
+          "referenceLocator": "cpe:2.3:a:busybox:busybox:1\\:1.37.0-7ubuntu1:*:*:*:*:*:*:*"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:deb/ubuntu/busybox@1%3A1.37.0-7ubuntu1?distro=ubuntu"
+        }
+      ]
+    },
+    {
+      "name": "openssl",
+      "SPDXID": "SPDXRef-Package-deb-openssl-4cd1251aba1f0bdf",
+      "versionInfo": "3.5.5-1ubuntu3.6",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "sourceInfo": "acquired package info from DPKG DB: /usr/lib/x86_64-linux-gnu/engines-3/afalg.so, /usr/lib/x86_64-linux-gnu/engines-3/loader_attic.so, /usr/lib/x86_64-linux-gnu/libcrypto.so.3, /usr/lib/x86_64-linux-gnu/libssl.so.3, /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceType": "cpe23Type",
+          "referenceLocator": "cpe:2.3:a:openssl:openssl:3.5.5-1ubuntu3.6:*:*:*:*:*:*:*"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:deb/ubuntu/openssl@3.5.5-1ubuntu3.6?distro=ubuntu"
+        }
+      ]
+    },
+    {
+      "name": "ghcr.io/devnullltd/yuzu-server-chisel",
+      "SPDXID": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-server-chisel",
+      "versionInfo": "0.14.0",
+      "supplier": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": true,
+      "packageVerificationCode": {
+        "packageVerificationCodeValue": "4f9331e39c4a881c06abaa5bb916d5edffbe4770"
+      },
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "b67d82571e0fea3a34f8f0861066a2c27dfbf8985bf167e13d575cd4652afb8e"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:oci/ghcr.io%2Fdevnullltd%2Fyuzu-server-chisel@sha256%3Ab67d82571e0fea3a34f8f0861066a2c27dfbf8985bf167e13d575cd4652afb8e?arch=amd64&tag=0.14.0"
+        }
+      ],
+      "primaryPackagePurpose": "CONTAINER"
+    }
+  ],
+  "files": [
+    {
+      "fileName": "usr/bin/busybox",
+      "SPDXID": "SPDXRef-File-usr-bin-busybox-89f4eacda31a6230",
+      "fileTypes": [
+        "APPLICATION",
+        "BINARY"
+      ],
+      "checksums": [
+        {
+          "algorithm": "SHA1",
+          "checksumValue": "50a12b9f0469725569569e621af5b7b610ed4668"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "df12634c17fcdca839ae5dc47d7627b7558511f7645de7c99ccf097a0f28ed5b"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "licenseInfoInFiles": [
+        "NOASSERTION"
+      ],
+      "copyrightText": "NOASSERTION",
+      "comment": "layerID: sha256:ba1616b90bf9f4797edd4e1d47fe98fb8cc46607320679dc849a03d9e2bcf28d"
+    },
+    {
+      "fileName": "usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+      "SPDXID": "SPDXRef-File-...lib-x86-64-linux-gnu-libcrypto.so.3-2c759f0960ab4fad",
+      "fileTypes": [
+        "APPLICATION",
+        "BINARY"
+      ],
+      "checksums": [
+        {
+          "algorithm": "SHA1",
+          "checksumValue": "561dffafe35b991dbc91ec168e11173687b967fd"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "dcce5a26377117c295c05a3c85261749e02cab31e0fb517a0f505a957ca49f4e"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "licenseInfoInFiles": [
+        "NOASSERTION"
+      ],
+      "copyrightText": "NOASSERTION",
+      "comment": "layerID: sha256:ba1616b90bf9f4797edd4e1d47fe98fb8cc46607320679dc849a03d9e2bcf28d"
+    },
+    {
+      "fileName": "usr/local/bin/yuzu-server",
+      "SPDXID": "SPDXRef-File-usr-local-bin-yuzu-server-32e2cfeb0cef6afc",
+      "checksums": [
+        {
+          "algorithm": "SHA1",
+          "checksumValue": "0000000000000000000000000000000000000000"
+        }
+      ],
+      "licenseConcluded": "NOASSERTION",
+      "licenseInfoInFiles": [
+        "NOASSERTION"
+      ],
+      "copyrightText": "NOASSERTION",
+      "comment": "layerID: sha256:ba1616b90bf9f4797edd4e1d47fe98fb8cc46607320679dc849a03d9e2bcf28d"
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-Package-deb-openssl-4cd1251aba1f0bdf",
+      "relatedSpdxElement": "SPDXRef-File-...lib-x86-64-linux-gnu-libcrypto.so.3-2c759f0960ab4fad",
+      "relationshipType": "OTHER",
+      "comment": "evident-by: indicates the package's existence is evident by the given file"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-deb-busybox-7f1f2a16ef6da4ee",
+      "relatedSpdxElement": "SPDXRef-File-usr-bin-busybox-89f4eacda31a6230",
+      "relationshipType": "OTHER",
+      "comment": "evident-by: indicates the package's existence is evident by the given file"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-server-chisel",
+      "relatedSpdxElement": "SPDXRef-Package-deb-busybox-7f1f2a16ef6da4ee",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-server-chisel",
+      "relatedSpdxElement": "SPDXRef-Package-deb-openssl-4cd1251aba1f0bdf",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-server-chisel",
+      "relatedSpdxElement": "SPDXRef-File-usr-bin-busybox-89f4eacda31a6230",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-server-chisel",
+      "relatedSpdxElement": "SPDXRef-File-...lib-x86-64-linux-gnu-libcrypto.so.3-2c759f0960ab4fad",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-server-chisel",
+      "relatedSpdxElement": "SPDXRef-File-usr-local-bin-yuzu-server-32e2cfeb0cef6afc",
+      "relationshipType": "CONTAINS"
+    },
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relatedSpdxElement": "SPDXRef-DocumentRoot-Image-ghcr.io-devnullltd-yuzu-server-chisel",
+      "relationshipType": "DESCRIBES"
+    }
+  ]
+}

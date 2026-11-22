@@ -166,8 +166,8 @@ struct ResultSet {
     std::string source_execution_id;      // set for async producers; else empty
     std::string matcher;                  // JSON matcher for instruction-result; else empty
     int64_t device_count{0};
-    /// Agents absent from the membership because their query failed (they answered at least once
-    /// with a failure: status not success, or output starting `error|`), not because they do not
+    /// Agents absent from the membership because their query failed or was only partly done (the
+    /// causes are listed once, on `ResultSetMembers::agents_failed`), not because they do not
     /// match. Async producers add the count from their own execution at fill time. A child created
     /// from a parent's members also carries the parent's count from creation (`inherit_completeness`),
     /// so along a lineage the value is a SUM over the chain, not "failed in this execution": only

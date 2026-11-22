@@ -7,6 +7,7 @@
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
+#include "mgmt_group_limits.hpp" // mgmt_group_id_ok -- the usage fragment's group-id rule (as REST)
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
                                      // X-Correlation-Id so header and body always agree
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
@@ -15,8 +16,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <chrono>
-#include <cmath>
 #include <ctime>
 #include <format>
 #include <string>
@@ -2089,83 +2088,6 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& r) {
 
 namespace {
 
-// The canned per-device warehouse query — last 48 hourly rollups, reversed to
-// chronological at parse. `$Perf_Hourly` is the operator-SQL dollar name; the
-// agent translates it and runs it through EchoDatabase::execute_user_query (the
-// read-only authorizer chokepoint, #760/#631), exactly like operator SQL from
-// the Echo page. The raw samples never leave the device until this on-demand,
-// per-device, permission-gated query (ADR-0004 federated model).
-constexpr const char* kDexPerfSql =
-    "SELECT hour_ts, cpu_avg, mem_avg, read_lat_us_avg, write_lat_us_avg "
-    "FROM $Perf_Hourly ORDER BY hour_ts DESC LIMIT 48";
-
-// PR2: the canned per-app query (A2 `$ProcPerf_Hourly` tier) — last 24 h
-// aggregated per application, top 25 by sample-weighted CPU. Runs through the
-// same read-only authorizer chokepoint (aggregate functions are permitted;
-// #760/#631). The epoch cutoff is computed server-side and embedded as a
-// literal — no SQL date functions, no user input. AS aliases pin the schema
-// line names the parser locates columns by.
-std::string dex_procperf_sql() {
-    const auto cutoff = std::chrono::duration_cast<std::chrono::seconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count() -
-                        86400;
-    return std::format(
-        // COUNT(DISTINCT hour_ts), not COUNT(*): the rollup now keys on
-        // (hour, name, version), so one app can have >1 row per hour during an
-        // in-place version change. "Hours seen" must count distinct hourly windows,
-        // not (hour x version) tuples, or it over-counts across a version flip.
-        "SELECT name, SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
-        "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
-        "CAST(SUM(ws_avg_bytes*samples)/SUM(samples) AS INTEGER) AS ws_avg, "
-        "MAX(ws_max_bytes) AS ws_max, COUNT(DISTINCT hour_ts) AS hours "
-        "FROM $ProcPerf_Hourly WHERE hour_ts >= {} "
-        "GROUP BY name ORDER BY cpu_avg DESC LIMIT 25",
-        cutoff);
-}
-
-std::vector<std::string> split_pipe(const std::string& line) {
-    std::vector<std::string> out;
-    std::size_t pos = 0;
-    while (true) {
-        const auto bar = line.find('|', pos);
-        if (bar == std::string::npos) {
-            out.push_back(line.substr(pos));
-            return out;
-        }
-        out.push_back(line.substr(pos, bar - pos));
-        pos = bar + 1;
-    }
-}
-
-// One finite, non-negative double out of an agent-supplied cell; nullopt on
-// garbage so the whole row is skipped (a forged cell must not render).
-//
-// Bounded above by kMaxSaneCell (1e15): every consumer either renders the
-// value or casts it to int64_t, and a finite-but-huge double (1e30) makes the
-// float→int conversion UNDEFINED BEHAVIOR per [conv.fpint] — remote-agent-
-// controlled UB (governance G3 BLOCKING, cpp-safety + cpp-expert consensus).
-// 1e15 comfortably covers every legitimate cell (epoch seconds, sample
-// counts, working-set bytes up to ~1 PB) and is exactly representable.
-//
-// Full-token parse: stod("42.5xyz") returns 42.5 and stod is LC_NUMERIC-
-// sensitive; requiring pos == size() rejects trailing garbage AND turns a
-// comma-decimal-locale mis-parse of "42.5" into a rejection instead of a
-// silent value distortion (G3 cpp-expert). libc++ on Apple Clang has no FP
-// from_chars, so stod+pos is the portable form.
-std::optional<double> cell_double(const std::string& s) {
-    constexpr double kMaxSaneCell = 1.0e15;
-    if (s.empty() || s.size() > 32)
-        return std::nullopt;
-    try {
-        std::size_t pos = 0;
-        const double v = std::stod(s, &pos);
-        if (pos == s.size() && std::isfinite(v) && v >= 0.0 && v <= kMaxSaneCell)
-            return v;
-    } catch (...) {}
-    return std::nullopt;
-}
-
 // Inline sparkline SVG (server-rendered, CSP-safe, no JS). Y auto-scales to the
 // series range; a flat series draws a midline. Emits only formatted numbers —
 // markup-safe by construction.
@@ -2198,146 +2120,6 @@ std::string sparkline_svg(const std::vector<double>& in_vals, const char* stroke
 }
 
 } // namespace
-
-std::vector<DexPerfPoint> parse_dex_perf_output(const std::string& output) {
-    std::vector<DexPerfPoint> out;
-    // Column indices into DATA rows, located by name from the __schema__ line
-    // (schema cell i names data cell i-1 — the "__schema__" marker is cell 0).
-    int col_ts = -1, col_cpu = -1, col_mem = -1, col_rlat = -1, col_wlat = -1;
-    bool have_schema = false;
-    std::size_t pos = 0;
-    int rows = 0;
-    while (pos < output.size() && rows < 200) {
-        const auto nl = output.find('\n', pos);
-        std::string line =
-            output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
-        pos = (nl == std::string::npos) ? output.size() : nl + 1;
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (line.empty())
-            continue;
-        if (!have_schema) {
-            if (line.starts_with("error|"))
-                return out; // agent-side error payload — nothing to parse
-            if (!line.starts_with("__schema__|"))
-                continue;
-            const auto cols = split_pipe(line);
-            for (int i = 1; i < static_cast<int>(cols.size()); ++i) {
-                if (cols[i] == "hour_ts") col_ts = i - 1;
-                else if (cols[i] == "cpu_avg") col_cpu = i - 1;
-                else if (cols[i] == "mem_avg") col_mem = i - 1;
-                else if (cols[i] == "read_lat_us_avg") col_rlat = i - 1;
-                else if (cols[i] == "write_lat_us_avg") col_wlat = i - 1;
-            }
-            if (col_ts < 0 || col_cpu < 0 || col_mem < 0 || col_rlat < 0 || col_wlat < 0)
-                return out; // wrong shape — refuse rather than guess
-            have_schema = true;
-            continue;
-        }
-        const auto cells = split_pipe(line);
-        const int need = (std::max)({col_ts, col_cpu, col_mem, col_rlat, col_wlat});
-        if (static_cast<int>(cells.size()) <= need)
-            continue; // trailer ("total|N") or a torn row
-        const auto ts = cell_double(cells[static_cast<std::size_t>(col_ts)]);
-        const auto cpu = cell_double(cells[static_cast<std::size_t>(col_cpu)]);
-        const auto mem = cell_double(cells[static_cast<std::size_t>(col_mem)]);
-        const auto rl = cell_double(cells[static_cast<std::size_t>(col_rlat)]);
-        const auto wl = cell_double(cells[static_cast<std::size_t>(col_wlat)]);
-        if (!ts || !cpu || !mem || !rl || !wl)
-            continue;
-        ++rows;
-        DexPerfPoint p;
-        p.hour_ts = static_cast<std::int64_t>(*ts);
-        p.cpu_avg = std::clamp(*cpu, 0.0, 100.0);
-        p.mem_avg = std::clamp(*mem, 0.0, 100.0);
-        // Worse of read/write avg per-IO service time, µs → ms. Clamped to a
-        // sane ceiling (1000 ms/IO is already pathological): the SVG y-axis
-        // auto-scales to the series range, so a single forged agent row of
-        // 1e9 µs would otherwise crush every real point to an invisible flat
-        // line (gov quality-engineer B1).
-        p.disk_lat_ms = std::clamp((std::max)(*rl, *wl) / 1000.0, 0.0, 1000.0);
-        out.push_back(p);
-    }
-    std::sort(out.begin(), out.end(),
-              [](const DexPerfPoint& a, const DexPerfPoint& b) { return a.hour_ts < b.hour_ts; });
-    return out;
-}
-
-std::vector<DexProcPerfRow> parse_dex_procperf_output(const std::string& output) {
-    std::vector<DexProcPerfRow> out;
-    // Same defensive contract as parse_dex_perf_output: columns by NAME from
-    // the __schema__ line (schema cell i names data cell i-1), per-field
-    // validation, malformed rows skipped, bounded row count.
-    int col_name = -1, col_samples = -1, col_inst = -1, col_cpu_avg = -1, col_cpu_max = -1,
-        col_ws_avg = -1, col_ws_max = -1, col_hours = -1;
-    bool have_schema = false;
-    std::size_t pos = 0;
-    int rows = 0;
-    constexpr double kMaxSaneWsBytes = 1.125899906842624e15; // 1 PiB — beyond absurd
-    while (pos < output.size() && rows < 100) {
-        const auto nl = output.find('\n', pos);
-        std::string line =
-            output.substr(pos, (nl == std::string::npos ? output.size() : nl) - pos);
-        pos = (nl == std::string::npos) ? output.size() : nl + 1;
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (line.empty())
-            continue;
-        if (!have_schema) {
-            if (line.starts_with("error|"))
-                return out; // agent-side error payload — nothing to parse
-            if (!line.starts_with("__schema__|"))
-                continue;
-            const auto cols = split_pipe(line);
-            for (int i = 1; i < static_cast<int>(cols.size()); ++i) {
-                if (cols[i] == "name") col_name = i - 1;
-                else if (cols[i] == "samples") col_samples = i - 1;
-                else if (cols[i] == "instances_max") col_inst = i - 1;
-                else if (cols[i] == "cpu_avg") col_cpu_avg = i - 1;
-                else if (cols[i] == "cpu_max") col_cpu_max = i - 1;
-                else if (cols[i] == "ws_avg") col_ws_avg = i - 1;
-                else if (cols[i] == "ws_max") col_ws_max = i - 1;
-                else if (cols[i] == "hours") col_hours = i - 1;
-            }
-            if (col_name < 0 || col_samples < 0 || col_inst < 0 || col_cpu_avg < 0 ||
-                col_cpu_max < 0 || col_ws_avg < 0 || col_ws_max < 0 || col_hours < 0)
-                return out; // wrong shape — refuse rather than guess
-            have_schema = true;
-            continue;
-        }
-        const auto cells = split_pipe(line);
-        const int need = (std::max)({col_name, col_samples, col_inst, col_cpu_avg, col_cpu_max,
-                                     col_ws_avg, col_ws_max, col_hours});
-        if (static_cast<int>(cells.size()) <= need)
-            continue; // trailer ("total|N") or a torn row
-        const auto& name = cells[static_cast<std::size_t>(col_name)];
-        if (name.empty() || name.size() > 256)
-            continue; // a forged/torn name cell must not render
-        const auto samples = cell_double(cells[static_cast<std::size_t>(col_samples)]);
-        const auto inst = cell_double(cells[static_cast<std::size_t>(col_inst)]);
-        const auto cpu_avg = cell_double(cells[static_cast<std::size_t>(col_cpu_avg)]);
-        const auto cpu_max = cell_double(cells[static_cast<std::size_t>(col_cpu_max)]);
-        const auto ws_avg = cell_double(cells[static_cast<std::size_t>(col_ws_avg)]);
-        const auto ws_max = cell_double(cells[static_cast<std::size_t>(col_ws_max)]);
-        const auto hours = cell_double(cells[static_cast<std::size_t>(col_hours)]);
-        if (!samples || !inst || !cpu_avg || !cpu_max || !ws_avg || !ws_max || !hours)
-            continue;
-        if (*ws_avg > kMaxSaneWsBytes || *ws_max > kMaxSaneWsBytes)
-            continue; // forged working-set claim — reject the row
-        ++rows;
-        DexProcPerfRow r;
-        r.name = name;
-        r.samples = static_cast<std::int64_t>(*samples);
-        r.instances_max = static_cast<std::int64_t>(*inst);
-        r.cpu_avg = std::clamp(*cpu_avg, 0.0, 100.0); // a >100% share is a lie
-        r.cpu_max = std::clamp(*cpu_max, 0.0, 100.0);
-        r.ws_avg_bytes = *ws_avg;
-        r.ws_max_bytes = *ws_max;
-        r.hours = static_cast<std::int64_t>(*hours);
-        out.push_back(std::move(r));
-    }
-    return out;
-}
 
 std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
     if (points.empty())
@@ -2503,26 +2285,21 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     });
 
     // -- Applications: the app-centric DEX lens (stability by app) --
-    sink.Get("/fragments/dex/apps", [this](const httplib::Request& req, httplib::Response& res) {
-        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
-            return;
-        // Canonical window and platform only: the raw params never reach the API or the markup.
-        // A model-level failure is a 200 with an error panel (htmx drops a non-2xx body); a denied
-        // permission keeps perm_fn_'s status.
-        const int window_days =
-            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        const std::string scope = dex_normalize_apps_scope(
-            req.has_param("platform") ? req.get_param_value("platform") : kDexAppsScopeAll);
-        // Nothing escapes this handler: a throwing DexApi or renderer still answers 200 with a
-        // visible panel (htmx drops a 5xx body, which would leave the pane blank), and the cause is
-        // logged once per interval, never once per request.
+    //
+    // The Apps page body, shared by the Stability route and by the usage route for a caller who may
+    // not read usage (that caller gets this page plus one line of words). Nothing escapes it: a
+    // throwing DexApi or renderer still answers a visible panel (htmx drops a 5xx body, which would
+    // leave the pane blank), and the cause is logged once per interval, never once per request.
+    // `entry` is what the page offers for the Usage view.
+    const auto apps_page = [this](int window_days, const std::string& scope,
+                                  DexAppsUsageEntry entry) -> std::string {
         const auto fail = [&](const char* reason, const std::string& what) {
             if (apps_error_log_.should_warn(reason))
                 spdlog::error("GET /fragments/dex/apps: {} ({})", ::yuzu::log_key_token(what), reason);
             DexAppsModel m;
             m.degraded = true;
             m.degraded_reason = reason;
-            return render_dex_apps_fragment(m, window_days, scope);
+            return render_dex_apps_fragment(m, window_days, scope, entry);
         };
         std::string html;
         try {
@@ -2536,14 +2313,176 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                 } else {
                     model = dex_api_->apps(dex_window_token(window_days), scope);
                 }
-                html = render_dex_apps_fragment(model, window_days, scope);
+                html = render_dex_apps_fragment(model, window_days, scope, entry);
             }
         } catch (const std::exception& e) {
             html = fail("internal_error", e.what());
         } catch (...) {
             html = fail("internal_error", "unknown exception");
         }
-        res.set_content(html, "text/html; charset=utf-8");
+        return html;
+    };
+
+    sink.Get("/fragments/dex/apps", [this, apps_page](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        // Canonical window and platform only: the raw params never reach the API or the markup.
+        // A model-level failure is a 200 with an error panel (htmx drops a non-2xx body); a denied
+        // permission keeps perm_fn_'s status.
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        const std::string scope = dex_normalize_apps_scope(
+            req.has_param("platform") ? req.get_param_value("platform") : kDexAppsScopeAll);
+        res.set_content(apps_page(window_days, scope, DexAppsUsageEntry::Offered),
+                        "text/html; charset=utf-8");
+    });
+
+    // -- Applications, Usage view: fleet application usage and the exposure rate --
+    //
+    // The second view of the Apps tab, over the SAME DexAppsUsageModel that GET
+    // /api/v1/dex/apps/usage serializes, read in-process through DexApi::apps_usage (no HTTP call),
+    // so the page and the payload cannot disagree. The seam supplies the 30-second answer cache and
+    // the read budget; the read is stateless and idempotent, and a refusal is never cached.
+    //
+    // Gates, in the REST route's order:
+    //  1. GuaranteedState:Read through perm_fn_ with the real response, as the Apps tab does.
+    //  2. Forensics:Read through fleet_read_fn_ against a THROWAWAY response: htmx drops a 4xx/5xx
+    //     body, so the gate's own answer is never forwarded and this route stays at 200. A refused
+    //     caller (403) gets the Stability page plus one line of words, any other failure or an
+    //     unwired gate the same page plus "the permission check could not be completed". The gate
+    //     still writes its own denial row, as it does for REST. gate.scope is the caller's visible
+    //     devices and is passed to apps_usage, which reads only those for the usage figures; the
+    //     application list (the Apps row set) is built from the unfiltered fleet snapshot, as
+    //     docs/dex/app-usage.md states.
+    //
+    // Audit: one dex.apps.usage.view row (the verb REST writes; target type Forensics, detail
+    // starting "dashboard") per view that passes its parameter checks, written BEFORE the read and
+    // FAIL CLOSED: when the row is known not to have persisted nothing is read and a words panel is
+    // drawn, still at status 200 so htmx swaps it. This is stricter than the other DEX fragments in
+    // this file, which set the audit and proceed on a failure ((void) emit_behavioral_audit); the
+    // fail-closed precedents are device_data_routes.cpp and app_usage_routes.cpp, because this one
+    // serves Forensics-tier data. The row records the admitted request, not the outcome: a refusal
+    // by the API still leaves it, as for REST. A bad parameter writes no row and reads nothing.
+    //
+    // Parameters follow REST (rest_api_v1.cpp, /api/v1/dex/apps/usage): platform, slice, group and
+    // tag_key are checked as REST checks them, including that `group` is refused outside slice=group
+    // and `tag_key` outside slice=tag. Two page conventions differ on purpose: an unknown `window`
+    // reads as 7d, as on every DEX tab (the lit chip and the audit row show the window in force;
+    // REST answers 400), and `floor` is not read (the page always reads at the default floor and
+    // prints it; REST accepts it). A stray value is never copied into the controls, the audit row
+    // or the markup.
+    sink.Get("/fragments/dex/apps/usage", [this, apps_page](const httplib::Request& req,
+                                                            httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        const std::string window = dex_window_token(window_days);
+        const std::string scope = dex_normalize_apps_scope(
+            req.has_param("platform") ? req.get_param_value("platform") : kDexAppsScopeAll);
+
+        if (!fleet_read_fn_) {
+            res.set_content(apps_page(window_days, scope, DexAppsUsageEntry::GateUnavailable),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        httplib::Response probe; // throwaway: never forwarded (htmx drops a 4xx/5xx body)
+        const authz::FleetReadGate gate = fleet_read_fn_(req, probe, "Forensics", "Read");
+        if (!gate.admitted) {
+            res.set_content(apps_page(window_days, scope,
+                                      probe.status == 403 ? DexAppsUsageEntry::Refused
+                                                          : DexAppsUsageEntry::GateUnavailable),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        DexAppsUsageControls controls;
+        controls.window_days = window_days;
+        controls.platform = scope;
+        const auto answer = [&res](const std::string& html) {
+            res.set_content(html, "text/html; charset=utf-8");
+        };
+        const auto refuse = [&](std::string_view reason, std::string_view detail) {
+            answer(render_dex_apps_usage_refusal(controls, reason, detail));
+        };
+        try {
+            if (group_list_fn_)
+                controls.groups = group_list_fn_();
+
+            // Parameter checks, in REST's order. Each is a words panel with no audit row and no read.
+            if (scope.empty()) {
+                refuse("invalid_scope", "");
+                return;
+            }
+            const std::string slice_text =
+                req.has_param("slice") ? req.get_param_value("slice") : std::string("fleet");
+            const auto parsed_kind = dex_usage_slice_kind_from_token(slice_text);
+            if (!parsed_kind) {
+                refuse("invalid_slice", ""); // the controls fall back to the whole fleet
+                return;
+            }
+            // The controls hold the slice from here on: the kind now (so a refusal below draws the
+            // right chip), the key only once it validates (a rejected value is never placed in them).
+            controls.slice.kind = *parsed_kind;
+            if (req.has_param("group") && controls.slice.kind != DexUsageSliceKind::Group) {
+                refuse("invalid_slice", "group_outside_slice");
+                return;
+            }
+            if (req.has_param("tag_key") && controls.slice.kind != DexUsageSliceKind::Tag) {
+                refuse("invalid_slice", "tag_key_outside_slice");
+                return;
+            }
+            if (controls.slice.kind == DexUsageSliceKind::Group) {
+                const std::string id = req.has_param("group") ? req.get_param_value("group") : std::string();
+                if (id.empty() || !mgmt_group_id_ok(id)) {
+                    refuse("invalid_slice", "no_group");
+                    return;
+                }
+                controls.slice.key = id;
+            } else if (controls.slice.kind == DexUsageSliceKind::Tag) {
+                const std::string key =
+                    req.has_param("tag_key") ? req.get_param_value("tag_key") : std::string(kDexDefaultCohortKey);
+                if (!valid_tag_key(key)) {
+                    refuse("invalid_slice", "invalid_tag_key"); // the controls keep the default key
+                    return;
+                }
+                controls.slice.key = key;
+            }
+
+            if (!dex_api_) {
+                if (apps_error_log_.should_warn("usage_not_wired"))
+                    spdlog::error("GET /fragments/dex/apps/usage: no DexApi is wired for the Usage view");
+                refuse("usage_unavailable", "not_wired");
+                return;
+            }
+
+            const auto cid = detail::make_correlation_id();
+            if (!detail::emit_behavioral_audit(audit_fn_, req, res, "dex.apps.usage.view", "success", "Forensics",
+                                               "",
+                                               "dashboard DEX fleet application usage read cid=" + cid +
+                                                   " window=" + window + " platform=" + scope +
+                                                   " slice=" + dex_usage_slice_token(controls.slice.kind) +
+                                                   " key=" + audit_token(controls.slice.key) +
+                                                   " floor=" + std::to_string(kDexCohortFloor))) {
+                spdlog::warn("dex.apps.usage.view audit fail-closed (usage not read) cid={}", cid);
+                refuse("audit_unavailable", "");
+                return;
+            }
+
+            const auto r = dex_api_->apps_usage(window, scope, controls.slice, kDexCohortFloor, gate.scope);
+            if (r)
+                answer(render_dex_apps_usage_fragment(controls, *r));
+            else
+                refuse(r.error().reason, r.error().detail);
+        } catch (const std::exception& e) {
+            if (apps_error_log_.should_warn("usage_internal_error"))
+                spdlog::error("GET /fragments/dex/apps/usage: {} (internal_error)", ::yuzu::log_key_token(e.what()));
+            refuse("internal_error", "");
+        } catch (...) {
+            if (apps_error_log_.should_warn("usage_internal_error"))
+                spdlog::error("GET /fragments/dex/apps/usage: unknown exception (internal_error)");
+            refuse("internal_error", "");
+        }
     });
 
     // -- Catalogue: family-card grid (View 1) + a family's signals (View 2) --
