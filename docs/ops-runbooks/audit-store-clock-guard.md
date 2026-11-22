@@ -156,6 +156,8 @@ ORDER BY a.timestamp;
 
 For an Echo purge the outcome row is the dispatch result of the SERVER (`success`, or a `failure` with the reason); what the device then did (rows deleted, `source_not_paused`) is in the command's response record, so confirm a purge on the device itself, not from these rows.
 
+The REST purge (`POST /api/v1/echo/retention-paused/purge`) is audit-first too, but it writes a `requested` row, not `attempted`, so the query above does not list it. When it refuses after that row, its `failure` row ends in the same ` cid=<id>`: `store_unavailable store=<mgmt_group_store|rbac_store> device=<id> source=<src> cid=<id>` when the refusal was a failed authorization read (an outage), `permission_revoked device=<id> source=<src> cid=<id>` when the grant or session was withdrawn. A REST purge that dispatched writes no outcome row, so a `requested` row on its own does not mean the purge was refused.
+
 An `attempted` row with no outcome row can mean the outcome row was lost, **or that the mutation itself failed**. They are not independent: the audit store and the management-group store share one connection pool, so pool exhaustion that fails `create_group` is likely to lose its `create_failed` row as well. Check the group (or the device) before concluding either way. An `attempted` row alone is evidence that the action was reached, never that it ran.
 
 **If behavioural-data routes are returning 503 but this counter is FLAT**, look

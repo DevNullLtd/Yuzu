@@ -454,7 +454,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
             "ambiguous / anonymous_operator / forbidden / approval_required / kill_switched).",
             "counter");
         // yuzu_echo_source_reenable_total / yuzu_echo_source_purge_total: described and every
-        // {result, surface} series created at 0 by the shared Echo action rules.
+        // {result, surface} series created at 0 by the shared Echo action rules. This one call
+        // also describes and seeds the REST purge's surface="rest" series: RestApiV1 writes
+        // them but never describes or seeds them, so this call must keep running on the
+        // registry REST uses (server.cpp passes the one registry to both).
         echo_source::describe_and_seed(*metrics_);
     }
 

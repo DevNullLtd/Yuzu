@@ -4720,7 +4720,7 @@ void RestApiV1::register_routes(
                 bump(echo_source::refusal_result(recheck, true));
                 return;
             }
-            // #1788 defense-in-depth: `scoped_perm_fn` above is the PRIMARY gate
+            // #1788 defense-in-depth: `scoped_gate_fn` above is the PRIMARY gate
             // and has already authorized this exact device_id, so the seam's
             // intersection is a second, independent check rather than the thing
             // standing between this caller and the fleet.
@@ -4752,7 +4752,7 @@ void RestApiV1::register_routes(
                 // being indistinguishable is deliberate — a distinct status
                 // would disclose that a device exists but is out of reach. The
                 // METRIC is a known small imprecision, and the path is only
-                // reachable at all if scoped_perm_fn and the derived set
+                // reachable at all if scoped_gate_fn and the derived set
                 // disagree about this device, which is itself a bug.
                 // #881: this can also mean the device is QUARANTINED — a
                 // permanent policy denial, not a transient reachability
