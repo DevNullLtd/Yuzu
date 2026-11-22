@@ -1118,10 +1118,11 @@ private:
     bool refuse_open_transaction_locked(const char* what) const;
 
     // ATOMIC because it is written at RUNTIME, not only at open/close: the
-    // wedged-rollback paths (execute_atomic_batch and checked_transaction) null it
-    // under mu_ while is_open() reads it WITHOUT mu_ from other threads (do_status
-    // runs on the command-dispatch thread and the slow collect tick reconciles the
-    // offline tag, the wedge on the rollup thread). Before that
+    // wedged-rollback paths null it under mu_ -- execute_atomic_batch, checked_transaction and
+    // rollback_open_transaction, the last of which runs a plain ROLLBACK that is not behind the
+    // OpenSeams::rollback seam, so no test can force that close -- while is_open() reads it
+    // WITHOUT mu_ from other threads (do_status runs on the command-dispatch thread and the slow
+    // collect tick reconciles the offline tag, the wedge on the rollup thread). Before that
     // runtime write existed the unlocked read was benign; adding it made this a
     // data race (#2361 governance Gate 2).
     //

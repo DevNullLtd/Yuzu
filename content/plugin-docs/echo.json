@@ -2941,6 +2941,7 @@
       "tests/test_echo_mapdrive_pin_lexical.py",
       "tests/test_echo_scrub_wiring_lexical.py",
       "tests/test_echo_security_wiring_lexical.py",
+      "tests/test_echo_storage_offline_reconcile_lexical.py",
       "tests/test_echo_test_standard_lexical.py",
       "tests/test_echo_timeline_script_behaviour.py",
       "tests/unit/server/test_echo_process_tree.cpp",

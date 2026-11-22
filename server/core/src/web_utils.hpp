@@ -101,7 +101,7 @@ inline std::string json_escape(std::string_view in) {
 /// the RAW output is wrong in both directions. Too small and it cuts the
 /// operator's recovery instruction mid-sentence; too large and it runs past the
 /// newline and renders the head of the NEXT record as debris -- `echo status`'s
-/// offline reply is `error|...` followed by `storage_state|offline`, and a
+/// offline reply is `error|...` followed by `storage_state|offline|rollback_wedged`, and a
 /// 300-byte window ends in a trailing `storage_stat`. Bounding the FIRST LINE is
 /// the property that holds whatever the message length becomes.
 ///

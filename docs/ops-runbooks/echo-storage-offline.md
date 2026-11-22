@@ -12,9 +12,10 @@ Background: `docs/user-manual/echo.md` "The retention clock guard", issue #2361.
 > - **Wedged rollback** (`storage_state|offline|rollback_wedged`, the rest of this runbook). The
 >   database opened and collected, then was closed at run time after a rollback failed. It is not
 >   retried: only an agent restart recovers. The tag appears at the next slow collect tick after the
->   close (well inside the alert's 30-minute hold), and it is cleared the same way once the agent
->   has restarted with a healthy database. The device's own `echo status` and its Capture-sources
->   frame show the same state.
+>   close (the tick period is `slow_interval_seconds`, 300 seconds by default, so within five minutes
+>   unless an operator changed it; the alert then holds 30 minutes from the tag), and it is cleared
+>   the same way once the agent has restarted with a healthy database. The device's own `echo status`
+>   and its Capture-sources frame show the same state.
 
 ## Offline at open: the agent retries
 

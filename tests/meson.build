@@ -4516,6 +4516,18 @@ test('Echo scrub-wiring lexical gate (WP07)',
   timeout: 30,
 )
 
+# #8099: lexical pin over echo_plugin.cpp's do_collect_slow -- the slow-tick reconcile that
+# publishes the rollback_wedged storage-offline tag or clears a stale one. The decision and the
+# store seam have unit tests; EchoPlugin is TU-local, so the shell that calls the decision and does
+# the storage_set / storage_delete is reachable by none. Carries its own in-memory mutation
+# self-test. Source text only, so Python, no build needed.
+test('Echo storage-offline reconcile wiring lexical gate (#8099)',
+  _python3_test,
+  args: [files('test_echo_storage_offline_reconcile_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # WP07: lexical pins for the agent's output-dropped counter increment and the server's boot call to
 # pg::report_server_encoding (neither is reachable from a unit test). Source text only.
 test('WP07 metrics wiring lexical gate',
