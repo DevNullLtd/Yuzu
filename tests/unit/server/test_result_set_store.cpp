@@ -1179,6 +1179,25 @@ TEST_CASE("ResultSetStore: a GC sweep cascading many member rows succeeds under 
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     if (!role_is_superuser(db.dsn()))
         SKIP("temp_file_limit needs a superuser test role");
+    // Seed without the limits (the bulk INSERT's own re-stamp needs temp space), then set them on
+    // the database and open a fresh pool, so every connection the sweep can use carries them.
+    std::string live_id;
+    {
+        PgPool seed_pool{{.conninfo = db.dsn(), .size = 1}};
+        ResultSetStore seed{seed_pool};
+        REQUIRE(seed.is_open());
+        auto live = seed.create_materialized(req("alice", "fresh-tfl"), {"y"});
+        REQUIRE(live.has_value());
+        live_id = live->id;
+    }
+    exec_sql(db.dsn(), "INSERT INTO result_set_store.result_sets "
+                       "(id, owner_principal, created_at, ttl_at, last_used_at, source_kind, "
+                       "source_payload, membership_generation) "
+                       "SELECT 'rs_tflbulk' || g, 'alice', 1, 2, 1, 'manual_curate', '{}', "
+                       "gen_random_uuid() FROM generate_series(1, 4) AS g; "
+                       "INSERT INTO result_set_store.result_set_members "
+                       "SELECT 'rs_tflbulk' || g, 'dev-' || d FROM generate_series(1, 4) AS g, "
+                       "generate_series(1, 10000) AS d");
     exec_sql(db.dsn(),
              "DO $$ BEGIN "
              "EXECUTE format('ALTER DATABASE %I SET temp_file_limit = ''64kB''', "
@@ -1187,24 +1206,26 @@ TEST_CASE("ResultSetStore: a GC sweep cascading many member rows succeeds under 
              "END $$");
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
+    {
+        // Hold both leases at once so each of the pool's two connections is checked.
+        auto a = pool.acquire();
+        auto b = pool.acquire();
+        REQUIRE(a);
+        REQUIRE(b);
+        for (PGconn* conn : {a.get(), b.get()}) {
+            PgResult r{PQexec(conn, "SELECT current_setting('temp_file_limit'), "
+                                    "current_setting('work_mem')")};
+            REQUIRE(PQresultStatus(r.get()) == PGRES_TUPLES_OK);
+            CHECK(std::string{PQgetvalue(r.get(), 0, 0)} == "64kB");
+            CHECK(std::string{PQgetvalue(r.get(), 0, 1)} == "64kB");
+        }
+    }
     ResultSetStore store{pool};
     REQUIRE(store.is_open());
-    REQUIRE(query_scalar(db.dsn(), "SHOW temp_file_limit") == "64kB");
-    auto live = store.create_materialized(req("alice", "fresh-tfl"), {"y"});
-    REQUIRE(live.has_value());
-    exec_sql(db.dsn(),
-             "INSERT INTO result_set_store.result_sets "
-             "(id, owner_principal, created_at, ttl_at, last_used_at, source_kind, "
-             "source_payload, membership_generation) "
-             "SELECT 'rs_tflbulk' || g, 'alice', 1, 2, 1, 'manual_curate', '{}', "
-             "gen_random_uuid() FROM generate_series(1, 4) AS g; "
-             "INSERT INTO result_set_store.result_set_members "
-             "SELECT 'rs_tflbulk' || g, 'dev-' || d FROM generate_series(1, 4) AS g, "
-             "generate_series(1, 10000) AS d");
     CHECK(store.gc_sweep() == 4);
     CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM result_set_store.result_set_members "
                                  "WHERE result_set_id LIKE 'rs_tflbulk%'") == "0");
-    CHECK(member_set_owned_ok(store, live->id, "alice") == std::unordered_set<std::string>{"y"});
+    CHECK(member_set_owned_ok(store, live_id, "alice") == std::unordered_set<std::string>{"y"});
 }
 
 // The constructor verifies the v7 triggers. A store opened while one is disabled, or demoted to
