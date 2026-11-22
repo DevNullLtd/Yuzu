@@ -1237,6 +1237,28 @@ TEST_CASE("ResultSetStore: lineage terminates on a parent_id cycle", "[pg][resul
     CHECK(chain.size() >= 1);
 }
 
+TEST_CASE("ResultSetStore: inventory parent intersection spans keyset pages",
+          "[pg][result_set][pagination]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ResultSetStore store(pool);
+    std::vector<std::string> parent_ids, expected;
+    std::unordered_set<std::string> candidates{"outside-parent"};
+    for (int i = 0; i < 4500; ++i) {
+        auto id = std::format("device-{:04}", i);
+        parent_ids.push_back(id);
+        if (i % 2 == 0) {
+            expected.push_back(id);
+            candidates.insert(id);
+        }
+    }
+    auto parent = store.create_materialized(req("alice"), parent_ids);
+    REQUIRE(parent.has_value());
+    auto intersection = store.matching_parent_members(parent->id, std::move(candidates));
+    REQUIRE(intersection.has_value());
+    CHECK(*intersection == expected);
+}
+
 TEST_CASE("ResultSetStore: members paginate past the page size", "[pg][result_set][pagination]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

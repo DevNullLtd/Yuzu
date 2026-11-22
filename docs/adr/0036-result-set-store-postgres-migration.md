@@ -93,6 +93,24 @@ a single global `shared_mutex` serializing every writer.
   longer for a lease, but still bound the wait"). Construction and the one-time backfill use
   unbounded `acquire()`/`with_txn` per ADR-0012 §2(a) (boot is serial).
 
+### Member reads and keyset consistency (2026-11-22)
+
+The dashboard detail fragment and the REST and MCP member lists resolve ownership and current
+device visibility on each request. PostgreSQL applies the visibility predicate before sorting by
+`device_id ASC` and takes one extra row to detect another page. The continuation is the last
+returned device ID, exclusive on the next request, using the same database ordering. Each request
+reads its own snapshot. A cursor confers no authority and does not freeze visibility across
+requests. A failed continuation is a degraded read.
+
+The REST and MCP inventory-query producers check parent ownership and readiness and reject
+truncated inventory reads. They evaluate the scoped inventory and intersect its distinct matching
+IDs with the parent in PostgreSQL, reading up to 1,000 matches at a time. Server memory depends
+on the bounded inventory candidates and one page even when the parent is fleet-sized. Normal
+materialized membership is immutable. A page failure discards the accumulated matches. The
+child insert references the parent through a foreign key, so a parent removed before insertion
+cannot yield a parentless child. The general scope-expression evaluator still loads a complete
+owned membership for repeated lookups while evaluating devices.
+
 ### 2026-07-26 hardening round (post-review)
 
 A consolidated governance review of this migration surfaced four further findings, all

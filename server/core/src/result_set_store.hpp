@@ -362,13 +362,15 @@ public:
     /// but empty = none (an empty page without a round trip). It is applied in the SQL before
     /// `ORDER BY`/`LIMIT` (ADR-0017 INV-3), so ids the caller can no longer see neither appear
     /// nor use up page slots, and the cursor walks only visible ids. EVERY read that DISPLAYS
-    /// membership to a person must pass the caller's scope. The default (unrestricted) is for
-    /// the two producer routes that materialise a parent set's members as the input of a
-    /// separately scoped query: narrowing the parent there would silently shrink a set that
-    /// targets the fleet (the #4306 target-erasure shape).
+    /// membership to a person must pass the caller's scope.
     std::expected<MembersPage, ResultSetError>
     members_checked(const std::string& id, const std::string& cursor, int limit,
                     const authz::VisibleSet& visible = std::nullopt);
+    /// Intersect an already authorized, materialized parent with scoped inventory matches.
+    /// A failed page discards the entire result, including when candidates is empty.
+    std::expected<std::vector<std::string>, ResultSetError>
+    matching_parent_members(const std::string& id, std::unordered_set<std::string> candidates);
+
     /// Deny-or-benign plain wrapper over `members_checked` — see the
     /// file-header posture note. `out_next_cursor` is cleared on a `DbError`
     /// (same shape as a genuine last page), matching this method's pre-#4306
@@ -542,6 +544,9 @@ public:
     int gc_sweep();
 
 private:
+    std::expected<MembersPage, ResultSetError>
+    read_members_page(const std::string& id, const std::string& cursor, int limit,
+                      const authz::VisibleSet& filter);
     pg::PgPool& pool_;
     bool open_{false};
 

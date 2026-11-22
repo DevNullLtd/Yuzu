@@ -16255,7 +16255,7 @@ void RestApiV1::register_routes(
                       // #2500, FOURTH instance — the one the original fix missed.
                       // A supplied `parent_id` that is numeric, empty or null used
                       // to fail the `is_string() && !empty()` test below and leave
-                      // `parent_members` unset, so the query evaluated over the
+                      // the parent filter unset, so the query evaluated over the
                       // UNSCOPED inventory: a caller who believed it was narrowing
                       // to one result set searched every device instead. This is a
                       // synchronous producer, so the consequence is a read wider
@@ -16334,7 +16334,6 @@ void RestApiV1::register_routes(
                           rs_err(res, 503, "inventory store not available");
                           return;
                       }
-                      std::optional<std::unordered_set<std::string>> parent_members;
                       CreateRequest cr;
                       cr.owner_principal = session->username;
                       cr.name = body.value("name", "");
@@ -16371,39 +16370,6 @@ void RestApiV1::register_routes(
                           inherit_completeness(cr, *parent);
                           cr.parent_id = pid;
                           body["scope_input_id"] = pid;
-                          std::unordered_set<std::string> ms;
-                          std::string cur;
-                          while (true) {
-                              // Separate in/out cursor: members() clears its
-                              // out-cursor first, so aliasing one variable as
-                              // both rereads page 1 forever once the parent
-                              // exceeds the page size (review finding B3).
-                              auto page_result = result_set_store->members_checked(pid, cur, 5000);
-                              // #4306 finding 3: the plain members() silently
-                              // truncated the loop on a degraded page,
-                              // indistinguishable from a genuine last page —
-                              // this route MATERIALISES the narrowed match set
-                              // into a durable result set, so a truncated read
-                              // here silently narrows who future dispatches
-                              // against it reach. Fail CLOSED: refuse the
-                              // whole operation rather than materialise a
-                              // partial parent_members set.
-                              if (!page_result) {
-                                  audit_failure("store_degraded");
-                                  rs_err(res, 503,
-                                         "RESULT_SET_STORE_UNAVAILABLE: could not read the "
-                                         "parent set's members; refusing to materialise a "
-                                         "partial result set",
-                                         {.retry_after_ms = 5000});
-                                  return;
-                              }
-                              ms.insert(page_result->device_ids.begin(),
-                                       page_result->device_ids.end());
-                              if (page_result->next_cursor.empty())
-                                  break;
-                              cur = std::move(page_result->next_cursor);
-                          }
-                          parent_members = std::move(ms);
                       }
                       cr.source_payload = body.dump();
 
@@ -16493,17 +16459,28 @@ void RestApiV1::register_routes(
                                  "match set");
                           return;
                       }
-                      std::unordered_set<std::string> seen;
-                      std::vector<std::string> members;
+                      std::unordered_set<std::string> candidates;
                       for (const auto& r : results) {
-                          if (!r.match)
-                              continue;
-                          if (parent_members && !parent_members->count(r.agent_id))
-                              continue;
-                          if (seen.insert(r.agent_id).second)
-                              members.push_back(r.agent_id);
+                          if (r.match)
+                              candidates.insert(r.agent_id);
                       }
-
+                      std::vector<std::string> members;
+                      if (cr.parent_id) {
+                          auto matched = result_set_store->matching_parent_members(
+                              *cr.parent_id, std::move(candidates));
+                          if (!matched) {
+                              audit_failure("store_degraded");
+                              rs_err(res, 503,
+                                     "RESULT_SET_STORE_UNAVAILABLE: could not read the "
+                                     "parent set's members; refusing to materialise a "
+                                     "partial result set",
+                                     {.retry_after_ms = 5000});
+                              return;
+                          }
+                          members = std::move(*matched);
+                      } else {
+                          members.assign(candidates.begin(), candidates.end());
+                      }
                       auto created = result_set_store->create_materialized(cr, members);
                       if (!created) {
                           if (metrics_registry &&

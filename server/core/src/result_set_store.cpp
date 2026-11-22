@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <format>
+#include <iterator>
 #include <limits>
 #include <random>
 #include <string_view>
@@ -548,6 +549,31 @@ std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::membe
         limit = 1000;
     if (visible && visible->empty())
         return MembersPage{}; // deny-all: nothing to read, nothing to disclose
+    return read_members_page(id, cursor, limit, visible);
+}
+
+std::expected<std::vector<std::string>, ResultSetError>
+ResultSetStore::matching_parent_members(const std::string& id,
+                                       std::unordered_set<std::string> candidates) {
+    if (!open_)
+        return std::unexpected(ResultSetError::DbError);
+    const authz::VisibleSet filter{std::move(candidates)};
+    std::vector<std::string> matches;
+    std::string cursor;
+    do {
+        // Even with zero matches, verify the parent membership table is readable (#4306).
+        auto page = read_members_page(id, cursor, 1000, filter);
+        if (!page)
+            return std::unexpected(page.error());
+        matches.insert(matches.end(), std::make_move_iterator(page->device_ids.begin()),
+                       std::make_move_iterator(page->device_ids.end()));
+        cursor = std::move(page->next_cursor);
+    } while (!cursor.empty());
+    return matches;
+}
+
+std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::read_members_page(
+    const std::string& id, const std::string& cursor, int limit, const authz::VisibleSet& visible) {
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::error("ResultSetStore::members_checked: no connection ({})", pool_.last_error());
