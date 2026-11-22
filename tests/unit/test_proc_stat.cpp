@@ -45,7 +45,7 @@ TEST_CASE("parse_stat_start_ticks: a command name holding a newline still yields
 
 TEST_CASE("read_stat_start_ticks: reads past a newline in the command name",
           "[proc_stat][processes]") {
-    // The reader, not the parser, is what once stopped at the first line.
+    // The reader must take the whole stream; the parser alone cannot see a second line.
     std::istringstream with_newline("9 (a\nb) S 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 31337 1 1\n");
     CHECK(read_stat_start_ticks(with_newline) == 31337u);
     std::istringstream two_newlines("9 (\n\n) S 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5 1 1\n");

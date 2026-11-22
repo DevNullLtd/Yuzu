@@ -26,12 +26,18 @@ import sys
 AGENT = pathlib.Path(__file__).resolve().parent.parent / "agents/core/src/agent.cpp"
 
 
-_COMMENT_OR_STRING = re.compile(r'"(?:\\.|[^"\\\n])*"|//[^\n]*|/\*.*?\*/', re.S)
+_COMMENT_OR_STRING = re.compile(
+    r'R"(?P<d>[^()\\\s]{0,16})\(.*?\)(?P=d)"'  # raw string literal, kept whole
+    r"|'(?:\\.|[^'\\\n])'"                      # char literal, kept whole (so '\"' opens nothing)
+    r'|"(?:\\.|[^"\\\n])*"'                      # string literal, kept whole
+    r"|//[^\n]*|/\*.*?\*/",                        # comments
+    re.S)
 
 
 def strip_comments(src):
-    """Source with C++ comments blanked; string literals are kept whole, so a '//' inside one stays."""
-    return _COMMENT_OR_STRING.sub(lambda m: m.group(0) if m.group(0).startswith('"') else " ", src)
+    """Source with C++ comments blanked; string, raw-string and char literals are kept whole."""
+    return _COMMENT_OR_STRING.sub(
+        lambda m: " " if m.group(0).startswith(("//", "/*")) else m.group(0), src)
 
 
 def check(src):
@@ -107,6 +113,7 @@ def selftest(src):
         "lane not from is_protective_action": src.replace("yuzu::protective::is_protective_action(cmd.plugin(), cmd.action());", "false;", 1),
         "lane pin satisfied only by a comment": src.replace("}, protective_lane);", "}); // }, protective_lane);", 1),
         "lane computed only in a comment": src.replace("const bool protective_lane =", "const bool protective_lane_x = false; // const bool protective_lane =", 1),
+        "char-literal decoy satisfies the submit pin": src.replace("}, protective_lane);", "}); char q = '\"'; // }, protective_lane); \"", 1),
         "no start check": src.replace("if (!command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())) {", "if (false) {", 1),
         "reject drops the claim release": drop_release_in_reject(src),
         "protective exemption dropped": src.replace("command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())", "command_pool_closing()", 1),
