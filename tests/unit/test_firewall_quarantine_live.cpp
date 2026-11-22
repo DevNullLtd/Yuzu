@@ -1776,17 +1776,17 @@ TEST_CASE("live: state reports what the OS tool reports, and the host is left as
     const auto want = yuzu::firewall::parse_alf_global_state(alf.output);
     CHECK(row_value(r.captured, "state") == std::string{yuzu::firewall::to_string(want.state)});
     CHECK(has_row(r.captured, "mode|block_all") == want.block_all);
-    // pf needs root: unreadable is `unknown` plus the row that says why, readable is the tool's word
+    // pf is read through the granted `sudo -n -- /sbin/pfctl` lines (direct when root), the same
+    // lines the baseline above went through, so a run that got this far (root, or the agent
+    // account with a clean `install-agent-user.sh --check`) must READ pf: the tool's word and the
+    // true count, never `unknown`, and no pf error row (a missing grant reads `error|pf:...:exit:1`).
     const auto pf = row_value(r.captured, "pf");
     REQUIRE(pf.has_value());
-    CHECK((*pf == "unknown") == has_prefix(r.captured, "error|pf:info:"));
-    CHECK((*ruleset == "unknown") == has_prefix(r.captured, "error|pf:rules:"));
-    if (running_as_root()) {
-        const auto status = fr::section(before, fr::label::kPfStatus).value_or("");
-        CHECK(*pf == (status.find("Status: Enabled") != std::string::npos ? "enabled" : "disabled"));
-        CHECK(ruleset == std::to_string(fr::count_pf_rule_lines(
-                             fr::section(before, fr::label::kPfRules).value_or(""))));
-    }
+    CHECK_FALSE(has_prefix(r.captured, "error|pf:"));
+    const auto status = fr::section(before, fr::label::kPfStatus).value_or("");
+    CHECK(*pf == (status.find("Status: Enabled") != std::string::npos ? "enabled" : "disabled"));
+    CHECK(ruleset == std::to_string(fr::count_pf_rule_lines(
+                         fr::section(before, fr::label::kPfRules).value_or(""))));
 #endif
     check_restored(before); // a read changes nothing
 }
@@ -1838,10 +1838,11 @@ TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it 
     const auto listed = capture_result({"/usr/libexec/ApplicationFirewall/socketfilterfw", "--listapps"});
     REQUIRE(yuzu::firewall::subprocess_complete(listed));
     CHECK(count_prefixed(r.captured, "app|") == yuzu::firewall::parse_alf_listapps(listed.output).size());
-    CHECK((*ruleset == "unknown") == has_prefix(r.captured, "error|pf:rules:"));
-    if (running_as_root())
-        CHECK(*ruleset == std::to_string(fr::count_pf_rule_lines(
-                              fr::section(before, fr::label::kPfRules).value_or(""))));
+    // the pf rule lines and anchors ride the granted sudo lines too: a run that got this far reads
+    // them, with the baseline's count and no pf error row
+    CHECK_FALSE(has_prefix(r.captured, "error|pf:"));
+    CHECK(*ruleset == std::to_string(fr::count_pf_rule_lines(
+                          fr::section(before, fr::label::kPfRules).value_or(""))));
 #endif
     check_restored(before);
 }

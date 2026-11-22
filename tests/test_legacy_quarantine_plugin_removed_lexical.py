@@ -1734,11 +1734,28 @@ class RenderedSudoers(unittest.TestCase):
                   p + "/sbin/pfctl -F states",
                   p + "/sbin/pfctl -s info",
                   p + "/sbin/pfctl -s rules",
+                  p + "/sbin/pfctl -s Anchors",
                   p + "/sbin/pfctl -s References",
                   p + "/Library/PrivilegedHelperTools/yuzu-svc-helper",
                   p + "/usr/bin/dscacheutil -flushcache",
                   p + "/usr/bin/killall -HUP mDNSResponder"])
         self.assertEqual(self.grants["macos"], mac)
+
+    def test_each_macos_state_and_rules_read_argv_is_a_grant_line(self):
+        """The three pfctl reads the firewall state and rules actions run through `sudo -n --` are
+        read out of the C++ argv pin case (what the plugin builds), and each, joined into one string,
+        is a NOPASSWD line of the rendered sudoers: a read the installer does not grant exits 1."""
+        cpp = read_text(PARSERS_TEST)
+        want = {}
+        for name in ("pfctl_info_argv", "pfctl_rules_argv", "pfctl_anchors_argv"):
+            m = re.search(r'CHECK\(join\(%s\(\)\) == "(/sbin/pfctl [^"]+)"\)' % name, cpp)
+            self.assertIsNotNone(m, name)
+            want[name] = m.group(1)
+        self.assertEqual(set(want.values()), {"/sbin/pfctl -s info", "/sbin/pfctl -s rules",
+                                              "/sbin/pfctl -s Anchors"})
+        for name, argv in want.items():
+            self.assertEqual([g for g in self.grants["macos"] if g.endswith("NOPASSWD: " + argv)],
+                             ["_yuzu ALL=(root) NOPASSWD: " + argv], name)
 
     @unittest.skipUnless(shutil.which("visudo"), "visudo is not installed")
     def test_visudo_accepts_the_rendered_text_of_each_platform(self):

@@ -146,6 +146,10 @@ constexpr std::chrono::milliseconds kAcqDeadline{5000};
 using yuzu::firewall::sanitize_field;
 using yuzu::firewall::subprocess_complete;
 
+// The containment builders (argv, parsers) live in the quarantine header; the read paths
+// below borrow its pfctl argv builders, so the alias is declared before them.
+namespace fq = yuzu::firewall::quarantine;
+
 #ifdef _WIN32
 
 using yuzu::shared::win::ComInit;
@@ -402,15 +406,17 @@ void do_state_macos(yuzu::CommandContext& ctx) {
     const auto alf_res = run_bounded_subprocess(
         {"/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"},
         SubprocessOptions{.deadline = kAcqDeadline});
-    // Secondary: the pf packet filter (reading /dev/pf needs root; an
-    // unprivileged read exits non-zero and reads as `unknown` plus the error
-    // row that says why, never a false-safe value). Absolute path, as every
-    // containment tool call uses.
-    const auto pf_res =
-        run_bounded_subprocess({"/sbin/pfctl", "-s", "info"}, SubprocessOptions{.deadline = kAcqDeadline});
-    const auto anchors_res = run_bounded_subprocess({"/sbin/pfctl", "-s", "Anchors"},
+    // Secondary: the pf packet filter. Reading /dev/pf needs root, so each read rides the
+    // installer's exact read-only `sudo -n -- /sbin/pfctl -s <word>` grant (the argv is
+    // unchanged when the agent is root; a refused sudo exits 1 and reads as `unknown` plus the
+    // error row that says why, never a false-safe value). The runner is called directly, not
+    // sudo_runner(): that one merges stderr, and pfctl's "No ALTQ support in kernel" banner
+    // would land in the rule rows and the count. Spawn sites: firewall/do_state_macos#2-#4.
+    const auto pf_res = run_bounded_subprocess(yuzu::shared::sudo_wrap(fq::pfctl_info_argv()),
+                                               SubprocessOptions{.deadline = kAcqDeadline});
+    const auto anchors_res = run_bounded_subprocess(yuzu::shared::sudo_wrap(fq::pfctl_anchors_argv()),
                                                     SubprocessOptions{.deadline = kAcqDeadline});
-    const auto rules_res = run_bounded_subprocess({"/sbin/pfctl", "-s", "rules"},
+    const auto rules_res = run_bounded_subprocess(yuzu::shared::sudo_wrap(fq::pfctl_rules_argv()),
                                                   SubprocessOptions{.deadline = kAcqDeadline});
     // Every decision (the completeness gate on each read, the unknown rows and the error row
     // that explains them) is the pure builder's; the four results are all this shell hands it.
@@ -427,10 +433,11 @@ void do_rules_macos(yuzu::CommandContext& ctx) {
         SubprocessOptions{.deadline = kAcqDeadline});
     // The rule lines and the trailing ruleset| count share ONE completeness gate, so a
     // truncated or timed-out pfctl read never publishes whatever partial lines it captured as
-    // the whole rule set.
-    const auto rules_res = run_bounded_subprocess({"/sbin/pfctl", "-s", "rules"},
+    // the whole rule set. Both pf reads ride the installer's exact read-only sudo grants (see
+    // do_state_macos); spawn sites: firewall/do_rules_macos#2-#3.
+    const auto rules_res = run_bounded_subprocess(yuzu::shared::sudo_wrap(fq::pfctl_rules_argv()),
                                                   SubprocessOptions{.deadline = kAcqDeadline});
-    const auto anchors_res = run_bounded_subprocess({"/sbin/pfctl", "-s", "Anchors"},
+    const auto anchors_res = run_bounded_subprocess(yuzu::shared::sudo_wrap(fq::pfctl_anchors_argv()),
                                                     SubprocessOptions{.deadline = kAcqDeadline});
     for (const auto& row : yuzu::firewall::macos_rules_rows(listapps_res, rules_res, anchors_res))
         ctx.write_output(row);
@@ -1496,8 +1503,6 @@ void do_rules_linux(yuzu::CommandContext& ctx) {
 // command runner (sudo + run_bounded_subprocess), the staged ruleset file, the
 // TCP probe, and the per-OS Leg. Nothing here decides anything a unit test could
 // pin.
-
-namespace fq = yuzu::firewall::quarantine;
 
 /// One in-flight mutating action at a time (quarantine / release /
 /// quarantine_allow). `quarantine_status` never takes it: a read must not queue
@@ -3028,7 +3033,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "else ufw/iptables via run_bounded_subprocess (rung 2)",
          nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2, "socketfilterfw/pfctl via run_bounded_subprocess", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "socketfilterfw via run_bounded_subprocess; pfctl reads via sudo -n -- on exact NOPASSWD "
+         "lines (direct when root)",
+         nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "INetFwPolicy2 COM (per-profile FirewallEnabled)", nullptr},
     },
@@ -3040,7 +3048,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "else ufw/iptables via run_bounded_subprocess (rung 2)",
          nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2, "socketfilterfw/pfctl via run_bounded_subprocess", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "socketfilterfw via run_bounded_subprocess; pfctl reads via sudo -n -- on exact NOPASSWD "
+         "lines (direct when root)",
+         nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "INetFwPolicy2 COM (INetFwRules enumeration)", nullptr},
     },

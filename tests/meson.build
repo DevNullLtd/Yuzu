@@ -4725,6 +4725,17 @@ test('firewall Windows release-guard wiring lexical gate',
   timeout: 30,
 )
 
+# Firewall state and rules reads: static lexical gate over the OS-specific wiring that only that OS
+# compiles. macOS: every pf read is run_bounded_subprocess(sudo_wrap(fq::pfctl_*_argv())) with stderr
+# unmerged and no /sbin/pfctl literal (a bare pfctl exits 1 for the least-privilege account). Carries
+# its own in-memory mutation self-test. No build required; well under a second.
+test('firewall read-path wiring lexical gate',
+  _python3_test,
+  args: [files('test_firewall_read_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
 # stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
 # page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes

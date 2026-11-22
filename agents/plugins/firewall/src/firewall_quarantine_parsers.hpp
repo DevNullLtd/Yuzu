@@ -2887,6 +2887,9 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
 }
 [[nodiscard]] inline Argv pfctl_info_argv() { return {std::string{kPfctlPath}, "-s", "info"}; }
 [[nodiscard]] inline Argv pfctl_rules_argv() { return {std::string{kPfctlPath}, "-s", "rules"}; }
+/// The state and rules reads' top-level anchor list. Not pfctl_siblings_argv: `-a com.apple -s
+/// Anchors` lists only the com.apple children, a different answer with its own grant line.
+[[nodiscard]] inline Argv pfctl_anchors_argv() { return {std::string{kPfctlPath}, "-s", "Anchors"}; }
 [[nodiscard]] inline Argv pfctl_anchor_rules_argv() {
     return {std::string{kPfctlPath}, "-a", std::string{kPfAnchor}, "-s", "rules"};
 }

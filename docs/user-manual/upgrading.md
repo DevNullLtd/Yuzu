@@ -11,6 +11,21 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Behaviour change: the firewall `state` and `rules` reads answer through granted privilege on macOS
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: anyone who reads the `firewall` plugin's `state` or `rules` rows from a macOS agent that does not run as root (the opt-in `_yuzu` least-privilege account, or a developer run). To do: provision the account with this build's `scripts/install-agent-user.sh`, which writes one new sudoers line.
+
+**What changed.**
+
+- **macOS.** The pf reads (`pfctl -s info`, `-s Anchors`, `-s rules`) now run as `sudo -n -- /sbin/pfctl -s <word>` on three exact read-only NOPASSWD lines, and directly when the agent is root. `-s info` and `-s rules` were already granted for the containment status read; `-s Anchors` (the top-level anchor list, not the `-a com.apple -s Anchors` line the containment path uses) is a new line, with no wildcard. With them the `_yuzu` account reads `pf|enabled` or `pf|disabled`, the anchors, the pf rule rows and the true `ruleset|<n>`; without them (no line, no root) it reads `pf|unknown`, `ruleset|unknown` and the `error|pf:...:exit:1` rows, never a false-safe value. On a non-root agent `exit:1` means sudo refused the grant or `pfctl` failed: stderr is dropped, so the two read alike. `install-agent-user.sh --check` reports a sudoers file that lacks the line.
+- Each refused `sudo -n` attempt is recorded by sudo: a macOS agent that is not root and has no grant makes up to three refused attempts per `state` read and two per `rules` read.
+
+**What to do.**
+- Run this build's `install-agent-user.sh` on each macOS host that runs the agent as `_yuzu`; check the host first (`--check`) so no existing account state is overwritten unseen.
+- Read `error|pf:...:exit:1` on a non-root macOS agent as "the grant is missing or `pfctl` failed", not as "pf is off".
+
 ## Behaviour change: the installed-software read routes return `package_id` (#6090)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

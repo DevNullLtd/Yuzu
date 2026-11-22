@@ -18,14 +18,15 @@
  * on the pure layer in test_firewall_parsers.cpp. The Windows cases compile and
  * run only on Windows.
  *
- * Assumes an unprivileged run on macOS: pf (read via pfctl) requires root, so a
- * pf|unknown state field is expected there, and the plugin says WHY with an
- * `error|pf:...` row (#4891, #6611) instead of an unexplained unknown. The
- * pairing is what the macOS cases pin, on a live host: `pf|unknown` if and only if
- * the pf info error row (a `pfctl -s info` that completes always names Enabled or
- * Disabled; the completed-but-unrecognised read, where `pf|unknown` comes alone,
- * is the pure layer's case), `ruleset|unknown` if and only if the pf rules error
- * row, so an unprivileged and a privileged run both pass.
+ * Runs as whatever account the suite runs as on macOS. pf is read through `sudo -n --` (the
+ * installer's exact read-only pfctl lines; direct when root), so an account with no such grant
+ * (a developer Mac, the CI runner account) gets a refused sudo, a pf|unknown state field and
+ * the row that says WHY (`error|pf:...`, #4891, #6611) instead of an unexplained unknown, while
+ * root and the granted account read pf. The pairing is what the macOS cases pin, on a live
+ * host: `pf|unknown` if and only if the pf info error row (a `pfctl -s info` that completes
+ * always names Enabled or Disabled; the completed-but-unrecognised read, where `pf|unknown`
+ * comes alone, is the pure layer's case), `ruleset|unknown` if and only if the pf rules error
+ * row, so a refused and a granted run both pass.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -186,10 +187,11 @@ TEST_CASE("firewall macOS 'state' acquires through the real bounded-subprocess c
         }
     CHECK_FALSE(has_row_starting_with(rows, "error|appfirewall:globalstate:"));
 
-    // pf (read via pfctl) DOES require root. Which of the two is true depends on this process's
-    // privilege, which the test does not control, so what is pinned is the PAIRING: an unreadable
-    // pf is `pf|unknown` with the row that says why (an unprivileged `pfctl -s info` exits
-    // non-zero, #4891), and a readable pf has neither. The same holds for the rule count.
+    // pf is read through `sudo -n -- /sbin/pfctl` (direct when root). Which of the two is true
+    // depends on this process's grant, which the test does not control, so what is pinned is the
+    // PAIRING: an unreadable pf is `pf|unknown` with the row that says why (a refused sudo or a
+    // failed `pfctl -s info` exits non-zero, #4891), and a readable pf has neither. The same
+    // holds for the rule count.
     const bool pf_unknown = std::find(rows.begin(), rows.end(), "pf|unknown") != rows.end();
     CHECK(pf_unknown == has_row_starting_with(rows, "error|pf:info:"));
     const bool ruleset_unknown = std::find(rows.begin(), rows.end(), "ruleset|unknown") != rows.end();

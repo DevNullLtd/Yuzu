@@ -544,7 +544,9 @@ EOF
 # writes the helper before this file; a host without it is provisioned with this build's installer.
 # The helper also takes one read-only word, snapshot, with no other argument; on a Mac it finds none
 # of the nft or iptables tools and prints [absent] sections (at most 1 MiB), and the pf reads below
-# stay on the exact pfctl lines.
+# stay on the exact pfctl lines. The state and rules reads use three of them, read-only and with no
+# wildcard: -s info, -s rules and -s Anchors (the top-level anchor list; the com.apple line below is
+# a different, narrower read that the containment path uses).
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E
 EOF
@@ -561,6 +563,7 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple -s Anchors
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -F states
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s info
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s Anchors
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s References
 
 # services.set_start_mode — launchd system domain. The agent account may run one program as root

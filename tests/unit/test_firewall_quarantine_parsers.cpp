@@ -2260,13 +2260,16 @@ TEST_CASE("pfctl argv: the anchor sorts first, flush is scoped to our anchor, no
     CHECK(join(pfctl_flush_anchor_nat_argv()) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -F nat");
     CHECK(join(pfctl_info_argv()) == "/sbin/pfctl -s info");
     CHECK(join(pfctl_rules_argv()) == "/sbin/pfctl -s rules");
+    // the state and rules reads: the top-level anchor list, NOT the com.apple children below
+    CHECK(join(pfctl_anchors_argv()) == "/sbin/pfctl -s Anchors");
     CHECK(join(pfctl_anchor_rules_argv()) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -s rules");
     CHECK(join(pfctl_siblings_argv()) == "/sbin/pfctl -a com.apple -s Anchors");
     for (const auto& a : {pfctl_load_argv("/tmp/x.pf"), pf_helper_load_argv("/tmp/x.pf"),
                           pfctl_flush_states_argv(), pfctl_references_argv(),
                           pfctl_release_argv("123456"), pfctl_enable_argv(),
                           pfctl_flush_anchor_rules_argv(), pfctl_flush_anchor_nat_argv(), pfctl_info_argv(),
-                          pfctl_rules_argv(), pfctl_anchor_rules_argv(), pfctl_siblings_argv()})
+                          pfctl_rules_argv(), pfctl_anchors_argv(), pfctl_anchor_rules_argv(),
+                          pfctl_siblings_argv()})
         CHECK(all_tokens_safe(a));
 }
 

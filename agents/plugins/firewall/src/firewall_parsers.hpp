@@ -181,9 +181,10 @@ struct AlfAppRule {
 }
 
 /// Parse `pfctl -s Anchors` — one anchor name per line, leading whitespace
-/// trimmed. Empty output (unprivileged refusal — "pfctl: /dev/pf:
-/// Permission denied" goes to stderr, which the caller discards, leaving
-/// empty stdout) yields an empty vector; blank lines are skipped rather than
+/// trimmed. The caller runs the read as `sudo -n -- /sbin/pfctl -s Anchors` and
+/// gates on subprocess_complete() first, so a refused grant or a failed pfctl
+/// (exit non-zero) never reaches this parser: it sees only a completed read.
+/// Empty output yields an empty vector; blank lines are skipped rather than
 /// emitted as empty anchor names.
 [[nodiscard]] inline std::vector<std::string> parse_pf_anchors(std::string_view out) {
     std::vector<std::string> anchors;
