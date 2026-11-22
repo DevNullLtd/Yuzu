@@ -9,6 +9,11 @@
   3. `execute_command_task` checks `command_pool_closing()` before it starts a task, and a rejected,
      never-started command goes through `reject_unstarted_command` (claim released, REJECTED).
 
+  4. the reserved protective lane (ADR-2005) stays wired: BOTH command-pool constructions pass
+     `kReservedProtectiveWorkers`, and the single `submit` site passes `protective_lane`, computed from
+     `is_protective_action` (dropping either keeps every unit test green while a queued containment
+     action can stall behind stuck ordinary commands).
+
 The behavioural proof of the slicing is tests/unit/test_interruptible_wait.cpp; this pins the wiring the
 unit tests cannot see.
 
@@ -38,6 +43,15 @@ def check(src):
     # run()'s teardown guard closes the start gate before any plugin is shut down, on EVERY exit.
     if not re.search(r"ShutdownDeadlineGuard watchdog\{kShutdownDeadlineGrace\};[^;]*(?:;\s*//[^\n]*|\n\s*//[^\n]*)*\s*command_pool_closing_\.store\(true", src):
         defects.append("run()'s teardown guard does not set command_pool_closing_ before shutting plugins down")
+    # The reserved lane: both pool constructions (the first start and the reconnect re-creation).
+    pools = re.findall(r"std::make_unique<ThreadPool>\(([^;]*?)\);", src, re.S)
+    if len(pools) != 2 or not all(re.search(r"kCommandQueueDepth\s*,\s*kReservedProtectiveWorkers\s*,", p) for p in pools):
+        defects.append("a command-pool construction does not pass kReservedProtectiveWorkers "
+                       "(expected exactly two make_unique<ThreadPool>, both reserving the protective lane)")
+    if not re.search(r"const bool protective_lane\s*=\s*yuzu::protective::is_protective_action\(\s*cmd\.plugin\(\)\s*,\s*cmd\.action\(\)\s*\);", src):
+        defects.append("protective_lane is not computed from is_protective_action(cmd.plugin(), cmd.action())")
+    if len(re.findall(r"thread_pool_->submit\(", src)) != 1 or not re.search(r"\}\s*,\s*protective_lane\s*\)\s*;", src):
+        defects.append("the single command submit site does not pass protective_lane")
     body = re.search(r"void execute_command_task\([^)]*\)\s*\{(.*?)Stagger/delay", src, re.S)
     if (not body or not re.search(r"command_may_start\(\s*cmd\.plugin\(\)\s*,\s*cmd\.action\(\)\s*,\s*command_pool_closing\(\)\s*\)", body.group(1))
             or "reject_unstarted_command" not in body.group(1)):
@@ -64,11 +78,20 @@ def drop_release_in_reject(src):
     return src[:m.start()] + m.group(0).replace("release(cmd.command_id())", "erase(cmd.command_id())", 1) + src[m.end():]
 
 
+def replace_last(src, old, new):
+    i = src.rindex(old)
+    return src[:i] + new + src[i + len(old):]
+
+
 def selftest(src):
     mutants = {
         "bare sleep": src.replace("if (!sleep_interruptible(std::chrono::seconds(total_delay),", "std::this_thread::sleep_for(std::chrono::seconds(total_delay)); if (!sleep_interruptible(std::chrono::seconds(0),", 1),
         "no closing flag set": src.replace("command_pool_closing_.store(true, std::memory_order_release);", ""),
         "run() exit guard does not close the gate": src.replace("command_pool_closing_.store(true, std::memory_order_release);", "", 1),
+        "first pool drops the reserved lane": src.replace("kCommandQueueDepth,\n                                                         kReservedProtectiveWorkers, pool_gauge_);", "kCommandQueueDepth,\n                                                         0, pool_gauge_);", 1),
+        "reconnect pool drops the reserved lane": replace_last(src, "kReservedProtectiveWorkers, pool_gauge_);", "0, pool_gauge_);"),
+        "submit drops protective_lane": src.replace("}, protective_lane);", "});", 1),
+        "lane not from is_protective_action": src.replace("yuzu::protective::is_protective_action(cmd.plugin(), cmd.action());", "false;", 1),
         "no start check": src.replace("if (!command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())) {", "if (false) {", 1),
         "reject drops the claim release": drop_release_in_reject(src),
         "protective exemption dropped": src.replace("command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())", "command_pool_closing()", 1),

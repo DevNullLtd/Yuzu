@@ -59,6 +59,7 @@
 #include <dirent.h>
 #include <fcntl.h>    // open (O_NONBLOCK on the exe link)
 #include <fstream>
+#include <iterator>
 #include <sys/stat.h> // fstat (identity key)
 #include <unistd.h>   // readlink, close
 #endif
@@ -111,9 +112,10 @@ std::optional<std::uint64_t> read_start_ticks(unsigned long pid) {
     std::ifstream ifs("/proc/" + std::to_string(pid) + "/stat");
     if (!ifs.is_open())
         return std::nullopt;
-    std::string line;
-    std::getline(ifs, line);
-    return yuzu::shared::parse_stat_start_ticks(line);
+    // The whole file, not its first line: a process names itself with prctl and the name may carry a
+    // newline, which would leave the first line without its closing ')'. The parser keys on the LAST ')'.
+    std::string text{std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>()};
+    return yuzu::shared::parse_stat_start_ticks(text);
 }
 
 std::vector<ProcessInfo> enumerate_processes() {

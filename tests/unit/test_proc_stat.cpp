@@ -31,6 +31,16 @@ TEST_CASE("parse_stat_start_ticks: field 22, command names with spaces and paren
     CHECK_FALSE(parse_stat_start_ticks("1 (x) S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 abc 1").has_value());
 }
 
+TEST_CASE("parse_stat_start_ticks: a command name holding a newline still yields the start time",
+          "[proc_stat][processes]") {
+    // A process sets its own name with prctl(PR_SET_NAME); the name may contain a newline, so the
+    // stat text must be parsed whole (the caller reads the whole file, not its first line).
+    CHECK(parse_stat_start_ticks("9 (evil\nname) S 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 4242 1 1\n") == 4242u);
+    CHECK(parse_stat_start_ticks("9 (a\n) S 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 77 1 1\n") == 77u);
+    // The first line alone has no closing ')' and is refused: why reading one line was wrong.
+    CHECK_FALSE(parse_stat_start_ticks("9 (evil").has_value());
+}
+
 TEST_CASE("same_process: only an equal, known start time keeps a row", "[proc_stat][processes]") {
     CHECK(same_process(100u, 100u));
     CHECK_FALSE(same_process(100u, 101u)); // a recycled pid

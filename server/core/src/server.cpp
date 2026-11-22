@@ -1720,10 +1720,11 @@ public:
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
         // sg10 / UP-1: `param_key_invalid` (a params key the agent would truncate, refused at the
-        // ingress) on every surface that counts it, pre-seeded so absent() alerting holds. The MCP
-        // execute_instruction counts it under yuzu_mcp_tool_args_too_large_total instead;
-        // execute_instruction_definition counts route="mcp" here (the shared execute core), and
-        // execute_bundle counts route="bundle".
+        // ingress) on every surface that counts it, pre-seeded so absent() alerting holds. Both
+        // MCP tools (execute_instruction and execute_instruction_definition) refuse it earlier, in
+        // their input-bound check, and count it under yuzu_mcp_tool_args_too_large_total, so
+        // route="mcp" is seeded for the shared execute core's own check but no MCP handler reaches
+        // it; execute_bundle counts route="bundle".
         for (const char* route : {"command", "command_v1", "instruction_execute", "mcp", "schedule", "bundle",
                                   "policy_fragment"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
