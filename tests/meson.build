@@ -5468,6 +5468,16 @@ test('Echo security wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# Echo corruption-audit gate signals: server.cpp's pre-seeds of the three new counters (the
+# quarantine alert's 0 sample), the wrote-guarded quarantine increment, the degraded-observer
+# counter and the sweep gauge, plus DegradedCause vs its pre-seed list. server.cpp is built by no
+# Mac unit binary; the script self-checks its detector.
+test('Echo corruption-audit gate wiring lexical gate',
+  _python3_test,
+  args: [files('test_corruption_audit_gate_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # The Echo test-writing standard (docs/testing/echo-test-standard.md): no sleeps, no std::async,
 # no unguarded wait, no size CHECK before an index in tests/unit/**/test_echo*.cpp. In suite 'echo',
 # not 'docs', because the docs suite is excluded on the Windows and macOS legs and echo runs on all.
