@@ -552,9 +552,9 @@ struct OpenSeams {
     /// (#1527). Production never sets it.
     std::function<void()> before_integrity_check;
     /// The filesystem steps of the quarantine that follows a corrupt verdict (the hard-link
-    /// claim, a sidecar move, a remove), forwarded to `quarantine_corrupt_db`. An empty member is
-    /// the real call. A test's `link` runs between the verdict and the claim, which is where a
-    /// swapped-in link has to be caught (#1527). Production never sets one.
+    /// claim, a sidecar move, a sidecar copy, a remove), forwarded to `quarantine_corrupt_db`. An
+    /// empty member is the real call. A test's `link` runs between the verdict and the claim, which
+    /// is where a swapped-in link has to be caught (#1527). Production never sets one.
     yuzu::shared::sqlite_quarantine::FsOps quarantine_ops;
     /// Called by the v10 migration after its pre-transaction reads, right before BEGIN IMMEDIATE,
     /// with the migrating connection. It stands in for another process acting in the gap between
