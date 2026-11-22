@@ -8646,3 +8646,34 @@ TEST_CASE("7921: the batch route with 22 referrers of one kind counts 21 and lis
     CHECK(count_of(msg, "schedule ") == 20);
     CHECK(msg.find(", and 1 more. Remove each of them") != std::string::npos);
 }
+
+// sg10 / UP-1: the legacy execute route refuses a params key the agent would truncate with a 400
+// before the execution row, the approval or the dispatch.
+TEST_CASE("POST /api/instructions/:id/execute: a params key with a NUL or control byte is refused 400 "
+          "(sg10)",
+          "[pg][workflow][execute][security][sg10]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-SG10", "Sg10");
+    h.dispatch_cmd_override = "cmd-sg10";
+    h.dispatch_sent_override = 3;
+    for (const char* key : {"targets\\u0000x", "a\\u0007b"}) {
+        auto res = h.sink.Post("/api/instructions/def-SG10/execute",
+                               std::string(R"({"agent_ids":["a1"],"params":{")") + key + R"(":"h"}})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("param_key_invalid") != std::string::npos);
+    }
+    CHECK(h.last_dispatch_execution_id.empty());
+    int denied = 0;
+    for (const auto& a : h.audit_calls)
+        if (a.action == "instruction.execute" && a.result == "denied" &&
+            a.detail.find("reason=param_key_invalid") != std::string::npos)
+            ++denied;
+    CHECK(denied == 2);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"}, {"reason", "param_key_invalid"}})
+              .value() == 2.0);
+}

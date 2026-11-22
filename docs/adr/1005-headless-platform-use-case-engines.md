@@ -1670,7 +1670,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        under the same global `Inventory` grant, the same limits and the same
        `requested` and outcome audit rows; the step-up class of the two writes
        mirrors the REST rows (exempt pending an owner ruling). The catalogue
-       identity and `package_id` half of the lifecycle surface is held with #6090
+       identity and `package_id` half of the lifecycle surface is held with #8357
        and is not built; roadmap row SAM.9-mcp stays open for it. Over MCP the
        whole JSON-RPC request is capped at 4 MiB before routing, so an import file
        whose JSON-escaped form plus the envelope passes that cap is refused by the
@@ -2031,7 +2031,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `BASELINE_UNTWINNED` rose by one (196 to 197). The row is retired, and
        the baseline lowered, when the MCP tool lands; the tool reuses
        `dex_apps_usage_json` and the `DexApi` `apps_usage` seam, not a second
-       copy of the model.
+       copy of the model. The Apps tab Usage view (`GET
+       /fragments/dex/apps/usage`) then added a second row,
+       `get.fragments-dex-apps-usage` (`twinned-rest-only`), which took the
+       baseline to 198; the MCP tool tracked by **#8096** retires both rows and
+       lowers the baseline by two.
      - **The exception relaxes no control.** The route is gated by
        `GuaranteedState:Read` and `Forensics:Read`, both required, and audited
        fail-closed as `dex.apps.usage.view` before the read; the usage figures
