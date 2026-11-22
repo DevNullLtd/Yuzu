@@ -353,9 +353,9 @@ TEST_CASE("expiry alert constants", "[normalize]") {
     CHECK(kRearmSecs == 604800);
 }
 
-// -- SAM-51: the normaliser defects found by the S-2 proxy -----------------------------------
+// -- SAM-51: the normaliser defects found by the proxy -----------------------------------
 //
-// tests/unit/fixtures/software-estate/normaliser/s2_cases.tsv holds the real titles and vendors
+// tests/unit/fixtures/software-estate/normaliser/normaliser_cases.tsv holds the real titles and vendors
 // (provenance.txt next to it says where each came from) with the output each must give. A row
 // per defect 1 to 7 plus controls for the neighbouring forms that must not move. The rows are
 // the committed reproduction evidence, so they are read from the file once, through a static;
@@ -378,7 +378,7 @@ const std::vector<S2Row>& s2_rows() {
     static const std::vector<S2Row> rows = [] {
         std::vector<S2Row> out;
         const auto path = std::filesystem::path{YUZU_TEST_FIXTURE_DIR} / "software-estate" /
-                          "normaliser" / "s2_cases.tsv";
+                          "normaliser" / "normaliser_cases.tsv";
         std::ifstream in(path);
         REQUIRE(in.is_open());
         std::string line;
@@ -409,8 +409,8 @@ const std::vector<S2Row>& s2_rows() {
 
 } // namespace
 
-TEST_CASE("every S-2 fixture row normalises to its expected title, edition, version or vendor",
-          "[normalize][s2]") {
+TEST_CASE("every fixture row normalises to its expected title, edition, version or vendor",
+          "[normalize][fixture]") {
     for (const auto& r : s2_rows()) {
         CAPTURE(r.line, r.input, r.defect);
         if (r.kind == "title") {
@@ -424,8 +424,8 @@ TEST_CASE("every S-2 fixture row normalises to its expected title, edition, vers
     }
 }
 
-TEST_CASE("the S-2 fixture holds a row for each of the defects 1 to 7 and for the controls",
-          "[normalize][s2]") {
+TEST_CASE("the fixture holds a row for each of the defects 1 to 7 and for the controls",
+          "[normalize][fixture]") {
     std::set<int> defects;
     for (const auto& r : s2_rows())
         defects.insert(r.defect);
@@ -434,8 +434,8 @@ TEST_CASE("the S-2 fixture holds a row for each of the defects 1 to 7 and for th
     CHECK(s2_rows().size() >= 30);
 }
 
-TEST_CASE("normalize_title is idempotent on its own output for every S-2 title row",
-          "[normalize][s2]") {
+TEST_CASE("normalize_title is idempotent on its own output for every fixture title row",
+          "[normalize][fixture]") {
     for (const auto& r : s2_rows()) {
         if (r.kind != "title")
             continue;
@@ -447,7 +447,7 @@ TEST_CASE("normalize_title is idempotent on its own output for every S-2 title r
 
 TEST_CASE("normalize_vendor never returns empty for a non-empty input that is not an origin "
           "label",
-          "[normalize][s2]") {
+          "[normalize][fixture]") {
     std::vector<std::string> inputs;
     for (const auto& r : s2_rows())
         if (r.kind == "vendor")
@@ -465,7 +465,7 @@ TEST_CASE("normalize_vendor never returns empty for a non-empty input that is no
     CHECK(normalize_vendor("   ").empty());
 }
 
-TEST_CASE("an edition word is an edition only after a title word", "[normalize][s2]") {
+TEST_CASE("an edition word is an edition only after a title word", "[normalize][fixture]") {
     SECTION("after a kept token it is still an edition") {
         const NormalizedTitle nt = normalize_title("Windows 11 Pro");
         CHECK(nt.title == "windows");
@@ -502,7 +502,7 @@ TEST_CASE("an edition word is an edition only after a title word", "[normalize][
 }
 
 TEST_CASE("a normalised title plus its edition re-normalises to the same title and edition",
-          "[normalize][s2]") {
+          "[normalize][fixture]") {
     // The stored alias key is the title plus its edition; a pack built from stored keys must
     // read each one back as the same title and edition.
     for (const char* raw : {"Home Edition", "Pro 2019 Edition", "Home - Edition",
@@ -516,14 +516,14 @@ TEST_CASE("a normalised title plus its edition re-normalises to the same title a
     }
 }
 
-TEST_CASE("a standalone dash is dropped and a dashed word is kept", "[normalize][s2]") {
+TEST_CASE("a standalone dash is dropped and a dashed word is kept", "[normalize][fixture]") {
     CHECK(normalize_title("Tool - Extras").title == "tool extras");
     CHECK(normalize_title("Tool - 1.2").title == "tool");
     CHECK(normalize_title("-").title.empty());
     CHECK(normalize_title("7-Zip e-mail x-ray").title == "7-zip e-mail x-ray");
 }
 
-TEST_CASE("name@version sets the version only when none was seen earlier", "[normalize][s2]") {
+TEST_CASE("name@version sets the version only when none was seen earlier", "[normalize][fixture]") {
     SECTION("a formula token keeps its name and supplies the version") {
         const NormalizedTitle nt = normalize_title("openssl@3");
         CHECK(nt.title == "openssl");
@@ -551,7 +551,7 @@ TEST_CASE("name@version sets the version only when none was seen earlier", "[nor
     }
 }
 
-TEST_CASE("a year range stays in the title and is never the version", "[normalize][s2]") {
+TEST_CASE("a year range stays in the title and is never the version", "[normalize][fixture]") {
     const NormalizedTitle nt =
         normalize_title("Microsoft Visual C++ 2015-2022 Redistributable (x64)");
     CHECK(nt.title == "microsoft visual c++ 2015-2022 redistributable");
@@ -562,7 +562,7 @@ TEST_CASE("a year range stays in the title and is never the version", "[normaliz
 }
 
 TEST_CASE("only a trailing run of legal-suffix words is stripped and the last token survives",
-          "[normalize][s2]") {
+          "[normalize][fixture]") {
     CHECK(normalize_vendor("Example Software Foundation Inc.") == "example");
     CHECK(normalize_vendor("Software Inc.") == "software");
     CHECK(normalize_vendor("Inc. Ltd.") == "inc.");
@@ -574,7 +574,7 @@ TEST_CASE("only a trailing run of legal-suffix words is stripped and the last to
 }
 
 TEST_CASE("compound legal forms are not reduced; kg, co and & are not suffix words",
-          "[normalize][s2]") {
+          "[normalize][fixture]") {
     CHECK(normalize_vendor("Example Software GmbH & Co. KG") == "example software gmbh & co. kg");
     CHECK(normalize_vendor("Example KG") == "example kg");
     CHECK(normalize_vendor("Example Co") == "example co");
@@ -582,7 +582,7 @@ TEST_CASE("compound legal forms are not reduced; kg, co and & are not suffix wor
 }
 
 TEST_CASE("normalize_edition reads an edition column and refuses any other word",
-          "[normalize][s2]") {
+          "[normalize][fixture]") {
     CHECK(normalize_edition("Standard") == "standard");
     CHECK(normalize_edition("  PRO ") == "pro");
     CHECK(normalize_edition("Home") == "home");

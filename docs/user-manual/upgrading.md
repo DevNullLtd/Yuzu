@@ -18,7 +18,7 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 **What changed.** The cleaned-up form of a title or publisher is the product's key, so these rules change keys:
 
 - An edition word (`Home`, `Pro`, `Standard`, ...) is an edition only after a title word. `Home` is now the title `home`, and `Pro Display Calibrator` the title `pro display calibrator` with no `pro` edition; `Windows 11 Pro` is still `windows` with edition `pro`. A lone edition word in an alias's `edition` column is still that edition.
-- The word `edition` right after an architecture or edition word is dropped: `7-Zip 26.04 (x64 edition)` is `7-zip`, no longer `7-zip edition)`.
+- The word `edition` right after an architecture word, or after a word taken as the edition, is dropped: `7-Zip 26.04 (x64 edition)` is `7-zip`, no longer `7-zip edition)`. A leading edition word kept as part of the title does not arm it: `Home Edition` is `home edition`.
 - A bare `-` token is dropped, so `Microsoft Visual C++ 2015-2022 Redistributable (x86) - 14.44.35211` is `microsoft visual c++ 2015-2022 redistributable`, no longer ending in ` -`. Year ranges such as `2015-2022` stay in the title.
 - A Homebrew `name@version` token keeps the name and supplies the version: `openssl@3` is `openssl`, version `3`.
 - Only the trailing run of legal-suffix words is stripped from a publisher, and the last word is never stripped, so `macOS Software Signing` and `Software AG` keep their names and `Software` is no longer empty. `l.l.c.` is a suffix word. Compound forms (`GmbH & Co. KG`) are still not reduced, so `Example Software GmbH & Co. KG` changes once, from `example & kg` to `example software gmbh & co. kg`.

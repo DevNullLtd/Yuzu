@@ -2327,8 +2327,8 @@ if build_server
                '-DYUZU_API_PARITY_LEDGER_DIR="' +
                (meson.project_source_root() / 'scripts' / 'ci' / 'api-parity').replace('\\', '/') +
                '"',
-               # test_product_normalize.cpp reads the committed S-2 normaliser fixture
-               # (tests/unit/fixtures/software-estate/normaliser/s2_cases.tsv) at run time; same
+               # test_product_normalize.cpp reads the committed normaliser fixture
+               # (tests/unit/fixtures/software-estate/normaliser/normaliser_cases.tsv) at run time; same
                # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
                '-DYUZU_TEST_FIXTURE_DIR="' +
                (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +

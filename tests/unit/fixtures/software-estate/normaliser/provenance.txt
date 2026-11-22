@@ -1,13 +1,13 @@
-Normaliser fixture: s2_cases.tsv
+Normaliser fixture: normaliser_cases.tsv
 ================================
 
-Loaded by tests/unit/server/test_product_normalize.cpp (the "S-2" test cases) through
+Loaded by tests/unit/server/test_product_normalize.cpp (the fixture test cases) through
 YUZU_TEST_FIXTURE_DIR. Columns: kind (title or vendor), input, wanted normalised title or vendor,
 wanted edition, wanted version, defect (1 to 7; 0 = a control row that must not change).
 
 Where the inputs came from
 --------------------------
-The S-2 proxy spike (2026-11-03) ran the SAM.4 normaliser over the installed-software lists of
+The proxy spike (2026-11-03) ran the SAM.4 normaliser over the installed-software lists of
 three developer machines: a macOS laptop, a Windows 11 host and Ubuntu 26.04 under WSL. Only the
 product name and publisher strings were kept. The rows marked CAPTURED below are strings
 present verbatim in that list; the rest are SYNTHETIC: written for this fixture to probe a rule
@@ -26,9 +26,9 @@ CAPTURED vendors
   macOS Software Signing, Microsoft Corporation, Python Software Foundation
 
 SYNTHETIC rows
-  Defect 5 probes: Software AG, Software, Example L.L.C. (the S-2 report probed "Software AG",
+  Defect 5 probes: Software AG, Software, Example L.L.C. (the spike report probed "Software AG",
     "Software" and "L.L.C." by hand; "Example L.L.C." shows the suffix stripped from a name).
-  Defect 7: Microsoft Office Professional Plus 2019 - en-us (an S-2 probe of the documented Office
+  Defect 7: Microsoft Office Professional Plus 2019 - en-us (a spike probe of the documented Office
     installer naming, not a captured title). Pinned as it is today, with the plus and locale words
     still in the title; the issue below tracks the decision.
   Controls: Windows 11 Pro, Microsoft Office Home and Business 2019, 7-Zip 23.01 (x64), the
