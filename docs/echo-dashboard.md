@@ -284,8 +284,10 @@ routes, before any permission check, dispatch or audit row. The routes answer wi
 which is the only signal visible there, because the dashboard's htmx drops a 4xx body. Agent
 registration and enrolment already refuse such an id (over 256 bytes, or a control byte), so
 the case cannot arise for a registered device: only a hand-built URL reaches this refusal. The
-DEX per-device fragments, the device-page fragments and the Echo purge refuse the same ids the
-same way.
+DEX per-device fragments, the device-page fragments, the REST purge
+(`POST /api/v1/echo/retention-paused/purge`) and the two retention-paused posts on the Echo page
+(`POST /fragments/echo/retention-paused/reenable` and `.../purge`, which answer
+"Invalid device id." and count the refusal as `invalid_input`) refuse the same ids the same way.
 
 ### 5.5 Permissions & audit
 

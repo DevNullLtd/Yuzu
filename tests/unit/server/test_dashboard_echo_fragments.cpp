@@ -1381,6 +1381,57 @@ TEST_CASE("fragment purge/reenable audit: a refused request writes no attempted 
     }
 }
 
+// #7811: the posted `device_id` reaches the scoped gate's denial row (`target_id`) and the
+// `attempted` row detail, and the audit store keeps CR, LF and TAB, so both posts refuse an
+// over-long or control-byte id before the gate. The harness gate admits only dev-A and dev-B and
+// records every probe: a 400 with no probe proves the id check ran first (the empty audit log and
+// the zero dispatches alone are also true of a route that never audits or sends).
+TEST_CASE("fragment purge/reenable: an unsafe device id is refused 400 before the scoped gate, "
+          "any audit row or dispatch",
+          "[pg][server][echo][purge][reenable][fragment][audit][7811]") {
+    struct Route {
+        const char* path;
+        const char* action;
+        const char* metric;
+    };
+    constexpr Route kRoutes[] = {
+        {kPurgePath, "echo.source.purge", "yuzu_echo_source_purge_total"},
+        {kReenablePath, "echo.source.reenable", "yuzu_echo_source_reenable_total"}};
+    const std::vector<std::string> bad = {std::string(257, 'a'), "dev%00A", "dev%0D%0AA", "dev%0AA",
+                                          "dev%09A"};
+    for (const auto& route : kRoutes) {
+        DYNAMIC_SECTION(route.action) {
+            FragmentHarness h;
+            std::size_t refused = 0;
+            for (const auto& id : bad) {
+                INFO(id.substr(0, 16));
+                const std::string form = "device_id=" + id + "&source=process";
+                for (const bool in_query : {false, true}) {
+                    auto res = in_query ? h.post(std::string{route.path} + "?" + form, "")
+                                        : h.post(route.path, form);
+                    CHECK(res->status == 400);
+                    CHECK(contains(res->body, "Invalid device id."));
+                    ++refused;
+                }
+            }
+            CHECK(h.scoped_calls.empty());
+            CHECK(h.audits.empty());
+            CHECK(h.calls.empty());
+            CHECK(h.metric(route.metric, "invalid_input") == static_cast<double>(refused));
+
+            // The 256-byte bound is inclusive: a printable id of that length passes the floor and
+            // reaches the gate, which refuses it (not in scope) as the offline 404.
+            const std::string edge(256, 'a');
+            auto res = h.post(route.path, "device_id=" + edge + "&source=process");
+            CHECK(res->status == 404);
+            CHECK(!contains(res->body, "Invalid device id."));
+            REQUIRE(h.scoped_calls.size() == 1);
+            CHECK(h.scoped_calls[0].agent_id == edge);
+            CHECK(h.calls.empty());
+        }
+    }
+}
+
 TEST_CASE("fragment purge/reenable audit: a success row that is not persisted keeps the 200 and "
           "is flagged on the response",
           "[pg][server][echo][purge][reenable][fragment][audit][3619]") {
