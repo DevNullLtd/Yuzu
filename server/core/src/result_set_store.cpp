@@ -30,7 +30,7 @@ namespace yuzu::server {
 
 // ── Small helpers ────────────────────────────────────────────────────────────
 
-static int64_t now_epoch() {
+int64_t ResultSetStore::system_epoch_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
@@ -496,8 +496,9 @@ int count_pinned_on(PGconn* conn, const std::string& owner) {
 
 // ── Construction ─────────────────────────────────────────────────────────────
 
-ResultSetStore::ResultSetStore(pg::PgPool& pool, std::size_t member_cache_bytes)
-    : pool_(pool), member_cache_budget_(member_cache_bytes) {
+ResultSetStore::ResultSetStore(pg::PgPool& pool, std::size_t member_cache_bytes,
+                               std::function<int64_t()> epoch_seconds)
+    : pool_(pool), epoch_seconds_(std::move(epoch_seconds)), member_cache_budget_(member_cache_bytes) {
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("ResultSetStore: no database connection at construction ({}) — result-set "
@@ -551,7 +552,7 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
     row.id = generate_id();
     row.name = req.name;
     row.owner_principal = req.owner_principal;
-    row.created_at = now_epoch();
+    row.created_at = epoch_seconds_();
     row.ttl_at = row.created_at + kDefaultTtlSeconds;
     row.last_used_at = row.created_at;
     row.pinned = false;
@@ -978,7 +979,7 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         "LEFT JOIN result_set_store.result_set_members m "
         "ON m.result_set_id = r.id AND r.owner_principal = $2 {}", columns, live_row);
     auto cached = cached_members(id);
-    const std::vector<std::string> params{id, owner, std::to_string(now_epoch())};
+    const std::vector<std::string> params{id, owner, std::to_string(epoch_seconds_())};
     pg::PgResult res;
     if (cached.members) {
         res = pg::exec_params(lease.get(), header_sql.c_str(), params);
@@ -1249,7 +1250,7 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::unpin(const std::string
     // Restore ttl_at = now + default (design §3.3). The original was
     // INT64_MAX while pinned, so this clamps rather than "restoring" a prior
     // value — same behavior as the SQLite implementation.
-    int64_t new_ttl = now_epoch() + kDefaultTtlSeconds;
+    int64_t new_ttl = epoch_seconds_() + kDefaultTtlSeconds;
     std::string sql = std::string("UPDATE result_set_store.result_sets SET pinned = false, "
                                   "ttl_at = $1::bigint WHERE id = $2 RETURNING ") +
                       kRowCols;
@@ -1272,7 +1273,7 @@ void ResultSetStore::touch(const std::string& id) {
         spdlog::error("ResultSetStore::touch: no connection ({})", pool_.last_error());
         return;
     }
-    int64_t now = now_epoch();
+    int64_t now = epoch_seconds_();
     // Do not shorten a pinned set's INT64_MAX ttl; only ever extend.
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -1604,7 +1605,7 @@ int ResultSetStore::gc_sweep() {
         if (!to_bool(PQgetvalue(lk.get(), 0, 0)))
             return true; // another replica holds the sweep
 
-        const int64_t now = now_epoch();
+        const int64_t now = epoch_seconds_();
 
         // Load the persisted reading + last-reported anomaly fact set.
         pg::PgResult meta = pg::exec_params(

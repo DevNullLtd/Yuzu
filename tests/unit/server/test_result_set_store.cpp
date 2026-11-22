@@ -1424,6 +1424,45 @@ TEST_CASE("ResultSetStore: a materialize fill and a pending set stamp as the wri
     CHECK(store.member_set_owned(empty->id, "alice")->ids == first->ids);
 }
 
+TEST_CASE("ResultSetStore: membership and GC agree when the server and PostgreSQL clocks differ",
+          "[pg][result_set][member_cache][clock_skew]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    const auto database_now = std::stoll(
+        query_scalar(db.dsn(), "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint"));
+    const int skew_seconds = GENERATE(-86400, 86400);
+    CAPTURE(skew_seconds);
+    int64_t server_now = database_now + skew_seconds;
+    const auto clock = [&server_now] { return server_now; };
+    ResultSetStore warm{pool, ResultSetStore::kDefaultMemberCacheBytes, clock};
+    auto set = warm.create_materialized(req("alice"), {"dev-1"});
+    REQUIRE(set.has_value());
+    REQUIRE(set->created_at == server_now);
+    REQUIRE(set->ttl_at == server_now + ResultSetStore::kDefaultTtlSeconds);
+
+    server_now = set->ttl_at;
+    // A younger live set makes expiry of the first an ordinary, non-wipe sweep.
+    auto younger = warm.create_materialized(req("alice"), {"dev-2"});
+    REQUIRE(younger.has_value());
+    auto first = warm.member_set_owned(set->id, "alice");
+    REQUIRE(first.has_value());
+    auto hit = warm.member_set_owned(set->id, "alice");
+    REQUIRE(hit.has_value());
+    CHECK(hit->ids == first->ids);
+    REQUIRE(warm.gc_sweep() == 0);
+
+    ++server_now;
+    ResultSetStore cold{pool, ResultSetStore::kDefaultMemberCacheBytes, clock};
+    for (auto* reader : {&warm, &cold}) {
+        auto expired = reader->member_set_owned(set->id, "alice");
+        REQUIRE_FALSE(expired.has_value());
+        CHECK(expired.error() == ResultSetError::NotFound);
+    }
+    REQUIRE(cold.gc_sweep() == 1);
+    CHECK_FALSE(get_ok(cold, set->id).has_value());
+    CHECK(get_ok(cold, younger->id).has_value());
+}
+
 TEST_CASE("ResultSetStore: expiry, pinning and readiness are judged on the live header, "
           "warm or cold",
           "[pg][result_set][member_cache]") {

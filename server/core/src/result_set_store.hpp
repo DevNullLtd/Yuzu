@@ -138,6 +138,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <list>
 #include <map>
 #include <memory>
@@ -339,7 +340,8 @@ public:
     /// migration on a pinned lease. `is_open()` is false if the lease was
     /// empty or the migration failed. Zero cache budget disables retention.
     explicit ResultSetStore(pg::PgPool& pool,
-                            std::size_t member_cache_bytes = kDefaultMemberCacheBytes);
+                            std::size_t member_cache_bytes = kDefaultMemberCacheBytes,
+                            std::function<int64_t()> epoch_seconds = system_epoch_seconds);
 
     ResultSetStore(const ResultSetStore&) = delete;
     ResultSetStore& operator=(const ResultSetStore&) = delete;
@@ -584,7 +586,9 @@ public:
     int gc_sweep();
 
 private:
+    static int64_t system_epoch_seconds();
     pg::PgPool& pool_;
+    const std::function<int64_t()> epoch_seconds_;
     bool open_{false};
 
     struct CachedMembership {
