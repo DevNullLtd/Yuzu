@@ -32,6 +32,7 @@
 #include <nlohmann/json.hpp>
 #include <yuzu/metrics.hpp>
 
+#include <chrono>
 #include <optional>
 #include <string>
 #include <vector>
@@ -1501,4 +1502,36 @@ TEST_CASE("REST /dex/perf/cohort-diff: deltas, required params, missing cohort",
         CHECK(jj["data"]["b"].is_null());
         CHECK(jj["data"]["delta_pct"]["cpu_pct"].is_null());
     }
+}
+
+// ── #2146: the canned device-perf SQL builders, hoisted out of dex_routes.cpp ──
+// The text is the contract with the agent's read-only echo.sql chokepoint and with the
+// column names the parsers locate by name, so it is pinned verbatim.
+TEST_CASE("dex perf canned SQL: warehouse queries are pinned verbatim", "[dex][perf][sql]") {
+    CHECK(std::string(kDexPerfSql) ==
+          "SELECT hour_ts, cpu_avg, mem_avg, read_lat_us_avg, write_lat_us_avg "
+          "FROM $Perf_Hourly ORDER BY hour_ts DESC LIMIT 48");
+    CHECK(dex_procperf_sql_at(1700086400) ==
+          "SELECT name, SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
+          "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
+          "CAST(SUM(ws_avg_bytes*samples)/SUM(samples) AS INTEGER) AS ws_avg, "
+          "MAX(ws_max_bytes) AS ws_max, COUNT(DISTINCT hour_ts) AS hours "
+          "FROM $ProcPerf_Hourly WHERE hour_ts >= 1700000000 "
+          "GROUP BY name ORDER BY cpu_avg DESC LIMIT 25");
+}
+
+TEST_CASE("dex perf canned SQL: the wall-clock wrapper embeds now minus 24 h", "[dex][perf][sql]") {
+    const auto before = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    const std::string sql = dex_procperf_sql();
+    const auto after = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    const std::string key = "hour_ts >= ";
+    const auto at = sql.find(key);
+    REQUIRE(at != std::string::npos);
+    const auto cutoff = std::stoll(sql.substr(at + key.size()));
+    CHECK(cutoff >= before - 86400);
+    CHECK(cutoff <= after - 86400);
 }

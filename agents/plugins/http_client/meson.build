@@ -1,5 +1,5 @@
 http_cpp_args = []
-# Windows: bcrypt.lib + ws2_32.lib linked via #pragma comment(lib) in source
+# Windows: ws2_32.lib linked via #pragma comment(lib) in source (hashing is the shared in-memory SHA-256)
 if host_machine.system() == 'windows'
   # Try to find OpenSSL on Windows for HTTPS support
   _http_openssl = dependency('openssl', method: 'cmake',
@@ -24,11 +24,14 @@ else
   http_cpp_args = ['-DCPPHTTPLIB_OPENSSL_SUPPORT']
 endif
 
-shared_library(
+# Captured so tests/meson.build can order it ahead of agent_test_exe via link_depends
+# (test_local_path_policy.cpp loads this plugin by path; a missing build must FAIL, not skip).
+http_client_plugin_lib = shared_library(
   'http_client',
   files('src/http_client_plugin.cpp'),
   name_prefix: '',
   cpp_args: http_cpp_args,
+  include_directories: include_directories('../../shared'),  # atomic_file_write.hpp, local_path_policy.hpp, outbound_address_policy.hpp
   dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep, httplib_dep] + http_extra_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',

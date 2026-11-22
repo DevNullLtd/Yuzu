@@ -25,7 +25,8 @@
 ///   2. decide_after_claim()  — AFTER the claim: replay / answer RUNNING / proceed.
 ///
 /// Invariants this header is the tested home of (docs/command-dedup.md):
-///   - #3  `__guard__` is the ONLY dispatch that bypasses the claim. The gate is the
+///   - #3  `__guard__` is the ONLY dispatch that skips claiming for its own reason (a command refused
+///         BEFORE the claim step, a NUL parameter, claims nothing and dispatches nothing). The gate is the
 ///         literal, NOT the reserved-name set, so dedup stays the SAFE DEFAULT for
 ///         `__sync__` and any future reserved name (e.g. an OTA `__update__`).
 ///   - #4  A duplicate NEVER re-executes. Terminal replays the stored frame;
