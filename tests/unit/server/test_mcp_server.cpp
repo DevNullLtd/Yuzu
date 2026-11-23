@@ -11849,6 +11849,51 @@ TEST_CASE("MCP get_device_live: strict arguments (object, agent_id 1..256 and ne
     CHECK(mcp_live_count(metrics, "unknown", "internal") == 0.0);
 }
 
+TEST_CASE("MCP get_device_live: agent_id is accepted at 256 characters and refused at 257",
+          "[mcp][integration][live][2146]") {
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 8}};
+    LiveDispatchProbe probe;
+    McpTestServer ts; // no ResponseStore: an admitted call stops at the wiring check
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) { return true; };
+    ts.start_with_dispatch(probe.fn(), "operator");
+
+    // 256 characters passes argument validation and reaches the wiring check (an internal error,
+    // never invalid params); 257 is refused as invalid params before any of it.
+    auto at_limit = ts.call(live_req(live_args(std::string(256, 'a'), "uptime")));
+    CHECK(live_error(at_limit)["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(mcp_live_count(metrics, "uptime", "not_configured") == 1.0);
+    auto over = ts.call(live_req(live_args(std::string(257, 'a'), "uptime")));
+    CHECK(live_error(over)["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(mcp_live_count(metrics, "uptime", "not_configured") == 1.0); // unchanged: not counted
+    CHECK(probe.calls == 0);
+    CHECK(ts.audit_log.empty());
+}
+
+TEST_CASE("MCP get_device_live: the served description states the lease limits the budget enforces",
+          "[mcp][integration][live][2146]") {
+    McpTestServer ts;
+    ts.start("operator");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    std::string description;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "get_device_live")
+            description = t["description"].get<std::string>();
+    REQUIRE_FALSE(description.empty());
+    // "(at most N per principal, M server-wide; ..." is the wording; a changed constant must
+    // change the text, and a changed text must change the constant.
+    const std::string expected =
+        "at most " + std::to_string(yuzu::server::detail::kPerPrincipalLiveRead) +
+        " per principal, " + std::to_string(yuzu::server::detail::kLiveReadSurfaceCap) +
+        " server-wide";
+    CHECK(description.find(expected) != std::string::npos);
+}
+
 TEST_CASE("MCP get_device_live: a kind outside the REST pair (a dashboard-only kind, an unknown name, "
           "another case) is -32602, counted bad_kind, with no row and no dispatch",
           "[mcp][integration][live][2146]") {
@@ -11966,6 +12011,36 @@ TEST_CASE("MCP get_device_live: refused under --mcp-read-only, with a denied row
     CHECK(mcp_live_count(metrics, "uptime", "read_only_refused") == 1.0);
 }
 
+TEST_CASE("MCP get_device_live: the scoped gates run before the supervised and read-only refusals, so "
+          "an out-of-scope device answers the gate's 403, not the mode refusal",
+          "[mcp][integration][live][scope][2146]") {
+    LiveDispatchProbe probe;
+    const auto deny_all_gate = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                                  const std::string&, const std::string&) {
+        res.status = 403;
+        res.set_content(R"({"error":"forbidden"})", "application/json");
+        return false;
+    };
+    SECTION("a supervised token") {
+        McpTestServer ts;
+        ts.scoped_perm_fn_for_test = deny_all_gate;
+        ts.start_with_dispatch(probe.fn(), "supervised");
+        auto res = ts.call(live_req(live_args("WS-9", "uptime")));
+        CHECK(res->status == 403);
+        CHECK(ts.audit_log.empty()); // no `denied` mode row: the gate answered first
+    }
+    SECTION("--mcp-read-only") {
+        McpTestServer ts;
+        ts.read_only_mode_ = true;
+        ts.scoped_perm_fn_for_test = deny_all_gate;
+        ts.start_with_dispatch(probe.fn(), "operator");
+        auto res = ts.call(live_req(live_args("WS-9", "uptime")));
+        CHECK(res->status == 403);
+        CHECK(ts.audit_log.empty());
+    }
+    CHECK(probe.calls == 0);
+}
+
 TEST_CASE("MCP get_device_live: the two scoped gates are decided per device; a withheld grant, or an "
           "unwired gate, sends nothing and writes nothing",
           "[mcp][integration][live][scope][2146]") {
@@ -12028,6 +12103,51 @@ TEST_CASE("MCP get_device_live: an unwired response store or dispatch is a retry
     CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpProviderWarmupRetryMs);
     CHECK(ts.audit_log.empty());
     CHECK(mcp_live_count(metrics, "uptime", "not_configured") == 1.0);
+}
+
+TEST_CASE("MCP get_device_live: an unwired Forensics plugin set is refused up front, retryable, with "
+          "no slot, no row and no dispatch",
+          "[pg][mcp][integration][live][forensics_tier][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.ts.forensics_unwired_for_test = true; // the response store and dispatch ARE wired
+    f.start();
+    const auto err = live_error(f.call("WS-1", "uptime"));
+    CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpProviderWarmupRetryMs);
+    CHECK(f.probe.calls == 0);
+    CHECK(f.ts.audit_log.empty());
+    CHECK(f.budget.active() == 0);
+    CHECK(mcp_live_count(f.metrics, "uptime", "not_configured") == 1.0);
+}
+
+TEST_CASE("MCP get_device_live: the in-flight gauge moves with the lease on the MCP surface and "
+          "returns to zero",
+          "[pg][mcp][integration][live][lease][metrics][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+    double gauge_in_dispatch = -1.0;
+    double gauge_at_requested = -1.0;
+    f.probe.on_dispatch = [&] { gauge_in_dispatch = f.metrics.gauge("yuzu_server_live_inflight").value(); };
+    f.ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+        if (action == "device.live.uptime")
+            gauge_at_requested = f.metrics.gauge("yuzu_server_live_inflight").value();
+        return true;
+    };
+    f.start();
+    CHECK(f.metrics.gauge("yuzu_server_live_inflight").value() == 0.0);
+    const auto p = live_payload(f.call("WS-1", "uptime"));
+    CHECK(p["kind"] == "uptime");
+    CHECK(gauge_at_requested == 1.0);
+    CHECK(gauge_in_dispatch == 1.0);
+    CHECK(f.metrics.gauge("yuzu_server_live_inflight").value() == 0.0);
+    CHECK(f.budget.active() == 0);
+
+    // A refused admission does not move it, and a throw from the dispatch returns it to zero.
+    f.probe.on_dispatch = [] { throw std::runtime_error("dispatch blew up"); };
+    (void)live_error(f.call("WS-1", "uptime"));
+    CHECK(f.metrics.gauge("yuzu_server_live_inflight").value() == 0.0);
 }
 
 TEST_CASE("MCP get_device_live: the `requested` row is FAIL CLOSED (a failing or throwing sink sends "
@@ -12223,7 +12343,9 @@ TEST_CASE("MCP get_device_live: a dispatch that reaches no agent is classified, 
     };
     for (const auto& d : {Denial{Reason::Forbidden, kPerm}, Denial{Reason::ApprovalRequired, kPerm},
                           Denial{Reason::KillSwitched, kPerm}, Denial{Reason::AnonymousOperator, kPerm},
-                          Denial{Reason::Unclassified, kInv}, Denial{Reason::Ambiguous, kInv}}) {
+                          // A server-named pair that is not in the catalogue is a server fault
+                          // (the REST route answers 500), never the caller's invalid params.
+                          Denial{Reason::Unclassified, kInt}, Denial{Reason::Ambiguous, kInt}}) {
         const std::string token(yuzu::server::detail::to_string(d.reason));
         INFO(token);
         f.ts.audit_log.clear();
@@ -12236,9 +12358,17 @@ TEST_CASE("MCP get_device_live: a dispatch that reaches no agent is classified, 
         auto res = f.call("WS-1", "uptime");
         const auto err = live_error(res);
         CHECK(err["code"] == d.code);
-        CHECK(err["data"]["reason"] == "dispatch_denied");
+        // The closed denial token rides as the error reason; the audit detail keeps the verb.
+        CHECK(err["data"]["reason"] == token);
         CHECK(err["data"]["retry_after_ms"].is_null());
         CHECK(f.ts.audit_details.back().find("dispatch_denied reason=" + token) != std::string::npos);
+        if (d.code == kInt) {
+            // The shared wording blames the caller's plugin/action name, which is not theirs.
+            CHECK(err["data"]["remediation"].get<std::string>().find("server catalogue fault") !=
+                  std::string::npos);
+            CHECK(err["data"]["remediation"].get<std::string>().find("confirm the plugin") ==
+                  std::string::npos);
+        }
         CHECK(live_domain_rows(f.ts).back() == "device.live.uptime|failure");
     }
     // The wording of the common case: the caller lacks Inventory:Read (the pair's real gate).

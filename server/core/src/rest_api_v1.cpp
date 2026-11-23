@@ -50,6 +50,7 @@
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate/export row builders
 #include "forensics_read_audit.hpp" // #4990: response.forensics.read (separately countable usage-class read)
+#include "live_gauge_mirror.hpp" // LiveGaugeMirror: the yuzu_server_live_inflight mirror (shared with MCP)
 #include "response_export_metrics.hpp"
 #include "response_query_params.hpp" // #4644/#4703: strict numeric params + export byte cap
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared execution/fleet statistics builders
@@ -715,33 +716,6 @@ static std::string reply_dispatch_denied(httplib::Response& res, const std::stri
                     "application/json");
     return token;
 }
-
-// Mirrors the number of held per-device live reads (`SseSurface::kLiveRead` leases) into the
-// `yuzu_server_live_inflight` gauge. Declare it BEFORE the lease it reports on: locals are destroyed
-// in reverse order, so the lease is returned first and the destructor then publishes the count
-// WITHOUT it (a gauge read after the lease went out of scope, not before). `publish()` is called
-// once after a successful acquire. Both the gauge and the budget are borrowed and may be null.
-class LiveGaugeMirror {
-public:
-    LiveGaugeMirror(detail::StreamBudget* budget, yuzu::Gauge* gauge) noexcept
-        : budget_(budget), gauge_(gauge) {}
-    ~LiveGaugeMirror() { publish(); }
-    LiveGaugeMirror(const LiveGaugeMirror&) = delete;
-    LiveGaugeMirror& operator=(const LiveGaugeMirror&) = delete;
-
-    void publish() noexcept {
-        if (budget_ == nullptr || gauge_ == nullptr)
-            return;
-        try {
-            gauge_->set(static_cast<double>(budget_->active_for_surface(detail::SseSurface::kLiveRead)));
-        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a request
-        }
-    }
-
-private:
-    detail::StreamBudget* budget_;
-    yuzu::Gauge* gauge_;
-};
 
 // Takes a `kLiveRead` lease: per principal `kPerPrincipalLiveRead`, across principals
 // `kLiveReadSurfaceCap`, both under the budget's one mutex. A null budget is the unmetered seam
@@ -8645,7 +8619,7 @@ void RestApiV1::register_routes(
                 // and answers 202 (never 429): the record is already releasing and the reconciler
                 // finishes it. The mirror is declared before the lease so the gauge is published
                 // after the lease is returned. A null budget is the unmetered seam (tests only).
-                LiveGaugeMirror gauge_mirror{
+                detail::LiveGaugeMirror gauge_mirror{
                     stream_budget, metrics_registry
                                        ? &metrics_registry->gauge("yuzu_server_live_inflight")
                                        : nullptr};
@@ -19980,7 +19954,7 @@ void RestApiV1::register_routes(
             // and BEFORE the `requested` row: an over-budget caller is answered 429 and leaves no
             // audit row, and no command is dispatched. The mirror is declared before the lease so
             // the gauge is published after the lease is returned, on every exit path.
-            LiveGaugeMirror gauge_mirror{
+            detail::LiveGaugeMirror gauge_mirror{
                 stream_budget,
                 metrics_registry ? &metrics_registry->gauge("yuzu_server_live_inflight") : nullptr};
             auto admission = acquire_live_read_lease(stream_budget, first_caller->principal);

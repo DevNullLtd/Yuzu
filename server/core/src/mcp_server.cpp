@@ -109,6 +109,7 @@
 #include "workflow_execute.hpp" // #2146 batch B: execute_workflow shares this sequence with POST /api/v1/workflows/{id}/execute
 #include "command_v1_routes.hpp" // command_v1::zero_reach_reply: the one zero-reach answer table (get_device_live)
 #include "dispatch_zero_reach.hpp" // classify_zero_reach / zero_reach_token / zero_reach_retryable
+#include "live_gauge_mirror.hpp" // LiveGaugeMirror: yuzu_server_live_inflight (shared with REST)
 #include "live_model.hpp" // resolve_rest_kind: the ONE live kind table (get_device_live)
 #include "live_outcome.hpp" // LiveOutcome / LiveSurface / kind_label: the closed metric label vocabulary
 #include "live_read_poll.hpp" // poll_live_output: the shared device-output poll
@@ -22108,6 +22109,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // refusal that needs no slot and BEFORE the `requested` row, so an over-budget call
                 // is answered with no audit row and nothing is sent. The lease is branch-local, so
                 // any return or throw below gives the slot back.
+                // The gauge mirror is declared BEFORE the lease so the lease is returned first and
+                // the destructor publishes the count without it, on every exit path.
+                yuzu::server::detail::LiveGaugeMirror gauge_mirror{
+                    stream_budget,
+                    metrics != nullptr ? &metrics->gauge("yuzu_server_live_inflight") : nullptr};
                 std::optional<yuzu::server::detail::StreamBudget::Lease> live_lease;
                 std::string_view admission_refusal; // empty == admitted
                 if (draining_fn_ && draining_fn_()) {
@@ -22132,6 +22138,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 : std::string_view(yuzu::server::detail::StreamBudget::kRejectGlobal);
                     }
                 }
+                gauge_mirror.publish();
                 if (!admission_refusal.empty()) {
                     using SB = yuzu::server::detail::StreamBudget;
                     const bool draining = admission_refusal == "draining";
@@ -22259,22 +22266,25 @@ McpServer::HandlerFn McpServer::build_handler(
                         const auto text = describe_dispatch_denial(denial.reason, lk->plugin,
                                                                    lk->action, denial,
                                                                    DenialSurface::kMcp);
-                        int code = kInternalError;
-                        switch (text.cls) {
-                        case DispatchDenialClass::kInvalidParams:
-                            code = kInvalidParams;
-                            break;
-                        case DispatchDenialClass::kPermissionDenied:
-                            code = kPermissionDenied;
-                            break;
-                        case DispatchDenialClass::kInternal:
-                            code = kInternalError;
-                            break;
-                        }
+                        // Only the permission class is the caller's to fix. Unclassified and
+                        // Ambiguous would read as kInvalidParams (the caller named a bad pair),
+                        // but this tool dispatches a SERVER-named pair, so they are a server
+                        // catalogue fault and answer as one (the REST route answers 500), with no
+                        // retry hint and without the shared "confirm the plugin/action name"
+                        // remediation that blames the caller.
+                        const bool permission_class =
+                            text.cls == DispatchDenialClass::kPermissionDenied;
                         const bool row_ok = domain_row("failure", "dispatch_denied reason=" + token);
-                        res.set_content(a4_error(code, text.message, text.remediation, -1, cid, row_ok,
-                                                 "dispatch_denied"),
-                                        "application/json");
+                        res.set_content(
+                            a4_error(permission_class ? kPermissionDenied : kInternalError,
+                                     permission_class ? text.message
+                                                      : "dispatch denied: reason=" + token,
+                                     permission_class
+                                         ? text.remediation
+                                         : "server catalogue fault for a server-named pair; "
+                                           "report to the administrator",
+                                     -1, cid, row_ok, token), // retry-hint-exempt: a denial is permanent for this caller or a server fault
+                                    "application/json");
                         return;
                     }
                     if (dispatched.sent == 0) {
