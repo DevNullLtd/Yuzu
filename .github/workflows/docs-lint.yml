@@ -1,7 +1,8 @@
 name: Docs Lint
 
 # Lightweight hygiene checks for the changelog (and docs). The `changelog-order`
-# job publishes the **required** "CHANGELOG order" status check, so this
+# job publishes the **required** "CHANGELOG order" status check (it aggregates
+# the three `docs-lint-*` shard jobs, see the comment above them), so this
 # workflow must run on EVERY pull request to main/dev. A `paths:` filter here
 # was the bug: a PR that didn't touch CHANGELOG.md never reported the required
 # check and got wedged forever on a status that never arrived (the
@@ -35,8 +36,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  changelog-order:
-    name: CHANGELOG order
+  # The required "CHANGELOG order" check is the AGGREGATOR job `changelog-order`
+  # at the end of this group. Its gates run in the three `docs-lint-*` shards
+  # below, in parallel; the aggregator goes green only when every shard
+  # succeeded, so each gate still blocks merge exactly as when they shared one
+  # job. The shards exist for run time: run one after another, the gates came to
+  # about 260s of a 300s budget and timed out once runners slowed. A NEW gate goes
+  # into a shard (and a new shard into the aggregator's `needs:`), never into
+  # the aggregator itself. Each shard checks out full history (fetch-depth 0):
+  # several gates read it (the personal-data ratchet's merge-base, the
+  # governance-ledger and docs-drift self-tests, whats-new). Steps have no `if:`, so
+  # a red step stops only its own shard; the other shards still report.
+  docs-lint-changelog-docs:
+    name: Docs lint (changelog and docs hygiene)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -65,6 +77,112 @@ jobs:
       # meson docs suite, so this runs here on every PR as well.
       - name: Gateway peer restart-advice lint
         run: python3 -I tests/test_gateway_peer_restart_advice_lint.py
+
+      # #2146: the workflow-execute zero-reach status list is named in the REST and MCP manuals, and
+      # no source or manual claims an absent command_id proves a step was never sent.
+      - name: Workflow execute docs gate (#2146)
+        run: python3 -I tests/test_workflow_execute_docs_lexical.py
+
+      # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
+      # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
+      # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts
+      # only); new hits fail, the baseline may only shrink (--ratchet, merge-base vs
+      # origin/dev, hence fetch-depth 0). See docs/plugin-readme-standard.md rule 5.
+      - name: Personal-data guard
+        # Ratchet against the PR's own target (a hotfix to main compares with main).
+        env:
+          PDG_BASE: origin/${{ github.base_ref || 'dev' }}
+        run: python3 -I scripts/ci/check-personal-data.py --strict-baseline --ratchet
+
+      - name: Personal-data guard self-test
+        run: python3 -I tests/test_check_personal_data_selftest.py
+
+      # Governance-ledger linter self-test. NOTE: the linter itself
+      # (scripts/ci/check-governance-ledger.py) is DELIBERATELY NOT run as a CI
+      # gate over governance.d/ — calibration showed most historical
+      # fragments predate its strict self-consistency rules, so it is an
+      # ADVISORY author-side pre-push check (the /governance skill runs it on
+      # the current run's fragment). Only this self-test runs in CI, to keep the
+      # tool's own discrimination logic from silently rotting — deterministic,
+      # synthetic input, touches no real ledger. Stdlib only.
+      - name: Governance-ledger linter self-test
+        run: python3 tests/test_governance_ledger_check_selftest.py
+
+      # RBAC doc/seed parity (#480): docs/user-manual/rbac.md's four tables
+      # (system roles, securable types, operations, the authorization-topology
+      # floor) are hand-maintained copies of arrays in rbac_store.cpp and
+      # authz_topology_floor.hpp. Nothing checked the copies still matched, and
+      # by the time PR #4776 audited them the doc was 15 securable types, one
+      # role and five floor entries behind — each drift arriving through a
+      # reviewed PR. Set-equality, so a failure names the entry rather than the
+      # count. Stdlib only, parses source text, needs no build.
+      - name: RBAC doc/seed parity
+        run: python3 tests/test_rbac_doc_counts.py
+
+      # The /swagger page's renderer runs under node against a fake DOM. The meson entry
+      # skips without node, so run it here on the hosted image and fail rather than skip
+      # if node is missing.
+      - name: Swagger page behaviour
+        run: |
+          node --version
+          YUZU_REQUIRE_NODE=1 python3 tests/test_swagger_page_behaviour.py
+
+      # OpenAPI authoring: a dev-side author adding an operation to rest_api_v1.cpp meets the C++
+      # completeness tests one kind of mistake per full Linux build (no operationId, then the
+      # checksum pin, then an untyped success response outside kUntyped). This lexical twin reports
+      # all of them at once, plus the 15,000-byte literal segment ceiling, with no build. Stdlib
+      # only; also registered in tests/meson.build for local `meson test --suite docs` parity.
+      - name: OpenAPI operation authoring (operationId, pin, typed responses)
+        run: python3 -I tests/test_openapi_operation_authoring.py
+
+      # Changelog promote --append (#5221): folds post-promotion hotfix
+      # fragments into an already-promoted release section. Stdlib only.
+      - name: Changelog promote --append
+        run: python3 tests/test_assemble_changelog_append.py
+
+      # scripts/whats-new.py: collated "what changed since my last pull" view
+      # (version bumps + changelog.d fragments). Builds a throwaway git repo.
+      - name: What's-new script
+        run: python3 tests/test_whats_new.py
+
+      # The Windows agent zip and installer ship the Visual C++ runtime
+      # app-local (deploy/packaging/windows/stage-msvc-runtime.ps1), and
+      # release.yml's build-windows checks every shipped binary's DLL imports
+      # against both payloads (scripts/ci/check-windows-payload-imports.py)
+      # before ISCC runs. Behavioural over synthetic PE images, the staging
+      # script under pwsh, and lexical wiring pins with mutants.
+      - name: Windows payload import closure
+        env:
+          # The runner image ships pwsh: require it so the staging-script
+          # behaviour cannot skip silently.
+          YUZU_REQUIRE_PWSH_TEST: '1'
+        run: python3 -I tests/test_windows_payload_imports.py
+
+      # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
+      # route, MCP tool and server/agent CLI flag is named in the user manual,
+      # ratcheted against a by-name baseline that only
+      # shrinks. Reuses check-api-parity.py's extractors; also self-checks
+      # the doc-coupling manifest that doc-coupling.yml's touch rule reads.
+      # Hosted in a shard of the required check so drift blocks merge, and LAST
+      # in that shard so a drift failure cannot hide a later step's result (the
+      # steps above have no `if:`, so a red step stops the shard).
+      - name: Docs drift gate (fact parity)
+        run: python3 -I scripts/ci/check-docs-drift.py
+
+      - name: Docs drift gate self-test
+        run: python3 -I tests/test_docs_drift_selftest.py
+
+  docs-lint-wiring-tripwires:
+    name: Docs lint (wiring tripwires)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history: the personal-data guard's baseline ratchet needs
+          # `git merge-base origin/dev HEAD`.
+          fetch-depth: 0
 
       # ADR-0032 sequencing-interlock merge-gate (WS-0). No engine-path code may
       # merge until the unconditional set (a)-(d)+(h) lands. Governance runs from
@@ -104,6 +222,16 @@ jobs:
       - name: Forensics tier wiring gate self-test (#4990)
         run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
 
+      # G01: server.cpp keeps handing the policy evaluator its capability registry (an evaluator
+      # without one refuses every dispatch, so a dropped line stops every policy and no unit test
+      # notices) and policy_evaluator.cpp keeps one dispatch site behind the refusal seam. The
+      # self-test mutates each required statement in memory and proves the gate names it.
+      - name: Policy dispatch wiring gate (G01)
+        run: python3 -I tests/test_policy_dispatch_wiring_lexical.py
+
+      - name: Policy dispatch wiring gate self-test (G01)
+        run: python3 -I tests/test_policy_dispatch_wiring_lexical_selftest.py
+
       # WP01: the agent re-registration proof gate stays wired into the direct and gateway ingest
       # paths (unit tests use fake hooks, so a deleted wiring line would leave them green).
       - name: Re-registration gate wiring gate (WP01)
@@ -121,8 +249,8 @@ jobs:
       # uses, scope constructions, scope arguments, predicate calls, mutation requests, raw-username
       # guards and gate refusals are frozen exact sets. Its self-test, which mutates the sources in
       # memory and proves every mutation is caught, runs in the separate `execution-owner-key-selftest`
-      # job below: it costs about half a minute of CPU, and this job is the required check with a
-      # five minute budget.
+      # job below: it costs about half a minute of CPU, and this shard feeds the required check
+      # under a five minute budget.
       - name: Execution owner key tripwire (#5557)
         run: python3 -I tests/test_execution_owner_key_tripwire.py
 
@@ -132,6 +260,7 @@ jobs:
         run: |
           python3 -I tests/test_plugin_allowlist_wiring_lexical.py
           python3 -I tests/test_installed_apps_no_brew_lexical.py
+          python3 -I tests/test_pkg_inventory_no_brew_lexical.py
           python3 -I tests/test_agent_installer_no_file_caps.py
           python3 -I tests/test_proc_access_status_lexical.py
           python3 -I tests/cpp_lex_helper.py
@@ -153,30 +282,11 @@ jobs:
       - name: vuln_scan no-brew gate self-test (WP13c)
         run: python3 -I tests/test_vuln_scan_no_brew_lexical_selftest.py
 
-      # #2146: the workflow-execute zero-reach status list is named in the REST and MCP manuals, and
-      # no source or manual claims an absent command_id proves a step was never sent.
-      - name: Workflow execute docs gate (#2146)
-        run: python3 -I tests/test_workflow_execute_docs_lexical.py
-
       # WP11: endpoint-derived plugin result rows (processes, procfetch, wmi, filesystem,
       # installed_apps, network_config proxy_address/bypass) are built by the neutralising
       # formatters at every call site. Best-effort lexical tripwire, self-checked in memory.
       - name: Plugin row formatters wiring gate (WP11)
         run: python3 -I tests/test_plugin_row_formatters_wiring_lexical.py
-
-      # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
-      # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
-      # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts
-      # only); new hits fail, the baseline may only shrink (--ratchet, merge-base vs
-      # origin/dev, hence fetch-depth 0). See docs/plugin-readme-standard.md rule 5.
-      - name: Personal-data guard
-        # Ratchet against the PR's own target (a hotfix to main compares with main).
-        env:
-          PDG_BASE: origin/${{ github.base_ref || 'dev' }}
-        run: python3 -I scripts/ci/check-personal-data.py --strict-baseline --ratchet
-
-      - name: Personal-data guard self-test
-        run: python3 -I tests/test_check_personal_data_selftest.py
 
       # #1611: keeps the compiled-in TSan suppression in
       # tests/unit/test_runner_main.cpp honest — fails if any first-party code
@@ -213,6 +323,12 @@ jobs:
       # `meson test --suite docs` parity.
       - name: Guardian/Spark log-injection tripwire (#4665)
         run: python3 tests/test_guardian_spark_log_injection_tripwire.py
+
+      # filesystem.exists must refuse a network/device path up front and never fall back to the
+      # raw caller path (the refusal is Windows-only code, so this pins the shape on every host).
+      # Also registered in tests/meson.build for local `meson test --suite docs` parity.
+      - name: filesystem exists has no raw-path fallback
+        run: python3 tests/test_filesystem_exists_no_raw_fallback_lexical.py
 
       # Per-family seam-enforcement scaffold (ADR-0031 migration step 3, WS-A4
       # item 1): a family's presentation/handler TUs must not reach a store
@@ -258,27 +374,17 @@ jobs:
           YUZU_REQUIRE_TOOLCHAIN: "1"
         run: python3 tests/test_core_presentation_link_selftest.py
 
-      # Governance-ledger linter self-test. NOTE: the linter itself
-      # (scripts/ci/check-governance-ledger.py) is DELIBERATELY NOT run as a CI
-      # gate over governance.d/ — calibration showed most historical
-      # fragments predate its strict self-consistency rules, so it is an
-      # ADVISORY author-side pre-push check (the /governance skill runs it on
-      # the current run's fragment). Only this self-test runs in CI, to keep the
-      # tool's own discrimination logic from silently rotting — deterministic,
-      # synthetic input, touches no real ledger. Stdlib only.
-      - name: Governance-ledger linter self-test
-        run: python3 tests/test_governance_ledger_check_selftest.py
-
-      # RBAC doc/seed parity (#480): docs/user-manual/rbac.md's four tables
-      # (system roles, securable types, operations, the authorization-topology
-      # floor) are hand-maintained copies of arrays in rbac_store.cpp and
-      # authz_topology_floor.hpp. Nothing checked the copies still matched, and
-      # by the time PR #4776 audited them the doc was 15 securable types, one
-      # role and five floor entries behind — each drift arriving through a
-      # reviewed PR. Set-equality, so a failure names the entry rather than the
-      # count. Stdlib only, parses source text, needs no build.
-      - name: RBAC doc/seed parity
-        run: python3 tests/test_rbac_doc_counts.py
+  docs-lint-release-packaging:
+    name: Docs lint (release and packaging)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history: the personal-data guard's baseline ratchet needs
+          # `git merge-base origin/dev HEAD`.
+          fetch-depth: 0
 
       # Gateway image guards (#2150). The abi-guard in Dockerfile.gateway's
       # runtime stage once shipped failing OPEN (`apk version -t` prints
@@ -289,13 +395,16 @@ jobs:
       # Docker.
       - name: Gateway image abi-guard
         run: python3 tests/test_gateway_abi_guard.py
+
       # #6711: the gateway image is amd64-only; the lint that keeps its pinned
       # builder index honest, run against fixture indexes (the registry read is
       # in docker-healthcheck-invariants.yml).
       - name: Gateway base index lint
         run: python3 tests/test_gateway_base_index.py
+
       - name: QA-stack gateway crash signatures
         run: python3 tests/test_qa_stack_crash_pat.py
+
       # #5420: the Compose Wizard's generated composes keep /etc/yuzu/certs
       # writable and persistent in every mode. The test drives generate.js under
       # node, which the self-hosted docs-suite runners may lack (the meson entry
@@ -305,32 +414,6 @@ jobs:
         run: |
           node --version
           YUZU_REQUIRE_NODE=1 python3 tests/test_compose_wizard.py
-
-      # The /swagger page's renderer runs under node against a fake DOM. The meson entry
-      # skips without node, so run it here on the hosted image and fail rather than skip
-      # if node is missing.
-      - name: Swagger page behaviour
-        run: |
-          node --version
-          YUZU_REQUIRE_NODE=1 python3 tests/test_swagger_page_behaviour.py
-
-      # OpenAPI authoring: a dev-side author adding an operation to rest_api_v1.cpp meets the C++
-      # completeness tests one kind of mistake per full Linux build (no operationId, then the
-      # checksum pin, then an untyped success response outside kUntyped). This lexical twin reports
-      # all of them at once, plus the 15,000-byte literal segment ceiling, with no build. Stdlib
-      # only; also registered in tests/meson.build for local `meson test --suite docs` parity.
-      - name: OpenAPI operation authoring (operationId, pin, typed responses)
-        run: python3 -I tests/test_openapi_operation_authoring.py
-
-      # Changelog promote --append (#5221): folds post-promotion hotfix
-      # fragments into an already-promoted release section. Stdlib only.
-      - name: Changelog promote --append
-        run: python3 tests/test_assemble_changelog_append.py
-
-      # scripts/whats-new.py: collated "what changed since my last pull" view
-      # (version bumps + changelog.d fragments). Builds a throwaway git repo.
-      - name: What's-new script
-        run: python3 tests/test_whats_new.py
 
       # Windows agent installer trust-anchor lockdown (#5196). The .iss is
       # compiled only by release.yml, never on a PR; this lints its source
@@ -347,19 +430,6 @@ jobs:
       # in the installer. Mutation-tests itself. Stdlib only.
       - name: Agent installer plugin coverage lint
         run: python3 -I tests/test_agent_installer_plugin_coverage_lint.py
-
-      # The Windows agent zip and installer ship the Visual C++ runtime
-      # app-local (deploy/packaging/windows/stage-msvc-runtime.ps1), and
-      # release.yml's build-windows checks every shipped binary's DLL imports
-      # against both payloads (scripts/ci/check-windows-payload-imports.py)
-      # before ISCC runs. Behavioural over synthetic PE images, the staging
-      # script under pwsh, and lexical wiring pins with mutants.
-      - name: Windows payload import closure
-        env:
-          # The runner image ships pwsh: require it so the staging-script
-          # behaviour cannot skip silently.
-          YUZU_REQUIRE_PWSH_TEST: '1'
-        run: python3 -I tests/test_windows_payload_imports.py
 
       # Gateway scrape (#5695): every shipped Prometheus config, and every
       # compose stack that runs a Prometheus next to a gateway, scrapes the
@@ -435,19 +505,29 @@ jobs:
       - name: Vendored NOTICE hashes
         run: python3 -I tests/test_vendored_notice_hashes.py
 
-      # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
-      # route, MCP tool and server/agent CLI flag is named in the user manual,
-      # ratcheted against a by-name baseline that only
-      # shrinks. Reuses check-api-parity.py's extractors; also self-checks
-      # the doc-coupling manifest that doc-coupling.yml's touch rule reads.
-      # Hosted in this required job so drift blocks merge, and LAST in it so a
-      # drift failure cannot hide a later step's result (the steps above have
-      # no `if:`, so a red step stops the job).
-      - name: Docs drift gate (fact parity)
-        run: python3 -I scripts/ci/check-docs-drift.py
-
-      - name: Docs drift gate self-test
-        run: python3 -I tests/test_docs_drift_selftest.py
+  changelog-order:
+    name: CHANGELOG order
+    needs: [docs-lint-changelog-docs, docs-lint-wiring-tripwires, docs-lint-release-packaging]
+    # always(): a failed or cancelled shard must turn THIS required check red,
+    # not leave it skipped (a skipped required check counts as passing).
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every docs-lint shard to have succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 -I -c '
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          bad = {k: v["result"] for k, v in needs.items() if v["result"] != "success"}
+          if not needs or len(needs) != 3:
+              sys.exit(f"expected 3 shards, got {sorted(needs)}")
+          for k, r in sorted(bad.items()):
+              print(f"::error::{k} finished {r}")
+          sys.exit(1 if bad else 0)
+          '
 
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
@@ -564,12 +644,12 @@ jobs:
           YUZU_REQUIRE_JSONSCHEMA: "1"
         run: python3 tests/test_artifact_sbom.py
 
-  # #5557: the self-test of the execution owner key tripwire that `changelog-order` runs. It mutates
+  # #5557: the self-test of the execution owner key tripwire that `docs-lint-wiring-tripwires` runs. It mutates
   # the server sources in memory and proves each mutation is caught. ITS OWN JOB, deliberately,
   # for a different reason than the three above: it needs no registry, but it costs about half a
   # minute of CPU (more on a hosted runner), which does not belong in the required "CHANGELOG
-  # order" check's five minute budget. Stdlib only, no build, no checkout history. The tripwire
-  # itself stays in `changelog-order`, where it is cheap. Also registered in tests/meson.build
+  # order" check's shard budgets. Stdlib only, no build, no checkout history. The tripwire
+  # itself stays in `docs-lint-wiring-tripwires`, where it is cheap. Also registered in tests/meson.build
   # for local `meson test --suite docs` parity.
   execution-owner-key-selftest:
     name: Execution owner key tripwire self-test

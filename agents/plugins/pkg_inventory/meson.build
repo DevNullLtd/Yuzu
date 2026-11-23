@@ -1,4 +1,4 @@
-# pkg_inventory — machine-scope package-manager inventory (read-only, no spawn).
+# pkg_inventory — package-manager inventory (read-only, no spawn).
 # Multi-TU shape follows agents/plugins/peripherals/meson.build: one portable
 # plugin TU plus three per-OS leg TUs, each #if-gated internally for its own
 # target so all four are listed unconditionally. No libxml2 (the Windows

@@ -173,6 +173,7 @@
 #include "quarantine_store.hpp"
 #include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
 #include "refusal_log_throttle.hpp"
+#include "outbound_destination_guard.hpp"
 #include "resolver_pool_metrics.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_members.hpp" // #4990
@@ -761,6 +762,10 @@ public:
         oidc_resolver_publisher_.register_metrics(
             metrics_, ::yuzu::server::oidc::oidc_resolver_pool_capacity(),
             ::yuzu::server::oidc::oidc_resolver_outcome_counts());
+        // The webhook / offload delivery resolver pool, described and pre-seeded the same way.
+        delivery_resolver_publisher_.register_metrics(
+            metrics_, ::yuzu::server::delivery_resolver_pool_capacity(),
+            ::yuzu::server::delivery_resolver_outcome_counts());
         // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".
         for (const char* reason :
              {"own_addresses_unavailable", "dns_unavailable", "dns_timeout", "dns_busy",
@@ -1107,6 +1112,48 @@ public:
                           "clamped to the worker pool). Utilisation = responses / capacity",
                           "gauge");
         metrics_.describe("yuzu_http_worker_pool_size", "Shared HTTP worker pool size", "gauge");
+        metrics_.describe("yuzu_auth_mfa_lockout_applied_total",
+                          "Accounts whose second factor was locked by the per-account failure budget",
+                          "counter");
+        metrics_.describe("yuzu_auth_mfa_lockout_blocked_total",
+                          "Second-factor attempts refused because the account budget was already spent",
+                          "counter");
+        metrics_.describe("yuzu_auth_mfa_budget_unavailable_total",
+                          "Second-factor attempts refused 503 because the attempt could not be "
+                          "reserved in the auth store (nothing was verified)",
+                          "counter");
+        metrics_.describe("yuzu_auth_pbkdf2_budget_rejected_total",
+                          "Password-hash requests refused 429 by the concurrency budget, stripe or "
+                          "break-glass lane (labels: route, class, reason)",
+                          "counter");
+        // Pre-seed so the first lock / refusal reads as an increase from 0, not a new series.
+        for (const char* n : {"yuzu_auth_mfa_lockout_applied_total",
+                              "yuzu_auth_mfa_lockout_blocked_total",
+                              "yuzu_auth_mfa_budget_unavailable_total"})
+            metrics_.counter(n);
+        for (const char* route : {"login", "password_change", "mfa_recovery"})
+            for (const char* cls : {"unauthenticated", "authenticated", "break_glass"})
+                for (const char* reason : {"per_source", "per_principal", "class_full",
+                                           "global_full", "stripe_busy", "stripe_cap"})
+                    metrics_.counter("yuzu_auth_pbkdf2_budget_rejected_total",
+                                     {{"route", route}, {"class", cls}, {"reason", reason}});
+        metrics_.describe("yuzu_auth_pbkdf2_budget_in_flight_peak",
+                          "Peak password-hash (PBKDF2) slots in use since the previous periodic sweep",
+                          "gauge");
+        metrics_.describe("yuzu_auth_login_stripe_waiters",
+                          "Login requests now waiting (at most 150 ms each) for their username's "
+                          "serialisation stripe",
+                          "gauge");
+        metrics_.describe("yuzu_auth_login_stripe_waiter_cap",
+                          "Most login requests that may wait for a username stripe at once (and "
+                          "at most 2 per stripe)",
+                          "gauge");
+        metrics_.describe("yuzu_auth_pbkdf2_budget_break_glass_lane",
+                          "Concurrent break-glass password attempts allowed (one per source "
+                          "address): min(4, cap/4)",
+                          "gauge");
+        metrics_.describe("yuzu_auth_pbkdf2_budget_capacity",
+                          "Process-wide cap on concurrent password-hash (PBKDF2) work", "gauge");
         metrics_.gauge("yuzu_http_held_open_responses").set(0);
         metrics_.describe("yuzu_mcp_streams_handover_pending",
                           "Superseded MCP SSE streams still draining - each still pins a worker",
@@ -1714,6 +1761,17 @@ public:
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
+        // sg10 / UP-1: `param_key_invalid` (a params key the agent would truncate, refused at the
+        // ingress) on every surface that counts it, pre-seeded so absent() alerting holds. Both
+        // MCP tools (execute_instruction and execute_instruction_definition) refuse it earlier, in
+        // their input-bound check, and count it under yuzu_mcp_tool_args_too_large_total, so
+        // route="mcp" is seeded for the shared execute core's own check but no MCP handler reaches
+        // it; execute_bundle counts route="bundle".
+        for (const char* route : {"command", "command_v1", "instruction_execute", "mcp", "schedule", "bundle",
+                                  "policy_fragment"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonParamKeyInvalid)}});
         // Stored `parameter_schema` refusals on the instruction execute route: a separate
         // family (a validation refusal, not a targeting one), seeded in workflow_routes.cpp.
         seed_instruction_param_rejected_metrics(metrics_);
@@ -2420,24 +2478,29 @@ public:
         // #4966: a store fault inside the account-lifecycle guard (a lock wait that expired, a
         // lost connection, an unwired guard), by the guarded operation. NOT a refusal: the
         // request was neither allowed nor judged. Counted in AuthManager, so the dashboard, SCIM
-        // and every other caller through it share one series. No alert rule ships with it yet
-        // (a later change owns the alerts).
+        // and every other caller through it share one series, except op=unassign, which
+        // RbacStore counts for a failed role unassignment of any role or principal type. No
+        // alert rule ships with it yet (a later change owns the alerts).
         metrics_.describe("yuzu_server_rbac_lifecycle_store_failure_total",
-                          "Store faults inside the account-lifecycle last-Administrator guard, "
-                          "by operation (deactivate: account removal; set_role: role write; "
-                          "would_strand: the advisory pre-check, after which the request still "
-                          "proceeds to the guarded write; grant_read: the SCIM "
-                          "pre-provisioning Administrator-grant read). The unwired fail-closed "
+                          "Store faults in the account-lifecycle last-Administrator guard and in "
+                          "role unassignment, by operation (deactivate: account removal; "
+                          "set_role: role write; would_strand: the advisory pre-check, after "
+                          "which the request still proceeds to the guarded write; grant_read: "
+                          "the SCIM pre-provisioning Administrator-grant read; unassign: a "
+                          "role unassignment, of any role or principal type, whose transaction "
+                          "failed with a store fault; a last-Administrator refusal is not "
+                          "counted). The unwired fail-closed "
                           "arm also counts, for deactivate and set_role only. A sustained "
-                          "non-zero rate means deprovisioning or role changes are being "
-                          "answered with a store-unavailable error rather than judged, except "
-                          "for would_strand, which never stops the request (SCIM answers 503 "
-                          "with Retry-After; the dashboard role route gives no retry hint): "
-                          "look at yuzu_pg_pool_waiters and "
-                          "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
-                          "holder.",
+                          "non-zero rate means deprovisioning, role changes or unassignments "
+                          "are being answered with a store-unavailable error rather than "
+                          "judged, except for would_strand, which never stops the request "
+                          "(SCIM answers 503 with Retry-After; the dashboard role route gives "
+                          "no retry hint): look at yuzu_pg_pool_waiters and "
+                          "yuzu_pg_acquire_wait_seconds, and for a stuck lock holder (the "
+                          "rbac_enabled row for deactivate and set_role; an unassign takes no "
+                          "rbac_enabled lock).",
                           "counter");
-        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read"})
+        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read", "unassign"})
             metrics_.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}});
         // #4966: a SCIM same-request compensation (the guarded undo of a just-created or
         // just-revived account) that did NOT complete. Written beside the
@@ -2866,9 +2929,10 @@ public:
                           "(cumulative per agent since install; a rising value is the signal)",
                           "gauge");
         metrics_.describe("yuzu_fleet_echo_storage_offline",
-                          "Agents whose Echo database is offline and being retried, by reason "
-                          "(free_space, migration_failed, open_failed; anything else sums under "
-                          "unknown). Published for every reason each sweep, 0 included",
+                          "Agents whose Echo database is offline, by reason (free_space, "
+                          "migration_failed, open_failed are retried; rollback_wedged is not and "
+                          "needs an agent restart; anything else sums under unknown). Published "
+                          "for every reason each sweep, 0 included",
                           "gauge");
         metrics_.describe("yuzu_fleet_plugin_init_failed",
                           "Agents reporting a plugin that failed init, by plugin name (absent "
@@ -2975,7 +3039,9 @@ public:
         metrics_.describe("yuzu_server_webhook_delivery_success_total",
                           "Webhook deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_webhook_delivery_failed_total",
-                          "Webhook deliveries that failed (connection error, non-2xx, exception)",
+                          "Webhook deliveries that failed (connection error, non-2xx, exception); a delivery "
+                          "declined before any connect is counted under "
+                          "yuzu_server_webhook_delivery_refused_total instead",
                           "counter");
         // ADR-0057 (gov Gate 3 sre): these three joined the family above but
         // were missing describe()/pre-seed, the same HC-1-class parity gap
@@ -2998,8 +3064,36 @@ public:
                           "Offload-target deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_offload_delivery_failed_total",
                           "Offload-target deliveries that failed (connection error, non-2xx, "
-                          "exception, or a tampered non-http(s) URL)",
+                          "exception, or a tampered non-http(s) URL); a delivery declined before any "
+                          "connect is counted under yuzu_server_offload_delivery_refused_total "
+                          "instead",
                           "counter");
+        // Deliveries DECLINED before any connect because the destination is a refused address or
+        // did not resolve (outbound_destination_guard.hpp, #4816). Counted here and NOT in the
+        // `_failed_total` counters above, so a refusal can never be mistaken for a flaky receiver
+        // (nor hide inside it). Closed `cause` set, pre-seeded.
+        for (const char* kind : {"webhook", "offload"}) {
+            const std::string name = std::string("yuzu_server_") + kind + "_delivery_refused_total";
+            metrics_.describe(name,
+                              std::string(kind == std::string("webhook") ? "Webhook" : "Offload-target") +
+                                  " deliveries declined before any connect, by cause: "
+                                  "destination_refused (a resolved or literal address is link-local, "
+                                  "cloud-metadata, unspecified, multicast or reserved) or "
+                                  "destination_unresolved (the name did not resolve) or "
+                                  "destination_resolver_busy (the delivery resolver pool was full)",
+                              "counter");
+            for (const char* cause : {"destination_refused", "destination_unresolved",
+                                      "destination_resolver_busy"})
+                metrics_.counter(name, {{"cause", cause}});
+        }
+        // A delivery whose name resolved to more than four vetted addresses tries only the first
+        // four (outbound_url_policy.hpp, kMaxDeliveryConnectAddresses); counted so the truncation
+        // is visible. Described and pre-seeded like its siblings.
+        metrics_.describe("yuzu_server_delivery_connect_addresses_truncated_total",
+                          "Webhook or offload-target deliveries whose name resolved to more than "
+                          "four vetted addresses and so tried only the first four",
+                          "counter");
+        metrics_.counter("yuzu_server_delivery_connect_addresses_truncated_total");
         // The two drop counters (closed `reason` set) and the delivery pool gauges are described
         // and pre-seeded together, shared with the tests (delivery_pool_metrics.hpp).
         yuzu::server::register_delivery_pool_metrics(metrics_);
@@ -4053,6 +4147,31 @@ public:
                           "--auth-mode=sso-only (the TOTP challenge still follows)",
                           "counter");
         metrics_.counter("yuzu_auth_break_glass_login_total");
+        metrics_.describe("yuzu_auth_break_glass_pending_refused_total",
+                          "Break-glass logins refused at the MFA step, by reason (disarmed: the arm "
+                          "was removed; window_ended; transient: the arm state could not be read) "
+                          "and stage (pre_verify: before a code was verified; pre_mint: after "
+                          "verification, before the session)",
+                          "counter");
+        for (const char* reason : {"disarmed", "window_ended", "transient"})
+            for (const char* stage : {"pre_verify", "pre_mint"})
+                metrics_.counter("yuzu_auth_break_glass_pending_refused_total",
+                                 {{"reason", reason}, {"stage", stage}});
+        metrics_.describe("yuzu_auth_break_glass_pending_transient_admitted_total",
+                          "Break-glass logins completed at the MFA step while the arm state could "
+                          "not be re-read, inside the bound taken from the read made before "
+                          "verification",
+                          "counter");
+        metrics_.counter("yuzu_auth_break_glass_pending_transient_admitted_total");
+        metrics_.describe("yuzu_auth_break_glass_arm_gate_total",
+                          "Break-glass arm-state gate answers where the arm state could not be "
+                          "established: read_failed (the bounded database read failed or there is "
+                          "no auth store), refresh_busy (a refresh was in flight and the cache was "
+                          "older than 1 s) and stale_read (a read said armed but started more than "
+                          "4.5 s earlier)",
+                          "counter");
+        for (const char* r : {"read_failed", "refresh_busy", "stale_read"})
+            metrics_.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", r}});
         // HA WS-1(1b), ADR-2002 section 5, and #4990: the dispatch-record
         // table's retention (ExecutionTracker's PG-backed command_execution
         // table: one row per dispatch carrying command_id -> plugin and
@@ -7827,6 +7946,33 @@ public:
                 // does not exist until this block. Nulled at teardown beside
                 // set_credential_change_owner(nullptr).
                 auth_mgr_.set_rbac_store(rbac_store_.get());
+                // An Administrator unassign clears the target's durable elevations in
+                // its own transaction (the RbacStore default mode; this file never opts out).
+                // That clear needs the session_store schema, which only an OPEN SessionStore
+                // guarantees. The SessionStore construction block earlier in this startup path
+                // already sets `startup_failed_` when the store fails to open, and this block
+                // runs only while `startup_failed_` is false, so the check below is a backstop
+                // against a future reordering, not a new boot refusal in a healthy configuration;
+                // it exists so a console where every user Administrator unassign would fail is
+                // never served. The callback then drops THIS
+                // replica's cached sessions of the user (other replicas converge on their next
+                // generation poll). `auth_mgr_` is a reference to main.cpp's AuthManager, which
+                // outlives ServerImpl; the callback is never cleared at teardown (it is
+                // read lock-free by serving threads) and only takes AuthManager's own lock.
+                if (!session_store_ || !session_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: the RbacStore Administrator unassign "
+                                  "ends the target's JIT elevation in its own transaction, which "
+                                  "needs an open SessionStore (session_store schema), and none is "
+                                  "available");
+                    startup_failed_ = true;
+                } else if (!rbac_store_->set_local_session_drop(
+                               [&auth_mgr = auth_mgr_](const std::string& username) {
+                                   auth_mgr.drop_local_sessions_of_user(username);
+                               })) {
+                    spdlog::error("[PG] Refusing to start: the RbacStore local session-drop "
+                                  "callback was already set; it must be wired exactly once");
+                    startup_failed_ = true;
+                }
             }
         }
         // #4966 boot self-check: an AuthDB without the guard would leave
@@ -8605,6 +8751,26 @@ public:
                         startup_failed_ = true;
                     } else {
                         webhook_store_->set_metrics(&metrics_);
+                        // A delivery DECLINED because its destination is a refused address or did
+                        // not resolve gets its own audit row (throttled per webhook by the store).
+                        // System attribution: no operator is on this path. The store is destroyed
+                        // (workers joined) before audit_store_.
+                        webhook_store_->set_delivery_refused_sink(
+                            [this](std::int64_t id, std::string_view cause,
+                                   std::string_view cls, const std::string& url_detail) {
+                                if (!audit_store_ || !audit_store_->is_open())
+                                    return;
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "system:webhook-delivery",
+                                     .principal_role = "system",
+                                     .action = "webhook.delivery.declined",
+                                     .target_type = "webhook",
+                                     .target_id = std::to_string(id),
+                                     .detail = std::format("cause={} class={} {}", cause,
+                                                           cls.empty() ? "-" : cls, url_detail),
+                                     .result = "denied"});
+                            });
                         legacy_sqlite_probe::harden_legacy_file_0600(
                             cfg_.db_dir() / "webhooks.db", "WebhookStore");
                         legacy_sqlite_probe::warn_if_legacy_rows(
@@ -8698,6 +8864,23 @@ public:
                         startup_failed_ = true;
                     } else {
                         offload_target_store_->set_metrics(&metrics_);
+                        // As the webhook sink above: a declined delivery gets its own audit row.
+                        offload_target_store_->set_delivery_refused_sink(
+                            [this](std::int64_t id, std::string_view cause,
+                                   std::string_view cls, const std::string& url_detail) {
+                                if (!audit_store_ || !audit_store_->is_open())
+                                    return;
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "system:offload-delivery",
+                                     .principal_role = "system",
+                                     .action = "offload_target.delivery.declined",
+                                     .target_type = "offload_target",
+                                     .target_id = std::to_string(id),
+                                     .detail = std::format("cause={} class={} {}", cause,
+                                                           cls.empty() ? "-" : cls, url_detail),
+                                     .result = "denied"});
+                            });
                         agent_service_.set_offload_target_store(offload_target_store_.get());
                         // ADR-0010 §Decision 3 evidence surface (gov Gate 6
                         // compliance-officer, contract floor — the
@@ -10636,6 +10819,15 @@ public:
                 // this thread's loop or terminate the process: the next tick republishes.
                 try {
                     publish_mfa_binding_gauges(metrics_, auth_db_.get(), session_store_.get());
+                    if (auth_routes_)
+                    {
+                        // Peak since the last sweep: an instantaneous reading is ~0 for a
+                        // 50-150 ms hash.
+                        metrics_.gauge("yuzu_auth_pbkdf2_budget_in_flight_peak")
+                            .set(static_cast<double>(auth_routes_->pbkdf2_budget().take_peak()));
+                        metrics_.gauge("yuzu_auth_login_stripe_waiters")
+                            .set(static_cast<double>(auth_routes_->stripe_waiters()));
+                    }
                 } catch (const std::exception& e) {
                     spdlog::warn("mfa binding gauge publish failed: {}", e.what());
                 } catch (...) {
@@ -10651,6 +10843,10 @@ public:
                     metrics_, ::yuzu::server::oidc::oidc_resolver_in_flight(),
                     ::yuzu::server::oidc::oidc_resolver_pool_capacity(),
                     ::yuzu::server::oidc::oidc_resolver_outcome_counts());
+                delivery_resolver_publisher_.publish(
+                    metrics_, ::yuzu::server::delivery_resolver_in_flight(),
+                    ::yuzu::server::delivery_resolver_pool_capacity(),
+                    ::yuzu::server::delivery_resolver_outcome_counts());
                 // Webhook and offload delivery pool backlog, from the same tick. A store that is
                 // not open reads 0 (never a stale value).
                 {
@@ -14913,7 +15109,8 @@ private:
             [this](std::string_view principal, std::string_view securable,
                    yuzu::server::authz::Operation op) {
                 return dispatch_has_permission(principal, securable, op);
-            });
+            },
+            &parameters); // sg10: the send path always passes the parameters (param-escalated securable)
 
         if (!decision) {
             const auto& denial = decision.error();
@@ -16952,6 +17149,45 @@ private:
         // its sibling above, from the same post-clamp number.
         metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
+        // WP03 perf-F1: cap concurrent PBKDF2 (login / recovery-code / password-change proof)
+        // work at a quarter of the worker pool so hashing can never pin every worker.
+        if (auth_routes_) {
+            // One pure sizing function (pbkdf2_budget.hpp, unit-tested at real pool sizes) feeds
+            // the setters, the gauges, the boot log and the boot warning.
+            const auto sz = yuzu::server::login_sizing(pool_max, cfg_.auth_pbkdf2_per_source_cap);
+            auth_routes_->set_pbkdf2_cap(sz.cap);
+            auth_routes_->pbkdf2_budget().set_per_source_cap(cfg_.auth_pbkdf2_per_source_cap);
+            auth_routes_->set_stripe_waiter_cap(sz.stripe_waiters);
+            metrics_.gauge("yuzu_auth_pbkdf2_budget_capacity").set(static_cast<double>(sz.cap));
+            metrics_.gauge("yuzu_auth_login_stripe_waiter_cap")
+                .set(static_cast<double>(sz.stripe_waiters));
+            metrics_.gauge("yuzu_auth_pbkdf2_budget_break_glass_lane")
+                .set(static_cast<double>(sz.break_glass_lane));
+            metrics_.gauge("yuzu_auth_login_stripe_waiters").set(0.0);
+            metrics_.gauge("yuzu_auth_pbkdf2_budget_in_flight_peak").set(0.0);
+            spdlog::info("login concurrency limits: worker pool {}, hashing cap {} (unauthenticated "
+                         "lane {}, authenticated lane {}), stripe waiter cap {} (2 per stripe), "
+                         "break-glass lane {}, per-address cap {}",
+                         pool_max, sz.cap, sz.unauthenticated_lane, sz.authenticated_lane,
+                         sz.stripe_waiters, sz.break_glass_lane, cfg_.auth_pbkdf2_per_source_cap);
+            if (sz.small_pool || sz.pool_crowded) {
+                spdlog::warn("login concurrency limits are reduced by the small HTTP worker pool "
+                             "({} workers): hashing cap {}, stripe waiter cap {}, break-glass lane {} "
+                             "(full size {} from a pool of 64). A modest flood of logins can occupy "
+                             "most of the pool and a few addresses can keep the break-glass lane "
+                             "busy; raise --http-worker-threads",
+                             pool_max, sz.cap, sz.stripe_waiters, sz.break_glass_lane,
+                             yuzu::server::kBreakGlassLaneMax);
+            }
+            if (sz.per_source_covers_lane) {
+                spdlog::warn("--auth-pbkdf2-per-source-cap {} is at or above the unauthenticated "
+                             "login lane ({}): one client address (or every user behind one proxy, "
+                             "load balancer or NAT) can hold the whole lane and every other "
+                             "address's login is answered 429. Lower the cap or raise "
+                             "--http-worker-threads",
+                             cfg_.auth_pbkdf2_per_source_cap, sz.unauthenticated_lane);
+            }
+        }
         // A security-relevant toggle nobody can confirm the state of is an operability
         // gap. --max-sse-streams already surfaces its resolved value as a gauge; this
         // does the same, so an operator can answer "is streamed POST live on this box"
@@ -18073,6 +18309,17 @@ private:
                                      const std::string& agent_id) -> bool {
             return require_scoped_permission(req, res, type, op, agent_id);
         };
+        // The SAME per-device scoped gate, returning its refusal class (admit, deny, "could not
+        // evaluate", or a degraded authorization read) instead of a bool. It is the one body the
+        // Boolean gate above compares with Admitted, so the response, audit row and metric are the
+        // gate's own either way. Wired into the two Echo purge surfaces that must tell a denial
+        // from an outage (the dashboard fragments and the REST purge); every other consumer keeps
+        // scoped_perm_fn.
+        auto scoped_gate_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& type, const std::string& op,
+                                     const std::string& agent_id) -> yuzu::server::ScopedGateOutcome {
+            return auth_routes_->require_scoped_permission_outcome(req, res, type, op, agent_id);
+        };
         // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
         // The fleet guaranteed-state status route's SOLE authorization gate, and the MCP
         // get_guardian_status / list_plugin_config tools' — never stacked with perm_fn (see
@@ -18845,6 +19092,7 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .audit_fn = audit_fn,
                              .schedule_engine = schedule_engine_.get(),
+                             .metrics = &metrics_,
                          });
 
         // #2542 PR-11: the 3-route legacy pre-v1 Responses API
@@ -19495,6 +19743,15 @@ private:
             // flips — same field and wiring as the other three background
             // engines' Deps.
             .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
+            // G01: the capability registry policy evaluation classifies a pair against before it
+            // dispatches (execute gate, Destructive class, reserved rows). Without it the
+            // evaluator refuses every dispatch (`unwired`), so this wiring is what lets a policy
+            // run at all. `capability_registry_` is declared before `policy_evaluator_`, so it
+            // outlives the evaluator.
+            .capability_registry = &capability_registry_,
+            // The `policy.dispatch` / `denied` audit rows; same store the other background
+            // engines write to.
+            .audit_store = audit_store_.get(),
         });
         policy_eval_thread_ = std::thread([this]() {
             spdlog::info("Policy evaluation thread started (cadence=10s, grace=15s)");
@@ -19953,10 +20210,11 @@ private:
             // `test_operator_surface_twins.cpp` exercise; the fail-closed
             // cases and the legacy-open posture are documented there.
             .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                   const std::string& action) -> bool {
+                                   const std::string& action,
+                const std::unordered_map<std::string, std::string>& parameters) -> bool {
                 return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                rbac_store_.get(), principal,
-                                                               plugin, action);
+                                                               plugin, action, parameters);
             },
             // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
             // is an error, not an empty answer, so the runner holds rather than fires.
@@ -19999,10 +20257,11 @@ private:
                 // re-verified AGAIN here at send time (authority may have changed
                 // between enqueue and delivery), the load-bearing re-authorization.
                 .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                       const std::string& action) -> bool {
+                                       const std::string& action,
+                const std::unordered_map<std::string, std::string>& parameters) -> bool {
                     return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                    rbac_store_.get(), principal,
-                                                                   plugin, action);
+                                                                   plugin, action, parameters);
                 },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
                 // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is
@@ -22218,8 +22477,11 @@ private:
                     auto fc = compliance_api->fleet_compliance();
                     if (!fc)
                         return std::nullopt;
-                    return home::ComplianceFigure{fc->total_checks, fc->compliant, fc->non_compliant,
-                                                  fc->unknown, fc->compliance_pct};
+                    // `error` and `blocked` count as failing, like `non_compliant`: the tile,
+                    // the compliance page's readout and its row pills are defined to agree.
+                    return home::ComplianceFigure{fc->total_checks, fc->compliant,
+                                                  fc->non_compliant, fc->unknown,
+                                                  fc->compliance_pct, fc->error, fc->blocked};
                 },
                 .failed_fn = [this]() -> std::optional<std::vector<home::FailedRow>> {
                     if (!execution_tracker_)
@@ -22774,7 +23036,8 @@ private:
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
         // #2540: the Echo purge/re-enable POSTs authorize through the SAME per-device scoped
         // gate as the REST purge twin (set before register_routes, per the ordering note above).
-        dashboard_routes_->set_scoped_perm_fn(scoped_perm_fn);
+        // The typed lambda: a degraded authorization read is answered 503, not collapsed into the 404.
+        dashboard_routes_->set_scoped_perm_fn(scoped_gate_fn);
         dashboard_routes_->set_forensics_plugin_set(forensics_plugins()); // #4990
         dashboard_routes_->set_forensics_visibility_fn(forensics_visibility_fn);
         // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
@@ -24030,6 +24293,11 @@ private:
         // register_routes() (captured by value at registration), same timing as the setters above.
         rest_api_v1_->set_forensics_plugin_set(forensics_plugins());
         rest_api_v1_->set_forensics_visibility_fn(forensics_visibility_fn);
+        // The Echo retention-paused purge route's typed scoped gate. The route copies the function
+        // by value when routes register, so this MUST stay above register_routes() (a call after
+        // it leaves the purge on its fail-closed 500 for good); tests/test_echo_security_wiring_lexical.py
+        // pins the order.
+        rest_api_v1_->set_scoped_gate_fn(scoped_gate_fn);
         // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
         // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
         // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT
@@ -24488,12 +24756,14 @@ private:
             // MCP tools can never disagree with the dashboard.
             network_api,
             // lockout_clear_fn — admin unlock (POST /api/v1/users/<name>/unlock).
-            // Wraps AuthDB::clear_failed_logins so RestApiV1 stays decoupled from
+            // Wraps AuthDB::clear_account_lockouts (the password lockout AND the MFA failure
+            // budget in one statement) so RestApiV1 stays decoupled from
             // AuthDB (same injection pattern as session_revoke_fn). SOC 2 CC6.3.
             // Empty/null auth_db ⇒ false ⇒ the route 500s and audits the failure.
             [this](const std::string& username) -> bool {
                 auto* db = auth_mgr_.auth_db_ptr();
-                return db && db->clear_failed_logins(username).has_value();
+                // WP03: ONE statement lifts both the password lockout and the MFA failure budget.
+                return db && db->clear_account_lockouts(username).has_value();
             },
             // Baseline-anchored per-device Guardian status route (trailing optional deps).
             baseline_store_.get(),
@@ -24935,6 +25205,16 @@ private:
                     };
             }
             tool_deps.crypto_access_fn = crypto_access_cb;
+            // Fleet application usage (get_dex_apps_usage): a pure forward of the same DexApi
+            // GET /api/v1/dex/apps/usage calls. Empty when the deployment has no DexApi.
+            if (dex_api) {
+                tool_deps.dex_apps_usage_fn =
+                    [dex_api](const std::string& window, const std::string& platform_scope,
+                              const DexUsageSlice& slice, std::int64_t floor,
+                              const authz::VisibleSet& visible) {
+                        return dex_api->apps_usage(window, platform_scope, slice, floor, visible);
+                    };
+            }
             // #6087: get/set/reset_dex_score_policy. The read closure is the REST GET's
             // reader; the apply closure is a pure forward of apply_dex_score_policy, the one
             // audit-first write path REST PUT/DELETE also call, with the per-request audit
@@ -25382,12 +25662,13 @@ private:
                 // B4 (#2146 API-parity) — backs the unlock_account MCP tool
                 // (twin of POST /api/v1/users/{name}/unlock). Same wiring as the
                 // REST route's lockout_clear_fn above: wraps
-                // AuthDB::clear_failed_logins so McpServer stays decoupled from
+                // AuthDB::clear_account_lockouts so McpServer stays decoupled from
                 // AuthDB. SOC 2 CC6.3. Empty/null auth_db => false => the tool
                 // reports "lockout subsystem unavailable".
                 [this](const std::string& username) -> bool {
                     auto* db = auth_mgr_.auth_db_ptr();
-                    return db && db->clear_failed_logins(username).has_value();
+                    // WP03: ONE statement lifts both the password lockout and the MFA failure budget.
+                    return db && db->clear_account_lockouts(username).has_value();
                 },
                 // B5 (api-parity #2146) — the SAME offload_target_store_ instance
                 // OffloadRoutes::register_routes wires above (a real, non-dormant
@@ -25786,6 +26067,8 @@ private:
     /// registered the metrics; nothing else reads or writes it.
     yuzu::server::ResolverPoolPublisher oidc_resolver_publisher_{
         yuzu::server::kOidcResolverMetrics};
+    yuzu::server::ResolverPoolPublisher delivery_resolver_publisher_{
+        yuzu::server::kDeliveryResolverMetrics};
     /// PR1.9c: the composed classification ruleset `build_classified_command`
     /// consults on every dispatch — core (this package) plus the six
     /// per-group plugin catalogues (p7/p10-p13). A STATIC ruleset, constructed

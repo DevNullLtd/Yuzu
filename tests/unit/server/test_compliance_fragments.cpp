@@ -21,7 +21,8 @@ bool has(const std::string& hay, const std::string& needle) {
 }
 
 ch::PolicyRow row(const std::string& name, int64_t compliant, int64_t non_compliant,
-                  int64_t unknown = 0, int64_t fixing = 0, int64_t error = 0, bool enabled = true) {
+                  int64_t unknown = 0, int64_t fixing = 0, int64_t error = 0, bool enabled = true,
+                  int64_t blocked = 0) {
     ch::PolicyRow r;
     r.id = "pol-" + name;
     r.name = name;
@@ -32,7 +33,8 @@ ch::PolicyRow row(const std::string& name, int64_t compliant, int64_t non_compli
     r.unknown = unknown;
     r.fixing = fixing;
     r.error = error;
-    r.total = compliant + non_compliant + unknown + fixing + error;
+    r.blocked = blocked;
+    r.total = compliant + non_compliant + unknown + fixing + error + blocked;
     return r;
 }
 
@@ -63,6 +65,46 @@ TEST_CASE("compliance summary: Failing checks tile counts non_compliant plus err
     CHECK(has(html, "<div class=\"v\">5</div><div class=\"l\">Failing checks</div>"));
     CHECK(has(html, "5 failing")); // the row pill agrees with the tile
     CHECK(has(html, "of 10 device checks"));
+}
+
+TEST_CASE("compliance summary: blocked counts as failing in the pill and the tile",
+          "[compliance][fragments]") {
+    // A device policy evaluation refused to dispatch for must stay in a failing view.
+    CHECK(has(ch::policy_status_pill(row("b", 3, 0, 0, 0, 0, true, 2)), "2 failing"));
+    CHECK(has(ch::policy_status_pill(row("b", 3, 1, 0, 0, 1, true, 2)), "4 failing"));
+
+    ch::SummaryView v;
+    v.policies.push_back(row("a", 5, 2, 0, 0, 3, true, 4));
+    v.fleet.total_checks = 14;
+    v.fleet.compliant = 5;
+    v.fleet.non_compliant = 2;
+    v.fleet.error = 3;
+    v.fleet.blocked = 4;
+    v.fleet.compliance_pct = 35.0;
+    const auto html = ch::render_summary(v);
+    CHECK(has(html, "<div class=\"v\">9</div><div class=\"l\">Failing checks</div>"));
+    CHECK(has(html, "9 failing")); // the row pill agrees with the tile
+}
+
+TEST_CASE("compliance detail: a blocked agent has its own pill and the summary badge",
+          "[compliance][fragments]") {
+    CHECK(has(ch::agent_status_pill("blocked"), "Blocked"));
+    CHECK_FALSE(has(ch::agent_status_pill("blocked"), "idle"));
+
+    ch::DetailView v;
+    v.policy_id = "pol-x";
+    v.policy_name = "x";
+    v.have_policy = true;
+    v.summary.compliant = 1;
+    v.summary.blocked = 2;
+    v.summary.total = 3;
+    ch::DetailAgent a;
+    a.agent_id = "agent-1";
+    a.status = "blocked";
+    v.agents.push_back(a);
+    const auto html = ch::render_detail(v);
+    CHECK(has(html, "2 blocked"));
+    CHECK(has(html, "Blocked"));
 }
 
 TEST_CASE("compliance summary: policies tile counts enabled with the total as detail",

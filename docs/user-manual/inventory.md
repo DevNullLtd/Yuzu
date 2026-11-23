@@ -14,7 +14,7 @@ cadences.
   `install_location`. The daily sync calls eleven inventory actions in-process,
   one at a time, and reports each as its own section (see "The per-source
   report (blob v3)" below): `installed_apps` `list_inventory` (Windows: `HKLM`
-  plus the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
+  plus the agent service account's own `HKCU`; Linux: the `dpkg` and `rpm` databases read in-process, `pacman`/`apk` run as tools;
   macOS: `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew;
   Chocolatey and winget on Windows) and `store_packages` (Linux snaps and
   flatpaks; the Windows Appx roster), and
@@ -81,8 +81,9 @@ cadences.
   `bundle_id` is `-` for rows the bounded bundle-id pass (30 s, at most 5000
   applications, one pass in flight) did not reach; that run leads with a
   `warning|bundle_id_*` row and reports CONSTRAINED -- never silently.
-  A degraded acquisition on any OS (Linux/macOS: timeout, kill, spawn failure,
-  truncation, or a nonzero exit; Windows: an unreadable Uninstall root or
+  A degraded acquisition on any OS (Linux pacman/apk and macOS: timeout, kill, spawn failure,
+  truncation, or a nonzero exit; Linux dpkg/rpm: an unreadable, locked, damaged
+  or over-limit package database; Windows: an unreadable Uninstall root or
   application subkey) now emits a single `error|installed_apps: acquisition
   degraded (...)` row and a nonzero result instead of an empty or partial
   `app|` list; on macOS a `list` may begin with a `warning|bundle_id_*` row --
@@ -106,7 +107,7 @@ cadences.
   | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — | — | — | — | — |
   | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | ✓ | — |
   | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the `PythonCore` registry tag (Windows), else `via:python` (always on Linux and macOS) | `IBM` | `Microsoft` | the build's self-reported `IMPLEMENTOR`, else `via:jvm` | `via:chocolatey` | `via:winget` | `via:appx` | provider, else signer, else `via:windows`; Linux `via:kernel_module` |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — | — | — | — | ✓ (Windows driver date) |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | epoch seconds (the receipt's install time; formulae only) | — | — | — | — | — | — | — | — | — | — | — | — | ✓ (Windows driver date) |
   | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — | — | — | — | `signed`/`unsigned`; empty = unknown |
   | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
@@ -134,13 +135,21 @@ cadences.
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
   verification. `distro_id`/`distro_version` are host-level (`/etc/os-release`
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
-  packages (they are installed). Machine-scope Homebrew
+  packages (they are installed). Machine-prefix Homebrew
   is collected through `pkg_inventory` with `ecosystem` `brew`: each formula is
   `kind` `pkg`, each cask `kind` `app` (`source` `pkg_inventory.packages`), plus
   one `kind` `app` row named `homebrew` (`publisher` `Homebrew`) with `source`
   `pkg_inventory.managers` that records Homebrew itself is present — one row however many prefixes
-  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
-  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew,
+  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). The formula and cask rows
+  are one per prefix, so a formula under both prefixes is two rows, each with its own
+  `install_location`; a formula row's `install_date` is its receipt's install time (a claim the
+  installing account wrote). A Homebrew a user installed in their own home (`~/homebrew`,
+  `~/.homebrew`) is listed by `pkg_inventory.packages` as a `user`-scope row that the sync never
+  collects: the sync is machine-scope. A user row carries the package, its version, the home
+  directory's name as its owner and the `~/` prefix only: its install time, tap and requested
+  flag are always `-`, because the agent opens no receipt under a user-owned prefix. The owner name
+  is command output: whoever can dispatch the action sees it, and every `Response:Read` holder sees
+  the stored rows for the response retention window, with no per-user erasure. Only Homebrew,
   Chocolatey and winget are mapped from `managers`: the Linux manager rows (dpkg,
   apt, rpm, dnf, pacman, apk, snap, flatpak) are read but not collected as
   software, and a
@@ -214,8 +223,9 @@ cadences.
   row from `installed_apps`' registry walk, so a Windows host normally carries
   two rows per MSI product. The `msi` row adds the product code (stored as
   `package_id`, which the REST and MCP software routes return on each row)
-  and the machine-context guarantee. Install location and uninstall string are
-  not collected (wire slots 13-14 stay reserved and empty, #5186). If the
+  and the machine-context guarantee. An `msi` row's `install_location` (wire slot
+  13) is empty, no uninstall string is read, sent or stored, and slot 14 is the
+  `attributes` field described below. If the
   enumeration itself fails the source is reported `constrained` (see Troubleshooting).
 
   **Python interpreters** are collected through `runtimes` `python` (all three OSes;
@@ -258,7 +268,8 @@ cadences.
 
   **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
   `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
-  or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
+  or `Java` (when the build does not say; on Linux the `release` file's `IMAGE_TYPE` decides and,
+  where it has none, the home's `bin/javac` and java entries do), `version` from the home's `release` file (when the home has
   none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
   Windows) and `publisher` the file's `IMPLEMENTOR` (on macOS, a bundle with an openable `Contents` and no `release` file
   under `Contents/Home` reports its `Info.plist` `JVMVendor`), else `via:jvm` (the home reports no vendor, or it is a
@@ -347,6 +358,85 @@ cadences.
   Linux an empty result is often honest — a host may legitimately have `rpm`
   installed and no rpm packages — so that check is not applied there.
 
+  **Linux dpkg and rpm rows come from an in-process database read.** This plugin
+  no longer runs `dpkg-query` or `rpm` (other plugins still run their own tools):
+  it reads the dpkg status file (and the `/var/lib/dpkg/status.d/` directory
+  minimal images use) and the rpm database (sqlite, ndb or Berkeley DB, whichever
+  the host uses) itself, read-only and without following a symlink at the file,
+  within 20 seconds, 50,000 packages (for dpkg, stanzas) and fixed byte limits
+  (32 MiB of dpkg text in total, 32 MiB per rpm header, 1 GiB of rpm headers and
+  8 MiB of retained text across them). The rows, and therefore the section hash,
+  are byte-for-byte what the tools produced on every host measured, so a fleet
+  upgrade resends nothing, with one exception: a host that carries a tab, pipe or
+  newline inside a maintainer or vendor sends those rows once more, with the full
+  value the tools used to truncate. What else is different from the tools:
+
+  - **`status.d`.** A host whose packages live only there (minimal images with no
+    shell) now reports them, as new install rows; and a host with a healthy status
+    file and one `status.d` control file that does not hold exactly one stanza, and that one in the installed state (a `not-installed` stanza beside it is ignored; unparseable, zero-byte and comment-only files are refused, and so is a second stanza of any other kind, or a single one in another state such as config-files or half-installed) is degraded
+    (`dpkg_status_d:corrupt`, no rows, the server keeps its stored ones) where
+    `dpkg-query` ignored the directory. The token does not name the file: list
+    `/var/lib/dpkg/status.d` and look for a zero-byte, comment-only or hand-edited
+    one, one holding two stanzas, one whose `Status` is not installed, or two files that name the same package. Restore it (reinstall the package
+    that owns it) rather than delete it: a deleted control file drops its package
+    from the roster, which is then read as complete. A name with a leading dot is
+    skipped, which costs the same as deleting it.
+  - **Which manager is read.** It is chosen by its database file, not its binary.
+    A dpkg status with no installed package (empty, or only config-files and
+    half-installed stanzas) falls through to rpm, and an rpm database that holds no
+    package falls through to `pacman` (and, for `list_inventory`, the daily sync,
+    `apk`); a host with such an empty database and no other manager reports an
+    empty collection, not a degraded one.
+  - **dpkg `Status`.** A `Status` is accepted only as dpkg writes it (dpkg's own
+    words, lowercase, one space between them). A status file hand-edited to mixed
+    case or repeated blanks, which `dpkg-query` read, is `dpkg_status:corrupt` (no
+    rows, the server keeps its stored ones) until dpkg next rewrites it.
+  - **Symlinks.** A symlinked status file, `status.d` directory or rpm database
+    file is refused (`symlink_refused`) where the tools followed the link. A
+    symlinked rpm directory is skipped, never followed; when a database file sits
+    behind such a link in a directory this reader did not read, the read is
+    `rpmdb:symlink_refused` rather than an empty list, and so is a populated
+    directory read after such a link that hides a different database (a link on
+    a later candidate is not examined). The current Fedora, RHEL and SUSE layout,
+    where `/var/lib/rpm` links to the directory that is read, is unaffected. A
+    regular file where an rpm database directory belongs is `rpmdb:not_regular`.
+  - **A writer is running.** On a host that keeps an ndb or Berkeley DB rpm
+    database, a running rpm transaction answers `locked` (the reader asks whether
+    rpm's transaction lock is held and never takes it); and on any host with a
+    pending update journal (a file named with digits only in
+    `/var/lib/dpkg/updates`, left by a dpkg run in progress or an interrupted one),
+    including an rpm host that carries a stale dpkg tree, the read answers
+    `dpkg_updates:locked`, where `dpkg-query` printed the merged view. Both
+    keep the server's stored rows. The rpm one clears when the transaction ends;
+    the dpkg one when dpkg next completes a run, and after an interrupted run
+    `dpkg --configure -a` (when no dpkg run is in progress) completes the journal
+    and clears it; on an rpm host there is no dpkg to run, so the leftover record
+    is removed by hand. An rpm lock file moved out of the database directory is not
+    seen.
+  - **Unprivileged read.** An rpm sqlite database without its WAL sidecars is
+    readable by an unprivileged account (measured on one AlmaLinux 9 image, where
+    `rpm -qa` failed as `nobody`); other accounts and images were not measured.
+
+  When the read fails, the collection is degraded exactly as above, with no rows and
+  a named reason in the agent log, the `list`/`query` error row and the result's
+  provenance (`installed_apps:<source>:<cause>`, source one of `dpkg_status`,
+  `dpkg_status_d`, `dpkg_updates`, `rpm_sqlite`, `rpm_ndb`, `rpm_bdb`, `rpmdb` or
+  `pkgdb`): `locked` (a writer holds the database: sqlite write-locked past its
+  timeout, an rpm transaction running on ndb or Berkeley DB, or a pending dpkg
+  update journal), `changed_during_read` (a transaction rewrote the rpm database
+  during the read), `corrupt` or `truncated` (a damaged database or record: one
+  bad rpm header fails the whole read rather than publishing a shorter list),
+  `unsupported_format` (a database layout the reader does not decode, for example
+  an LMDB rpm database or a Berkeley DB hash version other than 9),
+  `oversized`, `row_cap`, `byte_cap`, `timeout` and `busy` (a limit was reached),
+  `symlink_refused` and `not_regular` (the database, its directory or its
+  `.rpm.lock` is a link, or not a regular file or directory), and `unreadable` (a permission or I/O error). The daily sync's own
+  constrained token does not carry the reason yet; read it from the agent log
+  (where that is, `--log-file` or the console and your service manager, is under
+  "Where the lines go" in the Guardian `T_*` log-lines entry of
+  [server-admin.md](server-admin.md)). A degraded Linux host keeps its last-known
+  rows, shown as unconfirmed, until the database is readable again.
+
   **Windows degrades the same way (#4711).** The registry walk is native, so the
   subprocess cases above do not apply, but an Uninstall root that cannot be
   opened or enumerated to the end, or an application subkey whose open fails
@@ -377,13 +467,14 @@ cadences.
   `--inventory-disable`. The same holds for `list_inventory` dispatched directly
   as a command (it has no instruction definition, but the catalogue admits it at
   `Inventory:Read`): its fourteenth token is the raw location, minimised only by
-  the daily-sync writer, and the Response store keeps it as sent. The sync blob also has `install_location` and
-  `uninstall_string` slots. In the v2 blob they are reserved: the server ignores
-  them and stores neither, and an agent that fills them gets a full-resend request
-  every cycle. The sectioned v3 blob stores `install_location` and keeps
-  `uninstall_string` reserved (see "Install type, scope and location, and the
-  sectioned report" below). This build's agent sends `install_location` (the Windows
-  `InstallLocation`, the macOS `.app` path) and never `uninstall_string`; since a path under a
+  the daily-sync writer, and the Response store keeps it as sent. The sync blob also has two
+  trailing slots, 13 and 14: `install_location` and the `attributes` field (slot 14 was
+  reserved for an uninstall string until 2026-11-21 and never carried one). In the v2 blob the server stores neither,
+  and an agent that fills them gets a full-resend request every cycle. The sectioned v3 blob
+  stores both (see "Install type, scope and location, and the sectioned report" below, where
+  the `attributes` bullet lives). This build's agent sends `install_location` (the Windows
+  `InstallLocation`, the macOS `.app` path, a Homebrew machine prefix) and, in slot 14, only a
+  validated attribute field, never an uninstall string; since a path under a
   user's profile names an account, the location is an allowlist: the agent canonicalises the
   value (quotes, padding, doubled separators, `.` and `..` segments, the `\\?\` prefix and the
   macOS `/System/Volumes/Data` spelling) and keeps it, in one spelling (case is kept), only when it sits under a
@@ -537,7 +628,7 @@ Mach-O `.dylib` files on macOS. It reads each library's header in-process; no pr
 
 ### Install type, scope and location, and the sectioned report
 
-Each stored software row carries four more attributes. They are read-side facts today: the
+Each stored software row carries five more attributes. They are read-side facts today: the
 fleet query, catalogue and device pages do not return them yet, so they are visible only in the
 database.
 
@@ -556,7 +647,8 @@ database.
 - **`install_location`** is the folder the software was installed into, when the collector reports
   one. It is stored only from the v3 blob (the v2 blob's slot is ignored), so a device that has not
   yet sent a v3 report has none. The agent fills it for Windows applications (the registry's
-  `InstallLocation`) and macOS applications (the `.app` path); Linux packages, MSI products, store
+  `InstallLocation`), macOS applications (the `.app` path) and Homebrew formulae and casks (the
+  machine prefix, `/opt/homebrew` or `/usr/local`); Linux packages, MSI products, store
   packages and the other sources have no single install folder, so it is empty for them. Only a
   folder under a known machine root is sent (the allowlist above); a location outside those roots
   is blanked, and the row is still reported with its name, version and publisher.
@@ -569,6 +661,16 @@ database.
   v3 blob: a row from a v2 report has an empty `purl` until its device's first v3 report. The
   value is indexed, and the store can look up the devices carrying exactly one `purl`; the REST
   installs lookup returns it and filters on it, and the dashboard and the MCP tool do not yet.
+- **`attributes`** is a validated `key=value` field a collector can attach to a row (wire slot 14),
+  empty for a row that has none: pairs joined by `;`, keys in ascending order, each at most once.
+  One key exists today, `upgrade_code`: the MSI UpgradeCode of a Windows product, which is the same
+  for every version of that product, written as a braced GUID in upper-case hex, for example
+  `upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}`. The server stores it only from the v3 blob
+  (the v2 blob's slot is ignored), keeps it in the row's section hash, and does not return it from
+  any read route, dashboard page or MCP tool yet. No collector reports an `upgrade_code` yet. A
+  value the server cannot read as a valid attribute field refuses that one section (reason
+  `bad_attributes`, below). Two rows that differ only in `attributes` are two rows, and an
+  attribute-only change at the same version writes no change-feed entry.
 
 **The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
 each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
@@ -610,7 +712,14 @@ section hash (an out-of-band change to the table) set the starting point and pro
 the last case is logged as a warning and, by decision, no counter or alert counts it. Removed
 software is simply deleted from the device's list; the history entry is the record that it was
 there. History older than 400 days is pruned, and decommissioning a device deletes its history
-and its components with it. The change
+and its components with it. A development or UAT database that already holds a Mac's Homebrew rows
+from an earlier build (not a supported starting point: a fresh database baselines instead) records
+one `remove` and one `install` for each of that Mac's Homebrew formula and cask rows, at an
+unchanged version, on its first sync from the build that fills `install_location`, because the
+location is part of a row's identity. The pair is recognisable (the same device, facet
+`pkg_inventory.packages`, name and version, one `observed_at`; there is no cause label), happens
+once per Mac and is pruned with the rest of the history after 400 days; see
+[Upgrading](upgrading.md), section 4. The change
 history is read through `GET /api/v1/inventory/software/changes` and the components through
 `GET /api/v1/inventory/software/components` (see the REST API reference; the MCP tool
 `query_software_components` answers the same question); the dashboard shows
@@ -640,9 +749,9 @@ whatever the source: the older per-source behaviours that removed a constrained 
 section that broke the blob v3 grammar, and the warn-level server log line "v3 section(s) ...
 refused" names the agent and the reason. The reason is one of `unknown_facet`, `duplicate_facet`,
 `unknown_status`, `rows_in_status_only`, `delete_in_full`, `wrong_record_for_facet`,
-`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`, `row_cap`,
-`nul_byte` or `unterminated`. The agent resends the same bytes, so a refusal never clears on its
-own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
+`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`,
+`bad_attributes`, `row_cap`, `nul_byte` or `unterminated`. The agent resends the same bytes, so a
+refusal never clears on its own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
 deleted) until the agent is fixed. The one exception is a device's first v3 call that applies a section: its v2 rows were
 already replaced, so a facet refused then has no rows to keep. `facet="unknown"` on the counter means the server does not
 recognise the name: that is a version-skew incident (an agent and a server of different builds),
@@ -1655,12 +1764,50 @@ could not be read for a reason other than the product not having it (or, as
 `windows:msi_prop:oversized`, the value was implausibly long); it behaves the same
 way. A token is cut at 64 bytes and characters outside `A-Z a-z 0-9 _ . : = , -` become `_`, so a long
 list of constraint tokens is shortened. The server keeps the latest status and token of each source
-per device; no server page or API returns them yet, so read the cause from the agent's own log. Fix
+per device and returns them through `GET /api/v1/inventory/software/plugin-health` (which facets
+fail) and `/hosts/{agent_id}` (the device's token per facet), described above under "Collection
+health, hosts and the change feed"; the full token list of a facet whose token was cut is the
+action's own status row, in the agent's log. Fix
 the failing action, or remove its plugin, and the next daily sync recovers; `timeout` and `busy`
 are the exception: a worker that never returns holds its plugin's flag across passes and
 reconnects, so recovery is the worker returning or an agent restart, and that restart is the
 3-second drain and exit code 3 described under "Sections and deltas" (expect the critical
 `collector worker(s) still inside a plugin` journal line).
+
+**A Mac's Homebrew software is marked unconfirmed, and the `pkg_inventory.packages` token names a
+user prefix (`macos:user_homes:...`, `macos:homebrew_user_prefix:...`,
+`macos:homebrew_user_cellar:...` or `macos:homebrew_user_caskroom:...`).**
+The agent also walks the `~/homebrew` and `~/.homebrew` prefixes of each home under `/Users`, and a
+failed read of any of them makes the whole `packages` answer constrained: the server keeps the
+device's stored Homebrew rows, shown as unconfirmed, and no other source is affected. Find the
+affected device from its unconfirmed Homebrew row (`GET /api/v1/inventory/software/plugin-health` shows
+only whether the facet is affected across the fleet and lists the ten slowest devices), read the
+token on `/hosts/{agent_id}`, and look
+the detail up here and in the plugin's README (`agents/plugins/pkg_inventory/README.md`, caveats 1
+and 4). The tokens never name a user or a path.
+
+| Token (after `macos:`) | Meaning | Remedy |
+|---|---|---|
+| `user_homes:mounts_unreadable` | The mount table could not be read, so no home is opened. | Clears when the table reads again. |
+| `user_homes:network_mount`, `homebrew_user_prefix:network_mount` | `/Users`, a home or a candidate prefix is on a network mount and is never touched. | None while it is mounted. |
+| `user_homes:not_a_directory` | `/Users` is a symlink and was refused. It constrains every run. (A symlinked home under `/Users` is skipped silently, as "not a home".) | Make `/Users` a real directory. |
+| `user_homes:permission_denied` | The agent cannot open `/Users` or a home: a non-root agent against another account's home (unless its group or an ACL admits it). | Run the agent as root, or remove the prefix (the section stays unconfirmed until then). |
+| `homebrew_user_prefix:owner_mismatch` | The prefix is not owned by its home's owner; nothing under it is opened. | Fix the ownership, or remove the prefix. |
+| `homebrew_user_prefix:owner_name_unsupported` | A home whose directory name has a non-ASCII, control, pipe or backslash character (or is over 255 bytes) holds a Cellar or Caskroom. | Rename the home, or remove the prefix. It never clears on its own. |
+| `homebrew_user_cellar:not_a_directory`, `homebrew_user_caskroom:not_a_directory` | The Cellar or Caskroom is a symlink or a file. | Replace it with a real directory, or remove it. |
+| `user_homes`, `homebrew_user_prefix`, `homebrew_user_cellar` or `homebrew_user_caskroom` with `permission_denied`, `symlink_refused` or `io_error` | The directory could not be opened. | Correct its permissions or links. |
+| the same four with `entry_cap`, `enumeration_error`, `row_cap`, `byte_cap` or `walk_budget` | A size or time bound stopped the walk (4,096 names per directory, 20,000 rows, 1 MiB of rows, 200,000 entries or 10 seconds per action). | Reduce what the prefix holds. |
+
+A local account can hold its own Homebrew section at "unconfirmed" this way; that is an accepted
+trade-off (README caveat 1). There is no switch for the user-prefix walk alone. The collection
+setting `plugins.pkg_inventory=false` and the plugin-wide kill switch each switch off all three
+`pkg_inventory` facets of the scheduled collection; an on-demand `pkg_inventory.packages` dispatch still
+walks the user homes unless the plugin kill switch is set (a kill switch set for one operating system or one action does not stop the
+daily collection; see [Collection settings](#collection-settings)); otherwise remove or re-own the
+prefix. A `timeout` or `busy` token recovers when the worker returns or the agent restarts (the
+paragraph above). The first sync of a build that fills `install_location` can also add one `remove`
+and one `install` per Homebrew row to a carried database's change feed; see [Upgrading](upgrading.md),
+section 4.
 
 **A device's Python (or IBM MQ, .NET or Java) rows are marked unconfirmed, but the rest of its
 software is still reported; the log shows `sync: runtimes.python constrained (<tokens>) — reported
@@ -1989,7 +2136,8 @@ The server turns every distinct installed-software title into a stable identity 
 - **Cadence.** A quiet fleet is checked once an hour. A tick covers up to 200,000 titles or 60 seconds of work in total, whichever comes first. When it stops at either limit with more waiting (a new pack version, or the first run on a large fleet), the next tick starts after 60 seconds instead of an hour, so a backlog is worked off in back-to-back ticks rather than one tick an hour. The same 60 seconds applies right after a server start or upgrade when the catalogue rollup has not yet produced the title list: the job finds nothing to do and keeps checking every 60 seconds until the rollup has produced the title list, instead of waiting an hour. A tick that fails or times out is retried at the hourly interval, because an immediate retry would pick the same batch and fail the same way.
 - **The alias pack.** Resolution is driven by a versioned alias pack (`YYYY.MM.N`) stored in Postgres. A seed pack ships inside the server and is loaded on first boot only when no pack exists; a newer server build does not replace a pack that is already loaded (the boot log names both versions). If the pack cannot be loaded for any reason, including a transient database error, the server refuses to start and logs `[PG] Refusing to start`.
 - **Settled titles are re-resolved only when something changes.** A title is resolved when it first appears and again when the pack version changes, its product is deleted, or a registry write marks it stale. A curated alias (`POST /api/v1/inventory/software/normalization/aliases`) or a replaced pack (`POST .../pack`) marks every title stale in the same transaction, so the next hourly passes pick the fleet up again; rejecting a queue entry does not.
-- **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions, architectures and edition words are removed (for example `2019` or `Pro`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
+- **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions and architectures are removed (for example `2019` or `(x64)`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
+- **How a title and a publisher are cleaned up.** The product key is built from the publisher, the title and the edition, each cleaned the same way every time. Case is folded for ASCII letters and runs of spaces collapse. A title loses its standalone version words (`2019`, `16.0.1`, `v2.1`; the first is kept as the title's version), its architecture words (`x64`, `(64-bit)`) and a bare `-` separator. An edition word (`Standard`, `Enterprise`, `Pro`, `Home`, ...) is the edition only after a title word: `Windows 11 Pro` is `windows` with edition `pro`, while a title that is one (`Home`) or starts with one (`Pro Display Calibrator`) keeps it as part of the title. The word `edition` right after an architecture word, or after a word taken as the edition, is dropped (`7-Zip 26.04 (x64 edition)` is `7-zip`); a leading edition word kept as part of the title does not arm it (`Home Edition` is `home edition`). A Homebrew `name@version` keeps the name and supplies the version (`openssl@3` is `openssl`, version `3`). A year range such as `2015-2022` stays in the title because it names a runtime generation; a version glued to a name (`python3.14`, `postgresql-18`) is not stripped, since such package names are legitimate, so the seed pack lists those it knows. A publisher loses only the trailing run of legal-suffix words (`Inc.`, `Corporation`, `GmbH`, `L.L.C.`, `Software`, `Foundation`, ...) and never its last word, so `Python Software Foundation` is `python`, `macOS Software Signing` keeps its name and `Software` stays `software`; compound forms such as `GmbH & Co. KG` are not reduced. These rules decide the keys the pack and the curation queue use; see [Upgrading](upgrading.md) for what a change to them does to a server that already holds a pack.
 - **Origin labels.** A publisher of the form `via:<ecosystem>` (for example `via:brew`) names where a row came from, not a vendor, so it normalises to no vendor. It is the title's raw key: the queue and `GET .../queue` show it as `raw_publisher`, and a title the pack or a curated alias covers resolves through that alias like a title with no publisher.
 - **Editions are distinct products.** An alias binds exactly one edition, and a title is never matched to a different edition of the same product, so SQL Server Standard and SQL Server Enterprise resolve separately and an edition the pack does not list lands in the queue rather than on its neighbour.
 - **Automatic product creation is off.** The job does not create products for unmatched titles; they wait in the queue.
