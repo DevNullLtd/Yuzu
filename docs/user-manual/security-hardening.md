@@ -109,41 +109,57 @@ Run each component under its own system user:
 ### Firewall snapshot broker (Linux packages)
 
 The packaged agent unit keeps `NoNewPrivileges=true` and a bounding set of one capability, so it
-cannot read the nftables ruleset or `iptables` itself. The `.deb` and `.rpm` ship a root-owned
-socket unit for that, and the agent unit pulls it in (`Wants=yuzu-fw-snapshot.socket`):
+cannot read the nftables ruleset or the legacy iptables tables itself. The `.deb` and `.rpm` ship a
+root-owned socket unit for that, and the agent unit pulls it in (`Wants=yuzu-fw-snapshot.socket`).
+The units need systemd 239 or later; they were measured on Rocky 8.10 (systemd 239, legacy cgroup
+hierarchy, where `IPAddressDeny` is parsed and not enforced and the address-family list is the
+bound), Rocky 9.9 (systemd 252) and Ubuntu 26.04 (systemd 259), on 2026-11-23.
 
 - `yuzu-fw-snapshot.socket` listens on `/run/yuzu-fw-snapshot.sock`, owned by root with group
   `yuzu-agent` and mode `0660`, so only that group can connect.
 - Each connection starts `yuzu-fw-snapshot@.service`, which runs one fixed script as root with no
-  input and a read-only file system (apart from the iptables lock file). The script runs `nft -a list ruleset`,
-  `iptables -S` and `ip6tables -S` with those literal arguments and nothing else; the reply is cut
-  at 1 MiB. The agent sends nothing, checks that root created the socket and treats the reply as
-  untrusted text.
+  input and a read-only file system, `/run` included. The script runs `nft -a list ruleset` and
+  each address family's legacy save tool under its own name (`iptables-legacy-save` and
+  `ip6tables-legacy-save`, which list every instantiated table) with those literal arguments and
+  nothing else; a family with no save tool reads the kernel's own table list instead. The reply is
+  cut at 1 MiB. The agent sends nothing, checks that root created the socket and treats the reply as
+  untrusted text. The script changes no ruleset and writes no file. The legacy reads load no module
+  and take no lock; one effect is measured and stays: an nft read on a host where nf_tables is not
+  loaded makes the kernel load it (an empty ruleset, no table and no rule).
 - **What the agent account can now read:** the host's full nftables ruleset, rule handles and rule
-  comments included, and the `iptables` and `ip6tables` listings. It can change nothing through the
-  broker, and the agent unit's own sandbox is unchanged. Anyone who can run code as the agent can
-  read those listings; treat the ruleset as readable by that account.
+  comments included, and every instantiated legacy `iptables` and `ip6tables` table. It can change
+  nothing through the broker, and the agent unit's own sandbox is unchanged. Anyone who can run code
+  as the agent can read those listings; treat the ruleset as readable by that account. A host with
+  no `nft` command cannot have nf_tables read through the broker: the plugin then reports
+  `error|nftables:snapshot:absent` and never `inactive` for it.
 - The service unit has its own sandbox (its own two capabilities, a system call filter, address
   families, a read-only file system). It does not set `NoNewPrivileges`: with SELinux enforcing
   (measured on Rocky 9.9) that made every exec of the three tools a denied `nnp_transition`, three
   audit denials per read, and left the tools outside their own confined domain; the bounding set and
-  the filters, which systemd applies to every process the script starts, are what bound it. One
-  thing changes without the flag: an exec of a setuid or setgid program that belongs to another user
-  or group changes the process to that identity. That adds no capability beyond the two in the
-  bounding set, the filters still apply, and the script runs only its three fixed tools with no
-  input. The service unit's IP egress filter takes effect only on hosts with the unified cgroup
-  hierarchy; its address-family list is what bounds its sockets. The agent unit keeps
-  `NoNewPrivileges=true`.
+  the filters, which systemd applies to every process the script starts, are what bound it. On
+  Ubuntu 26.04 the broker's processes ran unconfined by AppArmor (measured). One thing changes
+  without the flag: an exec of a setuid or setgid program that belongs to another user or group
+  changes the process to that identity. That adds no capability beyond the two in the bounding set,
+  the filters still apply, and the script runs only its three fixed tools with no input. The service
+  unit's IP egress filter takes effect only on hosts with the unified cgroup hierarchy; its
+  address-family list is what bounds its sockets. The agent unit keeps `NoNewPrivileges=true`.
+- If a read answers `unknown` with no `error|snapshot:` row on a packaged host, there is no socket
+  file: the socket was stopped, masked or has failed. Run `systemctl status
+  yuzu-fw-snapshot.socket`; then `systemctl reset-failed yuzu-fw-snapshot.socket` and `systemctl
+  start yuzu-fw-snapshot.socket`, or restart `yuzu-agent`. `journalctl -u
+  'yuzu-fw-snapshot@*'` shows each instance.
 - To opt out, run `systemctl stop yuzu-fw-snapshot.socket` and then `systemctl mask
-  yuzu-fw-snapshot.socket`. The order matters: on Rocky 9.9 (systemd 252) `systemctl mask --now`
-  alone left the socket file, and the agent then reported `error|snapshot:connect:refused`; stop
-  first and then mask, or remove `/run/yuzu-fw-snapshot.sock`. The firewall plugin then answers as it
-  did before there was a broker: on a firewalld host firewalld's own rows (`backend|firewalld`,
-  `state|running`, `ruleset|unknown`), elsewhere `state|unknown` and `ruleset|unknown`, in both cases
-  after the one error row of the refused netlink read (`error|nftables:table:eperm`). On a host
-  without firewalld the rows that follow are the answer of `iptables` itself (`backend|iptables`,
-  `state|unknown`, `ruleset|unknown`, or `backend|none` when neither `ufw` nor `iptables` ran); a
-  refused `ufw` writes no row. It is not silent.
+  yuzu-fw-snapshot.socket`; to keep the broker from ever starting, run `systemctl mask
+  yuzu-fw-snapshot.socket` before the package is installed, and the agent starts without it. The
+  order matters on a running host: on Rocky 9.9 (systemd 252) `systemctl mask --now` alone left the
+  socket file, and the agent then reported `error|snapshot:connect:refused`; stop first and then
+  mask, or remove `/run/yuzu-fw-snapshot.sock`. The firewall plugin then answers as a host without
+  the broker does: on a firewalld host firewalld's own rows (`backend|firewalld`, `state|running`,
+  `ruleset|unknown`), elsewhere `state|unknown` and `ruleset|unknown`, in both cases after the one
+  error row of the refused netlink read (`error|nftables:table:eperm`). On a host without firewalld
+  the rows that follow are the answer of `iptables` itself (`backend|iptables`, `state|unknown`,
+  `ruleset|unknown`, or `backend|none` when neither `ufw` nor `iptables` ran); a refused `ufw`
+  writes no row. It is not silent.
 
 The design and its limits are in `docs/adr/3007-os-activated-read-helpers.md`.
 

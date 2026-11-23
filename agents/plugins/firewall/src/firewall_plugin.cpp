@@ -59,15 +59,19 @@
  *   Containment calls a non-root agent makes through the root-owned yuzu-fw-helper
  *   (nft load, iptables, pf load) are rung 3: the helper is a `#!/bin/sh` script, and a
  *   site's rung is set by the deepest interpreter intentionally invoked (ADR-3002 Decision 5),
- *   so those sites are registered in docs/agent-spawn-sink-manifest.md. The descriptor carries the
- *   worst rung a leg can reach (plugin.h); an agent that runs as root runs the tool directly, which
- *   is rung 2.
+ *   so those sites are registered in docs/agent-spawn-sink-manifest.md. The containment legs'
+ *   descriptors carry the deepest rung they can reach (plugin.h); an agent that runs as root runs
+ *   the tool directly, which is rung 2. The read legs (`state`, `rules`) carry their primary rung and
+ *   name the deeper one in the descriptor's fallback field (the helper's snapshot word, rung 3).
  */
 
 #include <yuzu/plugin.hpp>
 
 #include "firewall_parsers.hpp"
 #include "firewall_quarantine_parsers.hpp"
+#if defined(__linux__)
+#include "firewall_snapshot_reader.hpp"
+#endif
 
 #include <yuzu/agent/network_interfaces.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
@@ -611,7 +615,14 @@ FirewalldQueryResult query_firewalld() {
         r.services_complete = false;
         return r;
     }
-    while (sd_bus_message_enter_container(reply.m, 'e', "sa{sas}") > 0) {
+    for (;;) {
+        // > 0 a zone entry opened, 0 the array ended, < 0 the reply stopped decoding part way: the
+        // zones read so far are then not every zone, so the read is incomplete
+        const int entered = sd_bus_message_enter_container(reply.m, 'e', "sa{sas}");
+        if (entered < 0)
+            r.services_complete = false;
+        if (entered <= 0)
+            break;
         yuzu::firewall::FirewalldZone zone;
         const char* zone_name = nullptr;
         sd_bus_message_read(reply.m, "s", &zone_name);
@@ -630,6 +641,8 @@ FirewalldQueryResult query_firewalld() {
         sd_bus_message_exit_container(reply.m); // exit this zone's dict-entry
         if (!zone.name.empty())
             r.zones.push_back(std::move(zone));
+        else
+            r.services_complete = false; // a zone with no name cannot be asked for its services
     }
     sd_bus_message_exit_container(reply.m);
 
@@ -1295,101 +1308,45 @@ bool try_nftables_rules(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
 // as it did before the broker: firewalld's own rows on a firewalld host, `unknown` elsewhere, both
 // after the refused netlink read's error row.
 
-/// One read of the broker: the reply text, or the token that says why there is none. An EMPTY token
-/// means the broker is not installed (ENOENT) and is not reported. Tokens: connect:eacces,
-/// connect:refused, connect:busy, connect:errno:<n>, peer_not_root, timeout, oversized, io_error.
-[[nodiscard]] std::expected<std::string, std::string>
-read_fw_snapshot(std::chrono::steady_clock::time_point deadline) {
-    sockaddr_un addr{};
-    static_assert(yuzu::firewall::kFwSnapshotSocketPath.size() < sizeof(addr.sun_path),
-                  "the broker socket path must fit sockaddr_un::sun_path with its NUL");
-    addr.sun_family = AF_UNIX;
-    std::memcpy(addr.sun_path, yuzu::firewall::kFwSnapshotSocketPath.data(),
-                yuzu::firewall::kFwSnapshotSocketPath.size());
-
-    // Non-blocking from creation and owned by a ScopedFd: every return below closes it, and
-    // nothing else closes it (the single release path, as in open_nft_socket).
-    yuzu::agent::ScopedFd sock(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
-    if (!sock)
-        return std::unexpected(std::string{"io_error"});
-    if (::connect(sock.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0)
-        return std::unexpected(yuzu::firewall::snapshot_connect_token(errno));
-
-    // The socket must have been made by root: for a connected unix socket SO_PEERCRED is the
-    // credentials of the process that listen()ed, so a socket file an unprivileged account put at
-    // this path is refused before a byte of it is read.
-    ucred cred{};
-    socklen_t cred_len = sizeof(cred);
-    if (::getsockopt(sock.get(), SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) < 0 || cred_len != sizeof(cred))
-        return std::unexpected(std::string{"io_error"});
-    if (cred.uid != 0)
-        return std::unexpected(std::string{"peer_not_root"});
-
-    std::string text;
-    char buf[16 * 1024];
-    for (;;) {
-        const auto left = remaining_ms(deadline);
-        if (left.count() <= 0)
-            return std::unexpected(std::string{"timeout"});
-        pollfd pfd{sock.get(), POLLIN, 0};
-        const int ready = ::poll(&pfd, 1, static_cast<int>(left.count()));
-        if (ready < 0) {
-            if (errno == EINTR)
-                continue;
-            return std::unexpected(std::string{"io_error"});
-        }
-        if (ready == 0)
-            return std::unexpected(std::string{"timeout"});
-        const ssize_t n = ::read(sock.get(), buf, sizeof(buf));
-        if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN)
-                continue;
-            return std::unexpected(std::string{"io_error"});
-        }
-        if (n == 0)
-            return text; // end of stream: the broker has sent everything it will
-        text.append(buf, static_cast<std::size_t>(n));
-        if (text.size() > yuzu::firewall::kFwSnapshotMaxBytes)
-            return std::unexpected(std::string{"oversized"});
-    }
-}
+// The socket client itself is yuzu::firewall::read_fw_snapshot (firewall_snapshot_reader.hpp), so the
+// plugin and its tests run the same code. The path must fit sockaddr_un with its NUL.
+static_assert(yuzu::firewall::kFwSnapshotSocketPath.size() < sizeof(sockaddr_un::sun_path),
+              "the broker socket path must fit sockaddr_un::sun_path with its NUL");
 
 /// The second transport of the same listing, for a host the installer provisioned (no packaged
 /// socket): the root helper's `snapshot` word through `sudo -n --`. It is used only by a non-root
 /// agent that is not under NoNewPrivileges (the packaged unit, where sudo cannot elevate, has the
-/// broker instead). The helper's snapshot always exits 0 (a tool that failed is marked inside the
-/// reply), so a run that is not complete with exit 0 is sudo refusing or failing to exec: the
-/// transport is not provisioned here, and that is a silent decline with no row, as for an absent
-/// socket. Only a complete run that exited 0 is returned, and the caller parses it through the same
-/// strict framing as the socket's reply. Spawn site firewall/try_snapshot#1 (rung 3: the helper is
-/// a `#!/bin/sh` script).
-[[nodiscard]] std::optional<std::string> read_fw_snapshot_via_helper() {
+/// broker instead), and only when the helper file is there: a host the installer did not provision
+/// makes no sudo call at all. The pure helper_snapshot_outcome decides what the run came to: its
+/// listing, the silent decline (sudo refused with exit 1: this host is not provisioned for the
+/// read), or `helper:<token>` for a run that timed out, was clipped or failed. The caller parses a
+/// listing through the same strict framing as the socket's reply. Spawn site
+/// firewall/try_snapshot#1 (rung 3: the helper is a `#!/bin/sh` script).
+[[nodiscard]] std::expected<std::string, std::string> read_fw_snapshot_via_helper() {
     // privilege_refusal() (defined with the containment shell below) is the one reading of
     // NoNewPrivileges: it refuses a non-root agent under it, which cannot sudo.
-    if (::geteuid() == 0 || privilege_refusal())
-        return std::nullopt;
-    const auto res = run_bounded_subprocess(
+    if (::geteuid() == 0 || privilege_refusal() || ::access(std::string{fq::kFwHelperPath}.c_str(), X_OK) != 0)
+        return std::unexpected(std::string{});
+    return yuzu::firewall::helper_snapshot_outcome(run_bounded_subprocess(
         yuzu::shared::sudo_wrap({std::string{fq::kFwHelperPath}, "snapshot"}),
         SubprocessOptions{.deadline = kAcqDeadline,
-                          .output_cap_bytes = 2 * yuzu::firewall::kFwSnapshotMaxBytes});
-    if (!subprocess_complete(res))
-        return std::nullopt;
-    return res.output;
+                          .output_cap_bytes = 2 * yuzu::firewall::kFwSnapshotMaxBytes}));
 }
 
 /// true iff the snapshot answered (dispatch stops); false means the next rung runs. A broker that
 /// is not installed says nothing (and the helper transport is tried); one that is but could not be
 /// read says why in an `error|snapshot:<token>` row. The rows are the pure decision's
-/// (linux_snapshot_answer). While `info.firewalld_running` only an active answer is written and
-/// accepted; any other answer writes just its `error|` rows, so firewalld's held answer stands and
-/// the refusals that explain what was not read are still reported.
+/// (linux_snapshot_answer). A declined answer (no nft CLI and nothing read shows content) writes
+/// just its `error|` rows and the ladder goes on. While `info.firewalld_running` only an active
+/// answer is written and accepted; any other answer writes just its `error|` rows, so firewalld's
+/// held answer stands and the refusals that explain what was not read are still reported.
 bool try_snapshot(yuzu::CommandContext& ctx, const NftFallthroughInfo& info,
                   yuzu::firewall::FwReadAction action) {
-    auto reply = read_fw_snapshot(std::chrono::steady_clock::now() + kAcqDeadline);
+    auto reply = yuzu::firewall::read_fw_snapshot(yuzu::firewall::kFwSnapshotSocketPath,
+                                                  std::chrono::steady_clock::now() + kAcqDeadline);
     if (!reply && reply.error().empty()) {
         // No socket file: not the packaged unit. The installer's helper is the other transport.
-        if (auto via_helper = read_fw_snapshot_via_helper())
-            reply = std::move(*via_helper);
+        reply = read_fw_snapshot_via_helper();
     }
     if (!reply) {
         if (!reply.error().empty())
@@ -1402,9 +1359,8 @@ bool try_snapshot(yuzu::CommandContext& ctx, const NftFallthroughInfo& info,
         return false;
     }
     const auto answer = yuzu::firewall::linux_snapshot_answer(*snapshot, info.tables_seen, action);
-    if (answer.rows.empty())
-        return false; // no nft and no iptables on this host: nothing the snapshot can say
-    const bool answers = !info.firewalld_running || answer.state == yuzu::firewall::NftVerdict::active;
+    const bool answers =
+        !answer.declined && (!info.firewalld_running || answer.state == yuzu::firewall::NftVerdict::active);
     for (const auto& row : answer.rows)
         if (answers || row.starts_with("error|"))
             ctx.write_output(row);
@@ -3205,11 +3161,12 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
 // ── ABI4 capability declarations (#2204) ────────────────────────────────
 //
 // Windows: entirely native, zero subprocesses — INetFwPolicy2 COM (rung 1).
-// macOS: run_bounded_subprocess argv, no shell (rung 2) — same 3 sites as
-// before the migration. Linux: firewalld and nftables are both native rung 1
-// (bounded sd-bus / bounded NETLINK_NETFILTER); ufw/iptables are
-// run_bounded_subprocess argv (rung 2), the fallback once neither native
-// backend is reachable. `state` and `rules` never mutate firewall state. The
+// macOS: run_bounded_subprocess argv, no shell (rung 2); the pf reads run under `sudo -n` on the
+// installer's exact NOPASSWD lines (direct when root). Linux: firewalld and nftables are both native
+// rung 1 (bounded sd-bus / bounded NETLINK_NETFILTER), then the root snapshot broker (an AF_UNIX
+// read, rung 1) or, on a host the installer provisioned, the helper's snapshot word through
+// `sudo -n` (rung 3); ufw/iptables are run_bounded_subprocess argv (rung 2), the fallback once none
+// of those answers. `state` and `rules` never mutate firewall state. The
 // four containment actions below do: Windows over COM (rung 1), Linux over
 // the root-owned helper's nft load / iptables argv (rung 3, with the status read rung 1 -> 3),
 // macOS over the root-owned helper's pf load and `sudo pfctl` (rung 3): an own sub-anchor plus a pf

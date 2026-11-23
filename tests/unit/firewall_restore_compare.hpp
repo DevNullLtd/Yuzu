@@ -9,8 +9,8 @@
  * A snapshot is the text the harness reads before a case and after it:
  *
  *     == <section>
- *     <the tool's output, or [absent] when the tool is not installed, or [unloaded] when it is a
- *      legacy iptables or ip6tables whose kernel module is not loaded (not run), or [failed]>
+ *     <the tool's output, or [absent] when the tool is not installed, or [tables] and the kernel's
+ *      own list of a legacy family's tables when it has no legacy save tool, or [failed]>
  *     == <section>
  *     ...
  *     == end
@@ -21,9 +21,9 @@
  * two failed reads. A root-owned helper (`yuzu-fw-helper snapshot`) writes the same format for the
  * Linux agent account; for a tool that exits non-zero it prints what the tool wrote and then the
  * `[failed]` marker, and a section that carries the marker is unreadable whatever precedes it. For a
- * legacy iptables or ip6tables whose kernel module is not loaded it runs nothing and prints
- * `[unloaded]` alone: that is a section that was read (the family holds no rule), kept like any other
- * line, so a snapshot of such a host is readable and equal to itself.
+ * legacy family with no save tool it prints `[tables]` and then the family's table names, which are
+ * kept like any other line: a snapshot of a host with no table is readable and equal to itself, and
+ * a table that appears between two reads is a difference, not a pass.
  *
  * Per OS (the sections are the names in `label`):
  *   Windows  `profiles` (one line per profile: name and its defaults) and `rules` (one line per
@@ -31,9 +31,14 @@
  *            app-package pattern is counted and reported but never fails the comparison, because
  *            those rules churn by themselves; a package rule that was enabled and is now disabled
  *            is the exception, which is a failure whatever its name.
- *   Linux    `nft -a list ruleset`, `iptables -S`, `ip6tables -S`. Counters, a named counter
+ *   Linux    `nft -a list ruleset` and a pair of iptables sections, in one of two forms: the
+ *            broker's and the helper's (`iptables-legacy-save`, `ip6tables-legacy-save`: every
+ *            instantiated table, as the save tools print it) or the root harness's own mirror of the
+ *            direct legs (`iptables -S`, `ip6tables -S`: the filter table). Counters, a named counter
  *            object's values, a timed set element's countdown and rule handles are normalised
- *            away; `-P` lines are defaults; every other line is a multiset.
+ *            away, and in a save listing the `#` lines (a date) go and a chain line's packet and byte
+ *            counters go; `-P` lines and a save listing's `:<chain> <policy>` lines are defaults;
+ *            every other line is a multiset.
  *   macOS    `pf rules`, `pf status` (the `Status:` line, compared by its state word only because
  *            the line also carries the uptime), `pf references` (the line count) and `yuzu anchor`
  *            (anything in it after the noise is residue; an anchor that is not loaded is written
@@ -55,6 +60,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::test::fwrestore {
@@ -73,8 +79,12 @@ namespace label {
 inline constexpr std::string_view kProfiles = "profiles";
 inline constexpr std::string_view kRules = "rules";
 inline constexpr std::string_view kNft = "nft -a list ruleset";
+// the root harness's mirror of the direct legs (`-S`, the filter table), and the save-tool sections
+// the broker and the helper print: both forms exist because the baseline of a root run is the mirror
 inline constexpr std::string_view kIptables = "iptables -S";
 inline constexpr std::string_view kIp6tables = "ip6tables -S";
+inline constexpr std::string_view kIptablesSave = "iptables-legacy-save";
+inline constexpr std::string_view kIp6tablesSave = "ip6tables-legacy-save";
 inline constexpr std::string_view kPfRules = "pf rules";
 inline constexpr std::string_view kPfStatus = "pf status";
 inline constexpr std::string_view kPfReferences = "pf references";
@@ -257,16 +267,15 @@ inline void note(std::string& detail, std::string_view kind, std::string_view li
 
 /// The end of `<digits> bytes <digits>` that starts at `from` (the two values of a counter), or npos.
 [[nodiscard]] inline std::size_t counter_values_end(std::string_view s, std::size_t from) {
-    const auto digits = [&](std::size_t q) {
-        while (q < s.size() && s[q] >= '0' && s[q] <= '9')
-            ++q;
-        return q;
+    const auto digits_end = [&](std::size_t q) {
+        return std::min(s.find_first_not_of("0123456789", q), s.size());
     };
-    const auto packets = digits(from);
-    if (packets == from || s.compare(packets, 7, " bytes ") != 0)
+    const auto packets_end = digits_end(from);
+    if (packets_end == from || s.compare(packets_end, 7, " bytes ") != 0)
         return std::string_view::npos;
-    const auto bytes = digits(packets + 7);
-    return bytes == packets + 7 ? std::string_view::npos : bytes;
+    const auto bytes_start = packets_end + 7;
+    const auto bytes_end = digits_end(bytes_start);
+    return bytes_end == bytes_start ? std::string_view::npos : bytes_end;
 }
 
 /// The end of a duration as nft prints it (`29m22s440ms`: a digit, then digits and the letters d, h,
@@ -364,12 +373,27 @@ inline void diff_multiset(const std::vector<std::string>& before, const std::vec
     case Os::win:
         return {std::string{label::kProfiles}, std::string{label::kRules}};
     case Os::lin:
-        return {std::string{label::kNft}, std::string{label::kIptables}, std::string{label::kIp6tables}};
+        return {std::string{label::kNft}}; // the iptables pair is checked by linux_pair_present()
     case Os::mac:
         return {std::string{label::kPfRules}, std::string{label::kPfStatus},
                 std::string{label::kPfReferences}, std::string{label::kYuzuAnchor}};
     }
     return {};
+}
+
+/// The Linux section of one iptables family: the save-tool section when the snapshot has it, else the
+/// root harness's `-S` mirror, else null. A snapshot is one form or the other, never a mix.
+[[nodiscard]] inline const Section* linux_family(const Parsed& p, std::string_view save, std::string_view direct) {
+    if (const auto* s = find_section(p, save))
+        return s;
+    return find_section(p, direct);
+}
+
+/// Whether a Linux snapshot has both iptables families, in one form: `iptables-legacy-save` and
+/// `ip6tables-legacy-save`, or `iptables -S` and `ip6tables -S`.
+[[nodiscard]] inline bool linux_pair_present(const Parsed& p) {
+    return (find_section(p, label::kIptablesSave) && find_section(p, label::kIp6tablesSave)) ||
+           (find_section(p, label::kIptables) && find_section(p, label::kIp6tables));
 }
 
 /// Why a snapshot cannot be trusted, or empty when it can.
@@ -384,6 +408,8 @@ inline void diff_multiset(const std::vector<std::string>& before, const std::vec
     for (const auto& name : required_sections(os))
         if (!find_section(p, name))
             return "section missing: " + name;
+    if (os == Os::lin && !linux_pair_present(p))
+        return "section missing: the iptables and ip6tables pair";
     bool any_readable = false;
     for (const auto& s : p.sections) {
         if (is_failed(s))
@@ -487,10 +513,31 @@ inline void compare_windows(const Parsed& a, const Parsed& b, Verdict& v) {
     }
 }
 
+/// A save listing's chain line, `:<chain> <policy> [<packets>:<bytes>]`, without its counters. A line
+/// that is not one is returned unchanged.
+[[nodiscard]] inline std::string without_chain_counters(const std::string& line) {
+    if (!line.starts_with(':'))
+        return line;
+    const auto bracket = line.rfind(" [");
+    if (bracket == std::string::npos || line.back() != ']')
+        return line;
+    return line.substr(0, bracket);
+}
+
 inline void compare_linux(const Parsed& a, const Parsed& b, Verdict& v) {
-    for (const auto name : {label::kNft, label::kIptables, label::kIp6tables}) {
-        const auto* sa = find_section(a, name);
-        const auto* sb = find_section(b, name);
+    // nft is a section of its own; each iptables family is read from whichever form the snapshot has
+    const Section* nft_a = find_section(a, label::kNft);
+    const Section* nft_b = find_section(b, label::kNft);
+    const std::pair<std::string_view, std::pair<const Section*, const Section*>> sections[] = {
+        {label::kNft, {nft_a, nft_b}},
+        {label::kIptables, {linux_family(a, label::kIptablesSave, label::kIptables),
+                            linux_family(b, label::kIptablesSave, label::kIptables)}},
+        {label::kIp6tables, {linux_family(a, label::kIp6tablesSave, label::kIp6tables),
+                             linux_family(b, label::kIp6tablesSave, label::kIp6tables)}}};
+    for (const auto& [name, pair] : sections) {
+        const auto* sa = pair.first;
+        const auto* sb = pair.second;
+        const bool nft = name == label::kNft;
         std::vector<std::string> before, after;
         std::set<std::string> policy_a, policy_b;
         const auto fill = [&](const Section& s, std::vector<std::string>& rest, std::set<std::string>& policies) {
@@ -498,7 +545,15 @@ inline void compare_linux(const Parsed& a, const Parsed& b, Verdict& v) {
                 auto line = normalise_linux_line(raw);
                 if (line.empty())
                     continue;
-                if (line.starts_with("-P "))
+                // a save listing's comment lines carry the date it was made on: never a difference
+                if (!nft && line.starts_with('#'))
+                    continue;
+                line = without_chain_counters(line);
+                // `-P <chain> <policy>` (the `-S` form) and `:<chain> <policy>` (a save listing; a
+                // policy of `-` is a user-defined chain, which is a rule like any other) are defaults
+                const bool policy_line =
+                    line.starts_with("-P ") || (line.starts_with(':') && line.size() > 2 && !line.ends_with(" -"));
+                if (policy_line)
                     policies.insert(line);
                 else
                     rest.push_back(std::move(line));

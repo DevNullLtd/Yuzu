@@ -128,10 +128,7 @@
 #include <sys/sysctl.h>
 #endif
 #if defined(__linux__)
-#include <poll.h>
-#include <sys/un.h>
-
-#include <yuzu/agent/scoped_fd.hpp>
+#include "firewall_snapshot_reader.hpp" // the production socket client, which the baseline read below runs too
 #endif
 
 namespace fq = yuzu::firewall::quarantine;
@@ -318,46 +315,19 @@ constexpr fr::Os kThisOs = fr::Os::lin;
     return broker_socket_present() || installer_helper_present();
 }
 
-/// The broker's whole reply, read the way the agent reads it: connect, send NOTHING, read to end of
-/// stream, within `budget`. nullopt when it could not be read (no socket, not permitted, a timeout,
-/// or more than 2 MiB, which the broker never sends). The descriptor is a ScopedFd, so every return
-/// closes it and nothing else does.
+/// The broker's whole reply, read by the production reader the agent uses (connect, send NOTHING, read to
+/// end of stream, every wait bounded by the deadline). nullopt when it could not be read (no socket, not
+/// permitted, a timeout, more than 1 MiB, or a listener that was not made by root).
 [[nodiscard, maybe_unused]] std::optional<std::string> broker_snapshot_text(std::chrono::seconds budget = 60s) {
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    constexpr auto path = yuzu::firewall::kFwSnapshotSocketPath;
-    static_assert(path.size() < sizeof(addr.sun_path));
-    std::memcpy(addr.sun_path, path.data(), path.size());
-    yuzu::agent::ScopedFd sock(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
-    if (!sock || ::connect(sock.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0)
+    auto reply = yuzu::firewall::read_fw_snapshot(yuzu::firewall::kFwSnapshotSocketPath,
+                                                  std::chrono::steady_clock::now() + budget);
+    if (!reply)
         return std::nullopt;
-    const auto deadline = std::chrono::steady_clock::now() + budget;
-    std::string text;
-    char buf[16 * 1024];
-    for (;;) {
-        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
-        if (left.count() <= 0)
-            return std::nullopt;
-        pollfd pfd{sock.get(), POLLIN, 0};
-        const int ready = ::poll(&pfd, 1, static_cast<int>(left.count()));
-        if (ready < 0 && errno == EINTR)
-            continue;
-        if (ready <= 0)
-            return std::nullopt;
-        const ssize_t n = ::read(sock.get(), buf, sizeof(buf));
-        if (n < 0 && (errno == EINTR || errno == EAGAIN))
-            continue;
-        if (n < 0)
-            return std::nullopt;
-        if (n == 0)
-            return text;
-        text.append(buf, static_cast<std::size_t>(n));
-        if (text.size() > 2 * yuzu::firewall::kFwSnapshotMaxBytes)
-            return std::nullopt;
-    }
+    return *std::move(reply);
 }
 
-/// The `-A` lines (rules) of an `iptables -S` or `ip6tables -S` snapshot section.
+/// The `-A` lines (rules) of an `iptables -S` or `ip6tables -S` snapshot section, or of the broker's
+/// `iptables-legacy-save` or `ip6tables-legacy-save` section: both forms print a rule as an `-A` line.
 [[nodiscard, maybe_unused]] std::size_t count_appended(const std::string& section) {
     std::size_t appended = 0;
     for (const auto& line : rows_of(section))
@@ -365,24 +335,31 @@ constexpr fr::Os kThisOs = fr::Os::lin;
     return appended;
 }
 
-/// The rule count the baseline predicts for the backend that answered: nft's rule handles, or the
-/// `-A` lines of both iptables families. nullopt for any other backend (firewalld, ufw, none): their
-/// counts are not in the baseline, so a caller that REQUIREs the value fails such an answer instead of
-/// passing it without comparing anything.
+/// The rule count the baseline predicts for the backend that answered. A snapshot the root helper or the
+/// broker made (the legacy save-tool sections) is the plugin's own transport: the count is the nft rule
+/// handles plus the `-A` lines of both legacy families, whichever backend answered. A root baseline (the
+/// harness's mirror of the direct legs, `-S` sections) predicts what the root agent counts: nft's rule
+/// handles for `nftables`, the `-A` lines of both `-S` sections for `iptables`. nullopt for any other
+/// backend (firewalld, ufw, none): their counts are not in the baseline, so a caller that REQUIREs the
+/// value fails such an answer instead of passing it without comparing anything.
 [[nodiscard, maybe_unused]] std::optional<std::size_t> expected_ruleset_count(const std::string& before,
                                                                               std::string_view backend) {
-    if (backend == "nftables") {
-        const auto nft = fr::section(before, fr::label::kNft);
+    if (backend != "nftables" && backend != "iptables")
+        return std::nullopt;
+    const auto nft = fr::section(before, fr::label::kNft);
+    const auto save4 = fr::section(before, fr::label::kIptablesSave);
+    const auto save6 = fr::section(before, fr::label::kIp6tablesSave);
+    if (save4 || save6) {
+        const auto nft_rules = nft ? fr::count_nft_rules(*nft) : std::size_t{0};
+        return nft_rules + count_appended(save4.value_or("")) + count_appended(save6.value_or(""));
+    }
+    if (backend == "nftables")
         return nft ? std::optional<std::size_t>{fr::count_nft_rules(*nft)} : std::nullopt;
-    }
-    if (backend == "iptables") {
-        const auto ipt = fr::section(before, fr::label::kIptables);
-        const auto ip6t = fr::section(before, fr::label::kIp6tables);
-        if (!ipt && !ip6t)
-            return std::nullopt;
-        return count_appended(ipt.value_or("")) + count_appended(ip6t.value_or(""));
-    }
-    return std::nullopt;
+    const auto ipt = fr::section(before, fr::label::kIptables);
+    const auto ip6t = fr::section(before, fr::label::kIp6tables);
+    if (!ipt && !ip6t)
+        return std::nullopt;
+    return count_appended(ipt.value_or("")) + count_appended(ip6t.value_or(""));
 }
 #endif
 
@@ -446,8 +423,10 @@ constexpr fr::Os kThisOs = fr::Os::lin;
                       << (broker_socket_present() ? "present and not readable" : "absent"));
         return failed_snapshot();
     }
-    // Root: the same three tools with the helper's labels and arguments. A tool that is not
-    // executable is `[absent]`.
+    // Root: what the root agent's direct legs read, under the `-S` labels: nft, and `iptables -S` and
+    // `ip6tables -S`, which list the filter table only. The broker and the helper snapshots above use the
+    // legacy save tools' labels and list every table; restore_compare reads either form. A tool that is
+    // not executable is `[absent]`.
     struct Tool {
         std::string_view label;
         std::string_view path;

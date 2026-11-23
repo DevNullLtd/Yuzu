@@ -3,11 +3,11 @@
 # Started by yuzu-fw-snapshot.socket (Accept=yes), never enabled and never started by the agent.
 # It runs the fixed script /usr/share/yuzu/scripts/yuzu-fw-snapshot.sh as root with no input
 # (standard input is /dev/null; the connection is only the trigger and the output) and ends. The
-# contract is docs/adr/3007-os-activated-read-helpers.md. The unit is designed for systemd 239
-# and later; the agent's README names the versions it has been measured on. Two claims are made
-# here and they do not contradict each other. What the script does is fixed by the script itself:
-# three read-only commands and nothing else. The directives below bound what a process in the
-# instance could do beyond that if a tool misbehaved, and each has its own sandbox reason.
+# contract is docs/adr/3007-os-activated-read-helpers.md. The unit needs systemd 239 or later; the
+# agent's README names the versions it has been measured on. Two claims are made here and they do
+# not contradict each other. What the script does is fixed by the script itself: three read-only
+# commands and nothing else. The directives below bound what a process in the instance could do
+# beyond that if a tool misbehaved, and each has its own sandbox reason.
 [Unit]
 Description=Yuzu agent read-only firewall snapshot (one connection)
 Documentation=https://github.com/DevNullLtd/Yuzu
@@ -57,20 +57,25 @@ SystemCallArchitectures=native
 LockPersonality=true
 # Refuses memory that is both writable and executable.
 MemoryDenyWriteExecute=true
-# The file system is read-only for the instance, apart from the lock file legacy iptables takes
-# (the leading - ignores a path that does not exist).
+# The file system is read-only for the instance.
 ProtectSystem=strict
-ReadWritePaths=-/run/xtables.lock
+# With ProtectSystem=strict, /run stayed writable inside the instance whenever ProtectKernelTunables
+# or ProtectControlGroups was also set (measured on Ubuntu 26.04, systemd 259), so it is made
+# read-only by name. Nothing the script runs writes a file or takes a lock: the legacy save tools
+# take no xtables lock and the nft read creates nothing.
+ReadOnlyPaths=/run
 # Hides /home, /root and /run/user.
 ProtectHome=true
-# A private /tmp and /var/tmp that go away with the instance.
+# A private /tmp and /var/tmp. The script must not create files: on Rocky 8.10 with SELinux
+# enforcing, a file left in the private /tmp was not removed when the instance ended (measured), so
+# nothing here may depend on that clean-up.
 PrivateTmp=true
 # A minimal /dev without physical devices.
 PrivateDevices=true
-# Refuses explicit module loading and makes the module files unreachable, so a legacy iptables that
-# needs its core module cannot load it; the script does not run such a tool (it answers `[unloaded]`).
-# It does not stop the kernel itself loading a netfilter table module when a read of a loaded core
-# module needs one (measured, see the plugin README).
+# Refuses explicit module loading and makes the module files unreachable. No read needs it: the
+# legacy save tools load no module and the script runs no tool that would. It does not stop the
+# kernel itself loading a module on demand (an nft read on a host where nf_tables is not loaded
+# makes it load nf_tables, measured; see the plugin README).
 ProtectKernelModules=true
 # Makes /proc/sys, /sys and similar kernel tunables read-only.
 ProtectKernelTunables=true

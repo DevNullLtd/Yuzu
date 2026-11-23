@@ -10,7 +10,7 @@
 # elsewhere `unknown`, in both cases after the error rows of the reads it was refused. Measured on
 # Rocky 9.9 (systemd 252): `systemctl mask --now` alone left the socket file, and the agent then
 # reported `error|snapshot:connect:refused`; stop first, then mask, or remove the stale file.
-# The unit is designed for systemd 239 and later; the agent's README names the versions it has
+# The broker units need systemd 239 or later; the agent's README names the versions they have
 # been measured on.
 [Unit]
 Description=Yuzu agent read-only firewall snapshot socket

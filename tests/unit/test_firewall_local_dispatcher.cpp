@@ -15,8 +15,9 @@
  * Windows (INetFwPolicy2 COM, firewall.dll). Linux (firewalld D-Bus / ufw /
  * iptables / nftables netlink) acquisition is not exercised by this file: it
  * needs a Linux host with a configurable backend, and its decisions are pinned
- * on the pure layer in test_firewall_parsers.cpp. The Windows cases compile and
- * run only on Windows.
+ * on the pure layer in test_firewall_parsers.cpp. The one Linux piece that runs here is the
+ * snapshot broker's socket client (firewall_snapshot_reader.hpp), against an in-process listener.
+ * The Windows cases compile and run only on Windows.
  *
  * Runs as whatever account the suite runs as on macOS. pf is read through `sudo -n --` (the
  * installer's exact read-only pfctl lines; direct when root), so an account with no such grant
@@ -46,6 +47,22 @@
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
+
+#if defined(__linux__)
+#include "firewall_snapshot_reader.hpp"
+#include "test_helpers.hpp"
+
+#include <yuzu/agent/scoped_fd.hpp>
+
+#include <chrono>
+#include <cstring>
+#include <functional>
+#include <thread>
+
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
 
 #if defined(__APPLE__) || defined(_WIN32)
 
@@ -393,3 +410,165 @@ TEST_CASE("firewall Windows 'rules' lists at most 100 rules, with a count that m
 #endif // __APPLE__ / _WIN32
 
 #endif // __APPLE__ || _WIN32
+
+// ── Linux: the snapshot broker's socket client ────────────────────────────────────────────────
+//
+// read_fw_snapshot is the plugin's only code that talks to the broker's AF_UNIX socket, and its
+// bounds (reassembly, the 1 MiB cap, the deadline, the peer check) are otherwise pinned only
+// lexically. These cases run it against an in-process listener in a `yuzu_test_` temp directory. This
+// is the justification the test rules ask for: the cost is a socket in a temp directory and one joined
+// thread per case, nothing is spawned, and no case waits on a clock but the 50 ms deadline whose
+// expiry is the subject of one of them.
+
+#if defined(__linux__)
+
+namespace {
+
+using namespace std::chrono_literals;
+
+/// A listening AF_UNIX socket whose one accepted connection is handed to `serve` on a thread that the
+/// destructor joins. Every case connects exactly once, so accept() always returns. The listener is made
+/// by this process, so its peer credentials are this process's own uid: a case passes that uid to the
+/// reader as the uid the listener must have (the plugin passes 0), or a different one to see it refused.
+class SnapshotListener {
+public:
+    explicit SnapshotListener(std::function<void(int)> serve) : dir_("yuzu_test_fwsock_") {
+        std::filesystem::create_directories(dir_.path);
+        path_ = (dir_.path / "s.sock").string();
+        sockaddr_un addr{};
+        REQUIRE(path_.size() < sizeof(addr.sun_path));
+        addr.sun_family = AF_UNIX;
+        std::memcpy(addr.sun_path, path_.data(), path_.size());
+        fd_.reset(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+        REQUIRE(fd_);
+        // sockaddr_un is passed as a sockaddr for the call only; nothing reads through the cast
+        REQUIRE(::bind(fd_.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::listen(fd_.get(), 1) == 0);
+        thread_ = std::thread([this, serve = std::move(serve)] {
+            const int conn = ::accept(fd_.get(), nullptr, nullptr);
+            if (conn < 0)
+                return;
+            serve(conn);
+            ::close(conn);
+        });
+    }
+    ~SnapshotListener() {
+        if (thread_.joinable())
+            thread_.join();
+    }
+    SnapshotListener(const SnapshotListener&) = delete;
+    SnapshotListener& operator=(const SnapshotListener&) = delete;
+    [[nodiscard]] const std::string& path() const { return path_; }
+
+private:
+    yuzu::test::TempDir dir_;
+    std::string path_;
+    yuzu::agent::ScopedFd fd_;
+    std::thread thread_;
+};
+
+/// Writes all of `data`, never raising SIGPIPE when the reader has already gone.
+void send_all(int conn, std::string_view data) {
+    while (!data.empty()) {
+        const ssize_t n = ::send(conn, data.data(), data.size(), MSG_NOSIGNAL);
+        if (n <= 0)
+            return;
+        data.remove_prefix(static_cast<std::size_t>(n));
+    }
+}
+
+/// Reads until the peer closes, so a listener that sends nothing stays open exactly as long as the reader.
+void drain(int conn) {
+    char buf[64];
+    while (::read(conn, buf, sizeof(buf)) > 0) {
+    }
+}
+
+std::chrono::steady_clock::time_point in(std::chrono::milliseconds budget) {
+    return std::chrono::steady_clock::now() + budget;
+}
+
+} // namespace
+
+TEST_CASE("read_fw_snapshot: a reply sent in pieces is assembled, across reads of the reader's buffer",
+          "[firewall][snapshot_reader]") {
+    // 40,000 bytes in five writes: more than the reader's 16 KiB buffer, so at least three reads
+    std::string reply;
+    for (int i = 0; i < 5; ++i)
+        reply += std::string(8000, static_cast<char>('a' + i));
+    SnapshotListener listener([&reply](int conn) {
+        for (std::size_t at = 0; at < reply.size(); at += 8000)
+            send_all(conn, std::string_view{reply}.substr(at, 8000));
+    });
+    const auto got = yuzu::firewall::read_fw_snapshot(listener.path(), in(10s), ::geteuid());
+    REQUIRE(got.has_value());
+    CHECK(*got == reply);
+}
+
+TEST_CASE("read_fw_snapshot: a listener that sends nothing and closes is an empty reply", "[firewall][snapshot_reader]") {
+    SnapshotListener listener([](int) {});
+    const auto got = yuzu::firewall::read_fw_snapshot(listener.path(), in(10s), ::geteuid());
+    REQUIRE(got.has_value());
+    CHECK(got->empty()); // the framing parser reads it as `empty`
+}
+
+TEST_CASE("read_fw_snapshot: a reply longer than 1 MiB is oversized", "[firewall][snapshot_reader]") {
+    SnapshotListener listener([](int conn) {
+        const std::string chunk(64 * 1024, 'x');
+        for (std::size_t sent = 0; sent <= yuzu::firewall::kFwSnapshotMaxBytes + chunk.size(); sent += chunk.size())
+            send_all(conn, chunk);
+    });
+    const auto got = yuzu::firewall::read_fw_snapshot(listener.path(), in(10s), ::geteuid());
+    REQUIRE_FALSE(got.has_value());
+    CHECK(got.error() == "oversized");
+}
+
+TEST_CASE("read_fw_snapshot: a listener that accepts and sends nothing is a timeout at the deadline",
+          "[firewall][snapshot_reader]") {
+    SnapshotListener listener(drain); // stays open until the reader gives up and closes
+    const auto started = std::chrono::steady_clock::now();
+    const auto got = yuzu::firewall::read_fw_snapshot(listener.path(), in(50ms), ::geteuid());
+    REQUIRE_FALSE(got.has_value());
+    CHECK(got.error() == "timeout");
+    CHECK(std::chrono::steady_clock::now() - started < 10s); // bounded: it did not wait for the listener
+}
+
+TEST_CASE("read_fw_snapshot: a listener not made by the expected uid is refused before a byte is read",
+          "[firewall][snapshot_reader]") {
+    SnapshotListener listener(drain);
+    const auto got = yuzu::firewall::read_fw_snapshot(listener.path(), in(10s), ::geteuid() + 1);
+    REQUIRE_FALSE(got.has_value());
+    CHECK(got.error() == "peer_not_root");
+}
+
+TEST_CASE("read_fw_snapshot: no socket is the empty token, a socket nothing listens on is refused",
+          "[firewall][snapshot_reader]") {
+    yuzu::test::TempDir dir("yuzu_test_fwsock_");
+    std::filesystem::create_directories(dir.path);
+    const auto missing = (dir.path / "absent.sock").string();
+    const auto none = yuzu::firewall::read_fw_snapshot(missing, in(10s), ::geteuid());
+    REQUIRE_FALSE(none.has_value());
+    CHECK(none.error().empty()); // no broker installed: silent
+
+    // a socket file left behind with no listener behind it
+    const auto stale = (dir.path / "stale.sock").string();
+    sockaddr_un addr{};
+    REQUIRE(stale.size() < sizeof(addr.sun_path));
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, stale.data(), stale.size());
+    {
+        yuzu::agent::ScopedFd fd(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+        REQUIRE(fd);
+        REQUIRE(::bind(fd.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0);
+    } // closed without listen(): the file stays
+    const auto refused = yuzu::firewall::read_fw_snapshot(stale, in(10s), ::geteuid());
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == "connect:refused");
+
+    // a path that cannot fit sockaddr_un is an I/O error, never a truncated connect
+    const auto too_long = yuzu::firewall::read_fw_snapshot(std::string(200, 'a'), in(10s), ::geteuid());
+    REQUIRE_FALSE(too_long.has_value());
+    CHECK(too_long.error() == "io_error");
+}
+
+#endif // __linux__

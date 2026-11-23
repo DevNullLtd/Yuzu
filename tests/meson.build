@@ -4734,8 +4734,9 @@ test('firewall Windows release-guard wiring lexical gate',
 # behind the broker, which replaces it only with an active ruleset), the broker reader's bounds and the
 # installer-helper transport. Broker units: the shipped socket, template service and snapshot script,
 # what the deb and rpm install, the agent unit's untouched sandbox, and `systemd-analyze verify` of the
-# three units where that tool exists. Carries its own in-memory mutation self-test. No build required;
-# a few seconds with systemd-analyze, well under a second without.
+# three units where that tool exists (only the lines it prints about the unit under test count). Carries
+# its own in-memory mutation self-test. No build required; measured at about 4 s on a developer Mac
+# without systemd-analyze and 3.9 s on Ubuntu 26.04 with it.
 test('firewall read-path wiring lexical gate',
   _python3_test,
   args: [files('test_firewall_read_wiring_lexical.py')],
@@ -5427,8 +5428,13 @@ test('issue lifecycle docs',
 # The old standalone containment agent plugin is removed and nothing names it again (device
 # containment is the firewall plugin's four actions): no tracked file outside the history
 # allowlist names its files, actions, rule or chain prefixes or definition ids. The same file runs
-# the Linux firewall helper under every POSIX shell on the host (about three thousand short processes), so
-# its budget is wider than the source-text gates around it.
+# the Linux firewall helper (its containment words and its `snapshot` word) under every POSIX shell on
+# the host, and the broker script's own cases (argument refusal, standard input, the cap, one whole
+# reply) once under each; the script's functions are the helper's byte for byte, so the shell matrix of
+# their branches runs once, on the helper. That is thousands of short processes, so its budget is wider
+# than the source-text gates around it. Measured: 134 cases in about 39 s on a developer Mac (sh, dash,
+# bash), and 142 cases in 8.4 to 8.8 s on Ubuntu 26.04 before the broker script's cases were trimmed.
+
 test('removed containment plugin lexical gate',
   _python3_test,
   args: [files('test_legacy_quarantine_plugin_removed_lexical.py')],

@@ -10,8 +10,8 @@ Wants=network-online.target
 # starts the socket whenever the agent starts and its PartOf= stops it with the agent;
 # `systemctl stop yuzu-fw-snapshot.socket` and then `systemctl mask yuzu-fw-snapshot.socket` opts out
 # (`mask --now` alone left the socket file on Rocky 9.9, systemd 252). With no socket file the plugin
-# answers as it did before the broker: firewalld's own rows on a firewalld host, `unknown` elsewhere,
-# after the refused netlink read's error row. A unit file copied without the socket and service
+# answers as a host without the broker does: firewalld's own rows on a firewalld host, `unknown`
+# elsewhere, after the refused netlink read's error row. A unit file copied without the socket and service
 # units has no socket file either, so it reads the same way.
 Wants=yuzu-fw-snapshot.socket
 After=yuzu-fw-snapshot.socket

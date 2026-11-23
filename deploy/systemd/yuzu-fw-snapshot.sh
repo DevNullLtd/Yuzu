@@ -7,13 +7,17 @@
 #   - It takes no input. Nothing is read from the connection, the environment or any argument: it
 #     is a fixed list of three commands, each with its literal absolute path and literal arguments,
 #     under a reset PATH and locale. Any argument at all is refused (nothing printed, exit 64).
-#   - It changes nothing. It only runs `nft -a list ruleset`, `iptables -S` and `ip6tables -S` and
-#     prints each under a `== <label>` heading: `[absent]` for a tool that is not installed, a
-#     `[failed]` line of its own after the output of one that exits non-zero, and `[unloaded]`
-#     (the tool is not run) for a legacy iptables or ip6tables whose kernel module is not loaded,
-#     so the family holds no rule (snap_ipt below says how that is known). The whole reply is
-#     cut at 1 MiB and ends with `== end`, so a reply that was cut has no end line and the reader
-#     treats it as unknown.
+#   - It changes no ruleset and writes no file. It reads two kernel rulesets, one reader each: the
+#     nf_tables ruleset with `nft -a list ruleset`, and the legacy xtables tables of each family with
+#     that family's legacy save tool under its own name (`iptables-legacy-save`,
+#     `ip6tables-legacy-save`), which lists every instantiated table, loads no module and takes no
+#     lock. It prints each under a `== <label>` heading. `[absent]` is the nft tool not installed,
+#     so that section was not read. `[failed]` is a line of its own after the output of a tool that
+#     exits non-zero, and the whole section of one that could not be tried. A legacy family with no
+#     save tool prints `[tables]` and then the kernel's own list of its instantiated tables (see
+#     snap_xt). The whole reply is cut at 1 MiB and ends with `== end`, so a reply that was cut has
+#     no end line and the reader treats it as unknown. One side effect is measured and stays: an nft
+#     read on a host where nf_tables is not loaded makes the kernel load it.
 #   - The agent unit (NoNewPrivileges, one capability) never changes: this program returns data,
 #     it is not a way for the agent to gain anything.
 # The assignments and the three functions below are the root helper's `snapshot` word
@@ -24,9 +28,9 @@ set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 LC_ALL=C
 export PATH LC_ALL
-IPT=/usr/sbin/iptables
-IP6T=/usr/sbin/ip6tables
 NFT=/usr/sbin/nft
+XT4=/usr/sbin/iptables-legacy-save
+XT6=/usr/sbin/ip6tables-legacy-save
 
 # snap_one LABEL TOOL ARGS: one section of the snapshot. Reads only: the tool is run with the
 # fixed arguments the caller of this function names, and its standard error is dropped. A failed
@@ -43,23 +47,30 @@ snap_one() {
     "$snap_tool" "$@" 2>/dev/null || printf '\n[failed]\n'
 }
 
-# snap_ipt LABEL TOOL NAMES: the iptables and ip6tables sections, `-S` being the tool's only
-# argument. A legacy xtables tool whose core kernel module is not loaded runs modprobe itself, which
-# this service may not do (no CAP_SYS_MODULE, ProtectKernelModules): it exits non-zero having
-# printed nothing, while the same word run by an unconfined root would load the module. That is
-# decided here, before the tool runs and not from how it fails, so no module is loaded and no tool
-# output has to be trusted as empty. The section is the header and `[unloaded]`, and the tool is not
-# run, only when all four hold: the tool is installed; it is the legacy multi-call binary (the same
-# file, so the nft shim, an older or a moved binary never qualifies); the process can see /proc/net
-# (its device list is there); and NAMES, the family's table list under /proc/net, is not. That file
-# exists exactly while the family's core module is loaded, so without it the family holds no rule.
-# Anything else is snap_one, which is unchanged: a tool that runs and fails is still `[failed]`.
-snap_ipt() {
-    if [ -x "$2" ] && [ "$2" -ef /usr/sbin/xtables-legacy-multi ] && [ -e /proc/net/dev ] && [ ! -e "$3" ]; then
-        printf '== %s\n[unloaded]\n' "$1"
+# snap_xt LABEL TOOL NAMES: a legacy xtables section, read by the family's legacy save tool under
+# its own name, with no argument. That tool lists every instantiated table, loads no kernel module,
+# runs no modprobe and takes no lock; empty output with exit 0 is a family that holds no table, and
+# a non-zero exit is a failure (`[failed]` through snap_one). Two decisions are made here, before
+# any tool runs, from host state and never from input. If /proc/net cannot be stat'ed the process
+# cannot see the kernel's tables at all, and a save tool reads a missing table list as no table, so
+# the section is `[failed]` and no tool is run. If the family has no save tool, nothing here can
+# list its tables; the kernel's own list of them is printed under `[tables]`, which is the names
+# file NAMES, present exactly while the family's core module is loaded. `[tables]` alone says the
+# family holds no table; `[tables]` and a name say tables exist that nothing listed, and the reader
+# treats them as unread. NAMES that cannot be stat'ed is read as no table (behind the /proc/net
+# check above, which rules out every cause at directory level); a name list that cannot be read is
+# `[failed]`. No file is created.
+snap_xt() {
+    if [ ! -e /proc/net/dev ]; then
+        printf '== %s\n\n[failed]\n' "$1"
         return 0
     fi
-    snap_one "$1" "$2" -S
+    if [ -x "$2" ]; then
+        snap_one "$1" "$2"
+        return 0
+    fi
+    printf '== %s\n[tables]\n' "$1"
+    [ ! -e "$3" ] || head -c 4096 "$3" 2>/dev/null || printf '\n[failed]\n'
 }
 
 # host_snapshot: yuzu-fw-helper snapshot. Never returns. The group is cut at 1 MiB, so a listing
@@ -67,8 +78,8 @@ snap_ipt() {
 host_snapshot() {
     {
         snap_one 'nft -a list ruleset' "$NFT" -a list ruleset
-        snap_ipt 'iptables -S' "$IPT" /proc/net/ip_tables_names
-        snap_ipt 'ip6tables -S' "$IP6T" /proc/net/ip6_tables_names
+        snap_xt 'iptables-legacy-save' "$XT4" /proc/net/ip_tables_names
+        snap_xt 'ip6tables-legacy-save' "$XT6" /proc/net/ip6_tables_names
         printf '== end\n'
     } | head -c 1048576
     exit 0
