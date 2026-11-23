@@ -7,13 +7,16 @@ Best-effort lexical gate, two checks:
   1. agents/core/src/agent.cpp logs `session_fp={}` via `session_log_fingerprint(` and never
      passes `session_id_` to that spdlog call; dex_linux_collector.cpp wraps subject/reason.
   2. No scanned text file parses `session=` out of that agent line (scanned: the whole checkout
-     except SKIP_DIRS, top-level build* directories and files over 2 MB). Backslash continuations are
+     except the top-level SKIP_DIRS and build* directories, `node_modules` and `.git` at any depth,
+     files over 2 MB, binary files (a NUL in the first 4 KiB), unreadable paths, and this file;
+     directory symlinks are not followed). Backslash continuations are
      joined, and a `session=` extractor within WINDOW lines of a "Registered with server" mention
      (a separate-line extractor included) fails. A line that carries the marker
      `tripwire-allow: <reason>` is exempt, so each exemption is visible at its own line (only the
      upgrade note quoting the old line). There is NO other `session=` read of that line.
 The server-side "ProxyRegister succeeded: ... session=" line is the id's source and is not flagged.
 """
+import os
 import pathlib
 import re
 import sys
@@ -61,7 +64,11 @@ def check_text(path, text):
         if not EXTRACT.search(l) or ALLOW in l or ("ProxyRegister" in l and not MENTION.search(l)):
             continue
         if any(abs(i - m) <= WINDOW for m in mention_at):
-            errs.append(f"{path}:{n}: parses/mentions session= near the agent 'Registered with server' line")
+            # Worded so the message does not itself match MENTION + EXTRACT: a log at the top of the
+            # checkout that captured one failure (sanitizer-asan.log, a `meson test | tee`) would
+            # otherwise keep this gate red on every later run in that workspace.
+            errs.append(f"{path}:{n}: reads the session id near the agent's Registered line "
+                        "(log and join on session_fp instead)")
     return errs
 
 
@@ -89,27 +96,40 @@ def check_dex_emit(text):
     return []
 
 
+def skipped_dir(rel_parts):
+    """True for a repo-relative DIRECTORY this gate does not descend into."""
+    name = rel_parts[-1]
+    if len(rel_parts) == 1 and (name in SKIP_DIRS or name.startswith(SKIP_PREFIX)):
+        return True
+    return name in ("node_modules", ".git")
+
+
 def skipped(rel_parts):
-    """True when a repo-relative path lies in a directory this gate does not scan."""
-    top = rel_parts[0] if len(rel_parts) > 1 else ""
-    return (top in SKIP_DIRS or top.startswith(SKIP_PREFIX)
-            or "node_modules" in rel_parts or ".git" in rel_parts)
+    """True when a repo-relative FILE lies in a skipped directory (or is a `.git` gitfile)."""
+    return any(skipped_dir(rel_parts[:i]) for i in range(1, len(rel_parts))) or rel_parts[-1] == ".git"
 
 
 def iter_files(root=ROOT):
-    for p in root.rglob("*"):
-        rel = p.relative_to(root)
-        if skipped(rel.parts) or not p.is_file() or p.resolve() == SELF:
-            continue
-        try:
-            if p.stat().st_size > 2_000_000:
+    # os.walk with pruning, not rglob: a skipped tree is never listed, so another job deleting or
+    # writing its build output mid-scan cannot crash or slow this gate (#8637). Like rglob, it does
+    # not follow directory symlinks, and a directory it cannot list is passed over.
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = pathlib.Path(dirpath).relative_to(root).parts
+        dirnames[:] = [d for d in dirnames if not skipped_dir(rel_dir + (d,))]
+        for name in filenames:
+            rel = rel_dir + (name,)
+            p = pathlib.Path(dirpath, name)
+            if skipped(rel) or not p.is_file() or p.resolve() == SELF:
                 continue
-            raw = p.read_bytes()
-        except OSError:
-            continue
-        if b"\0" in raw[:4096]:
-            continue
-        yield rel.as_posix(), raw.decode("utf-8", errors="replace")
+            try:
+                if p.stat().st_size > 2_000_000:
+                    continue
+                raw = p.read_bytes()
+            except OSError:
+                continue
+            if b"\0" in raw[:4096]:
+                continue
+            yield "/".join(rel), raw.decode("utf-8", errors="replace")
 
 
 def selftest():
@@ -136,6 +156,9 @@ def selftest():
     assert not check_text("x.sh", "ProxyRegister succeeded: agent=a, session=b"), "selftest server line"
     # Windows-style path separators must not matter
     assert check_text("scripts\\x.sh".replace("\\", "/"), bad[0]), "selftest path"
+    # The gate's own FAIL line, captured in a top-level log, must not trip the gate on the next run.
+    hit = check_text("x.sh", bad[0])
+    assert hit and not check_text("x.log", "FAIL: " + hit[0]), "selftest: the FAIL message self-matches"
     selftest_walk(bad[0])
 
 
@@ -155,6 +178,8 @@ def selftest_walk(bad_line):
         (root / "scripts" / "x.sh").write_text(bad_line + "\n")
         # Still scanned: a build* name BELOW the top level, and top-level dirs the prefix must not
         # reach (a widened prefix such as "b", or a case-insensitive match, would skip these).
+        # Every top-level name in this tree must stay distinct after case-folding (a bare `build/`
+        # would merge with `Build/` on NTFS/APFS and break this assertion on Windows/macOS only).
         for rel in ("deploy/build-tools/y.sh", "bin/z.sh", "Build/z.sh"):
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             (root / rel).write_text(bad_line + "\n")
@@ -170,6 +195,9 @@ def main():
     errs += check_dex_emit((ROOT / "agents/core/src/dex_linux_collector.cpp").read_text(errors="replace"))
     for rel, text in iter_files():
         errs += check_text(rel, text)
+    if hasattr(sys.stdout, "reconfigure"):
+        # A non-UTF-8 file name must not turn the FAIL listing into a traceback that hides the rest.
+        sys.stdout.reconfigure(errors="backslashreplace")
     for e in errs:
         print("FAIL:", e)
     if errs:
