@@ -226,10 +226,20 @@ public:
     static constexpr std::size_t kMaxInFlight = 4;
     /// Bound on the per-agent identity map (one entry is evicted at the cap).
     static constexpr std::size_t kMaxAgents = 65536;
+    /// Most entries examined to pick the one evicted at the cap. remember_locked runs under mu_ on
+    /// the synchronous heartbeat path, so the search is a bounded prefix, never the whole map.
+    static constexpr std::size_t kVictimScan = 32;
     /// Most failing agents remembered at once: a remembered agent's failure opens no gate-wide
     /// window. At the cap the one whose wait ends earliest is forgotten. It is also the most
     /// contained lookups a failing store sees per retry period.
     static constexpr std::size_t kMaxFailing = 16;
+
+    /// Most entries any single eviction has examined (never above kVictimScan): lets a test pin
+    /// that the search stays bounded.
+    [[nodiscard]] std::size_t max_victim_probe() const {
+        std::lock_guard lock(mu_);
+        return max_victim_probe_;
+    }
 
     /// The production clock (the default NowFn): monotonic seconds.
     static int64_t steady_seconds() {
@@ -409,19 +419,25 @@ private:
                          bool wrote_row) {
         failing_.erase(agent_id); // a success forgets it: its next failure opens the window again
         if (agents_.size() >= kMaxAgents && !agents_.contains(agent_id)) {
-            // Prefer an entry whose rate-limit window has elapsed (or that never had one), so
-            // an agent still inside its window keeps its limit; fall back to the first entry
-            // only when every entry is inside its window. The lookup backs an evicted entry.
-            // ponytail: O(n) scan under mu_, at the cap only; an LRU list if the cap is hit
-            // routinely.
+            // Prefer an entry whose rate-limit window has elapsed (or that never had one), so an
+            // agent still inside its window keeps its limit, but look only at the first
+            // kVictimScan entries: a scan of the whole map at the cap cost about 10 ms per new
+            // identity under mu_ during a mass quarantine (the event this gate exists to report).
+            // When none of them has elapsed the first entry goes (the O(1) fallback): an agent
+            // still inside its window may then be forgotten and be admitted again sooner, and the
+            // lookup backs the evicted entry. An LRU or expiry-ordered index is the upgrade if a
+            // fleet is ever seen to evict in-window agents routinely.
             auto victim = agents_.begin();
-            for (auto it = agents_.begin(); it != agents_.end(); ++it) {
+            std::size_t examined = 0;
+            for (auto it = agents_.begin(); it != agents_.end() && examined < kVictimScan; ++it) {
+                ++examined;
                 const auto& at = it->second.last_row_at;
                 if (!at || now - *at >= kEchoCorruptionAuditMinRowInterval) {
                     victim = it;
                     break;
                 }
             }
+            max_victim_probe_ = std::max(max_victim_probe_, examined);
             agents_.erase(victim);
         }
         agents_[agent_id] = Entry{quarantine, wrote_row ? std::optional<int64_t>{now} : std::nullopt};
@@ -429,8 +445,9 @@ private:
     LatestFn latest_;
     NowFn now_s_;
     DegradedFn on_degraded_;
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::unordered_map<std::string, Entry> agents_;
+    std::size_t max_victim_probe_{0}; // most entries any eviction examined (test pin of kVictimScan)
     int64_t degraded_until_{0};
     // Agents whose last lookup or write failed (each until it succeeds), with the end of each
     // one's own wait. Bounded by kMaxFailing.
