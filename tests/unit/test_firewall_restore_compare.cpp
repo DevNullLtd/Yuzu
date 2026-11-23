@@ -92,6 +92,19 @@ std::string lin_snapshot(std::string_view nft, std::string_view ipt, std::string
 
 constexpr std::string_view kIpt = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n";
 
+// The real lines of a Rocky 9.9 firewalld host's ruleset that change by themselves between two reads: a
+// named counter object's values, and the elements of a set with timers (nft prints the countdown after each
+// element, and the two timer texts below are the ones two reads of that host measured, a moment apart).
+std::string timed_ruleset(std::string_view first_timer, std::string_view second_timer,
+                          std::string_view counter_values = "packets 0 bytes 0") {
+    return "table ip labrich { # handle 18\n\tcounter lab_ctr { # handle 15\n\t\t" + std::string{counter_values} +
+           "\n\t}\n\n\tset timedset { # handle 3\n\t\ttype ipv4_addr\n\t\tsize 1024\n\t\tcounter\n"
+           "\t\ttimeout 1h\n\t\tcomment \"lab timed set\"\n"
+           "\t\telements = { 192.0.2.50 counter packets 0 bytes 0 timeout 30m expires " +
+           std::string{first_timer} + ",\n\t\t\t     192.0.2.51 counter packets 0 bytes 0 expires " +
+           std::string{second_timer} + " }\n\t}\n}\n";
+}
+
 // ── macOS ────────────────────────────────────────────────────────────────────
 
 std::string mac_snapshot(std::string_view rules, std::string_view status, std::string_view refs,
@@ -322,6 +335,56 @@ TEST_CASE("Linux: counters and handles are normalised away", "[firewall]") {
     INFO(describe(v));
     CHECK(v.readable);
     CHECK(v.restored);
+}
+
+TEST_CASE("Linux: a timed set element's countdown and a counter object's values are normalised away",
+          "[firewall]") {
+    using detail::normalise_linux_line;
+    // the real lines, from the Rocky 9.9 rich ruleset
+    CHECK(normalise_linux_line("\t\telements = { 192.0.2.50 counter packets 0 bytes 0 timeout 30m expires 29m22s440ms,") ==
+          "\t\telements = { 192.0.2.50 counter timeout 30m,");
+    CHECK(normalise_linux_line("\t\t\t     192.0.2.51 counter packets 0 bytes 0 expires 59m22s }") ==
+          "\t\t\t     192.0.2.51 counter }");
+    CHECK(normalise_linux_line("\t\tpackets 0 bytes 0") == "\t\tpackets bytes");
+    CHECK(normalise_linux_line("\t\tpackets 4096 bytes 1234567") == "\t\tpackets bytes");
+    // every duration shape nft prints, at the end of the line too
+    CHECK(normalise_linux_line("192.0.2.1 expires 1d2h3m4s5ms") == "192.0.2.1");
+    CHECK(normalise_linux_line("192.0.2.1 expires 7s, 192.0.2.2 expires 9m") == "192.0.2.1, 192.0.2.2");
+    // the element's own timeout is configuration, and text that merely looks like these stays
+    CHECK(normalise_linux_line("192.0.2.1 timeout 30m") == "192.0.2.1 timeout 30m");
+    CHECK(normalise_linux_line("comment \"expires soon\"") == "comment \"expires soon\"");
+    CHECK(normalise_linux_line("192.0.2.1 expires m5") == "192.0.2.1 expires m5");
+    CHECK(normalise_linux_line("192.0.2.1 expires 5m!") == "192.0.2.1 expires 5m!");
+    CHECK(normalise_linux_line("comment \"expires 5m\"") == "comment \"expires 5m\"");
+    CHECK(normalise_linux_line("\t\tpackets 0 bytes 0 drop") == "\t\tpackets 0 bytes 0 drop");
+    CHECK(normalise_linux_line("\t\tpackets x bytes 0") == "\t\tpackets x bytes 0");
+    CHECK(normalise_linux_line("\t\tpackets 0 bytes") == "\t\tpackets 0 bytes");
+
+    // two reads of the same ruleset: the timers ticked (and one lost its milliseconds, so the wrapped
+    // line changed width) and traffic went through the named counter
+    const auto before = lin_snapshot(timed_ruleset("29m22s440ms", "59m22s440ms"), kIpt, kIpt);
+    const auto after = lin_snapshot(timed_ruleset("29m22s", "59m22s", "packets 12 bytes 1840"), kIpt, kIpt);
+    const auto same = compare(Os::lin, before, after);
+    INFO(describe(same));
+    CHECK(same.readable);
+    CHECK(same.restored);
+
+    // a change that is not a tick is still a difference: the timeout, an element, a quoted comment
+    const auto edited = [](std::string_view from, std::string_view to) {
+        auto text = timed_ruleset("29m22s", "59m22s");
+        const auto at = text.find(from);
+        REQUIRE(at != std::string::npos);
+        text.replace(at, from.size(), to);
+        return lin_snapshot(text, kIpt, kIpt);
+    };
+    const auto base = edited("timeout 30m", "timeout 30m");
+    for (const auto& changed : {edited("timeout 30m", "timeout 45m"), edited("192.0.2.51", "192.0.2.52")}) {
+        const auto v = compare(Os::lin, base, changed);
+        INFO(describe(v));
+        CHECK_FALSE(v.restored);
+    }
+    CHECK_FALSE(compare(Os::lin, edited("lab timed set", "expires soon"), edited("lab timed set", "expires later"))
+                    .restored);
 }
 
 TEST_CASE("Linux: an added or lost rule line fails, a changed -P policy fails", "[firewall]") {

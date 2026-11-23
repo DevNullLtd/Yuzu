@@ -30,7 +30,8 @@
  *                 account that polkit refuses getServices (the packaged
  *                 agent's) reads a partial answer, which is held: nftables
  *                 and the broker run, only an active ruleset replaces it,
- *                 and ufw and iptables are not consulted (firewalld_rung).
+ *                 and ufw and iptables are not consulted (the hold is in
+ *                 do_state_linux and do_rules_linux).
  *               nftables:  rung 1, bounded NETLINK_NETFILTER (no libnftnl/
  *                 libmnl dependency — neither is a vcpkg dependency today,
  *                 see PR notes). Read-only table/chain/rule enumeration via
@@ -551,8 +552,8 @@ struct FirewalldQueryResult {
     // individual getServices call return rc<0 (that zone's services are a
     // silent undercount, not a genuine zero) -- a ruleset|<n> count is only
     // ever emitted from a `true` here (#3462-... completeness-gated count).
-    // Defaults true: the want_rules=false caller never reaches the loop that
-    // would set it false, and has nothing to count anyway.
+    // Defaults true; every exit of a reachable read that did not read every
+    // zone's services sets it false.
     bool services_complete = true;
 };
 
@@ -576,7 +577,7 @@ struct FirewalldQueryResult {
 // honestly-empty one — service enumeration alone is the higher-confidence
 // subset. Tracked as a gap for whoever next touches this leg with access to
 // a live firewalld.
-FirewalldQueryResult query_firewalld(bool want_rules) {
+FirewalldQueryResult query_firewalld() {
     FirewalldQueryResult r;
     BusGuard bus;
     if (sd_bus_open_system(&bus.bus) < 0 || !bus.bus)
@@ -600,8 +601,6 @@ FirewalldQueryResult query_firewalld(bool want_rules) {
     if (rc < 0)
         return r; // firewalld not running / not reachable -> fall through
     r.reachable = true;
-    if (!want_rules)
-        return r;
 
     if (sd_bus_message_enter_container(reply.m, 'a', "{sa{sas}}") < 0) {
         // Reachable but the active-zones reply didn't decode -- an empty
@@ -699,14 +698,11 @@ FirewalldQueryResult query_firewalld(bool want_rules) {
 }
 
 /// One read of firewalld for `state` or `rules`, as the rows it would write and how complete the read
-/// was. want_rules=true for both actions: the state action's ruleset|<n> row needs the services
-/// enumerated, and want_rules=false returns none, which would read as ruleset|0 rather than the
-/// honest count or ruleset|unknown. The account that runs the packaged agent has no polkit rule, so
-/// firewalld answers its getActiveZones and refuses getServices (measured on Rocky 9.9, firewalld
-/// running): a `partial` read, which must not stand in for the ruleset the account can read through
-/// the broker.
+/// was. The account that runs the packaged agent has no polkit rule, so firewalld answers its
+/// getActiveZones and refuses getServices (measured on Rocky 9.9, firewalld running): a `partial`
+/// read, which must not stand in for the ruleset the account can read through the broker.
 FirewalldRung firewalld_rung(yuzu::firewall::FwReadAction action) {
-    const auto q = query_firewalld(/*want_rules=*/true);
+    const auto q = query_firewalld();
     const auto read = yuzu::firewall::firewalld_read(q.reachable, q.services_complete);
     if (read == yuzu::firewall::FirewalldRead::absent)
         return {read, {}};
@@ -1295,6 +1291,9 @@ bool try_nftables_rules(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
 // helper's `snapshot` word instead (read_fw_snapshot_via_helper below). The documented opt-out
 // stops the socket and then masks it (`systemctl stop`, then `systemctl mask`): on Rocky 9.9
 // (systemd 252) `mask --now` alone left the socket file and this read reported `connect:refused`.
+// After stop-then-mask the socket file is gone, this rung declines silently and the ladder answers
+// as it did before the broker: firewalld's own rows on a firewalld host, `unknown` elsewhere, both
+// after the refused netlink read's error row.
 
 /// One read of the broker: the reply text, or the token that says why there is none. An EMPTY token
 /// means the broker is not installed (ENOENT) and is not reported. Tokens: connect:eacces,

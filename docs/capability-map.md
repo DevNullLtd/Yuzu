@@ -576,7 +576,7 @@ row on both actions via `INetFwRules::get_Count` — `state`'s is the true
 policy-wide total, `rules`' is the count of rows actually emitted that call
 (capped at 100), a distinct number from `state`'s. Linux probes a fixed
 backend ladder — firewalld (sd-bus; it answers first only when its read was
-complete, a partly read firewalld is held behind the later rungs) → nftables
+complete, a partly read firewalld is held behind the nftables and snapshot reads) → nftables
 (netlink, kernel-origin-verified via `nl_pid == 0`) → the root snapshot broker
 (a root-owned systemd socket on the packaged unit, ADR-3007; the installer
 helper's `snapshot` word through sudo on an installer-provisioned host) → ufw →

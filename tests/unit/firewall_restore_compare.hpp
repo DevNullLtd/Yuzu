@@ -27,8 +27,9 @@
  *            app-package pattern is counted and reported but never fails the comparison, because
  *            those rules churn by themselves; a package rule that was enabled and is now disabled
  *            is the exception, which is a failure whatever its name.
- *   Linux    `nft -a list ruleset`, `iptables -S`, `ip6tables -S`. Counters and rule handles are
- *            normalised away; `-P` lines are defaults; every other line is a multiset.
+ *   Linux    `nft -a list ruleset`, `iptables -S`, `ip6tables -S`. Counters, a named counter
+ *            object's values, a timed set element's countdown and rule handles are normalised
+ *            away; `-P` lines are defaults; every other line is a multiset.
  *   macOS    `pf rules`, `pf status` (the `Status:` line, compared by its state word only because
  *            the line also carries the uptime), `pf references` (the line count) and `yuzu anchor`
  *            (anything in it after the noise is residue; an anchor that is not loaded is written
@@ -250,26 +251,51 @@ inline void note(std::string& detail, std::string_view kind, std::string_view li
 
 // ── Linux normalisation ─────────────────────────────────────────────────────
 
+/// The end of `<digits> bytes <digits>` that starts at `from` (the two values of a counter), or npos.
+[[nodiscard]] inline std::size_t counter_values_end(std::string_view s, std::size_t from) {
+    const auto digits = [&](std::size_t q) {
+        while (q < s.size() && s[q] >= '0' && s[q] <= '9')
+            ++q;
+        return q;
+    };
+    const auto packets = digits(from);
+    if (packets == from || s.compare(packets, 7, " bytes ") != 0)
+        return std::string_view::npos;
+    const auto bytes = digits(packets + 7);
+    return bytes == packets + 7 ? std::string_view::npos : bytes;
+}
+
+/// The end of a duration as nft prints it (`29m22s440ms`: a digit, then digits and the letters d, h,
+/// m and s) that starts at `from` and ends at a comma, a blank, a closing brace or the end, or npos.
+[[nodiscard]] inline std::size_t nft_duration_end(std::string_view s, std::size_t from) {
+    if (from >= s.size() || s[from] < '0' || s[from] > '9')
+        return std::string_view::npos;
+    const auto end = std::min(s.find_first_not_of("0123456789dhms", from), s.size());
+    return end == s.size() || std::string_view{",} \t\r"}.find(s[end]) != std::string_view::npos
+               ? end
+               : std::string_view::npos;
+}
+
 /// Removes what changes by itself between two reads of the same ruleset: ` counter packets N bytes
-/// N` becomes ` counter`, the trailing ` # handle N` goes, and trailing blanks go.
+/// N` becomes ` counter`, a timed set element's ` expires <duration>` goes (its own `timeout` is
+/// configuration and stays), a named counter object's line `packets N bytes N` becomes `packets
+/// bytes`, the trailing ` # handle N` goes, and trailing blanks go.
 [[nodiscard]] inline std::string normalise_linux_line(std::string_view line) {
     std::string s{line};
     constexpr std::string_view kCounter = " counter packets ";
     for (std::size_t at = s.find(kCounter); at != std::string::npos; at = s.find(kCounter, at + 8)) {
-        std::size_t p = at + kCounter.size();
-        const auto digits = [&](std::size_t from) {
-            std::size_t q = from;
-            while (q < s.size() && s[q] >= '0' && s[q] <= '9')
-                ++q;
-            return q;
-        };
-        const auto after_packets = digits(p);
-        if (after_packets == p || s.compare(after_packets, 7, " bytes ") != 0)
+        const auto end = counter_values_end(s, at + kCounter.size());
+        if (end == std::string_view::npos)
             continue;
-        const auto after_bytes = digits(after_packets + 7);
-        if (after_bytes == after_packets + 7)
-            continue;
-        s.replace(at, after_bytes - at, " counter");
+        s.replace(at, end - at, " counter");
+    }
+    constexpr std::string_view kExpires = " expires ";
+    std::size_t from = 0;
+    for (auto at = s.find(kExpires); at != std::string::npos; at = s.find(kExpires, from)) {
+        const auto end = nft_duration_end(s, at + kExpires.size());
+        if (end != std::string_view::npos)
+            s.erase(at, end - at);
+        from = end == std::string_view::npos ? at + kExpires.size() : at;
     }
     constexpr std::string_view kHandle = " # handle ";
     if (const auto at = s.rfind(kHandle); at != std::string::npos) {
@@ -279,6 +305,11 @@ inline void note(std::string& detail, std::string_view kind, std::string_view li
     }
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r'))
         s.pop_back();
+    constexpr std::string_view kValues = "packets ";
+    const auto first = s.find_first_not_of(" \t");
+    if (first != std::string::npos && std::string_view{s}.substr(first).starts_with(kValues) &&
+        counter_values_end(s, first + kValues.size()) == s.size())
+        s.replace(first, std::string::npos, "packets bytes");
     return s;
 }
 

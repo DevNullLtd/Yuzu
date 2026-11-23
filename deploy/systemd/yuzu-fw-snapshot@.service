@@ -4,9 +4,10 @@
 # It runs the fixed script /usr/share/yuzu/scripts/yuzu-fw-snapshot.sh as root with no input
 # (standard input is /dev/null; the connection is only the trigger and the output) and ends. The
 # contract is docs/adr/3007-os-activated-read-helpers.md. The unit is designed for systemd 239
-# and later; the agent's README names the versions it has been measured on. Each directive below
-# has its own sandbox reason; none of them is the bound on what the script can do, which is that
-# the script runs three fixed read-only commands and nothing else.
+# and later; the agent's README names the versions it has been measured on. Two claims are made
+# here and they do not contradict each other. What the script does is fixed by the script itself:
+# three read-only commands and nothing else. The directives below bound what a process in the
+# instance could do beyond that if a tool misbehaved, and each has its own sandbox reason.
 [Unit]
 Description=Yuzu agent read-only firewall snapshot (one connection)
 Documentation=https://github.com/DevNullLtd/Yuzu
@@ -28,10 +29,14 @@ TasksMax=16
 # NoNewPrivileges is deliberately NOT set. Measured on Rocky 9.9 with SELinux enforcing (systemd 252):
 # with it, every exec of nft, iptables and ip6tables was a denied nnp_transition from initrc_t to
 # iptables_t (three audit denials per read) and the tools ran in the script's domain, not their own
-# confined one; the distribution's policy grants that transition only without no_new_privs. What bounds
-# the instance without it is unchanged: it runs as root with only the two capabilities below, so an exec
-# can yield no more than that set, and the system call filter, address families, namespaces, memory and
-# file system restrictions below apply to every process the script starts. The script takes no input.
+# confined one; the distribution's policy grants that transition only without no_new_privs. What
+# bounds the instance without it: it runs as root with only the two capabilities below, so an exec
+# can yield no more capabilities than that set, and the system call filter, address families,
+# namespaces, memory and file system restrictions below apply to every process the script starts.
+# One thing does change without the flag: an exec of a setuid or setgid program that belongs to
+# another user or group changes the process to that identity. That adds no capability beyond the two
+# in the bounding set, the filters still apply to it, and the script runs only its three fixed tools
+# with no input.
 # The agent's own unit keeps NoNewPrivileges=true and its one capability (yuzu-agent.service).
 # Only the two capabilities the reads can need: CAP_NET_ADMIN to read nftables and iptables state,
 # CAP_NET_RAW for legacy iptables (a raw socket; that it needs the capability is inferred, not measured).

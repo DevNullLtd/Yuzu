@@ -1621,12 +1621,11 @@ namespace detail {
 
 /// `s` without its leading and trailing space, tab and carriage return.
 [[nodiscard]] inline std::string_view trim(std::string_view s) noexcept {
-    const auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
-    while (!s.empty() && blank(s.back()))
-        s.remove_suffix(1);
-    while (!s.empty() && blank(s.front()))
-        s.remove_prefix(1);
-    return s;
+    constexpr std::string_view blank = " \t\r";
+    const auto first = s.find_first_not_of(blank);
+    if (first == std::string_view::npos)
+        return {};
+    return s.substr(first, s.find_last_not_of(blank) - first + 1);
 }
 
 /// The lines of `text` without their newlines. A final newline ends the last line and adds no empty
@@ -1812,7 +1811,7 @@ struct NftTextLine {
 /// flag a newer nft adds still reads; a line with a brace or a handle, or any other shape, is not one.
 [[nodiscard]] inline bool nft_text_table_property(const NftTextLine& line,
                                                   const std::vector<std::string_view>& tokens) noexcept {
-    if (line.delta() != 0 || line.has_handle || tokens.size() != 2)
+    if (line.opens != 0 || line.closes != 0 || line.has_handle || tokens.size() != 2)
         return false;
     if (tokens[0] == "flags")
         return true;
@@ -1838,8 +1837,9 @@ struct NftTextLine {
 
 } // namespace detail
 
-/// Parses `nft -a list ruleset` text into tables, chains and rules; nullopt when it is not a
-/// listing this parser fully understands. It is written against real `nft -a` output, where the
+/// Parses `nft -a list ruleset` text into chains and rules, each carrying its table's family and
+/// name; nullopt when it is not a listing this parser fully understands. It is written against
+/// real `nft -a` output, where the
 /// table, chain, set, map and flowtable headers end `{ # handle N` and every rule ends
 /// `# handle N` (a listing without -a has no handles, so a rule cannot be told from a property
 /// line and every rule line fails: a listing must never UNDERCOUNT). Per line the comment is split
@@ -1851,7 +1851,7 @@ struct NftTextLine {
 /// `type ... hook <h> ...; policy <p>;` line makes it a base chain, a line that carries a handle
 /// and does not open a block is one rule, a line that opens a block starts a multi-line rule
 /// that must close on a line carrying a handle, and any other line returns nullopt. Unbalanced
-/// text (a listing cut mid-block) returns nullopt. Empty text is an empty ruleset: 0 tables.
+/// text (a listing cut mid-block) returns nullopt. Empty text is an empty ruleset: no chains and no rules.
 [[nodiscard]] inline std::optional<NftTextRuleset> parse_nft_ruleset_text(std::string_view text) {
     enum class Where { top, table, chain, block, rule };
     NftTextRuleset out;

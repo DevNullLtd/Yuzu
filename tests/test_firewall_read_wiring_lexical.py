@@ -554,6 +554,21 @@ LINUX_MUTATIONS = [
     # firewalld: ufw and iptables consulted behind a running firewalld (the held write does not return)
     (_lmut(r"(if \(info\.firewalld_running\) \{\s*for \(const auto& row : firewalld\.rows\)\s*ctx\.write_output\(row\);)\s*return;",
            r"\1"), "no longer writes the held firewalld rows"),
+    # firewalld: the positions. The complete-read block moved after the nftables rung (state ladder) ...
+    (_lmut(r"(\s*if \(firewalld\.read == yuzu::firewall::FirewalldRead::complete\) " + _HELD_ROWS + r")"
+           r"(\s*NftFallthroughInfo info;\s*info\.firewalld_running = [^;]*;\s*if \(try_nftables_state\(ctx, info\)\)\s*return;)",
+           r"\2\1"), "no longer writes firewalld's rows and returns, before any other rung, when its read is complete"),
+    # ... the held flag set only after the nftables rung has run (state ladder) ...
+    (_lmut(r"(\s*info\.firewalld_running = firewalld\.read == yuzu::firewall::FirewalldRead::partial;)"
+           r"(\s*if \(try_nftables_state\(ctx, info\)\)\s*return;)", r"\2\1"),
+     "no longer sets info.firewalld_running from a partial firewalld read before the"),
+    # ... the held write ahead of the deferred rows (state ladder) ...
+    (_lmut(r"(\s*for \(const auto& row : info\.pending_rows\)\s*ctx\.write_output\(row\);)"
+           r"((?:\s*//[^\n]*)*\s*if \(info\.firewalld_running\) " + _HELD_ROWS + r")", r"\2\1"),
+     "no longer writes the held firewalld rows and returns after info.pending_rows"),
+    # ... and the held write after ufw has been consulted (rules ladder)
+    (_lmut(r"(\s*if \(info\.firewalld_running\) " + _HELD_ROWS + r")(\s*if \(try_ufw_rules\(ctx\)\)\s*return;)", r"\2\1"),
+     "no longer writes the held firewalld rows and returns after info.pending_rows and before try_ufw_rules"),
     # the nft rung answers a non-active ruleset while firewalld is held, or writes its row first
     (_lmut(r"if \(info\.firewalld_running && verdict != yuzu::firewall::NftVerdict::active\)\s*return false;", ""),
      "try_nftables_state no longer declines"),
@@ -571,7 +586,7 @@ LINUX_MUTATIONS = [
     (_lmut(r"if \(answers \|\| row\.starts_with\(\"error\|\"\)\)", "if (true)"), "only an active ruleset while firewalld is held"),
     (_lmut(r"return answers;", "return true;"), "only an active ruleset while firewalld is held"),
     # the firewalld rung writes a row itself, or decides without the pure functions
-    (_lmut(r"(const auto q = query_firewalld\(/\*want_rules=\*/true\);)", r'\1 write_output("x");'), "firewalld_rung writes a row itself"),
+    (_lmut(r"(const auto q = query_firewalld\(\);)", r'\1 write_output("x");'), "firewalld_rung writes a row itself"),
     (_lmut(r"yuzu::firewall::firewalld_read\(q\.reachable, q\.services_complete\)",
            "(q.reachable ? yuzu::firewall::FirewalldRead::complete : yuzu::firewall::FirewalldRead::absent)"),
      "decides through firewalld_read"),

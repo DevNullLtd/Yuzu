@@ -1991,6 +1991,824 @@ table inet firewalld { # handle 3 progname (null)
 == end
 )FWREAL";
 
+// The whole broker reply of a real RHEL-family host with a RICH ruleset: Rocky 9.9 aarch64, firewalld plus
+// lab-loaded tables of every family (13 tables, 215 rules; 24,059 bytes, captured 2026-11-23). It holds
+// shapes the printer rules alone could not vouch for: sets with timers, interval and concatenated sets, set
+// and map elements wrapped over lines, counter, quota, limit, ct and synproxy objects, a flowtable, a dormant
+// table, a table comment, named and inline verdict maps, rich-rule chains and anonymous `jump {` and
+// `goto {` chains. It is not trimmed, so it can be compared with the capture byte for byte; the one edit is
+// that the two `macset` elements, typed in the lab under a real vendor prefix, read 00:00:5e:00:53:01 and
+// 00:00:5e:00:53:02 (the documentation range, same length) so the personal-data guard's MAC detector stays
+// quiet. Two adjacent raw literals, each under MSVC's 16,380-byte limit, split at a line boundary.
+constexpr std::string_view kRichRealReply = R"FWREAL(== nft -a list ruleset
+table inet firewalld { # handle 14 progname (null)
+	flags owner,persist
+
+	set labnet { # handle 1
+		type ipv4_addr
+		flags interval
+		elements = { 198.51.100.0/24, 203.0.113.0/25 }
+	}
+
+	set labset { # handle 2
+		type ipv4_addr
+		flags interval
+		elements = { 192.0.2.1, 192.0.2.2,
+			     192.0.2.3, 192.0.2.4,
+			     192.0.2.5, 192.0.2.6,
+			     192.0.2.7, 192.0.2.8,
+			     192.0.2.9, 192.0.2.10,
+			     192.0.2.11, 192.0.2.12 }
+	}
+
+	chain mangle_PREROUTING { # handle 3
+		type filter hook prerouting priority mangle + 10; policy accept;
+		jump mangle_PREROUTING_ZONES # handle 7
+	}
+
+	chain mangle_PREROUTING_POLICIES_pre { # handle 4
+		jump mangle_PRE_policy_allow-host-ipv6 # handle 173
+	}
+
+	chain mangle_PREROUTING_ZONES { # handle 5
+		ip saddr 192.0.2.200 goto mangle_PRE_trusted # handle 285
+		iifname "eth0" goto mangle_PRE_public # handle 186
+		goto mangle_PRE_public # handle 137
+	}
+
+	chain mangle_PREROUTING_POLICIES_post { # handle 6
+	}
+
+	chain nat_PREROUTING { # handle 8
+		type nat hook prerouting priority dstnat + 10; policy accept;
+		jump nat_PREROUTING_ZONES # handle 12
+	}
+
+	chain nat_PREROUTING_POLICIES_pre { # handle 9
+		jump nat_PRE_policy_allow-host-ipv6 # handle 172
+	}
+
+	chain nat_PREROUTING_ZONES { # handle 10
+		ip saddr 192.0.2.200 goto nat_PRE_trusted # handle 284
+		iifname "eth0" goto nat_PRE_public # handle 185
+		goto nat_PRE_public # handle 136
+	}
+
+	chain nat_PREROUTING_POLICIES_post { # handle 11
+	}
+
+	chain nat_POSTROUTING { # handle 13
+		type nat hook postrouting priority srcnat + 10; policy accept;
+		jump nat_POSTROUTING_ZONES # handle 17
+	}
+
+	chain nat_POSTROUTING_POLICIES_pre { # handle 14
+	}
+
+	chain nat_POSTROUTING_ZONES { # handle 15
+		ip daddr 192.0.2.200 goto nat_POST_trusted # handle 282
+		oifname "eth0" goto nat_POST_public # handle 183
+		goto nat_POST_public # handle 134
+	}
+
+	chain nat_POSTROUTING_POLICIES_post { # handle 16
+	}
+
+	chain nat_OUTPUT { # handle 18
+		type nat hook output priority dstnat + 10; policy accept;
+		jump nat_OUTPUT_POLICIES_pre # handle 20
+		jump nat_OUTPUT_POLICIES_post # handle 22
+	}
+
+	chain nat_OUTPUT_POLICIES_pre { # handle 19
+	}
+
+	chain nat_OUTPUT_POLICIES_post { # handle 21
+	}
+
+	chain filter_PREROUTING { # handle 23
+		type filter hook prerouting priority filter + 10; policy accept;
+		icmpv6 type { nd-router-advert, nd-neighbor-solicit } accept # handle 56
+		meta nfproto ipv6 fib saddr . mark . iif check missing drop # handle 54
+	}
+
+	chain filter_INPUT { # handle 24
+		type filter hook input priority filter + 10; policy accept;
+		ct state { established, related } accept # handle 28
+		ct status dnat accept # handle 29
+		iifname "lo" accept # handle 30
+		ct state invalid drop # handle 31
+		jump filter_INPUT_ZONES # handle 35
+		reject with icmpx admin-prohibited # handle 36
+	}
+
+	chain filter_FORWARD { # handle 25
+		type filter hook forward priority filter + 10; policy accept;
+		ct state { established, related } accept # handle 38
+		ct status dnat accept # handle 39
+		iifname "lo" accept # handle 40
+		ct state invalid drop # handle 41
+		ip6 daddr { ::/96, ::ffff:0.0.0.0/96, 2002::/24, 2002:a00::/24, 2002:7f00::/24, 2002:a9fe::/32, 2002:ac10::/28, 2002:c0a8::/32, 2002:e000::/19 } reject with icmpv6 addr-unreachable # handle 60
+		jump filter_FORWARD_ZONES # handle 44
+		reject with icmpx admin-prohibited # handle 46
+	}
+
+	chain filter_OUTPUT { # handle 26
+		type filter hook output priority filter + 10; policy accept;
+		ct state { established, related } accept # handle 48
+		oifname "lo" accept # handle 49
+		ip6 daddr { ::/96, ::ffff:0.0.0.0/96, 2002::/24, 2002:a00::/24, 2002:7f00::/24, 2002:a9fe::/32, 2002:ac10::/28, 2002:c0a8::/32, 2002:e000::/19 } reject with icmpv6 addr-unreachable # handle 58
+		jump filter_OUTPUT_POLICIES_pre # handle 51
+		jump filter_OUTPUT_POLICIES_post # handle 53
+	}
+
+	chain filter_INPUT_POLICIES_pre { # handle 32
+		jump filter_IN_policy_allow-host-ipv6 # handle 171
+	}
+
+	chain filter_INPUT_ZONES { # handle 33
+		ip saddr 192.0.2.200 goto filter_IN_trusted # handle 281
+		iifname "eth0" goto filter_IN_public # handle 182
+		goto filter_IN_public # handle 133
+	}
+
+	chain filter_INPUT_POLICIES_post { # handle 34
+	}
+
+	chain filter_FORWARD_POLICIES_pre { # handle 42
+	}
+
+	chain filter_FORWARD_ZONES { # handle 43
+		ip saddr 192.0.2.200 goto filter_FWD_trusted # handle 283
+		iifname "eth0" goto filter_FWD_public # handle 184
+		goto filter_FWD_public # handle 135
+	}
+
+	chain filter_FORWARD_POLICIES_post { # handle 45
+	}
+
+	chain filter_OUTPUT_POLICIES_pre { # handle 50
+	}
+
+	chain filter_OUTPUT_POLICIES_post { # handle 52
+	}
+
+	chain filter_IN_public { # handle 61
+		jump filter_INPUT_POLICIES_pre # handle 67
+		jump filter_IN_public_pre # handle 68
+		jump filter_IN_public_log # handle 69
+		jump filter_IN_public_deny # handle 70
+		jump filter_IN_public_allow # handle 71
+		jump filter_IN_public_post # handle 72
+		jump filter_INPUT_POLICIES_post # handle 73
+		meta l4proto { icmp, ipv6-icmp } accept # handle 132
+		reject with icmpx admin-prohibited # handle 74
+	}
+
+	chain filter_IN_public_pre { # handle 62
+	}
+
+	chain filter_IN_public_log { # handle 63
+		ip saddr 192.0.2.0/24 limit rate 1/minute burst 5 packets log prefix "labrich " level info # handle 196
+		ip saddr @labnet limit rate 3/minute burst 5 packets log prefix "labnet " # handle 201
+	}
+
+	chain filter_IN_public_deny { # handle 64
+		ip saddr 203.0.113.0/24 tcp dport 2222 reject with icmp port-unreachable # handle 199
+		ip saddr @labset drop # handle 200
+		ip saddr @labnet drop # handle 202
+		icmp type echo-request reject with icmpx admin-prohibited # handle 212
+		icmpv6 type echo-request reject with icmpx admin-prohibited # handle 213
+	}
+
+	chain filter_IN_public_allow { # handle 65
+		tcp dport 22 accept # handle 75
+		ip6 daddr fe80::/64 udp dport 546 accept # handle 76
+		tcp dport 9090 accept # handle 77
+		tcp dport 80 accept # handle 188
+		tcp dport 8080 accept # handle 189
+		udp dport 5000-5010 accept # handle 190
+		ip saddr 192.0.2.0/24 accept # handle 197
+		ip saddr 198.51.100.7 tcp dport 443 accept # handle 198
+	}
+
+	chain filter_IN_public_post { # handle 66
+	}
+
+	chain nat_POST_public { # handle 78
+		jump nat_POSTROUTING_POLICIES_pre # handle 84
+		jump nat_POST_public_pre # handle 85
+		jump nat_POST_public_log # handle 86
+		jump nat_POST_public_deny # handle 87
+		jump nat_POST_public_allow # handle 88
+		jump nat_POST_public_post # handle 89
+		jump nat_POSTROUTING_POLICIES_post # handle 90
+	}
+
+	chain nat_POST_public_pre { # handle 79
+	}
+
+	chain nat_POST_public_log { # handle 80
+	}
+
+	chain nat_POST_public_deny { # handle 81
+	}
+
+	chain nat_POST_public_allow { # handle 82
+		meta nfproto ipv4 oifname != "lo" masquerade # handle 205
+	}
+
+	chain nat_POST_public_post { # handle 83
+	}
+
+	chain filter_FWD_public { # handle 91
+		jump filter_FORWARD_POLICIES_pre # handle 97
+		jump filter_FWD_public_pre # handle 98
+		jump filter_FWD_public_log # handle 99
+		jump filter_FWD_public_deny # handle 100
+		jump filter_FWD_public_allow # handle 101
+		jump filter_FWD_public_post # handle 102
+		jump filter_FORWARD_POLICIES_post # handle 103
+		reject with icmpx admin-prohibited # handle 104
+	}
+
+	chain filter_FWD_public_pre { # handle 92
+	}
+
+	chain filter_FWD_public_log { # handle 93
+	}
+
+	chain filter_FWD_public_deny { # handle 94
+	}
+
+	chain filter_FWD_public_allow { # handle 95
+		oifname "eth0" accept # handle 187
+	}
+
+	chain filter_FWD_public_post { # handle 96
+	}
+
+	chain nat_PRE_public { # handle 105
+		jump nat_PREROUTING_POLICIES_pre # handle 111
+		jump nat_PRE_public_pre # handle 112
+		jump nat_PRE_public_log # handle 113
+		jump nat_PRE_public_deny # handle 114
+		jump nat_PRE_public_allow # handle 115
+		jump nat_PRE_public_post # handle 116
+		jump nat_PREROUTING_POLICIES_post # handle 117
+	}
+
+	chain nat_PRE_public_pre { # handle 106
+	}
+
+	chain nat_PRE_public_log { # handle 107
+	}
+
+	chain nat_PRE_public_deny { # handle 108
+	}
+
+	chain nat_PRE_public_allow { # handle 109
+		meta nfproto ipv4 tcp dport 8081 redirect to :80 # handle 208
+		meta nfproto ipv4 tcp dport 8082 dnat ip to 192.0.2.99:8080 # handle 211
+	}
+
+	chain nat_PRE_public_post { # handle 110
+	}
+
+	chain mangle_PRE_public { # handle 118
+		jump mangle_PREROUTING_POLICIES_pre # handle 124
+		jump mangle_PRE_public_pre # handle 125
+		jump mangle_PRE_public_log # handle 126
+		jump mangle_PRE_public_deny # handle 127
+		jump mangle_PRE_public_allow # handle 128
+		jump mangle_PRE_public_post # handle 129
+		jump mangle_PREROUTING_POLICIES_post # handle 130
+	}
+
+	chain mangle_PRE_public_pre { # handle 119
+	}
+
+	chain mangle_PRE_public_log { # handle 120
+	}
+
+	chain mangle_PRE_public_deny { # handle 121
+	}
+
+	chain mangle_PRE_public_allow { # handle 122
+	}
+
+	chain mangle_PRE_public_post { # handle 123
+	}
+
+	chain filter_IN_policy_allow-host-ipv6 { # handle 138
+		jump filter_IN_policy_allow-host-ipv6_pre # handle 144
+		jump filter_IN_policy_allow-host-ipv6_log # handle 145
+		jump filter_IN_policy_allow-host-ipv6_deny # handle 146
+		jump filter_IN_policy_allow-host-ipv6_allow # handle 147
+		jump filter_IN_policy_allow-host-ipv6_post # handle 148
+	}
+
+	chain filter_IN_policy_allow-host-ipv6_pre { # handle 139
+	}
+
+	chain filter_IN_policy_allow-host-ipv6_log { # handle 140
+	}
+
+	chain filter_IN_policy_allow-host-ipv6_deny { # handle 141
+	}
+
+	chain filter_IN_policy_allow-host-ipv6_allow { # handle 142
+		icmpv6 type nd-neighbor-advert accept # handle 174
+		icmpv6 type nd-neighbor-solicit accept # handle 175
+		icmpv6 type nd-router-advert accept # handle 176
+		icmpv6 type nd-redirect accept # handle 177
+		icmpv6 type mld-listener-done accept # handle 178
+		icmpv6 type mld-listener-query accept # handle 179
+		icmpv6 type mld-listener-report accept # handle 180
+		icmpv6 type mld2-listener-report accept # handle 181
+	}
+
+	chain filter_IN_policy_allow-host-ipv6_post { # handle 143
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6 { # handle 149
+		jump nat_PRE_policy_allow-host-ipv6_pre # handle 155
+		jump nat_PRE_policy_allow-host-ipv6_log # handle 156
+		jump nat_PRE_policy_allow-host-ipv6_deny # handle 157
+		jump nat_PRE_policy_allow-host-ipv6_allow # handle 158
+		jump nat_PRE_policy_allow-host-ipv6_post # handle 159
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6_pre { # handle 150
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6_log { # handle 151
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6_deny { # handle 152
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6_allow { # handle 153
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6_post { # handle 154
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6 { # handle 160
+		jump mangle_PRE_policy_allow-host-ipv6_pre # handle 166
+		jump mangle_PRE_policy_allow-host-ipv6_log # handle 167
+		jump mangle_PRE_policy_allow-host-ipv6_deny # handle 168
+		jump mangle_PRE_policy_allow-host-ipv6_allow # handle 169
+		jump mangle_PRE_policy_allow-host-ipv6_post # handle 170
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6_pre { # handle 161
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6_log { # handle 162
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6_deny { # handle 163
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6_allow { # handle 164
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6_post { # handle 165
+	}
+
+	chain filter_IN_trusted { # handle 214
+		jump filter_INPUT_POLICIES_pre # handle 220
+		jump filter_IN_trusted_pre # handle 221
+		jump filter_IN_trusted_log # handle 222
+		jump filter_IN_trusted_deny # handle 223
+		jump filter_IN_trusted_allow # handle 224
+		jump filter_IN_trusted_post # handle 225
+		jump filter_INPUT_POLICIES_post # handle 226
+		accept # handle 227
+	}
+
+	chain filter_IN_trusted_pre { # handle 215
+	}
+
+	chain filter_IN_trusted_log { # handle 216
+	}
+
+	chain filter_IN_trusted_deny { # handle 217
+	}
+
+	chain filter_IN_trusted_allow { # handle 218
+	}
+
+	chain filter_IN_trusted_post { # handle 219
+	}
+
+	chain nat_POST_trusted { # handle 228
+		jump nat_POSTROUTING_POLICIES_pre # handle 234
+		jump nat_POST_trusted_pre # handle 235
+		jump nat_POST_trusted_log # handle 236
+		jump nat_POST_trusted_deny # handle 237
+		jump nat_POST_trusted_allow # handle 238
+		jump nat_POST_trusted_post # handle 239
+		jump nat_POSTROUTING_POLICIES_post # handle 240
+	}
+
+)FWREAL" R"FWREAL(	chain nat_POST_trusted_pre { # handle 229
+	}
+
+	chain nat_POST_trusted_log { # handle 230
+	}
+
+	chain nat_POST_trusted_deny { # handle 231
+	}
+
+	chain nat_POST_trusted_allow { # handle 232
+	}
+
+	chain nat_POST_trusted_post { # handle 233
+	}
+
+	chain filter_FWD_trusted { # handle 241
+		jump filter_FORWARD_POLICIES_pre # handle 247
+		jump filter_FWD_trusted_pre # handle 248
+		jump filter_FWD_trusted_log # handle 249
+		jump filter_FWD_trusted_deny # handle 250
+		jump filter_FWD_trusted_allow # handle 251
+		jump filter_FWD_trusted_post # handle 252
+		jump filter_FORWARD_POLICIES_post # handle 253
+		accept # handle 254
+	}
+
+	chain filter_FWD_trusted_pre { # handle 242
+	}
+
+	chain filter_FWD_trusted_log { # handle 243
+	}
+
+	chain filter_FWD_trusted_deny { # handle 244
+	}
+
+	chain filter_FWD_trusted_allow { # handle 245
+		ip daddr 192.0.2.200 accept # handle 286
+	}
+
+	chain filter_FWD_trusted_post { # handle 246
+	}
+
+	chain nat_PRE_trusted { # handle 255
+		jump nat_PREROUTING_POLICIES_pre # handle 261
+		jump nat_PRE_trusted_pre # handle 262
+		jump nat_PRE_trusted_log # handle 263
+		jump nat_PRE_trusted_deny # handle 264
+		jump nat_PRE_trusted_allow # handle 265
+		jump nat_PRE_trusted_post # handle 266
+		jump nat_PREROUTING_POLICIES_post # handle 267
+	}
+
+	chain nat_PRE_trusted_pre { # handle 256
+	}
+
+	chain nat_PRE_trusted_log { # handle 257
+	}
+
+	chain nat_PRE_trusted_deny { # handle 258
+	}
+
+	chain nat_PRE_trusted_allow { # handle 259
+	}
+
+	chain nat_PRE_trusted_post { # handle 260
+	}
+
+	chain mangle_PRE_trusted { # handle 268
+		jump mangle_PREROUTING_POLICIES_pre # handle 274
+		jump mangle_PRE_trusted_pre # handle 275
+		jump mangle_PRE_trusted_log # handle 276
+		jump mangle_PRE_trusted_deny # handle 277
+		jump mangle_PRE_trusted_allow # handle 278
+		jump mangle_PRE_trusted_post # handle 279
+		jump mangle_PREROUTING_POLICIES_post # handle 280
+	}
+
+	chain mangle_PRE_trusted_pre { # handle 269
+	}
+
+	chain mangle_PRE_trusted_log { # handle 270
+	}
+
+	chain mangle_PRE_trusted_deny { # handle 271
+	}
+
+	chain mangle_PRE_trusted_allow { # handle 272
+	}
+
+	chain mangle_PRE_trusted_post { # handle 273
+	}
+}
+table ip filter { # handle 17
+	chain INPUT { # handle 1
+		type filter hook input priority filter; policy accept;
+		tcp dport 9999 counter packets 0 bytes 0 accept # handle 2
+		tcp dport 7777 counter packets 0 bytes 0 accept # handle 3
+		ip saddr 192.0.2.4  counter packets 0 bytes 0 accept # handle 4
+		ip saddr 192.0.2.5 counter packets 0 bytes 0 jump LAB_CHAIN # handle 9
+		ip saddr 192.0.2.6 xt match "recent" counter packets 0 bytes 0 # handle 10
+		ip saddr 192.0.2.7 xt match "string" counter packets 0 bytes 0 drop # handle 11
+		ip saddr 192.0.2.9 limit rate 5/minute burst 5 packets counter packets 0 bytes 0 log prefix "lab " # handle 12
+		ip saddr 192.0.2.8 ip protocol tcp tcp dport { 5000, 5001, 5002 } counter packets 0 bytes 0 accept # handle 13
+		ip saddr 192.0.2.10 tcp dport 7778 counter packets 0 bytes 0 reject with tcp reset # handle 14
+	}
+
+	chain FORWARD { # handle 5
+		type filter hook forward priority filter; policy accept;
+		ct state related,established counter packets 0 bytes 0 accept # handle 6
+	}
+
+	chain LAB_CHAIN { # handle 7
+		counter packets 0 bytes 0 return # handle 8
+	}
+}
+table ip labrich { # handle 18
+	counter lab_ctr { # handle 15
+		packets 0 bytes 0
+	}
+
+	quota lab_quota { # handle 16
+		over 25 mbytes
+	}
+
+	limit lab_lim { # handle 17
+		rate 10/second
+	}
+
+	ct helper lab_ftp { # handle 18
+		type "ftp" protocol tcp
+		l3proto ip
+	}
+
+	ct timeout lab_ctt { # handle 19
+		protocol tcp
+		l3proto ip
+		policy = { established : 1m40s }
+	}
+
+	ct expectation lab_exp { # handle 20
+		protocol tcp
+		dport 5000
+		timeout 1h
+		size 12
+		l3proto ip
+	}
+
+	synproxy lab_syn { # handle 21
+		mss 1460
+		wscale 8
+		timestamp sack-perm
+	}
+
+	set bigset { # handle 1
+		type ipv4_addr
+		elements = { 10.20.0.1, 10.20.0.2,
+			     10.20.0.3, 10.20.0.4,
+			     10.20.0.5, 10.20.0.6,
+			     10.20.0.7, 10.20.0.8,
+			     10.20.0.9, 10.20.1.10,
+			     10.20.1.11, 10.20.1.12,
+			     10.20.1.13, 10.20.1.14,
+			     10.20.1.15, 10.20.1.16,
+			     10.20.1.17, 10.20.1.18,
+			     10.20.1.19, 10.20.2.20,
+			     10.20.2.21, 10.20.2.22,
+			     10.20.2.23, 10.20.2.24,
+			     10.20.2.25, 10.20.2.26,
+			     10.20.2.27, 10.20.2.28,
+			     10.20.2.29, 10.20.3.30,
+			     10.20.3.31, 10.20.3.32,
+			     10.20.3.33, 10.20.3.34,
+			     10.20.3.35, 10.20.3.36,
+			     10.20.3.37, 10.20.3.38,
+			     10.20.3.39, 10.20.4.40,
+			     10.20.4.41, 10.20.4.42,
+			     10.20.4.43, 10.20.4.44,
+			     10.20.4.45, 10.20.4.46,
+			     10.20.4.47, 10.20.4.48,
+			     10.20.4.49, 10.20.5.50,
+			     10.20.5.51, 10.20.5.52,
+			     10.20.5.53, 10.20.5.54,
+			     10.20.5.55, 10.20.5.56,
+			     10.20.5.57, 10.20.5.58,
+			     10.20.5.59, 10.20.6.60 }
+	}
+
+	set cidrset { # handle 2
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8, 100.64.0.0/10,
+			     169.254.0.0/16, 172.16.0.0/12,
+			     192.0.2.0/24, 192.168.0.0/16,
+			     198.18.0.0/15, 198.51.100.0/24,
+			     203.0.113.0/24 }
+	}
+
+	set timedset { # handle 3
+		type ipv4_addr
+		size 1024
+		counter
+		timeout 1h
+		comment "lab timed set"
+		elements = { 192.0.2.50 counter packets 0 bytes 0 timeout 30m expires 29m34s900ms,
+			     192.0.2.51 counter packets 0 bytes 0 expires 59m34s900ms }
+	}
+
+	set concatset { # handle 4
+		type ipv4_addr . inet_service
+		flags interval
+		elements = { 192.0.2.0/24 . 80-90,
+			     198.51.100.1 . 443 }
+	}
+
+	set dynset { # handle 5
+		type ipv4_addr
+		size 4096
+		flags dynamic,timeout
+		timeout 1m
+	}
+
+	set macset { # handle 6
+		type ether_addr
+		elements = { 00:00:5e:00:53:01,
+			     00:00:5e:00:53:02 }
+	}
+
+	map lab_vmap { # handle 13
+		type ipv4_addr : verdict
+		elements = { 192.0.2.1 : accept,
+			     192.0.2.2 : drop,
+			     192.0.2.3 : jump lab_sub }
+	}
+
+	map lab_dmap { # handle 14
+		type inet_service : ipv4_addr
+		elements = { 8080 : 192.0.2.20,
+			     8443 : 192.0.2.21 }
+	}
+
+	chain lab_sub { # handle 7
+		counter packets 2 bytes 144 # handle 45
+		return # handle 46
+	}
+
+	chain lab_in { # handle 8
+		comment "lab input chain"
+		type filter hook input priority filter + 5; policy accept;
+		ct state established,related accept # handle 22
+		ct state invalid counter packets 0 bytes 0 drop # handle 23
+		meta l4proto tcp iifname "lo" accept # handle 24
+		iifname "eth*" tcp dport { 22, 80, 443 } counter packets 4 bytes 256 accept # handle 26
+		ip saddr @bigset counter packets 0 bytes 0 drop # handle 27
+		ip saddr @cidrset jump lab_sub # handle 28
+		ip saddr . tcp dport @concatset counter packets 0 bytes 0 accept # handle 29
+		tcp dport 9998 log prefix "x" counter packets 0 bytes 0 # handle 30
+		tcp dport 9997 log prefix "lab: " level info flags all # handle 31
+		ip saddr vmap @lab_vmap # handle 32
+		tcp dport 9999 counter name "lab_ctr" # handle 35
+		tcp dport 9996 quota name "lab_quota" accept # handle 36
+		tcp dport 9995 limit name "lab_lim" accept # handle 37
+		ip protocol vmap { icmp : accept, tcp : jump lab_sub, udp : goto lab_sub } # handle 39
+		tcp dport 8888 accept comment "has # handle 99 and { brace" # handle 40
+		meta mark set 0x00000010 ct mark set meta mark # handle 41
+		ip saddr 192.0.2.77 add @dynset { ip saddr timeout 30s limit rate over 10/second burst 5 packets } counter packets 0 bytes 0 drop # handle 42
+		tcp dport { 1001, 1008, 1015, 1022, 1029, 1036, 1043, 1050, 1057, 1064, 1071, 1078, 1085, 1092, 1099, 1106, 1113, 1120, 1127, 1134, 1141, 1148, 1155, 1162, 1169, 1176, 1183, 1190, 1197, 1204, 1211, 1218, 1225, 1232, 1239, 1246, 1253, 1260, 1267, 1274, 1281, 1288, 1295, 1302, 1309, 1316, 1323, 1330, 1337, 1344, 1351, 1358, 1365, 1372, 1379, 1386, 1393, 1400, 1407, 1414, 1421, 1428, 1435, 1442, 1449, 1456, 1463, 1470, 1477, 1484, 1491, 1498, 1505, 1512, 1519, 1526, 1533, 1540, 1547, 1554, 1561, 1568, 1575, 1582, 1589, 1596, 1603, 1610, 1617, 1624 } counter packets 0 bytes 0 accept # handle 44
+		tcp dport 5555 jump {
+			counter packets 0 bytes 0 accept
+		} # handle 59
+		ip saddr 192.0.2.78 tcp dport 5556 goto {
+			counter packets 0 bytes 0 drop
+		} # handle 62
+		tcp dport 5557 jump {
+			ct state established accept
+			tcp dport 5558 counter packets 0 bytes 0 drop
+		} # handle 66
+	}
+
+	chain lab_out { # handle 9
+		type filter hook output priority filter - 5; policy accept;
+		oif "lo" accept # handle 52
+		ct state established,related accept # handle 53
+		tcp dport 8099 reject with tcp reset # handle 55
+		ip daddr 192.0.2.250 reject with icmp host-unreachable # handle 56
+	}
+
+	chain lab_nat { # handle 10
+		type nat hook prerouting priority dstnat; policy accept;
+		tcp dport 8080 dnat to 192.0.2.20:80 # handle 47
+		tcp dport 8443 redirect to :443 # handle 48
+	}
+
+	chain lab_post { # handle 11
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "eth0" masquerade # handle 49
+		ip saddr 192.0.2.0/24 snat to 203.0.113.1 # handle 50
+	}
+
+	chain lab_fwd { # handle 12
+		type filter hook forward priority filter; policy accept;
+		iifname "lo" oifname "lo" accept # handle 51
+	}
+}
+table ip6 labrich6 { # handle 19
+	chain in6 { # handle 1
+		type filter hook input priority filter; policy accept;
+		ip6 saddr fe80::/10 icmpv6 type { nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept # handle 3
+		tcp dport 7770 counter packets 0 bytes 0 drop # handle 4
+	}
+}
+table inet labinet { # handle 20
+	comment "lab inet table"
+	flowtable ft { # handle 4
+		hook ingress priority filter
+		devices = { "lo" }
+	}
+
+	chain c { # handle 1
+		type filter hook input priority filter; policy accept;
+		meta nfproto ipv4 tcp dport 7771 counter packets 0 bytes 0 # handle 2
+	}
+}
+table ip labdorm { # handle 21
+	flags dormant
+
+	chain c { # handle 1
+		type filter hook input priority filter; policy accept;
+		counter packets 0 bytes 0 accept # handle 2
+	}
+}
+table bridge labbr { # handle 22
+	chain c { # handle 1
+		type filter hook prerouting priority dstnat; policy accept;
+		ether type ip counter packets 0 bytes 0 # handle 2
+	}
+}
+table arp labarp { # handle 23
+	chain c { # handle 1
+		type filter hook input priority filter; policy accept;
+		arp operation request counter packets 0 bytes 0 accept # handle 2
+	}
+}
+table netdev labnd { # handle 24
+	chain c { # handle 1
+		type filter hook ingress device "lo" priority filter; policy accept;
+		ip saddr 192.0.2.250 counter packets 0 bytes 0 drop # handle 2
+	}
+}
+table ip nat { # handle 25
+	chain POSTROUTING { # handle 1
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 192.0.2.0/24 counter packets 0 bytes 0 masquerade # handle 2
+	}
+}
+table ip6 filter { # handle 26
+	chain INPUT { # handle 1
+		type filter hook input priority filter; policy accept;
+		tcp dport 7777 counter packets 0 bytes 0 accept # handle 2
+	}
+}
+table ip mangle { # handle 27
+	chain PREROUTING { # handle 1
+		type filter hook prerouting priority mangle; policy accept;
+		ip saddr 192.0.2.11 counter packets 0 bytes 0 meta mark set 0x7 # handle 2
+	}
+}
+table ip raw { # handle 28
+	chain PREROUTING { # handle 1
+		type filter hook prerouting priority raw; policy accept;
+		ip saddr 192.0.2.12 counter packets 0 bytes 0 notrack # handle 2
+	}
+}
+== iptables -S
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+-N LAB_CHAIN
+-A INPUT -p tcp -m tcp --dport 9999 -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 7777 -j ACCEPT
+-A INPUT -s 192.0.2.4/32 -m comment --comment "lab # handle 5 { x }" -j ACCEPT
+-A INPUT -s 192.0.2.5/32 -j LAB_CHAIN
+-A INPUT -s 192.0.2.6/32 -m recent --set --name lab --mask 255.255.255.255 --rsource
+-A INPUT -s 192.0.2.7/32 -m string --string "abc" --algo bm -j DROP
+-A INPUT -s 192.0.2.9/32 -m limit --limit 5/min -j LOG --log-prefix "lab "
+-A INPUT -s 192.0.2.8/32 -p tcp -m multiport --dports 5000,5001,5002 -j ACCEPT
+-A INPUT -s 192.0.2.10/32 -p tcp -m tcp --dport 7778 -j REJECT --reject-with tcp-reset
+-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A LAB_CHAIN -j RETURN
+== ip6tables -S
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+-A INPUT -p tcp -m tcp --dport 7777 -j ACCEPT
+== end
+)FWREAL";
+
 constexpr std::string_view kIptClean = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n";
 constexpr std::string_view kIptV6Rules =
     "-P INPUT DROP\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT\n";
@@ -1999,23 +2817,19 @@ constexpr std::string_view kFailed = "-P INPUT ACC\n\n[failed]\n"; // partial ou
 
 using Rows = std::vector<std::string>;
 
-Rows state_rows(std::string_view nft, std::string_view ipt, std::string_view ip6t, bool tables_seen = false) {
-    const auto parsed = parse_fw_snapshot(snap(nft, ipt, ip6t));
-    REQUIRE(parsed.has_value());
-    return linux_snapshot_answer(*parsed, tables_seen, FwReadAction::state).rows;
-}
-
-Rows rules_rows(std::string_view nft, std::string_view ipt, std::string_view ip6t, bool tables_seen = false) {
-    const auto parsed = parse_fw_snapshot(snap(nft, ipt, ip6t));
-    REQUIRE(parsed.has_value());
-    return linux_snapshot_answer(*parsed, tables_seen, FwReadAction::rules).rows;
-}
-
 LinuxSnapshotAnswer snapshot_answer(std::string_view nft, std::string_view ipt, std::string_view ip6t,
                                     bool tables_seen, FwReadAction action) {
     const auto parsed = parse_fw_snapshot(snap(nft, ipt, ip6t));
     REQUIRE(parsed.has_value());
     return linux_snapshot_answer(*parsed, tables_seen, action);
+}
+
+Rows state_rows(std::string_view nft, std::string_view ipt, std::string_view ip6t, bool tables_seen = false) {
+    return snapshot_answer(nft, ipt, ip6t, tables_seen, FwReadAction::state).rows;
+}
+
+Rows rules_rows(std::string_view nft, std::string_view ipt, std::string_view ip6t, bool tables_seen = false) {
+    return snapshot_answer(nft, ipt, ip6t, tables_seen, FwReadAction::rules).rows;
 }
 
 } // namespace
@@ -2126,7 +2940,8 @@ TEST_CASE("parse_nft_ruleset_text: sets, maps, a flowtable and a multi-line rule
         CHECK(rule.chain == "input");
 }
 
-TEST_CASE("parse_nft_ruleset_text: empty text is no tables, and a listing it cannot read is nullopt", "[firewall]") {
+TEST_CASE("parse_nft_ruleset_text: empty text is no chains and no rules, and a listing it cannot read is nullopt",
+          "[firewall]") {
     const auto none = parse_nft_ruleset_text("");
     REQUIRE(none.has_value());
     CHECK(none->chains.empty());
@@ -2237,8 +3052,9 @@ TEST_CASE("parse_nft_ruleset_text: the table-level lines nft prints (flags, comm
     CHECK(both->rules.empty());
     // any other table-level line fails closed: it could hide a rule
     for (const std::string_view bad :
-         {"\tflags", "\tflags a b", "\tflags dormant {", "\tflags owner # handle 7", "\tcomment hello",
-          "\tcomment \"a\" \"b\"", "\tcomment", "\tmystery;", "\tcounter packets 1 bytes 2 # handle 9"}) {
+         {"\tflags", "\tflags a b", "\tflags dormant {", "\tflags {a}", "\tflags owner # handle 7",
+          "\tcomment hello", "\tcomment \"a\" \"b\"", "\tcomment", "\tmystery;",
+          "\tcounter packets 1 bytes 2 # handle 9"}) {
         INFO(bad);
         CHECK_FALSE(parse_nft_ruleset_text(with(bad)));
     }
@@ -2279,9 +3095,10 @@ TEST_CASE("parse_nft_ruleset_text: objects, sets, maps and rules shaped as nft p
     CHECK(r->rules[1].handle == std::optional<std::uint64_t>{14});
     CHECK(r->rules[2].handle == std::optional<std::uint64_t>{15});
     CHECK(r->rules.size() == yuzu::test::fwrestore::count_nft_rules(kShapes));
-    // the printed shapes the parser has still not been shown on a real host: tunnel and the other
-    // objects above, wrapped set and map elements, a verdict map, the anonymous chain and the table
-    // flags of an older nft (all but `flags owner,persist` here are from the printer, not a capture)
+    // the printed shapes here that no real host has shown the parser: the `tunnel` object with its nested
+    // `erspan {` block, the `secmark` object header (accepted by the allow-list, in no capture and in no case
+    // here) and set or map elements that open `elements = {` with nothing after the brace (the real Rocky 9.9
+    // ruleset wraps them after the first element). Every other shape above is in the real rich reply below.
 }
 
 TEST_CASE("the real reply of a firewalld host reads active, with the independent rule count and the "
@@ -2320,6 +3137,28 @@ TEST_CASE("the real reply of a firewalld host reads active, with the independent
     CHECK(rules.rows.back() == "ruleset|103");
     // a table the netlink leg saw changes nothing about an active answer
     CHECK(linux_snapshot_answer(*snapshot, true, FwReadAction::state).rows == state.rows);
+}
+
+TEST_CASE("the real rich ruleset of a firewalld host reads active, with every rule counted",
+          "[firewall]") {
+    const auto snapshot = parse_fw_snapshot(kRichRealReply);
+    REQUIRE(snapshot.has_value()); // the framing is good
+    REQUIRE(snapshot->nft.kind == FwSectionKind::text);
+    const auto listing = parse_nft_ruleset_text(snapshot->nft.text); // the whole listing, no line unrecognised
+    REQUIRE(listing.has_value());
+    const auto handles = yuzu::test::fwrestore::count_nft_rules(snapshot->nft.text); // an independent counter
+    CHECK(handles == 215);
+    CHECK(listing->rules.size() == handles);
+
+    const auto state = linux_snapshot_answer(*snapshot, false, FwReadAction::state);
+    CHECK(state.state == NftVerdict::active);
+    CHECK(state.rows == Rows{"backend|nftables", "state|active", "ruleset|215"});
+
+    const auto rules = linux_snapshot_answer(*snapshot, false, FwReadAction::rules);
+    CHECK(rules.state == NftVerdict::active);
+    CHECK(std::count_if(rules.rows.begin(), rules.rows.end(),
+                        [](const std::string& row) { return row.find("|handle|") != std::string::npos; }) == 215);
+    CHECK(rules.rows.back() == "ruleset|215");
 }
 
 TEST_CASE("the text parser and the netlink formatters name families, hooks and policies alike", "[firewall]") {

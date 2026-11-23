@@ -76,8 +76,17 @@ breaks any of them is outside this ADR and needs its own threat model.
    `NoNewPrivileges`: measured on Rocky 9.9 with SELinux enforcing, under it every exec of the
    three tools was a denied `nnp_transition` (three audit denials per read) and the tools ran in
    the script's domain instead of their own, so the unit is bounded by root with two capabilities
-   (an exec yields no more than the bounding set) and by the filters, which systemd applies to every
-   process the script starts. `NoNewPrivileges` and the one-capability bounding
+   (an exec yields no more capabilities than the bounding set) and by the filters, which systemd
+   applies to every process the script starts. One thing does change without the flag: an exec of a
+   setuid or setgid program that belongs to another user or group changes the process to that
+   identity; that adds no capability beyond the two in the bounding set, the filters still apply, and
+   the script runs only its three fixed tools with no input. Measured on the Rocky 9.9 host
+   (aarch64, systemd 252, SELinux enforcing, 2026-11-23) with the service as shipped: no denial in
+   the audit log over 30 broker reads under the policy's default audit configuration; with the
+   policy's `dontaudit` rules switched off for the experiment (`semodule -DB`, still enforcing),
+   `nft`, now running in `iptables_t`, was denied about 127 `search` accesses per read on other
+   processes' `/proc/<pid>` directories and the listing was unchanged (30 of 30 reads complete,
+   count 103). `NoNewPrivileges` and the one-capability bounding
    set on the agent unit are untouched: the helper returns data, it is never a way for the agent to
    gain a privilege. The IP egress filter in the helper's unit is defence in depth and takes effect
    only on hosts with the unified cgroup hierarchy; the family list is what bounds its sockets.
@@ -92,8 +101,7 @@ breaks any of them is outside this ADR and needs its own threat model.
    what ADR-3002 asks of an ownership-transferring launch (the exec-success acknowledgement); a
    reply without it is incomplete.
 10. **A mutating helper is out of scope.** A helper that changes host state (a containment,
-    for example) needs its own threat model and its own ADR; the roadmap tracks it separately
-    (FW6.1).
+    for example) needs its own threat model and its own ADR.
 
 ## What this discharges
 

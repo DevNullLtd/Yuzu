@@ -436,6 +436,14 @@ constexpr fr::Os kThisOs = fr::Os::lin;
         if (broker_socket_present())
             if (auto text = broker_snapshot_text())
                 return *std::move(text);
+        // This is the harness's own baseline read, not a plugin answer: say what it tried, so the
+        // failing REQUIRE or CHECK that follows is not read as a plugin failure.
+        UNSCOPED_INFO("the harness's own firewall snapshot found no transport that worked: the installer helper "
+                      "through sudo "
+                      << (res.tool_ran ? "exited " + std::to_string(res.exit_code) + (res.timed_out ? " (timed out)" : "")
+                                       : std::string{"did not run"})
+                      << "; the broker socket " << yuzu::firewall::kFwSnapshotSocketPath << " is "
+                      << (broker_socket_present() ? "present and not readable" : "absent"));
         return failed_snapshot();
     }
     // Root: the same three tools with the helper's labels and arguments. A tool that is not

@@ -127,17 +127,23 @@ socket unit for that, and the agent unit pulls it in (`Wants=yuzu-fw-snapshot.so
   families, a read-only file system). It does not set `NoNewPrivileges`: with SELinux enforcing
   (measured on Rocky 9.9) that made every exec of the three tools a denied `nnp_transition`, three
   audit denials per read, and left the tools outside their own confined domain; the bounding set and
-  the filters, which systemd applies to every process the script starts, are what bound it. The agent
-  unit keeps `NoNewPrivileges=true`. Its IP egress filter takes effect only on hosts with the
-  unified cgroup hierarchy; the address-family list is what bounds its sockets.
+  the filters, which systemd applies to every process the script starts, are what bound it. One
+  thing changes without the flag: an exec of a setuid or setgid program that belongs to another user
+  or group changes the process to that identity. That adds no capability beyond the two in the
+  bounding set, the filters still apply, and the script runs only its three fixed tools with no
+  input. The service unit's IP egress filter takes effect only on hosts with the unified cgroup
+  hierarchy; its address-family list is what bounds its sockets. The agent unit keeps
+  `NoNewPrivileges=true`.
 - To opt out, run `systemctl stop yuzu-fw-snapshot.socket` and then `systemctl mask
   yuzu-fw-snapshot.socket`. The order matters: on Rocky 9.9 (systemd 252) `systemctl mask --now`
   alone left the socket file, and the agent then reported `error|snapshot:connect:refused`; stop
   first and then mask, or remove `/run/yuzu-fw-snapshot.sock`. The firewall plugin then answers as it
   did before there was a broker: on a firewalld host firewalld's own rows (`backend|firewalld`,
   `state|running`, `ruleset|unknown`), elsewhere `state|unknown` and `ruleset|unknown`, in both cases
-  after the error rows of the reads it was refused (`error|nftables:table:eperm` and, on a host
-  without firewalld, the later rungs' rows). It is not silent.
+  after the one error row of the refused netlink read (`error|nftables:table:eperm`). On a host
+  without firewalld the rows that follow are the answer of `iptables` itself (`backend|iptables`,
+  `state|unknown`, `ruleset|unknown`, or `backend|none` when neither `ufw` nor `iptables` ran); a
+  refused `ufw` writes no row. It is not silent.
 
 The design and its limits are in `docs/adr/3007-os-activated-read-helpers.md`.
 
