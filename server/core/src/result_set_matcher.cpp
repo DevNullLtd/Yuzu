@@ -315,6 +315,11 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
         return validate_quantified_matcher(m);
     if (m.contains("where"))
         return "matcher.where requires any, none, all or count_where";
+    if (kind == "any_response" || kind == "echo_rows_ge") {
+        for (const auto& [key, val] : m.items())
+            if (key != "kind" && !(kind == "echo_rows_ge" && key == "n"))
+                return "unexpected field for matcher.kind";
+    }
     if (kind == "any_response")
         return std::nullopt;
     // log_id_token is used here for its control-byte fold + length cap on caller input echoed
@@ -436,11 +441,12 @@ bool ParsedMatcher::constrained_answer_is_unresolved(int plugin_result_status) c
            flag_is_true(*matcher_, kPartialWhenConstrainedKey);
 }
 
-RowMatch ParsedMatcher::evaluate(int status, std::string_view output, int plugin_result_status) const {
+RowMatch ParsedMatcher::evaluate(int status, std::string_view output, int plugin_result_status,
+                                 AnswerSource source) const {
     if (status != kStatusSuccess)
         return RowMatch::False;
     if (quantified_)
-        return quantified_->evaluate(output, plugin_result_status == 0 || plugin_result_status == 1);
+        return quantified_->evaluate(output, plugin_result_status == 0 || plugin_result_status == 1, source);
     if (is_quantified_matcher(*matcher_))
         return RowMatch::MalformedValue;
     return legacy_matches(status, output) ? RowMatch::True : RowMatch::False;

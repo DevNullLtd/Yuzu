@@ -84,11 +84,15 @@ inline std::optional<ResultSetMembers> quantified_result_set_members(
     int status = rs_matcher::kStatusSuccess;
     int plugin_status = 0;
     bool exceeded = false;
+    // Source provenance comes from the server-authored pending row. Existing instruction
+    // definitions do not attest the completeness of arbitrary JSON or plain pipe outputs.
+    const auto source = pending.source_kind == "echo_query" ? rs_matcher::AnswerSource::EchoSql
+                                                            : rs_matcher::AnswerSource::UnframedInstruction;
     auto finish_agent = [&] {
         if (agent.empty())
             return;
         const auto verdict = exceeded ? rs_matcher::RowMatch::RowBound
-                                      : matcher.evaluate(status, output, plugin_status);
+                                      : matcher.evaluate(status, output, plugin_status, source);
         if (verdict == rs_matcher::RowMatch::True)
             members.push_back(agent);
         else if (verdict != rs_matcher::RowMatch::False || status != rs_matcher::kStatusSuccess)

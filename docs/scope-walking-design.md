@@ -309,7 +309,7 @@ bounds apply. `count_where` takes an additional comparison `op` (`eq`, `lt`, `le
 
 Missing or null fields produce `missing_value`; unusable values produce `malformed_value`.
 Frames are grouped by device in store insertion order across pages. A response above 2 MiB or marked as truncated by the server is undecidable. An evaluator reads at most 10,000 rows per answer. Echo stops at 10,000 without recording whether more rows existed, so reaching the boundary leaves its count open. An empty Echo cell can represent SQL NULL and is missing for quantified row tests. More rows than read give an open upper
-bound (`row_bound`). A plain pipe answer has no terminal row count and cannot prove absence. Any declared plugin result other than OK likewise leaves the upper bound
+bound (`row_bound`). A legacy instruction result, including JSON, does not attest completeness. It can prove a witnessed match, but cannot prove absence or a count above one after possible retries. The Echo SQL producer requires its terminal row count before it trusts the answer. Any declared plugin result other than OK likewise leaves the upper bound
 open. A true disjunct or a false conjunct can decide a row that also has unknown fields.
 A count compares the range from known matches to known matches plus unknown rows; an open
 upper end represents additional possible matches. Only a comparison true for the entire

@@ -228,13 +228,15 @@ RowMatch QuantifiedMatcher::Predicate::evaluate(const Json& row) const {
 QuantifiedMatcher::QuantifiedMatcher(const Json& matcher)
     : matcher_(matcher), where_(matcher.at("where")) {}
 
-RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete) const {
+RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete, AnswerSource source) const {
     Counts counts;
-    RowMatch open_end = complete ? RowMatch::False : RowMatch::CoverageUnproven;
+    RowMatch open_end = complete && source != AnswerSource::UnframedInstruction ? RowMatch::False : RowMatch::CoverageUnproven;
     if (output.starts_with("error|"))
         return RowMatch::MalformedValue;
     const auto first = output.find_first_not_of(" \r\t\n");
     if (first != output.npos && (output[first] == '[' || output[first] == '{')) {
+        if (source == AnswerSource::EchoSql)
+            return RowMatch::MalformedValue;
         const auto doc = Json::parse(output, nullptr, false);
         const auto* rows = &doc;
         if (doc.is_object() && doc.contains("rows"))
@@ -267,6 +269,8 @@ RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete) con
             if (total_rows)
                 return RowMatch::MalformedValue;
             if (line.starts_with("__schema__|")) {
+                if (source == AnswerSource::UnframedInstruction)
+                    return RowMatch::CoverageUnproven;
                 if (echo || counts.size())
                     return RowMatch::MalformedValue;
                 echo = true;
@@ -317,8 +321,10 @@ RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete) con
             open_end = RowMatch::CoverageUnproven;
         if (echo && counts.size() >= kQuantifiedRowLimit)
             open_end = RowMatch::RowBound;
-        if (echo && !total_rows && open_end != RowMatch::RowBound)
-            open_end = RowMatch::CoverageUnproven;
+        if (echo && !total_rows)
+            return RowMatch::CoverageUnproven;
+        if (source == AnswerSource::EchoSql && !echo)
+            return RowMatch::CoverageUnproven;
     }
     const auto& kind = matcher_.at("kind").get_ref<const std::string&>();
     if (kind == "count_where") {
@@ -328,8 +334,12 @@ RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete) con
             compare_range(op, n, counts.yes, counts.yes + counts.undecided, counts.cause);
         if (!unknown(open_end))
             return limited;
+        // A legacy unframed instruction may repeat its response after a reconnect.
+        // A witnessed match proves at least one occurrence, even if its frame repeats.
+        const auto lower = source == AnswerSource::UnframedInstruction
+                               ? std::min(counts.yes, std::size_t{1}) : counts.yes;
         const auto wide =
-            compare_range(op, n, counts.yes, std::numeric_limits<std::uint64_t>::max(), open_end);
+            compare_range(op, n, lower, std::numeric_limits<std::uint64_t>::max(), open_end);
         // The unbounded tail supplies the cause only when it changed a definite answer.
         return unknown(wide) && unknown(limited) ? limited : wide;
     }

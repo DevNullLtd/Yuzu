@@ -1463,3 +1463,18 @@ TEST_CASE("Quantified predicates reject malformed operators and enforce nested f
     for (int n=0;n<17;++n) nested=nlohmann::json{{"not",std::move(nested)}};
     CHECK(validate(nested).has_value());
 }
+
+TEST_CASE("Quantified result-set membership requires server-known source completeness",
+          "[result_set][matcher][quantified]") {
+    const auto none = ParsedMatcher(R"({"kind":"none","where":{"column":"n","op":"exists"}})");
+    CHECK(none.evaluate(kOk,"[]",0,AnswerSource::UnframedInstruction) == RowMatch::CoverageUnproven);
+    CHECK(none.evaluate(kOk,"__schema__|n\n__total__|0",0,AnswerSource::UnframedInstruction) ==
+          RowMatch::CoverageUnproven);
+    CHECK(none.evaluate(kOk,"__schema__|n\n__total__|0",0,AnswerSource::EchoSql) == RowMatch::True);
+    const auto any = ParsedMatcher(R"({"kind":"any","where":{"column":"n","op":"exists"}})");
+    CHECK(any.evaluate(kOk,"__schema__|n\nx",0,AnswerSource::EchoSql) == RowMatch::CoverageUnproven);
+    const auto count = ParsedMatcher(R"({"kind":"count_where","op":"ge","n":2,"where":{"column":"n","op":"exists"}})");
+    CHECK(count.evaluate(kOk,R"([{"n":"x"},{"n":"x"}])",0,AnswerSource::UnframedInstruction) ==
+          RowMatch::CoverageUnproven);
+    CHECK(validate_matcher(R"({"kind":"any_response","where":{"column":"name","op":"exists"}})"));
+}

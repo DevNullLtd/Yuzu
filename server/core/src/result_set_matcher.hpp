@@ -105,7 +105,8 @@ public:
     [[nodiscard]] bool response_matches(int status, std::string_view output) const;
     [[nodiscard]] bool quantified() const { return static_cast<bool>(quantified_); }
     [[nodiscard]] RowMatch evaluate(int status, std::string_view output,
-                                    int plugin_result_status = 0) const;
+                                    int plugin_result_status = 0,
+                                    AnswerSource source = AnswerSource::CompleteInput) const;
     [[nodiscard]] bool answer_lacks_matcher_column(std::string_view output) const;
     [[nodiscard]] bool constrained_answer_is_unresolved(int plugin_result_status) const;
 

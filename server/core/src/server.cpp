@@ -20354,6 +20354,8 @@ private:
                         // or Guardian reap — JC-6 decoupling).
                         if (rs_ok)
                         for (const auto& p : result_set_store_->list_pending()) {
+                            if (stop_requested_.load(std::memory_order_acquire))
+                                break;
                             if (p.source_execution_id.empty())
                                 continue;
                             bool terminal = false;

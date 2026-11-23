@@ -4952,6 +4952,7 @@ TEST_CASE("materialise: the members read pages past the store's default row limi
         put_exec_row(responses, exec, "alpha", 1, "alpha\n__total__|2", 100);
         PendingSet pending;
         pending.source_execution_id = exec;
+        pending.source_kind = "echo_query";
         const auto* plugins = &yuzu::server::test::forensics_plugin_set();
         for (const auto& kind : {std::string{"none"}, std::string{"any"}}) {
             pending.matcher = nlohmann::json{{"kind",kind},{"where",{{"column","name"},{"op","eq"},{"value","alpha"}}}}.dump();

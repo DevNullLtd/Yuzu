@@ -12,6 +12,7 @@
 namespace yuzu::server::rs_matcher {
 
 // Unknown carries a reason through every boolean operation. Only a final True selects a device.
+enum class AnswerSource { CompleteInput, EchoSql, UnframedInstruction };
 enum class RowMatch { False, True, MissingValue, MalformedValue, RowBound, CoverageUnproven };
 
 inline constexpr std::size_t kQuantifiedRowLimit = 10000;
@@ -22,7 +23,7 @@ class QuantifiedMatcher {
 public:
     // The caller owns matcher and keeps it immutable for this object's lifetime.
     explicit QuantifiedMatcher(const nlohmann::json& matcher);
-    RowMatch evaluate(std::string_view output, bool complete) const;
+    RowMatch evaluate(std::string_view output, bool complete, AnswerSource source) const;
 
 private:
     struct Predicate {

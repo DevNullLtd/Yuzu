@@ -1,1 +1,0 @@
-- Echo and instruction-result producers accept quantified row matchers through REST and MCP. Boolean row predicates retain unknown results for missing, malformed or bounded answers, and only a definite top-level match selects a device.
