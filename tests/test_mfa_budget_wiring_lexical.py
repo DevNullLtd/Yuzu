@@ -429,50 +429,6 @@ def check_arm_recheck(files):
     return bad
 
 
-REFUND_RESTORE_WHEN = ("WHEN mfa_last_attempt_at = (NULLIF($3::text, '')::timestamp "
-                       "AT TIME ZONE 'UTC')")
-REFUND_RESTORE_THEN = "THEN (NULLIF($4::text, '')::timestamp AT TIME ZONE 'UTC')"
-
-
-def check_mfa_refund_restore(files):
-    """C-02 (PR #8626 review): the refund puts back the reservation's mfa_last_attempt_at, and only
-    while it is still the one that reservation wrote. Pinned in three places: the reserve
-    statement returns the pre-image and its own stamp, the refund statement restores
-    conditionally, and every route refund passes its own reservation."""
-    bad = []
-    sqlh = _ws(files.get("auth_db_sql_helpers.hpp", ""))
-    for col in ("AS prev_attempt_at", "AS this_attempt_at",
-                "mfa_last_attempt_at AS prev_attempt_at"):
-        if col not in sqlh:
-            bad.append(f"kReserveMfaAttemptSql must return `{col}` (C-02)")
-    ref = sqlh.find("kRefundMfaAttemptSql =")
-    ref_sql = sqlh[ref:sqlh.find(";", ref)] if ref >= 0 else ""
-    if not ref_sql:
-        bad.append("kRefundMfaAttemptSql missing (C-02)")
-    else:
-        if _ws(REFUND_RESTORE_WHEN) not in ref_sql.replace('" "', " ").replace('""', ""):
-            bad.append("kRefundMfaAttemptSql must restore only while mfa_last_attempt_at is the "
-                       "reservation's own stamp ($3) (C-02)")
-        if _ws(REFUND_RESTORE_THEN) not in ref_sql.replace('" "', " ").replace('""', ""):
-            bad.append("kRefundMfaAttemptSql must restore the pre-image ($4) (C-02)")
-    db = files.get("auth_db.cpp", "")
-    fn = db.find("AuthDB::refund_mfa_attempt(")
-    body = db[fn:db.find("\n}\n", fn)] if fn >= 0 else ""
-    if "auth_sql::kRefundMfaAttemptSql" not in body:
-        bad.append("AuthDB::refund_mfa_attempt must run kRefundMfaAttemptSql (C-02)")
-    if not re.search(r"username,\s*reservation\.this_attempt_at,\s*reservation\.prev_attempt_at\}", body):
-        bad.append("AuthDB::refund_mfa_attempt must bind (threshold, username, this_attempt_at, "
-                   "prev_attempt_at) in that order (C-02)")
-    rt = files.get("auth_routes.cpp", "")
-    calls = re.findall(r"mfa_budget_refund\(([^)]*)\)", rt)
-    use = [c for c in calls if not c.startswith("const std::string&")]
-    if len(use) != 4 or any(not c.endswith(", reservation") for c in use):
-        bad.append(f"every route refund must pass its own reservation (4 sites): {use} (C-02)")
-    if "r->prev_attempt_at, r->this_attempt_at}" not in rt:
-        bad.append("mfa_budget_reserve must carry the store's prev/this attempt stamps (C-02)")
-    return bad
-
-
 def check(files):
     bad = []
     sites = {}
@@ -488,7 +444,6 @@ def check(files):
         bad += check_gate_order(files["auth_routes.cpp"], files.get("auth_routes.hpp", ""),
                                 files.get("server.cpp", ""))
         bad += check_arm_recheck(files)
-        bad += check_mfa_refund_restore(files)
     else:
         bad.append("auth_routes.cpp missing")
     return bad
@@ -770,27 +725,6 @@ def selftest(files):
     m["rogue.cpp"] = "void f(){ db->mfa_verify_login_code(u, c); }"
     if not check(m):
         failures.append("MUTATION NOT DETECTED: rogue verifier caller")
-    # C-02: the refund's timestamp restore.
-    def sub_in(fname, a, b):
-        def f(m):
-            if a not in m.get(fname, ""):
-                return False
-            m[fname] = m[fname].replace(a, b, 1)
-            return True
-        return f
-    mut("C-02: the refund restores the timestamp unconditionally",
-        sub_in("auth_db_sql_helpers.hpp", "WHEN mfa_last_attempt_at = (NULLIF($3::text, '')", "WHEN TRUE OR (NULLIF($3::text, '')"))
-    mut("C-02: the refund never restores the pre-image",
-        sub_in("auth_db_sql_helpers.hpp", "THEN (NULLIF($4::text, '')::timestamp AT TIME ZONE 'UTC')", "THEN mfa_last_attempt_at"))
-    mut("C-02: the reserve statement drops the pre-image",
-        sub_in("auth_db_sql_helpers.hpp", "mfa_last_attempt_at AS prev_attempt_at", "NULL AS prev_attempt_at"))
-    mut("C-02: the refund binds the stamps in the wrong order",
-        sub_in("auth_db.cpp", "reservation.this_attempt_at,\n                                 reservation.prev_attempt_at}",
-               "reservation.prev_attempt_at,\n                                 reservation.this_attempt_at}"))
-    mut("C-02: a route refund does not pass its reservation",
-        sub_in("auth_routes.cpp", "mfa_budget_refund(session->username, reservation)",
-               "mfa_budget_refund(session->username, {})"))
-
     return failures
 
 

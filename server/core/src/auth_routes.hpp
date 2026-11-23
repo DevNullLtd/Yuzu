@@ -1534,8 +1534,6 @@ private:
     struct MfaReserved {
         MfaBudget budget{MfaBudget::kStoreUnavailable};
         bool just_locked{false}; // this reservation crossed the threshold
-        std::string prev_attempt_at; // the store's pre-image of mfa_last_attempt_at (C-02 refund)
-        std::string this_attempt_at; // the mfa_last_attempt_at this reservation wrote
     };
     static constexpr int kMfaBudgetDefaultThreshold = 5;
     static constexpr int kMfaBudgetDefaultWindowSecs = 300;
@@ -1545,8 +1543,8 @@ private:
     /// A wrong code consumed its reservation; audit once when it tripped the lock.
     void mfa_budget_note_failure(const httplib::Request& req, const std::string& username,
                                  const std::string& role_str, const MfaReserved& r);
-    /// Verified code / store outage: give the reservation back (count and timestamp, C-02).
-    void mfa_budget_refund(const std::string& username, const MfaReserved& r);
+    /// Verified code / store outage: give the reservation back.
+    void mfa_budget_refund(const std::string& username);
 };
 
 } // namespace yuzu::server

@@ -721,8 +721,6 @@ public:
         bool reserved{true};     // false: the account was already locked, nothing was spent
         bool locked{false};      // account is locked after this statement
         bool just_locked{false}; // this reservation crossed the threshold
-        std::string prev_attempt_at; // mfa_last_attempt_at before it (UTC text, '' for NULL)
-        std::string this_attempt_at; // the mfa_last_attempt_at it wrote (UTC text)
     };
 
     /// RESERVE one second-factor attempt BEFORE the code is verified (check and increment in ONE
@@ -733,11 +731,8 @@ public:
 
     /// Give back ONE reservation after a verified code (or a store outage that proved nothing).
     /// Decrement, never reset: failures consumed concurrently stay counted. A crash before the
-    /// refund errs toward counting. The reservation's `mfa_last_attempt_at` is put back to its
-    /// pre-image only while it is still the one this reservation wrote, so a success does not
-    /// move the failure window forward (C-02); after a later reservation it stays.
-    std::expected<void, AuthDBError> refund_mfa_attempt(const std::string& username, int threshold,
-                                                        const MfaReservation& reservation);
+    /// refund errs toward counting.
+    std::expected<void, AuthDBError> refund_mfa_attempt(const std::string& username, int threshold);
 
     /// Operator unlock: clear the password-lockout columns AND the MFA failure budget in ONE
     /// statement (no window where one is lifted and the other is not). Idempotent.

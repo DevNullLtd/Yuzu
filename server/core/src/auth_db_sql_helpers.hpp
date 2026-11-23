@@ -221,13 +221,10 @@ inline std::optional<std::int64_t> count_active_local_admin_accounts(PGconn* c, 
 /// several reservations share one transaction timestamp. A live lock changes nothing. Otherwise
 /// the count restarts at 1 when the last reservation is older than the window (exactly when a
 /// lock set by it has expired), else increments; the lock arms (DB `now()`) when the count
-/// reaches the threshold. No row (unknown/inactive user) returns zero rows. Columns 3 and 4 are
-/// the PRE-update `mfa_last_attempt_at` and the one this reservation wrote, as UTC text ('' for
-/// NULL), so a refund can put the timestamp back (C-02, PR #8626 review).
+/// reaches the threshold. No row (unknown/inactive user) returns zero rows.
 inline constexpr const char* kReserveMfaAttemptSql =
     "WITH pre AS (SELECT id, (mfa_locked_until IS NOT NULL AND mfa_locked_until > now()) "
-    "             AS was_locked, mfa_last_attempt_at AS prev_attempt_at "
-    "             FROM auth.users WHERE username = $3 AND is_active = TRUE "
+    "             AS was_locked FROM auth.users WHERE username = $3 AND is_active = TRUE "
     "             FOR UPDATE) "
     "UPDATE auth.users u SET "
     "mfa_failed_count = CASE WHEN pre.was_locked THEN u.mfa_failed_count "
@@ -242,25 +239,6 @@ inline constexpr const char* kReserveMfaAttemptSql =
     "    THEN now() + make_interval(secs => $2::int) ELSE NULL END "
     "FROM pre WHERE u.id = pre.id "
     "RETURNING u.mfa_failed_count, (NOT pre.was_locked) AS reserved, "
-    "(u.mfa_locked_until IS NOT NULL AND u.mfa_locked_until > now()) AS locked, "
-    "COALESCE((pre.prev_attempt_at AT TIME ZONE 'UTC')::text, '') AS prev_attempt_at, "
-    "COALESCE((u.mfa_last_attempt_at AT TIME ZONE 'UTC')::text, '') AS this_attempt_at";
-
-/// WP03 C-02 (PR #8626 review): the ONE statement behind `AuthDB::refund_mfa_attempt`. $1
-/// threshold, $2 username, $3 the `mfa_last_attempt_at` the reservation wrote, $4 the one it
-/// replaced (UTC text, '' for NULL). Gives back exactly ONE reservation (never a reset:
-/// concurrent failures stay counted), lifts the lock only if the count falls back under the
-/// threshold, and puts the timestamp back ONLY while it is still the one this reservation wrote
-/// (a later reservation's stamp is never undone). Without that, a successful login moved the
-/// failure window forward and kept an old failure counting past its window.
-inline constexpr const char* kRefundMfaAttemptSql =
-    "UPDATE auth.users SET mfa_failed_count = GREATEST(mfa_failed_count - 1, 0), "
-    "mfa_locked_until = CASE WHEN GREATEST(mfa_failed_count - 1, 0) < $1::int "
-    "    THEN NULL ELSE mfa_locked_until END, "
-    "mfa_last_attempt_at = CASE "
-    "    WHEN mfa_last_attempt_at = (NULLIF($3::text, '')::timestamp AT TIME ZONE 'UTC') "
-    "    THEN (NULLIF($4::text, '')::timestamp AT TIME ZONE 'UTC') "
-    "    ELSE mfa_last_attempt_at END "
-    "WHERE username = $2 AND is_active = TRUE";
+    "(u.mfa_locked_until IS NOT NULL AND u.mfa_locked_until > now()) AS locked";
 
 } // namespace yuzu::server::auth_sql

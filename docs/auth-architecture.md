@@ -1922,9 +1922,7 @@ account policy)"* — this ships **both** halves.
   count against the durable per-account MFA budget (`auth.users.mfa_failed_count` /
   `mfa_locked_until` / `mfa_last_attempt_at`; reserve-before-verify in ONE row-locked DB
   statement, so an attempt that cannot be counted is never verified and answers 503;
-  a verified code refunds only its own reservation: its count, and its `mfa_last_attempt_at`
-  while that is still the stamp the reservation wrote, so a success does not move the failure
-  window forward) for the break-glass account like
+  a verified code refunds only its own reservation) for the break-glass account like
   any other, because exempting it would leave the only protected factor of the
   highest-value account open to online guessing by anyone who knows the password.
   Accepted trade-off: an attacker who already knows the break-glass PASSWORD can keep
