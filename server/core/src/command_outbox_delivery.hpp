@@ -144,7 +144,9 @@ public:
     /// send time. Fail-closed: an unset callback denies every delivery.
     using ArmingCheckFn = std::function<bool(const std::string& principal,
                                              const std::string& plugin,
-                                             const std::string& action)>;
+                                             const std::string& action,
+                                             const std::unordered_map<std::string, std::string>&
+                                                 parameters)>;
 
     /// #3678 (R4): the dispatch counters (`dispatch_position.hpp`), `nullopt` when they cannot be
     /// read. server.cpp binds this to `ExecutionTracker::current_dispatch_position`.

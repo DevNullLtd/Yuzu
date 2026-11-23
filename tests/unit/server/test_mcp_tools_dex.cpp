@@ -1,7 +1,8 @@
 /// @file test_mcp_tools_dex.cpp
 /// The DEX score policy MCP twins (mcp_tools_dex.cpp, #6087): `get_dex_score_policy`,
 /// `set_dex_score_policy` and `reset_dex_score_policy`, plus the pure helpers in
-/// dex_score_policy_mcp.hpp.
+/// dex_score_policy_mcp.hpp, and the fleet application usage tool `get_dex_apps_usage` (its
+/// gates, the audit-before-read order, the refusal mapping and the unwired closures).
 ///
 /// The fixture (`Twin`) drives a real `McpServer` through its in-process handler with a
 /// `ToolDeps` whose read and apply closures forward to an in-memory fake store through the REAL
@@ -17,6 +18,7 @@
 
 #include "dex_score_policy_mcp.hpp"
 #include "dex_score_policy_writer.hpp"
+#include "dex_usage_json.hpp"
 #include "mcp_jsonrpc.hpp"
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp"
@@ -42,6 +44,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -109,12 +112,35 @@ struct Twin {
     // The per-row resolvers the write tools must NOT use for domain rows: ToolDeps::audit_fn and
     // ToolDeps::username_fn. Both are wired as traps (a row written through audit_fn lands here;
     // username_fn names someone else).
+    //
+    // For get_dex_apps_usage, td.audit_fn IS the domain sink: the same sink records the target
+    // and the detail, and can be told to drop or throw. The knobs default off, so the trap
+    // assertions of the score-policy tests keep their meaning.
     std::vector<std::string> legacy_rows;
+    std::vector<std::string> legacy_targets; // parallel: type|id
+    std::vector<std::string> legacy_details; // parallel
+    bool legacy_audit_fails = false;
+    bool legacy_audit_throws = false;
     bool generic_audit_ok = true;
     std::vector<std::string> generic_rows;   // action|result
     std::string username = "tester";
     std::string tier = "supervised";
     std::string scope_service;
+    // ── the fleet usage seams (get_dex_apps_usage) ──
+    std::vector<std::string> fleet_calls; // "<securable>:<operation>", in call order
+    bool fleet_admit = true;              // false: the gate writes a 403 and refuses
+    authz::VisibleSet fleet_scope;        // handed to the read; default nullopt = unfiltered
+    struct UsageCall {
+        std::string window;
+        std::string platform;
+        DexUsageSlice slice;
+        std::int64_t floor = 0;
+        authz::VisibleSet visible;
+    };
+    std::vector<UsageCall> usage_calls;
+    std::expected<DexAppsUsageModel, DexUsageRefusal> usage_result{DexAppsUsageModel{}};
+    // Every seam appends here, so a test asserts the ORDER of gates, rows and the read.
+    std::vector<std::string> events;
     bool read_only_mode_ = false; // build_handler keeps ADDRESSES of these two
     bool mcp_disabled_ = false;
 
@@ -126,6 +152,9 @@ struct Twin {
         bool wire_apply = true;
         bool wire_audit = true;   // the session-bound audit writer (audit_as_session_fn)
         bool wire_session = true; // the session resolver (session_fn)
+        bool wire_fleet_read = true;   // the Forensics fleet gate (fleet_read_fn)
+        bool wire_legacy_audit = true; // the domain audit sink (audit_fn)
+        bool wire_usage = true;        // the usage read closure (dex_apps_usage_fn)
         yuzu::server::ApprovalManager* approval = nullptr;
     };
 
@@ -221,14 +250,46 @@ struct Twin {
                 }
                 return s;
             };
-        // Traps: the per-row re-resolving sink and username resolver the write tools used to
-        // call. Neither may be reached by a domain row.
-        td.audit_fn = [this](const httplib::Request&, const std::string& action,
-                             const std::string& result, const std::string&, const std::string&,
-                             const std::string&) -> bool {
-            legacy_rows.push_back(action + "|" + result);
-            return true;
-        };
+        // Traps for the score-policy write tools: the per-row re-resolving sink and username
+        // resolver they used to call; neither may be reached by one of their domain rows. The
+        // sink is the domain sink for get_dex_apps_usage.
+        if (o.wire_legacy_audit)
+            td.audit_fn = [this](const httplib::Request&, const std::string& action,
+                                 const std::string& result, const std::string& target_type,
+                                 const std::string& target_id, const std::string& detail) -> bool {
+                legacy_rows.push_back(action + "|" + result);
+                legacy_targets.push_back(target_type + "|" + target_id);
+                legacy_details.push_back(detail);
+                events.push_back("audit:" + action + "|" + result);
+                if (legacy_audit_throws)
+                    throw std::runtime_error("audit sink blew up");
+                return !legacy_audit_fails;
+            };
+        if (o.wire_fleet_read)
+            td.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
+                                      const std::string& securable,
+                                      const std::string& operation) -> authz::FleetReadGate {
+                fleet_calls.push_back(securable + ":" + operation);
+                events.push_back("fleet:" + securable + ":" + operation);
+                authz::FleetReadGate g;
+                if (!fleet_admit) {
+                    res.status = 403;
+                    res.set_content(R"({"error":"forbidden"})", "application/json");
+                    return g; // admitted=false: the response is already written
+                }
+                g.admitted = true;
+                g.scope = fleet_scope;
+                return g;
+            };
+        if (o.wire_usage)
+            td.dex_apps_usage_fn = [this](const std::string& window, const std::string& platform,
+                                          const DexUsageSlice& slice, std::int64_t floor,
+                                          const authz::VisibleSet& visible)
+                -> std::expected<DexAppsUsageModel, DexUsageRefusal> {
+                usage_calls.push_back({window, platform, slice, floor, visible});
+                events.push_back("read");
+                return usage_result;
+            };
         td.username_fn = [](const httplib::Request&) -> std::optional<std::string> {
             return std::string("intruder");
         };
@@ -257,6 +318,7 @@ struct Twin {
                               const std::string& securable, const std::string& operation) {
             const std::string key = securable + ":" + operation;
             perm_calls.push_back(key);
+            events.push_back("perm:" + key);
             if (!perm_deny.empty() && key == perm_deny) {
                 res.status = 403;
                 res.set_content(R"({"error":"forbidden"})", "application/json");
@@ -319,6 +381,11 @@ struct Twin {
         domain_roles.clear();
         generic_rows.clear();
         legacy_rows.clear();
+        legacy_targets.clear();
+        legacy_details.clear();
+        fleet_calls.clear();
+        usage_calls.clear();
+        events.clear();
     }
 
     /// Every domain row was stamped from the one session this write resolved, with the
@@ -1679,5 +1746,375 @@ TEST_CASE("reset_dex_score_policy: an unwired apply closure, session-bound audit
         CHECK(audit_count(t.generic_rows, "mcp.reset_dex_score_policy|failure") == 1);
         CHECK(t.car_calls == 0);
         CHECK(t.stored.has_value());
+    }
+}
+
+// ───────────────────────── get_dex_apps_usage ───────────────────────────────────
+// The handler's gates, the audit-before-read order, the refusal mapping and the unwired
+// closures, over the same Twin fixture. The pure argument parser and refusal table are in
+// test_dex_usage_model.cpp. The Forensics:Read gate is a fake here: these cases prove the
+// handler asks for it and honours its answer, not the tier ladder inside require_fleet_read.
+
+namespace {
+
+const std::string kUsageRow = "dex.apps.usage.view|success";
+const std::string kUsageGeneric = "mcp.get_dex_apps_usage|";
+
+/// A model that exercises every serialised shape: a rated row, a withheld row and an ambiguous one.
+DexAppsUsageModel usage_model() {
+    DexAppsUsageModel m;
+    m.window = "7d";
+    m.platform_scope = "all";
+    m.slice.kind = DexUsageSliceKind::Fleet;
+    m.population = 5;
+    m.reporting_devices = 3;
+    m.stale_devices = 1;
+    m.floor = 1;
+    m.as_of_epoch = 1'700'000'000;
+
+    DexAppUsage rated;
+    rated.subject = "chrome.exe";
+    rated.state = DexUsageState::Matched;
+    rated.devices = 3;
+    rated.totals = DexUsageTotals{7200, 14};
+    DexUsageCell cell;
+    cell.label = "fleet";
+    cell.devices = 3;
+    cell.totals = DexUsageTotals{7200, 14};
+    cell.small_cohort = true;
+    rated.cells.push_back(cell);
+    DexExposureRate rate;
+    rate.per_hour = DexInterval{0.5, 0.1, 0.9, true};
+    rate.hours = 2.0;
+    rate.crashes = 1;
+    rate.hangs = 0;
+    rated.rate = rate;
+    m.apps.push_back(rated);
+
+    DexAppUsage withheld;
+    withheld.subject = "rare.exe";
+    withheld.state = DexUsageState::Matched;
+    withheld.devices = 1;
+    withheld.rate_withheld = "below_floor";
+    m.apps.push_back(withheld);
+
+    DexAppUsage ambiguous;
+    ambiguous.subject = "shared";
+    ambiguous.state = DexUsageState::AmbiguousName;
+    ambiguous.rate_withheld = "ambiguous_name";
+    m.apps.push_back(ambiguous);
+    return m;
+}
+
+} // namespace
+
+TEST_CASE("get_dex_apps_usage: served with typed schemas and a description naming both permissions",
+          "[mcp][dex][usage][registry_seam]") {
+    Twin t;
+    // The declared pair is the REST route's first gate (Forensics:Read is the handler's second) and a
+    // service-scoped token is refused outright: nothing else pins this tool's service-scope class.
+    const auto sec = mcp::tool_security_rows_for_test();
+    const auto sec_it = std::find_if(sec.begin(), sec.end(),
+                                     [](const auto& s) { return s.name == "get_dex_apps_usage"; });
+    REQUIRE(sec_it != sec.end());
+    CHECK(sec_it->securable == "GuaranteedState");
+    CHECK(sec_it->operation == "Read");
+    CHECK(sec_it->service_scope == mcp::ServiceScopeClassForTest::kDenied);
+
+    auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const json listed = json::parse(res->body);
+    const json* tool = nullptr;
+    for (const auto& e : listed["result"]["tools"])
+        if (e["name"] == "get_dex_apps_usage")
+            tool = &e;
+    REQUIRE(tool != nullptr);
+    const json& out = (*tool)["outputSchema"];
+    CHECK(out["properties"].contains("apps"));
+    CHECK(out["properties"].contains("population"));
+    CHECK(out["properties"].contains("audit_persisted"));
+    const json& in = (*tool)["inputSchema"];
+    CHECK(in["additionalProperties"] == false);
+    for (const char* p : {"window", "platform", "slice", "group", "tag_key", "floor"})
+        CHECK(in["properties"].contains(p));
+    const std::string desc = (*tool).value("description", "");
+    CHECK(desc.find("Forensics:Read") != std::string::npos);
+    CHECK(desc.find("dex.apps.usage.view") != std::string::npos);
+}
+
+TEST_CASE("get_dex_apps_usage: success serves the REST body, writes the domain row before the read "
+          "and the generic row after",
+          "[mcp][dex][usage]") {
+    Twin t;
+    t.usage_result = usage_model();
+    const json r = t.call("get_dex_apps_usage");
+    REQUIRE_FALSE(r.contains("error"));
+    const json& sc = r["result"]["structuredContent"];
+    CHECK(sc == json::parse(dex_apps_usage_json(usage_model())));
+    CHECK(schema_violation(t.output_schema("get_dex_apps_usage"), sc) == "");
+    CHECK_FALSE(sc.contains("audit_persisted"));
+
+    REQUIRE(t.legacy_rows.size() == 1);
+    CHECK(t.legacy_rows[0] == kUsageRow);
+    CHECK(t.legacy_targets[0] == "Forensics|");
+    for (const char* key : {"window=7d", "platform=all", "slice=fleet", "key=", "floor=1"})
+        CHECK(t.legacy_details[0].find(key) != std::string::npos);
+    CHECK(t.legacy_details[0].find("agent") == std::string::npos); // no agent id
+    CHECK(audit_count(t.generic_rows, kUsageGeneric + "success") == 1);
+    // The access row is durable before the read starts.
+    const std::vector<std::string> expected{"perm:GuaranteedState:Read", "fleet:Forensics:Read",
+                                            "audit:" + kUsageRow, "read"};
+    CHECK(t.events == expected);
+    REQUIRE(t.usage_calls.size() == 1);
+}
+
+TEST_CASE("get_dex_apps_usage: both gates are asked, in REST's order, and each refusal reads nothing",
+          "[mcp][dex][usage][security]") {
+    SECTION("GuaranteedState:Read refused: the gate's own body, the fleet gate never asked") {
+        Twin t;
+        t.perm_deny = "GuaranteedState:Read";
+        auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/call","id":7,)"
+                          R"("params":{"name":"get_dex_apps_usage","arguments":{}}})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(t.fleet_calls.empty());
+        CHECK(t.legacy_rows.empty());
+        CHECK(t.usage_calls.empty());
+    }
+    SECTION("Forensics:Read refused: no domain row, no read, no generic success row") {
+        Twin t;
+        t.fleet_admit = false;
+        auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/call","id":7,)"
+                          R"("params":{"name":"get_dex_apps_usage","arguments":{}}})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(t.perm_calls == std::vector<std::string>{"GuaranteedState:Read"});
+        CHECK(t.fleet_calls == std::vector<std::string>{"Forensics:Read"});
+        CHECK(t.legacy_rows.empty());
+        CHECK(t.usage_calls.empty());
+        CHECK(audit_count(t.generic_rows, kUsageGeneric + "success") == 0);
+    }
+    SECTION("a readonly token passes the handler's own tier check and goes on to the fleet gate") {
+        // The fleet gate is a fake here, so the Forensics:Read tier ladder inside
+        // require_fleet_read (authz_gates.cpp) is NOT exercised by this case.
+        Twin t;
+        t.tier = "readonly";
+        const json r = t.call("get_dex_apps_usage");
+        CHECK_FALSE(r.contains("error"));
+        CHECK(t.fleet_calls == std::vector<std::string>{"Forensics:Read"});
+    }
+    SECTION("a service-scoped token is refused before the handler") {
+        Twin t;
+        t.scope_service = "printers";
+        const json r = t.call("get_dex_apps_usage");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kPermissionDenied);
+        CHECK(t.perm_calls.empty());
+        CHECK(t.fleet_calls.empty());
+        CHECK(t.legacy_rows.empty());
+        CHECK(t.usage_calls.empty());
+    }
+}
+
+TEST_CASE("get_dex_apps_usage: an argument refusal is an invalid-params error with no domain row "
+          "and no read",
+          "[mcp][dex][usage]") {
+    // The handler's strict parser refuses an unknown key (the schema also says so); one case proves
+    // the handler maps a parse failure to invalid-params, the full table is in test_dex_usage_model.cpp.
+    SECTION("an unknown argument") {
+        Twin t;
+        const json r = t.call("get_dex_apps_usage", json{{"bogus", 1}});
+        check_a4_refusal(r, "correct the arguments and call again");
+        CHECK(audit_count(t.generic_rows, kUsageGeneric + "denied") == 1);
+        CHECK(t.legacy_rows.empty());
+        CHECK(t.usage_calls.empty());
+    }
+    SECTION("a dropped denial row is reported in the refusal's envelope") {
+        Twin t;
+        t.generic_audit_ok = false;
+        const json r = t.call("get_dex_apps_usage", json{{"bogus", 1}});
+        check_a4_refusal(r, "correct the arguments and call again", /*audit_persisted=*/false);
+        CHECK(t.usage_calls.empty());
+    }
+    SECTION("the Forensics gate runs before argument parsing: a refused caller learns nothing "
+            "about the arguments") {
+        Twin t;
+        t.fleet_admit = false;
+        auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/call","id":7,)"
+                          R"("params":{"name":"get_dex_apps_usage","arguments":{"bogus":1}}})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(t.fleet_calls == std::vector<std::string>{"Forensics:Read"});
+        CHECK(audit_count(t.generic_rows, kUsageGeneric + "denied") == 0);
+        CHECK(t.usage_calls.empty());
+    }
+}
+
+TEST_CASE("get_dex_apps_usage: valid arguments reach the read unchanged", "[mcp][dex][usage]") {
+    Twin t;
+    REQUIRE_FALSE(t.call("get_dex_apps_usage", {{"slice", "group"}, {"group", "grp-1"},
+                                                 {"window", "30d"}, {"platform", "linux"},
+                                                 {"floor", 10}})
+                      .contains("error"));
+    REQUIRE_FALSE(t.call("get_dex_apps_usage", {{"slice", "tag"}}).contains("error"));
+    REQUIRE(t.usage_calls.size() == 2);
+    CHECK(t.usage_calls[0].slice.kind == DexUsageSliceKind::Group);
+    CHECK(t.usage_calls[0].slice.key == "grp-1");
+    CHECK(t.usage_calls[0].window == "30d");
+    CHECK(t.usage_calls[0].platform == "linux");
+    CHECK(t.usage_calls[0].floor == 10);
+    CHECK(t.usage_calls[1].slice.kind == DexUsageSliceKind::Tag);
+    CHECK(t.usage_calls[1].slice.key == kDexDefaultCohortKey);
+}
+
+TEST_CASE("get_dex_apps_usage: the fleet gate's scope reaches the read exactly as given",
+          "[mcp][dex][usage][security]") {
+    SECTION("unfiltered") {
+        Twin t;
+        REQUIRE_FALSE(t.call("get_dex_apps_usage").contains("error"));
+        REQUIRE(t.usage_calls.size() == 1);
+        CHECK_FALSE(t.usage_calls[0].visible.has_value());
+    }
+    SECTION("a named set") {
+        Twin t;
+        t.fleet_scope = std::unordered_set<std::string>{"a1"};
+        REQUIRE_FALSE(t.call("get_dex_apps_usage").contains("error"));
+        REQUIRE(t.usage_calls.size() == 1);
+        REQUIRE(t.usage_calls[0].visible.has_value());
+        CHECK(*t.usage_calls[0].visible == std::unordered_set<std::string>{"a1"});
+    }
+    SECTION("engaged and empty stays engaged and empty") {
+        Twin t;
+        t.fleet_scope = std::unordered_set<std::string>{};
+        REQUIRE_FALSE(t.call("get_dex_apps_usage").contains("error"));
+        REQUIRE(t.usage_calls.size() == 1);
+        REQUIRE(t.usage_calls[0].visible.has_value());
+        CHECK(t.usage_calls[0].visible->empty());
+    }
+}
+
+TEST_CASE("get_dex_apps_usage: the access row fails closed, so a dropped or throwing sink reads nothing",
+          "[mcp][dex][usage][security]") {
+    for (const bool throws : {false, true}) {
+        INFO((throws ? "sink throws" : "sink drops the row"));
+        Twin t;
+        t.legacy_audit_fails = !throws;
+        t.legacy_audit_throws = throws;
+        const json r = t.call("get_dex_apps_usage");
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == 5000);
+        CHECK(r["error"]["message"].get<std::string>().find("audit subsystem unavailable") !=
+              std::string::npos);
+        CHECK_FALSE(r["error"]["data"].contains("audit_persisted"));
+        CHECK(t.usage_calls.empty()); // the read never ran
+        CHECK(audit_count(t.generic_rows, kUsageGeneric + "failure") == 1);
+    }
+}
+
+TEST_CASE("get_dex_apps_usage: a dropped generic row serves the data and says so",
+          "[mcp][dex][usage]") {
+    Twin t;
+    t.usage_result = usage_model();
+    t.generic_audit_ok = false;
+    const json r = t.call("get_dex_apps_usage");
+    REQUIRE_FALSE(r.contains("error"));
+    const json& sc = r["result"]["structuredContent"];
+    CHECK(sc["audit_persisted"] == false);
+    CHECK(sc["apps"].size() == 3);
+    CHECK(schema_violation(t.output_schema("get_dex_apps_usage"), sc) == "");
+    CHECK(t.legacy_rows == std::vector<std::string>{kUsageRow}); // the access row stands
+}
+
+TEST_CASE("get_dex_apps_usage: a refused read is an error, classified as the REST route classifies it",
+          "[mcp][dex][usage]") {
+    struct Row {
+        const char* reason;
+        const char* detail;
+        int code;
+        bool retryable;
+    };
+    const Row rows[] = {
+        {"invalid_slice", "unknown_group", mcp::kInvalidParams, false},
+        {"usage_unavailable", "fleet_too_large", mcp::kInternalError, false},
+        {"usage_unavailable", "concurrency_budget", mcp::kInternalError, true},
+    };
+    for (const auto& row : rows) {
+        INFO(row.reason << ":" << row.detail);
+        Twin t;
+        t.usage_result = std::unexpected(DexUsageRefusal{row.reason, row.detail});
+        const json r = t.call("get_dex_apps_usage");
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result")); // never a success with zero figures
+        CHECK(r["error"]["code"] == row.code);
+        if (row.retryable) {
+            CHECK(r["error"]["data"]["retry_after_ms"] == 2000);
+            CHECK(r["error"]["message"].get<std::string>().find(row.reason) != std::string::npos);
+        } else {
+            CHECK(r["error"]["data"]["retry_after_ms"].is_null());
+        }
+        if (std::string(row.detail) == "fleet_too_large") // the terminal answer says what to change
+            CHECK(r["error"]["data"]["remediation"].get<std::string>().find("narrower") !=
+                  std::string::npos);
+        // The access row was written before the read, whatever the read answered.
+        CHECK(t.legacy_rows == std::vector<std::string>{kUsageRow});
+    }
+    SECTION("an unknown group points at list_management_groups") {
+        Twin t;
+        t.usage_result = std::unexpected(DexUsageRefusal{"invalid_slice", "unknown_group"});
+        const json r = t.call("get_dex_apps_usage", {{"slice", "group"}, {"group", "nope"}});
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["message"] == "unknown management group");
+        CHECK(r["error"]["data"]["remediation"].get<std::string>().find("list_management_groups") !=
+              std::string::npos);
+        CHECK(audit_count(t.generic_rows, kUsageGeneric + "denied") == 1);
+    }
+}
+
+TEST_CASE("get_dex_apps_usage: every admitted call writes its own access row, a retry included",
+          "[mcp][dex][usage]") {
+    Twin t;
+    t.usage_result = std::unexpected(DexUsageRefusal{"usage_unavailable", "concurrency_budget"});
+    REQUIRE(t.call("get_dex_apps_usage").contains("error"));
+    REQUIRE(t.call("get_dex_apps_usage").contains("error"));
+    CHECK(audit_count(t.legacy_rows, kUsageRow) == 2);
+    CHECK(t.usage_calls.size() == 2);
+}
+
+TEST_CASE("get_dex_apps_usage: an unwired closure is a non-retryable internal error and reads nothing",
+          "[mcp][dex][usage]") {
+    SECTION("no fleet gate: refused before the Forensics gate") {
+        Twin::Opts o;
+        o.wire_fleet_read = false;
+        Twin t(o);
+        const json r = t.call("get_dex_apps_usage");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(t.fleet_calls.empty());
+        CHECK(t.usage_calls.empty());
+    }
+    SECTION("no audit sink: unwired, not audit-off") {
+        Twin::Opts o;
+        o.wire_legacy_audit = false;
+        Twin t(o);
+        const json r = t.call("get_dex_apps_usage");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(t.fleet_calls.empty());
+        CHECK(t.usage_calls.empty());
+    }
+    SECTION("no usage closure: refused after the Forensics gate") {
+        Twin::Opts o;
+        o.wire_usage = false;
+        Twin t(o);
+        const json r = t.call("get_dex_apps_usage");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(t.fleet_calls == std::vector<std::string>{"Forensics:Read"});
+        CHECK(t.legacy_rows.empty());
     }
 }
