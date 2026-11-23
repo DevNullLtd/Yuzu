@@ -6316,9 +6316,21 @@ per-agent scoped gate: `true` is granted, `false` is a definitive denial, and
 `unexpected(msg)` means the answer is a deny *because a read failed* (the first
 failed read wins; an allow and an explicit deny-group hit are returned as such).
 `check_scoped_permission` is its `value_or(false)` wrapper, so every other
-caller is unchanged. `AuthRoutes::require_scoped_permission` uses it only to
+caller is unchanged. `AuthRoutes::require_scoped_permission_outcome` uses it to
 label the `auth.scoped_permission_required` audit row `(read degraded:
-mgmt_group_store|rbac_store)`; the response stays a fail-closed 403. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
+mgmt_group_store|rbac_store)` and also returns that class to its caller as a
+typed `ScopedGateOutcome` (`scoped_gate_outcome.hpp`: `Denied`, `Unauthenticated`,
+`Unavailable`, `MgmtGroupReadDegraded`, `RbacReadDegraded`, `Admitted`); the
+Boolean `require_scoped_permission` is that function compared with `Admitted`,
+so every other caller is unchanged and the response stays a fail-closed 403
+whatever the class. The two typed callers today are the Echo purge and re-enable
+fragments and the REST Echo purge. The fragments use the class to tell an outage
+from a denial (503 and `store_unavailable`, not the 404 and `scope_violation`).
+The REST purge keeps the gate's own status (the fail-closed 403 for a degraded
+read) and uses the class only for the metric result and, at the recheck, the
+failure row's detail. The
+engine-principal branch of the gate deliberately keeps the unchecked read, so an
+engine caller's degraded read is the plain `Denied` class. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
 under SQLite a corrupt/unreadable RBAC store could fall through to an engaged
 allow at some call sites; the PostgreSQL `rbac_store` now denies on any degrade.
 
@@ -6479,6 +6491,8 @@ The canonical full statement of these catastrophic-if-violated invariants. The a
 The canonical full statement of these catastrophic-if-violated invariants. The always-loaded routed-concern table carries only a compressed trigger for them.
 
 Authentication, RBAC, headers, tokens, self-target principal-destruction guard (#397/#403). Every new list/fan-out read of per-agent data MUST use the admit-then-filter `authorize_list_read` chokepoint (World A, ADR-0017) — never a bare global `require_permission` (inert for confined operators; `require_permission`/`require_scoped_permission` fail **closed** on any `rbac_store` degrade: Postgres denies on acquire timeout/query error/store-not-open, deny-on-degrade ADR-0041, `yuzu_server_rbac_read_degrade_total` — but a bare gate still discloses the whole fleet to any global-permission holder). **Engine principals** (ADR-1005 class; ADR-0031) are default-deny: they resolve authority RBAC-only in `require_permission`/`require_scoped_permission` (never pre-RBAC legacy or service-scoped fallback; 403 no-grant or fresh RBAC-off, 503 store-unavailable; the gates but `require_scoped_permission` decide through `engine_grant_checked`, which refuses a degraded view; that one keeps raw `is_rbac_enabled()`, deny-only; the visibility resolvers keep `rbac_enforcement_in_effect`), cannot hold a system role (`assign_role`'s `is_system` bar; a hand-made namesake role is not barred); a wildcard custom role is permitted, detected afterwards by the fail-closed `audit/no-admin` auditor (ruling 2026-10-23, #2485). Grants: `/api/v1/engine-principals/{id}/roles` + MCP twins; boot-time `engine:` collision scan fails **closed** (degraded `rbac_store` refuses boot). **CATASTROPHIC-IF-VIOLATED (#3623/#3952): `rbac_meta.backfill_complete`/`backfill_source_fingerprint` must be POISONED, never DELETEd.** `rbac_store.cpp`'s `migrations()` v4 step forces `backfill_source_fingerprint` to `"sourceless"` (`kSourcelessFingerprint`), never removing the rows — a bare `DELETE` reproduces "marker absent," read by the retired idempotency check as "never migrated," bypassing its fingerprint check into an UNCONDITIONAL overwrite of live `rbac_enabled` from any legacy `rbac.db` a rolled-back binary finds (`up-1`, #3952). The other 5 retired stores are safe with a bare `DROP TABLE` (42P01); only live `rbac_meta` must poison.
+
+**The scoped gate has ONE body (#2532).** `AuthRoutes::require_scoped_permission_outcome` holds every check, status, response body, audit row and metric of the per-device scoped gate and returns a `ScopedGateOutcome`; `require_scoped_permission` is `return require_scoped_permission_outcome(...) == ScopedGateOutcome::Admitted;` and nothing else. Never add a second body (a typed twin that re-implements the checks is how the two drift), and never add a second admitting value: a caller admits ONLY on `== Admitted`. The zero value of the enum is `Denied`, so a value-initialised or out-of-range outcome refuses, and `enum class` has no bool conversion, so a stray `return true` in the body is a compile error. The class never changes what the gate answers: a degraded RBAC or management-group read is still the ADR-0041 fail-closed 403, and the class only tells a caller why. `tests/test_echo_security_wiring_lexical.py` pins the wrapper's exact form and the order of the typed lambda's two wirings in `server.cpp` (the REST setter must precede `register_routes`).
 
 ## Periodic access review invariants (full statement)
 

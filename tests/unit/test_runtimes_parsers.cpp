@@ -139,7 +139,8 @@ TEST_CASE("runtimes: jvm_flavour_from maps IMAGE_TYPE and otherwise says unmodel
     CHECK(rt::jvm_flavour_from("JDK") == rt::JvmFlavour::jdk);
     CHECK(rt::jvm_flavour_from("jre") == rt::JvmFlavour::jre);
     CHECK(rt::jvm_flavour_from(" Jdk ") == rt::JvmFlavour::jdk); // case-insensitive, trimmed
-    // No IMAGE_TYPE (Debian, SUSE): unmodelled, never guessed from the path or the module list.
+    // No IMAGE_TYPE (Debian, Ubuntu, SUSE): unmodelled here, never guessed from the path or the module
+    // list; the Linux leg answers it from bin/javac and passes that to jvm_row.
     CHECK(rt::jvm_flavour_from("") == rt::JvmFlavour::unmodelled);
     CHECK(rt::jvm_flavour_from("SOMETHING") == rt::JvmFlavour::unmodelled);
     CHECK(rt::flavour_token(rt::JvmFlavour::unmodelled) == "unmodelled");
@@ -156,6 +157,48 @@ TEST_CASE("runtimes: jvm_row builds the wire row from the real release fixtures"
         "/usr/lib/jvm/java-17-openjdk-arm64");
     REQUIRE(debian.has_value());
     CHECK(*debian == "jvm|unmodelled|17.0.20.1|/usr/lib/jvm/java-17-openjdk-arm64|Debian");
+}
+
+TEST_CASE("runtimes: jvm_row takes the fallback flavour only when the release file has no IMAGE_TYPE",
+          "[runtimes]") {
+    // The real Debian, Ubuntu and SUSE release files carry no IMAGE_TYPE: the leg's bin/javac answer
+    // (`fallback`) decides, and the vendor stays IMPLEMENTOR as written.
+    const struct { const char* file; const char* path; const char* vendor; } captures[] = {
+        {"debian12_openjdk17_jre_release.txt", "/usr/lib/jvm/java-17-openjdk-arm64", "Debian"},
+        {"ubuntu2404_openjdk21_release.txt", "/usr/lib/jvm/java-21-openjdk-arm64", "Ubuntu"},
+        {"opensuse156_openjdk17_release.txt", "/usr/lib64/jvm/java-17-openjdk-17", "N/A"},
+    };
+    for (const auto& c : captures) {
+        INFO("capture: " << c.file);
+        const auto f = rt::parse_release_file(read_fixture(c.file));
+        CHECK(f.image_type.empty());
+        CHECK(f.implementor == c.vendor);
+        CHECK_FALSE(rt::has_image_type(f));
+        const std::string tail = std::string{"|"} + c.path + "|" + c.vendor;
+        const auto none = rt::jvm_row(f, c.path);
+        const auto jdk = rt::jvm_row(f, c.path, rt::JvmFlavour::jdk);
+        const auto jre = rt::jvm_row(f, c.path, rt::JvmFlavour::jre);
+        REQUIRE((none && jdk && jre));
+        CHECK(none->rfind("jvm|unmodelled|", 0) == 0); // no fallback given: as before
+        CHECK(jdk->rfind("jvm|jdk|", 0) == 0);
+        CHECK(jre->rfind("jvm|jre|", 0) == 0);
+        CHECK(jdk->size() > tail.size());
+        CHECK(jdk->compare(jdk->size() - tail.size(), tail.size(), tail) == 0);
+    }
+
+    // IMAGE_TYPE present (any value) decides; the fallback is ignored.
+    const auto temurin = rt::parse_release_file(read_fixture("temurin17_release.txt"));
+    CHECK(rt::has_image_type(temurin));
+    CHECK(*rt::jvm_row(temurin, "/opt/j", rt::JvmFlavour::jre) ==
+          "jvm|jdk|17.0.20|/opt/j|Eclipse Adoptium");
+    CHECK(*rt::jvm_row(rt::parse_release_file("JAVA_VERSION=\"1\"\nIMAGE_TYPE=\"SDK\"\n"), "/opt/j",
+                       rt::JvmFlavour::jdk) == "jvm|unmodelled|1|/opt/j|-");
+    CHECK_FALSE(rt::has_image_type(rt::parse_release_file("JAVA_VERSION=\"1\"\nIMAGE_TYPE=\"  \"\n")));
+
+    // the release-less row takes the flavour it is given
+    CHECK(rt::jvm_row_release_missing("/opt/j") == "jvm|unmodelled|-|/opt/j|-");
+    CHECK(rt::jvm_row_release_missing("/opt/j", rt::JvmFlavour::jdk) == "jvm|jdk|-|/opt/j|-");
+    CHECK(rt::jvm_row_release_missing("/opt/j", rt::JvmFlavour::jre) == "jvm|jre|-|/opt/j|-");
 }
 
 TEST_CASE("runtimes: jvm_row falls back to JAVA_RUNTIME_VERSION and rejects a versionless file",
