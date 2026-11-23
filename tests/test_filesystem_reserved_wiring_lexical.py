@@ -40,7 +40,7 @@ def main() -> int:
         if needle not in b:
             problems.append(f"missing {needle!r}: {why}")
 
-    need("contains_nul(p.string())", "a NUL in the candidate path must refuse")
+    need("contains_nul(path_bytes(p))", "a NUL in the candidate path must refuse (UTF-8 bytes, never p.string())")
     need("contains_nul(cs)", "a NUL in the canonical path must refuse")
     need("is_dev_fd_path(cs)", "canonical /dev/fd spelling")
     need("is_dev_fd_path(path_bytes(p.lexically_normal()))", "literal /dev/fd spelling")
@@ -49,15 +49,15 @@ def main() -> int:
     need("is_apple_vol_path(cs)", "canonical /.vol/")
     need("refresh(snapshot.files)", "per-decision re-resolution of reserved files")
     need("refresh(snapshot.dirs)", "per-decision re-resolution of reserved dirs")
-    if "contains_nul(p.string())" in b and "g_reserved_mu" in b:
-        if b.index("contains_nul(p.string())") > b.index("g_reserved_mu"):
+    if "contains_nul(path_bytes(p))" in b and "g_reserved_mu" in b:
+        if b.index("contains_nul(path_bytes(p))") > b.index("g_reserved_mu"):
             problems.append("the NUL refusal must precede the reserved-set snapshot")
     # Whole-statement pins: the call, its `return true`, and the exact argument spelling, so a
     # weakened condition (`&&` for `||`, a dropped argument, `if (false && ...)`) is caught too.
     flat = re.sub(r"\s+", " ", b)
     R = r"yuzu::filesystem::reserved::"
     pins = {
-        "nul literal": r"^\{ if \(" + R + r"contains_nul\(p\.string\(\)\)\) return true;",
+        "nul literal": r"^\{ if \(" + R + r"contains_nul\(path_bytes\(p\)\)\) return true;",
         "nul canonical": r"if \(" + R + r"contains_nul\(cs\)\) return true;",
         "dev_fd": r"if \(\s*" + R + r"is_dev_fd_path\(cs\) \|\| " + R
         + r"is_dev_fd_path\(path_bytes\(p\.lexically_normal\(\)\)\)\) return true;",
@@ -76,6 +76,11 @@ def main() -> int:
     for name, rx in pins.items():
         if not re.search(rx, flat):
             problems.append(f"whole-statement pin {name!r} not found (condition weakened or removed)")
+    # path::string() throws on MSVC for a name the active code page cannot hold, and the guard turns a throw
+    # into a REFUSAL: every non-ACP file name was refused as reserved. The decision converts through
+    # path_bytes (UTF-8) only.
+    if re.search(r"\.string\(\)", b):
+        problems.append("the reserved decision calls .string(): use path_bytes() (MSVC throws for a non-ACP name)")
     if re.search(r"if \(false|if \(0\b", flat):
         problems.append("a disabled branch (`if (false` / `if (0`) in the decision")
     if not re.search(r"constexpr int kMaxLinkHops = 40;", re.sub(r"\s+", " ", code)):

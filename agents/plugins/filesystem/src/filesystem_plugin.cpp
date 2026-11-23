@@ -228,7 +228,10 @@ Ident identity_of(const fs::path& a, const fs::path& b) {
 // identity: there is no object to compare. It is re-canonicalised at every decision so a symlink
 // planted at it after the snapshot is followed.
 bool path_is_reserved_unguarded(const fs::path& p) {
-    if (yuzu::filesystem::reserved::contains_nul(p.string()))
+    // path_bytes (UTF-8), never p.string(): on MSVC string() throws for a name the active code page
+    // cannot hold, and the guard turns a throw into a refusal, which refused every such name as if it
+    // were reserved (a file named U+96EA.txt could not be read, listed or hashed).
+    if (yuzu::filesystem::reserved::contains_nul(path_bytes(p)))
         return true;
 #ifdef _WIN32
     // A spelling Win32 normalises to another name (an alternate data stream, a trailing space or dot)
