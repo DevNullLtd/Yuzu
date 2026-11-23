@@ -43417,7 +43417,11 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a failed continuation lea
     cr.source_payload = "{}";
     auto parent = store->create_materialized(cr, yuzu::test::seed_paged_inventory(store.dsn()));
     REQUIRE(parent.has_value());
-    yuzu::test::fail_on_second_result_page(store.dsn());
+    const bool stale_ordering = GENERATE(false, true);
+    if (stale_ordering)
+        yuzu::test::seed_stale_result_set_collation(store.dsn());
+    else
+        yuzu::test::fail_on_second_result_page(store.dsn());
 
     McpTestServer ts;
     ts.result_set_store_for_test = store.get();
@@ -43430,8 +43434,19 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a failed continuation lea
     REQUIRE(res);
     const auto body = nlohmann::json::parse(res->body);
     CHECK(body["error"]["code"] == kInternalError);
-    CHECK(body["error"]["message"].get<std::string>().find("parent set's members") !=
-          std::string::npos);
+    if (stale_ordering) {
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_ORDERING_UNAVAILABLE") !=
+              std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"] == 60000);
+        CHECK(mcp_audit_details(ts, "result_set.create|failure") ==
+              std::vector<std::string>{"reason=ordering_unavailable source_kind=inventory_query"});
+    } else {
+        CHECK(body["error"]["message"].get<std::string>().find("parent set's members") !=
+              std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+        CHECK(mcp_audit_details(ts, "result_set.create|failure") ==
+              std::vector<std::string>{"reason=store_degraded source_kind=inventory_query"});
+    }
     auto count = store->count_for_owner_checked("test-user");
     REQUIRE(count.has_value());
     CHECK(*count == 1);

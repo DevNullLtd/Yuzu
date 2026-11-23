@@ -218,6 +218,7 @@ enum class ResultSetError {
     Pinned,
     TooManyMembers,
     DbError,
+    /// A parent intersection refused a collation mismatch, unknown actual version or invalid index.
     OrderingUnavailable,
     /// The set exists and is owned, but is still `pending`: it has no membership yet, and may
     /// fill. Returned by `member_set_owned` only.
@@ -367,7 +368,9 @@ public:
     members_checked(const std::string& id, const std::string& cursor, int limit,
                     const authz::VisibleSet& visible = std::nullopt);
     /// Intersect an already authorized, materialized parent with scoped inventory matches.
-    /// A failed page discards the entire result, including when candidates is empty.
+    /// The transaction checks the database collation before paging. OrderingUnavailable
+    /// reports a refused ordering check. A catalog SQL error or failed page returns DbError;
+    /// either error discards the entire result, including when the candidate set is empty.
     std::expected<std::vector<std::string>, ResultSetError>
     matching_parent_members(const std::string& id, std::unordered_set<std::string> candidates);
 

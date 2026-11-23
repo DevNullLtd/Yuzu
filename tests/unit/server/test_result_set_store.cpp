@@ -1242,7 +1242,7 @@ TEST_CASE("ResultSetStore: lineage terminates on a parent_id cycle", "[pg][resul
 TEST_CASE("ResultSetStore: inventory parent intersection spans keyset pages",
           "[pg][result_set][pagination]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 150}};
     ResultSetStore store(pool);
     std::vector<std::string> parent_ids, expected;
     std::unordered_set<std::string> candidates{"outside-parent"};
@@ -1270,24 +1270,64 @@ TEST_CASE("ResultSetStore: inventory parent intersection spans keyset pages",
         CHECK(*intersection == expected);
     }
     SECTION("a recorded collation mismatch or unreadable version refuses the intersection") {
-        // Only the disposable database clone is changed. A non-superuser cannot seed
-        // this catalog condition; the shared collation decision tests still run.
-        PgConn admin{PQconnectdb(db.dsn().c_str())};
-        REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
-        if (PQserverVersion(admin.get()) < 150000)
-            SKIP("pg_database.datcollversion is available from PostgreSQL 15");
-        PgResult seed{
-            PQexec(admin.get(),
-                   "UPDATE pg_catalog.pg_database SET datcollversion = 'yuzu_test_stale_version' "
-                   "WHERE datname = current_database()")};
-        const char* sqlstate = PQresultErrorField(seed.get(), PG_DIAG_SQLSTATE);
-        if (!seed.ok() && sqlstate && std::string_view(sqlstate) == "42501")
-            SKIP("setting the disposable database collation version needs a privileged fixture "
-                 "role");
-        REQUIRE(seed.ok());
+        const auto expected_reason = yuzu::test::seed_stale_result_set_collation(db.dsn());
+        yuzu::test::LogCapture logs{spdlog::level::warn};
         const auto intersection = store.matching_parent_members(parent->id, std::move(candidates));
         REQUIRE_FALSE(intersection.has_value());
         CHECK(intersection.error() == ResultSetError::OrderingUnavailable);
+        logs.stop();
+        CHECK(logs.text().find("parent intersection refused: " + expected_reason) !=
+              std::string::npos);
+    }
+    SECTION("an invalid result-set index holds a database whose collation versions agree") {
+        PgConn admin{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+        if (PQserverVersion(admin.get()) < 150000)
+            SKIP("database collation version requires PostgreSQL 15 or newer");
+        PgResult versions{
+            PQexec(admin.get(), "SELECT datcollversion = pg_database_collation_actual_version(oid) "
+                                "FROM pg_database WHERE datname=current_database()")};
+        REQUIRE(versions.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(versions.get()) == 1);
+        if (std::string_view(PQgetvalue(versions.get(), 0, 0)) != "t")
+            SKIP("the invalid index hold applies when the recorded and actual versions agree");
+
+        // A unique parent ID index cannot complete on this multi-member parent. PostgreSQL
+        // retains its invalid index stub exclusively in this test's database clone.
+        PgResult create{PQexec(admin.get(),
+                               "CREATE UNIQUE INDEX CONCURRENTLY yuzu_test_invalid "
+                               "ON result_set_store.result_set_members (result_set_id)")};
+        REQUIRE(create.status() == PGRES_FATAL_ERROR);
+        const char* sqlstate = PQresultErrorField(create.get(), PG_DIAG_SQLSTATE);
+        REQUIRE(sqlstate != nullptr);
+        REQUIRE(std::string_view(sqlstate) == "23505");
+        yuzu::test::LogCapture logs{spdlog::level::warn};
+        const auto intersection = store.matching_parent_members(parent->id, std::move(candidates));
+        REQUIRE_FALSE(intersection.has_value());
+        CHECK(intersection.error() == ResultSetError::OrderingUnavailable);
+        logs.stop();
+        CHECK(logs.text().find("parent intersection refused: invalid result-set index") !=
+              std::string::npos);
+    }
+    SECTION("a catalog query error is a store fault and yields no matches") {
+        PgConn locker{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+        PgResult tx{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(tx.ok());
+        // pg_attribute is local to the disposable clone. A short store lock timeout
+        // exercises the real failed-query path without changing global role grants.
+        PgResult lock{
+            PQexec(locker.get(), "LOCK TABLE pg_catalog.pg_attribute IN ACCESS EXCLUSIVE MODE")};
+        const char* sqlstate = PQresultErrorField(lock.get(), PG_DIAG_SQLSTATE);
+        if (!lock.ok() && sqlstate && std::string_view(sqlstate) == "42501")
+            SKIP("locking the disposable database catalog needs a privileged fixture role");
+        REQUIRE(lock.ok());
+        yuzu::test::LogCapture logs{spdlog::level::err};
+        const auto intersection = store.matching_parent_members(parent->id, std::move(candidates));
+        REQUIRE_FALSE(intersection.has_value());
+        CHECK(intersection.error() == ResultSetError::DbError);
+        logs.stop();
+        CHECK(logs.text().find("parent intersection collation query failed:") != std::string::npos);
     }
     SECTION("a database fault after the first page discards the accumulated matches") {
         yuzu::test::fail_on_second_result_page(db.dsn());

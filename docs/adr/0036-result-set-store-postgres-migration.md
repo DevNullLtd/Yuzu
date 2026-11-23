@@ -109,10 +109,17 @@ truncated inventory reads. They evaluate the scoped inventory and intersect its 
 IDs with the parent in PostgreSQL, reading up to 1,000 matches per page in one read-only,
 repeatable-read transaction. Before reading the first page, check the database collation
 and the result-set schema indexes in that same transaction using the shared PostgreSQL
-collation check. A mismatch or unreadable check refuses the operation. Server memory covers the bounded candidates, accumulated
-matches and one page, independently of total parent size. Normal
-materialized membership is immutable. A page failure discards the accumulated matches. Both producers return a retryable store
-error and record the existing `result_set.create` failure reason `store_degraded`. The
+collation check. Version mismatch, a recorded version without an actual version, and an
+invalid index with equal versions refuse the operation and audit `ordering_unavailable`.
+On 2026-11-23 Nathan approved the existing PostgreSQL maintenance precondition for these
+inventory-query producer reads (D71). Rebuild affected indexes after a locale change
+before refreshing the recorded version. The indexed keyset relies on this procedure.
+A premature refresh or a change in sort rules with the same version can leave a stale
+index undetected and a stored child incomplete. Revisit the decision if the keyset or
+supported maintenance procedure changes.
+A catalog SQL error or failed page audits `store_degraded`. Both producers discard accumulated
+matches before returning the error. Server memory covers the bounded candidates, their
+matches and one page, independently of the parent size. Materialized membership is immutable. The
 child insert references the parent through a foreign key, so a parent removed before insertion
 cannot yield a parentless child. The general scope-expression evaluator still loads a complete
 owned membership for repeated lookups while evaluating devices.

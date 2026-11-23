@@ -23,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::test {
@@ -41,6 +42,26 @@ inline void setup_result_set_store_pg_template(const std::string& dsn) {
 /// test_result_set_store.cpp / test_rest_result_sets_async.cpp.
 inline PgTestTemplate result_set_store_pg_template{"resultset",
                                                     &detail::setup_result_set_store_pg_template};
+
+/// Overwrite only the isolated clone's recorded version. Return the diagnostic expected
+/// from its real provider (libc C/POSIX can report no actual version).
+inline std::string seed_stale_result_set_collation(const std::string& dsn) {
+    yuzu::server::pg::PgConn admin{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+    if (PQserverVersion(admin.get()) < 150000)
+        SKIP("database collation version requires PostgreSQL 15 or newer");
+    yuzu::server::pg::PgResult seed{PQexec(
+        admin.get(), "UPDATE pg_catalog.pg_database SET datcollversion = 'yuzu_test_stale_version' "
+                     "WHERE datname = current_database() RETURNING "
+                     "pg_database_collation_actual_version(oid) IS NULL")};
+    const char* sqlstate = PQresultErrorField(seed.get(), PG_DIAG_SQLSTATE);
+    if (!seed.ok() && sqlstate && std::string_view(sqlstate) == "42501")
+        SKIP("changing the disposable database catalog needs a privileged fixture role");
+    REQUIRE(seed.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(seed.get()) == 1);
+    return std::string_view(PQgetvalue(seed.get(), 0, 0)) == "t" ? "actual version unavailable"
+                                                                 : "version mismatch";
+}
 
 /// Fault after a complete page, on the production connection inside its read-only transaction.
 /// The scalar subquery runs once per SELECT; rollback discards its local setting.

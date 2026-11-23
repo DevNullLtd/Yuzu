@@ -1,6 +1,6 @@
-#include "device_ci_read_gate.hpp"
 #include "mcp_server.hpp"
 
+#include "device_ci_read_gate.hpp"
 #include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
@@ -1657,7 +1657,9 @@ static const ToolDef kTools[] = {
      "follow-up for the parse-error cause; each cause is its own distinctly-named refusal "
      "reason - query_truncated/poison_excluded/parse_error_excluded). A parent_id that is "
      "pending or failed is refused -32602 RESULT_SET_NOT_READY; the new set inherits the "
-     "parent's agents_failed and agents_unanswered. REST v1 twin: "
+     "parent's agents_failed and agents_unanswered. A refused parent collation check returns "
+     "RESULT_SET_ORDERING_UNAVAILABLE (60000 ms retry hint); a failed catalog or page read "
+     "returns RESULT_SET_STORE_UNAVAILABLE (5000 ms). REST v1 twin: "
      "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. JSON integers are exact; every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is -32602: send an integer, or send the decimal as a string under > >= < <= (at most 15 significant digits, a magnitude below 2^53, not subnormal, within the range of a double), where == and != stay a text compare; write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as 1e16 (read exactly). Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS

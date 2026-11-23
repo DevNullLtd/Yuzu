@@ -35,6 +35,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
@@ -4245,7 +4246,11 @@ TEST_CASE("from-inventory-query: a failed continuation does not create a partial
     AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
     const auto ids = yuzu::test::seed_paged_inventory(db.dsn());
     const auto parent = h.seed_materialized("paged-parent", ids);
-    yuzu::test::fail_on_second_result_page(db.dsn());
+    const bool stale_ordering = GENERATE(false, true);
+    if (stale_ordering)
+        yuzu::test::seed_stale_result_set_collation(db.dsn());
+    else
+        yuzu::test::fail_on_second_result_page(db.dsn());
 
     int status = 0;
     auto request = nlohmann::json::parse(
@@ -4253,8 +4258,19 @@ TEST_CASE("from-inventory-query: a failed continuation does not create a partial
     request["parent_id"] = parent;
     const auto body = h.post("/api/v1/result-sets/from-inventory-query", request.dump(), status);
     REQUIRE(status == 503);
-    CHECK(body["error"]["message"].get<std::string>().find("parent set's members") !=
-          std::string::npos);
+    if (stale_ordering) {
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_ORDERING_UNAVAILABLE") !=
+              std::string::npos);
+        CHECK(body["error"]["retry_after_ms"] == 60000);
+        REQUIRE_FALSE(h.audits.empty());
+        CHECK(h.audits.back().detail == "reason=ordering_unavailable source_kind=inventory_query");
+    } else {
+        CHECK(body["error"]["message"].get<std::string>().find("parent set's members") !=
+              std::string::npos);
+        CHECK(body["error"]["retry_after_ms"] == 5000);
+        REQUIRE_FALSE(h.audits.empty());
+        CHECK(h.audits.back().detail == "reason=store_degraded source_kind=inventory_query");
+    }
     auto count = h.store->count_for_owner_checked("operator-1");
     REQUIRE(count.has_value());
     CHECK(*count == 1);

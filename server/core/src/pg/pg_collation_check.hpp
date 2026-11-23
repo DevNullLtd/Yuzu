@@ -13,9 +13,9 @@
 /// (`pg_database.datcollversion`) and can compute the current one
 /// (`pg_database_collation_actual_version(oid)`); a difference is the signal checked here.
 ///
-/// SHAPE. A pure decision (`decide_collation_verdict`) over four facts, and one I/O function
-/// (`check_collation_version`) that fetches them with one short bounded transaction. Neither
-/// throws. The check never stops the server: it logs the result, exports a gauge, and keeps
+/// SHAPE. `read_collation_facts` reads four facts on the connection supplied by its caller;
+/// `decide_collation_verdict` evaluates them without I/O. The periodic check wraps the read
+/// in its own short bounded transaction. The result-set producer supplies its page snapshot. The check never stops the server: it logs the result, exports a gauge, and keeps
 /// booting whatever the verdict, because an operator must be able to start the server to fix the
 /// database. Besides the gauge and the log it publishes a lock-free `CollationGate` (below) that
 /// the consumers read: a Mismatch pauses device_ci writes, and any gate other than Trusted
@@ -61,7 +61,9 @@
 /// an Unreadable report never writes the gate (`report_collation_check`), so it keeps a standing
 /// Mismatch (or the boot Unproven) in place and never enters Mismatch, never pauses a write by
 /// itself, and never disturbs a Trusted gate. It covers only the CONCURRENTLY failure form (a
-/// plain `REINDEX` that fails rolls back and leaves no invalid index) and only that one schema.
+/// plain `REINDEX` that fails rolls back and leaves no invalid index). The periodic reporter checks
+/// device inventory. Inventory-query result-set producers separately read the same catalog facts
+/// for result_set_store in their own transaction.
 
 #include "../collation_gate_types.hpp"
 

@@ -11,6 +11,15 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Parent membership in inventory-query result sets
+
+The REST and MCP inventory-query producers now read a materialized parent in pages. Existing
+member cursors and stored data require no migration. If a parented query starts returning
+`RESULT_SET_ORDERING_UNAVAILABLE`, follow the [PostgreSQL collation repair procedure](server-admin.md#postgresql-collation-version)
+before retrying. A five-second `RESULT_SET_STORE_UNAVAILABLE` retry hint can also indicate a
+persistent catalog permission problem. Check the server’s parent-intersection error log and
+restore catalog read access when the same refusal persists.
+
 ## ⚠️ Breaking: second-factor failure budget (auth schema v4), first-run password prompt needs a terminal on Linux and macOS
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

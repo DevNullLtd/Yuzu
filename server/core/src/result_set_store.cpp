@@ -607,12 +607,18 @@ ResultSetStore::matching_parent_members(const std::string& id,
         // Check the same database and B-tree schema that will produce these durable members.
         // A separate lease could check another host after failover.
         const auto facts = pg::read_collation_facts(conn, "result_set_store");
-        const auto ordering =
-            facts ? pg::decide_collation_verdict(*facts) : pg::CollationVerdict::Unreadable;
+        if (!facts) {
+            spdlog::error("ResultSetStore: parent intersection collation query failed: {}",
+                          facts.error());
+            return false;
+        }
+        const auto ordering = pg::decide_collation_verdict(*facts);
         if (ordering == pg::CollationVerdict::Mismatch ||
             ordering == pg::CollationVerdict::Unreadable) {
-            spdlog::warn("ResultSetStore: parent intersection refused: collation {}",
-                         pg::to_string(ordering));
+            const char* reason = facts->invalid_index ? "invalid result-set index"
+                                 : !facts->actual     ? "actual version unavailable"
+                                                      : "version mismatch";
+            spdlog::warn("ResultSetStore: parent intersection refused: {}", reason);
             failure = ResultSetError::OrderingUnavailable;
             return false;
         }
