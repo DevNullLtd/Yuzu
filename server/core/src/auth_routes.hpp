@@ -1453,7 +1453,8 @@ private:
     std::chrono::system_clock::time_point bg_arm_started_wall_{}; ///< the same instant on the wall clock
     std::string bg_arm_id_;                                    ///< `armed_until` of the cached read
     /// Kept across failed reads and across not-armed reads: the id of the last definitive armed
-    /// read, and when the last definitive not-armed read started.
+    /// read, and the newest "not armed" time (an own read's end, a shared refresh's start; it
+    /// never moves back).
     std::string bg_last_armed_id_;
     std::optional<std::chrono::steady_clock::time_point> bg_last_not_armed_at_;
     std::atomic<bool> bg_arm_refreshing_{false};

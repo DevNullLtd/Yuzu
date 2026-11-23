@@ -1863,8 +1863,10 @@ TEST_CASE("break-glass MFA step: the second re-check reads the arm state itself"
     const auto hold_a_refresh = [&] {
         ctl.block = true;
         refresher.emplace([&] { (void)r.sso_only_local_password_gate("admin"); });
-        while (ctl.blocked.load() == 0)
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(5); // real time
+        while (ctl.blocked.load() == 0 && std::chrono::steady_clock::now() < give_up)
             std::this_thread::yield();
+        REQUIRE(ctl.blocked.load() == 1);
     };
 
     SECTION("a slow login with a refresh held by another request still completes") {
