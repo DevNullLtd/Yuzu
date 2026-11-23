@@ -351,6 +351,11 @@ What this means in use:
   failed read of the policy or its fragment skips the check). **Pack install does not refuse** a policy
   whose instruction is refused: it installs, and shows `blocked` at its first dispatch.
   Enabling such a policy through the route answers `400`.
+- On fragment create this check runs before the fragment is parsed and stored, so before every
+  other check on the fragment (its kind, size, compliance expressions, parameter keys and name).
+  A fragment that names a refused instruction and also holds a parameter key with a control byte
+  gets this `400` and one `policy_fragment.create` row with detail `reason=<reason> instruction=<id>`,
+  not the `param_key_invalid` refusal.
 - **No policy can run an action that has an execute gate, and nothing approves one.** There
   is no approval step for a policy and no setting that allows one, so a remediation attempt on a
   policy whose fix runs such an action is refused (`409`) and its devices show `blocked` until the

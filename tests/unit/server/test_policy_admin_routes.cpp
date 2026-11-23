@@ -515,6 +515,8 @@ struct RefusalRoutes {
     std::string empty_group_id;
     int dispatch_calls{0};
     std::optional<PolicyEvaluator> evaluator;
+    // Declared before `routes`, which counts refusals into it.
+    yuzu::MetricsRegistry metrics;
     // Declared before `sink`: the sink captures `routes`'s `this`, so `routes` must outlive it.
     PolicyAdminRoutes routes;
     yuzu::server::test::TestRouteSink sink;
@@ -572,7 +574,7 @@ struct RefusalRoutes {
         };
         auto emit_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
                           const nlohmann::json&) {};
-        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, &ps, &*evaluator, nullptr);
+        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, &ps, &*evaluator, &metrics);
     }
 
     std::string define(const std::string& id, const std::string& plugin, const std::string& action,
@@ -1070,4 +1072,60 @@ TEST_CASE("POST /api/policy-fragments: a hostile parameter key in check, fix or 
     auto stored = store.query_fragments();
     REQUIRE(stored.has_value());
     CHECK(stored->empty());
+}
+
+// G01 and sg10 together. A fragment that BOTH names an instruction policy evaluation does not
+// dispatch AND holds a parameter key with a control byte is refused by G01's authoring check,
+// which runs before the store parses the fragment (and so before every store-side validation,
+// the parameter-key rule included). The caller gets G01's 400 and exactly one denied audit row,
+// `reason=gated instruction=<id>`; no `param_key_invalid` row is written and the param_key_invalid
+// counter does not move. The same key with an allowed instruction is the sg10 refusal (control).
+TEST_CASE("POST /api/policy-fragments: a fragment that is both refused by G01 and holds a hostile "
+          "parameter key gets the G01 400 and one G01 audit row, not param_key_invalid",
+          "[pg][policy][admin][dispatch_approval][sg10]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto gated = r.define("i.gated", "content_dist", "execute_staged");
+    const auto allowed = r.define("i.status", "echo", "status");
+    const std::string bad_key = std::string("bad\x07key");
+    const auto with_bad_key = [&](const std::string& name, const std::string& check) {
+        return fragment_yaml(name, check) + "    parameters:\n      " + bad_key + ": v\n";
+    };
+    const auto key_counter = [&] {
+        return r.metrics
+            .counter("yuzu_server_dispatch_target_rejected_total",
+                     {{"route", "policy_fragment"}, {"reason", "param_key_invalid"}})
+            .value();
+    };
+
+    auto both = r.sink.Post("/api/policy-fragments", with_bad_key("both", gated), "text/plain");
+    REQUIRE(both);
+    CHECK(both->status == 400);
+    {
+        const auto err = nlohmann::json::parse(both->body).at("error");
+        CHECK(err.at("message").get<std::string>().find("(gated)") != std::string::npos);
+        CHECK(err.at("remediation").get<std::string>().rfind("policy_dispatch_refused: gated", 0) == 0);
+    }
+    REQUIRE(r.audit_calls.size() == 1);
+    CHECK(r.audit_calls[0].action == "policy_fragment.create");
+    CHECK(r.audit_calls[0].result == "denied");
+    CHECK(r.audit_calls[0].target_id == "both");
+    CHECK(r.audit_calls[0].detail == "reason=gated instruction=i.gated");
+    CHECK(key_counter() == 0.0);
+
+    // Control: the same key with an allowed instruction reaches the store and is the sg10 refusal.
+    r.audit_calls.clear();
+    auto key_only = r.sink.Post("/api/policy-fragments", with_bad_key("key only", allowed), "text/plain");
+    REQUIRE(key_only);
+    CHECK(key_only->status == 400);
+    CHECK(key_only->body.find("param_key_invalid") != std::string::npos);
+    REQUIRE(r.audit_calls.size() == 1);
+    CHECK(r.audit_calls[0].action == "policy_fragment.create");
+    CHECK(r.audit_calls[0].result == "denied");
+    CHECK(r.audit_calls[0].detail == "reason=param_key_invalid");
+    CHECK(key_counter() == 1.0);
+
+    auto frags = r.ps.query_fragments();
+    REQUIRE(frags.has_value());
+    CHECK(frags->empty());
 }
