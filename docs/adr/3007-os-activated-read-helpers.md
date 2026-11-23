@@ -113,9 +113,10 @@ breaks any of them is outside this ADR and needs its own threat model.
    `modprobe`, which found no module (the instance cannot read the module directory), no process of
    the instance loaded a module, and the tool exited 1 with `Cannot initialize`, the status the
    script prints as `[failed]`. The IPv6 tool was not run in this position. Neither of the two
-   measured loads can be avoided inside this contract: skipping nft needs proof that nf_tables is
-   absent, and no existence test gives it on a kernel that builds nf_tables in; and nothing the
-   script can test closes the time between the kernel's list and the tool's request.
+   loads the kernel makes on demand (the first and second cases above) can be avoided inside this
+   contract: skipping nft needs proof that nf_tables is absent, and no existence test gives it on
+   a kernel that builds nf_tables in; and nothing the script can test closes the time between the
+   kernel's list and the tool's request.
 4. **Bounded.** The output is cut at 4 MiB (4194304 bytes), the same number as the cap on the
    plugin's netlink dumps (`kNftDumpMaxBytes`); the two bound different encodings, this one the text
    listing and that one the netlink dump, so a ruleset can fit one and not the other. The instance
