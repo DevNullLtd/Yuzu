@@ -29,7 +29,8 @@ wiring around them, per OS class below:
                      only the netlink table-dump row is deferred (to
                      the decline path), and only while no table has been seen (a second pass whose
                      table dump fails after a table was seen writes its row at once), never the
-                     socket-open diagnostics; the broker reader (in
+                     socket-open diagnostics; info.tables_seen, which decides that and feeds every
+                     clamp, is assigned in one place and can only turn on; the broker reader (in
                      firewall_snapshot_reader.hpp, which the plugin and its tests share) opens
                      a close-on-exec non-blocking ScopedFd socket, checks SO_PEERCRED for the
                      expected uid (the plugin passes none, so root), bounds its wait and its size,
@@ -444,18 +445,31 @@ def linux_problems(plugin_src, reader_src):
         out.append("firewall_plugin.cpp no longer defines run_nft_probe(ctx, info)")
     else:
         text = squash(probe)
-        if len(re.findall(r"pending_rows\.push_back\(", text)) != 1 or not re.search(
-                r'info\.pending_rows\.push_back\( ?yuzu::firewall::nft_diag_row\( ?"table",', text):
+        if len(re.findall(r"pending_rows\.push_back\(", text)) != 1:
             out.append("run_nft_probe no longer defers exactly the table-dump row "
                        '(info.pending_rows.push_back(nft_diag_row("table", ...)))')
         at_once = r'ctx\.write_output\( ?yuzu::firewall::nft_diag_row\( ?"table", table\.res ?\) ?\);'
         if len(re.findall(at_once, text)) != 1 or not re.search(
-                r"if \( ?info\.tables_seen ?\) " + at_once + r" else info\.pending_rows\.push_back\( ?"
-                r'yuzu::firewall::nft_diag_row\( ?"table", table\.res ?\) ?\);', text):
-            out.append("run_nft_probe no longer writes the table-dump row at once exactly when a table was seen "
-                       "and defers it otherwise (deferred with a table seen, the snapshot rung's clamped unknown "
-                       "has no reason row; written at once with none seen, an EPERM row sits beside a successful "
-                       "snapshot read)")
+                r"if \( ?!table\.open_errno ?\) \{ if \( ?info\.tables_seen ?\) " + at_once +
+                r" else info\.pending_rows\.push_back\( ?"
+                r'yuzu::firewall::nft_diag_row\( ?"table", table\.res ?\) ?\); \}', text):
+            out.append("run_nft_probe no longer writes the table-dump row at once exactly when a "
+                       "table was seen and defers it otherwise, for a dump that ran (deferred with "
+                       "a table seen, the snapshot rung's clamped unknown has no reason row; "
+                       "written at once with none seen, an EPERM row sits beside a successful "
+                       "snapshot read; a socket that did not open has no dump to report)")
+        # info.tables_seen decides that branch and feeds every clamp: the whole file assigns it
+        # once, after the table-failure branch, and that assignment can only turn it on.
+        seen = (r"return std::nullopt; \} info\.tables_seen = info\.tables_seen \|\| "
+                r"!yuzu::firewall::parse_nft_tables\(table\.buf\)\.empty\(\);")
+        assigned = re.findall(r"(?<!bool )\btables_seen ?[|&^]?=(?!=)", squash(live))
+        if len(assigned) != 1 or not re.search(seen, text):
+            out.append("firewall_plugin.cpp no longer sets info.tables_seen in exactly one "
+                       "place, in run_nft_probe after the table-failure branch, as "
+                       "info.tables_seen || <the dump listed a table> (never set or cleared, the "
+                       "snapshot, ufw and iptables rungs can answer inactive beside tables the "
+                       "netlink read saw; set early, every read is clamped and an EPERM row sits "
+                       "beside a snapshot answer)")
         opens = len(re.findall(r"for \( ?const auto& row : yuzu::firewall::nft_open_diag_rows\(open_errnos\) ?\) "
                                r"ctx\.write_output\(row\);", text))
         if opens != 2:
@@ -600,6 +614,21 @@ LINUX_MUTATIONS = [
     (_lmut(r'if \(info\.tables_seen\)\s*ctx\.write_output\(yuzu::firewall::nft_diag_row\("table", table\.res\)\);\s*else\s*'
            r'(info\.pending_rows\.push_back\(yuzu::firewall::nft_diag_row\("table", table\.res\)\);)', r'\1'),
      "writes the table-dump row at once exactly when a table was seen"),
+    # the socket guard dropped: a socket that did not open writes a row for a dump that never ran
+    (_lmut(r"if \(!table\.open_errno\) \{(\s*if \(info\.tables_seen\))", r"if (true) {\1"),
+     "writes the table-dump row at once exactly when a table was seen"),
+    # info.tables_seen never set: nothing is clamped, a re-run's table-dump row is deferred again
+    (_lmut(r"\n\s*info\.tables_seen = info\.tables_seen \|\| "
+           r"!yuzu::firewall::parse_nft_tables\(table\.buf\)\.empty\(\);", ""),
+     "no longer sets info.tables_seen in exactly one place"),
+    # ... set before the table dump was looked at: every read is clamped, no row is deferred
+    (_lmut(r"(const auto table = take\(nft::kNftMsgGettable, table_deadline\);)",
+           r"\1 info.tables_seen = true;"),
+     "no longer sets info.tables_seen in exactly one place"),
+    # ... cleared before the snapshot rung: its clamp and the clamp of ufw and iptables are lost
+    (_lmut(r"(if \(try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::state\)\))",
+           r"info.tables_seen = false; \1"),
+     "no longer sets info.tables_seen in exactly one place"),
     # a socket-open diagnostic deferred as well
     (_lmut(r"(for \(const auto& row : yuzu::firewall::nft_open_diag_rows\(open_errnos\)\)\s*)ctx\.write_output\(row\);",
            r"\1info.pending_rows.push_back(row);"), "never deferred"),

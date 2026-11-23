@@ -1090,7 +1090,10 @@ struct NftFallthroughInfo {
     /// here while no table has been seen, because the snapshot rung that follows may read the very
     /// ruleset the dump was refused, and an EPERM row beside a successful read would mislead.
     /// Once a table has been seen nothing waits: the snapshot rung's unknown can then rest on the
-    /// netlink read (nft_fallthrough_clamp), so run_nft_probe writes the row at once.
+    /// netlink read (nft_fallthrough_clamp), so run_nft_probe writes the row at once, before that
+    /// rung runs and whatever it then answers. The row can therefore also stand before an active
+    /// answer, as the fallthrough rows of a pass that got past its table dump can: it names a
+    /// re-run that failed after a pass that saw a table, not an account that cannot read.
     std::vector<std::string> pending_rows;
 };
 
@@ -1190,11 +1193,12 @@ struct NftProbeResult {
             // On a re-run this is the same path: the earlier pass's churn is superseded.
             // The socket-open diagnostics (fd_exhausted, a refused open) are written at once, as
             // ever. The table-dump row is deferred to the dispatcher
-            // (NftFallthroughInfo::pending_rows) only while no table has been seen, which is the
-            // account that cannot read at all. On a re-run whose first pass saw a table the row is
-            // written at once, as the fallthrough rows of a pass that got past its table dump are:
-            // the snapshot rung then turns an empty listing to unknown on the strength of this
-            // read and writes no error row of its own for it.
+            // (NftFallthroughInfo::pending_rows) only while no table has been seen: on a first
+            // pass, whatever made its dump fail (the account that cannot read at all among them),
+            // and on a re-run whose first pass listed no table. On a re-run whose first pass saw a
+            // table the row is written at once, as the fallthrough rows of a pass that got past
+            // its table dump are: the snapshot rung then turns an empty listing to unknown on the
+            // strength of this read and writes no error row of its own for it.
             for (const auto& row : yuzu::firewall::nft_open_diag_rows(open_errnos))
                 ctx.write_output(row);
             if (!table.open_errno) {
@@ -1568,8 +1572,9 @@ void do_state_linux(yuzu::CommandContext& ctx) {
 
     if (info.tables_seen) {
         // GETTABLE succeeded (something IS managing nftables here) but the
-        // chain/rule content couldn't be trusted -- a fallthrough row was
-        // already written by try_nftables_state. Probe ufw/iptables next,
+        // chain/rule content couldn't be trusted -- any fallthrough row, or
+        // the table-dump row of a re-run that failed after a table was seen,
+        // was already written by run_nft_probe. Probe ufw/iptables next,
         // clamped so neither can report a confident "disabled" that
         // contradicts the tables just seen.
         if (try_ufw_state(ctx, /*tables_seen=*/true))
