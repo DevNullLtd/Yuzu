@@ -3,11 +3,13 @@
 
 ServerImpl is never constructed by a unit test, and server code cannot be built on every dev host,
 so nothing else notices if the wiring around the gate (echo_corruption_audit.hpp, unit-tested in
-isolation) is dropped with every unit case green. Four sites (plus the closed-store counter, pre-seeded in 1 and incremented in 2's sink), anchored on tokens (never line
+isolation) is dropped with every unit case green. Four sites, anchored on tokens (never line
 numbers):
 
-  1. Pre-seeds. `yuzu_server_echo_db_quarantines_total`, `yuzu_server_health_upsert_exceptions_total`,
-     `yuzu_server_echo_corruption_audit_store_closed_total` and every `yuzu_server_echo_corruption_audit_degraded_total{reason}` series are touched to 0 at
+  1. Pre-seeds. `yuzu_server_echo_db_quarantines_total`,
+     `yuzu_server_health_upsert_exceptions_total`,
+     `yuzu_server_echo_corruption_audit_store_closed_total` and every
+     `yuzu_server_echo_corruption_audit_degraded_total{reason}` series are touched to 0 at
      boot, unconditionally, in the block that describes them. The YuzuEchoDbCorruptionDetected alert
      is an increase() over the counter, and increase() of a series first seen at 1 is 0 (promtool
      CORRUPTION CASE 5). The reason list is written twice, once in the pre-seed and once as the
