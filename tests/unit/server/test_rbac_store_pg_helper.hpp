@@ -68,6 +68,11 @@ public:
         REQUIRE(pool_->valid());
         store_ = std::make_unique<yuzu::server::RbacStore>(*pool_);
         REQUIRE(store_->is_open());
+        // The `rbacstore` template has no `session_store` schema, and the Administrator unassign
+        // clears durable elevations by default: opt out here (test-only) so fixtures built on
+        // this helper stay a one-liner. A test that exercises the durable clear builds its own
+        // SessionStore on the same pool (test_rbac_account_lifecycle_guard.cpp).
+        store_->use_no_session_store_for_test();
     }
 
     RbacStorePg(const RbacStorePg&) = delete;

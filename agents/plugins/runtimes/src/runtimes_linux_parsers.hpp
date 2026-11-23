@@ -667,6 +667,57 @@ inline bool home_has_java_binary(DIR* home, ConstraintAccumulator& acc) {
     return false;
 }
 
+/// Whether <home>/bin/javac is a regular file or a symlink (never followed, never run: directory
+/// entry only). `bin` is opened O_NOFOLLOW; no `bin` or no `javac` is a definite `false`. A failed
+/// open of `bin`, a symlinked `bin` (refused, `symlink_refused`) or a failed stat of `javac` (other
+/// than ENOENT) is recorded and answers nullopt: undecided, never read as "no javac". A directory
+/// or other special file named `javac` is not a compiler.
+[[nodiscard]] inline std::optional<bool> home_has_javac(DIR* home, ConstraintAccumulator& acc) {
+    Opened o = open_child(home, "bin");
+    if (o.status == OpenStatus::absent) return false;
+    if (o.status == OpenStatus::alias) {
+        acc.add_failure(kTokSymlinkRefused);
+        return std::nullopt;
+    }
+    if (o.status == OpenStatus::failed) {
+        acc.add_failure(o.token);
+        return std::nullopt;
+    }
+    struct stat st{};
+    if (::fstatat(::dirfd(o.dir.get()), "javac", &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        const auto tok = stat_errno_token(errno);
+        if (!tok) return false;
+        acc.add_failure(*tok);
+        return std::nullopt;
+    }
+    return S_ISREG(st.st_mode) || S_ISLNK(st.st_mode);
+}
+
+/// Flavour of a home whose `release` file names no IMAGE_TYPE: `jdk` when bin/javac is there, `jre`
+/// when it is not but a java binary is (`java_known` skips the second probe when the caller has
+/// already found one), `unmodelled` when neither can be established. Validated by real Debian,
+/// Ubuntu and openSUSE JDK/JRE package captures (tests/unit/fixtures/wave10/runtimes/linux/).
+///
+/// The probe is charged one unit of `budget.entries_left` BEFORE it runs, however many fixed-name
+/// opens it makes (up to four per home: `bin` for javac, then `bin`, `jre` and `jre/bin` for java).
+/// A spent budget answers nullopt after recording `row_cap` and exhausting the walk, exactly as
+/// list_entries does: the caller stops, and the home's flavour is never guessed.
+[[nodiscard]] inline std::optional<JvmFlavour> flavour_from_bin(DIR* home, bool java_known,
+                                                                ConstraintAccumulator& acc,
+                                                                WalkBudget& budget) {
+    if (budget.entries_left == 0) {
+        budget.exhausted = true;
+        acc.add_failure(kTokRowCap);
+        return std::nullopt;
+    }
+    --budget.entries_left;
+    const auto javac = home_has_javac(home, acc);
+    if (!javac) return JvmFlavour::unmodelled;
+    if (*javac) return JvmFlavour::jdk;
+    return (java_known || home_has_java_binary(home, acc)) ? JvmFlavour::jre
+                                                           : JvmFlavour::unmodelled;
+}
+
 /// The mount table at `path` (production: /proc/self/mountinfo) reduced to its network mount
 /// points, streamed line-wise (see kMountinfoChunk). `ok` is false when it cannot be read in full
 /// (absent, refused, not a regular file, an I/O error, more than `max_total` bytes, or a line too
@@ -779,7 +830,9 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
 /// neither a `release` file nor a bin/java or jre/bin/java is not a JVM home (silent); one with a
 /// java binary but no `release` (e.g. Ubuntu OpenJDK 8) is a row with an unknown version plus
 /// `release_missing`; an unreadable / oversized / version-less `release` is a recorded constraint.
-/// Symlinked homes are aliases.
+/// Symlinked homes are aliases. The flavour is the release file's IMAGE_TYPE; where that is absent
+/// (Debian, Ubuntu, openSUSE, ...) it is read from the home's bin/ by directory entry (see
+/// flavour_from_bin, which states the opens and the budget charge).
 [[nodiscard]] inline std::vector<std::string> jvm_rows_at(
     const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
     const WalkConfig& cfg = {}) {
@@ -801,7 +854,9 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
             if (rr.status == ReadStatus::absent) {
                 if (!home_has_java_binary(hh.get(), acc)) continue;
                 acc.add_failure(kTokReleaseMissing);
-                if (!push_row(rows, jvm_row_release_missing(path), budget, acc)) break;
+                const auto flavour = flavour_from_bin(hh.get(), /*java_known=*/true, acc, budget);
+                if (!flavour) break;
+                if (!push_row(rows, jvm_row_release_missing(path, *flavour), budget, acc)) break;
                 continue;
             }
             if (rr.status == ReadStatus::failed) {
@@ -810,7 +865,18 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
             }
             const auto fields = parse_release_file(rr.text);
             if (fields.oversized) acc.add_failure(kTokFieldOversized);
-            auto row = jvm_row(fields, path);
+            // A version-less file yields no row (jvm_row): decided before the probe, so it costs
+            // no budget and no bin token.
+            if (fields.java_version.empty() && fields.java_runtime_version.empty()) {
+                acc.add_failure(kTokReleaseUnparsable);
+                continue;
+            }
+            std::optional<JvmFlavour> fallback = JvmFlavour::unmodelled; // IMAGE_TYPE decides
+            if (!has_image_type(fields)) {
+                fallback = flavour_from_bin(hh.get(), /*java_known=*/false, acc, budget);
+                if (!fallback) break;
+            }
+            auto row = jvm_row(fields, path, *fallback);
             if (!row) {
                 acc.add_failure(kTokReleaseUnparsable);
                 continue;

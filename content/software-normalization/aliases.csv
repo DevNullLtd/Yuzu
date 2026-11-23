@@ -32,7 +32,7 @@
 # vendor is part of the product's identity, so two vendor spellings are two products.
 # No quoting: a field may not contain a comma or a double quote.
 #
-#pack_version: 2026.11.1
+#pack_version: 2026.11.2
 #
 # -- Linux distribution packages (ecosystem-agnostic names) -------------------------
 ,openssl,,openssl,openssl,,runtime,openssl
@@ -54,12 +54,14 @@
 ,tomcat10,,apache,tomcat,,web_server,tomcat
 ,postgresql,,postgresql,postgresql,,database,postgresql
 ,postgresql-server,,postgresql,postgresql,,database,postgresql
+,postgresql-18,,postgresql,postgresql,,database,postgresql
 ,mariadb-server,,mariadb,mariadb,,database,mariadb
 ,mysql-server,,oracle,mysql,,database,mysql
 ,redis-server,,redis,redis,,database,redis
 ,rabbitmq-server,,rabbitmq,rabbitmq,,message_broker,rabbitmq
 ,mosquitto,,eclipse,mosquitto,,message_broker,mosquitto
 ,python3,,python,python,,runtime,python
+,python3.14,,python,python,,runtime,python
 ,nodejs,,openjs,node.js,,runtime,node.js
 ,git,,git-scm,git,,other,git
 # -- Windows applications -----------------------------------------------------------

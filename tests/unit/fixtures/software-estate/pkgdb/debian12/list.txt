@@ -1,0 +1,10 @@
+debconf|1.5.82|Debconf Developers <debconf-devel@lists.alioth.debian.org>|install ok installed
+hostname|3.23+nmu1|Michael Meskes <meskes@debian.org>|install ok installed
+libacl1|2.3.1-3|Guillem Jover <guillem@debian.org>|install ok installed
+libattr1|1:2.5.1-4|Guillem Jover <guillem@debian.org>|install ok installed
+libaudit-common|1:3.0.9-1|Laurent Bigonville <bigon@debian.org>|install ok installed
+libgmp10|2:6.2.1+dfsg1-1.1|Debian Science Team <debian-science-maintainers@lists.alioth.debian.org>|install ok installed
+libtinfo6|6.4-4|Craig Small <csmall@debian.org>|install ok installed
+login|1:4.13+dfsg1-1+deb12u2|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|install ok installed
+sed|4.9-1+deb12u1|Clint Adams <clint@debian.org>|install ok installed
+tzdata|2026f-0+deb12u1|GNU Libc Maintainers <debian-glibc@lists.debian.org>|install ok installed
