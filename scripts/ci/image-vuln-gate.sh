@@ -824,7 +824,7 @@ for w in "${GRYPE_DB_WAIVERS[@]}"; do
     w="${w#waiver: provider }"
     [ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::provider waiver in force: grype DB provider ${w%% *} is older than 72 hours (an image that passes under it is marked in its report)"
 done
-[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    provider waiver in force for $(waived_desc): every image judged while it is in force uses it"
+[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    provider waiver in force for $(waived_desc): an image that passes while it is in force is marked in its report"
 GRYPE_DB_REF="$GRYPE_DB_URL/$gdb_path ($gdb_sum, schema $gdb_schema, built $gdb_built)"
 printf '%s\n' "$gstat" | sed 's/^/    /'
 echo "    $GRYPE_DB_REF"
@@ -1176,7 +1176,7 @@ for idx in "${!NAMES[@]}"; do
     grype_scan "$name" "$image" "$want_family"
 done
 
-if [ "${#waived_providers[@]}" -gt 0 ]; then
+if [ "$n_degraded" -gt 0 ]; then
     wsum="$(printf '%s\n' "${!waived_providers[@]}" | sort | paste -sd, - | sed 's/,/, /g')"
     echo "DEGRADED: provider waiver in force for grype DB provider(s) $wsum (older than 72 hours): $n_degraded image(s) passed under it; each grype .gate.txt names the waiver"
     summary ""

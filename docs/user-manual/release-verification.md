@@ -196,8 +196,8 @@ pass:
   for another reason.
 - `in force for this run (<name>), but the image was not judged`, or `stale and not waived ...
   and the image was not judged`: the gate stopped (or was cancelled) before this image. The waiver bounds how long it is in force (14 days), not how old the
-capture it admits may be: the capture's age is on the `provider waiver:` line. The project's
-release procedure requires the release notes of a release scanned degraded to say so; the
+capture it admits may be: the capture's age is on the `provider waiver:` line. The release
+notes of a release scanned degraded carry the "Image scan: DEGRADED" section automatically; the
 reports are the record either way. Follow the waiver's `approval_ref` to audit it,
 as for an accepted finding, and read its `statement` (the evidence of the stall) in the tag's own
 file: `git show vX.Y.Z:.grypeignore.yaml`.

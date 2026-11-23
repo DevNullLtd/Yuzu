@@ -449,6 +449,12 @@ class DegradedPass(unittest.TestCase):
             s = self.statement(d)
             self.assertEqual((s.returncode, s.stdout), (0, ""), s.stderr)
 
+    def test_an_empty_directory_is_not_reported_as_clean(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            s = self.statement(Path(t))
+            self.assertEqual(s.returncode, 10, s.stderr)
+            self.assertIn("could not be determined", s.stdout)
+
     def test_a_degraded_published_attempt_is_reported_but_not_refused(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
             d = Path(t)

@@ -1855,7 +1855,7 @@ class ProviderWaiver(unittest.TestCase):
         # crossing UTC midnight on its expiry day): the generated waivers file
         # is emptied once the run's nvd waiver has been read.
         lapse = ('[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    provider waiver in force for $(waived_desc): '
-                 'every image judged while it is in force uses it"\n')
+                 'an image that passes while it is in force is marked in its report"\n')
         def gate_copy(label, extra_edits=()):
             return GrypeMutants.mutant(self, label, [(lapse, lapse + 'echo "[]" > "$GRYPE_WAIVERS"\n'),
                                                      *extra_edits], [])
@@ -1954,7 +1954,7 @@ class ProviderWaiver(unittest.TestCase):
         # Every image lapsed before any passed: no DEGRADED line at the end.
         rep2 = self.tmp / "rep-all-lapsed"
         lapse = ('[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    provider waiver in force for $(waived_desc): '
-                 'every image judged while it is in force uses it"\n')
+                 'an image that passes while it is in force is marked in its report"\n')
         gate2 = GrypeMutants.mutant(self, "waiver-lapses-at-start", [(lapse, lapse + 'echo "[]" > "$GRYPE_WAIVERS"\n')], [])
         r = self.run_gate("a=img:1", "b=img:2", grype_mode="provider-stale",
                           grype_ignore=self.waived(waiver(), name="w5.yaml"), gate=gate2,

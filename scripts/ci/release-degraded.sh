@@ -63,6 +63,8 @@ for img in $(printf '%s\n' "${!images[@]}" | sort); do
     fi
 done
 
+# No image at all is not "none degraded": the reports are missing.
+[ "${#images[@]}" -gt 0 ] || unknown+=("no image gate report or publish journal was found in $DIR")
 [ "${#degraded[@]}" -gt 0 ] || [ "${#unknown[@]}" -gt 0 ] || exit 0
 
 echo "## Image scan: DEGRADED"
