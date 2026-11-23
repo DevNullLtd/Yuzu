@@ -1967,7 +1967,9 @@ is `SsoOnlyGateResult::admits_password_evaluation()` (open or armed), and `kTran
 refusal for every caller except the MFA step's second check; (2) a failed, stale or
 in-flight read is never recorded as "not armed" and never cached, and an "armed" snapshot whose read
 started at or before a "not armed" read this server holds is never served from the cache, and the first MFA
-check refuses such an answer as a disarm before anything is verified or spent; (3) no "armed" read is
+check refuses such an answer as a disarm before anything is verified or spent; the second check applies the
+same test to its own read, so an "armed" own read is refused as a disarm when a "not armed" read this server
+holds ended at or after that read started; (3) no "armed" read is
 honoured more than `kArmSnapshotMaxAge` (4.5 s) after it started, one comparison
 (`arm_observation_fresh`, on the steady clock) at every site; (4) the first MFA check uses the cached
 single-flight mode (its snapshot is what the second check's bounded rule relies on) and puts

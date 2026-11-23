@@ -3826,7 +3826,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             mfa_verify_barrier_for_test_("/login/mfa", proof);
         // Re-check the arm state once more at the mint (the code verification took time). A code
         // may already be spent here, so the three answers are kept apart:
-        //  - armed: mint;
+        //  - armed: mint, unless a "not armed" read this server holds ended at or after this
+        //    read started (then it is a disarm, refused);
         //  - a definitive "not armed": refuse (the refusal is honest about a spent code);
         // This check reads the arm state ITSELF (no shared cache, no single flight), so a refresh
         // held by another request, or an old cache, cannot refuse a login whose code is spent.
@@ -3852,9 +3853,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 wall2 - arm1->wall_at <= kArmSnapshotMaxAge &&
                 !arm1->arm_id.empty() && gate2.arm_id == arm1->arm_id &&
                 !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at);
-            const bool admit =
-                arm1.has_value() &&
-                (gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);
+            // An armed own read is honoured only if no "not armed" read this server holds ended
+            // at or after it STARTED: such a read is the newer fact (C-01, PR #8626 review).
+            const bool armed_ok =
+                gate2.state == SsoOnlyLocalGate::kBreakGlassArmed &&
+                !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= gate2.read_at);
+            const bool admit = arm1.has_value() && (armed_ok || transient_ok);
             if (!admit) {
                 const char* reason = "transient";
                 const char* detail = "reason=break_glass_arm_state_unreadable_before_mint";

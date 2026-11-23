@@ -1961,6 +1961,42 @@ TEST_CASE("break-glass MFA step: the second re-check reads the arm state itself"
         CHECK(refused(h, "disarmed", "pre_mint") == 1.0);
         CHECK(transient_admitted(h) == 0.0);
     }
+    SECTION("an own read that says armed is refused when a not-armed read was recorded after it started") {
+        const auto pending = login_step1(h);
+        r.set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+            r.advance_arm_clock_for_test(1100);
+            // Inside the second re-check's own read (it has started): another request refreshes
+            // and reads "not armed" a little later; then the own read itself answers ARMED.
+            ctl.before_answer = [&] {
+                r.advance_arm_clock_for_test(10);
+                ctl.mode = ArmCtl::kNotArmed;
+                REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kRefused);
+                ctl.mode = ArmCtl::kArmed;
+            };
+        });
+        auto res = login_step2(h, pending, mfa.codes[0]);
+        // The not-armed read ended after the own read started, so the armed answer is superseded
+        // (C-01, PR #8626 review; mutation: the armed branch skips the supersession test -> 200).
+        CHECK(res->status == 401);
+        CHECK(refused(h, "disarmed", "pre_mint") == 1.0);
+        CHECK(transient_admitted(h) == 0.0);
+    }
+    SECTION("an own read that says armed is honoured when the only not-armed read ended before it started") {
+        const auto pending = login_step1(h);
+        r.set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+            r.advance_arm_clock_for_test(1100);
+            // A not-armed read, then a re-arm, both BEFORE the second re-check's read starts.
+            ctl.mode = ArmCtl::kNotArmed;
+            REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kRefused);
+            ctl.mode = ArmCtl::kArmed;
+            r.advance_arm_clock_for_test(10);
+        });
+        auto res = login_step2(h, pending, mfa.codes[0]);
+        // An armed read that started after the not-armed one is the newer fact: it mints (guards
+        // the fix against refusing on ANY recorded not-armed time).
+        CHECK(res->status == 200);
+        CHECK(refused_total(h) == 0.0);
+    }
     SECTION("an own read that says not armed makes the next request read again") {
         const auto pending = login_step1(h);
         r.set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {

@@ -311,9 +311,16 @@ def check_arm_recheck(files):
                    "!(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at)"):
         if clause not in seg:
             bad.append(f"/login/mfa: the transient admit rule must contain `{clause}`")
+    # C-01 (PR #8626 review): an ARMED own read is also tested for supersession, against the own
+    # read's own start: a not-armed read recorded at or after it started refuses.
+    if not re.search(r"const bool armed_ok =\s*gate2\.state == SsoOnlyLocalGate::kBreakGlassArmed &&\s*"
+                     r"!\(gate2\.last_not_armed_at && \*gate2\.last_not_armed_at >= gate2\.read_at\);", seg):
+        bad.append("/login/mfa: armed_ok must be `armed && !(gate2.last_not_armed_at && "
+                   "*gate2.last_not_armed_at >= gate2.read_at)` (an armed own read is superseded "
+                   "by a not-armed read that ended at or after it started)")
     if not re.search(r"const bool admit =\s*arm1\.has_value\(\) &&\s*"
-                     r"\(gate2\.state == SsoOnlyLocalGate::kBreakGlassArmed \|\| transient_ok\);", seg):
-        bad.append("/login/mfa: admit must be `arm1.has_value() && (armed || transient_ok)` "
+                     r"\(armed_ok \|\| transient_ok\);", seg):
+        bad.append("/login/mfa: admit must be `arm1.has_value() && (armed_ok || transient_ok)` "
                    "(a login with no first-re-check snapshot never mints)")
     refuse = seg.find("if (!admit) {")
     if refuse < 0:
@@ -618,13 +625,23 @@ def selftest(files):
             sub_cpp("const auto now2 = arm_clock_now();\n            const auto wall2 = arm_wall_clock_now();",
                     "const auto wall2 = arm_wall_clock_now();\n            const auto now2 = arm_clock_now();"))
         mut("wall time used to admit",
-            sub_cpp("(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);",
-                    "(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok || wall2 < arm1->wall_at);"))
+            sub_cpp("(armed_ok || transient_ok);",
+                    "(armed_ok || transient_ok || wall2 < arm1->wall_at);"))
         mut("arm1.has_value() dropped from admit",
-            sub_cpp("const bool admit =\n                arm1.has_value() &&", "const bool admit ="))
+            sub_cpp("const bool admit = arm1.has_value() &&", "const bool admit ="))
         mut("arm1.has_value() only inside the transient rule",
-            sub_cpp("arm1.has_value() &&\n                (gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);",
-                    "(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || (arm1.has_value() && transient_ok));"))
+            sub_cpp("arm1.has_value() && (armed_ok || transient_ok);",
+                    "(armed_ok || (arm1.has_value() && transient_ok));"))
+        # C-01: the armed branch's supersession test.
+        mut("the armed own read skips the supersession test (C-01)",
+            sub_cpp("gate2.state == SsoOnlyLocalGate::kBreakGlassArmed &&\n"
+                    "                !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= gate2.read_at);",
+                    "gate2.state == SsoOnlyLocalGate::kBreakGlassArmed;"))
+        mut("the armed own read is superseded against the first check's start, not its own",
+            sub_cpp("*gate2.last_not_armed_at >= gate2.read_at);", "*gate2.last_not_armed_at >= arm1->read_at);"))
+        mut("admit takes the raw armed state instead of armed_ok",
+            sub_cpp("(armed_ok || transient_ok);",
+                    "(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);"))
         r2 = blk2.find("if (!admit) {")
         ret2 = blk2.find("return;", r2)
         if r2 < 0 or ret2 < 0:
