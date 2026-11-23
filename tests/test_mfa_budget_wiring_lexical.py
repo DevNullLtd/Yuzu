@@ -276,11 +276,12 @@ def check_arm_recheck(files):
         bad.append("/login/mfa: the first arm re-check must precede mfa_budget_reserve( and the first verifier")
     if g1 < res and body[g1:res].count("return;") != 2:
         bad.append("/login/mfa: the first arm re-check must have exactly two refusals, each ending in return;")
-    if "arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at};" not in body[g1:res]:
-        bad.append("/login/mfa: the first arm re-check must record arm1 from the armed answer")
-    if "arm1->wall_at = arm_wall_clock_now();" not in body[g1:res]:
-        bad.append("/login/mfa: the first arm re-check must record the wall time of arm1 "
-                   "(arm1->wall_at = arm_wall_clock_now();)")
+    if "arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at, gate1.read_wall_at};" not in body[g1:res]:
+        bad.append("/login/mfa: the first arm re-check must record arm1 from the armed answer, with the wall "
+                   "time at which THAT read started (gate1.read_wall_at), not a sample taken after the gate returned")
+    if "arm_wall_clock_now()" in body[g1:res]:
+        bad.append("/login/mfa: no wall-clock sample between the first gate call and the reservation "
+                   "(the anchor is the read's start, carried by the gate)")
     # Re-check #2: the gate, then ONE clock sample, then the decision, then the mint.
     if not calls[-1] < g2 < mint:
         bad.append("/login/mfa: the second arm re-check must be after the verifiers and before the mint")
@@ -354,6 +355,14 @@ def check_arm_recheck(files):
                      "if (armed_now && !arm_observation_fresh(started, finished)) {"):
             if stmt not in gate:
                 bad.append(f"the gate must apply the cap as `{stmt}`")
+        # The wall anchor of a cached snapshot is the wall time when its read STARTED (UP-1b).
+        if "const auto started_wall = arm_wall_clock_now();" not in gate or \
+                gate.find("const auto started_wall = arm_wall_clock_now();") > gate.find("read = hook();"):
+            bad.append("the gate must sample `started_wall` before the read")
+        for stmt in ("bg_arm_started_wall_ = started_wall;", "out.read_wall_at = bg_arm_started_wall_;",
+                     "out.read_wall_at = started_wall;"):
+            if stmt not in gate:
+                bad.append(f"the gate must contain `{stmt}`")
         # An armed snapshot older than a not-armed read this server holds is never served (UP-2).
         for stmt in ("const bool superseded = bg_arm_armed_ && bg_last_not_armed_at_ && "
                      "*bg_last_not_armed_at_ >= bg_arm_started_;",
@@ -380,7 +389,8 @@ def check_arm_recheck(files):
                 bad.append("the own read must write bg_last_not_armed_at_ in exactly one place "
                            "(a successful not-armed read)")
             for forbidden in ("bg_arm_armed_ =", "bg_arm_at_ =", "bg_arm_deadline_ =", "bg_arm_started_ =",
-                              "bg_arm_id_ =", "bg_arm_valid_ = true", "compare_exchange_strong"):
+                              "bg_arm_id_ =", "bg_arm_started_wall_ =", "bg_arm_valid_ = true",
+                              "compare_exchange_strong"):
                 if forbidden in own:
                     bad.append(f"the second re-check's own read must not write the armed cache or "
                                f"take the single flight (`{forbidden}`)")
@@ -560,7 +570,9 @@ def selftest(files):
         mut("first re-check moved after the first verifier",
             lambda m: move_text(m, blk1, "if (store_unavailable) {"))
         mut("first re-check does not record arm1",
-            sub_cpp("arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at};", ""))
+            sub_cpp("arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at, gate1.read_wall_at};", ""))
+        mut("first re-check anchors the wall time after the gate returned",
+            sub_cpp("gate1.read_at, gate1.read_wall_at};", "gate1.read_at, arm_wall_clock_now()};"))
         mut("second re-check moved after the mint",
             lambda m: move_text(m, blk2, "if (token.empty()) {"))
         mut("now2 sampled before the second gate call",
@@ -574,12 +586,22 @@ def selftest(files):
                        "!(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at)"):
             mut(f"transient admit clause removed: {clause}",
                 sub_cpp(clause, "true &&" if clause.endswith("&&") else "true"))
+        mut("the cache hit does not carry the wall time of the read",
+            sub_cpp("out.read_wall_at = bg_arm_started_wall_;", ""))
+        mut("the cached snapshot's wall time is not recorded",
+            sub_cpp("bg_arm_started_wall_ = started_wall;", ""))
+        def _late_wall(m):
+            k, stmt = "auth_routes.cpp", "const auto started_wall = arm_wall_clock_now();"
+            anchor = "bg_arm_started_wall_ = started_wall;"
+            if stmt not in m[k] or anchor not in m[k]:
+                return False
+            m[k] = m[k].replace(stmt, "", 1).replace(anchor, stmt + " " + anchor, 1)
+            return True
+        mut("the gate samples the wall time after its read, at the cache write", _late_wall)
         mut("the cache serves an armed snapshot older than a not-armed read this server holds",
             sub_cpp("kBreakGlassArmCacheTtl && !superseded) {", "kBreakGlassArmCacheTtl) {"))
         mut("the superseded test never fires",
             sub_cpp("bg_arm_armed_ && bg_last_not_armed_at_ && *bg_last_not_armed_at_ >= bg_arm_started_;", "false;"))
-        mut("wall time of arm1 not recorded at the first re-check",
-            sub_cpp("arm1->wall_at = arm_wall_clock_now();", ""))
         mut("a second wall sample in the second re-check",
             sub_cpp("wall2 - arm1->wall_at", "arm_wall_clock_now() - arm1->wall_at"))
         mut("wall2 sampled before now2",

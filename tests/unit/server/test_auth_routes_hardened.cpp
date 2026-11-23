@@ -1174,6 +1174,41 @@ TEST_CASE("break-glass MFA step: a suspend between the two checks refuses an unr
     }
 }
 
+// UP-1b (governance round 11, found by four reviewers): the wall clock must be measured from the START
+// of the read behind the first check, not from the moment the first check returned. A cache entry up
+// to a second old on the monotonic clock can be served after a suspend of any length.
+TEST_CASE("break-glass MFA step: a suspend between the cached read and the first check refuses an unreadable arm state at the second",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    // Wall time that passes between the cached read and the first check; the monotonic clock moves 100 ms.
+    const std::int64_t wall_ms = GENERATE(100, 4400, 4500, 4600, 60000);
+    const bool refuses = wall_ms > 4500;
+    INFO("wall clock moved " << wall_ms << " ms before the first check, monotonic 100 ms");
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    auto& r = *h.auth_routes;
+    r.set_arm_wall_clock_for_test(kW0);
+    REQUIRE(r.sso_only_local_password_gate("admin").state == SsoOnlyLocalGate::kBreakGlassArmed); // the cached read
+    r.advance_arm_clock_for_test(100);
+    r.advance_arm_wall_clock_for_test(wall_ms); // the suspend
+    const auto pending = login_step1(h);        // and the first check below are answered from that cache entry
+    r.set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        r.advance_arm_clock_for_test(1100); // past the 1 s cache, well inside 4.5 s
+        ctl.mode = ArmCtl::kFail;           // the re-read fails
+    });
+    auto res = login_step2(h, pending, mfa.codes[0]);
+    if (refuses) {
+        CHECK(res->status == 401);
+        CHECK(res->get_header_value("Set-Cookie").empty());
+        CHECK(refused(h, "transient", "pre_mint") == 1.0);
+        CHECK(transient_admitted(h) == 0.0);
+    } else {
+        CHECK(res->status == 200);
+        CHECK(transient_admitted(h) == 1.0);
+    }
+}
+
 // T2 (and T7)
 TEST_CASE("break-glass MFA step: an unreadable arm state after the window's end refuses as window_ended",
           "[pg][auth][hardened][routes][fail-closed][wp03]") {

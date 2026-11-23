@@ -2732,6 +2732,7 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
             out.arm_id = bg_arm_id_;
             out.deadline = bg_arm_deadline_;
             out.read_at = bg_arm_started_;
+            out.read_wall_at = bg_arm_started_wall_;
             return out;
         }
         out.arm_id = bg_last_armed_id_; // what a transient answer carries
@@ -2765,6 +2766,7 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
     // BEFORE the read: the database snapshot it sees is at or after this instant, so the arm
     // deadline and the age of the observation both count from the conservative side.
     const auto started = arm_clock_now();
+    const auto started_wall = arm_wall_clock_now(); // the same instant, for a suspend between this read and the first MFA check
     if (hook) {
         read = hook();
     } else if (auto* db = auth_mgr_.auth_db_ptr()) {
@@ -2805,6 +2807,7 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
     bg_arm_armed_ = armed_now;
     bg_arm_at_ = finished;
     bg_arm_started_ = started;
+    bg_arm_started_wall_ = started_wall;
     bg_arm_deadline_ = deadline;
     bg_arm_id_ = read.armed_until;
     if (armed_now) {
@@ -2813,6 +2816,7 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
         out.arm_id = read.armed_until;
         out.deadline = deadline;
         out.read_at = started;
+        out.read_wall_at = started_wall;
         return out;
     }
     // A definitive "not armed". The last armed id is left in place on purpose.
@@ -3592,7 +3596,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             std::string arm_id;
             std::chrono::steady_clock::time_point deadline;
             std::chrono::steady_clock::time_point read_at;
-            std::chrono::system_clock::time_point wall_at{}; ///< wall time when this snapshot was taken
+            std::chrono::system_clock::time_point wall_at; ///< wall time when that read STARTED
         };
         std::optional<ArmSnapshot> arm1;
         bool admitted_under_transient = false;
@@ -3605,8 +3609,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (entry.break_glass) {
             const SsoOnlyGateResult gate1 = sso_only_local_password_gate(entry.username);
             if (gate1.state == SsoOnlyLocalGate::kBreakGlassArmed) {
-                arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at};
-                arm1->wall_at = arm_wall_clock_now();
+                arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at, gate1.read_wall_at};
             } else if (gate1.state == SsoOnlyLocalGate::kTransient) {
                 const std::string uname = entry.username;
                 const auto urole = entry.role;
@@ -3828,9 +3831,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // as a bounded read), and both time checks use it. A login with no snapshot from the
         // first re-check never mints, whatever the gate says now.
         // The monotonic clock does not advance while the host is suspended, so those checks cannot
-        // see a suspend between the two re-checks. The wall clock is sampled with `now2` (and when
-        // the first snapshot was taken) ONLY to refuse: if more than kArmSnapshotMaxAge of wall
-        // time passed, an unreadable arm state is not admitted. A wall clock that moved backward
+        // see a suspend after the first snapshot's read started. The wall clock is sampled with
+        // `now2`, and was sampled when that read started, ONLY to refuse: if more than
+        // kArmSnapshotMaxAge of wall time passed since then, an unreadable arm state is not admitted. A wall clock that moved backward
         // changes nothing; it is never evidence for admitting.
         if (entry.break_glass) {
             const SsoOnlyGateResult gate2 =

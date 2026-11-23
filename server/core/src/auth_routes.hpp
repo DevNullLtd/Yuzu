@@ -232,6 +232,10 @@ struct SsoOnlyGateResult {
     /// kBreakGlassArmed: when the database read behind this answer STARTED (the snapshot it saw is
     /// at or after this instant).
     std::chrono::steady_clock::time_point read_at{};
+    /// kBreakGlassArmed from the cached (single-flight) mode: the WALL time when that same read
+    /// STARTED. The MFA step's second check measures wall time from it, so a host suspend between
+    /// the read and the first check is seen too. Not set by the second check's own read.
+    std::chrono::system_clock::time_point read_wall_at{};
     /// When the last successful read that said NOT armed started (unset when there was none).
     std::optional<std::chrono::steady_clock::time_point> last_not_armed_at;
 
@@ -1442,6 +1446,7 @@ private:
     std::chrono::steady_clock::time_point bg_arm_at_{};
     std::chrono::steady_clock::time_point bg_arm_deadline_{}; ///< local monotonic end of the arm window
     std::chrono::steady_clock::time_point bg_arm_started_{};  ///< when the cached read STARTED
+    std::chrono::system_clock::time_point bg_arm_started_wall_{}; ///< the same instant on the wall clock
     std::string bg_arm_id_;                                    ///< `armed_until` of the cached read
     /// Kept across failed reads and across not-armed reads: the id of the last definitive armed
     /// read, and when the last definitive not-armed read started.
