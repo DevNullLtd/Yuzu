@@ -14737,8 +14737,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // The id floor precedes the fail-closed guard, as on the REST drill: an unsafe
-                // id is input validation and must reach no audit row.
+                // The id floor precedes the fail-closed guard (the REST drills also floor before
+                // their scoped gate): an unsafe id is input validation and must reach no audit
+                // row.
                 auto agent_id = param_str(args, "agent_id");
                 if (refuse_unsafe_agent_id(agent_id))
                     return;
@@ -14849,7 +14850,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // The id floor precedes the fail-closed guard, as on the REST drill.
+                // The id floor precedes the fail-closed guard (the REST drills also floor
+                // before their scoped gate).
                 auto agent_id = param_str(args, "agent_id");
                 if (refuse_unsafe_agent_id(agent_id))
                     return;
