@@ -16,7 +16,8 @@ nlohmann::json fleet_compliance_json(const FleetCompliance& fc) {
                           {"non_compliant", fc.non_compliant},
                           {"unknown", fc.unknown},
                           {"fixing", fc.fixing},
-                          {"error", fc.error}};
+                          {"error", fc.error},
+                          {"blocked", fc.blocked}};
 }
 
 nlohmann::json compliance_summary_json(const ComplianceSummary& cs) {
@@ -25,6 +26,7 @@ nlohmann::json compliance_summary_json(const ComplianceSummary& cs) {
                           {"unknown", cs.unknown},
                           {"fixing", cs.fixing},
                           {"error", cs.error},
+                          {"blocked", cs.blocked},
                           {"total", cs.total}};
 }
 
@@ -103,6 +105,8 @@ ConfinedPolicyCompliance confined_policy_compliance(const std::vector<PolicyAgen
             ++out.summary.fixing;
         else if (s.status == "error")
             ++out.summary.error;
+        else if (s.status == "blocked")
+            ++out.summary.blocked;
     }
     return out;
 }

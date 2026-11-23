@@ -14,6 +14,7 @@
 #include "oidc_provider.hpp"
 #include "saml_provider.hpp"
 #include "rbac_store.hpp"
+#include "scoped_gate_outcome.hpp"
 #include "service_scope_policy.hpp" // authz::PermPair — the test-override seam's element type
 #include "tag_store.hpp"
 
@@ -576,9 +577,24 @@ public:
     TierPolicyFn gateless_tier_policy_fn();
 
     /// Scoped RBAC-aware permission check for device-specific operations.
+    ///
+    /// This is the `== ScopedGateOutcome::Admitted` wrapper over
+    /// `require_scoped_permission_outcome`, which holds the ONE body of the gate. A caller that
+    /// only needs admit-or-refuse keeps this Boolean path.
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
                                    const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id);
+
+    /// The ONE body of the per-device scoped gate: the same checks, statuses, bodies, audit rows
+    /// and metrics as always, returning the refusal class instead of a bool. Never add a second
+    /// body or a second admitting value; `require_scoped_permission` is this function compared
+    /// with `ScopedGateOutcome::Admitted`. A caller that must tell "denied" from "an
+    /// authorization read failed" (the Echo purge surfaces) uses this accessor and admits only on
+    /// `== Admitted`.
+    [[nodiscard]] ScopedGateOutcome
+    require_scoped_permission_outcome(const httplib::Request& req, httplib::Response& res,
+                                      const std::string& securable_type,
+                                      const std::string& operation, const std::string& agent_id);
 
     /// The transport-layer ADR-0017 admit-then-filter list-read gate — the
     /// SOLE authorization gate for a list/fan-out route reading per-agent
