@@ -334,6 +334,13 @@ PolicyEvaluator::PolicyEvaluator(Deps deps) : d_(std::move(deps)) {
         // increase) and the YuzuPolicyCollectSkipped alert can fire on it.
         for (const char* ph : {"collect_target", "collect_item"})
             d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", ph}});
+        // A state gauge with a true zero: seeded at 0 so a healthy server exports the family.
+        d_.metrics->describe("yuzu_server_policy_error_verdict_unwritten_agents",
+                             "Agents whose per-agent error verdict write was lost and not yet "
+                             "rewritten (an upper bound: the targets of each failed call). Zero "
+                             "means none.",
+                             "gauge");
+        d_.metrics->gauge("yuzu_server_policy_error_verdict_unwritten_agents").set(0.0);
     }
 
     // ADR-0056: the boot-time stranded-'fixing' reset that used to live here
@@ -346,6 +353,37 @@ PolicyEvaluator::PolicyEvaluator(Deps deps) : d_(std::move(deps)) {
 }
 
 int64_t PolicyEvaluator::now() const { return d_.now_fn(); }
+
+void PolicyEvaluator::publish_unwritten_locked() {
+    if (!d_.metrics)
+        return;
+    double total = 0;
+    for (const auto& [id, v] : unwritten_)
+        total += static_cast<double>(v.first);
+    d_.metrics->gauge("yuzu_server_policy_error_verdict_unwritten_agents").set(total);
+}
+
+void PolicyEvaluator::note_unwritten(const std::string& policy_id, std::size_t agents) {
+    std::lock_guard<std::mutex> lk(unwritten_mu_);
+    unwritten_[policy_id] = {agents, now()};
+    publish_unwritten_locked();
+}
+
+void PolicyEvaluator::clear_unwritten(const std::string& policy_id) {
+    std::lock_guard<std::mutex> lk(unwritten_mu_);
+    if (unwritten_.erase(policy_id) > 0)
+        publish_unwritten_locked();
+}
+
+void PolicyEvaluator::prune_and_publish_unwritten() {
+    std::lock_guard<std::mutex> lk(unwritten_mu_);
+    if (unwritten_.empty())
+        return;
+    const auto cutoff = now() - kUnwrittenMaxAgeSeconds;
+    for (auto it = unwritten_.begin(); it != unwritten_.end();)
+        it = it->second.second < cutoff ? unwritten_.erase(it) : std::next(it);
+    publish_unwritten_locked();
+}
 
 std::string PolicyEvaluator::gen_execution_id() {
     return "polchk-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
@@ -550,6 +588,9 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
                 d_.metrics->counter("yuzu_server_policy_eval_errors_total",
                                     {{"phase", "error_verdict_write"}})
                     .increment();
+            note_unwritten(p.id, targets.size());
+        } else {
+            clear_unwritten(p.id);
         }
     };
     if (dispatch_result->pair_mismatch) {
@@ -1099,9 +1140,14 @@ void PolicyEvaluator::collect_ready() {
                         if (!r)
                             spdlog::warn("policy_evaluator: update_agent_status failed: {}",
                                          r.error());
-                        else if (!*r && d_.metrics)
-                            d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total")
-                                .increment();
+                        else {
+                            // The policy is writing real verdicts again: an earlier lost
+                            // error-verdict write no longer stands.
+                            clear_unwritten(f.policy_id);
+                            if (!*r && d_.metrics)
+                                d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total")
+                                    .increment();
+                        }
                     }
                     if (d_.metrics)
                         d_.metrics
@@ -1250,6 +1296,7 @@ void PolicyEvaluator::tick(bool dispatch_due_allowed) {
     // non-leader (the two-dispatch-planes rule: never fence an operator-synchronous
     // path). Only dispatch_due() — the leader-owned durable due-policy scheduling
     // (ADR-0056 claim_due_policies) — is fenced, via `dispatch_due_allowed`.
+    prune_and_publish_unwritten();
     collect_ready();
     if (dispatch_due_allowed)
         dispatch_due();

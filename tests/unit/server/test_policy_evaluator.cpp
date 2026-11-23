@@ -1028,6 +1028,63 @@ TEST_CASE("policy evaluator: a lost error-verdict chunk is counted in the error_
               .value() >= 1.0);
 }
 
+TEST_CASE("policy evaluator: the unwritten-agents gauge is a state that stays up until the policy writes "
+          "again, then clears (WP06 F4)", "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "a")};
+    auto pid = h.author("result.hostname != ''");
+    yuzu::MetricsRegistry metrics;
+    auto d = h.deps();
+    d.metrics = &metrics;
+    PolicyEvaluator ev(d);
+    const char* kGauge = "yuzu_server_policy_error_verdict_unwritten_agents";
+    CHECK(metrics.gauge(kGauge).value() == 0.0); // seeded: a healthy server exports the family at 0
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.is.delete_definition("test.check"));
+    h.fake_now += 4000;
+    h.ps.set_chunk_fault_hook_for_test([](std::size_t) { return true; }); // every attempt fails
+    REQUIRE_FALSE(ev.evaluate_now(pid).has_value());
+    h.ps.set_chunk_fault_hook_for_test({});
+    CHECK(metrics.gauge(kGauge).value() >= 1.0); // set at the failure
+    // A later tick far inside the age-out window does not clear it: the stale verdict still stands.
+    h.fake_now += 600;
+    ev.tick(false);
+    CHECK(metrics.gauge(kGauge).value() >= 1.0);
+    // The next successful error-verdict write for the policy clears it.
+    h.fake_now += 4000;
+    REQUIRE_FALSE(ev.evaluate_now(pid).has_value());
+    CHECK(metrics.gauge(kGauge).value() == 0.0);
+}
+
+TEST_CASE("policy evaluator: an unwritten-agents entry for a policy that never writes again ages out",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "a")};
+    auto pid = h.author("result.hostname != ''");
+    yuzu::MetricsRegistry metrics;
+    auto d = h.deps();
+    d.metrics = &metrics;
+    PolicyEvaluator ev(d);
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(false);
+    REQUIRE(h.is.delete_definition("test.check"));
+    h.fake_now += 4000;
+    h.ps.set_chunk_fault_hook_for_test([](std::size_t) { return true; });
+    REQUIRE_FALSE(ev.evaluate_now(pid).has_value());
+    h.ps.set_chunk_fault_hook_for_test({});
+    REQUIRE(metrics.gauge("yuzu_server_policy_error_verdict_unwritten_agents").value() >= 1.0);
+    h.fake_now += 25 * 3600; // the policy was deleted or disabled: nothing ever rewrites it
+    ev.tick(false);
+    CHECK(metrics.gauge("yuzu_server_policy_error_verdict_unwritten_agents").value() == 0.0);
+}
+
 TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

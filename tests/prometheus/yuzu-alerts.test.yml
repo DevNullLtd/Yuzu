@@ -11137,26 +11137,58 @@ tests:
           - labels: 'ALERTS{alertname="YuzuScheduleDueHeld", alertstate="firing", instance="s_held", severity="warning"}'
             value: 1
 
-  # ── YuzuPolicyErrorVerdictWriteFailed ─────────────────────────────────────
-  # CASE - a pre-seeded 0 that steps to 1 fires (a first increment is measurable); a flat series
-  # and a failure on another phase stay quiet. RED if `> 0` becomes `>= 0` or the phase matcher is lost.
+  # ── YuzuPolicyErrorVerdictWriteFailed (state gauge) / YuzuPolicyErrorVerdictWriteRetrying ──────
+  # CASE - the gauge alert fires after `for: 5m` and STAYS firing past one hour (the point of the
+  # state gauge: an increase() alert cleared 1h after the last failure while the stale verdict stood).
+  # s_blip (one minute above zero) and s_flat (0) stay quiet. RED if the rule goes back to an
+  # increase() window (s_fail would clear by 75m), if `for:` is dropped (s_blip fires at 5m), if
+  # `> 0` becomes `>= 0` (s_flat fires), or if the metric name drifts.
   - interval: 1m
-    name: policy error verdict write failed - first increment fires, flat and other phases do not
+    name: policy error verdict unwritten gauge - fires after 5m and outlives one hour; blip and zero quiet
     input_series:
-      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu-server",instance="s_fail",phase="error_verdict_write"}'
-        values: "0 0 0 1x20"
-      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu-server",instance="s_flat",phase="error_verdict_write"}'
-        values: "0x23"
-      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu-server",instance="s_other",phase="claim"}'
-        values: "0 0 0 5x20"
+      - series: 'yuzu_server_policy_error_verdict_unwritten_agents{job="yuzu-server",instance="s_fail"}'
+        values: "0 0 0 3x100"
+      - series: 'yuzu_server_policy_error_verdict_unwritten_agents{job="yuzu-server",instance="s_blip"}'
+        values: "0 0 3 0x100"
+      - series: 'yuzu_server_policy_error_verdict_unwritten_agents{job="yuzu-server",instance="s_flat"}'
+        values: "0x103"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuPolicyErrorVerdictWriteFailed", alertstate="firing"}'
-        eval_time: 2m
+        eval_time: 6m
         exp_samples: []
       - expr: 'ALERTS{alertname="YuzuPolicyErrorVerdictWriteFailed", alertstate="firing"}'
         eval_time: 10m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuPolicyErrorVerdictWriteFailed", alertstate="firing", instance="s_fail", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuPolicyErrorVerdictWriteFailed", alertstate="firing", instance="s_fail", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuPolicyErrorVerdictWriteFailed", alertstate="firing"}'
+        eval_time: 80m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPolicyErrorVerdictWriteFailed", alertstate="firing", instance="s_fail", severity="critical"}'
+            value: 1
+
+  # CASE - the retry alert fires on a steady retry stream (after the 10m window and the 10m hold),
+  # and stays quiet for a single burst that ended and for a flat counter. RED if the phase matcher is
+  # lost, `for:` is dropped (s_burst fires), or the window is lengthened past the hold.
+  - interval: 1m
+    name: policy error verdict retry - a steady stream fires, a one-off burst and a flat counter do not
+    input_series:
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu-server",instance="s_steady",phase="error_verdict_retry"}'
+        values: "0+1x60"
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu-server",instance="s_burst",phase="error_verdict_retry"}'
+        values: "0 0 5x59"
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu-server",instance="s_flat",phase="error_verdict_retry"}'
+        values: "0x61"
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu-server",instance="s_other",phase="claim"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyErrorVerdictWriteRetrying", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPolicyErrorVerdictWriteRetrying", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPolicyErrorVerdictWriteRetrying", alertstate="firing", instance="s_steady", severity="warning"}'
             value: 1
 
   # ── WP01 agent re-registration proof rollout ─────────────────────────────

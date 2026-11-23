@@ -247,6 +247,21 @@ private:
     Deps d_;
     std::mutex mu_; // guards in_flight_
     std::vector<InFlight> in_flight_;
+
+    // The agents whose per-agent `error` verdict write was LOST and has not been rewritten since
+    // (policy id -> {agents, when}), published as `yuzu_server_policy_error_verdict_unwritten_agents`.
+    // A STATE, not an event: it stays up while the stale (possibly compliant) verdict stands, so the
+    // alert on it does not clear one window after the last failure. Cleared for a policy by its next
+    // successful error-verdict write or collected verdict write; an entry not rewritten within
+    // kUnwrittenMaxAgeSeconds (a deleted or disabled policy never writes again) ages out on the next
+    // tick. Own mutex: never held across a store call. Lock order: mu_ is never held with it.
+    static constexpr int64_t kUnwrittenMaxAgeSeconds = 24 * 3600;
+    std::mutex unwritten_mu_;
+    std::unordered_map<std::string, std::pair<std::size_t, int64_t>> unwritten_;
+    void note_unwritten(const std::string& policy_id, std::size_t agents);
+    void clear_unwritten(const std::string& policy_id);
+    void prune_and_publish_unwritten();
+    void publish_unwritten_locked();
     // HA WS-3 3.4: the process-local `remediating_`/`ReservationGuard` guard
     // that used to live here (governance UP-3, 2026-08-24) is DELETED, not
     // demoted — the durable per-(policy,agent) claim in PolicyStore

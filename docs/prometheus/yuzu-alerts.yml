@@ -9450,21 +9450,43 @@ groups:
       - alert: YuzuPolicyErrorVerdictWriteFailed
         # The evaluator could not write the per-agent `error` verdict for a policy whose check
         # instruction is gone or whose pair no longer matches (a chunk failed after its retries).
-        # The affected agents keep their PREVIOUS verdict, which may read compliant, until the next
-        # evaluation. The series is pre-seeded at 0, so a first failure is an increase.
+        # The affected agents keep their PREVIOUS verdict, which may read compliant, until the policy
+        # next writes a verdict. This is a STATE alert on a gauge, not an increase() alert: the gauge
+        # stays above zero for as long as the stale verdict stands, so the alert does not clear one
+        # window after the last failure. The gauge is seeded at 0, so a healthy server exports it and
+        # `for: 5m` ignores a blip that the next write already cleared.
         expr: |
-          sum by (instance) (increase(yuzu_server_policy_eval_errors_total{phase="error_verdict_write"}[1h])) > 0
-        for: 0m
+          max by (instance) (yuzu_server_policy_error_verdict_unwritten_agents) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Policy error verdicts are unwritten on {{ $labels.instance }}"
+          description: >-
+            yuzu_server_policy_error_verdict_unwritten_agents is above zero: a policy check was
+            refused (deleted instruction or mismatched pair) but its per-agent error verdict could
+            not be written for at least one chunk of targets, so those agents still show their
+            previous verdict, which may read compliant. Check Postgres reachability and the policy
+            store, then wait for the current evaluation to finish and run POST
+            /api/policies/{id}/evaluate once; do not call it in a loop during database trouble.
+            The gauge returns to zero when the policy next writes a verdict.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
+      - alert: YuzuPolicyErrorVerdictWriteRetrying
+        # A chunk of the error-verdict write needed a retry on a fresh pool lease, steadily for ten
+        # minutes: the policy store connection is unhealthy even if every write eventually succeeds.
+        # A single retry after a Postgres restart is normal and stays quiet.
+        expr: |
+          sum by (instance) (increase(yuzu_server_policy_eval_errors_total{phase="error_verdict_retry"}[10m])) > 0
+        for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Policy error verdicts were not written on {{ $labels.instance }}"
+          summary: "Policy error-verdict writes keep retrying on {{ $labels.instance }}"
           description: >-
-            yuzu_server_policy_eval_errors_total{phase="error_verdict_write"} increased in the
-            last hour: a policy check was refused (deleted instruction or mismatched pair) but the
-            per-agent error verdict could not be written for at least one chunk of targets, so
-            those agents still show their previous verdict. Check Postgres reachability and the
-            policy store, then re-run POST /api/policies/{id}/evaluate.
+            yuzu_server_policy_eval_errors_total{phase="error_verdict_retry"} has increased for ten
+            minutes: error-verdict chunk writes are being retried on fresh pool leases. Check
+            Postgres reachability and pool health before the retries run out and
+            YuzuPolicyErrorVerdictWriteFailed fires.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
       - alert: YuzuScheduleArmingUnavailable
         # A due schedule was HELD (not advanced) because its creator's authority could not be
