@@ -20513,6 +20513,8 @@ private:
                         // or Guardian reap — JC-6 decoupling).
                         if (rs_ok)
                         for (const auto& p : result_set_store_->list_pending()) {
+                            if (stop_requested_.load(std::memory_order_acquire))
+                                break;
                             if (p.source_execution_id.empty())
                                 continue;
                             bool terminal = false;
@@ -20578,6 +20580,16 @@ private:
                                     result_set_members(*response_store_, forensics_plugins(), p);
                                 if (!found)
                                     continue;
+                                if (found->quantified && (count_unreadable || dropped > 0)) {
+                                    // The tracker counts devices with a dropped frame but does not
+                                    // identify them here. Publishing their remaining frames could
+                                    // turn an incomplete answer into evidence of absence.
+                                    result_set_store_->mark_failed(p.id, "incomplete source response stream");
+                                    metrics_.counter("yuzu_result_sets_total",
+                                                     {{"source_kind", p.source_kind},
+                                                      {"result", "materialize_failed"}}).increment();
+                                    continue;
+                                }
                                 if (found->truncated) {
                                     // The read hit its row bound before the stored rows ran
                                     // out: a membership that is incomplete in a way

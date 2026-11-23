@@ -13,6 +13,7 @@
 /// tracker (which reads no rows) still says every agent answered: a complete-empty set. The async
 /// producers refuse such a source before they dispatch (`plugin_may_seed_result_set`).
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -60,10 +61,86 @@ struct ResultSetMembers : std::vector<std::string> {
     /// incomplete in a way `agents_failed` cannot express, so the caller fails the set closed
     /// instead of materializing it. A store holding exactly `max_rows` rows is not truncated.
     bool truncated{false};
+    /// Whole-answer quantifiers need a proven response stream before publishing membership.
+    bool quantified{false};
 };
 
 /// Rows the members read takes per store query. The read pages until a page comes back short.
 inline constexpr int kResultSetMembersPageRows = 500;
+
+/// Quantified membership tests the agent's entire answer. A RUNNING frame can end in the
+/// middle of its table and the terminal status is backfilled on each stored frame. Walk
+/// by (agent_id, insertion id) across page boundaries, holding only one answer in memory.
+inline std::optional<ResultSetMembers> quantified_result_set_members(
+    ResponseStore& responses, const ResponseTierFilter& tier, const PendingSet& pending,
+    const rs_matcher::ParsedMatcher& matcher, int page_rows, int max_rows) {
+    // Above this bound absence cannot be established. Fail just the affected agent closed.
+    constexpr std::size_t max_answer_bytes = 2 * 1024 * 1024;
+    ResultSetMembers members;
+    members.quantified = true;
+    ResponseQuery page;
+    page.frames_after.emplace("", 0);
+    std::string agent, output;
+    int status = rs_matcher::kStatusSuccess;
+    int plugin_status = 0;
+    bool exceeded = false;
+    // Source provenance comes from the server-authored pending row. Existing instruction
+    // definitions do not attest the completeness of arbitrary JSON or plain pipe outputs.
+    const auto source = pending.source_kind == "echo_query" ? rs_matcher::AnswerSource::EchoSql
+                                                            : rs_matcher::AnswerSource::UnframedInstruction;
+    auto finish_agent = [&] {
+        if (agent.empty())
+            return;
+        const auto verdict = exceeded ? rs_matcher::RowMatch::RowBound
+                                      : matcher.evaluate(status, output, plugin_status, source);
+        if (verdict == rs_matcher::RowMatch::True)
+            members.push_back(agent);
+        else if (verdict != rs_matcher::RowMatch::False || status != rs_matcher::kStatusSuccess)
+            ++members.agents_failed;
+    };
+    for (int read = 0;;) {
+        page.limit = std::min(page_rows, max_rows - read + 1);
+        auto rows = responses.query_by_execution(pending.source_execution_id, tier, page);
+        if (!rows)
+            return std::nullopt;
+        for (const auto& frame : *rows) {
+            if (++read > max_rows) {
+                members.truncated = true;
+                return members;
+            }
+            if (agent != frame.agent_id) {
+                finish_agent();
+                agent = frame.agent_id;
+                output.clear();
+                status = rs_matcher::kStatusSuccess;
+                plugin_status = 0;
+                exceeded = false;
+            }
+            if (frame.status != rs_matcher::kStatusSuccess)
+                status = frame.status;
+            if (frame.plugin_result_status > 1)
+                plugin_status = frame.plugin_result_status;
+            if (frame.output.empty() || exceeded)
+                continue;
+            if (frame.output.size() + !output.empty() > max_answer_bytes - output.size() ||
+                frame.output.find(kResponseIngestTruncation) != std::string::npos ||
+                frame.output.find(kResponseRowsTruncation) != std::string::npos ||
+                frame.output.find("...[truncated: output line over 2 MiB]") != std::string::npos ||
+                frame.output == "duplicate command still in flight") {
+                exceeded = true;
+                continue;
+            }
+            if (!output.empty())
+                output.push_back('\n');
+            output.append(frame.output);
+        }
+        if (rows->size() < static_cast<std::size_t>(page.limit))
+            break;
+        page.frames_after.emplace(rows->back().agent_id, rows->back().id);
+    }
+    finish_agent();
+    return members;
+}
 
 /// The agent ids that satisfy `pending`'s matcher, in order of first appearance in the store's read
 /// (which is newest row first, `timestamp DESC, id DESC`, not first-response order), plus
@@ -86,6 +163,8 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
     page.limit = page_rows;
     // The matcher is one text for the whole set: parsed once here, asked about every row below.
     const rs_matcher::ParsedMatcher matcher(pending.matcher);
+    if (matcher.quantified())
+        return quantified_result_set_members(responses, tier, pending, matcher, page_rows, max_rows);
     for (int read = 0;;) {
         auto rows = responses.query_by_execution(pending.source_execution_id, tier, page);
         if (!rows)
@@ -96,8 +175,9 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
             break;
         }
         for (const auto& r : *rows) {
-            if (!matcher.response_matches(r.status, r.output)) {
-                if (r.status != rs_matcher::kStatusSuccess || r.output.starts_with("error|") ||
+            const auto verdict = matcher.evaluate(r.status, r.output, r.plugin_result_status);
+            if (verdict != rs_matcher::RowMatch::True) {
+                if (verdict != rs_matcher::RowMatch::False || r.status != rs_matcher::kStatusSuccess || r.output.starts_with("error|") ||
                     matcher.answer_lacks_matcher_column(r.output) ||
                     matcher.constrained_answer_is_unresolved(r.plugin_result_status))
                     failed.insert(r.agent_id);

@@ -43039,6 +43039,32 @@ TEST_CASE("MCP result-sets: a supplied-but-empty/wrong-type parent_id is refused
 // type_error on a type mismatch rather than coercing - a non-boolean
 // include_empty must be a clean kInvalidParams, never an uncaught exception
 // (matches REST's identical fix on the same field, same handler shape).
+TEST_CASE("MCP Echo accepts a quantified matcher and preserves it for the fill",
+          "[mcp][integration][result-sets][echo][quantified]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    int calls = 0;
+    ts.start_with_dispatch([&](const std::string&, const std::string&,
+               const std::vector<std::string>&, const std::string& scope,
+               const std::unordered_map<std::string, std::string>&, const std::string&,
+               const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        CHECK(scope == "__all__");
+        ++calls;
+        return {.sent = 1, .command_id = "cmd-quantified"};
+    }, "operator");
+    auto reply = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":11,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT 1","matcher":{"kind":"all","where":{"column":"name","op":"exists"}}}}})");
+    REQUIRE(reply);
+    const auto payload = operator_surface_payload(reply);
+    auto set = rs_bundle.get()->get(payload["id"].get<std::string>());
+    REQUIRE(set.has_value());
+    REQUIRE(set->has_value());
+    CHECK(nlohmann::json::parse((*set)->matcher).at("kind") == "all");
+    CHECK(calls == 1);
+}
+
 TEST_CASE("MCP create_result_set_from_echo_query: a non-boolean include_empty is refused "
           "with kInvalidParams, never an uncaught nlohmann::json::type_error",
           "[mcp][integration][result-sets]") {

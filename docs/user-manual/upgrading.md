@@ -11,6 +11,11 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Explicit matchers on asynchronous Echo result sets
+
+The Echo REST and MCP producers now validate an explicit `matcher`. Previously they ignored that field. To keep the previous selection behavior, omit `matcher` and use `include_empty`. An explicit Echo matcher requires a recognized `kind`, including for clients previously sending an empty object. Both producers refuse a `where` clause without a quantified kind and fields beyond `kind` and `n` on `any_response` or `echo_rows_ge`. Invalid matchers return HTTP 400 or MCP invalid params before dispatch. Plain instruction pipe rows without a completeness envelope can prove presence but leave absence unknown. Devices with unknown results drop out of the selected scope.
+
+
 ## ⚠️ Breaking: removing a user's Administrator grant ends that user's JIT elevation window, the unassign audit detail and failure modes change, and `POST /api/v1/elevate` can refuse a call that races an eligibility revoke
 
 **In short.** Affected: operators and automation that remove a user's `Administrator` RBAC grant (`DELETE /api/v1/rbac/roles/Administrator/assignments/{principal_id}` or the MCP tool `unassign_rbac_role`), and anything that parses the audit trail for those calls. To do: no configuration change is needed, but check any parser of the `rbac.role.unassigned` detail and of `role.elevation.revoked` rows (the grammar changed, see below), and any retry logic that treats an unassign `503` as "nothing was removed". Also affected: callers of `POST /api/v1/elevate`, which can now answer `403`, `503` or `500` (instead of `200` plus a standing elevation) when an eligibility revoke lands during the call, with no `role.elevation.granted` row. Elevation eligibility is untouched, and an unassign for a user who holds no `Administrator` grant ends nothing.

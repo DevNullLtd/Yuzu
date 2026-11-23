@@ -28,6 +28,7 @@
 #include "rest_api_v1.hpp"
 #include "result_set_members.hpp"
 #include "result_set_store.hpp"
+#include "result_set_matcher.hpp"
 #include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
@@ -434,6 +435,29 @@ TEST_CASE("from-echo-query: 202 pending, dispatch to __all__ when no parent",
     REQUIRE(row.has_value());
     REQUIRE(row->status == ResultSetStatus::Pending);
     REQUIRE(row->matcher.find("echo_rows_ge") != std::string::npos);
+}
+
+TEST_CASE("from-echo-query: a row quantifier selects only definite matches",
+          "[pg][result_set][async][echo][quantified]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AsyncHarness h(pool);
+    int status{};
+    const auto created = h.post("/api/v1/result-sets/from-echo-query",
+        R"({"sql":"SELECT name FROM $Process_Hourly","matcher":{"kind":"none","where":{"column":"name","op":"eq","value":"alpha"}}})", status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+    const auto row = get_ok(*h.store, created["data"]["id"].get<std::string>());
+    REQUIRE(row.has_value());
+    const yuzu::server::rs_matcher::ParsedMatcher matcher(row->matcher);
+    CHECK(matcher.response_matches(yuzu::server::rs_matcher::kStatusSuccess,
+                                   "__schema__|name\n__total__|0"));
+    CHECK_FALSE(matcher.response_matches(yuzu::server::rs_matcher::kStatusSuccess,
+                                         R"([{"different":"column"}])"));
+    h.post("/api/v1/result-sets/from-echo-query",
+        R"({"sql":"SELECT 1","matcher":{"kind":"none","where":{"and":[]}}})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.size() == 1);
 }
 
 TEST_CASE("from-echo-query: parent_id scopes dispatch via from_result_set:",
@@ -4922,6 +4946,23 @@ TEST_CASE("materialise: the members read pages past the store's default row limi
         CHECK(members == std::vector<std::string>{"agent-0", "agent-1", "agent-2", "agent-3",
                                                   "agent-4", "agent-5"});
     }
+    SECTION("a quantifier spans all frames for a device across page boundaries") {
+        put_exec_row(responses, exec, "alpha", 1, "__schema__|name\nbeta", 100);
+        put_exec_row(responses, exec, "beta", 1, "__schema__|name\nbeta\n__total__|1", 100);
+        put_exec_row(responses, exec, "alpha", 1, "alpha\n__total__|2", 100);
+        PendingSet pending;
+        pending.source_execution_id = exec;
+        pending.source_kind = "echo_query";
+        const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+        for (const auto& kind : {std::string{"none"}, std::string{"any"}}) {
+            pending.matcher = nlohmann::json{{"kind",kind},{"where",{{"column","name"},{"op","eq"},{"value","alpha"}}}}.dump();
+            const auto members = result_set_members(responses, plugins, pending, 1, 10);
+            REQUIRE(members);
+            REQUIRE(members->size() == 1);
+            CHECK(members->front() == (kind == "none" ? "beta" : "alpha"));
+            CHECK(members->agents_failed == 0);
+        }
+    }
     SECTION("the read reports truncated only when rows lie past its bound") {
         for (int i = 0; i < 6; ++i)
             put_exec_row(responses, exec, "agent-" + std::to_string(i), 1, kOneRow, 100 + i);
@@ -5079,12 +5120,13 @@ TEST_CASE("materialise: the members read parses the matcher once, before the pag
     // this pins the statements. The text is read in one place, ahead of the loop over pages.
     const auto src = normalised_source("result_set_members.hpp");
     const auto parsed_at = src.find("const rs_matcher::ParsedMatcher matcher(pending.matcher);");
-    const auto loop_at = src.find("for (int read = 0;;) {");
+    const auto loop_at = src.find("for (int read = 0;;) {", parsed_at);
     REQUIRE(parsed_at != std::string::npos);
     REQUIRE(loop_at != std::string::npos);
     CHECK(parsed_at < loop_at);
     CHECK(count_in(src, "pending.matcher") == 1);
-    CHECK(count_in(src, "ParsedMatcher") == 1);
+    CHECK(count_in(src, "ParsedMatcher matcher(") == 1);
+    CHECK(src.find("const rs_matcher::ParsedMatcher& matcher") != std::string::npos);
     // The same holds for an `in` matcher's entries: the one loop over `value_set` is the parse's
     // own, and a cell is looked up in the set it fills.
     const auto matcher_src = normalised_source("result_set_matcher.cpp");

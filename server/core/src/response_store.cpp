@@ -61,12 +61,6 @@ constexpr std::chrono::milliseconds kIngestTimeout{500};
 // can carry many distinct values without approaching the byte cap.
 constexpr std::size_t kMaxIngestBytes = 2ull * 1024 * 1024;
 constexpr std::size_t kMaxFacetsPerResponse = 5'000;
-constexpr const char* kTruncationMarker = "\n...[truncated by server ingest cap]";
-// Appended to a capped pair's newest retained row (#561) so a reader can tell a stream whose
-// tail was dropped by the per-pair row cap from a complete one; the sibling of kTruncationMarker
-// (which marks the per-ROW byte cap).
-constexpr const char* kRowCapMarker = "\n...[rows past per-agent cap dropped]";
-
 // Ingest-drop / read-degrade reason labels (ADR-0037 label convention).
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
@@ -238,7 +232,7 @@ bool has_embedded_nul(std::string_view s) {
 std::string truncate_ingest(std::string_view s, std::size_t max_bytes) {
     if (s.size() <= max_bytes)
         return std::string(s);
-    return std::string(s.substr(0, max_bytes)) + kTruncationMarker;
+    return std::string(s.substr(0, max_bytes)) + kResponseIngestTruncation;
 }
 
 double to_double(const char* s) {
@@ -447,6 +441,12 @@ const std::vector<pg::PgMigration>& migrations() {
             CREATE INDEX IF NOT EXISTS idx_resp_instr_agent_status
                 ON responses(instruction_id, agent_id, status);
         )"},
+        // Stream result-set inputs in frame order with one bounded agent buffer.
+        {5, R"(
+            SET LOCAL statement_timeout = 0;
+            CREATE INDEX IF NOT EXISTS idx_resp_execution_agent_frame
+                ON responses(execution_id, agent_id, id) WHERE execution_id != '';
+        )"},
     };
     return kMigrations;
 }
@@ -608,7 +608,7 @@ StoreOutcome ResponseStore::store(const StoredResponse& resp) {
         if (!per_agent_cap_admits(to_i64(PQgetvalue(probe.get(), 0, 0)), max_rows_per_agent_,
                                   is_terminal, to_bool(PQgetvalue(probe.get(), 0, 1)))) {
             // Mark the pair's newest retained row so a reader can tell a capped stream from a
-            // complete one (the sibling of kTruncationMarker). One idempotent UPDATE in this
+            // complete one (the sibling of kResponseIngestTruncation). One idempotent UPDATE in this
             // transaction: the suffix compare makes every refusal after the first a no-op.
             // `timestamp + 0` is deliberate: a bare `ORDER BY timestamp DESC LIMIT 1` lets the
             // planner walk idx_resp_instr_ts backwards filtering on agent_id, which reads every
@@ -624,7 +624,7 @@ StoreOutcome ResponseStore::store(const StoredResponse& resp) {
                 "WHERE instruction_id=$1 AND agent_id=$2 "
                 "ORDER BY timestamp + 0 DESC, id DESC LIMIT 1) "
                 "AND right(output, length($3::text)) <> $3::text",
-                std::vector<std::string>{resp.instruction_id, resp.agent_id, kRowCapMarker});
+                std::vector<std::string>{resp.instruction_id, resp.agent_id, kResponseRowsTruncation});
             if (mark.status() != PGRES_COMMAND_OK) {
                 spdlog::warn("ResponseStore: per-agent cap marker failed for instruction={} "
                              "agent={}: {}",
@@ -864,8 +864,8 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     // (#2691): a terminal frame's message must not exceed the documented
     // per-row worst case: kMaxIngestBytes bounds the agent-supplied bytes of
     // each field; output may additionally carry the two server-authored
-    // markers (kTruncationMarker, kRowCapMarker), error_detail at most
-    // kTruncationMarker.
+    // markers (kResponseIngestTruncation, kResponseRowsTruncation), error_detail at most
+    // kResponseIngestTruncation.
     const std::string sanitized_error =
         sanitize_pg_text(truncate_ingest(error_detail, kMaxIngestBytes));
     pg::PgResult res = pg::exec_params(
@@ -1181,7 +1181,14 @@ ResponseStore::query_by_execution(const std::string& execution_id, const Respons
                 sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
                 binds.push_back(std::to_string(*q.until));
             }
-            if (q.continue_after) {
+            if (q.frames_after && q.frames_after->second > 0) {
+                const int agent_idx = idx++;
+                const int frame_idx = idx++;
+                sql += " AND (agent_id, id) > ($" + std::to_string(agent_idx) + ", $" +
+                       std::to_string(frame_idx) + "::bigint)";
+                binds.push_back(q.frames_after->first);
+                binds.push_back(std::to_string(q.frames_after->second));
+            } else if (q.continue_after) {
                 // Keyset cursor over the read's total order (`timestamp DESC, id DESC`): the
                 // row comparison selects the rows strictly after the cursor in that order.
                 // Two placeholders: number them in separate statements, because the operand
@@ -1198,8 +1205,8 @@ ResponseStore::query_by_execution(const std::string& execution_id, const Respons
             append_tier_clause(sql, binds, idx, tier);
             // `id DESC` makes the order total: timestamps are epoch seconds and a fleet answers
             // in bursts, so a page boundary inside a tie must be deterministic.
-            sql += " ORDER BY timestamp DESC, id DESC LIMIT $" + std::to_string(idx++) +
-                   "::integer";
+            sql += q.frames_after ? " ORDER BY agent_id, id" : " ORDER BY timestamp DESC, id DESC";
+            sql += " LIMIT $" + std::to_string(idx++) + "::integer";
             binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
                 sql += " OFFSET $" + std::to_string(idx++) + "::integer";

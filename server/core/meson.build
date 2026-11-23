@@ -831,6 +831,7 @@ yuzu_server_core_lib = static_library(
     'src/quarantine_containment_reconciler.cpp',
     'src/result_set_store.cpp',
     'src/result_set_matcher.cpp',
+    'src/quantified_matcher.cpp',
     'src/result_set_model.cpp', # #2146 Batch B2: shared REST v1 + MCP builder
     'src/policy_store.cpp',
     'src/policy_evaluator.cpp',

@@ -1392,3 +1392,89 @@ TEST_CASE("the three line splitters' CR handling is pinned (WP07 review)", "[res
     CHECK(yuzu::server::split_output_lines(in) == std::vector<std::string>{"ab", "c"});
     CHECK(yuzu::server::live::split_lines(in) == std::vector<std::string>{"a\rb", "c"});
 }
+
+TEST_CASE("Quantified matcher preserves unknown until the selection boundary",
+          "[result_set][matcher][quantified]") {
+    const nlohmann::json name = {{"column", "name"}, {"op", "eq"}, {"value", "alpha"}};
+    const nlohmann::json active = {{"column", "state"}, {"op", "eq"}, {"value", "active"}};
+    const auto make = [&](std::string_view kind, const nlohmann::json& where) {
+        return nlohmann::json{{"kind", kind}, {"where", where}}.dump();
+    };
+    const auto none = make("none", name);
+    const auto all = make("all", name);
+    const auto any = make("any", name);
+    CHECK_FALSE(validate_matcher(none).has_value());
+    CHECK(ParsedMatcher(none).evaluate(kOk, R"([{"other":"beta"}])") == RowMatch::MissingValue);
+    CHECK_FALSE(response_matches(none, kOk, R"([{"other":"beta"}])"));
+    CHECK(response_matches(none, kOk, "[]"));
+    CHECK(response_matches(all, kOk, R"({"rows":[]})"));
+    CHECK_FALSE(response_matches(any, kOk, "[]"));
+    CHECK(response_matches(any, kOk, R"([{},{"name":"alpha"}])"));
+    CHECK_FALSE(response_matches(all, kOk, R"([{},{"name":"beta"}])"));
+    CHECK(ParsedMatcher(none).evaluate(kOk, R"([{"name":{}}])") == RowMatch::MalformedValue);
+    CHECK(ParsedMatcher(none).evaluate(kOk, "error|failed") == RowMatch::MalformedValue);
+    CHECK_FALSE(response_matches(none, kFail, "[]"));
+    const auto disj = make("any", {{"or", {name, active}}});
+    CHECK(response_matches(disj, kOk, R"([{"state":"active"}])"));
+    const auto conj = make("all", {{"and", {name, active}}});
+    CHECK(ParsedMatcher(conj).evaluate(kOk, R"([{"state":"inactive"}])") == RowMatch::False);
+    const auto neg = make("none", {{"not",name}});
+    CHECK(ParsedMatcher(neg).evaluate(kOk, "[{}]") == RowMatch::MissingValue);
+    CHECK(response_matches(none, kOk, "__schema__|name\n__total__|0"));
+    CHECK(ParsedMatcher(none).evaluate(kOk, "__schema__|name\n") == RowMatch::CoverageUnproven);
+    CHECK(ParsedMatcher(none).evaluate(kOk, "__schema__|name\nx\n__total__|0") == RowMatch::MalformedValue);
+    CHECK(ParsedMatcher(none).evaluate(kOk, "__schema__|name\n__total__|0\nextra") == RowMatch::MalformedValue);
+    CHECK(ParsedMatcher(none).evaluate(kOk, "__schema__|name\nbeta\n__total__|2") == RowMatch::RowBound);
+    CHECK(response_matches(any, kOk, "__schema__|name\nalpha\n__total__|2"));
+}
+
+TEST_CASE("Count where compares the whole possible count range", "[result_set][matcher][quantified]") {
+    const nlohmann::json leaf{{"column","name"},{"op","eq"},{"value","alpha"}};
+    auto compare = [&](std::string_view op, unsigned n, std::string_view rows) {
+        nlohmann::json matcher{{"kind","count_where"},{"where",leaf},{"op",op},{"n",n}};
+        REQUIRE_FALSE(validate_matcher_object(matcher).has_value());
+        return ParsedMatcher(matcher.dump()).evaluate(kOk, rows);
+    };
+    constexpr std::string_view rows = R"([{"name":"alpha"},{},{"name":"beta"}])";
+    CHECK(compare("ge", 1, rows) == RowMatch::True);
+    CHECK(compare("gt", 2, rows) == RowMatch::False);
+    CHECK(compare("eq", 1, rows) == RowMatch::MissingValue);
+    CHECK(compare("lt", 2, rows) == RowMatch::MissingValue);
+    CHECK(compare("le", 2, rows) == RowMatch::True);
+    CHECK(compare("eq", 0, "[]") == RowMatch::True);
+    CHECK(compare("eq", 0, "__schema__|name\n__total__|10001") == RowMatch::RowBound);
+    CHECK(compare("lt", 1, "__schema__|name\nalpha\n__total__|10001") == RowMatch::False);
+    auto many = nlohmann::json::array();
+    for (std::size_t n=0; n<=kQuantifiedRowLimit; ++n) many.push_back({{"name","beta"}});
+    CHECK(compare("eq", 0, many.dump()) == RowMatch::RowBound);
+}
+
+TEST_CASE("Quantified predicates reject malformed operators and enforce nested field bounds",
+          "[result_set][matcher][quantified]") {
+    const auto validate=[](nlohmann::json where) {
+        return validate_matcher_object({{"kind","none"},{"where",std::move(where)}});
+    };
+    CHECK(validate({{"not", nlohmann::json::object()}}).has_value());
+    CHECK(validate({{"and", nlohmann::json::array()}}).has_value());
+    CHECK(validate({{"column","name"},{"op","eq"},{"value","ok"},{"plugin","forged"}}).has_value());
+    CHECK(validate({{"column","name"},{"op","eq"},{"value",std::string(513,'x')}})==kMatcherFieldTooLargeMessage);
+    CHECK(validate({{"column","name"},{"op","in"},{"value_set", {1,2}}}).has_value());
+    auto nested=nlohmann::json{{"column","name"},{"op","exists"}};
+    for (int n=0;n<17;++n) nested=nlohmann::json{{"not",std::move(nested)}};
+    CHECK(validate(nested).has_value());
+}
+
+TEST_CASE("Quantified result-set membership requires server-known source completeness",
+          "[result_set][matcher][quantified]") {
+    const auto none = ParsedMatcher(R"({"kind":"none","where":{"column":"n","op":"exists"}})");
+    CHECK(none.evaluate(kOk,"[]",0,AnswerSource::UnframedInstruction) == RowMatch::CoverageUnproven);
+    CHECK(none.evaluate(kOk,"__schema__|n\n__total__|0",0,AnswerSource::UnframedInstruction) ==
+          RowMatch::CoverageUnproven);
+    CHECK(none.evaluate(kOk,"__schema__|n\n__total__|0",0,AnswerSource::EchoSql) == RowMatch::True);
+    const auto any = ParsedMatcher(R"({"kind":"any","where":{"column":"n","op":"exists"}})");
+    CHECK(any.evaluate(kOk,"__schema__|n\nx",0,AnswerSource::EchoSql) == RowMatch::CoverageUnproven);
+    const auto count = ParsedMatcher(R"({"kind":"count_where","op":"ge","n":2,"where":{"column":"n","op":"exists"}})");
+    CHECK(count.evaluate(kOk,R"([{"n":"x"},{"n":"x"}])",0,AnswerSource::UnframedInstruction) ==
+          RowMatch::CoverageUnproven);
+    CHECK(validate_matcher(R"({"kind":"any_response","where":{"column":"name","op":"exists"}})"));
+}
