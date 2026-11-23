@@ -1968,8 +1968,11 @@ refusal for every caller except the MFA step's second check; (2) a failed, stale
 in-flight read is never recorded as "not armed" and never cached, and an "armed" snapshot whose read
 started at or before a "not armed" read this server holds is never served from the cache, and the first MFA
 check refuses such an answer as a disarm before anything is verified or spent; the second check applies the
-same test to its own read, so an "armed" own read is refused as a disarm when a "not armed" read this server
-holds ended at or after that read started; (3) no "armed" read is
+same test to its own read, so an "armed" own read is refused as a disarm when the "not armed" time this server
+holds is at or after that read started. That time only moves forward (`bg_last_not_armed_at_`): an own read
+records when it ENDED, a shared refresh when it STARTED (recording the end there would refuse re-armed logins
+after their recovery code is spent). The residual, pinned by a test: a shared "not armed" read that started
+before the own read, but finished during it, does not refuse that own read's "armed" answer; (3) no "armed" read is
 honoured more than `kArmSnapshotMaxAge` (4.5 s) after it started, one comparison
 (`arm_observation_fresh`, on the steady clock) at every site; (4) the first MFA check uses the cached
 single-flight mode (its snapshot is what the second check's bounded rule relies on) and puts

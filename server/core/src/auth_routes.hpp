@@ -236,7 +236,8 @@ struct SsoOnlyGateResult {
     /// STARTED. The MFA step's second check measures wall time from it, so a host suspend between
     /// the read and the first check is seen too. Not set by the second check's own read.
     std::chrono::system_clock::time_point read_wall_at{};
-    /// When the last successful read that said NOT armed started (unset when there was none).
+    /// The newest "not armed" time this server holds (unset when there was none): an own read
+    /// records when it ENDED, a shared refresh when it STARTED, and the time never moves back.
     std::optional<std::chrono::steady_clock::time_point> last_not_armed_at;
 
     /// The ONE admit set for "evaluate a local password": open mode or an armed break-glass

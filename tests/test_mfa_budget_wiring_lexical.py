@@ -339,6 +339,20 @@ def check_arm_recheck(files):
                        "may sit between the second arm re-check and the mint")
     if 'counter("yuzu_auth_break_glass_pending_refused_total")' in t:
         bad.append("yuzu_auth_break_glass_pending_refused_total must carry reason and stage labels")
+    # SG-1 (governance on the C-01 fix): the "not armed" time only moves forward. Every write is
+    # guarded by `if (!x || *x < v) x = v;`; an own read records its END (`finished`), the shared
+    # refresh its START (`started`, governance UP-1: recording the end there refuses re-armed
+    # logins after the recovery code is spent).
+    nat = "bg_last_not_armed_at_"
+    writes = re.findall(re.escape(nat) + r"\s*=\s*(\w+)\s*;", t)
+    guarded = re.findall(r"if \(!" + re.escape(nat) + r" \|\| \*" + re.escape(nat) +
+                         r" < (\w+)\)\s*" + re.escape(nat) + r" = (\w+);", t)
+    if sorted(writes) != ["finished", "started"]:
+        bad.append(f"{nat}: expected exactly two writes, the own read's `finished` and the shared "
+                   f"refresh's `started`; found {sorted(writes)}")
+    if sorted(g for g, v in guarded if g == v) != sorted(writes):
+        bad.append(f"{nat}: every write must be monotonic, `if (!{nat} || *{nat} < v) {nat} = v;` "
+                   "(a slow shared read must not lower a newer time an own read recorded)")
     # The gate result cannot be compared with, or converted to, the bare state.
     for name, text in files.items():
         if name.startswith("__"):
@@ -642,6 +656,18 @@ def selftest(files):
         mut("admit takes the raw armed state instead of armed_ok",
             sub_cpp("(armed_ok || transient_ok);",
                     "(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);"))
+        # SG-1: the not-armed time is monotonic, own read at its end, shared refresh at its start.
+        mut("the shared refresh's not-armed write is not monotonic (SG-1)",
+            sub_cpp("if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < started)\n"
+                    "        bg_last_not_armed_at_ = started;",
+                    "bg_last_not_armed_at_ = started;"))
+        mut("the own read's not-armed write is not monotonic",
+            sub_cpp("if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < finished)\n"
+                    "                bg_last_not_armed_at_ = finished;",
+                    "bg_last_not_armed_at_ = finished;"))
+        mut("the shared refresh records its END (UP-1)",
+            sub_cpp("*bg_last_not_armed_at_ < started)\n        bg_last_not_armed_at_ = started;",
+                    "*bg_last_not_armed_at_ < finished)\n        bg_last_not_armed_at_ = finished;"))
         r2 = blk2.find("if (!admit) {")
         ret2 = blk2.find("return;", r2)
         if r2 < 0 or ret2 < 0:

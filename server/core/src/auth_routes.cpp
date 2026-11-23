@@ -2819,8 +2819,11 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
         out.read_wall_at = started_wall;
         return out;
     }
-    // A definitive "not armed". The last armed id is left in place on purpose.
-    bg_last_not_armed_at_ = started;
+    // A definitive "not armed". The last armed id is left in place on purpose. The time is this
+    // read's START, and it only ever moves forward: an own read that ended later may already have
+    // recorded a newer time, which a slow shared read must not lower (SG-1).
+    if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < started)
+        bg_last_not_armed_at_ = started;
     out.last_not_armed_at = bg_last_not_armed_at_;
     out.state = SsoOnlyLocalGate::kRefused;
     out.why = read.armed_until.empty() ? SsoOnlyRefusedWhy::kDisarmed
@@ -3826,7 +3829,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             mfa_verify_barrier_for_test_("/login/mfa", proof);
         // Re-check the arm state once more at the mint (the code verification took time). A code
         // may already be spent here, so the three answers are kept apart:
-        //  - armed: mint, unless a "not armed" read this server holds ended at or after this
+        //  - armed: mint, unless the "not armed" time this server holds is at or after this
         //    read started (then it is a disarm, refused);
         //  - a definitive "not armed": refuse (the refusal is honest about a spent code);
         // This check reads the arm state ITSELF (no shared cache, no single flight), so a refresh
@@ -3853,8 +3856,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 wall2 - arm1->wall_at <= kArmSnapshotMaxAge &&
                 !arm1->arm_id.empty() && gate2.arm_id == arm1->arm_id &&
                 !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at);
-            // An armed own read is honoured only if no "not armed" read this server holds ended
-            // at or after it STARTED: such a read is the newer fact (C-01, PR #8626 review).
+            // An armed own read is honoured only if the "not armed" time this server holds is
+            // before it STARTED; a time at or after that is the newer fact (C-01, PR #8626
+            // review). An own read records that time at its END, a shared refresh at its START,
+            // so a shared "not armed" read that started before this read is not seen (a
+            // documented residual, auth-architecture.md arm-gate invariant (2)).
             const bool armed_ok =
                 gate2.state == SsoOnlyLocalGate::kBreakGlassArmed &&
                 !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= gate2.read_at);

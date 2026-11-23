@@ -1980,6 +1980,79 @@ TEST_CASE("break-glass MFA step: the second re-check reads the arm state itself"
         CHECK(res->status == 401);
         CHECK(refused(h, "disarmed", "pre_mint") == 1.0);
         CHECK(transient_admitted(h) == 0.0);
+        CHECK(rows_containing(audit_rows(h, "auth.login"), "reason=break_glass_disarmed_before_mint") == 1);
+    }
+    SECTION("an own read that says armed is refused at the exact instant a not-armed read ended") {
+        const auto pending = login_step1(h);
+        r.set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+            r.advance_arm_clock_for_test(1100);
+            // Another request's own read says "not armed" and ends exactly when the second
+            // re-check's read starts (no clock advance between them).
+            ctl.mode = ArmCtl::kNotArmed;
+            ctl.advance_in_read_ms = 10;
+            REQUIRE(r.sso_only_local_password_gate("admin", SsoOnlyArmRead::kOwnFreshRead).state ==
+                    SsoOnlyLocalGate::kRefused);
+            ctl.advance_in_read_ms = 0;
+            ctl.mode = ArmCtl::kArmed;
+        });
+        auto res = login_step2(h, pending, mfa.codes[0]);
+        // "At or after": an equal instant supersedes (mutation: `>` for `>=` -> 200).
+        CHECK(res->status == 401);
+        CHECK(refused(h, "disarmed", "pre_mint") == 1.0);
+    }
+    SECTION("a slow shared not-armed refresh does not lower a later not-armed time an own read recorded") {
+        const auto pending = login_step1(h);
+        r.set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+            r.advance_arm_clock_for_test(1100); // the cache is stale: the next shared call refreshes
+            hold_a_refresh();                    // shared refresh S, started at T+1100, held
+            r.advance_arm_clock_for_test(10);    // the second re-check's own read starts at T+1110
+            ctl.before_answer = [&] {
+                // Inside that own read: another request's own read says "not armed" and ends at
+                // T+1120 (recorded as its END); then S is released, also says "not armed", and
+                // records its START, T+1100. The own read itself then answers ARMED.
+                ctl.mode = ArmCtl::kNotArmed;
+                ctl.advance_in_read_ms = 10;
+                REQUIRE(r.sso_only_local_password_gate("admin", SsoOnlyArmRead::kOwnFreshRead)
+                            .state == SsoOnlyLocalGate::kRefused);
+                ctl.advance_in_read_ms = 0;
+                ctl.release();
+                refresher.reset(); // joins S
+                ctl.mode = ArmCtl::kArmed;
+            };
+        });
+        auto res = login_step2(h, pending, mfa.codes[0]);
+        // The newest not-armed time this server holds is T+1120, after the own read started at
+        // T+1110, so the armed answer is refused (SG-1; mutation: S's write is not monotonic ->
+        // it lowers the time to T+1100 -> 200).
+        CHECK(res->status == 401);
+        CHECK(refused(h, "disarmed", "pre_mint") == 1.0);
+        r.set_mfa_verify_barrier_for_test(nullptr);
+        const auto g = r.sso_only_local_password_gate("admin", SsoOnlyArmRead::kOwnFreshRead);
+        REQUIRE(g.last_not_armed_at.has_value());
+        CHECK(*g.last_not_armed_at ==
+              std::chrono::steady_clock::time_point(std::chrono::milliseconds(kT0 + 1120)));
+    }
+    SECTION("a shared not-armed read recorded by its START does not supersede an own read that started later") {
+        const auto pending = login_step1(h);
+        r.set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+            r.advance_arm_clock_for_test(1100);
+            hold_a_refresh();                 // S starts at T+1100
+            r.advance_arm_clock_for_test(10); // the own read starts at T+1110
+            ctl.before_answer = [&] {
+                ctl.mode = ArmCtl::kNotArmed; // S, released inside the own read, says not armed
+                ctl.release();
+                refresher.reset();
+                ctl.mode = ArmCtl::kArmed; // and the own read says armed
+            };
+        });
+        auto res = login_step2(h, pending, mfa.codes[0]);
+        // A documented residual, pinned on purpose: the shared refresh records a not-armed read at
+        // its START (T+1100), before the own read started (T+1110), so the armed own read is the
+        // newer fact and mints. Which database snapshot is newer is not knowable from the two
+        // intervals; recording the END instead would refuse re-armed logins after their recovery
+        // code is spent (governance UP-1). Changing this is a deliberate design decision.
+        CHECK(res->status == 200);
+        CHECK(refused_total(h) == 0.0);
     }
     SECTION("an own read that says armed is honoured when the only not-armed read ended before it started") {
         const auto pending = login_step1(h);
