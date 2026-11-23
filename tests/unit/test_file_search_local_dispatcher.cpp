@@ -513,6 +513,40 @@ TEST_CASE("file_search plugin (Windows): one real search over a fixture finds th
         CHECK(t[6] == "links_skipped=1"); // the planted junction: counted, never followed
         CHECK(last.result_status == YUZU_RESULT_STATUS_OK);
         CHECK(last.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+
+        // The same fixture with kinds=both: the directory joins the two controls as a third match, with no size, no
+        // time and no extents row (a directory is never opened); the junction is still counted and never matched.
+        const Search both = search_all(plugin->descriptor, {fx.root.string(), "yuzu-fs-control-" + salt + "-*.bin", "both", ""});
+        REQUIRE_FALSE(both.slices.empty());
+        const std::string dir_path = label + "/yuzu-fs-control-" + salt + "-dir.bin";
+        std::vector<std::string> expected_both = expected;
+        expected_both.push_back(dir_path);
+        std::ranges::sort(expected_both);
+        CHECK(found_paths(both) == expected_both);
+        std::size_t dir_rows = 0;
+        for (const auto& row : both.rows) {
+            if (!starts(row, "match|"))
+                continue;
+            const auto f = split(row);
+            REQUIRE(f.size() == 7);
+            if (*fsr::decode_name(f[1]) != dir_path)
+                continue;
+            ++dir_rows;
+            CHECK(f[2] == "directory");
+            CHECK(f[4] == "-");
+            CHECK(f[5] == "-");
+        }
+        CHECK(dir_rows == 1);
+        CHECK(std::ranges::count_if(both.rows, [](const std::string& r) { return starts(r, "extents|"); }) == 2); // the controls only
+        CHECK(std::ranges::none_of(both.rows, [](const std::string& r) { return starts(r, "gap|"); }));
+        CHECK(std::ranges::any_of(both.rows, [](const std::string& r) { return starts(r, "coverage|complete|"); }));
+        const auto both_trailer = split(captured_rows(both.last().captured).back());
+        REQUIRE(both_trailer.size() == 7);
+        CHECK(both_trailer[1] == "ok");
+        CHECK(both_trailer[2] == "none");
+        CHECK(both_trailer[6] == "links_skipped=1");
+        CHECK(both.last().result_status == YUZU_RESULT_STATUS_OK);
+        CHECK(both.last().result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
     } else {
         CHECK(std::ranges::none_of(s.rows, [](const std::string& r) { return starts(r, "match|"); }));
         CHECK(std::ranges::any_of(s.rows, [](const std::string& r) { return starts(r, "volume|") && r.find("|not_searched|") != std::string::npos; }));

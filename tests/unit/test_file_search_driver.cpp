@@ -876,6 +876,7 @@ TEST_CASE("file_search driver: with two workers still abandoned every slice answ
     REQUIRE(rig.state.abandoned_count() == 2);
 
     const int calls = rig.runner_calls;
+    const int mount_reads = rig.mount_reads;
     for (int i = 0; i < 3; ++i) {
         const SliceResult busy = checked_slice(make_request(kCtl), rig.b);
         CHECK(busy.status == Status::busy);
@@ -883,6 +884,7 @@ TEST_CASE("file_search driver: with two workers still abandoned every slice answ
         CHECK(checked_slice(make_request("other-*.bin"), rig.b).status == Status::busy); // any search
     }
     CHECK(rig.runner_calls == calls);
+    CHECK(rig.mount_reads == mount_reads); // the busy slices read no mount table
     CHECK(rig.legs.empty()); // a held worker never ran its work: no leg was ever made, and the busy slices made none
     CHECK(rig.user_root_reads == 0);
 
