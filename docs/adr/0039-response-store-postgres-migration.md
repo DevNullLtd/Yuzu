@@ -18,6 +18,7 @@ per-device and Forensics-tier filtering in every detail and aggregate query befo
 or pagination, fail-closed reads when authorization is unavailable, and incomplete coverage
 after loss. Specify the fail-closed access audit and the pause, redelivery and deadline
 behavior after a sink failure in either dispatch profile. Test distinct scopes and tier grants before cutover.
+Reuse the protected-store outage notice required by the substrate amendment.
 Until that cutover ships the existing PostgreSQL path remains operational.
 
 ## Context

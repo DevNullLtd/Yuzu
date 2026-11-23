@@ -195,7 +195,7 @@ expiry, keep a failed export readable warm. Per-device verdicts are working data
 
 ### Terminal expiry during an outage
 
-On 2026-11-22 Nathan decided that a run without a confirmed export expires at final
+On 2026-11-22 Nathan decided (D70) that a run without a confirmed export expires at final
 plus 90 days, including when ClickHouse remains offline. At that deadline, stop serving
 its verdicts and fence its exporter. Serialize the terminal transition with export
 acknowledgement on the PostgreSQL run record, using the same guarded database clock.
@@ -204,8 +204,9 @@ one durable, counts-only loss event keyed by run and terminal transition. Record
 expiry time, reason, expected verdict count and count with confirmed durable receipts,
 without device IDs. This event supplements the ordinary summary emitted at final.
 
-Commit the loss audit, removal of retained warm data and release of its actual reservation
-as one recoverable outcome. A failed audit or commit must leave the expired data
+In a single PostgreSQL transaction, write the uniquely keyed loss audit, dispose of
+members before their header, and release the charges for both. The committed audit is
+the durable witness of the terminal transition. A failed audit or commit must leave the expired data
 inaccessible and still charged for retry. Restart, simultaneous replicas or an ambiguous
 commit must produce one audit and one release. In-flight or retried batches cannot revive
 the expired run; partial cold copies remain inaccessible and subject to the original TTL.
@@ -253,29 +254,44 @@ It must document the recovery-time bound for abandoned reservations and the head
 thresholds before testing. Verify explicit deletion during export: fence outstanding batches, revoke read access
 and ensure restore cannot resurrect the deleted run. Verify relational and cold-store
 restore and the same authorization-denial audit policy on both tiers. Ordinary successful
-criteria-run reads add no per-device audit event (ADR-0075 R11.7).
-Retain the access-grant review, disposal evidence and outage alert test with that packet. A release between packets 1.10
+criteria-run reads add no per-device audit event.
+Restore must reconcile a deletion record outside the restored copy before reopening reads;
+if it cannot establish deletion history, keep the affected data unavailable. Remove expired
+or explicitly deleted cold records under the disposal policy, including late batches.
+Retain the access-grant review, disposal evidence and outage alert test with that packet.
+Ship a bounded-label terminal-loss counter and alert, plus an advance alert on unexported
+age before terminal expiry. Catalogue the loss audit verb and its idempotency key in 1.13. A release between packets 1.10
 and 1.13 documents warm-only retention in its operator manual, changelog and upgrade notes
 (ADR-0075 R11.9). A cold-store outage degrades those operations independently of core's
 PostgreSQL startup and readiness contract.
 
 ### Notifying operators when a configured ClickHouse store goes offline
 
-On 2026-11-22 Nathan required an outage notice at login and an MCP request for agentic
+On 2026-11-22 Nathan required (D69) an outage notice at login and an MCP request for agentic
 workers to notify their human operators. Surface the failure when core detects it. Keep
 the notice visible while the configured store is offline, including when PostgreSQL can
 still serve requests. Name ClickHouse and the affected functions without exposing data,
 credentials or connection strings. Clear the notice after core confirms recovery.
-A deployment with ClickHouse intentionally disabled has no outage to report.
+Only an explicit configuration disabling every dependent feature with no outstanding
+protected-store work suppresses this notice. Missing credentials, a missing DSN or an
+unreachable host on an enabled deployment are failures. Outstanding runs keep their
+original expiry and disposal rules across configuration changes.
 
-Packet 1.13 owns the shared datastore-health signal and its first protected-store outage
-test. Wire it to the authenticated dashboard landing page after sign-in, MCP
-`initialize.instructions` and the existing `yuzu://server/health` resource. An agentic
-worker opening an MCP session during the outage must receive an explicit request to
-notify its human operator. A connected worker must also receive that request on its
-next interaction. In the outage test, sign in and exercise both new and existing MCP
-sessions, then recover the store and verify both notices clear. Reuse this signal for
-the bulk response store at cutover. Preserve unrelated PostgreSQL service during the test.
+Packet 1.13 owns the shared health state and the first protected-store outage test.
+Publish bounded, timestamped health transitions to PostgreSQL for all replicas. Refresh
+on a bounded cadence and require confirmed recovery before clearing the notice. Distinguish
+an unknown or stale observation from health. Drive the authenticated dashboard landing
+page, an authenticated REST datastore-status read, and MCP `yuzu://server/health` from
+that state. Anonymous liveness and readiness probes retain their existing contracts.
+
+Keep MCP's static orientation text shared with `yuzu://about`. On an authenticated
+initialization or subsequent response-bearing interaction during an outage, include a
+fixed notice in Yuzu result `_meta` (or error data on an error response) asking the
+agentic worker to notify its human operator. Preserve tool result schemas. Use a
+closed set of status codes and fixed messages. Test sign-in, authenticated REST,
+new and existing MCP sessions, and a recovery that clears the notice on every replica.
+The bulk response cutover reuses this signal. Verify unrelated PostgreSQL service
+continues through the test.
 
 ### Bulk live instruction responses (approved design, 2026-11-22)
 
