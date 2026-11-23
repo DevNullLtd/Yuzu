@@ -538,8 +538,11 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     auto targets = resolve_targets(p, &degrade_reason);
     if (!degrade_reason.empty())
         return std::unexpected("scope evaluation degraded: " + degrade_reason);
-    if (targets.empty())
+    if (targets.empty()) {
+        // Nothing is targeted, so no verdict is owed: an earlier lost write no longer stands.
+        clear_unwritten(p.id);
         return "";
+    }
 
     // Dedupe (gov UP-5 / UP-13): if a Check for this policy is already in flight,
     // do not dispatch another — otherwise rapid /evaluate calls or a tick landing

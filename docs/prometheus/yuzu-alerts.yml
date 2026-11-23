@@ -9449,11 +9449,11 @@ groups:
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
       - alert: YuzuPolicyErrorVerdictWriteFailed
         # The evaluator could not write the per-agent `error` verdict for a policy whose check
-        # instruction is gone or whose pair no longer matches (a chunk failed after its retries).
+        # instruction is gone or whose pair does not match the authorized one (a chunk failed after its retries).
         # The affected agents keep their PREVIOUS verdict, which may read compliant, until the policy
         # next writes a verdict. This is a STATE alert on a gauge, not an increase() alert: the gauge
-        # stays above zero for as long as the stale verdict stands, so the alert does not clear one
-        # window after the last failure. The gauge is seeded at 0, so a healthy server exports it and
+        # stays above zero until the policy next writes a verdict on that server, for at most 24 hours
+        # and not across a restart, so the alert does not clear one window after the last failure. The gauge is seeded at 0, so a healthy server exports it and
         # `for: 5m` ignores a blip that the next write already cleared.
         expr: |
           max by (instance) (yuzu_server_policy_error_verdict_unwritten_agents) > 0
@@ -9469,7 +9469,7 @@ groups:
             previous verdict, which may read compliant. Check Postgres reachability and the policy
             store, then wait for the current evaluation to finish and run POST
             /api/policies/{id}/evaluate once; do not call it in a loop during database trouble.
-            The gauge returns to zero when the policy next writes a verdict.
+            The gauge returns to zero when the policy next writes a verdict on that server, and is dropped after 24 hours or a server restart.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
       - alert: YuzuPolicyErrorVerdictWriteRetrying
         # A chunk of the error-verdict write needed a retry on a fresh pool lease, steadily for ten
