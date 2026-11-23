@@ -280,8 +280,7 @@ TEST_CASE("REST purge: an unsafe device id answers 400 before the scope gate, an
     CHECK(h.scoped_calls == 0);
     CHECK(h.calls.empty());
     CHECK(h.audits.empty());
-    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "invalid_input"}}).value() ==
-          static_cast<double>(bad.size()));
+    CHECK(h.metric("invalid_input") == static_cast<double>(bad.size()));
 
     // The same route does reach the scope gate for a safe id at the 256-byte limit.
     int st = 0;
