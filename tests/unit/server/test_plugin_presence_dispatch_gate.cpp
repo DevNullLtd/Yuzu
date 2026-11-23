@@ -595,6 +595,31 @@ TEST_CASE("retired_tar_only_count counts only tar-without-echo sessions",
     // ... and a removed session no longer counts.
     registry.remove_agent("dev-tar-2");
     CHECK(registry.retired_tar_only_count() == 0);
+
+    // The count is a counter kept at every insert, replace and erase (the health sweep reads it in
+    // O(1)), so each removal path and a same-flag replace must leave it equal to a scan.
+    const auto register_ret = [&](const std::string& id, const std::string& session) {
+        auto info = make_presence_test_info(id);
+        info.add_plugins()->set_name("tar");
+        auto s = registry.register_agent(info);
+        REQUIRE(s);
+        registry.map_session(session, id);
+        return *s;
+    };
+    (void)register_ret("dev-a", "sess-a");
+    const auto installed_b = register_ret("dev-b", "sess-b");
+    (void)register_ret("dev-c", "sess-c");
+    CHECK(registry.retired_tar_only_count() == 3);
+    (void)register_ret("dev-a", "sess-a2"); // tar replaced by tar: still one entry
+    CHECK(registry.retired_tar_only_count() == 3);
+    CHECK(registry.remove_agent_if_session("dev-a", "sess-a2"));
+    CHECK(registry.retired_tar_only_count() == 2);
+    CHECK_FALSE(registry.remove_agent_if_session("dev-b", "not-the-session")); // refused: no change
+    CHECK(registry.retired_tar_only_count() == 2);
+    registry.remove_agent_if_same("dev-b", installed_b);
+    CHECK(registry.retired_tar_only_count() == 1);
+    registry.remove_agent("dev-c");
+    CHECK(registry.retired_tar_only_count() == 0);
 }
 
 TEST_CASE("an agent reporting `echo` has it and send_to / send_to_all write `echo` to the wire",

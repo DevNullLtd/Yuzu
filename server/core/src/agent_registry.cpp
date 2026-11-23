@@ -226,6 +226,11 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         }
         if (it != agents_.end() && !it->second->session_id.empty())
             session_to_agent_.erase(it->second->session_id);
+        // retired_tar_only_n_ follows agents_ at every insert, replace and erase (O(1) read).
+        if (it != agents_.end() && it->second->retired_tar_only)
+            --retired_tar_only_n_;
+        if (session->retired_tar_only)
+            ++retired_tar_only_n_;
         agents_[info.agent_id()] = session;
     }
     metrics_.counter("yuzu_agents_registered_total").increment();
@@ -387,6 +392,8 @@ void AgentRegistry::remove_agent(const std::string& agent_id) {
             if (!it->second->session_id.empty()) {
                 session_to_agent_.erase(it->second->session_id);
             }
+            if (it->second->retired_tar_only)
+                --retired_tar_only_n_;
             agents_.erase(it);
         }
     }
@@ -408,6 +415,8 @@ bool AgentRegistry::remove_agent_if_session(const std::string& agent_id,
             return false;
         }
         session_to_agent_.erase(session_id);
+        if (it->second->retired_tar_only)
+            --retired_tar_only_n_;
         agents_.erase(it);
     }
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
@@ -430,6 +439,8 @@ void AgentRegistry::remove_agent_if_same(const std::string& agent_id,
         }
         if (!it->second->session_id.empty())
             session_to_agent_.erase(it->second->session_id);
+        if (it->second->retired_tar_only)
+            --retired_tar_only_n_;
         agents_.erase(it);
     }
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
@@ -1882,8 +1893,7 @@ std::size_t AgentRegistry::agent_count() const {
 
 std::size_t AgentRegistry::retired_tar_only_count() const {
     std::lock_guard lock(mu_);
-    return static_cast<std::size_t>(
-        std::ranges::count_if(agents_, [](const auto& kv) { return kv.second->retired_tar_only; }));
+    return retired_tar_only_n_;
 }
 
 void AgentRegistry::map_session(const std::string& session_id, const std::string& agent_id) {
