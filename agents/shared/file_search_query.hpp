@@ -18,6 +18,7 @@
 // no I/O: the zero-dependency leaf-helper convention of this directory.
 #pragma once
 
+#include "file_search_position.hpp"
 #include "sha256.hpp"
 #include "wire_utf8.hpp"
 
@@ -42,6 +43,7 @@ inline constexpr std::size_t kMinLiteralBytes = 3;
 // A canonical pattern or name longer than this cannot be matched (bounds the matcher's work).
 inline constexpr std::size_t kMaxCanonicalPatternBytes = 4 * kMaxPatternBytes;
 inline constexpr std::size_t kMaxCanonicalNameBytes = 4 * 255;
+static_assert(kMaxCanonicalNameBytes >= kMaxNameBytes, "a name a Position can hold must still be evaluable");
 
 enum class PatternError { empty, too_long, too_many_stars, too_few_literals, forbidden_byte };
 

@@ -667,7 +667,7 @@ Partial — read-only posture only (Wave 8 PR8.6; refs #282, `docs/roadmap.md` I
 
 `filesystem` plugin.
 
-`file_search` plugin `search`: on-demand, resumable search of the local disks of a device by leaf-name glob under one absolute root, one slice per call with a cursor the agent authenticates and seals and a per-volume coverage verdict, reporting each match's type, size, modification time and extents (names, types, sizes, times and extents only: a matched file is opened and never read, no file content is read or hashed). `FileRetrieval` securable, `AdminOrApproval`, default-off, not single-target; the rows it stores are read in the Forensics tier (global `Forensics:Read`). Linux and macOS constrained, Windows planned. *(Evidence: `agents/plugins/file_search/README.md`.)*
+`file_search` plugin `search`: on-demand, resumable search of the local disks of a device by leaf-name glob under one absolute root, one slice per call with a cursor the agent authenticates and seals and a per-volume coverage verdict, reporting each match's type, size, modification time and extents (names, types, sizes, times and extents only: a matched file is opened and never read, no file content is read or hashed). `FileRetrieval` securable, `AdminOrApproval`, on by default (the kill switch turns it off), not single-target; the rows it stores are read in the Forensics tier (global `Forensics:Read`). Linux, macOS and Windows constrained (Windows: fixed volumes, walk and extents only). *(Evidence: `agents/plugins/file_search/README.md`.)*
 
 ### 10.3 File Content Read (by Line) :white_check_mark: `T1`
 
@@ -1011,7 +1011,7 @@ Token rotation: `POST /api/v1/tokens/{id}/rotate` and its confirm step (`ApiToke
 
 ### 18.17 Plugin Configuration, Secrets and Kill Switches :white_check_mark: `T2` *(new row, v4.1)*
 
-`/api/v1/plugin-config` (list, get, set per key, and the per-plugin `kill-switch` with optional `action`/`os`) on the `PluginConfig` and `PluginSecret` securables, with MCP twins `list_plugin_config`, `get_plugin_config`, `set_plugin_config`, `delete_plugin_config`, `set_plugin_secret`, `delete_plugin_secret`, `get_plugin_kill_switch` and `set_plugin_kill_switch`. The Forensics-tier plugins (`browser_inventory`, `execution_artifacts`, `file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`) are seeded default-off. *(Evidence: `server/core/src/plugin_config_parsers.hpp`, `PluginConfigStore::seed_kill_switch_default_off`.)*
+`/api/v1/plugin-config` (list, get, set per key, and the per-plugin `kill-switch` with optional `action`/`os`) on the `PluginConfig` and `PluginSecret` securables, with MCP twins `list_plugin_config`, `get_plugin_config`, `set_plugin_config`, `delete_plugin_config`, `set_plugin_secret`, `delete_plugin_secret`, `get_plugin_kill_switch` and `set_plugin_kill_switch`. The Forensics-tier plugins `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect` and `remote_access_audit` are seeded default-off; `file_search` (also Forensics-tier for what it stores) is on by default. *(Evidence: `server/core/src/plugin_config_parsers.hpp`, `PluginConfigStore::seed_kill_switch_default_off`.)*
 
 ### 18.18 KEK Rotation and Secrets Rewrap :white_check_mark: `T2` *(new row, v4.1)*
 
@@ -1900,7 +1900,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | system_hardening | Y | Y | Y | Security |
 | filesystem | Y | Y | Y | File System |
 | filesystem_posture | 🟡 | 🟡 | Y | File System |
-| file_search | - | 🟡 | 🟡 | File System |
+| file_search | 🟡 | 🟡 | 🟡 | File System |
 | registry | Y | - | - | System Config |
 | wmi | Y | - | - | System Config |
 | windows_optional_features | Y | - | - | System Config |

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::file_search {
@@ -128,6 +129,11 @@ struct FileExtents {
     std::vector<Extent> extents; // at most kMaxExtents
     std::uint64_t total{0};      // extents seen, listed or not
     bool total_exact{true};      // false: `total` is a lower bound
+    /// A closed token (a string literal, never built at run time) that qualifies the state: the reason a
+    /// file was not opened or read, or the tag family of an entry that is not an ordinary file. Printed as
+    /// `<state>:<note>`; empty prints the state alone, so every existing row is unchanged. No flag bit and
+    /// no column is added for it.
+    std::string_view note{};
 
     /// Counts one extent seen and keeps it while there is room.
     void add(const Extent& e) {
@@ -154,11 +160,16 @@ struct FiemapRequest {
     return r;
 }
 
-/// `extents|<dev:id>|<state>|<total>|<list>`: <total> is the count or `>=<count>` for a lower bound; <list>
-/// is up to kMaxExtents of `<logical>:<physical>:<length>:<flags>` joined by ',', or `-` for none. The
+/// `extents|<dev:id>|<state>[:<note>]|<total>|<list>`: <total> is the count or `>=<count>` for a lower bound;
+/// <list> is up to kMaxExtents of `<logical>:<physical>:<length>:<flags>` joined by ',', or `-` for none. The
 /// identity is the key of the file's match row.
 [[nodiscard]] inline std::string format_extents_row(fsr::FileIdentity id, const FileExtents& x) {
-    std::string row = "extents|" + fsr::format_file_identity(id) + "|" + to_token(x.state) + "|";
+    std::string row = "extents|" + fsr::format_file_identity(id) + "|" + to_token(x.state);
+    if (!x.note.empty()) {
+        row += ':';
+        row += x.note;
+    }
+    row += '|';
     if (!x.total_exact)
         row += ">=";
     row += std::to_string(x.total);

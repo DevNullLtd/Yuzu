@@ -39,12 +39,14 @@
 #include "file_search_test_support.hpp"
 
 #include <base64.hpp>
+#include <bounded_wait.hpp>
 #include <file_search_names.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <map>
 #include <optional>
 #include <set>
@@ -98,6 +100,11 @@ struct Rig {
     std::function<WorkResult()> replacement;        // Mode::replace: what the runner hands back
     std::function<void(const std::string&)> facts_hook;
     std::function<void(const std::string&)> list_hook;
+    // Replaces the leg's facts for an entry (extents state, notes); sees the listed entry like the real leg.
+    std::function<FileFacts(const std::string& dir, const DirEntry& entry)> facts_override;
+    std::map<std::string, std::uint64_t> hints_seen; // path -> the leg_hint facts() was handed
+    std::function<std::vector<std::string>(const Unit&)> user_roots_fn;
+    int user_root_reads{0};
     bool bump_root_identity{false};
 
     Rig() : b{.state = state, .slot = slot} {
@@ -106,6 +113,10 @@ struct Rig {
             return std::optional<yuzu::shared::MountTable>(mounts.table());
         };
         b.make_leg = [this](const Unit& u) { return leg_for(u); };
+        b.read_user_roots = [this](const Unit& u) {
+            ++user_root_reads;
+            return user_roots_fn ? user_roots_fn(u) : std::vector<std::string>{};
+        };
         b.run_bounded = [this](std::chrono::milliseconds t, std::function<WorkResult()> work) {
             return run(t, std::move(work));
         };
@@ -167,18 +178,23 @@ struct Rig {
                 e.file_id = id_of(yuzu::component_inventory::walk_detail::join(d, e.name));
             return r;
         };
-        l.facts = [this](const std::string& dir, const std::string& name) {
-            const std::string p = yuzu::component_inventory::walk_detail::join(dir, name);
+        l.facts = [this](const std::string& dir, const DirEntry& entry) {
+            const std::string p = yuzu::component_inventory::walk_detail::join(dir, entry.name);
             facts_calls.push_back(p);
+            hints_seen[p] = entry.leg_hint;
             if (facts_hook)
                 facts_hook(p);
+            if (facts_override)
+                return facts_override(dir, entry);
             FileFacts f;
+            f.extents.state = ExtentsState::failed; // the leg owns its extents state: failed unless it read them
             const auto it = fs.files.find(p);
             if (it == fs.files.end())
                 return f;
             f.facts.opened = true;
             f.facts.size = it->second.size();
             f.facts.mtime = MemTree::kDefaultMtime;
+            f.extents = {};
             f.extents.state = ExtentsState::ok;
             f.extents.add({0, 4096, 4096, 0});
             return f;
@@ -568,6 +584,25 @@ TEST_CASE("file_search driver: a search cut by a budget and resumed by cursor fi
     CHECK(found(search(by_rows, kCtl)) == found(whole));
 }
 
+TEST_CASE("file_search driver: a 765-byte name resumes across a slice and a 766-byte one is a name_too_long gap",
+          "[file_search][file_search_driver]") {
+    const std::string wide(fsr::kMaxNameBytes, 'w');        // the longest name a Position holds
+    const std::string wider(fsr::kMaxNameBytes + 1, 'x');   // one byte more: never placed
+    Rig rig;
+    rig.fs.add_file("/r/" + wide + "/yuzu-fs-control-1.bin", "");
+    rig.fs.add_file("/r/" + wide + "/yuzu-fs-control-2.bin", "");
+    rig.fs.add_file("/r/" + wider + "/yuzu-fs-control-9.bin", "");
+    rig.b.limits.max_entries = 2; // every slice ends inside the wide directory
+    const Run run = search(rig, kCtl);
+    CHECK(run.slices.size() > 1);
+    CHECK(found(run) == Strs{"/r/" + wide + "/yuzu-fs-control-1.bin", "/r/" + wide + "/yuzu-fs-control-2.bin"});
+    CHECK(count_rows(run, "gap|") >= 1);
+    for (const auto& s : run.slices)
+        if (const auto g = row_of(s, "gap|"); !g.empty())
+            CHECK(g.find("name_too_long") != std::string::npos);
+    CHECK_FALSE(complete(run)); // the 766-byte directory was not searched, and the verdict says so
+}
+
 TEST_CASE("file_search driver: a unit nested in another is searched, never listed by its parent, with no gap",
           "[file_search][file_search_driver]") {
     Rig rig;
@@ -780,6 +815,8 @@ TEST_CASE("file_search driver: a second concurrent slice answers busy without ca
     CHECK(starts(inner->rows[0], "search|busy|busy|"));
     CHECK(rig.runner_calls == 1);
     CHECK(rig.mount_reads == reads_during); // the busy call read nothing
+    CHECK(rig.legs.size() == 1);            // and made no leg: only the outer slice's worker did
+    CHECK(rig.user_root_reads == 1);
     CHECK(outer.status == Status::ok);
     CHECK_FALSE(rig.slot.load()); // released by the slice that took it
 }
@@ -846,6 +883,8 @@ TEST_CASE("file_search driver: with two workers still abandoned every slice answ
         CHECK(checked_slice(make_request("other-*.bin"), rig.b).status == Status::busy); // any search
     }
     CHECK(rig.runner_calls == calls);
+    CHECK(rig.legs.empty()); // a held worker never ran its work: no leg was ever made, and the busy slices made none
+    CHECK(rig.user_root_reads == 0);
 
     rig.state.abandoned()[0].done->store(true); // one comes back: there is room again
     rig.mode = Rig::Mode::run;
@@ -1025,7 +1064,7 @@ TEST_CASE("file_search driver: a position no cursor can spell is never progress 
         WorkResult w;
         w.walk.stop = yuzu::component_inventory::Stop::budget_time;
         w.walk.advanced = true;
-        w.walk.position.after = std::string(300, 'a'); // longer than a name can be: not a valid position
+        w.walk.position.after = std::string(fsr::kMaxNameBytes + 1, 'a'); // longer than a name can be: not a valid position
         return w;
     };
     const SliceResult r = checked_slice(make_request(kCtl), rig.b);
@@ -1093,6 +1132,7 @@ TEST_CASE("file_search driver: invalid governor limits are refused before a gove
     CHECK(rig.mount_reads == 0);
     CHECK(rig.runner_calls == 0);
     CHECK(rig.legs.empty());
+    CHECK(rig.user_root_reads == 0);
 }
 
 // ---- pacing ----
@@ -1345,6 +1385,8 @@ TEST_CASE("file_search driver: a forged cursor is refused before any boundary is
     }
     CHECK(rig.mount_reads == 0);
     CHECK(rig.runner_calls == 0);
+    CHECK(rig.legs.empty()); // no leg factory, no user-roots reader before the cursor is believed
+    CHECK(rig.user_root_reads == 0);
 
     // The cursor is judged BEFORE the slot is taken: a forged one answers bad_cursor even while another
     // slice holds the slot, never busy, and it neither takes nor releases the slot.
@@ -1354,6 +1396,8 @@ TEST_CASE("file_search driver: a forged cursor is refused before any boundary is
     CHECK(held.reason == "bad_cursor");
     CHECK(rig.slot.load());
     CHECK(rig.mount_reads == 0);
+    CHECK(rig.legs.empty());
+    CHECK(rig.user_root_reads == 0);
     rig.slot = false;
 
     // a well-formed cursor of a changed unit set ends the search once the table has been read
@@ -1451,6 +1495,7 @@ TEST_CASE("file_search driver: a cursor key nobody set is refused before a curso
     CHECK(rig.mount_reads == 0);
     CHECK(rig.runner_calls == 0);
     CHECK(rig.legs.empty());
+    CHECK(rig.user_root_reads == 0);
 }
 
 TEST_CASE("file_search driver: an unreadable or malformed mount table ends the slice with no walk",
@@ -1777,4 +1822,249 @@ TEST_CASE("file_search driver: a seeded sweep over trees, budgets and mutations 
         if (!mutate)
             CHECK(complete(run) == !tmp);
     }
+}
+
+// ---- the entry gap, the leg's own extents state, the roots and the worker-made leg ----
+
+namespace {
+
+DirEntry gap_entry(std::string name, Type type, fsr::GapCause cause, std::uint64_t hint = 0) {
+    DirEntry e{std::move(name), type};
+    e.gap = cause;
+    e.leg_hint = hint;
+    return e;
+}
+
+/// A real bounded runner with a fixed 100 ms bound, so a test can drive a blocked worker.
+RunOutcome<WorkResult> bounded_100ms(std::chrono::milliseconds, std::function<WorkResult()> work) {
+    auto ran = yuzu::shared::bounded_call_ex(std::chrono::milliseconds{100}, std::move(work));
+    RunOutcome<WorkResult> out;
+    switch (ran.status) {
+    case yuzu::shared::BoundedCallStatus::Completed:
+        out.status = RunStatus::completed;
+        out.value = std::move(ran.value);
+        break;
+    case yuzu::shared::BoundedCallStatus::TimedOut:
+        out.status = RunStatus::timed_out;
+        break;
+    case yuzu::shared::BoundedCallStatus::Rejected:
+        out.status = RunStatus::rejected;
+        break;
+    }
+    return out;
+}
+
+std::vector<std::string> rows_of_kind(const Run& run, const std::string& prefix) {
+    std::vector<std::string> out;
+    for (const auto& s : run.slices)
+        for (const auto& row : s.rows)
+            if (starts(row, prefix))
+                out.push_back(row);
+    return out;
+}
+
+/// path -> scope of every match row of the run.
+std::map<std::string, std::string> scopes_of(const Run& run) {
+    std::map<std::string, std::string> out;
+    for (const auto& row : rows_of_kind(run, "match|")) {
+        const auto cols = split(row);
+        const auto path = fsr::decode_name(cols[1]);
+        REQUIRE(path.has_value());
+        out[*path] = cols[6];
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("file_search driver: an entry with a gap is one gap row, never visited, entered, charged or carried in a cursor",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.fs.add_file("/r/yuzu-fs-control-3.bin", "");
+    rig.fs.add_file("/r/yuzu-fs-control-dir/inner.bin", ""); // must never be listed: its entry carries a gap
+    auto& root = rig.fs.dirs["/r"];
+    std::erase_if(root, [](const DirEntry& e) { return e.name == "yuzu-fs-control-dir"; });
+    root.push_back(gap_entry("yuzu-fs-control-2.bin", Type::file, fsr::GapCause::reparse_unknown));
+    root.push_back(gap_entry("yuzu-fs-control-dir", Type::dir, fsr::GapCause::dataless));
+    rig.b.limits.max_entries = 1; // only a searchable entry is charged
+
+    const Run run = search(rig, kCtl, "/r", "both");
+    CHECK(sorted(found(run)) == Strs{"/r/yuzu-fs-control-1.bin", "/r/yuzu-fs-control-3.bin"});
+    CHECK(sorted(rig.facts_calls) == Strs{"/r/yuzu-fs-control-1.bin", "/r/yuzu-fs-control-3.bin"}); // never opened
+    CHECK(std::ranges::find(rig.fs.listed, "/r/yuzu-fs-control-dir") == rig.fs.listed.end());      // never entered
+    const auto gaps = rows_of_kind(run, "gap|");
+    CHECK(std::ranges::any_of(gaps, [](const std::string& g) { return g.find("reparse_unknown") != std::string::npos; }));
+    CHECK(std::ranges::any_of(gaps, [](const std::string& g) { return g.find("dataless") != std::string::npos; }));
+    CHECK_FALSE(complete(run)); // a gap makes the verdict partial
+    // and no cursor of the search names an entry that carried a gap
+    const auto qh = fsr::query_hash(make_request(kCtl, "/r", "both").query);
+    for (const auto& s : run.slices) {
+        if (s.cursor.empty())
+            continue;
+        const auto cursor = decode_volume_cursor(s.cursor, qh, rig.b.cursor_key);
+        REQUIRE(cursor.has_value());
+        const auto& pos = cursor->inner.position;
+        CHECK(pos.after != "yuzu-fs-control-2.bin");
+        CHECK(pos.after != "yuzu-fs-control-dir");
+        for (const auto& f : pos.dirs)
+            CHECK(f.name != "yuzu-fs-control-dir");
+    }
+}
+
+TEST_CASE("file_search driver: facts receives the listed entry and its leg_hint",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    for (auto& e : rig.fs.dirs["/r"])
+        if (e.name == "yuzu-fs-control-1.bin")
+            e.leg_hint = 0x2000000000000420ULL;
+    const Run run = search(rig, kCtl);
+    CHECK(found(run) == Strs{"/r/yuzu-fs-control-1.bin"});
+    CHECK(rig.hints_seen.at("/r/yuzu-fs-control-1.bin") == 0x2000000000000420ULL);
+}
+
+TEST_CASE("file_search driver: the leg's extents state and note are printed as the leg gave them",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-a.bin", "");
+    rig.fs.add_file("/r/yuzu-fs-control-b.bin", "");
+    rig.fs.add_file("/r/yuzu-fs-control-c.bin", "");
+    rig.facts_override = [](const std::string&, const DirEntry& e) {
+        FileFacts f;
+        if (e.name == "yuzu-fs-control-a.bin") { // never opened: unsupported, and the note says why
+            f.extents.state = ExtentsState::unsupported;
+            f.extents.note = "placeholder";
+        } else if (e.name == "yuzu-fs-control-b.bin") { // opened and fully local: real extents, flagged as cloud
+            f.facts.opened = true;
+            f.facts.size = 7;
+            f.facts.mtime = MemTree::kDefaultMtime;
+            f.extents.state = ExtentsState::ok;
+            f.extents.note = "cloud";
+            f.extents.add({0, 4096, 4096, 0});
+        } else { // never opened, nothing said: failed, as on POSIX
+            f.extents.state = ExtentsState::failed;
+        }
+        return f;
+    };
+    const Run run = search(rig, kCtl);
+    const auto matches = rows_of_kind(run, "match|");
+    const auto extents = rows_of_kind(run, "extents|");
+    REQUIRE(matches.size() == 3);
+    REQUIRE(extents.size() == 3);
+    CHECK(extents[0].find("|unsupported:placeholder|0|-") != std::string::npos);
+    CHECK(matches[0].ends_with("|-|-|system")); // size and time read '-'
+    CHECK(extents[1].find("|ok:cloud|1|0:4096:4096:-") != std::string::npos);
+    CHECK_FALSE(matches[1].ends_with("|-|-|system"));
+    CHECK(extents[2].find("|failed|0|-") != std::string::npos);
+    CHECK(extents[2].find("failed:") == std::string::npos); // no note: the state alone
+}
+
+TEST_CASE("file_search driver: a Windows-labelled tree walks, reports label paths, and tags a relocated profile through the unit's roots",
+          "[file_search][file_search_driver]") {
+    for (const std::string label : {"/C:", "/Volume{0f1e2d3c-1111-2222-3333-444455556666}"}) {
+        INFO(label);
+        Rig rig;
+        rig.b.os = Os::windows;
+        rig.mounts = Mounts{};
+        rig.mounts.add(label, "NTFS", "0:5");
+        for (const char* dir : {"/Profiles/alice", "/Profilesx", "/Users/bob", "/Windows"})
+            rig.fs.add_file(label + dir + "/yuzu-fs-control-1.bin", "");
+        std::vector<std::string> units_seen;
+        rig.user_roots_fn = [&](const Unit& u) {
+            units_seen.push_back(u.mount_point);
+            return std::vector<std::string>{u.mount_point + "/Profiles/alice"};
+        };
+        const Run run = search(rig, kCtl, label);
+        REQUIRE(run.last().status == Status::ok);
+        const auto scopes = scopes_of(run);
+        REQUIRE(scopes.size() == 4);
+        CHECK(scopes.at(label + "/Profiles/alice/yuzu-fs-control-1.bin") == "user");   // the relocated profile
+        CHECK(scopes.at(label + "/Profilesx/yuzu-fs-control-1.bin") == "system");      // a sibling prefix is not it
+        CHECK(scopes.at(label + "/Users/bob/yuzu-fs-control-1.bin") == "user");        // the built-in rule
+        CHECK(scopes.at(label + "/Windows/yuzu-fs-control-1.bin") == "system");
+        CHECK(units_seen == Strs{label}); // read once, for the unit that was searched
+        CHECK(rig.user_root_reads == 1);
+
+        // an unset reader tags by the built-in rule only
+        Rig plain;
+        plain.b.os = Os::windows;
+        plain.b.read_user_roots = nullptr;
+        plain.mounts = Mounts{};
+        plain.mounts.add(label, "NTFS", "0:5");
+        for (const char* dir : {"/Profiles/alice", "/Users/bob"})
+            plain.fs.add_file(label + dir + "/yuzu-fs-control-1.bin", "");
+        const auto plain_scopes = scopes_of(search(plain, kCtl, label));
+        CHECK(plain_scopes.at(label + "/Profiles/alice/yuzu-fs-control-1.bin") == "system");
+        CHECK(plain_scopes.at(label + "/Users/bob/yuzu-fs-control-1.bin") == "user");
+    }
+}
+
+TEST_CASE("file_search driver: the leg and the user roots are made only inside the runner's work",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    const std::string key = rig.plan().units[0].key();
+
+    rig.mode = Rig::Mode::reject; // refused: nothing ran
+    CHECK(checked_slice(make_request(kCtl), rig.b).reason == "rejected");
+    CHECK(rig.legs.empty());
+    CHECK(rig.user_root_reads == 0);
+    CHECK_FALSE(rig.slot.load());
+
+    rig.mode = Rig::Mode::timeout; // held: the work was handed over and never started
+    CHECK(checked_slice(make_request(kCtl), rig.b).reason == "timed_out");
+    CHECK(rig.legs.empty());
+    CHECK(rig.user_root_reads == 0);
+    CHECK_FALSE(rig.slot.load());
+    CHECK(rig.state.abandoned_count() == 1);
+    CHECK(rig.state.is_stalled(key));
+
+    // the held work is what builds the leg and reads the roots, when it finally runs
+    REQUIRE(rig.held);
+    const WorkResult late = rig.held();
+    CHECK_FALSE(late.threw);
+    CHECK(rig.legs == Strs{"/r"});
+    CHECK(rig.user_root_reads == 1);
+}
+
+TEST_CASE("file_search driver: a refused root reads no user roots", "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.link("/r");
+    const SliceResult r = checked_slice(make_request(kCtl), rig.b);
+    CHECK(r.status == Status::invalid);
+    CHECK(r.reason == "root_is_link");
+    CHECK(rig.legs == Strs{"/r"}); // the leg answered the root check
+    CHECK(rig.user_root_reads == 0);
+}
+
+TEST_CASE("file_search driver: a leg factory that blocks is a timed-out slice, the slot is freed and the worker is abandoned",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    const std::string key = rig.plan().units[0].key();
+    // The factory owns only what it shares: the gate, and a throw once released, so the abandoned worker ends
+    // without touching the rig.
+    auto release = std::make_shared<std::promise<void>>();
+    std::shared_future<void> gate = release->get_future().share();
+    rig.b.make_leg = [gate](const Unit&) -> UnitLeg {
+        gate.wait();
+        throw std::runtime_error("factory released");
+    };
+    rig.b.run_bounded = &bounded_100ms;
+
+    const SliceResult first = checked_slice(make_request(kCtl), rig.b);
+    CHECK(first.status == Status::failed);
+    CHECK(first.reason == "timed_out");
+    CHECK_FALSE(rig.slot.load());
+    CHECK(rig.state.abandoned_count() == 1);
+    CHECK(rig.state.is_stalled(key));
+
+    // the next slice finds that volume stalled and does not walk it
+    const SliceResult next = checked_slice(make_request(kCtl), rig.b);
+    CHECK(next.status == Status::ok);
+    CHECK(next.reason == "stalled");
+    CHECK(row_of(next, "volume|").find("volume|/|ext4|partial|stalled|") == 0);
+
+    release->set_value(); // the test lets the factory go before it ends
 }

@@ -31,7 +31,9 @@
  * returns, and the scan's rows, are bounded by count (max_rows), not bytes, at up to max_rows full
  * paths of about max_depth x 256 bytes each.
  *
- * Paths are joined with '/': only the POSIX legs ship. By default no directory is excluded by name (an
+ * Paths are '/'-joined LABELS: a leg never hands one to the OS (the POSIX legs open by descriptor,
+ * the Windows leg by handle, each from the previous directory), so a label need not be an OS path. By
+ * default no directory is excluded by name (an
  * OSGi container keeps its bundles in <product>/system, so such names are ordinary application
  * directories); a WalkPolicy::skip_dir may exclude whole trees, and each one is counted.
  * Links and network mounts are never listed; each is counted in its own stat. Any other entry type is
@@ -78,6 +80,13 @@ struct DirEntry {
     std::string name;
     Type type{Type::other};
     std::uint64_t file_id{0}; // inode or file reference number; 0 = unknown
+    // The leg cannot search this entry: the ordered walk reports it with this cause and never visits it,
+    // enters it, matches it against a resume frame, places it in a Position or charges it to the entry
+    // budget (see walk_ordered, LISTINGS). Only a search leg sets it.
+    std::optional<yuzu::shared::file_search::GapCause> gap{};
+    // Leg-private, handed back to the same leg's facts call for this entry; the walker and the driver
+    // never read it.
+    std::uint64_t leg_hint{0};
 };
 
 /// Why a directory could not be listed. `error` stays the plain flag the breadth-first walk() reads;
@@ -123,7 +132,11 @@ struct FsOps {
     /// rule: an empty name, "." and ".." are ignored; a name over kMaxNameBytes or holding '/' or NUL
     /// (file_search::valid_component false) is a name_too_long gap, never joined into a path, never
     /// compared with a pattern and never placed in a Position. A leg that hid such an entry would turn
-    /// an unsearched name into a silent miss.
+    /// an unsearched name into a silent miss. An entry the leg cannot search for another reason
+    /// (DirEntry::gap) is judged by the same rule, whatever its name: reported with the leg's cause,
+    /// never visited, entered, matched against a resume frame or placed in a Position. Such an entry is
+    /// never merged with an entry of the same name (a lossy name can equal a real sibling's), sorts
+    /// before a searchable entry of that name, and so is reported in the pass that completes its twin.
     std::function<ListResult(const std::string& dir, std::size_t cap)> list;
     // nullopt = not opened: a link, not a regular file, refused or gone.
     std::function<std::optional<FileView>(const std::string& path)> open_file;
@@ -227,7 +240,10 @@ struct OrderedGap {
 };
 
 inline constexpr std::size_t kMaxOrderedGaps = 1000;
-inline constexpr std::size_t kMaxOrderedRetainedBytes = 16 * 1024 * 1024;
+inline constexpr std::size_t kMaxOrderedRetainedBytes = 48 * 1024 * 1024;
+static_assert(WalkLimits{}.max_dir_entries * (yuzu::shared::file_search::kMaxNameBytes + sizeof(DirEntry)) <=
+                  kMaxOrderedRetainedBytes,
+              "a listing of max_dir_entries entries of the longest names must fit the retained-bytes bound");
 
 struct OrderedResult {
     Stop stop{Stop::complete}; // complete, budget_time, budget_entries or section_rows only
@@ -396,11 +412,18 @@ private:
     }
 
     bool walk_entries(const std::string& path, std::size_t depth, ListResult& lr, bool on_path) {
-        // Never trusted to arrive sorted; a repeated name keeps its first entry.
-        std::stable_sort(lr.entries.begin(), lr.entries.end(),
-                         [](const DirEntry& a, const DirEntry& b) { return a.name < b.name; });
+        // Never trusted to arrive sorted; a repeated name keeps its first entry. An entry the leg cannot
+        // search (a gap) sorts BEFORE a searchable entry of the same name, so its gap is always reported
+        // in the pass that completes that entry and a later `after` floor can never hide it, and it is
+        // never merged with another entry: a lossy name can equal a real one, and losing either is a
+        // silent miss or a lost gap.
+        std::stable_sort(lr.entries.begin(), lr.entries.end(), [](const DirEntry& a, const DirEntry& b) {
+            return a.name != b.name ? a.name < b.name : (a.gap.has_value() && !b.gap.has_value());
+        });
         lr.entries.erase(std::unique(lr.entries.begin(), lr.entries.end(),
-                                     [](const DirEntry& a, const DirEntry& b) { return a.name == b.name; }),
+                                     [](const DirEntry& a, const DirEntry& b) {
+                                         return a.name == b.name && !a.gap && !b.gap;
+                                     }),
                          lr.entries.end());
 
         // On the resume path: the child to enter by name at this level, or (innermost level) the last
@@ -412,6 +435,27 @@ private:
         for (const DirEntry& e : lr.entries) {
             if (e.name.empty() || e.name == "." || e.name == "..")
                 continue;
+
+            // An entry the leg cannot search (DirEntry::gap), or a name a Position cannot hold
+            // (valid_component false: over kMaxNameBytes, or holding a slash or NUL), is never placed in
+            // one, or the cursor for this slice would be empty and every retry would stall at this
+            // directory. It is not searched and says so. It is judged BEFORE the resume block and
+            // BEFORE the budget checks, and costs none of the entry budget: charged, it would be
+            // consumed again by every retry that stops on the next entry, with the position never
+            // moving past it. It never touches `next`: an entry that carries the resume frame's name is
+            // never handed to enter_resumed, the frame is dropped by the next searchable entry exactly
+            // as a missing name is, and a real directory of that name that follows is still resumed,
+            // not restarted. An entry already behind the resume point is passed silently. After a slice
+            // boundary right here the entry is met and reported again: the gap count may over-count,
+            // never under-count.
+            if (e.gap || !fsr::valid_component(e.name)) {
+                const bool passed =
+                    (next != nullptr && e.name < next->name) || (floor != nullptr && e.name <= *floor);
+                if (!passed)
+                    add_gap(walk_detail::join(path, e.name), e.gap.value_or(Cause::name_too_long));
+                continue;
+            }
+
             if (next != nullptr) {
                 if (e.name < next->name)
                     continue;
@@ -425,18 +469,6 @@ private:
                 // The name is missing or no longer a directory: the remaining frames are dropped and
                 // this entry, the first one >= the name, is new.
             } else if (floor != nullptr && e.name <= *floor) {
-                continue;
-            }
-
-            // A name a Position cannot hold (valid_component false: over kMaxNameBytes, or holding a
-            // slash or NUL) is never placed in one, or the cursor for this slice would be empty and
-            // every retry would stall at this directory. It is not searched and says so. It is judged
-            // BEFORE the budget checks and costs none of the entry budget: charged, it would be
-            // consumed again by every retry that stops on the next entry, with the position never
-            // moving past it. After a slice boundary right here the entry is met and reported again:
-            // the gap count may over-count, never under-count.
-            if (!fsr::valid_component(e.name)) {
-                add_gap(walk_detail::join(path, e.name), Cause::name_too_long);
                 continue;
             }
 
@@ -517,7 +549,11 @@ private:
  * LISTINGS. Every listing comes from fs.list(dir, limits.max_dir_entries) and is sorted by name bytes
  * here (never trusted to arrive sorted; a repeated name keeps its first entry). Entries that are empty,
  * "." or ".." are ignored; every other entry counts one in stats.entries, except a name_too_long entry
- * (a gap, not counted). Links count links_skipped;
+ * or an entry carrying DirEntry::gap (each a gap, not counted). A gap-bearing entry follows three rules:
+ * it is never merged with, and never replaces, another entry of the same name (a lossy name can equal a
+ * real sibling's); it sorts before a searchable entry of that name, so its gap is reported in the pass
+ * that completes the searchable twin; and it is judged above the resume match, so it never touches a
+ * resume frame. Links count links_skipped;
  * a network_mount counts mounts_skipped and adds a network_mount gap; any other type is skipped. A
  * listing with error is a dir_unreadable gap, or a permission_denied or dataless gap when its cause says
  * the directory was refused rather than unreadable. A listing that is truncated or longer than
@@ -560,8 +596,11 @@ private:
  * listing, `restarted` is set and that subtree (or the root) starts from its first entry: duplicates are
  * possible, a silent skip is not. The RAW reading is compared, so a half that was known never survives
  * an unknown reading; a half that was unknown and is now known is refinement, never a restart. A name
- * a Position cannot hold (valid_component false) is reported as a name_too_long gap, costs no entry
- * budget and is never placed in the position. Listings re-read on the resume path are NOT charged to
+ * a Position cannot hold (valid_component false) is reported as a name_too_long gap, and an entry that
+ * carries DirEntry::gap as a gap with the leg's cause; neither costs entry budget, is visited or entered,
+ * or is placed in the position, and neither is ever matched against a resume frame: a gap-bearing entry
+ * that carries the frame's name leaves the frame for the next searchable entry, so a real directory of
+ * that name that follows is still resumed, not restarted. Listings re-read on the resume path are NOT charged to
  * max_entries (only entries after the resume point are), so a deep resume cannot exhaust the budget
  * before progressing. `advanced` is true when the returned position is later than `resume` in
  * file_search::walk_order or the walk completed. A slice with restarted false NEVER returns a position
@@ -584,7 +623,7 @@ private:
  * directory. A directory (the root included, and one re-entered on the resume path) whose listing would
  * take the total over `max_retained_bytes` is not entered: a memory_cap gap, none of its entries is
  * visited, and the walk continues with its next sibling. With the default 50,000-entry listing cap and
- * 255-byte names one listing is about 15 MiB, so a single directory always fits and the cap bites only
+ * 765-byte names one listing is about 41 MiB, so a single directory always fits and the cap bites only
  * on a chain of very large ancestors. retained_bytes_peak reports the high-water mark.
  * The cap bounds what is HELD, not peak live memory: a listing is live before it is charged (one a
  * memory_cap gap then rejects included) and the sort takes scratch, so allow about one more listing.
@@ -667,7 +706,7 @@ walk_ordered(const std::string& root, const yuzu::shared::file_search::Position&
             }
             if (listing.truncated || listing.entries.size() > limits.max_dir_entries)
                 record(Stop::dir_truncated);
-            const std::size_t n = std::min(listing.entries.size(), limits.max_dir_entries);
+            const std::size_t n = (std::min)(listing.entries.size(), limits.max_dir_entries);
 
             for (std::size_t i = 0; i < n; ++i) {
                 const DirEntry& e = listing.entries[i];

@@ -228,3 +228,14 @@ The `file_search` plugin searches the local disks of a device by file or directo
 - No new privilege is taken. On Linux the packaged unit's `CAP_DAC_READ_SEARCH` is already held by the agent for every plugin (`docs/agent-privilege-model.md`); on macOS the daemon already runs as root, and what the system's privacy controls refuse it is reported as a `permission_denied` gap. No impersonation, no `sudo -u` hop and no helper process is involved, and nothing here changes the three-tier partition, the no-arbitrary-exec invariant or the de-escalation-only principle.
 
 A per-user read of file content, or of per-session state, still needs the helper tiers decided above and is not covered by this Update.
+
+## Update (2026-11-23) -- the Windows leg of on-demand file search, and the plugin ships on
+
+The Windows leg of `file_search` lists user-profile directories from the system context, on the same reading as the Update above, and the plugin is now on by default on all three OSes.
+
+- On Windows a search from a root such as `C:\` lists names under `C:\Users\<name>` and under every other profile directory the system's profile list names on the searched volume. The system-context agent (LocalSystem today; the low-privilege agent account of #1442 when it lands) MAY do so, on its own token: no `SeBackupPrivilege` or `SeRestorePrivilege` is held, asked for or adjusted, so a folder the token is refused is a `permission_denied` gap, never an empty listing. The same record covers a search whose root is a volume GUID path.
+- The profile directories are tagged `user` in the last column of the match row. The rule on the path is `/<volume>/Users/<name>` (either label form, `Public`, `Default`, `Default User` and `All Users` excepted), and the profile list adds the profiles kept elsewhere on the searched volume, read on the search's worker and translated into that volume's label form, so one profile reads `user` whether the volume was searched by drive letter or by volume GUID path. A profile whose volume cannot be resolved is tagged by the path rule only.
+- Nothing about content changes: names, types, sizes, times and extents only, no file content read or hashed. A matched file is opened for its attributes only (no data right), so the handle can neither read nor recall a cloud placeholder, and a placeholder or offline file or folder is never opened for use, listed or read.
+- The plugin ships on: the server no longer seeds a default-off kill switch for `file_search`, so it dispatches unless an operator turns it off with the plugin-config kill switch. What it stores is still Forensics-tier and launching it is still `FileRetrieval` with `AdminOrApproval`. An existing kill-switch row is not changed.
+
+This Update changes nothing about the three-tier partition, the no-arbitrary-exec invariant or the de-escalation-only principle.

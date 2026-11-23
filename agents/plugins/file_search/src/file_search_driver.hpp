@@ -15,16 +15,20 @@
  *   5. the current volume is stalled (an abandoned worker is still blocked in it): emit it as stalled,
  *      count one gap and move on to the next volume without walking;
  *   6. otherwise run the unit's slice on a worker through the bounded runner (slice time + grace). The
- *      worker, on the first slice, asks the leg what the root is (a link, a missing path, a file: `invalid`
- *      with that token, no walk), then runs walk_ordered with the match visitor;
+ *      worker makes the unit's leg (the leg factory runs INSIDE the bound, never before it), on the first
+ *      slice asks the leg what the root is (a link, a missing path, a file: `invalid` with that token, no
+ *      walk), reads the unit's user roots once (only for a root that was not refused), then runs
+ *      walk_ordered with the match visitor. So no leg code and no profile read runs before the cursor is
+ *      authenticated, the slot is taken and the worker is running;
  *   7. on the pool thread: record the slice, build the next cursor (only after the transition validator
  *      accepts it), the rows and the verdict.
  *
  * ONE VOLUME PER SLICE. A slice never mixes volumes: every state write and every row is made by the pool
  * thread, and a stalled volume cannot hold up the rest.
  *
- * THREADS. The worker touches only values and shared pointers it owns (WorkInput) and the OS through its
- * leg; it never reads the slot, the SearchState or the caller's Boundaries. It sets its own done flag when it
+ * THREADS. The worker touches only values and shared pointers it owns (WorkInput: copies of the leg
+ * factory, the unit and the user-roots reader) and the OS through its leg; it never reads the slot, the
+ * SearchState or the caller's Boundaries. It sets its own done flag when it
  * returns, even by exception, and that flag is the only way an abandoned worker is ever seen to finish.
  * The slot is released ONLY by the pool thread of the slice that took it, through one RAII guard.
  *
@@ -110,6 +114,9 @@ struct Boundaries {
     std::atomic<bool>& slot; // the process-wide single-flight slot
     MountReader read_mounts{};
     LegFactory make_leg{};
+    /// The profile directories of a unit's volume that the built-in user-directory rule does not reach, as
+    /// labels in the unit's namespace. Called on the slice's worker; unset reads none.
+    std::function<std::vector<std::string>(const Unit&)> read_user_roots{};
     BoundedRunner<WorkResult> run_bounded{};
     std::function<fsr::Clock::time_point()> now{};
     std::function<void(std::chrono::milliseconds)> sleep{};
@@ -144,7 +151,9 @@ namespace driver_detail {
 
 /// Everything the worker owns. Copies only: no reference to the caller's state.
 struct WorkInput {
-    UnitLeg leg;
+    LegFactory make_leg; // called on the worker, inside the bound
+    Unit unit;
+    std::function<std::vector<std::string>(const Unit&)> read_user_roots; // likewise; may be empty
     fsr::Pattern pattern;
     fsr::Kinds kinds{fsr::Kinds::files};
     std::string search_root;
@@ -189,8 +198,9 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
     WorkResult out;
     const DoneOnExit done{in.done};
     try {
+        const UnitLeg leg = in.make_leg(in.unit);
         if (in.check_root) {
-            switch (in.leg.root_state(in.search_root)) {
+            switch (leg.root_state(in.search_root)) {
             case ci::RootState::is_link:
                 out.root_error = RequestError::root_is_link;
                 return out;
@@ -205,9 +215,12 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
                 break;
             }
         }
+        // Read once per slice, and only for a root that was not refused (the boundary stays a worker read).
+        const std::vector<std::string> user_roots =
+            in.read_user_roots ? in.read_user_roots(in.unit) : std::vector<std::string>{};
 
         fsr::SliceGovernor gov(in.limits, {in.now, in.sleep});
-        ci::FsOps ops = in.leg.ops;
+        ci::FsOps ops = leg.ops;
         ops.now = in.now; // one clock for the governor's deadline and the walk's reads of it
         // A resumed slice re-lists every ancestor of its resume point before it visits an entry, and
         // those listings reach nothing new: they are paced like any work but not judged by the back-off,
@@ -215,7 +228,7 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
         // starts true only for a slice with no resume position at all (a cursor that stopped in the root
         // has `after` set and no `dirs`) and turns true when the walk visits its first entry.
         bool judge = in.resume.dirs.empty() && in.resume.after.empty();
-        ops.list = [&gov, &judge, now = in.now, list = in.leg.ops.list](const std::string& dir, std::size_t cap) {
+        ops.list = [&gov, &judge, now = in.now, list = leg.ops.list](const std::string& dir, std::size_t cap) {
             gov.pace();
             const auto before = now();
             auto listed = list(dir, cap);
@@ -261,16 +274,14 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
             m.path = full;
             m.kind = is_dir ? fsr::EntryKind::directory : fsr::EntryKind::file;
             m.id = {dir_dev, e.file_id};
-            m.scope = is_user_profile_path(full, in.os) ? Scope::user : Scope::system;
+            m.scope = is_user_profile_path(full, in.os) || under_user_root(full, user_roots, in.os) ? Scope::user
+                                                                                                    : Scope::system;
             std::string extents_row;
             if (!is_dir) { // a file is opened for its facts and never read; a directory is never opened
-                FileFacts f = in.leg.facts(dir, e.name);
+                const FileFacts f = leg.facts(dir, e); // the leg owns its extents state, never rewritten here
                 if (f.facts.opened) {
                     m.size = f.facts.size;
                     m.mtime = f.facts.mtime;
-                } else {
-                    f.extents = {};
-                    f.extents.state = ExtentsState::failed;
                 }
                 extents_row = format_extents_row(m.id, f.extents);
             }
@@ -492,7 +503,9 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
 
     // 6. the unit's slice on a worker, bounded
     const DoneFlag done = make_done_flag();
-    WorkInput work{.leg = b.make_leg(unit),
+    WorkInput work{.make_leg = b.make_leg,
+                   .unit = unit,
+                   .read_user_roots = b.read_user_roots,
                    .pattern = req.query.pattern,
                    .kinds = req.query.kinds,
                    .search_root = req.query.root,

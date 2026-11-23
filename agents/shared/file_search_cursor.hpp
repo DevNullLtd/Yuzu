@@ -72,7 +72,12 @@
 namespace yuzu::shared::file_search {
 
 inline constexpr std::string_view kCursorPrefix = "fs1:";
-inline constexpr std::size_t kMaxCursorTokenBytes = 32 * 1024;
+inline constexpr std::size_t kMaxCursorTokenBytes = 72 * 1024;
+// The deepest position of the longest names must still fit: the body layout above is 50 fixed bytes, then
+// per directory 2 + name + 16, then 2 + the `after` name, and the token is the prefix plus padded base64.
+static_assert(4 + 4 * ((50 + kMaxPositionDepth * (2 + kMaxNameBytes + 16) + 2 + kMaxNameBytes + 2) / 3) <=
+                  kMaxCursorTokenBytes,
+              "the deepest position of kMaxNameBytes names must fit the token bound");
 
 using QueryHash = std::array<std::uint8_t, 16>;
 

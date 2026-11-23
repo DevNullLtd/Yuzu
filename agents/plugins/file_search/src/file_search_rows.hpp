@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -41,7 +42,7 @@ namespace yuzu::file_search {
 namespace fsr = yuzu::shared::file_search;
 
 /// The platform a leg runs on; it picks the name rule, the user-directory rule and the mount rules.
-enum class Os { linux_os, macos };
+enum class Os { linux_os, macos, windows };
 
 // ---- named budgets (code and tests only: the README names a budget, never its figure) ----
 
@@ -65,7 +66,7 @@ inline constexpr std::size_t kMaxFstypeBytes = 64;
 
 /// The most bytes one match row or one extents row can take: an encoded path of a root plus the deepest
 /// position, three bytes per byte at worst, plus the other columns.
-inline constexpr std::size_t kMaxMatchRowBytes = 64u * 1024;
+inline constexpr std::size_t kMaxMatchRowBytes = 192u * 1024;
 static_assert(3 * (kMaxRootBytes + (fsr::kMaxPositionDepth + 1) * (fsr::kMaxNameBytes + 1)) + 512 <=
                   kMaxMatchRowBytes,
               "a match row must fit kMaxMatchRowBytes for every path a walk can reach");
@@ -100,13 +101,57 @@ enum class Scope { system, user };
            (path.size() == prefix.size() || path[prefix.size()] == '/');
 }
 
+// ASCII-only case folding: a Windows label compares `Users` and the volume's profile names this way and no
+// further (the rule is a path rule, not a lookup).
+[[nodiscard]] constexpr char ascii_lower(char c) noexcept {
+    return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+[[nodiscard]] constexpr bool ascii_ieq(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size())
+        return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (ascii_lower(a[i]) != ascii_lower(b[i]))
+            return false;
+    return true;
+}
+
+/// A Windows label `/<volume>/Users/<name>[/...]`: <volume> is the label's first component in either form
+/// (`C:` or `Volume{guid}`), `Users` and the excluded names compare ASCII-case-insensitively, and the
+/// shared profile directories (Public, Default, Default User, All Users) are system.
+[[nodiscard]] constexpr bool is_windows_user_profile_path(std::string_view path) noexcept {
+    if (path.empty() || path.front() != '/')
+        return false;
+    path.remove_prefix(1);
+    const auto component = [&path](std::string_view& out) {
+        if (path.empty())
+            return false;
+        const std::size_t slash = path.find('/');
+        out = path.substr(0, slash);
+        path = slash == std::string_view::npos ? std::string_view{} : path.substr(slash + 1);
+        return true;
+    };
+    std::string_view volume, users, name;
+    if (!component(volume) || volume.empty() || !component(users) || !ascii_ieq(users, "Users") ||
+        !component(name) || name.empty())
+        return false;
+    for (const std::string_view shared : {"Public", "Default", "Default User", "All Users"})
+        if (ascii_ieq(name, shared))
+            return false;
+    return true;
+}
+
 /// A user profile directory or anything below one. Linux: /home/<name> and /root, and the same layout's
 /// spellings /var/home/<name> and /var/roothome (on an ostree-based system /home is a link the walk never
 /// follows, so every home is reached as /var/home/<name>). macOS: /Users/<name> except /Users/Shared, and
 /// /private/var/root (/var is a link there, so /var/root is never walked into and is not tagged); a path
 /// below /System/Volumes/Data (the root of a complete data-volume search) is read without that prefix. A
 /// home relocated elsewhere, or spelled in another case, is NOT tagged: the tag is a path rule, not a lookup.
+/// Windows: /<volume>/Users/<name> (is_windows_user_profile_path), in either label form; a profile kept
+/// elsewhere is reached through the unit's user roots (under_user_root).
 [[nodiscard]] constexpr bool is_user_profile_path(std::string_view path, Os os) noexcept {
+    if (os == Os::windows)
+        return is_windows_user_profile_path(path);
     if (os == Os::linux_os)
         return (path.size() > 6 && path.substr(0, 6) == "/home/") || (path.size() > 10 && path.substr(0, 10) == "/var/home/") ||
                under(path, "/root") || under(path, "/var/roothome");
@@ -116,6 +161,23 @@ enum class Scope { system, user };
     if (under(path, "/private/var/root"))
         return true;
     return path.size() > 7 && path.substr(0, 7) == "/Users/" && !under(path, "/Users/Shared");
+}
+
+/// `path` is one of `roots`, or below one, on a component boundary. `roots` are labels in the walked
+/// unit's own namespace (what the OS shell read for this unit). On Windows both sides compare ASCII-folded.
+[[nodiscard]] inline bool under_user_root(std::string_view path, std::span<const std::string> roots, Os os) noexcept {
+    for (const std::string& root : roots) {
+        if (root.empty())
+            continue; // an empty prefix would read every path as user
+        if (os != Os::windows) {
+            if (under(path, root))
+                return true;
+        } else if (path.size() >= root.size() && ascii_ieq(path.substr(0, root.size()), root) &&
+                   (path.size() == root.size() || path[root.size()] == '/')) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// A gap path that may be emitted; a longer one is counted in gaps_dropped.

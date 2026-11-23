@@ -26,10 +26,11 @@
 
 namespace yuzu::shared::file_search {
 
-// The longest directory-entry name a Position can hold (the POSIX NAME_MAX). A longer name that a
-// filesystem allows (255 UTF-16 units can be 765 UTF-8 bytes on HFS-family and Windows volumes) is
-// never placed in a Position: the walker reports it as a `name_too_long` gap instead.
-inline constexpr std::size_t kMaxNameBytes = 255;
+// The longest directory-entry name a Position can hold: 765 bytes, the UTF-8 form of the longest name
+// a Windows or HFS-family volume allows (255 UTF-16 units, at most 3 bytes each); it also covers the
+// POSIX NAME_MAX of 255. A longer name is never placed in a Position: the walker reports it as a
+// `name_too_long` gap instead.
+inline constexpr std::size_t kMaxNameBytes = 765;
 inline constexpr std::size_t kMaxPositionDepth = 64;
 
 enum class GapCause {
@@ -46,7 +47,10 @@ enum class GapCause {
     // holding '/' or NUL): not searched
     name_too_long,
     // matches in one directory beyond the per-directory cap of one slice were not reported
-    match_cap
+    match_cap,
+    // an entry whose reparse tag is not one the leg understands (or a directory whose kind the leg will
+    // not enter): not searched
+    reparse_unknown
 };
 
 [[nodiscard]] constexpr const char* to_token(GapCause c) noexcept {
@@ -73,6 +77,8 @@ enum class GapCause {
         return "name_too_long";
     case GapCause::match_cap:
         return "match_cap";
+    case GapCause::reparse_unknown:
+        return "reparse_unknown";
     }
     return "unknown";
 }
@@ -109,7 +115,7 @@ struct Position {
     return (dev != 0 && dev != later_dev) || (id != 0 && id != later_id);
 }
 
-/// One directory-entry name: 1..255 bytes, no NUL, no '/', not "." or "..".
+/// One directory-entry name: 1..kMaxNameBytes bytes, no NUL, no '/', not "." or "..".
 [[nodiscard]] inline bool valid_component(std::string_view s) noexcept {
     if (s.empty() || s.size() > kMaxNameBytes || s == "." || s == "..")
         return false;

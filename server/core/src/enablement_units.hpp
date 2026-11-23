@@ -148,7 +148,7 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // virtualization runtime_posture added by PR12.1-b2; firewall quarantine, release, quarantine_status
 // and quarantine_allow added by PRQ.1; PRQ.2 removed the old containment plugin's four rows; component_inventory scan added by SAM-16 and native by SAM-22, Windows leg
 // planned for both; process_introspect inspect added by PR13.1-a, Windows and macOS legs planned so applicable on all three;
-// file_search search added with the file_search plugin, Windows leg planned so applicable on all three), 252 rows.
+// file_search search added with the file_search plugin, applicable on all three), 252 rows.
 inline constexpr std::array<UnitOsRow, 252> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
@@ -340,7 +340,7 @@ inline constexpr std::array<UnitOsRow, 252> kUnitOs{{
     {"remote_access_audit", "list", kWin | kLin | kMac},
     // process_introspect: Linux is constrained, macOS and Windows `planned` (applicable).
     {"process_introspect", "inspect", kWin | kLin | kMac},
-    // file_search: Linux and macOS are constrained, Windows `planned` (applicable).
+    // file_search: constrained on Linux, macOS and Windows (applicable on all three).
     {"file_search", "search", kWin | kLin | kMac},
     // shares: Linux, Windows and macOS are all supported.
     {"shares", "list", kWin | kLin | kMac},

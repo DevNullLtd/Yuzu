@@ -34,10 +34,14 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
+#include <map>
+#include <set>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -720,39 +724,48 @@ TEST_CASE("ServerImpl's boot sequence actually calls "
     CHECK(block.find("Wave ") == std::string::npos);
 }
 
-TEST_CASE("ServerImpl's boot sequence actually calls "
-          "seed_kill_switch_default_off(\"file_search\", ...) and fails the boot "
-          "closed on a seed error — source tripwire against server.cpp, since a full "
-          "ServerImpl construction is not practical at the unit level",
+TEST_CASE("ServerImpl's boot sequence seeds NO default-off kill switch for file_search, and the five "
+          "remaining plugin-level seeds are still present and still fail the boot closed — source "
+          "tripwire against server.cpp, since a full ServerImpl construction is not practical at the "
+          "unit level",
           "[server][killswitch][source_tripwire]") {
     std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     REQUIRE(input.is_open());
     const std::string source{std::istreambuf_iterator<char>(input),
                              std::istreambuf_iterator<char>()};
 
-    const auto marker = source.find("seed_kill_switch_default_off(\n                    \"file_search\"");
-    REQUIRE(marker != std::string::npos);
-    const auto block_end = source.find("\n        }\n", marker);
-    REQUIRE(block_end != std::string::npos);
-    const auto block = source.substr(marker, block_end - marker);
+    // Every plugin-level seed call, by its first argument (a string literal on the line after the
+    // opening parenthesis), with the text of the block it sits in.
+    constexpr std::string_view kCall = "seed_kill_switch_default_off(";
+    std::map<std::string, std::string> seeded;
+    for (auto at = source.find(kCall); at != std::string::npos; at = source.find(kCall, at + 1)) {
+        auto quote = source.find_first_not_of(" \n", at + kCall.size());
+        REQUIRE(quote != std::string::npos);
+        if (source[quote] != '"')
+            continue; // the declaration or a non-literal use is not a seed of a named plugin
+        const auto name_end = source.find('"', quote + 1);
+        REQUIRE(name_end != std::string::npos);
+        const auto block_end = source.find("\n        }\n", at);
+        REQUIRE(block_end != std::string::npos);
+        seeded[source.substr(quote + 1, name_end - quote - 1)] = source.substr(at, block_end - at);
+    }
 
-    // The call is gated on the store existing and the boot not already
-    // having failed — never unconditional.
-    const auto guard_start = source.rfind("if (plugin_config_store_ && !startup_failed_)",
-                                          marker);
-    REQUIRE(guard_start != std::string::npos);
-    CHECK(guard_start < marker);
-    // The guard must be this call's own, not an earlier seed's.
-    CHECK(source.substr(guard_start, marker - guard_start).find("seed_kill_switch_default_off") ==
-          std::string::npos);
+    // file_search ships ON: a seed that is added back fails this case. An existing row that is OFF
+    // stays OFF (no migration), and nothing here turns one on.
+    CHECK(seeded.find("file_search") == seeded.end());
 
-    CHECK(block.find("startup_failed_ = true;") != std::string::npos);
-    CHECK(block.find("Refusing to start") != std::string::npos);
-
-    // The seed reason is public (it is stored and shown to an operator): the exact route text,
-    // split across two source literals, and no roadmap-wave wording.
-    CHECK(block.find("\"/api/v1/plugin-config/file_search/kill-switch\"") != std::string::npos);
-    CHECK(block.find("Wave ") == std::string::npos);
+    // The five plugins that still start off, each failing the boot closed on a seed error.
+    const std::set<std::string> still_off = {"execution_artifacts", "browser_inventory", "privacy_permissions",
+                                             "remote_access_audit", "process_introspect"};
+    std::set<std::string> present;
+    for (const auto& [name, block] : seeded) {
+        present.insert(name);
+        INFO(name);
+        CHECK(block.find("startup_failed_ = true;") != std::string::npos);
+        CHECK(block.find("Refusing to start") != std::string::npos);
+        CHECK(block.find("/api/v1/plugin-config/" + name + "/kill-switch") != std::string::npos);
+    }
+    CHECK(present == still_off);
 }
 
 TEST_CASE("set_kill_switch rejects an invalid reason as InvalidInput",

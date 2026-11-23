@@ -78,9 +78,11 @@ namespace fsr = yuzu::shared::file_search;
 using T = DirEntry::Type;
 using Cause = OrderedGap::Cause;
 
-// One default-cap listing of 255-byte names fits the default retained-bytes cap (the default cap itself
-// is pinned at 50,000 in test_component_walk.cpp and in the file_search driver's limits mapping).
-static_assert(WalkLimits{}.max_dir_entries * (255 + sizeof(DirEntry)) <= kMaxOrderedRetainedBytes);
+// One default-cap listing of the longest names a Position holds fits the default retained-bytes cap (the
+// default cap itself is pinned at 50,000 in test_component_walk.cpp and in the file_search driver's limits
+// mapping).
+static_assert(WalkLimits{}.max_dir_entries * (fsr::kMaxNameBytes + sizeof(DirEntry)) <=
+              kMaxOrderedRetainedBytes);
 
 namespace {
 
@@ -138,6 +140,12 @@ DirEntry D(std::string n) { return {std::move(n), T::dir}; }
 DirEntry F(std::string n) { return {std::move(n), T::file}; }
 DirEntry L(std::string n) { return {std::move(n), T::link}; }
 DirEntry M(std::string n) { return {std::move(n), T::network_mount}; }
+/// An entry the leg cannot search: reported with `c`, whatever its type.
+DirEntry G(std::string n, T t, Cause c) {
+    DirEntry e{std::move(n), t};
+    e.gap = c;
+    return e;
+}
 
 using Strs = std::vector<std::string>;
 
@@ -723,6 +731,116 @@ TEST_CASE("walk_ordered: an unplaceable name never pins bounded continuations, w
     }
 }
 
+TEST_CASE("walk_ordered: an entry carrying a gap is one gap, never visited, entered or counted",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    r.dir("/r", {G("f", T::file, Cause::reparse_unknown), G("d", T::dir, Cause::dataless),
+                 G("l", T::link, Cause::reparse_unknown), F("z")});
+    r.dir("/r/d", {F("must-not-be-listed")});
+    const auto res = slice(r, {}, {});
+    CHECK(res.stop == Stop::complete);
+    CHECK(r.visits == Strs{"/r/z"});
+    CHECK(r.fs.listed == Strs{"/r"}); // the directory carrying a gap is never listed
+    CHECK(tokens(res) == Strs{"dataless /r/d", "reparse_unknown /r/f", "reparse_unknown /r/l"});
+    CHECK(res.stats.entries == 1); // only "z" is charged
+    CHECK(res.stats.links_skipped == 0); // a link carrying a gap is a gap, not a skipped link
+}
+
+TEST_CASE("walk_ordered: an entry carrying a gap never pins bounded continuations, whatever the budget",
+          "[walk_ordered][file_search][component_walk]") {
+    for (const std::size_t budget : {1u, 2u, 3u}) {
+        Rig r;
+        r.dir("/r", {F("a"), G("b", T::file, Cause::reparse_unknown), F("c"), F("d")});
+        WalkLimits lim;
+        lim.max_entries = budget;
+        fsr::Position p;
+        bool done = false;
+        for (int i = 0; i < 8 && !done; ++i) {
+            const auto out = slice(r, p, lim);
+            CAPTURE(budget, i, out.position.after, out.advanced);
+            CHECK(fsr::valid_position(out.position));
+            if (out.stop != Stop::complete)
+                CHECK(out.advanced);
+            done = out.stop == Stop::complete;
+            p = out.position;
+        }
+        CHECK(done);
+        CHECK(r.visits == Strs{"/r/a", "/r/c", "/r/d"});
+    }
+}
+
+TEST_CASE("walk_ordered: a gap and a searchable entry of one name are both kept, in either listing order",
+          "[walk_ordered][file_search][component_walk]") {
+    const bool gap_first = GENERATE(true, false);
+    INFO("gap listed first: " << gap_first);
+    Rig r;
+    const DirEntry gap = G("d", T::file, Cause::reparse_unknown);
+    r.dir("/r", gap_first ? std::vector<DirEntry>{gap, D("d"), F("x"), G("x", T::dir, Cause::dataless)}
+                          : std::vector<DirEntry>{D("d"), gap, G("x", T::dir, Cause::dataless), F("x")});
+    r.dir("/r/d", {F("f")});
+    const auto res = slice(r, {}, {});
+    CHECK(res.stop == Stop::complete);
+    CHECK(r.visits == Strs{"/r/d", "/r/d/f", "/r/x"}); // the searchable twin is visited, and entered when a directory
+    CHECK(tokens(res) == Strs{"reparse_unknown /r/d", "dataless /r/x"}); // and the gap is reported
+}
+
+TEST_CASE("walk_ordered: two entries carrying a gap under one name are two gaps",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    r.dir("/r", {G("a", T::file, Cause::reparse_unknown), G("a", T::dir, Cause::dataless), F("b")});
+    const auto res = slice(r, {}, {});
+    CHECK(res.stop == Stop::complete);
+    CHECK(r.visits == Strs{"/r/b"});
+    CHECK(res.gaps.size() == 2);
+}
+
+TEST_CASE("walk_ordered: a resume-path directory that now carries a gap is not entered, and no restart is reported",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    r.dir("/r", {G("a", T::dir, Cause::reparse_unknown), F("b"), F("c")});
+    r.dir("/r/a", {F("x"), F("y")});
+    r.ids["/r"] = {1, 5};
+    const fsr::Position in{1, 5, {{"a", 1, 10}}, "x"}; // the previous slice stopped inside /r/a after "x"
+    const auto res = slice(r, in, {});
+    CHECK(res.stop == Stop::complete);
+    CHECK_FALSE(res.restarted);
+    CHECK(r.fs.listed == Strs{"/r"});         // never entered
+    CHECK(r.visits == Strs{"/r/b", "/r/c"}); // the remaining frames are dropped, the next entries are new
+    CHECK(tokens(res) == Strs{"reparse_unknown /r/a"});
+}
+
+TEST_CASE("walk_ordered: a gap carrying the resume frame's name leaves the real directory resumed, not restarted",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    r.dir("/r", {D("a"), G("a", T::file, Cause::reparse_unknown), F("b")});
+    r.dir("/r/a", {F("w"), F("x"), F("y")});
+    r.ids["/r"] = {1, 5};
+    r.ids["/r/a"] = {1, 10};
+    const fsr::Position in{1, 5, {{"a", 1, 10}}, "x"};
+    const auto res = slice(r, in, {});
+    CHECK(res.stop == Stop::complete);
+    CHECK_FALSE(res.restarted);
+    CHECK(r.visits == Strs{"/r/a/y", "/r/b"}); // resumed after "x": no row is repeated, "a" is not visited again
+    CHECK(tokens(res) == Strs{"reparse_unknown /r/a"});
+}
+
+TEST_CASE("walk_ordered: once the searchable twin of a gap has completed, a resumed slice skips both",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    r.dir("/r", {G("b", T::file, Cause::reparse_unknown), F("b"), F("c")});
+    WalkLimits one;
+    one.max_entries = 1; // "b" is visited, then the slice stops on "c"
+    const auto first = slice(r, {}, one);
+    CHECK(first.stop == Stop::budget_entries);
+    CHECK(r.visits == Strs{"/r/b"});
+    CHECK(tokens(first) == Strs{"reparse_unknown /r/b"}); // reported in the pass that completed the twin
+    CHECK(first.position.after == "b");
+    const auto rest = slice(r, first.position, {});
+    CHECK(rest.stop == Stop::complete);
+    CHECK(r.visits == Strs{"/r/b", "/r/c"});
+    CHECK(rest.gaps.empty()); // the gap already counted is neither lost nor counted twice
+}
+
 TEST_CASE("walk_ordered: a name with a slash or a NUL is not placed either",
           "[walk_ordered][file_search][component_walk]") {
     // valid_component refuses these as well as a long name; a listing never carries them from a real
@@ -1110,7 +1228,7 @@ TEST_CASE("walk_ordered: a name with a slash or a NUL is a gap and is never join
           "[walk_ordered][file_search][component_walk]") {
     Rig r;
     // directories, so a path joined from the name would be listed: it must not be
-    r.dir("/r", {D("a"), D("b/x"), D(std::string("b\0x", 3)), D(std::string(300, 'n'))});
+    r.dir("/r", {D("a"), D("b/x"), D(std::string("b\0x", 3)), D(std::string(fsr::kMaxNameBytes + 1, 'n'))});
     r.dir("/r/a", {F("f")});
     r.dir("/r/b/x", {F("must-not-be-listed")});
     r.dir("/r/b", {F("nor-this")});
