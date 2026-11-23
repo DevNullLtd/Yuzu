@@ -274,8 +274,8 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
             m.path = full;
             m.kind = is_dir ? fsr::EntryKind::directory : fsr::EntryKind::file;
             m.id = {dir_dev, e.file_id};
-            m.scope = is_user_profile_path(full, in.os) || under_user_root(full, user_roots, in.os) ? Scope::user
-                                                                                                    : Scope::system;
+            m.scope = is_user_profile_path(full, in.os) || under_user_root(full, user_roots) ? Scope::user
+                                                                                               : Scope::system;
             std::string extents_row;
             if (!is_dir) { // a file is opened for its facts and never read; a directory is never opened
                 const FileFacts f = leg.facts(dir, e); // the leg owns its extents state, never rewritten here

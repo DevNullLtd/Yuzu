@@ -37,6 +37,9 @@
  *    dlclose (glibc) when the case runs before any other init in the process. macOS's dyld keeps this
  *    plugin's image resident whether or not it is pinned (checked with a bare dlopen/dlclose pair), so on
  *    that host the case cannot fail; the Linux run is the one that discriminates.
+ *  - shutdown: a shutdown that does not set the stop flag, an init that does not clear it, or a shell that
+ *    does not hand the flag to the driver fails the shutdown case (the next search is not cancelled, or the
+ *    one after a re-init still is).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -858,3 +861,46 @@ TEST_CASE("file_search plugin: the heartbeat totals count from this process's st
 }
 
 #endif // !_WIN32
+
+// Runs on every OS, after the pin and heartbeat cases on purpose: this one inits the plugin three times. It
+// proves the three wiring lines that make a shutdown stop a running search: shutdown sets the stop flag, init
+// clears it, and the shell hands the flag to the driver. The driver's own handling of the flag is pinned in
+// test_file_search_driver.cpp ("a stop request ends the slice cancelled").
+TEST_CASE("file_search plugin: shutdown ends the next search cancelled and the next init clears it",
+          "[file_search][file_search_dispatcher][file_search_shutdown]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    Fixture fx{"yuzu_test_fs_disp_"};
+    const std::string salt = fx.root.filename().string();
+    write_file(fx.root / ("yuzu-fs-control-" + salt + "-1.bin"), "control");
+    const Call call{fx.root.string(), "yuzu-fs-control-" + salt + "-*.bin", "", ""};
+
+    yuzu::agent::StandalonePluginContext pctx("file_search", {});
+    REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
+    plugin->descriptor->shutdown(pctx.get()); // sets the stop flag
+    const auto stopped = call.run(plugin->descriptor);
+    REQUIRE(plugin->descriptor->init(pctx.get()) == 0); // clears it
+    yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(pctx.get()); }};
+    const Search running = search_all(plugin->descriptor, call);
+
+    // The cancelled end is reached only by a walk, so a fixture the plan refuses cannot show it.
+    const bool searched = fixture_was_searched(running);
+    require_searched_when_searchable(fx.root, running, searched);
+    if (!searched) {
+        WARN("file_search shutdown: the fixture's filesystem is not searched here; the cancelled end is not checked");
+        return;
+    }
+    const auto stopped_rows = captured_rows(stopped.captured);
+    REQUIRE_FALSE(stopped_rows.empty());
+    CHECK(starts(stopped_rows.back(), "search|failed|cancelled|"));
+    CHECK(std::ranges::none_of(stopped_rows, [](const std::string& r) { return starts(r, "cursor|"); }));
+
+    REQUIRE_FALSE(running.slices.empty());
+    const auto trailer = split(captured_rows(running.last().captured).back());
+    REQUIRE(trailer.size() == 7);
+    CHECK(trailer[1] == "ok");
+    CHECK(std::ranges::any_of(running.rows, [](const std::string& r) { return starts(r, "match|"); }));
+}

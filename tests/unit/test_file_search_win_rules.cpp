@@ -68,6 +68,12 @@ TEST_CASE("windows root: any other device or NT-namespace form is root_device_pa
     CHECK(err("\\\\?\\Volume{not-a-guid}\\") == RequestError::root_device_path);
     CHECK(err("\\\\?\\Volume{0f1e2d3c-1111-2222-3333-44445555aabg}\\") == RequestError::root_device_path); // not hex
     CHECK(err(std::string("\\\\?\\Volume{") + kGuid + "}x") == RequestError::root_device_path); // glued suffix
+    // The forward-slash and mixed-separator spellings are device paths, not a UNC root; only the exact
+    // backslash `\\?\Volume{guid}\` form is accepted.
+    CHECK(err(std::string("//?/Volume{") + kGuid + "}/x") == RequestError::root_device_path);
+    CHECK(err("//./C:/x") == RequestError::root_device_path);
+    CHECK(err(std::string("\\\\?/Volume{") + kGuid + "}\\x") == RequestError::root_device_path);
+    CHECK(err("/\\.\\C:\\x") == RequestError::root_device_path);
 }
 
 TEST_CASE("windows root: anything not absolute is root_not_absolute", "[file_search][win_rules]") {
@@ -374,6 +380,18 @@ TEST_CASE("format_extents_row prints the note after the state and leaves existin
     FileExtents failed;
     failed.state = ExtentsState::failed;
     CHECK(format_extents_row({1, 2}, failed) == "extents|0000000000000001:0000000000000002|failed|0|-");
+}
+
+TEST_CASE("with_note: an answered list keeps the note, a failed or unsupported one carries none",
+          "[file_search][win_rules]") {
+    CHECK(with_note(map(0, {{8, 100}}), "cloud").note == "cloud");
+    CHECK(with_note(map(0, {{8, 100}}), {}).note.empty());
+    const auto failed = with_note(map(1117, {}), "cloud"); // an I/O error: failed
+    CHECK(failed.state == ExtentsState::failed);
+    CHECK(failed.note.empty());
+    const auto unsupported = with_note(map(1, {}), "cloud"); // ERROR_INVALID_FUNCTION: unsupported
+    CHECK(unsupported.state == ExtentsState::unsupported);
+    CHECK(unsupported.note.empty());
 }
 
 // ---- identity ----

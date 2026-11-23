@@ -12,8 +12,8 @@ check, no new audit verb. A unit test cannot see most of these rows go missing; 
 Pinned over server/core/src (comments stripped): the enum and its ordinary default, the one derivation, the
 two catalogue defect rules and the four properties of the file_search row; the tier flag named only in the
 enum, the derivation and the fragment; the plugin named by a string literal only in its fragment, the
-enablement table, the action descriptions and the kill-switch seed (a name-keyed special case is a second
-path around the set); no second-tier or new-audit-verb spelling. The four
+enablement table and the action descriptions (a name-keyed special case, or a seed for the plugin in
+server.cpp, is a second path around the set); no second-tier or new-audit-verb spelling. The four
 `unrestricted_internal_consumer()` sites stay pinned, per site, by tests/test_response_store_read_tripwire.py.
 
 GREP LIMIT: lexical; it cannot see a branch that never runs, a plugin name built at run time or one split
@@ -36,7 +36,6 @@ CAP_HPP = os.path.join(SRC, "command_capability.hpp")
 SET_HPP = os.path.join(SRC, "forensics_plugin_set.hpp")
 FRAGMENT = os.path.join(SRC, "capability_decls", "plugin_action_catalogue_file_search.hpp")
 FILTER_HPP = os.path.join(SRC, "response_tier_filter.hpp")
-SERVER_CPP = os.path.join(SRC, "server.cpp")
 ENABLEMENT = os.path.join(SRC, "enablement_units.hpp")
 DESCRIPTIONS = os.path.join(SRC, "agent_registry.cpp")
 HINT = (" (this gate pins where the file_search stored rows are read; if the rule was legitimately "
@@ -87,7 +86,7 @@ FORBIDDEN: list[tuple[str, str, str]] = [
 
 # The files that may name the tier flag, and the files that may name the plugin by a string literal.
 TIER_FLAG_FILES = frozenset({CAP_HPP, SET_HPP, FRAGMENT})
-PLUGIN_NAME_FILES = frozenset({FRAGMENT, ENABLEMENT, DESCRIPTIONS, SERVER_CPP})
+PLUGIN_NAME_FILES = frozenset({FRAGMENT, ENABLEMENT, DESCRIPTIONS})
 TIER_FLAG = re.compile(r"\bStoredRowTier\b|\bstored_rows\b")
 # A quote, or the raw-string opener `"(`, then the name, in any case: a SQL literal ('file_search' inside a
 # string), a case variant and R"(file_search)" are all names. A bare identifier is not (f(file_search)).

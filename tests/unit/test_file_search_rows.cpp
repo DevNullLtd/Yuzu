@@ -277,22 +277,20 @@ TEST_CASE("file_search rows: the Windows user tag in both label forms", "[file_s
     CHECK_FALSE(is_user_profile_path("/Users/alice", Os::windows)); // the first component is the volume
 }
 
-TEST_CASE("file_search rows: under_user_root is on a component boundary and folds ASCII only on windows",
+TEST_CASE("file_search rows: under_user_root is on a component boundary and folds ASCII only",
           "[file_search][file_search_rows]") {
     const std::vector<std::string> roots = {"/C:/Profiles/alice", "/D:/Staff"};
-    CHECK(under_user_root("/C:/Profiles/alice", roots, Os::windows));
-    CHECK(under_user_root("/C:/Profiles/alice/x/y.txt", roots, Os::windows));
-    CHECK(under_user_root("/c:/profiles/ALICE/x", roots, Os::windows));   // ASCII fold
-    CHECK(under_user_root("/D:/Staff/b", roots, Os::windows));
-    CHECK_FALSE(under_user_root("/C:/Profiles/alicex", roots, Os::windows)); // a sibling prefix is not it
-    CHECK_FALSE(under_user_root("/C:/Profiles", roots, Os::windows));
-    CHECK_FALSE(under_user_root("/E:/Profiles/alice", roots, Os::windows));
-    CHECK_FALSE(under_user_root("/C:/Profiles/al\xc3\xaf" "ce", roots, Os::windows)); // no non-ASCII folding
-    CHECK_FALSE(under_user_root("/c:/profiles/alice", roots, Os::linux_os));         // exact bytes off Windows
-    CHECK(under_user_root("/C:/Profiles/alice/x", roots, Os::linux_os));
-    CHECK_FALSE(under_user_root("/C:/anything", {}, Os::windows));                   // no roots: nothing is one
+    CHECK(under_user_root("/C:/Profiles/alice", roots));
+    CHECK(under_user_root("/C:/Profiles/alice/x/y.txt", roots));
+    CHECK(under_user_root("/c:/profiles/ALICE/x", roots));   // ASCII fold
+    CHECK(under_user_root("/D:/Staff/b", roots));
+    CHECK_FALSE(under_user_root("/C:/Profiles/alicex", roots)); // a sibling prefix is not it
+    CHECK_FALSE(under_user_root("/C:/Profiles", roots));
+    CHECK_FALSE(under_user_root("/E:/Profiles/alice", roots));
+    CHECK_FALSE(under_user_root("/C:/Profiles/al\xc3\xaf" "ce", roots)); // no non-ASCII folding
+    CHECK_FALSE(under_user_root("/C:/anything", {}));                   // no roots: nothing is one
     const std::vector<std::string> empty_root = {""};
-    CHECK_FALSE(under_user_root("/C:/anything", empty_root, Os::windows)); // an empty prefix never matches everything
+    CHECK_FALSE(under_user_root("/C:/anything", empty_root)); // an empty prefix never matches everything
 }
 
 TEST_CASE("file_search rows: a gap path over the bound is counted, never emitted",
@@ -338,11 +336,13 @@ TEST_CASE("file_search constants: the raised bounds and the relations that tie t
           "[file_search][file_search_rows]") {
     // 255 UTF-16 units are at most 765 UTF-8 bytes; every bound derived from the longest name moves with it.
     static_assert(fsr::kMaxNameBytes == 765);
-    static_assert(fsr::kMaxCursorTokenBytes == 72u * 1024);
+    static_assert(fsr::kMaxCursorTokenBytes == 65'408);
+    static_assert(fsr::kMaxPositionDepth == 61);
     static_assert(fsr::kMaxCanonicalNameBytes >= fsr::kMaxNameBytes);
     static_assert(kMaxRequestCursorBytes == fsr::kMaxCursorTokenBytes + 128);
+    static_assert(kMaxRequestCursorBytes == 64u * 1024); // the server's limit on one instruction parameter
     static_assert(3 * (kMaxRootBytes + (fsr::kMaxPositionDepth + 1) * (fsr::kMaxNameBytes + 1)) + 512 <= kMaxMatchRowBytes);
     CHECK(fsr::kMaxNameBytes == 765);
-    CHECK(fsr::kMaxCursorTokenBytes == 72u * 1024);
+    CHECK(fsr::kMaxCursorTokenBytes == 65'408);
     CHECK(yuzu::component_inventory::kMaxOrderedRetainedBytes == 48u * 1024 * 1024);
 }

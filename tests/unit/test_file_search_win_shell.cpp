@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -433,7 +434,7 @@ TEST_CASE("file_search windows shell: the name rule is windows_upcase_v1 and fol
     CHECK(sem.canon("").empty());
 }
 
-TEST_CASE("file_search windows shell: the cursor key draws non-zero and is stable across calls",
+TEST_CASE("file_search windows shell: the cursor key draws non-zero, fresh bytes on every draw, and init succeeds on every call",
           "[file_search][file_search_win_shell]") {
     CursorKey a{};
     REQUIRE(os_draw_cursor_key(a));
@@ -441,7 +442,7 @@ TEST_CASE("file_search windows shell: the cursor key draws non-zero and is stabl
     CursorKey b{};
     REQUIRE(os_draw_cursor_key(b));
     CHECK(a != b); // each draw is fresh random bytes
-    // the process's key is drawn once and held: asking again never fails and never redraws
+    // init succeeds on every call
     CHECK(init_cursor_key());
     CHECK(init_cursor_key());
 }
@@ -543,6 +544,40 @@ TEST_CASE("file_search windows shell: run_on_worker runs the work inside the wor
     REQUIRE(out.value.has_value());
     CHECK(out.value->rows == std::vector<std::string>{"ran"});
     CHECK(*errors_suppressed); // hard-error dialogs are suppressed for the worker thread
+}
+
+TEST_CASE("file_search windows shell: the work function runs in background mode",
+          "[file_search][file_search_win_shell]") {
+    // Background mode is a per-thread setting made with a bare number, so a wrong one would run fleet searches
+    // at normal CPU and I/O priority with nothing to show it. Read it back from inside the work function by the
+    // documented probe: beginning it again on a thread already in it fails with this code. The value is handed
+    // out as a plain DWORD (Catch2 assertions are made on the test's own thread).
+    const auto probe = std::make_shared<DWORD>(ERROR_SUCCESS);
+    const auto out = run_on_worker(std::chrono::seconds{60}, [probe]() -> WorkResult {
+        if (::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) == 0)
+            *probe = ::GetLastError();
+        return WorkResult{};
+    });
+    REQUIRE(out.status == RunStatus::completed);
+    REQUIRE(out.value.has_value());
+    CHECK_FALSE(out.value->threw);
+    CHECK(*probe == ERROR_THREAD_MODE_ALREADY_BACKGROUND);
+}
+
+TEST_CASE("file_search windows shell: the worker environment suppresses hard-error dialogs around the body only",
+          "[file_search][file_search_win_shell]") {
+    // On a thread of its own, joined: the environment starts background mode and never ends it, so it must not
+    // run on the test's thread. The error mode is cleared first so the restore is observable.
+    DWORD inside = 0;
+    DWORD after = ~DWORD{0};
+    std::thread worker([&] {
+        ::SetThreadErrorMode(0, nullptr);
+        os_in_worker_environment([&] { inside = ::GetThreadErrorMode(); });
+        after = ::GetThreadErrorMode();
+    });
+    worker.join();
+    CHECK((inside & SEM_FAILCRITICALERRORS) != 0);
+    CHECK(after == 0);
 }
 
 #endif // _WIN32

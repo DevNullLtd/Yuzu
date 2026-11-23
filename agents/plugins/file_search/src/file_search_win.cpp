@@ -402,9 +402,9 @@ public:
             for (std::size_t i = 0; i < n; ++i)
                 runs.push_back({static_cast<std::uint64_t>(out->Extents[i].NextVcn.QuadPart), out->Extents[i].Lcn.QuadPart});
         }
-        f.extents = wr::map_retrieval_pointers(
-            {error, starting_vcn, runs, cluster_bytes(), opened.size, opened.attributes});
-        f.extents.note = now->note; // a fully local cloud file reads ok:cloud
+        f.extents = wr::with_note(
+            wr::map_retrieval_pointers({error, starting_vcn, runs, cluster_bytes(), opened.size, opened.attributes}),
+            now->note); // a fully local cloud file reads ok:cloud
         return f;
     }
 
@@ -492,18 +492,13 @@ private:
     [[nodiscard]] std::optional<std::vector<std::string>> components_below_walk_root(const std::string& dir) const {
         if (!under(dir, walk_root_))
             return std::nullopt;
-        std::vector<std::string> parts;
-        std::string_view rest = std::string_view(dir).substr(walk_root_.size());
-        while (!rest.empty()) {
-            rest.remove_prefix(1); // the '/'
-            const std::size_t slash = rest.find('/');
-            const std::string_view piece = rest.substr(0, slash);
-            if (piece.empty())
-                return std::nullopt;
-            parts.emplace_back(piece);
-            rest = slash == std::string_view::npos ? std::string_view{} : rest.substr(slash);
-        }
-        return parts;
+        auto d = wr::split_label(dir);
+        const auto w = wr::split_label(walk_root_);
+        if (!d || !w)
+            return std::nullopt;
+        // under() put the walk root's components first in the directory's.
+        d->components.erase(d->components.begin(), d->components.begin() + static_cast<std::ptrdiff_t>(w->components.size()));
+        return std::move(d->components);
     }
 
     [[nodiscard]] static HANDLE duplicate_of(HANDLE h) {

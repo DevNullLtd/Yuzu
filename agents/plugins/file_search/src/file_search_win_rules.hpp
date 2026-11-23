@@ -59,9 +59,6 @@ namespace cfs = yuzu::agent::confined_fs;
 
 // ---- the values (spelled here: no OS header) ----
 
-inline constexpr std::uint32_t kAttrDirectory = cfs::kAttrDirectory;
-inline constexpr std::uint32_t kAttrReparsePoint = cfs::kAttrReparsePoint;
-inline constexpr std::uint32_t kAttrRecallOrOffline = cfs::kAttrRecallOrOffline; // 0x40000 | 0x400000 | 0x1000
 inline constexpr std::uint32_t kAttrCompressed = 0x00000800;
 inline constexpr std::uint32_t kAttrEncrypted = 0x00004000;
 
@@ -128,10 +125,6 @@ namespace detail {
             return false;
     }
     return true;
-}
-
-[[nodiscard]] constexpr char lower(char c) noexcept {
-    return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
 }
 
 [[nodiscard]] constexpr bool starts_icase(std::string_view s, std::string_view prefix) noexcept {
@@ -208,9 +201,13 @@ namespace detail {
             return std::unexpected(RequestError::root_device_path);
         label = "/Volume{";
         for (const char c : guid)
-            label += detail::lower(c);
+            label += ascii_lower(c);
         label += '}';
-    } else if (raw.starts_with("\\\\.\\") || raw.starts_with("\\??\\")) {
+    } else if (raw.starts_with("\\??\\") ||
+               (raw.size() >= 4 && is_sep(raw[0]) && is_sep(raw[1]) && (raw[2] == '?' || raw[2] == '.') &&
+                is_sep(raw[3]))) {
+        // `\\.\`, `//?/`, `//./` and the mixed-separator spellings are device paths too, never a UNC root.
+        // Only the exact `\\?\Volume{guid}\` spelling above is accepted.
         return std::unexpected(RequestError::root_device_path);
     } else if (raw.size() >= 2 && is_sep(raw[0]) && is_sep(raw[1])) {
         return std::unexpected(RequestError::root_unc); // \\server\share, //server/share
@@ -307,7 +304,7 @@ struct Listed {
 
 /// `recall`: any of RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS, OFFLINE.
 [[nodiscard]] constexpr bool has_recall(std::uint32_t attributes) noexcept {
-    return (attributes & kAttrRecallOrOffline) != 0;
+    return (attributes & cfs::kAttrRecallOrOffline) != 0;
 }
 
 /// The one classification of a listed entry (the same function is applied to the attributes and tag read
@@ -325,10 +322,10 @@ struct Listed {
 /// file lists as a plain file with no tag, measured): see external_backing_of.
 [[nodiscard]] constexpr Listed classify(std::uint32_t attributes, std::uint32_t reparse_tag) noexcept {
     using Type = ci::DirEntry::Type;
-    const bool dir = (attributes & kAttrDirectory) != 0;
+    const bool dir = (attributes & cfs::kAttrDirectory) != 0;
     const bool recall = has_recall(attributes);
     Listed out;
-    if ((attributes & kAttrReparsePoint) == 0) {
+    if ((attributes & cfs::kAttrReparsePoint) == 0) {
         out.type = dir ? Type::dir : Type::file;
         if (dir && recall)
             out.gap = fsr::GapCause::dataless;
@@ -514,6 +511,15 @@ struct RetrievalInput {
         mapped.total_exact = false;
     }
     return mapped;
+}
+
+/// The mapped extents with the decision's note attached, on an answered list only: a fully local cloud file
+/// reads `ok:cloud`, and a failed or unsupported answer carries no note, so no `failed:cloud` or
+/// `unsupported:cloud` is ever printed (the README lists exactly the tokens that remain).
+[[nodiscard]] inline FileExtents with_note(FileExtents extents, std::string_view note) {
+    if (extents.state == ExtentsState::ok)
+        extents.note = note;
+    return extents;
 }
 
 // ---- identity: ONE policy ----

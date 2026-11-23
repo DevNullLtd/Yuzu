@@ -109,7 +109,7 @@ spec:
           before an agent restart, is refused with bad_cursor before anything is read, and the
           search starts again without one.
         validation:
-          maxLength: 73856
+          maxLength: 65536
 
   result:
     columns:

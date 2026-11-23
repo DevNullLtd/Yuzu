@@ -102,6 +102,11 @@ class FileSearchDefinitionParameters(unittest.TestCase):
         self.assertEqual(props["cursor"]["validation"]["maxLength"],
                          _int_constant(SHARED / "file_search_cursor.hpp", "kMaxCursorTokenBytes")
                          + int(m.group(1)))
+        # The server refuses an instruction parameter value over kMaxParamValueLen on every execute
+        # surface, so a cursor the definition admits must be one a client can pass back.
+        self.assertLessEqual(props["cursor"]["validation"]["maxLength"],
+                             _int_constant(REPO_ROOT / "server" / "core" / "src" / "bundle_service.hpp",
+                                           "kMaxParamValueLen"))
 
     def test_root_pattern_is_an_absolute_path_prefix_in_either_form(self):
         root = re.compile(self._params()["properties"]["root"]["validation"]["pattern"])

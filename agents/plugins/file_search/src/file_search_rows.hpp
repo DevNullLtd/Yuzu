@@ -102,7 +102,8 @@ enum class Scope { system, user };
 }
 
 // ASCII-only case folding: a Windows label compares `Users` and the volume's profile names this way and no
-// further (the rule is a path rule, not a lookup).
+// further (the rule is a path rule, not a lookup). user_profile_model.hpp's iequals_ascii is not reused: it goes
+// through std::tolower (locale-dependent, not constexpr) and the label rules here are constexpr.
 [[nodiscard]] constexpr char ascii_lower(char c) noexcept {
     return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
 }
@@ -164,18 +165,15 @@ enum class Scope { system, user };
 }
 
 /// `path` is one of `roots`, or below one, on a component boundary. `roots` are labels in the walked
-/// unit's own namespace (what the OS shell read for this unit). On Windows both sides compare ASCII-folded.
-[[nodiscard]] inline bool under_user_root(std::string_view path, std::span<const std::string> roots, Os os) noexcept {
+/// unit's own namespace, and only the Windows shell supplies any (the POSIX one returns none), so the
+/// comparison is the Windows label rule: ASCII-folded, on a component boundary.
+[[nodiscard]] inline bool under_user_root(std::string_view path, std::span<const std::string> roots) noexcept {
     for (const std::string& root : roots) {
         if (root.empty())
             continue; // an empty prefix would read every path as user
-        if (os != Os::windows) {
-            if (under(path, root))
-                return true;
-        } else if (path.size() >= root.size() && ascii_ieq(path.substr(0, root.size()), root) &&
-                   (path.size() == root.size() || path[root.size()] == '/')) {
+        if (path.size() >= root.size() && ascii_ieq(path.substr(0, root.size()), root) &&
+            (path.size() == root.size() || path[root.size()] == '/'))
             return true;
-        }
     }
     return false;
 }

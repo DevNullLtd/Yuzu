@@ -93,6 +93,9 @@ enum class RequestError {
 
 /// The longest cursor token accepted: the fs1 token plus the volume prefix around it.
 inline constexpr std::size_t kMaxRequestCursorBytes = fsr::kMaxCursorTokenBytes + 128;
+static_assert(kMaxRequestCursorBytes <= 64 * 1024,
+              "a cursor longer than the server's per-parameter cap (kMaxParamValueLen, bundle_service.hpp) "
+              "could not be passed back on any surface");
 
 struct Request {
     fsr::Query query;   // pattern (compiled), kinds, root (normalised)

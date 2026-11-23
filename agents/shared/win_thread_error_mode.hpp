@@ -25,6 +25,7 @@ namespace yuzu::win {
 
 class ThreadErrorModeGuard {
 public:
+    // SetThreadErrorMode fails only for a value that is not a SEM_* mode, so the return is not checked.
     explicit ThreadErrorModeGuard(DWORD mode) noexcept { ::SetThreadErrorMode(mode, &prev_); }
     ~ThreadErrorModeGuard() { ::SetThreadErrorMode(prev_, nullptr); }
     ThreadErrorModeGuard(const ThreadErrorModeGuard&) = delete;

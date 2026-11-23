@@ -1105,7 +1105,7 @@ TEST_CASE("walk_ordered: max_depth is capped at the deepest directory a Position
 
     CHECK(res.stop == Stop::complete);
     CHECK(tokens(res) == Strs{"depth " + path});
-    CHECK(r.fs.listed.size() == fsr::kMaxPositionDepth + 1); // the root and 64 levels below it
+    CHECK(r.fs.listed.size() == fsr::kMaxPositionDepth + 1); // the root and kMaxPositionDepth levels below it
 }
 
 TEST_CASE("walk_ordered: only a visit that returns true counts a row",
