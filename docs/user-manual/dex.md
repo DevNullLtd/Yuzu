@@ -668,7 +668,7 @@ does (agentic-first parity):
   launches over a 30-day basis and its crashes and hangs per hour of use, marked as estimated. It
   needs `Forensics:Read` as well as `GuaranteedState:Read` (administrators only while RBAC is off) and
   is audited fail-closed as `dex.apps.usage.view` once its parameters validate. The device floor applies per table only. No
-  agent ids appear. The Apps tab shows it as the [Usage view](#apps); there is no MCP tool yet. See
+  agent ids appear. The Apps tab shows it as the [Usage view](#apps), and the MCP tool `get_dex_apps_usage` serves the same read. See
   [app usage](../dex/app-usage.md#fleet-usage-per-application).
 - **`GET /api/v1/dex/catalogue?os=&window=`**, the Catalogue family cards, fleet
   coverage and the uncatalogued list, and **`GET /api/v1/dex/catalogue/group?name=&os=&window=`**,
@@ -731,7 +731,9 @@ version-row devices drill has its own MCP twin `list_dex_app_perf_devices`
 per-device app-perf drill is exposed via REST, the dashboard device drill
 (the "Application performance over time" panel) and the MCP tool
 `get_dex_device_app_perf` (all three write the same `dex.device.app_perf.view`
-audit). Fleet application usage (`GET /api/v1/dex/apps/usage`) has no MCP tool yet. Full request/response
+audit). Fleet application usage (`GET /api/v1/dex/apps/usage`) is the MCP tool `get_dex_apps_usage`, which needs
+`Forensics:Read` as well as `GuaranteedState:Read` and writes the same `dex.apps.usage.view` audit row
+before it reads. Full request/response
 shapes are in [`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
 `GET /api/v1/openapi.json`.
 

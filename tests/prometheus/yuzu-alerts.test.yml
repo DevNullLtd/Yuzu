@@ -2661,7 +2661,7 @@ tests:
     name: dispatch target rejected - unknown-plugin denials never fire the targeting alert
     input_series:
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="unknown_plugin"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
         eval_time: 10m
@@ -2676,7 +2676,7 @@ tests:
     name: dispatch target rejected - kill-switched-os withholdings never fire the targeting alert
     input_series:
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="kill_switched_os"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
         eval_time: 10m
@@ -2685,26 +2685,47 @@ tests:
         eval_time: 25m
         exp_samples: []
 
-  # CASE 62b -- a real targeting mistake still fires alongside ALL THREE excluded
-  # reasons on the same route, so no exclusion widened into a silencer.
+  # CASE 61d -- a client looping on a params key the agent would truncate (refused at the ingress,
+  # `param_key_invalid`) is a refused malformed request, not a targeting near-miss: silent. The series keep rising through
+  # both probes, so the 15m increase is non-zero at each; only the exclusion keeps the alert quiet.
   - interval: 1m
-    name: dispatch target rejected - a real targeting mistake still fires alongside all three exclusions
+    name: dispatch target rejected - param_key_invalid refusals never fire the targeting alert
+    input_series:
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="param_key_invalid"}'
+        values: "0+40x30"
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="schedule",reason="param_key_invalid"}'
+        values: "0+40x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE 62b -- a real targeting mistake still fires alongside ALL FOUR excluded
+  # reasons on the same route, so no exclusion widened into a silencer. The excluded series keep
+  # rising through the probe, so their 15m increase is non-zero and only the exclusion hides them.
+  - interval: 1m
+    name: dispatch target rejected - a real targeting mistake still fires alongside all four exclusions
     input_series:
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="agent_ids_empty"}'
         values: "0 0 0 0+1x30"
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="quarantined"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="unknown_plugin"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="kill_switched_os"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="param_key_invalid"}'
+        values: "0+40x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected", alertstate="firing"}'
         eval_time: 20m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuDispatchTargetRejected", alertstate="firing", route="command", reason="agent_ids_empty", severity="warning"}'
             value: 1
-      - expr: 'sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os"}[15m]))'
+      - expr: 'sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os|param_key_invalid"}[15m]))'
         eval_time: 20m
         exp_samples:
           - labels: '{route="command", reason="agent_ids_empty"}'

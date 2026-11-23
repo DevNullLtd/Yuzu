@@ -64,7 +64,7 @@ machine-independent, and keeping a test honest about the host it ran on.
 7. **Keep real-OS cases off the shared critical path; share no global session.** The agent suite's
    shards are the bottleneck. A real-OS case lives where its cost is already budgeted, and none
    holds a session another case reads. Salt every fixed name, port or path (CLAUDE.md, "Test
-   conventions"). The 13 `echo plugin:*` dispatcher cases run in agent shard C (#8244), the slowest
+   conventions"). The 14 `echo plugin:*` dispatcher cases run in agent shard C (#8244), the slowest
    agent shard, whose limit already had to be doubled (#7177). A real-time ETW session outlives its
    test process, and the four runner agents share one OS identity, so a killed test leaves state the
    next job inherits (#7175).
@@ -74,7 +74,7 @@ machine-independent, and keeping a test honest about the host it ran on.
    destructor after a failed `REQUIRE` included. Run a new case with `--order rand` and several seeds
    before pushing. Evidence: several dispatcher cases started and shut the plugin down by hand, so a
    failed `REQUIRE` left it initialised or a source paused for the cases after it, and one case
-   depended on declaration order (#8213). `EchoSession` now owns init and shutdown for all 13 cases;
+   depended on declaration order (#8213). `EchoSession` now owns init and shutdown for all 14 cases;
    the source-health ledger reset the issue also asks for needs a production line and stays open there.
 9. **Every timeout and bound cites a recorded measurement.** A limit is set from data and raised only
    with a new measurement recorded beside it. `tests/meson.build` carries the Echo limits with their
@@ -93,9 +93,9 @@ machine-independent, and keeping a test honest about the host it ran on.
 ### The bounded-return constant
 
 `yuzu::test::kReturnBound` is **120 s**, derived and not guessed. The slowest single Catch2 leaf of
-the 13 `echo plugin:*` dispatcher cases on native Windows MSVC Debug (a Windows host, 5 runs, a WSL
-VM active, CPU 12-31%) was **38.7 s**. A shutdown happens inside a leaf, so that is an upper bound on
-any shutdown. Shared CI amplifies I/O 3-6x (the "Budget rule" in
+the 13 `echo plugin:*` dispatcher cases that existed when it was measured, on native Windows MSVC
+Debug (a Windows host, 5 runs, a WSL VM active, CPU 12-31%) was **38.7 s**. A shutdown happens inside
+a leaf, so that is an upper bound on any shutdown. Shared CI amplifies I/O 3-6x (the "Budget rule" in
 [unit-test-conventions.md](unit-test-conventions.md)); at the lower end, 3 x 38.7 s = 116.1 s,
 rounded up to **120 s**. On macOS (5 runs) the slowest case took 1.331 s and the offline-shutdown
 case 0.007 s. The Windows figure is itself under investigation (#8244). Revise the constant only
