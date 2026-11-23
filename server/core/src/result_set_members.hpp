@@ -61,6 +61,8 @@ struct ResultSetMembers : std::vector<std::string> {
     /// incomplete in a way `agents_failed` cannot express, so the caller fails the set closed
     /// instead of materializing it. A store holding exactly `max_rows` rows is not truncated.
     bool truncated{false};
+    /// Whole-answer quantifiers need a proven response stream before publishing membership.
+    bool quantified{false};
 };
 
 /// Rows the members read takes per store query. The read pages until a page comes back short.
@@ -75,6 +77,7 @@ inline std::optional<ResultSetMembers> quantified_result_set_members(
     // Above this bound absence cannot be established. Fail just the affected agent closed.
     constexpr std::size_t max_answer_bytes = 2 * 1024 * 1024;
     ResultSetMembers members;
+    members.quantified = true;
     ResponseQuery page;
     page.frames_after.emplace("", 0);
     std::string agent, output;
@@ -117,7 +120,9 @@ inline std::optional<ResultSetMembers> quantified_result_set_members(
                 continue;
             if (frame.output.size() + !output.empty() > max_answer_bytes - output.size() ||
                 frame.output.find(kResponseIngestTruncation) != std::string::npos ||
-                frame.output.find(kResponseRowsTruncation) != std::string::npos) {
+                frame.output.find(kResponseRowsTruncation) != std::string::npos ||
+                frame.output.find("...[truncated: output line over 2 MiB]") != std::string::npos ||
+                frame.output == "duplicate command still in flight") {
                 exceeded = true;
                 continue;
             }

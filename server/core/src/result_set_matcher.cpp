@@ -313,6 +313,8 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
     // an empty set indistinguishable from "no device matched". Refuse it at admission instead.
     if (is_quantified_matcher(m))
         return validate_quantified_matcher(m);
+    if (m.contains("where"))
+        return "matcher.where requires any, none, all or count_where";
     if (kind == "any_response")
         return std::nullopt;
     // log_id_token is used here for its control-byte fold + length cap on caller input echoed

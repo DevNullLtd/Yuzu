@@ -5119,12 +5119,13 @@ TEST_CASE("materialise: the members read parses the matcher once, before the pag
     // this pins the statements. The text is read in one place, ahead of the loop over pages.
     const auto src = normalised_source("result_set_members.hpp");
     const auto parsed_at = src.find("const rs_matcher::ParsedMatcher matcher(pending.matcher);");
-    const auto loop_at = src.find("for (int read = 0;;) {");
+    const auto loop_at = src.find("for (int read = 0;;) {", parsed_at);
     REQUIRE(parsed_at != std::string::npos);
     REQUIRE(loop_at != std::string::npos);
     CHECK(parsed_at < loop_at);
     CHECK(count_in(src, "pending.matcher") == 1);
-    CHECK(count_in(src, "ParsedMatcher") == 1);
+    CHECK(count_in(src, "ParsedMatcher matcher(") == 1);
+    CHECK(src.find("const rs_matcher::ParsedMatcher& matcher") != std::string::npos);
     // The same holds for an `in` matcher's entries: the one loop over `value_set` is the parse's
     // own, and a cell is looked up in the set it fills.
     const auto matcher_src = normalised_source("result_set_matcher.cpp");

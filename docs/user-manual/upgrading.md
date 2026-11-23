@@ -11,6 +11,11 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Explicit matchers on asynchronous Echo result sets
+
+The Echo REST and MCP producers now validate an explicit `matcher`. Previously they ignored that field. To keep the previous selection behavior, omit `matcher` and use `include_empty`. An explicit Echo matcher requires a recognized `kind`, including for clients previously sending an empty object. Invalid matchers return HTTP 400 or MCP invalid params before dispatch. Plain instruction pipe rows without a completeness envelope can prove presence but leave absence unknown. Devices with unknown results drop out of the selected scope.
+
+
 ## Behaviour change: the installed-software read routes return `package_id` (#6090)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

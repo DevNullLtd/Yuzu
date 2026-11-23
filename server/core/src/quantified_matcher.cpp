@@ -253,6 +253,7 @@ RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete) con
         std::vector<std::string> columns;
         if (bound)
             columns = matcher_.at("declared_columns").get<std::vector<std::string>>();
+        std::uint64_t observed = 0;
         bool echo = false;
         std::optional<std::uint64_t> total_rows;
         while (!output.empty()) {
@@ -279,18 +280,19 @@ RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete) con
                     std::from_chars(total.data(), total.data() + total.size(), n);
                 if (err != std::errc{} || ptr != total.data() + total.size())
                     return RowMatch::MalformedValue;
-                if (!echo || n < counts.size())
+                if (!echo || n < observed)
                     return RowMatch::MalformedValue;
                 total_rows = n;
-                if (n > counts.size())
+                if (n > observed)
                     open_end = RowMatch::RowBound;
                 continue;
             }
             if (columns.empty())
                 return RowMatch::MissingValue;
+            ++observed;
             if (counts.size() == kQuantifiedRowLimit) {
                 open_end = RowMatch::RowBound;
-                break;
+                continue; // verify the trailing count even after stopping row evaluation
             }
             auto cells =
                 echo ? split_echo_cells(line)
@@ -311,6 +313,8 @@ RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete) con
         }
         if (columns.empty())
             return RowMatch::MissingValue;
+        if (!echo && !unknown(open_end))
+            open_end = RowMatch::CoverageUnproven;
         if (echo && counts.size() >= kQuantifiedRowLimit)
             open_end = RowMatch::RowBound;
         if (echo && !total_rows && open_end != RowMatch::RowBound)
