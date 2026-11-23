@@ -14737,6 +14737,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The id floor precedes the fail-closed guard, as on the REST drill: an unsafe
+                // id is input validation and must reach no audit row.
+                auto agent_id = param_str(args, "agent_id");
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 // #1717 fail-closed (parity with the REST SLE gate's sle_gate_usable):
                 // a loaded-but-corrupt / unopened rbac.db must refuse, not serve a
                 // legacy-open Read of per-agent licence facts.
@@ -14754,14 +14759,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "agent_id is required"),
                                     "application/json");
                     return;
                 }
-                if (refuse_unsafe_agent_id(agent_id))
-                    return;
                 // Per-device SCOPED gate (SoftwareLicensing:Read + management group) —
                 // the SAME ancestor-aware confinement the REST drill takes (the set_tag
                 // precedent), NOT the global perm gate. Fail closed if it is unwired.
@@ -14847,6 +14849,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The id floor precedes the fail-closed guard, as on the REST drill.
+                auto agent_id = param_str(args, "agent_id");
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 if (rbac_enforcement_in_effect(rbac_store) && !(rbac_store && rbac_store->is_open())) {
                     mcp_audit("failure", "authorization subsystem unavailable (#1717 fail-closed)");
                     res.set_content(a4_error(kInternalError, "authorization subsystem unavailable",
@@ -14854,14 +14860,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "agent_id is required"),
                                     "application/json");
                     return;
                 }
-                if (refuse_unsafe_agent_id(agent_id))
-                    return;
                 if (!scoped_perm_fn) {
                     res.set_content(a4_error(kInternalError, "scope gate not configured"),
                                     "application/json");

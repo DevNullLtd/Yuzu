@@ -34933,12 +34933,12 @@ TEST_CASE("MCP: an unsafe agent_id is refused with -32602 before the scoped gate
             CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
             const auto message = body["error"]["message"].get<std::string>();
             // Three tools answer an over-long id with their own earlier bound, so that row never
-            // reaches the shared floor. Every other row does, and carries the floor's message:
-            // reverting the guard at any of these tools turns its rows into a different answer.
-            if (name == "get_software_host_collection_settings" && id.size() > 128)
-                CHECK(message.find("1 to 128 characters") != std::string::npos);
-            else if ((name == "get_guardian_device_guards" || name == "get_guardian_agent_status") &&
-                     id.size() > 256)
+            // reaches the shared floor (the settings tool's strict() arg check refuses above 128
+            // bytes). Every other row does, and carries the floor's message: reverting the guard
+            // at any of these tools turns its rows into a different answer.
+            if ((name == "get_software_host_collection_settings" && id.size() > 128) ||
+                ((name == "get_guardian_device_guards" || name == "get_guardian_agent_status") &&
+                 id.size() > 256))
                 CHECK(message == "agent_id is too long");
             else
                 CHECK(message == floor_message);

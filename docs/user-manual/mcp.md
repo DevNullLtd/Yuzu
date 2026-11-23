@@ -1065,7 +1065,7 @@ What runs first, and what differs:
   `invalid arguments: agent_id`. The row carries no id.
 - The two Guardian drills keep their own "agent_id is too long" answer for an over-long id and
   add the control-byte refusal. `get_software_host_collection_settings` keeps its own
-  "1 to 128 characters" answer for an id over 128 bytes and applies this check to a shorter id
+  "agent_id is too long" answer for an id over 128 bytes and applies this check to a shorter id
   that has a control byte.
 - A tool that already refused such an id through its own check (`get_host_topology`,
   `list_guardian_events`, `get_guardian_device_compliance`, `get_execution_statistics_by_agent`
