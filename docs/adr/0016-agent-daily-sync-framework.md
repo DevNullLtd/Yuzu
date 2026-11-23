@@ -2009,11 +2009,10 @@ does not, or the reverse.
   which `dpkg-query` never read) now reports them: new install rows and install events for that host. Each
   package there is a control file with no `Status` field, plus a `.md5sums` sibling that is skipped; a present
   file is read as installed, and a file that does carry a `Status` is held to the same three-word rule. The
-  converse is also new: a host with a healthy status file and one `status.d` control file that does not hold exactly one installed stanza
-  (unparseable, zero-byte, comment-only, two installed stanzas, or only a not-installed one) is
+  converse is also new: a host with a healthy status file and one `status.d` control file that does not hold exactly one stanza in the installed state, ignoring any `not-installed` one (unparseable, zero-byte, comment-only, two or more other stanzas, or a single one in another state such as config-files or half-installed) is
   degraded (`dpkg_status_d:corrupt`, no rows) where `dpkg-query` ignored the directory, and the status file's own
   packages are withheld with it, because a roster without the `status.d`-only packages would be published as the
-  host's complete one. The remedy is to remove the file or give it a leading dot (hidden names are skipped).
+  host's complete one. The remedy is to restore the file (reinstall the package that owns it), not to delete it or hide it with a leading dot: either drops that package from a roster then read as complete. Remove or hide a file only once it is verified extraneous.
 - A symlinked leaf is refused where the tools followed it: a symlinked status file, `status.d` directory or rpm
   database file is `symlink_refused` (the directories above the leaf are reached by path and are followed, as before).
   An rpm candidate DIRECTORY that is a symlink is never followed and is skipped; when a database file exists behind
@@ -2031,15 +2030,14 @@ does not, or the reverse.
   AlmaLinux 9 image: `rpm -qa` fails there as `nobody`).
 - **A running rpm transaction answers `locked` on ndb and Berkeley DB.** rpm rewrites those two files in place and
   every rpm writer holds its transaction lock (an fcntl write lock on `.rpm.lock`, beside the database) for the whole
-  run, while a read-only `rpm -qa` joined the library's own locking and so never saw a writer's half-finished state. The
+  run, while a read-only `rpm -qa` was isolated from a writer by the library's own lock (ndb: a shared flock on `Packages.db`; Berkeley DB: the shared environment), which a raw reader of the file does not have. The
   reader takes the same precaution in the only way open to it: after the first change stamp and before the first
   read it asks `fcntl(F_GETLK)` whether a write lock on `.rpm.lock` would conflict, and a held lock is
   `<source>:locked` with no rows and the server keeping its stored ones. It never TAKES a lock, so it cannot delay
   rpm; a missing lock file means no transaction has run; a symlinked or non-regular one is its named cause, never
   "not locked". sqlite keeps its own isolation (a shared lock for a rollback journal, a snapshot for WAL) and does not
   consult it. The change stamp stays as the second line of defence. Residual: rpm's lock path is configurable
-  (`%_rpmlock_path`), and a lock file moved out of the database directory is not seen. The old path would have printed
-  a roster read between the writer's steps.
+  (`%_rpmlock_path`), and a lock file moved out of the database directory is not seen.
 - **A pending dpkg update journal answers `locked`.** `dpkg-query -W` replays `/var/lib/dpkg/updates/` in memory
   over the status file before it answers, so it printed the status MERGED with a run in progress, or left by an
   interrupted one until dpkg next runs. This reader reads the status file alone, which in that state is the

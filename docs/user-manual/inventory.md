@@ -371,16 +371,14 @@ cadences.
 
   - **`status.d`.** A host whose packages live only there (minimal images with no
     shell) now reports them, as new install rows; and a host with a healthy status
-    file and one `status.d` control file that does not hold exactly one installed
-    stanza (unparseable, zero-byte, comment-only, holding two installed stanzas, or
-    only a not-installed one) is degraded
+    file and one `status.d` control file that does not hold exactly one stanza in the installed state, ignoring any `not-installed` one (unparseable, zero-byte, comment-only, two or more other stanzas, or a single one in another state such as config-files or half-installed) is degraded
     (`dpkg_status_d:corrupt`, no rows, the server keeps its stored ones) where
     `dpkg-query` ignored the directory. The token does not name the file: list
     `/var/lib/dpkg/status.d` and look for a zero-byte, comment-only or hand-edited
     one, or one holding two installed stanzas. Restore it (reinstall the package
     that owns it) rather than delete it: a deleted control file drops its package
     from the roster, which is then read as complete. A name with a leading dot is
-    skipped.
+    skipped, which costs the same as deleting it.
   - **Which manager is read.** It is chosen by its database file, not its binary.
     A dpkg status with no installed package (empty, or only config-files and
     half-installed stanzas) falls through to rpm, and an rpm database that holds no
