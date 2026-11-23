@@ -9336,7 +9336,7 @@ The three writes are audited BEFORE the store is touched, as `inventory.software
 The stored pack version, load time and loader, the titles normalized and unnormalized, and the queue's open and rejected counts, read in one snapshot.
 
 ```json
-{"data": {"pack_version": "2026.11.1", "loaded_at": 1793000000, "loaded_by": "seed",
+{"data": {"pack_version": "2026.11.2", "loaded_at": 1793000000, "loaded_by": "seed",
           "titles_normalized": 812, "titles_unnormalized": 41, "queue_open": 38, "queue_rejected": 3},
  "meta": {"api_version": "v1"}}
 ```

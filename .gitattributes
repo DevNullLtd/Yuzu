@@ -10,6 +10,12 @@
 *.dylib binary
 *.exe binary
 
+# Real package-database captures committed as test fixtures (installed_apps SAM-45): never rewrite them.
+tests/unit/fixtures/software-estate/pkgdb/**/Packages binary
+tests/unit/fixtures/software-estate/pkgdb/**/Packages.db binary
+tests/unit/fixtures/software-estate/pkgdb/**/rpmdb.sqlite binary
+tests/unit/fixtures/software-estate/pkgdb/**/status.d/* binary
+
 # Windows-specific files that need CRLF
 *.bat text eol=crlf
 *.ps1 text eol=crlf

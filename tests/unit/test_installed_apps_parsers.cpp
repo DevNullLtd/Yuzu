@@ -16,6 +16,7 @@
  *     same discipline as test_firewall_parsers.cpp's ufw fixtures.
  */
 
+#include "installed_apps_old_path_oracle.hpp" // parse_dpkg_list / parse_rpm_list (test-only since SAM-45)
 #include "installed_apps_parsers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
