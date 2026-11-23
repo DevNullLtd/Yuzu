@@ -140,6 +140,8 @@ OPEN_STREAM = re.compile(r"\bopen_stream\s*\(")
 def problems(srcs):
     found, total = [], 0
     for name, text in sorted(srcs.items()):
+        if "httplib" not in text:
+            continue  # no httplib token: cannot construct a client (also keeps the runtime low)
         if OPEN_STREAM.search(blank(text)):
             found.append(f"{name}: open_stream() is banned (a StreamHandle decodes regardless of decompress_)")
         for var, prob, _ in check(text):
@@ -182,17 +184,24 @@ def wiring_problems(raw):
     if hg is None:
         return ["http_get not found"]
     rawhg = func_body(raw, r"std::string\s+http_get\s*\(") or ""
-    if not re.search(r'equal_range\s*\(\s*"Content-Encoding"\s*\)', rawhg):
+    # The key literal is checked on raw text, the call and the accumulation on BLANKED text so a
+    # comment or string cannot satisfy them.
+    m = re.search(r"equal_range\s*\(", hg)  # blanked text: a comment cannot match
+    if not m or not re.match(r'equal_range\s*\(\s*"Content-Encoding"\s*\)', rawhg[m.start():]):
         out.append("http_get must read every Content-Encoding line with equal_range")
+    if not m or not re.search(r"\bcontent_encodings\s*(?:\+=\s*\w+(?:->|\.)second|\.append\s*\(\s*\w+(?:->|\.)second)", hg[m.end():]):
+        out.append("http_get must accumulate every Content-Encoding value into content_encodings")
+    if len(re.findall(r"\bcontent_encodings\s*\.clear\s*\(", hg)) < 2:
+        out.append("http_get must reset content_encodings at entry and at the start of each attempt")
     dg = func_body(t, r"int\s+do_get\s*\(")
     if dg is None:
         return out + ["do_get not found"]
-    refuse = dg.find("encoding_refusal_row")
-    if refuse < 0:
-        out.append("do_get does not call encoding_refusal_row")
-    if "http_get(" not in dg or "content_encodings" not in dg:
-        out.append("do_get must pass the collected content_encodings from http_get to the refusal")
-    # `body|` is a string literal, so it is blank in `t`; find it in the raw text of do_get.
+    if not re.search(r"encoding_refusal_row\s*\(\s*content_encodings\s*\)", dg):
+        out.append("do_get must pass the collected content_encodings to encoding_refusal_row")
+    if not re.search(r"\bhttp_get\s*\([^;]*content_encodings", dg):
+        out.append("do_get must pass content_encodings to http_get")
+    if not re.search(r"status\s*!=\s*0", dg):
+        out.append("do_get must apply the refusal for status != 0")
     rawdg = func_body(raw, r"int\s+do_get\s*\(") or ""
     body_at = rawdg.find('"body|')
     ref_raw = rawdg.find("encoding_refusal_row")
@@ -200,6 +209,11 @@ def wiring_problems(raw):
         out.append("do_get no longer writes a body| row: pin is stale")
     elif ref_raw < 0 or ref_raw > body_at:
         out.append("do_get writes body| before applying encoding_refusal_row")
+    else:
+        # a `return` must sit between the refusal write and the body write, or the body follows it
+        seg = blank(rawdg)[ref_raw:body_at]
+        if not re.search(r"\breturn\b", seg):
+            out.append("do_get must return after writing the refusal row, before any body| write")
     if len(re.findall(r'"body\|', rawdg)) != 1:
         out.append("do_get must write the body through exactly one body| site")
     return out
@@ -252,6 +266,12 @@ class NoDecompress(unittest.TestCase):
         muts = {
             "refusal call deleted": raw.replace("encoding_refusal_row(content_encodings)", "std::string{}", 1),
             "only first header": raw.replace("equal_range(", "find_first_of(", 1),
+            "accumulation deleted": raw.replace("content_encodings += it->second;", "", 1),
+            "empty arg to refusal": raw.replace("encoding_refusal_row(content_encodings)", "encoding_refusal_row(std::string{})", 1),
+            "return dropped": raw.replace("ctx.write_output(refusal);\n                return 1;", "ctx.write_output(refusal);", 1),
+            "guard inverted": raw.replace("if (status != 0) {\n            if (const auto refusal", "if (status == 0) {\n            if (const auto refusal", 1),
+            "clear deleted": raw.replace("content_encodings.clear();\n                              return cli.Get(", "return cli.Get(", 1),
+            "equal_range in comment": raw.replace("const auto range = r.headers.equal_range(\"Content-Encoding\");", "// r.headers.equal_range(\"Content-Encoding\");\n const auto range = r.headers.equal_range(\"X\");", 1),
             "body before refusal": raw.replace("ctx.write_output(std::format(\"status|{}\", status));\n        // The client",
                                                "ctx.write_output(std::format(\"status|{}\", status));\n        ctx.write_output(\"body|x\");\n        // The client", 1),
         }

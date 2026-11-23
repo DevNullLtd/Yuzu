@@ -26,7 +26,7 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **How to spot it.** A `stage` or `download` whose pinned hash is of the decompressed content fails with `hash mismatch: expected=<your hash>, got=<hash of the bytes the server sent>`. The file is removed.
 
-**What to do.** Pin the `sha256` of the bytes on the wire. Compute it with `curl -s URL | sha256sum`, without `--compressed` and without an `Accept-Encoding` header. Or serve the artefact uncompressed (`Content-Encoding` absent).
+**What to do.** `stage` and `download` set no `Accept-Encoding` header of their own, so they cannot ask a server for an uncompressed file: pin the `sha256` of the bytes on the wire. Compute it with `curl -s URL | sha256sum`, without `--compressed` and without an `Accept-Encoding` header. Or serve the artefact uncompressed (`Content-Encoding` absent). A `get` that answers `error|peer sent Content-Encoding <token>; body not decoded` means the peer compressed the response even though `get` asked for `identity`: serve that resource without a `Content-Encoding`, or fetch it with `download` and pin the hash of the bytes on the wire.
 
 ## ⚠️ Breaking: second-factor failure budget (auth schema v4), first-run password prompt needs a terminal on Linux and macOS
 
