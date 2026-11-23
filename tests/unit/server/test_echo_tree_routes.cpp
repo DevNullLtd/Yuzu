@@ -821,7 +821,7 @@ TEST_CASE("Echo capture-sources: an offline device shows the agent's reason, not
         "error|Echo storage is offline on this endpoint; the database was closed after a "
         "transaction could not be rolled back. Collection and retention are both stopped. The "
         "read-only query connection is unavailable too, so `echo sql` cannot read the historical "
-        "data either. Restart the agent to recover.\nstorage_state|offline";
+        "data either. Restart the agent to recover.\nstorage_state|offline|rollback_wedged";
 
     auto res = h.run_capture_sources();
     REQUIRE(res != nullptr);
