@@ -132,10 +132,13 @@ using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 // A path as UTF-8 bytes, NON-THROWING: path::string() throws on Windows for a name the active code
 // page cannot represent and u8string() throws for a name with an unpaired UTF-16 surrogate (which
 // Windows allows). The shared converter (find_by_hash::path_utf8, from_wide on Windows) does neither:
-// such a unit becomes U+FFFD. Used for comparison only, never to open a file.
+// such a unit becomes U+FFFD. Used for comparison and for the reserved Set; a path is rebuilt from
+// those bytes only through path_from_bytes.
 std::string path_bytes(const fs::path& p) { return yuzu::filesystem::find_by_hash::path_utf8(p); }
 
-// The inverse of path_bytes for the reserved Set, which is UTF-8 by construction: the narrow
+// The inverse of path_bytes for every name that has a UTF-8 form (a lone UTF-16 surrogate was already
+// replaced by U+FFFD and cannot be rebuilt; invalid UTF-8 yields an empty path). The reserved Set is
+// UTF-8 by construction: the narrow
 // fs::path constructor would decode those bytes as the active code page on MSVC and name a different
 // (mojibake) path, so the identity, hard-link and planted-link legs would compare against nothing.
 fs::path path_from_bytes(const std::string& s) {

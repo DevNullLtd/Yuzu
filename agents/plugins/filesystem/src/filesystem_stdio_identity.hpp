@@ -4,7 +4,7 @@
 /// POSIX only. The agent's own stdout and stderr can be a regular file: launchd's StandardErrorPath
 /// (macOS) and systemd's StandardOutput=file: send the process's log lines to a file the log-file
 /// rule does not name (`yuzu-agent.stderr.log`). A caller must not read those bytes through the
-/// filesystem plugin either, so a candidate that is the SAME FILE (st_dev and st_ino) as an open
+/// filesystem plugin, so a candidate that is the SAME FILE (st_dev and st_ino) as an open
 /// regular-file descriptor 1 or 2 is refused as the agent's own log.
 
 #ifndef _WIN32

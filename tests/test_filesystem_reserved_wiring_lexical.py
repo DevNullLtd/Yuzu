@@ -45,6 +45,20 @@ def main() -> int:
     need("is_agent_stdio_file(canon)", "the agent's own stdout/stderr file (launchd/systemd log redirection)")
     need("path_from_bytes(f)", "the reserved Set is UTF-8: rebuild paths with path_from_bytes, never fs::path{std::string}")
     need("path_from_bytes(d)", "the reserved Set is UTF-8: rebuild paths with path_from_bytes, never fs::path{std::string}")
+    # Whole-statement pins for the five sites that rebuild the UTF-8 reserved Set, and for the inverse itself.
+    flat_b = re.sub(r"\s+", " ", b)
+    for stmt in ("fs::path cur = path_from_bytes(v[i]);",
+                 "const auto id = identity_of(canon, path_from_bytes(f));",
+                 "fs::exists(path_from_bytes(d), e4)",
+                 "fs::recursive_directory_iterator it{path_from_bytes(d), fs::directory_options::none, e4}",
+                 "const auto id = identity_of(a, path_from_bytes(d));",
+                 "if (yuzu::filesystem::reserved::is_agent_stdio_file(canon)) return true;"):
+        if stmt not in flat_b:
+            problems.append(f"the reserved decision lost the statement: {stmt}")
+    if not re.search(r"fs::path path_from_bytes\(const std::string& s\) \{ #ifdef _WIN32 return fs::path\{yuzu::win::to_wide\(s\)\}; #else return fs::path\{s\}; #endif \}", re.sub(r"\s+", " ", code)):
+        problems.append("path_from_bytes is not exactly to_wide on Windows and the narrow path on POSIX")
+    if re.search(r"fs::path\s*[({]\s*(?:std::string\s*[({]\s*)?(?:f|d|v\[i\])\b", b):
+        problems.append("the reserved decision rebuilds a reserved path with a narrow constructor")
     if re.search(r"fs::path\{(?:f|d|v\[i\])\}", b):
         problems.append("the reserved decision rebuilds a reserved path with the narrow fs::path{std::string} (ACP on MSVC)")
     need("is_dev_fd_path(cs)", "canonical /dev/fd spelling")
