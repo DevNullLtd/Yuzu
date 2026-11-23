@@ -126,6 +126,24 @@ bool contains(const std::string& hay, std::string_view needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+/// The last space-separated token of an audit detail.
+std::string last_token(const std::string& detail) {
+    const auto at = detail.rfind(' ');
+    return at == std::string::npos ? detail : detail.substr(at + 1);
+}
+/// The id in the trailing `cid=<id>` token of an audit detail ("" when the last token is not one).
+std::string cid_of(const std::string& detail) {
+    const auto token = last_token(detail);
+    return token.rfind("cid=", 0) == 0 ? token.substr(4) : std::string{};
+}
+/// The detail without its trailing `cid=<id>` token.
+std::string without_cid(const std::string& detail) {
+    const auto token = last_token(detail);
+    if (token.rfind("cid=", 0) != 0)
+        return detail;
+    return detail.substr(0, detail.size() - token.size() - 1);
+}
+
 std::set<std::string> member_ids_of(ManagementGroupStore& mg, const std::string& group_id) {
     std::set<std::string> ids;
     for (const auto& m : mg.get_members(group_id))
@@ -768,7 +786,7 @@ TEST_CASE("group-from-results: an add_member partial failure is reported "
     CHECK(contains(res->body, "1 of 2"));
 
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
-    CHECK(h.audit_detail("group.create_from_results", "failure") ==
+    CHECK(without_cid(h.audit_detail("group.create_from_results", "failure")) ==
           "partial_materialisation added=1 failed=1");
     CHECK(h.audits_for("group.create_from_results", "success") == 0);
 
@@ -1453,7 +1471,7 @@ TEST_CASE("group-from-results: a Search term needs the results table's Response:
         // Filters alone are unaffected by the missing gate.
         CHECK(h.post(GroupFromResultsHarness::form_body("unwired-filters"))->status == 200);
     }
-    SECTION("admitted: the gate runs once per request on the Search path, and scoping still applies") {
+    SECTION("admitted: one gate call on the preview, two on the POST; scoping still applies") {
         h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
             return std::set<std::string>{"agent-A"};
         };
@@ -1465,7 +1483,8 @@ TEST_CASE("group-from-results: a Search term needs the results table's Response:
 
         auto res = h.post(q_form_body("q-admitted", "&q=a"));
         CHECK(res->status == 200);
-        CHECK(h.fleet_read_calls == 2);
+        // The POST decides it before the attempted row and again after it (#7112).
+        CHECK(h.fleet_read_calls == 3);
         auto group = h.mg.find_group_by_name("q-admitted");
         REQUIRE(group.has_value());
         CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
@@ -1703,7 +1722,7 @@ TEST_CASE("group-from-results audit: a create_group failure records a failure ou
     CHECK_FALSE(h.mg.find_group_by_name("create-fails").has_value());
     REQUIRE(h.audits_for("group.create_from_results", "attempted") == 1);
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
-    CHECK(h.audit_detail("group.create_from_results", "failure") ==
+    CHECK(without_cid(h.audit_detail("group.create_from_results", "failure")) ==
           "create_failed name=create-fails");
     // The form is hx-swap="none": the toast is the only thing the operator sees (Gate 8 UP-1).
     CHECK(toast_message(*res) ==
@@ -1848,7 +1867,7 @@ TEST_CASE("group-from-results audit (UP-5): every agent revoked while the attemp
     CHECK_FALSE(h.mg.find_group_by_name("all-revoked").has_value());
     CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
-    CHECK(h.audit_detail("group.create_from_results", "failure") == "scope_revoked");
+    CHECK(without_cid(h.audit_detail("group.create_from_results", "failure")) == "scope_revoked");
     CHECK(toast_message(*res) == "No agents match the current filters. Nothing was created.");
     CHECK(contains(h.audit_detail("response.read", "denied"), "phase=post_attempted"));
 }
@@ -1894,7 +1913,8 @@ TEST_CASE("group-from-results audit (UP-5): a session invalidated while the atte
     CHECK_FALSE(h.mg.find_group_by_name("session-gone").has_value());
     CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
-    CHECK(h.audit_detail("group.create_from_results", "failure") == "session_revoked");
+    CHECK(without_cid(h.audit_detail("group.create_from_results", "failure")) ==
+          "session_revoked");
 }
 
 TEST_CASE("group-from-results audit (UP-5): ManagementGroup:Write revoked while the attempted row "
@@ -1915,7 +1935,7 @@ TEST_CASE("group-from-results audit (UP-5): ManagementGroup:Write revoked while 
     CHECK(h.perm_asked == std::vector<std::string>{"ManagementGroup:Write", "ManagementGroup:Write"});
     CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
     REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
-    CHECK(h.audit_detail("group.create_from_results", "failure") ==
+    CHECK(without_cid(h.audit_detail("group.create_from_results", "failure")) ==
           "permission_revoked name=perm-revoked");
     CHECK(h.audits_for("group.create_from_results", "success") == 0);
 }
@@ -1941,8 +1961,256 @@ TEST_CASE("group-from-results audit (UP-5, Gate 5 CH-1): a recheck refusal whose
     CHECK_FALSE(h.mg.find_group_by_name("perm-revoked-audit-down").has_value());
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
-    CHECK(h.audit_detail("group.create_from_results", "failure") ==
+    CHECK(without_cid(h.audit_detail("group.create_from_results", "failure")) ==
           "permission_revoked name=perm-revoked-audit-down");
     CHECK(h.audits_for("group.create_from_results", "failure") == 1);
     CHECK(h.audits_for("group.create_from_results", "success") == 0);
+}
+
+// ── #7112: the Forensics tier and the Search term's admission are decided again after the row ───
+
+namespace {
+/// Stores one stored frame per (agent, plugin) under kCommandId with a matching category.
+void seed_forensics_tier_rows(ResponseStore& rs, std::initializer_list<std::string> forensics_agents,
+                              std::initializer_list<std::string> ordinary_agents) {
+    for (const auto& agent : forensics_agents)
+        seed_titled_response(rs, agent, "cat-a", "title", yuzu::server::test::kForensicsPlugin);
+    for (const auto& agent : ordinary_agents)
+        seed_titled_response(rs, agent, "cat-a", "title", yuzu::server::test::kOrdinaryPlugin);
+}
+/// A persist predicate that runs @p on_attempted when the `attempted` row is written.
+std::function<bool(const AuditRow&)> on_attempted_row(std::function<void()> on_attempted) {
+    return [on_attempted = std::move(on_attempted)](const AuditRow& r) {
+        if (r.action == "group.create_from_results" && r.result == "attempted")
+            on_attempted();
+        return true;
+    };
+}
+} // namespace
+
+TEST_CASE("group-from-results (#7112): Forensics:Read withdrawn inside the attempted-row write "
+          "leaves only what the caller may still read in the group",
+          "[pg][server][dashboard][group_from_results][audit][security][forensics][3619][7112]") {
+    GroupFromResultsHarness h;
+    // agent-A and agent-B match through the Forensics plugin, agent-C through an ordinary one.
+    seed_forensics_tier_rows(h.rs(), {"agent-A", "agent-B"}, {"agent-C"});
+    h.forensics.admin();
+    h.audit_persists = on_attempted_row([&h] { h.forensics.viewer(); }); // withdrawn mid-write
+
+    auto res = h.post(GroupFromResultsHarness::form_body("tier-withdrawn"));
+    CHECK(res->status == 200);
+    auto group = h.mg.find_group_by_name("tier-withdrawn");
+    REQUIRE(group.has_value());
+    // Ground truth from the store: only the ordinary match is in the group.
+    CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
+    // The attempted row recorded the pre-wait set; the success row records what was created.
+    CHECK(contains(h.audit_detail("group.create_from_results", "attempted"), "(3 agents from"));
+    CHECK(contains(h.audit_detail("group.create_from_results", "success"), "(1 agents from"));
+}
+
+TEST_CASE("group-from-results (#7112): the Forensics tier becoming unknown inside the write creates "
+          "no group and answers the same notice as before the row",
+          "[pg][server][dashboard][group_from_results][audit][security][forensics][3619][7112]") {
+    GroupFromResultsHarness h;
+    seed_forensics_tier_rows(h.rs(), {}, {"agent-A"});
+    h.forensics.admin();
+    h.audit_persists = on_attempted_row([&h] { h.forensics.unknown(); });
+
+    auto res = h.post(GroupFromResultsHarness::form_body("tier-unknown-mid"));
+    // The identical answer to the pre-row refusal (a 200 with the error toast).
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("HX-Trigger") ==
+          R"({"showToast":{"message":"The permission check for this action could not be completed. )"
+          R"(Nothing was created. Retry shortly.","level":"error"}})");
+    CHECK_FALSE(h.mg.find_group_by_name("tier-unknown-mid").has_value());
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+    REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
+    const auto failure = h.audit_detail("group.create_from_results", "failure");
+    CHECK(without_cid(failure) == "forensics_tier_unknown");
+    CHECK(cid_of(failure) == cid_of(h.audit_detail("group.create_from_results", "attempted")));
+    CHECK(h.audits_for("group.create_from_results", "success") == 0);
+}
+
+TEST_CASE("group-from-results (#7112): every match Forensics-only and the grant withdrawn inside the "
+          "write answers 422, creates no group and records scope_revoked",
+          "[pg][server][dashboard][group_from_results][audit][security][forensics][3619][7112]") {
+    GroupFromResultsHarness h;
+    seed_forensics_tier_rows(h.rs(), {"agent-A"}, {});
+    h.forensics.admin();
+    h.audit_persists = on_attempted_row([&h] { h.forensics.viewer(); });
+
+    auto res = h.post(GroupFromResultsHarness::form_body("tier-all-withdrawn"));
+    CHECK(res->status == 422);
+    CHECK_FALSE(h.mg.find_group_by_name("tier-all-withdrawn").has_value());
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+    REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
+    CHECK(without_cid(h.audit_detail("group.create_from_results", "failure")) == "scope_revoked");
+    CHECK(h.audits_for("group.create_from_results", "success") == 0);
+}
+
+TEST_CASE("group-from-results (#7112): Forensics:Read granted inside the write leaves the group "
+          "exactly the pre-row set",
+          "[pg][server][dashboard][group_from_results][audit][security][forensics][3619][7112]") {
+    GroupFromResultsHarness h;
+    seed_forensics_tier_rows(h.rs(), {"agent-A"}, {"agent-C"});
+    h.forensics.viewer(); // the pre-row set is the ordinary match only
+    h.audit_persists = on_attempted_row([&h] { h.forensics.admin(); }); // granted mid-write
+
+    auto res = h.post(GroupFromResultsHarness::form_body("tier-granted"));
+    CHECK(res->status == 200);
+    auto group = h.mg.find_group_by_name("tier-granted");
+    REQUIRE(group.has_value());
+    // A wider tier performs no second read: the group is not widened to what the grant now reaches.
+    CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
+    CHECK(h.audits_for("group.create_from_results", "failure") == 0);
+}
+
+TEST_CASE("group-from-results (#7112): the Search term's Response:Read admission withdrawn inside "
+          "the write creates no group and records response_read_revoked",
+          "[pg][server][dashboard][group_from_results][search][audit][security][3619][7112]") {
+    GroupFromResultsHarness h;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha");
+    h.audit_persists = on_attempted_row([&h] { h.fleet_read_admit = false; });
+
+    auto res = h.post(q_form_body("q-admission-revoked", "&q=alp"));
+    CHECK(res->status == 403); // the gate's own refusal
+    CHECK(h.fleet_read_calls == 2); // before the row, and again after it
+    CHECK_FALSE(h.mg.find_group_by_name("q-admission-revoked").has_value());
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+    REQUIRE(h.audits_for("group.create_from_results", "failure") == 1);
+    const auto failure = h.audit_detail("group.create_from_results", "failure");
+    CHECK(failure.rfind("response_read_revoked name=q-admission-revoked", 0) == 0);
+    CHECK(cid_of(failure) == cid_of(h.audit_detail("group.create_from_results", "attempted")));
+    CHECK(h.audits_for("group.create_from_results", "success") == 0);
+}
+
+TEST_CASE("group-from-results (#7112): a Search term and Forensics:Read withdrawn inside the write "
+          "re-run the read under the narrower tier",
+          "[pg][server][dashboard][group_from_results][search][audit][security][forensics][3619][7112]") {
+    GroupFromResultsHarness h;
+    const char* const forensics = yuzu::server::test::kForensicsPlugin;
+    seed_titled_response(h.rs(), "agent-A", "cat-a", "alpha", forensics);
+    seed_titled_response(h.rs(), "agent-B", "cat-b", "alpha2", forensics);
+    seed_titled_response(h.rs(), "agent-C", "cat-a", "alpha3", yuzu::server::test::kOrdinaryPlugin);
+    seed_titled_response(h.rs(), "agent-D", "cat-a", "beta", yuzu::server::test::kOrdinaryPlugin);
+    h.forensics.admin();
+    h.audit_persists = on_attempted_row([&h] { h.forensics.viewer(); });
+
+    auto res = h.post(q_form_body("q-tier-withdrawn", "&q=alp"));
+    CHECK(res->status == 200);
+    auto group = h.mg.find_group_by_name("q-tier-withdrawn");
+    REQUIRE(group.has_value());
+    // Under the admin tier the Search matched A, B and C; the second read runs under the narrower
+    // tier, so only the agent whose ordinary-plugin output matches stays.
+    CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
+    CHECK(contains(h.audit_detail("group.create_from_results", "attempted"), "(3 agents from"));
+}
+
+TEST_CASE("group-from-results audit (#7076): one trailing cid ties the attempted row to every row "
+          "written after it",
+          "[pg][server][dashboard][group_from_results][audit][3619][7076]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    std::set<std::string> ids;
+    // Posts one request; its attempted row and its one outcome row, in order.
+    const auto run = [&](const std::string& body, const char* what) {
+        CAPTURE(what);
+        h.audits.clear();
+        h.post(body);
+        std::vector<AuditRow> rows;
+        for (const auto& row : h.audits)
+            if (row.action == "group.create_from_results")
+                rows.push_back(row);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].result == "attempted");
+        const auto id = cid_of(rows[0].detail);
+        CHECK(id.rfind("req-", 0) == 0);
+        CHECK(cid_of(rows[1].detail) == id);
+        ids.insert(id);
+        return rows;
+    };
+
+    // Success.
+    const auto ok = run(GroupFromResultsHarness::form_body("cid-ok"), "success");
+    CHECK(ok[1].result == "success");
+
+    // A group name carrying a forged ` cid=` token: the last token is still the server's.
+    const auto forged = run(GroupFromResultsHarness::form_body("cid-name+cid%3Dforged"), "forged name");
+    CHECK(contains(forged[0].detail, "cid-name cid=forged"));
+    CHECK(cid_of(forged[0].detail) != "forged");
+    CHECK(cid_of(forged[1].detail) != "forged");
+
+    // session_revoked.
+    h.audit_persists = on_attempted_row([&h] { h.session_valid = false; });
+    const auto session = run(GroupFromResultsHarness::form_body("cid-session"), "session_revoked");
+    h.audit_persists = [](const AuditRow&) { return true; };
+    h.session_valid = true;
+    CHECK(without_cid(session[1].detail) == "session_revoked");
+
+    // permission_revoked.
+    h.audit_persists = on_attempted_row([&h] { h.perm_allow = false; });
+    const auto permission = run(GroupFromResultsHarness::form_body("cid-perm"), "permission_revoked");
+    h.audit_persists = [](const AuditRow&) { return true; };
+    h.perm_allow = true;
+    CHECK(without_cid(permission[1].detail) == "permission_revoked name=cid-perm");
+
+    // scope_revoked: the visible set empties inside the write.
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::set<std::string>{"agent-A"};
+    };
+    h.audit_persists = on_attempted_row([&h] {
+        h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+            return std::set<std::string>{};
+        };
+    });
+    const auto scope = run(GroupFromResultsHarness::form_body("cid-scope"), "scope_revoked");
+    h.audit_persists = [](const AuditRow&) { return true; };
+    h.visible_set_fn = [](const std::string&) -> std::optional<std::set<std::string>> {
+        return std::nullopt;
+    };
+    CHECK(without_cid(scope[1].detail) == "scope_revoked");
+
+    // create_failed: a trigger makes the group insert fail (last, it breaks every later create).
+    {
+        PgConn conn{PQconnectdb(h.mg_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult fn_res{PQexec(
+            conn.get(),
+            "CREATE OR REPLACE FUNCTION management_group_store.block_group_7076() RETURNS "
+            "trigger AS $$ BEGIN RAISE EXCEPTION 'test: forced create_group failure'; END; $$ "
+            "LANGUAGE plpgsql;")};
+        REQUIRE(fn_res.ok());
+        PgResult trig_res{PQexec(conn.get(),
+                                 "CREATE TRIGGER block_group_7076 BEFORE INSERT ON "
+                                 "management_group_store.management_groups FOR EACH ROW "
+                                 "EXECUTE FUNCTION management_group_store.block_group_7076();")};
+        REQUIRE(trig_res.ok());
+    }
+    const auto create = run(GroupFromResultsHarness::form_body("cid-create"), "create_failed");
+    CHECK(without_cid(create[1].detail) == "create_failed name=cid-create");
+
+    CHECK(ids.size() == 6); // six requests, six different ids
+}
+
+TEST_CASE("group-from-results audit (#7116 CH-7): ManagementGroup:Write revoked after the last "
+          "recheck still ends in success, with no failure row",
+          "[pg][server][dashboard][group_from_results][audit][security][3619][7116]") {
+    // The visible set is resolved twice (before the row, and again after its rechecks). A grant that
+    // goes at the second resolution is past the last recheck: the group is created, and the honest
+    // outcome is success, never a failure row beside a created group.
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    h.visible_set_fn = [&h](const std::string&) -> std::optional<std::set<std::string>> {
+        if (h.visible_set_fn_calls == 2)
+            h.perm_allow = false;
+        return std::nullopt;
+    };
+
+    auto res = h.post(GroupFromResultsHarness::form_body("ch7-group"));
+    CHECK(res->status == 200);
+    CHECK(h.visible_set_fn_calls == 2);
+    CHECK(h.mg.find_group_by_name("ch7-group").has_value());
+    CHECK(h.audits_for("group.create_from_results", "attempted") == 1);
+    CHECK(h.audits_for("group.create_from_results", "success") == 1);
+    CHECK(h.audits_for("group.create_from_results", "failure") == 0);
 }
