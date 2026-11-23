@@ -4,8 +4,12 @@
 # iptables, and sudo cannot elevate under it. systemd, as root, owns this socket and starts one
 # yuzu-fw-snapshot@.service per connection; that service runs one fixed read-only script
 # (yuzu-fw-snapshot.sh) and writes its listing to the connection. The contract is
-# docs/adr/3007-os-activated-read-helpers.md. Disable it with `systemctl mask --now
-# yuzu-fw-snapshot.socket`: the agent then reads no firewall state on this unit and says so.
+# docs/adr/3007-os-activated-read-helpers.md. Disable it by stopping the socket and then masking it:
+# `systemctl stop yuzu-fw-snapshot.socket`, then `systemctl mask yuzu-fw-snapshot.socket`. The agent
+# then reads no firewall state through it: on a firewalld host the plugin answers firewalld's own rows,
+# elsewhere `unknown`, in both cases after the error rows of the reads it was refused. Measured on
+# Rocky 9.9 (systemd 252): `systemctl mask --now` alone left the socket file, and the agent then
+# reported `error|snapshot:connect:refused`; stop first, then mask, or remove the stale file.
 # The unit is designed for systemd 239 and later; the agent's README names the versions it has
 # been measured on.
 [Unit]
@@ -22,10 +26,10 @@ ListenStream=/run/yuzu-fw-snapshot.sock
 SocketUser=root
 SocketGroup=yuzu-agent
 SocketMode=0660
-# One service instance per connection, at most four at once; a fifth connect is refused and the
-# agent reports connect:busy.
+# One service instance per connection, at most four at once. A connection over the limit is accepted
+# and closed at once (measured on Rocky 9.9, systemd 252): the agent reads no byte and reports `empty`.
 Accept=yes
 MaxConnections=4
-# A stopped or masked broker leaves no socket file, so the agent declines silently instead of
-# reporting connect:refused on a socket nothing listens on.
+# Stopping the socket removes the file, so a broker that is stopped and then masked leaves none and the
+# agent declines silently instead of reporting connect:refused on a socket nothing listens on.
 RemoveOnStop=yes

@@ -443,8 +443,10 @@ TEST_CASE("macOS: a non-empty yuzu anchor is residue", "[firewall]") {
 
 TEST_CASE("macOS: pf_anchor_absent reads an anchor that is not loaded as absent, and nothing else",
           "[firewall]") {
-    // what pfctl is expected to answer for an anchor that does not exist (not yet observed on a
-    // macOS host): it ran, exited non-zero (1 here) and printed its error; both main reads completed
+    // what pfctl answers for an anchor that is not loaded on macOS 26.6.2 is exit 0 with this line on
+    // stderr (see pf_anchor_section below); an exit of 1 with it was not observed there, and is the
+    // absent anchor of a host that does exit non-zero: it ran, exited non-zero and printed its error;
+    // both main reads completed
     const std::string_view invalid = "pfctl: DIOCGETRULES: Invalid argument\n";
     CHECK(pf_anchor_absent(true, true, 1, invalid));
     // the exit status decides, not the wording: another pfctl text with the same exit is absent too
@@ -481,6 +483,59 @@ TEST_CASE("macOS: pf_anchor_absent reads an anchor that is not loaded as absent,
     write_section(broken, label::kYuzuAnchor, false, "");
     finish(broken);
     CHECK_FALSE(readable(Os::mac, broken));
+}
+
+TEST_CASE("macOS: the anchor section is the read's stdout, and stderr is asked for only when it did not "
+          "complete",
+          "[firewall]") {
+    // measured on macOS 26.6.2: an anchor that is not loaded reads exit 0, nothing on stdout and this on stderr
+    const std::string_view real_line = "pfctl: DIOCGETRULES: Invalid argument\n";
+    int rereads = 0;
+    const auto reread = [&](PfAnchorRead merged) {
+        return [&rereads, merged = std::move(merged)] {
+            ++rereads;
+            return merged;
+        };
+    };
+    const auto base = mac_snapshot(kPfRulesMain, kPfOn, kPfRefs, "");
+
+    // exit 0 and empty stdout: an empty, readable section that restores, and no second read
+    const auto empty = pf_anchor_section(true, PfAnchorRead{true, true, 0, ""}, reread({}));
+    REQUIRE(empty.has_value());
+    CHECK(empty->empty());
+    CHECK(rereads == 0);
+    const auto restored = compare(Os::mac, base, mac_snapshot(kPfRulesMain, kPfOn, kPfRefs, *empty));
+    CHECK(restored.readable);
+    CHECK(restored.restored);
+
+    // exit 0 with rule lines: they are kept, and they are residue
+    const auto loaded = pf_anchor_section(true, PfAnchorRead{true, true, 0, "no nat all\nno rdr all\nblock drop quick all\n"},
+                                          reread({}));
+    REQUIRE(loaded.has_value());
+    const auto residue = compare(Os::mac, base, mac_snapshot(kPfRulesMain, kPfOn, kPfRefs, *loaded));
+    CHECK(residue.yuzu_residue == 3);
+    CHECK_FALSE(residue.restored);
+    CHECK(rereads == 0);
+
+    // why stderr must stay out of the section: the real line, were it in there, is read as a rule left behind
+    const auto merged_in = compare(Os::mac, base, mac_snapshot(kPfRulesMain, kPfOn, kPfRefs, real_line));
+    CHECK(merged_in.yuzu_residue == 1);
+    CHECK_FALSE(merged_in.restored);
+
+    // a read that did not complete is read again with stderr merged: a sudo refusal is never an absent anchor
+    const auto refused = pf_anchor_section(true, PfAnchorRead{false, true, 1, ""},
+                                           reread({false, true, 1, "sudo: a password is required\n"}));
+    CHECK_FALSE(refused.has_value()); // `[failed]`
+    CHECK(rereads == 1);
+    // ... a non-zero exit with pfctl's own error is the absent anchor of a host that exits non-zero
+    const auto absent = pf_anchor_section(true, PfAnchorRead{false, true, 1, ""}, reread({false, true, 1, std::string{real_line}}));
+    REQUIRE(absent.has_value());
+    CHECK(absent->empty());
+    CHECK(rereads == 2);
+    // ... but only after the two main reads completed, and never for a read that did not run to an exit
+    CHECK_FALSE(pf_anchor_section(false, PfAnchorRead{false, true, 1, ""}, reread({false, true, 1, std::string{real_line}}))
+                    .has_value());
+    CHECK_FALSE(pf_anchor_section(true, PfAnchorRead{false, false, 0, ""}, reread({false, false, 0, ""})).has_value());
 }
 
 TEST_CASE("macOS: count_pf_rule_lines leaves the ALTQ notices and blank lines out",

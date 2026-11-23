@@ -4729,8 +4729,13 @@ test('firewall Windows release-guard wiring lexical gate',
 # compiles. macOS: every pf read is run_bounded_subprocess(sudo_wrap(fq::pfctl_*_argv())) with stderr
 # unmerged and no /sbin/pfctl literal (a bare pfctl exits 1 for the least-privilege account).
 # Windows: every per-rule property read lands in an HRESULT that reaches the pure row builder (no
-# FAILED() decides a field) and neither skip site drops a rule without its row. Carries its own
-# in-memory mutation self-test. No build required; well under a second.
+# FAILED() decides a field) and neither skip site drops a rule without its row. Linux: the ladder
+# firewalld -> nftables -> root snapshot broker -> ufw -> iptables (a partly read firewalld is held
+# behind the broker, which replaces it only with an active ruleset), the broker reader's bounds and the
+# installer-helper transport. Broker units: the shipped socket, template service and snapshot script,
+# what the deb and rpm install, the agent unit's untouched sandbox, and `systemd-analyze verify` of the
+# three units where that tool exists. Carries its own in-memory mutation self-test. No build required;
+# a few seconds with systemd-analyze, well under a second without.
 test('firewall read-path wiring lexical gate',
   _python3_test,
   args: [files('test_firewall_read_wiring_lexical.py')],

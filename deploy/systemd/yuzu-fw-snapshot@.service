@@ -25,8 +25,14 @@ StandardError=null
 RuntimeMaxSec=30
 # Bounds the processes and threads the instance may create.
 TasksMax=16
-# No privilege can be gained by any program the script starts.
-NoNewPrivileges=true
+# NoNewPrivileges is deliberately NOT set. Measured on Rocky 9.9 with SELinux enforcing (systemd 252):
+# with it, every exec of nft, iptables and ip6tables was a denied nnp_transition from initrc_t to
+# iptables_t (three audit denials per read) and the tools ran in the script's domain, not their own
+# confined one; the distribution's policy grants that transition only without no_new_privs. What bounds
+# the instance without it is unchanged: it runs as root with only the two capabilities below, so an exec
+# can yield no more than that set, and the system call filter, address families, namespaces, memory and
+# file system restrictions below apply to every process the script starts. The script takes no input.
+# The agent's own unit keeps NoNewPrivileges=true and its one capability (yuzu-agent.service).
 # Only the two capabilities the reads can need: CAP_NET_ADMIN to read nftables and iptables state,
 # CAP_NET_RAW for legacy iptables (a raw socket; that it needs the capability is inferred, not measured).
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW

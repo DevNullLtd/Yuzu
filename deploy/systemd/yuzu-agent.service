@@ -4,12 +4,13 @@ Documentation=https://github.com/DevNullLtd/Yuzu
 After=network-online.target
 Wants=network-online.target
 # The root-owned socket the firewall plugin reads the host firewall through
-# (docs/adr/3007-os-activated-read-helpers.md). This unit's own [Service] sandbox below is unchanged: NoNewPrivileges stays true and the
-# bounding set stays the one capability. The agent only connects to the socket and reads; the
-# service that answers is started by systemd, never by the agent. Wants= starts the socket whenever
-# the agent starts and its PartOf= stops it with the agent; `systemctl mask --now
-# yuzu-fw-snapshot.socket` opts out. A unit file copied without the socket and service units simply
-# gets no firewall state from the plugin.
+# (docs/adr/3007-os-activated-read-helpers.md). This unit's own [Service] sandbox below is unchanged:
+# NoNewPrivileges stays true and the bounding set stays the one capability. The agent only connects to
+# the socket and reads; the service that answers is started by systemd, never by the agent. Wants=
+# starts the socket whenever the agent starts and its PartOf= stops it with the agent;
+# `systemctl stop yuzu-fw-snapshot.socket` and then `systemctl mask yuzu-fw-snapshot.socket` opts out
+# (`mask --now` alone left the socket file on Rocky 9.9). A unit file copied without the socket and
+# service units simply gets no firewall state from the plugin.
 Wants=yuzu-fw-snapshot.socket
 After=yuzu-fw-snapshot.socket
 

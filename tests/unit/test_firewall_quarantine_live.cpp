@@ -352,7 +352,7 @@ constexpr fr::Os kThisOs = fr::Os::lin;
         if (n == 0)
             return text;
         text.append(buf, static_cast<std::size_t>(n));
-        if (text.size() > 2 * 1048576)
+        if (text.size() > 2 * yuzu::firewall::kFwSnapshotMaxBytes)
             return std::nullopt;
     }
 }
@@ -364,6 +364,26 @@ constexpr fr::Os kThisOs = fr::Os::lin;
         appended += line.rfind("-A ", 0) == 0 ? 1 : 0;
     return appended;
 }
+
+/// The rule count the baseline predicts for the backend that answered: nft's rule handles, or the
+/// `-A` lines of both iptables families. nullopt for any other backend (firewalld, ufw, none): their
+/// counts are not in the baseline, so a caller that REQUIREs the value fails such an answer instead of
+/// passing it without comparing anything.
+[[nodiscard, maybe_unused]] std::optional<std::size_t> expected_ruleset_count(const std::string& before,
+                                                                              std::string_view backend) {
+    if (backend == "nftables") {
+        const auto nft = fr::section(before, fr::label::kNft);
+        return nft ? std::optional<std::size_t>{fr::count_nft_rules(*nft)} : std::nullopt;
+    }
+    if (backend == "iptables") {
+        const auto ipt = fr::section(before, fr::label::kIptables);
+        const auto ip6t = fr::section(before, fr::label::kIp6tables);
+        if (!ipt && !ip6t)
+            return std::nullopt;
+        return count_appended(ipt.value_or("")) + count_appended(ip6t.value_or(""));
+    }
+    return std::nullopt;
+}
 #endif
 
 /// A snapshot whose one read failed: it can never compare equal to anything, itself included.
@@ -374,12 +394,17 @@ constexpr fr::Os kThisOs = fr::Os::lin;
     return out;
 }
 
+/// An anchor read reduced to what fr::pf_anchor_section and fr::pf_anchor_absent decide on.
+[[nodiscard, maybe_unused]] fr::PfAnchorRead pf_anchor_read(const yuzu::agent::SubprocessResult& anchor) {
+    return {yuzu::firewall::subprocess_complete(anchor),
+            anchor.tool_ran && !anchor.timed_out && !anchor.output_truncated, anchor.exit_code, anchor.output};
+}
+
 /// The anchor read, decided by fr::pf_anchor_absent from the subprocess result.
 [[nodiscard, maybe_unused]] bool pf_anchor_absent(bool main_reads_complete,
                                                   const yuzu::agent::SubprocessResult& anchor) {
-    return fr::pf_anchor_absent(main_reads_complete,
-                                anchor.tool_ran && !anchor.timed_out && !anchor.output_truncated,
-                                anchor.exit_code, anchor.output);
+    const auto read = pf_anchor_read(anchor);
+    return fr::pf_anchor_absent(main_reads_complete, read.ran_to_exit, read.exit_code, read.output);
 }
 
 /// The host firewall as sectioned text (firewall_restore_compare.hpp), for the restore check.
@@ -452,16 +477,18 @@ constexpr fr::Os kThisOs = fr::Os::lin;
                       fr::pf_status_line(info.output));
     const auto refs = pf({"-s", "References"});
     fr::write_section(out, fr::label::kPfReferences, yuzu::firewall::subprocess_complete(refs), refs.output);
-    // The yuzu anchor is simply not loaded on a clean host and after a release: pfctl then exits
-    // non-zero for it, which is an EMPTY section (the plugin reads it as "no anchor" the same way),
-    // never `[failed]`. Anything else that did not complete stays `[failed]`.
-    const auto anchor = pf({"-a", std::string{fq::kPfAnchor}, "-s", "rules"});
+    // The yuzu anchor is simply not loaded on a clean host and after a release: pfctl then prints an
+    // error on stderr (macOS 26.6.2: exit 0), which must not be read as a rule left behind, so the
+    // section is the anchor read's STDOUT. Only a read that did not complete is made again with
+    // stderr merged, for sudo's own message (fr::pf_anchor_section): absent is an EMPTY section (the
+    // plugin reads it as "no anchor" the same way), anything else that did not complete is `[failed]`.
     const bool main_complete =
         yuzu::firewall::subprocess_complete(rules) && yuzu::firewall::subprocess_complete(info);
-    const bool anchor_complete = yuzu::firewall::subprocess_complete(anchor);
-    fr::write_section(out, fr::label::kYuzuAnchor,
-                      anchor_complete || pf_anchor_absent(main_complete, anchor),
-                      anchor_complete ? anchor.output : "");
+    const auto anchor_argv = harness_sudo({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", "rules"});
+    const auto anchor = fr::pf_anchor_section(
+        main_complete, pf_anchor_read(capture_result(anchor_argv, 60s, /*merge_stderr=*/false)),
+        [&] { return pf_anchor_read(capture_result(anchor_argv)); });
+    fr::write_section(out, fr::label::kYuzuAnchor, anchor.has_value(), anchor.value_or(""));
     fr::finish(out);
     return out;
 #endif
@@ -1841,26 +1868,17 @@ TEST_CASE("live: state reports what the OS tool reports, and the host is left as
     } else if (running_as_root() && *backend == "iptables") {
         const auto ipt = fr::section(before, fr::label::kIptables);
         REQUIRE(ipt.has_value());
-        std::size_t appended = 0;
-        for (const auto& line : rows_of(*ipt))
-            appended += line.rfind("-A ", 0) == 0 ? 1 : 0;
-        CHECK(*ruleset == std::to_string(appended));
+        CHECK(*ruleset == std::to_string(count_appended(*ipt))); // a root agent's own iptables leg reads IPv4 only
     } else if (!running_as_root() && snapshot_transport_present()) {
         // Answered through the root snapshot broker or the installer helper's snapshot word (the
         // agent cannot read the ruleset itself): the state is a real answer, no error row says
-        // otherwise, and the count is the baseline's.
+        // otherwise, and the count is the baseline's. The backend must be nftables or iptables: a
+        // firewalld answer (a service list the account could not read) is not this transport's.
         CHECK(*state != "unknown");
         CHECK_FALSE(has_prefix(r.captured, "error|"));
-        if (*backend == "nftables") {
-            const auto nft = fr::section(before, fr::label::kNft);
-            REQUIRE(nft.has_value());
-            CHECK(*ruleset == std::to_string(fr::count_nft_rules(*nft)));
-        } else if (*backend == "iptables") {
-            const auto ipt = fr::section(before, fr::label::kIptables);
-            const auto ip6t = fr::section(before, fr::label::kIp6tables);
-            REQUIRE((ipt.has_value() || ip6t.has_value()));
-            CHECK(*ruleset == std::to_string(count_appended(ipt.value_or("")) + count_appended(ip6t.value_or(""))));
-        }
+        const auto want = expected_ruleset_count(before, *backend);
+        REQUIRE(want.has_value());
+        CHECK(*ruleset == std::to_string(*want));
     } else if (!running_as_root() && *state == "unknown") {
         // The agent account cannot read the ruleset itself (netlink dumps and iptables need root):
         // an honest unknown is the right answer, and it must say why, unless the backend that
@@ -1934,20 +1952,16 @@ TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it 
         CHECK(count_prefixed(r.captured, "rule|nftables|") >= n); // the rule handles, plus the base chains
     } else if (!running_as_root() && snapshot_transport_present()) {
         // Answered through the root snapshot broker or the installer helper: a real count, no error
-        // row, and the baseline's.
+        // row, and the baseline's, from nftables or iptables (never a firewalld answer, as above).
         CHECK_FALSE(has_prefix(r.captured, "error|"));
         CHECK(is_integer(*ruleset));
-        if (*backend == "nftables") {
-            const auto nft = fr::section(before, fr::label::kNft);
-            REQUIRE(nft.has_value());
-            CHECK(*ruleset == std::to_string(fr::count_nft_rules(*nft)));
-        } else if (*backend == "iptables") {
-            const auto ipt = fr::section(before, fr::label::kIptables);
-            const auto ip6t = fr::section(before, fr::label::kIp6tables);
-            REQUIRE((ipt.has_value() || ip6t.has_value()));
-            CHECK(*ruleset == std::to_string(count_appended(ipt.value_or("")) + count_appended(ip6t.value_or(""))));
+        const auto want = expected_ruleset_count(before, *backend);
+        REQUIRE(want.has_value());
+        CHECK(*ruleset == std::to_string(*want));
+        if (*backend == "iptables") {
             // an IPv6 entry is listed under its own form
-            CHECK((count_appended(ip6t.value_or("")) == 0 || has_prefix(r.captured, "rule|ip6|")));
+            CHECK((count_appended(fr::section(before, fr::label::kIp6tables).value_or("")) == 0 ||
+                   has_prefix(r.captured, "rule|ip6|")));
         }
     } else if (!running_as_root()) {
         CHECK((*ruleset == "unknown" || is_integer(*ruleset))); // honest, never a fabricated count

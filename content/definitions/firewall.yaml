@@ -26,7 +26,10 @@ metadata:
     Query the firewall state on the endpoint. On Windows, reports the
     enabled/disabled status of each Windows Firewall profile (Domain,
     Private, Public). On Linux, auto-detects the active firewall backend
-    (firewalld, nftables, ufw or iptables) and reports its state; on the
+    (firewalld, nftables, ufw or iptables) and reports its state; a firewalld
+    whose service list could not be read completely is held behind the
+    nftables and snapshot reads and answers (state|running, ruleset|unknown)
+    only when none of them shows an active ruleset; on the
     packaged unit, which cannot read nftables or iptables itself, the nftables
     and iptables state is read through the root-owned snapshot socket
     (error|snapshot:<token> when that read fails). On macOS, reports
@@ -174,7 +177,9 @@ metadata:
     (capped at 100 rules, with a truncated marker row only when a genuine 101st rule exists)
     with rule name, enabled state, direction, action, and profile mask. On
     Linux, uses the detected backend: firewalld zones and services over
-    D-Bus, nftables chains and rule handles over netlink (or, on the packaged
+    D-Bus (only when that read was complete: a partly read firewalld is held
+    and answers, with ruleset|unknown, only when no read shows an active
+    ruleset), nftables chains and rule handles over netlink (or, on the packaged
     unit, the root snapshot socket's nftables listing), or the structured
     parse of ufw status numbered / iptables -S (through the snapshot socket
     the iptables and ip6tables listings are read together, IPv6 entries as
@@ -233,7 +238,14 @@ spec:
           complete (macOS: appfirewall:listapps:<token>, pf:anchors:<token>,
           pf:rules:<token>; Windows: rule_property:<rules>:0x<hresult>, the
           number of rules with a property that could not be read and the
-          first HRESULT, written before the ruleset row), and Linux emits "backend", "fallthrough" and a
+          first HRESULT, written before the ruleset row; Linux:
+          snapshot:<token> when the root snapshot socket could not be read
+          (connect:eacces, connect:refused, connect:busy, connect:errno:<n>,
+          peer_not_root, timeout, io_error, oversized, empty, truncated or
+          malformed), nftables:snapshot:failed, nftables:unrecognised_output,
+          iptables:snapshot:failed, ip6tables:snapshot:failed or
+          ip6tables:unrecognised_output for a snapshot section that failed or
+          is not in the expected shape), and Linux emits "backend", "fallthrough" and a
           "rules" row (unknown) when no backend could answer.
         values: [rule, app, anchor, ruleset, truncated, backend, error, fallthrough, rules]
         example: Core Networking - DNS (UDP-Out)

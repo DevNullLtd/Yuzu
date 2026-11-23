@@ -26,6 +26,11 @@
  *               firewalld: rung 1, bounded sd-bus (org.fedoraproject.
  *                 FirewallD1), mirroring guardian_state_reader.cpp's
  *                 timeout-budget-re-arm pattern across sequential calls.
+ *                 It answers first only when its read was complete. An
+ *                 account that polkit refuses getServices (the packaged
+ *                 agent's) reads a partial answer, which is held: nftables
+ *                 and the broker run, only an active ruleset replaces it,
+ *                 and ufw and iptables are not consulted (firewalld_rung).
  *               nftables:  rung 1, bounded NETLINK_NETFILTER (no libnftnl/
  *                 libmnl dependency — neither is a vcpkg dependency today,
  *                 see PR notes). Read-only table/chain/rule enumeration via
@@ -40,7 +45,7 @@
  *                 neither nftables nor iptables itself, so the broker's
  *                 fixed read-only script does, and the pure parsers frame
  *                 and decide its reply (parse_fw_snapshot and
- *                 linux_snapshot_*_rows in firewall_parsers.hpp). With no
+ *                 linux_snapshot_answer in firewall_parsers.hpp). With no
  *                 socket, a non-root agent not under NoNewPrivileges reads
  *                 the same listing from the root helper's `snapshot` word
  *                 through sudo (rung 3, site firewall/try_snapshot#1).
@@ -479,6 +484,14 @@ void do_rules_macos(yuzu::CommandContext& ctx) {
 
 #elif defined(__linux__)
 
+/// What the firewalld rung read and the rows it would write for it. The rung writes nothing itself:
+/// the dispatcher decides whether firewalld's answer stands (a complete read) or waits behind the
+/// reads that can see more (do_state_linux, do_rules_linux).
+struct FirewalldRung {
+    yuzu::firewall::FirewalldRead read = yuzu::firewall::FirewalldRead::absent;
+    std::vector<std::string> rows;
+};
+
 #if defined(YUZU_HAVE_LIBSYSTEMD)
 
 // ── firewalld (rung 1, bounded sd-bus) ──────────────────────────────────
@@ -530,13 +543,9 @@ constexpr const char* kFirewalldDest = "org.fedoraproject.FirewallD1";
 constexpr const char* kFirewalldPath = "/org/fedoraproject/FirewallD1";
 constexpr const char* kFirewalldZoneIface = "org.fedoraproject.FirewallD1.zone";
 
-struct FirewalldZoneInfo {
-    std::string name;
-    std::vector<std::string> services;
-};
 struct FirewalldQueryResult {
     bool reachable = false; // false -> caller falls through to the next backend
-    std::vector<FirewalldZoneInfo> zones;
+    std::vector<yuzu::firewall::FirewalldZone> zones;
     // false whenever the per-zone getServices loop below either hit the
     // remaining-budget==0 break (some zones never queried at all) or saw any
     // individual getServices call return rc<0 (that zone's services are a
@@ -550,12 +559,16 @@ struct FirewalldQueryResult {
 // NOTE: getActiveZones()'s "a{sa{sas}}" signature (zone -> {"interfaces":
 // [...], "sources": [...]}) and getServices()'s "as" signature are taken
 // from firewalld's published D-Bus API and exercised here via the same
-// enter_container/exit_container idiom as guardian_state_reader.cpp — this
-// leg has not been verified against a live firewalld (no D-Bus broker
-// available in this sandbox; see the PR notes). A signature mismatch fails
-// the corresponding enter_container/read call (rc < 0), which this code
-// treats as "that field unavailable" rather than a crash or a fabricated
-// row — so a wrong guess degrades honestly instead of corrupting output.
+// enter_container/exit_container idiom as guardian_state_reader.cpp.
+// Measured once, on Rocky 9.9 with firewalld running, as the packaged
+// agent account (no polkit rule for it): getActiveZones answered and
+// getServices was refused, so that account reads a `partial` answer
+// (firewalld_read in firewall_parsers.hpp). The getServices reply decode
+// has not been run against a live reply by an account allowed to ask. A
+// signature mismatch fails the corresponding enter_container/read call
+// (rc < 0), which this code treats as "that field unavailable" rather than
+// a crash or a fabricated row — so a wrong guess degrades honestly instead
+// of corrupting output.
 // getPorts() is deliberately NOT queried here: its per-element termination
 // semantics under a manually-entered outer array could not be verified with
 // the same confidence (no live firewalld to test against) and a
@@ -600,7 +613,7 @@ FirewalldQueryResult query_firewalld(bool want_rules) {
         return r;
     }
     while (sd_bus_message_enter_container(reply.m, 'e', "sa{sas}") > 0) {
-        FirewalldZoneInfo zone;
+        yuzu::firewall::FirewalldZone zone;
         const char* zone_name = nullptr;
         sd_bus_message_read(reply.m, "s", &zone_name);
         if (zone_name)
@@ -685,49 +698,24 @@ FirewalldQueryResult query_firewalld(bool want_rules) {
     return r;
 }
 
-bool try_firewalld_state(yuzu::CommandContext& ctx) {
-    // want_rules=true (not the old false): the state action's ruleset|<n>
-    // row needs services actually enumerated -- want_rules=false returns
-    // zero services unconditionally, which would misreport as ruleset|0
-    // rather than the honest ruleset|unknown/real count this row promises.
-    auto q = query_firewalld(/*want_rules=*/true);
-    if (!q.reachable)
-        return false;
-    ctx.write_output("backend|firewalld");
-    ctx.write_output("state|running");
-    if (q.services_complete) {
-        std::size_t total = 0;
-        for (const auto& zone : q.zones)
-            total += zone.services.size();
-        ctx.write_output(std::format("ruleset|{}", total));
-    } else {
-        ctx.write_output("ruleset|unknown");
-    }
-    return true;
-}
-
-bool try_firewalld_rules(yuzu::CommandContext& ctx) {
-    auto q = query_firewalld(/*want_rules=*/true);
-    if (!q.reachable)
-        return false;
-    ctx.write_output("backend|firewalld");
-    std::size_t total = 0;
-    for (const auto& zone : q.zones) {
-        for (const auto& svc : zone.services) {
-            ctx.write_output(
-                std::format("rule|firewalld|{}|service|{}", sanitize_field(zone.name), svc));
-            ++total;
-        }
-    }
-    ctx.write_output(q.services_complete ? std::format("ruleset|{}", total)
-                                         : std::string("ruleset|unknown"));
-    return true;
+/// One read of firewalld for `state` or `rules`, as the rows it would write and how complete the read
+/// was. want_rules=true for both actions: the state action's ruleset|<n> row needs the services
+/// enumerated, and want_rules=false returns none, which would read as ruleset|0 rather than the
+/// honest count or ruleset|unknown. The account that runs the packaged agent has no polkit rule, so
+/// firewalld answers its getActiveZones and refuses getServices (measured on Rocky 9.9, firewalld
+/// running): a `partial` read, which must not stand in for the ruleset the account can read through
+/// the broker.
+FirewalldRung firewalld_rung(yuzu::firewall::FwReadAction action) {
+    const auto q = query_firewalld(/*want_rules=*/true);
+    const auto read = yuzu::firewall::firewalld_read(q.reachable, q.services_complete);
+    if (read == yuzu::firewall::FirewalldRead::absent)
+        return {read, {}};
+    return {read, yuzu::firewall::firewalld_rows(q.zones, q.services_complete, action)};
 }
 
 #else // !YUZU_HAVE_LIBSYSTEMD
 
-bool try_firewalld_state(yuzu::CommandContext&) { return false; }
-bool try_firewalld_rules(yuzu::CommandContext&) { return false; }
+FirewalldRung firewalld_rung(yuzu::firewall::FwReadAction) { return {}; }
 
 #endif // YUZU_HAVE_LIBSYSTEMD
 
@@ -1090,6 +1078,10 @@ nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
 /// than restructured).
 struct NftFallthroughInfo {
     bool tables_seen = false;
+    /// firewalld answered getActiveZones but its service list was not completely read (a `partial`
+    /// firewalld_rung): its own answer is held behind the reads that can see the ruleset, and until
+    /// one of them shows an active ruleset the nft rung and the snapshot rung write no answer.
+    bool firewalld_running = false;
     std::vector<yuzu::firewall::NftFailedDump> failed;
     unsigned churn_streak = 0;
     /// Rows the dispatcher writes only when no later rung answers: the table dump's own row waits
@@ -1239,7 +1231,9 @@ struct NftProbeResult {
 
 /// true iff a trustworthy state| row was written (dispatch should stop);
 /// false means the caller continues probing ufw/iptables, clamped per
-/// `info.tables_seen` (C4).
+/// `info.tables_seen` (C4). While `info.firewalld_running`, only an active
+/// ruleset answers: anything else returns false with no backend row, so
+/// firewalld's held answer is replaced only by a read that shows content.
 bool try_nftables_state(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
     auto probe = run_nft_probe(ctx, info);
     if (!probe)
@@ -1249,7 +1243,6 @@ bool try_nftables_state(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
 
     auto chains = yuzu::firewall::parse_nft_chains(probe->chain_buf);
     auto rules = yuzu::firewall::parse_nft_rules(probe->rule_buf);
-    ctx.write_output("backend|nftables"); // commits: nftables IS the final answer
     // probe->trusted is already true here (the early return above handles
     // false), so nft_decide_state(true, true, ...) always resolves through
     // its active/inactive branch -- called anyway so the unit-tested
@@ -1257,6 +1250,9 @@ bool try_nftables_state(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
     // hand-inlined equivalent (#3463-2).
     const auto verdict = yuzu::firewall::nft_decide_state(/*chains_ok=*/true, /*rules_ok=*/true,
                                                             chains, rules);
+    if (info.firewalld_running && verdict != yuzu::firewall::NftVerdict::active)
+        return false;
+    ctx.write_output("backend|nftables"); // commits: nftables IS the final answer
     ctx.write_output(std::format("state|{}", yuzu::firewall::nft_verdict_name(verdict)));
     ctx.write_output(std::format("ruleset|{}", rules.size()));
     return true;
@@ -1270,14 +1266,17 @@ bool try_nftables_rules(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
     if (!probe->trusted)
         return false;
 
+    const auto chains = yuzu::firewall::parse_nft_chains(probe->chain_buf);
+    const auto rules = yuzu::firewall::parse_nft_rules(probe->rule_buf);
+    if (info.firewalld_running && !yuzu::firewall::nft_has_content(chains, rules))
+        return false;
     ctx.write_output("backend|nftables"); // commits
 
-    for (const auto& c : yuzu::firewall::parse_nft_chains(probe->chain_buf)) {
+    for (const auto& c : chains) {
         if (!c.is_base_chain)
             continue; // regular chains carry no hook/policy of their own
         ctx.write_output(yuzu::firewall::format_nft_chain_rule_row(c));
     }
-    const auto rules = yuzu::firewall::parse_nft_rules(probe->rule_buf);
     for (const auto& r : rules)
         ctx.write_output(yuzu::firewall::format_nft_rule_handle_row(r));
     ctx.write_output(std::format("ruleset|{}", rules.size()));
@@ -1292,8 +1291,10 @@ bool try_nftables_rules(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
 // socket unit yuzu-fw-snapshot.socket runs one fixed read-only script per connection and writes the
 // listing to it. The agent connects, sends NOTHING and reads to end of stream: no process is
 // spawned here (rung 1), and the reply is untrusted text that the pure parsers frame and decide.
-// A host without the broker has no socket file (RemoveOnStop=yes), which declines silently, or
-// reads the installer helper's `snapshot` word instead (read_fw_snapshot_via_helper below).
+// A host without the broker has no socket file, which declines silently, or reads the installer
+// helper's `snapshot` word instead (read_fw_snapshot_via_helper below). The documented opt-out
+// stops the socket and then masks it (`systemctl stop`, then `systemctl mask`): on Rocky 9.9
+// (systemd 252) `mask --now` alone left the socket file and this read reported `connect:refused`.
 
 /// One read of the broker: the reply text, or the token that says why there is none. An EMPTY token
 /// means the broker is not installed (ENOENT) and is not reported. Tokens: connect:eacces,
@@ -1370,7 +1371,8 @@ read_fw_snapshot(std::chrono::steady_clock::time_point deadline) {
         return std::nullopt;
     const auto res = run_bounded_subprocess(
         yuzu::shared::sudo_wrap({std::string{fq::kFwHelperPath}, "snapshot"}),
-        SubprocessOptions{.deadline = kAcqDeadline, .output_cap_bytes = 2 * 1024 * 1024});
+        SubprocessOptions{.deadline = kAcqDeadline,
+                          .output_cap_bytes = 2 * yuzu::firewall::kFwSnapshotMaxBytes});
     if (!subprocess_complete(res))
         return std::nullopt;
     return res.output;
@@ -1378,9 +1380,12 @@ read_fw_snapshot(std::chrono::steady_clock::time_point deadline) {
 
 /// true iff the snapshot answered (dispatch stops); false means the next rung runs. A broker that
 /// is not installed says nothing (and the helper transport is tried); one that is but could not be
-/// read says why in an `error|snapshot:<token>` row. `rules` selects the action; the rows are the
-/// pure decision's.
-bool try_snapshot(yuzu::CommandContext& ctx, bool tables_seen, bool rules) {
+/// read says why in an `error|snapshot:<token>` row. The rows are the pure decision's
+/// (linux_snapshot_answer). While `info.firewalld_running` only an active answer is written and
+/// accepted; any other answer writes just its `error|` rows, so firewalld's held answer stands and
+/// the refusals that explain what was not read are still reported.
+bool try_snapshot(yuzu::CommandContext& ctx, const NftFallthroughInfo& info,
+                  yuzu::firewall::FwReadAction action) {
     auto reply = read_fw_snapshot(std::chrono::steady_clock::now() + kAcqDeadline);
     if (!reply && reply.error().empty()) {
         // No socket file: not the packaged unit. The installer's helper is the other transport.
@@ -1397,21 +1402,14 @@ bool try_snapshot(yuzu::CommandContext& ctx, bool tables_seen, bool rules) {
         ctx.write_output(yuzu::firewall::snapshot_error_row(snapshot.error()));
         return false;
     }
-    const auto rows = rules ? yuzu::firewall::linux_snapshot_rules_rows(*snapshot, tables_seen)
-                            : yuzu::firewall::linux_snapshot_state_rows(*snapshot, tables_seen);
-    if (rows.empty())
+    const auto answer = yuzu::firewall::linux_snapshot_answer(*snapshot, info.tables_seen, action);
+    if (answer.rows.empty())
         return false; // no nft and no iptables on this host: nothing the snapshot can say
-    for (const auto& row : rows)
-        ctx.write_output(row);
-    return true;
-}
-
-bool try_snapshot_state(yuzu::CommandContext& ctx, bool tables_seen) {
-    return try_snapshot(ctx, tables_seen, /*rules=*/false);
-}
-
-bool try_snapshot_rules(yuzu::CommandContext& ctx, bool tables_seen) {
-    return try_snapshot(ctx, tables_seen, /*rules=*/true);
+    const bool answers = !info.firewalld_running || answer.state == yuzu::firewall::NftVerdict::active;
+    for (const auto& row : answer.rows)
+        if (answers || row.starts_with("error|"))
+            ctx.write_output(row);
+    return answers;
 }
 
 // ── ufw (rung 2, argv) ───────────────────────────────────────────────────
@@ -1575,20 +1573,37 @@ bool try_iptables_rules(yuzu::CommandContext& ctx) {
 // answers either — bookkeeping a boolean chain can't carry.
 
 void do_state_linux(yuzu::CommandContext& ctx) {
-    if (try_firewalld_state(ctx))
+    // firewalld answers first only when its read was complete. A partial read (getServices refused
+    // to this account) holds its rows behind the reads that can see the ruleset: it says that
+    // firewalld runs, which is true, but not what is filtering, and it must not hide an agent that
+    // can read the ruleset or the broker that can read it for one that cannot.
+    const auto firewalld = firewalld_rung(yuzu::firewall::FwReadAction::state);
+    if (firewalld.read == yuzu::firewall::FirewalldRead::complete) {
+        for (const auto& row : firewalld.rows)
+            ctx.write_output(row);
         return;
+    }
 
     NftFallthroughInfo info;
+    info.firewalld_running = firewalld.read == yuzu::firewall::FirewalldRead::partial;
     if (try_nftables_state(ctx, info))
         return;
 
     // The packaged unit cannot read nftables or iptables itself: the root snapshot broker can. When
     // it answers, the table dump's deferred row is dropped (the read succeeded, so the EPERM row
     // would mislead); when it does not, the row is written and the ladder goes on as before.
-    if (try_snapshot_state(ctx, info.tables_seen))
+    if (try_snapshot(ctx, info, yuzu::firewall::FwReadAction::state))
         return;
     for (const auto& row : info.pending_rows)
         ctx.write_output(row);
+
+    // Nothing that can see the ruleset showed an active one: a partly read firewalld answers, as it
+    // did before the broker existed (ufw and iptables are not consulted).
+    if (info.firewalld_running) {
+        for (const auto& row : firewalld.rows)
+            ctx.write_output(row);
+        return;
+    }
 
     if (info.tables_seen) {
         // GETTABLE succeeded (something IS managing nftables here) but the
@@ -1627,18 +1642,30 @@ void do_state_linux(yuzu::CommandContext& ctx) {
 }
 
 void do_rules_linux(yuzu::CommandContext& ctx) {
-    if (try_firewalld_rules(ctx))
+    // firewalld's answer, held when it was only partly read, as in do_state_linux.
+    const auto firewalld = firewalld_rung(yuzu::firewall::FwReadAction::rules);
+    if (firewalld.read == yuzu::firewall::FirewalldRead::complete) {
+        for (const auto& row : firewalld.rows)
+            ctx.write_output(row);
         return;
+    }
 
     NftFallthroughInfo info;
+    info.firewalld_running = firewalld.read == yuzu::firewall::FirewalldRead::partial;
     if (try_nftables_rules(ctx, info))
         return;
 
     // The root snapshot broker, as in do_state_linux.
-    if (try_snapshot_rules(ctx, info.tables_seen))
+    if (try_snapshot(ctx, info, yuzu::firewall::FwReadAction::rules))
         return;
     for (const auto& row : info.pending_rows)
         ctx.write_output(row);
+
+    if (info.firewalld_running) {
+        for (const auto& row : firewalld.rows)
+            ctx.write_output(row);
+        return;
+    }
 
     if (try_ufw_rules(ctx))
         return;
@@ -3196,7 +3223,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), "
          "else the root snapshot broker over AF_UNIX (packaged systemd socket), "
          "else ufw/iptables via run_bounded_subprocess (rung 2)",
-         nullptr},
+         "on a host the installer provisioned (no broker socket) the root helper's snapshot word "
+         "through sudo -n (rung 3, site firewall/try_snapshot#1)"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,
          "socketfilterfw via run_bounded_subprocess; pfctl reads via sudo -n -- on exact NOPASSWD "
@@ -3212,7 +3240,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "firewalld sd-bus, else nftables NETLINK_NETFILTER (both rung 1), "
          "else the root snapshot broker over AF_UNIX (packaged systemd socket), "
          "else ufw/iptables via run_bounded_subprocess (rung 2)",
-         nullptr},
+         "on a host the installer provisioned (no broker socket) the root helper's snapshot word "
+         "through sudo -n (rung 3, site firewall/try_snapshot#1)"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,
          "socketfilterfw via run_bounded_subprocess; pfctl reads via sudo -n -- on exact NOPASSWD "

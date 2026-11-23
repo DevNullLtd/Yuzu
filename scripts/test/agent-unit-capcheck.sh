@@ -52,7 +52,9 @@
 #       the ruleset (CI logs are public)
 #     * a control copy of the template whose ExecStart prints /proc/self/status shows the sandbox
 #       the shipped service has: CapBnd = CapEff = 0x3000 (CAP_NET_ADMIN, CAP_NET_RAW),
-#       NoNewPrivs = 1, Seccomp = 2
+#       NoNewPrivs = 0 (the service deliberately does not set it: SELinux denies the tools' domain
+#       transition under it, see the unit) with Seccomp = 2 (the system call filter is installed
+#       without it)
 #     * an account outside the socket's group cannot connect (EACCES), and the socket file is
 #       root:yuzu-agent 0660
 #     * the real yuzu-fw-snapshot.socket is left in the state it was found in: the salted agent
@@ -740,7 +742,7 @@ as_root systemctl start "$snapctl.socket" || fail "broker control socket failed 
 status=$(snap_client "$SVC_USER" "$run_dir/$snapctl.sock" 0 status) || true
 eq "broker service: CapBnd" "$(kv "$status" status_CapBnd)" "0000000000003000"
 eq "broker service: CapEff" "$(kv "$status" status_CapEff)" "0000000000003000"
-eq "broker service: NoNewPrivs" "$(kv "$status" status_NoNewPrivs)" "1"
+eq "broker service: NoNewPrivs (deliberately not set)" "$(kv "$status" status_NoNewPrivs)" "0"
 eq "broker service: Seccomp (filter)" "$(kv "$status" status_Seccomp)" "2"
 
 if getent passwd nobody >/dev/null && ! id -nG nobody | tr ' ' '\n' | grep -qx "$SVC_USER"; then

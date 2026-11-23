@@ -124,11 +124,20 @@ socket unit for that, and the agent unit pulls it in (`Wants=yuzu-fw-snapshot.so
   broker, and the agent unit's own sandbox is unchanged. Anyone who can run code as the agent can
   read those listings; treat the ruleset as readable by that account.
 - The service unit has its own sandbox (its own two capabilities, a system call filter, address
-  families, a read-only file system). Its IP egress filter takes effect only on hosts with the
+  families, a read-only file system). It does not set `NoNewPrivileges`: with SELinux enforcing
+  (measured on Rocky 9.9) that made every exec of the three tools a denied `nnp_transition`, three
+  audit denials per read, and left the tools outside their own confined domain; the bounding set and
+  the filters, which systemd applies to every process the script starts, are what bound it. The agent
+  unit keeps `NoNewPrivileges=true`. Its IP egress filter takes effect only on hosts with the
   unified cgroup hierarchy; the address-family list is what bounds its sockets.
-- To opt out, run `systemctl mask --now yuzu-fw-snapshot.socket`. The firewall plugin then reads
-  `unknown` for `state` and `rules` on that unit, with no error row (a masked socket leaves no
-  socket file).
+- To opt out, run `systemctl stop yuzu-fw-snapshot.socket` and then `systemctl mask
+  yuzu-fw-snapshot.socket`. The order matters: on Rocky 9.9 (systemd 252) `systemctl mask --now`
+  alone left the socket file, and the agent then reported `error|snapshot:connect:refused`; stop
+  first and then mask, or remove `/run/yuzu-fw-snapshot.sock`. The firewall plugin then answers as it
+  did before there was a broker: on a firewalld host firewalld's own rows (`backend|firewalld`,
+  `state|running`, `ruleset|unknown`), elsewhere `state|unknown` and `ruleset|unknown`, in both cases
+  after the error rows of the reads it was refused (`error|nftables:table:eperm` and, on a host
+  without firewalld, the later rungs' rows). It is not silent.
 
 The design and its limits are in `docs/adr/3007-os-activated-read-helpers.md`.
 

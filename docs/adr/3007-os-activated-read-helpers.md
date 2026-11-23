@@ -72,7 +72,12 @@ breaks any of them is outside this ADR and needs its own threat model.
    empty.
 7. **The helper has its own minimum sandbox, and the agent unit never changes.** The helper
    service runs with its own bounding set, system call filter, address families and file system
-   protections, each documented where it is set. `NoNewPrivileges` and the one-capability bounding
+   protections, each documented where it is set. The helper service does not set
+   `NoNewPrivileges`: measured on Rocky 9.9 with SELinux enforcing, under it every exec of the
+   three tools was a denied `nnp_transition` (three audit denials per read) and the tools ran in
+   the script's domain instead of their own, so the unit is bounded by root with two capabilities
+   (an exec yields no more than the bounding set) and by the filters, which systemd applies to every
+   process the script starts. `NoNewPrivileges` and the one-capability bounding
    set on the agent unit are untouched: the helper returns data, it is never a way for the agent to
    gain a privilege. The IP egress filter in the helper's unit is defence in depth and takes effect
    only on hosts with the unified cgroup hierarchy; the family list is what bounds its sockets.
@@ -103,12 +108,16 @@ breaks any of them is outside this ADR and needs its own threat model.
 
 - The packaged Linux agent reads nftables and iptables state and rules through
   `yuzu-fw-snapshot.socket` (`/run/yuzu-fw-snapshot.sock`, `root:yuzu-agent`, `0660`). A host can
-  opt out with `systemctl mask --now yuzu-fw-snapshot.socket`, after which the plugin reads
-  `unknown` on that unit, as it did before.
+  opt out with `systemctl stop yuzu-fw-snapshot.socket` and then `systemctl mask
+  yuzu-fw-snapshot.socket` (measured on Rocky 9.9, systemd 252: `mask --now` alone left the socket
+  file, and the agent reported `error|snapshot:connect:refused`), after which the plugin answers as
+  it did before: firewalld's own rows on a firewalld host, `unknown` elsewhere, after the error rows
+  of the reads it was refused.
 - On a host the installer provisioned (no packaged socket), the plugin reads the same listing from the
   root helper's `snapshot` word through `sudo -n --`, a rung-3 site registered in the manifest
   (`firewall/try_snapshot#1`); a sudo that refuses is a silent decline. It is not an OS-activated helper
-  and is outside this contract; it is recorded here only because it feeds the same parser.
+  and is outside this contract; it is recorded here only because it feeds the same parser, and the
+  descriptors' `fallback` field names it.
 - The agent account can now read the host's full nftables ruleset and the iptables listings. That
   is the cost, and `docs/user-manual/security-hardening.md` says so.
 - The units are designed for systemd 239 and later; the plugin README names the versions the

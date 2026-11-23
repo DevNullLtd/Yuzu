@@ -22,7 +22,11 @@ wiring around them, per OS class below:
 
   LinuxSnapshotWiring
                      both Linux dispatchers try firewalld, nftables, the root snapshot broker, ufw
-                     and iptables in that order; only the netlink table-dump row is deferred (to
+                     and iptables in that order, firewalld's answer standing at once only when its
+                     read was complete: a partial one (getServices refused to the account) is held
+                     behind the nftables and snapshot rungs, which replace it only with an active
+                     ruleset (both write nothing else), and is written when none does, before ufw;
+                     only the netlink table-dump row is deferred (to
                      the decline path), never the socket-open diagnostics; the broker reader opens
                      a close-on-exec non-blocking ScopedFd socket, checks SO_PEERCRED for root,
                      bounds its wait and its size, and never writes to the socket. The installer
@@ -33,7 +37,9 @@ wiring around them, per OS class below:
   BrokerUnits        the shipped socket, template service and snapshot script are exactly the
                      reviewed directive sets, agree with the plugin's socket path and with what the
                      deb and rpm packaging install, the script reads nothing, and the agent unit's
-                     NoNewPrivileges and single capability are untouched.
+                     NoNewPrivileges and single capability are untouched. The service unit
+                     deliberately has no NoNewPrivileges (SELinux denies the tools' domain
+                     transition under it), and the gate says so by name.
 
 Matching runs on tests/cpp_lex_helper.live_text(): comments, backslash-continued comments and
 `#if 0` blocks are removed first (string contents kept), so a pin cannot be satisfied by commented-out
@@ -43,6 +49,7 @@ no longer matches fails loudly (stale pattern) rather than passing vacuously.
 
 Usage: python3 -I tests/test_firewall_read_wiring_lexical.py
 """
+import os
 import re
 import shutil
 import subprocess
@@ -335,14 +342,14 @@ class WindowsRuleReadWiring(unittest.TestCase):
 # ── Linux ───────────────────────────────────────────────────────────────────────────────────────
 
 LINUX_ORDER = {
-    "do_state_linux": ("try_firewalld_state", "try_nftables_state", "try_snapshot_state", "try_ufw_state",
-                       "try_iptables_state"),
-    "do_rules_linux": ("try_firewalld_rules", "try_nftables_rules", "try_snapshot_rules", "try_ufw_rules",
-                       "try_iptables_rules"),
+    "do_state_linux": ("firewalld_rung", "try_nftables_state", "try_snapshot", "try_ufw_state", "try_iptables_state"),
+    "do_rules_linux": ("firewalld_rung", "try_nftables_rules", "try_snapshot", "try_ufw_rules", "try_iptables_rules"),
 }
+LINUX_ACTION = {"do_state_linux": "state", "do_rules_linux": "rules"}
 # calls that would write to the broker socket (the agent sends nothing)
 WRITE_CALLS = (r"::write\(", r"::send\(", r"::sendto\(", r"::sendmsg\(", r"::writev\(", r"::pwrite\(",
                r"\bwrite\(sock", r"\bsend\(sock")
+WRITE_ROWS = r"for \( ?const auto& row : firewalld\.rows ?\) ctx\.write_output\(row\);"
 
 
 def linux_problems(plugin_src):
@@ -354,21 +361,70 @@ def linux_problems(plugin_src):
             out.append(f"firewall_plugin.cpp no longer defines void {fn}(yuzu::CommandContext&)")
             continue
         text = squash(body)
+        action = LINUX_ACTION[fn]
         pos = [text.find(r + "(") for r in rungs]
         if -1 in pos:
             out.append(f"{fn} no longer calls {rungs[pos.index(-1)]}(")
         elif pos != sorted(pos):
             out.append(f"{fn} no longer tries {', '.join(rungs)} in that order (the snapshot sits after "
                        "nftables and before ufw)")
+        # firewalld is read for this action by the one rung that writes nothing itself
+        if not re.search(r"const auto firewalld = firewalld_rung\( ?yuzu::firewall::FwReadAction::%s ?\);" % action, text):
+            out.append(f"{fn} no longer reads firewalld with firewalld_rung(FwReadAction::{action}) into `firewalld`")
+        # a COMPLETE firewalld read answers at once, first of all
+        complete = re.search(r"if \( ?firewalld\.read == yuzu::firewall::FirewalldRead::complete ?\) \{ %s return; \}"
+                             % WRITE_ROWS, text)
+        if not complete or complete.start() > text.find(rungs[1] + "("):
+            out.append(f"{fn} no longer writes firewalld's rows and returns, before any other rung, when its read "
+                       "is complete")
+        # a PARTIAL one only marks the dispatch: the nft rung and the snapshot rung then answer only active
+        flag = re.search(r"info\.firewalld_running = firewalld\.read == yuzu::firewall::FirewalldRead::partial;", text)
+        info = text.find("NftFallthroughInfo info;")
+        if not flag or info < 0 or flag.start() < info or flag.start() > text.find(rungs[1] + "("):
+            out.append(f"{fn} no longer sets info.firewalld_running from a partial firewalld read before the "
+                       f"{rungs[1]} rung")
         snap = rungs[2]
-        if not re.search(r"if \( ?%s\(ctx, info\.tables_seen\) ?\) return;" % snap, text):
-            out.append(f"{fn} no longer returns when {snap}(ctx, info.tables_seen) answers")
+        if not re.search(r"if \( ?%s\(ctx, info, yuzu::firewall::FwReadAction::%s\) ?\) return;" % (snap, action), text):
+            out.append(f"{fn} no longer returns when {snap}(ctx, info, FwReadAction::{action}) answers")
         # the deferred table-dump row is written after the snapshot declines and before the next rung
         written = re.search(r"for \( ?const auto& row : info\.pending_rows ?\) ctx\.write_output\(row\);", text)
         at = text.find(snap + "(")
         if not written or at < 0 or written.start() < at or written.start() > text.find(rungs[3] + "("):
             out.append(f"{fn} no longer writes info.pending_rows after {snap} declines and before "
                        f"{rungs[3]} (the deferred table-dump row would be lost)")
+        # the held firewalld answer: after the deferred rows, before ufw, and nothing else answers after it
+        held = re.search(r"if \( ?info\.firewalld_running ?\) \{ %s return; \}" % WRITE_ROWS, text)
+        if not held or not written or held.start() < written.start() or held.start() > text.find(rungs[3] + "("):
+            out.append(f"{fn} no longer writes the held firewalld rows and returns after info.pending_rows and "
+                       f"before {rungs[3]} (ufw and iptables are not consulted behind a running firewalld)")
+
+    # the firewalld rung reads and returns rows: it writes nothing itself
+    rung = function_body(live, r"FirewalldRung firewalld_rung\(yuzu::firewall::FwReadAction action\) ?(?=\{)")
+    if rung is None:
+        out.append("firewall_plugin.cpp no longer defines FirewalldRung firewalld_rung(FwReadAction action)")
+    else:
+        text = squash(rung)
+        if "write_output" in text:
+            out.append("firewalld_rung writes a row itself: the dispatcher decides whether firewalld's rows stand")
+        if not re.search(r"yuzu::firewall::firewalld_read\( ?q\.reachable, q\.services_complete ?\)", text) or \
+                not re.search(r"yuzu::firewall::firewalld_rows\( ?q\.zones, q\.services_complete, action ?\)", text):
+            out.append("firewalld_rung no longer decides through firewalld_read and firewalld_rows")
+    if not re.search(r"FirewalldRung firewalld_rung\(yuzu::firewall::FwReadAction\) \{ return \{\}; \}", squash(live)):
+        out.append("the build without libsystemd no longer has a firewalld_rung that reports no firewalld")
+
+    # while firewalld was only partly read, the nft rung answers only a ruleset that shows content, and
+    # writes no backend row before it knows
+    for name, guard in (("try_nftables_state", r"verdict != yuzu::firewall::NftVerdict::active"),
+                        ("try_nftables_rules", r"!yuzu::firewall::nft_has_content\(chains, rules\)")):
+        body = function_body(live, r"bool " + name + r"\(yuzu::CommandContext& ctx, NftFallthroughInfo& info\) ?(?=\{)")
+        if body is None:
+            out.append(f"firewall_plugin.cpp no longer defines {name}(ctx, info)")
+            continue
+        text = squash(body)
+        held = re.search(r"if \( ?info\.firewalld_running && %s ?\) return false;" % guard, text)
+        if not held or held.start() > text.find('ctx.write_output("backend|nftables")'):
+            out.append(f"{name} no longer declines, before it writes its backend row, when firewalld is held and the "
+                       "ruleset shows no content")
 
     probe = function_body(live, r"\[\[nodiscard\]\] std::optional<NftProbeResult> run_nft_probe\(yuzu::CommandContext& ctx,\s*"
                                 r"NftFallthroughInfo& info\) ?(?=\{)")
@@ -421,9 +477,9 @@ def linux_problems(plugin_src):
         for what, pat in (
                 ("the refusal to run for root or under NoNewPrivileges (sudo cannot elevate there)",
                  r"if \( ?::geteuid\( ?\) == 0 \|\| privilege_refusal\( ?\) ?\) return std::nullopt;"),
-                ("the sudo-wrapped helper snapshot word as its only argv, with the deadline and the 2 MiB cap",
+                ("the sudo-wrapped helper snapshot word as its only argv, with the deadline and a cap of twice the broker's cut",
                  r"run_bounded_subprocess\( ?yuzu::shared::sudo_wrap\(\{std::string\{fq::kFwHelperPath\}, \"snapshot\"\}\), "
-                 r"SubprocessOptions\{\.deadline = kAcqDeadline, \.output_cap_bytes = 2 \* 1024 \* 1024\}\)"),
+                 r"SubprocessOptions\{\.deadline = kAcqDeadline, \.output_cap_bytes = 2 \* yuzu::firewall::kFwSnapshotMaxBytes\}\)"),
                 ("the rule that only a complete run that exited 0 is returned (subprocess_complete, a silent decline otherwise)",
                  r"if \( ?!subprocess_complete\(res\) ?\) return std::nullopt; return res\.output;")):
             if not re.search(pat, text):
@@ -433,13 +489,24 @@ def linux_problems(plugin_src):
         if "exit_code" in text or "write_output" in text:
             out.append("read_fw_snapshot_via_helper decides on an exit code itself or writes a row: "
                        "subprocess_complete is the one rule and the decline is silent")
-    snapshot = function_body(live, r"bool try_snapshot\(yuzu::CommandContext& ctx, bool tables_seen, bool rules\) ?(?=\{)")
+    snapshot = function_body(live, r"bool try_snapshot\(yuzu::CommandContext& ctx, const NftFallthroughInfo& info,\s*"
+                                   r"yuzu::firewall::FwReadAction action\) ?(?=\{)")
     if snapshot is None:
-        out.append("firewall_plugin.cpp no longer defines try_snapshot(ctx, tables_seen, rules)")
-    elif not re.search(r"if \( ?!reply && reply\.error\(\)\.empty\(\) ?\) \{[^{}]*read_fw_snapshot_via_helper\(\)",
-                       squash(snapshot)):
-        out.append("try_snapshot no longer tries the helper transport only when the socket is absent "
-                   "(an empty token): a reported socket failure must not fall to sudo")
+        out.append("firewall_plugin.cpp no longer defines try_snapshot(ctx, info, action)")
+    else:
+        text = squash(snapshot)
+        if not re.search(r"if \( ?!reply && reply\.error\(\)\.empty\(\) ?\) \{[^{}]*read_fw_snapshot_via_helper\(\)", text):
+            out.append("try_snapshot no longer tries the helper transport only when the socket is absent "
+                       "(an empty token): a reported socket failure must not fall to sudo")
+        if not re.search(r"yuzu::firewall::linux_snapshot_answer\( ?\*snapshot, info\.tables_seen, action ?\)", text):
+            out.append("try_snapshot no longer decides through linux_snapshot_answer(*snapshot, info.tables_seen, action)")
+        # held firewalld: only an active answer is written and accepted, any other writes just its error| rows
+        if not re.search(r"const bool answers = !info\.firewalld_running \|\| answer\.state == yuzu::firewall::NftVerdict::active;"
+                         r" for \( ?const auto& row : answer\.rows ?\) if \( ?answers \|\| row\.starts_with\(\"error\|\"\) ?\) "
+                         r"ctx\.write_output\(row\); return answers;", text):
+            out.append("try_snapshot no longer answers only an active ruleset while firewalld is held (a held firewalld "
+                       "is replaced only by a complete read that shows an active ruleset, never by inactive or unknown), "
+                       "writing just the error| rows otherwise")
     if len(re.findall(r"else the root snapshot broker over AF_UNIX \(packaged systemd socket\)", squash(live))) != 2:
         out.append("the Linux state and rules descriptors no longer both name the root snapshot broker")
     return out
@@ -449,14 +516,19 @@ def _lmut(pattern, repl, count=1):
     return lambda raw: re.subn(pattern, repl, raw, count=count, flags=re.S)
 
 
+_HELD_ROWS = r"\{\s*for \(const auto& row : firewalld\.rows\)\s*ctx\.write_output\(row\);\s*return;\s*\}"
+
 LINUX_MUTATIONS = [
     # the snapshot rung dropped from the state ladder
-    (_lmut(r"\s*if \(try_snapshot_state\(ctx, info\.tables_seen\)\)\s*return;", ""), "do_state_linux"),
+    (_lmut(r"\s*if \(try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::state\)\)\s*return;", ""), "do_state_linux"),
     # ... and from the rules ladder
-    (_lmut(r"\s*if \(try_snapshot_rules\(ctx, info\.tables_seen\)\)\s*return;", ""), "do_rules_linux"),
+    (_lmut(r"\s*if \(try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::rules\)\)\s*return;", ""), "do_rules_linux"),
     # moved after ufw: the snapshot must come before it
-    (_lmut(r"(if \(try_snapshot_rules\(ctx, info\.tables_seen\)\)\s*return;)(\s*for \(const auto& row : info\.pending_rows\)\s*ctx\.write_output\(row\);)(\s*if \(try_ufw_rules\(ctx\)\)\s*return;)",
-           r"\3\1\2"), "in that order"),
+    (_lmut(r"(\s*if \(try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::rules\)\)\s*return;)(.*?if \(try_ufw_rules\(ctx\)\)\s*return;)",
+           r"\2\1"), "in that order"),
+    # the snapshot asked for the wrong action
+    (_lmut(r"try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::state\)", "try_snapshot(ctx, info, yuzu::firewall::FwReadAction::rules)"),
+     "no longer returns when try_snapshot"),
     # the deferred rows never written (state)
     (_lmut(r"for \(const auto& row : info\.pending_rows\)\s*ctx\.write_output\(row\);", ""), "info.pending_rows"),
     # the table-dump row written at once again
@@ -465,6 +537,44 @@ LINUX_MUTATIONS = [
     # a socket-open diagnostic deferred as well
     (_lmut(r"(for \(const auto& row : yuzu::firewall::nft_open_diag_rows\(open_errnos\)\)\s*)ctx\.write_output\(row\);",
            r"\1info.pending_rows.push_back(row);"), "never deferred"),
+    # firewalld: a complete read no longer answers at once (state, then rules)
+    (_lmut(r"firewalld\.read == yuzu::firewall::FirewalldRead::complete", "firewalld.read != yuzu::firewall::FirewalldRead::absent"),
+     "when its read is complete"),
+    (_lmut(r"(FwReadAction::rules\);\s*if \()firewalld\.read == yuzu::firewall::FirewalldRead::complete",
+           r"\1firewalld.read != yuzu::firewall::FirewalldRead::absent"), "when its read is complete"),
+    # firewalld: a partial read no longer marks the dispatch (state, then rules)
+    (_lmut(r"info\.firewalld_running = firewalld\.read == yuzu::firewall::FirewalldRead::partial;", "info.firewalld_running = false;"),
+     "no longer sets info.firewalld_running"),
+    (_lmut(r"(FwReadAction::rules\);.*?)info\.firewalld_running = firewalld\.read == yuzu::firewall::FirewalldRead::partial;",
+           r"\1info.firewalld_running = false;"), "no longer sets info.firewalld_running"),
+    # firewalld: the held rows are never written when nothing shows an active ruleset (state, then rules)
+    (_lmut(r"\s*if \(info\.firewalld_running\) " + _HELD_ROWS, ""), "no longer writes the held firewalld rows"),
+    (_lmut(r"(FwReadAction::rules\)\)\s*return;.*?)\s*if \(info\.firewalld_running\) " + _HELD_ROWS, r"\1"),
+     "no longer writes the held firewalld rows"),
+    # firewalld: ufw and iptables consulted behind a running firewalld (the held write does not return)
+    (_lmut(r"(if \(info\.firewalld_running\) \{\s*for \(const auto& row : firewalld\.rows\)\s*ctx\.write_output\(row\);)\s*return;",
+           r"\1"), "no longer writes the held firewalld rows"),
+    # the nft rung answers a non-active ruleset while firewalld is held, or writes its row first
+    (_lmut(r"if \(info\.firewalld_running && verdict != yuzu::firewall::NftVerdict::active\)\s*return false;", ""),
+     "try_nftables_state no longer declines"),
+    (_lmut(r"verdict != yuzu::firewall::NftVerdict::active\)\s*return false;", "verdict == yuzu::firewall::NftVerdict::unknown) return false;"),
+     "try_nftables_state no longer declines"),
+    (_lmut(r"(if \(info\.firewalld_running && verdict != yuzu::firewall::NftVerdict::active\)\s*return false;)(\s*ctx\.write_output\(\"backend\|nftables\"\);[^\n]*)",
+           r"\2\1"), "try_nftables_state no longer declines"),
+    (_lmut(r"if \(info\.firewalld_running && !yuzu::firewall::nft_has_content\(chains, rules\)\)\s*return false;", ""),
+     "try_nftables_rules no longer declines"),
+    (_lmut(r"(if \(info\.firewalld_running && !yuzu::firewall::nft_has_content\(chains, rules\)\)\s*return false;)(\s*ctx\.write_output\(\"backend\|nftables\"\);[^\n]*)",
+           r"\2\1"), "try_nftables_rules no longer declines"),
+    # the snapshot rung answers a non-active ruleset while firewalld is held
+    (_lmut(r"const bool answers = !info\.firewalld_running \|\| answer\.state == yuzu::firewall::NftVerdict::active;",
+           "const bool answers = true;"), "only an active ruleset while firewalld is held"),
+    (_lmut(r"if \(answers \|\| row\.starts_with\(\"error\|\"\)\)", "if (true)"), "only an active ruleset while firewalld is held"),
+    (_lmut(r"return answers;", "return true;"), "only an active ruleset while firewalld is held"),
+    # the firewalld rung writes a row itself, or decides without the pure functions
+    (_lmut(r"(const auto q = query_firewalld\(/\*want_rules=\*/true\);)", r'\1 write_output("x");'), "firewalld_rung writes a row itself"),
+    (_lmut(r"yuzu::firewall::firewalld_read\(q\.reachable, q\.services_complete\)",
+           "(q.reachable ? yuzu::firewall::FirewalldRead::complete : yuzu::firewall::FirewalldRead::absent)"),
+     "decides through firewalld_read"),
     # the reader: no root check
     (_lmut(r"if \(cred\.uid != 0\)\s*return std::unexpected\(std::string\{\"peer_not_root\"\}\);", ""),
      "refusal of a peer that is not root"),
@@ -490,9 +600,11 @@ LINUX_MUTATIONS = [
      "refusal to run for root or under NoNewPrivileges"),
     (_lmut(r"if \(::geteuid\(\) == 0 \|\| privilege_refusal\(\)\)", "if (::geteuid() == 0)"),
      "refusal to run for root or under NoNewPrivileges"),
-    (_lmut(r", \.output_cap_bytes = 2 \* 1024 \* 1024", ""), "deadline and the 2 MiB cap"),
-    (_lmut(r"\.output_cap_bytes = 2 \* 1024 \* 1024\}", ".output_cap_bytes = 2 * 1024 * 1024, .merge_stderr = true}"),
-     "deadline and the 2 MiB cap"),
+    (_lmut(r",\s*\.output_cap_bytes = 2 \* yuzu::firewall::kFwSnapshotMaxBytes", ""), "a cap of twice the broker's cut"),
+    (_lmut(r"\.output_cap_bytes = 2 \* yuzu::firewall::kFwSnapshotMaxBytes\}",
+           ".output_cap_bytes = 2 * yuzu::firewall::kFwSnapshotMaxBytes, .merge_stderr = true}"), "a cap of twice the broker's cut"),
+    (_lmut(r"\.output_cap_bytes = 2 \* yuzu::firewall::kFwSnapshotMaxBytes", ".output_cap_bytes = 2 * 1024 * 1024"),
+     "a cap of twice the broker's cut"),
     (_lmut(r"if \(!reply && reply\.error\(\)\.empty\(\)\)", "if (!reply)"), "only when the socket is absent"),
     (_lmut(r"\{std::string\{fq::kFwHelperPath\}, \"snapshot\"\}", '{std::string{fq::kFwHelperPath}, "snapshot", "x"}'),
      "helper snapshot word as its only argv"),
@@ -541,7 +653,7 @@ SERVICE_UNIT = {
     "Service": {"User": "root",
                 "ExecStart": "/bin/sh /usr/share/yuzu/scripts/yuzu-fw-snapshot.sh",
                 "StandardInput": "null", "StandardOutput": "socket", "StandardError": "null",
-                "RuntimeMaxSec": "30", "TasksMax": "16", "NoNewPrivileges": "true",
+                "RuntimeMaxSec": "30", "TasksMax": "16",
                 "CapabilityBoundingSet": "CAP_NET_ADMIN CAP_NET_RAW",
                 "RestrictAddressFamilies": "AF_UNIX AF_NETLINK AF_INET AF_INET6",
                 "IPAddressDeny": "any", "SystemCallFilter": "@system-service", "SystemCallErrorNumber": "EPERM",
@@ -594,6 +706,12 @@ def broker_problems(sources):
         for section in got:
             if section not in want:
                 out.append(f"the {name} unit has a section the review did not cover: [{section}]")
+    # NoNewPrivileges is deliberately absent from the service: under SELinux enforcing it makes every exec of
+    # nft, iptables and ip6tables a denied nnp_transition (three audit denials per read) and leaves the tools
+    # in the script's domain instead of their own; the agent unit keeps it (checked below)
+    if "NoNewPrivileges" in parse_unit(sources["service"]).get("Service", {}):
+        out.append("the service unit sets NoNewPrivileges: SELinux denies the domain transition of the tools it "
+                   "runs, three denials per read (ADR-3007 clause 7)")
     # the socket path is the one the plugin connects to
     m = re.search(r'kFwSnapshotSocketPath = "([^"]+)"', sources["parsers"])
     if not m or m.group(1) != SOCKET_UNIT["Socket"]["ListenStream"]:
@@ -681,7 +799,7 @@ BROKER_MUTATIONS = [
     (_set("socket", "SocketGroup=yuzu-agent", "SocketGroup=users"), "SocketGroup"),
     (_set("socket", "[Socket]\n", "[Install]\nWantedBy=sockets.target\n\n[Socket]\n"), "[Install]"),
     (_set("socket", "Accept=yes", "Accept=yes\nBind=0.0.0.0"), "a directive the review did not cover"),
-    (_set("service", "NoNewPrivileges=true", "NoNewPrivileges=false"), "NoNewPrivileges"),
+    (_set("service", "ProtectSystem=strict", "NoNewPrivileges=true\nProtectSystem=strict"), "sets NoNewPrivileges"),
     (_set("service", "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", "CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN"),
      "CapabilityBoundingSet"),
     (_set("service", "StandardInput=null", "StandardInput=socket"), "StandardInput"),
@@ -730,11 +848,14 @@ class BrokerUnits(unittest.TestCase):
                 self.assertTrue(p, "mutation was NOT detected by the gate")
                 self.assertTrue(any(expected in m for m in p), f"expected {expected!r} in {p}")
 
+    @unittest.skipIf(os.name == "nt", "the execute bit is not represented on Windows; the packages set the modes "
+                                      "themselves (chmod in build-deb.sh, install -m in the spec), both pinned in broker_problems")
     def test_the_script_and_units_have_the_modes_the_packages_install(self):
-        import os
-        self.assertTrue(os.access(BROKER_FILES["script"], os.X_OK), "the script is shipped 0755")
+        def executable(path):
+            return bool(os.stat(path).st_mode & 0o111)
+        self.assertTrue(executable(BROKER_FILES["script"]), "the script is shipped 0755")
         for name in ("socket", "service"):
-            self.assertFalse(os.access(BROKER_FILES[name], os.X_OK), f"the {name} unit is not executable")
+            self.assertFalse(executable(BROKER_FILES[name]), f"the {name} unit is not executable")
 
     @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze is not installed")
     def test_systemd_accepts_the_directives_of_the_units(self):
@@ -742,7 +863,7 @@ class BrokerUnits(unittest.TestCase):
         # script, an agent unit and a group that do not exist on a build host, and verify says so.
         bad = re.compile(r"Unknown (?:key|section|lvalue)|Failed to parse|Invalid argument|Unknown assignment|"
                          r"Invalid|unsupported|not a valid")
-        for name in ("socket", "service"):
+        for name in ("socket", "service", "agent"):
             r = subprocess.run(["systemd-analyze", "verify", "--man=no", str(BROKER_FILES[name])],
                                capture_output=True, text=True, timeout=60)
             findings = [l for l in (r.stdout + r.stderr).splitlines() if bad.search(l)]

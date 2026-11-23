@@ -2312,7 +2312,7 @@ class HelperSitesAreGovernedInterpreterSites(unittest.TestCase):
 
     SITES = ("firewall/sudo_runner#1", "firewall/sudo_runner#4", "firewall/sudo_runner#5",
              "firewall/sudo_runner#6", "firewall/sudo_runner#7", "firewall/sudo_runner#8",
-             "firewall/sudo_runner#14", "services/set_start_mode_linux#1",
+             "firewall/sudo_runner#14", "firewall/try_snapshot#1", "services/set_start_mode_linux#1",
              "services/set_start_mode_macos#1")
 
     def test_each_helper_site_is_a_registered_decision_5_interpreter_site(self):

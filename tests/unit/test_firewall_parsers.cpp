@@ -15,6 +15,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -1634,6 +1636,361 @@ constexpr std::string_view kNftBig =
     "\t}\n"
     "}\n";
 
+// The whole broker reply of a real RHEL-family host: Rocky 9.9 aarch64, firewalld running, the
+// packaged account reading through the broker (9,787 bytes, captured 2026-11-22). Its table is
+// `table inet firewalld { # handle 3 progname (null)` followed by the line `\tflags owner,persist`, which nft
+// prints without a semicolon: the shape the first parser rejected. One raw literal, under MSVC's 16 KB limit.
+constexpr std::string_view kFirewalldRealReply = R"FWREAL(== nft -a list ruleset
+table inet firewalld { # handle 3 progname (null)
+	flags owner,persist
+
+	chain mangle_PREROUTING { # handle 144
+		type filter hook prerouting priority mangle + 10; policy accept;
+		jump mangle_PREROUTING_ZONES # handle 148
+	}
+
+	chain mangle_PREROUTING_POLICIES_pre { # handle 145
+		jump mangle_PRE_policy_allow-host-ipv6 # handle 314
+	}
+
+	chain mangle_PREROUTING_ZONES { # handle 146
+		iifname "eth0" goto mangle_PRE_public # handle 327
+		goto mangle_PRE_public # handle 278
+	}
+
+	chain mangle_PREROUTING_POLICIES_post { # handle 147
+	}
+
+	chain nat_PREROUTING { # handle 149
+		type nat hook prerouting priority dstnat + 10; policy accept;
+		jump nat_PREROUTING_ZONES # handle 153
+	}
+
+	chain nat_PREROUTING_POLICIES_pre { # handle 150
+		jump nat_PRE_policy_allow-host-ipv6 # handle 313
+	}
+
+	chain nat_PREROUTING_ZONES { # handle 151
+		iifname "eth0" goto nat_PRE_public # handle 326
+		goto nat_PRE_public # handle 277
+	}
+
+	chain nat_PREROUTING_POLICIES_post { # handle 152
+	}
+
+	chain nat_POSTROUTING { # handle 154
+		type nat hook postrouting priority srcnat + 10; policy accept;
+		jump nat_POSTROUTING_ZONES # handle 158
+	}
+
+	chain nat_POSTROUTING_POLICIES_pre { # handle 155
+	}
+
+	chain nat_POSTROUTING_ZONES { # handle 156
+		oifname "eth0" goto nat_POST_public # handle 324
+		goto nat_POST_public # handle 275
+	}
+
+	chain nat_POSTROUTING_POLICIES_post { # handle 157
+	}
+
+	chain nat_OUTPUT { # handle 159
+		type nat hook output priority dstnat + 10; policy accept;
+		jump nat_OUTPUT_POLICIES_pre # handle 161
+		jump nat_OUTPUT_POLICIES_post # handle 163
+	}
+
+	chain nat_OUTPUT_POLICIES_pre { # handle 160
+	}
+
+	chain nat_OUTPUT_POLICIES_post { # handle 162
+	}
+
+	chain filter_PREROUTING { # handle 164
+		type filter hook prerouting priority filter + 10; policy accept;
+		icmpv6 type { nd-router-advert, nd-neighbor-solicit } accept # handle 197
+		meta nfproto ipv6 fib saddr . mark . iif check missing drop # handle 195
+	}
+
+	chain filter_INPUT { # handle 165
+		type filter hook input priority filter + 10; policy accept;
+		ct state { established, related } accept # handle 169
+		ct status dnat accept # handle 170
+		iifname "lo" accept # handle 171
+		ct state invalid drop # handle 172
+		jump filter_INPUT_ZONES # handle 176
+		reject with icmpx admin-prohibited # handle 177
+	}
+
+	chain filter_FORWARD { # handle 166
+		type filter hook forward priority filter + 10; policy accept;
+		ct state { established, related } accept # handle 179
+		ct status dnat accept # handle 180
+		iifname "lo" accept # handle 181
+		ct state invalid drop # handle 182
+		ip6 daddr { ::/96, ::ffff:0.0.0.0/96, 2002::/24, 2002:a00::/24, 2002:7f00::/24, 2002:a9fe::/32, 2002:ac10::/28, 2002:c0a8::/32, 2002:e000::/19 } reject with icmpv6 addr-unreachable # handle 201
+		jump filter_FORWARD_ZONES # handle 185
+		reject with icmpx admin-prohibited # handle 187
+	}
+
+	chain filter_OUTPUT { # handle 167
+		type filter hook output priority filter + 10; policy accept;
+		ct state { established, related } accept # handle 189
+		oifname "lo" accept # handle 190
+		ip6 daddr { ::/96, ::ffff:0.0.0.0/96, 2002::/24, 2002:a00::/24, 2002:7f00::/24, 2002:a9fe::/32, 2002:ac10::/28, 2002:c0a8::/32, 2002:e000::/19 } reject with icmpv6 addr-unreachable # handle 199
+		jump filter_OUTPUT_POLICIES_pre # handle 192
+		jump filter_OUTPUT_POLICIES_post # handle 194
+	}
+
+	chain filter_INPUT_POLICIES_pre { # handle 173
+		jump filter_IN_policy_allow-host-ipv6 # handle 312
+	}
+
+	chain filter_INPUT_ZONES { # handle 174
+		iifname "eth0" goto filter_IN_public # handle 323
+		goto filter_IN_public # handle 274
+	}
+
+	chain filter_INPUT_POLICIES_post { # handle 175
+	}
+
+	chain filter_FORWARD_POLICIES_pre { # handle 183
+	}
+
+	chain filter_FORWARD_ZONES { # handle 184
+		iifname "eth0" goto filter_FWD_public # handle 325
+		goto filter_FWD_public # handle 276
+	}
+
+	chain filter_FORWARD_POLICIES_post { # handle 186
+	}
+
+	chain filter_OUTPUT_POLICIES_pre { # handle 191
+	}
+
+	chain filter_OUTPUT_POLICIES_post { # handle 193
+	}
+
+	chain filter_IN_public { # handle 202
+		jump filter_INPUT_POLICIES_pre # handle 208
+		jump filter_IN_public_pre # handle 209
+		jump filter_IN_public_log # handle 210
+		jump filter_IN_public_deny # handle 211
+		jump filter_IN_public_allow # handle 212
+		jump filter_IN_public_post # handle 213
+		jump filter_INPUT_POLICIES_post # handle 214
+		meta l4proto { icmp, ipv6-icmp } accept # handle 273
+		reject with icmpx admin-prohibited # handle 215
+	}
+
+	chain filter_IN_public_pre { # handle 203
+	}
+
+	chain filter_IN_public_log { # handle 204
+	}
+
+	chain filter_IN_public_deny { # handle 205
+	}
+
+	chain filter_IN_public_allow { # handle 206
+		tcp dport 22 accept # handle 216
+		ip6 daddr fe80::/64 udp dport 546 accept # handle 217
+		tcp dport 9090 accept # handle 218
+	}
+
+	chain filter_IN_public_post { # handle 207
+	}
+
+	chain nat_POST_public { # handle 219
+		jump nat_POSTROUTING_POLICIES_pre # handle 225
+		jump nat_POST_public_pre # handle 226
+		jump nat_POST_public_log # handle 227
+		jump nat_POST_public_deny # handle 228
+		jump nat_POST_public_allow # handle 229
+		jump nat_POST_public_post # handle 230
+		jump nat_POSTROUTING_POLICIES_post # handle 231
+	}
+
+	chain nat_POST_public_pre { # handle 220
+	}
+
+	chain nat_POST_public_log { # handle 221
+	}
+
+	chain nat_POST_public_deny { # handle 222
+	}
+
+	chain nat_POST_public_allow { # handle 223
+	}
+
+	chain nat_POST_public_post { # handle 224
+	}
+
+	chain filter_FWD_public { # handle 232
+		jump filter_FORWARD_POLICIES_pre # handle 238
+		jump filter_FWD_public_pre # handle 239
+		jump filter_FWD_public_log # handle 240
+		jump filter_FWD_public_deny # handle 241
+		jump filter_FWD_public_allow # handle 242
+		jump filter_FWD_public_post # handle 243
+		jump filter_FORWARD_POLICIES_post # handle 244
+		reject with icmpx admin-prohibited # handle 245
+	}
+
+	chain filter_FWD_public_pre { # handle 233
+	}
+
+	chain filter_FWD_public_log { # handle 234
+	}
+
+	chain filter_FWD_public_deny { # handle 235
+	}
+
+	chain filter_FWD_public_allow { # handle 236
+		oifname "eth0" accept # handle 328
+	}
+
+	chain filter_FWD_public_post { # handle 237
+	}
+
+	chain nat_PRE_public { # handle 246
+		jump nat_PREROUTING_POLICIES_pre # handle 252
+		jump nat_PRE_public_pre # handle 253
+		jump nat_PRE_public_log # handle 254
+		jump nat_PRE_public_deny # handle 255
+		jump nat_PRE_public_allow # handle 256
+		jump nat_PRE_public_post # handle 257
+		jump nat_PREROUTING_POLICIES_post # handle 258
+	}
+
+	chain nat_PRE_public_pre { # handle 247
+	}
+
+	chain nat_PRE_public_log { # handle 248
+	}
+
+	chain nat_PRE_public_deny { # handle 249
+	}
+
+	chain nat_PRE_public_allow { # handle 250
+	}
+
+	chain nat_PRE_public_post { # handle 251
+	}
+
+	chain mangle_PRE_public { # handle 259
+		jump mangle_PREROUTING_POLICIES_pre # handle 265
+		jump mangle_PRE_public_pre # handle 266
+		jump mangle_PRE_public_log # handle 267
+		jump mangle_PRE_public_deny # handle 268
+		jump mangle_PRE_public_allow # handle 269
+		jump mangle_PRE_public_post # handle 270
+		jump mangle_PREROUTING_POLICIES_post # handle 271
+	}
+
+	chain mangle_PRE_public_pre { # handle 260
+	}
+
+	chain mangle_PRE_public_log { # handle 261
+	}
+
+	chain mangle_PRE_public_deny { # handle 262
+	}
+
+	chain mangle_PRE_public_allow { # handle 263
+	}
+
+	chain mangle_PRE_public_post { # handle 264
+	}
+
+	chain filter_IN_policy_allow-host-ipv6 { # handle 279
+		jump filter_IN_policy_allow-host-ipv6_pre # handle 285
+		jump filter_IN_policy_allow-host-ipv6_log # handle 286
+		jump filter_IN_policy_allow-host-ipv6_deny # handle 287
+		jump filter_IN_policy_allow-host-ipv6_allow # handle 288
+		jump filter_IN_policy_allow-host-ipv6_post # handle 289
+	}
+
+	chain filter_IN_policy_allow-host-ipv6_pre { # handle 280
+	}
+
+	chain filter_IN_policy_allow-host-ipv6_log { # handle 281
+	}
+
+	chain filter_IN_policy_allow-host-ipv6_deny { # handle 282
+	}
+
+	chain filter_IN_policy_allow-host-ipv6_allow { # handle 283
+		icmpv6 type nd-neighbor-advert accept # handle 315
+		icmpv6 type nd-neighbor-solicit accept # handle 316
+		icmpv6 type nd-router-advert accept # handle 317
+		icmpv6 type nd-redirect accept # handle 318
+		icmpv6 type mld-listener-done accept # handle 319
+		icmpv6 type mld-listener-query accept # handle 320
+		icmpv6 type mld-listener-report accept # handle 321
+		icmpv6 type mld2-listener-report accept # handle 322
+	}
+
+	chain filter_IN_policy_allow-host-ipv6_post { # handle 284
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6 { # handle 290
+		jump nat_PRE_policy_allow-host-ipv6_pre # handle 296
+		jump nat_PRE_policy_allow-host-ipv6_log # handle 297
+		jump nat_PRE_policy_allow-host-ipv6_deny # handle 298
+		jump nat_PRE_policy_allow-host-ipv6_allow # handle 299
+		jump nat_PRE_policy_allow-host-ipv6_post # handle 300
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6_pre { # handle 291
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6_log { # handle 292
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6_deny { # handle 293
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6_allow { # handle 294
+	}
+
+	chain nat_PRE_policy_allow-host-ipv6_post { # handle 295
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6 { # handle 301
+		jump mangle_PRE_policy_allow-host-ipv6_pre # handle 307
+		jump mangle_PRE_policy_allow-host-ipv6_log # handle 308
+		jump mangle_PRE_policy_allow-host-ipv6_deny # handle 309
+		jump mangle_PRE_policy_allow-host-ipv6_allow # handle 310
+		jump mangle_PRE_policy_allow-host-ipv6_post # handle 311
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6_pre { # handle 302
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6_log { # handle 303
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6_deny { # handle 304
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6_allow { # handle 305
+	}
+
+	chain mangle_PRE_policy_allow-host-ipv6_post { # handle 306
+	}
+}
+== iptables -S
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+== ip6tables -S
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+== end
+)FWREAL";
+
 constexpr std::string_view kIptClean = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n";
 constexpr std::string_view kIptV6Rules =
     "-P INPUT DROP\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT\n";
@@ -1645,13 +2002,20 @@ using Rows = std::vector<std::string>;
 Rows state_rows(std::string_view nft, std::string_view ipt, std::string_view ip6t, bool tables_seen = false) {
     const auto parsed = parse_fw_snapshot(snap(nft, ipt, ip6t));
     REQUIRE(parsed.has_value());
-    return linux_snapshot_state_rows(*parsed, tables_seen);
+    return linux_snapshot_answer(*parsed, tables_seen, FwReadAction::state).rows;
 }
 
 Rows rules_rows(std::string_view nft, std::string_view ipt, std::string_view ip6t, bool tables_seen = false) {
     const auto parsed = parse_fw_snapshot(snap(nft, ipt, ip6t));
     REQUIRE(parsed.has_value());
-    return linux_snapshot_rules_rows(*parsed, tables_seen);
+    return linux_snapshot_answer(*parsed, tables_seen, FwReadAction::rules).rows;
+}
+
+LinuxSnapshotAnswer snapshot_answer(std::string_view nft, std::string_view ipt, std::string_view ip6t,
+                                    bool tables_seen, FwReadAction action) {
+    const auto parsed = parse_fw_snapshot(snap(nft, ipt, ip6t));
+    REQUIRE(parsed.has_value());
+    return linux_snapshot_answer(*parsed, tables_seen, action);
 }
 
 } // namespace
@@ -1720,12 +2084,10 @@ TEST_CASE("parse_nft_ruleset_text: a real listing is tables, chains with hook an
           "[firewall]") {
     const auto r = parse_nft_ruleset_text(kNftOne);
     REQUIRE(r.has_value());
-    REQUIRE(r->tables.size() == 1);
-    CHECK(r->tables[0].family == nft_raw::kNfprotoInet);
-    CHECK(r->tables[0].name == "filter");
     REQUIRE(r->chains.size() == 1);
     CHECK(r->chains[0].name == "input");
     CHECK(r->chains[0].table == "filter");
+    CHECK(r->chains[0].family == nft_raw::kNfprotoInet);
     CHECK(r->chains[0].is_base_chain);
     CHECK(r->chains[0].hooknum == std::optional<std::uint32_t>{1});
     CHECK(r->chains[0].policy == std::optional<std::uint32_t>{nft_raw::kNftPolicyAccept});
@@ -1744,8 +2106,6 @@ TEST_CASE("parse_nft_ruleset_text: sets, maps, a flowtable and a multi-line rule
           "[firewall]") {
     const auto r = parse_nft_ruleset_text(kNftBig);
     REQUIRE(r.has_value());
-    REQUIRE(r->tables.size() == 2);
-    CHECK(r->tables[1].family == nft_raw::kNfprotoIpv6);
     // handles 6, 7, 8 (one rule over three lines), 9 and the ip6 rule 2: five, and no header counted
     REQUIRE(r->rules.size() == 5);
     CHECK(r->rules[2].handle == std::optional<std::uint64_t>{8});
@@ -1758,6 +2118,8 @@ TEST_CASE("parse_nft_ruleset_text: sets, maps, a flowtable and a multi-line rule
     CHECK(r->chains[1].policy == std::optional<std::uint32_t>{nft_raw::kNftPolicyDrop});
     CHECK(r->chains[1].hooknum == std::optional<std::uint32_t>{2});
     CHECK_FALSE(r->chains[2].is_base_chain); // a regular chain carries no hook
+    CHECK(r->chains[2].family == nft_raw::kNfprotoIpv6); // the second table's family and name
+    CHECK(r->chains[2].table == "filter");
     // attribution: the rules of the first table are in `input`, none in `forward`
     CHECK(r->rules[0].chain == "input");
     for (const auto& rule : r->rules)
@@ -1767,10 +2129,12 @@ TEST_CASE("parse_nft_ruleset_text: sets, maps, a flowtable and a multi-line rule
 TEST_CASE("parse_nft_ruleset_text: empty text is no tables, and a listing it cannot read is nullopt", "[firewall]") {
     const auto none = parse_nft_ruleset_text("");
     REQUIRE(none.has_value());
-    CHECK(none->tables.empty());
+    CHECK(none->chains.empty());
+    CHECK(none->rules.empty());
     const auto only_comments = parse_nft_ruleset_text("# Warning: nothing here\n\n   \n");
     REQUIRE(only_comments.has_value());
-    CHECK(only_comments->tables.empty());
+    CHECK(only_comments->chains.empty());
+    CHECK(only_comments->rules.empty());
     // cut mid-block
     CHECK_FALSE(parse_nft_ruleset_text("table inet filter { # handle 1\n\tchain input { # handle 1\n"));
     CHECK_FALSE(parse_nft_ruleset_text(kNftOne.substr(0, kNftOne.size() - 2))); // the closing brace gone
@@ -1812,10 +2176,10 @@ TEST_CASE("parse_nft_ruleset_text: a brace or a handle inside a quoted comment c
     CHECK(r->rules[0].handle == std::optional<std::uint64_t>{4});
     CHECK(r->rules[1].handle == std::optional<std::uint64_t>{5});
     // a quoted name is a name, with its spaces
-    const auto q = parse_nft_ruleset_text("table inet \"my table\" { # handle 1\n}\n");
+    const auto q = parse_nft_ruleset_text("table inet \"my table\" { # handle 1\n\tchain c { # handle 2\n\t}\n}\n");
     REQUIRE(q.has_value());
-    REQUIRE(q->tables.size() == 1);
-    CHECK(q->tables[0].name == "my table");
+    REQUIRE(q->chains.size() == 1);
+    CHECK(q->chains[0].table == "my table");
 }
 
 TEST_CASE("parse_nft_ruleset_text: arp and netdev chains parse and leave the verdict to policy and rules",
@@ -1832,10 +2196,9 @@ TEST_CASE("parse_nft_ruleset_text: arp and netdev chains parse and leave the ver
         "\t}\n"
         "}\n");
     REQUIRE(r.has_value());
-    REQUIRE(r->tables.size() == 2);
-    CHECK(r->tables[0].family == nft_raw::kNfprotoArp);
-    CHECK(r->tables[1].family == nft_raw::kNfprotoNetdev);
     REQUIRE(r->chains.size() == 2);
+    CHECK(r->chains[0].family == nft_raw::kNfprotoArp);
+    CHECK(r->chains[1].family == nft_raw::kNfprotoNetdev);
     CHECK(r->chains[1].is_base_chain);
     CHECK_FALSE(r->chains[1].hooknum.has_value()); // ingress is not one of the five inet hooks
     CHECK(nft_decide_state(true, true, r->chains, r->rules) == NftVerdict::inactive);
@@ -1845,6 +2208,145 @@ TEST_CASE("parse_nft_ruleset_text: arp and netdev chains parse and leave the ver
         "\t\ttype filter hook ingress device \"lo\" priority filter; policy drop;\n\t}\n}\n");
     REQUIRE(drop.has_value());
     CHECK(nft_decide_state(true, true, drop->chains, drop->rules) == NftVerdict::active);
+}
+
+TEST_CASE("parse_nft_ruleset_text: the table-level lines nft prints (flags, comment) are properties, not "
+          "rules",
+          "[firewall]") {
+    // nft's table_print_options writes `\tflags <names>` and `\tcomment "<text>"` with no semicolon
+    const auto with = [](std::string_view property) {
+        return "table inet filter { # handle 1\n" + std::string{property} +
+               "\n\tchain input { # handle 2\n\t\ttype filter hook input priority filter; policy accept;\n"
+               "\t\taccept # handle 3\n\t}\n}\n";
+    };
+    for (const std::string_view property :
+         {"\tflags owner,persist", "\tflags dormant", "\tflags dormant,owner,persist",
+          "\tcomment \"managed by the host\"", "\tcomment \"a # handle 9 { b } c\""}) {
+        INFO(property);
+        const auto r = parse_nft_ruleset_text(with(property));
+        REQUIRE(r.has_value());
+        REQUIRE(r->chains.size() == 1);
+        REQUIRE(r->rules.size() == 1);
+        CHECK(r->rules[0].handle == std::optional<std::uint64_t>{3});
+    }
+    // both lines, in nft's order, ahead of a named set
+    const auto both = parse_nft_ruleset_text(
+        "table inet filter { # handle 1\n\tflags owner,persist\n\tcomment \"x\"\n\tset s { # handle 2\n"
+        "\t\ttype ipv4_addr\n\t}\n}\n");
+    REQUIRE(both.has_value());
+    CHECK(both->rules.empty());
+    // any other table-level line fails closed: it could hide a rule
+    for (const std::string_view bad :
+         {"\tflags", "\tflags a b", "\tflags dormant {", "\tflags owner # handle 7", "\tcomment hello",
+          "\tcomment \"a\" \"b\"", "\tcomment", "\tmystery;", "\tcounter packets 1 bytes 2 # handle 9"}) {
+        INFO(bad);
+        CHECK_FALSE(parse_nft_ruleset_text(with(bad)));
+    }
+}
+
+TEST_CASE("parse_nft_ruleset_text: objects, sets, maps and rules shaped as nft prints them", "[firewall]") {
+    // built from the nftables printer rules (src/rule.c, src/expression.c, src/statement.c), not from a
+    // host: a tunnel (nft 1.1.x), counter, quota, limit and ct objects, a named set and a verdict map
+    // with their elements wrapped over lines, an inline vmap, a rule with an anonymous `jump {` chain
+    constexpr std::string_view kShapes =
+        "table inet filter { # handle 1\n"
+        "\tflags owner,persist\n"
+        "\tcounter c1 { # handle 2\n\t\tpackets 0 bytes 0\n\t}\n"
+        "\tquota q1 { # handle 3\n\t\tover 25 mbytes used 0 bytes\n\t}\n"
+        "\tlimit l1 { # handle 4\n\t\trate 10/second burst 5 packets\n\t}\n"
+        "\tct helper h1 { # handle 5\n\t\ttype \"ftp\" protocol tcp\n\t\tl3proto inet\n\t}\n"
+        "\tct timeout t1 { # handle 6\n\t\tprotocol tcp\n\t\tl3proto inet\n\t\tpolicy = { established : 120 }\n\t}\n"
+        "\tsynproxy sp { # handle 7\n\t\tmss 1460 wscale 7 timestamp sack-perm\n\t}\n"
+        "\ttunnel tun1 { # handle 8\n\t\tid 10\n\t\tip saddr 192.0.2.1\n\t\tip daddr 192.0.2.2\n"
+        "\t\terspan {\n\t\t\tversion 1\n\t\t\tindex 0x123\n\t\t}\n\t}\n"
+        "\tset blocked { # handle 9\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\telements = {\n"
+        "\t\t\t192.0.2.0/24,\n\t\t\t198.51.100.0/24\n\t\t}\n\t}\n"
+        "\tmap vm { # handle 10\n\t\ttype ipv4_addr : verdict\n\t\telements = {\n"
+        "\t\t\t192.0.2.1 : drop,\n\t\t\t192.0.2.2 : jump other\n\t\t}\n\t}\n"
+        "\tchain other { # handle 11\n\t}\n"
+        "\tchain input { # handle 12\n"
+        "\t\ttype filter hook input priority filter; policy accept;\n"
+        "\t\tip saddr vmap { 192.0.2.1 : drop, 192.0.2.2 : accept } # handle 13\n"
+        "\t\ttcp dport 22 jump {\n\t\t\tcounter packets 0 bytes 0 accept\n\t\t} # handle 14\n"
+        "\t\tct helper set \"h1\" # handle 15\n"
+        "\t}\n"
+        "}\n";
+    const auto r = parse_nft_ruleset_text(kShapes);
+    REQUIRE(r.has_value());
+    REQUIRE(r->chains.size() == 2);
+    REQUIRE(r->rules.size() == 3);
+    CHECK(r->rules[0].handle == std::optional<std::uint64_t>{13});
+    CHECK(r->rules[1].handle == std::optional<std::uint64_t>{14});
+    CHECK(r->rules[2].handle == std::optional<std::uint64_t>{15});
+    CHECK(r->rules.size() == yuzu::test::fwrestore::count_nft_rules(kShapes));
+    // the printed shapes the parser has still not been shown on a real host: tunnel and the other
+    // objects above, wrapped set and map elements, a verdict map, the anonymous chain and the table
+    // flags of an older nft (all but `flags owner,persist` here are from the printer, not a capture)
+}
+
+TEST_CASE("the real reply of a firewalld host reads active, with the independent rule count and the "
+          "base chains it shows",
+          "[firewall]") {
+    const auto snapshot = parse_fw_snapshot(kFirewalldRealReply);
+    REQUIRE(snapshot.has_value()); // the framing is good
+    REQUIRE(snapshot->nft.kind == FwSectionKind::text);
+    const auto listing = parse_nft_ruleset_text(snapshot->nft.text);
+    REQUIRE(listing.has_value());
+    const auto handles = yuzu::test::fwrestore::count_nft_rules(snapshot->nft.text); // an independent counter
+    CHECK(handles == 103);
+    CHECK(listing->rules.size() == handles);
+    CHECK(listing->chains.size() == 75);
+
+    const auto state = linux_snapshot_answer(*snapshot, false, FwReadAction::state);
+    CHECK(state.state == NftVerdict::active);
+    CHECK(state.rows == Rows{"backend|nftables", "state|active", "ruleset|103"});
+
+    const auto rules = linux_snapshot_answer(*snapshot, false, FwReadAction::rules);
+    CHECK(rules.state == NftVerdict::active);
+    REQUIRE(rules.rows.size() == 1 + 8 + 103 + 1);
+    CHECK(rules.rows.front() == "backend|nftables");
+    // the eight base chains, in the order the listing prints them, covering all five hooks
+    const Rows chains{"rule|nftables|inet|firewalld|mangle_PREROUTING|prerouting|accept",
+                      "rule|nftables|inet|firewalld|nat_PREROUTING|prerouting|accept",
+                      "rule|nftables|inet|firewalld|nat_POSTROUTING|postrouting|accept",
+                      "rule|nftables|inet|firewalld|nat_OUTPUT|output|accept",
+                      "rule|nftables|inet|firewalld|filter_PREROUTING|prerouting|accept",
+                      "rule|nftables|inet|firewalld|filter_INPUT|input|accept",
+                      "rule|nftables|inet|firewalld|filter_FORWARD|forward|accept",
+                      "rule|nftables|inet|firewalld|filter_OUTPUT|output|accept"};
+    CHECK(Rows(rules.rows.begin() + 1, rules.rows.begin() + 9) == chains);
+    CHECK(std::count_if(rules.rows.begin(), rules.rows.end(),
+                        [](const std::string& row) { return row.find("|handle|") != std::string::npos; }) == 103);
+    CHECK(rules.rows.back() == "ruleset|103");
+    // a table the netlink leg saw changes nothing about an active answer
+    CHECK(linux_snapshot_answer(*snapshot, true, FwReadAction::state).rows == state.rows);
+}
+
+TEST_CASE("the text parser and the netlink formatters name families, hooks and policies alike", "[firewall]") {
+    // the two directions are kept by hand: pin them against each other
+    for (const std::string_view name : {"ip", "ip6", "inet", "arp", "bridge", "netdev"}) {
+        INFO(name);
+        const auto family = detail::nft_text_family(name);
+        REQUIRE(family.has_value());
+        CHECK(nft_family_name(*family) == name);
+    }
+    CHECK_FALSE(detail::nft_text_family("unspec")); // nft never lists it, and the text parser must not accept it
+    CHECK_FALSE(detail::nft_text_family("family7"));
+    // one table with a base chain per hook and a drop policy, then the same with accept: each row
+    // names the hook and the policy the listing text says
+    for (const std::string_view policy : {"accept", "drop"}) {
+        std::string text = "table ip t { # handle 1\n";
+        for (const std::string_view hook : {"prerouting", "input", "forward", "output", "postrouting"})
+            text += std::format("\tchain c_{0} {{ # handle 2\n\t\ttype filter hook {0} priority filter; policy {1};\n\t}}\n",
+                                hook, policy);
+        text += "}\n";
+        const auto r = rules_rows(text, kAbsent, kAbsent);
+        Rows want{"backend|nftables"};
+        for (const std::string_view hook : {"prerouting", "input", "forward", "output", "postrouting"})
+            want.push_back(std::format("rule|nftables|ip|t|c_{0}|{0}|{1}", hook, policy));
+        want.emplace_back("ruleset|0");
+        CHECK(r == want); // a drop policy is content (active) and accept is not (inactive): the same rows
+    }
 }
 
 TEST_CASE("iptables_summary and format_iptables_rule_row: content, shape and the IPv4 and IPv6 row forms",
@@ -2004,6 +2506,87 @@ TEST_CASE("linux_snapshot rows, branch 6: inactive reads unknown when the netlin
     // and the same snapshot without a table seen is inactive
     CHECK(state_rows(kAbsent, kIptClean, kIptClean, false) ==
           Rows{"backend|iptables", "state|inactive", "ruleset|0"});
+}
+
+TEST_CASE("linux_snapshot_answer: the verdict travels with the rows on every decision-table branch",
+          "[firewall]") {
+    using V = NftVerdict;
+    const auto state = [](std::string_view nft, std::string_view ipt, std::string_view ip6t, bool seen = false) {
+        return snapshot_answer(nft, ipt, ip6t, seen, FwReadAction::state).state;
+    };
+    const std::string cut = "table inet filter { # handle 1\n"; // not closed
+    const std::string no_content =
+        "table inet filter { # handle 1\n\tchain input { # handle 1\n"
+        "\t\ttype filter hook input priority filter; policy accept;\n\t}\n}\n";
+    CHECK(state(cut, kIptClean, kIptClean) == V::unknown);                // 1. unreadable nft text
+    CHECK(state(kNftOne, kIptClean, kIptClean) == V::active);             // 2. nft with content
+    CHECK(state(no_content, kIptV6Rules, kIptClean) == V::active);        // 3. a family with content
+    CHECK(state(no_content, kFailed, kIptClean) == V::unknown);           //    a family that was not read
+    CHECK(state(no_content, kIptClean, kIptClean) == V::inactive);        //    nothing anywhere
+    CHECK(state(kAbsent, kIptV6Rules, kIptClean) == V::active);           // 4. no nft: the family
+    CHECK(state(kAbsent, kIptClean, kIptClean) == V::inactive);
+    CHECK(snapshot_answer(kAbsent, kAbsent, kAbsent, false, FwReadAction::state).rows.empty()); // declines
+    CHECK(state(kFailed, kIptV6Rules, kIptClean) == V::active);           // 5. nft failed, a family has content
+    CHECK(state(kFailed, kIptClean, kIptClean) == V::unknown);            //    never read as empty
+    CHECK(state("", kAbsent, kAbsent, true) == V::unknown);               // 6. inactive with a table seen
+    CHECK(state(kAbsent, kIptClean, kIptClean, true) == V::unknown);
+    CHECK(state(kNftOne, kIptClean, kIptClean, true) == V::active);       //    an active reading stands
+
+    // for every combination: both actions reach the same verdict, the one `state|` row says it, and an
+    // unknown verdict carries no count
+    const std::array<std::string_view, 6> nfts{kAbsent, kFailed, cut, kNftOne, "", no_content};
+    const std::array<std::string_view, 5> ipts{kAbsent, kFailed, kIptClean, kIptV6Rules, "surprise\n"};
+    for (const auto nft : nfts) {
+        for (const auto ipt : ipts) {
+            for (const auto ip6t : ipts) {
+                for (const bool seen : {false, true}) {
+                    INFO(nft << " | " << ipt << " | " << ip6t << " | seen=" << seen);
+                    const auto st = snapshot_answer(nft, ipt, ip6t, seen, FwReadAction::state);
+                    const auto ru = snapshot_answer(nft, ipt, ip6t, seen, FwReadAction::rules);
+                    CHECK(st.state == ru.state);
+                    CHECK(st.rows.empty() == ru.rows.empty());
+                    if (st.rows.empty())
+                        continue;
+                    CHECK(std::count(st.rows.begin(), st.rows.end(),
+                                     "state|" + std::string{nft_verdict_name(st.state)}) == 1);
+                    CHECK(std::count_if(st.rows.begin(), st.rows.end(),
+                                        [](const std::string& r) { return r.starts_with("state|"); }) == 1);
+                    if (st.state == V::unknown)
+                        CHECK(std::count_if(st.rows.begin(), st.rows.end(), [](const std::string& r) {
+                                  return r.starts_with("ruleset|") && r != "ruleset|unknown";
+                              }) == 0);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("firewalld_read: complete only when firewalld answered and every service list was read", "[firewall]") {
+    CHECK(firewalld_read(false, true) == FirewalldRead::absent); // getActiveZones failed: not reachable
+    CHECK(firewalld_read(false, false) == FirewalldRead::absent);
+    CHECK(firewalld_read(true, true) == FirewalldRead::complete);
+    // getServices refused (polkit), undecodable, or the budget ran out: the shell reports all three as
+    // an incomplete service list
+    CHECK(firewalld_read(true, false) == FirewalldRead::partial);
+}
+
+TEST_CASE("firewalld_rows: today's rows, complete and partial, for state and rules", "[firewall]") {
+    const std::vector<FirewalldZone> zones{{"public", {"ssh", "dhcpv6-client"}}, {"internal", {"mdns"}}};
+    CHECK(firewalld_rows(zones, true, FwReadAction::state) ==
+          Rows{"backend|firewalld", "state|running", "ruleset|3"});
+    CHECK(firewalld_rows(zones, false, FwReadAction::state) ==
+          Rows{"backend|firewalld", "state|running", "ruleset|unknown"}); // an undercount is not a count
+    CHECK(firewalld_rows({}, true, FwReadAction::state) == Rows{"backend|firewalld", "state|running", "ruleset|0"});
+    CHECK(firewalld_rows(zones, true, FwReadAction::rules) ==
+          Rows{"backend|firewalld", "rule|firewalld|public|service|ssh", "rule|firewalld|public|service|dhcpv6-client",
+               "rule|firewalld|internal|service|mdns", "ruleset|3"});
+    CHECK(firewalld_rows(zones, false, FwReadAction::rules).back() == "ruleset|unknown");
+    CHECK(firewalld_rows(zones, false, FwReadAction::rules).size() == 5); // the services that were read stay listed
+    CHECK(firewalld_rows({}, true, FwReadAction::rules) == Rows{"backend|firewalld", "ruleset|0"});
+    // a `|` or a newline in a zone or service name cannot make a field or a row
+    const std::vector<FirewalldZone> hostile{{"a|b\nc", {"x|y\rz"}}};
+    CHECK(firewalld_rows(hostile, true, FwReadAction::rules) ==
+          Rows{"backend|firewalld", "rule|firewalld|a_b_c|service|x_y_z", "ruleset|1"});
 }
 
 TEST_CASE("snapshot_connect_token and snapshot_error_row", "[firewall]") {

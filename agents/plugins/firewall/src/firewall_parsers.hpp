@@ -922,6 +922,18 @@ enum class NftVerdict { active, inactive, unknown };
     return downstream_state;
 }
 
+/// The same reconciliation for an NftVerdict: `inactive` reads `unknown` once a table was seen.
+/// The snapshot rung's every `inactive` (nft's and the iptables family's) goes through this one
+/// function rather than a respelled condition.
+[[nodiscard]] constexpr NftVerdict nft_fallthrough_clamp(bool tables_seen, NftVerdict verdict) noexcept {
+    return tables_seen && verdict == NftVerdict::inactive ? NftVerdict::unknown : verdict;
+}
+static_assert(nft_fallthrough_clamp(true, NftVerdict::inactive) == NftVerdict::unknown &&
+                  nft_fallthrough_clamp(true, NftVerdict::active) == NftVerdict::active &&
+                  nft_fallthrough_clamp(true, NftVerdict::unknown) == NftVerdict::unknown &&
+                  nft_fallthrough_clamp(false, NftVerdict::inactive) == NftVerdict::inactive,
+              "an inactive verdict reads unknown only when a table was seen");
+
 /// Composes subprocess_complete() with nft_fallthrough_clamp(): the single
 /// completeness-gated state decision every rung-2 backend (ufw, iptables)
 /// makes the same way -- an incomplete subprocess read must degrade to
@@ -1605,6 +1617,35 @@ struct FwSnapshot {
     FwSnapshotSection ip6tables;
 };
 
+namespace detail {
+
+/// `s` without its leading and trailing space, tab and carriage return.
+[[nodiscard]] inline std::string_view trim(std::string_view s) noexcept {
+    const auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
+    while (!s.empty() && blank(s.back()))
+        s.remove_suffix(1);
+    while (!s.empty() && blank(s.front()))
+        s.remove_prefix(1);
+    return s;
+}
+
+/// The lines of `text` without their newlines. A final newline ends the last line and adds no empty
+/// one after it (parse_fw_snapshot tells text after the end line by the last element).
+[[nodiscard]] inline std::vector<std::string_view> lines(std::string_view text) {
+    std::vector<std::string_view> out;
+    for (std::size_t pos = 0; pos < text.size();) {
+        const auto nl = text.find('\n', pos);
+        out.push_back(text.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos));
+        pos = nl == std::string_view::npos ? text.size() : nl + 1;
+    }
+    return out;
+}
+
+} // namespace detail
+
+/// The two Linux read actions, which every Linux row builder below is written for.
+enum class FwReadAction { state, rules };
+
 /// Frames a broker reply: exactly the three headed sections in order, then `== end` as the last
 /// line, every line newline-terminated. The error token is `empty` (zero bytes: the broker
 /// accepted the connection and sent nothing, as when MaxConnections is reached or the service could
@@ -1614,12 +1655,7 @@ struct FwSnapshot {
 [[nodiscard]] inline std::expected<FwSnapshot, std::string_view> parse_fw_snapshot(std::string_view reply) {
     if (reply.empty())
         return std::unexpected{std::string_view{"empty"}};
-    std::vector<std::string_view> lines;
-    for (std::size_t pos = 0; pos < reply.size();) {
-        const auto nl = reply.find('\n', pos);
-        lines.push_back(reply.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos));
-        pos = nl == std::string_view::npos ? reply.size() : nl + 1;
-    }
+    const auto lines = detail::lines(reply);
     const std::array<std::string, 3> headers{"== " + std::string{kFwSnapshotNftLabel},
                                              "== " + std::string{kFwSnapshotIptablesLabel},
                                              "== " + std::string{kFwSnapshotIp6tablesLabel}};
@@ -1668,11 +1704,11 @@ struct FwSnapshot {
     return snap;
 }
 
-/// An `nft -a list ruleset` listing read as text: its tables, its chains (with the base-chain hook
-/// and policy) and its rules, in the same records the netlink dumps decode to, so the state
-/// verdict (nft_has_content) and the row formatters are the ones the netlink leg uses.
+/// An `nft -a list ruleset` listing read as text: its chains (with the base-chain hook and policy)
+/// and its rules, in the same records the netlink dumps decode to, so the state verdict
+/// (nft_has_content) and the row formatters are the ones the netlink leg uses. A table is read for
+/// the family and name its chains and rules carry; one with no chain and no rule says nothing more.
 struct NftTextRuleset {
-    std::vector<NftTableInfo> tables;
     std::vector<NftChainInfo> chains;
     std::vector<NftRuleInfo> rules;
 };
@@ -1693,11 +1729,7 @@ struct NftTextLine {
 };
 
 [[nodiscard]] inline std::optional<NftTextLine> nft_text_line(std::string_view raw) {
-    const auto is_blank = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
-    while (!raw.empty() && is_blank(raw.back()))
-        raw.remove_suffix(1);
-    while (!raw.empty() && is_blank(raw.front()))
-        raw.remove_prefix(1);
+    raw = trim(raw);
     NftTextLine out;
     bool quoted = false;
     std::size_t comment = std::string_view::npos;
@@ -1723,13 +1755,9 @@ struct NftTextLine {
     }
     if (quoted)
         return std::nullopt;
-    out.code = raw.substr(0, comment);
-    while (!out.code.empty() && is_blank(out.code.back()))
-        out.code.remove_suffix(1);
+    out.code = trim(raw.substr(0, comment));
     if (comment != std::string_view::npos) {
-        auto note = raw.substr(comment + 1);
-        while (!note.empty() && is_blank(note.front()))
-            note.remove_prefix(1);
+        const auto note = trim(raw.substr(comment + 1));
         constexpr std::string_view kHandle = "handle ";
         if (note.starts_with(kHandle)) {
             const auto digits = note.substr(kHandle.size());
@@ -1778,6 +1806,19 @@ struct NftTextLine {
     return std::string{token};
 }
 
+/// A line nft prints inside a table that opens no block and is neither a chain nor an object
+/// header: `flags <comma-separated names>` (`flags owner,persist`, `flags dormant`) or `comment "<text>"`,
+/// both printed without a semicolon (nft's table_print_options). The flag names are not listed, so a
+/// flag a newer nft adds still reads; a line with a brace or a handle, or any other shape, is not one.
+[[nodiscard]] inline bool nft_text_table_property(const NftTextLine& line,
+                                                  const std::vector<std::string_view>& tokens) noexcept {
+    if (line.delta() != 0 || line.has_handle || tokens.size() != 2)
+        return false;
+    if (tokens[0] == "flags")
+        return true;
+    return tokens[0] == "comment" && tokens[1].size() >= 2 && tokens[1].front() == '"' && tokens[1].back() == '"';
+}
+
 [[nodiscard]] inline std::optional<std::uint8_t> nft_text_family(std::string_view name) {
     using namespace nft_raw;
     if (name == "ip")
@@ -1805,7 +1846,8 @@ struct NftTextLine {
 /// off first (quote-aware, so a `# handle 9` or a brace inside a quoted comment changes nothing),
 /// then: at top level only blank lines, comments and `table <family> <name> {`; inside a table
 /// `chain <name> {` opens a chain, a `set`, `map`, `flowtable` or other object header is only
-/// brace-counted, and a `...;` or `comment ...` line is a property; inside a chain a
+/// brace-counted, and a `flags <names>` or `comment "<text>"` line is a table property (nft prints
+/// both without a semicolon); inside a chain a
 /// `type ... hook <h> ...; policy <p>;` line makes it a base chain, a line that carries a handle
 /// and does not open a block is one rule, a line that opens a block starts a multi-line rule
 /// that must close on a line carrying a handle, and any other line returns nullopt. Unbalanced
@@ -1818,10 +1860,7 @@ struct NftTextLine {
     std::uint8_t family = 0;
     std::string table;
     std::string chain;
-    for (std::size_t pos = 0; pos < text.size();) {
-        const auto nl = text.find('\n', pos);
-        const auto raw = text.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
-        pos = nl == std::string_view::npos ? text.size() : nl + 1;
+    for (const auto raw : detail::lines(text)) {
         const auto scanned = detail::nft_text_line(raw);
         if (!scanned)
             return std::nullopt;
@@ -1836,7 +1875,6 @@ struct NftTextLine {
                 return std::nullopt;
             family = *fam;
             table = detail::nft_text_name(tokens[2]);
-            out.tables.push_back(NftTableInfo{family, table});
             depth = 1;
             where = Where::table;
             break;
@@ -1857,17 +1895,17 @@ struct NftTextLine {
                     where = Where::chain;
                 } else {
                     // an object that holds no rules; unknown headers fail closed
-                    static constexpr std::string_view kObjects[] = {"set",   "map",     "flowtable", "counter",
-                                                                    "quota", "limit",   "ct",        "synproxy",
-                                                                    "secmark"};
+                    static constexpr std::string_view kObjects[] = {"set",      "map",    "flowtable", "counter",
+                                                                    "quota",    "limit",  "ct",        "synproxy",
+                                                                    "secmark",  "tunnel"};
                     if (std::find(std::begin(kObjects), std::end(kObjects), tokens[0]) == std::end(kObjects) ||
                         line.delta() < 1)
                         return std::nullopt;
                     depth += line.delta();
                     where = Where::block;
                 }
-            } else if (!(line.delta() == 0 && !line.has_handle && (line.code.back() == ';' || tokens[0] == "comment"))) {
-                return std::nullopt; // a table property (`flags dormant;`, `comment "..."`) is the only other line
+            } else if (!detail::nft_text_table_property(line, tokens)) {
+                return std::nullopt; // a table property (`flags owner,persist`, `comment "..."`) is the only other line
             }
             break;
         }
@@ -1938,10 +1976,13 @@ struct NftTextLine {
     return out;
 }
 
-/// The two iptables sections of a snapshot read together (`iptables -S` and `ip6tables -S`).
-/// A member is TRUSTED when it is text and shaped; an absent member (no binary) adds nothing; a
-/// failed or unshaped member is untrusted and what it printed is ignored for the verdict.
-enum class FwFamilyState { active, inactive, unknown };
+/// What the snapshot rung answers: the verdict it reached and the rows that carry it. Both leave
+/// together so a caller can decide whether the answer is one it accepts without reading rows back.
+/// No rows means the rung declines (no nft and no iptables on the host).
+struct LinuxSnapshotAnswer {
+    NftVerdict state = NftVerdict::unknown;
+    std::vector<std::string> rows;
+};
 
 namespace detail {
 
@@ -1953,6 +1994,9 @@ struct IptablesMember {
     [[nodiscard]] bool trusted() const noexcept { return kind == FwSectionKind::text && summary.shaped; }
 };
 
+/// The two iptables sections of a snapshot read together (`iptables -S` and `ip6tables -S`).
+/// A member is TRUSTED when it is text and shaped; an absent member (no binary) adds nothing; a
+/// failed or unshaped member is untrusted and what it printed is ignored for the verdict.
 struct IptablesFamily {
     std::array<IptablesMember, 2> members;
     [[nodiscard]] bool absent() const noexcept {
@@ -1960,14 +2004,14 @@ struct IptablesFamily {
     }
     /// active when any trusted member has content; else unknown when any member is untrusted; else
     /// inactive (every present member is trusted and shows no content).
-    [[nodiscard]] FwFamilyState state() const noexcept {
+    [[nodiscard]] NftVerdict state() const noexcept {
         bool untrusted = false;
         for (const auto& m : members) {
             if (m.trusted() && m.summary.has_content)
-                return FwFamilyState::active;
+                return NftVerdict::active;
             untrusted = untrusted || (m.kind != FwSectionKind::absent && !m.trusted());
         }
-        return untrusted ? FwFamilyState::unknown : FwFamilyState::inactive;
+        return untrusted ? NftVerdict::unknown : NftVerdict::inactive;
     }
     /// The sum of -A entries when every present member is trusted, else nullopt.
     [[nodiscard]] std::optional<int> count() const noexcept {
@@ -1996,25 +2040,20 @@ struct IptablesFamily {
     return f;
 }
 
-enum class SnapshotMode { state, rules };
-
-[[nodiscard]] inline std::string_view fw_family_state_name(FwFamilyState s) noexcept {
-    return s == FwFamilyState::active ? "active" : s == FwFamilyState::inactive ? "inactive" : "unknown";
-}
-
 /// `backend|iptables` and what follows for `state` (state, count) or `rules` (the rows of every
 /// text member, IPv4 then IPv6, or `rules|unknown` when none was text; then the count), then one
-/// row per untrusted member. `clamp` turns `inactive` into `unknown` (the netlink leg saw a table
-/// this snapshot did not explain): the state is `unknown`, `rules` lists nothing and says
-/// `rules|unknown`, and neither carries a count (an unknown answer never carries one).
-[[nodiscard]] inline std::vector<std::string> iptables_family_rows(const IptablesFamily& f, SnapshotMode mode,
-                                                                   bool clamp) {
-    std::vector<std::string> rows{"backend|iptables"};
-    const bool clamped = clamp && f.state() == FwFamilyState::inactive;
-    const auto state = clamped ? FwFamilyState::unknown : f.state();
+/// row per untrusted member. `tables_seen` (the netlink leg saw a table this snapshot did not
+/// explain) turns an `inactive` family into `unknown` through nft_fallthrough_clamp: the state is
+/// `unknown`, `rules` lists nothing and says `rules|unknown`, and neither carries a count (an
+/// unknown answer never carries one).
+[[nodiscard]] inline LinuxSnapshotAnswer iptables_family_answer(const IptablesFamily& f, FwReadAction action,
+                                                                bool tables_seen) {
+    LinuxSnapshotAnswer answer{nft_fallthrough_clamp(tables_seen, f.state()), {"backend|iptables"}};
+    auto& rows = answer.rows;
+    const bool clamped = answer.state != f.state();
     const auto count = f.count();
-    if (mode == SnapshotMode::state) {
-        rows.push_back(std::format("state|{}", fw_family_state_name(state)));
+    if (action == FwReadAction::state) {
+        rows.push_back(std::format("state|{}", nft_verdict_name(answer.state)));
     } else {
         bool any_text = false;
         for (const auto& m : f.members) {
@@ -2034,18 +2073,19 @@ enum class SnapshotMode { state, rules };
         else if (m.kind == FwSectionKind::text && !m.summary.shaped)
             rows.push_back(unrecognised_output_row(m.tool));
     }
-    return rows;
+    return answer;
 }
 
-[[nodiscard]] inline std::vector<std::string> nft_snapshot_rows(const NftTextRuleset& nft, NftVerdict verdict,
-                                                                SnapshotMode mode) {
-    std::vector<std::string> rows{"backend|nftables"};
+[[nodiscard]] inline LinuxSnapshotAnswer nft_snapshot_answer(const NftTextRuleset& nft, NftVerdict verdict,
+                                                             FwReadAction action) {
+    LinuxSnapshotAnswer answer{verdict, {"backend|nftables"}};
+    auto& rows = answer.rows;
     if (verdict == NftVerdict::unknown) {
-        rows.emplace_back(mode == SnapshotMode::state ? "state|unknown" : "rules|unknown");
+        rows.emplace_back(action == FwReadAction::state ? "state|unknown" : "rules|unknown");
         rows.emplace_back("ruleset|unknown");
-        return rows;
+        return answer;
     }
-    if (mode == SnapshotMode::state) {
+    if (action == FwReadAction::state) {
         rows.push_back(std::format("state|{}", nft_verdict_name(verdict)));
     } else {
         for (const auto& c : nft.chains)
@@ -2055,55 +2095,14 @@ enum class SnapshotMode { state, rules };
             rows.push_back(format_nft_rule_handle_row(r));
     }
     rows.push_back(std::format("ruleset|{}", nft.rules.size()));
-    return rows;
-}
-
-[[nodiscard]] inline std::vector<std::string> linux_snapshot_rows(const FwSnapshot& snap, bool tables_seen,
-                                                                  SnapshotMode mode) {
-    const auto family = iptables_family(snap);
-    const auto nft_unknown = [&] {
-        return std::vector<std::string>{"backend|nftables",
-                                        mode == SnapshotMode::state ? "state|unknown" : "rules|unknown",
-                                        "ruleset|unknown"};
-    };
-    const auto append = [](std::vector<std::string> head, const std::vector<std::string>& tail) {
-        head.insert(head.end(), tail.begin(), tail.end());
-        return head;
-    };
-    switch (snap.nft.kind) {
-    case FwSectionKind::absent:
-        // 4. no nft: the iptables family answers, or the rung declines
-        return family.absent() ? std::vector<std::string>{} : iptables_family_rows(family, mode, tables_seen);
-    case FwSectionKind::failed:
-        // 5. nft was there and could not be read: say so, and let a family that shows content answer;
-        //    anything else is unknown (an unread nft ruleset is not an empty one)
-        return append({"error|nftables:snapshot:failed"},
-                      family.state() == FwFamilyState::active ? iptables_family_rows(family, mode, tables_seen)
-                                                              : nft_unknown());
-    case FwSectionKind::text:
-        break;
-    }
-    const auto nft = parse_nft_ruleset_text(snap.nft.text);
-    if (!nft) // 1. a listing this parser does not fully understand
-        return append(nft_unknown(), {unrecognised_output_row("nftables")});
-    const auto verdict = nft_decide_state(/*chains_ok=*/true, /*rules_ok=*/true, nft->chains, nft->rules);
-    if (verdict == NftVerdict::active) // 2.
-        return nft_snapshot_rows(*nft, verdict, mode);
-    // 3. nft shows no content: a family with content, or one that could not be read, answers instead
-    if (!family.absent() && family.state() != FwFamilyState::inactive)
-        return iptables_family_rows(family, mode, tables_seen);
-    // 6. and `inactive` is only answered when no table was seen by the netlink leg either
-    return nft_snapshot_rows(*nft, nft_fallthrough_clamp(tables_seen, FwState::disabled) == FwState::unknown
-                                       ? NftVerdict::unknown
-                                       : NftVerdict::inactive,
-                             mode);
+    return answer;
 }
 
 } // namespace detail
 
-/// The `state` rows a snapshot answers with, or no rows when the rung declines (no nft and no
-/// iptables on the host). `tables_seen` is true when the netlink leg saw a table it could not
-/// read. The decision table:
+/// The snapshot rung's answer for `state` or `rules`: no rows when the rung declines (no nft and no
+/// iptables on the host), else the verdict and its rows. `tables_seen` is true when the netlink leg
+/// saw a table it could not read. The decision table:
 ///  1. nft text that does not parse: backend|nftables, state|unknown, ruleset|unknown and
 ///     error|nftables:unrecognised_output.
 ///  2. nft parsed with content: backend|nftables, state|active, ruleset|<rules>.
@@ -2116,21 +2115,89 @@ enum class SnapshotMode { state, rules };
 ///  6. last, every `inactive` reads unknown when the netlink leg saw a table, with no count (an
 ///     unknown state never carries one): `inactive` is answered only when every section that was
 ///     read shows no content.
-[[nodiscard]] inline std::vector<std::string> linux_snapshot_state_rows(const FwSnapshot& snap, bool tables_seen) {
-    return detail::linux_snapshot_rows(snap, tables_seen, detail::SnapshotMode::state);
+/// For `rules` the rule rows (nft base chains then rule handles; iptables entries, `rule|ip6|...` for
+/// IPv6) stand where `state` has its verdict, and `rules|unknown` where the verdict is unknown.
+[[nodiscard]] inline LinuxSnapshotAnswer linux_snapshot_answer(const FwSnapshot& snap, bool tables_seen,
+                                                               FwReadAction action) {
+    const auto family = detail::iptables_family(snap);
+    switch (snap.nft.kind) {
+    case FwSectionKind::absent:
+        // 4. no nft: the iptables family answers, or the rung declines
+        return family.absent() ? LinuxSnapshotAnswer{} : detail::iptables_family_answer(family, action, tables_seen);
+    case FwSectionKind::failed: {
+        // 5. nft was there and could not be read: say so, and let a family that shows content answer;
+        //    anything else is unknown (an unread nft ruleset is not an empty one)
+        auto answer = family.state() == NftVerdict::active
+                          ? detail::iptables_family_answer(family, action, tables_seen)
+                          : detail::nft_snapshot_answer({}, NftVerdict::unknown, action);
+        answer.rows.insert(answer.rows.begin(), "error|nftables:snapshot:failed");
+        return answer;
+    }
+    case FwSectionKind::text:
+        break;
+    }
+    const auto nft = parse_nft_ruleset_text(snap.nft.text);
+    if (!nft) { // 1. a listing this parser does not fully understand
+        auto answer = detail::nft_snapshot_answer({}, NftVerdict::unknown, action);
+        answer.rows.push_back(unrecognised_output_row("nftables"));
+        return answer;
+    }
+    const auto verdict = nft_decide_state(/*chains_ok=*/true, /*rules_ok=*/true, nft->chains, nft->rules);
+    if (verdict == NftVerdict::active) // 2.
+        return detail::nft_snapshot_answer(*nft, verdict, action);
+    // 3. nft shows no content: a family with content, or one that could not be read, answers instead
+    if (!family.absent() && family.state() != NftVerdict::inactive)
+        return detail::iptables_family_answer(family, action, tables_seen);
+    // 6. and `inactive` is only answered when no table was seen by the netlink leg either
+    return detail::nft_snapshot_answer(*nft, nft_fallthrough_clamp(tables_seen, verdict), action);
 }
 
-/// The `rules` rows: the same branch and the same backend row as linux_snapshot_state_rows, with
-/// the rule rows (nft base chains then rule handles; iptables entries, `rule|ip6|...` for IPv6)
-/// where `state` has its verdict, and `rules|unknown` where the verdict is unknown.
-[[nodiscard]] inline std::vector<std::string> linux_snapshot_rules_rows(const FwSnapshot& snap, bool tables_seen) {
-    return detail::linux_snapshot_rows(snap, tables_seen, detail::SnapshotMode::rules);
+// ── Linux: firewalld's own answer ───────────────────────────────────────────────────────────
+
+/// How much of firewalld's answer was read. `absent`: firewalld is not reachable. `partial`: it
+/// answered getActiveZones but a getServices read was refused, failed or ran out of budget (an
+/// account with no polkit rule, as the packaged agent's): its zones are known and its service
+/// list is not. `complete`: everything the answer needs was read.
+enum class FirewalldRead { absent, partial, complete };
+
+[[nodiscard]] constexpr FirewalldRead firewalld_read(bool reachable, bool services_complete) noexcept {
+    return !reachable ? FirewalldRead::absent : services_complete ? FirewalldRead::complete : FirewalldRead::partial;
+}
+
+struct FirewalldZone {
+    std::string name;
+    std::vector<std::string> services;
+};
+
+/// The rows firewalld's own answer writes: `backend|firewalld`, then for `state` `state|running` and
+/// for `rules` one `rule|firewalld|<zone>|service|<service>` row per service, then the service
+/// count, or `ruleset|unknown` when the service list is not complete (a count over an incomplete
+/// list would be an undercount, never a genuine zero). Zone and service names are echoed through
+/// sanitize_field.
+[[nodiscard]] inline std::vector<std::string> firewalld_rows(const std::vector<FirewalldZone>& zones,
+                                                             bool services_complete, FwReadAction action) {
+    std::vector<std::string> rows{"backend|firewalld"};
+    if (action == FwReadAction::state)
+        rows.emplace_back("state|running");
+    std::size_t total = 0;
+    for (const auto& zone : zones) {
+        for (const auto& svc : zone.services) {
+            if (action == FwReadAction::rules)
+                rows.push_back(
+                    std::format("rule|firewalld|{}|service|{}", sanitize_field(zone.name), sanitize_field(svc)));
+            ++total;
+        }
+    }
+    rows.push_back(services_complete ? std::format("ruleset|{}", total) : std::string{"ruleset|unknown"});
+    return rows;
 }
 
 /// The token for a failed connect(2) to the broker socket: empty for ENOENT (no broker is
 /// installed, which is not an error to report), else `connect:eacces` (the agent account is not in
-/// the socket's group), `connect:refused` (the socket file exists and nothing listens),
-/// `connect:busy` (MaxConnections is reached) or `connect:errno:<n>`.
+/// the socket's group), `connect:refused` (the socket file exists and nothing listens; the
+/// documented opt-out stops the socket before masking it, so no file is left), `connect:busy`
+/// (EAGAIN from the non-blocking connect: the socket's listen backlog is full; a connection over
+/// MaxConnections is accepted and closed at once and reads as `empty`) or `connect:errno:<n>`.
 [[nodiscard]] inline std::string snapshot_connect_token(int err) {
     switch (err) {
     case ENOENT:
