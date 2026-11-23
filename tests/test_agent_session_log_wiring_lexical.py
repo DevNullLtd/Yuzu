@@ -16,11 +16,17 @@ The server-side "ProxyRegister succeeded: ... session=" line is the id's source 
 import pathlib
 import re
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SELF = pathlib.Path(__file__).resolve()
-SKIP_DIRS = {".git", "build-linux", "build-windows", "build-macos", "node_modules", "vcpkg_installed",
+SKIP_DIRS = {".git", "node_modules", "vcpkg_installed",
              "scratchpad", "governance.d", ".claude", "changelog.d", "site"}
+# Every top-level build* directory is skipped, not only the three per-OS names: the self-hosted
+# runners build several CI jobs into sibling dirs of one checkout (build-linux-coverage,
+# build-linux-clang-21-debug, ...), whose test logs and coverage reports quote the agent's
+# Registered line and would fail this gate on a PR that never touched it (#8637).
+SKIP_PREFIX = "build"
 WINDOW = 25  # extractors may sit well after the grep that fetches the line
 MENTION = re.compile(r"Registered\s+with\s+server")
 EXTRACT = re.compile(r"\bsession\\?=(?!fp)")
@@ -79,12 +85,19 @@ def check_dex_emit(text):
     return []
 
 
-def iter_files():
-    for p in ROOT.rglob("*"):
+def skipped(rel_parts):
+    """True when a repo-relative path lies in a directory this gate does not scan."""
+    top = rel_parts[0] if len(rel_parts) > 1 else ""
+    return (top in SKIP_DIRS or top.startswith(SKIP_PREFIX)
+            or "node_modules" in rel_parts or ".git" in rel_parts)
+
+
+def iter_files(root=ROOT):
+    for p in root.rglob("*"):
         if not p.is_file() or p.resolve() == SELF:
             continue
-        rel = p.relative_to(ROOT)
-        if SKIP_DIRS & set(rel.parts[:1]) or "node_modules" in rel.parts or ".git" in rel.parts:
+        rel = p.relative_to(root)
+        if skipped(rel.parts):
             continue
         try:
             if p.stat().st_size > 2_000_000:
@@ -121,6 +134,29 @@ def selftest():
     assert not check_text("x.sh", "ProxyRegister succeeded: agent=a, session=b"), "selftest server line"
     # Windows-style path separators must not matter
     assert check_text("scripts\\x.sh".replace("\\", "/"), bad[0]), "selftest path"
+    selftest_walk(bad[0])
+
+
+def selftest_walk(bad_line):
+    """#8637: another CI job's output under any top-level build* dir is not scanned, while the
+    same line in a source file still is. Runs the real walk over a throwaway tree."""
+    log_line = "[info] Registered with server session=0123456789abcdef\n"
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_session_log_walk_") as tmp:
+        root = pathlib.Path(tmp)
+        for rel in ("build-linux-clang-21-debug/meson-logs/ci-half-nonpg.log",
+                    "build-linux-coverage/coverage-html/index.html",
+                    "build-linux/meson-logs/testlog.txt",
+                    "builddir/meson-logs/testlog.txt"):
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(log_line)
+        (root / "scripts").mkdir()
+        (root / "scripts" / "x.sh").write_text(bad_line + "\n")
+        # A build* name BELOW the top level is ordinary source and is still scanned.
+        (root / "deploy" / "build-tools").mkdir(parents=True)
+        (root / "deploy" / "build-tools" / "y.sh").write_text(bad_line + "\n")
+        flagged = sorted(rel for rel, text in iter_files(root) if check_text(rel, text))
+        assert flagged == ["deploy/build-tools/y.sh", "scripts/x.sh"], ("selftest walk", flagged)
+    assert not skipped(("build-tools.sh",)), "selftest: a top-level FILE named build* is still scanned"
 
 
 def main():
