@@ -2935,6 +2935,13 @@ public:
         for (const char* reason : {"lookup_degraded", "lookup_threw", "write_failed"})
             metrics_.counter("yuzu_server_echo_corruption_audit_degraded_total",
                              {{"reason", reason}});
+        metrics_.describe("yuzu_server_echo_corruption_audit_store_closed_total",
+                          "Heartbeats that carried an echo.db quarantine candidate while the audit "
+                          "store was closed: nothing can be audited or counted as a quarantine "
+                          "then, so a rise here means the quarantine counter is blind, not that "
+                          "no agent is corrupt",
+                          "counter");
+        metrics_.counter("yuzu_server_echo_corruption_audit_store_closed_total");
         metrics_.describe("yuzu_server_health_upsert_exceptions_total",
                           "Heartbeat health-store upserts that threw out of the store (caught in "
                           "the heartbeat handler, logged and counted; the rest of ingestion "
@@ -7049,8 +7056,12 @@ public:
                 health_store_.set_corruption_sink([this, gate](const std::string& agent_id,
                                                                int64_t total,
                                                                const std::string& quarantine) {
-                    if (!audit_store_ || !audit_store_->is_open())
+                    if (!audit_store_ || !audit_store_->is_open()) {
+                        // No row can be written, so the quarantine counter cannot move: say so, or
+                        // the corruption signal would be silent exactly when the store is down.
+                        metrics_.counter("yuzu_server_echo_corruption_audit_store_closed_total").increment();
                         return;
+                    }
                     // log_echo_corruption_once admits via the gate and completes the reservation
                     // even if AuditEvent construction or audit_store_->log() throws (log() is
                     // not noexcept). It returns true only for a row this call wrote, so the

@@ -43,6 +43,7 @@ HINT = (" (this gate pins the corruption-audit gate signal wiring; if server.cpp
 QUARANTINES = "yuzu_server_echo_db_quarantines_total"
 DEGRADED = "yuzu_server_echo_corruption_audit_degraded_total"
 UPSERTS = "yuzu_server_health_upsert_exceptions_total"
+STORE_CLOSED = "yuzu_server_echo_corruption_audit_store_closed_total"
 TAR_ONLY = "yuzu_fleet_retired_tar_plugin_agents"
 
 # Comments and literals are found in ONE pass, so a quote inside a comment, or a comment marker
@@ -103,6 +104,7 @@ def problems(server_src, header_src):
     seeds = {
         QUARANTINES: f'metrics_.counter("{QUARANTINES}");',
         UPSERTS: f'metrics_.counter("{UPSERTS}");',
+        STORE_CLOSED: f'metrics_.counter("{STORE_CLOSED}");',
     }
     seed_at = {name: find(stmt, f"pre-seed `{stmt}` (the first increase() needs a 0 sample)")
                for name, stmt in seeds.items()}
@@ -139,6 +141,16 @@ def problems(server_src, header_src):
         out.append(f"{QUARANTINES} is incremented {incs} times; only the one behind `wrote` may be")
     if call is not None and guard is not None and not (call < guard and same_block(s, call, guard)):
         out.append("the `if (wrote)` increment is not in the sink, after the log_echo_corruption_once call")
+
+    # 2b. A closed audit store is counted, once, in the sink before the audit call: the quarantine
+    # counter cannot move then, so without this the signal is silent exactly when the store is down.
+    closed_inc = find(f'metrics_.counter("{STORE_CLOSED}").increment();',
+                      f"increment of {STORE_CLOSED} (a closed audit store must be counted)")
+    closed_guard = find("if (!audit_store_ || !audit_store_->is_open()) { "
+                        f'metrics_.counter("{STORE_CLOSED}").increment(); return; }}',
+                        f"closed-store branch that counts {STORE_CLOSED} before it returns")
+    if closed_inc is not None and call is not None and not closed_inc < call:
+        out.append(f"the {STORE_CLOSED} increment must come before the log_echo_corruption_once call")
 
     # 3. The observer counts under its argument's token and is the gate's third argument.
     find('auto on_degraded = [this](detail::DegradedCause cause) { '
@@ -206,6 +218,12 @@ MUTATIONS = [
      'const char* reason = "lookup_degraded";', "degraded observer counting"),
     ("the observer is not handed to the gate", "s", ", std::move(on_degraded))", ")",
      "gate construction handing the observer"),
+    ("closed-store pre-seed removed", "s", f'metrics_.counter("{STORE_CLOSED}");', "",
+     "pre-seed `metrics_.counter(\"" + STORE_CLOSED),
+    ("closed-store increment removed", "s", f'metrics_.counter("{STORE_CLOSED}").increment();', "",
+     f"increment of {STORE_CLOSED}"),
+    ("closed-store branch returns without counting", "s", f'metrics_.counter("{STORE_CLOSED}").increment(); return;',
+     "return;", f"increment of {STORE_CLOSED}"),
     ("the sweep gauge removed", "s", GAUGE, "", "sweep that sets"),
     ("the sweep gauge kept only in a comment", "s", GAUGE, "/* " + GAUGE + " */", "sweep that sets"),
     ("the sweep gauge made conditional", "s", GAUGE, "if (stream_budget_) { " + GAUGE + " }",
