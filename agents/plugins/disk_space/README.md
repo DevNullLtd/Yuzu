@@ -26,6 +26,8 @@ flowchart LR
   WIN & MAC & LIN --> ROWS[disk row, no typed status] --> RS[(ResponseStore)] --> API[REST /api/responses · /auto pre-flight · device-live disk card]
 ```
 
+**A network or device path is refused before any syscall.** `path` is judged by the shared `agents/shared/local_path_policy.hpp` first, and the judgement and the query both run on a bounded helper (15 s; a stalled filesystem answers `error|timeout` instead of holding a command-pool worker; the helper itself can stay blocked until the filesystem answers). Windows: a UNC path (`\\host\share`, `\\?\UNC\...`), a `\\.\` or `\??\` device spelling, a reserved DOS device name and a drive letter (`X:`, `X:file`, `X:\`) whose type is not `DRIVE_FIXED` all answer `error|path_refused:...`; the decision is lexical, so a junction or directory symlink to a share is a residual (tracked as #8208). Linux and macOS: symlinks in the path are resolved (without touching anything under a network mount) and a path on or symlinked into a mount of a listed network type (`agents/shared/network_fstype.hpp`: NFS, CIFS/SMB, autofs, virtiofs, 9p, any FUSE that is not a known-local type, an overlay over a network mount) is refused; an unreadable mount table refuses (`path_refused:mount_table_unreadable`). The row names the class, never the path. There is no operator override: a host whose root filesystem is network-mounted (diskless NFS, a WSL2 or VM guest on virtiofs/9p, a systemd automount) refuses even the default `/`, and needs an explicit local `path`. The server also refuses a `path` that starts with two separators (the definition pattern).
+
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
@@ -51,7 +53,7 @@ No external binaries, no subprocesses, no network access — one in-process OS c
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
 | Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `crossplatform.storage.free` | `path` | string | no | - | maxLength 4096 | Directory or volume root to measure (e.g. "C:\", "/", "/var"). Defaults to the platform root if omitted (C:\ on Windows, / on Linux and macOS); reported free space is the caller-usable figure, not raw free blocks. |
+| `crossplatform.storage.free` | `path` | string | no | - | pattern: ^($\|[^\\/].*\|[\\/]([^\\/].*)?)$ · maxLength 4096 | Directory or volume root to measure (e.g. "C:\", "/", "/var"). A UNC or device path (two leading separators) is refused; on the agent a path on a network mount, symlinked into one, or on a non-fixed Windows drive answers `error\|path_refused:...` (a host whose root filesystem is network-mounted must be given an explicit local path). Defaults to the platform root if omitted (C:\ on Windows, / on Linux and macOS); reported free space is the caller-usable figure, not raw free blocks. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -77,7 +79,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (default 90-day retention, `server/core/src/response_store.hpp:8`), readable at `/api/responses/{id}`.
 - **`/auto` Pre-flight page.** `crossplatform.storage.free`'s raw `disk|<path>|<total>|<free>|<percent_used>` row is one of the five Slice-1 pre-flight checks (`server/core/src/preflight_parse.hpp:53`); the parser reads `free` at field[3] and applies the operator's `min_free_gib` threshold to produce a Pass/Fail/Warn/Unknown verdict per device (`server/core/src/preflight_parse.hpp:18-20`, `:60-67`).
-- **Device-live "disk" card.** The `/device/live?kind=disk` route dispatches `disk_space.free` directly and renders the result as `LiveDiskVolume{path, total, free, percent_used}` (`server/core/src/device_routes.cpp:97`, `server/core/src/device_routes.hpp:164-165`), audited as `device.live.disk`.
+- **Device-live "disk" card.** The `/device/live?kind=disk` route dispatches `disk_space.free` directly and renders the result as `LiveDiskVolume{path, total, free, percent_used}` (the `disk` row of the kind table and `parse_disk` in `server/core/src/live_model.cpp`, the `LiveDiskVolume` struct in `server/core/src/live_model.hpp`, rendered by `render_live_result` in `server/core/src/device_routes.cpp`), audited as `device.live.disk`.
 - **Not consumed by** daily-sync inventory, the Echo warehouse, or the DEX performance store.
 - **Sensitivity.** Rows carry only the caller-supplied volume `path` and byte/percentage counts — nothing that identifies a specific device, a person, or installed software.
 - **Siblings:** `disk_actions` (`crossplatform.storage.smart`, `crossplatform.storage.volumes` — physical-drive health and the volume-to-drive join; `total_bytes` there is raw media capacity, not comparable field-for-field with this plugin's), `filesystem_posture` (`crossplatform.storage.mounts` — full mount inventory).
@@ -125,6 +127,6 @@ disk|/|485473984512|407729123328|16
 - Plugin: `agents/plugins/disk_space/src/disk_space_plugin.cpp`
 - Definitions: `content/definitions/disk_space.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
-- Tests: none found by name
+- Tests: `tests/test_disk_space_definition_pattern.py`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->
