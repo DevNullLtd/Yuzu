@@ -72,6 +72,9 @@ EXPECTED_FAMILIES = {
             "server/core/src/device_lens_routes.hpp",
             "server/core/src/live_model.cpp",
             "server/core/src/live_model.hpp",
+            "server/core/src/live_result_json.cpp",
+            "server/core/src/live_result_json.hpp",
+            "server/core/src/live_outcome.hpp",
         ],
     },
     "network": {

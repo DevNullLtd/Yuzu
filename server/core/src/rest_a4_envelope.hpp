@@ -41,6 +41,8 @@ std::string make_correlation_id();
 ///     carries the same "no recovery hint" meaning per §A4);
 ///   - `permission`: emitted as `"<securable_type>:<operation>"` when set —
 ///     the §A4 kPermissionDenied specialisation that names the missing grant;
+///   - `reason`: a closed machine token naming the cause (e.g. a zero-reach cause),
+///     emitted inside `error` only when non-empty;
 ///   - `approval_id` + `status_url`: emitted when set — the §A4
 ///     kApprovalRequired specialisation so a worker can poll the workflow
 ///     rather than re-issue the request.
@@ -55,6 +57,9 @@ struct A4ErrorOpts {
     std::string_view permission;                ///< "<securable_type>:<operation>"
     std::string_view approval_id;               ///< kApprovalRequired only
     std::string_view status_url;                ///< kApprovalRequired only
+    std::string_view reason;                    ///< closed machine token naming the cause; omitted when
+                                                ///< empty. Last member, so every existing designated
+                                                ///< initialiser keeps its order.
 };
 
 /// A4-compliant error envelope. Per `docs/agentic-first-principle.md` §A4,

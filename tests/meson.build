@@ -1902,6 +1902,9 @@ if build_server
       'unit/server/test_echo_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       'unit/server/test_live_model.cpp', # #2146: pure live-read kind table + parsers (live_model)
+      'unit/server/test_live_outcome.cpp', # live read: closed outcome/surface/kind token vocabulary
+      'unit/server/test_live_result_json.cpp', # live read: the shared REST+MCP `data` JSON builder
+      'unit/server/test_live_read_poll.cpp', # live read: pure reduce_rows + the poll loop seams
       # #1845 registry tripwire: pins detail::dex_perf_os_collects to the echo plugin's
       # capture_sources() perf row. Registry TU compiled in here; NO echo include dir
       # (see the include-path constraint below) - the test includes the header by

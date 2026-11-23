@@ -164,6 +164,95 @@ TEST_CASE("StreamBudget: kMcpPost is an independent surface — its per-principa
     CHECK(budget.active_for(detail::SseSurface::kMcpGet, "alice") == 1);
 }
 
+TEST_CASE("StreamBudget: kLiveRead is a surface of the ONE budget: 2 per principal, a surface cap of 4 "
+          "across principals, counted in the global cap, released with the lease",
+          "[mcp][stream][live][twin]") {
+    CHECK(std::string(detail::to_string(detail::SseSurface::kLiveRead)) == "live_read");
+    CHECK(detail::kPerPrincipalLiveRead == 2);
+    CHECK(detail::kLiveReadSurfaceCap == 4);
+    CHECK(std::string(detail::StreamBudget::kRejectSurface) == "surface_stream_cap");
+
+    detail::StreamBudget budget{{.global_cap = 5}};
+    std::vector<detail::StreamBudget::Lease> held;
+    auto take = [&](const char* who) {
+        return budget.try_acquire(detail::SseSurface::kLiveRead, who, detail::kPerPrincipalLiveRead,
+                                  detail::StreamBudget::Admission::kEnforceCaps,
+                                  detail::kLiveReadSurfaceCap);
+    };
+
+    // Two per principal; the third for the same principal is the PER-PRINCIPAL refusal.
+    for (int i = 0; i < 2; ++i) {
+        auto r = take("alice");
+        REQUIRE(r.lease);
+        held.push_back(std::move(r.lease));
+    }
+    auto over = take("alice");
+    CHECK_FALSE(over.lease);
+    CHECK(std::string(over.reject_reason) == detail::StreamBudget::kRejectPerPrincipal);
+
+    // Another principal fills the surface to 4; the surface cap, not the principal cap, refuses
+    // the fifth even though bob and carol are each under their own share.
+    for (int i = 0; i < 2; ++i) {
+        auto r = take("bob");
+        REQUIRE(r.lease);
+        held.push_back(std::move(r.lease));
+    }
+    CHECK(budget.active_for_surface(detail::SseSurface::kLiveRead) == 4);
+    auto carol = take("carol");
+    CHECK_FALSE(carol.lease);
+    CHECK(std::string(carol.reject_reason) == detail::StreamBudget::kRejectSurface);
+
+    // The surface cap is per SURFACE: another surface still admits, and it counts in the global
+    // cap (4 live + 1 stream = 5), after which the global cap refuses first.
+    auto stream = budget.try_acquire(detail::SseSurface::kApiEvents, "carol", detail::kPerPrincipalApiEvents);
+    REQUIRE(stream.lease);
+    CHECK(budget.active() == 5);
+    auto global = take("carol");
+    CHECK_FALSE(global.lease);
+    CHECK(std::string(global.reject_reason) == detail::StreamBudget::kRejectGlobal);
+    stream.lease.release();
+
+    // Releasing a lease returns the slot, so the next admission succeeds.
+    held.pop_back();
+    CHECK(budget.active_for_surface(detail::SseSurface::kLiveRead) == 3);
+    auto again = take("carol");
+    CHECK(again.lease);
+
+    held.clear();
+    again.lease.release();
+    CHECK(budget.active_for_surface(detail::SseSurface::kLiveRead) == 0);
+    CHECK(budget.active() == 0);
+}
+
+TEST_CASE("StreamBudget: surface_cap 0 means unlimited and an omitted argument leaves every existing "
+          "caller unchanged",
+          "[mcp][stream][live][twin]") {
+    detail::StreamBudget budget{{.global_cap = 64}};
+    std::vector<detail::StreamBudget::Lease> held;
+    // 20 principals, one lease each, on a surface with no surface cap: all admitted.
+    for (int i = 0; i < 20; ++i) {
+        auto r = budget.try_acquire(detail::SseSurface::kWorkflowRun, "p" + std::to_string(i), 2);
+        REQUIRE(r.lease);
+        held.push_back(std::move(r.lease));
+    }
+    // An explicit 0 is the same as omitting it.
+    auto zero = budget.try_acquire(detail::SseSurface::kWorkflowRun, "z", 2,
+                                   detail::StreamBudget::Admission::kEnforceCaps, 0);
+    CHECK(zero.lease);
+    // A surface cap is not applied to a takeover (it is not a new stream).
+    detail::StreamBudget tight{{.global_cap = 8}};
+    auto a = tight.try_acquire(detail::SseSurface::kLiveRead, "a", 2,
+                               detail::StreamBudget::Admission::kEnforceCaps, 1);
+    REQUIRE(a.lease);
+    auto refused = tight.try_acquire(detail::SseSurface::kLiveRead, "b", 2,
+                                     detail::StreamBudget::Admission::kEnforceCaps, 1);
+    CHECK_FALSE(refused.lease);
+    CHECK(std::string(refused.reject_reason) == detail::StreamBudget::kRejectSurface);
+    auto takeover = tight.try_acquire(detail::SseSurface::kLiveRead, "b", 2,
+                                      detail::StreamBudget::Admission::kTakeover, 1);
+    CHECK(takeover.lease);
+}
+
 TEST_CASE("StreamBudget: kWorkflowRun is a surface of the ONE budget: 2 per principal, counted in "
           "the global cap, released with the lease (#2146 D3)",
           "[mcp][stream][ch5][workflow][twin]") {

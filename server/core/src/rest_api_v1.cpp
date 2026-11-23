@@ -33,6 +33,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_model.hpp" // the ONE live-read kind table + wire-format parsers (pure; #2146)
+#include "live_result_json.hpp" // the ONE live `data` JSON builder shared with the MCP tool
 #include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
@@ -711,27 +712,13 @@ static std::string reply_dispatch_denied(httplib::Response& res, const std::stri
     return token;
 }
 
-// Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
-// The wire-format parsing (kind table + field extraction) is shared with the
-// dashboard HTML path via live_model.hpp so the two cannot drift (governance S2);
-// this only maps the parsed fields to JSON. The agent sanitizes '|'/CR/LF out of
-// every field, and the parser is bounds-safe on any input regardless.
+// Render a live plugin output into the JSON `data` object for the live route. The builder
+// (kind table lookup, row parsing, JSON) is the one shared with the MCP tool, in
+// live_result_json.hpp; the route has already resolved `kind` to a rest_v1 kind, so a
+// nullopt here cannot occur and renders as JSON null rather than a wrong shape.
 std::string live_result_json(const std::string& kind, const std::string& output) {
-    if (kind == "uptime") {
-        const auto u = live::parse_uptime(output);
-        JObj o;
-        o.add("kind", "uptime");
-        if (u.display)
-            o.add("uptime_display", *u.display);
-        if (u.seconds)
-            o.add("uptime_seconds", *u.seconds);
-        return o.str();
-    }
-    JArr procs;
-    for (const auto& p : live::parse_processes(output))
-        procs.add(
-            JObj().add("pid", p.pid).add("name", p.name).add("sha256", p.sha256).add("path", p.path));
-    return JObj().add("kind", "processes").raw("processes", procs.str()).str();
+    auto r = live::live_result_json(kind, output);
+    return r ? std::move(r->body) : std::string("null");
 }
 
 // Bound concurrent /api/v1/dex/devices/{id}/live polls (UP-1/2/3): each call pins
