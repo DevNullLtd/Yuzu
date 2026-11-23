@@ -1,0 +1,10 @@
+debconf	ii 	1.5.86ubuntu1	all	Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+gzip	ii 	1.12-1ubuntu3.2	arm64	Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+hostname	ii 	3.23+nmu2ubuntu2	arm64	Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+libacl1	ii 	2.3.2-1build1.1	arm64	Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+libattr1	ii 	1:2.5.2-1ubuntu0.1	arm64	Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+libaudit-common	ii 	1:3.1.2-2.1ubuntu0.1	all	Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+libgmp10	ii 	2:6.3.0+dfsg-2ubuntu6.1	arm64	Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+libpam-runtime	ii 	1.5.3-5ubuntu5.7	all	Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+sed	ii 	4.9-2ubuntu0.24.04.1	arm64	Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+ubuntu-keyring	ii 	2023.11.28.1	all	Dimitri John Ledkov <dimitri.ledkov@canonical.com>
