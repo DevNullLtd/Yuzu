@@ -1299,3 +1299,42 @@ TEST_CASE("find_by_hash walk: an entry the refusal predicate names is never hash
     CHECK(std::any_of(probe.hashed.begin(), probe.hashed.end(),
                       [](const fs::path& h) { return h.filename() == "ok.txt"; }));
 }
+
+// WP06 F55 (Gate 8 adjudication): the reserved decision canonicalises, so it follows a link. The walk
+// must therefore ask it only for an entry that is neither under a mount nor a link: a symlink planted
+// in the tree (on Windows one to a UNC share) must never reach a canonicalising call.
+TEST_CASE("find_by_hash walk: the refusal predicate is never asked about a symlink or an entry under a mount",
+          "[agent][filesystem_plugin][find_by_hash][reserved][symlink]") {
+    yuzu::test::TempDir root{"yuzu_test_fbh_refuse_order_"};
+    std::error_code ec;
+    fs::create_directories(root.path / "mnt", ec);
+    fs::create_directories(root.path / "dir", ec);
+    for (const auto& f : {root.path / "ok.txt", root.path / "mnt" / "m.txt", root.path / "dir" / "d.txt"}) {
+        std::ofstream o(f);
+        o << "x";
+    }
+    fs::create_symlink(root.path / "ok.txt", root.path / "file_link", ec);
+    REQUIRE_FALSE(ec);
+    fs::create_directory_symlink(root.path / "dir", root.path / "dir_link", ec);
+    REQUIRE_FALSE(ec);
+    Probe probe;
+    auto env = fake_env(probe);
+    env.network_mounts = {(root.path / "mnt").string()};
+    std::vector<fs::path> asked;
+    env.is_refused = [&](const fs::path& p) {
+        asked.push_back(p);
+        return false;
+    };
+    (void)fbh::walk_find_by_hash(root.path.string(), std::string{kTarget}, 5, fbh::WalkLimits{}, env,
+                                 [](const std::string&) {});
+    CHECK_FALSE(asked.empty()); // the ordinary entries are still judged
+    for (const auto& p : asked) {
+        INFO(p.string());
+        CHECK(p.filename() != "file_link");
+        CHECK(p.filename() != "dir_link");
+        CHECK(p.filename() != "mnt");
+        CHECK(p.filename() != "m.txt");
+    }
+    CHECK(std::any_of(asked.begin(), asked.end(), [](const fs::path& p) { return p.filename() == "ok.txt"; }));
+    CHECK(std::any_of(asked.begin(), asked.end(), [](const fs::path& p) { return p.filename() == "dir"; }));
+}
