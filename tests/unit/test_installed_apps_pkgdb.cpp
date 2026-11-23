@@ -686,6 +686,8 @@ struct ScopedNoAccess {
     explicit ScopedNoAccess(fs::path p) : path(std::move(p)) {
         fs::permissions(path, fs::perms::none, fs::perm_options::replace);
     }
+    /// Root, or an account with CAP_DAC_OVERRIDE, still searches the directory: the test cannot run there.
+    [[nodiscard]] bool effective() const { return ::access(path.c_str(), X_OK) != 0; }
     ~ScopedNoAccess() {
         std::error_code ec;
         fs::permissions(path, fs::perms::owner_all, fs::perm_options::replace, ec);
@@ -695,8 +697,6 @@ struct ScopedNoAccess {
 
 TEST_CASE("pkgdb rpm: a link whose target the agent cannot search is a refusal, never 'no database behind it'",
           "[installed_apps][pkgdb]") {
-    if (::geteuid() == 0)
-        SKIP("root bypasses directory permissions, so the target cannot be made unsearchable");
     const fs::path alma9 = default_fixture_root() / "alma9" / "rpmdb.sqlite";
     const fs::path fedora = default_fixture_root() / "fedora41" / "rpmdb.sqlite";
     SECTION("the target directory has no search permission: its database cannot be shown absent") {
@@ -707,6 +707,8 @@ TEST_CASE("pkgdb rpm: a link whose target the agent cannot search is a refusal, 
         fs::create_directory_symlink(root.at("elsewhere"), root.at("usr/lib/sysimage/rpm"));
         {
             ScopedNoAccess no_access{root.at("elsewhere")};
+            if (!no_access.effective())
+                SKIP("this account searches an unsearchable directory (root or CAP_DAC_OVERRIDE)");
             const auto h = read_root(root);
             CHECK(h.failure == "rpmdb:unreadable");
             CHECK(h.ecosystem == Eco::none);
@@ -722,6 +724,8 @@ TEST_CASE("pkgdb rpm: a link whose target the agent cannot search is a refusal, 
         fs::create_directories(root.at("usr/lib/sysimage"));
         fs::create_directory_symlink(root.at("hidden/elsewhere"), root.at("usr/lib/sysimage/rpm"));
         ScopedNoAccess no_access{root.at("hidden")};
+        if (!no_access.effective())
+            SKIP("this account searches an unsearchable directory (root or CAP_DAC_OVERRIDE)");
         const auto h = read_root(root);
         CHECK(h.failure == "rpmdb:unreadable");
         CHECK(h.rpm.empty());
@@ -948,6 +952,12 @@ TEST_CASE("pkgdb status.d: a control file that is not exactly one stanza is corr
             INFO(state);
             refused(with_base_files(netbase + "Status: " + state + "\n"));
         }
+    }
+    SECTION("one installed stanza beside a not-installed one is accepted: the not-installed one is no record") {
+        const auto h = with_base_files(read_text(kStatusDCapture / "base-files") + "\n" + netbase +
+                                       "Status: install ok not-installed\n");
+        REQUIRE(h.failure.empty());
+        CHECK(h.dpkg.size() == 3);
     }
     SECTION("one installed stanza beside a config-files one is refused") {
         refused(with_base_files(read_text(kStatusDCapture / "base-files") + "\n" + netbase +

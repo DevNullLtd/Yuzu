@@ -40,10 +40,12 @@ namespace yuzu::shared {
 enum class PkgDbCause {
     unreadable,          ///< open/read/stat failed, or the database could not be queried
     symlink_refused,     ///< the database (or a directory on the way) is a symlink
-    not_regular,         ///< a directory, FIFO or device where a database file belongs, or a regular file where a database directory belongs
+    not_regular,         ///< a directory, FIFO or device where a database file belongs, or a regular
+                         ///< file where a database directory belongs
     oversized,           ///< a file, row or length above its cap
     corrupt,             ///< a bound, magic or structure check failed on bytes that were read
-    truncated,           ///< a header promises more bytes than the file holds, or the file ends inside a fixed header (the 20-byte sqlite one)
+    truncated,           ///< a header promises more bytes than the file holds, or the file ends inside a
+                         ///< fixed header (the 20-byte sqlite one)
     unsupported_format,  ///< a recognised container this reader does not decode
     locked,              ///< a writer holds the database: sqlite busy past its timeout, an rpm transaction
                          ///< running (ndb and Berkeley DB), or a dpkg update journal pending

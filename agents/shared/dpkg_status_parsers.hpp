@@ -280,13 +280,12 @@ parse_dpkg_status(std::string_view text, PkgDbBudget& budget,
 /// `status`, so call it once per collection, never once per file.
 inline void merge_dpkg_status_d(std::vector<DpkgPackage>& status,
                                 std::vector<DpkgPackage>&& status_d) {
-    const auto key = [](const DpkgPackage& p) { return dpkg_package_key(p); };
     std::unordered_set<std::string> have;
     have.reserve(status.size() + status_d.size());
     for (const auto& p : status)
-        have.insert(key(p));
+        have.insert(dpkg_package_key(p));
     for (auto& p : status_d)
-        if (have.insert(key(p)).second)
+        if (have.insert(dpkg_package_key(p)).second)
             status.push_back(std::move(p));
 }
 

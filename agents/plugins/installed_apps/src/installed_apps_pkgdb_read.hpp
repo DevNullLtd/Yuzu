@@ -686,10 +686,10 @@ struct LinkProbe {
     bool refused = false;        ///< the inspection itself was refused (EACCES and the like): unknown, not absent
 };
 
-/// An errno that says "nothing there" (a dangling link, a missing name, a link loop, a name too long). Any
+/// An errno that says "nothing there" (a dangling link, a missing name, a link loop), the same set read_rpm_dir treats as absent. Any
 /// other stat failure is a refusal: a database we cannot show absent (the rule read_rpm_dir states below).
 [[nodiscard]] inline bool means_absent(int err) noexcept {
-    return err == ENOENT || err == ENOTDIR || err == ELOOP || err == ENAMETOOLONG;
+    return err == ENOENT || err == ENOTDIR || err == ELOOP;
 }
 
 /// Looks behind `dir_path` when it is a symlink: the directory it resolves to when a database file is behind

@@ -2009,15 +2009,15 @@ does not, or the reverse.
   which `dpkg-query` never read) now reports them: new install rows and install events for that host. Each
   package there is a control file with no `Status` field, plus a `.md5sums` sibling that is skipped; a present
   file is read as installed, and a file that does carry a `Status` is held to the same three-word rule. The
-  converse is also new: a host with a healthy status file and one `status.d` control file that does not hold exactly one stanza in the installed state, ignoring any `not-installed` one (unparseable, zero-byte, comment-only, two or more other stanzas, or a single one in another state such as config-files or half-installed) is
+  converse is also new: a host with a healthy status file and one `status.d` control file that does not hold exactly one stanza, and that one in the installed state (a `not-installed` stanza beside it is ignored; unparseable, zero-byte and comment-only files are refused, and so is a second stanza of any other kind, or a single one in another state such as config-files or half-installed) is
   degraded (`dpkg_status_d:corrupt`, no rows) where `dpkg-query` ignored the directory, and the status file's own
   packages are withheld with it, because a roster without the `status.d`-only packages would be published as the
-  host's complete one. The remedy is to restore the file (reinstall the package that owns it), not to delete it or hide it with a leading dot: either drops that package from a roster then read as complete. Remove or hide a file only once it is verified extraneous.
+  host's complete one. Two control files that name the same package and architecture are refused the same way (the first would hide the other). The remedy is to restore the file (from the image, or by reinstalling the package that owns it; for a duplicate pair, the one that holds the other package's record), not to delete it or hide it with a leading dot: either drops that package from a roster then read as complete. Remove or hide a file only once it is verified extraneous.
 - A symlinked leaf is refused where the tools followed it: a symlinked status file, `status.d` directory or rpm
   database file is `symlink_refused` (the directories above the leaf are reached by path and are followed, as before).
   An rpm candidate DIRECTORY that is a symlink is never followed and is skipped; when a database file exists behind
-  such a link, the read is `rpmdb:symlink_refused` (a stat only; nothing is opened through the link) instead of an
-  empty list, unless the link resolves, by device and inode, to a directory whose database this reader read itself (an
+  such a link, the read is `rpmdb:symlink_refused` (a stat only; nothing is opened through the link; a link whose target the
+  agent cannot search is `rpmdb:unreadable`, never taken for no database) instead of an empty list, unless the link resolves, by device and inode, to a directory whose database this reader read itself (an
   empty one counts). That is decided when a database is about to be accepted and, if none was, once every candidate has been tried, because on
   the older layout the sysimage link is seen before the `/var/lib/rpm` directory it points at; a populated directory read
   after a link that hides a different database is refused too. The current Fedora, RHEL and SUSE layout
