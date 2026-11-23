@@ -933,6 +933,21 @@ TEST_CASE("bdb hostile: edited real file with a bad magic, version, page size, c
                 put16(lowered, page_base + 20, static_cast<std::uint16_t>(n - 2), be);
                 CHECK(cause(lowered) == PkgDbCause::corrupt);
             }
+            // Count AND item-area start both rewritten to an empty page: self-consistent, so this is the one
+            // damage the cross-check cannot see (#8545), and it is what exercises the n == 0 arm (an empty
+            // page's items start at the page size) -- the read succeeds and delivers fewer headers.
+            {
+                Bytes both = good;
+                put16(both, page_base + 20, 0, be);
+                put16(both, page_base + 22, static_cast<std::uint16_t>(v.pagesize), be);
+                std::size_t after = 0;
+                auto b = generous();
+                REQUIRE(run_bdb(both, b, &after).has_value());
+                std::size_t before = 0;
+                auto b0 = generous();
+                REQUIRE(run_bdb(good, b0, &before).has_value());
+                CHECK(after < before);
+            }
             Bytes bad_hf = good; // the header field itself damaged
             put16(bad_hf, page_base + 22, static_cast<std::uint16_t>(get16(good, page_base + 22, be) + 2), be);
             CHECK(cause(bad_hf) == PkgDbCause::corrupt);

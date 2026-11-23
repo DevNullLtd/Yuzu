@@ -208,6 +208,10 @@ worker. Where a path is not covered, the entry says so.
 - `tests/unit/test_installed_apps_pkgdb.cpp`: the held-lock cases (Linux only) hold an open-file-description lock
   through a `yuzu::shared::ScopedFile` (a `std::optional<ScopedFile>` where the lock is released mid-test by
   `reset()`); the temp trees are `TempDir` with the `yuzu_test_pkgdb_` prefix. No raw `::close`, no `FILE*`.
+- `tests/unit/test_installed_apps_pkgdb.cpp`: `ScopedNoAccess` drops one `TempDir` subtree's mode to none for an
+  unsearchable-link-target case and restores `owner_all` in its destructor with the non-throwing `error_code` overload
+  (one owner, one release on every exit including a `SKIP`; it is destroyed before the `Root` that owns the path, so
+  `TempDir` can still remove the tree). It acquires nothing else.
 - `tests/unit/test_rpmdb_parsers.cpp`: `blobs_of_sqlite` owns the connection and the statement with `std::unique_ptr`
   (the connection first, before the `REQUIRE` on the open result, so a failed open still closes; the statement
   declared after it so it is finalized first). This closes finding `qe-6-raw-sqlite-handle-in-test`.
