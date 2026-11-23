@@ -457,17 +457,18 @@ TEST_CASE("The async producer counts response rows independently of distinct mat
     // matches all rows under the normal Forensics filter.
     bool overflow = false;
     SECTION("exactly 100,000 matching responses from distinct devices materialize") {}
-    SECTION("one additional response from the same nonmatching device exhausts the row budget") {
+    SECTION("a second, nonmatching response from one device exhausts the row budget") {
         overflow = true;
     }
     auto rows = pg::exec_params(
         seed.get(),
         "INSERT INTO response_store.responses "
         "(instruction_id, agent_id, timestamp, status, output, plugin, execution_id) "
-        "SELECT 'echo', CASE WHEN $2::boolean THEN 'same' ELSE 'dev-' || n END, n, 1, "
-        "CASE WHEN $2::boolean THEN '__total__|0' ELSE E'__schema__|pid\n1\n__total__|1' END, "
+        "SELECT 'echo', CASE WHEN n > $2::int THEN 'dev-1' ELSE 'dev-' || n END, n, 1, "
+        "CASE WHEN n > $2::int THEN '__total__|0' ELSE E'__schema__|pid\n1\n__total__|1' END, "
         "$3, $1 FROM generate_series(1, $4::int) AS n",
-        std::vector<std::string>{pending.front().source_execution_id, overflow ? "true" : "false",
+        std::vector<std::string>{pending.front().source_execution_id,
+                                 std::to_string(ResultSetStore::kMaxMembersPerSet),
                                  yuzu::server::test::kOrdinaryPlugin,
                                  std::to_string(ResultSetStore::kMaxMembersPerSet + overflow)});
     REQUIRE(rows.status() == PGRES_COMMAND_OK);
