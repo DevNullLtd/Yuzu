@@ -1343,13 +1343,14 @@ TierPolicyFn AuthRoutes::gateless_tier_policy_fn() {
     };
 }
 
-bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib::Response& res,
-                                           const std::string& securable_type,
-                                           const std::string& operation,
-                                           const std::string& agent_id) {
+ScopedGateOutcome AuthRoutes::require_scoped_permission_outcome(const httplib::Request& req,
+                                                                httplib::Response& res,
+                                                                const std::string& securable_type,
+                                                                const std::string& operation,
+                                                                const std::string& agent_id) {
     auto session = require_auth(req, res);
     if (!session)
-        return false;
+        return ScopedGateOutcome::Unauthenticated;
 
     // JIT admin elevation grants full admin (across all management groups) for
     // its window — cookie-session-only, so unreachable by MCP/service tokens.
@@ -1362,7 +1363,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // that invariant ever changes. Do NOT read its presence as evidence
     // elevation is reachable for service tokens today; it is not.
     if (auth::is_elevated(*session) && session->token_scope_service.empty())
-        return true;
+        return ScopedGateOutcome::Admitted;
 
     // Engine principals have NO legacy or service-scoped authority — their only
     // authority is an explicit RBAC assignment (design §4.2 default-deny). The
@@ -1379,7 +1380,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                               detail::A4ErrorOpts{.permission = securable_type + ":" +
                                                                         operation}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         if (!rbac_store_->is_rbac_enabled() ||
             !rbac_store_->check_scoped_permission(session->username, securable_type, operation,
@@ -1391,7 +1392,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // Belt-and-braces (#2298 PR 3, mirrors require_permission's identical
         // guard): engine-token mint already rejects a non-empty
@@ -1413,9 +1414,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             // "MUST NOT name a permission that wouldn't actually admit").
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
-        return true;
+        return ScopedGateOutcome::Admitted;
     }
 
     // MCP-tier tokens: enforce the tier policy then fall through to the standard
@@ -1433,7 +1434,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // On the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate in
         // mcp_server.cpp is the authoritative approval gate (ticket-then-recall,
@@ -1460,7 +1461,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                     "operation requires approval for this MCP tier on this transport",
                     detail::A4ErrorOpts{.remediation = remediation, .permission = perm}),
                 "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
     }
 
@@ -1480,7 +1481,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403,
                                               "service-scoped tokens require RBAC to be enabled"),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // Check that the ITServiceOwner role grants this permission type
         // Shared ceiling helper (authz::service_ceiling_check). A Degraded verdict (a failed
@@ -1493,7 +1494,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                      "service-scoped token blocked: RBAC read degraded "
                                      "resolving the ITServiceOwner ceiling",
                                      ceiling);
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         // Everything that is not an explicit Admit is refused: a Deny verdict, and any
         // out-of-range value, which must never fall through to the admit.
@@ -1509,7 +1510,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                               " (requires ITServiceOwner AND the target agent's service tag "
                               "to match the token's scope)";
             res.set_content(detail::a4_denial(res, 403, msg), "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // Verify the target agent's service tag matches the token's scope
         if (!tag_store_) {
@@ -1520,7 +1521,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 503, "tag store unavailable, cannot verify scope",
                                               detail::A4ErrorOpts{.retry_after_ms = 5000}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         // #2298 PR 3 (§3b): an empty agent_id used to skip the ONLY
         // comparison that could deny and fall through to an unconditional
@@ -1541,7 +1542,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 400, "agent_id is required",
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // ADR-0050 typed read: a degraded store is a 503 (retryable),
         // never conflated with "agent has no service tag" — the
@@ -1557,7 +1558,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                               "tag store unavailable, cannot verify scope",
                                               detail::A4ErrorOpts{.retry_after_ms = 5000}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         const std::string agent_service = service_tag->value_or(std::string{});
         if (agent_service != session->token_scope_service) {
@@ -1572,9 +1573,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                                   session->token_scope_service + "'",
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
-        return true;
+        return ScopedGateOutcome::Admitted;
     }
 
     // #1717 (ADR-0017 ship-now HIGH): gate on `rbac_enforcement_in_effect`, NOT
@@ -1588,16 +1589,19 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         // a degraded scoped check is still a fail-closed 403 (ADR-0041 deny-on-degrade), not a 503.
         // The detail keeps the `RBAC denied` prefix (a denial either way) and adds a greppable
         // `read degraded:` token that does NOT reuse the 503 forms' "RBAC read degraded resolving
-        // the ITServiceOwner ceiling" phrase (upgrading.md's runbook keys on that phrase).
+        // the ITServiceOwner ceiling" phrase (upgrading.md's runbook keys on that phrase). The
+        // same store label is returned as the outcome class (MgmtGroupReadDegraded or
+        // RbacReadDegraded), so a typed caller learns what the audit row says.
         const auto scoped = rbac_store_->check_scoped_permission_checked(
             session->username, securable_type, operation, agent_id, mgmt_group_store_);
         if (!scoped.has_value() || !*scoped) {
             std::string denial_detail = "RBAC denied " + securable_type + ":" + operation;
+            ScopedGateOutcome refused = ScopedGateOutcome::Denied;
             if (!scoped.has_value()) {
-                const char* source =
-                    scoped.error() == kRbacErrMgmtGroupReadDegraded ? "mgmt_group_store"
-                                                                    : "rbac_store";
-                denial_detail += std::string(" (read degraded: ") + source + ")";
+                refused = scoped.error() == kRbacErrMgmtGroupReadDegraded
+                              ? ScopedGateOutcome::MgmtGroupReadDegraded
+                              : ScopedGateOutcome::RbacReadDegraded;
+                denial_detail += " (read degraded: " + std::string(degraded_store(refused)) + ")";
             }
             // target_type/target_id/detail spelled out: passing the id and the message
             // positionally lands the id in `target_type` and the message in `target_id` (#3219).
@@ -1608,9 +1612,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return refused;
         }
-        return true;
+        return ScopedGateOutcome::Admitted;
     }
 
     // Legacy fallback: write/delete/execute/approve require admin (effective_role
@@ -1653,9 +1657,17 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                           detail::A4ErrorOpts{.permission = securable_type + ":" +
                                                                     operation}),
                         "application/json");
-        return false;
+        return ScopedGateOutcome::Denied;
     }
-    return true;
+    return ScopedGateOutcome::Admitted;
+}
+
+bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib::Response& res,
+                                           const std::string& securable_type,
+                                           const std::string& operation,
+                                           const std::string& agent_id) {
+    return require_scoped_permission_outcome(req, res, securable_type, operation, agent_id) ==
+           ScopedGateOutcome::Admitted;
 }
 
 ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib::Response& res,
