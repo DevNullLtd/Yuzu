@@ -47,7 +47,7 @@
 #     * the script's path is the path build-deb.sh and yuzu-agent.spec install it to (with its mode)
 #     * a client run as the yuzu-agent account connects, sends junk bytes (which nothing reads) and
 #       reads to the end: the reply starts `== nft -a list ruleset`, ends `== end`, is at most
-#       1 MiB and its nft section is not `[failed]` when /usr/sbin/nft exists; a connection reset
+#       4 MiB and its nft section is not `[failed]` when /usr/sbin/nft exists; a connection reset
 #       counts only after the end line arrived. Section names and byte counts are printed, never
 #       the ruleset (CI logs are public)
 #     * a control copy of the template whose ExecStart prints /proc/self/status shows the sandbox
@@ -672,7 +672,7 @@ if junk:
     except OSError:
         pass
 buf, reset = b"", False
-while len(buf) <= 2 * 1048576:
+while len(buf) <= 2 * 4194304:
     try:
         chunk = s.recv(65536)
     except ConnectionResetError:
@@ -722,10 +722,10 @@ eq "broker reply: starts with the nft section header" "$(kv "$reply" starts)" "1
 # A reset after the junk is acceptable only once the end line has arrived: ends=1 is that proof.
 eq "broker reply: ends with the end line" "$(kv "$reply" ends)" "1"
 bytes=$(kv "$reply" bytes)
-if [[ $bytes =~ ^[0-9]+$ && $bytes -gt 0 && $bytes -le 1048576 ]]; then
-    pass "broker reply: $bytes bytes, within 1 MiB"
+if [[ $bytes =~ ^[0-9]+$ && $bytes -gt 0 && $bytes -le 4194304 ]]; then
+    pass "broker reply: $bytes bytes, within 4 MiB"
 else
-    fail "broker reply: size '$bytes' is not within 1 MiB"
+    fail "broker reply: size '$bytes' is not within 4 MiB"
 fi
 printf '%s\n' "$reply" | grep '^section=' | sed 's/^/NOTE: /' || true
 if [[ -x /usr/sbin/nft ]]; then

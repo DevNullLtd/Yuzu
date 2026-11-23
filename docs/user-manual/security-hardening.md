@@ -111,9 +111,9 @@ Run each component under its own system user:
 The packaged agent unit keeps `NoNewPrivileges=true` and a bounding set of one capability, so it
 cannot read the nftables ruleset or the legacy iptables tables itself. The `.deb` and `.rpm` ship a
 root-owned socket unit for that, and the agent unit pulls it in (`Wants=yuzu-fw-snapshot.socket`).
-The units need systemd 239 or later; they were measured on Rocky 8.10 (systemd 239, legacy cgroup
-hierarchy, where `IPAddressDeny` is parsed and not enforced and the address-family list is the
-bound), Rocky 9.9 (systemd 252) and Ubuntu 26.04 (systemd 259), on 2026-11-23.
+The units need systemd 239 or later; on a host with the legacy cgroup hierarchy `IPAddressDeny` is
+parsed and not enforced (measured on Rocky 8.10, systemd 239) and the address-family list is the
+bound.
 
 - `yuzu-fw-snapshot.socket` listens on `/run/yuzu-fw-snapshot.sock`, owned by root with group
   `yuzu-agent` and mode `0660`, so only that group can connect.
@@ -122,25 +122,27 @@ bound), Rocky 9.9 (systemd 252) and Ubuntu 26.04 (systemd 259), on 2026-11-23.
   each address family's legacy save tool under its own name (`iptables-legacy-save` and
   `ip6tables-legacy-save`, which list every instantiated table) with those literal arguments and
   nothing else; a family with no save tool reads the kernel's own table list instead. The reply is
-  cut at 1 MiB. The agent sends nothing, checks that root created the socket and treats the reply as
-  untrusted text. The script changes no ruleset and writes no file. The legacy reads load no module
-  and take no lock; one effect is measured and stays: an nft read on a host where nf_tables is not
-  loaded makes the kernel load it (an empty ruleset, no table and no rule).
+  cut at 4 MiB. The agent sends nothing, checks that root created the socket and treats the reply as
+  untrusted text. The script changes no ruleset and writes no file. For the tables the kernel lists,
+  the legacy reads load no module and take no lock; one effect is measured and stays: an nft read on
+  a host where nf_tables is not loaded makes the kernel load it (an empty ruleset, no table and no
+  rule).
 - **What the agent account can now read:** the host's full nftables ruleset, rule handles and rule
-  comments included, and every instantiated legacy `iptables` and `ip6tables` table. It can change
-  nothing through the broker, and the agent unit's own sandbox is unchanged. Anyone who can run code
+  comments included, and every instantiated legacy `iptables` and `ip6tables` table. Through the
+  broker it can change no ruleset and write no file, and the agent unit's own sandbox is unchanged. Anyone who can run code
   as the agent can read those listings; treat the ruleset as readable by that account. A host with
   no `nft` command cannot have nf_tables read through the broker: the plugin then reports
   `error|nftables:snapshot:absent` and never `inactive` for it.
 - The service unit has its own sandbox (its own two capabilities, a system call filter, address
   families, a read-only file system). It does not set `NoNewPrivileges`: with SELinux enforcing
-  (measured on Rocky 9.9) that made every exec of the three tools a denied `nnp_transition`, three
-  audit denials per read, and left the tools outside their own confined domain; the bounding set and
-  the filters, which systemd applies to every process the script starts, are what bound it. On
+  (measured on Rocky 9.9, systemd 252) the exec of `nft` was a denied `nnp_transition` under it and
+  `nft` ran outside its own confined domain; the bounding set and the filters, which systemd
+  applies to every process the script starts, are what bound it. On
   Ubuntu 26.04 the broker's processes ran unconfined by AppArmor (measured). One thing changes
   without the flag: an exec of a setuid or setgid program that belongs to another user or group
   changes the process to that identity. That adds no capability beyond the two in the bounding set,
-  the filters still apply, and the script runs only its three fixed tools with no input. The service
+  the filters still apply, and the script runs only `nft`, the two legacy save tools and `head`, with no
+  input. The service
   unit's IP egress filter takes effect only on hosts with the unified cgroup hierarchy; its
   address-family list is what bounds its sockets. The agent unit keeps `NoNewPrivileges=true`.
 - If a read answers `unknown` with no `error|snapshot:` row on a packaged host, there is no socket

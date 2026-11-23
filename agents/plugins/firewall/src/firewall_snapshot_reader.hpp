@@ -17,8 +17,10 @@
 
 #include <yuzu/agent/scoped_fd.hpp>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <expected>
 #include <string>
@@ -31,6 +33,15 @@
 #include <unistd.h>
 
 namespace yuzu::firewall {
+
+/// Time left until `deadline`, clamped to zero (never negative).
+[[nodiscard]] inline std::chrono::milliseconds
+remaining_ms(std::chrono::steady_clock::time_point deadline) noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline)
+        return std::chrono::milliseconds{0};
+    return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+}
 
 /// One read of the broker at `socket_path`: the reply text, or the token that says why there is none.
 /// An EMPTY token means no broker is installed there (ENOENT) and is not reported. Tokens:
@@ -69,13 +80,13 @@ read_fw_snapshot(std::string_view socket_path, std::chrono::steady_clock::time_p
     std::string text;
     char buf[16 * 1024];
     for (;;) {
-        const auto now = std::chrono::steady_clock::now();
-        const auto left = now >= deadline ? std::chrono::milliseconds{0}
-                                          : std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        const auto left = remaining_ms(deadline);
         if (left.count() <= 0)
             return std::unexpected(std::string{"timeout"});
         pollfd pfd{sock.get(), POLLIN, 0};
-        const int ready = ::poll(&pfd, 1, static_cast<int>(left.count()));
+        // clamped: a deadline more than INT_MAX milliseconds away must not wrap to a negative poll
+        // timeout, which poll() reads as unbounded
+        const int ready = ::poll(&pfd, 1, static_cast<int>(std::min<std::chrono::milliseconds::rep>(left.count(), INT_MAX)));
         if (ready < 0) {
             if (errno == EINTR)
                 continue;

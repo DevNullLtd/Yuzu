@@ -50,12 +50,14 @@
 
 #if defined(__linux__)
 #include "firewall_snapshot_reader.hpp"
+#include "test_bounded_return.hpp"
 #include "test_helpers.hpp"
 
 #include <yuzu/agent/scoped_fd.hpp>
 
 #include <chrono>
 #include <cstring>
+#include <expected>
 #include <functional>
 #include <thread>
 
@@ -414,7 +416,7 @@ TEST_CASE("firewall Windows 'rules' lists at most 100 rules, with a count that m
 // ── Linux: the snapshot broker's socket client ────────────────────────────────────────────────
 //
 // read_fw_snapshot is the plugin's only code that talks to the broker's AF_UNIX socket, and its
-// bounds (reassembly, the 1 MiB cap, the deadline, the peer check) are otherwise pinned only
+// bounds (reassembly, the 4 MiB cap, the deadline, the peer check) are otherwise pinned only
 // lexically. These cases run it against an in-process listener in a `yuzu_test_` temp directory. This
 // is the justification the test rules ask for: the cost is a socket in a temp directory and one joined
 // thread per case, nothing is spawned, and no case waits on a clock but the 50 ms deadline whose
@@ -426,33 +428,43 @@ namespace {
 
 using namespace std::chrono_literals;
 
+/// An AF_UNIX stream socket bound to `path`, owned by the returned ScopedFd. The sockaddr_un is passed
+/// as a sockaddr for the call only: the kernel copies sizeof(addr) bytes and nothing here reads through
+/// the cast (docs/cpp-conventions.md, aliasing).
+yuzu::agent::ScopedFd bound_unix_socket(const std::string& path) {
+    sockaddr_un addr{};
+    REQUIRE(path.size() < sizeof(addr.sun_path));
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.data(), path.size());
+    yuzu::agent::ScopedFd fd(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    REQUIRE(fd);
+    REQUIRE(::bind(fd.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0);
+    return fd;
+}
+
 /// A listening AF_UNIX socket whose one accepted connection is handed to `serve` on a thread that the
-/// destructor joins. Every case connects exactly once, so accept() always returns. The listener is made
-/// by this process, so its peer credentials are this process's own uid: a case passes that uid to the
-/// reader as the uid the listener must have (the plugin passes 0), or a different one to see it refused.
+/// destructor joins. A case that connects gets its connection served; the destructor shuts the listening
+/// socket down first, which ends an accept() that nobody connected to, so a case that fails before it
+/// connects does not hang the join. The listener is made by this process, so its peer credentials are
+/// this process's own uid: a case passes that uid to the reader as the uid the listener must have (the
+/// plugin passes 0), or a different one to see it refused.
 class SnapshotListener {
 public:
     explicit SnapshotListener(std::function<void(int)> serve) : dir_("yuzu_test_fwsock_") {
         std::filesystem::create_directories(dir_.path);
         path_ = (dir_.path / "s.sock").string();
-        sockaddr_un addr{};
-        REQUIRE(path_.size() < sizeof(addr.sun_path));
-        addr.sun_family = AF_UNIX;
-        std::memcpy(addr.sun_path, path_.data(), path_.size());
-        fd_.reset(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
-        REQUIRE(fd_);
-        // sockaddr_un is passed as a sockaddr for the call only; nothing reads through the cast
-        REQUIRE(::bind(fd_.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0);
+        fd_ = bound_unix_socket(path_);
         REQUIRE(::listen(fd_.get(), 1) == 0);
         thread_ = std::thread([this, serve = std::move(serve)] {
-            const int conn = ::accept(fd_.get(), nullptr, nullptr);
-            if (conn < 0)
+            yuzu::agent::ScopedFd conn(::accept(fd_.get(), nullptr, nullptr));
+            if (!conn)
                 return;
-            serve(conn);
-            ::close(conn);
+            serve(conn.get());
         });
     }
     ~SnapshotListener() {
+        if (fd_)
+            ::shutdown(fd_.get(), SHUT_RDWR); // ends an accept() nobody connected to, with no clock
         if (thread_.joinable())
             thread_.join();
     }
@@ -512,7 +524,7 @@ TEST_CASE("read_fw_snapshot: a listener that sends nothing and closes is an empt
     CHECK(got->empty()); // the framing parser reads it as `empty`
 }
 
-TEST_CASE("read_fw_snapshot: a reply longer than 1 MiB is oversized", "[firewall][snapshot_reader]") {
+TEST_CASE("read_fw_snapshot: a reply longer than the 4 MiB cap is oversized", "[firewall][snapshot_reader]") {
     SnapshotListener listener([](int conn) {
         const std::string chunk(64 * 1024, 'x');
         for (std::size_t sent = 0; sent <= yuzu::firewall::kFwSnapshotMaxBytes + chunk.size(); sent += chunk.size())
@@ -526,11 +538,21 @@ TEST_CASE("read_fw_snapshot: a reply longer than 1 MiB is oversized", "[firewall
 TEST_CASE("read_fw_snapshot: a listener that accepts and sends nothing is a timeout at the deadline",
           "[firewall][snapshot_reader]") {
     SnapshotListener listener(drain); // stays open until the reader gives up and closes
-    const auto started = std::chrono::steady_clock::now();
-    const auto got = yuzu::firewall::read_fw_snapshot(listener.path(), in(50ms), ::geteuid());
+    // The subject is that the call returns: a reader that ignored its deadline would end the process with the
+    // call's name, not hang in the listener's join. The bound is the property under test and is not scaled.
+    std::expected<std::string, std::string> got;
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "read_fw_snapshot past its deadline", [&] {
+        got = yuzu::firewall::read_fw_snapshot(listener.path(), in(50ms), ::geteuid());
+    });
     REQUIRE_FALSE(got.has_value());
     CHECK(got.error() == "timeout");
-    CHECK(std::chrono::steady_clock::now() - started < 10s); // bounded: it did not wait for the listener
+}
+
+TEST_CASE("SnapshotListener: a listener that nobody connects to is destroyed, not waited for",
+          "[firewall][snapshot_reader]") {
+    // the destructor shuts the listening socket down, which ends the accept() the thread is blocked in
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "~SnapshotListener with no connection",
+                                   [] { SnapshotListener listener([](int) {}); });
 }
 
 TEST_CASE("read_fw_snapshot: a listener not made by the expected uid is refused before a byte is read",
@@ -552,14 +574,8 @@ TEST_CASE("read_fw_snapshot: no socket is the empty token, a socket nothing list
 
     // a socket file left behind with no listener behind it
     const auto stale = (dir.path / "stale.sock").string();
-    sockaddr_un addr{};
-    REQUIRE(stale.size() < sizeof(addr.sun_path));
-    addr.sun_family = AF_UNIX;
-    std::memcpy(addr.sun_path, stale.data(), stale.size());
     {
-        yuzu::agent::ScopedFd fd(::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
-        REQUIRE(fd);
-        REQUIRE(::bind(fd.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0);
+        [[maybe_unused]] const auto fd = bound_unix_socket(stale);
     } // closed without listen(): the file stays
     const auto refused = yuzu::firewall::read_fw_snapshot(stale, in(10s), ::geteuid());
     REQUIRE_FALSE(refused.has_value());

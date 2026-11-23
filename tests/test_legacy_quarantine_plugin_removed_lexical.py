@@ -686,7 +686,7 @@ DIR = object()
 
 class SnapshotCase:
     """What the helper's `snapshot` word and the broker script share: three sections (nft, and the legacy
-    iptables and ip6tables tables), each printed under `== <label>`, then `== end`, cut at one MiB. The text
+    iptables and ip6tables tables), each printed under `== <label>`, then `== end`, cut at four MiB. The text
     under test is run with its tool paths and the three host paths it tests replaced by paths inside a case
     directory, where each case builds the host state it wants: which tools exist, whether /proc/net/dev is
     visible and what the kernel's table lists hold. A mixin: the helper's class and the script's class use
@@ -699,8 +699,15 @@ class SnapshotCase:
     TOOLS = (NFT, XT4, XT6)
     PROC_DEV = "/proc/net/dev"
     NAMES = {XT4[1]: "/proc/net/ip_tables_names", XT6[1]: "/proc/net/ip6_tables_names"}
-    CAP = 1048576
+    CAP = 4194304
     FILE_NAME = "yuzu-fw-helper"
+    # the bodies map of a host with neither legacy save tool installed
+    NO_SAVE_TOOLS = {XT4[1]: NOT_INSTALLED, XT6[1]: NOT_INSTALLED}
+
+    def ran_marker(self):
+        """A path and the stub body that creates it: a section whose tool ran leaves the file."""
+        marker = os.path.join(self.tmp.name, "ran-" + os.urandom(6).hex())
+        return marker, ': > "%s"\n' % marker + STUB_ECHO
 
     @staticmethod
     def source_text():
@@ -779,7 +786,7 @@ class SnapshotRuns(SnapshotCase, unittest.TestCase):
     """`yuzu-fw-helper snapshot`, the one read-only word of the helper: the helper text run with its three
     tool paths replaced by stubs, under each POSIX shell found (sh, dash, bash), like the other helper
     cases. It runs each tool with exactly its own fixed arguments (nothing from the caller), prints one
-    headed section per tool, then `== end`, and is cut at one MiB."""
+    headed section per tool, then `== end`, and is cut at four MiB."""
 
     @staticmethod
     def source_text():
@@ -854,7 +861,7 @@ class SnapshotRuns(SnapshotCase, unittest.TestCase):
                               "== iptables-legacy-save\n\n[failed]\n== ip6tables-legacy-save\n\n[failed]\n== end\n"), shell)
             self.assertFalse(os.path.exists(marker4) or os.path.exists(marker6), (shell, "a legacy tool ran"))
             # and with no save tool either, the table lists are not read: still `[failed]`, not `[tables]`
-            none = {self.XT4[1]: NOT_INSTALLED, self.XT6[1]: NOT_INSTALLED}
+            none = self.NO_SAVE_TOOLS
             r = self.run_snapshot(shell, self.make_helper(none, dev=False, names=names))
             self.assertEqual(r.stdout.count("[failed]"), 2, shell)
             self.assertNotIn("[tables]", r.stdout, shell)
@@ -863,11 +870,6 @@ class SnapshotRuns(SnapshotCase, unittest.TestCase):
     @classmethod
     def nft_echo(cls):
         return cls.NFT[0], "stub-nft", cls.NFT[2]
-
-    def ran_marker(self):
-        """A path and the stub body that creates it: a section whose tool ran leaves the file."""
-        marker = os.path.join(self.tmp.name, "ran-" + os.urandom(6).hex())
-        return marker, ': > "%s"\n' % marker + STUB_ECHO
 
     def test_a_save_tool_that_is_installed_is_run_with_no_argument_whatever_the_table_lists_say(self):
         # the tool opens the list itself, so the shell does not read it: with the file absent, present, or
@@ -878,7 +880,7 @@ class SnapshotRuns(SnapshotCase, unittest.TestCase):
                 self.assertEqual(r.stdout, self.echo_listing(), (shell, names))
 
     def test_a_family_with_no_save_tool_prints_the_marker_and_the_kernels_own_list(self):
-        none = {self.XT4[1]: NOT_INSTALLED, self.XT6[1]: NOT_INSTALLED}
+        none = self.NO_SAVE_TOOLS
         head = self.echo_section(*self.nft_echo())
         for shell in available_shells():
             # no list file: the family holds no table
@@ -896,7 +898,7 @@ class SnapshotRuns(SnapshotCase, unittest.TestCase):
     def test_each_family_reads_its_own_list_file(self):
         # only the IPv6 list has a name: IPv4 is `[tables]` alone and IPv6 lists it; the reverse likewise (a pair
         # of files read the wrong way round gives the other answer in both cases)
-        none = {self.XT4[1]: NOT_INSTALLED, self.XT6[1]: NOT_INSTALLED}
+        none = self.NO_SAVE_TOOLS
         head = self.echo_section(*self.nft_echo())
         for shell in available_shells():
             r = self.run_snapshot(shell, self.make_helper(none, names={self.XT6[1]: "filter\n"}))
@@ -910,7 +912,7 @@ class SnapshotRuns(SnapshotCase, unittest.TestCase):
                 "== ip6tables-legacy-save\n[tables]\nfilter\n== end\n", shell)
 
     def test_a_table_list_that_cannot_be_read_is_failed_after_the_marker(self):
-        none = {self.XT4[1]: NOT_INSTALLED, self.XT6[1]: NOT_INSTALLED}
+        none = self.NO_SAVE_TOOLS
         for shell in available_shells():
             r = self.run_snapshot(shell, self.make_helper(none, names={self.XT4[1]: DIR}))
             self.assertIn("== iptables-legacy-save\n[tables]\n\n[failed]\n== ip6tables-legacy-save\n", r.stdout, (shell, "head fails"))
@@ -939,7 +941,7 @@ class SnapshotRuns(SnapshotCase, unittest.TestCase):
                 self.assertIsNone(re.search(shim, body), (name, shim))
 
     def test_a_listing_longer_than_the_cap_is_cut_and_has_no_end_line(self):
-        big = "head -c 1100000 /dev/zero | tr '\\000' 'a'\n"
+        big = "head -c 4300000 /dev/zero | tr '\\000' 'a'\n"
         for shell in available_shells():
             r = subprocess.run([shell, self.make_helper({self.NFT[1]: big}), "snapshot"],
                                capture_output=True, timeout=60)
@@ -966,7 +968,7 @@ class SnapshotRuns(SnapshotCase, unittest.TestCase):
         # planted first in the caller's PATH: it must never run. Deleting the helper's own PATH line, or
         # appending to the caller's PATH instead of replacing it, would run it. The table-list read is the
         # second use of `head`: a family with no save tool and a name in its list runs it too.
-        none = {self.XT4[1]: NOT_INSTALLED, self.XT6[1]: NOT_INSTALLED}
+        none = self.NO_SAVE_TOOLS
         names = {self.XT4[1]: "filter\n", self.XT6[1]: "filter\n"}
         for shell in available_shells():
             plant = tempfile.TemporaryDirectory(prefix="yuzu_test_fwplant_")
@@ -1010,7 +1012,7 @@ class BrokerSnapshotScriptRuns(SnapshotCase, unittest.TestCase):
     are the helper's byte for byte (pinned below), so the behaviour of every branch is SnapshotRuns' to
     prove, once, under every shell. This class keeps what is the script FILE's own: it takes NO argument
     at all (the helper's one-word call is the script's bare call), reads nothing from its standard input,
-    cuts its reply at one MiB, and prints one whole reply end to end, each under every shell."""
+    cuts its reply at four MiB, and prints one whole reply end to end, each under every shell."""
 
     FILE_NAME = "yuzu-fw-snapshot.sh"
 
@@ -1027,7 +1029,7 @@ class BrokerSnapshotScriptRuns(SnapshotCase, unittest.TestCase):
             r = self.run_bare(shell, self.make_helper())
             self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, ""), shell)
             # a family with no save tool and a name in its list, beside a failing nft
-            none = {self.XT4[1]: NOT_INSTALLED, self.XT6[1]: NOT_INSTALLED}
+            none = self.NO_SAVE_TOOLS
             r = self.run_bare(shell, self.make_helper({self.NFT[1]: 'exit 1\n', **none}, names={self.XT4[1]: "filter\n"}))
             self.assertEqual(
                 (r.returncode, r.stdout),
@@ -1035,7 +1037,7 @@ class BrokerSnapshotScriptRuns(SnapshotCase, unittest.TestCase):
                     "== ip6tables-legacy-save\n[tables]\n== end\n"), shell)
 
     def test_a_listing_longer_than_the_cap_is_cut_and_has_no_end_line(self):
-        big = "head -c 1100000 /dev/zero | tr '\\000' 'a'\n"
+        big = "head -c 4300000 /dev/zero | tr '\\000' 'a'\n"
         for shell in available_shells():
             r = subprocess.run([shell, self.make_helper({self.NFT[1]: big})], capture_output=True, timeout=60)
             self.assertEqual(r.returncode, 0, shell)
@@ -1051,10 +1053,6 @@ class BrokerSnapshotScriptRuns(SnapshotCase, unittest.TestCase):
             for args, r in zip(bad, run_all([[shell, script] + list(a) for a in bad])):
                 self.assertEqual((r.returncode, r.stdout, r.stderr), (64, "", ""), (shell, args))
             self.assertFalse(os.path.exists(marker), (shell, "a tool ran"))
-
-    def ran_marker(self):
-        marker = os.path.join(self.tmp.name, "ran-" + os.urandom(6).hex())
-        return marker, ': > "%s"\n' % marker + STUB_ECHO
 
     def test_it_reads_nothing_from_its_standard_input(self):
         # A script that read its input would take what is written to it: a closed stdin, /dev/null and
@@ -1091,7 +1089,7 @@ class BrokerSnapshotScriptRuns(SnapshotCase, unittest.TestCase):
             self.assertIn('"%s"' % marker, header, marker)
         self.assertNotIn("[unloaded]", header)
         self.assertIn('kFwSnapshotSocketPath = "/run/yuzu-fw-snapshot.sock"', header)
-        self.assertIn("kFwSnapshotMaxBytes = 1048576", header)
+        self.assertIn("kFwSnapshotMaxBytes = 4194304", header)
 
 
 GOLDEN_RE = re.compile(r'kGoldenNftRuleset = R"NFTGOLDEN\((.*?)\)NFTGOLDEN";', re.S)

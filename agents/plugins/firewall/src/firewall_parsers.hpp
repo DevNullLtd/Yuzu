@@ -332,6 +332,8 @@ struct IptablesRule {
     std::string spec; // policy target ("ACCEPT"/"DROP") for `policy`; empty
                        // for `new_chain`; the rule spec after the chain name
                        // for `append`; the raw line for `unknown`.
+    std::string table; // the xtables table of a save-listing entry; empty for the filter table
+                       // and for every `-S` read (which lists the filter table only)
 };
 
 /// Parse `iptables -S` into structured rows, replacing the old opaque
@@ -1565,16 +1567,20 @@ struct IptablesSummary {
     return sum;
 }
 
-/// One iptables entry as a row: `rule|<kind>|<chain>|<spec>`, or `rule|ip6|<kind>|<chain>|<spec>`
-/// for an ip6tables entry. `ip6` is none of the kinds (policy, new_chain, append, unknown), so
-/// the two forms cannot be confused. Chain and spec are echoed, so they are sanitised.
+/// One iptables entry as a row: `rule|[ip6|][<table>|]<kind>|<chain>|<spec>`. `ip6|` marks an
+/// ip6tables entry. `<table>` is written only for an entry of a legacy save listing outside the
+/// filter table, and is one of `nat`, `mangle`, `raw`, `security` (parse_iptables_legacy_save admits
+/// no other table name). `<kind>` is one of `policy`, `new_chain`, `append`, `unknown`. Those are two
+/// closed sets of fixed words, so the second field of a row is one of nine words (`ip6`, the four
+/// tables, the four kinds) and never `nftables`, `firewalld` or another backend's word. Chain and
+/// spec are echoed, so they are sanitised.
 [[nodiscard]] inline std::string format_iptables_rule_row(const IptablesRule& r, bool ip6) {
     const char* kind = r.type == IptablesEntryType::policy      ? "policy"
                        : r.type == IptablesEntryType::new_chain ? "new_chain"
                        : r.type == IptablesEntryType::append    ? "append"
                                                                 : "unknown";
-    return std::format("rule|{}{}|{}|{}", ip6 ? "ip6|" : "", kind, sanitize_field(r.chain),
-                       sanitize_field(r.spec));
+    return std::format("rule|{}{}{}|{}|{}", ip6 ? "ip6|" : "", r.table.empty() ? "" : r.table + "|", kind,
+                       sanitize_field(r.chain), sanitize_field(r.spec));
 }
 
 // ── Linux: the root snapshot broker (docs/adr/3007-os-activated-read-helpers.md) ─────────────
@@ -1589,12 +1595,18 @@ struct IptablesSummary {
 // false-safe value. Three sections, three disjoint rulesets, one reader each: the nf_tables ruleset
 // (nft), and the legacy IPv4 and IPv6 xtables tables (the legacy save tools by name, or the kernel's
 // own table list when a family has no such tool). A section is READ when it vouches for its ruleset
-// and UNREAD otherwise; `inactive` and a rule count are answered only when all three were read.
+// and UNREAD otherwise. `inactive` is answered only when all three sections were read and none shows
+// content, in two snapshots taken one after the other; a rule count is written whenever all three
+// were read.
 
 inline constexpr std::string_view kFwSnapshotSocketPath = "/run/yuzu-fw-snapshot.sock";
 /// The script cuts its whole reply here (`head -c`), so a reply that is longer than this was not
-/// produced by it, and one cut at this size has no end line.
-inline constexpr std::size_t kFwSnapshotMaxBytes = 1048576;
+/// produced by it, and one cut at this size has no end line. It is the bound the netlink leg already
+/// has for the same host ruleset (kNftDumpMaxBytes), so the plugin has one bound for it: a ruleset
+/// whose listing is over this reads `error|snapshot:truncated` and unknown, never a shorter one.
+inline constexpr std::size_t kFwSnapshotMaxBytes = 4194304;
+static_assert(kFwSnapshotMaxBytes == kNftDumpMaxBytes,
+              "the broker reply cap is the netlink dump cap: one bound for a host ruleset");
 inline constexpr std::string_view kFwSnapshotNftLabel = "nft -a list ruleset";
 inline constexpr std::string_view kFwSnapshotIptablesLabel = "iptables-legacy-save";
 inline constexpr std::string_view kFwSnapshotIp6tablesLabel = "ip6tables-legacy-save";
@@ -2006,32 +2018,32 @@ struct NftTextLine {
 // table only, #8614). The listing is a few comment lines and, per table, `*<name>`, then `:<chain>
 // <policy> [<packets>:<bytes>]` lines, `-A <chain> <spec>` lines and `COMMIT`.
 
-/// One entry of a save listing: the table it belongs to and the entry in the shape the `-S` reads
-/// use (a `:<chain> <policy>` line is a `policy` entry, or a `new_chain` entry when the policy is
-/// `-`, which marks a user-defined chain).
-struct IptablesSaveEntry {
-    std::string table;
-    IptablesRule rule;
-};
-
-struct IptablesSaveListing {
-    std::vector<IptablesSaveEntry> entries;
-    /// An append, a user-defined chain, or a policy other than ACCEPT. Counters are never read and
-    /// never assumed zero.
-    bool has_content = false;
-    int append_count = 0; // the `-A` entries of every table
-};
-
 namespace detail {
 
-/// A table name as `iptables-save` prints it: lower-case letters, digits and `_`, and not a word the
-/// rows use as a kind or as the IPv6 marker, so a row's table field cannot be taken for either.
+/// A table name as `iptables-save` prints it: one of the five tables the kernel has for IPv4 and for
+/// IPv6 (xt_table), and no other word.
 [[nodiscard]] inline bool save_table_name_ok(std::string_view name) noexcept {
-    if (name.empty() || name == "ip6" || name == "policy" || name == "new_chain" || name == "append" ||
-        name == "unknown")
-        return false;
-    return std::all_of(name.begin(), name.end(),
-                       [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; });
+    return name == "filter" || name == "nat" || name == "mangle" || name == "raw" || name == "security";
+}
+
+/// True when every double quote on `line` is closed the way `iptables-save` writes one: outside
+/// quotes a double quote opens, inside a backslash takes the next byte and a double quote closes. The
+/// tool writes a rule comment or log prefix raw between double quotes and escapes only the double
+/// quote, the backslash and the single quote, so a newline inside one leaves the first line open:
+/// the listing is unread, it does not become further lines.
+[[nodiscard]] inline bool save_quotes_closed(std::string_view line) noexcept {
+    bool quoted = false;
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        if (quoted) {
+            if (line[i] == '\\')
+                ++i;
+            else if (line[i] == '"')
+                quoted = false;
+        } else if (line[i] == '"') {
+            quoted = true;
+        }
+    }
+    return !quoted;
 }
 
 /// `[<digits>:<digits>]`, the packet and byte counters of a `:<chain>` line.
@@ -2050,24 +2062,37 @@ namespace detail {
 
 } // namespace detail
 
-/// Parses an `iptables-legacy-save` / `ip6tables-legacy-save` listing; nullopt when it is not one
-/// this parser fully understands. Blank lines and lines that start with `#` are skipped; `*<name>`
-/// opens a table; inside a table a `:<chain> <policy> [<digits>:<digits>]` line is a chain, a
-/// `-A <chain> <spec>` line is an append and `COMMIT` closes the table. Anything else, any of those
-/// outside a table, and text that ends inside a table is not shaped (nullopt). Empty text is a
-/// listing of no table: the family holds none.
-[[nodiscard]] inline std::optional<IptablesSaveListing> parse_iptables_legacy_save(std::string_view text) {
-    IptablesSaveListing out;
-    std::string table;
+/// Parses an `iptables-legacy-save` / `ip6tables-legacy-save` listing into the entries the `-S` reads
+/// use (a `:<chain> <policy> [p:b]` line is a `policy` entry, or a `new_chain` entry when the policy
+/// is `-`, which marks a user-defined chain; an entry outside the filter table carries its table).
+/// It accepts only what `iptables-save` writes, and is nullopt for anything else, so an unshaped
+/// listing is never an empty summary that reads as no content:
+///  1. a line that is empty or starts with `#` is skipped (a line of only blanks is not shaped);
+///  2. `*<name>` opens a table when none is open and `<name>` is one of the five kernel table names
+///     (filter, nat, mangle, raw, security) not opened before in this listing: a repeated table, or
+///     a table called `nftables` or `firewalld`, is not shaped;
+///  3. inside a table every `:` line and `-A` line closes its quotes (detail::save_quotes_closed);
+///  4. a `:<chain> <policy> [p:b]` line is a chain, a `-A <chain> <spec>` line is an append, `COMMIT`
+///     closes the table; anything else, any of those outside a table, and text that ends inside a
+///     table is not shaped.
+/// Content is an append, a user-defined chain, or a policy other than ACCEPT; counters are never read
+/// and never assumed zero. Empty text is a listing of no table: the family holds none.
+[[nodiscard]] inline std::optional<IptablesSummary> parse_iptables_legacy_save(std::string_view text) {
+    IptablesSummary out;
+    out.shaped = true;
+    std::string table; // empty for the filter table
+    std::vector<std::string> opened;
     bool in_table = false;
     for (const auto line : detail::lines(text)) {
         if (line.empty() || line.front() == '#')
             continue;
         if (line.front() == '*') {
-            const auto name = line.substr(1);
-            if (in_table || !detail::save_table_name_ok(name))
+            const std::string name{line.substr(1)};
+            if (in_table || !detail::save_table_name_ok(name) ||
+                std::find(opened.begin(), opened.end(), name) != opened.end())
                 return std::nullopt;
-            table = std::string{name};
+            opened.push_back(name);
+            table = name == "filter" ? std::string{} : name;
             in_table = true;
             continue;
         }
@@ -2077,7 +2102,10 @@ namespace detail {
             in_table = false;
             continue;
         }
-        IptablesSaveEntry entry{table, {}};
+        if (!detail::save_quotes_closed(line))
+            return std::nullopt;
+        IptablesRule entry;
+        entry.table = table;
         if (line.front() == ':') {
             // `:<chain> <policy> [p:b]`: exactly three single-space separated tokens
             const auto sp1 = line.find(' ');
@@ -2087,13 +2115,13 @@ namespace detail {
             const auto policy = line.substr(sp1 + 1, sp2 - sp1 - 1);
             if (!detail::save_counters_ok(line.substr(sp2 + 1)))
                 return std::nullopt;
-            entry.rule.chain = std::string{line.substr(1, sp1 - 1)};
+            entry.chain = std::string{line.substr(1, sp1 - 1)};
             if (policy == "-") {
-                entry.rule.type = IptablesEntryType::new_chain;
+                entry.type = IptablesEntryType::new_chain;
                 out.has_content = true;
             } else {
-                entry.rule.type = IptablesEntryType::policy;
-                entry.rule.spec = std::string{policy};
+                entry.type = IptablesEntryType::policy;
+                entry.spec = std::string{policy};
                 out.has_content = out.has_content || policy != "ACCEPT";
             }
         } else if (line.starts_with("-A ")) {
@@ -2101,9 +2129,9 @@ namespace detail {
             const auto sp = rest.find(' ');
             if (rest.empty() || sp == 0)
                 return std::nullopt;
-            entry.rule.type = IptablesEntryType::append;
-            entry.rule.chain = std::string{rest.substr(0, sp)};
-            entry.rule.spec = sp == std::string_view::npos ? std::string{} : std::string{rest.substr(sp + 1)};
+            entry.type = IptablesEntryType::append;
+            entry.chain = std::string{rest.substr(0, sp)};
+            entry.spec = sp == std::string_view::npos ? std::string{} : std::string{rest.substr(sp + 1)};
             out.has_content = true;
             ++out.append_count;
         } else {
@@ -2114,20 +2142,6 @@ namespace detail {
     if (in_table)
         return std::nullopt; // cut inside a table
     return out;
-}
-
-/// One save-listing entry as a row. A filter-table entry keeps the `-S` row form,
-/// `rule|<kind>|<chain>|<spec>` (`rule|ip6|<kind>|...` for IPv6); an entry of any other table carries
-/// the table before the kind, `rule|raw|append|PREROUTING|...` and `rule|ip6|mangle|policy|...`. The
-/// table is none of the kinds and is not `ip6` (save_table_name_ok), so the forms cannot be confused.
-/// Chain and spec are echoed, so they are sanitised.
-[[nodiscard]] inline std::string format_iptables_save_row(const IptablesSaveEntry& e, bool ip6) {
-    const char* kind = e.rule.type == IptablesEntryType::policy      ? "policy"
-                       : e.rule.type == IptablesEntryType::new_chain ? "new_chain"
-                       : e.rule.type == IptablesEntryType::append    ? "append"
-                                                                     : "unknown";
-    return std::format("rule|{}{}{}|{}|{}", ip6 ? "ip6|" : "", e.table == "filter" ? "" : e.table + "|", kind,
-                       sanitize_field(e.rule.chain), sanitize_field(e.rule.spec));
 }
 
 /// What the snapshot rung answers: the verdict it reached and the rows that carry it. Both leave
@@ -2225,19 +2239,21 @@ struct SnapshotSectionReading {
     r.rules = static_cast<std::size_t>(listing->append_count);
     if (want_rows)
         for (const auto& entry : listing->entries)
-            r.rows.push_back(format_iptables_save_row(entry, ip6));
+            r.rows.push_back(format_iptables_rule_row(entry, ip6));
     return r;
 }
 
 } // namespace detail
 
-/// The snapshot rung's answer for `state` or `rules`. `tables_seen` is true when the netlink leg saw
-/// a table it could not read. Each of the three sections is READ or UNREAD (see
-/// detail::read_nft_section and detail::read_legacy_section), and:
+/// One snapshot's answer for `state` or `rules` (linux_snapshot_rung takes a second snapshot before it
+/// answers `inactive`). `tables_seen` is true when the netlink leg saw a table it could not read. Each
+/// of the three sections is READ or UNREAD (see detail::read_nft_section and
+/// detail::read_legacy_section), and:
 ///  1. state: `active` when any READ section has content; else `unknown` when any section is UNREAD;
-///     else `inactive`, which nft_fallthrough_clamp turns to `unknown` when `tables_seen`.
-///  2. count: `ruleset|<nft rules + the -A rules of both legacy families>` only when all three are
-///     READ and the state was not clamped; otherwise `ruleset|unknown`.
+///     else `inactive`, which nft_fallthrough_clamp turns to `unknown` when `tables_seen`. So
+///     `inactive` is answered only when all three sections were read and none shows content.
+///  2. count: `ruleset|<nft rules + the -A rules of both legacy families>` whenever all three are
+///     READ and the netlink read did not turn the state to `unknown`; otherwise `ruleset|unknown`.
 ///  3. backend: `backend|iptables` when a legacy section has content and nft has none; otherwise
 ///     `backend|nftables`.
 ///  4. rules: the rule rows of every READ section (nft base chains, nft handles, IPv4 entries, IPv6
@@ -2360,27 +2376,82 @@ struct FirewalldZone {
     }
 }
 
-/// The row a failed broker read writes: `error|snapshot:<token>` (`error|snapshot:helper:<token>`
-/// for the installer helper's transport).
+/// The row a failed read of the snapshot writes: `error|snapshot:<token>` for a read that failed on
+/// either transport, with the reader's token (a reply that fails the framing is `empty`, `truncated`
+/// or `malformed` whichever transport carried it), and `error|snapshot:helper:<token>` only when the
+/// installer helper's own run did not complete (helper_snapshot_outcome).
 [[nodiscard]] inline std::string snapshot_error_row(std::string_view token) {
     return std::format("error|snapshot:{}", token);
 }
 
-/// What the root helper's `snapshot` word, run through `sudo -n --`, came to. Its listing when the
-/// run completed with exit 0. The silent decline (an EMPTY token, no row) when sudo refused: that
-/// exits 1, and the helper itself exits 0 whatever its tools did, so a refusal means this host was
-/// not provisioned for the read. Anything else is `helper:<token>` with the token
-/// subprocess_failure_token gives (`not_run`, `timeout`, `truncated`, `exit:<n>`): a helper that
-/// timed out, was clipped or refused the word (an older one exits 64) is a failed read, never "not
-/// provisioned".
+/// What the root helper's `snapshot` word, run through `sudo -n --`, came to: its listing when the run
+/// completed with exit 0, else `helper:<token>` with the token subprocess_failure_token gives
+/// (`not_run`, `timeout`, `truncated`, `exit:<n>`). The caller makes no sudo call at all on a host the
+/// installer did not provision (no helper file), so a sudo that refuses (exit 1) is a failed read of
+/// a provisioned transport, as is a helper that timed out, was clipped, or does not accept the word
+/// (it exits 64). None of them is read as "not provisioned".
 [[nodiscard]] inline std::expected<std::string, std::string>
 helper_snapshot_outcome(const yuzu::agent::SubprocessResult& res) {
     const auto token = subprocess_failure_token(res);
     if (token.empty())
         return res.output;
-    if (token == "exit:1")
-        return std::unexpected(std::string{});
     return std::unexpected("helper:" + token);
+}
+
+/// What the snapshot rung comes to for one `state` or `rules` read: the rows to write, in order, and
+/// whether the answer stands (dispatch stops) or the next rung runs.
+struct LinuxSnapshotRung {
+    std::vector<std::string> rows;
+    bool answered = false;
+};
+
+/// Runs the snapshot rung. `read` is the transport: a callable that takes one whole snapshot and
+/// returns its text, or the token that says why there is none (an EMPTY token: no transport is
+/// provisioned on this host, which is not reported). `firewalld_held` is true while firewalld's own
+/// answer is held: only an `active` answer is then accepted, and any other writes just its `error|`
+/// rows, so the refusals that explain what was not read are still reported.
+///
+/// `inactive` is never answered from one snapshot. The three sections are read one after another and
+/// are three separate kernel rulesets, so a rule set that moves from one backend to another between
+/// two of the reads would be read as empty by the one snapshot that saw each side at the wrong time.
+/// When a snapshot would be accepted as `inactive` (all three sections READ, no content, not declined,
+/// not clamped to unknown, firewalld not held), the rung takes a second whole snapshot through the same
+/// transport, and the second answer is the answer whatever it is: `inactive` confirmed, `active`,
+/// `unknown` with its error rows, or a transport or framing error row and no answer. The six reads
+/// run in the order nft, IPv4, IPv6, nft, IPv4, IPv6, so for content to move from one ruleset to
+/// another unseen every read of the one must follow the move and every read of the other must
+/// precede it, which no pair of reads allows: every single move is seen. Two or more moves between
+/// rulesets inside one read can still be missed, and the count of an `active` answer is the sum of
+/// one pass, so a rule in motion can be counted twice or not at all (ADR-3007, clause 6). Only a host
+/// that reads `inactive` pays the second read, and the caller gives both reads one deadline.
+template <typename Reader>
+[[nodiscard]] LinuxSnapshotRung linux_snapshot_rung(Reader&& read, bool tables_seen, bool firewalld_held,
+                                                    FwReadAction action) {
+    // The answer of one snapshot, or the row that says why there is none (empty: write nothing).
+    const auto one = [&]() -> std::expected<LinuxSnapshotAnswer, std::string> {
+        const auto reply = read();
+        if (!reply)
+            return std::unexpected(reply.error().empty() ? std::string{} : snapshot_error_row(reply.error()));
+        const auto snapshot = parse_fw_snapshot(*reply);
+        if (!snapshot)
+            return std::unexpected(snapshot_error_row(snapshot.error()));
+        return linux_snapshot_answer(*snapshot, tables_seen, action);
+    };
+    auto answer = one();
+    if (answer && !answer->declined && !firewalld_held && answer->state == NftVerdict::inactive)
+        answer = one();
+
+    LinuxSnapshotRung rung;
+    if (!answer) {
+        if (!answer.error().empty())
+            rung.rows.push_back(answer.error());
+        return rung;
+    }
+    rung.answered = !answer->declined && (!firewalld_held || answer->state == NftVerdict::active);
+    for (auto& row : answer->rows)
+        if (rung.answered || row.starts_with("error|"))
+            rung.rows.push_back(std::move(row));
+    return rung;
 }
 
 } // namespace yuzu::firewall

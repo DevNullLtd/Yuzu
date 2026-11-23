@@ -45,8 +45,10 @@
  *                 packaged unit (NoNewPrivileges, one capability) can read
  *                 neither nftables nor iptables itself, so the broker's
  *                 fixed read-only script does, and the pure parsers frame
- *                 and decide its reply (parse_fw_snapshot and
- *                 linux_snapshot_answer in firewall_parsers.hpp). With no
+ *                 and decide its reply (parse_fw_snapshot,
+ *                 linux_snapshot_answer and linux_snapshot_rung, which
+ *                 takes a second snapshot before it answers `inactive`,
+ *                 in firewall_parsers.hpp). With no
  *                 socket, a non-root agent not under NoNewPrivileges reads
  *                 the same listing from the root helper's `snapshot` word
  *                 through sudo (rung 3, site firewall/try_snapshot#1).
@@ -842,15 +844,6 @@ static_assert(nft::kNftPolicyAccept == static_cast<std::uint32_t>(NF_ACCEPT));
 static_assert(kNlmFRequest == static_cast<std::uint16_t>(NLM_F_REQUEST));
 static_assert(kNlmFDump == static_cast<std::uint16_t>(NLM_F_DUMP));
 
-/// Remaining time until `deadline`, clamped to zero (never negative).
-[[nodiscard]] std::chrono::milliseconds
-remaining_ms(std::chrono::steady_clock::time_point deadline) noexcept {
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline)
-        return std::chrono::milliseconds{0};
-    return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-}
-
 /// Opens and binds a NETLINK_NETFILTER socket for one dump round-trip, with
 /// SO_SNDTIMEO bounding the request send() to `send_budget` -- this socket
 /// only ever sends one small fixed-size dump request, but an unbounded send()
@@ -1128,7 +1121,7 @@ struct NftDump {
 [[nodiscard]] NftDump dump_once(std::uint16_t msg_type,
                                 std::chrono::steady_clock::time_point deadline) {
     NftDump dump;
-    auto sock = open_nft_socket(remaining_ms(deadline));
+    auto sock = open_nft_socket(yuzu::firewall::remaining_ms(deadline));
     if (!sock) {
         dump.open_errno = sock.error();
         return dump;
@@ -1214,7 +1207,7 @@ struct NftProbeResult {
         result.chain_buf = std::move(chain.buf);
         result.rule_buf = std::move(rule.buf);
         if (!yuzu::firewall::nft_rerun_worthwhile(yuzu::firewall::nft_churn_only(failed), attempt,
-                                                  remaining_ms(overall_deadline)))
+                                                  yuzu::firewall::remaining_ms(overall_deadline)))
             break;
     }
 
@@ -1305,8 +1298,8 @@ bool try_nftables_rules(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
 // stops the socket and then masks it (`systemctl stop`, then `systemctl mask`): on Rocky 9.9
 // (systemd 252) `mask --now` alone left the socket file and this read reported `connect:refused`.
 // After stop-then-mask the socket file is gone, this rung declines silently and the ladder answers
-// as it did before the broker: firewalld's own rows on a firewalld host, `unknown` elsewhere, both
-// after the refused netlink read's error row.
+// as a host without the broker does: firewalld's own rows on a firewalld host, `unknown` elsewhere,
+// both after the refused netlink read's error row.
 
 // The socket client itself is yuzu::firewall::read_fw_snapshot (firewall_snapshot_reader.hpp), so the
 // plugin and its tests run the same code. The path must fit sockaddr_un with its NUL.
@@ -1317,54 +1310,50 @@ static_assert(yuzu::firewall::kFwSnapshotSocketPath.size() < sizeof(sockaddr_un:
 /// socket): the root helper's `snapshot` word through `sudo -n --`. It is used only by a non-root
 /// agent that is not under NoNewPrivileges (the packaged unit, where sudo cannot elevate, has the
 /// broker instead), and only when the helper file is there: a host the installer did not provision
-/// makes no sudo call at all. The pure helper_snapshot_outcome decides what the run came to: its
-/// listing, the silent decline (sudo refused with exit 1: this host is not provisioned for the
-/// read), or `helper:<token>` for a run that timed out, was clipped or failed. The caller parses a
-/// listing through the same strict framing as the socket's reply. Spawn site
-/// firewall/try_snapshot#1 (rung 3: the helper is a `#!/bin/sh` script).
-[[nodiscard]] std::expected<std::string, std::string> read_fw_snapshot_via_helper() {
+/// makes no sudo call at all and reads as no transport (an empty token). Once the helper file is
+/// there, the pure helper_snapshot_outcome decides what the run came to: its listing, or
+/// `helper:<token>` for a sudo that refused, a run that timed out, was clipped or failed. The run
+/// gets what is left of `deadline`, which the whole rung shares. The caller parses a listing through
+/// the same strict framing as the socket's reply. Spawn site firewall/try_snapshot#1 (rung 3: the
+/// helper is a `#!/bin/sh` script).
+[[nodiscard]] std::expected<std::string, std::string>
+read_fw_snapshot_via_helper(std::chrono::steady_clock::time_point deadline) {
     // privilege_refusal() (defined with the containment shell below) is the one reading of
     // NoNewPrivileges: it refuses a non-root agent under it, which cannot sudo.
     if (::geteuid() == 0 || privilege_refusal() || ::access(std::string{fq::kFwHelperPath}.c_str(), X_OK) != 0)
         return std::unexpected(std::string{});
+    const auto left = yuzu::firewall::remaining_ms(deadline);
+    if (left.count() <= 0)
+        return std::unexpected(std::string{"helper:timeout"});
     return yuzu::firewall::helper_snapshot_outcome(run_bounded_subprocess(
         yuzu::shared::sudo_wrap({std::string{fq::kFwHelperPath}, "snapshot"}),
-        SubprocessOptions{.deadline = kAcqDeadline,
-                          .output_cap_bytes = 2 * yuzu::firewall::kFwSnapshotMaxBytes}));
+        SubprocessOptions{.deadline = left, .output_cap_bytes = 2 * yuzu::firewall::kFwSnapshotMaxBytes}));
 }
 
-/// true iff the snapshot answered (dispatch stops); false means the next rung runs. A broker that
-/// is not installed says nothing (and the helper transport is tried); one that is but could not be
-/// read says why in an `error|snapshot:<token>` row. The rows are the pure decision's
-/// (linux_snapshot_answer). A declined answer (no nft CLI and nothing read shows content) writes
-/// just its `error|` rows and the ladder goes on. While `info.firewalld_running` only an active
-/// answer is written and accepted; any other answer writes just its `error|` rows, so firewalld's
-/// held answer stands and the refusals that explain what was not read are still reported.
+/// true iff the snapshot answered (dispatch stops); false means the next rung runs. A host with no
+/// transport (no socket, no provisioned helper) says nothing; one that has a transport but could not
+/// be read says why in an `error|snapshot:<token>` row. The rows and the decision are the pure
+/// linux_snapshot_rung's: it reads one whole snapshot, and a second before it answers `inactive`.
+/// Both reads share one deadline, computed once, so the rung's worst case does not change. A
+/// declined answer (no nft CLI and nothing read shows content) writes just its `error|` rows and the
+/// ladder goes on. While `info.firewalld_running` only an active answer is written and accepted; any
+/// other answer writes just its `error|` rows, so firewalld's held answer stands and the refusals
+/// that explain what was not read are still reported.
 bool try_snapshot(yuzu::CommandContext& ctx, const NftFallthroughInfo& info,
                   yuzu::firewall::FwReadAction action) {
-    auto reply = yuzu::firewall::read_fw_snapshot(yuzu::firewall::kFwSnapshotSocketPath,
-                                                  std::chrono::steady_clock::now() + kAcqDeadline);
-    if (!reply && reply.error().empty()) {
-        // No socket file: not the packaged unit. The installer's helper is the other transport.
-        reply = read_fw_snapshot_via_helper();
-    }
-    if (!reply) {
-        if (!reply.error().empty())
-            ctx.write_output(yuzu::firewall::snapshot_error_row(reply.error()));
-        return false;
-    }
-    const auto snapshot = yuzu::firewall::parse_fw_snapshot(*reply);
-    if (!snapshot) {
-        ctx.write_output(yuzu::firewall::snapshot_error_row(snapshot.error()));
-        return false;
-    }
-    const auto answer = yuzu::firewall::linux_snapshot_answer(*snapshot, info.tables_seen, action);
-    const bool answers =
-        !answer.declined && (!info.firewalld_running || answer.state == yuzu::firewall::NftVerdict::active);
-    for (const auto& row : answer.rows)
-        if (answers || row.starts_with("error|"))
-            ctx.write_output(row);
-    return answers;
+    const auto deadline = std::chrono::steady_clock::now() + kAcqDeadline;
+    const auto read = [&deadline]() -> std::expected<std::string, std::string> {
+        auto reply = yuzu::firewall::read_fw_snapshot(yuzu::firewall::kFwSnapshotSocketPath, deadline);
+        if (!reply && reply.error().empty()) {
+            // No socket file: not the packaged unit. The installer's helper is the other transport.
+            return read_fw_snapshot_via_helper(deadline);
+        }
+        return reply;
+    };
+    const auto rung = yuzu::firewall::linux_snapshot_rung(read, info.tables_seen, info.firewalld_running, action);
+    for (const auto& row : rung.rows)
+        ctx.write_output(row);
+    return rung.answered;
 }
 
 // ── ufw (rung 2, argv) ───────────────────────────────────────────────────
@@ -1553,7 +1542,7 @@ void do_state_linux(yuzu::CommandContext& ctx) {
         ctx.write_output(row);
 
     // Nothing that can see the ruleset showed an active one: a partly read firewalld answers, as it
-    // did before the broker existed (ufw and iptables are not consulted).
+    // does on a host without the broker (ufw and iptables are not consulted).
     if (info.firewalld_running) {
         for (const auto& row : firewalld.rows)
             ctx.write_output(row);
@@ -1859,7 +1848,7 @@ private:
 /// that is the usual case and the core falls back to `sudo nft list table`.
 [[nodiscard]] std::optional<fq::NftTableListing> read_quarantine_table_netlink() {
     const auto deadline = std::chrono::steady_clock::now() + kAcqDeadline;
-    auto sock = open_nft_socket(remaining_ms(deadline));
+    auto sock = open_nft_socket(yuzu::firewall::remaining_ms(deadline));
     if (!sock)
         return std::nullopt;
     std::vector<std::byte> buf;

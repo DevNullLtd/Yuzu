@@ -545,7 +545,7 @@ EOF
 # writes the helper before this file; a host without it is provisioned with this build's installer.
 # The helper also takes one read-only word, snapshot, with no other argument; on a Mac it prints
 # [absent] for nft and [failed] for the two legacy iptables sections (there is no /proc/net), at most
-# 1 MiB, and the pf reads below stay on the exact pfctl lines. The state and rules reads use three of them, read-only and with no
+# 4 MiB, and the pf reads below stay on the exact pfctl lines. The state and rules reads use three of them, read-only and with no
 # wildcard: -s info, -s rules and -s Anchors (the top-level anchor list; the com.apple line below is
 # a different, narrower read that the containment path uses).
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
@@ -602,7 +602,7 @@ EOF
 # Debian 11 do not ship. The installer writes the helper before this file; a host without it is
 # provisioned with this build's installer. The helper also takes one read-only word, snapshot,
 # with no other argument: it prints the nft ruleset and the legacy iptables and ip6tables tables of
-# the host (at most 1 MiB), changes no ruleset and writes no file, so the agent account can read the
+# the host (at most 4 MiB), changes no ruleset and writes no file, so the agent account can read the
 # host ruleset through this same line. One side effect is measured: an nft read on a host where
 # nf_tables is not loaded makes the kernel load it.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
@@ -729,13 +729,13 @@ remove_sudoers() {
 #     its own literals plus the checked tokens on standard input.
 #   - snapshot: exactly one argument, the word snapshot, and read-only. It runs $NFT -a list
 #     ruleset and, for each address family, that family's legacy save tool by its own name
-#     ($XT4 for IPv4, $XT6 for IPv6; with no argument: they list every instantiated table and load
-#     no module), each with those fixed arguments and nothing from the caller, and prints them under
+#     ($XT4 for IPv4, $XT6 for IPv6; with no argument: they list every instantiated table and, for
+#     the tables the kernel lists, load no module), each with those fixed arguments and nothing from the caller, and prints them under
 #     `== <label>` headings: `[absent]` for the nft tool not installed (that section was not read),
 #     `[failed]` after the output of a tool that exits non-zero, `[failed]` alone for a legacy
 #     section when /proc/net cannot be stat'ed, then `== end`. A legacy family with no save tool
 #     prints `[tables]` and then the kernel's own list of its tables (`[tables]` alone: no table).
-#     The whole listing is cut at 1 MiB (a cut one has no `== end`) and the exit status is 0.
+#     The whole listing is cut at 4 MiB (a cut one has no `== end`) and the exit status is 0.
 #   - anything else exits 64 having run nothing.
 # The helper is ONE text on both platforms. An action whose tool is not on the host (iptables or
 # nft on a Mac, pfctl on Linux) fails at exec, after the same validation, having changed nothing.
@@ -794,7 +794,7 @@ generate_fw_helper_content() {
 # the section is `[failed]` alone and no tool is run; when the family has no save tool the section
 # is `[tables]` and then the kernel's own list of the family's tables, one name per line (`[tables]`
 # alone is a family that holds no table). The listing ends with `== end`, the whole of it is cut at
-# 1048576 bytes, and the exit status is 0. A listing that was cut has no `== end`. The tools are run
+# 4194304 bytes, and the exit status is 0. A listing that was cut has no `== end`. The tools are run
 # with their own fixed arguments and nothing from the caller. It reads the host ruleset, which
 # includes rule handles, and changes no ruleset and writes no file. An nft read on a host where
 # nf_tables is not loaded makes the kernel load it.
@@ -884,10 +884,10 @@ snap_one() {
 }
 
 # snap_xt LABEL TOOL NAMES: a legacy xtables section, read by the family's legacy save tool under
-# its own name, with no argument. That tool lists every instantiated table, loads no kernel module,
-# runs no modprobe and takes no lock; empty output with exit 0 is a family that holds no table, and
-# a non-zero exit is a failure (`[failed]` through snap_one). Two decisions are made here, before
-# any tool runs, from host state and never from input. If /proc/net cannot be stat'ed the process
+# its own name, with no argument. That tool lists every instantiated table; for the tables the
+# kernel lists it loads no kernel module, runs no modprobe and takes no lock. Empty output with exit
+# 0 is a family that holds no table, and a non-zero exit is a failure (`[failed]` through snap_one).
+# Two decisions are made here, before any tool runs, from host state and never from input. If /proc/net cannot be stat'ed the process
 # cannot see the kernel's tables at all, and a save tool reads a missing table list as no table, so
 # the section is `[failed]` and no tool is run. If the family has no save tool, nothing here can
 # list its tables; the kernel's own list of them is printed under `[tables]`, which is the names
@@ -909,7 +909,7 @@ snap_xt() {
     [ ! -e "$3" ] || head -c 4096 "$3" 2>/dev/null || printf '\n[failed]\n'
 }
 
-# host_snapshot: yuzu-fw-helper snapshot. Never returns. The group is cut at 1 MiB, so a listing
+# host_snapshot: yuzu-fw-helper snapshot. Never returns. The group is cut at 4 MiB, so a listing
 # that was cut has no end line.
 host_snapshot() {
     {
@@ -917,7 +917,7 @@ host_snapshot() {
         snap_xt 'iptables-legacy-save' "$XT4" /proc/net/ip_tables_names
         snap_xt 'ip6tables-legacy-save' "$XT6" /proc/net/ip6_tables_names
         printf '== end\n'
-    } | head -c 1048576
+    } | head -c 4194304
     exit 0
 }
 

@@ -81,11 +81,15 @@ const std::string kNftRuleset =
     "\t}\n"
     "}\n";
 
-std::string lin_snapshot(std::string_view nft, std::string_view ipt, std::string_view ip6t) {
+// The two iptables sections carry `ipt_label` and `ip6t_label`: the root harness's `-S` mirror of the direct
+// legs by default, or the save tools' own names as the broker and the helper print them.
+std::string lin_snapshot(std::string_view nft, std::string_view ipt, std::string_view ip6t,
+                         std::string_view ipt_label = label::kIptables,
+                         std::string_view ip6t_label = label::kIp6tables) {
     std::string out;
     write_section(out, label::kNft, true, nft);
-    write_section(out, label::kIptables, true, ipt);
-    write_section(out, label::kIp6tables, true, ip6t);
+    write_section(out, ipt_label, true, ipt);
+    write_section(out, ip6t_label, true, ip6t);
     finish(out);
     return out;
 }
@@ -95,12 +99,7 @@ constexpr std::string_view kIpt = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT
 // The same three sections as the broker and the helper print them: the legacy save tools' own names, and in
 // each of those two sections either a save listing or `[tables]` (and the kernel's table names).
 std::string lin_snapshot_save(std::string_view nft, std::string_view ipt, std::string_view ip6t) {
-    std::string out;
-    write_section(out, label::kNft, true, nft);
-    write_section(out, label::kIptablesSave, true, ipt);
-    write_section(out, label::kIp6tablesSave, true, ip6t);
-    finish(out);
-    return out;
+    return lin_snapshot(nft, ipt, ip6t, label::kIptablesSave, label::kIp6tablesSave);
 }
 
 // A save listing as `iptables-save` prints it (counters read [0:0] without -c; the first and last lines are
@@ -364,7 +363,6 @@ TEST_CASE("Linux: a snapshot with [tables] legacy sections is readable and equal
     // their baseline from such a host, so it must be a readable snapshot and not a failed read.
     for (const auto& snap : {lin_snapshot_save(kNftRuleset, "[tables]\n", "[tables]\n"),
                              lin_snapshot_save(kNftRuleset, "[tables]\n", save_listing("a")),
-                             lin_snapshot_save(kNftRuleset, save_listing("a"), "[tables]\nfilter\n"),
                              lin_snapshot_save("", "[tables]\n", "[tables]\n")}) {
         INFO(snap);
         CHECK(readable(Os::lin, snap));
@@ -373,17 +371,68 @@ TEST_CASE("Linux: a snapshot with [tables] legacy sections is readable and equal
         CHECK(v.readable);
         CHECK(v.restored);
     }
-    // a table that appears between two reads is a difference, not a pass: one line added, nothing else moved
+    // a table that appears between two reads is a difference, not a pass
     const auto loaded_later = compare(Os::lin, lin_snapshot_save(kNftRuleset, "[tables]\n", "[tables]\n"),
-                                      lin_snapshot_save(kNftRuleset, "[tables]\nfilter\n", "[tables]\n"));
+                                      lin_snapshot_save(kNftRuleset, save_listing("x"), "[tables]\n"));
     INFO(describe(loaded_later));
     CHECK(loaded_later.readable);
     CHECK_FALSE(loaded_later.restored);
-    CHECK(loaded_later.added == 1);
-    CHECK(loaded_later.gone == 0);
-    CHECK(loaded_later.changed == 0);
+    CHECK(loaded_later.added >= 1);
     // and it does not make a failed read readable
     CHECK_FALSE(readable(Os::lin, lin_snapshot_save(kNftRuleset, "[tables]\n\n[failed]\n", "[tables]\n")));
+}
+
+TEST_CASE("Linux: [tables] followed by a name is tables nothing listed, so the plugin reads it as unread and so "
+          "does the harness",
+          "[firewall]") {
+    // `[tables]` alone is a family that holds no table (readable, above); with a name after it, tables exist
+    // that nothing listed (read_legacy_section reads that as unread), so a restore proof that called it
+    // restored would call restored what nobody listed
+    for (const char* names : {"[tables]\nfilter\n", "[tables]\nnat\nfilter\n"}) {
+        INFO(names);
+        for (const auto& snap : {lin_snapshot_save(kNftRuleset, names, "[tables]\n"),
+                                 lin_snapshot_save(kNftRuleset, "[tables]\n", names)}) {
+            CHECK_FALSE(readable(Os::lin, snap));
+            const auto v = compare(Os::lin, snap, snap);
+            CHECK_FALSE(v.readable);
+            CHECK_FALSE(v.restored); // an unreadable baseline never compares equal to itself
+        }
+    }
+}
+
+TEST_CASE("Linux: a policy or a rule that changes in one table cannot hide behind the same line in another",
+          "[firewall]") {
+    // raw OUTPUT is DROP, mangle OUTPUT is ACCEPT, and filter OUTPUT goes from ACCEPT to DROP: the set of
+    // policy lines is the same before and after unless each line carries the table it belongs to
+    const auto listing = [](std::string_view filter_output) {
+        return "*raw\n:PREROUTING ACCEPT [0:0]\n:OUTPUT DROP [0:0]\nCOMMIT\n"
+               "*mangle\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n"
+               "*filter\n:INPUT ACCEPT [0:0]\n:OUTPUT " + std::string{filter_output} + " [0:0]\nCOMMIT\n";
+    };
+    const auto same = compare(Os::lin, lin_snapshot_save(kNftRuleset, listing("ACCEPT"), "[tables]\n"),
+                              lin_snapshot_save(kNftRuleset, listing("ACCEPT"), "[tables]\n"));
+    CHECK(same.readable);
+    CHECK(same.restored);
+    const auto leak = compare(Os::lin, lin_snapshot_save(kNftRuleset, listing("ACCEPT"), "[tables]\n"),
+                              lin_snapshot_save(kNftRuleset, listing("DROP"), "[tables]\n"));
+    INFO(describe(leak));
+    CHECK(leak.readable);
+    CHECK_FALSE(leak.restored);
+    CHECK(leak.defaults_changed == 2); // the filter policy that went and the one that came
+    // a rule that moves from one table to another is a line gone and a line added, not a pass
+    const auto in_filter = "*filter\n:INPUT ACCEPT [0:0]\n-A INPUT -p tcp -j ACCEPT\nCOMMIT\n*mangle\n:INPUT ACCEPT [0:0]\nCOMMIT\n";
+    const auto in_mangle = "*filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n*mangle\n:INPUT ACCEPT [0:0]\n-A INPUT -p tcp -j ACCEPT\nCOMMIT\n";
+    const auto moved = compare(Os::lin, lin_snapshot_save(kNftRuleset, in_filter, "[tables]\n"),
+                               lin_snapshot_save(kNftRuleset, in_mangle, "[tables]\n"));
+    INFO(describe(moved));
+    CHECK(moved.readable);
+    CHECK_FALSE(moved.restored);
+    CHECK(moved.gone == 1);
+    CHECK(moved.added == 1);
+    // the `-S` form lists the filter table alone and is compared as before
+    CHECK_FALSE(compare(Os::lin, lin_snapshot(kNftRuleset, kIpt, kIpt),
+                        lin_snapshot(kNftRuleset, "-P INPUT DROP\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n", kIpt))
+                    .restored);
 }
 
 TEST_CASE("Linux: a save listing's dates and chain counters are normalised away, and nothing else", "[firewall]") {

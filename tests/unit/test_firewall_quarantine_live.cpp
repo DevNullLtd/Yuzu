@@ -315,17 +315,6 @@ constexpr fr::Os kThisOs = fr::Os::lin;
     return broker_socket_present() || installer_helper_present();
 }
 
-/// The broker's whole reply, read by the production reader the agent uses (connect, send NOTHING, read to
-/// end of stream, every wait bounded by the deadline). nullopt when it could not be read (no socket, not
-/// permitted, a timeout, more than 1 MiB, or a listener that was not made by root).
-[[nodiscard, maybe_unused]] std::optional<std::string> broker_snapshot_text(std::chrono::seconds budget = 60s) {
-    auto reply = yuzu::firewall::read_fw_snapshot(yuzu::firewall::kFwSnapshotSocketPath,
-                                                  std::chrono::steady_clock::now() + budget);
-    if (!reply)
-        return std::nullopt;
-    return *std::move(reply);
-}
-
 /// The `-A` lines (rules) of an `iptables -S` or `ip6tables -S` snapshot section, or of the broker's
 /// `iptables-legacy-save` or `ip6tables-legacy-save` section: both forms print a rule as an `-A` line.
 [[nodiscard, maybe_unused]] std::size_t count_appended(const std::string& section) {
@@ -408,11 +397,12 @@ constexpr fr::Os kThisOs = fr::Os::lin;
         if (yuzu::firewall::subprocess_complete(res))
             return res.output;
         // No installer grant (the packaged account, which has no sudoers file): the same listing,
-        // read from the broker socket the way the agent reads it. Used only when the helper's read
-        // did not complete and the socket is there; otherwise the snapshot is the failed form.
-        if (broker_socket_present())
-            if (auto text = broker_snapshot_text())
-                return *std::move(text);
+        // read from the broker socket by the production reader the agent uses (connect, send NOTHING, read
+        // to end of stream, every wait bounded by the deadline). Used only when the helper's read did not
+        // complete; no socket is the reader's own empty token, and then the snapshot is the failed form.
+        if (auto reply = yuzu::firewall::read_fw_snapshot(yuzu::firewall::kFwSnapshotSocketPath,
+                                                          std::chrono::steady_clock::now() + 60s))
+            return *std::move(reply);
         // This is the harness's own baseline read, not a plugin answer: say what it tried, so the
         // failing REQUIRE or CHECK that follows is not read as a plugin failure.
         UNSCOPED_INFO("the harness's own firewall snapshot found no transport that worked: the installer helper "
@@ -488,6 +478,18 @@ constexpr fr::Os kThisOs = fr::Os::lin;
     INFO("baseline snapshot:\n" << text.substr(0, 2000));
     REQUIRE(fr::readable(kThisOs, text));
     return text;
+}
+
+/// The baseline of a `state` or `rules` case, or nullopt where no read of the host can be expected to work:
+/// a non-root Linux agent with neither the broker socket nor the installer helper has no transport, so there
+/// is nothing to compare with and the case asserts the answer alone (baseline_snapshot would fail its REQUIRE
+/// before the answer is looked at).
+[[nodiscard, maybe_unused]] std::optional<std::string> read_case_baseline() {
+#if defined(__linux__)
+    if (!running_as_root() && !snapshot_transport_present())
+        return std::nullopt;
+#endif
+    return baseline_snapshot();
 }
 
 /// The restore check: the baseline must be readable, the snapshot taken now must be readable, and
@@ -1809,7 +1811,8 @@ TEST_CASE("live: quarantine is refused self_host when the control endpoint is th
 TEST_CASE("live: state reports what the OS tool reports, and the host is left as it was",
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
-    const auto before = baseline_snapshot();
+    const auto baseline = read_case_baseline();
+    const std::string before = baseline.value_or(std::string{}); // used only where a baseline exists
     PluginRig rig(env.server, env.server_ip());
     const auto r = rig.run("state");
     INFO(r.captured);
@@ -1866,12 +1869,18 @@ TEST_CASE("live: state reports what the OS tool reports, and the host is left as
         const auto want = expected_ruleset_count(before, *backend);
         REQUIRE(want.has_value());
         CHECK(*ruleset == std::to_string(*want));
-    } else if (!running_as_root() && *state == "unknown") {
-        // The agent account cannot read the ruleset itself (netlink dumps and iptables need root):
-        // an honest unknown is the right answer, and it must say why, unless the backend that
-        // answered is one whose refusal is a silent exit status (iptables, ufw) or none answered.
-        CHECK((has_prefix(r.captured, "error|") || has_prefix(r.captured, "fallthrough|") ||
-               *backend == "iptables" || *backend == "ufw" || *backend == "none"));
+    } else if (!running_as_root()) {
+        // No snapshot transport (the packaged account with the broker masked, or an account the installer
+        // did not provision) and the account cannot read the ruleset itself (netlink dumps and iptables
+        // need root): there is no baseline to compare with, and an honest unknown is the right answer.
+        // The absence of a transport is not a failed read, so no `error|snapshot:` row says otherwise.
+        CHECK_FALSE(has_prefix(r.captured, "error|snapshot:"));
+        CHECK((*ruleset == "unknown" || *backend == "firewalld")); // firewalld's own answer is its own
+        // an unknown must say why, unless the backend that answered is one whose refusal is a silent exit
+        // status (iptables, ufw) or none answered
+        if (*state == "unknown")
+            CHECK((has_prefix(r.captured, "error|") || has_prefix(r.captured, "fallthrough|") ||
+                   *backend == "iptables" || *backend == "ufw" || *backend == "none"));
     }
 #else
     // macOS: the Application Firewall state is an unprivileged read, run here directly.
@@ -1892,13 +1901,15 @@ TEST_CASE("live: state reports what the OS tool reports, and the host is left as
     CHECK(ruleset == std::to_string(fr::count_pf_rule_lines(
                          fr::section(before, fr::label::kPfRules).value_or(""))));
 #endif
-    check_restored(before); // a read changes nothing
+    if (baseline)
+        check_restored(before); // a read changes nothing
 }
 
 TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it was",
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
-    const auto before = baseline_snapshot();
+    const auto baseline = read_case_baseline();
+    const std::string before = baseline.value_or(std::string{}); // used only where a baseline exists
     PluginRig rig(env.server, env.server_ip());
     const auto r = rig.run("rules");
     INFO(r.captured);
@@ -1951,7 +1962,11 @@ TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it 
                    has_prefix(r.captured, "rule|ip6|")));
         }
     } else if (!running_as_root()) {
-        CHECK((*ruleset == "unknown" || is_integer(*ruleset))); // honest, never a fabricated count
+        // No snapshot transport and no privilege to read the ruleset: no baseline, and the honest answer is
+        // `ruleset|unknown`, never a fabricated count and never a failed-read row for a transport that is
+        // not there.
+        CHECK_FALSE(has_prefix(r.captured, "error|snapshot:"));
+        CHECK((*ruleset == "unknown" || *backend == "firewalld"));
     }
 #else
     // macOS: the app list is an unprivileged read, run here directly
@@ -1964,7 +1979,8 @@ TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it 
     CHECK(*ruleset == std::to_string(fr::count_pf_rule_lines(
                           fr::section(before, fr::label::kPfRules).value_or(""))));
 #endif
-    check_restored(before);
+    if (baseline)
+        check_restored(before);
 }
 
 #if defined(__linux__)
@@ -1979,7 +1995,7 @@ TEST_CASE("live (linux, agent account): the helper's snapshot word answers throu
                                      /*merge_stderr=*/false);
     INFO(snap.output.substr(0, 2000));
     REQUIRE(yuzu::firewall::subprocess_complete(snap));
-    CHECK(snap.output.size() <= 1048576);
+    CHECK(snap.output.size() <= yuzu::firewall::kFwSnapshotMaxBytes);
     CHECK(fr::readable(fr::Os::lin, snap.output)); // headed sections and the == end trailer
 
     // the word takes no argument: with one it is refused (exit 64) and prints no listing

@@ -55,7 +55,8 @@ breaks any of them is outside this ADR and needs its own threat model.
    when the package is built. The client sends nothing, and bytes it does send are never read.
 3. **Fixed, read-only work.** The program is a root-owned file shipped by the package. It names
    each tool by its literal absolute path with literal arguments, under a reset `PATH` and locale,
-   and changes no ruleset, writes no file, takes no lock and loads no legacy module. It reads two
+   and changes no ruleset, writes no file and takes no lock, and, for the tables the kernel lists,
+   loads no kernel module. It reads two
    kernel rulesets, one reader each: the nf_tables ruleset with `/usr/sbin/nft -a list ruleset`,
    and the legacy xtables tables of each address family with that family's legacy save tool under
    its own name, `/usr/sbin/iptables-legacy-save` and `/usr/sbin/ip6tables-legacy-save`, run with
@@ -72,13 +73,28 @@ breaks any of them is outside this ADR and needs its own threat model.
    `PATH`, as the size cut is. The legacy save tools were measured on Ubuntu 26.04 ARM64 (kernel
    7.0.0-43, systemd 259, iptables 1.8.11, 2026-11-23) unconfined and in the sandbox of the
    shipped unit: they loaded no module, ran no `modprobe` and created no `/run/xtables.lock`. The
-   broker's processes ran unconfined by AppArmor there. One side effect is measured and stays: an
-   nft read on a host where nf_tables is not loaded makes the kernel load nf_tables (an empty
-   ruleset: no table, no rule). It cannot be avoided inside this contract: skipping nft needs proof
-   that nf_tables is absent, and no existence test gives it on a kernel that builds nf_tables in.
-4. **Bounded.** The output is cut at a size cap, the instance has `RuntimeMaxSec` and `TasksMax`,
-   the socket has `MaxConnections`, and the client has its own deadline and size cap. A listing
-   over the cap is cut and read as unknown, never as a shorter ruleset.
+   broker's processes ran unconfined by AppArmor there. A save tool that cannot open its table-list
+   file for a reason other than the file not existing must exit non-zero, which the script prints as
+   `[failed]`: `for_each_table` in `iptables/iptables-save.c` returns quietly only for `ENOENT` and
+   prints `Failed to list table names` and calls `exit(1)` for any other error number, as read in the
+   Debian archive's source at iptables 1.8.2-4, 1.8.7-1, 1.8.9-2, 1.8.11-2 and 1.8.13-1 (and in
+   `ip6tables-save.c` at 1.8.2-4; one file serves both families from 1.8.7), and as measured on
+   1.8.11 in the broker's sandbox. A release not named here is not covered by that statement. Release
+   1.6.0 returns quietly on any failure, but it has no `-legacy-save` name, so the script never runs
+   it. A table that goes away between the kernel listing it and the tool reading it is the one case
+   in which a save tool asks for a module: `do_output` runs `xtables_load_ko`, which runs `modprobe`
+   for the family's core module and asks again, in every release read, and then fails. That
+   `modprobe` can load nothing in the broker's instance under `ProtectKernelModules` and runs as
+   root in the installer's helper, which has no such sandbox; the section is `[failed]`. One side
+   effect is measured and stays: an nft read on a host where nf_tables is not loaded makes the
+   kernel load nf_tables (an empty ruleset: no table, no rule). It cannot be avoided inside this
+   contract: skipping nft needs proof that nf_tables is absent, and no existence test gives it on a
+   kernel that builds nf_tables in.
+4. **Bounded.** The output is cut at 4 MiB (4194304 bytes), which is the bound the plugin's netlink
+   leg already has for the same host ruleset (`kNftDumpMaxBytes`), so the plugin has one bound for
+   it; the instance has `RuntimeMaxSec` and `TasksMax`, the socket has `MaxConnections`, and the
+   client has its own deadline and the same size cap (the installer helper's run is capped at twice
+   that). A listing over the cap is cut and read as unknown, never as a shorter ruleset.
 5. **Authorisation is the socket.** Who may connect is the socket's owner, group and mode. That
    proves identity and not authenticity, so only data that is acceptable to disclose to the agent
    account may be served. What the firewall snapshot serves is the host's full nftables ruleset
@@ -93,39 +109,42 @@ breaks any of them is outside this ADR and needs its own threat model.
    `[tables]` is honoured only as the first line of a legacy section; in the nft section it is text
    the parser does not recognise. What each section vouches for: the nft section, the whole
    nf_tables ruleset; each legacy section, every instantiated legacy table of its family, from the
-   save tool's listing or, with no tool, from the kernel's list. Not read: legacy `arptables` and
-   `ebtables` tables. A section is READ when it vouches for its own ruleset: nft text that parses;
+   save tool's listing or, with no tool, from the kernel's list. A section is READ when it vouches
+   for its own ruleset: nft text that parses;
    a legacy save listing in the shape the client knows (empty output is a family that holds no
    table); `[tables]` with no name after it. It is UNREAD otherwise: `[absent]`, `[failed]`, text
    that does not parse, and `[tables]` followed by a name (tables exist that nothing listed). The
    decision: `active` when any READ section shows content; `unknown` when none does and a section
-   is UNREAD; `inactive`, and a rule count, only when all three were READ and none shows content,
-   and then `unknown` again if the netlink read saw a table. A reply never produces a false-safe
-   value: an `[absent]` nft section is never evidence of an empty ruleset, so with no content
-   anywhere the rung declines and the read ladder goes on, and one that failed or was cut is never
-   read as empty.
+   is UNREAD; `inactive` when all three sections were READ and none shows content in two snapshots
+   taken one after the other (the second is taken only when the first reads `inactive`, and its
+   answer is the answer), and then `unknown` again if the netlink read saw a table. A rule count is
+   written whenever all three sections of the answering snapshot were READ and the netlink read did
+   not turn the state to `unknown`: the nft rules plus the `-A` rules of both legacy families.
+   `inactive` therefore means that, twice in a row, the nf_tables ruleset (every family nft lists,
+   arp and bridge included) and every legacy IPv4 and IPv6 table held no rule, no user-defined chain
+   and no policy other than accept. Outside that statement: legacy `arptables` and `ebtables`
+   tables, which no read of this plugin lists; a family with no save tool whose table list cannot be
+   stat'ed while `/proc/net/dev` can (read as no table, clause 3); and rules that move between
+   rulesets more than once inside one read. The count is the sum of one pass of three reads, so a
+   rule that moves during it can be counted twice or not at all. An `[absent]` nft section is never
+   evidence of an empty ruleset, so with no content anywhere the rung declines and the read ladder
+   goes on, and a reply that failed or was cut is never read as empty.
 7. **The helper has its own minimum sandbox, and the agent unit never changes.** The helper
    service runs with its own bounding set, system call filter, address families and file system
    protections, each documented where it is set. The helper service does not set
-   `NoNewPrivileges`: measured on Rocky 9.9 with SELinux enforcing, under it every exec of the
-   three tools was a denied `nnp_transition` (three audit denials per read) and the tools ran in
-   the script's domain instead of their own, so the unit is bounded by root with two capabilities
+   `NoNewPrivileges`: measured on Rocky 9.9 (systemd 252, SELinux enforcing), under it the exec of
+   `nft` was a denied `nnp_transition` from `initrc_t` to `iptables_t` and `nft` ran in the script's
+   domain instead of its own, so the unit is bounded by root with two capabilities
    (an exec yields no more capabilities than the bounding set) and by the filters, which systemd
    applies to every process the script starts. One thing does change without the flag: an exec of a
    setuid or setgid program that belongs to another user or group changes the process to that
    identity; that adds no capability beyond the two in the bounding set, the filters still apply, and
-   the script runs only its three fixed tools with no input. The script must not create files: with
+   the script runs only the tools clause 3 names, with no input. The script must not create files: with
    SELinux enforcing on Rocky 8.10, a file left in the instance's private `/tmp` was not removed
    when the instance ended. `/run` is made read-only by name (`ReadOnlyPaths=/run`), because with
    `ProtectSystem=strict` it stayed writable in the instance whenever `ProtectKernelTunables` or
    `ProtectControlGroups` was set (measured on Ubuntu 26.04, systemd 259); nothing the script runs
-   writes there. Measured on the Rocky 9.9 host
-   (aarch64, systemd 252, SELinux enforcing, 2026-11-23) with the service as shipped: no denial in
-   the audit log over 30 broker reads under the policy's default audit configuration; with the
-   policy's `dontaudit` rules switched off for the experiment (`semodule -DB`, still enforcing),
-   `nft`, now running in `iptables_t`, was denied about 127 `search` accesses per read on other
-   processes' `/proc/<pid>` directories and the listing was unchanged (30 of 30 reads complete,
-   count 103). `NoNewPrivileges` and the one-capability bounding
+   writes there. `NoNewPrivileges` and the one-capability bounding
    set on the agent unit are untouched: the helper returns data, it is never a way for the agent to
    gain a privilege. The IP egress filter in the helper's unit is defence in depth and takes effect
    only on hosts with the unified cgroup hierarchy; the family list is what bounds its sockets. On
@@ -168,10 +187,18 @@ breaks any of them is outside this ADR and needs its own threat model.
   `error|nftables:snapshot:absent` and the ladder's own `unknown` follows; with legacy content it
   answers `active` with no count. The real fix is the package depending on `nftables`, or a
   compiled netlink reader under this contract, which is a decision for the owner.
+- `inactive` is a bounded statement (clause 6): it does not cover legacy `arptables` and `ebtables`
+  tables, a family whose table list cannot be stat'ed while `/proc/net/dev` can, or two or more
+  rule moves between rulesets inside one read, and the count is one pass of three reads. The
+  table-list residual is not closed in the script: `[ -e ]` cannot tell a missing file from a refused
+  stat, and the only shell test that could (a glob over `/proc/net`) is switched off in the helper
+  (`set -f`). The real fix for it, and for a host without the `nft` command, is a compiled reader
+  under this contract, which can tell a missing file from a refused one.
 - On a host the installer provisioned (no packaged socket), the plugin reads the same listing from the
   root helper's `snapshot` word through `sudo -n --`, a rung-3 site registered in the manifest
-  (`firewall/try_snapshot#1`); a sudo that refuses is a silent decline, and a helper that times out,
-  is clipped or fails is `error|snapshot:helper:<token>`. It is not an OS-activated helper
+  (`firewall/try_snapshot#1`); a host with no helper file makes no sudo call and says nothing, and a
+  sudo that refuses, or a helper that times out, is clipped, does not accept the word or fails, is
+  `error|snapshot:helper:<token>`. It is not an OS-activated helper
   and is outside this contract; it is recorded here only because it feeds the same parser, and the
   descriptors' `fallback` field names it.
 - The agent account can now read the host's full nftables ruleset and the legacy iptables listings.

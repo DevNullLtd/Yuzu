@@ -57,9 +57,10 @@ metadata:
     error|nftables:unrecognised_output, error|iptables:snapshot:failed,
     error|iptables:snapshot:absent, error|iptables:unrecognised_output,
     error|ip6tables:snapshot:failed, error|ip6tables:snapshot:absent or
-    error|ip6tables:unrecognised_output), and inactive and a rule count are
-    answered only when all three sections (nftables, legacy iptables, legacy
-    ip6tables) were read and none shows content.
+    error|ip6tables:unrecognised_output). inactive is answered only when all
+    three sections (nftables, legacy iptables, legacy ip6tables) were read and
+    none shows content, in two snapshots taken one after the other; a rule
+    count is written whenever all three were read.
   tags: [security, firewall, compliance, network]
 
 spec:
@@ -116,7 +117,7 @@ spec:
           for output that finished but is not in the expected shape; snapshot:<token> when the root snapshot socket
           could not be read (connect:eacces, connect:refused, connect:busy, connect:errno:<n>, peer_not_root, timeout,
           io_error, oversized, empty, truncated or malformed); snapshot:helper:<token> when the root helper's
-          snapshot word run through sudo timed out, was clipped or failed (not_run, timeout, truncated, exit:<n>);
+          snapshot word run through sudo timed out, was clipped, was refused or failed (not_run, timeout, truncated, exit:<n>);
           nftables:snapshot:failed, nftables:snapshot:absent, nftables:unrecognised_output, iptables:snapshot:failed,
           iptables:snapshot:absent, iptables:unrecognised_output, ip6tables:snapshot:failed,
           ip6tables:snapshot:absent or ip6tables:unrecognised_output for a snapshot section that was not read.
@@ -189,10 +190,10 @@ metadata:
     and answers, with ruleset|unknown, only when no read shows an active
     ruleset), nftables chains and rule handles over netlink (or, on the packaged
     unit, the root snapshot socket's nftables listing), or the structured
-    parse of ufw status numbered / iptables -S (through the snapshot socket
+    parse of ufw status numbered / iptables -S; through the snapshot socket
     every instantiated legacy iptables and ip6tables table is read together
-    with the nftables ruleset, IPv6 entries as rule|ip6|<kind>|<chain>|<spec>
-    rows and a table other than filter named before the kind). On macOS, lists the
+    with the nftables ruleset (rows rule|[ip6|][<table>|]<kind>|<chain>|<spec>,
+    the table written only outside the filter table). On macOS, lists the
     per-app Application Firewall allow/block decisions (socketfilterfw
     --listapps, unprivileged), the pf rules via pfctl -s rules and the
     pf anchor list (root, or the installer's exact sudo grant, is required to
@@ -238,7 +239,8 @@ spec:
           rule spec), or "ip6" then that kind, chain and spec for an ip6tables
           entry read through the root snapshot socket; an entry of a legacy
           table other than filter carries the table name before the kind
-          (raw, mangle, nat, security; "ip6" then the table for IPv6). macOS: "rule" rows carry the raw pf rule line; "app"
+          (nat, mangle, raw or security, the only other tables the parser
+          admits; "ip6" then the table for IPv6). macOS: "rule" rows carry the raw pf rule line; "app"
           rows carry the per-app path and allow/block/unknown decision
           (unprivileged, from socketfilterfw --listapps); "anchor" rows carry
           one pf anchor name each; "ruleset" is the pf rule count, or unknown
@@ -254,7 +256,7 @@ spec:
           (connect:eacces, connect:refused, connect:busy, connect:errno:<n>,
           peer_not_root, timeout, io_error, oversized, empty, truncated or
           malformed), snapshot:helper:<token> when the root helper's snapshot
-          word run through sudo timed out, was clipped or failed,
+          word run through sudo timed out, was clipped, was refused or failed,
           nftables:snapshot:failed, nftables:snapshot:absent,
           nftables:unrecognised_output, iptables:snapshot:failed,
           iptables:snapshot:absent, iptables:unrecognised_output,

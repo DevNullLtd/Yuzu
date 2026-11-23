@@ -34,8 +34,12 @@ wiring around them, per OS class below:
                      and never writes to the socket. The installer helper's `snapshot` word is the
                      second transport, tried only when the socket is absent and the helper file is
                      there: the pure helper_snapshot_outcome decides what the run came to (its
-                     listing, the silent decline of a sudo refusal, or a `helper:<token>` row).
-                     A declined snapshot answer writes its error rows and lets the ladder go on.
+                     listing, or a `helper:<token>` row), and the run gets what is left of the
+                     rung's one deadline. try_snapshot computes that deadline once and hands the
+                     transport to the pure linux_snapshot_rung, which takes a second whole
+                     snapshot before it answers `inactive`; the plugin never decides a snapshot
+                     itself. A declined snapshot answer writes its error rows and lets the ladder
+                     go on.
 
   BrokerUnits        the shipped socket, template service and snapshot script are exactly the
                      reviewed directive sets, agree with the plugin's socket path and with what the
@@ -465,8 +469,11 @@ def linux_problems(plugin_src, reader_src):
                  r"cred\.uid != peer_uid\) return std::unexpected\(std::string\{\"peer_not_root\"\}\)"),
                 ("the socket path bound (a path that does not fit sun_path is an io_error)",
                  r"socket_path\.size\(\) >= sizeof\(addr\.sun_path\)\) return std::unexpected\(std::string\{\"io_error\"\}\)"),
-                ("the deadline (the time left, a timeout token)", r"deadline - now"),
+                ("the deadline (the time left from remaining_ms, a timeout token)",
+                 r"const auto left = remaining_ms\(deadline\);"),
                 ("the poll before every read", r"::poll\("),
+                ("the poll timeout clamped to INT_MAX (a far deadline must not wrap to an unbounded poll)",
+                 r"::poll\(&pfd, 1, static_cast<int>\(std::min<std::chrono::milliseconds::rep>\(left\.count\(\), INT_MAX\)\)\)"),
                 ("the size cap", r"text\.size\(\) > kFwSnapshotMaxBytes"),
                 ("a retry of EINTR after the poll", r"if \( ?ready < 0 ?\) \{ if \( ?errno == EINTR ?\) continue;"),
                 ("a retry of EINTR after the read", r"errno == EINTR \|\| errno == EAGAIN")):
@@ -484,11 +491,22 @@ def linux_problems(plugin_src, reader_src):
     if "read_fw_snapshot(std::string_view" in live:
         out.append("firewall_plugin.cpp defines its own read_fw_snapshot again: the plugin and its tests share the "
                    "one in firewall_snapshot_reader.hpp")
+    if re.search(r"remaining_ms\(std::chrono::steady_clock::time_point", live):
+        out.append("firewall_plugin.cpp defines its own remaining_ms again: the time left until a deadline is "
+                   "yuzu::firewall::remaining_ms in firewall_snapshot_reader.hpp, which the reader and the netlink "
+                   "legs share")
+    if not re.search(r"\[\[nodiscard\]\] inline std::chrono::milliseconds\s+remaining_ms\(std::chrono::steady_clock::time_point "
+                     r"deadline\) noexcept", lexh.live_text(reader_src)):
+        out.append("firewall_snapshot_reader.hpp no longer defines remaining_ms(deadline)")
+    if "linux_snapshot_answer(" in live:
+        out.append("firewall_plugin.cpp calls linux_snapshot_answer itself: a snapshot is decided through "
+                   "linux_snapshot_rung, which takes a second snapshot before it answers inactive")
     if not re.search(r"static_assert\( ?yuzu::firewall::kFwSnapshotSocketPath\.size\(\) < sizeof\(sockaddr_un::sun_path\)", live):
         out.append("firewall_plugin.cpp no longer static_asserts that the broker socket path fits sockaddr_un::sun_path")
-    helper = function_body(live, r"\[\[nodiscard\]\] std::expected<std::string, std::string> read_fw_snapshot_via_helper\(\) ?(?=\{)")
+    helper = function_body(live, r"\[\[nodiscard\]\] std::expected<std::string, std::string>\s+"
+                                 r"read_fw_snapshot_via_helper\(std::chrono::steady_clock::time_point deadline\) ?(?=\{)")
     if helper is None:
-        out.append("firewall_plugin.cpp no longer defines read_fw_snapshot_via_helper()")
+        out.append("firewall_plugin.cpp no longer defines read_fw_snapshot_via_helper(deadline)")
     else:
         text = squash(helper)
         for what, pat in (
@@ -497,14 +515,19 @@ def linux_problems(plugin_src, reader_src):
                  r"if \( ?::geteuid\( ?\) == 0 \|\| privilege_refusal\( ?\) \|\| "
                  r"::access\(std::string\{fq::kFwHelperPath\}\.c_str\(\), X_OK\) != 0 ?\) "
                  r"return std::unexpected\(std::string\{\}\);"),
-                ("the sudo-wrapped helper snapshot word as its only argv, with the deadline and a cap of twice the "
+                ("the run's budget: what is left of the rung's one deadline, a token and no run once it is spent",
+                 r"const auto left = yuzu::firewall::remaining_ms\(deadline\); if \( ?left\.count\(\) <= 0 ?\) "
+                 r"return std::unexpected\(std::string\{\"helper:timeout\"\}\);"),
+                ("the sudo-wrapped helper snapshot word as its only argv, with the time left and a cap of twice the "
                  "broker's cut, decided by helper_snapshot_outcome",
                  r"return yuzu::firewall::helper_snapshot_outcome\( ?run_bounded_subprocess\( ?"
                  r"yuzu::shared::sudo_wrap\(\{std::string\{fq::kFwHelperPath\}, \"snapshot\"\}\), "
-                 r"SubprocessOptions\{\.deadline = kAcqDeadline, "
+                 r"SubprocessOptions\{\.deadline = left, "
                  r"\.output_cap_bytes = 2 \* yuzu::firewall::kFwSnapshotMaxBytes\}\)\);")):
             if not re.search(pat, text):
                 out.append(f"read_fw_snapshot_via_helper no longer has {what}")
+        if "kAcqDeadline" in text:
+            out.append("read_fw_snapshot_via_helper starts a deadline of its own: both reads of the rung share one")
         if "merge_stderr" in text or "sudo_runner(" in text:
             out.append("read_fw_snapshot_via_helper merges stderr: sudo's message would be read as listing")
         if "exit_code" in text or "write_output" in text or "subprocess_complete" in text:
@@ -516,25 +539,24 @@ def linux_problems(plugin_src, reader_src):
         out.append("firewall_plugin.cpp no longer defines try_snapshot(ctx, info, action)")
     else:
         text = squash(snapshot)
+        if len(re.findall(r"std::chrono::steady_clock::now\(\) \+ kAcqDeadline", text)) != 1 or not re.search(
+                r"const auto deadline = std::chrono::steady_clock::now\(\) \+ kAcqDeadline;", text):
+            out.append("try_snapshot no longer computes ONE deadline, now + kAcqDeadline, for the whole rung (the "
+                       "second read of an inactive answer shares it, so the worst case does not grow)")
         if not re.search(r"auto reply = yuzu::firewall::read_fw_snapshot\( ?yuzu::firewall::kFwSnapshotSocketPath, "
-                         r"std::chrono::steady_clock::now\(\) \+ kAcqDeadline ?\);", text):
+                         r"deadline ?\);", text):
             out.append("try_snapshot no longer reads the broker with read_fw_snapshot(kFwSnapshotSocketPath, "
-                       "now + kAcqDeadline) and no uid (the socket must have been made by root)")
-        if not re.search(r"if \( ?!reply && reply\.error\(\)\.empty\(\) ?\) \{[^{}]*reply = read_fw_snapshot_via_helper\(\)", text):
+                       "deadline) and no uid (the socket must have been made by root)")
+        if not re.search(r"if \( ?!reply && reply\.error\(\)\.empty\(\) ?\) \{[^{}]*return read_fw_snapshot_via_helper\(deadline\);", text):
             out.append("try_snapshot no longer tries the helper transport only when the socket is absent "
                        "(an empty token): a reported socket failure must not fall to sudo")
-        if not re.search(r"yuzu::firewall::linux_snapshot_answer\( ?\*snapshot, info\.tables_seen, action ?\)", text):
-            out.append("try_snapshot no longer decides through linux_snapshot_answer(*snapshot, info.tables_seen, action)")
-        # a declined answer writes its error rows and lets the ladder go on; held firewalld: only an active
-        # answer is written and accepted, any other writes just its error| rows
-        if not re.search(r"const bool answers = !answer\.declined && \( ?!info\.firewalld_running \|\| "
-                         r"answer\.state == yuzu::firewall::NftVerdict::active ?\);"
-                         r" for \( ?const auto& row : answer\.rows ?\) if \( ?answers \|\| row\.starts_with\(\"error\|\"\) ?\) "
-                         r"ctx\.write_output\(row\); return answers;", text):
-            out.append("try_snapshot no longer answers only an answer that did not decline, and only an active ruleset "
-                       "while firewalld is held (a held firewalld is replaced only by a complete read that shows an "
-                       "active ruleset, never by inactive or unknown; a declined answer lets the ladder go on), writing "
-                       "just the error| rows otherwise")
+        if not re.search(r"yuzu::firewall::linux_snapshot_rung\( ?read, info\.tables_seen, info\.firewalld_running, "
+                         r"action ?\)", text):
+            out.append("try_snapshot no longer decides through linux_snapshot_rung(read, info.tables_seen, "
+                       "info.firewalld_running, action): the rung takes a second snapshot before it answers inactive "
+                       "and holds firewalld's answer unless a complete read shows an active ruleset")
+        if not re.search(r"for \( ?const auto& row : rung\.rows ?\) ctx\.write_output\(row\); return rung\.answered;", text):
+            out.append("try_snapshot no longer writes the rung's rows and returns its answer")
     if len(re.findall(r"else the root snapshot broker over AF_UNIX \(packaged systemd socket\)", squash(live))) != 2:
         out.append("the Linux state and rules descriptors no longer both name the root snapshot broker")
     return out
@@ -608,26 +630,38 @@ LINUX_MUTATIONS = [
      "try_nftables_rules no longer declines"),
     (_lmut(r"(if \(info\.firewalld_running && !yuzu::firewall::nft_has_content\(chains, rules\)\)\s*return false;)(\s*ctx\.write_output\(\"backend\|nftables\"\);[^\n]*)",
            r"\2\1"), "try_nftables_rules no longer declines"),
-    # the snapshot rung answers a non-active ruleset while firewalld is held, or a declined answer
-    (_lmut(r"const bool answers =\s*!answer\.declined && \(!info\.firewalld_running \|\| answer\.state == yuzu::firewall::NftVerdict::active\);",
-           "const bool answers = true;"), "only an active ruleset while firewalld is held"),
-    (_lmut(r"!answer\.declined && ", ""), "only an answer that did not decline"),
-    (_lmut(r"!info\.firewalld_running \|\| answer\.state == yuzu::firewall::NftVerdict::active", "true"),
-     "only an active ruleset while firewalld is held"),
-    (_lmut(r"if \(answers \|\| row\.starts_with\(\"error\|\"\)\)", "if (true)"), "only an active ruleset while firewalld is held"),
-    (_lmut(r"return answers;", "return true;"), "only an active ruleset while firewalld is held"),
+    # the snapshot is decided without the pure rung, or its held-firewalld input or its answer is bypassed
+    (_lmut(r"linux_snapshot_rung\(read, info\.tables_seen, info\.firewalld_running, action\)",
+           "linux_snapshot_rung(read, info.tables_seen, false, action)"), "decides through linux_snapshot_rung"),
+    (_lmut(r"linux_snapshot_rung\(read, info\.tables_seen, info\.firewalld_running, action\)",
+           "linux_snapshot_answer(*snapshot, info.tables_seen, action)"), "decides through linux_snapshot_rung"),
+    (_lmut(r"return rung\.answered;", "return true;"), "writes the rung's rows and returns its answer"),
+    (_lmut(r"for \(const auto& row : rung\.rows\)\s*ctx\.write_output\(row\);", ""),
+     "writes the rung's rows and returns its answer"),
+    # a second deadline for the second read, or a fresh one for the helper run
+    (_lmut(r"(const auto deadline = std::chrono::steady_clock::now\(\) \+ kAcqDeadline;)",
+           r"\1 (void)(std::chrono::steady_clock::now() + kAcqDeadline);"), "ONE deadline"),
+    (_lmut(r"return read_fw_snapshot_via_helper\(deadline\);",
+           "return read_fw_snapshot_via_helper(std::chrono::steady_clock::now() + kAcqDeadline);"),
+     "helper transport only when the socket is absent"),
+    (_lmut(r"SubprocessOptions\{\.deadline = left,", "SubprocessOptions{.deadline = kAcqDeadline,"),
+     "the sudo-wrapped helper snapshot word as its only argv"),
+    (_lmut(r"if \(left\.count\(\) <= 0\)\s*return std::unexpected\(std::string\{\"helper:timeout\"\}\);", ""),
+     "the run's budget"),
     # the firewalld rung writes a row itself, or decides without the pure functions
     (_lmut(r"(const auto q = query_firewalld\(\);)", r'\1 write_output("x");'), "firewalld_rung writes a row itself"),
     (_lmut(r"yuzu::firewall::firewalld_read\(q\.reachable, q\.services_complete\)",
            "(q.reachable ? yuzu::firewall::FirewalldRead::complete : yuzu::firewall::FirewalldRead::absent)"),
      "decides through firewalld_read"),
     # the broker is read with a uid, or not through the shared reader at all
-    (_lmut(r"std::chrono::steady_clock::now\(\) \+ kAcqDeadline\);\s*if \(!reply && reply\.error\(\)\.empty\(\)\)",
-           "std::chrono::steady_clock::now() + kAcqDeadline, 1000);\n if (!reply && reply.error().empty())"),
+    (_lmut(r"yuzu::firewall::kFwSnapshotSocketPath, deadline\);", "yuzu::firewall::kFwSnapshotSocketPath, deadline, 1000);"),
      "with read_fw_snapshot(kFwSnapshotSocketPath"),
-    (_lmut(r"yuzu::firewall::kFwSnapshotSocketPath,\s*std::chrono::steady_clock::now\(\) \+ kAcqDeadline\);",
-           'std::string_view{"/run/other.sock"}, std::chrono::steady_clock::now() + kAcqDeadline);'),
+    (_lmut(r"yuzu::firewall::kFwSnapshotSocketPath, deadline\);", 'std::string_view{"/run/other.sock"}, deadline);'),
      "with read_fw_snapshot(kFwSnapshotSocketPath"),
+    # the plugin defines a remaining_ms of its own again
+    (_lmut(r"(// The socket client itself is)",
+           r"[[nodiscard]] std::chrono::milliseconds remaining_ms(std::chrono::steady_clock::time_point d) noexcept { return {}; }\n\1"),
+     "its own remaining_ms"),
     # the plugin defines a reader of its own again, or loses the path bound
     (_lmut(r"(// The socket client itself is)", r"[[nodiscard]] std::expected<std::string, std::string> x() { return read_fw_snapshot(std::string_view{\"\"}); }\n\1"),
      "its own read_fw_snapshot"),
@@ -672,13 +706,17 @@ READER_MUTATIONS = [
     (_lmut(r"if \(socket_path\.size\(\) >= sizeof\(addr\.sun_path\)\)\s*return std::unexpected\(std::string\{\"io_error\"\}\);", ""),
      "the socket path bound"),
     # no deadline, no timeout token, no poll
-    (_lmut(r"const auto left = now >= deadline \? std::chrono::milliseconds\{0\}\s*: std::chrono::duration_cast<std::chrono::milliseconds>\(deadline - now\);",
-           "const auto left = std::chrono::milliseconds{1000};"), "the deadline"),
+    (_lmut(r"const auto left = remaining_ms\(deadline\);", "const auto left = std::chrono::milliseconds{1000};"),
+     "the deadline"),
     (_lmut(r"if \(left\.count\(\) <= 0\)\s*return std::unexpected\(std::string\{\"timeout\"\}\);",
            'if (left.count() <= 0) return std::unexpected(std::string{"io_error"});'), "the timeout token at both"),
     (_lmut(r"if \(ready == 0\)\s*return std::unexpected\(std::string\{\"timeout\"\}\);",
            'if (ready == 0) return std::unexpected(std::string{"io_error"});'), "the timeout token at both"),
-    (_lmut(r"::poll\(&pfd, 1, static_cast<int>\(left\.count\(\)\)\)", "1"), "the poll before every read"),
+    (_lmut(r"::poll\(&pfd, 1, static_cast<int>\(std::min<std::chrono::milliseconds::rep>\(left\.count\(\), INT_MAX\)\)\)",
+           "1"), "the poll before every read"),
+    # a far deadline wraps to a negative poll timeout, which poll() reads as unbounded
+    (_lmut(r"static_cast<int>\(std::min<std::chrono::milliseconds::rep>\(left\.count\(\), INT_MAX\)\)",
+           "static_cast<int>(left.count())"), "clamped to INT_MAX"),
     # unbounded
     (_lmut(r"if \(text\.size\(\) > kFwSnapshotMaxBytes\)\s*return std::unexpected\(std::string\{\"oversized\"\}\);", ""),
      "the size cap"),
@@ -855,7 +893,7 @@ def broker_problems(sources):
                       ("a file test of the tool's identity", r" -ef "), ("the retired marker", r"\[unloaded\]"),
                       ("a file write", r"(?<![<>&0-9])>{1,2}\s*[^&\s/][^\s]*|>\s*/(?!dev/null)")):
         if re.search(pat, code):
-            out.append(f"yuzu-fw-snapshot.sh has {what}: the legacy save reads load no module, take no lock and write no file")
+            out.append(f"yuzu-fw-snapshot.sh has {what}: for the tables the kernel lists, the legacy save reads load no module, take no lock and write no file")
     # the agent unit is untouched where it matters
     agent = sources["agent"]
     agent_code = "\n".join(code_lines(agent))

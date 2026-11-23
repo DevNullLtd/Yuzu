@@ -21,9 +21,10 @@
  * two failed reads. A root-owned helper (`yuzu-fw-helper snapshot`) writes the same format for the
  * Linux agent account; for a tool that exits non-zero it prints what the tool wrote and then the
  * `[failed]` marker, and a section that carries the marker is unreadable whatever precedes it. For a
- * legacy family with no save tool it prints `[tables]` and then the family's table names, which are
- * kept like any other line: a snapshot of a host with no table is readable and equal to itself, and
- * a table that appears between two reads is a difference, not a pass.
+ * legacy family with no save tool it prints `[tables]` and then the family's table names. `[tables]`
+ * alone is a family that holds no table: that snapshot is readable and equal to itself, and a table
+ * that appears between two reads is a difference, not a pass. `[tables]` followed by a name is tables
+ * that exist and that nothing listed, which the plugin reads as unread, so it is unreadable here too.
  *
  * Per OS (the sections are the names in `label`):
  *   Windows  `profiles` (one line per profile: name and its defaults) and `rules` (one line per
@@ -72,6 +73,7 @@ enum class Os { win, lin, mac };
 inline constexpr std::string_view kEndLine = "== end";
 inline constexpr std::string_view kFailedMarker = "[failed]";
 inline constexpr std::string_view kAbsentMarker = "[absent]";
+inline constexpr std::string_view kTablesMarker = "[tables]";
 
 /// The section names, in the order a snapshot lists them. The Linux ones are the labels the
 /// helper's `snapshot` prints.
@@ -414,6 +416,13 @@ inline void diff_multiset(const std::vector<std::string>& before, const std::vec
     for (const auto& s : p.sections) {
         if (is_failed(s))
             return "a read failed: " + s.name;
+        // a legacy section with no save tool: `[tables]` alone holds no table; with a name after it, tables
+        // exist that nothing listed (read_legacy_section reads that as unread)
+        if (os == Os::lin && (s.name == label::kIptablesSave || s.name == label::kIp6tablesSave)) {
+            const auto lines = content_lines(s);
+            if (lines.size() > 1 && trim(lines.front()) == kTablesMarker)
+                return "tables nothing listed: " + s.name;
+        }
         for (const auto& l : s.lines)
             if (trim(l).starts_with("sudo:") || trim(l).starts_with("sudo-rs:"))
                 return "sudo refused: " + s.name;
@@ -525,22 +534,26 @@ inline void compare_windows(const Parsed& a, const Parsed& b, Verdict& v) {
 }
 
 inline void compare_linux(const Parsed& a, const Parsed& b, Verdict& v) {
-    // nft is a section of its own; each iptables family is read from whichever form the snapshot has
-    const Section* nft_a = find_section(a, label::kNft);
-    const Section* nft_b = find_section(b, label::kNft);
-    const std::pair<std::string_view, std::pair<const Section*, const Section*>> sections[] = {
-        {label::kNft, {nft_a, nft_b}},
-        {label::kIptables, {linux_family(a, label::kIptablesSave, label::kIptables),
-                            linux_family(b, label::kIptablesSave, label::kIptables)}},
-        {label::kIp6tables, {linux_family(a, label::kIp6tablesSave, label::kIp6tables),
-                             linux_family(b, label::kIp6tablesSave, label::kIp6tables)}}};
-    for (const auto& [name, pair] : sections) {
-        const auto* sa = pair.first;
-        const auto* sb = pair.second;
+    // nft is a section of its own (its two labels are the same); each iptables family is read from
+    // whichever form the snapshot has: the save-tool section, else the root harness's `-S` mirror
+    struct Family {
+        std::string_view name;
+        std::string_view save;
+    };
+    static constexpr Family families[] = {{label::kNft, label::kNft},
+                                          {label::kIptables, label::kIptablesSave},
+                                          {label::kIp6tables, label::kIp6tablesSave}};
+    for (const auto& [name, save] : families) {
+        const auto* sa = linux_family(a, save, name);
+        const auto* sb = linux_family(b, save, name);
         const bool nft = name == label::kNft;
         std::vector<std::string> before, after;
         std::set<std::string> policy_a, policy_b;
         const auto fill = [&](const Section& s, std::vector<std::string>& rest, std::set<std::string>& policies) {
+            // a save listing's current `*<table>`: every line inside it is keyed with its table, so a policy or a
+            // rule that changes in one table cannot hide behind the same line in another (the `-S` form lists the
+            // filter table alone and has no table lines)
+            std::string table;
             for (const auto& raw : content_lines(s)) {
                 auto line = normalise_linux_line(raw);
                 if (line.empty())
@@ -553,6 +566,14 @@ inline void compare_linux(const Parsed& a, const Parsed& b, Verdict& v) {
                 // policy of `-` is a user-defined chain, which is a rule like any other) are defaults
                 const bool policy_line =
                     line.starts_with("-P ") || (line.starts_with(':') && line.size() > 2 && !line.ends_with(" -"));
+                const bool opens = !nft && line.starts_with('*');
+                const bool closes = !table.empty() && line == "COMMIT";
+                if (opens)
+                    table = line.substr(1);
+                else if (!table.empty())
+                    line = table + " " + line;
+                if (closes)
+                    table.clear();
                 if (policy_line)
                     policies.insert(line);
                 else
