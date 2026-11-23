@@ -19,9 +19,11 @@ import plugin_doc_gen as g  # noqa: E402
 
 SAMPLES = REPO_ROOT / "agents" / "plugins" / "firewall" / "docs" / "samples"
 ACTIONS = ["state", "rules", "quarantine", "release", "quarantine_status", "quarantine_allow"]
-# The macOS capture is taken without root, where pf is unreadable and the plugin
-# answers `ruleset|unknown` beside its `error|` rows; Linux and Windows are root
-# or elevated captures, so their ruleset is a count and carries no error row.
+# The macOS capture is taken with neither root nor the pf sudoers lines, where
+# pf is unreadable and the plugin answers `ruleset|unknown` beside its `error|`
+# rows. The Linux capture is taken as the packaged account through the root
+# snapshot broker and the Windows one elevated, so their ruleset is a count and
+# carries no error row.
 PRIVILEGED = ("linux", "windows")
 
 
