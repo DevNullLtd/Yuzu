@@ -538,16 +538,16 @@ implementation is.
 | http_client | head | linux | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | head | macos | supported | 1 | cpp-httplib (native sockets) | - |
 | http_client | head | windows | supported | 1 | cpp-httplib (native sockets) | - |
-| installed_apps | list | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | list | linux | supported | 2 | dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman via bounded argv runner | - |
 | installed_apps | list | macos | supported | 2 | system_profiler via bounded argv runner + native CFBundle enrichment | - |
 | installed_apps | list | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
-| installed_apps | query | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | query | linux | supported | 2 | dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman via bounded argv runner | - |
 | installed_apps | query | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | query | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
-| installed_apps | list_per_user | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
+| installed_apps | list_per_user | linux | supported | 2 | dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman via bounded argv runner | - |
 | installed_apps | list_per_user | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | list_per_user | windows | supported | 1 | Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | - |
-| installed_apps | list_inventory | linux | supported | 2 | dpkg-query/rpm/pacman/apk via bounded argv runner | - |
+| installed_apps | list_inventory | linux | supported | 2 | dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman/apk via bounded argv runner | - |
 | installed_apps | list_inventory | macos | supported | 2 | system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment | - |
 | installed_apps | list_inventory | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
 | interaction | notify | linux | supported | 2 | notify_send | - |

@@ -332,8 +332,13 @@ scope here.
   `AuthRoutes`, not the database, so it still only serializes attempts within
   one server process. A DB-atomic attempt-reservation (now straightforward on
   Postgres — e.g. `UPDATE ... WHERE failed_login_count < threshold RETURNING`)
-  is the multi-replica-correct form and remains a tracked follow-up, not
-  something this migration delivered incidentally. `login_rate_limit` remains
+  is the multi-replica-correct form and remains a tracked follow-up (#8215), not
+  something this migration delivered incidentally. The stripe wait is bounded
+  (150 ms) and the number of waiters capped (2 per stripe, `max(2, pool/8)` overall), so a
+  flood of one name cannot queue unboundedly; the stripe is per process (N replicas:
+  about threshold + (N - 1) guesses per window, because each replica can have one
+  attempt in flight per name past its lockout check and the failure counter itself
+  is a database-atomic increment). `login_rate_limit` remains
   the companion control for the distributed vector.
   - *On failure*: `record_failed_login` increments the counter and arms
     `locked_until` on the threshold-th failure. A window that has **fully
@@ -1912,6 +1917,32 @@ account policy)"* — this ships **both** halves.
   the password is never evaluated; wrong attempts are still audited
   (`auth.login_failed`) + per-IP rate-limited. Normal lockout still applies in
   standard mode.
+- **The second-factor failure budget is NOT exempted for break-glass (WP03).** The
+  lockout exemption above covers failed *passwords* only. Wrong TOTP/recovery codes
+  count against the durable per-account MFA budget (`auth.users.mfa_failed_count` /
+  `mfa_locked_until` / `mfa_last_attempt_at`; reserve-before-verify in ONE row-locked DB
+  statement, so an attempt that cannot be counted is never verified and answers 503;
+  a verified code refunds only its own reservation) for the break-glass account like
+  any other, because exempting it would leave the only protected factor of the
+  highest-value account open to online guessing by anyone who knows the password.
+  Accepted trade-off: an attacker who already knows the break-glass PASSWORD can keep
+  its MFA locked for one window at a time (`auth.mfa.lockout.applied`). The lock is
+  time-boxed and self-clearing. What clears it early: an operator unlock
+  (`POST /api/v1/users/{name}/unlock` / MCP `unlock_account`), an administrative
+  password reset, reactivation, `--mfa-reset`, and **`--break-glass-arm`** (the
+  out-of-band recovery: it resets the budget in the same statement that arms, and its
+  `auth.breakglass.armed` audit row says so). A self-service password change does NOT
+  clear it. Sole-administrator wedge (sole admin, enrolled factor, no API token, locked
+  at step-up): the only host-CLI remedies are `--break-glass-arm` (if that account is the
+  configured break-glass user) or `--mfa-reset <user>` then re-enrol; otherwise wait out
+  the window.
+- **Lock windows follow the database clock.** The MFA failure budget's `mfa_locked_until` and
+  `mfa_last_attempt_at` are authored from, and compared against, the Postgres `now()` (DB-clock
+  authority, #3715) like the password lockout and the sessions. A forward step of the database
+  clock of at least the remaining lock time ends a live lock early and starts a fresh failure
+  count (a new set of guesses); a backward step lengthens the lock. This is a limit of
+  database-clock authority shared with the password lockout; an operator unlock still clears a
+  lock. Accepted by the owner (2026-11-18) as a documented residual.
 - **Arming is an out-of-band host operation, never a session route.** The IdP
   being down is *why* you break the glass, so arming cannot depend on a login.
   `yuzu-server --break-glass-arm` (with `--break-glass-user` + `--postgres-dsn`
@@ -1926,6 +1957,31 @@ account policy)"* — this ships **both** halves.
   (`resolve_os_principal`, not the forgeable `USER` env var), `principal_role =
   break-glass`. Refuses to arm — and exits non-zero — if any check fails or the
   audit row can't persist.
+
+The gate is tri-state (`SsoOnlyGateResult`: `kOpen`, `kBreakGlassArmed`, `kRefused` for a
+definitive answer, `kTransient` when the arm state could not be established) and has four
+callers: `POST /login`, the password-change verify function, and the MFA step
+(`POST /login/mfa`) before a code is spent and again before the session is minted.
+Standing invariants, pinned by `tests/test_mfa_budget_wiring_lexical.py`: (1) the ONE admit set
+is `SsoOnlyGateResult::admits_password_evaluation()` (open or armed), and `kTransient` is a
+refusal for every caller except the MFA step's second check; (2) a failed, stale or
+in-flight read is never recorded as "not armed" and never cached, and an "armed" snapshot whose read
+started at or before a "not armed" read this server holds is never served from the cache, and the first MFA
+check refuses such an answer as a disarm before anything is verified or spent; (3) no "armed" read is
+honoured more than `kArmSnapshotMaxAge` (4.5 s) after it started, one comparison
+(`arm_observation_fresh`, on the steady clock) at every site; (4) the first MFA check uses the cached
+single-flight mode (its snapshot is what the second check's bounded rule relies on) and puts
+the pending token back on a transient answer; the second check reads the arm state itself
+(`SsoOnlyArmRead::kOwnFreshRead`), never writes the armed cache, and may admit on a failed read
+only inside that bounded rule (before the first snapshot's window end, at most 4.5 s after that
+read started, the same non-empty arm id, no "not armed" read recorded on this server
+since, and at most 4.5 s of WALL time since that read started), with one sample of each clock taken
+after the gate returns. The steady clock does not advance while the host is suspended, so every
+bound above except the wall-time one is measured on it and cannot see a suspend; the wall clock is therefore sampled
+when each shared read starts (the first check carries that sample) and once after the second
+gate call, ONLY to refuse (a wall clock that moved backward changes nothing, and wall time
+never admits). It sees a suspend only if the wall clock moves forward across it. Operator
+text: [Authentication](user-manual/authentication.md) and the break-glass runbook.
 
 Implementation: gate at `auth_routes.cpp` `POST /login` (between the lockout
 pre-check and `verify_password`); accessors `AuthDB::break_glass_status` /
@@ -6260,9 +6316,21 @@ per-agent scoped gate: `true` is granted, `false` is a definitive denial, and
 `unexpected(msg)` means the answer is a deny *because a read failed* (the first
 failed read wins; an allow and an explicit deny-group hit are returned as such).
 `check_scoped_permission` is its `value_or(false)` wrapper, so every other
-caller is unchanged. `AuthRoutes::require_scoped_permission` uses it only to
+caller is unchanged. `AuthRoutes::require_scoped_permission_outcome` uses it to
 label the `auth.scoped_permission_required` audit row `(read degraded:
-mgmt_group_store|rbac_store)`; the response stays a fail-closed 403. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
+mgmt_group_store|rbac_store)` and also returns that class to its caller as a
+typed `ScopedGateOutcome` (`scoped_gate_outcome.hpp`: `Denied`, `Unauthenticated`,
+`Unavailable`, `MgmtGroupReadDegraded`, `RbacReadDegraded`, `Admitted`); the
+Boolean `require_scoped_permission` is that function compared with `Admitted`,
+so every other caller is unchanged and the response stays a fail-closed 403
+whatever the class. The two typed callers today are the Echo purge and re-enable
+fragments and the REST Echo purge. The fragments use the class to tell an outage
+from a denial (503 and `store_unavailable`, not the 404 and `scope_violation`).
+The REST purge keeps the gate's own status (the fail-closed 403 for a degraded
+read) and uses the class only for the metric result and, at the recheck, the
+failure row's detail. The
+engine-principal branch of the gate deliberately keeps the unchecked read, so an
+engine caller's degraded read is the plain `Denied` class. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
 under SQLite a corrupt/unreadable RBAC store could fall through to an engaged
 allow at some call sites; the PostgreSQL `rbac_store` now denies on any degrade.
 
@@ -6423,6 +6491,8 @@ The canonical full statement of these catastrophic-if-violated invariants. The a
 The canonical full statement of these catastrophic-if-violated invariants. The always-loaded routed-concern table carries only a compressed trigger for them.
 
 Authentication, RBAC, headers, tokens, self-target principal-destruction guard (#397/#403). Every new list/fan-out read of per-agent data MUST use the admit-then-filter `authorize_list_read` chokepoint (World A, ADR-0017) — never a bare global `require_permission` (inert for confined operators; `require_permission`/`require_scoped_permission` fail **closed** on any `rbac_store` degrade: Postgres denies on acquire timeout/query error/store-not-open, deny-on-degrade ADR-0041, `yuzu_server_rbac_read_degrade_total` — but a bare gate still discloses the whole fleet to any global-permission holder). **Engine principals** (ADR-1005 class; ADR-0031) are default-deny: they resolve authority RBAC-only in `require_permission`/`require_scoped_permission` (never pre-RBAC legacy or service-scoped fallback; 403 no-grant or fresh RBAC-off, 503 store-unavailable; the gates but `require_scoped_permission` decide through `engine_grant_checked`, which refuses a degraded view; that one keeps raw `is_rbac_enabled()`, deny-only; the visibility resolvers keep `rbac_enforcement_in_effect`), cannot hold a system role (`assign_role`'s `is_system` bar; a hand-made namesake role is not barred); a wildcard custom role is permitted, detected afterwards by the fail-closed `audit/no-admin` auditor (ruling 2026-10-23, #2485). Grants: `/api/v1/engine-principals/{id}/roles` + MCP twins; boot-time `engine:` collision scan fails **closed** (degraded `rbac_store` refuses boot). **CATASTROPHIC-IF-VIOLATED (#3623/#3952): `rbac_meta.backfill_complete`/`backfill_source_fingerprint` must be POISONED, never DELETEd.** `rbac_store.cpp`'s `migrations()` v4 step forces `backfill_source_fingerprint` to `"sourceless"` (`kSourcelessFingerprint`), never removing the rows — a bare `DELETE` reproduces "marker absent," read by the retired idempotency check as "never migrated," bypassing its fingerprint check into an UNCONDITIONAL overwrite of live `rbac_enabled` from any legacy `rbac.db` a rolled-back binary finds (`up-1`, #3952). The other 5 retired stores are safe with a bare `DROP TABLE` (42P01); only live `rbac_meta` must poison.
+
+**The scoped gate has ONE body (#2532).** `AuthRoutes::require_scoped_permission_outcome` holds every check, status, response body, audit row and metric of the per-device scoped gate and returns a `ScopedGateOutcome`; `require_scoped_permission` is `return require_scoped_permission_outcome(...) == ScopedGateOutcome::Admitted;` and nothing else. Never add a second body (a typed twin that re-implements the checks is how the two drift), and never add a second admitting value: a caller admits ONLY on `== Admitted`. The zero value of the enum is `Denied`, so a value-initialised or out-of-range outcome refuses, and `enum class` has no bool conversion, so a stray `return true` in the body is a compile error. The class never changes what the gate answers: a degraded RBAC or management-group read is still the ADR-0041 fail-closed 403, and the class only tells a caller why. `tests/test_echo_security_wiring_lexical.py` pins the wrapper's exact form and the order of the typed lambda's two wirings in `server.cpp` (the REST setter must precede `register_routes`).
 
 ## Periodic access review invariants (full statement)
 

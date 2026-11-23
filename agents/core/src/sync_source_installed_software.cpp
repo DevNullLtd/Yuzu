@@ -9,6 +9,7 @@
 #include <inventory_status_row.hpp> // the status-row grammar shared with the producing plugins
 #include <middleware_products.hpp>  // the middleware product table (title/vendor/ecosystem/kind)
 #include <spdlog/spdlog.h>
+#include <yuzu/install_row_attributes.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -474,15 +475,18 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
 }
 
 AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out) {
-    // inv|<product_code>|<name>|<version>|<publisher>, machine-context MSI products.
-    // The producer deletes '|', tab, CR, LF and NUL from the fields (msi_packages_inventory.hpp
-    // strip_row_breakers), so no unescape is needed here and an over-wide row can only be
-    // malformed. A constrained status (an enumeration error or a failed property
-    // read) is a status-only `constrained` section: the stored msi rows are kept.
+    // inv|<product_code>|<name>|<version>|<publisher>[|<upgrade_code>], machine-context MSI
+    // products. The producer deletes '|', tab, CR, LF and NUL from the fields
+    // (msi_packages_inventory.hpp strip_row_breakers), so no unescape is needed here and an
+    // over-wide row can only be malformed. A constrained status (an enumeration error or a failed
+    // property read) is a status-only `constrained` section: the stored msi rows are kept.
+    // The optional sixth token is the product's UpgradeCode: a braced GUID in any case becomes the
+    // `upgrade_code` attribute (upper-cased, the canonical spelling); anything else (empty,
+    // malformed) is ignored and the row is kept without it.
     return adapt_pkg_inventory(out, "list_inventory",
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
-        if (tok[0] != "inv" || tok.size() != 5)
+        if (tok[0] != "inv" || (tok.size() != 5 && tok.size() != 6))
             return false;
         SwEntry e;
         e.name = clamp_field(tok[2], kV3MaxFieldLen);
@@ -493,6 +497,14 @@ AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out) {
         e.kind = "pkg";
         e.ecosystem = "msi";
         e.package_id = clamp_field(tok[1], kV3MaxFieldLen);
+        if (tok.size() == 6) {
+            std::string code(tok[5]);
+            std::ranges::transform(code, code.begin(), [](char c) {
+                return (c >= 'a' && c <= 'f') ? static_cast<char>(c - 'a' + 'A') : c;
+            });
+            const std::pair<std::string_view, std::string_view> kv[] = {{"upgrade_code", code}};
+            e.attributes = yuzu::install_attrs::make_attributes(kv).value_or(std::string{});
+        }
         entries.push_back(std::move(e));
         return true;
     });
