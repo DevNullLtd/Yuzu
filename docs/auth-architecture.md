@@ -1965,19 +1965,19 @@ callers: `POST /login`, the password-change verify function, and the MFA step
 Standing invariants, pinned by `tests/test_mfa_budget_wiring_lexical.py`: (1) the ONE admit set
 is `SsoOnlyGateResult::admits_password_evaluation()` (open or armed), and `kTransient` is a
 refusal for every caller except the MFA step's second check; (2) a failed, stale or
-in-flight read is never recorded as "not armed" and never cached, and an "armed" snapshot older
-than a "not armed" read this server holds is never served from the cache, and the first MFA
+in-flight read is never recorded as "not armed" and never cached, and an "armed" snapshot whose read
+started at or before a "not armed" read this server holds is never served from the cache, and the first MFA
 check refuses such an answer as a disarm before anything is verified or spent; (3) no "armed" read is
 honoured more than `kArmSnapshotMaxAge` (4.5 s) after it started, one comparison
-(`arm_observation_fresh`) at every site; (4) the first MFA check uses the cached
+(`arm_observation_fresh`, on the steady clock) at every site; (4) the first MFA check uses the cached
 single-flight mode (its snapshot is what the second check's bounded rule relies on) and puts
 the pending token back on a transient answer; the second check reads the arm state itself
 (`SsoOnlyArmRead::kOwnFreshRead`), never writes the armed cache, and may admit on a failed read
 only inside that bounded rule (before the first snapshot's window end, at most 4.5 s after that
 read started, the same non-empty arm id, no "not armed" read recorded on this server
-since, and at most 4.5 s of WALL time since that read started), with one clock sample taken
-after the gate returns. The steady clock does not advance while the host is suspended, so the
-other bounds above are measured on it and cannot see a suspend; the wall clock is therefore sampled
+since, and at most 4.5 s of WALL time since that read started), with one sample of each clock taken
+after the gate returns. The steady clock does not advance while the host is suspended, so every
+bound above except the wall-time one is measured on it and cannot see a suspend; the wall clock is therefore sampled
 when each shared read starts (the first check carries that sample) and once after the second
 gate call, ONLY to refuse (a wall clock that moved backward changes nothing, and wall time
 never admits). It sees a suspend only if the wall clock moves forward across it. Operator
