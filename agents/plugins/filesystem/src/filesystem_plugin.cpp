@@ -419,7 +419,7 @@ bool path_is_reserved_raw(std::string_view raw) {
 }
 
 bool is_reserved_canonical(const std::string& canonical) {
-    return path_is_reserved(fs::path{canonical});
+    return path_is_reserved_raw(canonical);
 }
 
 void add_reserved(yuzu::filesystem::reserved::Set& set, std::string_view raw, bool is_dir) {
