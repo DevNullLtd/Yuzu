@@ -88,28 +88,34 @@ breaks any of them is outside this ADR and needs its own threat model.
    table whose module is not loaded makes the kernel itself request and load that table's module,
    and the tool then lists the table the kernel has just made, which is empty: measured on Ubuntu
    26.04 ARM64 (kernel 7.0.0-43, iptables 1.8.11, 2026-11-23) with `iptables-legacy-save -t raw`
-   while `iptable_raw` was not loaded, unconfined and in an instance of the shipped unit. The
-   request came from the kernel (`xt_request_find_table_lock`), `modprobe` was started by a kernel
-   worker and not by the tool, the tool exited 0, and `ProtectKernelModules` did not stop the load:
-   that directive bounds what a process of the instance loads, not what the kernel loads on demand.
-   The script's tools are run with no argument and ask only for the tables the kernel has just
-   listed (`for_each_table`), so the second case is reached only when a table is removed between the
-   kernel listing it and the tool asking for it, which puts the tool in the measured position: the
-   kernel loads the module again and the section lists the table it then holds. The tool starts
-   `modprobe` itself in one narrower case, read in the source and not measured. When its request for
-   a table fails, `do_output` (`iptables/iptables-save.c`) calls `xtables_load_ko`
-   (`libxtables/xtables.c`) and asks again, and ends with `Cannot initialize` when that fails too;
-   `xtables_load_ko` returns at once while the family's table list under `/proc/net` exists, and
-   otherwise runs `modprobe` for the family's core module (`ip_tables` or `ip6_tables`). Both
-   functions were read in the Debian archive's source at iptables 1.8.2-4, 1.8.7-1, 1.8.9-2 and
+   while `ip_tables` was loaded and `iptable_raw` was not, unconfined and in an instance of the
+   shipped unit. The request came from the kernel (`xt_request_find_table_lock`), `modprobe` was
+   started by a kernel worker and not by the tool, the tool exited 0, and `ProtectKernelModules` did
+   not stop the load: that directive bounds what a process of the instance loads, not what the
+   kernel loads on demand. The script's tools are run with no argument and ask only for the tables
+   the kernel has just listed (`for_each_table`), so the second case is reached only when a table is
+   removed between the kernel listing it and the tool asking for it, which puts the tool in the
+   measured position: the kernel loads the module again and the section lists the table it then
+   holds. The tool starts `modprobe` itself in one narrower case, read in the source and measured
+   for IPv4. When its request for a table fails, `do_output` (`iptables/iptables-save.c`) calls
+   `xtables_load_ko` (`libxtables/xtables.c`) and asks again, and ends with `Cannot initialize` when
+   that fails too; `xtables_load_ko` returns at once while the family's table list under `/proc/net`
+   exists, and otherwise runs `modprobe` for the family's core module (`ip_tables` or `ip6_tables`).
+   Both functions were read in the Debian archive's source at iptables 1.8.2-4, 1.8.7-1, 1.8.9-2 and
    1.8.11-2; the exit status (1) and the program it starts (the one `/proc/sys/kernel/modprobe`
    names) at 1.8.11-2. The script reaches this only when a table's module and the family's core
-   module are both removed between the kernel listing the table and the tool asking for it. In the
-   instance `ProtectKernelModules` refuses a module load by the instance's processes; the
-   installer's helper has no such sandbox. What the section then holds in either is not measured.
-   Neither of the two measured loads can be avoided inside this contract: skipping nft needs proof
-   that nf_tables is absent, and no existence test gives it on a kernel that builds nf_tables in;
-   and nothing the script can test closes the time between the kernel's list and the tool's request.
+   module are both removed between the kernel listing the table and the tool asking for it. Measured
+   on Ubuntu 26.04 ARM64 (kernel 7.0.0-43, iptables 1.8.11, 2026-11-23) with `iptables-legacy-save
+   -t raw` while neither `ip_tables` nor `iptable_raw` was loaded. As root with no sandbox, the
+   position of the installer's helper, the tool started `modprobe ip_tables`, which loaded
+   `x_tables` and `ip_tables`; the kernel then loaded `iptable_raw` as in the second case, and the
+   tool exited 0 with the empty table. In an instance of the shipped unit the tool started the same
+   `modprobe`, which found no module (the instance cannot read the module directory), no process of
+   the instance loaded a module, and the tool exited 1 with `Cannot initialize`, the status the
+   script prints as `[failed]`. The IPv6 tool was not run in this position. Neither of the two
+   measured loads can be avoided inside this contract: skipping nft needs proof that nf_tables is
+   absent, and no existence test gives it on a kernel that builds nf_tables in; and nothing the
+   script can test closes the time between the kernel's list and the tool's request.
 4. **Bounded.** The output is cut at 4 MiB (4194304 bytes), the same number as the cap on the
    plugin's netlink dumps (`kNftDumpMaxBytes`); the two bound different encodings, this one the text
    listing and that one the netlink dump, so a ruleset can fit one and not the other. The instance
@@ -118,19 +124,32 @@ breaks any of them is outside this ADR and needs its own threat model.
    over the cap is cut and read as unknown, never as a shorter ruleset. Both snapshots of a read
    that reaches `inactive` share the client's one 5 second deadline: a host on which they do not
    fit reads `error|snapshot:timeout` (`error|snapshot:helper:timeout` through the installer's
-   helper) and `unknown`, never `inactive`. The socket also keeps the service manager's own
-   activation limit, which the unit does not set: 200 activations in 2 seconds on the hosts
-   measured (`TriggerLimitIntervalUSec=2s`, `TriggerLimitBurst=200` from `systemctl show`), and a
-   connection refused at `MaxConnections` counts toward it. Measured on Rocky 9.9 (systemd 252,
-   2026-11-23): 200 connections at once left the socket active, and 201 inside 2 seconds put it in
-   the failed state (`Result=trigger-limit-hit`) and removed the socket file until
-   `systemctl reset-failed` and `systemctl start`. On Ubuntu 26.04 (systemd 259) 600 connections at
-   once did not fail it. With the socket file gone the packaged agent answers as a host without the
-   broker does: firewalld's own rows on a firewalld host and `unknown` elsewhere, after the error
-   rows of the reads it was refused, and never `inactive`. The limit is kept on purpose: only root
-   and the agent's group can connect, a read makes at most two connections, so the agent's own
-   reads pass it only above 100 reads of one host inside 2 seconds, and without it nothing in the
-   unit bounds how often those clients can make the service manager accept and close a connection.
+   helper) and `unknown`, never `inactive`. Measured on Ubuntu 26.04 ARM64 (2026-11-23) on an empty
+   host: a warm read of two snapshots took a median of 0.053 seconds through the broker and 0.010
+   seconds through the installer's helper, and with the `nft` listing slowed by 3 seconds a read
+   ended in `unknown` after 5.03 and 6.04 seconds, the helper's figure being the deadline plus the
+   time to end the sudo child. The socket also keeps the service manager's own activation limit,
+   which the unit does not set: 200 activations in 2 seconds on the hosts measured
+   (`TriggerLimitIntervalUSec=2s`, `TriggerLimitBurst=200` from `systemctl show` on systemd 239, 252
+   and 259), and a connection refused at `MaxConnections` counts toward it. Measured on 2026-11-23
+   with connections made at once by a member of the socket's group. On Rocky 9.9 (systemd 252) 150
+   connections and 20 reads inside 2 seconds left the socket active and every read answered; 250
+   connections put it in the failed state (`Result=trigger-limit-hit`) and removed the socket file.
+   On Ubuntu 26.04 (systemd 259, which also has `PollLimitIntervalUSec=2s` and `PollLimitBurst=150`)
+   150, 250 and 600 connections did not fail it; of the 20 reads made during each, 16, 20 and 20
+   read `unknown` with `error|snapshot:empty` (`error|snapshot:timeout` at 600). On Rocky 8.10
+   (systemd 239, under emulation) 150 and 250 connections did not fail it, the service manager
+   having counted 149 of them in the window, and a copy of the units with `TriggerLimitBurst=100`
+   failed the same way after 5 accepted and 97 refused connections. On Rocky 9.9 `systemctl
+   reset-failed` and `systemctl start` recovered the socket 3 seconds after the connections stopped,
+   and so did `systemctl restart yuzu-agent` alone; a reset and start made straight after them
+   failed again at the next connection. With the socket file gone the packaged agent answers as a
+   host without the broker does: firewalld's own rows on a firewalld host and `unknown` elsewhere,
+   after the error rows of the reads it was refused, and never `inactive`. The limit is kept on
+   purpose: only root and the agent's group can connect, a read makes at most two connections, so
+   the agent's own reads pass it only above 100 reads of one host inside 2 seconds, and without it
+   nothing in the unit bounds how often those clients can make the service manager accept and close
+   a connection.
 5. **Authorisation is the socket.** Who may connect is the socket's owner, group and mode. That
    proves identity and not authenticity, so only data that is acceptable to disclose to the agent
    account may be served. What the firewall snapshot serves is the host's full nftables ruleset
@@ -162,10 +181,16 @@ breaks any of them is outside this ADR and needs its own threat model.
    rule, no user-defined chain and no policy other than accept. Outside that statement: legacy
    `arptables` and `ebtables` tables, which no read of this plugin lists; a family with no save tool
    whose table list cannot be stat'ed while `/proc/net/dev` can (read as no table, clause 3); and
-   rules that move between rulesets more than once inside one read. The count is the sum of one pass
-   of three reads, so a rule that moves during it can be counted twice or not at all. An `[absent]`
-   nft section is never evidence of an empty ruleset, so with no content anywhere the rung declines
-   and the read ladder goes on, and a reply that failed or was cut is never read as empty.
+   rules that move between rulesets more than once inside one read. Measured on Ubuntu 26.04 ARM64
+   (kernel 7.0.0-43, 2026-11-23) through the broker, with the `nft` listing slowed by 1 second so
+   that a read took over a second: against a mover that moved the rules between the legacy and
+   nf_tables rulesets about six times per read, 7 of 200 reads answered `inactive`; with one move
+   per read, in either direction, 50 of 50 reads stayed `active`; with at most one move every 2.4
+   seconds 200 of 200 did; and at the host's own read speed (0.04 seconds per read) 1,000 of 1,000
+   did against the same fast mover. The count is the sum of one pass of three reads, so a rule that
+   moves during it can be counted twice or not at all. An `[absent]` nft section is never evidence
+   of an empty ruleset, so with no content anywhere the rung declines and the read ladder goes on,
+   and a reply that failed or was cut is never read as empty.
 7. **The helper has its own minimum sandbox, and the agent unit never changes.** The helper
    service runs with its own bounding set, system call filter, address families and file system
    protections, each documented where it is set. The helper service does not set
@@ -201,9 +226,11 @@ breaks any of them is outside this ADR and needs its own threat model.
     a module on demand, in the two cases clause 3 records, is a side effect of a read, not work the
     helper does.
     So is the third path clause 3 records, a save tool that starts `modprobe` for its family's core
-    module in a removal race (read in the source): there a process of the helper asks for the load,
-    `ProtectKernelModules` is the bound on it in the broker's instance, and the installer's helper,
-    which has no sandbox, has none.
+    module in a removal race (read in the source, and measured for IPv4): there a process of the
+    helper asks for the load. In the broker's instance the measured `modprobe` could not read a
+    module directory and loaded nothing; the unit sets `ProtectKernelModules` and its bounding set
+    has no `CAP_SYS_MODULE`, and the measurement does not show which of the two refused it. The
+    installer's helper has no sandbox: as root with no sandbox the measured load went through.
 
 ## What this discharges
 

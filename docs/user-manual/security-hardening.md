@@ -153,14 +153,20 @@ bound.
   with no row that names the snapshot. If a read answers so, look at the socket: its file is gone
   when the socket was stopped, was masked before it ever started, or has failed (below). A read
   whose first snapshot was `inactive` and whose second found the socket gone answers `unknown` with
-  `error|snapshot:gone`, for the same reason. The socket fails when systemd's activation limit is passed: more than 200 connections
-  inside 2 seconds, with those refused at `MaxConnections` counted (measured on Rocky 9.9, systemd
-  252: `systemctl show -p Result yuzu-fw-snapshot.socket` printed `trigger-limit-hit` and the socket
-  file was removed; on Ubuntu 26.04, systemd 259, 600 connections at once did not fail it). A
-  `state` or `rules` read makes at most two connections, so the agent's own reads pass that limit
-  only above 100 reads of one host inside 2 seconds. Run `systemctl status yuzu-fw-snapshot.socket`;
-  then `systemctl reset-failed yuzu-fw-snapshot.socket` and
-  `systemctl start yuzu-fw-snapshot.socket`.
+  `error|snapshot:gone`, for the same reason. The socket fails when systemd's activation limit is
+  passed: `TriggerLimitBurst=200` in `TriggerLimitIntervalUSec=2s` (the `systemctl show` values),
+  with connections refused at `MaxConnections` counted. Measured on Rocky 9.9 (systemd 252): 150
+  connections made at once left the socket active, and after 250 `systemctl show -p Result
+  yuzu-fw-snapshot.socket` printed `trigger-limit-hit` and the socket file was removed; on Ubuntu
+  26.04 (systemd 259) 150, 250 and 600 connections did not fail it. A `state` or `rules` read makes
+  at most two connections, so the agent's own reads pass that limit only above 100 reads of one host
+  inside 2 seconds. The socket also fails at the first connection when `yuzu-fw-snapshot@.service`
+  is masked (`Result=resources`): that read answers `error|snapshot:empty` and the reads after it
+  find no socket (measured on Ubuntu 26.04 and Rocky 9.9); unmask the template first. Run `systemctl
+  status yuzu-fw-snapshot.socket`; then `systemctl reset-failed yuzu-fw-snapshot.socket` and
+  `systemctl start yuzu-fw-snapshot.socket`, once the connections that failed it have stopped: on
+  Rocky 9.9 a reset and start made 3 seconds after them held, one made straight after them failed
+  again at the next connection, and `systemctl restart yuzu-agent` alone also recovered the socket.
   `journalctl -u 'yuzu-fw-snapshot@*'` shows each instance.
 - If a read answers `error|snapshot:empty` or `error|snapshot:timeout`, the broker was reached and
   did not reply in full: either four reads were already in flight (`MaxConnections=4`; a connection
