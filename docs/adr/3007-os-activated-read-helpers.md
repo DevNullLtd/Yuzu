@@ -55,8 +55,21 @@ breaks any of them is outside this ADR and needs its own threat model.
    when the package is built. The client sends nothing, and bytes it does send are never read.
 3. **Fixed, read-only work.** The program is a root-owned file shipped by the package. It names
    each tool by its literal absolute path with literal arguments, under a reset `PATH` and locale,
-   and changes nothing. Running a read can cause the kernel to load a netfilter module; this ADR
-   states only what the lab measured on that (see the plugin README), and claims nothing more.
+   and changes no ruleset. One decision is made before a tool runs, from host state and never from
+   input: a legacy `iptables` or `ip6tables` whose core kernel module is not loaded is not run,
+   because the service may not load a module and the same command run by an unconfined root does.
+   The section is the marker `[unloaded]` when all four hold: the tool is executable; it is the same
+   file as the legacy multi-call binary; `/proc/net/dev` exists; and the family's table list under
+   `/proc/net` does not, which is so exactly while the family's core module is loaded, so the family
+   holds no rule. In every other state the tool runs, and one that fails is `[failed]`. What a read
+   that does run was seen to do to the host was measured on Ubuntu 26.04 ARM64 (kernel 7.0.0-43,
+   systemd 259, iptables 1.8.11, 2026-11-23) and is the whole claim: with `ip_tables` loaded and
+   `iptable_filter` not, one read was followed by the kernel loading `iptable_filter`; on the nft
+   shim `lsmod` was identical around one read; with `/run/xtables.lock` removed the reply was
+   unchanged, no module was added and the file was there again afterwards (root, mode `0600`; what
+   created it was not established); AppArmor logged no new denial over 30 reads and the broker
+   processes ran unconfined. A legacy tool run by an unconfined root with its modules not loaded
+   loaded `ip_tables` and `iptable_filter` on that host.
 4. **Bounded.** The output is cut at a size cap, the instance has `RuntimeMaxSec` and `TasksMax`,
    the socket has `MaxConnections`, and the client has its own deadline and size cap. A listing
    over the cap is cut and read as unknown, never as a shorter ruleset.
@@ -69,7 +82,13 @@ breaks any of them is outside this ADR and needs its own threat model.
    treats the reply as untrusted text: strict framing, and anything that does not parse is
    unknown. A reply never produces a false-safe value: `inactive` is answered only when every
    section that was read shows no content, and a section that failed or was cut is never read as
-   empty.
+   empty. The reply has four markers: `[absent]` (tool not installed), `[failed]` (tool exited
+   non-zero), `[unloaded]` (clause 3: a legacy `iptables` tool whose core module is not loaded, not
+   run) and the closing `== end`. `[unloaded]` is honoured only as the whole body of an `iptables`
+   or `ip6tables` section: there it is a section that was read and holds no rule, adds nothing to
+   the count and makes the family neither unknown nor active by itself. In the `nft` section, beside
+   other text, or as an empty section it is not a marker: it is text the parser does not
+   recognise, which reads unknown.
 7. **The helper has its own minimum sandbox, and the agent unit never changes.** The helper
    service runs with its own bounding set, system call filter, address families and file system
    protections, each documented where it is set. The helper service does not set

@@ -1598,12 +1598,17 @@ inline constexpr std::string_view kFwSnapshotIptablesLabel = "iptables -S";
 inline constexpr std::string_view kFwSnapshotIp6tablesLabel = "ip6tables -S";
 inline constexpr std::string_view kFwSnapshotAbsentMarker = "[absent]";
 inline constexpr std::string_view kFwSnapshotFailedMarker = "[failed]";
+inline constexpr std::string_view kFwSnapshotUnloadedMarker = "[unloaded]";
 inline constexpr std::string_view kFwSnapshotEndLine = "== end";
 
 enum class FwSectionKind {
     text,   // the tool ran and exited 0: `text` is its whole output
     absent, // the tool is not installed (the section body is exactly `[absent]`)
     failed, // the tool ran and exited non-zero (a line of the body is `[failed]`): its text is not kept
+    // a legacy iptables or ip6tables whose core kernel module is not loaded, so the family holds no
+    // rule and the tool was not run (the body is exactly `[unloaded]`; only the two iptables
+    // sections can be this, in the nft section the line is ordinary text)
+    unloaded,
 };
 
 struct FwSnapshotSection {
@@ -1679,6 +1684,8 @@ enum class FwReadAction { state, rules };
             slot = FwSnapshotSection{FwSectionKind::failed, {}};
         } else if (body == std::string{kFwSnapshotAbsentMarker} + "\n") {
             slot = FwSnapshotSection{FwSectionKind::absent, {}};
+        } else if (section > 0 && body == std::string{kFwSnapshotUnloadedMarker} + "\n") {
+            slot = FwSnapshotSection{FwSectionKind::unloaded, {}};
         } else {
             slot = FwSnapshotSection{FwSectionKind::text, std::move(body)};
         }
@@ -1996,28 +2003,32 @@ struct IptablesMember {
 
 /// The two iptables sections of a snapshot read together (`iptables -S` and `ip6tables -S`).
 /// A member is TRUSTED when it is text and shaped; an absent member (no binary) adds nothing; a
-/// failed or unshaped member is untrusted and what it printed is ignored for the verdict.
+/// failed or unshaped member is untrusted and what it printed is ignored for the verdict. An
+/// unloaded member (the broker did not run a legacy tool whose kernel module is not loaded) was
+/// read: it has no content, adds 0 to the count and is neither absent nor untrusted.
 struct IptablesFamily {
     std::array<IptablesMember, 2> members;
     [[nodiscard]] bool absent() const noexcept {
         return members[0].kind == FwSectionKind::absent && members[1].kind == FwSectionKind::absent;
     }
     /// active when any trusted member has content; else unknown when any member is untrusted; else
-    /// inactive (every present member is trusted and shows no content).
+    /// inactive (every present member is trusted or unloaded and shows no content).
     [[nodiscard]] NftVerdict state() const noexcept {
         bool untrusted = false;
         for (const auto& m : members) {
             if (m.trusted() && m.summary.has_content)
                 return NftVerdict::active;
-            untrusted = untrusted || (m.kind != FwSectionKind::absent && !m.trusted());
+            untrusted = untrusted || (m.kind != FwSectionKind::absent && m.kind != FwSectionKind::unloaded &&
+                                      !m.trusted());
         }
         return untrusted ? NftVerdict::unknown : NftVerdict::inactive;
     }
-    /// The sum of -A entries when every present member is trusted, else nullopt.
+    /// The sum of -A entries when every present member is trusted or unloaded (which adds 0), else
+    /// nullopt.
     [[nodiscard]] std::optional<int> count() const noexcept {
         int sum = 0;
         for (const auto& m : members) {
-            if (m.kind == FwSectionKind::absent)
+            if (m.kind == FwSectionKind::absent || m.kind == FwSectionKind::unloaded)
                 continue;
             if (!m.trusted())
                 return std::nullopt;
@@ -2041,11 +2052,12 @@ struct IptablesFamily {
 }
 
 /// `backend|iptables` and what follows for `state` (state, count) or `rules` (the rows of every
-/// text member, IPv4 then IPv6, or `rules|unknown` when none was text; then the count), then one
-/// row per untrusted member. `tables_seen` (the netlink leg saw a table this snapshot did not
-/// explain) turns an `inactive` family into `unknown` through nft_fallthrough_clamp: the state is
-/// `unknown`, `rules` lists nothing and says `rules|unknown`, and neither carries a count (an
-/// unknown answer never carries one).
+/// text member, IPv4 then IPv6, or `rules|unknown` when none was text and the answer is not
+/// `inactive`; then the count), then one row per untrusted member (an unloaded member has none).
+/// `tables_seen` (the netlink leg saw a table this snapshot did not explain) turns an `inactive`
+/// family into `unknown` through nft_fallthrough_clamp: the state is `unknown`, `rules` lists
+/// nothing and says `rules|unknown`, and neither carries a count (an unknown answer never carries
+/// one).
 [[nodiscard]] inline LinuxSnapshotAnswer iptables_family_answer(const IptablesFamily& f, FwReadAction action,
                                                                 bool tables_seen) {
     LinuxSnapshotAnswer answer{nft_fallthrough_clamp(tables_seen, f.state()), {"backend|iptables"}};
@@ -2063,7 +2075,8 @@ struct IptablesFamily {
             for (const auto& entry : m.summary.entries)
                 rows.push_back(format_iptables_rule_row(entry, m.ip6));
         }
-        if (!any_text)
+        // nothing listed: unknown, unless every member was read and the family holds no rule
+        if (!any_text && answer.state != NftVerdict::inactive)
             rows.emplace_back("rules|unknown");
     }
     rows.push_back(count && !clamped ? std::format("ruleset|{}", *count) : std::string{"ruleset|unknown"});
@@ -2102,7 +2115,9 @@ struct IptablesFamily {
 
 /// The snapshot rung's answer for `state` or `rules`: no rows when the rung declines (no nft and no
 /// iptables on the host), else the verdict and its rows. `tables_seen` is true when the netlink leg
-/// saw a table it could not read. The decision table:
+/// saw a table it could not read. In the iptables family an unloaded member (a legacy tool whose
+/// kernel module is not loaded, which the broker did not run) was read and holds no rule: it never
+/// makes the family active, unknown or absent, and adds 0 to the count. The decision table:
 ///  1. nft text that does not parse: backend|nftables, state|unknown, ruleset|unknown and
 ///     error|nftables:unrecognised_output.
 ///  2. nft parsed with content: backend|nftables, state|active, ruleset|<rules>.
@@ -2124,6 +2139,7 @@ struct IptablesFamily {
     case FwSectionKind::absent:
         // 4. no nft: the iptables family answers, or the rung declines
         return family.absent() ? LinuxSnapshotAnswer{} : detail::iptables_family_answer(family, action, tables_seen);
+    case FwSectionKind::unloaded: // the framing parser never makes the nft section this: fail closed
     case FwSectionKind::failed: {
         // 5. nft was there and could not be read: say so, and let a family that shows content answer;
         //    anything else is unknown (an unread nft ruleset is not an empty one)

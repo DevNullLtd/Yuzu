@@ -9,7 +9,8 @@
  * A snapshot is the text the harness reads before a case and after it:
  *
  *     == <section>
- *     <the tool's output, or [absent] when the tool is not installed, or [failed]>
+ *     <the tool's output, or [absent] when the tool is not installed, or [unloaded] when it is a
+ *      legacy iptables or ip6tables whose kernel module is not loaded (not run), or [failed]>
  *     == <section>
  *     ...
  *     == end
@@ -19,7 +20,10 @@
  * content, so an unreadable snapshot can never compare equal to itself and a case cannot pass on
  * two failed reads. A root-owned helper (`yuzu-fw-helper snapshot`) writes the same format for the
  * Linux agent account; for a tool that exits non-zero it prints what the tool wrote and then the
- * `[failed]` marker, and a section that carries the marker is unreadable whatever precedes it.
+ * `[failed]` marker, and a section that carries the marker is unreadable whatever precedes it. For a
+ * legacy iptables or ip6tables whose kernel module is not loaded it runs nothing and prints
+ * `[unloaded]` alone: that is a section that was read (the family holds no rule), kept like any other
+ * line, so a snapshot of such a host is readable and equal to itself.
  *
  * Per OS (the sections are the names in `label`):
  *   Windows  `profiles` (one line per profile: name and its defaults) and `rules` (one line per

@@ -337,6 +337,29 @@ TEST_CASE("Linux: counters and handles are normalised away", "[firewall]") {
     CHECK(v.restored);
 }
 
+TEST_CASE("Linux: a snapshot with [unloaded] iptables sections is readable and equal to itself", "[firewall]") {
+    // The helper's `snapshot` word and the broker print `[unloaded]` alone for a legacy iptables or ip6tables
+    // whose kernel module is not loaded (the family holds no rule and the tool was not run). The live read
+    // cases take their baseline from such a host, so it must be a readable snapshot and not a failed read.
+    for (const auto& snap : {lin_snapshot(kNftRuleset, "[unloaded]\n", "[unloaded]\n"),
+                             lin_snapshot(kNftRuleset, "[unloaded]\n", kIpt),
+                             lin_snapshot(kNftRuleset, kIpt, "[unloaded]\n"),
+                             lin_snapshot("", "[unloaded]\n", "[unloaded]\n")}) {
+        INFO(snap);
+        CHECK(readable(Os::lin, snap));
+        const auto v = compare(Os::lin, snap, snap);
+        INFO(describe(v));
+        CHECK(v.readable);
+        CHECK(v.restored);
+    }
+    // a section that is `[unloaded]` once and lists the tables later is a difference, not a pass
+    const auto loaded_later = compare(Os::lin, lin_snapshot(kNftRuleset, "[unloaded]\n", kIpt),
+                                      lin_snapshot(kNftRuleset, std::string{kIpt} + "-N lab\n", kIpt));
+    CHECK_FALSE(loaded_later.restored);
+    // and it does not make a failed read readable
+    CHECK_FALSE(readable(Os::lin, lin_snapshot(kNftRuleset, "[unloaded]\n\n[failed]\n", kIpt)));
+}
+
 TEST_CASE("Linux: a timed set element's countdown and a counter object's values are normalised away",
           "[firewall]") {
     using detail::normalise_linux_line;

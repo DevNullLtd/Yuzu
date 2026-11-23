@@ -665,35 +665,74 @@ class SnapshotRuns(unittest.TestCase):
         ("iptables -S", "/usr/sbin/iptables", ["-S"]),
         ("ip6tables -S", "/usr/sbin/ip6tables", ["-S"]),
     )
+    # The four host paths the `[unloaded]` decision names, each once in the text, and the table-list
+    # file each family reads: the test points every one of them into its own case directory.
+    LEGACY_BINARY = "/usr/sbin/xtables-legacy-multi"
+    PROC_DEV = "/proc/net/dev"
+    NAMES = {"/usr/sbin/iptables": "/proc/net/ip_tables_names", "/usr/sbin/ip6tables": "/proc/net/ip6_tables_names"}
     CAP = 1048576
+    FILE_NAME = "yuzu-fw-helper"
+
+    @staticmethod
+    def source_text():
+        return helper_text()
 
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_fwsnap_")
         cls.counter = 0
         for _label, tool, _args in cls.TOOLS:
-            assert helper_text().count(tool) == 1, "the helper must name %s exactly once" % tool
+            assert cls.source_text().count(tool) == 1, "the text must name %s exactly once" % tool
+        for path in (cls.LEGACY_BINARY, cls.PROC_DEV, *cls.NAMES.values()):
+            assert cls.source_text().count(path) == 1, "the text must name %s exactly once" % path
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def make_helper(self, bodies):
-        """The helper with each tool path replaced by a stub whose script body is bodies[tool]; a
-        tool whose body is None is replaced by a path that does not exist (not installed)."""
+    def make_helper(self, bodies, legacy=(), binary=None, legacy_mode=0o755, dev=False, names=()):
+        """The text with each tool path replaced by a stub whose script body is bodies[tool]; a tool
+        whose body is None is replaced by a path that does not exist (not installed). The other four
+        host paths point into the case directory, where the host state the `[unloaded]` decision
+        reads is built: `legacy` is the set of iptables tool paths that are the legacy multi-call
+        binary (a symlink chain to one file, as the distributions' alternatives make it; the one file
+        runs the body of the tool it was reached through), `binary` whether that file exists at all
+        (default: when `legacy` is not empty), `legacy_mode` its mode, `dev` whether /proc/net/dev
+        exists and `names` the tools whose table-list file exists."""
         type(self).counter += 1
         d = os.path.join(self.tmp.name, "case%d" % self.counter)
-        os.mkdir(d)
-        text = helper_text()
+        os.makedirs(os.path.join(d, "proc", "net"))
+        text = self.source_text()
+        legacy_bin = os.path.join(d, "xtables-legacy-multi")
+        arms = ""
+        for tool in legacy:
+            if bodies.get(tool, STUB_ECHO) is not None:
+                arms += "%s)\n%s;;\n" % ("stub-" + os.path.basename(tool), bodies.get(tool, STUB_ECHO))
+        if bool(legacy) if binary is None else binary:
+            with open(legacy_bin, "w") as f:
+                f.write("#!/bin/sh\ncase ${0##*/} in\n%s*) exit 99 ;;\nesac\n" % arms)
+            os.chmod(legacy_bin, legacy_mode)
         for _label, tool, _args in self.TOOLS:
             body = bodies.get(tool, STUB_ECHO)
             stub = os.path.join(d, "stub-" + os.path.basename(tool))
-            if body is not None:
+            if body is not None and tool in legacy:
+                alternative = os.path.join(d, "alt-" + os.path.basename(tool))
+                os.symlink(legacy_bin, alternative)
+                os.symlink(alternative, stub)
+            elif body is not None:
                 with open(stub, "w") as f:
                     f.write("#!/bin/sh\n" + body)
                 os.chmod(stub, 0o755)
             text = text.replace(tool, stub)
-        path = os.path.join(d, "yuzu-fw-helper")
+        text = text.replace(self.LEGACY_BINARY, legacy_bin)
+        text = text.replace(self.PROC_DEV, os.path.join(d, "proc", "net", "dev"))
+        for tool, proc_path in self.NAMES.items():
+            text = text.replace(proc_path, os.path.join(d, "proc", "net", os.path.basename(proc_path)))
+        if dev:
+            open(os.path.join(d, "proc", "net", "dev"), "w").close()
+        for tool in names:
+            open(os.path.join(d, "proc", "net", os.path.basename(self.NAMES[tool])), "w").close()
+        path = os.path.join(d, self.FILE_NAME)
         with open(path, "w") as f:
             f.write(text)
         return path
@@ -704,10 +743,14 @@ class SnapshotRuns(unittest.TestCase):
     @staticmethod
     def expected_listing(stub_names):
         """What the echo stubs make the whole listing: each section's header, the stub's own name
-        and the arguments it was handed, one per line, and the end line."""
+        and the arguments it was handed, one per line, and the end line. A name of None is a section
+        the script answered `[unloaded]` without running its tool."""
         out = ""
         for (label, _tool, args), name in zip(SnapshotRuns.TOOLS, stub_names):
-            out += "== %s\n" % label + "RAN %s\n" % name + "".join(a + "\n" for a in args)
+            if name is None:
+                out += "== %s\n[unloaded]\n" % label
+            else:
+                out += "== %s\n" % label + "RAN %s\n" % name + "".join(a + "\n" for a in args)
         return out + "== end\n"
 
     def test_the_sections_come_in_order_each_with_the_tools_own_fixed_arguments(self):
@@ -752,6 +795,106 @@ class SnapshotRuns(unittest.TestCase):
             self.assertIn("[failed]", r.stdout.split("\n"), (shell, "the marker is not a whole line"))
             self.assertEqual(r.stdout.count("[failed]"), 1, shell)
             self.assertTrue(r.stdout.endswith("== end\n"), shell)
+
+    # ── `[unloaded]`: a legacy tool whose kernel module is not loaded is not run ─────────────────────
+    IPT, IP6T = "/usr/sbin/iptables", "/usr/sbin/ip6tables"
+    BOTH = (IPT, IP6T)
+    NFT_RAN = "== nft -a list ruleset\nRAN stub-nft\n-a\nlist\nruleset\n"
+    FAILING = 'echo "to stderr" >&2; exit 3\n'
+
+    def ran_marker(self):
+        """A path and the stub body that creates it: a section whose tool ran leaves the file."""
+        marker = os.path.join(self.tmp.name, "ran-" + os.urandom(6).hex())
+        return marker, ': > "%s"\n' % marker + STUB_ECHO
+
+    def run_snapshot(self, shell, path):
+        return self.run_helper(shell, path, ["snapshot"])
+
+    def test_a_legacy_tool_with_its_module_not_loaded_is_unloaded_and_is_not_run(self):
+        # legacy (a symlink chain to the legacy multi-call binary), /proc/net visible, the family's
+        # table-list file absent: the section is the header and `[unloaded]`, the tool did not run
+        # (the marker its stub would leave is not there), the other sections ran, the listing ends.
+        want = self.expected_listing(["stub-nft", None, None])
+        for shell in available_shells():
+            marker4, body4 = self.ran_marker()
+            marker6, body6 = self.ran_marker()
+            helper = self.make_helper({self.IPT: body4, self.IP6T: body6}, legacy=self.BOTH, dev=True)
+            r = self.run_snapshot(shell, helper)
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, ""), shell)
+            self.assertFalse(os.path.exists(marker4) or os.path.exists(marker6), (shell, "a tool ran"))
+            self.assertNotIn("[failed]", r.stdout, shell)
+
+    def test_each_family_reads_its_own_table_list_file(self):
+        # only the IPv6 file exists: IPv4 is unloaded and IPv6 runs; only the IPv4 file: the reverse
+        # (a pair of files read the wrong way round gives the other answer in both cases)
+        cases = ((("/usr/sbin/ip6tables",), [None, "stub-ip6tables"]), (("/usr/sbin/iptables",), ["stub-iptables", None]))
+        for shell in available_shells():
+            for names, stubs in cases:
+                helper = self.make_helper({}, legacy=self.BOTH, dev=True, names=names)
+                r = self.run_snapshot(shell, helper)
+                self.assertEqual((r.returncode, r.stdout), (0, self.expected_listing(["stub-nft"] + stubs)),
+                                 (shell, names))
+            # a family's own tool decides its own section: legacy IPv4 beside an nft-shim IPv6 tool
+            r = self.run_snapshot(shell, self.make_helper({}, legacy=(self.IPT,), dev=True))
+            self.assertEqual(r.stdout, self.expected_listing(["stub-nft", None, "stub-ip6tables"]), shell)
+            r = self.run_snapshot(shell, self.make_helper({}, legacy=(self.IP6T,), dev=True))
+            self.assertEqual(r.stdout, self.expected_listing(["stub-nft", "stub-iptables", None]), shell)
+
+    def test_a_legacy_tool_with_its_table_list_file_present_is_run_and_a_failure_is_failed(self):
+        for shell in available_shells():
+            # exit 0: the tool's own output, whatever it is
+            r = self.run_snapshot(shell, self.make_helper({}, legacy=self.BOTH, dev=True, names=self.BOTH))
+            self.assertEqual(r.stdout, self.expected_listing(["stub-nft", "stub-iptables", "stub-ip6tables"]), shell)
+            # non-zero, with nothing printed: [failed], not unloaded and not empty
+            for failing in self.BOTH:
+                r = self.run_snapshot(shell, self.make_helper({failing: self.FAILING}, legacy=self.BOTH, dev=True,
+                                                              names=self.BOTH))
+                label = "iptables -S" if failing == self.IPT else "ip6tables -S"
+                self.assertIn("== %s\n\n[failed]\n" % label, r.stdout, (shell, failing))
+                self.assertEqual((r.returncode, r.stdout.count("[failed]"), "[unloaded]" in r.stdout),
+                                 (0, 1, False), (shell, failing))
+                self.assertTrue(r.stdout.endswith("== end\n"), shell)
+
+    def test_a_tool_that_is_not_the_legacy_binary_is_always_run(self):
+        # table-list files absent and /proc/net visible, as for a host with nothing loaded, but the tool is
+        # not the legacy multi-call binary: the nft shim, a legacy binary that is somewhere else, or a
+        # legacy binary that is a different file. It runs, and a failure is `[failed]`.
+        layouts = (("the legacy binary is not on the host", {}),
+                   ("the legacy binary is another file", {"binary": True}))
+        for shell in available_shells():
+            for what, extra in layouts:
+                r = self.run_snapshot(shell, self.make_helper({}, dev=True, **extra))
+                self.assertEqual(r.stdout, self.expected_listing(["stub-nft", "stub-iptables", "stub-ip6tables"]),
+                                 (shell, what))
+                helper = self.make_helper({self.IPT: self.FAILING, self.IP6T: self.FAILING}, dev=True, **extra)
+                r = self.run_snapshot(shell, helper)
+                self.assertEqual((r.returncode, r.stdout.count("[failed]"), "[unloaded]" in r.stdout),
+                                 (0, 2, False), (shell, what))
+                self.assertIn("== iptables -S\n\n[failed]\n== ip6tables -S\n\n[failed]\n== end\n", r.stdout,
+                              (shell, what))
+
+    def test_without_a_visible_proc_net_the_tool_is_run_even_if_it_is_legacy(self):
+        # a process that cannot see /proc/net cannot tell an unloaded module from a hidden file
+        for shell in available_shells():
+            r = self.run_snapshot(shell, self.make_helper({}, legacy=self.BOTH, dev=False))
+            self.assertEqual(r.stdout, self.expected_listing(["stub-nft", "stub-iptables", "stub-ip6tables"]), shell)
+            helper = self.make_helper({self.IPT: self.FAILING, self.IP6T: self.FAILING}, legacy=self.BOTH, dev=False)
+            r = self.run_snapshot(shell, helper)
+            self.assertEqual((r.returncode, r.stdout.count("[failed]"), "[unloaded]" in r.stdout),
+                             (0, 2, False), shell)
+
+    def test_a_tool_that_is_not_executable_is_absent_whatever_the_host_state_says(self):
+        for shell in available_shells():
+            # not installed at all, with every other condition for `[unloaded]` met
+            helper = self.make_helper({self.IPT: None, self.IP6T: None}, legacy=self.BOTH, binary=True, dev=True)
+            r = self.run_snapshot(shell, helper)
+            self.assertEqual((r.returncode, r.stdout),
+                             (0, self.NFT_RAN + "== iptables -S\n[absent]\n== ip6tables -S\n[absent]\n== end\n"), shell)
+            # the legacy binary (and so the tool that is a link to it) is there but has no execute bit
+            helper = self.make_helper({}, legacy=self.BOTH, legacy_mode=0o644, dev=True)
+            r = self.run_snapshot(shell, helper)
+            self.assertEqual(r.stdout, self.NFT_RAN + "== iptables -S\n[absent]\n== ip6tables -S\n[absent]\n== end\n",
+                             shell)
 
     def test_a_listing_longer_than_the_cap_is_cut_and_has_no_end_line(self):
         big = "head -c 1100000 /dev/zero | tr '\\000' 'a'\n"
@@ -834,29 +977,11 @@ class BrokerSnapshotScriptRuns(SnapshotRuns):
     argument at all (the helper's word has no counterpart), so the helper's one-word call is the
     script's bare call here, and anything on its command line is refused having run nothing."""
 
-    def make_helper(self, bodies):
-        type(self).counter += 1
-        d = os.path.join(self.tmp.name, "case%d" % self.counter)
-        os.mkdir(d)
-        text = broker_script_text()
-        for _label, tool, _args in self.TOOLS:
-            body = bodies.get(tool, STUB_ECHO)
-            stub = os.path.join(d, "stub-" + os.path.basename(tool))
-            if body is not None:
-                with open(stub, "w") as f:
-                    f.write("#!/bin/sh\n" + body)
-                os.chmod(stub, 0o755)
-            text = text.replace(tool, stub)
-        path = os.path.join(d, "yuzu-fw-snapshot.sh")
-        with open(path, "w") as f:
-            f.write(text)
-        return path
+    FILE_NAME = "yuzu-fw-snapshot.sh"
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        for _label, tool, _args in cls.TOOLS:
-            assert broker_script_text().count(tool) == 1, "the script must name %s exactly once" % tool
+    @staticmethod
+    def source_text():
+        return broker_script_text()
 
     def run_helper(self, shell, path, args, env=None):
         # the inherited cases call the word `snapshot`; the script's counterpart is the bare call
@@ -899,7 +1024,7 @@ class BrokerSnapshotScriptRuns(SnapshotRuns):
         assignments = "IPT=/usr/sbin/iptables\nIP6T=/usr/sbin/ip6tables\nNFT=/usr/sbin/nft\n"
         self.assertIn(assignments, script)
         self.assertIn(assignments, helper)
-        for name in ("snap_one", "host_snapshot"):
+        for name in ("snap_one", "snap_ipt", "host_snapshot"):
             self.assertEqual(sh_function(script, name), sh_function(helper, name), name)
         for line in ("set -u", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", "export PATH LC_ALL"):
             self.assertIn("\n%s\n" % line, script, line)
@@ -911,7 +1036,7 @@ class BrokerSnapshotScriptRuns(SnapshotRuns):
         self.assertIsNotNone(header, PARSERS_HEADER)
         for label, _tool, _args in self.TOOLS:
             self.assertIn('"%s"' % label, header, label)
-        for marker in ("[absent]", "[failed]", "== end"):
+        for marker in ("[absent]", "[failed]", "[unloaded]", "== end"):
             self.assertIn('"%s"' % marker, header, marker)
         self.assertIn('kFwSnapshotSocketPath = "/run/yuzu-fw-snapshot.sock"', header)
         self.assertIn("kFwSnapshotMaxBytes = 1048576", header)

@@ -67,8 +67,10 @@ ProtectHome=true
 PrivateTmp=true
 # A minimal /dev without physical devices.
 PrivateDevices=true
-# Refuses explicit module loading and makes the module files unreachable. It does not stop the
-# kernel loading a netfilter module itself when a read needs one.
+# Refuses explicit module loading and makes the module files unreachable, so a legacy iptables that
+# needs its core module cannot load it; the script does not run such a tool (it answers `[unloaded]`).
+# It does not stop the kernel itself loading a netfilter table module when a read of a loaded core
+# module needs one (measured, see the plugin README).
 ProtectKernelModules=true
 # Makes /proc/sys, /sys and similar kernel tunables read-only.
 ProtectKernelTunables=true

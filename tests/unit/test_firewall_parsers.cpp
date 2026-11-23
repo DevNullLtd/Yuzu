@@ -2813,6 +2813,7 @@ constexpr std::string_view kIptClean = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P O
 constexpr std::string_view kIptV6Rules =
     "-P INPUT DROP\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT\n";
 constexpr std::string_view kAbsent = "[absent]\n";
+constexpr std::string_view kUnloaded = "[unloaded]\n"; // a legacy tool whose kernel module is not loaded: not run
 constexpr std::string_view kFailed = "-P INPUT ACC\n\n[failed]\n"; // partial output, then the marker
 
 using Rows = std::vector<std::string>;
@@ -2863,6 +2864,42 @@ TEST_CASE("parse_fw_snapshot: a [failed] line makes the section failed whatever 
     const auto not_failed = parse_fw_snapshot(snap(kNftOne, "-A INPUT -m comment --comment [failed] -j ACCEPT\n", kIptClean));
     REQUIRE(not_failed.has_value());
     CHECK(not_failed->iptables.kind == FwSectionKind::text);
+}
+
+TEST_CASE("parse_fw_snapshot: [unloaded] is its own kind, only as the whole body of an iptables section",
+          "[firewall]") {
+    CHECK(kFwSnapshotUnloadedMarker == "[unloaded]");
+    const auto got = parse_fw_snapshot(snap(kNftOne, kUnloaded, kUnloaded));
+    REQUIRE(got.has_value());
+    CHECK(got->iptables.kind == FwSectionKind::unloaded);
+    CHECK(got->iptables.text.empty());
+    CHECK(got->ip6tables.kind == FwSectionKind::unloaded);
+    CHECK(got->nft.kind == FwSectionKind::text);
+    // in the nft section the same line is ordinary text
+    const auto in_nft = parse_fw_snapshot(snap(kUnloaded, kIptClean, kIptClean));
+    REQUIRE(in_nft.has_value());
+    CHECK(in_nft->nft.kind == FwSectionKind::text);
+    CHECK(in_nft->nft.text == kUnloaded);
+    // beside any other line, before or after it, it is text; the marker must be the whole body and exact
+    for (const auto& body : {std::string{"[unloaded]\n"} + std::string{kIptClean},
+                                   std::string{kIptClean} + "[unloaded]\n", std::string{"[unloaded]\n[unloaded]\n"},
+                                   std::string{"\n[unloaded]\n"}, std::string{" [unloaded]\n"},
+                                   std::string{"[unloaded] \n"}, std::string{"[UNLOADED]\n"}, std::string{"[unloaded]\r\n"},
+                                   std::string{"[unloaded\n"}, std::string{}}) {
+        INFO(body);
+        const auto r = parse_fw_snapshot(snap(kNftOne, body, kIptClean));
+        REQUIRE(r.has_value());
+        CHECK(r->iptables.kind == FwSectionKind::text);
+    }
+    // a failed section stays failed, whatever else it says
+    const auto both = parse_fw_snapshot(snap(kNftOne, "[unloaded]\n\n[failed]\n", kUnloaded));
+    REQUIRE(both.has_value());
+    CHECK(both->iptables.kind == FwSectionKind::failed);
+    CHECK(both->ip6tables.kind == FwSectionKind::unloaded);
+    // and it is not the absent marker
+    const auto absent = parse_fw_snapshot(snap(kNftOne, kAbsent, kUnloaded));
+    REQUIRE(absent.has_value());
+    CHECK(absent->iptables.kind == FwSectionKind::absent);
 }
 
 TEST_CASE("parse_fw_snapshot: zero bytes is empty, a missing end line is truncated, anything else malformed",
@@ -3249,6 +3286,86 @@ TEST_CASE("iptables family: both address families are read together, and a membe
     CHECK(rules_rows(kAbsent, kAbsent, kAbsent).empty());
 }
 
+TEST_CASE("iptables family: an unloaded member was read, holds no rule and adds 0, so the other family answers",
+          "[firewall]") {
+    // IPv4 legacy core module not loaded, IPv6 with a DROP policy and one rule: active, the IPv6 count,
+    // the four IPv6 rows and nothing for IPv4, no error row
+    for (const auto nft : {std::string_view{""}, kAbsent}) {
+        CHECK(state_rows(nft, kUnloaded, kIptV6Rules) == Rows{"backend|iptables", "state|active", "ruleset|1"});
+        CHECK(rules_rows(nft, kUnloaded, kIptV6Rules) ==
+              Rows{"backend|iptables", "rule|ip6|policy|INPUT|DROP", "rule|ip6|policy|FORWARD|ACCEPT",
+                   "rule|ip6|policy|OUTPUT|ACCEPT", "rule|ip6|append|INPUT|-p tcp -m tcp --dport 22 -j ACCEPT",
+                   "ruleset|1"});
+    }
+    // the other way round
+    CHECK(state_rows("", kIptV6Rules, kUnloaded) == Rows{"backend|iptables", "state|active", "ruleset|1"});
+    // a trusted member with no content beside an unloaded one is inactive, a count of zero
+    CHECK(state_rows(kAbsent, kUnloaded, kIptClean) == Rows{"backend|iptables", "state|inactive", "ruleset|0"});
+    CHECK(rules_rows(kAbsent, kUnloaded, kIptClean) ==
+          Rows{"backend|iptables", "rule|ip6|policy|INPUT|ACCEPT", "rule|ip6|policy|FORWARD|ACCEPT",
+               "rule|ip6|policy|OUTPUT|ACCEPT", "ruleset|0"});
+    // one unloaded and the other tool not installed: still a family that was read, inactive
+    CHECK(state_rows(kAbsent, kUnloaded, kAbsent) == Rows{"backend|iptables", "state|inactive", "ruleset|0"});
+    CHECK(state_rows(kAbsent, kAbsent, kUnloaded) == Rows{"backend|iptables", "state|inactive", "ruleset|0"});
+}
+
+TEST_CASE("iptables family: nothing loaded and nothing else is no rules, and never a false-safe value otherwise",
+          "[firewall]") {
+    // nft read and empty, both legacy tables unloaded: the host filters nothing
+    CHECK(state_rows("", kUnloaded, kUnloaded) == Rows{"backend|nftables", "state|inactive", "ruleset|0"});
+    CHECK(rules_rows("", kUnloaded, kUnloaded) == Rows{"backend|nftables", "ruleset|0"});
+    // nft not installed, both unloaded: the family answers inactive, with no rule row and no unknown row
+    CHECK(state_rows(kAbsent, kUnloaded, kUnloaded) == Rows{"backend|iptables", "state|inactive", "ruleset|0"});
+    CHECK(rules_rows(kAbsent, kUnloaded, kUnloaded) == Rows{"backend|iptables", "ruleset|0"});
+    // a table the netlink leg saw and this snapshot did not explain turns inactive into unknown, no count
+    CHECK(state_rows("", kUnloaded, kUnloaded, true) == Rows{"backend|nftables", "state|unknown", "ruleset|unknown"});
+    CHECK(rules_rows("", kUnloaded, kUnloaded, true) ==
+          Rows{"backend|nftables", "rules|unknown", "ruleset|unknown"});
+    CHECK(state_rows(kAbsent, kUnloaded, kUnloaded, true) ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown"});
+    CHECK(rules_rows(kAbsent, kUnloaded, kUnloaded, true) ==
+          Rows{"backend|iptables", "rules|unknown", "ruleset|unknown"});
+    // an unloaded member beside a failed one: unknown, that member's error row, no count, nothing listed
+    const Rows ip6_failed{"backend|iptables", "state|unknown", "ruleset|unknown", "error|ip6tables:snapshot:failed"};
+    CHECK(state_rows(kAbsent, kUnloaded, kFailed) == ip6_failed);
+    CHECK(state_rows("", kUnloaded, kFailed) == ip6_failed);
+    CHECK(state_rows("", kFailed, kUnloaded) ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown", "error|iptables:snapshot:failed"});
+    CHECK(rules_rows(kAbsent, kUnloaded, kFailed) ==
+          Rows{"backend|iptables", "rules|unknown", "ruleset|unknown", "error|ip6tables:snapshot:failed"});
+    // ... and beside a member in a shape the parser does not know
+    CHECK(state_rows(kAbsent, kUnloaded, "surprise\n") ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown", "error|ip6tables:unrecognised_output"});
+    // nft that failed is never read as empty, whatever the family says
+    CHECK(state_rows(kFailed, kUnloaded, kUnloaded) ==
+          Rows{"error|nftables:snapshot:failed", "backend|nftables", "state|unknown", "ruleset|unknown"});
+    CHECK(rules_rows(kFailed, kUnloaded, kUnloaded) ==
+          Rows{"error|nftables:snapshot:failed", "backend|nftables", "rules|unknown", "ruleset|unknown"});
+    // ... unless a family with content answers beside the error row
+    CHECK(state_rows(kFailed, kUnloaded, kIptV6Rules) ==
+          Rows{"error|nftables:snapshot:failed", "backend|iptables", "state|active", "ruleset|1"});
+}
+
+TEST_CASE("iptables family: [unloaded] beside other text is unrecognised output, and so is an empty section",
+          "[firewall]") {
+    // beside other lines in an iptables section the line is an unknown entry in a listing that is not in shape
+    const std::string beside = std::string{kUnloaded} + std::string{kIptClean};
+    CHECK(state_rows(kAbsent, beside, kIptClean) ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown", "error|iptables:unrecognised_output"});
+    CHECK(state_rows(kAbsent, kIptClean, beside) ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown", "error|ip6tables:unrecognised_output"});
+    // as the nft section it is text nft does not understand
+    CHECK(state_rows(kUnloaded, kIptClean, kIptClean) ==
+          Rows{"backend|nftables", "state|unknown", "ruleset|unknown", "error|nftables:unrecognised_output"});
+    CHECK(rules_rows(kUnloaded, kUnloaded, kUnloaded) ==
+          Rows{"backend|nftables", "rules|unknown", "ruleset|unknown", "error|nftables:unrecognised_output"});
+    // an empty iptables section (a tool that exited 0 and printed nothing) is still not "no rules"
+    CHECK(state_rows(kAbsent, "", kIptClean) ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown", "error|iptables:unrecognised_output"});
+    CHECK(state_rows("", kUnloaded, "") ==
+          Rows{"backend|iptables", "state|unknown", "ruleset|unknown", "error|ip6tables:unrecognised_output"});
+}
+
 TEST_CASE("linux_snapshot rows, branch 1: nft text it cannot read is unknown with the error row", "[firewall]") {
     const std::string cut = "table inet filter { # handle 1\n"; // not closed
     const Rows state{"backend|nftables", "state|unknown", "ruleset|unknown", "error|nftables:unrecognised_output"};
@@ -3364,6 +3481,9 @@ TEST_CASE("linux_snapshot_answer: the verdict travels with the rows on every dec
     CHECK(state(no_content, kIptClean, kIptClean) == V::inactive);        //    nothing anywhere
     CHECK(state(kAbsent, kIptV6Rules, kIptClean) == V::active);           // 4. no nft: the family
     CHECK(state(kAbsent, kIptClean, kIptClean) == V::inactive);
+    CHECK(state(kAbsent, kUnloaded, kIptV6Rules) == V::active);           //    an unloaded member adds nothing
+    CHECK(state(kAbsent, kUnloaded, kUnloaded) == V::inactive);           //    both read, no rule
+    CHECK(state(kAbsent, kUnloaded, kFailed) == V::unknown);              //    unloaded beside a failed one
     CHECK(snapshot_answer(kAbsent, kAbsent, kAbsent, false, FwReadAction::state).rows.empty()); // declines
     CHECK(state(kFailed, kIptV6Rules, kIptClean) == V::active);           // 5. nft failed, a family has content
     CHECK(state(kFailed, kIptClean, kIptClean) == V::unknown);            //    never read as empty
@@ -3374,7 +3494,7 @@ TEST_CASE("linux_snapshot_answer: the verdict travels with the rows on every dec
     // for every combination: both actions reach the same verdict, the one `state|` row says it, and an
     // unknown verdict carries no count
     const std::array<std::string_view, 6> nfts{kAbsent, kFailed, cut, kNftOne, "", no_content};
-    const std::array<std::string_view, 5> ipts{kAbsent, kFailed, kIptClean, kIptV6Rules, "surprise\n"};
+    const std::array<std::string_view, 6> ipts{kAbsent, kFailed, kIptClean, kIptV6Rules, "surprise\n", kUnloaded};
     for (const auto nft : nfts) {
         for (const auto ipt : ipts) {
             for (const auto ip6t : ipts) {
