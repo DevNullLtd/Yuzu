@@ -188,6 +188,9 @@ struct FacetFilter {
     std::string value; // exact match
 };
 
+inline constexpr char kResponseIngestTruncation[] = "\n...[truncated by server ingest cap]";
+inline constexpr char kResponseRowsTruncation[] = "\n...[rows past per-agent cap dropped]";
+
 struct ResponseQuery {
     std::string agent_id;
     int status{-1};   // -1 = any
@@ -207,6 +210,9 @@ struct ResponseQuery {
     /// tied timestamp, or a row reaped between two pages, never skips or repeats a row (an
     /// `offset` walk can do both). The other reads do not honour it.
     std::optional<std::pair<int64_t, int64_t>> continue_after;
+    /// An execution's frame read groups by agent, with insertion id ascending within a stream.
+    /// An empty agent with id zero starts the walk. Mutually exclusive with continue_after.
+    std::optional<std::pair<std::string, int64_t>> frames_after;
 };
 
 /// Management-group scope filter for `aggregate()`, `query()`, and

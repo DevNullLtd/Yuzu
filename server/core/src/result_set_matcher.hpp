@@ -103,6 +103,7 @@ public:
     ~ParsedMatcher();
 
     [[nodiscard]] bool response_matches(int status, std::string_view output) const;
+    [[nodiscard]] bool quantified() const { return static_cast<bool>(quantified_); }
     [[nodiscard]] RowMatch evaluate(int status, std::string_view output,
                                     int plugin_result_status = 0) const;
     [[nodiscard]] bool answer_lacks_matcher_column(std::string_view output) const;
@@ -172,6 +173,7 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json);
 /// MCP both call this ONE function, so both apply the same bounds in the same order, and a third
 /// producer cannot admit accept-all by calling only the text check. An ABSENT matcher is the
 /// caller's own default and is not passed here.
+std::optional<std::string> validate_echo_matcher(const nlohmann::json& matcher);
 std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher);
 
 /// Server-authored binding of a kind-less column matcher to the instruction definition's

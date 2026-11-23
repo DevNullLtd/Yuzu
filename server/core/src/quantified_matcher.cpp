@@ -17,7 +17,10 @@ bool recognized_kind(std::string_view kind) {
     return kind == "any" || kind == "none" || kind == "all" || kind == "count_where";
 }
 
-std::optional<std::string> check_predicate(const Json& expr, unsigned depth) {
+std::optional<std::string> check_predicate(const Json& expr, unsigned depth, unsigned& remaining) {
+    if (remaining == 0)
+        return "matcher.where exceeds 64 predicates";
+    --remaining;
     if (depth > 16)
         return "matcher.where exceeds 16 levels";
     if (!expr.is_object())
@@ -29,11 +32,11 @@ std::optional<std::string> check_predicate(const Json& expr, unsigned depth) {
             return "a boolean row predicate must contain exactly one operator";
         const auto& arg = expr.at(key);
         if (std::string_view(key) == "not")
-            return check_predicate(arg, depth + 1);
+            return check_predicate(arg, depth + 1, remaining);
         if (!arg.is_array() || arg.empty())
             return "and/or require a nonempty array of row predicates";
         for (const auto& child : arg)
-            if (auto error = check_predicate(child, depth + 1))
+            if (auto error = check_predicate(child, depth + 1, remaining))
                 return error;
         return std::nullopt;
     }
@@ -141,6 +144,12 @@ bool is_quantified_matcher(const Json& matcher) {
 }
 
 std::optional<std::string> validate_quantified_matcher(const Json& m) {
+    for (const auto& [key, value] : m.items()) {
+        if (key != "kind" && key != "where" && key != "op" && key != "n" &&
+            key != "declared_columns" && key != "row_discriminator" && key != "plugin" &&
+            key != "partial_when_constrained")
+            return "unknown key in quantified matcher";
+    }
     if (!m.contains("where"))
         return "quantified matcher requires where";
     if (m.at("kind") == "count_where") {
@@ -156,7 +165,8 @@ std::optional<std::string> validate_quantified_matcher(const Json& m) {
             return "count_where.n exceeds the signed integer range";
     } else if (m.contains("op") || m.contains("n"))
         return "only count_where takes op and n";
-    return check_predicate(m.at("where"), 1);
+    unsigned remaining = 64;
+    return check_predicate(m.at("where"), 1, remaining);
 }
 
 QuantifiedMatcher::Predicate::Predicate(const Json& expr) {
@@ -244,13 +254,20 @@ RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete) con
         if (bound)
             columns = matcher_.at("declared_columns").get<std::vector<std::string>>();
         bool echo = false;
+        std::optional<std::uint64_t> total_rows;
         while (!output.empty()) {
             const auto end = output.find('\n');
-            const auto line = output.substr(0, end);
+            auto line = output.substr(0, end);
+            if (line.ends_with('\r'))
+                line.remove_suffix(1);
             output.remove_prefix(end == output.npos ? output.size() : end + 1);
-            if (line.empty())
+            if (line.empty() && !echo)
                 continue;
+            if (total_rows)
+                return RowMatch::MalformedValue;
             if (line.starts_with("__schema__|")) {
+                if (echo || counts.size())
+                    return RowMatch::MalformedValue;
                 echo = true;
                 columns = split_echo_cells(line.substr(11));
                 continue;
@@ -262,6 +279,9 @@ RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete) con
                     std::from_chars(total.data(), total.data() + total.size(), n);
                 if (err != std::errc{} || ptr != total.data() + total.size())
                     return RowMatch::MalformedValue;
+                if (!echo || n < counts.size())
+                    return RowMatch::MalformedValue;
+                total_rows = n;
                 if (n > counts.size())
                     open_end = RowMatch::RowBound;
                 continue;
@@ -279,19 +299,24 @@ RowMatch QuantifiedMatcher::evaluate(std::string_view output, bool complete) con
                     : split_fields(matcher_.value("plugin", std::string{}), std::string(line));
             if (!echo && cells == columns)
                 continue;
-            if (!echo && cells.size() != columns.size()) {
+            if (cells.size() != columns.size()) {
                 counts.add(RowMatch::MalformedValue);
                 continue;
             }
             auto row = Json::object();
             for (std::size_t i = 0; i < std::min(cells.size(), columns.size()); ++i)
-                row.emplace(columns[i], std::move(cells[i]));
+                if (!echo || !cells[i].empty())
+                    row.emplace(columns[i], std::move(cells[i]));
             counts.add(where_.evaluate(row));
         }
         if (columns.empty())
             return RowMatch::MissingValue;
+        if (echo && counts.size() >= kQuantifiedRowLimit)
+            open_end = RowMatch::RowBound;
+        if (echo && !total_rows && open_end != RowMatch::RowBound)
+            open_end = RowMatch::CoverageUnproven;
     }
-    auto kind = matcher_.at("kind").get_ref<const std::string&>();
+    const auto& kind = matcher_.at("kind").get_ref<const std::string&>();
     if (kind == "count_where") {
         const auto& op = matcher_.at("op").get_ref<const std::string&>();
         const auto n = matcher_.at("n").get<std::uint64_t>();

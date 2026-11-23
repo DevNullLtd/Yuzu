@@ -302,8 +302,11 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
          {kDeclaredColumnsKey, kPluginKey, kRowDiscriminatorKey, kPartialWhenConstrainedKey})
         if (m.contains(key))
             return std::string("matcher.") + key + " is server-authored and cannot be supplied";
-    if (!m.contains("kind"))
+    if (!m.contains("kind")) {
+        if (m.contains("where") || m.contains("n"))
+            return "quantified matcher requires a kind";
         return column_shape_defect(m);
+    }
     const auto kind = m["kind"].get<std::string>();
     // A closed set: an unknown kind would be admitted and then match nobody at evaluation
     // (below), so a stale client still sending the pre-rename `tar_rows_ge` would get a 202 and
@@ -338,6 +341,14 @@ std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher
         too_long("value", kMatcherValueMaxBytes))
         return std::string(kMatcherFieldTooLargeMessage);
     return validate_matcher(matcher.dump());
+}
+
+std::optional<std::string> validate_echo_matcher(const nlohmann::json& matcher) {
+    if (auto error = validate_matcher_object(matcher))
+        return error;
+    if (!matcher.contains("kind"))
+        return "an explicit Echo matcher requires a kind";
+    return std::nullopt;
 }
 
 void bind_declared_columns(nlohmann::json& matcher, const std::string& result_schema_json,
@@ -427,7 +438,7 @@ RowMatch ParsedMatcher::evaluate(int status, std::string_view output, int plugin
     if (status != kStatusSuccess)
         return RowMatch::False;
     if (quantified_)
-        return quantified_->evaluate(output, !constrained_answer_is_unresolved(plugin_result_status));
+        return quantified_->evaluate(output, plugin_result_status == 0 || plugin_result_status == 1);
     if (is_quantified_matcher(*matcher_))
         return RowMatch::MalformedValue;
     return legacy_matches(status, output) ? RowMatch::True : RowMatch::False;

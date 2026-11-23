@@ -4946,6 +4946,22 @@ TEST_CASE("materialise: the members read pages past the store's default row limi
         CHECK(members == std::vector<std::string>{"agent-0", "agent-1", "agent-2", "agent-3",
                                                   "agent-4", "agent-5"});
     }
+    SECTION("a quantifier spans all frames for a device across page boundaries") {
+        put_exec_row(responses, exec, "alpha", 1, "__schema__|name\nbeta", 100);
+        put_exec_row(responses, exec, "beta", 1, "__schema__|name\nbeta\n__total__|1", 100);
+        put_exec_row(responses, exec, "alpha", 1, "alpha\n__total__|2", 100);
+        PendingSet pending;
+        pending.source_execution_id = exec;
+        const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+        for (const auto& kind : {std::string{"none"}, std::string{"any"}}) {
+            pending.matcher = nlohmann::json{{"kind",kind},{"where",{{"column","name"},{"op","eq"},{"value","alpha"}}}}.dump();
+            const auto members = result_set_members(responses, plugins, pending, 1, 10);
+            REQUIRE(members);
+            REQUIRE(members->size() == 1);
+            CHECK(members->front() == (kind == "none" ? "beta" : "alpha"));
+            CHECK(members->agents_failed == 0);
+        }
+    }
     SECTION("the read reports truncated only when rows lie past its bound") {
         for (int i = 0; i < 6; ++i)
             put_exec_row(responses, exec, "agent-" + std::to_string(i), 1, kOneRow, 100 + i);

@@ -303,13 +303,13 @@ producer's default. A matcher can test successive rows with `kind` set to `any`,
 
 A leaf supports `eq`, `contains`, `exists` and `in` (use `value_set` for the latter).
 An `and` or `or` array contains one or more predicates. `not` takes one predicate.
-Expressions are limited to 16 levels, and the existing 65,536-byte matcher limit and field
+Expressions are limited to 64 predicates and 16 levels, and the existing 65,536-byte matcher limit and field
 bounds apply. `count_where` takes an additional comparison `op` (`eq`, `lt`, `le`,
 `gt`, `ge`) and a nonnegative integer `n`.
 
 Missing or null fields produce `missing_value`; unusable values produce `malformed_value`.
-An evaluator reads at most 10,000 rows per answer. More rows than read give an open upper
-bound (`row_bound`). A declared constrained, partial answer likewise leaves the upper bound
+Frames are grouped by device in store insertion order across pages. A response above 2 MiB or marked as truncated by the server is undecidable. An evaluator reads at most 10,000 rows per answer. Echo stops at 10,000 without recording whether more rows existed, so reaching the boundary leaves its count open. An empty Echo cell can represent SQL NULL and is missing for quantified row tests. More rows than read give an open upper
+bound (`row_bound`). Any declared plugin result other than OK likewise leaves the upper bound
 open. A true disjunct or a false conjunct can decide a row that also has unknown fields.
 A count compares the range from known matches to known matches plus unknown rows; an open
 upper end represents additional possible matches. Only a comparison true for the entire

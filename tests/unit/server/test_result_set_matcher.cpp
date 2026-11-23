@@ -1421,6 +1421,9 @@ TEST_CASE("Quantified matcher preserves unknown until the selection boundary",
     const auto neg = make("none", {{"not",name}});
     CHECK(ParsedMatcher(neg).evaluate(kOk, "[{}]") == RowMatch::MissingValue);
     CHECK(response_matches(none, kOk, "__schema__|name\n__total__|0"));
+    CHECK(ParsedMatcher(none).evaluate(kOk, "__schema__|name\n") == RowMatch::CoverageUnproven);
+    CHECK(ParsedMatcher(none).evaluate(kOk, "__schema__|name\nx\n__total__|0") == RowMatch::MalformedValue);
+    CHECK(ParsedMatcher(none).evaluate(kOk, "__schema__|name\n__total__|0\nextra") == RowMatch::MalformedValue);
     CHECK(ParsedMatcher(none).evaluate(kOk, "__schema__|name\nbeta\n__total__|2") == RowMatch::RowBound);
     CHECK(response_matches(any, kOk, "__schema__|name\nalpha\n__total__|2"));
 }
