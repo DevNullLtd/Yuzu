@@ -5893,8 +5893,9 @@ public:
         metrics_.describe("yuzu_server_policy_eval_errors_total",
                           "Policy evaluator failures by phase: claim (the due-policy claim), "
                           "dispatch, check, fix, verify, remediate_claim, and error_verdict_write "
-                          "(a chunk of the per-agent error verdict write failed: a statement "
-                          "error, or connection-class retries or the 30 s budget used up), and "
+                          "(a per-agent error verdict write lost at least one chunk, counted "
+                          "once per call: a statement error, connection-class retries used up, "
+                          "or chunks not reached after the 30 s budget), and "
                           "error_verdict_retry (one per retried chunk attempt on a fresh pool "
                           "lease, not itself a failure). Zero means none of that phase.",
                           "counter");

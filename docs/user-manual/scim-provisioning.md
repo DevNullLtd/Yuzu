@@ -365,9 +365,8 @@ has the same effect:
      `yuzu_http_held_open_responses` (per replica; `yuzu_http_held_open_capacity` is its ceiling)
      shows which replicas hold any, and your reverse proxy's connection log shows the client
      address and the replica it reached.
-  3. End it: close the connection at the proxy (this drops that one client), or restart the replica
-     holding it. **A restart drops every held-open stream on that replica, for every operator and
-     service**, so prefer the proxy for a single user and drain the replica first if you must restart.
+  3. End it: restart the replica holding it. **A restart drops every held-open stream on that
+     replica, for every operator and service**, so drain the replica first.
   4. Verify: the user's reconnect attempt is refused (`401`), and `yuzu_http_held_open_responses` on
      that replica no longer counts the stream.
 

@@ -1260,9 +1260,11 @@ PolicyStore::set_agents_error_status(const std::string& policy_id,
     // to one attempt per pooled connection plus one, so the dead ones are drained and a live one is
     // reached. A STATEMENT error (a timeout, a lock wait, a constraint) reuses the same healthy backend
     // and would fail the same way, so it is NOT retried. The whole call (all chunks, all retries) shares
-    // one wall-clock budget, kErrorVerdictBudget. Every chunk is attempted whatever happened to the
-    // one before it: stopping at the first failure would leave the tail holding its previous (possibly
-    // compliant) verdict for the whole interval.
+    // one wall-clock budget, kErrorVerdictBudget: no new attempt starts after it, but an attempt already
+    // started can run on (pool acquire plus statement_timeout), so a call can take about a minute.
+    // A failed chunk does not stop the next one while the budget lasts (stopping at the first failure
+    // would leave the tail holding its previous, possibly compliant, verdict for the whole interval);
+    // chunks not reached once the budget is spent get no attempt and are counted as failed.
     const std::size_t max_attempts = pool_.size() + 1;
     const auto budget = budget_for_test_.value_or(
         std::chrono::duration_cast<std::chrono::milliseconds>(kErrorVerdictBudget));
