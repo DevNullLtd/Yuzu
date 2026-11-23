@@ -21,6 +21,11 @@ elif host_machine.system() == 'darwin'
     message('INSTALLED_APPS: Security framework not found -- list_inventory\'s macOS '
             + 'per-app bundle-id/publisher/signature enrichment compiles as a no-op.')
   endif
+elif host_machine.system() == 'linux'
+  # SAM-45: the rpm sqlite database (Fedora, RHEL 9 and later) is read in-process through the
+  # sqlite API by installed_apps_pkgdb_read.hpp, the same vcpkg sqlite3_dep app_usage and echo link.
+  # The dpkg status, ndb and Berkeley DB readers need no library.
+  installed_apps_deps += [sqlite3_dep]
 endif
 
 installed_apps_plugin_lib = shared_library(

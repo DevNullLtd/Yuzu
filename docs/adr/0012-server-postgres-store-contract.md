@@ -307,7 +307,7 @@ row, then `session_store.sessions` rows, then the `audit_store.audit_events` INS
 `auth.users`), no audit writer touches `session_store`, the locking post-mint re-read
 (`AuthDB::recheck_role_locked`) takes `auth.users` only after its own session INSERT has committed,
 and `RbacAdminAuthorityOwner` takes `principal_roles` before `auth.users` and never a session or
-audit lock (superseded for `deactivate_account` by Update 2026-11-13 below). Like the RBAC owner, it is correct only because `AuthDB`, `SessionStore` and
+audit lock (superseded for `deactivate_account` by Update 2026-11-13 and for the user `Administrator` unassign by the Update 2026-11-16 titled "the user `Administrator` unassign takes the target's `session_store.sessions` rows", both below). Like the RBAC owner, it is correct only because `AuthDB`, `SessionStore` and
 `AuditStore` share ONE pool/database (ADR-0006); a split onto separate databases fails every
 statement closed, never a silent partial write.
 
@@ -472,6 +472,52 @@ takes an account or RBAC lock, so nothing that holds `session_meta` waits on one
 The wait on that row is bounded per lock by the lifecycle `lock_timeout` the owner installs; session
 create and revoke writers install no timeout of their own and run under the pool defaults.
 A failed bump aborts the deactivation (the account stays active, a store failure to the caller).
+
+## Update (2026-11-16) -- the user `Administrator` unassign takes the target's `session_store.sessions` rows
+
+The 2026-10-04 entry says `RbacAdminAuthorityOwner` "takes `principal_roles` before `auth.users` and
+never a session or audit lock", and the 2026-11-13 entry narrowed that to the `session_meta` row in
+`deactivate_account`. A second session-side lock class now exists. When `RbacAdminAuthorityOwner::unassign_role`
+removes a USER `Administrator` grant (a `principal_type` of `user`, role `Administrator`, and the DELETE
+removed a row) and `RbacStore` is in its default `SessionGenerationMode::kBumpSessionGeneration`, the same
+transaction ends the target's JIT elevation: it takes ALL of the target's `session_store.sessions` rows
+`FOR UPDATE`, ordered by `token_hash`, with no elevation predicate
+(`session_sql::lock_user_session_rows_in_txn`); then zeroes `elevated_until_ms` and `elevation_issued_ms`
+on the rows whose `elevated_until_ms` is nonzero (`session_sql::clear_user_elevations_in_txn`, a separate
+statement so its snapshot sees an elevation a writer committed while the lock was awaited); and, only when
+at least one row changed, takes the `session_store.session_meta` `write_generation` row
+(`session_sql::bump_generation_in_txn`). It is a data write into `session_store` from the owner, not
+only a bump, and it still takes no audit lock.
+
+Lock order of that transaction (the owner header banner is authoritative): the `principal_roles` rows
+(every active-user `Administrator` grant, ordered by `principal_id`), then one `auth.users` row (only
+when the removed grant was not already in the locked set), then the target's `session_store.sessions`
+rows, then the `rbac_meta` `write_generation` row, then the `session_meta` `write_generation` row LAST,
+then COMMIT. Every statement after the first runs under the lifecycle `lock_timeout` (2000 ms) and a
+15 s `idle_in_transaction_session_timeout` that the unassign installs as its first statement for every
+attempt at a USER `Administrator` unassign, whether or not its DELETE then removes a row; every other unassign keeps the pool defaults and touches no `session_store` object. Any
+failure aborts the transaction and the grant removal rolls back (fail closed).
+
+The owner reaches `session_store` SQL only through the `session_sql::` helpers in
+`session_store_sql_helpers.hpp`, never a `session_store.` literal of its own
+(`tests/test_session_account_gate_wiring.py` pins this lexically, as a tripwire and not a proof). The
+statement in `clear_user_elevations_in_txn` is the one exception to that header's "one definition"
+rule: `SessionStore::clear_user_elevations` writes the same statement out for its own transaction, and
+the two must be kept in step.
+
+Acyclicity rests on the same argument as before: no single-row session writer takes an RBAC or account
+lock, so nothing that holds a `sessions` row or `session_meta` waits on `principal_roles` or
+`auth.users`. It is weaker for the new rows. Two multi-row writers on one user's sessions
+(`invalidate_user`, the reaper's DELETE, `delete_user_sessions_in_txn` and
+`SessionStore::clear_user_elevations`, which the eligibility revoke runs) can still deadlock with the
+unassign on row order; Postgres aborts one victim, and when that is the unassign it rolls back as a
+retryable store failure (REST `503`, MCP internal error with a retry hint). The one-pool requirement
+now covers `SessionStore` as well as `AuthDB`: the unassign is correct only because `RbacStore`,
+`AuthDB` and `SessionStore` share ONE pool/database (ADR-0006), and a split, or a missing
+`session_store` schema, fails the statement and rolls the unassign back rather than answering success
+while the elevation survives. There is no per-user cap on session rows, so the row lock and the clear
+touch every row the user holds; that count is bounded only by the 8 h absolute session lifetime, the
+session reaper and the per-IP login rate limit, and was not measured.
 
 ## Update (2026-11-16) -- a seventh query owner: DexAppUsageOwner
 

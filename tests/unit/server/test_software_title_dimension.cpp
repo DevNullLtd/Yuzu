@@ -252,16 +252,15 @@ TEST_CASE("resolve_title never labels a merely similar product: a subset-title p
 TEST_CASE("resolve_title treats a name with no title token as unnormalized even when an alias is keyed "
           "on it",
           "[normalization][title]") {
-    // "2019" and "(x64)" normalise to an empty title, "Pro" to an empty title plus an edition.
-    // Positive control: an alias row keyed on exactly the key each would form would be adopted
-    // by the alias loop, so the unnormalized result below is the explicit guard, not the absence
-    // of a candidate.
+    // "2019" and "(x64)" normalise to an empty title. Positive control: an alias row keyed on
+    // exactly the key each would form would be adopted by the alias loop, so the unnormalized
+    // result below is the explicit guard, not the absence of a candidate.
     const auto p = prod(1, "acme", "anything");
-    for (const char* raw : {"2019", "(x64)", "Pro", "Pro 2019 (x64)"}) {
+    for (const char* raw : {"2019", "(x64)", "2019 (x64)"}) {
         CAPTURE(raw);
         const NormalizedTitle nt = normalize_title(raw);
         REQUIRE(nt.title.empty());
-        const std::string key = alias_key(nt); // "" or " pro"
+        const std::string key = alias_key(nt); // ""
         const auto r = resolve({raw, "", "windows"}, {alias("pack:", key, "", p)}, {p});
         CHECK(r.norm_status == "unnormalized");
         CHECK(r.method.empty());
@@ -271,6 +270,15 @@ TEST_CASE("resolve_title treats a name with no title token as unnormalized even 
     // And a title that does have tokens still matches the same shaped alias.
     CHECK(resolve({"Anything 2019", "", "windows"}, {alias("pack:", "anything", "", p)}, {p})
               .norm_status == "normalized");
+    // An edition word on its own is a title word, so it is a title that can be aliased.
+    for (const char* raw : {"Pro", "Pro 2019 (x64)", "Home"}) {
+        CAPTURE(raw);
+        const NormalizedTitle nt = normalize_title(raw);
+        REQUIRE_FALSE(nt.title.empty());
+        CHECK(nt.edition.empty());
+        CHECK(resolve({raw, "", "windows"}, {alias("pack:", alias_key(nt), "", p)}, {p})
+                  .norm_status == "normalized");
+    }
 }
 
 TEST_CASE("resolve_title with auto birth off labels an unmatched title unnormalized with a null "
@@ -363,7 +371,7 @@ TEST_CASE("owner pass writes one dimension row per candidate triple and is idemp
     CHECK(dim(pool, "7-Zip 23.01 (x64)", "vendor") == "igor pavlov");
     CHECK(dim(pool, "7-Zip 23.01 (x64)", "title_version") == "23.01");
     CHECK(dim(pool, "7-Zip 23.01 (x64)", "cpe_product") == "7-zip");
-    CHECK(dim(pool, "7-Zip 23.01 (x64)", "pack_version") == "2026.11.1");
+    CHECK(dim(pool, "7-Zip 23.01 (x64)", "pack_version") == "2026.11.2");
     CHECK(dim(pool, "7-Zip 23.01 (x64)", "product_id") != "");
     CHECK(dim(pool, "Mystery Tool", "norm_status") == "unnormalized");
     CHECK(dim(pool, "Mystery Tool", "product_id").empty()); // NULL, never guessed
@@ -416,7 +424,7 @@ TEST_CASE("owner pass re-normalises a row whose pack_version is the empty stale 
               "WHERE raw_name = 'Mystery Tool'");
     const auto again = owner.run_pass();
     CHECK(again.processed == 1);
-    CHECK(dim(pool, "Mystery Tool", "pack_version") == "2026.11.1");
+    CHECK(dim(pool, "Mystery Tool", "pack_version") == "2026.11.2");
 }
 
 TEST_CASE("owner pass queues unnormalized titles with device counts and removes a title from the "
@@ -727,7 +735,7 @@ TEST_CASE("gauges report normalized unnormalized and pending titles and the inst
     CHECK(titles("pending") == 1);
     CHECK(metrics.gauge("yuzu_software_unnormalized_ratio").value() == 0.4); // (2+2)/10
     CHECK(metrics.gauge("yuzu_software_normalization_curation_queue_size").value() == 1);
-    CHECK(metrics.gauge("yuzu_software_normalization_pack_info", {{"pack_version", "2026.11.1"}})
+    CHECK(metrics.gauge("yuzu_software_normalization_pack_info", {{"pack_version", "2026.11.2"}})
               .value() == 1);
 }
 
@@ -806,7 +814,7 @@ TEST_CASE("owner pass re-resolving a row moves updated_at and keeps first_seen_a
     REQUIRE(owner.run_pass().processed == 1); // selected again through the stale sentinel
     CHECK(std::stoll(dim(pool, "Mystery Tool", "updated_at")) > 1); // the re-resolution is stamped
     CHECK(dim(pool, "Mystery Tool", "first_seen_at") == "5");       // the first sighting survives
-    CHECK(dim(pool, "Mystery Tool", "pack_version") == "2026.11.1");
+    CHECK(dim(pool, "Mystery Tool", "pack_version") == "2026.11.2");
     CHECK(scalar(pool, "SELECT first_queued_at FROM product_registry_store.curation_queue") == "1");
     CHECK(scalar(pool, "SELECT device_count FROM product_registry_store.curation_queue") == "7");
 }
@@ -989,7 +997,7 @@ TEST_CASE("gauges leave the ratio unset while the title source is empty and zero
     owner.refresh_gauges();
     CHECK(metrics.serialize().find("yuzu_software_unnormalized_ratio") == std::string::npos);
     CHECK(metrics.gauge("yuzu_software_titles", {{"norm_status", "pending"}}).value() == 0);
-    CHECK(metrics.gauge("yuzu_software_normalization_pack_info", {{"pack_version", "2026.11.1"}})
+    CHECK(metrics.gauge("yuzu_software_normalization_pack_info", {{"pack_version", "2026.11.2"}})
               .value() == 1);
 
     // A non-empty source sets it; emptying the source again leaves the last value (no false 0).
@@ -1004,7 +1012,7 @@ TEST_CASE("gauges leave the ratio unset while the title source is empty and zero
     // A new pack version moves the info series: the old label reads 0, the new one 1.
     sql(pool, "UPDATE product_registry_store.normalization_pack SET pack_version = '2026.12.1'");
     owner.refresh_gauges();
-    CHECK(metrics.gauge("yuzu_software_normalization_pack_info", {{"pack_version", "2026.11.1"}})
+    CHECK(metrics.gauge("yuzu_software_normalization_pack_info", {{"pack_version", "2026.11.2"}})
               .value() == 0);
     CHECK(metrics.gauge("yuzu_software_normalization_pack_info", {{"pack_version", "2026.12.1"}})
               .value() == 1);

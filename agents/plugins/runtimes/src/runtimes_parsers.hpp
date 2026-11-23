@@ -223,9 +223,11 @@ struct ReleaseFields {
 }
 
 /// IMAGE_TYPE "JDK"/"JRE" (case-insensitive) decides. Distributions that omit
-/// the key (Debian's OpenJDK `release` file has no IMAGE_TYPE) read
-/// `unmodelled` -- deliberately NOT guessed from the module list, which
-/// Debian's headless JRE package fills with jdk.* modules, nor from the path.
+/// the key (Debian, Ubuntu and openSUSE OpenJDK `release` files have no
+/// IMAGE_TYPE) read `unmodelled` here -- deliberately NOT guessed from the module
+/// list, which Debian's headless JRE package fills with jdk.* modules, nor from
+/// the path. The Linux leg answers those from the home's bin/javac instead
+/// (flavour_from_bin in runtimes_linux_parsers.hpp), passed to jvm_row as `fallback`.
 [[nodiscard]] inline JvmFlavour jvm_flavour_from(std::string_view image_type) noexcept {
     const auto t = detail::trim(image_type);
     if (detail::ieq(t, "jdk")) return JvmFlavour::jdk;
@@ -334,25 +336,35 @@ struct StatusOutcome {
 
 // -- per-runtime row builders (parse + format in one pure step) ------------------
 
+/// True when the release file carries a non-blank IMAGE_TYPE (whatever its value): then
+/// jvm_flavour_from decides and no fallback is consulted.
+[[nodiscard]] inline bool has_image_type(const ReleaseFields& f) noexcept {
+    return !detail::trim(f.image_type).empty();
+}
+
 /// jvm row from a parsed `release` file. Version = JAVA_VERSION, falling back
-/// to JAVA_RUNTIME_VERSION; vendor = IMPLEMENTOR. nullopt when neither version
-/// key is present (an unparsable `release` file is not a JVM row; the leg
+/// to JAVA_RUNTIME_VERSION; vendor = IMPLEMENTOR; flavour = IMAGE_TYPE when the file has one,
+/// otherwise `fallback` (default unmodelled: the macOS and Windows legs pass none). nullopt when
+/// neither version key is present (an unparsable `release` file is not a JVM row; the leg
 /// records a constraint token for it).
-[[nodiscard]] inline std::optional<std::string> jvm_row(const ReleaseFields& f,
-                                                        std::string_view install_path) {
+[[nodiscard]] inline std::optional<std::string> jvm_row(
+    const ReleaseFields& f, std::string_view install_path,
+    JvmFlavour fallback = JvmFlavour::unmodelled) {
     const std::string_view version =
         !f.java_version.empty() ? std::string_view{f.java_version}
                                 : std::string_view{f.java_runtime_version};
     if (version.empty()) return std::nullopt;
-    return format_runtime_row("jvm", flavour_token(jvm_flavour_from(f.image_type)), version,
-                              install_path, f.implementor);
+    const auto flavour = has_image_type(f) ? jvm_flavour_from(f.image_type) : fallback;
+    return format_runtime_row("jvm", flavour_token(flavour), version, install_path, f.implementor);
 }
 
 /// jvm row for a home whose installer laid down no `release` file (some distro OpenJDK 8
-/// packages): the home is real but its version and vendor are unknown, so both read `-`. The leg
-/// records `release_missing` next to it; such a home is never left out.
-[[nodiscard]] inline std::string jvm_row_release_missing(std::string_view install_path) {
-    return format_runtime_row("jvm", flavour_token(JvmFlavour::unmodelled), "", install_path, "");
+/// packages): the home is real but its version and vendor are unknown, so both read `-`; the
+/// flavour is whatever the leg could read from bin/ (default unmodelled). The leg records
+/// `release_missing` next to it; such a home is never left out.
+[[nodiscard]] inline std::string jvm_row_release_missing(
+    std::string_view install_path, JvmFlavour flavour = JvmFlavour::unmodelled) {
+    return format_runtime_row("jvm", flavour_token(flavour), "", install_path, "");
 }
 
 /// dotnet row for one shared/<fw>/<ver> or sdk/<ver> directory pair.
