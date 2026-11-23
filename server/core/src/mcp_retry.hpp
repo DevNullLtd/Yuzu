@@ -107,6 +107,22 @@ inline constexpr std::int64_t kMcpResultPollRetryMs = 2000;
 /// round trips. Bounded above by the ticket's own TTL (7 days).
 inline constexpr std::int64_t kMcpApprovalPollRetryMs = 30000;
 
+/// `retry_after_ms` for `get_device_live` refused at admission because the live-read lease cap
+/// (per principal or across the server) is reached. Anchor: the REST twin's 429 answers
+/// `Retry-After: 2` / `retry_after_ms: 2000` for the same condition, so the two surfaces tell a
+/// worker the same thing. A held lease frees when a live read ends, which is bounded by the
+/// ~20 s poll budget; 2 s is the cheapest interval at which a lease could plausibly have freed
+/// and costs one admission pass to learn it has not. Equal in value to `kMcpStoreFaultShortRetryMs`
+/// by REST parity, not by shared derivation: they are free to diverge.
+inline constexpr std::int64_t kMcpLiveReadCapRetryMs = 2000;
+
+/// `retry_after_ms` for `get_device_live` when the device was reached but did not answer inside
+/// the poll budget. Anchor: the REST twin's 504 `retry_after_ms: 3000`. The device may simply be
+/// slow (`processes` hashes every executable image), so the next attempt is worth making soon,
+/// but a retry that lands inside the same hashing run only adds device load; 3 s is the REST
+/// route's own pricing of that trade and is kept identical so the two surfaces agree.
+inline constexpr std::int64_t kMcpLiveReadDeviceTimeoutRetryMs = 3000;
+
 /// Metric-name symbol for the poll-rate counter (#3344), so the `describe`/
 /// pre-seed site (`server.cpp`) and the increment site (`mcp_server.cpp`)
 /// cannot silently diverge into a shadow series — same precedent as

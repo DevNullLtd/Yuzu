@@ -56,7 +56,7 @@ std::string_view operating_model_text() {
 
 namespace {
 
-constexpr std::string_view kFleet[] = {"list_agents", "get_agent_details"};
+constexpr std::string_view kFleet[] = {"list_agents", "get_agent_details", "get_device_live"};
 constexpr std::string_view kTags[] = {"get_tags", "search_agents_by_tag", "set_tag", "delete_tag"};
 // #4029: export_definition joins the family — same domain, same securable.
 // #2146 batch C: the nine authoring twins (definition create/update/delete/import/YAML save and
