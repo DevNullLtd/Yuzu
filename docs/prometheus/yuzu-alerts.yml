@@ -3356,7 +3356,7 @@ groups:
       - alert: YuzuDispatchTargetRejected
         expr: |
           sum by (route, reason) (
-            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os"}[15m])
+            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os|param_key_invalid"}[15m])
           ) > 3
         labels:
           severity: warning
@@ -3401,7 +3401,12 @@ groups:
             reason="kill_switched_os" (#5294) are excluded for the same reason:
             a withheld dispatch to a plugin absent from the target, or to an OS
             whose switch is off, is the control working, audited as
-            command.dispatch_withheld. reason values
+            command.dispatch_withheld. reason="param_key_invalid" (a params key with a control
+            byte, NUL or invalid UTF-8, or a NUL value, refused at the ingress) is excluded
+            for a different reason: it is a refused malformed request, never a request that
+            named no device, and one client looping on it must not page as a targeting
+            near-miss (the audit row `reason=param_key_invalid` and the counter are the
+            evidence). reason values
             "query_truncated"/"poison_excluded"/"parse_error_excluded" (#4496 + follow-up,
             route="result_set_inventory_query") are NOT excluded from the
             expression, unlike quarantined above: a well-formed, correctly-targeted

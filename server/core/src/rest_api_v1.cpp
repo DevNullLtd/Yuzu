@@ -4463,8 +4463,8 @@ void RestApiV1::register_routes(
     // POST /api/v1/bundles — dispatch (async). Returns the correlation id; poll
     // GET /api/v1/bundles/{id} for the collated result.
     sink.Post("/api/v1/bundles",
-              [auth_fn, scoped_perm_fn, audit_fn, bundle_orch,
-               exec_visible_fn](const httplib::Request& req, httplib::Response& res) {
+              [auth_fn, scoped_perm_fn, audit_fn, bundle_orch, exec_visible_fn,
+               metrics_registry](const httplib::Request& req, httplib::Response& res) {
                   // K-R6-01/CDX-R5-02: a bundle targets ONE device, so
                   // authorization is the per-target scoped gate on agent_id
                   // (below, once parsed) -- NOT the targetless global
@@ -4512,10 +4512,16 @@ void RestApiV1::register_routes(
                       res.set_content(detail::a4_error(res, "steps is required"), "application/json");
                       return;
                   }
-                  auto specs = validate_bundle_steps(body["steps"].dump());
+                  auto specs = validate_bundle_steps_typed(body["steps"].dump());
                   if (!specs) {
+                      if (specs.error().kind == BundleStepsError::Kind::kParamKeyInvalid) {
+                          // sg10 / UP-1: counted and audited like every other ingress refusal.
+                          count_param_key_invalid(metrics_registry, "bundle");
+                          (void)audit_fn(req, "bundle.dispatch", "denied", "Execution", "",
+                                         std::string("reason=") + std::string(kReasonParamKeyInvalid));
+                      }
                       res.status = 400;
-                      res.set_content(detail::a4_error(res, "steps: " + specs.error()), "application/json");
+                      res.set_content(detail::a4_error(res, "steps: " + specs.error().message), "application/json");
                       return;
                   }
                   auto session = auth_fn(req, res);
@@ -21645,34 +21651,22 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(dex_apps_usage_json(*r)), "application/json");
             return;
         }
-        const DexUsageRefusal& f = r.error();
-        if (f.reason == "invalid_slice") {
-            bad_request(f.detail == "unknown_group" ? "unknown management group" : "invalid slice");
+        // The one refusal table (dex_usage_json.hpp), shared with the MCP twin. Tokens only,
+        // never caller text.
+        const DexUsageRefusalClass c = dex_usage_refusal_class(r.error());
+        if (c.kind == DexUsageRefusalKind::CallerError) {
+            bad_request(c.message);
             return;
         }
-        // Tokens only, never caller text.
-        const std::string message = "fleet application usage unavailable (" + f.reason +
-                                    (f.detail.empty() || f.detail == f.reason ? "" : ": " + f.detail) +
-                                    ")";
         res.status = 503;
-        if (f.reason == "usage_unavailable" && f.detail == "fleet_too_large") {
-            // Sustained statement timeouts: retrying does not help.
-            res.set_content(
-                detail::error_json_a4(
-                    503, message, cid,
-                    detail::A4ErrorOpts{
-                        .remediation = "the usage read no longer fits its time bound for this fleet; "
-                                       "retrying does not help, only a narrower platform scope "
-                                       "reduces the read, and the state clears on the first "
-                                       "successful read (see 'Fleet usage per application' in the "
-                                       "DEX guide, docs/dex/app-usage.md)"}),
-                "application/json");
-        } else if (f.reason == "no_population" || f.reason == "invalid_request") {
-            res.set_content(detail::error_json_a4(503, message, cid), "application/json");
-        } else {
-            res.set_content(detail::error_json_a4(503, message, cid, 2000, "retry shortly"),
-                            "application/json");
-        }
+        res.set_content(
+            detail::error_json_a4(
+                503, c.message, cid,
+                detail::A4ErrorOpts{.retry_after_ms = c.retry_after_ms >= 0
+                                                          ? std::optional<std::int64_t>(c.retry_after_ms)
+                                                          : std::nullopt,
+                                    .remediation = c.remediation}),
+            "application/json");
     });
 
     // ── GET / PUT / DELETE /api/v1/dex/score-policy (#6086) ──
