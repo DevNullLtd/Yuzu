@@ -134,7 +134,8 @@ constexpr std::string_view kDexSignals[] = {
     "get_dex_catalogue",      // ADR-0031 WS-A4 PR-1
     "get_dex_catalogue_group", "get_dex_device_history",  "get_dex_observation",
     "get_dex_health",         "get_dex_trends",           "get_dex_overview",
-    "get_dex_score_policy",   "set_dex_score_policy",     "reset_dex_score_policy"};
+    "get_dex_score_policy",   "set_dex_score_policy",     "reset_dex_score_policy",
+    "get_dex_apps_usage"};
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",
                                          "get_dex_perf_cohort_diff", "list_dex_perf_devices",
                                          "list_dex_perf_apps",   "get_dex_app_perf",
@@ -398,7 +399,8 @@ constexpr std::array<ToolFamily, 43> kFamilies{{
     {"DEX signals",
      "digital-employee-experience reliability signals and their scope/detail, plus the customer "
      "score policy (get_dex_score_policy; set_dex_score_policy and reset_dex_score_policy are "
-     "supervised-tier writes, reset also approval-gated)",
+     "supervised-tier writes, reset also approval-gated), and fleet application usage "
+     "(get_dex_apps_usage: Forensics:Read as well, audited before the read)",
      kDexSignals},
     {"DEX performance", "fleet, cohort, device, and per-app performance over time", kDexPerf},
     {"Network quality", "fleet and per-device network-quality posture, and hosts found by "
