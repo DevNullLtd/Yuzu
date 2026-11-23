@@ -69,8 +69,11 @@
 #include <atomic>
 #include <chrono>
 #include <optional>
+#include <expected>
 #include <string>
 #include <string_view>
+
+struct pg_conn;
 
 namespace yuzu {
 class MetricsRegistry;
@@ -111,11 +114,16 @@ struct CollationFacts {
     /// `pg_database_collation_actual_version(oid)`; nullopt when NULL.
     std::optional<std::string> actual;
     /// An invalid index (`pg_index.indisvalid = false`) exists in schema
-    /// `device_inventory_store`. Read only when the two versions are equal (the one case it
+    /// selected by the caller. Read only when the two versions are equal (the one case it
     /// changes the answer); false otherwise, so a row of the decision table that never reads it
     /// is unaffected.
     bool invalid_index{false};
 };
+
+/// Read the default-collation and schema index facts on the caller's connection and snapshot.
+/// The optional database name is used by the periodic operator-facing report.
+[[nodiscard]] std::expected<CollationFacts, std::string>
+read_collation_facts(pg_conn* conn, std::string_view schema, std::string* database = nullptr);
 
 /// Pure. No I/O.
 [[nodiscard]] CollationVerdict decide_collation_verdict(const CollationFacts& facts) noexcept;

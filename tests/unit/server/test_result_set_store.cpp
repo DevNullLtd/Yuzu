@@ -21,6 +21,8 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
+#include "test_result_set_store_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -1256,26 +1258,45 @@ TEST_CASE("ResultSetStore: inventory parent intersection spans keyset pages",
     REQUIRE(parent.has_value());
     // Each section uses its disposable database. The view observes the actual production
     // connection, without sleeps, thread scheduling or a test hook in the paging loop.
-    exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_set_members RENAME TO source_members");
     SECTION("read every page using repeatable read") {
+        exec_sql(db.dsn(),
+                 "ALTER TABLE result_set_store.result_set_members RENAME TO source_members");
         exec_sql(db.dsn(), "CREATE VIEW result_set_store.result_set_members AS "
                            "SELECT * FROM result_set_store.source_members "
-                           "WHERE current_setting('transaction_isolation') = 'repeatable read'");
+                           "WHERE current_setting('transaction_isolation') = 'repeatable read' "
+                           "AND current_setting('transaction_read_only') = 'on'");
         auto intersection = store.matching_parent_members(parent->id, std::move(candidates));
         REQUIRE(intersection.has_value());
         CHECK(*intersection == expected);
     }
+    SECTION("a recorded collation mismatch or unreadable version refuses the intersection") {
+        // Only the disposable database clone is changed. A non-superuser cannot seed
+        // this catalog condition; the shared collation decision tests still run.
+        PgConn admin{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+        if (PQserverVersion(admin.get()) < 150000)
+            SKIP("pg_database.datcollversion is available from PostgreSQL 15");
+        PgResult seed{
+            PQexec(admin.get(),
+                   "UPDATE pg_catalog.pg_database SET datcollversion = 'yuzu_test_stale_version' "
+                   "WHERE datname = current_database()")};
+        const char* sqlstate = PQresultErrorField(seed.get(), PG_DIAG_SQLSTATE);
+        if (!seed.ok() && sqlstate && std::string_view(sqlstate) == "42501")
+            SKIP("setting the disposable database collation version needs a privileged fixture "
+                 "role");
+        REQUIRE(seed.ok());
+        const auto intersection = store.matching_parent_members(parent->id, std::move(candidates));
+        REQUIRE_FALSE(intersection.has_value());
+        CHECK(intersection.error() == ResultSetError::OrderingUnavailable);
+    }
     SECTION("a database fault after the first page discards the accumulated matches") {
-        // The uncorrelated scalar subquery requests one sequence value per SELECT. Only the
-        // first page can obtain one; the next statement hits MAXVALUE and fails in PostgreSQL.
-        exec_sql(db.dsn(), "CREATE SEQUENCE result_set_store.page_attempt MINVALUE 1 MAXVALUE 2 "
-                           "START WITH 2 NO CYCLE");
-        exec_sql(db.dsn(), "CREATE VIEW result_set_store.result_set_members AS "
-                           "SELECT * FROM result_set_store.source_members "
-                           "WHERE (SELECT nextval('result_set_store.page_attempt')) > 0");
+        yuzu::test::fail_on_second_result_page(db.dsn());
+        yuzu::test::LogCapture logs{spdlog::level::err};
         auto intersection = store.matching_parent_members(parent->id, std::move(candidates));
         REQUIRE_FALSE(intersection.has_value());
         CHECK(intersection.error() == ResultSetError::DbError);
+        logs.stop();
+        CHECK(logs.text().find("injected result-set continuation failure") != std::string::npos);
     }
 }
 

@@ -29,11 +29,10 @@
 /// per-owner quota check on the three async result-set producers (#4306
 /// finding 1): a silently-empty/zero count there would let an over-quota
 /// dispatch fire for real before the authoritative in-txn recheck ever runs.
-/// `members_checked`/`list_by_owner_checked`/`lineage_checked` back every
-/// REST/MCP consumer that materialises or reports membership (#4306 finding 3
-/// / #4307 finding 2): a silently-truncated page there is indistinguishable
-/// from a genuine last page or an empty fleet. Every caller of these eight
-/// methods MUST apply the reviewer test: "if this value were silently
+/// `matching_parent_members`, `members_checked`, `list_by_owner_checked` and `lineage_checked` back
+/// every REST/MCP consumer that materialises or reports membership (#4306 finding 3 / #4307 finding
+/// 2): a silently-truncated page there is indistinguishable from a genuine last page or an empty
+/// fleet. Every caller of these methods MUST apply the reviewer test: "if this value were silently
 /// empty/false, could any downstream branch grant/target/enforce/skip/
 /// invert(NOT)/report success? If yes, fail closed (abort/503) on `DbError`
 /// — never treat it as empty-container."
@@ -219,6 +218,7 @@ enum class ResultSetError {
     Pinned,
     TooManyMembers,
     DbError,
+    OrderingUnavailable,
     /// The set exists and is owned, but is still `pending`: it has no membership yet, and may
     /// fill. Returned by `member_set_owned` only.
     NotReady,

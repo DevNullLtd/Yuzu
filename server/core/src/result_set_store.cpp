@@ -4,6 +4,7 @@
 
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "pg/pg_array.hpp"
+#include "pg/pg_collation_check.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -80,6 +81,8 @@ const char* to_string(ResultSetError e) {
         return "RESULT_SET_PINNED";
     case ResultSetError::TooManyMembers:
         return "RESULT_SET_TOO_MANY_MEMBERS";
+    case ResultSetError::OrderingUnavailable:
+        return "RESULT_SET_ORDERING_UNAVAILABLE";
     case ResultSetError::DbError:
         return "RESULT_SET_DB_ERROR";
     case ResultSetError::NotReady:
@@ -546,8 +549,7 @@ static std::expected<ResultSetStore::MembersPage, ResultSetError> read_members_p
     const auto built = build_members_page_sql(id, cursor, limit, visible);
     pg::PgResult res = pg::exec_params(conn, built.sql.c_str(), built.params);
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::members_checked: query failed: {}",
-                      PQerrorMessage(conn));
+        spdlog::error("ResultSetStore: member page query failed: {}", PQerrorMessage(conn));
         return std::unexpected(ResultSetError::DbError);
     }
     ResultSetStore::MembersPage page;
@@ -589,13 +591,29 @@ ResultSetStore::matching_parent_members(const std::string& id,
     std::vector<std::string> matches;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
-        spdlog::error("ResultSetStore::matching_parent_members: no connection");
+        spdlog::error("ResultSetStore::matching_parent_members: no connection ({})",
+                      pool_.last_error());
         return std::unexpected(ResultSetError::DbError);
     }
+    auto failure = ResultSetError::DbError;
     const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* conn) {
         pg::PgResult iso{PQexec(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")};
         if (iso.status() != PGRES_COMMAND_OK) {
-            spdlog::error("ResultSetStore::matching_parent_members: could not establish read snapshot");
+            spdlog::error(
+                "ResultSetStore::matching_parent_members: could not establish read snapshot: {}",
+                PQerrorMessage(conn));
+            return false;
+        }
+        // Check the same database and B-tree schema that will produce these durable members.
+        // A separate lease could check another host after failover.
+        const auto facts = pg::read_collation_facts(conn, "result_set_store");
+        const auto ordering =
+            facts ? pg::decide_collation_verdict(*facts) : pg::CollationVerdict::Unreadable;
+        if (ordering == pg::CollationVerdict::Mismatch ||
+            ordering == pg::CollationVerdict::Unreadable) {
+            spdlog::warn("ResultSetStore: parent intersection refused: collation {}",
+                         pg::to_string(ordering));
+            failure = ResultSetError::OrderingUnavailable;
             return false;
         }
         std::string cursor;
@@ -611,7 +629,7 @@ ResultSetStore::matching_parent_members(const std::string& id,
         return true;
     });
     if (!ok)
-        return std::unexpected(ResultSetError::DbError);
+        return std::unexpected(failure);
     return matches;
 }
 

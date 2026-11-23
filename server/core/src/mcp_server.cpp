@@ -1,3 +1,4 @@
+#include "device_ci_read_gate.hpp"
 #include "mcp_server.hpp"
 
 #include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
@@ -18543,6 +18544,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto matched = result_set_store_->matching_parent_members(
                         *cr.parent_id, std::move(candidates));
                     if (!matched) {
+                        if (matched.error() == ResultSetError::OrderingUnavailable) {
+                            const bool audited =
+                                audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                         "reason=ordering_unavailable source_kind=inventory_query");
+                            res.set_content(
+                                a4_error(kInternalError, to_string(matched.error()),
+                                         "check database collation health and retry after repair",
+                                         device_ci_read_gate::kOrderingRetryAfterMs, {}, audited),
+                                "application/json");
+                            return;
+                        }
                         const bool audit_ok = audit_fn(
                             req, "result_set.create", "failure", "ResultSet", "",
                             "reason=store_degraded source_kind=inventory_query");

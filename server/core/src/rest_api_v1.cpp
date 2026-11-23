@@ -1,3 +1,4 @@
+#include "device_ci_read_gate.hpp"
 #include "rest_api_v1.hpp"
 #include "model_param_helpers.hpp"
 
@@ -16475,6 +16476,13 @@ void RestApiV1::register_routes(
                           auto matched = result_set_store->matching_parent_members(
                               *cr.parent_id, std::move(candidates));
                           if (!matched) {
+                              if (matched.error() == ResultSetError::OrderingUnavailable) {
+                                  audit_failure("ordering_unavailable");
+                                  rs_err(res, 503, to_string(matched.error()),
+                                         {.retry_after_ms =
+                                              device_ci_read_gate::kOrderingRetryAfterMs});
+                                  return;
+                              }
                               audit_failure("store_degraded");
                               rs_err(res, 503,
                                      "RESULT_SET_STORE_UNAVAILABLE: could not read the "

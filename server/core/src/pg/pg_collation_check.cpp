@@ -14,6 +14,7 @@
 #include <chrono>
 #include <exception>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server::pg {
@@ -85,6 +86,55 @@ std::optional<std::string> nullable(PGresult* r, int row, int col) {
 
 } // namespace
 
+std::expected<CollationFacts, std::string> read_collation_facts(PGconn* c, std::string_view schema,
+                                                                std::string* database) {
+    CollationFacts facts;
+    // pg_database.datcollversion exists from PostgreSQL 15. Naming a missing column is a
+    // parse error, so look the column up first and only then select it.
+    PgResult col = exec_params(c,
+                               "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+                               "WHERE attrelid = 'pg_catalog.pg_database'::regclass "
+                               "AND attname = 'datcollversion' AND NOT attisdropped)",
+                               std::vector<std::string>{});
+    if (col.status() != PGRES_TUPLES_OK || PQntuples(col.get()) != 1) {
+        return std::unexpected(std::string(PQerrorMessage(c)));
+    }
+    facts.column_exists = std::string(PQgetvalue(col.get(), 0, 0)) == "t";
+    if (!facts.column_exists) {
+        return facts;
+    }
+    PgResult row = exec_params(c,
+                               "SELECT current_database(), d.datcollversion, "
+                               "pg_catalog.pg_database_collation_actual_version(d.oid) "
+                               "FROM pg_catalog.pg_database d WHERE d.datname = current_database()",
+                               std::vector<std::string>{});
+    if (row.status() != PGRES_TUPLES_OK || PQntuples(row.get()) != 1) {
+        return std::unexpected(row.status() != PGRES_TUPLES_OK
+                                   ? std::string(PQerrorMessage(c))
+                                   : std::string("no pg_database row for the current database"));
+    }
+    if (database)
+        *database = PQgetvalue(row.get(), 0, 0);
+    facts.recorded = nullable(row.get(), 0, 1);
+    facts.actual = nullable(row.get(), 0, 2);
+    // The invalid-index fact matters only when the versions are equal (see
+    // `decide_collation_verdict`), so it is read only then: every other verdict is
+    // reached without this query, and cannot be made Unreadable by it.
+    if (facts.recorded && facts.actual && *facts.recorded == *facts.actual) {
+        PgResult inv = exec_params(c,
+                                   "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_index i "
+                                   "JOIN pg_catalog.pg_class c ON c.oid = i.indrelid "
+                                   "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                                   "WHERE NOT i.indisvalid AND n.nspname = $1)",
+                                   std::vector<std::string>{std::string(schema)});
+        if (inv.status() != PGRES_TUPLES_OK || PQntuples(inv.get()) != 1) {
+            return std::unexpected(std::string(PQerrorMessage(c)));
+        }
+        facts.invalid_index = std::string(PQgetvalue(inv.get(), 0, 0)) == "t";
+    }
+    return facts;
+}
+
 CollationReport check_collation_version(PgPool& pool) noexcept {
     CollationReport out;
     try {
@@ -99,54 +149,12 @@ CollationReport check_collation_version(PgPool& pool) noexcept {
                 failure = PQerrorMessage(c);
                 return false;
             }
-            // pg_database.datcollversion exists from PostgreSQL 15. Naming a missing column is a
-            // parse error, so look the column up first and only then select it.
-            PgResult col = exec_params(c,
-                                       "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
-                                       "WHERE attrelid = 'pg_catalog.pg_database'::regclass "
-                                       "AND attname = 'datcollversion' AND NOT attisdropped)",
-                                       std::vector<std::string>{});
-            if (col.status() != PGRES_TUPLES_OK || PQntuples(col.get()) != 1) {
-                failure = PQerrorMessage(c);
+            auto result = read_collation_facts(c, kDeviceInventoryStoreSchema, &out.database);
+            if (!result) {
+                failure = std::move(result.error());
                 return false;
             }
-            facts.column_exists = std::string(PQgetvalue(col.get(), 0, 0)) == "t";
-            if (!facts.column_exists) {
-                facts_read = true;
-                return true;
-            }
-            PgResult row =
-                exec_params(c,
-                            "SELECT current_database(), d.datcollversion, "
-                            "pg_catalog.pg_database_collation_actual_version(d.oid) "
-                            "FROM pg_catalog.pg_database d WHERE d.datname = current_database()",
-                            std::vector<std::string>{});
-            if (row.status() != PGRES_TUPLES_OK || PQntuples(row.get()) != 1) {
-                failure = row.status() != PGRES_TUPLES_OK
-                              ? std::string(PQerrorMessage(c))
-                              : std::string("no pg_database row for the current database");
-                return false;
-            }
-            out.database = PQgetvalue(row.get(), 0, 0);
-            facts.recorded = nullable(row.get(), 0, 1);
-            facts.actual = nullable(row.get(), 0, 2);
-            // The invalid-index fact matters only when the versions are equal (see
-            // `decide_collation_verdict`), so it is read only then: every other verdict is
-            // reached without this query, and cannot be made Unreadable by it.
-            if (facts.recorded && facts.actual && *facts.recorded == *facts.actual) {
-                PgResult inv = exec_params(
-                    c,
-                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_index i "
-                    "JOIN pg_catalog.pg_class c ON c.oid = i.indrelid "
-                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-                    "WHERE NOT i.indisvalid AND n.nspname = $1)",
-                    std::vector<std::string>{kDeviceInventoryStoreSchema});
-                if (inv.status() != PGRES_TUPLES_OK || PQntuples(inv.get()) != 1) {
-                    failure = PQerrorMessage(c);
-                    return false;
-                }
-                facts.invalid_index = std::string(PQgetvalue(inv.get(), 0, 0)) == "t";
-            }
+            facts = std::move(*result);
             facts_read = true;
             return true;
         });

@@ -14,6 +14,7 @@
 
 #include "result_set_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -22,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace yuzu::test {
 
@@ -39,6 +41,46 @@ inline void setup_result_set_store_pg_template(const std::string& dsn) {
 /// test_result_set_store.cpp / test_rest_result_sets_async.cpp.
 inline PgTestTemplate result_set_store_pg_template{"resultset",
                                                     &detail::setup_result_set_store_pg_template};
+
+/// Fault after a complete page, on the production connection inside its read-only transaction.
+/// The scalar subquery runs once per SELECT; rollback discards its local setting.
+inline void fail_on_second_result_page(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult result{PQexec(conn.get(), R"sql(
+        ALTER TABLE result_set_store.result_set_members RENAME TO source_members;
+        CREATE FUNCTION result_set_store.fail_on_continuation() RETURNS boolean
+        LANGUAGE plpgsql VOLATILE AS $$
+        BEGIN
+            IF current_setting('yuzu_test.page_read', true) = 'yes' THEN
+                RAISE EXCEPTION 'injected result-set continuation failure';
+            END IF;
+            PERFORM set_config('yuzu_test.page_read', 'yes', true);
+            RETURN true;
+        END $$;
+        CREATE VIEW result_set_store.result_set_members AS
+        SELECT * FROM result_set_store.source_members
+        WHERE (SELECT result_set_store.fail_on_continuation())
+    )sql")};
+    INFO(PQresultErrorMessage(result.get()));
+    REQUIRE(result.ok());
+}
+
+/// Seed enough distinct inventory candidates for a second internal page.
+inline std::vector<std::string> seed_paged_inventory(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult result{PQexec(conn.get(), R"sql(
+        INSERT INTO inventory_store.inventory_data (agent_id, plugin, data_json, collected_at)
+        SELECT 'device-' || i, 'custom', '{"field1":"match"}', 1
+        FROM generate_series(1,1001) AS i RETURNING agent_id
+    )sql")};
+    REQUIRE(result.status() == PGRES_TUPLES_OK);
+    std::vector<std::string> ids;
+    for (int i = 0; i < PQntuples(result.get()); ++i)
+        ids.emplace_back(PQgetvalue(result.get(), i, 0));
+    return ids;
+}
 
 /// RAII bundle: ephemeral database + PgPool + ResultSetStore, in
 /// destruction-safe member order (declared last, so it destructs first) —

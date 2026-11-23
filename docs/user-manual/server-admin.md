@@ -4983,6 +4983,15 @@ Held-open SSE streams also lease this pool: each re-validates its credential eve
 
 ### PostgreSQL collation version
 
+Inventory-query result sets with a parent check the active database's collation inside
+the repeatable-read transaction used for the intersection. A mismatch or unreadable
+check refuses creation with `RESULT_SET_ORDERING_UNAVAILABLE`. The general device-CI
+check below also describes databases without a recorded version. Other result-set reads
+and writes still rely on correctly maintained text indexes. After an upgrade that changed
+the collation, repair the indexes before using result sets created during the affected
+period. Compare or recreate those sets before using them as scopes, including exclusions.
+
+
 Text-keyed indexes are ordered by the database's collation, which comes from the operating system's C library (or ICU) at the time the database was created. If an operating-system or libc upgrade changes the collation rules, an existing index can disagree with the new rules, and an ordered read of a text key (a keyset page walk, for example) can then skip or repeat rows without any error. PostgreSQL records the collation version a database was created with and can compute the version the operating system reports now. A mismatch usually follows an operating-system or libc upgrade that changes collation rules, a base-image change under an existing data volume, or, on managed PostgreSQL, a provider maintenance event you did not trigger. The server compares the two and reports a difference. **The check does not stop the server and does not change anything in the database.** Its output is the log line, the gauges, the counter and the alerts below, plus one operational effect on the device-CI table: while the latest conclusive check found a mismatch the server pauses writes to that table, and until the latest conclusive check found a match it refuses the bulk CI read and degrades the per-device CI reads (see "What a mismatch pauses and refuses" below). PostgreSQL itself also writes `WARNING: database "<name>" has a collation version mismatch` to the server's standard error on each new connection while a mismatch stands (libpq's default notice handling, which the pool does not change); that line comes from PostgreSQL, not from a second Yuzu check.
 
 **What the server does about it.** At start, once the connection pool is open and before any store serves, and then again at intervals, the server compares the database's recorded collation version (`pg_database.datcollversion`) with the version the operating system of the PostgreSQL server reports now (`pg_database_collation_actual_version`, which the database server itself computes). Each check reads the catalog only and changes nothing in the database. The start-time check runs in the server's constructor, so the listeners bind after it has returned; the repeat runs on its own thread and delays no other work.
