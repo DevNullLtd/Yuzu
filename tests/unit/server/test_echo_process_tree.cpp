@@ -977,7 +977,7 @@ TEST_CASE("echo_agent_error_note: any other failure keeps its reason and only it
     CHECK(echo_agent_error_note("error|database is locked") == "The device reported an error: database is locked");
     CHECK(echo_agent_error_note("database is locked") == "The device reported an error: database is locked");
     // Only the first record of a multi-record reply; the next record never leaks in.
-    const auto note = echo_agent_error_note("error|Echo storage is offline.\nstorage_state|offline");
+    const auto note = echo_agent_error_note("error|Echo storage is offline.\nstorage_state|offline|rollback_wedged");
     CHECK(note == "The device reported an error: Echo storage is offline.");
     CHECK(note.find("storage_state") == std::string::npos);
     // A reply with no reason still says it failed.

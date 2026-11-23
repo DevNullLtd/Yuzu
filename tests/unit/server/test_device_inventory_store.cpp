@@ -3851,8 +3851,21 @@ TEST_CASE("opening the store warns when the C-collated index is missing, invalid
         CHECK(warn.find("is defined differently") != std::string::npos);
     }
     SECTION("an invalid index (an interrupted build)") {
-        exec_stmt(pool, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
-                        "'device_inventory_store.device_ci_agent_id_c_idx'::regclass");
+        // Writing pg_index needs a superuser. Skip on any other role, as the pg_index and
+        // pg_database writes in test_pg_collation_check.cpp do: a least-privilege test role
+        // (scripts/setup-rhel9.sh grants CREATEDB and pg_signal_backend only) is a supported setup.
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                "UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
+                "'device_inventory_store.device_ci_agent_id_c_idx'::regclass",
+                std::vector<std::string>{});
+            if (res.status() != PGRES_COMMAND_OK)
+                SKIP("the test role cannot update pg_index (not a superuser): "
+                     << PQresultErrorMessage(res.get()));
+        }
         open_and_capture(warn);
         CHECK(warn.find("is invalid") != std::string::npos);
     }

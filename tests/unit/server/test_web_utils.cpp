@@ -1272,7 +1272,7 @@ TEST_CASE("agent_error_display bounds the FIRST record, not a byte window",
         "error|Echo storage is offline on this endpoint; the database was closed after a "
         "transaction could not be rolled back. Collection and retention are both stopped. The "
         "read-only query connection is unavailable too, so `echo sql` cannot read the historical "
-        "data either. Restart the agent to recover.\nstorage_state|offline";
+        "data either. Restart the agent to recover.\nstorage_state|offline|rollback_wedged";
 
     const auto shown = yuzu::server::agent_error_display(offline);
     CHECK(shown.starts_with("Echo storage is offline")); // prefix stripped

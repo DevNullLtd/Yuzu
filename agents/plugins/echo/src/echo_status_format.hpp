@@ -31,6 +31,11 @@
 
 namespace yuzu::echo {
 
+/// The reason token of a store closed at run time by a failed rollback (OfflineReason::
+/// rollback_wedged). Named here because the status reply below, which comes before the enum,
+/// publishes it as its second line so the reply and the heartbeat tag agree.
+inline constexpr std::string_view kRollbackWedgedToken = "rollback_wedged";
+
 /// The complete `echo status` reply for a store that has failed closed, in the
 /// order it must be written.
 ///
@@ -53,7 +58,7 @@ format_storage_offline_lines(bool query_engine_available) {
                     "are both stopped. "}
             .append(read_path)
             .append(" Restart the agent to recover."),
-        "storage_state|offline",
+        std::format("storage_state|offline|{}", kRollbackWedgedToken),
     };
 }
 
@@ -79,7 +84,11 @@ inline constexpr std::string_view kV10DeadlineMarker = "did not finish inside it
 /// Why Echo loaded offline at open (the plugin is present, nothing collects, the open is retried).
 /// `none` = the failure is not one of the retried kinds and `init` fails as it always did.
 /// The tokens are mirrored by server/core/src/echo_storage_offline_tag.hpp.
-enum class OfflineReason { none, free_space, migration_failed, open_failed };
+/// `rollback_wedged` is the one reason that is not an open failure: the database opened and ran,
+/// then was closed at run time after a ROLLBACK failed with the transaction still open
+/// (EchoDatabase closes the write connection; only an agent restart recovers). It never comes out
+/// of classify_open_failure and is never retried.
+enum class OfflineReason { none, free_space, migration_failed, open_failed, rollback_wedged };
 
 [[nodiscard]] constexpr std::string_view offline_reason_token(OfflineReason reason) noexcept {
     switch (reason) {
@@ -89,6 +98,8 @@ enum class OfflineReason { none, free_space, migration_failed, open_failed };
         return "migration_failed";
     case OfflineReason::open_failed:
         return "open_failed";
+    case OfflineReason::rollback_wedged:
+        return kRollbackWedgedToken;
     case OfflineReason::none:
         break;
     }
@@ -98,7 +109,7 @@ enum class OfflineReason { none, free_space, migration_failed, open_failed };
 /// The plugin KV key the agent's heartbeat bridge publishes as the status tag
 /// `yuzu.plugin.echo.storage_offline` (agents/core plugin_heartbeat_tags.hpp); its value is the
 /// reason token. The server's fleet gauge (server/core/src/echo_storage_offline_tag.hpp) mirrors
-/// the tag and the three tokens as literals; a test on each side pins them.
+/// the tag and the four tokens as literals; a test on each side pins them.
 inline constexpr std::string_view kStorageOfflineKey = "heartbeat.storage_offline";
 
 /// Tell the retried open failures from every other one by the wrapper text open() puts at the
@@ -168,6 +179,55 @@ format_storage_refused_lines(OfflineReason reason, std::string_view detail,
         std::move(line0),
         std::format("storage_state|offline|{}", offline_reason_token(reason)),
     };
+}
+
+/// What the slow-tick reconcile does with the storage-offline tag while the plugin is online
+/// (the open succeeded; go_offline never runs here). `store_open` is EchoDatabase::is_open(),
+/// `key_present` whether the tag is set, `current` its value. A store closed at run time by a
+/// failed rollback publishes `rollback_wedged` (once: a key already at that token is left, so a
+/// stuck tick does not rewrite it); an open store clears any tag, which is a stale one from a
+/// previous run or a failed delete replayed.
+enum class OfflineTagAction { leave, publish_wedged, clear };
+
+[[nodiscard]] constexpr OfflineTagAction online_offline_tag_action(bool store_open, bool key_present,
+                                                                   std::string_view current) noexcept {
+    if (!store_open)
+        return key_present && current == kRollbackWedgedToken ? OfflineTagAction::leave
+                                                              : OfflineTagAction::publish_wedged;
+    return key_present ? OfflineTagAction::clear : OfflineTagAction::leave;
+}
+
+/// Whether `action` is refused while the write connection is closed (EchoDatabase::is_open() is
+/// false: a failed rollback closed it at run time, #8099). Dispatch gates only on `online_`, which
+/// that close never clears, so every action still runs. Traced against the code, these five answer
+/// WRONG on a closed store and are refused:
+///   collect_fast, collect_slow  every source's enable flag reads as unreadable, each leg is skipped
+///                               and the tick answers `echo|collect_*|0|events_recorded`, rc 0: the
+///                               reply of an idle healthy host
+///   fleet_snapshot              process and tcp read as disabled, so the snapshot carries
+///                               `process_source_paused` and `tcp_source_paused`, a pause no operator made
+///   rollup                      retention and the byte budget are skipped (logged) and it answers
+///                               `echo|rollup|0|rows_aggregated`, rc 0
+///   configure                   writes fail and say so, except a `usage_enabled=true` re-assert: the
+///                               closed store returns the default, no change is seen, and it answers
+///                               `status|ok` with nothing written
+/// The rest answer honestly and are left as they are: status (the offline lines), sql (the read-only
+/// connection, which the status reply promises), compatibility (static), query and export
+/// (`error|database not open`), purge_source (`error|config_unreadable`), snapshot (partial, every
+/// source named), collect_perf and collect_software (`state_unreadable`). A new action that reads
+/// or writes through the write connection must be classified here.
+[[nodiscard]] constexpr bool refused_on_closed_store(std::string_view action) noexcept {
+    return action == "collect_fast" || action == "collect_slow" || action == "configure" ||
+           action == "fleet_snapshot" || action == "rollup";
+}
+
+/// The one line a refused action answers with: line 0 of the offline status reply, so the two read
+/// the same. `nullopt` = the action runs (the store is open, or the action answers honestly).
+[[nodiscard]] inline std::optional<std::string>
+format_closed_store_refusal(std::string_view action, bool store_open, bool query_engine_available) {
+    if (store_open || !refused_on_closed_store(action))
+        return std::nullopt;
+    return format_storage_offline_lines(query_engine_available).front();
 }
 
 /// `db_health|<ok|quarantined>|<epoch>` (#1567). `quarantined` iff THIS open

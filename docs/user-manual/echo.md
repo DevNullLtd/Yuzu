@@ -407,7 +407,7 @@ constrained via the `NET_RT_FLAGS` sysctl route dump — `entry_type` always
 `unknown` there), so `arp_enabled|true` reports real rows there — run the
 `compatibility` action to distinguish a supported-but-empty source from a
 planned-but-unimplemented one.
-`<source>_rows` counts the rows of the source's finest tier (its hourly tier; `usage_daily` for `usage`), and `<source>_oldest_ts` is the start of that tier's oldest bucket, not an event's own time. For `usage`, `usage_rows` is the `usage_daily` row count and `usage_oldest_ts` the oldest day, not the number of open runs in `usage_live`. `netqual_boot_rows` counts the per-boot baseline table. When the storage is offline the reply leads with `error|` and then `storage_state|offline`. When Echo loaded offline at open, that line carries the reason as a third field: `storage_state|offline|free_space` (the migration was refused for lack of free space), `storage_state|offline|migration_failed` (the v10 roll-up step, or an earlier step, failed or ran out of time) or `storage_state|offline|open_failed` (any other failure met on a later retry). The `error|` line says the open is retried automatically, 1, 5 and 15 minutes after the first failure and then hourly, so no restart is needed once the cause is cleared (the exception is a collection start that fails after a late open: nothing more is retried and the line asks for an agent restart); see [Upgrading an existing database](#upgrading-an-existing-database).
+`<source>_rows` counts the rows of the source's finest tier (its hourly tier; `usage_daily` for `usage`), and `<source>_oldest_ts` is the start of that tier's oldest bucket, not an event's own time. For `usage`, `usage_rows` is the `usage_daily` row count and `usage_oldest_ts` the oldest day, not the number of open runs in `usage_live`. `netqual_boot_rows` counts the per-boot baseline table. When the storage is offline the reply leads with `error|` and then `storage_state|offline`. The line always carries the reason as a third field: `storage_state|offline|free_space` (the migration was refused for lack of free space), `storage_state|offline|migration_failed` (the v10 roll-up step, or an earlier step, failed or ran out of time), `storage_state|offline|open_failed` (any other failure met on a later retry) or `storage_state|offline|rollback_wedged` (the database opened, then was closed at run time after a rollback failed). The first three are an open that failed: the `error|` line says the open is retried automatically, 1, 5 and 15 minutes after the first failure and then hourly, so no restart is needed once the cause is cleared (the exception is a collection start that fails after a late open: nothing more is retried and the line asks for an agent restart). `rollback_wedged` is never retried: the line asks for an agent restart; see [Upgrading an existing database](#upgrading-an-existing-database).
 `software_last_run_ts` is the wall-clock of the last `collect_software` tick (`0`
 if it has not run yet); it is the heartbeat that distinguishes "healthy but no
 software changed" (where `software_rows` stays low) from "the hourly trigger
@@ -496,7 +496,9 @@ which distinguishes "failed to load" from "not installed". An Echo that loads
 is not counted there: it retries by itself, and it is visible as the
 `yuzu.plugin.echo.storage_offline` heartbeat tag, the
 `yuzu_fleet_echo_storage_offline{reason}` gauge and the `YuzuEchoStorageOffline`
-alert. The plugin keeps its
+alert. A database closed at run time after a rollback failed is reported the same
+way with reason `rollback_wedged`; it is not retried, and only an agent restart
+recovers it. The plugin keeps its
 count in a private storage record; if that record is present but unreadable the
 plugin logs `ECHO: db_health.ledger unreadable; not overwriting` and stops updating
 the two heartbeat keys rather than resetting the count — `status` still reports
@@ -581,7 +583,7 @@ The first frame surfaces every device × source pair where the collector has bee
 
 **State persistence:** Scan results are held in the server's memory keyed by your username. Restarting the server clears the last-scan reference; click **Scan fleet** again after a restart. Persistence across restarts and multi-server coordination are planned for Phase 15.G operational hardening.
 
-**Audit trail:** Every Scan emits an `echo.status.scan` audit event. Every Re-enable emits `echo.source.reenable` (with `result=success` and `detail` carrying `device_id` and `source` on success, or `result=failure` with `detail` carrying the real reason — `scope_violation`, `agent_not_connected`, `permission_revoked` (the grant lapsed after the `attempted` row: `Execution:Execute` for a re-enable, `Infrastructure:Delete` for a purge) or `dispatch_denied reason=<token>` (the dispatch chokepoint refused the command for the operator, answered `403`, or `500` for a server catalogue fault; #7114) — on rejected attempts). Every **Purge data** emits `echo.source.purge` (same detail shape; `result=denied` if the `Infrastructure:Delete` permission is missing). Because purge dispatch is fire-and-forget, the number of rows deleted is recorded in the command's **response record**, not the dispatch audit row. See `docs/user-manual/audit-log.md` for the full schema.
+**Audit trail:** Every Scan emits an `echo.status.scan` audit event. Every Re-enable emits `echo.source.reenable` (with `result=success` and `detail` carrying `device_id` and `source` on success, or `result=failure` with `detail` carrying the real reason — `scope_violation`, `agent_not_connected`, `permission_revoked` (the grant lapsed, or the session ended, after the `attempted` row: `Execution:Execute` for a re-enable, `Infrastructure:Delete` for a purge), `store_unavailable store=<mgmt_group_store|rbac_store>` (an authorization read failed after the `attempted` row, answered `503`) or `dispatch_denied reason=<token>` (the dispatch chokepoint refused the command for the operator, answered `403`, or `500` for a server catalogue fault; #7114) — on rejected attempts). A refusal before the `attempted` row is `result=denied` when authorization could not be evaluated, the session ended or the request repeats a recent one: `store_unavailable store=<mgmt_group_store|rbac_store>` (an authorization read failed, answered `503` instead of the `404`), `scoped_gate_unavailable` (`503`; after the `attempted` row the same token is `result=failure`), `session_revoked` (`404`) and `rate_limited cooldown=<N>s` (the same device and source was dispatched less than 30 seconds ago, answered `429`; always `denied`). Every row from the `attempted` row on ends in the same `cid=<id>`, so an outcome pairs with its attempt. Every **Purge data** emits `echo.source.purge` (same detail shape; a caller without `Infrastructure:Delete` on the device is `result=failure` with `scope_violation`, answered `404`). Because purge dispatch is fire-and-forget, the number of rows deleted is recorded in the command's **response record**, not the dispatch audit row. See `docs/user-manual/audit-log.md` for the full schema.
 
 ### Process tree viewer
 
@@ -751,7 +753,7 @@ If that rollback ITSELF fails and the database is left inside the transaction,
 the agent **closes the Echo database**. Every later write on a connection stuck in
 an uncommittable transaction would be reported durable and then lost at restart,
 so it fails all of them closed instead. `echo status` then returns non-zero and
-emits an `error|` line followed by `storage_state|offline`, and nothing else --
+emits an `error|` line followed by `storage_state|offline|rollback_wedged`, and nothing else --
 every `config|` line is withheld. Collection and retention are both stopped on
 that endpoint until the agent restarts. **Historical data normally stays
 readable**: the close affects only the read-write connection, so `echo sql` can
@@ -759,8 +761,13 @@ still query what was already collected. The error line says which of those two
 cases you are in -- the read-only connection is itself optional at open time, and
 on the rare endpoint where it never opened, `echo sql` cannot read the history
 either, so the line says that instead of promising a read path that is not there.
-This needs a disk-level fault to reach, but read `storage_state` before trusting
-any other line in that output.
+While the database is closed, `collect_fast`, `collect_slow`, `rollup`, `configure` and
+`fleet_snapshot` fail with that same `error|` line, because each would otherwise answer as
+if nothing were wrong (an empty success, a snapshot that shows the process and tcp sources
+paused by an operator, or a `configure` that reports `status|ok` with nothing written).
+`query` and `export` fail with `error|database not open`; `echo sql` is the one action that
+keeps answering. This needs a disk-level fault to reach, but read `storage_state` before
+trusting any other line in that output.
 
 In the dashboard, the capture-sources frame surfaces that error line verbatim
 rather than a generic failure, so the reason and the recovery advice reach the

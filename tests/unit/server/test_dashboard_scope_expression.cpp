@@ -687,13 +687,13 @@ TEST_CASE("dashboard execute audit (#3619): a plain send that reaches no agent r
     h.post("instruction=version");
     REQUIRE(h.persisted.size() == 1);
     CHECK(h.persisted[0].result == "attempted");
-    CHECK(h.persisted[0].detail == "os_info:os_version scope=__all__");
+    CHECK(h.persisted[0].detail.rfind("os_info:os_version scope=__all__ correlation_id=req-", 0) == 0);
     CHECK(h.order == std::vector<std::string>{"audit:attempted", "dispatch"});
     int failures = 0;
     for (const auto& a : h.audits)
         if (a.action == "command.dispatch" && a.result == "failure") {
             ++failures;
-            CHECK(a.detail == "reason=no_agents_reached");
+            CHECK(a.detail.rfind("reason=no_agents_reached correlation_id=req-", 0) == 0);
         }
     CHECK(failures == 1);
 }
