@@ -56,7 +56,7 @@ std::string sec(std::string_view facet, std::string_view status, std::string_vie
     return rec({"S", facet, status, base, token, dur, bytes, expect});
 }
 
-// `+` record with the 16 row slots (slot 14 is the reserved uninstall_string).
+// `+` record with the 16 row slots (slot 14 is the attribute field: empty or canonical).
 std::string plus(std::string_view name, std::string_view source,
                  std::string_view install_location = "", std::string_view slot14 = "",
                  std::string_view version = "1.0") {
@@ -65,6 +65,7 @@ std::string plus(std::string_view name, std::string_view source,
 }
 
 constexpr std::string_view kApps = "installed_apps.list_inventory";
+constexpr std::string_view kUpgradeCode = "upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}";
 
 const V3Section* find(const V3Report& r, std::string_view facet) {
     for (const auto& s : r.sections) {
@@ -106,7 +107,7 @@ TEST_CASE("v3 parses every record kind", "[server][inventory_blob_v3]") {
     const std::string h1(64, 'a');
     std::string blob = header();
     blob += sec(kApps, "full", "", "tok", "1234", "5678");
-    blob += plus("Alpha", kApps, "C:\\Program Files\\Alpha\\", "uninstall.exe /x");
+    blob += plus("Alpha", kApps, "C:\\Program Files\\Alpha\\", kUpgradeCode);
     blob += plus("Beta", kApps);
     blob += sec("pkg_inventory.packages", "delta", "basehash");
     blob += rec({"-", h1});
@@ -128,12 +129,14 @@ TEST_CASE("v3 parses every record kind", "[server][inventory_blob_v3]") {
     CHECK(apps->duration_ms == 1234);
     CHECK(apps->bytes_read == 5678);
     REQUIRE(apps->rows.size() == 2);
-    // Slot 13 is stored; slot 14 (the uninstall string) is consumed and dropped.
+    // Slot 13 and slot 14 (the canonical attribute field) are stored.
     CHECK(apps->rows[0].name == "Alpha");
     CHECK(apps->rows[0].install_location == "C:\\Program Files\\Alpha\\");
+    CHECK(apps->rows[0].attributes == kUpgradeCode);
     CHECK(apps->rows[0].package_id == "pkg-id");
     CHECK(apps->rows[0].source == kApps);
     CHECK(apps->rows[1].install_location.empty());
+    CHECK(apps->rows[1].attributes.empty());
 
     const auto* pk = find(r, "pkg_inventory.packages");
     REQUIRE(pk != nullptr);
@@ -244,6 +247,22 @@ TEST_CASE("v3 grammar refusals isolate to the section", "[server][inventory_blob
         {"a comp record outside component_inventory",
          sec(kApps, "full") + rec({"comp", "jar", "x", "1", "pom", "/p", "1", "1", ""}),
          V3Refusal::kWrongRecordForFacet},
+        {"a slot 14 that is not canonical (a former uninstall string)",
+         sec(kApps, "full") + plus("A", kApps, "", "uninstall.exe /x"), V3Refusal::kBadAttributes},
+        {"a slot 14 with a lower-case upgrade code",
+         sec(kApps, "full") +
+             plus("A", kApps, "", "upgrade_code={12345678-90ab-cdef-1234-567890abcdef}"),
+         V3Refusal::kBadAttributes},
+        {"a slot 14 with an unknown key",
+         sec(kApps, "full") + plus("A", kApps, "", "unknown=1"), V3Refusal::kBadAttributes},
+        {"a slot 14 with a trailing separator",
+         sec(kApps, "full") + plus("A", kApps, "", std::string(kUpgradeCode) + ";"),
+         V3Refusal::kBadAttributes},
+        {"a slot 14 over the field cap",
+         sec(kApps, "full") + plus("A", kApps, "", std::string(1100, 'a')),
+         V3Refusal::kBadAttributes},
+        {"a bad slot 14 in a delta section",
+         sec(kApps, "delta", "b") + plus("A", kApps, "", "junk"), V3Refusal::kBadAttributes},
         {"an unknown comp version_source",
          sec(kComponentInventoryFacet, "full") +
              rec({"comp", "jar", "x", "1", "guess", "/p", "1", "1", ""}),
@@ -561,6 +580,47 @@ TEST_CASE("v3 drops a 17th token and a nameless row", "[server][inventory_blob_v
     const V3Report s2 = parse_ok(header() + sec(kApps, "full") + shorter);
     REQUIRE(s2.sections.size() == 1);
     CHECK(s2.sections[0].refusal == V3Refusal::kSourceMismatch);
+}
+
+TEST_CASE("v3 slot 14 is the attribute field: kept when canonical, empty as before, a refusal only for its section",
+          "[server][inventory_blob_v3][attributes]") {
+    CHECK(v3_refusal_name(V3Refusal::kBadAttributes) == "bad_attributes");
+    // A canonical value is kept on the row, whole; an empty slot parses exactly as it always did.
+    {
+        const V3Report r = parse_ok(header() + sec(kApps, "full") +
+                                    plus("With", kApps, "", kUpgradeCode) + plus("Without", kApps));
+        REQUIRE(r.sections.size() == 1);
+        CHECK(r.sections[0].refusal == V3Refusal::kNone);
+        REQUIRE(r.sections[0].rows.size() == 2);
+        CHECK(r.sections[0].rows[0].attributes == kUpgradeCode);
+        CHECK(r.sections[0].rows[0].package_id == "pkg-id"); // slot 15 still lands in package_id
+        CHECK(r.sections[0].rows[0].source == kApps);
+        CHECK(r.sections[0].rows[1].attributes.empty());
+        CHECK(r.sections[0].rows[1].package_id == "pkg-id");
+    }
+    // A non-canonical value refuses THAT section only, with every row of it cleared: the section
+    // before and the one after still apply.
+    {
+        const V3Report r = parse_ok(
+            header() + sec("pkg_inventory.packages", "full") +
+            plus("Before", "pkg_inventory.packages") + sec(kApps, "full") + plus("Ok", kApps) +
+            plus("Bad", kApps, "", "upgrade_code=nope") + plus("AfterBad", kApps) +
+            sec("runtimes.python", "full") + plus("After", "runtimes.python", "", kUpgradeCode));
+        REQUIRE(r.sections.size() == 3);
+        const auto* before = find(r, "pkg_inventory.packages");
+        REQUIRE(before != nullptr);
+        CHECK(before->refusal == V3Refusal::kNone);
+        CHECK(before->rows.size() == 1);
+        const auto* bad = find(r, kApps);
+        REQUIRE(bad != nullptr);
+        CHECK(bad->refusal == V3Refusal::kBadAttributes);
+        CHECK(bad->rows.empty());
+        const auto* after = find(r, "runtimes.python");
+        REQUIRE(after != nullptr);
+        CHECK(after->refusal == V3Refusal::kNone);
+        REQUIRE(after->rows.size() == 1);
+        CHECK(after->rows[0].attributes == kUpgradeCode);
+    }
 }
 
 TEST_CASE("v3 a 0x1E or 0x1F byte inside a field frames the record and never reaches a parsed "

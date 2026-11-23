@@ -552,9 +552,9 @@ struct OpenSeams {
     /// (#1527). Production never sets it.
     std::function<void()> before_integrity_check;
     /// The filesystem steps of the quarantine that follows a corrupt verdict (the hard-link
-    /// claim, a sidecar move, a remove), forwarded to `quarantine_corrupt_db`. An empty member is
-    /// the real call. A test's `link` runs between the verdict and the claim, which is where a
-    /// swapped-in link has to be caught (#1527). Production never sets one.
+    /// claim, a sidecar move, a sidecar copy, a remove), forwarded to `quarantine_corrupt_db`. An
+    /// empty member is the real call. A test's `link` runs between the verdict and the claim, which
+    /// is where a swapped-in link has to be caught (#1527). Production never sets one.
     yuzu::shared::sqlite_quarantine::FsOps quarantine_ops;
     /// Called by the v10 migration after its pre-transaction reads, right before BEGIN IMMEDIATE,
     /// with the migrating connection. It stands in for another process acting in the gap between
@@ -818,6 +818,14 @@ public:
     /// failure there is warned and tolerated, echo_db.cpp), and promising a read
     /// path that is not there is worse than admitting the store is dark.
     [[nodiscard]] bool query_engine_available() const noexcept { return query_db_ != nullptr; }
+
+    /// False when open() succeeded but `create_warehouse_tables` failed (a broken
+    /// table or index DDL on an otherwise readable file): the store is open and
+    /// its config and state rows work, but the registry-declared warehouse tables
+    /// are incomplete. Set once in open() before the object is published, so it
+    /// needs no lock. Reported on the `echo status` surface as
+    /// `config|warehouse_tables_ok` (#2626).
+    [[nodiscard]] bool warehouse_tables_ok() const noexcept { return warehouse_tables_ok_; }
 
     /// Epoch at which THIS open() quarantined a corrupt echo.db; nullopt for a
     /// clean open. Drives only the echo.status db_health value — the durable
@@ -1134,6 +1142,7 @@ private:
     // so there is no concurrent writer to race with.
     sqlite3* query_db_{nullptr};
     std::optional<int64_t> quarantined_at_{};
+    bool warehouse_tables_ok_{true}; // cleared by open() when create_warehouse_tables fails (#2626)
     /// The ONE roll-up writer for this database (echo_fold.hpp: one instance per database is a
     /// construction rule, so it lives here). Built by open(); null only in a moved-from object.
     std::unique_ptr<EchoFold> fold_;

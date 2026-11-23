@@ -12,11 +12,6 @@
    "path": "CONTRIBUTING.md"
   },
   {
-   "detector": "personal-email",
-   "max_hits": 9,
-   "path": "agents/plugins/installed_apps/docs/samples/linux.txt"
-  },
-  {
    "detector": "home-path",
    "max_hits": 1,
    "path": "agents/plugins/privacy_permissions/src/privacy_permissions_macos_parsers.hpp"

@@ -51,8 +51,10 @@ std::string join_tokens(const std::vector<std::string>& tokens) {
     return out;
 }
 
-/// Trim wrapping punctuation from a token for CLASSIFICATION only — the
-/// emitted token is never rewritten. Tolerates "(64-bit)", "[x64]", "2019,".
+/// Trim wrapping punctuation from the edges of a token as split. Tolerates
+/// "(64-bit)", "[x64]", "2019,". The name@version split runs on the token after
+/// this trim, so a wrapper just before the "@" stays in the emitted name:
+/// "(openssl)@3" gives "openssl)" (see #8462).
 std::string_view trim_wrapping(std::string_view t) {
     constexpr std::string_view kWrap = "()[]{},;";
     while (!t.empty() && kWrap.find(t.front()) != std::string_view::npos)
@@ -98,10 +100,10 @@ bool is_edition_token(std::string_view t) {
 /// Legal-suffix tokens dropped from vendor names (compared after trimming
 /// commas/semicolons off token edges; the dotted forms keep their dots).
 bool is_legal_suffix_token(std::string_view t) {
-    static constexpr std::array<std::string_view, 17> kSuffix = {
+    static constexpr std::array<std::string_view, 18> kSuffix = {
         "inc",  "inc.",  "incorporated", "corp",         "corp.",   "corporation",
-        "ltd",  "ltd.",  "llc",          "gmbh",         "s.a.",    "co.",
-        "company", "technologies", "software", "systems", "foundation",
+        "ltd",  "ltd.",  "llc",          "l.l.c.",       "gmbh",    "s.a.",
+        "co.",  "company", "technologies", "software",   "systems", "foundation",
     };
     return std::find(kSuffix.begin(), kSuffix.end(), t) != kSuffix.end();
 }
@@ -146,16 +148,45 @@ bool multiset_subset(const std::vector<std::string>& sub, const std::vector<std:
 NormalizedTitle normalize_title(std::string_view raw) {
     NormalizedTitle out;
     std::vector<std::string> kept;
+    // True when the previous classified token was an arch or edition word: the word "edition"
+    // right after one is the tail of "(x64 edition)" / "Pro Edition", not a title word.
+    bool after_arch_or_edition = false;
+    const auto take_version = [&out](std::string_view v) {
+        if (out.version.empty())
+            out.version = std::string{v.front() == 'v' ? v.substr(1) : v};
+    };
     for (auto& token : split_tokens(ascii_lower(raw))) {
-        const std::string_view t = trim_wrapping(token);
-        if (t.empty() || is_arch_token(t))
+        std::string_view t = trim_wrapping(token);
+        if (t.empty())
             continue;
-        if (is_version_token(t)) {
-            if (out.version.empty())
-                out.version = std::string{t.front() == 'v' ? t.substr(1) : t};
+        const bool was_after = std::exchange(after_arch_or_edition, false);
+        if (t == "-") // a bare separator ("Redistributable (x64) - 14.38") names nothing
+            continue;
+        // "name@version" (a Homebrew formula): the tail is the version and the name is then
+        // classified like any other token, so the result stays idempotent under re-normalising.
+        if (const std::size_t at = t.find('@'); at != std::string_view::npos && at > 0 &&
+                                                 t.find('@', at + 1) == std::string_view::npos &&
+                                                 is_version_token(t.substr(at + 1))) {
+            take_version(t.substr(at + 1));
+            token = std::string{t.substr(0, at)};
+            t = trim_wrapping(token);
+        }
+        if (is_arch_token(t)) {
+            after_arch_or_edition = true;
             continue;
         }
-        if (is_edition_token(t)) {
+        if (was_after && t == "edition")
+            continue;
+        if (is_version_token(t)) {
+            take_version(t);
+            continue;
+        }
+        // An edition word is an edition only after a title word: a title that is an edition
+        // word ("Home") or starts with one ("Pro Display Calibrator") keeps it as a title word.
+        // Only a word actually taken as the edition arms the "edition" drop above, so a kept
+        // "Home" leaves "Home Edition" as `home edition` and the key stays idempotent.
+        if (is_edition_token(t) && !kept.empty()) {
+            after_arch_or_edition = true;
             if (out.edition.empty())
                 out.edition = std::string{t};
             continue;
@@ -164,6 +195,20 @@ NormalizedTitle normalize_title(std::string_view raw) {
     }
     out.title = join_tokens(kept);
     return out;
+}
+
+std::string normalize_edition(std::string_view raw) {
+    std::string edition;
+    for (const auto& token : split_tokens(ascii_lower(raw))) {
+        const std::string_view t = trim_wrapping(token);
+        if (t.empty() || is_arch_token(t) || is_version_token(t))
+            continue;
+        if (!is_edition_token(t))
+            return {};
+        if (edition.empty())
+            edition = std::string{t};
+    }
+    return edition;
 }
 
 std::string normalize_vendor(std::string_view raw) {
@@ -181,12 +226,12 @@ std::string normalize_vendor(std::string_view raw) {
     if (const std::string_view hit = vendor_alias(collapsed); !hit.empty())
         return std::string{hit};
 
-    std::vector<std::string> kept;
-    for (auto& t : tokens) {
-        if (!is_legal_suffix_token(t))
-            kept.push_back(std::move(t));
-    }
-    const std::string stripped = join_tokens(kept);
+    // Only the TRAILING run of suffix words is a legal form ("Python Software Foundation"); a
+    // suffix word earlier in the name is part of it ("macOS Software Signing", "Software AG"),
+    // and the last remaining token is never stripped, so a vendor never reduces to nothing.
+    while (tokens.size() > 1 && is_legal_suffix_token(tokens.back()))
+        tokens.pop_back();
+    const std::string stripped = join_tokens(tokens);
     if (const std::string_view hit = vendor_alias(stripped); !hit.empty())
         return std::string{hit};
     return stripped;
