@@ -1,0 +1,141 @@
+Directory: tests/unit/fixtures/software-estate/pkgdb/
+Captured 2026-11-19 and 2026-11-20 for the installed_apps in-process package-database readers (SAM-45):
+test_dpkg_status_parsers.cpp, test_rpmdb_parsers.cpp and test_installed_apps_pkgdb.cpp, all loaded
+through YUZU_TEST_FIXTURE_DIR. Every database and oracle file in this directory is loaded by at least
+one of them.
+
+What the fixtures are
+  Each <capture>/ holds a real package database and, beside it, the OUTPUT of the old subprocess path
+  for that same database (inventory.tsv = the installed_apps list_inventory query, list.txt = the
+  `list` query), so the readers are compared with what dpkg-query / rpm printed, not with a
+  reimplementation. Every database is from the S-7 package-database captures (Docker containers on
+  Docker Desktop 4.89.0, host braga, command-only containers, no repository code), trimmed to a few
+  packages so the committed bytes stay small.
+
+  capture        database file   format                        image (digest of the platform manifest)                       tool
+  debian12       status          dpkg status text              debian:12   sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8   dpkg 1.21.23
+  ubuntu2404     status          dpkg status text              ubuntu:24.04 sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8  dpkg 1.22.6
+  fedora41       rpmdb.sqlite    rpm sqlite (WAL mode)         fedora:41   sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d   rpm 4.20.1
+  alma9          rpmdb.sqlite    rpm sqlite (WAL mode)         almalinux:9 sha256:02df05719ef287ebd0df0a1eedb9172a00bd70703aed7b25660e426b8e0d6047    rpm 4.16.1.3
+  leap156        Packages.db     rpm ndb                       opensuse/leap:15.6 sha256:79be7751205ea84559990fb76b1bec71e38d6fad41c70a4f6c921b803b58f421  rpm 4.14.3
+  tumbleweed     Packages.db     rpm ndb                       opensuse/tumbleweed:latest sha256:873ddd8d2a548bbd38c9d8485bd710ab6d17d013cacb38a252005f634b3ab187  rpm 4.20.1
+  alma8          Packages        rpm Berkeley DB hash, LE      almalinux:8 (linux/arm64) sha256:768bedc30fe0a536adb0a65d2eddb7caad364e514fbddd0ae9e026975f590342  rpm 4.14.3
+  alma8-s390x    Packages        rpm Berkeley DB hash, BE      almalinux:8 (linux/s390x) sha256:d2b527544c4669295ca29a68c1fc1c1a2bb3869f129cc5a3ab357341b63f3572  rpm 4.14.3
+
+  The s390x database is a REAL big-endian Berkeley DB file: the same AlmaLinux 8 image run under
+  emulation (docker run --platform linux/s390x), captured by the same S-7 method (cp -a of
+  /var/lib/rpm and the rpm -qa outputs), then trimmed by the same recipe. It is the only big-endian
+  hash database in the tree.
+
+dpkg fixtures (debian12, ubuntu2404): REAL stanzas, trimmed by selection
+  status:         ten whole stanzas copied verbatim, in file order, from the capture's
+                  /var/lib/dpkg/status; the blank line after each is kept. Chosen to cover an epoch
+                  version (1:, 2:), Architecture: all, a multi-line Conffiles, an Essential: yes
+                  package and a long Maintainer. No stanza was edited.
+  inventory.tsv:  the capture's own `dpkg-query -W -f='${Package}\t${db:Status-Abbrev}\t${Version}\t
+                  ${Architecture}\t${Maintainer}\n'` lines for exactly those ten packages, in the
+                  capture's order, bytes unchanged.
+  list.txt:       the capture's own `dpkg-query -W -f='${Package}|${Version}|${Maintainer}|${Status}\n'`
+                  lines for the same ten packages, bytes unchanged.
+  No capture holds a half-installed, unpacked, config-files, held or reinstreq package (a fresh
+  container has none) and none of the S-7 captures has a status.d directory (status.d.txt in them is
+  empty). The real status.d layout is the separate capture below.
+
+dpkg status.d fixture (debian12-statusd): a REAL status.d from a minimal Debian 12 image
+  Captured 2026-11-20 on braga (Docker 29.7.2) from a minimal Debian 12 image that has no shell and no
+  package manager. It is not one of the S-7 captures. Platform manifest digest (linux/arm64):
+  sha256:b6d8cd9eeccef7a63b91771ba943056f484c0dc92396ec3140a5fe2c6279d581
+  Image as pulled: gcr.io/distroless/static-debian12:latest (index digest
+  sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2; the platform manifest
+  above is its linux/arm64 entry).
+  Commands (the container is never started, `/nonexistent` only satisfies `docker create` for an
+  image with no default command):
+    docker pull --platform linux/arm64 gcr.io/distroless/static-debian12:latest
+    docker create --platform linux/arm64 gcr.io/distroless/static-debian12:latest /nonexistent   -> prints the container id
+    docker cp <container id>:/var/lib/dpkg/status.d <scratch>/status.d
+    docker rm <container id>
+  The image has no /var/lib/dpkg/status and no dpkg-query, so there is no old-path output: this
+  directory has no inventory.tsv or list.txt and is not a parity capture (the parity case skips a
+  directory with no database file beside it).
+  What the layout is, as captured: status.d holds one control file per package, named for it, plus a
+  `<package>.md5sums` sibling (the list of file checksums). The control file is the package's
+  control stanza as an image builder writes it, and it has NO Status field. Five packages were
+  present (base-files, ca-certificates, media-types, netbase, tzdata). Three are committed, each with
+  its .md5sums sibling, all six files byte for byte: base-files (arm64, 720 B), media-types (all,
+  883 B) and netbase (all, 484 B). ca-certificates and tzdata were left out only because their
+  .md5sums siblings are 16 KB and 63 KB. Nothing was edited.
+  Loaded by test_installed_apps_pkgdb.cpp (the shell reads the directory as a host's status.d, with
+  and without a status file) and by test_dpkg_status_parsers.cpp (the parser's missing-Status
+  policy).
+
+rpm fixtures: REAL databases, trimmed by real rpm
+  Recipe (the same for every rpm capture; run inside the same image with --network none):
+    1. mount the captured database directory read-only, copy it to a scratch dbpath;
+    2. rpm --dbpath <scratch> -e --justdb --nodeps --noscripts --notriggers --allmatches <every
+       package not on the keep-list>  (in batches of 40);
+    3. rpm --dbpath <scratch> --rebuilddb  (real rpm rewrites the container compactly);
+    4. rpm --dbpath <scratch> -qa --queryformat of the exact old formats below, into inventory.tsv
+       and list.txt; copy only the database file (rpmdb.sqlite, Packages.db or Packages) out.
+  inventory.tsv:  rpm --queryformat '%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t
+                  %{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\t%{VENDOR}\t%{PACKAGER}\n'
+                  (the plugin's old list_inventory format, kRpmInvQueryFormat).
+  list.txt:       rpm --queryformat '%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\n'
+                  (the plugin's old `list` format).
+  Both ran in a container with no TZ and no locale, so the dates are UTC and C-locale.
+  Keep-lists (every gpg-pubkey is kept; each capture keeps an epoch package where the capture has one
+  and at least one header over 8 KB; tzdata and any package whose changelog names a consumer-mailbox
+  address were avoided, because rpm headers carry changelog author addresses and the personal-data
+  guard scans binary files):
+    fedora41     gpg-pubkey basesystem gmp libssh-config
+    alma9        gpg-pubkey basesystem dbus gmp libgomp
+    alma8        gpg-pubkey basesystem findutils libverto            (findutils: epoch 1, a 31 KB header)
+    alma8-s390x  gpg-pubkey basesystem findutils libverto
+    leap156      gpg-pubkey system-user-root fillup libffi7 libnsl2 libverto1 diffutils libcrypt1
+    tumbleweed   gpg-pubkey system-user-root fillup openssl libnss_usrfiles2 lsb-release libjitterentropy3
+  The rpm sqlite files are about 240 KB each, above the ~200 KB target: rpm creates an empty table and
+  index for every tag (about 40 pages) whatever the package count, so that is the floor for a real
+  rpm sqlite database. Index.db (ndb) was not committed: the reader never opens it.
+  rpmdb.sqlite is WAL-mode (header bytes 18 and 19 are 2) and is committed WITHOUT its -wal and -shm
+  sidecars (rpm removed them when it closed the database). The sqlite cases copy it into a yuzu_test_
+  temporary directory before opening it, so no sidecar is ever created in this tree.
+
+The full, untrimmed captures
+  The same parity case runs over the full S-7 captures when YUZU_TEST_PKGDB_FIXTURE_ROOT points at a
+  tree of <capture>/{status|rpmdb.sqlite|Packages.db|Packages}, inventory.tsv and list.txt. For that run
+  the rpm oracle files were recomposed to the old formats from the S-7 files (inventory = S-7 columns
+  1,2,3,4,5,7,8,9, then VENDOR from list.txt, then column 6; list = the S-7 list line, '|', column 7;
+  the two S-7 files align line by line on every rpm capture). Counts (packages = inv rows = list rows):
+  alma8 156, alma8-s390x 156, alma9 159, debian12 88, debian12-dense 240, fedora41 125, fedora41-dense 470,
+  leap156 141, leap156-dense 181, tumbleweed 123, ubuntu2404 92.
+
+Which test cases edit a real input (each says "edited" in its case name or comment)
+  test_dpkg_status_parsers.cpp   the Status line of the real debian12 libacl1 stanza is replaced
+                                 (half-installed, unpacked, half-configured, triggers-pending,
+                                 config-files, hold ok installed, reinstreq, deinstall ok installed,
+                                 not-installed); a real debconf stanza gets extra continuation lines.
+  test_rpmdb_parsers.cpp         bytes of a real header blob, of the real leap156 ndb file and of the
+                                 real alma8 / alma8-s390x Berkeley DB files are changed in memory
+                                 (il, dl, offsets, magics, versions, page sizes, entry counts, item
+                                 offsets and types, overflow-chain links, lengths, truncation).
+  test_installed_apps_pkgdb.cpp  a copy of a real rpmdb.sqlite is switched to the rollback journal, or
+                                 has one row deleted through a second open connection; the debian12
+                                 libacl1 stanza is cut out of status and written to status.d/libacl1
+                                 (a stanza that HAS a Status, unlike the real status.d capture) and
+                                 a second copy of it carries another Version; one real status.d
+                                 control file gets an invalid Status line appended; the Maintainer of
+                                 the real debian12 libacl1 stanza is replaced by a value holding a pipe
+                                 and a tab; the real fedora41 libssh-config header blob is edited in
+                                 memory (the first three bytes of VENDOR or PACKAGER become a pipe, a
+                                 tab and a newline; the VENDOR, PACKAGER or RELEASE index entry is
+                                 renumbered to an unused tag) and written into a one-package sqlite
+                                 database; copies of the real ndb, bdb and sqlite files get one byte
+                                 appended or their mtime moved, from inside the read, and a copy of the
+                                 real rpmdb.sqlite (WAL, or switched to the rollback journal) is
+                                 written to by a second connection while it is being read; other
+                                 hostile inputs (not sqlite, no Packages table, a TEXT blob, a symlink,
+                                 a directory, an oversized file, too many files) are built from scratch.
+  SYNTHETIC inputs (hand-built, not taken from any capture): the tm with a single-digit day of month
+  in the date-formatter case (test_rpmdb_parsers.cpp), for the space-padded %e; the hostile dpkg
+  strings in test_dpkg_status_parsers.cpp (NUL byte, missing colon, duplicate field, wrong Status
+  word count and the like); and the hostile inputs listed above as built from scratch. Every real
+  install time is compared with rpm's own text.
