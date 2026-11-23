@@ -447,7 +447,9 @@ else the `PACKAGER` tag.
 > `InstalledProductName`/`VersionString`/`Publisher`. The product code travels in
 > the blob's extended-tail `package_id` field (the tail appended after the twelve
 > v2 fields); the tail's first two slots, `install_location` and
-> `uninstall_string`, stay reserved and empty (#5186). A `constrained`
+> `uninstall_string`, stay reserved and empty (#5186). (**Superseded 2026-11-21:**
+> slot 14 is the stored attribute field on the v3 path, see the 2026-11-21 Update; no
+> uninstall string is collected.) A `constrained`
 > enumeration, or a product-property read that fails for any reason other than
 > the product not having the property, fails the action and skips the whole
 > cycle, like `pkg_inventory.packages`. (**Superseded 2026-11-09:** a constrained or
@@ -888,7 +890,7 @@ kind:
 | Record | Fields after the kind | Meaning |
 |---|---|---|
 | `S` | `facet`, `status`, `base`, `token`, `duration_ms`, `bytes_read`, `expect` | opens a section; `expect` is the section hash after the agent applies it (64 lowercase hex, mandatory on `delta`, see the SAM-14 entry below) |
-| `+` | `name`, `version`, `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`, `install_location`, *slot 14 (reserved, empty)*, `package_id`, `source` | an install row |
+| `+` | `name`, `version`, `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`, `install_location`, `attributes` (slot 14: empty, or the canonical `key=value` field of the 2026-11-21 Update), `package_id`, `source` | an install row |
 | `-` | `row_hash` | a deletion by row hash (64 lowercase hex); applied by the SAM-14 delta apply below |
 | `comp` | `kind`, `name`, `version`, `version_source`, `path`, `size`, `mtime`, `anchor_app` | a component row; `version_source` is one of `filename`, `pom`, `manifest`, `metadata`, `package_json`, `pe`, `elf`, `macho`, `unreadable`; stored by the SAM-14 component store below |
 
@@ -920,7 +922,8 @@ v2 parser is unchanged.
 **Containment.** A grammar violation inside a section refuses that section only: a `+`, `-` or
 `comp` record in a status-only section; a `-` record in a `full` section; a `+` source other
 than the facet; `+` in `component_inventory` or `comp` anywhere else; an unknown status, facet or
-record kind; a malformed row hash; an unknown `version_source`; a repeated facet; a row over the
+record kind; a malformed row hash; an unknown `version_source`; a `+` whose slot 14 is not a
+canonical attribute field (`bad_attributes`); a repeated facet; a row over the
 per-call cap; a record holding a NUL byte; a final record with no terminator. The rest of a refused section is skipped to the next `S`, and the other sections
 still apply. A defect that cannot be attributed to a facet fails the whole blob (a record before
 any section, a header with no section after it, an `S` record whose facet is empty or outside
@@ -932,7 +935,8 @@ the charset, more than 32 sections, over 3 MiB): the ingest seam answers the who
 the nack for a hash-only claim the server cannot match and for an unattributable v3 blob.
 
 **Section hash.** `canonical_section_hash(rows)` is the SHA-256 hex of the section's rows,
-sorted and de-duplicated, each written as all 16 wire slots (slot 14 empty, and no conditional
+sorted and de-duplicated, each written as all 16 wire slots (slot 14 the attribute field, empty
+when a row has none, and no conditional
 tail: unlike the v2 hash, `package_id` and `source` are always written), `0x1F`-joined and
 `0x1E`-terminated. The sort walks the stored fields in wire order: `name`, `version`,
 `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`,
@@ -990,7 +994,8 @@ advisory lock as the v2 replace):
 **Slot 13 is stored on v3 only.** `install_location` (wire slot 13) is stored from the v3 `+`
 record. The v2 path still parses and discards it, so a v2 row's location is always empty and the
 v2 canonical hash is unchanged. Slot 14 (`uninstall_string`) stays reserved on both paths, so
-#5186 is closed for slot 13 only.
+#5186 is closed for slot 13 only. (**Superseded 2026-11-21:** slot 14 is the stored attribute field on the v3
+path, see that Update; the v2 path still discards it, and no uninstall string is collected.)
 
 *§8 outcome for slot 13 (this change re-opens §8 for the server store).* `install_location` is
 operator-tier: machine-scope roots only (ADR-0028), but a root can still name an account's home
@@ -1871,7 +1876,7 @@ Five REST v1 reads over the typed installed-software store, all `Inventory:Read`
 **Dropped from the earlier read-model plan, with reasons.**
 
 - Tombstones for removed packages: dropped. A removal is already a hard delete plus a `remove` ledger row carrying the name, publisher and version, so no read needs a `removed_at` filter and the change feed is the record of removals.
-- Reading the reserved slot 14 (`uninstall_string`): dropped. The slot stays reserved and empty in the v3 record (#5186), stays in the hash as an empty slot, and no read exposes it; nothing in the host or feed views needs it.
+- Reading the reserved slot 14 (`uninstall_string`): dropped. The slot stays reserved and empty in the v3 record (#5186), stays in the hash as an empty slot, and no read exposes it; nothing in the host or feed views needs it. (**Superseded 2026-11-21:** slot 14 is now the stored attribute field on the v3 path, see the 2026-11-21 Update; no uninstall string is collected, and the field is still on no read route.)
 - A separate freshness field per row: dropped. The row `status` (`current`, `unconfirmed`, `disabled`) and `last_confirmed_at`, derived from the facet state, already say how fresh a row is, and the hosts read exposes both per facet.
 - Device record fields on the host rows (OS, serial, system UUID, MAC addresses, agent version): dropped. A host row carries `agent_id`, the roster `hostname`, `last_seen` and the facet states, the same hostname join the lookup rows use. The full device record is served by the hardware list under the behavioural-PII access audit (`emit_behavioral_audit`), while these five routes audit set-and-proceed, so joining those fields here would change this route's audit contract and data tier, which this change neither planned nor reviewed. The runbook sends the operator to `GET /api/v1/devices/{id}` for the OS and the agent version. Which fields belong on a host row is tracked by #7784.
 - A `scope` parameter on the hosts list: dropped as unbacked, the same ruling that leaves `scope=expr` off the installs route; nothing in this read model resolves a scope expression. The hosts list reads `q`, `last_synced_before`, `limit` and `cursor` only, and the caller's gate scope is applied on every page, so a request cannot widen or narrow it.
@@ -1959,6 +1964,67 @@ neither end carries handling for a peer that predates it.
   withheld collectors, carrying a per-OS or per-action kill switch (only the plugin-wide switch is carried,
   which is the one the effective-settings route shows), and zone conversion on the agent.
 
+### 2026-11-21 — install-row attributes in wire slot 14 (SAM-46)
+
+**Decision.** Slot 14 of the blob-v3 `+` record, reserved as `uninstall_string` since #5186 and always
+sent empty, is now the **attribute field**: a validated `key=value` text that rides the synced install
+row, stored on the server and covered by the section hash. The first key is `upgrade_code` (the MSI
+UpgradeCode, the identifier shared by every version of one Windows product). The `uninstall_string`
+reservation is withdrawn: nothing sends, stores or hashes an uninstall string, and slot 14 will not
+carry one. SAM-45b (#8361) adds its keys to this field and lands after this change, with no new wire
+change, migration or parser change.
+
+- **Canonical form.** `key=value` pairs joined by `;`, keys in strictly ascending byte order, each key at
+  most once, no leading or trailing `;`, no empty key or value, the whole field at most 1,024 bytes (the
+  v3 field cap). The empty string means no attributes and is what the slot carried before this change. A
+  value holds no `;`, no `=` and no control byte (`0x00-0x1F` and `0x7F`, which covers NUL and both
+  wire separators, `0x1E` and `0x1F`). The validator checks and never repairs: a canonical value is
+  returned unchanged and anything else is refused whole, so nothing is re-ordered, re-cased or trimmed
+  into shape. The only step before it is the field step every slot gets, and the two sides differ: the
+  agent's `clamp_field` scrubs invalid UTF-8, clamps the length and then strips `0x1F`, `0x1E` and NUL,
+  so a canonical value with a stray wire separator or NUL appended is sent as the canonical value; the
+  server's scrub-and-clamp only repairs invalid UTF-8 and clamps the length and strips nothing (a NUL
+  is refused as `nul_byte`, and a stray `0x1F` or `0x1E` is a framing fault of the record, never a slot
+  value).
+- **One key registry.** `kAttributeKeys` in `common/include/yuzu/install_row_attributes.hpp` is a closed,
+  name-sorted table of `{name, validator}` (a `static_assert` pins the order), and the same header holds
+  `canonical_attributes`, `attribute_value` and `make_attributes`. The agent writer, the agent adapters
+  and the server parser all include it, so there is one definition of what a row may carry. Version 1 of
+  the table is `upgrade_code`, whose value is exactly `{8-4-4-4-12}` upper-case hex with the braces.
+- **How a key is added.** One row in `kAttributeKeys`, in name order, with its validator, and a golden
+  vector for the key pinned in both the agent and the server tests. That is the whole change: no
+  migration (the column is free text), no parser change (the parser asks the table) and no wire change.
+  #8361 lands after this change and adds its keys that way.
+- **Indexing.** Wire slot 14 is field 14 of the parsed `+` record (the `+` kind marker is field 0) and
+  index 13 of the sixteen-slot record both sides hash, between `install_location` (index 12) and
+  `package_id` (index 14). The agent's `SwEntry.attributes` and the server's `SoftwareEntry.attributes`
+  sit in that position, so member order stays wire order, and both comparators order rows by
+  `install_location`, then `attributes`, then `package_id`, then `source`.
+- **Agent.** `v3_normal_form` keeps a row's attributes, after the field step, only when they are
+  already canonical and drops them otherwise: the writer never sends what the server would refuse,
+  and the row then hashes exactly as if the slot were empty. The `msi_packages.list_inventory`
+  adapter accepts a row of five or six
+  tokens; a sixth token that is a braced GUID in either case becomes `upgrade_code={UPPER}`, and any other
+  sixth token is ignored and the row is kept. No producer sends a sixth token yet: until the
+  `msi_packages` producer change lands, nothing on the wire changes.
+- **Server.** The parser keeps field 14 and refuses a section whose `+` record carries a value that is
+  not canonical, with the new refusal `bad_attributes` (the `bad_version_source` precedent: that section
+  only, its rows cleared, the other sections of the call apply). A refused section is resent in full,
+  as every refusal is. Schema v13 adds `installed_software.attributes TEXT NOT NULL DEFAULT ''`: a
+  constant default, so metadata-only on every supported Postgres version, no rewrite and no index. The
+  comparator, the sixteen-slot record, the batched insert and the row load that recomputes a section
+  hash all carry the column. `instance_key`, the SHA-256 of the record, therefore changes when a row's
+  attributes change, and a `-` record names a row by it.
+- **Hash agreement.** An empty slot 14 hashes to the bytes it hashed to before, so no stored row, no
+  section hash and no held agent state moves, and no agent resends. A row carrying `upgrade_code` is
+  pinned by one golden vector whose literal record bytes and SHA-256 are identical in
+  `tests/unit/test_installed_software_v3.cpp` and `tests/unit/server/test_software_inventory_store.cpp`;
+  both fail if either side moves.
+- **Not in this change.** Any REST, MCP or UI field for `attributes` (stored, not yet on a read route;
+  #8441 exposes `upgrade_code` on the installed-software read routes, then the MCP twin); any use of
+  an attribute in `identity_key` or the change ledger (the ledger pairs rows by identity and
+  version, so an attribute-only change at the same version writes no ledger event); the v2 path, where
+  slot 14 is still parsed and discarded.
 ### 2026-11-20 — Linux dpkg and rpm rows are read from the package databases in-process (SAM-45)
 
 **What changed.** The `installed_apps` plugin no longer runs `dpkg-query` or `rpm -qa` on Linux for
@@ -2080,4 +2146,4 @@ change; it needs a server change and is tracked as SAM-45b (#8361).
 
 Moved verbatim from the `Agent daily-sync framework` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
 
-Agent daily-sync framework + installed-software inventory (ADR-0016) — agent pushes per-source state daily over `ReportInventory` (hash-skip); sources: #1 `installed_software` (blob v3, a section per source: `installed_apps.list_inventory` — `list` rows are never hashed; `pkg_inventory.*`, `windows_optional_features.list`, `msi_packages.list_inventory`, `runtimes.*`, `middleware.ibm_mq`, `hardware.drivers_inventory`), #2 `app_perf`, #3 `device_ci` (serial/UUID/MAC = GDPR personal data → behavioural-PII tier). CRITICAL: (1) `inventory_state.last_seen`/`first_seen` = SERVER receipt time, never agent `collected_at` (#1685); (2) a new sync source is a new `plugin_data` map KEY, NOT a proto field (no `agent_pb`/`gateway_pb` regen); (3) Windows registry STRING reads use `Reg*W` via `win_str.hpp`, never `Reg*A` (#1662/#1682); (4) the v3 section hash is hashed byte-for-byte on agent (`agents/core/src/installed_software_v3.cpp`, the only writer) + server (`software_inventory_store.cpp`): 16 slots, slot 14 (uninstall_string) RESERVED (#5186), slot 13 (install_location) an agent-side allowlist (§8: kept under a machine root, else blanked), source = facet, publisher never empty — a one-sided change breaks hash agreement for good; the writer follows the `v3:` held-facet rule and commits on ack (a status-only ack ERASES the facet's acked set); a degraded answer is a status-only section, never rows; collector workers drain before plugin shutdown.
+Agent daily-sync framework + installed-software inventory (ADR-0016) — agent pushes per-source state daily over `ReportInventory` (hash-skip); sources: #1 `installed_software` (blob v3, a section per source: `installed_apps.list_inventory` — `list` rows are never hashed; `pkg_inventory.*`, `windows_optional_features.list`, `msi_packages.list_inventory`, `runtimes.*`, `middleware.ibm_mq`, `hardware.drivers_inventory`), #2 `app_perf`, #3 `device_ci` (serial/UUID/MAC = GDPR personal data → behavioural-PII tier). CRITICAL: (1) `inventory_state.last_seen`/`first_seen` = SERVER receipt time, never agent `collected_at` (#1685); (2) a new sync source is a new `plugin_data` map KEY, NOT a proto field (no `agent_pb`/`gateway_pb` regen); (3) Windows registry STRING reads use `Reg*W` via `win_str.hpp`, never `Reg*A` (#1662/#1682); (4) the v3 section hash is hashed byte-for-byte on agent (`agents/core/src/installed_software_v3.cpp`, the only writer) + server (`software_inventory_store.cpp`): 16 slots, slot 14 the attribute field (the ONE key table and canonical form of `common/include/yuzu/install_row_attributes.hpp`, included by both ends; the `uninstall_string` reservation of #5186 is withdrawn), slot 13 (install_location) an agent-side allowlist (§8: kept under a machine root, else blanked), source = facet, publisher never empty — a one-sided change breaks hash agreement for good; the writer follows the `v3:` held-facet rule and commits on ack (a status-only ack ERASES the facet's acked set); a degraded answer is a status-only section, never rows; collector workers drain before plugin shutdown.

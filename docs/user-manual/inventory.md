@@ -223,8 +223,9 @@ cadences.
   row from `installed_apps`' registry walk, so a Windows host normally carries
   two rows per MSI product. The `msi` row adds the product code (stored as
   `package_id`, which the REST and MCP software routes return on each row)
-  and the machine-context guarantee. Install location and uninstall string are
-  not collected (wire slots 13-14 stay reserved and empty, #5186). If the
+  and the machine-context guarantee. An `msi` row's `install_location` (wire slot
+  13) is empty, no uninstall string is read, sent or stored, and slot 14 is the
+  `attributes` field described below. If the
   enumeration itself fails the source is reported `constrained` (see Troubleshooting).
 
   **Python interpreters** are collected through `runtimes` `python` (all three OSes;
@@ -267,7 +268,8 @@ cadences.
 
   **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
   `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
-  or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
+  or `Java` (when the build does not say; on Linux the `release` file's `IMAGE_TYPE` decides and,
+  where it has none, the home's `bin/javac` and java entries do), `version` from the home's `release` file (when the home has
   none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
   Windows) and `publisher` the file's `IMPLEMENTOR` (on macOS, a bundle with an openable `Contents` and no `release` file
   under `Contents/Home` reports its `Info.plist` `JVMVendor`), else `via:jvm` (the home reports no vendor, or it is a
@@ -465,13 +467,14 @@ cadences.
   `--inventory-disable`. The same holds for `list_inventory` dispatched directly
   as a command (it has no instruction definition, but the catalogue admits it at
   `Inventory:Read`): its fourteenth token is the raw location, minimised only by
-  the daily-sync writer, and the Response store keeps it as sent. The sync blob also has `install_location` and
-  `uninstall_string` slots. In the v2 blob they are reserved: the server ignores
-  them and stores neither, and an agent that fills them gets a full-resend request
-  every cycle. The sectioned v3 blob stores `install_location` and keeps
-  `uninstall_string` reserved (see "Install type, scope and location, and the
-  sectioned report" below). This build's agent sends `install_location` (the Windows
-  `InstallLocation`, the macOS `.app` path, a Homebrew machine prefix) and never `uninstall_string`; since a path under a
+  the daily-sync writer, and the Response store keeps it as sent. The sync blob also has two
+  trailing slots, 13 and 14: `install_location` and the `attributes` field (slot 14 was
+  reserved for an uninstall string until 2026-11-21 and never carried one). In the v2 blob the server stores neither,
+  and an agent that fills them gets a full-resend request every cycle. The sectioned v3 blob
+  stores both (see "Install type, scope and location, and the sectioned report" below, where
+  the `attributes` bullet lives). This build's agent sends `install_location` (the Windows
+  `InstallLocation`, the macOS `.app` path, a Homebrew machine prefix) and, in slot 14, only a
+  validated attribute field, never an uninstall string; since a path under a
   user's profile names an account, the location is an allowlist: the agent canonicalises the
   value (quotes, padding, doubled separators, `.` and `..` segments, the `\\?\` prefix and the
   macOS `/System/Volumes/Data` spelling) and keeps it, in one spelling (case is kept), only when it sits under a
@@ -625,7 +628,7 @@ Mach-O `.dylib` files on macOS. It reads each library's header in-process; no pr
 
 ### Install type, scope and location, and the sectioned report
 
-Each stored software row carries four more attributes. They are read-side facts today: the
+Each stored software row carries five more attributes. They are read-side facts today: the
 fleet query, catalogue and device pages do not return them yet, so they are visible only in the
 database.
 
@@ -658,6 +661,16 @@ database.
   v3 blob: a row from a v2 report has an empty `purl` until its device's first v3 report. The
   value is indexed, and the store can look up the devices carrying exactly one `purl`; the REST
   installs lookup returns it and filters on it, and the dashboard and the MCP tool do not yet.
+- **`attributes`** is a validated `key=value` field a collector can attach to a row (wire slot 14),
+  empty for a row that has none: pairs joined by `;`, keys in ascending order, each at most once.
+  One key exists today, `upgrade_code`: the MSI UpgradeCode of a Windows product, which is the same
+  for every version of that product, written as a braced GUID in upper-case hex, for example
+  `upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}`. The server stores it only from the v3 blob
+  (the v2 blob's slot is ignored), keeps it in the row's section hash, and does not return it from
+  any read route, dashboard page or MCP tool yet. No collector reports an `upgrade_code` yet. A
+  value the server cannot read as a valid attribute field refuses that one section (reason
+  `bad_attributes`, below). Two rows that differ only in `attributes` are two rows, and an
+  attribute-only change at the same version writes no change-feed entry.
 
 **The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
 each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
@@ -736,9 +749,9 @@ whatever the source: the older per-source behaviours that removed a constrained 
 section that broke the blob v3 grammar, and the warn-level server log line "v3 section(s) ...
 refused" names the agent and the reason. The reason is one of `unknown_facet`, `duplicate_facet`,
 `unknown_status`, `rows_in_status_only`, `delete_in_full`, `wrong_record_for_facet`,
-`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`, `row_cap`,
-`nul_byte` or `unterminated`. The agent resends the same bytes, so a refusal never clears on its
-own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
+`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`,
+`bad_attributes`, `row_cap`, `nul_byte` or `unterminated`. The agent resends the same bytes, so a
+refusal never clears on its own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
 deleted) until the agent is fixed. The one exception is a device's first v3 call that applies a section: its v2 rows were
 already replaced, so a facet refused then has no rows to keep. `facet="unknown"` on the counter means the server does not
 recognise the name: that is a version-skew incident (an agent and a server of different builds),
@@ -2123,7 +2136,8 @@ The server turns every distinct installed-software title into a stable identity 
 - **Cadence.** A quiet fleet is checked once an hour. A tick covers up to 200,000 titles or 60 seconds of work in total, whichever comes first. When it stops at either limit with more waiting (a new pack version, or the first run on a large fleet), the next tick starts after 60 seconds instead of an hour, so a backlog is worked off in back-to-back ticks rather than one tick an hour. The same 60 seconds applies right after a server start or upgrade when the catalogue rollup has not yet produced the title list: the job finds nothing to do and keeps checking every 60 seconds until the rollup has produced the title list, instead of waiting an hour. A tick that fails or times out is retried at the hourly interval, because an immediate retry would pick the same batch and fail the same way.
 - **The alias pack.** Resolution is driven by a versioned alias pack (`YYYY.MM.N`) stored in Postgres. A seed pack ships inside the server and is loaded on first boot only when no pack exists; a newer server build does not replace a pack that is already loaded (the boot log names both versions). If the pack cannot be loaded for any reason, including a transient database error, the server refuses to start and logs `[PG] Refusing to start`.
 - **Settled titles are re-resolved only when something changes.** A title is resolved when it first appears and again when the pack version changes, its product is deleted, or a registry write marks it stale. A curated alias (`POST /api/v1/inventory/software/normalization/aliases`) or a replaced pack (`POST .../pack`) marks every title stale in the same transaction, so the next hourly passes pick the fleet up again; rejecting a queue entry does not.
-- **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions, architectures and edition words are removed (for example `2019` or `Pro`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
+- **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions and architectures are removed (for example `2019` or `(x64)`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
+- **How a title and a publisher are cleaned up.** The product key is built from the publisher, the title and the edition, each cleaned the same way every time. Case is folded for ASCII letters and runs of spaces collapse. A title loses its standalone version words (`2019`, `16.0.1`, `v2.1`; the first is kept as the title's version), its architecture words (`x64`, `(64-bit)`) and a bare `-` separator. An edition word (`Standard`, `Enterprise`, `Pro`, `Home`, ...) is the edition only after a title word: `Windows 11 Pro` is `windows` with edition `pro`, while a title that is one (`Home`) or starts with one (`Pro Display Calibrator`) keeps it as part of the title. The word `edition` right after an architecture word, or after a word taken as the edition, is dropped (`7-Zip 26.04 (x64 edition)` is `7-zip`); a leading edition word kept as part of the title does not arm it (`Home Edition` is `home edition`). A Homebrew `name@version` keeps the name and supplies the version (`openssl@3` is `openssl`, version `3`). A year range such as `2015-2022` stays in the title because it names a runtime generation; a version glued to a name (`python3.14`, `postgresql-18`) is not stripped, since such package names are legitimate, so the seed pack lists those it knows. A publisher loses only the trailing run of legal-suffix words (`Inc.`, `Corporation`, `GmbH`, `L.L.C.`, `Software`, `Foundation`, ...) and never its last word, so `Python Software Foundation` is `python`, `macOS Software Signing` keeps its name and `Software` stays `software`; compound forms such as `GmbH & Co. KG` are not reduced. These rules decide the keys the pack and the curation queue use; see [Upgrading](upgrading.md) for what a change to them does to a server that already holds a pack.
 - **Origin labels.** A publisher of the form `via:<ecosystem>` (for example `via:brew`) names where a row came from, not a vendor, so it normalises to no vendor. It is the title's raw key: the queue and `GET .../queue` show it as `raw_publisher`, and a title the pack or a curated alias covers resolves through that alias like a title with no publisher.
 - **Editions are distinct products.** An alias binds exactly one edition, and a title is never matched to a different edition of the same product, so SQL Server Standard and SQL Server Enterprise resolve separately and an edition the pack does not list lands in the queue rather than on its neighbour.
 - **Automatic product creation is off.** The job does not create products for unmatched titles; they wait in the queue.
