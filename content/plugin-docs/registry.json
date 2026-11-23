@@ -2194,9 +2194,9 @@
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
     "changelog": [
-      "changelog.d/2026-11-17-wp06-registry-hku-reads.security.md",
       "changelog.d/7173-echo-registry-live-etw-skip.fixed.md",
-      "changelog.d/8016-spark-registry-rename-deaf-watch.fixed.md"
+      "changelog.d/8016-spark-registry-rename-deaf-watch.fixed.md",
+      "changelog.d/8687-wp06-registry-hku-reads.security.md"
     ],
     "definitions": [
       "content/definitions/registry.yaml"

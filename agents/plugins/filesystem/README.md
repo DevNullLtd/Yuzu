@@ -826,5 +826,5 @@ total_lines_after|1
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/test_filesystem_definition.py` · `tests/test_filesystem_exists_no_raw_fallback_lexical.py` · `tests/test_filesystem_reserved_wiring_lexical.py` · `tests/unit/test_filesystem_acl_parsers.cpp` · `tests/unit/test_filesystem_actions.cpp` · `tests/unit/test_filesystem_find_by_hash.cpp` · `tests/unit/test_filesystem_find_by_hash_dispatcher.cpp` · `tests/unit/test_filesystem_get_acl_dispatcher.cpp` · `tests/unit/test_filesystem_local_dispatcher.cpp` · `tests/unit/test_filesystem_macos_sig.cpp` · `tests/unit/test_filesystem_posture_local_dispatcher.cpp` · `tests/unit/test_filesystem_posture_parsers.cpp` · `tests/unit/test_filesystem_read.cpp` · `tests/unit/test_filesystem_reserved_paths.cpp` · `tests/unit/test_filesystem_search_dir.cpp` · `tests/unit/test_filesystem_search_dir_dispatcher.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-11-18-wp06-filesystem-stat-errors-refuse.security.md` · `changelog.d/6478-filesystem-search-dir-bounds.changed.md`
+- Changelog: `changelog.d/6478-filesystem-search-dir-bounds.changed.md` · `changelog.d/8687-wp06-filesystem-stat-errors-refuse.security.md`
 <!-- END GENERATED -->
