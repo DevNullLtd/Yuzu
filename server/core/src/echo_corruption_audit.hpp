@@ -10,9 +10,9 @@
  * process wrote), bounded by kMaxAgents (one entry is evicted at the cap, never a
  * wholesale clear: the first of the first kVictimScan entries whose rate-limit window
  * has already elapsed, else the one of them written longest ago, a constant amount
- * of work under the mutex; an agent still inside its window can therefore be
- * forgotten and admitted again sooner when the examined entries are all inside
- * theirs), and, on a miss, ONE lookup of the newest
+ * of work under the mutex; the rate limit is therefore best effort at the cap: an
+ * agent inside its window can be forgotten and admitted again sooner when the
+ * examined entries are all inside theirs), and, on a miss, ONE lookup of the newest
  * `echo.db.corruption_quarantined` audit row for the agent. Net effect: exactly
  * one audit row per (agent, quarantine identity) across store prunes, server
  * restarts and HA node switches (per server process: another HA node ingesting
@@ -110,7 +110,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -422,19 +421,18 @@ private:
                          bool wrote_row) {
         failing_.erase(agent_id); // a success forgets it: its next failure opens the window again
         if (agents_.size() >= kMaxAgents && !agents_.contains(agent_id)) {
-            // Prefer an entry whose rate-limit window has elapsed (or that never had one), so an
-            // agent still inside its window keeps its limit, but look only at the first
-            // kVictimScan entries: a scan of the whole map at the cap cost about 10 ms per new
-            // identity under mu_ during a mass quarantine (the event this gate exists to report).
-            // When none of them has elapsed, the one written longest ago goes, never begin():
-            // that is the most recently inserted node, so two agents writing at the cap would
-            // evict each other's live window on every call and each write a row every time. An
-            // agent still inside its window can still be forgotten and admitted again sooner when
-            // the whole examined prefix is in-window; the lookup backs the evicted entry. An LRU
-            // or expiry-ordered index is the upgrade if a fleet is ever seen to rely on the limit
-            // at the cap.
+            // Prefer an entry whose rate-limit window has elapsed (or that never had one), but
+            // look only at the first kVictimScan entries: a scan of the whole map at the cap cost
+            // about 10 ms per new identity under mu_ during a mass quarantine (the event this
+            // gate exists to report). When none of them has elapsed, evict the one written longest
+            // ago (the last of equals, whole-second stamps tie), not the first entry: iteration
+            // order is implementation-defined and often puts a just-inserted node first, which let
+            // two agents evict each other's live window and each write a row on every call. The
+            // limit stays best effort at the cap: a fleet churning new identities faster than a
+            // window ages out the examined head can still forget an agent early; the durable
+            // lookup backs the forgotten entry. A write-ordered index is the upgrade if a fleet is
+            // ever seen to rely on the limit at the cap.
             auto victim = agents_.begin();
-            int64_t oldest = std::numeric_limits<int64_t>::max();
             std::size_t examined = 0;
             for (auto it = agents_.begin(); it != agents_.end() && examined < kVictimScan; ++it) {
                 ++examined;
@@ -443,10 +441,8 @@ private:
                     victim = it;
                     break;
                 }
-                if (*at < oldest) {
-                    oldest = *at;
+                if (*at <= *victim->second.last_row_at)
                     victim = it;
-                }
             }
             max_victim_probe_ = std::max(max_victim_probe_, examined);
             agents_.erase(victim);

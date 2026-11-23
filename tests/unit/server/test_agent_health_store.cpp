@@ -3323,9 +3323,9 @@ TEST_CASE("EchoCorruptionAuditGate: the eviction search at the cap is a bounded 
     // (#5034) is now best effort: only the first kVictimScan entries are searched, and which
     // entries those are depends on the standard library's iteration order, so it is not asserted.
     // Sustained all-fresh at the cap: every entry is inside its rate-limit window, so no
-    // eviction finds an aged victim; each one must stop at the prefix bound and fall back to the
-    // first entry. A whole-map scan per new identity (about 10 ms each at this size) would have
-    // examined 65,536 entries here.
+    // eviction finds an elapsed victim; each one must stop at the prefix bound and fall back to
+    // the oldest examined entry. A whole-map scan per new identity (about 10 ms each at this
+    // size) would have examined 65,536 entries here.
     for (int i = 0; i < kFill; ++i)
         gate.mark_logged("fresh-" + std::to_string(i), "1:f");
     CHECK(gate.max_victim_probe() == 0); // exactly at the cap, nothing evicted yet
@@ -3352,7 +3352,9 @@ TEST_CASE("EchoCorruptionAuditGate: agents writing at the cap do not evict each 
     // examined prefix has no elapsed window the victim must be the oldest entry, never the one
     // just inserted: evicting the newest node let two agents erase each other's window, so each
     // wrote a row on every call.
-    constexpr int kRounds = 8; // fewer new entries than kVictimScan, so old entries stay in view
+    constexpr int kRounds = 8;
+    // Two new entries per round against a 32-entry examined prefix: old entries stay in view.
+    static_assert(2 * kRounds < static_cast<int>(EchoCorruptionAuditGate::kVictimScan));
     for (int r = 1; r <= kRounds; ++r) {
         clock = 1000 + r;
         const std::string a = "a-" + std::to_string(r);
@@ -3366,6 +3368,68 @@ TEST_CASE("EchoCorruptionAuditGate: agents writing at the cap do not evict each 
         // Each new agent's window is still live: a rotated identity is refused, not admitted.
         CHECK_FALSE(gate.should_log("a-" + std::to_string(r), "2:g"));
         CHECK_FALSE(gate.should_log("b-" + std::to_string(r), "2:g"));
+    }
+}
+
+TEST_CASE("EchoCorruptionAuditGate: at the cap an agent with a live window is not evicted while "
+          "elapsed or never-windowed entries are examined",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditMinRowInterval;
+    int64_t clock = 1000;
+    // Ids starting "dur-" are already durable (found by the lookup only: no row of ours, so no
+    // window at all); every other id has no audit row yet.
+    EchoCorruptionAuditGate gate(
+        [&](const std::string& id) {
+            return std::optional<std::optional<std::string>>{
+                id.starts_with("dur-") ? std::optional<std::string>{"1:f"}
+                                       : std::optional<std::string>{}};
+        },
+        [&] { return clock; });
+    constexpr int kFill = static_cast<int>(EchoCorruptionAuditGate::kMaxAgents);
+    for (int i = 0; i < kFill; ++i) {
+        if (i % 2 == 0) {
+            gate.mark_logged("old-" + std::to_string(i), "1:f"); // window opened at 1000
+        } else {
+            REQUIRE_FALSE(gate.should_log("dur-" + std::to_string(i), "1:f")); // no window
+        }
+    }
+    clock += kEchoCorruptionAuditMinRowInterval; // every old window has elapsed
+    // "limited" opens a live window at the cap. The examined prefix of each later insert holds at
+    // most 9 of the new entries, so it always holds an elapsed or never-windowed entry, and the
+    // search stops at the first of those: "limited" is never the victim.
+    REQUIRE(gate.should_log("limited", "1:f"));
+    gate.mark_logged("limited", "1:f");
+    for (int i = 0; i < 8; ++i)
+        gate.mark_logged("newcomer-" + std::to_string(i), "1:f");
+    CHECK_FALSE(gate.should_log("limited", "2:g")); // still inside its window: refused
+}
+
+TEST_CASE("EchoCorruptionAuditGate: agents written in the same second at the cap keep their window",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [&] { return clock; });
+    constexpr int kFill = static_cast<int>(EchoCorruptionAuditGate::kMaxAgents);
+    for (int i = 0; i < kFill; ++i)
+        gate.mark_logged("fresh-" + std::to_string(i), "1:f");
+    // The clock does not move: whole-second stamps tie, and the first examined entry (often a
+    // just-inserted node) must not win a tie against an older-or-equal one.
+    for (int r = 0; r < 2; ++r) {
+        const std::string a = "pa-" + std::to_string(r);
+        const std::string b = "pb-" + std::to_string(r);
+        REQUIRE(gate.should_log(a, "1:f"));
+        gate.mark_logged(a, "1:f");
+        REQUIRE(gate.should_log(b, "1:f"));
+        gate.mark_logged(b, "1:f");
+    }
+    for (int r = 0; r < 2; ++r) {
+        CHECK_FALSE(gate.should_log("pa-" + std::to_string(r), "2:g"));
+        CHECK_FALSE(gate.should_log("pb-" + std::to_string(r), "2:g"));
     }
 }
 
