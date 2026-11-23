@@ -7,7 +7,8 @@ Best-effort lexical gate, two checks:
   1. agents/core/src/agent.cpp logs `session_fp={}` via `session_log_fingerprint(` and never
      passes `session_id_` to that spdlog call; dex_linux_collector.cpp wraps subject/reason.
   2. No scanned text file parses `session=` out of that agent line (scanned: the whole checkout
-     except the top-level SKIP_DIRS and build* directories, `node_modules` and `.git` at any depth,
+     except the top-level SKIP_DIRS and build* directories, `node_modules`, `.git` and `_build*`
+     (rebar3 output) at any depth,
      files over 2 MB, binary files (a NUL in the first 4 KiB), unreadable paths, and this file;
      directory symlinks are not followed). Backslash continuations are
      joined, and a `session=` extractor within WINDOW lines of a "Registered with server" mention
@@ -24,15 +25,20 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SELF = pathlib.Path(__file__).resolve()
-SKIP_DIRS = {".git", "node_modules", "vcpkg_installed",
+SKIP_DIRS = {".git", "node_modules", "vcpkg_installed", "vcpkg",
              "scratchpad", "governance.d", ".claude", "changelog.d", "site"}
+# Untracked trees the CI runners keep in the checkout (a vcpkg clone at vcpkg/, rebar3's
+# gateway/_build*: ~110k of the ~120k files on a Big Tam workspace, #8637) are pruned too, so the
+# walk stays far inside the meson timeout under load.
+SKIP_ANY_DEPTH = ("node_modules", ".git")
+SKIP_ANY_DEPTH_PREFIX = "_build"
 # Every top-level build* directory is skipped, not only the three per-OS names: the self-hosted
 # runners build several CI jobs into sibling dirs of one checkout (build-linux-coverage,
 # build-linux-clang-21-debug, ...), whose test logs and coverage reports quote the agent's
 # Registered line and would fail this gate on a PR that never touched it (#8637). Top-level FILES
-# named build* are still scanned. The skip rests on one premise: no TRACKED top-level directory
-# starts with the prefix, so only build output is skipped, never source. Nothing checks it yet
-# (#8643); do not add a tracked top-level build* directory without narrowing the prefix.
+# named build* are still scanned. Every skip here rests on one premise: no TRACKED file lies in a
+# skipped directory, so only build output and third-party clones are skipped, never source.
+# Nothing checks it yet (#8643); do not add tracked files under any of these names.
 SKIP_PREFIX = "build"
 WINDOW = 25  # extractors may sit well after the grep that fetches the line
 MENTION = re.compile(r"Registered\s+with\s+server")
@@ -101,7 +107,7 @@ def skipped_dir(rel_parts):
     name = rel_parts[-1]
     if len(rel_parts) == 1 and (name in SKIP_DIRS or name.startswith(SKIP_PREFIX)):
         return True
-    return name in ("node_modules", ".git")
+    return name in SKIP_ANY_DEPTH or name.startswith(SKIP_ANY_DEPTH_PREFIX)
 
 
 def skipped(rel_parts):
@@ -109,12 +115,15 @@ def skipped(rel_parts):
     return any(skipped_dir(rel_parts[:i]) for i in range(1, len(rel_parts))) or rel_parts[-1] == ".git"
 
 
-def iter_files(root=ROOT):
+def iter_files(root=ROOT, visited=None):
     # os.walk with pruning, not rglob: a skipped tree is never listed, so another job deleting or
     # writing its build output mid-scan cannot crash or slow this gate (#8637). Like rglob, it does
-    # not follow directory symlinks, and a directory it cannot list is passed over.
+    # not follow directory symlinks, and a directory it cannot list is passed over. `visited`, when
+    # given, collects every directory listed (the selftest uses it to pin the pruning).
     for dirpath, dirnames, filenames in os.walk(root):
         rel_dir = pathlib.Path(dirpath).relative_to(root).parts
+        if visited is not None:
+            visited.append("/".join(rel_dir))
         dirnames[:] = [d for d in dirnames if not skipped_dir(rel_dir + (d,))]
         for name in filenames:
             rel = rel_dir + (name,)
@@ -147,10 +156,14 @@ def selftest():
         'grep "Registered with server" x | sed s/session\\=//',
         'grep "Registered with server" x > $t\n' + "echo\n" * 15 + 'v=$(grep -oE "session=[^ ]+" $t)',
     ]
-    for b in bad:
-        assert check_text("x.sh", b), ("selftest: must fire on", b)
+    # Assert messages name the case by index and never quote it, and no assert line carries a
+    # matching literal: a failing selftest's traceback, teed to a top-level log, must not re-trip
+    # this gate the way the old FAIL message did.
+    for i, b in enumerate(bad):
+        assert check_text("x.sh", b), f"selftest: must fire on bad[{i}]"
     # re-adding a session= read of the Registered line (a fallback) must be RED
-    assert check_text("lib.sh", 'grep -a "Registered with server" "$1" | grep -aoE \'session=[^ ,)]+\''), "selftest fallback"
+    fallback = 'grep -a "Registered with server" "$1" | grep -aoE \'session=[^ ,)]+\''
+    assert check_text("lib.sh", fallback), "selftest fallback"
     assert not check_text("x.sh", "Registered with server (session_fp=ab12cd34, "), "selftest ok-fp"
     assert not check_text("x.sh", 'grep "Registered with server" x | grep session=  # tripwire-allow: reviewed example'), "selftest allow"
     assert not check_text("x.sh", "ProxyRegister succeeded: agent=a, session=b"), "selftest server line"
@@ -168,10 +181,15 @@ def selftest_walk(bad_line):
     log_line = "[info] Registered with server session=0123456789abcdef\n"
     with tempfile.TemporaryDirectory(prefix="yuzu_test_session_log_walk_") as tmp:
         root = pathlib.Path(tmp)
+        skipped_trees = ("build-linux-clang-21-debug", "build-linux-coverage", "build-linux",
+                         "builddir", "vcpkg", "gateway/_build", "gateway/_build_eunit_3")
         for rel in ("build-linux-clang-21-debug/meson-logs/ci-half-nonpg.log",
                     "build-linux-coverage/coverage-html/index.html",
                     "build-linux/meson-logs/testlog.txt",
-                    "builddir/meson-logs/testlog.txt"):
+                    "builddir/meson-logs/testlog.txt",
+                    "vcpkg/ports/x/log.txt",
+                    "gateway/_build/test/logs/ct.log",
+                    "gateway/_build_eunit_3/x.log"):
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             (root / rel).write_text(log_line)
         (root / "scripts").mkdir()
@@ -183,9 +201,14 @@ def selftest_walk(bad_line):
         for rel in ("deploy/build-tools/y.sh", "bin/z.sh", "Build/z.sh"):
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             (root / rel).write_text(bad_line + "\n")
-        flagged = sorted(rel for rel, text in iter_files(root) if check_text(rel, text))
+        visited = []
+        flagged = sorted(rel for rel, text in iter_files(root, visited) if check_text(rel, text))
         assert flagged == ["Build/z.sh", "bin/z.sh", "deploy/build-tools/y.sh", "scripts/x.sh"], \
             ("selftest walk", flagged)
+        # Pruned, not just filtered: no skipped tree is ever listed (#8637: another job may be
+        # deleting it mid-scan, and listing it costs time against the meson timeout).
+        entered = [v for v in visited if any(v == t or v.startswith(t + "/") for t in skipped_trees)]
+        assert not entered, ("selftest: walk entered skipped trees", entered)
     assert not skipped(("build-tools.sh",)), "selftest: a top-level FILE named build* is still scanned"
 
 
