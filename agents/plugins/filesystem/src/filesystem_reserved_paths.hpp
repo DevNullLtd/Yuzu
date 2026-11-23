@@ -149,4 +149,37 @@ struct Set {
     return path.find('\0') != std::string_view::npos;
 }
 
+/// Windows: a spelling that Win32 normalises to a DIFFERENT name than the one compared lexically.
+/// A not-yet-existing reserved file is compared by string, so `keys\agent.key::$DATA`,
+/// `keys\agent.key:ads` (an alternate data stream of the same file) and `keys\agent.key ` (a trailing
+/// space, stripped by Win32) would each slip past the string match and then create or reach the
+/// reserved file. Refused as a SPELLING, before any reserved comparison: a ':' anywhere after the
+/// leading drive designator (`X:`) and the verbatim prefix (`\\?\`), and any component that ends in a
+/// space or a '.' (the components "." and ".." are navigation, not names). Pure and
+/// platform-neutral so it is unit-tested on Linux; the plugin applies it on `_WIN32` only (on POSIX a
+/// ':' or a trailing space is an ordinary file name). Over-refusal is the safe side.
+[[nodiscard]] inline bool is_windows_alias_spelling(std::string_view p) {
+    auto sep = [](char c) { return c == '\\' || c == '/'; };
+    std::size_t i = 0;
+    if (p.size() >= 4 && sep(p[0]) && sep(p[1]) && p[2] == '?' && sep(p[3]))
+        i = 4;
+    if (p.size() >= i + 2 && ((p[i] >= 'A' && p[i] <= 'Z') || (p[i] >= 'a' && p[i] <= 'z')) &&
+        p[i + 1] == ':')
+        i += 2;
+    const std::string_view rest = p.substr(i);
+    if (rest.find(':') != std::string_view::npos)
+        return true;
+    std::size_t start = 0;
+    while (start <= rest.size()) {
+        std::size_t end = start;
+        while (end < rest.size() && !sep(rest[end]))
+            ++end;
+        const std::string_view comp = rest.substr(start, end - start);
+        if (!comp.empty() && comp != "." && comp != ".." && (comp.back() == ' ' || comp.back() == '.'))
+            return true;
+        start = end + 1;
+    }
+    return false;
+}
+
 } // namespace yuzu::filesystem::reserved

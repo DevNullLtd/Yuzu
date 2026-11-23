@@ -64,6 +64,31 @@ TEST_CASE("is_agent_reserved_path: an empty set reserves nothing; windows separa
     CHECK(rsv::is_agent_reserved_path(s, "C:\\ProgramData\\Yuzu\\yuzu-agent.log"));
 }
 
+TEST_CASE("is_windows_alias_spelling: an ADS, a trailing space or dot and a ':' after the drive are refused "
+          "(WP06 F55, Windows probe 2026-11-23)",
+          "[agent][filesystem_plugin][reserved][winalias]") {
+    // The exact spellings that created an ABSENT reserved file on Windows.
+    CHECK(rsv::is_windows_alias_spelling(R"(C:\data\keys\agent.key::$DATA)"));
+    CHECK(rsv::is_windows_alias_spelling(R"(C:\data\keys\agent.key:ads)"));
+    CHECK(rsv::is_windows_alias_spelling("C:\\data\\keys\\agent.key "));
+    CHECK(rsv::is_windows_alias_spelling(R"(\\?\C:\data\keys\agent.key::$DATA)"));
+    CHECK(rsv::is_windows_alias_spelling("C:/data/keys/agent.key::$DATA"));
+    CHECK(rsv::is_windows_alias_spelling(R"(C:\data\keys\agent.key.)"));
+    CHECK(rsv::is_windows_alias_spelling("C:\\data\\keys \\agent.key")); // a directory component with a trailing space
+    CHECK(rsv::is_windows_alias_spelling(R"(C:\data\keys...\agent.key)"));
+    CHECK(rsv::is_windows_alias_spelling("agent.key:ads"));
+    CHECK(rsv::is_windows_alias_spelling(R"(C:\a\b:c\d)"));
+    // Ordinary spellings stay out of it (the verbatim prefix and the drive designator are not ':').
+    CHECK_FALSE(rsv::is_windows_alias_spelling(R"(C:\data\keys\agent.key)"));
+    CHECK_FALSE(rsv::is_windows_alias_spelling(R"(\\?\C:\data\keys\agent.key)"));
+    CHECK_FALSE(rsv::is_windows_alias_spelling("c:/data/keys/agent.key"));
+    CHECK_FALSE(rsv::is_windows_alias_spelling(R"(C:\data\.\keys\..\agent.key)"));
+    CHECK_FALSE(rsv::is_windows_alias_spelling(R"(C:\data\.hidden\agent.key)"));
+    CHECK_FALSE(rsv::is_windows_alias_spelling(R"(C:\data\)"));
+    CHECK_FALSE(rsv::is_windows_alias_spelling("/var/lib/yuzu/agent.key"));
+    CHECK_FALSE(rsv::is_windows_alias_spelling(""));
+}
+
 TEST_CASE("is_dev_fd_path: /dev/fd/N and the stdio aliases are refused (macOS has no /proc)",
           "[agent][filesystem_plugin][reserved]") {
     CHECK(rsv::is_dev_fd_path("/dev/fd/3"));
@@ -605,6 +630,76 @@ TEST_CASE("filesystem plugin: write_content refuses a dangling NTFS junction lea
     auto w = d.run(handle->descriptor(), "write_content", params);
     CHECK(w.rc != 0);
     CHECK_FALSE(fs::exists(target));
+    handle->descriptor()->shutdown(ctx.get());
+}
+
+// WP06 F55 (Windows only; run on a Windows host): a write_content create=true to an ABSENT reserved file
+// through an alias spelling must be refused and must not create it.
+TEST_CASE("filesystem plugin: write_content refuses every alias spelling of an absent reserved file",
+          "[agent][filesystem_plugin][reserved][winalias]") {
+    const auto plugin_path = sup::find_plugin();
+    if (plugin_path.empty())
+        SKIP("filesystem plugin library not found");
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    if (!handle.has_value() || !handle->descriptor())
+        SKIP("filesystem plugin did not load");
+    yuzu::test::TempDir root{"yuzu_test_fs_reserved_alias_"};
+    std::error_code ec;
+    const auto keys = root.path / "keys";
+    fs::create_directories(keys, ec);
+    const auto reserved = keys / "agent.key"; // absent
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {{"agent.tls_client_key", reserved.string()}}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    const std::string base = reserved.string();
+    for (const std::string& spelling :
+         {base + "::$DATA", base + ":ads", base + " ", "\\\\?\\" + base + "::$DATA"}) {
+        const std::array<YuzuParam, 3> params{{{"path", spelling.c_str()}, {"content", "EVIL"}, {"create", "true"}}};
+        yuzu::agent::LocalDispatcher d;
+        auto w = d.run(handle->descriptor(), "write_content", params);
+        INFO("spelling=" << spelling);
+        CHECK(w.rc != 0);
+        CHECK_FALSE(fs::exists(reserved));
+    }
+    handle->descriptor()->shutdown(ctx.get());
+}
+
+// WP06 F55 (Windows only): a link chain past the reparse limit (weakly_canonical answers
+// ERROR_CANT_RESOLVE_FILENAME, no errc mapping) planted at a reserved name refuses; it must neither
+// leak the target nor skip the reserved entry.
+TEST_CASE("filesystem plugin: a 70-link chain at a reserved name refuses every read",
+          "[agent][filesystem_plugin][reserved][winchain]") {
+    const auto plugin_path = sup::find_plugin();
+    if (plugin_path.empty())
+        SKIP("filesystem plugin library not found");
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    if (!handle.has_value() || !handle->descriptor())
+        SKIP("filesystem plugin did not load");
+    yuzu::test::TempDir root{"yuzu_test_fs_reserved_chain70_"};
+    std::error_code ec;
+    fs::create_directories(root.path, ec);
+    const auto ok = root.path / "ok.txt";
+    {
+        std::ofstream o(ok);
+        o << "fine\n";
+    }
+    const auto reserved = root.path / "chain-0";
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {{"agent.tls_client_key", reserved.string()}}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    for (int i = 0; i < 70; ++i) {
+        std::error_code lec;
+        fs::create_symlink(root.path / ("chain-" + std::to_string(i + 1)), root.path / ("chain-" + std::to_string(i)), lec);
+        if (lec)
+            SKIP("symlink creation needs Developer Mode or the symlink privilege");
+    }
+    yuzu::agent::LocalDispatcher d;
+    const std::string rp = reserved.string();
+    const std::string mid = (root.path / "chain-35").string();
+    for (const std::string& p : {rp, mid, ok.string()}) {
+        const std::array<YuzuParam, 1> params{{{"path", p.c_str()}}};
+        auto r = d.run(handle->descriptor(), "read", params);
+        INFO("path=" << p);
+        CHECK(r.rc != 0); // an unresolvable chain refuses (fail closed), even an unrelated read
+    }
     handle->descriptor()->shutdown(ctx.get());
 }
 #endif

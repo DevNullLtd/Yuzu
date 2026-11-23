@@ -43,6 +43,13 @@ def check(source):
         args = [a.strip() for a in " ".join(m.group(1).split()).split(",")]
         if args[-1] != "parameters" or len(args) != 4:
             defects.append(f"schedule_arming is not called with the lambda's `parameters` last: {args}")
+    # The lazy legacy-admin closure fails closed: no auth store or no creator is a DENIAL, and only the
+    # administrator role admits (a later edit to `return true;` would arm every non-Read pair under RBAC off).
+    for needle in ("if (!auth_db_ || principal.empty())\n                    return false;",
+                   "return user->role == auth::Role::admin;",
+                   "return yuzu::server::legacy_admin_lookup_failure(user.error());"):
+        if needle not in source:
+            defects.append(f"the legacy-admin closure in schedule_arming lost `{needle.splitlines()[0]}`")
     # Raw text: the one-pass comment stripper is not trustworthy across the whole file (see below).
     n_calls = len(PERMITTED.findall(source))
     if n_calls != 1:
@@ -85,6 +92,7 @@ def selftest(source):
         "the shared call drops parameters": source.replace("principal, plugin, action, parameters,\n            [this", "principal, plugin, action, {},\n            [this", 1),
         "passes the argument from a first lambda only": source.replace("plugin, action, parameters);", "plugin, action);", 1),
     }
+    mutants["legacy-admin closure admits"] = source.replace("return user->role == auth::Role::admin;", "return true;", 1)
     mutants["schedule Deps without metrics"] = source.replace("                             .metrics = &metrics_,\n                         });\n\n        // #2542 PR-11: the 3-route legacy pre-v1 Responses API","                         });\n\n        // #2542 PR-11: the 3-route legacy pre-v1 Responses API",1)
     mutants["pre-seed drops a route"] = source.replace('"mcp", "schedule", "bundle",\n                                  "policy_fragment"}','"mcp", "bundle",\n                                  "policy_fragment"}',1)
     mutants["pre-seed drops mcp"] = source.replace('"instruction_execute", "mcp", "schedule"','"instruction_execute", "schedule"',1)

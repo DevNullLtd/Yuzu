@@ -64,7 +64,13 @@ def main() -> int:
         "vol": r"#ifdef __APPLE__ if \(" + R + r"is_apple_vol_path\(path_bytes\(p\.lexically_normal\(\)\)\) \|\| "
         + R + r"is_apple_vol_path\(cs\)\) return true;",
         "refresh": r"if \(!refresh\(snapshot\.files\) \|\| !refresh\(snapshot\.dirs\)\) return true;",
-        "eloop": r"too_many_symbolic_link_levels\) return false;",
+        # FAIL CLOSED on a link chain the system cannot resolve (MSVC ERROR_CANT_RESOLVE_FILENAME 1921 has no
+        # errc mapping): only absent / unsearchable skips an entry, every other error refuses.
+        "eloop": r"if \(rec\) \{ if \(absent_error\(rec\) \|\| rec == std::errc::permission_denied \|\| "
+                 r"rec == std::errc::operation_not_permitted\) \{ ok = false; break; \} return false; \} "
+                 r"const auto st = fs::symlink_status\(cur, rec\); if \(rec && !absent_error\(rec\)\) return false;",
+        "winalias": r"#ifdef _WIN32 if \(yuzu::filesystem::reserved::is_windows_alias_spelling\("
+                    r"path_bytes\(p\)\)\) return true; #endif",
         "unresolved": r"if \(ok && !resolved\) return false;",
     }
     for name, rx in pins.items():

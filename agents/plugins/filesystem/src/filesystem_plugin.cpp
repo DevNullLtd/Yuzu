@@ -230,6 +230,12 @@ Ident identity_of(const fs::path& a, const fs::path& b) {
 bool path_is_reserved_unguarded(const fs::path& p) {
     if (yuzu::filesystem::reserved::contains_nul(p.string()))
         return true;
+#ifdef _WIN32
+    // A spelling Win32 normalises to another name (an alternate data stream, a trailing space or dot)
+    // is refused before any comparison: a not-yet-existing reserved file is compared by string only.
+    if (yuzu::filesystem::reserved::is_windows_alias_spelling(path_bytes(p)))
+        return true;
+#endif
     std::error_code ec;
     const fs::path canon = fs::weakly_canonical(p, ec);
     if (ec)
@@ -272,21 +278,34 @@ bool path_is_reserved_unguarded(const fs::path& p) {
                 for (int hop = 0; hop < kMaxLinkHops && ok; ++hop) {
                     std::error_code rec;
                     cur = fs::weakly_canonical(cur, rec);
-                    if (rec == std::errc::too_many_symbolic_link_levels)
-                        return false; // the kernel's own hop cap: an unresolvable link chain refuses
+                    // FAIL CLOSED: only a failure that says the reserved entry cannot be reached by THIS
+                    // process (absent, or an unsearchable parent) skips it. Any other error, the
+                    // kernel's hop cap and MSVC's ERROR_CANT_RESOLVE_FILENAME (1921, a link chain past
+                    // the reparse limit, which has no errc mapping) included, is an unresolvable link
+                    // chain and REFUSES.
                     if (rec) {
-                        ok = false; // any other failure (e.g. an unsearchable parent) skips this entry
-                        break;
+                        if (absent_error(rec) || rec == std::errc::permission_denied ||
+                            rec == std::errc::operation_not_permitted) {
+                            ok = false;
+                            break;
+                        }
+                        return false;
                     }
                     const auto st = fs::symlink_status(cur, rec);
+                    if (rec && !absent_error(rec))
+                        return false;
                     if (rec || !fs::is_symlink(st)) {
                         resolved = true;
                         break;
                     }
                     auto t = fs::read_symlink(cur, rec);
                     if (rec) {
-                        ok = false;
-                        break;
+                        if (absent_error(rec) || rec == std::errc::permission_denied ||
+                            rec == std::errc::operation_not_permitted) {
+                            ok = false;
+                            break;
+                        }
+                        return false;
                     }
                     cur = t.is_relative() ? cur.parent_path() / t : t;
                 }
@@ -384,6 +403,16 @@ bool path_is_reserved_unguarded(const fs::path& p) {
 bool path_is_reserved(const fs::path& p) {
     try {
         return path_is_reserved_unguarded(p);
+    } catch (...) {
+        return true;
+    }
+}
+
+// The raw-spelling form: the fs::path is built INSIDE the guard, because MSVC can throw while
+// converting a narrow string the active code page cannot represent, and a throw is a refusal.
+bool path_is_reserved_raw(std::string_view raw) {
+    try {
+        return path_is_reserved_unguarded(fs::path(std::string{raw}));
     } catch (...) {
         return true;
     }
@@ -1178,7 +1207,7 @@ private:
 
         // WP06 F55: existence, type and size of the agent's own secrets are refused too (an empty
         // base_dir would otherwise fall back to the raw path below).
-        if (path_is_reserved(fs::path(path))) { // a refuse-only decision; the raw spelling reaches no other call
+        if (path_is_reserved_raw(path)) { // a refuse-only decision; the raw spelling reaches no other call
             ctx.write_output("error|path is not accessible or outside allowed base directory");
             return 1;
         }
