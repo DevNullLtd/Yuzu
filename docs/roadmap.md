@@ -6,6 +6,14 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 
 **Platform constraints (binding on every phase below):** the server and the gateway are **Linux-only**; Windows and macOS are **agent-only** (ADR-0035, accepted 2026-11-10 — CI legs agent-only #7499, release ships only the agent on Windows/macOS #7523, `server` build-feature option + agent-only vcpkg off Linux #7632), on the Linux native build floor of ADR-2003 (accepted, #6632). gRPC is the permanent agent transport and QUIC is withdrawn (ADR-0066, #5582; #376 and #1042–#1044 closed NOT_PLANNED). The gateway's transport is a Cowboy edge + Gun upstream client in place of the vendored grpcbox (ADR-0069, #5695; memory give-back #6713; multi-node cluster formation #4604).
 
+### Planned Instructions work · fleet-wide incident dispatch (2026-11-22)
+
+Before enabling live criteria runs, land the response-store design (3C), authenticated bulk
+ingest and scoped ClickHouse reads (3D), then incident dispatch after general delivery (3F).
+Gate live inputs (3G) on shared admission budgets, acknowledged waves, bounded in-flight bytes
+and visible incomplete coverage under sink failure. The stored-inventory ladder keeps its
+independent PostgreSQL verdict budget in 1.13. [Instruction Engine design](Instruction-Engine.md#planned-incident-mode-dispatch).
+
 <!-- Reproducibility recipe for the next re-roll: batch-resolve every issue number cited below in one
      call — `gh api graphql -f query="query { repository(owner: \"DevNullLtd\", name: \"Yuzu\") {
      i<N>: issueOrPullRequest(number: <N>) { ... on Issue { number state stateReason closedAt title }
@@ -1688,7 +1696,7 @@ Active-passive failover for server resilience:
 
 New `/echo` page off the main dashboard nav. First frame is the retention-paused source list — directly enabled by the issue #539 retention guard. Per-source `<source>_paused_at` timestamp added to `echo.status`, server aggregates per-device responses, dashboard renders a sortable filterable table with one-click re-enable and a typed-confirmation purge. Independent re-enable per source (the #539 invariant).
 
-**As shipped:** the destructive **Purge data** action (design §3.4) is a new agent action `echo.purge_source` (drops the source's tier tables — roll-up tiers included — leaving it paused; Echo retention tier defaults are published on the data-retention API and shown in Settings, #6556, #6615), a `POST /fragments/echo/retention-paused/purge` handler gated on `Infrastructure:Delete`, and a typed-hostname confirmation (a native `prompt()` — CSP-safe, no custom modal). The paused-guard is **agent-side** (`echo.purge_source` refuses if the source is enabled) — authoritative, and it closes the scan→purge TOCTOU; the server frame is an ephemeral live scan (no persisted paused-state, so no server-side `SOURCE_NOT_PAUSED` check). Audit verb `echo.source.purge`; metric `yuzu_echo_source_purge_total{result}`. `rows_deleted` is computed agent-side (returned in the response record), not in the fire-and-forget dispatch audit row.
+**As shipped:** the destructive **Purge data** action (design §3.4) is a new agent action `echo.purge_source` (drops the source's tier tables — roll-up tiers included — leaving it paused; Echo retention tier defaults are published on the data-retention API and shown in Settings, #6556, #6615), a `POST /fragments/echo/retention-paused/purge` handler gated on `Infrastructure:Delete`, and a typed-hostname confirmation (a native `prompt()` — CSP-safe, no custom modal). The paused-guard is **agent-side** (`echo.purge_source` refuses if the source is enabled) — authoritative, and it closes the scan→purge TOCTOU; the server frame is an ephemeral live scan (no persisted paused-state, so no server-side `SOURCE_NOT_PAUSED` check). Audit verb `echo.source.purge`; metric `yuzu_echo_source_purge_total{result,surface}`. `rows_deleted` is computed agent-side (returned in the response record), not in the fire-and-forget dispatch audit row.
 
 **Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`, `agents/plugins/echo/src/echo_plugin.cpp`, new `tests/unit/server/test_echo_dashboard_*`. Design: `docs/echo-dashboard.md` §3.
 

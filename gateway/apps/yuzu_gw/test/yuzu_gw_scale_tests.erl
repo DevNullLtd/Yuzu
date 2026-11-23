@@ -123,7 +123,7 @@ fanout_count() ->
 
 bulk_register() ->
     N = scale_count(),
-    %% Spawn N dummy processes and register them, each with the 68 plugins of
+    %% Spawn N dummy processes and register them, each with the 72 plugins of
     %% a full agent build (the registry used to make one pg call per plugin).
     Plugins = yuzu_gw_registry_cost_tests:plugin_names(),
     {TimeUs, {Pids, Ids}} =

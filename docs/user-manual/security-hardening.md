@@ -113,7 +113,7 @@ Run each component under its own system user:
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
 > the agent listener (a `tls` map in its `{yuzu_gw, grpc_listeners}` entry with
-> `verify => verify_none`, `fail_if_no_peer_cert => false`; see
+> `verify => verify_peer`, `fail_if_no_peer_cert => false`, `witness_client_cert => true`; see
 > `gateway/config/sys.config.prod`) and ship the
 > CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
 > cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.
@@ -525,7 +525,7 @@ The agent deduplicates commands by `command_id` so a captured or redelivered com
   - **What and where.** The corrupt file becomes `command_dedup.db.corrupt-<unix-epoch-seconds>` in the data directory, with `-<n>` appended if that name is taken and any non-empty `-wal`/`-shm`/`-journal` files alongside as `<that name>-wal` and so on. The number is the time of the recovery in Unix seconds: `date -r N` on macOS, `date -d @N` on Linux.
   - **What you lose.** **The command history in the corrupt file is lost**, so a command that already ran and is redelivered afterwards may run again.
   - **How you see it.** The agent logs an error naming the quarantined file, increments the agent-local counter `yuzu_agent_dedup_quarantined_total`, and reports the `yuzu.dedup_quarantined` heartbeat tag. `yuzu.dedup_degraded` stays `0` because protection is active again. The tag is a per-process value, so it returns to 0 when the agent restarts even though the quarantined files remain; the log line and the files themselves are the lasting record.
-  - **What is kept.** Only the **newest 3** quarantined files are kept; older ones are removed automatically at the end of each recovery. They hold the same saved command responses as the live store (status, exit code and short error text, not streamed output), so treat them as sensitive as a precaution. Once reviewed they are safe to delete: remove every file matching `<data-dir>/command_dedup.db.corrupt-*`, which includes the `-wal`, `-shm` and `-journal` files that travelled with them. A normal uninstall does not remove them.
+  - **What is kept.** Only the **newest 3** quarantined files are kept; older ones are removed automatically at the end of each recovery (a stray `.partial-<pid>-<n>` file left by a copy whose process died is not counted and not pruned; delete it by hand). They hold the same saved command responses as the live store (status, exit code and short error text, not streamed output), so treat them as sensitive as a precaution. Once reviewed they are safe to delete: remove every file matching `<data-dir>/command_dedup.db.corrupt-*`, which includes the `-wal`, `-shm` and `-journal` files that travelled with them. A normal uninstall does not remove them.
   - **What is not replaced.** A file that still opens but has a few damaged pages is deliberately **not** replaced (that would discard commands that are still running); the agent keeps using it and only the commands that hit a damaged page run undeduplicated, counted in `yuzu.dedup_claim_errors`.
   - **If it cannot recover.** If the file cannot be moved aside (for example a read-only directory, or a data directory on a filesystem without hard links, for example exFAT, or a network share whose server does not provide them: the quarantine claims its name with a hard link and never falls back to a plain rename), or the fresh store cannot be created afterwards (for example a full disk), the agent falls back to degraded mode as described above and `yuzu.dedup_degraded` is `1`; in the second case the history is already lost and the error names the kept file. Fix the directory's permissions, move the data directory to a filesystem with hard links (NTFS, ReFS, ext4, xfs or APFS), or free the space, or move the file away by hand, and restart the agent. Repeated `.corrupt-*` files on one endpoint mean the disk is corrupting the file on successive boots; check that disk.
   - **Unsupported.** Running two agent processes against one data directory is not supported; recovery protects the quarantined evidence from being overwritten, not the live store from the other process.
@@ -600,8 +600,10 @@ curl -s -X POST http://localhost:8080/api/v1/quarantine \
 
 ### The whitelist (read this before quarantining a dual-stack host)
 
-The whitelist is a comma-separated list of **bare IPv4 or IPv6 addresses, at most 32**. Each address
-is sent to the plugin as an outbound and an inbound exception. A port, a prefix length, an
+The whitelist is a comma-separated list of **bare IPv4 or IPv6 addresses, at most 32 and at most 512
+characters in total**. Each address is sent to the plugin as an outbound and an inbound exception. A
+list over 512 characters is refused with `400` (`whitelist exceeds 512 characters`; about 13 full-length
+IPv6 addresses reach it, well under 32 entries). A port, a prefix length, an
 IPv4-mapped form (`::ffff:1.2.3.4`), an IPv4 octet with a leading zero or a host name is refused
 with `400`; nothing is silently dropped. Containment covers **both address families**: a v4-only
 whitelist leaves IPv6 fully contained.
@@ -672,7 +674,8 @@ verified proof confirms). Confirmed means **the device reports its rules in forc
   `note|allow_set_unchanged_use_quarantine_allow=1`. For a record that has never been confirmed the
   server then does **not** confirm it and does not read status: the device is contained, but not under
   this record's whitelist. The record stays unconfirmed, one `quarantine.reapply` failure row
-  (`allow_set_not_applied record_id=<id> command_id=<id>`) is written, and
+  (`allow_set_not_applied record_id=<id> command_id=<id>`, one per record, and one more after a server
+  restart) is written, and
   `YuzuQuarantineEndpointUnconfirmed` fires after its usual delay. **The new whitelist is still not on
   the device.** To get it there, release the device and quarantine it again (the release ends the record
   once the device confirms, and the new quarantine then applies the whitelist to a device that holds no
@@ -688,7 +691,18 @@ reads `releasing`, stays listed, and keeps the dispatch refusal, so a device tha
 containment is never treated as free. The reconciler reads the device's status first (`inactive` ends
 the record), otherwise sends `firewall.release` and reads status again, and no answer to the release
 itself ends anything. A record that cannot finish stays listed with commands refused until it is forced,
-and `YuzuQuarantineReleasePending` fires after 15 minutes for a connected device.
+and `YuzuQuarantineReleasePending` fires after 15 minutes for a connected device. That gauge carries no
+device label: find the devices with `GET /api/v1/quarantine` and read the records whose `status` is
+`releasing`.
+
+**How a `202` finishes.** There is no callback. The record leaves `GET /api/v1/quarantine` when the
+device confirms, and a `DELETE` repeated after that answers `400` (`device is not quarantined`), the
+same as for a device that was never quarantined: poll the list. A `202` is also the answer when the
+device did say `inactive` but an apply reached it, or was being sent to it, after that observation: the
+record could not end on a word the apply may have overtaken, so it stays `releasing` and the next
+status read settles it (the audit row's `detail` says `apply_in_flight=1`). The same holds for an apply
+sent before the release whose reply the reconciler has not read yet: about a minute after a reconciler
+apply, and up to 120 seconds after an MCP `quarantine_device` call, which reads no reply.
 
 **The two ways a record ends, and no other:**
 
@@ -704,9 +718,14 @@ not end the record either; the quarantine routes set no time limit.
 finish a release (such as the Linux packaged unit, which refuses mutation). Authority is the release's
 own: scoped `Security:Execute`, the same-principal check and the dispatch check for `firewall.release`.
 It **does not release the device**: the device may still be contained, the server stops refusing
-commands to it, the reconciler sends the release it owes once per reconnect and then parks the device
-after one unconfirmed cycle (`yuzu_server_quarantine_forced_release_owed` counts them; no alert fires
-on it), and an operator can send `firewall.release` through the generic routes at any time. A device
+commands to it, the reconciler sends the release it owes once per reconnect and once per server start
+(the bookkeeping is in memory, and a restart drops every device's stream anyway) and then parks the
+device after one unconfirmed cycle (`yuzu_server_quarantine_forced_release_owed` counts them; no alert
+fires on it), and an operator can send `firewall.release` through the generic routes at any time.
+A forced end answers `released: false`, because the device's word is what `released` reports.
+`GET /api/v1/quarantine?include=release_owed` (MCP `list_quarantined_devices` with
+`include=release_owed`) lists the records that were ended by force and whose device has not yet
+confirmed a release, so the forced-end runbook can find them: each has `status: "release_owed"`. A device
 whose firewall plugin does not load cannot be released from the server at all (#7444).
 
 Until the device confirms that owed release, **the release lifts whatever containment the device holds,
@@ -803,13 +822,17 @@ Two consequences worth planning for:
 
 ### Reconnect re-application (#3425), re-verify and drift
 
+The reserved lane governs worker admission while a pool is running. It does not bound pool teardown. When the stream drops the agent destroys the pool. A queued ordinary task that has not started is answered REJECTED ("agent reconnecting") without running and an ordinary command's stagger sleep ends within about a second. A queued protective action is never rejected: it runs, with no stagger sleep, before the pool is destroyed. The agent then waits, with no bound, for every task already RUNNING its plugin to return before it reconnects; a command blocked in the kernel holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` sent after the drop is not received until it returns (#8247). The 20 s shutdown watchdog does not cover this wait. On Linux the `yuzu-agent` unit sets `TimeoutStopSec=60`: a stop still waiting at 60 s ends in SIGKILL (`status=9/KILL`), and the unit is left `failed` (`Result=timeout`) and stopped: systemd does not restart a unit whose stop was requested, so it stays down until it is started again. A reconnect teardown has no such budget.
+
 A device quarantined while **offline** is contained at the control plane immediately (the gate above
 refuses it), but its own firewall cannot be touched until a dispatch reaches it. The
 `QuarantineContainmentReconciler` closes that automatically. For every record not yet confirmed:
 
 - **Trigger.** A heartbeat from the device (the fast path) or a periodic ~20-second tick (the
-  backstop). Deliberately **not** agent registration itself: the command stream does not exist yet
-  there. Full confirmation is a state machine (apply, a follow-up `firewall.quarantine_status` after a
+  backstop). A heartbeat only **marks** the device due; it reads no store and dispatches nothing, so
+  heartbeat ingest never waits on the database. The reconciler thread, which does all of this work,
+  acts on the marks every second. Deliberately **not** agent registration itself: the command stream
+  does not exist yet there. Full confirmation is a state machine (apply, a follow-up `firewall.quarantine_status` after a
   short grace window, confirm), so it spans a few heartbeat intervals from reconnect to a confirmed
   record.
 - **What it dispatches.** The **stored** whitelist, mapped to the plugin's `exceptions` (`<ip>/out,<ip>/in`
@@ -820,9 +843,13 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   `validation_failed`.
 - **Re-verify and drift.** A confirmed record is re-read every 5 minutes while its device is connected,
   and stays confirmed meanwhile (the unconfirmed gauge and its alert do not blink); the CONFIRMED audit
-  row is written once per transition. A re-verify that no longer confirms is **drift**: one
-  `quarantine.reapply` failure row (`drift status=<name>`), then the next cycle re-applies through the
-  same chokepoint. A device whose live session changes (a reboot) re-verifies via status first, and a
+  row is written once per transition. A re-verify that no longer confirms is read against the store
+  again before it is called **drift** (the record may have ended or begun releasing while the status
+  command was in flight): a failed read writes no row and re-verifies, a release requested in the
+  meantime makes it a release, and only a record that still reads active gets one `quarantine.reapply`
+  failure row (`drift status=<name>`, counted as `result="drift"`), then the next cycle re-applies
+  through the same chokepoint. `YuzuQuarantineDriftRepeated` fires at three drift rows in an hour across
+  the server's devices (the counter has no device label; the audit rows name each device). A device whose live session changes (a reboot) re-verifies via status first, and a
   record that is replaced (released and re-quarantined while the agent stayed connected) resets to a
   fresh apply. A confirm is checked against the session that was live when the verifying status was
   sent. A restarted server applies first (its in-memory state starts empty), then reads status.
@@ -839,7 +866,10 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   release only on a new session. A `busy` answer (the device's mutation gate was held, so the release
   did not run) does not spend the session's release: the reconciler waits an escalating backoff, reads
   status and sends the release again, so a gate that stays busy costs at most one release and one
-  `forced_release_sent` row per 15 minutes.
+  `forced_release_sent` row per 15 minutes. The bookkeeping that remembers a session's release is in
+  memory: a server restart sends the release once more (and writes the `forced_release_*` rows again),
+  which is harmless because a release is idempotent on the device.
+- **What the server keeps as evidence.** The reconciler's re-verify replies are working data, kept 24 hours (or forever on a server set to keep responses forever). What lasts is the record's `last_confirmed_at` stamp, which every confirming re-verify moves, the audit rows written on each change (`CONFIRMED`, `drift`, the release rows, `forced_release_unconfirmed`) and the counters; no reply is kept as proof that re-verify kept running. The lasting evidence for a parked owed release is its `forced_release_unconfirmed status=<name>` row, not the reply.
 - **Audit.** `quarantine.reapply` (`principal: system`): `record_id=<id> command_id=<id>
   trigger=tick|heartbeat` per apply, `CONFIRMED ...`, `drift ...`, `allow_set_not_applied ...`. `quarantine.disable`: the release
   rows described in the audit log reference. `record_id` is the internal `QuarantineRecord::id`, so a
@@ -850,30 +880,54 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   instances; `offline` is expected and not alerted on, a sustained `connected` count is the signal
   (`YuzuQuarantineEndpointUnconfirmed`, `YuzuQuarantineReleasePending` in [Metrics](metrics.md)).
   `yuzu_server_quarantine_reapply_total{result}` breaks down every outcome (`reapplied`, `confirmed`,
-  `unconfirmed`, `busy`, `offline`, `not_reached`, `rate_limited`, `pending`, `degraded`,
+  `unconfirmed`, `drift`, `busy`, `offline`, `not_reached`, `rate_limited`, `pending`, `degraded`,
   `validation_failed`, `dispatch_error`, `release_sent`, `released`).
   `yuzu_server_quarantine_reconciler_tick_healthy` (0/1) distinguishes an empty queue from a tick that
   could not read at all: check it first when a gauge looks suspiciously static.
+  `yuzu_server_quarantine_reconciler_last_tick_unixtime` is when a tick last finished, and
+  `YuzuQuarantineReconcilerStalled` fires when no server of the job has finished one for about ten minutes
+  (five minutes stale, held for five): while it fires, the gauges above are frozen at their last values.
 
-**Known limitation.** A release request landing at the exact moment the reconciler is mid-apply for the
-same device can end with the apply arriving after the release, in one of two ways:
+**The apply fence, and what it does not close.** A record ends on the device's `inactive` answer, and an
+apply that reaches the device after the observation that produced that answer would leave the device
+contained with no record naming it. Two parts close that:
 
-- The apply lands while the record still reads releasing: the release_pending guard and the
-  status-first rule make the next cycle correct it, but for up to one cycle the device can be contained
-  under a record that reads releasing.
-- The release completes first and the apply lands after it: the device is firewalled and **no record
-  names it**. Nothing re-reads it, so nothing corrects it. The only trace is a `quarantine.reapply`
-  failure row in the audit log, `dispatch accepted record_id=<id> command_id=<id> but the durable stamp
-  failed: device is not quarantined`, and the way back is `firewall.release` sent through the generic
-  command routes.
+- Every stored-record apply (the reconciler's and the MCP `quarantine_device` retry's) first **claims** the
+  record, which moves a durable apply generation. A dispatch that returned is not a delivery (a gateway
+  only queues the command), and a delivered command is not a run (the agent executes commands on a
+  thread pool, and the firewall plugin takes its own gate in the order its workers reach it). So an apply
+  that reached a device **keeps its claim** until the reconciler has read the apply's reply, and
+  otherwise until the claim stops counting; while it is held no generation is issued and no end is
+  accepted, whether it rests on a release's `inactive` answer or on a status read. An apply that threw or
+  reached no device drops its claim at once. The generation outlives the claim. A claim stops counting
+  120 seconds after it was stamped, and both the stamp and that test use the database's clock, so a
+  server whose own clock steps cannot make a live claim read as expired or a dead one as live. The
+  server also keeps the claims it stamped on its own monotonic clock for the same 120 seconds, so a
+  step of the database's clock cannot make one of them read expired early; after a restart (or for a
+  claim another replica stamped) the database clock alone judges the window. MCP
+  `quarantine_device` reads no reply, so after any call that reached a device (the first as well as a retry) a second call, a
+  release's confirmed end and the reconciler's own apply are held back until the claim expires, at most 120
+  seconds; the second call answers a retryable fault.
+- Whoever will act on an `inactive` answer reads the generation **before it sends the command whose
+  answer it will use** (the reconciler before its status read, `DELETE` before its release), and the
+  write that ends the record presents it. The store refuses the end when an apply was claimed since
+  (`apply_in_flight`). The record then stays `releasing` and the next status read takes a fresh
+  generation and settles it. A forced end rests on no observation and is not refused.
+
+This relies on commands to one device arriving in the order one server dispatched them (one stream, a
+first-in first-out gateway queue). **Still open:** a transport that reorders commands to one device;
+an apply and a release dispatched by two different server replicas; a claim older than 120 seconds (an
+apply that stays unexecuted that long is ignored); and the two check-then-dispatch windows below. In each the
+trace is the same, a `quarantine.reapply` failure row and a device that is contained under no record or
+a releasing one, and the way back is `firewall.release` sent through the generic command routes.
 
 The release a `DELETE` sends and the owed release both check the record and then dispatch, so each has the
 same narrow window against a new quarantine of the same device (the new record's re-verify corrects it
 within 5 minutes). The same outcome follows when a release sent earlier is run by the device after a later
 record's apply, because commands are not ordered on the device: the new record can be confirmed and the
-device then released, uncontained until the re-verify re-applies it. If you release and immediately re-quarantine the same device with a different
-whitelist, a follow-up `firewall.quarantine_status` check is a reasonable sanity step. Tracked for a
-proper fix (a claim or generation token on the active record).
+device then released, uncontained until the re-verify re-applies it. If you release and immediately
+re-quarantine the same device with a different whitelist, a follow-up `firewall.quarantine_status` check
+is a reasonable sanity step.
 
 ## IOC Checking
 
@@ -905,6 +959,8 @@ curl -s -X POST http://localhost:8080/api/v1/executions \
     "scope": "tag:env == \"production\""
   }'
 ```
+
+**Domain checks and the Windows DNS cache.** On Windows a `domains` check reads the resolver cache once per command. If the cache cannot be read (the DNS API is unavailable, or returns failure, which some Windows 11 builds do on every call), the result is marked **constrained / partial** with provenance `windows:ioc:dns_cache_unreadable`, and each domain row says `DNS resolver cache could not be read`. Treat that as **unknown, not clean**: a constrained domain answer says nothing about whether the endpoint resolved the domain. Earlier builds reported `Not in DNS cache` in this case. At most 100 domains are accepted per command; more is refused whole with `error|domains|false|Too many domains (N, max 100)`.
 
 IOC checks run locally on each endpoint, querying active connections (Windows: `GetExtendedTcpTable`, Linux: `/proc/net/tcp`, macOS: `lsof`), DNS cache, and filesystem state. Results include matched indicators and the source of the match.
 
@@ -951,3 +1007,60 @@ When using OIDC (for example with Keycloak or Microsoft Entra ID):
 > rotation, so the old one must be **deleted** at the IdP; and deletion does not reach what was
 > already issued under it — access tokens stay valid until they expire, and sessions have to be
 > ended separately at the IdP and in Yuzu.
+
+## Agent re-registration proof: alert runbook
+
+The alerts below belong to `--agent-reregistration-proof` (see [Upgrading: re-registration proof](upgrading.md#behaviour-change-re-registering-an-already-enrolled-agent-can-require-proof-of-its-identity-wp01) for the modes, the soak and the recovery rules). Each heading is the alert name; every `runbook_url` in `docs/prometheus/yuzu-alerts.yml` for these alerts points here. These are sample rules: `docs/prometheus/yuzu-alerts.yml` is not loaded by anything this repo ships (no compose file mounts it, no Alertmanager configuration ships), so they fire only where an operator has wired the rules and routed their severities. The authoritative count of decisions is always `yuzu_register_reregistration_total`; audit rows are bounded and can be dropped.
+
+### YuzuAgentReregistrationWouldRefuse
+
+`audit` mode admitted a re-registration that `enforce` would refuse. For each `outcome` in `yuzu_register_reregistration_total{mode="audit"}`: `no_proof` (no certificate or token shown for a live-leaf id), `unattested_gateway` (a gateway that cannot witness certificates: set `witness_client_cert` on its agent listener; the gateway reads its configuration at boot), `revoked_identity`, `lookup_failed` (the CA store could not be read). Look at the `agent.reregistration_unproven` rows for the agent ids and addresses. Do not switch to `enforce` while real agents appear here.
+
+### YuzuAgentReregistrationUnattestedGateway
+
+A gateway reported that it cannot witness client certificates. Under `enforce` every leaf-holding agent behind it is refused. Fix the gateway's agent listener (`verify => verify_peer`, `fail_if_no_peer_cert => false`, `witness_client_cert => true`; the gateway reads its configuration at boot, so the change is in effect on a gateway process started afterwards); a wizard, demo, UAT or plaintext gateway cannot be enforced.
+
+### YuzuAgentReregistrationRefused
+
+`enforce` refused re-registrations. Check the `agent.reregistration_refused` rows. A real agent that lost its key: if it has no certificate file, give it a fresh single-use token (`max_uses` 1); if it still holds a certificate file, remove its `cert_dir`, restart it and give it the token. Unexpected ids and addresses are the takeover attempt the control stops.
+
+### YuzuAgentReregistrationLookupFailed
+
+The CA store could not be read, so every re-registration is refused `UNAVAILABLE` (retryable). Restore the PostgreSQL/CA store; agents retry on their own backoff.
+
+### YuzuAgentReenrolTokenRefusedBurst
+
+More than five re-enrolment tokens were refused in 15 minutes. Read `yuzu_register_reenrol_token_refused_total{reason}`: `multi_use_token` means the wrong kind of token was minted (re-enrolment needs `max_uses` 1; the single-token form defaults to 100); `already_consumed`, `expired`, `revoked` mean a spent or dead token is being retried; `not_found` repeated across ids means token guessing.
+
+### YuzuAgentReenrolTokenRefusedFirstWeeks
+
+A first-weeks-after-flip alert: it fires on ANY refused token re-enrolment (`increase(yuzu_register_reenrol_token_refused_total[1h]) > 0`). The audit-mode soak cannot exercise the token path, so for the first weeks after `--agent-reregistration-proof=enforce` is switched on each refusal is a lost-key agent that still cannot get back in, or a wrong token. Read the `reason` label: `multi_use_token` (re-enrolment needs `max_uses` 1; the single-token form defaults to 100), `already_consumed` / `expired` / `revoked` (a spent or dead token: mint a new one), `not_found` (a mistyped token, or a guess), `invalid_input_length`. Mint a fresh single-use token; if the agent still holds a certificate file, remove its `cert_dir` and restart it first. It is a standing rule with no end date: once the fleet has settled and the alert is only noise, silence it in Alertmanager or remove the rule; `YuzuAgentReenrolTokenRefusedBurst` keeps watching for bursts.
+
+### YuzuAgentReenrolTokenNoLeaf
+
+A single-use token was consumed to re-enrol a live-leaf id but no leaf was issued (`yuzu_register_reenrol_token_no_leaf_total{reason}`). `no_csr`: the agent's certificate file is inside its first two thirds of life, so it sent no CSR (it sends one only when the certificate is missing, unreadable, not matching its key, expired or past two thirds of its life). On that endpoint remove `cert_dir`, restart the agent and give it a fresh single-use token. `no_signer`: the server has no CA signer wired. `signer_failed` or `signer_threw`: read the server log for the signer error (a per-agent rate limit is one cause). The spent token cannot be reused; the older leaf is not superseded. Tracked: #8252, #8253.
+
+### YuzuAgentReregistrationAuditWriteFailed
+
+A re-registration audit row could not be written (`reason` `store_unavailable` or `write_failed`). Restore the audit store. The decision still happened and is counted in `yuzu_register_reregistration_total`; the call itself is not changed by the failed write.
+
+### YuzuAgentReregistrationRefusalAuditDropped
+
+An enforce-mode `agent.reregistration_refused` audit row lost its per-key budget (10 rows per outcome and agent id, 64 distinct keys, then one overflow allowance per outcome, per 10 s window) and was not written. Unlike the audit-mode `agent.reregistration_unproven` rows, a dropped refusal row has no chunked summary: it is counted only by action in `yuzu_register_reregistration_audit_dropped_total{action="agent.reregistration_refused"}`, its id is named nowhere, and `yuzu_register_reregistration_audit_ids_truncated_total` does not count it. The unbudgeted `yuzu_register_reregistration_total{mode="enforce"}` still counts every refusal. A sustained rise means one source is looping refusals or many ids are being refused at once: find it in the gateway and firewall logs and in the refusal rows that were written.
+
+### YuzuAgentReregistrationAuditIdsTruncated
+
+Agent ids that no summary row names are being counted (an upper bound: each repeat of an over-cap id counts again): more than 20000 DISTINCT ids were dropped inside one 10 s window (`ids_beyond_cap_max=N` on each summary row), or a summary chunk was dropped or never built (see the next alert). Treat it as a sustained flood of re-registrations for ids that hold live leaves. The unbudgeted `yuzu_register_reregistration_total` still counts every one; find the source in the per-source counts of the `agent.reregistration_unproven` aggregate rows (`sources=`) and in gateway and firewall logs.
+
+### YuzuAgentReregistrationAuditSummaryDropped
+
+A dropped-row summary chunk was not written (`reason`: `queue_full`, the 128-row queue overflowed; `write_failed`, three failed writes; `shutdown`, still queued when the server stopped; `alloc_failed`, the window's summary could not be built). Restore the audit store if `write_failed`. The ids that chunk would have named are now UNNAMED: they are counted by id in `yuzu_register_reregistration_audit_ids_truncated_total` (`yuzu_register_reregistration_audit_dropped_total` counts rows, not ids), and the unbudgeted `yuzu_register_reregistration_total` still counts every decision.
+
+### YuzuAgentLeafSupersedeFailed
+
+After a token re-enrolment issued a fresh leaf, revoking the agent's OLDER leaves failed or threw. A failure writes a `ca.cert.supersede_failed` audit row; **a throw writes no audit row**, only a server log line and `yuzu_server_ca_supersede_failed_total`. The older, possibly lost or stolen leaf stays valid until it expires (about 365 days) or you revoke it. Revoke it by hand: `GET /api/v1/ca/issued` (needs `Security:Read`), find the agent's leaves, and `POST /api/v1/ca/revoke` the serial of the OLDER one (`Security:Delete`; irreversible for that serial). Tracked: #8254.
+
+### YuzuAgentReregistrationModeMixed
+
+Server replicas run different `--agent-reregistration-proof` values for more than 10 minutes. The flag is per process, so the fleet is only as enforced as its weakest replica: set the same value on every replica. A throwaway `enforce` replica used for the soak test raises this alert by design; stop it when the test is done.
+

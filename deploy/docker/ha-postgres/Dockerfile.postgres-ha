@@ -2,7 +2,8 @@
 # Yuzu HA-Postgres node — the yuzu-postgres substrate + Patroni (WS-7, ADR-2002 §11).
 #
 # This is a THIN layer over ghcr.io/<owner>/yuzu-postgres:<version>: same
-# PostgreSQL 18.4, same pinned pgvector build, same two-password first-boot
+# PostgreSQL 18 minor (the one Dockerfile.postgres pins, 18.6 since WP15), same
+# pinned pgvector build, same two-password first-boot
 # init (deploy/docker/postgres-init/, inherited from the base at
 # /docker-entrypoint-initdb.d/). Patroni is added on top to manage
 # replication, leader election (via etcd), and automatic failover.

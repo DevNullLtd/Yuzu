@@ -9,7 +9,7 @@
 # We satisfy that with a single static busybox exposing its full applet set.
 #
 # Two deviations from the alpine production image:
-#   1. Builder is glibc Erlang (erlang:28, debian-based), NOT erlang:28-alpine.
+#   1. Builder is glibc Erlang (erlang:28, debian-based), NOT the Alpine hexpm/erlang.
 #      The bundled ERTS + crypto NIF must link the SAME libc family as the
 #      chiselled Ubuntu (glibc) runtime — a musl ERTS cannot run here.
 #   2. Runtime is chiselled Ubuntu 26.04 instead of alpine:3.23.
@@ -18,7 +18,17 @@
 #   docker build -t yuzu-gateway:chisel -f deploy/docker/Dockerfile.gateway.chisel .
 
 # ── Stage 1: deps — fetch + compile Erlang dependencies (cached) ──────────
-ARG ERLANG_IMAGE=erlang:28@sha256:dc7e60b050b1c8f5ac25cef3f15cac0a7bec200b51158634c259e8a371118aae
+# erlang:28 = OTP 28.5.0.8 (built 2026-11-05). `include_erts` puts this
+# image's ERTS and OTP libraries into the shipped release, so this digest decides
+# the OTP the chisel gateway runs. It is held in an ARG default, which Dependabot
+# does not see: refresh it by hand (last: 2026-11-17). On every refresh, read the
+# new image's OTP (`docker run --rm <image> cat
+# /usr/local/lib/erlang/releases/28/OTP_VERSION`) and set it on the line above
+# and in scripts/ci/image-vuln-gate.sh's GRYPE_REQUIRED_COMPONENTS: a test
+# checks those two agree, but it cannot read the digest, so a stale line passes
+# the test and the release gate then refuses the chisel gateway. It is a separate pin from
+# Dockerfile.gateway's hexpm/erlang:28.5.0.8-alpine-3.23.8 builder (WP15).
+ARG ERLANG_IMAGE=erlang:28@sha256:fe3425a5d92e03aa3696b951b128f6c55c6f76d4ddf341c8e511ae9c515ac8d2
 FROM ${ERLANG_IMAGE} AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends git \
@@ -71,7 +81,13 @@ RUN set -eux; \
 # package indices (main + universe) from the Ubuntu archive over the network,
 # and the large universe index occasionally EOFs mid-download. Retrying makes
 # release rebuilds reliable.
+# YUZU_PACKAGE_REFRESH: release.yml passes a value that changes on every run
+# attempt, so the cut below fetches the current archive (security and updates
+# pockets) instead of being served from the runner's persistent build cache.
+# Local builds leave it empty and cache as usual.
+ARG YUZU_PACKAGE_REFRESH=
 RUN set -eux; mkdir -p /rootfs; \
+    : "package refresh: ${YUZU_PACKAGE_REFRESH}"; \
     SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
       base-files_release-info base-passwd_data netbase_config \
       ca-certificates_data openssl_config libc6_libs libgcc-s1_libs \

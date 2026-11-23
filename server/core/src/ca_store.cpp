@@ -387,6 +387,16 @@ const std::vector<pg::PgMigration>& migrations() {
             "(revoked_at, serial_hex) INCLUDE (revocation_reason) WHERE revoked_at > 0; "
             "CREATE INDEX IF NOT EXISTS idx_ca_issued_issued_at_serial ON ca_issued "
             "(issued_at, serial_hex) INCLUDE (revoked_at, revocation_reason);"},
+        // v6 (WP01): the per-agent identity lookup that Register/ProxyRegister make before
+        // re-admitting an already-enrolled agent id (agent_leaf_state). Register is
+        // unauthenticated and hot and ca_issued is never pruned, so this must not be a table
+        // scan. Partial on purpose: only agent leaves are ever looked up by subject. Plain
+        // CREATE INDEX blocks ca_issued writers while it builds - the same accepted exception as
+        // v5 (ADR-0053 "Update (2026-10-20)"), with the same lock_timeout / statement_timeout.
+        {6, "SET LOCAL lock_timeout = '30s'; "
+            "SET LOCAL statement_timeout = 0; "
+            "CREATE INDEX IF NOT EXISTS idx_ca_issued_agent_subject ON ca_issued "
+            "(subject, not_after) WHERE purpose = 'agent';"},
     };
     return kMigrations;
 }
@@ -530,12 +540,12 @@ std::expected<void, std::string> CaStore::record_issued(const IssuedCertRecord& 
         "INSERT INTO ca_store.ca_issued (serial_hex, subject, san, purpose, not_after, status, "
         "revocation_reason, revoked_at, issued_at, issued_by, enrollment_request_id, cert_pem, "
         "issuer_fingerprint, issuer_key_id) "
-        "VALUES ($1,$2,$3,$4,$5::bigint,$6,$7,$8::bigint,$9::bigint,$10,$11,$12,$13,$14)",
+        "VALUES ($1,$2,$3,$4,$5::bigint,$6,$7,$8::bigint,COALESCE(NULLIF($9::bigint, 0), floor(extract(epoch FROM now()))::bigint),$10,$11,$12,$13,$14)",
         std::vector<std::string>{
             *serial, sanitize_pg_text(rec.subject), sanitize_pg_text(rec.san),
             sanitize_pg_text(rec.purpose), std::to_string(rec.not_after),
             cert_status_to_string(rec.status), sanitize_pg_text(rec.revocation_reason),
-            std::to_string(rec.revoked_at), std::to_string(rec.issued_at ? rec.issued_at : now_epoch()),
+            std::to_string(rec.revoked_at), std::to_string(rec.issued_at),
             sanitize_pg_text(rec.issued_by), sanitize_pg_text(rec.enrollment_request_id),
             sanitize_pg_text(rec.cert_pem), rec.issuer_fingerprint, rec.issuer_key_id});
     if (res.status() != PGRES_COMMAND_OK) {
@@ -675,6 +685,12 @@ public:
     const std::string& unpublished() {
         return bind(unpublished_, [&] { return p_.add_text(kRevokeReasonUnpublished); });
     }
+    /// WP01: a leaf the server revoked as `reenrolled` is lifecycle bookkeeping exactly like
+    /// `superseded` (a fresh leaf replaced it), so it counts in the SUPERSEDED bucket, never in
+    /// "other" (which a reader takes for compromise revocations).
+    const std::string& reenrolled() {
+        return bind(reenrolled_, [&] { return p_.add_text(kRevokeReasonReenrolled); });
+    }
 
 private:
     template <class F> const std::string& bind(std::string& slot, F&& make) {
@@ -685,6 +701,7 @@ private:
     SqlParams& p_;
     std::string superseded_;
     std::string unpublished_;
+    std::string reenrolled_;
 };
 
 // The statement's one-row clock CTE, `t(as_of, week)`: as_of is the caller's pinned value bound
@@ -709,11 +726,12 @@ std::string bucket_predicate(std::optional<CaRevokeBucket> bucket, PredicateRefs
         return {};
     switch (*bucket) {
     case CaRevokeBucket::kSuperseded:
-        return " AND revocation_reason = " + r.superseded();
+        return " AND revocation_reason IN (" + r.superseded() + ", " + r.reenrolled() + ")";
     case CaRevokeBucket::kUnpublished:
         return " AND revocation_reason = " + r.unpublished();
     case CaRevokeBucket::kOther:
-        return " AND revocation_reason NOT IN (" + r.superseded() + ", " + r.unpublished() + ")";
+        return " AND revocation_reason NOT IN (" + r.superseded() + ", " + r.reenrolled() + ", " +
+               r.unpublished() + ")";
     }
     return " AND false"; // unreachable: every enumerator returns above
 }
@@ -721,8 +739,8 @@ std::string bucket_predicate(std::optional<CaRevokeBucket> bucket, PredicateRefs
 // The same three buckets as a value (0 superseded, 1 unpublished, 2 other) for the per-week
 // revoked series' GROUP BY - the CASE arms are bucket_predicate's, in the same order.
 std::string bucket_index(PredicateRefs& r) {
-    return "CASE WHEN revocation_reason = " + r.superseded() +
-           " THEN 0 WHEN revocation_reason = " + r.unpublished() + " THEN 1 ELSE 2 END";
+    return "CASE WHEN revocation_reason IN (" + r.superseded() + ", " + r.reenrolled() +
+           ") THEN 0 WHEN revocation_reason = " + r.unpublished() + " THEN 1 ELSE 2 END";
 }
 
 // An issued count never includes a certificate revoked as unpublished: it was recorded but never
@@ -1196,7 +1214,8 @@ std::string qualify_operator_reason(const std::string& reason) {
     std::string folded = b == std::string::npos ? std::string{} : reason.substr(b, e - b + 1);
     for (auto& c : folded)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (folded == kRevokeReasonSuperseded || folded == kRevokeReasonUnpublished)
+    if (folded == kRevokeReasonSuperseded || folded == kRevokeReasonUnpublished ||
+        folded == kRevokeReasonReenrolled)
         return "operator-supplied: " + reason;
     return reason;
 }
@@ -1309,6 +1328,151 @@ std::expected<std::vector<std::string>, std::string> CaStore::list_revoked_seria
     for (int i = 0; i < serial_rows; ++i)
         serials.push_back(text_col(res.get(), i, 0));
     return serials;
+}
+
+std::expected<AgentLeafState, std::string> CaStore::agent_leaf_state(const std::string& agent_id) {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    // The database clock decides "unexpired" (never this replica's system_clock, #3715). The
+    // purpose filter is load-bearing: `subject` has no namespace of its own, so a revoked
+    // code-signing leaf whose CN equals an agent id must not read as that agent's identity.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT COALESCE(bool_or(status = 'active'), false), "
+        "COALESCE(bool_or(status = 'revoked' AND revocation_reason <> $2), false) "
+        "FROM ca_store.ca_issued WHERE purpose = 'agent' AND subject = $1 "
+        "AND not_after > extract(epoch FROM now())::bigint",
+        std::vector<std::string>{sanitize_pg_text(agent_id), std::string(kRevokeReasonReenrolled)});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "agent_leaf_state failed: " + PQerrorMessage(lease.get()));
+    AgentLeafState st;
+    st.has_live = text_col(res.get(), 0, 0) == "t";
+    st.has_revoked_unexpired = text_col(res.get(), 0, 1) == "t";
+    return st;
+}
+
+std::expected<std::vector<std::string>, std::string>
+CaStore::live_agent_serials(const std::string& agent_id) {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT serial_hex FROM ca_store.ca_issued WHERE purpose = 'agent' AND subject = $1 "
+        "AND status = 'active' AND not_after > extract(epoch FROM now())::bigint",
+        std::vector<std::string>{sanitize_pg_text(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "live_agent_serials failed: " + PQerrorMessage(lease.get()));
+    std::vector<std::string> out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.push_back(text_col(res.get(), i, 0));
+    return out;
+}
+
+std::expected<std::vector<std::string>, std::string>
+CaStore::revoke_older_agent_leaves(const std::string& agent_id, const std::string& keep_serial) {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    const auto keep = normalize_serial_hex(keep_serial);
+    if (!keep)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "keep serial is not hex");
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    std::vector<std::string> out;
+    std::string failure;
+    bool survivor_inactive = false;
+    // ONE transaction under a per-agent advisory lock (ADR-0012): the lock is taken BEFORE the
+    // UPDATE's snapshot, so two concurrent re-enrolments of one id run strictly one after the
+    // other, and the second sees the first's committed leaf. The statement revokes only leaves
+    // OLDER than the caller's own (the survivor, which must be active and unexpired) by
+    // (issued_at, serial_hex), so it never revokes the survivor and cannot leave the id with zero
+    // live leaves. RESIDUALS (best effort, #8254): `issued_at` has one-second resolution, so on a
+    // same-second tie whose caller serial is the LOWER one the other leaf is not older and both
+    // stay live until the next re-enrolment (reproduced in PG); there is no lock around ISSUANCE,
+    // only around this revoke. `issued_at` is stamped from the DATABASE clock at issuance
+    // (sign_agent_csr uses db_now()), so a lagging replica clock cannot make its newer leaf look
+    // older.
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
+        pg::PgResult lock = pg::exec_params(
+            conn, "SELECT pg_advisory_xact_lock(hashtextextended('ca_agent_leaf:' || $1, 0))",
+            std::vector<std::string>{sanitize_pg_text(agent_id)});
+        if (lock.status() != PGRES_TUPLES_OK) {
+            failure = PQerrorMessage(conn);
+            return false;
+        }
+        // The survivor is the caller's OWN new leaf and it must be ACTIVE and unexpired: otherwise
+        // (operator-revoked in between, never recorded) NOTHING is revoked and the call reports
+        // failure, so an older, possibly stolen leaf is never "superseded" by a leaf that is not
+        // live. Only leaves OLDER than the survivor by (issued_at, serial_hex) are revoked, so two
+        // concurrent re-enrolments can never revoke each other's (or the caller's own) fresh
+        // leaf. issued_at is stamped by the INSERT from the database clock. revoked_at is the
+        // database clock too.
+        pg::PgResult live = pg::exec_params(
+            conn,
+            "SELECT 1 FROM ca_store.ca_issued WHERE serial_hex = $2 AND purpose = 'agent' "
+            "AND subject = $1 AND status = 'active' "
+            "AND not_after > extract(epoch FROM now())::bigint",
+            std::vector<std::string>{sanitize_pg_text(agent_id), *keep});
+        if (live.status() != PGRES_TUPLES_OK) {
+            failure = PQerrorMessage(conn);
+            return false;
+        }
+        if (PQntuples(live.get()) != 1) {
+            survivor_inactive = true;
+            return true; // nothing revoked; reported below
+        }
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "UPDATE ca_store.ca_issued o SET status = 'revoked', revocation_reason = $3, "
+            "revoked_at = floor(extract(epoch FROM now()))::bigint "
+            "FROM ca_store.ca_issued k "
+            "WHERE k.serial_hex = $2 AND k.purpose = 'agent' AND k.subject = $1 "
+            "AND o.purpose = 'agent' AND o.subject = $1 AND o.status = 'active' "
+            "AND o.not_after > extract(epoch FROM now())::bigint "
+            "AND (o.issued_at, o.serial_hex) < (k.issued_at, k.serial_hex) "
+            "RETURNING o.serial_hex",
+            std::vector<std::string>{sanitize_pg_text(agent_id), *keep,
+                                     std::string(kRevokeReasonReenrolled)});
+        if (res.status() != PGRES_TUPLES_OK) {
+            failure = PQerrorMessage(conn);
+            return false;
+        }
+        const int n = PQntuples(res.get());
+        for (int i = 0; i < n; ++i)
+            out.push_back(text_col(res.get(), i, 0));
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "revoke_older_agent_leaves failed: " + failure);
+    if (survivor_inactive)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "the new leaf is not an active agent leaf: nothing revoked");
+    return out;
+}
+
+std::expected<std::int64_t, std::string> CaStore::db_now() {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT floor(extract(epoch FROM now()))::bigint",
+                                       std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "db_now failed");
+    return static_cast<std::int64_t>(std::strtoll(text_col(res.get(), 0, 0).c_str(), nullptr, 10));
 }
 
 bool CaStore::delete_issued_by(const std::string& issued_by) {

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-//
 // oidc_writer_gate.hpp -- writer priority for the route-level OIDC lock (`oidc_mu_`, #5692 UP-13).
 //
 // `oidc_mu_` is a std::shared_mutex, and on glibc that is a READER-preferring rwlock: while at

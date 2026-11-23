@@ -28,6 +28,12 @@ The Linux Service spark case in `test_spark_mechanism.cpp` (a private `dbus-daem
 
 `yuzu::test::open_echo_db(path)` (`tests/unit/echo_test_db.hpp`, `yuzu_echo_tests` only) opens an `EchoDatabase` that starts at the current schema version: it copies a per-process migrated template to `path` first and sets `PRAGMA synchronous=OFF` on the write connection. A fresh `EchoDatabase::open` walks the v2 to v10 ladder as separate commits (about 25 fsyncs), and the suite opens about 470 databases, which made the Windows debug leg fsync-bound and intermittently past its 180 s limit (#7135, #7872). Use it where a test wants "the state a fresh open leaves". **Keep a real `EchoDatabase::open` on a path the test prepared** for anything about the open itself or the ladder (a fresh open's own end state, an upgrade, a corrupt, busy or colliding file, the open's log lines) and for durability or crash behaviour. The helper prints to stderr and falls back to a plain open if the template cannot be built, and `echo_test_db: the migrated template is built...` fails the suite in that case.
 
+## Echo tests
+
+New and changed `tests/unit/**/test_echo*.cpp` follow [echo-test-standard.md](echo-test-standard.md): ten rules (cost and
+determinism, host dependence and honesty) and the lexical gate `tests/test_echo_test_standard_lexical.py` (meson suite `echo`),
+whose four patterns cover rules 3 to 5. A finding is waived only by a real `// echo-test-ok: <reason>` comment, justified in the PR.
+
 ## Route-handler tests — `TestRouteSink`
 
 For route-handler tests, `TestRouteSink` (`tests/unit/server/test_route_sink.hpp`, used by 41 files) mirrors `httplib::Server`'s parsing of the path, the query string, and an `application/x-www-form-urlencoded` body into `req.params` (query first, so query wins) — and **nothing else**: no path percent-decoding, no multipart/chunked, no duplicate headers, and none of the pre/post-routing pipeline. So a gate that moves into pre-routing leaves every sink test green. Two traps: `Post(path, body)` defaults to `application/json` and does NOT populate `req.params` (omitting the content-type silently tests a handler's fallback instead of its production branch — the #1786 false-green, re-armable), and fixtures must declare the sink **after** the route owner it registers (its handlers capture the owner's `this`). Contract pinned by `tests/unit/server/test_route_sink_harness.cpp`.
@@ -45,6 +51,13 @@ FIRST (reverse declaration order); its callback must not throw, since it can run
 mid-unwind, where a second throw would terminate. Used by `test_thread_pool.cpp`
 (releasing parked pool workers before `~ThreadPool` joins them). Promoted from
 `test_thread_pool.cpp` once a second file needed it.
+
+A call whose **return** is under test (`OpenRetryLoop::stop()`, a plugin's `shutdown()`) is the
+exception to "guard it with `ScopeExit`": a hung call cannot be unwound, because the owner's
+destructor blocks in it too. Run it through `yuzu::test::must_return_within`
+(`tests/unit/test_bounded_return.hpp`), which runs the call on the calling thread under a watchdog
+that ends the process with the call's name if the bound passes, and prints every call's elapsed
+seconds. Never `std::async` plus `wait_for` for this: the future's destructor blocks in the same call.
 
 A bounded drain is not a lifetime guarantee for a detached worker. In
 `test_guardian_outbox_send_executor.cpp`, each stalled callback owns its gate
@@ -97,6 +110,8 @@ For server tests needing live **PostgreSQL**, use `PostgresTestDb` + `YUZU_REQUI
 **Clone-strategy knob.** `YUZU_TEST_PG_CLONE_STRATEGY` selects the `STRATEGY` of the template clone (`CREATE DATABASE "<db>" TEMPLATE "<tpl>"`, the `YUZU_REQUIRE_PG_DB_TPL` path): `wal_log` or `file_copy`, case-insensitive, appends ` STRATEGY WAL_LOG` / ` STRATEGY FILE_COPY`. **Unset (or empty) leaves the SQL byte-identical** to the knob not existing, so the server default (`WAL_LOG`) applies. **Any other value FAILS the fixture** (`PostgresTestDb::error()` names the variable and the accepted values; the macro's `REQUIRE` reports it) rather than silently measuring the default. **The `STRATEGY` clause needs PostgreSQL 15 or later**: an older server rejects the `CREATE DATABASE`, which fails the fixture, so leave the variable unset there. **`file_copy` is only faster on a cluster running with `fsync=off`** (as CI's does); on a durable one, such as a default local `postgres:18` container, each clone is several times slower, so leave it unset locally unless your cluster runs that way. Fresh empty databases (plain `YUZU_REQUIRE_PG_DB`) are not affected. The Linux CI test step's pg half sets it to `file_copy` (measured about 6-7% faster on that half than the default; a value already in the runner's environment is overridden there, with a `::warning::`); no other CI job sets it, so the Windows and macOS legs, the nightlies and local runs keep the server default unless you set it (`docs/ci-architecture.md`, "Postgres for server tests"). Parser and its contract: `parse_pg_clone_strategy` in `test_helpers.hpp`, tested in `tests/unit/server/test_pg_template_cleanup.cpp` (the parser on its own, plus a `[pg][template]` case cloning with each value and with an invalid one).
 
 **Census pair harness knobs.** `YUZU_TEST_PAIR_HARNESS_SEEDS=N` (seeds 0..N-1, default 64), `YUZU_TEST_PAIR_HARNESS_ONLY=S` (seed S alone, schedule printed) and `YUZU_TEST_PAIR_HARNESS_DECISIONS=0` (leave the decision-label comparison out) steer `census pair harness: seeds replayed through the store against the model`; a malformed SEEDS or ONLY value fails the case instead of running a default. The replay recipe, the digest table and where the original Python model is (not in the tree) are in the header of `tests/unit/server/test_census_pair_harness.cpp`.
+
+**Package-database fixture root.** `YUZU_TEST_PKGDB_FIXTURE_ROOT` replaces the directory that the row-set parity case in `tests/unit/test_installed_apps_pkgdb.cpp` walks. **Unset (or empty) means the eight committed trimmed captures** under `tests/unit/fixtures/software-estate/pkgdb/`; set, it must name a directory with one sub-directory per capture holding its database file (`status`, `rpmdb.sqlite`, `Packages.db` or `Packages`) plus `inventory.tsv` and `list.txt` in the OLD output formats, and the same case then runs over those full, untrimmed captures and prints one `[pkgdb parity]` line of package and row counts per capture to stderr. A set value that is not a directory fails the case. The full captures are not in the tree; the recipe that recomposes their oracle files is in `provenance.txt` beside the fixtures, under "The full, untrimmed captures".
 
 ## Prometheus alert rules — parse vs behaviour
 

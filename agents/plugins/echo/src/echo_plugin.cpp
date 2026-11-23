@@ -20,6 +20,7 @@
  *   -> compute diff -> insert events -> save current state
  */
 
+#include "echo_wire_scrub.hpp" // scrub identity strings at collection (baseline round-trip)
 #include "echo_capture_status.hpp" // yuzu::echo::collect_or_retain
 #include "echo_collectors.hpp"
 #include "echo_cursor.hpp" // yuzu::echo::CursorSource, make_cursor_sources
@@ -1225,6 +1226,22 @@ public:
         return 1;
     }
 
+    // The database closed at run time (a failed rollback, #8099) while the plugin stays online:
+    // answer the actions that would otherwise report a healthy empty store with the offline error
+    // and tell the caller not to run them. Which actions, and why the others are left alone, is
+    // refused_on_closed_store's contract. Only reads the lock-free liveness probes, so a long
+    // `echo sql` or a rollup holding the database mutex cannot stall a tick here.
+    bool refuse_on_closed_store(yuzu::CommandContext& ctx, std::string_view action) {
+        if (!db_)
+            return false;
+        const auto line = yuzu::echo::format_closed_store_refusal(action, db_->is_open(),
+                                                                 db_->query_engine_available());
+        if (!line)
+            return false;
+        ctx.write_output(*line);
+        return true;
+    }
+
     int execute_dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
         if (!online_.load(std::memory_order_acquire)) {
             OfflineState offline;
@@ -1255,10 +1272,14 @@ public:
             return 1;
         }
 
-        if (action == "collect_fast")
-            return do_collect_fast(ctx);
+        // collect_slow first: it reconciles the storage-offline tag, which a closed store still
+        // needs published, and then applies the same closed-store refusal itself.
         if (action == "collect_slow")
             return do_collect_slow(ctx);
+        if (refuse_on_closed_store(ctx, action))
+            return 1;
+        if (action == "collect_fast")
+            return do_collect_fast(ctx);
         if (action == "collect_perf")
             return do_collect_perf(ctx);
         if (action == "collect_software")
@@ -1325,7 +1346,11 @@ public:
             if (pid_name_.size() >= kPidNameCap)
                 pid_name_.clear(); // wholesale flush, as the ETW consumer's cache does
         }
-        pid_name_[pid] = yuzu::echo::PidName{name, 0};
+        // The stream leg's image names are raw OS bytes; this map labels connection rows that
+        // are then diffed and dumped with replace, so keep it well-formed (see echo_wire_scrub.hpp).
+        std::string clean = name;
+        yuzu::echo::scrub_wire_strings(clean);
+        pid_name_[pid] = yuzu::echo::PidName{std::move(clean), 0};
     }
     // A stop never erases: loads and sockets of a just-exited process still resolve inside
     // kPidNameGraceSec, while a reused pid whose start was missed resolves to "" after it.
@@ -1802,6 +1827,10 @@ private:
                     pe.ppid = e.ppid;
                     pe.name = e.image_name;
                     pe.user = e.user;
+                    // Stream-leg image names/users are raw OS bytes (ETW / ES): well-formed UTF-8 at
+                    // collection, like every other Echo identity string (echo_wire_scrub.hpp).
+                    yuzu::echo::scrub_wire_strings(pe.name);
+                    yuzu::echo::scrub_wire_strings(pe.user);
                     pe.exit_code = e.exit_code;
                     pe.parent_name = yuzu::echo::pid_name_lookup(pid_name_, e.ppid, e.ts_unix);
                     typed.push_back(std::move(pe));
@@ -1865,6 +1894,7 @@ private:
                     // since the fallback. (Mirrors the poll branch's enumerate +
                     // stabilization-exclusion filter, minus the diff/insert.)
                     auto current = yuzu::agent::enumerate_processes();
+                    yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
                     note_pid_names(current, ts);
                     if (!stab_excl.empty()) {
                         std::erase_if(current, [&](const auto& p) {
@@ -1886,6 +1916,7 @@ private:
                 // No active stream (poll-only platform, or stream unavailable):
                 // snapshot-diff poll.
                 auto current = yuzu::agent::enumerate_processes();
+                yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
                 // Before the exclusions: a noisy process still names its sockets.
                 note_pid_names(current, ts);
 
@@ -1977,6 +2008,7 @@ private:
             // Label sockets the collector could not name (TIME_WAIT sockets have pid 0 and stay
             // unnamed; the rest resolve through the process source's pid -> name map).
             yuzu::echo::fill_process_names(current, pid_name_, ts);
+            yuzu::echo::scrub_wire_strings(current); // AFTER the fill: baseline round-trips losslessly
 
             // macOS (roadmap 2.2): nstat is the PRIMARY tcp lifecycle source
             // when the plugin's NstatClient is live and system-wide — its
@@ -2148,7 +2180,7 @@ private:
             // otherwise persist the full snapshot as before (the poll owns
             // both protocols). Events + baseline commit in ONE transaction.
             const std::string state_json =
-                connections_to_json(nstat_primary ? *diff_current : current).dump();
+                connections_to_json(nstat_primary ? *diff_current : current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state(net_key, state_json)
                                 : db_->fold_network_events(
@@ -2264,12 +2296,13 @@ private:
                 }
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 auto previous = json_to_arp(db_->get_state("arp"));
                 auto typed = yuzu::echo::compute_arp_events(previous, *current, ts, snap_id);
                 // Events + baseline in one transaction (#1654); non-fatal, so a
                 // failure emits no `error|` line (the tick's events_recorded
                 // contract holds) and the ledger records the token.
-                const std::string state_json = arp_to_json(*current).dump();
+                const std::string state_json = arp_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state("arp", state_json)
                                     : db_->fold_arp_events(
@@ -2295,9 +2328,10 @@ private:
         const auto dns_state = yuzu::echo::source_enabled_state(*db_, "dns");
         if (dns_state.value_or(false)) {
             auto current = dns_pre ? std::move(*dns_pre) : yuzu::echo::enumerate_dns();
+            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
             auto previous = json_to_dns(db_->get_state("dns"));
             auto typed = yuzu::echo::compute_dns_events(previous, current, ts, snap_id);
-            const std::string state_json = dns_to_json(current).dump();
+            const std::string state_json = dns_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state("dns", state_json)
                                 : db_->fold_dns_events(
@@ -2380,6 +2414,12 @@ private:
                 r.signed_state = std::string{yuzu::echo::module_signed_token(e.signed_state)};
                 r.signer = e.signer;
                 r.is_kernel = e.is_kernel;
+                // Module-load identity strings are raw OS bytes (ETW / ES): well-formed UTF-8 at
+                // collection, like every other Echo identity sink (echo_wire_scrub.hpp).
+                yuzu::echo::scrub_wire_strings(r.process_name);
+                yuzu::echo::scrub_wire_strings(r.module_name);
+                yuzu::echo::scrub_wire_strings(r.module_dir);
+                yuzu::echo::scrub_wire_strings(r.signer);
                 mrows.push_back(std::move(r));
             }
             if (!mrows.empty()) {
@@ -2686,13 +2726,14 @@ private:
                 note_health("service", "capture_incomplete");
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 const std::string svc_key{yuzu::echo::diff_state_key("service")}; // #538
                 auto prev_json = db_->get_state(svc_key);
                 auto previous = json_to_services(prev_json);
 
                 auto typed = yuzu::echo::compute_service_events(previous, *current, ts, snap_id);
                 // Events + baseline in ONE transaction (#1654).
-                const std::string state_json = services_to_json(*current).dump();
+                const std::string state_json = services_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state(svc_key, state_json)
                                     : db_->fold_service_events(
@@ -2717,12 +2758,13 @@ private:
         if (user_state.value_or(false)) {
             const std::string usr_key{yuzu::echo::diff_state_key("user")}; // #538
             auto current = yuzu::echo::enumerate_users();
+            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
             auto prev_json = db_->get_state(usr_key);
             auto previous = json_to_users(prev_json);
 
             auto typed = yuzu::echo::compute_user_events(previous, current, ts, snap_id);
             // Events + baseline in ONE transaction (#1654).
-            const std::string state_json = users_to_json(current).dump();
+            const std::string state_json = users_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state(usr_key, state_json)
                                 : db_->fold_user_events(
@@ -2827,10 +2869,11 @@ private:
                 note_health("mapdrive", "capture_incomplete");
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 const std::string md_key{yuzu::echo::diff_state_key("mapdrive")}; // #538
                 auto previous = json_to_mapdrive(db_->get_state(md_key));
                 auto typed = yuzu::echo::compute_mapdrive_events(previous, *current, ts, snap_id);
-                const std::string state_json = mapdrive_to_json(*current).dump();
+                const std::string state_json = mapdrive_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state(md_key, state_json)
                                     : db_->fold_mapdrive_events(
@@ -3155,17 +3198,51 @@ private:
     }
 
     int do_collect_slow(yuzu::CommandContext& ctx) {
+        // Return, never fall through to a reconcile that would read a missing store as closed: a
+        // null db_ (the plugin's EchoDatabase, which a wedge leaves in place) would publish
+        // rollback_wedged. The online_ gate makes this unreachable in a running agent (teardown
+        // stops the triggers before it resets db_); the check is parity with
+        // reconcile_db_health_publish.
+        if (!db_) {
+            ctx.write_output("error|Echo database not initialized");
+            return 1;
+        }
         {
             yuzu::PluginContext pctx{plugin_ctx_};
             reconcile_db_health_publish(pctx);
-            // Replay a storage-offline tag delete that failed when the open recovered. Stateless
-            // and safe: this tick runs only past the online_ gate, where nothing legitimately
-            // sets the key (go_offline runs only while offline).
-            if (pctx.storage_exists(yuzu::echo::kStorageOfflineKey) &&
-                !pctx.storage_delete(yuzu::echo::kStorageOfflineKey))
-                spdlog::warn("ECHO: the storage-offline heartbeat tag is still set after "
-                             "recovery and could not be cleared; retried on the next slow collect");
+            // Reconcile the storage-offline tag with the store, stateless. This tick runs only
+            // past the online_ gate, where go_offline never runs, so the only legitimate value
+            // here is rollback_wedged: the store was closed at run time by a failed rollback and
+            // nothing collects until the agent restarts. Anything else is stale (a previous
+            // run's tag, or a delete that failed when the open recovered) and is cleared.
+            const bool key_present = pctx.storage_exists(yuzu::echo::kStorageOfflineKey);
+            const bool store_open = db_->is_open();
+            switch (yuzu::echo::online_offline_tag_action(
+                store_open, key_present,
+                key_present ? pctx.storage_get(yuzu::echo::kStorageOfflineKey) : std::string{})) {
+            case yuzu::echo::OfflineTagAction::publish_wedged:
+                if (pctx.storage_set(yuzu::echo::kStorageOfflineKey, yuzu::echo::kRollbackWedgedToken))
+                    spdlog::error("ECHO: storage offline (rollback_wedged): the database was closed "
+                                  "after a transaction could not be rolled back; collection and "
+                                  "retention are stopped until the agent restarts");
+                else
+                    spdlog::warn("ECHO: failed to publish the storage-offline heartbeat tag; "
+                                 "retried on the next slow collect");
+                break;
+            case yuzu::echo::OfflineTagAction::clear:
+                if (!pctx.storage_delete(yuzu::echo::kStorageOfflineKey))
+                    spdlog::warn("ECHO: the storage-offline heartbeat tag is still set after "
+                                 "recovery and could not be cleared; retried on the next slow "
+                                 "collect");
+                break;
+            case yuzu::echo::OfflineTagAction::leave:
+                break;
+            }
         }
+        // After the reconcile, so a closed store still publishes its tag; nothing below may run on
+        // it (the mapdrive retry and the collect read every source as unreadable).
+        if (refuse_on_closed_store(ctx, "collect_slow"))
+            return 1;
         // §3.8 bounded mapdrive-backfill retry (related issue #5291): above collect_mu_, same as
         // init()'s call site, so hive I/O never runs under the shared lock. Cheap when nothing is
         // due (phase A's own short lock-and-check) — see retry_pending_mapdrive_backfill's banner.
@@ -3318,6 +3395,9 @@ private:
             const auto q = db_->quarantined_this_open();
             ctx.write_output(yuzu::echo::format_db_health_line(q.has_value(), q ? *q : last_q));
         }
+        for (const auto& line : yuzu::echo::format_schema_status_lines(
+                 db_->schema_version(), db_->warehouse_tables_ok()))
+            ctx.write_output(line);
         auto s = db_->stats();
         ctx.write_output(std::format("record_count|{}", s.record_count));
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));
@@ -3868,7 +3948,7 @@ private:
             arr.push_back(std::move(obj));
         }
 
-        ctx.write_output(arr.dump());
+        ctx.write_output(arr.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
         return 0;
     }
 
@@ -4027,6 +4107,13 @@ private:
             // nothing to widen it with and `fleet_snapshot_window_seconds` no longer has an effect.
             connections = std::move(live);
         }
+        // The snapshot carries identity strings (host name, process names/users/command lines,
+        // socket owners, local addresses) as raw OS bytes: well-formed UTF-8 at collection, like
+        // every other Echo identity sink (echo_wire_scrub.hpp).
+        yuzu::echo::scrub_wire_strings(processes);
+        yuzu::echo::scrub_wire_strings(connections);
+        yuzu::echo::scrub_wire_strings(hostname);
+        yuzu::echo::scrub_wire_strings(local_ips);
 
         // Redaction defaults are now unioned inside load_redaction_patterns (so
         // every collect path — collect_fast, procperf, and this snapshot — is
@@ -4574,7 +4661,7 @@ private:
                 const bool tcp_prev_enabled = (src_name == "tcp") && cursor_prev_canon == "true";
                 transition_ok = yuzu::echo::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
-                if (transition_ok && v == "false") {
+                if (transition_ok && yuzu::echo::interval_baseline_reset_due(cursor_prev_canon, v)) {
                     // The interval samplers (perf / procperf) keep their previous
                     // reading in memory, not in a diff-state row, so the
                     // diff_state_key clear inside apply_source_enabled_transition
@@ -4587,7 +4674,11 @@ private:
                     // "re-enabling starts from a clean baseline" promise in
                     // docs/user-manual/echo.md). default-constructed → valid=false,
                     // which derive_sample/derive_proc_samples treat as "no baseline"
-                    // (records nothing on the next tick).
+                    // (records nothing on the next tick). The same reset covers
+                    // recovery from a corrupt ("errored") flag (#1624): a skipped
+                    // tick leaves the reading untouched, so the first tick after
+                    // the recovery would otherwise diff against the pre-error
+                    // reading and record the errored interval's activity.
                     if (src_name == "perf")
                         prev_perf_ = yuzu::echo::PerfCounters{};
                     else if (src_name == "procperf")

@@ -2661,7 +2661,7 @@ tests:
     name: dispatch target rejected - unknown-plugin denials never fire the targeting alert
     input_series:
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="unknown_plugin"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
         eval_time: 10m
@@ -2676,7 +2676,7 @@ tests:
     name: dispatch target rejected - kill-switched-os withholdings never fire the targeting alert
     input_series:
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="kill_switched_os"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
         eval_time: 10m
@@ -2685,26 +2685,47 @@ tests:
         eval_time: 25m
         exp_samples: []
 
-  # CASE 62b -- a real targeting mistake still fires alongside ALL THREE excluded
-  # reasons on the same route, so no exclusion widened into a silencer.
+  # CASE 61d -- a client looping on a params key the agent would truncate (refused at the ingress,
+  # `param_key_invalid`) is a refused malformed request, not a targeting near-miss: silent. The series keep rising through
+  # both probes, so the 15m increase is non-zero at each; only the exclusion keeps the alert quiet.
   - interval: 1m
-    name: dispatch target rejected - a real targeting mistake still fires alongside all three exclusions
+    name: dispatch target rejected - param_key_invalid refusals never fire the targeting alert
+    input_series:
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="param_key_invalid"}'
+        values: "0+40x30"
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="schedule",reason="param_key_invalid"}'
+        values: "0+40x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE 62b -- a real targeting mistake still fires alongside ALL FOUR excluded
+  # reasons on the same route, so no exclusion widened into a silencer. The excluded series keep
+  # rising through the probe, so their 15m increase is non-zero and only the exclusion hides them.
+  - interval: 1m
+    name: dispatch target rejected - a real targeting mistake still fires alongside all four exclusions
     input_series:
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="agent_ids_empty"}'
         values: "0 0 0 0+1x30"
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="quarantined"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="unknown_plugin"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="kill_switched_os"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
+      - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="param_key_invalid"}'
+        values: "0+40x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected", alertstate="firing"}'
         eval_time: 20m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuDispatchTargetRejected", alertstate="firing", route="command", reason="agent_ids_empty", severity="warning"}'
             value: 1
-      - expr: 'sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os"}[15m]))'
+      - expr: 'sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os|param_key_invalid"}[15m]))'
         eval_time: 20m
         exp_samples:
           - labels: '{route="command", reason="agent_ids_empty"}'
@@ -4467,6 +4488,23 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing"}'
         eval_time: 30m
         exp_samples: []
+
+  # WP01 review fix: the enforce refusal is counted as code 16 on a healthy gateway, so the alert text
+  # must say the peer guard is not the only source. RED if the amended description is lost.
+  - interval: 1m
+    name: gateway upstream auth refused - the text names the enforce re-registration refusal as a second source
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="proxy_register",code="16"}'
+        values: "_x5 1+1x30"
+    alert_rule_test:
+      - alertname: YuzuGatewayUpstreamAuthRefused
+        eval_time: 15m
+        exp_alerts:
+          - exp_labels: {instance: g1, rpc_name: proxy_register, severity: warning}
+            exp_annotations:
+              summary: "The server refused this gateway's upstream call as unauthenticated (proxy_register on g1)"
+              description: "g1 received gRPC status 16 (UNAUTHENTICATED) on proxy_register for at least 2 minutes. On the gateway-upstream service that is either the server's peer-authorization guard refusing this gateway's certificate or, under --agent-reregistration-proof=enforce, the server's uniform refusal of one agent's re-registration (the gateway counts it as code 16 too, and does not treat it as a breaker failure). Tell them apart first: if yuzu_register_reregistration_total{mode=\"enforce\"} refusals are rising while yuzu_server_gateway_peer_denied_total is flat, the gateway and its pin are healthy and YuzuAgentReregistrationRefused is the alert to follow. For the guard, look at the server side for the reason: yuzu_server_gateway_peer_denied_total by reason, or the server log line \"gateway peer denied\" with the spki= prefix of the key the gateway presented, then follow the YuzuGatewayPeerDenied remedies (a pin that does not match the gateway's current certificate key, a certificate that expired while the connection was open, a certificate without serverAuth). Status 16 is an RPC result, not a transport failure, so the gateway does not redial by itself. If the cause was on the server side (a pin or acknowledgement), fix it, restart the serving replicas, and do not restart the gateways first unless the checks below fail, because on agents without the #5183 fix (shipped in 0.15.0) a gateway restart leaves released agents wedged; see \"What happens when the server restarts\" in docs/user-manual/gateway.md. Only on a gateway that has the #1197 consumer (#5383) does the gateway then recover through its replay path. Check three separate things: the registration counts with sum(yuzu_gw_agents_current) - sum(yuzu_agents_connected{job=\"yuzu-server\"}) (summed across all gateway nodes and all replicas; the server gauge also counts direct agents and counts registration, not placement), no rise in the raw yuzu_gw_upstream_rpc_errors_total{rpc_name=\"notify_stream\",code=\"16\"} or yuzu_gw_upstream_notify_dropped_total, and a read-only command to a sample agent that returns a result (the exact request is in the runbook). Agreeing counts alone do not prove placement. If the cause is on the gateway side (a certificate that expired or was renewed, a rotated key), the gateway presents its current files only when it redials, and a server restart forces a redial, so first check whether it already has: read yuzu_server_gateway_peer_denied_total and yuzu_gw_upstream_rpc_errors_total{code=\"16\"} twice, a minute apart, and see that they have stopped rising, and compute the SPKI prefix of the certificate file the gateway is configured with. A redial can still present the old certificate for about 2 minutes after the files change (Erlang ssl PEM cache; measured on OTP 28.4.2 with a stub, not on a Yuzu gateway). Restart that gateway node, one at a time, only if denials continue and its agents can take the disconnect, because unless the agents run a build with the #5183 fix (shipped in 0.15.0) a gateway restart leaves released agents wedged. For placement loss after a refusal window, restart the agent service on the unreachable agents (the observed fix), and restart the gateway node only if many agents behind one node are affected and the checks still fail. This alert stays active for about 11 minutes after the last refusal (a 10 minute window, so the gateway's circuit breaker, which can leave up to 300 seconds between two calls it makes, cannot blank it): check that the counter is flat rather than waiting for it to clear. See docs/user-manual/server-admin.md \"Gateway upstream peer authorization\"."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
 
   # CASE T -- sustained TLS handshake failures fire the warning after the 5m
   # `for:`, labelled with instance and kind (the rpc_name label is aggregated
@@ -9480,7 +9518,7 @@ tests:
               reason: migration_failed
             exp_annotations:
               summary: "About 2 agent(s) have Echo storage offline (migration_failed)"
-              description: "For more than 25 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that their Echo database could not be opened and Echo is offline (heartbeat tag yuzu.plugin.echo.storage_offline), reason migration_failed: free_space is too little free disk for the v10 roll-up migration, migration_failed is a migration that failed or ran past its deadline and was rolled back with the old data intact, open_failed is any other failure on a retry. reason=\"unknown\" sums values the server does not recognise. Nothing is collected on an affected endpoint, but the agent keeps retrying (1, 5 and 15 minutes, then hourly) and recovers by itself once the cause is gone, except an open_failed where the database opened but collection failed to start: that is not retried and needs an agent restart. The agent log and `echo status` on the device name the cause. The value and the reason are agent-self-reported, so the signal is not authoritative."
+              description: "For more than 25 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that their Echo database could not be opened, or was closed at run time after a failed rollback, and Echo is offline (heartbeat tag yuzu.plugin.echo.storage_offline), reason migration_failed: free_space is too little free disk for the v10 roll-up migration, migration_failed is a migration that failed or ran past its deadline and was rolled back with the old data intact, open_failed is any other failure on a retry, rollback_wedged is a database that opened and was then closed because a transaction could not be rolled back. reason=\"unknown\" sums values the server does not recognise. Nothing is collected on an affected endpoint, but the agent keeps retrying (1, 5 and 15 minutes, then hourly) and recovers by itself once the cause is gone, except an open_failed where the database opened but collection failed to start and every rollback_wedged: neither is retried and both need an agent restart. The agent log and `echo status` on the device name the cause. The value and the reason are agent-self-reported, so the signal is not authoritative."
               runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/echo-storage-offline.md"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
@@ -9523,6 +9561,120 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing", job="yuzu", reason="free_space", severity="warning"}'
             value: 1
+
+
+  # CASE P (#8099) -- a database closed at run time after a failed rollback is published as
+  # reason=rollback_wedged: quiet at 29m, firing at 30m, with the shipped annotations. RED if the
+  # rule stops selecting the reason (a `reason=~` filter that omits it) or if the description
+  # loses the not-retried wording.
+  - interval: 1m
+    name: echo storage offline - rollback_wedged held past 30m fires, not before
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="rollback_wedged"}'
+        values: "1x45"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: YuzuEchoStorageOffline
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: yuzu
+              reason: rollback_wedged
+            exp_annotations:
+              summary: "About 1 agent(s) have Echo storage offline (rollback_wedged)"
+              description: "For more than 25 minutes, about 1 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that their Echo database could not be opened, or was closed at run time after a failed rollback, and Echo is offline (heartbeat tag yuzu.plugin.echo.storage_offline), reason rollback_wedged: free_space is too little free disk for the v10 roll-up migration, migration_failed is a migration that failed or ran past its deadline and was rolled back with the old data intact, open_failed is any other failure on a retry, rollback_wedged is a database that opened and was then closed because a transaction could not be rolled back. reason=\"unknown\" sums values the server does not recognise. Nothing is collected on an affected endpoint, but the agent keeps retrying (1, 5 and 15 minutes, then hourly) and recovers by itself once the cause is gone, except an open_failed where the database opened but collection failed to start and every rollback_wedged: neither is retried and both need an agent restart. The agent log and `echo status` on the device name the cause. The value and the reason are agent-self-reported, so the signal is not authoritative."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/echo-storage-offline.md"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 29m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing", job="yuzu", reason="rollback_wedged", severity="warning"}'
+            value: 1
+
+  # CASE Q (#8099) -- negative control: rollback_wedged at 0 beside another reason firing raises no
+  # rollback_wedged alert. RED if the alert stops being per reason (a label dropped from `sum by`).
+  - interval: 1m
+    name: echo storage offline - rollback_wedged at 0 beside another firing reason stays quiet
+    input_series:
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="rollback_wedged"}'
+        values: "0x60"
+      - series: 'yuzu_fleet_echo_storage_offline{job="yuzu",instance="s1",reason="free_space"}'
+        values: "1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEchoStorageOffline", alertstate="firing", job="yuzu", reason="free_space", severity="warning"}'
+            value: 1
+
+
+  # ── YuzuQuarantineDriftRepeated (#7622) ───────────────────────────────────
+  #
+  # `increase(yuzu_server_quarantine_reapply_total{result="drift"}[1h]) >= 3`, no hold, warning.
+  # The counters below start at 5 (a server that has already counted earlier drifts), so the
+  # window's first sample is not 0 and the extrapolation cannot clamp to zero: three drifts read
+  # a little over 3, two read a little over 2, which keeps both sides clear of the threshold.
+
+  # CASE M -- three drifts inside the hour fire; two on another instance do not. RED if the alert
+  # is removed, or its threshold moves to 4 or more (the firing side reads about 3.05 and goes
+  # quiet) or to 2 or less (the other instance reads about 2.03 and fires). It cannot tell >= 3
+  # from > 3: both sit under 3.05.
+  - interval: 1m
+    name: quarantine drift - three drifts in an hour fire, two do not
+    input_series:
+      - series: 'yuzu_server_quarantine_reapply_total{job="yuzu",instance="s1",result="drift"}'
+        values: "5x20 6 7 8 8x20"
+      - series: 'yuzu_server_quarantine_reapply_total{job="yuzu",instance="s2",result="drift"}'
+        values: "5x20 6 7 7x22"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineDriftRepeated", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineDriftRepeated", alertstate="firing", instance="s1", job="yuzu", result="drift", severity="warning"}'
+            value: 1
+
+  # ── YuzuQuarantineReconcilerStalled (#7623) ───────────────────────────────
+  #
+  # `time() - max by (job) (yuzu_server_quarantine_reconciler_last_tick_unixtime) > 300`,
+  # for: 5m, warning. Under promtool `time()` is the evaluation time in seconds from the start of
+  # the test, so a series whose value equals its own timestamp is a gauge that is being stamped
+  # every scrape ("0+60x40" at a 1m interval) and a series stuck at 0 is a thread that stopped.
+
+  # CASE N -- a gauge that stopped at t=0 fires once it is older than five minutes AND has stayed
+  # so for the hold: quiet at 8m (stale since 5m, still pending), firing at 20m. RED if the age
+  # threshold or the hold is removed.
+  - interval: 1m
+    name: quarantine reconciler stalled - a stale last-tick gauge fires after the hold
+    input_series:
+      - series: 'yuzu_server_quarantine_reconciler_last_tick_unixtime{job="yuzu",instance="s1"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE O -- a gauge stamped on every scrape never fires, and neither does a job where ONE of
+  # two instances is stale and the other is fresh (a follower that does not tick: the max over the
+  # job is the leader's). RED if `max by (job)` becomes a per-instance comparison.
+  - interval: 1m
+    name: quarantine reconciler stalled - a fresh instance keeps the job quiet
+    input_series:
+      - series: 'yuzu_server_quarantine_reconciler_last_tick_unixtime{job="yuzu",instance="s1"}'
+        values: "0+60x40"
+      - series: 'yuzu_server_quarantine_reconciler_last_tick_unixtime{job="yuzu",instance="s2"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled"}'
+        eval_time: 30m
+        exp_samples: []
 
   # CASE -- the one-minute recheck clears a fixed database: the gauge goes 1 -> 0 while the server keeps
   # running, the alert fires after the hold and is gone once the gauge reads 0. Red if the rule
@@ -10857,3 +11009,422 @@ tests:
       - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
         eval_time: 17m
         exp_samples: []
+
+  # ── WP01 agent re-registration proof rollout ─────────────────────────────
+  - interval: 1m
+    name: reregistration would-refuse in audit mode fires
+    input_series:
+      - series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="no_proof",mode="audit"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  - interval: 1m
+    name: reregistration healthy proven re-registrations stay quiet
+    input_series:
+      - series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="proven_by_leaf",mode="audit"}'
+        values: "0+5x60"
+      - series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="no_proof",mode="audit"}'
+        values: "0+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  - interval: 1m
+    name: reregistration seeded-at-zero series first incrementing fires (5177 trap)
+    input_series:
+      - series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="gateway_proxy",outcome="unattested_gateway",mode="audit"}'
+        values: "0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  - interval: 1m
+    name: supersede failure fires
+    input_series:
+      - series: 'yuzu_server_ca_supersede_failed_total{job="yuzu",instance="s1"}'
+        values: "0 0 0 1 1 1 1 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  - interval: 1m
+    name: mixed reregistration modes fire, uniform modes do not
+    input_series:
+      - series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="audit"}'
+        values: "1+0x30"
+      - series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="enforce"}'
+        values: "0+0x30"
+      - series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="audit"}'
+        values: "0+0x30"
+      - series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="enforce"}'
+        values: "1+0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # --- proposed killers
+  - interval: 1m
+    name: K uniform audit does not fire
+    input_series:
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="audit"}', values: "1+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="enforce"}', values: "0+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="off"}', values: "0+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="audit"}', values: "1+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="enforce"}', values: "0+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="off"}', values: "0+0x30"}
+    promql_expr_test:
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed"}', eval_time: 25m, exp_samples: []}
+  - interval: 1m
+    name: K would-refuse unattested_gateway fires
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="unattested_gateway",mode="audit"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: K would-refuse revoked_identity fires
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="revoked_identity",mode="audit"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: K would-refuse lookup_failed fires
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="lookup_failed",mode="audit"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: K enforce mode does not fire audit rule
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="no_proof",mode="enforce"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse"}', eval_time: 30m, exp_samples: []}
+  - interval: 1m
+    name: K unattested direct path or other outcome does not fire
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="unattested_gateway",mode="audit"}', values: "0+1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="gateway_proxy",outcome="no_proof",mode="audit"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway"}', eval_time: 30m, exp_samples: []}
+
+  # --- enforce-phase alerts and the transient-mixed case (M8: `for:` must hold)
+  - interval: 1m
+    name: enforce refusals fire
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="no_proof",mode="enforce"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: enforce lookup_failed fires, audit-mode lookup_failed does not fire the enforce rule
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s1",path="direct",outcome="lookup_failed",mode="enforce"}', values: "0+1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="s2",path="direct",outcome="lookup_failed",mode="audit"}', values: "0+1x60"}
+    promql_expr_test:
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: token refusal burst fires above 5 and stays quiet at 3
+    input_series:
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="s1",reason="multi_use_token"}', values: "0+1x60"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="s2",reason="not_found"}', values: "0 0 0 1 2 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3"}
+    promql_expr_test:
+      - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing", instance="s2"}', eval_time: 20m, exp_samples: []}
+      - {expr: 'count(ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing", instance="s1"})', eval_time: 30m, exp_samples: [{labels: '{}', value: 1}]}
+  - interval: 1m
+    name: mixed modes - for:10m holds exactly (quiet at 9m, firing from 11m, severity warning)
+    input_series:
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="audit"}', values: "1+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s1",mode="enforce"}', values: "0+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="audit"}', values: "0+0x30"}
+      - {series: 'yuzu_server_agent_reregistration_proof_mode{job="yuzu",instance="s2",mode="enforce"}', values: "1+0x30"}
+    promql_expr_test:
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing"}', eval_time: 9m, exp_samples: []}
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentReregistrationModeMixed", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # WP01 Gate 8 pass 3: exact-value cases. Every counter starts at 0 and steps once, so increase() is
+  # exact (no extrapolation) and each window / threshold / severity / alternative mutant changes the
+  # verdict.
+  - interval: 1m
+    name: would-refuse - single step fires within 1h only, severity warning, every alternative
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="no_proof",mode="audit"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="audit"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="revoked_identity",mode="audit"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="d",path="direct",outcome="lookup_failed",mode="audit"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="e",path="direct",outcome="proven_by_leaf",mode="audit"}', values: "0x10 1 1x65"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="b", job="yuzu", severity="warning"}', value: 1}
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="c", job="yuzu", severity="warning"}', value: 1}
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="d", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}', eval_time: 75m, exp_samples: []}
+
+  - interval: 1m
+    name: enforce refusals - each alternative fires per instance at warning, window 15m, exact threshold
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="no_proof",mode="enforce"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="revoked_identity",mode="enforce"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="d",path="direct",outcome="no_proof",mode="audit"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="e",path="direct",outcome="proven_by_leaf",mode="enforce"}', values: "0x10 1 1x25"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing", instance="b", job="yuzu", severity="warning"}', value: 1}
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing", instance="c", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing"}', eval_time: 30m, exp_samples: []}
+
+  - interval: 1m
+    name: enforce lookup_failed - critical, enforce only, window 10m
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="lookup_failed",mode="enforce"}', values: "0x10 1 1x20"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="lookup_failed",mode="audit"}', values: "0x10 1 1x20"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="no_proof",mode="enforce"}', values: "0x10 1 1x20"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing", instance="a", job="yuzu", severity="critical"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing"}', eval_time: 25m, exp_samples: []}
+
+  - interval: 1m
+    name: token refusal burst - exact boundary (4 and 5 refusals quiet, 6 fires), window 15m, per instance
+    input_series:
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="a",reason="multi_use_token"}', values: "0x5 1 2 3 4 4x35"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="b",reason="not_found"}', values: "0x5 1 2 3 4 5 5x35"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="c",reason="expired"}', values: "0x5 1 2 3 4 5 6 6x35"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing", instance="c", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing"}', eval_time: 40m, exp_samples: []}
+
+  - interval: 1m
+    name: supersede failed - single step fires within 1h at warning, quiet after
+    input_series:
+      - {series: 'yuzu_server_ca_supersede_failed_total{job="yuzu",instance="a"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_server_ca_superseded_leaf_total{job="yuzu",instance="b"}', values: "0x10 1 1x65"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing"}', eval_time: 75m, exp_samples: []}
+
+  - interval: 1m
+    name: audit write failures fire at warning and stay quiet after the window
+    input_series:
+      - {series: 'yuzu_register_reregistration_audit_write_failures_total{job="yuzu",instance="a",reason="store_unavailable"}', values: "0x10 1 1x25"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing"}', eval_time: 30m, exp_samples: []}
+
+  # WP01 Gate 8 pass 4: the new alerts, and the UnattestedGateway window.
+  - interval: 1m
+    name: unattested gateway - fires inside its 30m window, quiet after it (a 2h window would still fire)
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="gateway_proxy",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x40"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x40"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing"}', eval_time: 45m, exp_samples: []}
+
+  - interval: 1m
+    name: token consumed but no leaf - fires at warning per instance, quiet after 15m, ignores other counters
+    input_series:
+      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="a",reason="no_csr"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="b",reason="signer_threw"}', values: "0x40"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="c",reason="expired"}', values: "0x10 1 1x25"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReenrolTokenNoLeaf", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReenrolTokenNoLeaf", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenNoLeaf", alertstate="firing"}', eval_time: 30m, exp_samples: []}
+
+  - interval: 1m
+    name: audit ids truncated - fires at warning, window 1h
+    input_series:
+      - {series: 'yuzu_register_reregistration_audit_ids_truncated_total{job="yuzu",instance="a"}', values: "0x10 4700 4700x65"}
+      - {series: 'yuzu_register_reregistration_audit_ids_truncated_total{job="yuzu",instance="b"}', values: "0x80"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditIdsTruncated", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditIdsTruncated", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditIdsTruncated", alertstate="firing"}', eval_time: 75m, exp_samples: []}
+
+  - interval: 1m
+    name: audit summary dropped - fires at warning, window 15m
+    input_series:
+      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="a",reason="queue_full"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="b",reason="shutdown"}', values: "0x40"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing"}', eval_time: 30m, exp_samples: []}
+
+  # WP01 Gate 8 pass 6: the alloc_failed reason fires too, and the annotation names the right counter.
+  - interval: 1m
+    name: audit summary dropped - alloc_failed fires, and the description points at the ids counter
+    input_series:
+      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="a",reason="alloc_failed"}', values: "0x10 1 1x15"}
+    alert_rule_test:
+      - alertname: YuzuAgentReregistrationAuditSummaryDropped
+        eval_time: 20m
+        exp_alerts:
+          - exp_labels: {job: yuzu, instance: a, severity: warning}
+            exp_annotations:
+              summary: "A dropped-row summary chunk for re-registration audit rows was not written"
+              description: "A summary chunk was discarded (reason queue_full, write_failed, shutdown or alloc_failed). The ids it would have named are now UNNAMED and counted by id in yuzu_register_reregistration_audit_ids_truncated_total (yuzu_register_reregistration_audit_dropped_total counts rows, not ids). The unbudgeted yuzu_register_reregistration_total still counts every decision."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationauditsummarydropped"
+
+  # WP01 pass 7: the first-weeks-after-flip alert fires on any refused token re-enrolment, within 1h.
+  - interval: 1m
+    name: token refused first weeks - one refusal fires (info), quiet after 1h, other reasons and counters count
+    input_series:
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="a",reason="not_found"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="b",reason="multi_use_token"}', values: "0x80"}
+      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="c",reason="no_csr"}', values: "0x10 1 1x65"}
+    alert_rule_test:
+      - alertname: YuzuAgentReenrolTokenRefusedFirstWeeks
+        eval_time: 30m
+        exp_alerts:
+          - exp_labels: {job: yuzu, instance: a, severity: info}
+            exp_annotations:
+              summary: "A token re-enrolment was refused (first weeks after enforce)"
+              description: "An enrollment token was refused for an agent id that holds a live leaf (reason multi_use_token, not_found, expired, revoked, already_consumed or invalid_input_length). The audit-mode soak cannot exercise the token path, so for the first weeks after --agent-reregistration-proof=enforce was switched on every refusal is a lost-key agent that still has no way back in, or a wrong token. Mint a fresh single-use token (max_uses 1); if the agent still holds a certificate file, remove its cert_dir first."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreenroltokenrefusedfirstweeks"
+      - alertname: YuzuAgentReenrolTokenRefusedFirstWeeks
+        eval_time: 75m
+        exp_alerts: []
+
+  # WP01 review fix: an enforce refusal row dropped by the older budget is counted by action only.
+  - interval: 1m
+    name: refusal audit dropped - only the refused action fires, window 15m, at warning
+    input_series:
+      - {series: 'yuzu_register_reregistration_audit_dropped_total{job="yuzu",instance="a",action="agent.reregistration_refused"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_audit_dropped_total{job="yuzu",instance="b",action="agent.reregistration_unproven"}', values: "0x10 1 1x25"}
+    alert_rule_test:
+      - alertname: YuzuAgentReregistrationRefusalAuditDropped
+        eval_time: 20m
+        exp_alerts:
+          - exp_labels: {job: yuzu, instance: a, severity: warning}
+            exp_annotations:
+              summary: "Enforce-mode re-registration refusal rows were dropped and are named nowhere"
+              description: "An agent.reregistration_refused audit row lost the older per-key budget (10 rows per outcome and agent id, 64 distinct keys, then one overflow allowance per outcome, per 10 s window). Unlike audit-mode agent.reregistration_unproven rows, a dropped refusal row is counted only by action: no summary row names its id and yuzu_register_reregistration_audit_ids_truncated_total does not count it. The unbudgeted yuzu_register_reregistration_total still counts every decision."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationrefusalauditdropped"
+      - alertname: YuzuAgentReregistrationRefusalAuditDropped
+        eval_time: 30m
+        exp_alerts: []
+
+  # CASE WP07-A -- a sustained stream of skipped collect targets fires YuzuPolicyCollectSkipped.
+  - interval: 1m
+    name: policy collect skipped - a sustained skip fires
+    input_series:
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu",instance="s1",phase="collect_target"}'
+        values: "0+1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE WP07-B -- the other phases of the same counter (dispatch, claim, ...) are NOT this alert.
+  - interval: 1m
+    name: policy collect skipped - other phases stay quiet
+    input_series:
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu",instance="s1",phase="dispatch"}'
+        values: "0+1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE WP07-C -- a counter that is pre-seeded at 0 and then increments (the first skip) fires.
+  # Without the pre-seed the series would be born at 1 and increase() would see no increase.
+  - interval: 1m
+    name: policy collect skipped - the first skip after a pre-seeded 0 fires
+    input_series:
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu",instance="s1",phase="collect_item"}'
+        values: "0x20 1x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE WP07-D -- the encoding gauge at 1 fires YuzuPgServerEncodingNotUtf8; at 0 it stays quiet.
+  - interval: 1m
+    name: pg server encoding - not UTF8 fires
+    input_series:
+      - series: 'yuzu_pg_server_encoding_not_utf8{job="yuzu",instance="s1"}'
+        values: "1x30"
+    promql_expr_test:
+      # Still inside `for: 5m`: pending, not firing (catches a `for: 0m` regression).
+      - expr: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  - interval: 1m
+    name: pg server encoding - UTF8 stays quiet
+    input_series:
+      - series: 'yuzu_pg_server_encoding_not_utf8{job="yuzu",instance="s1"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+
+  # CASE WP07-E -- two replicas of one deployment share ONE database, so both reporting 1 is ONE alert.
+  - interval: 1m
+    name: pg server encoding - two replicas report one alert
+    input_series:
+      - series: 'yuzu_pg_server_encoding_not_utf8{job="yuzu",instance="s1"}'
+        values: "1x30"
+      - series: 'yuzu_pg_server_encoding_not_utf8{job="yuzu",instance="s2"}'
+        values: "1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1

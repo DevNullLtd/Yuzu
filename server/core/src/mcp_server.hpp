@@ -108,6 +108,8 @@ class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 namespace yuzu::server {
 class HttpRouteSink; // #2542 PR-6: register_routes(HttpRouteSink&, ...) overload
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
+class SoftwareLifecycleStore; // SAM-29: lifecycle-rule twins (list/import/delete_software_lifecycle_rules)
+class ProductRegistryStore;  // SAM-29: normalisation curation twins
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
 class AppUsageStore; // wave 7 PR7.2 app-usage projection (get_agent_app_usage)
 // EnginePrincipalStore backs BOTH the PR 4.2 role-assignment MCP twins
@@ -793,6 +795,17 @@ public:
         collection_settings_probe_perm_fn_ = std::move(probe_perm_fn);
     }
 
+    /// The lifecycle rule store behind list/import/delete_software_lifecycle_rules: the SAME
+    /// instance SoftwareLifecycleRoutes borrows. Wired once at construction; unset = those tools
+    /// answer an internal error with no retry hint.
+    void set_software_lifecycle_store(SoftwareLifecycleStore* store) { software_lifecycle_store_ = store; }
+
+    /// The product registry behind get_software_normalization_status, list_software_curation_queue,
+    /// curate_software_alias, reject_software_curation and replace_software_normalization_pack: the
+    /// SAME instance SoftwareCurationRoutes borrows. Wired once at construction; unset = those tools
+    /// answer an internal error with no retry hint.
+    void set_product_registry_store(ProductRegistryStore* store) { product_registry_store_ = store; }
+
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
     /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_echo_process_
     /// tree_devices`/`list_echo_capture_sources_devices` previously intersected
@@ -1023,7 +1036,7 @@ public:
     /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
     /// without pulling in rest_api_v1.hpp for one nested type (same mirror-not-
     /// reuse discipline as `PublishCrlFn` below, which mirrors `CaRoutes::
-    /// PublishCrlFn`). Wraps `AuthDB::clear_failed_logins`. Returns true when
+    /// PublishCrlFn`). Wraps `AuthDB::clear_account_lockouts` (password lockout AND MFA failure budget). Returns true when
     /// the underlying auth store write succeeded. Empty/unset callback = the
     /// tool answers "lockout subsystem unavailable" (503-equivalent), matching
     /// the REST route's degrade when `lockout_clear_fn` is unwired.
@@ -1508,6 +1521,9 @@ private:
     std::optional<software_read_api::Ctx> software_read_ctx_;
     software_collection_settings_api::Stores collection_settings_stores_;
     PermFn collection_settings_probe_perm_fn_;
+    // SAM-29 - see set_software_lifecycle_store / set_product_registry_store above.
+    SoftwareLifecycleStore* software_lifecycle_store_{nullptr};
+    ProductRegistryStore* product_registry_store_{nullptr};
     // #2146 Batch B3 — see set_viz_deps above.
     FleetTopologyStore* fleet_topology_store_{nullptr};
     yuzu::server::OfflineRosterFn offline_roster_fn_;

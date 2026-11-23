@@ -39,6 +39,7 @@
 #include "response_store.hpp"
 #include "result_set_store.hpp"
 #include "schedule_engine.hpp"
+#include "scoped_gate_outcome.hpp" // ScopedGateFn's return type: the per-device gate's refusal class
 #include "scope_eval_error.hpp" // #4981 PR-2: ScopeEvalError — ScopeEvaluateFn's typed failure surface
 #include "scope_engine.hpp"     // #4981 PR-2: yuzu::scope::Expression — ScopeEvaluateFn's parsed-expr param
 #include "software_deployment_store.hpp"
@@ -121,6 +122,13 @@ std::atomic<int>& live_poll_interval_ms(); // default 500
 // DELETE /api/v1/quarantine/{agent_id}: how many times (one per live_poll_interval_ms) the handler
 // reads the device's reply to its firewall.release before answering 202. Same seam, same reason.
 std::atomic<int>& release_confirm_max_polls(); // default 10
+// TEST SEAM, in the pattern of the two above and never set outside tests: called by the DELETE
+// handler's reply wait before every poll after the first, just ahead of the interval sleep. A test
+// stores the device's reply from it, so a reply that arrives BETWEEN polls (the late confirmation,
+// #7584a) is produced without a thread or a sleep. Empty in production. Unlike the atomics above it
+// is not synchronised: set it only while no request is in flight (the tests run the handler on
+// their own thread through TestRouteSink).
+std::function<void()>& release_confirm_pause_hook();
 } // namespace detail
 
 /// Versioned REST API v1 — registers all /api/v1/ routes on the httplib::Server.
@@ -166,6 +174,15 @@ public:
     /// Set via `set_hostnames_fn` (below), BEFORE `register_routes()`; `{}` leaves those
     /// hostnames `null` (unknown).
     using HostnamesFn = std::function<std::unordered_map<std::string, std::string>()>;
+    /// The per-device scoped gate (`AuthRoutes::require_scoped_permission_outcome`) WITH its
+    /// refusal class: the gate writes its own response and audit row, and returns why it refused
+    /// so a route can tell a denial from an unavailable or degraded authorization read. Sole
+    /// consumer: POST /api/v1/echo/retention-paused/purge. Set via `set_scoped_gate_fn` (below),
+    /// BEFORE `register_routes()`; unset makes that route answer its fail-closed 500
+    /// `scope gate not configured`.
+    using ScopedGateFn = std::function<yuzu::server::ScopedGateOutcome(
+        const httplib::Request&, httplib::Response&, const std::string& securable_type,
+        const std::string& operation, const std::string& agent_id)>;
     /// ADR-0017 admit-then-filter list-read gate for a list/fan-out route
     /// over per-agent data (`AuthRoutes::require_list_read`). Unlike PermFn/
     /// ScopedPermFn (bool: caller re-derives the session separately if
@@ -406,7 +423,7 @@ public:
         std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
     /// Clear a user's account-lockout counter (admin unlock — SOC 2 CC6.3).
-    /// Wraps `AuthDB::clear_failed_logins` so RestApiV1 stays decoupled from
+    /// Wraps `AuthDB::clear_account_lockouts` (password lockout AND MFA failure budget) so RestApiV1 stays decoupled from
     /// AuthDB (same injection pattern as SessionRevokeFn). Returns true when
     /// the underlying auth.db write succeeded. Empty/missing callback =
     /// `POST /api/v1/users/<name>/unlock` returns 503.
@@ -763,6 +780,12 @@ public:
     /// Unset (`{}`, the default) leaves those hostnames `null`.
     void set_hostnames_fn(HostnamesFn fn) { hostnames_fn_ = std::move(fn); }
 
+    /// The typed per-device scoped gate (see `ScopedGateFn`). MUST be called BEFORE
+    /// `register_routes()`: the purge route copies the function by value when routes register, so
+    /// a call after that point leaves the route on its 500 for good. Unset (`{}`, the default)
+    /// leaves POST /api/v1/echo/retention-paused/purge on its fail-closed 500.
+    void set_scoped_gate_fn(ScopedGateFn fn) { scoped_gate_fn_ = std::move(fn); }
+
     /// TEST SEAM for POST /api/v1/executions/{id}/cancel and .../rerun. Production leaves this
     /// unset and the routes bind `make_tracker_mutation_ports(execution_tracker)`; a test that
     /// has no Postgres sets fake ports instead. MUST be called BEFORE `register_routes()`. An
@@ -890,6 +913,7 @@ private:
     ScopeEvaluateFn scope_evaluate_fn_;
     AllAgentIdsFn all_agent_ids_fn_;
     HostnamesFn hostnames_fn_; // see set_hostnames_fn
+    ScopedGateFn scoped_gate_fn_; // see set_scoped_gate_fn
     ExecutionMutationPorts execution_mutation_ports_; // see set_execution_mutation_ports_for_test
     EmitEventFn emit_event_fn_;                       // see set_emit_event_fn
 };

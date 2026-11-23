@@ -1,4 +1,5 @@
-shared_library(
+# Named so tests/meson.build can list it in link_depends (test_tags_concurrency.cpp loads it by path).
+tags_plugin_lib = shared_library(
   'tags',
   files('src/tags_plugin.cpp'),
   name_prefix: '',

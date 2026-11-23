@@ -7,10 +7,11 @@
  * peripherals_parsers.hpp. The O_NOFOLLOW / walk_dir_capped directory
  * primitives live in the guarded walk layer (pkg_inventory_legs.hpp, `posix::`).
  *
- * SCOPE. MACHINE-SCOPE package-manager state only: per-user package stores
- * (npm/pip/cargo/per-user Homebrew) are out of scope and deferred to the
- * user-session helper (ADR-3003). This release ships the macOS Homebrew
- * legs, the Linux `managers` (tool presence + capture-backed facts) and
+ * SCOPE. MACHINE prefixes (/opt/homebrew, /usr/local) AND the user-owned Homebrew
+ * prefixes under /Users (~/homebrew, ~/.homebrew) in `packages`; other per-user
+ * package stores (npm/pip/cargo) are out of scope and deferred to the user-session
+ * helper (ADR-3003). `managers` reports machine prefixes only. This release ships the
+ * macOS Homebrew legs, the Linux `managers` (tool presence + capture-backed facts) and
  * `store_packages` (snap, flatpak) legs, and the Windows legs (Chocolatey
  * `packages`, Chocolatey and winget presence in `managers`, the Appx
  * `store_packages` roster; pkg_inventory_win_parsers.hpp). Linux never reports
@@ -21,9 +22,18 @@
  *
  *   status|<action>|<supported|constrained|unsupported>|<tokens or ->
  *   manager|<dpkg|apt|rpm|dnf|pacman|apk|snap|flatpak|homebrew|chocolatey|winget>|<present|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->
- *   package|homebrew|<id>|<version>|<formula|cask>
+ *   package|homebrew|<id>|<version>|<formula|cask>|<install_time or ->|<tap or ->|<true|false|->|<machine|user>|<owner or ->|<prefix>
  *   package|chocolatey|<id>|<version or ->|pkg
  *   package|<snap|flatpak|appx>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<active|inactive|unknown|deprovisioned>
+ *
+ * A Homebrew row is ELEVEN fields; the first five are unchanged. Machine rows carry
+ * owner `-` and prefix `/opt/homebrew` or `/usr/local`; user rows carry the home
+ * directory's NAME as owner and the literal `~/homebrew` or `~/.homebrew` as prefix
+ * (never an absolute home path). install_time, tap and installed_on_request are the
+ * formula's INSTALL_RECEIPT.json claims -- the installing account's own words, validated
+ * for shape and never trusted. They are read for MACHINE-prefix formulae only: a cask row,
+ * a formula without a usable receipt and EVERY user row carry `-` (no receipt under a
+ * user-owned prefix is opened).
  *
  * The status row is formatted (and read back by the installed-software
  * collector) by the shared yuzu::shared helper in agents/shared/inventory_status_row.hpp;
@@ -65,10 +75,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace yuzu::pkg_inventory {
 
@@ -76,25 +88,27 @@ namespace yuzu::pkg_inventory {
 
 /// Per-directory entry cap handed to walk_dir_capped.
 inline constexpr std::size_t kMaxEntriesPerDir = 4096;
-/// Whole-action package row cap (the macOS Homebrew and Linux snap/flatpak walks): once reached, no further row is
-/// added and the status carries `row_cap` (a later container is still opened, but
-/// stops at its first version directory).
+/// Whole-action package row cap (the macOS Homebrew walks, machine and user prefixes alike, and
+/// the Linux snap/flatpak walks): once reached, no further row is added and the status carries
+/// `row_cap` (a later container is still opened, but stops at its first version directory).
 inline constexpr std::size_t kMaxPackageRows = 20000;
-/// Whole-action cap on the bytes of package rows emitted (the row cap alone
-/// allows ~10 MB of maximum-length names, and the command path applies no output
-/// cap of its own). A real install is a few KB; beyond it no further row is
-/// added and the status carries `byte_cap`.
+/// Whole-action cap on the bytes of package rows emitted, user-prefix rows included (the row cap
+/// alone allows ~10 MB of maximum-length names, and the command path applies no output cap of its
+/// own). A real install is a few KB; beyond it no further row is added and the status carries
+/// `byte_cap`.
 inline constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
-/// Whole-ACTION entries budget across each action's entire walk (macOS Homebrew
-/// `packages`: both prefixes x Cellar/Caskroom; `managers`: both prefixes x Taps,
-/// Cellar, Caskroom; Linux `store_packages`: the snap and flatpak trees): each directory's own listing is bounded by kMaxEntriesPerDir and
+/// Whole-ACTION entries budget across each action's entire walk (macOS Homebrew `packages`: both
+/// machine prefixes x Cellar/Caskroom, then the /Users listing and each home's two user prefixes
+/// x Cellar/Caskroom; `managers`: both prefixes x Taps, Cellar, Caskroom; Linux `store_packages`:
+/// the snap and flatpak trees): each directory's own listing is bounded by kMaxEntriesPerDir and
 /// rows are bounded by kMaxPackageRows, but neither bounds the walk as a whole
 /// -- a tree with kMaxEntriesPerDir id/org-directories x kMaxEntriesPerDir
 /// entries each (or a Cellar full of plain files that never trip the row cap)
 /// is otherwise read in full every call. Sized generously for a real large
 /// Homebrew, snap or flatpak install.
 inline constexpr std::size_t kMaxPackageWalkEntries = 200000;
-/// Whole-action wall-clock budget (seconds) for the same walks.
+/// Whole-action wall-clock budget (seconds) for the same walks, the user-prefix walk and the
+/// machine-prefix receipt reads included.
 inline constexpr std::size_t kMaxPackageWalkSeconds = 10;
 
 /// The resource bounds as ONE injectable value. Production always uses
@@ -302,6 +316,163 @@ private:
     out += version.empty() ? std::string{"-"} : yuzu::util::safe_output_field(version);
     out += '|';
     out += package_kind_token(kind);
+    return out;
+}
+
+// ── Homebrew install receipts (pure) ─────────────────────────────────────
+
+/// Upper bound on the bytes read from one INSTALL_RECEIPT.json (the largest on a real
+/// install is ~8 KB; `tap` sits near the END of the file). Same bound as kMaxSnapYamlBytes.
+inline constexpr std::size_t kMaxBrewReceiptBytes = 64 * 1024;
+/// `<org>/<repo>` total length cap.
+inline constexpr std::size_t kMaxBrewTapLen = 140;
+/// An install time is exactly this many decimal digits (every epoch second from 2009 to 2100).
+inline constexpr std::size_t kBrewInstallTimeDigits = 10;
+/// install time bounds, epoch seconds: 2009-01-01 (Homebrew's first release) up to, and
+/// excluding, 2100-01-01.
+inline constexpr long long kMinBrewInstallTime = 1230768000;
+inline constexpr long long kMaxBrewInstallTime = 4102444800;
+
+/// The three receipt claims that reach a row. An empty member is unknown (written `-`).
+struct BrewReceipt {
+    std::string install_time; ///< decimal epoch seconds
+    std::string tap;          ///< `<org>/<repo>`
+    std::string on_request;   ///< `true` or `false`
+};
+
+namespace detail {
+
+[[nodiscard]] inline bool receipt_ws(char c) noexcept {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+/// The text after the colon of the FIRST object key spelled exactly `key` (no escapes), with
+/// leading whitespace skipped; nullopt when there is none. Every string literal is consumed
+/// whole (backslash escapes honoured), so key-shaped text inside a VALUE is never a hit, and an
+/// unterminated string ends the scan. Not a JSON validator: a flat scan, linear, no allocation.
+[[nodiscard]] inline std::optional<std::string_view> receipt_value_after(std::string_view text,
+                                                                         std::string_view key) noexcept {
+    std::size_t i = 0;
+    while (i < text.size()) {
+        if (text[i] != '"') {
+            ++i;
+            continue;
+        }
+        const std::size_t begin = ++i;
+        bool escaped = false;
+        while (i < text.size() && (escaped || text[i] != '"')) {
+            escaped = !escaped && text[i] == '\\';
+            ++i;
+        }
+        if (i >= text.size()) return std::nullopt; // unterminated string
+        const std::string_view str = text.substr(begin, i - begin);
+        ++i; // closing quote
+        if (str != key) continue;
+        std::size_t j = i;
+        while (j < text.size() && receipt_ws(text[j])) ++j;
+        if (j < text.size() && text[j] == ':') {
+            ++j;
+            while (j < text.size() && receipt_ws(text[j])) ++j;
+            return text.substr(j);
+        }
+    }
+    return std::nullopt;
+}
+
+/// ASCII `[0-9A-Za-z]`. Not std::isalnum (locale-dependent, undefined on a negative char).
+[[nodiscard]] inline bool ascii_alnum(char c) noexcept {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+[[nodiscard]] inline bool receipt_ident(char c) noexcept { return ascii_alnum(c) || c == '_'; }
+
+[[nodiscard]] inline bool tap_segment_ok(std::string_view seg) noexcept {
+    if (seg.empty() || !ascii_alnum(seg.front())) return false;
+    return std::all_of(seg.begin(), seg.end(),
+                       [](char c) { return ascii_alnum(c) || c == '.' || c == '_' || c == '-'; });
+}
+
+} // namespace detail
+
+/// Extracts and validates `time`, `source.tap` (the first `"tap"` key) and
+/// `installed_on_request` from INSTALL_RECEIPT.json text. Each claim is the FIRST hit of its
+/// key; a value of any other shape (or no hit) leaves that member empty -- never a failed row,
+/// never a token. No receipt content makes it throw (every index is bounds-checked); an
+/// allocation failure in the three output strings is contained by the plugin's run_guarded seam.
+[[nodiscard]] inline BrewReceipt parse_brew_receipt(std::string_view text) {
+    BrewReceipt r;
+    if (const auto v = detail::receipt_value_after(text, "time")) {
+        std::size_t n = 0;
+        while (n < v->size() && (*v)[n] >= '0' && (*v)[n] <= '9') ++n;
+        const bool end_ok =
+            n < v->size() && ((*v)[n] == ',' || (*v)[n] == '}' || detail::receipt_ws((*v)[n]));
+        long long t = 0;
+        if (n == kBrewInstallTimeDigits && end_ok &&
+            std::from_chars(v->data(), v->data() + n, t).ec == std::errc{} &&
+            t >= kMinBrewInstallTime && t < kMaxBrewInstallTime)
+            r.install_time = std::to_string(t);
+    }
+    if (const auto v = detail::receipt_value_after(text, "tap")) {
+        if (!v->empty() && v->front() == '"') {
+            const auto close = v->find('"', 1);
+            if (close != std::string_view::npos) {
+                const auto tap = v->substr(1, close - 1);
+                const auto slash = tap.find('/');
+                if (tap.size() <= kMaxBrewTapLen && slash != std::string_view::npos &&
+                    tap.find('/', slash + 1) == std::string_view::npos &&
+                    detail::tap_segment_ok(tap.substr(0, slash)) &&
+                    detail::tap_segment_ok(tap.substr(slash + 1)))
+                    r.tap = std::string{tap};
+            }
+        }
+    }
+    if (const auto v = detail::receipt_value_after(text, "installed_on_request")) {
+        for (const std::string_view word : {std::string_view{"true"}, std::string_view{"false"}}) {
+            if (v->starts_with(word) && v->size() > word.size() &&
+                !detail::receipt_ident((*v)[word.size()]))
+                r.on_request = std::string{word};
+        }
+    }
+    return r;
+}
+
+/// Whose prefix a Homebrew row came from.
+enum class BrewScope { machine, user };
+
+[[nodiscard]] constexpr std::string_view brew_scope_token(BrewScope s) noexcept {
+    switch (s) {
+    case BrewScope::machine: return "machine";
+    case BrewScope::user:    return "user";
+    }
+    return "machine";
+}
+
+/// package|homebrew|<id>|<version>|<formula|cask>|<install_time or ->|<tap or ->|<on_request or ->|<scope>|<owner or ->|<prefix>
+/// format_package_row's five fields plus six. Empty receipt members and an empty owner are `-`;
+/// owner and prefix go through safe_output_field.
+[[nodiscard]] inline std::string format_homebrew_package_row(std::string_view id,
+                                                             std::string_view version,
+                                                             PackageKind kind,
+                                                             const BrewReceipt& receipt,
+                                                             BrewScope scope,
+                                                             std::string_view owner,
+                                                             std::string_view prefix) {
+    const auto field = [](std::string_view v) {
+        return v.empty() ? std::string{"-"} : yuzu::util::safe_output_field(v);
+    };
+    std::string out = format_package_row(id, version, kind);
+    out += '|';
+    out += field(receipt.install_time);
+    out += '|';
+    out += field(receipt.tap);
+    out += '|';
+    out += field(receipt.on_request);
+    out += '|';
+    out += brew_scope_token(scope);
+    out += '|';
+    out += field(owner);
+    out += '|';
+    out += field(prefix);
     return out;
 }
 

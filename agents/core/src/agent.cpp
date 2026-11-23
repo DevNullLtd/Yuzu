@@ -41,11 +41,13 @@ __declspec(allocate(".CRT$XCB"))
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
+#include "session_log_fingerprint.hpp" // #8159: the session id is a bearer credential; log a fingerprint only
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
 #include "plugin_heartbeat_tags.hpp" // #1567 plugin heartbeat.* KV -> status tags
 #include "local_dispatcher.hpp"
+#include <wire_utf8.hpp>        // F70: yuzu::shared::scrub_wire_bytes at the plugin-output seam
 #include "ctx_slot.hpp"         // CtxSlot / cancel_ctx_slot (unit-tested, #2182)
 #include "command_frames.hpp"   // make_output_frame / make_final_frame (CommandResponse.action)
 #include "ota_update_thread.hpp" // OTA update thread lifecycle (unit-tested, #2182)
@@ -53,6 +55,9 @@ __declspec(allocate(".CRT$XCB"))
 #include "hard_exit.hpp"                 // hard_exit / kOrphanDrainGrace: the detached-collector drain barrier
 #include "log_handoff.hpp"               // drain_log_bounded: breadcrumb before that hard_exit
 #include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
+#include "command_params.hpp"                    // command_params_have_nul (sg10 / UP-1)
+#include "command_start_gate.hpp"                // command_may_start/command_may_stagger: protective actions run at teardown
+#include "interruptible_wait.hpp"                 // sleep_interruptible: a stagger never outlives a reconnect or stop
 #include "collection_settings_agent.hpp"       // __sync__.settings decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
@@ -82,6 +87,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
+#include <yuzu/protective_actions.hpp> // is_protective_action: the reserved-lane predicate (ADR-2005)
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -273,6 +279,12 @@ std::string read_file_contents(const std::filesystem::path& p) {
 // (Subscribe RPC: stream CommandResponse -> stream CommandRequest)
 using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::CommandRequest>;
 
+// Command pool shape (ADR-2005): the queue depth every lane uses (the ThreadPool default), and the
+// number of workers held back for PROTECTIVE actions so stuck ordinary commands do not take the
+// last worker (not a completion guarantee: ADR-2005 "What this does NOT establish"). Both pool construction sites use these two names.
+constexpr std::size_t kCommandQueueDepth = 1000;
+constexpr std::size_t kReservedProtectiveWorkers = 1;
+
 // ThreadPool (bounded dispatch pool + per-task exception firewall, #2037) now
 // lives in thread_pool.hpp so the firewall behaviour is unit-testable in
 // isolation. Used unqualified below via namespace yuzu::agent.
@@ -300,6 +312,11 @@ struct PluginContextImpl {
 // issuing one Write per line. This reduces serialized gRPC writes from N-per-
 // command to 1-per-command for most plugins.
 static constexpr size_t kOutputFlushThreshold = 64 * 1024; // 64 KB auto-flush
+
+// Commands (since process start) where a plugin output write was lost to an allocation failure.
+// Process-wide so the heartbeat can carry it as `yuzu.output_dropped` (the agent exposes no
+// /metrics endpoint; yuzu_agent_plugin_output_dropped_total is agent-local).
+inline std::atomic<std::uint64_t> g_output_dropped_commands{0};
 
 struct CommandContextImpl {
     std::shared_ptr<SubscribeStream> stream;
@@ -340,7 +357,33 @@ struct CommandContextImpl {
     // per-dispatch via `capture_max_bytes` below — see dispatch_with_capture.
     static constexpr std::size_t kCaptureMaxBytes = 2ull * 1024 * 1024;
     std::size_t capture_max_bytes{kCaptureMaxBytes};
-    bool capture_truncated{false};
+    std::atomic<bool> capture_truncated{false};
+
+    // Set when a plugin write could not be buffered (allocation failure, caught at the C ABI in
+    // yuzu_ctx_write_output). The output is then INCOMPLETE: capture-mode consumers trust
+    // `rc == 0 && !truncated`, so this also sets capture_truncated, and the command's typed status
+    // is forced to CONSTRAINED/PARTIAL (apply_output_drop) so a status-only section keeps the
+    // server's stored rows rather than replacing them with a short blob. noexcept, lock-free.
+    std::atomic<bool> output_dropped{false};
+    void note_output_dropped() noexcept {
+        output_dropped.store(true, std::memory_order_relaxed);
+        capture_truncated = true;
+    }
+    // Read-time mapping: a dropped write is never reported OK/UNDECLARED. A worse reported status
+    // (UNAVAILABLE / PERMISSION_DENIED) stands.
+    void apply_output_drop() noexcept {
+        if (!output_dropped.load(std::memory_order_relaxed))
+            return;
+        if (result_status == YUZU_RESULT_STATUS_UNDECLARED ||
+            result_status == YUZU_RESULT_STATUS_OK)
+            result_status = YUZU_RESULT_STATUS_CONSTRAINED;
+        result_completeness = YUZU_RESULT_COMPLETENESS_PARTIAL;
+        try {
+            if (result_provenance.empty())
+                result_provenance = "host:output_dropped";
+        } catch (...) { // NOLINT(bugprone-empty-catch) -- the typed flags above are authoritative
+        }
+    }
 
     // CC-07 plugin→host typed result seam (ABI4, sdk/include/yuzu/plugin.h).
     // Written at most by the single plugin thread executing this command's
@@ -354,7 +397,35 @@ struct CommandContextImpl {
     YuzuResultCompleteness result_completeness{YUZU_RESULT_COMPLETENESS_UNKNOWN};
     std::string result_provenance;
 
+    // TEST SEAM (production: one relaxed load): throw std::bad_alloc from the Nth next
+    // allocation-bearing step of append_output, to prove a dropped write is made visible.
+    static inline std::atomic<int> alloc_fault_countdown{0};
+    static void maybe_inject_alloc_failure() {
+        const int c = alloc_fault_countdown.load(std::memory_order_relaxed);
+        if (c > 0 && alloc_fault_countdown.fetch_sub(1, std::memory_order_relaxed) == 1)
+            throw std::bad_alloc();
+    }
+
     void append_output(const char* text) {
+        // F70: plugin text is declared UTF-8 but nothing enforced it, and the
+        // server's proto3 `string` parse rejects the WHOLE frame on one bad
+        // byte (ending this agent's command stream). Enforce the contract once,
+        // here, with the shared RFC 3629 scrubber (bad bytes -> '?'); the copy
+        // is made only when something needs replacing.
+        std::string scrubbed;
+        if (yuzu::shared::count_invalid_wire_bytes(text) != 0) {
+            scrubbed.assign(text);
+            const auto replaced = yuzu::shared::scrub_wire_bytes(scrubbed);
+            text = scrubbed.c_str();
+            // Observable, throttled (first and every power-of-two thereafter): a plugin that
+            // keeps emitting non-UTF-8 is a plugin bug or hostile endpoint data worth seeing.
+            static std::atomic<std::uint64_t> scrubbed_writes{0};
+            const auto n = scrubbed_writes.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0)
+                spdlog::warn("agent: replaced {} non-UTF-8 byte(s) in plugin output for command "
+                             "{} (occurrence #{}, logged on powers of two)",
+                             replaced, yuzu::log_id_token(command_id), n);
+        }
         std::lock_guard lock(buf_mu);
         size_t len = std::strlen(text);
         if (capture) {
@@ -373,21 +444,42 @@ struct CommandContextImpl {
                 capture_truncated = true;
                 return;
             }
+            // Reserve FIRST: the only throwing step runs before any mutation, so a bad_alloc leaves
+            // the buffer exactly as it was (no stray '\n' separator for a chunk that never landed).
+            maybe_inject_alloc_failure();
+            // Grow geometrically (bounded by the cap): reserve(n) alone may reallocate on every
+            // append for a large run of small writes.
+            if (prospective > capture->capacity())
+                capture->reserve(std::min<std::size_t>(
+                    capture_max_bytes, std::max<std::size_t>(prospective, 2 * capture->capacity())));
             if (!capture->empty())
                 capture->push_back('\n');
             capture->append(text, len);
             return;
         }
-        output_buffer.emplace_back(text, len);
-        output_buffer_bytes += len;
+        // One plugin line is bounded so a frame never exceeds the server's receive limit.
+        if (len > yuzu::agent::kMaxOutputLineBytes) {
+            output_buffer.push_back(yuzu::agent::clamp_output_line(std::string_view{text, len}));
+            output_buffer_bytes += output_buffer.back().size();
+        } else {
+            output_buffer.emplace_back(text, len);
+            output_buffer_bytes += len;
+        }
         if (output_buffer_bytes >= kOutputFlushThreshold) {
             flush_output_locked();
         }
     }
 
-    void flush_output() {
-        std::lock_guard lock(buf_mu);
-        flush_output_locked();
+    // Contained: the final flush after execute() builds the concatenated payload (an allocation)
+    // and must not unwind to the dispatch firewall with the drop uncounted. A failure here means
+    // buffered plugin output never reached the wire: mark it exactly like a lost write.
+    void flush_output() noexcept {
+        try {
+            std::lock_guard lock(buf_mu);
+            flush_output_locked();
+        } catch (...) {
+            note_output_dropped();
+        }
     }
 
 private:
@@ -400,6 +492,7 @@ private:
         if (output_buffer.empty())
             return;
 
+        maybe_inject_alloc_failure(); // TEST SEAM (see alloc_fault_countdown)
         // Concatenate all buffered lines into a single payload
         std::string combined;
         combined.reserve(output_buffer_bytes + output_buffer.size()); // +size for newlines
@@ -411,6 +504,7 @@ private:
         output_buffer.clear();
         output_buffer_bytes = 0;
 
+        maybe_inject_alloc_failure(); // TEST SEAM: a failure AFTER the buffer was cleared
         const auto resp = yuzu::agent::make_output_frame(command_id, action, std::move(combined));
 
         std::lock_guard lock(*write_mu);
@@ -528,6 +622,13 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
     int rc = descriptor->execute(raw_ctx, action, params, param_count);
     ctx_impl.flush_output(); // no-op in capture mode
+    ctx_impl.apply_output_drop();
+    if (ctx_impl.output_dropped.load(std::memory_order_relaxed)) {
+        g_output_dropped_commands.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("local dispatch '{}': a plugin output write was lost to an allocation "
+                      "failure; the capture is reported truncated",
+                      yuzu::log_id_token(action ? action : ""));
+    }
     if (truncated_out)
         *truncated_out = ctx_impl.capture_truncated;
     // BR-001: read back whatever the plugin reported via
@@ -579,6 +680,25 @@ YUZU_EXPORT YuzuResultStatus set_result_status_and_read_back(YuzuResultStatus st
     return ctx_impl.result_status;
 }
 
+// Test seam (no public header, same convention as set_result_status_and_read_back above): make
+// the Nth next capture-mode append_output allocation step throw std::bad_alloc.
+YUZU_EXPORT void arm_output_alloc_failure_for_test(int nth) {
+    CommandContextImpl::alloc_fault_countdown.store(nth, std::memory_order_relaxed);
+}
+
+// Test seam: a stream-mode final flush that hits an allocation failure is contained and counted
+// as a dropped write (returns CommandContextImpl::output_dropped). No stream is needed: the
+// injected failure fires before flush_output_locked touches it.
+YUZU_EXPORT bool stream_flush_alloc_failure_marks_dropped_for_test(int nth) {
+    CommandContextImpl ctx_impl{};
+    ctx_impl.output_buffer.emplace_back("buffered plugin output");
+    ctx_impl.output_buffer_bytes = ctx_impl.output_buffer.back().size();
+    CommandContextImpl::alloc_fault_countdown.store(nth, std::memory_order_relaxed);
+    ctx_impl.flush_output();
+    CommandContextImpl::alloc_fault_countdown.store(0, std::memory_order_relaxed);
+    return ctx_impl.output_dropped.load(std::memory_order_relaxed);
+}
+
 // C ABI context function implementations
 
 extern "C" {
@@ -587,7 +707,15 @@ YUZU_EXPORT void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text
     if (!ctx || !text)
         return;
     auto* impl = reinterpret_cast<CommandContextImpl*>(ctx);
-    impl->append_output(text);
+    // C ABI boundary: nothing may unwind into the plugin. append_output allocates (buffering, and
+    // the F70 scrub copy); on bad_alloc this write is dropped rather than crossing the ABI.
+    try {
+        impl->append_output(text);
+    } catch (...) {
+        // No logging under OOM. The drop is made visible, not silent: capture_truncated (so every
+        // capture consumer reports constrained) and output_dropped (typed CONSTRAINED/PARTIAL).
+        impl->note_output_dropped();
+    }
 }
 
 YUZU_EXPORT void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent) {
@@ -620,7 +748,14 @@ YUZU_EXPORT void yuzu_ctx_set_result_status(YuzuCommandContext* ctx, YuzuResultS
     }
     impl->result_status = status;
     impl->result_completeness = completeness;
-    impl->result_provenance = provenance ? provenance : "";
+    // C ABI: the string assignment allocates; nothing may unwind into the plugin. On failure the
+    // typed status/completeness above stand and the provenance stays as it was.
+    try {
+        std::string prov = provenance ? provenance : "";
+        yuzu::shared::scrub_wire_bytes(prov); // a proto3 string field: well-formed UTF-8 only
+        impl->result_provenance = std::move(prov);
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* key) {
@@ -631,10 +766,14 @@ YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* 
     // (see PluginContextImpl::server_peer): nullptr until a Register has published it.
     if (std::strcmp(key, "agent.server_peer") == 0)
         return impl->server_peer.load(std::memory_order_acquire);
-    auto it = impl->config.find(key);
-    if (it == impl->config.end())
+    try {
+        auto it = impl->config.find(key); // builds a std::string key: can throw
+        if (it == impl->config.end())
+            return nullptr;
+        return it->second.c_str();
+    } catch (...) {
         return nullptr;
-    return it->second.c_str();
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key) {
@@ -651,7 +790,11 @@ YUZU_EXPORT int yuzu_ctx_storage_set(YuzuPluginContext* ctx, const char* key, co
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return -2;
-    return impl->kv_store->set(impl->plugin_name, key, value) ? 0 : 1;
+    try {
+        return impl->kv_store->set(impl->plugin_name, key, value) ? 0 : 1;
+    } catch (...) { // C ABI: no exception into the plugin
+        return 1;
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_storage_get(YuzuPluginContext* ctx, const char* key) {
@@ -660,7 +803,12 @@ YUZU_EXPORT const char* yuzu_ctx_storage_get(YuzuPluginContext* ctx, const char*
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return nullptr;
-    auto val = impl->kv_store->get(impl->plugin_name, key);
+    std::optional<std::string> val;
+    try {
+        val = impl->kv_store->get(impl->plugin_name, key);
+    } catch (...) { // C ABI: no exception into the plugin
+        return nullptr;
+    }
     if (!val.has_value())
         return nullptr;
     // Caller must free with yuzu_free_string()
@@ -677,7 +825,11 @@ YUZU_EXPORT int yuzu_ctx_storage_delete(YuzuPluginContext* ctx, const char* key)
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return -2;
-    return impl->kv_store->del(impl->plugin_name, key) ? 0 : 1;
+    try {
+        return impl->kv_store->del(impl->plugin_name, key) ? 0 : 1;
+    } catch (...) { // C ABI: no exception into the plugin
+        return 1;
+    }
 }
 
 YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key) {
@@ -690,10 +842,16 @@ YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key)
     // (closed handle, SQLITE_BUSY after the busy budget, a failed prepare) is -3, never
     // "absent" -- a plugin that treats absent as "nothing to recover" would otherwise
     // act on a fault as if it were the answer.
-    const auto present = impl->kv_store->exists_checked(impl->plugin_name, key);
-    if (!present)
+    // C ABI: the string_view->string conversions inside can throw; nothing may unwind into the
+    // plugin, and an unanswerable query is -3 (never "absent").
+    try {
+        const auto present = impl->kv_store->exists_checked(impl->plugin_name, key);
+        if (!present)
+            return -3;
+        return *present ? 0 : 1;
+    } catch (...) {
         return -3;
-    return *present ? 0 : 1;
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char* prefix) {
@@ -702,32 +860,36 @@ YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return nullptr;
-    auto keys = impl->kv_store->list(impl->plugin_name, prefix ? prefix : "");
+    try {
+        auto keys = impl->kv_store->list(impl->plugin_name, prefix ? prefix : "");
 
-    // Build JSON array: ["key1","key2",...]
-    std::string json = "[";
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i > 0)
-            json += ',';
-        json += '"';
-        // Escape any quotes in key names
-        for (char c : keys[i]) {
-            if (c == '"')
-                json += "\\\"";
-            else if (c == '\\')
-                json += "\\\\";
-            else
-                json += c;
+        // Build JSON array: ["key1","key2",...]
+        std::string json = "[";
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i > 0)
+                json += ',';
+            json += '"';
+            // Escape any quotes in key names
+            for (char c : keys[i]) {
+                if (c == '"')
+                    json += "\\\"";
+                else if (c == '\\')
+                    json += "\\\\";
+                else
+                    json += c;
+            }
+            json += '"';
         }
-        json += '"';
-    }
-    json += ']';
+        json += ']';
 
-    char* result = static_cast<char*>(std::malloc(json.size() + 1));
-    if (!result)
+        char* result = static_cast<char*>(std::malloc(json.size() + 1));
+        if (!result)
+            return nullptr;
+        std::memcpy(result, json.c_str(), json.size() + 1);
+        return result;
+    } catch (...) { // C ABI: no exception into the plugin
         return nullptr;
-    std::memcpy(result, json.c_str(), json.size() + 1);
-    return result;
+    }
 }
 
 YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigger_id,
@@ -796,6 +958,26 @@ public:
         metrics_.describe("yuzu_agent_uptime_seconds", "Agent uptime in seconds", "gauge");
         metrics_.describe("yuzu_agent_commands_executed_total", "Total commands executed by plugin",
                           "counter");
+        metrics_.describe("yuzu_agent_commands_refused_nul_params_total",
+                          "Commands refused because a parameter key or value held a NUL byte (a "
+                          "plugin would read a truncated name); refused before the dedup claim",
+                          "counter");
+        metrics_.counter("yuzu_agent_commands_refused_nul_params_total");
+        metrics_.describe("yuzu_agent_commands_rejected_closing_total",
+                          "Ordinary commands answered REJECTED without running because the command pool "
+                          "was closing for a reconnect or the agent was stopping (claim released); "
+                          "a protective action is never counted",
+                          "counter");
+        metrics_.counter("yuzu_agent_commands_rejected_closing_total");
+        metrics_.describe("yuzu_agent_protective_commands_run_closing_total",
+                          "Protective commands that ran while the command pool was closing for a "
+                          "reconnect or the agent was stopping; the close waits for them, unbounded",
+                          "counter");
+        metrics_.counter("yuzu_agent_protective_commands_run_closing_total");
+        metrics_.describe("yuzu_agent_plugin_output_dropped_total",
+                          "Commands where a plugin output write could not be buffered "
+                          "(allocation failure) and the result was marked constrained",
+                          "counter");
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
@@ -820,7 +1002,24 @@ public:
         spdlog::info("Yuzu agent starting (id={})", cfg_.agent_id);
 
         // 1. Load plugins (with optional allowlist + code-signing verification)
-        auto allowlist = load_plugin_allowlist(cfg_.plugin_allowlist);
+        // F52: three-state load; a configured allowlist that is missing, unreadable or empty
+        // refuses to start (copy of the --plugin-require-signature guard below) instead of
+        // letting an empty map disable enforcement.
+        auto allowlist_load = load_plugin_allowlist(cfg_.plugin_allowlist);
+        if (auto refusal = evaluate_allowlist_startup(cfg_.plugin_allowlist, allowlist_load)) {
+            // Return from run() with startup_failed_ (the established fatal-startup path)
+            // instead of std::exit: the log hand-off is ASYNC, so std::exit would race the
+            // queue and could drop this very line, and main() drains the log on its normal
+            // return. main() maps startup_failed() to a non-zero exit, so systemd Restart=,
+            // the SCM and launchd observe the failure; no plugin has been loaded.
+            spdlog::critical("{}. Refusing to start: this would silently fail-open (every "
+                             "plugin would load unverified).",
+                             *refusal);
+            startup_failed_ = true;
+            return;
+        }
+        const bool allowlist_required = !cfg_.plugin_allowlist.empty();
+        const auto& allowlist = allowlist_load.entries;
         PluginSigningPolicy signing{cfg_.plugin_trust_bundle, cfg_.plugin_require_signature};
         // Fail-closed guard against silent fail-open. If the operator passed
         // --plugin-require-signature but forgot --plugin-trust-bundle (or
@@ -833,9 +1032,12 @@ public:
             spdlog::critical("--plugin-require-signature is set but --plugin-trust-bundle "
                              "is empty. Refusing to start: this combination would silently "
                              "fail-open (every plugin would load unverified).");
-            std::exit(EXIT_FAILURE);
+            // Same mechanism as the allowlist refusal above: std::exit raced the async log
+            // hand-off and could drop the line above (WP13 governance N-NC).
+            startup_failed_ = true;
+            return;
         }
-        auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist, signing);
+        auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist, signing, allowlist_required);
 
         // Collect successfully loaded handles first (before init)
         std::vector<PluginHandle> candidates;
@@ -1203,6 +1405,10 @@ public:
             // see shutdown_deadline_guard.hpp — multiple concurrent guards need no
             // coordination with each other.
             yuzu::agent::ShutdownDeadlineGuard watchdog{kShutdownDeadlineGrace};
+            // Close the command start gate on EVERY run() exit, before any plugin is shut
+            // down: a task still queued in the pool would otherwise start against a plugin
+            // whose shutdown() has run (only protective commands may start while closing).
+            command_pool_closing_.store(true, std::memory_order_release);
             // Guardian BEFORE SparkEngine, on EVERY run() exit - not just the
             // externally-triggered Agent::stop() path (handler_ex / the shutdown
             // watcher / the console handler). A run() exit that never went
@@ -1316,7 +1522,9 @@ public:
         // point of rung 1 — an agent that lives long enough to SAY spark degraded, rather
         // than a crash-loop that destroys the very signal the degrade path produces.
         try {
-            thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+            thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency(), kCommandQueueDepth,
+                                                         kReservedProtectiveWorkers, pool_gauge_);
+            command_pool_closing_.store(false, std::memory_order_release);
         } catch (const std::exception& e) {
             spdlog::critical("could not create the command dispatch thread pool ({}) — the host "
                              "is out of threads. Exiting with a startup failure rather than "
@@ -1560,6 +1768,11 @@ public:
             }
             if (!descriptor) {
                 spdlog::warn("Trigger dispatch: plugin '{}' not loaded — skipping action '{}'",
+                             plugin, action);
+                return;
+            }
+            if (command_params_have_nul(params)) {
+                spdlog::warn("Trigger dispatch: {}.{} refused: a parameter holds a NUL byte",
                              plugin, action);
                 return;
             }
@@ -2307,7 +2520,8 @@ public:
                     }
                     plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
                 }
-                spdlog::info("Registered with server (session={}, enrollment={})", session_id_,
+                spdlog::info("Registered with server (session_fp={}, enrollment={})",
+                             session_log_fingerprint(session_id_),
                              enrollment_status.empty() ? "enrolled" : enrollment_status);
 
                 // Mark Guardian as network-connected. PR 4 will use this hook to
@@ -2905,6 +3119,15 @@ public:
                             // which is not separately detectable. "replays" counts
                             // served terminal replays.
                             tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
+                            // ADR-2005: the command pool's in-flight gauge (tasks executing now,
+                            // "running/workers", plus "queued"): a wedge (every ordinary worker
+                            // held by a stalled filesystem or resolver) shows here while the
+                            // reserved protective worker keeps containment running.
+                            // Read from pool_gauge_ (lock-free atomics that outlive every pool),
+                            // never from thread_pool_ itself: a reconnect destroys and re-creates it.
+                            tags["yuzu.command_pool_busy"] = std::to_string(pool_gauge_->running.load()) +
+                                                             "/" + std::to_string(pool_gauge_->workers.load());
+                            tags["yuzu.command_pool_queued"] = std::to_string(pool_gauge_->queued.load());
                             // #3665: >0 when THIS process start recovered from a corrupt
                             // command_dedup.db (history before the boot was lost). Without
                             // this tag the recovery would be visible only in the endpoint's
@@ -2958,6 +3181,12 @@ public:
                                 tags["yuzu.ota_signature_refused"] =
                                     std::to_string(static_cast<int64_t>(refused));
                             }
+                            // WP07: plugin output writes lost to an allocation failure (the
+                            // command is reported constrained). Omitted while zero.
+                            if (const auto dropped = g_output_dropped_commands.load(
+                                    std::memory_order_relaxed);
+                                dropped != 0)
+                                tags["yuzu.output_dropped"] = std::to_string(dropped);
                             // #5249: the OTA update-signature mode this process
                             // enforces (off / bundle / bundle+require), so a fleet
                             // view CAN find agents that are NOT verifying update
@@ -3644,6 +3873,27 @@ public:
                     // queue-full release so it never deletes a concurrent owner's row.
                     bool claimed_here = false;
 
+                    // sg10 / UP-1: a parameter key or value with a NUL byte would be truncated by
+                    // `c_str()` and read by a plugin as a different name. Refused BEFORE the
+                    // dedup claim and the stagger sleep (no in-flight record, no held worker).
+                    if (command_params_have_nul(cmd.parameters())) {
+                        spdlog::warn("Command {} refused: a parameter key or value holds a NUL "
+                                     "byte",
+                                     cmd.command_id());
+                        metrics_.counter("yuzu_agent_commands_refused_nul_params_total").increment();
+                        pb::CommandResponse refused;
+                        refused.set_command_id(cmd.command_id());
+                        refused.set_status(pb::CommandResponse::REJECTED);
+                        refused.set_output("command refused: a parameter holds a NUL byte");
+                        refused.mutable_sent_at()->set_millis_epoch(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count());
+                        std::lock_guard lock(stream_write_mu_);
+                        stream->Write(refused, grpc::WriteOptions());
+                        continue;
+                    }
+
                     // Command replay protection (HA WS-0, ADR-2002). claim() is the
                     // atomic first-writer-wins gate: on a duplicate we REPLAY the
                     // original terminal outcome (never a bare REJECTED that would
@@ -3659,10 +3909,12 @@ public:
                     // branch resolves via its own write + continue, so claiming it
                     // would leak an unresolved in-flight record AND wrongly answer a
                     // re-sent control command RUNNING. It is the ONLY dispatch that
-                    // bypasses the claim: gating on the literal (not the whole
-                    // reserved-name set) keeps durable idempotency the SAFE DEFAULT
-                    // for any future reserved-name command — a future __update__ OTA
-                    // path is deduplicated unless it, too, opts out in should_claim().
+                    // skips claiming for a reason of its own. (A command refused above, for
+                    // a NUL parameter, claims nothing and dispatches nothing, so no claim
+                    // exists to skip.) Gating on the literal, not the whole reserved-name
+                    // set, keeps durable idempotency the SAFE DEFAULT for any future
+                    // reserved-name command: a future __update__ OTA path is deduplicated
+                    // unless it, too, opts out in should_claim().
                     // The decision itself (which commands are claimed; replay / RUNNING /
                     // proceed after the claim) lives in command_dedup_decision.hpp — pure
                     // and unit-tested (tests/unit/test_command_dedup_decision.cpp, #3668).
@@ -3920,7 +4172,13 @@ public:
                     // so concurrent dispatch is required.
                     // Each task captures the shared_ptr to guarantee the stream
                     // outlives all writers (fixes use-after-free risk from #66).
-                    bool submitted = thread_pool_->submit([this, target, cmd, stream]() {
+                    // ADR-2005: a protective action that reaches the pool (the closed firewall
+                    // containment set) goes to its reserved lane; every other command can never
+                    // occupy the last reserved worker. __guard__.push_rules is also protective
+                    // but never reaches the pool: it is answered inline in this loop, above.
+                    const bool protective_lane =
+                        yuzu::protective::is_protective_action(cmd.plugin(), cmd.action());
+                    bool submitted = thread_pool_->submit([this, target, cmd, stream, claimed_here]() {
                         // Outer exception firewall (#2037). The ThreadPool worker
                         // already contains any escaped exception so the agent
                         // process survives; catching here additionally lets the
@@ -3928,7 +4186,7 @@ public:
                         // its own timeout for a command whose dispatch task threw
                         // outside the plugin execute() guard.
                         try {
-                            execute_command_task(target, cmd, stream);
+                            execute_command_task(target, cmd, stream, claimed_here);
                         } catch (const std::exception& e) {
                             spdlog::error("Command {} dispatch failed outside plugin execute: {}",
                                           cmd.command_id(), e.what());
@@ -3941,7 +4199,7 @@ public:
                             send_dispatch_failure(stream, cmd.command_id(),
                                                   "agent dispatch error: non-std exception");
                         }
-                    });
+                    }, protective_lane);
 
                     if (!submitted) {
                         spdlog::warn("Thread pool queue full — rejecting command {}",
@@ -4000,6 +4258,7 @@ public:
                 // Destroy thread pool BEFORE stream goes out of scope — this drains
                 // the queue, waits for in-flight tasks, and joins all worker threads,
                 // ensuring no task holds a dangling stream pointer.
+                command_pool_closing_.store(true, std::memory_order_release);
                 thread_pool_.reset();
 
                 // Stop and join the OTA update thread
@@ -4121,7 +4380,9 @@ public:
                     // cleanly. (governance: cpp-safety BLOCKING, sre OR-5, happy-path F1.)
                     try {
                         thread_pool_ =
-                            std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+                            std::make_unique<ThreadPool>(std::thread::hardware_concurrency(), kCommandQueueDepth,
+                                                         kReservedProtectiveWorkers, pool_gauge_);
+                        command_pool_closing_.store(false, std::memory_order_release);
                     } catch (const std::exception& e) {
                         spdlog::critical("could not re-create the command dispatch thread pool on "
                                          "reconnect ({}) — the host is out of threads. Stopping "
@@ -4423,8 +4684,56 @@ private:
     // FAILURE-on-throw path around it stay small and readable. A `return`
     // here skips this command's remaining status writes exactly as it did
     // inside the lambda.
+    /// True while the command pool is being destroyed for a reconnect, or the agent is stopping: a task
+    /// that has not started its plugin yet must not start (and must not sleep a stagger), because the
+    /// pool destructor waits for every task (#8247 is the unbounded join of a RUNNING task). A
+    /// protective action is the one exemption (`command_may_start`): it still runs, with no stagger.
+    [[nodiscard]] bool command_pool_closing() const {
+        return command_pool_closing_.load(std::memory_order_acquire) ||
+               stop_requested_.load(std::memory_order_acquire);
+    }
+
+    /// A command that never started (the pool is closing): answer REJECTED so the server does not wait,
+    /// release OUR claim so a redelivery after the reconnect can run it (never memoise a terminal for
+    /// work that did not happen), and erase its in-flight entry (record_command_terminal is not used:
+    /// it would memoise).
+    void reject_unstarted_command(const std::shared_ptr<SubscribeStream>& stream,
+                                  const pb::CommandRequest& cmd, bool claimed_here) {
+        const bool stopping = stop_requested_.load(std::memory_order_acquire);
+        spdlog::warn("Command {} not started: agent {}", cmd.command_id(),
+                     stopping ? "stopping" : "reconnecting");
+        metrics_.counter("yuzu_agent_commands_rejected_closing_total").increment();
+        if (!cmd.command_id().empty()) {
+            std::lock_guard lock(in_flight_mu_);
+            in_flight_ids_.erase(cmd.command_id());
+        }
+        if (command_dedup_ && claimed_here &&
+            command_dedup_->release(cmd.command_id()) == ReleaseOutcome::Error)
+            metrics_.counter("yuzu_agent_dedup_release_errors_total").increment();
+        pb::CommandResponse resp;
+        resp.set_command_id(cmd.command_id());
+        resp.set_status(pb::CommandResponse::REJECTED);
+        resp.set_output(stopping ? "command not started: agent stopping"
+                                 : "command not started: agent reconnecting");
+        std::lock_guard lock(stream_write_mu_);
+        stream->Write(resp, grpc::WriteOptions());
+    }
+
     void execute_command_task(const YuzuPluginDescriptor* target, const pb::CommandRequest& cmd,
-                              const std::shared_ptr<SubscribeStream>& stream) {
+                              const std::shared_ptr<SubscribeStream>& stream, bool claimed_here) {
+        // A task still queued (or about to sleep) when the pool closes never starts, EXCEPT a protective
+        // action (ADR-2005): a containment queued ahead of a teardown still runs, so the
+        // close can never strand it (a rule push is answered inline and is never queued). The same single predicate chooses the reserved lane at submit.
+        if (!command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())) {
+            reject_unstarted_command(stream, cmd, claimed_here);
+            return;
+        }
+        if (protective_runs_while_closing(cmd.plugin(), cmd.action(), command_pool_closing()) &&
+            note_protective_run_closing(metrics_, protective_closing_runs_)) {
+            spdlog::warn("Protective command {} ({}.{}) runs while the command pool is closing; the "
+                         "close waits for it, unbounded",
+                         cmd.command_id(), cmd.plugin(), cmd.action());
+        }
         // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
         const int32_t stagger_s = std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
         const int32_t delay_s = std::min(cmd.delay_seconds(), int32_t{300});     // cap 5 min
@@ -4441,12 +4750,23 @@ private:
             spdlog::debug("Command {} stagger {}s + delay {}s = {}s", cmd.command_id(),
                           random_stagger, delay_s, total_delay);
 
-            if (total_delay > 0) {
-                std::this_thread::sleep_for(std::chrono::seconds(total_delay));
+            // A protective action never sleeps a stagger or delay: it runs at once, even at teardown.
+            if (total_delay > 0 && command_may_stagger(cmd.plugin(), cmd.action())) {
+                // Sliced (<= 1 s) and stop-aware: a long stagger can never hold this worker past a
+                // reconnect or a stop. An interrupted command never ran: reject it and let it be
+                // redelivered.
+                if (!sleep_interruptible(std::chrono::seconds(total_delay),
+                                         [this] { return command_pool_closing(); })) {
+                    reject_unstarted_command(stream, cmd, claimed_here);
+                    return;
+                }
             }
 
-            // Check expiration after the delay — skip stale commands
-            if (cmd.has_expires_at() && cmd.expires_at().millis_epoch() > 0) {
+            // Check expiration after the delay — skip stale commands. A protective action is never
+            // rejected as expired (command_may_expire): the stored-state reconciler stays the
+            // authority, so a late containment is applied rather than dropped.
+            if (command_may_expire(cmd.plugin(), cmd.action()) && cmd.has_expires_at() &&
+                cmd.expires_at().millis_epoch() > 0) {
                 auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::system_clock::now().time_since_epoch())
                                   .count();
@@ -4524,6 +4844,11 @@ private:
 
         // Flush any buffered output before sending timing/status
         ctx_impl.flush_output();
+        // Account a lost output write FIRST (atomic bumps only): the timing frame and the
+        // labelled counter lookup below allocate, and must not run before the drop is counted.
+        ctx_impl.apply_output_drop();
+        if (ctx_impl.output_dropped.load(std::memory_order_relaxed))
+            g_output_dropped_commands.fetch_add(1, std::memory_order_relaxed);
 
         auto end_time = std::chrono::steady_clock::now();
         auto exec_ms =
@@ -4546,6 +4871,14 @@ private:
         // for the operator log line below. It is a READ-TIME/PRESENTATION
         // derivation ONLY — see derive_effective_result_status(), unit-tested in
         // tests/unit/test_capability_descriptor.cpp.
+        if (ctx_impl.output_dropped.load(std::memory_order_relaxed)) {
+            metrics_.counter("yuzu_agent_plugin_output_dropped_total", {{"plugin", cmd.plugin()}})
+                .increment();
+            // AFTER unwinding (the allocation failure is long gone): one loud line.
+            spdlog::error("Command {} plugin {}: a plugin output write was lost to an allocation "
+                          "failure; the result is reported constrained/partial",
+                          yuzu::log_id_token(cmd.command_id()), yuzu::log_id_token(cmd.plugin()));
+        }
         YuzuResultStatus effective_result_status =
             derive_effective_result_status(ctx_impl.result_status, rc);
 
@@ -4627,8 +4960,11 @@ private:
                     *slim.mutable_sent_at() = resp.sent_at();
                 if (resp.has_error()) {
                     slim.mutable_error()->set_code(resp.error().code());
+                    // Cut on a scalar boundary: a mid-sequence cut is invalid UTF-8 in a proto3
+                    // string, which would make this stored blob unparseable on replay.
+                    const std::string& em = resp.error().message();
                     slim.mutable_error()->set_message(
-                        resp.error().message().substr(0, kMaxDedupErrorMessageBytes));
+                        em.substr(0, yuzu::shared::utf8_prefix_len(em, kMaxDedupErrorMessageBytes)));
                 }
                 slim.set_output("[output replaced in dedup store: response exceeded size cap; "
                                 "command completed]");
@@ -4876,6 +5212,7 @@ private:
     // shutdown so a trigger never fires into a half-torn-down plugin.
     TriggerEngine trigger_engine_;
     yuzu::MetricsRegistry metrics_;
+    std::atomic<std::uint64_t> protective_closing_runs_{0}; // throttles the closing-run WARN
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;
     std::atomic<bool> stop_requested_{false};
@@ -5036,6 +5373,8 @@ private:
     // tag.
     std::shared_ptr<std::atomic<bool>> dex_health_;
     std::unique_ptr<ISignalObserver> dex_observer_;
+    // Declared BEFORE thread_pool_ (it outlives every pool and is read by the heartbeat thread).
+    std::shared_ptr<PoolGauge> pool_gauge_ = std::make_shared<PoolGauge>();
     std::unique_ptr<ThreadPool> thread_pool_;
     // F3 orphan-exit accounting for mechanism-internal detached workers
     // (#2012/#3840 plan, "F3 orphan-exit accounting - Route A (corrected)").
@@ -5210,6 +5549,9 @@ private:
     // during startup and never reassigned, so the reader thread and the dispatch
     // workers read the pointer freely; the store serialises its own access.
     std::unique_ptr<CommandDedupStore> command_dedup_;
+    /// Set just before the command pool is destroyed on a reconnect (cleared when a pool is created):
+    /// tasks that have not started their plugin reject instead of starting or sleeping a stagger.
+    std::atomic<bool> command_pool_closing_{false};
 
     // CHAOS-TTL-1 (PR #3784 fix round, governance ledger): a plugin-cooperation-
     // independent liveness signal for the server's per-device concurrency claim

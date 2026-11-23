@@ -121,6 +121,13 @@ jobs:
       - name: Run zizmor
         uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
         with:
+          # Pinned, never `latest`. The action resolves `latest` to the
+          # newest zizmor its own tree knows, so a Dependabot bump of the
+          # action above would silently change the auditor and its findings.
+          # An exact version must have a lock file in the action's
+          # support/locks/ at the pinned SHA: bump the two together, and run
+          # the same zizmor locally first (`zizmor .github`).
+          version: '1.32.0'
           # Audit everything under .github/workflows/ and reusable
           # composite actions. The action uploads SARIF itself.
           inputs: ./.github

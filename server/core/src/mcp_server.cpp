@@ -61,6 +61,12 @@
 #include "crypto_widget_catalogue.hpp" // the /crypto widget, layout and Yuzu-issued twins (shared model)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
+#include "software_curation_api.hpp"    // SAM-29: the five curation twins' shared body
+#include "software_curation_routes.hpp"  // SAM-29: curation_keys::kMaxKeyBytes (the reject key bound)
+#include "software_lifecycle_api.hpp"    // SAM-29: the three lifecycle-rule twins' shared body
+#include "software_lifecycle_import.hpp" // SAM-29: lifecycle_import::kImportMaxBytes (the content bound)
+#include "software_lifecycle_routes.hpp" // SAM-29: kLifecycleImportNameMaxBytes
+#include "software_normalization_pack.hpp" // SAM-29: kMaxPackBytes, kMaxFieldBytes
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
 #include "app_usage_store.hpp"            // get_agent_app_usage (wave 7 PR7.2 projection)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
@@ -716,7 +722,7 @@ static_assert(kMaxFacetValueBytes == 2048,
 // nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
 // array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
 // #undef'd right after it.
-#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are counted in agents_unanswered. 0 for a failed set"},"agents_unanswered":{"type":"integer","description":"Targeted agents absent from the membership because they never answered before the set was filled, or because their answer was not fully stored. 1 can mean not known complete rather than an exact count. 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed or agents_unanswered is above zero: the set may be missing devices. A set created from a parent's members carries the parent's counters, summed along a lineage, so partial is the reliable signal. False for a failed set"})j"
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column, or with a constrained, partly completed answer when the definition sets partialWhenConstrained and the matcher's column is one it declares) and never matched; they are absent from the membership. Agents that never answered are counted in agents_unanswered. 0 for a failed set"},"agents_unanswered":{"type":"integer","description":"Targeted agents absent from the membership because they never answered before the set was filled, or because their answer was not fully stored. 1 can mean not known complete rather than an exact count. 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed or agents_unanswered is above zero: the set may be missing devices. A set created from a parent's members carries the parent's counters, summed along a lineage, so partial is the reliable signal. False for a failed set"})j"
 #define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","agents_unanswered","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents",
@@ -1001,8 +1007,11 @@ static const ToolDef kTools[] = {
      "unconfirmed | disabled) and `version_min` / `version_max` (inclusive bounds compared under the "
      "catalogue's version order; they need `name` with match=exact and cannot be combined with "
      "`version`). Each row also carries hostname, last_seen, status, last_confirmed_at, "
-     "install_type, install_scope, install_location, instance_key and purl; null means not known, "
-     "never zero. `count` is the rows on the page. `totals` (installs, devices, as_of) is served "
+     "install_type, install_scope, install_location, instance_key and purl (null means not "
+     "known, never zero), and package_id, always a string (the source's own package identifier: "
+     "the Windows Installer product code on msi rows, an empty string when the source sets "
+     "none). `count` is the rows "
+     "on the page. `totals` (installs, devices, as_of) is served "
      "only to a caller whose read is fleet-wide and only for an exact `name` with at most one "
      "version filter or range; otherwise totals is null and totals_omitted says why (scope | filters "
      "| building). A degraded rows, device-facts or totals read is a retryable error, never an "
@@ -1010,7 +1019,7 @@ static const ToolDef kTools[] = {
      "object. The purl and vers filters are REST-only. For the fleet title rollup use "
      "query_software_catalogue; to list the devices carrying one title, filter here by `name`.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":1024,"description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","maxLength":256,"description":"Exact agent/device filter; omit for fleet-wide"},"version":{"type":"string","maxLength":1024,"description":"Exact version filter; an empty string selects the empty-version rows"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum rows returned"},"q":{"type":"string","maxLength":128,"description":"Substring search"},"kind":{"type":"string","maxLength":16,"description":"Restrict to one kind (package, app, pkg, feat or driver)"},"ecosystem":{"type":"string","maxLength":32,"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"match":{"type":"string","enum":["exact","prefix","contains"],"default":"exact","description":"How name is matched; prefix and contains need name"},"status":{"type":"string","enum":["current","unconfirmed","disabled"],"description":"Restrict to one install status"},"version_min":{"type":"string","maxLength":1024,"description":"Inclusive lower version bound; needs name with match=exact"},"version_max":{"type":"string","maxLength":1024,"description":"Inclusive upper version bound; needs name with match=exact"}}})j",
-     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"},"source":{"type":"string"},"hostname":{"type":["string","null"]},"last_seen":{"type":["integer","null"]},"status":{"type":"string","enum":["current","unconfirmed","disabled"]},"last_confirmed_at":{"type":["integer","null"]},"install_type":{"type":"string"},"install_scope":{"type":"string"},"install_location":{"type":"string"},"instance_key":{"type":"string"},"purl":{"type":["string","null"]}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version","source","hostname","last_seen","status","last_confirmed_at","install_type","install_scope","install_location","instance_key","purl"]}},"count":{"type":"integer","description":"Rows on this page"},"totals":{"type":["object","null"],"properties":{"installs":{"type":"integer"},"devices":{"type":"integer"},"as_of":{"type":["integer","null"]}},"description":"Install rows and distinct devices for an exact name; null when not shown (see totals_omitted)"},"totals_omitted":{"type":"string","enum":["scope","filters","building"],"description":"Present when totals is null: why"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows may exist (the page is full or, on a wide scope, the read was cut short)"},"devices_omitted":{"type":"integer","description":"Distinct devices hidden by the in-process scope post-filter within the scanned window (0 under SQL push-down)"},"next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when no more rows may exist. A wide-scope page can be empty with a non-null next_cursor"}},"required":["software","count","totals","devices_omitted","next_cursor"]})j"},
+     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"},"source":{"type":"string"},"package_id":{"type":"string","description":"The source's own package identifier: the Windows Installer product code on rows from msi_packages.list_inventory; empty when the source sets none"},"hostname":{"type":["string","null"]},"last_seen":{"type":["integer","null"]},"status":{"type":"string","enum":["current","unconfirmed","disabled"]},"last_confirmed_at":{"type":["integer","null"]},"install_type":{"type":"string"},"install_scope":{"type":"string"},"install_location":{"type":"string"},"instance_key":{"type":"string"},"purl":{"type":["string","null"]}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version","source","package_id","hostname","last_seen","status","last_confirmed_at","install_type","install_scope","install_location","instance_key","purl"]}},"count":{"type":"integer","description":"Rows on this page"},"totals":{"type":["object","null"],"properties":{"installs":{"type":"integer"},"devices":{"type":"integer"},"as_of":{"type":["integer","null"]}},"description":"Install rows and distinct devices for an exact name; null when not shown (see totals_omitted)"},"totals_omitted":{"type":"string","enum":["scope","filters","building"],"description":"Present when totals is null: why"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows may exist (the page is full or, on a wide scope, the read was cut short)"},"devices_omitted":{"type":"integer","description":"Distinct devices hidden by the in-process scope post-filter within the scanned window (0 under SQL push-down)"},"next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when no more rows may exist. A wide-scope page can be empty with a non-null next_cursor"}},"required":["software","count","totals","devices_omitted","next_cursor"]})j"},
 
     {"get_tags", "Get all tags for a specific agent.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
@@ -1730,7 +1739,7 @@ static const ToolDef kTools[] = {
      "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
-     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647. At most 65536 bytes as compact JSON"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
      R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
@@ -3771,6 +3780,29 @@ static const ToolDef kTools[] = {
      "principal is never counted as a surviving Administrator, so a refusal can happen even "
      "when other Administrator grants nominally exist. "
      "Idempotent: unassigning a role the principal did not hold still returns success. "
+     "Removing a user's Administrator grant also ends that user's JIT elevation window "
+     "in the same transaction: the removal and the clear commit together, and if the clear "
+     "fails the removal is rolled back (an internal error with a retry hint; after a lost "
+     "commit acknowledgement the removal may have committed, so read the grant list before "
+     "assuming nothing changed). The clear runs only when a grant was actually removed: "
+     "unassigning an Administrator grant the user does not hold still succeeds but ends no "
+     "elevation. After the commit the replica that handled the call drops its cached sessions "
+     "of the user, so the elevation ends at once there; other replicas converge on their next "
+     "session-generation poll (about 1 s, up to about 30 s while that read is failing or "
+     "slow; neither bound holds after a database restore or a failover to a lagging "
+     "standby). It does not change the user's elevation eligibility, so an eligible user "
+     "can elevate again, and an elevate request that had already passed its eligibility "
+     "check can complete just after the unassign commits. To end elevated access for good, "
+     "revoke the user's elevation eligibility first with the REST route "
+     "POST /api/v1/users/{name}/elevation-eligibility (it ends live elevations at once on the "
+     "replica that handled it and on other replicas on their next session-generation poll, "
+     "with the same bounds); "
+     "there is no MCP equivalent yet, so an MCP-only caller cannot take that step. If the "
+     "error says the audit record could not be persisted, the removal is already committed: "
+     "verify with a read and do not repeat the call. "
+     "At the supervised tier the approval ticket is consumed before this tool runs and is not "
+     "restored when the call then fails, so a retry after an internal error needs a new "
+     "approval ticket. "
      "Destructive — verify the target doesn't need this role before calling. Requires "
      "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -3897,7 +3929,7 @@ static const ToolDef kTools[] = {
     // lockout lifecycle; this is the first. New "Account lockout" family in
     // mcp_orientation.cpp.
     {"unlock_account",
-     "Clear a local account's failed-login lockout counter (SOC 2 CC6.3 operability path — the "
+     "Clear a local account's failed-login lockout counter AND its second-factor (MFA) failure lock (SOC 2 CC6.3 operability path — the "
      "lockout also auto-expires on its own after the lockout window). Self-target is permitted: "
      "clearing your own lockout is recoverable. Requires the Postgres auth store (AuthDB) — "
      "answers 'lockout subsystem unavailable' if it is not wired, same as the REST route. "
@@ -4569,10 +4601,14 @@ static const ToolDef kTools[] = {
      "never echoed back by any tool — only has_credential (bool) is ever readable afterward "
      "(ADR-0010). url must be http:// or https://; batch_size 1 delivers each event "
      "immediately, >1 accumulates up to that many events per POST. Additive (mints a new "
-     "target, overwrites nothing) but a duplicate name is rejected. url is NOT restricted "
-     "to external hosts - a caller with Infrastructure:Write can point deliveries at any "
-     "reachable address, including the server's own loopback/internal network (no SSRF "
-     "guard on this field today, same posture as REST's twin). Requires "
+     "target, overwrites nothing) but a duplicate name is rejected. Open-world: the server "
+     "POSTs to url. A url whose host is a link-local/cloud-metadata, unspecified, multicast or "
+     "reserved address (or a numeric spelling of one, e.g. 2852039166) is refused with -32602 "
+     "(audited as destination_refused); at delivery a host name is resolved once, every answer "
+     "is vetted and the connect is pinned to a vetted address, and a declined delivery is "
+     "logged destination_refused or destination_unresolved. Loopback and private ranges are NOT "
+     "refused: a caller with Infrastructure:Write can still point deliveries at the server's "
+     "own loopback or internal network (opt-in policy: #4816). Requires "
      "Infrastructure:Write.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique target name; a duplicate is rejected"},)j"
@@ -5459,6 +5495,135 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":128,"description":"Device agent id"}},"required":["agent_id"],"additionalProperties":false})j",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"effective":{"type":"object","properties":{"interval_s":{"type":"integer"},"window":{"type":["object","null"]},"timezone":{"type":"string"},"plugins":{"type":"object"}},"required":["interval_s","window","timezone","plugins"]},"source_group_id":{"type":"string"},"version":{"type":"string"},"kill_switched":{"type":"array","items":{"type":"string"}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["agent_id","effective","source_group_id","version","kill_switched"]})j"},
 
+    // ── SAM-29: the software lifecycle-rule and normalisation-curation twins. Each tool returns
+    // field for field what its REST route returns in `data`, because both call the SAME function
+    // (software_lifecycle_api.cpp behind /api/v1/inventory/software/lifecycle/rules,
+    // software_curation_api.cpp behind /api/v1/inventory/software/normalization/*): the same
+    // global gate, limits, refusals and audit rows. Every one takes the global Inventory grant and
+    // keeps the default-denied service-scope class. The package_id and catalogue identity half of
+    // the lifecycle surface is held (#8357) and is not here. Appended at the VERY END of kTools[]
+    // per the standing governance note above.
+    {"list_software_lifecycle_rules",
+     "The imported software lifecycle rules (end-of-life, end-of-support and similar dated events "
+     "per product and version prefix) as stored: source picks which set to list, imported (the "
+     "default, what import_software_lifecycle_rules wrote), shipped or external. Rules come back "
+     "ordered by product, version prefix and event. Input is strict: an unknown key, a source "
+     "outside the three values or an over-long string is refused. A degraded or closed store is a "
+     "retryable error, never an empty list. Read-only. Audited as "
+     "mcp.list_software_lifecycle_rules. Mirrors GET /api/v1/inventory/software/lifecycle/rules. "
+     "Requires Inventory:Read (global grant).",
+     R"j({"type":"object","properties":{"source":{"type":"string","enum":["imported","shipped","external"],"default":"imported","maxLength":16,"description":"Which rule set to list"}},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"source":{"type":"string"},"rules":{"type":"array","items":{"type":"object","properties":{"product_key":{"type":"string"},"version_prefix":{"type":"string"},"event":{"type":"string"},"date":{"type":"string"},"source_reference":{"type":"string"}},"required":["product_key","version_prefix","event","date","source_reference"]}},"count":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit row for this read failed to persist"}},"required":["source","rules","count"]})j"},
+
+    {"import_software_lifecycle_rules",
+     "Replace the whole imported software lifecycle rule set from a file: name is the file name "
+     "stamped on every rule as its source reference (1 to 128 bytes, no control characters), "
+     "format is csv or cle (the CLE 1.0 JSON document), and content is the file text. The import "
+     "is all or nothing: a file that fails to parse, or any rule that fails validation, stores "
+     "nothing and the refusal names the first defect; rows that cannot be modelled are skipped and "
+     "counted by reason in skipped. The shipped and external sets are never touched. content is at "
+     "most 4,194,304 bytes (a csv file at most 262,144), and over MCP the whole JSON-RPC request is also capped at 4 MiB before "
+     "routing, so a file whose JSON-escaped form plus the envelope passes that cap is refused by "
+     "the transport first. SUPERVISED tier only (readonly and operator tokens are refused). "
+     "Audited like the REST route: a requested row is written BEFORE the change and the change is "
+     "refused (retryable, nothing changed) if that row cannot be stored, and an outcome row "
+     "follows; audit_persisted:false means only the outcome row was lost after the change was "
+     "made. Not idempotent in the hint's sense: each call records its own audit rows. Mirrors POST "
+     "/api/v1/inventory/software/lifecycle/rules. Requires Inventory:Write (global grant).",
+     R"j({"type":"object","properties":{)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"File name, stamped on every rule as its source reference"},)j"
+     R"j("format":{"type":"string","enum":["csv","cle"],"maxLength":8,"description":"csv or cle (CLE 1.0 JSON)"},)j"
+     R"j("content":{"type":"string","maxLength":4194304,"description":"The file text; at most 4,194,304 bytes"})j"
+     R"j(},"required":["name","format","content"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"stored":{"type":"integer"},"replaced":{"const":true},"format":{"type":"string"},"spec_version":{"type":"string"},"source_reference":{"type":"string"},"skipped":{"type":"array","items":{"type":"object","properties":{"reason":{"type":"string"},"count":{"type":"integer"}},"required":["reason","count"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when an audit row failed to persist after the change was made"}},"required":["stored","replaced","format","spec_version","source_reference","skipped"]})j"},
+
+    {"delete_software_lifecycle_rules",
+     "Empty the imported software lifecycle rule set. The shipped and external sets are never "
+     "touched. Takes no arguments. Returns {removed}, the count the call saw; a second delete "
+     "answers removed 0. SUPERVISED tier only (readonly and operator tokens are refused). Audited "
+     "like the REST route: a requested row is written BEFORE the change and the change is refused "
+     "(retryable, nothing changed) if that row cannot be stored, and an outcome row follows; "
+     "audit_persisted:false means only the outcome row was lost. Mirrors DELETE "
+     "/api/v1/inventory/software/lifecycle/rules. Requires Inventory:Write (global grant).",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"removed":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when an audit row failed to persist after the change was made"}},"required":["removed"]})j"},
+
+    {"get_software_normalization_status",
+     "The software title normalisation layer's headline state in one read: the stored alias pack "
+     "version (empty when none is stored), when and by whom it was loaded, how many installed "
+     "titles resolve and how many do not, and the curation queue's open and rejected counts. "
+     "Takes no arguments. A degraded store read is a retryable error. Read-only. Audited as "
+     "mcp.get_software_normalization_status. Mirrors GET "
+     "/api/v1/inventory/software/normalization/status. Requires Inventory:Read (global grant).",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"pack_version":{"type":"string"},"loaded_at":{"type":"integer"},"loaded_by":{"type":"string"},"titles_normalized":{"type":"integer"},"titles_unnormalized":{"type":"integer"},"queue_open":{"type":"integer"},"queue_rejected":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit row for this read failed to persist"}},"required":["pack_version","loaded_at","loaded_by","titles_normalized","titles_unnormalized","queue_open","queue_rejected"]})j"},
+
+    {"list_software_curation_queue",
+     "The software title curation queue: installed-software titles the normalisation layer could "
+     "not resolve, most widely installed first (device_count), each with an opaque key that "
+     "reject_software_curation takes. status picks open (the default), rejected or all; limit is "
+     "1 to 500 (default 100). Page with next_cursor passed back as cursor; null means the last "
+     "page. To resolve a title use curate_software_alias, with the raw_name, raw_publisher and "
+     "ecosystem read here. Input is strict: an unknown key, a status outside the three values or "
+     "an out-of-range limit is refused. A degraded store read is a retryable error, never an "
+     "empty page. Read-only. Audited as mcp.list_software_curation_queue. Mirrors GET "
+     "/api/v1/inventory/software/normalization/queue. Requires Inventory:Read (global grant).",
+     R"j({"type":"object","properties":{"status":{"type":"string","enum":["open","rejected","all"],"default":"open","maxLength":16,"description":"Which queue entries to list"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":500,"description":"Maximum entries returned"},"cursor":{"type":"string","maxLength":3236,"description":"next_cursor from the previous page"}},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"key":{"type":["string","null"]},"raw_name":{"type":"string"},"raw_publisher":{"type":"string"},"ecosystem":{"type":"string"},"device_count":{"type":"integer"},"status":{"type":"string"},"first_queued_at":{"type":"integer"},"last_seen_at":{"type":"integer"}},"required":["key","raw_name","raw_publisher","ecosystem","device_count","status","first_queued_at","last_seen_at"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit row for this read failed to persist"}},"required":["items","count","next_cursor"]})j"},
+
+    {"curate_software_alias",
+     "Resolve one unrecognised software title: mint (or refresh) the canonical product named by "
+     "vendor, product and edition, and bind the title's alias (ecosystem, raw_name, raw_publisher) "
+     "to it. ecosystem, raw_name, vendor and product are required; raw_publisher, edition, "
+     "category (web_server, database, message_broker, runtime or other) and cpe_product are "
+     "optional, and an omitted category keeps an existing product's category (a new product gets "
+     "other). Every field is at most 256 bytes. The write marks every title for re-resolution at "
+     "the next normalisation pass, fleet-wide. SUPERVISED tier only (readonly and operator "
+     "tokens are refused). Audited like the REST route: a requested row is written BEFORE the "
+     "change and the change is refused (retryable, nothing changed) if that row cannot be stored. "
+     "Not idempotent in the hint's sense: each call re-marks every title and records its own "
+     "audit row. Mirrors POST /api/v1/inventory/software/normalization/aliases. Requires "
+     "Inventory:Write (global grant).",
+     R"j({"type":"object","properties":{)j"
+     R"j("ecosystem":{"type":"string","minLength":1,"maxLength":256,"description":"Package ecosystem of the title, as list_software_curation_queue shows it"},)j"
+     R"j("raw_name":{"type":"string","minLength":1,"maxLength":256,"description":"The title's raw name"},)j"
+     R"j("raw_publisher":{"type":"string","maxLength":256,"description":"The title's raw publisher; omit for none"},)j"
+     R"j("vendor":{"type":"string","minLength":1,"maxLength":256,"description":"Canonical vendor"},)j"
+     R"j("product":{"type":"string","minLength":1,"maxLength":256,"description":"Canonical product"},)j"
+     R"j("edition":{"type":"string","maxLength":256,"description":"Canonical edition; omit for none"},)j"
+     R"j("category":{"type":"string","enum":["web_server","database","message_broker","runtime","other"],"maxLength":256,"description":"Product category; omit to keep an existing product's"},)j"
+     R"j("cpe_product":{"type":"string","maxLength":256,"description":"CPE product token; omit for none"})j"
+     R"j(},"required":["ecosystem","raw_name","vendor","product"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"product_id":{"type":"integer"},"norm_key":{"type":"string"},"alias_source":{"type":"string"},"alias_key":{"type":"string"},"alias_publisher":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present and false only when an audit row failed to persist"}},"required":["product_id","norm_key","alias_source","alias_key","alias_publisher"]})j"},
+
+    {"reject_software_curation",
+     "Reject one open entry of the software title curation queue so it stops being offered for "
+     "curation; a rejected entry is kept. key is the opaque key list_software_curation_queue "
+     "returned. A key that does not decode is refused, and a key with no open entry (unknown or "
+     "already rejected) is refused as not found and nothing changes. SUPERVISED tier only "
+     "(readonly and operator tokens are refused). Audited like the REST route: a requested row "
+     "is written BEFORE the change and the change is refused (retryable, nothing changed) if that "
+     "row cannot be stored. Mirrors POST "
+     "/api/v1/inventory/software/normalization/queue/{key}/reject. Requires Inventory:Write "
+     "(global grant).",
+     R"j({"type":"object","properties":{"key":{"type":"string","minLength":1,"maxLength":3204,"pattern":"^[A-Za-z0-9_-]+$","description":"Queue entry key from list_software_curation_queue"}},"required":["key"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"rejected":{"const":true},"audit_persisted":{"type":"boolean","description":"Present and false only when an audit row failed to persist"}},"required":["rejected"]})j"},
+
+    {"replace_software_normalization_pack",
+     "Replace the stored software title alias pack from its CSV text. The pack is validated whole "
+     "(at most 1,048,576 bytes and 5,000 rows, each field at most 256 bytes) and a pack that "
+     "fails validation stores nothing, the refusal naming the first defect with its line. A pack "
+     "whose version equals the stored version is refused as a conflict and nothing changes. "
+     "Curated products and aliases are kept; every title is re-resolved at the next "
+     "normalisation pass, fleet-wide. Over MCP the whole JSON-RPC request is also capped at 4 "
+     "MiB before routing. SUPERVISED tier only (readonly and operator tokens are refused). "
+     "Audited like the REST route: a requested row is written BEFORE the change and the change "
+     "is refused (retryable, nothing changed) if that row cannot be stored. Not idempotent in "
+     "the hint's sense: each call re-marks every title and records its own audit row. Mirrors "
+     "POST /api/v1/inventory/software/normalization/pack. Requires Inventory:Write (global "
+     "grant).",
+     R"j({"type":"object","properties":{"content":{"type":"string","minLength":1,"maxLength":1048576,"description":"The pack CSV text; at most 1,048,576 bytes"}},"required":["content"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"pack_version":{"type":"string"},"sha256":{"type":"string"},"rows":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when an audit row failed to persist"}},"required":["pack_version","sha256","rows"]})j"},
     // ── SAM-21 lookup and sync-status twins. query_software_components mirrors GET
     // /api/v1/inventory/software/components and get_software_sync_status mirrors GET
     // /api/v1/hardware/sync/{execution_id}; each calls the SAME function its REST route calls
@@ -5545,6 +5710,9 @@ static const char* const kWriteToolsRaw[] = {
     "sync_hardware_software",
     // SAM-35: PUT twin of the per-group software collection settings (ManagementGroup:Write).
     "set_software_collection_settings",
+    // SAM-29: lifecycle-rule import and delete, and the normalisation curation writes (Inventory:Write).
+    "import_software_lifecycle_rules", "delete_software_lifecycle_rules", "curate_software_alias",
+    "reject_software_curation", "replace_software_normalization_pack",
     "set_tag",         "delete_tag",     "execute_instruction", "execute_instruction_definition",
     "execute_workflow",
     // #2146 batch C: instruction-definition and instruction-set authoring twins. The five
@@ -5740,6 +5908,17 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_software_collection_settings", {"ManagementGroup", "Read"}},
     {"get_software_collection_settings", {"ManagementGroup", "Read"}},
     {"set_software_collection_settings", {"ManagementGroup", "Write"}},
+    // SAM-29: the lifecycle-rule and normalisation-curation twins gate on the GLOBAL Inventory pair
+    // their REST routes take (perm_fn, no fleet-read scope to narrow it); a service-scoped token
+    // clears neither, so every row keeps the default `denied` class.
+    {"list_software_lifecycle_rules", {"Inventory", "Read"}},
+    {"import_software_lifecycle_rules", {"Inventory", "Write"}},
+    {"delete_software_lifecycle_rules", {"Inventory", "Write"}},
+    {"get_software_normalization_status", {"Inventory", "Read"}},
+    {"list_software_curation_queue", {"Inventory", "Read"}},
+    {"curate_software_alias", {"Inventory", "Write"}},
+    {"reject_software_curation", {"Inventory", "Write"}},
+    {"replace_software_normalization_pack", {"Inventory", "Write"}},
     // SAM-21: the components lookup is the second twin of the fleet-read admit-then-filter gate,
     // so `confined` like query_installed_software. The sync status row is {Execution, Read}, NOT
     // {Execution, Execute}: this row feeds the tier, the approval rule and the readOnlyHint
@@ -6664,6 +6843,18 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
      {ToolEffect::ReadOnly, true, "Get a host's effective software collection settings"}},
     {"set_software_collection_settings",
      {ToolEffect::Destructive, false, "Set a group's software collection settings"}},
+    {"list_software_lifecycle_rules", {ToolEffect::ReadOnly, true, "List software lifecycle rules"}},
+    {"import_software_lifecycle_rules",
+     {ToolEffect::Destructive, false, "Import software lifecycle rules"}},
+    {"delete_software_lifecycle_rules",
+     {ToolEffect::Destructive, true, "Delete imported software lifecycle rules"}},
+    {"get_software_normalization_status",
+     {ToolEffect::ReadOnly, true, "Get software normalisation status"}},
+    {"list_software_curation_queue", {ToolEffect::ReadOnly, true, "List the software curation queue"}},
+    {"curate_software_alias", {ToolEffect::Destructive, false, "Curate a software title alias"}},
+    {"reject_software_curation", {ToolEffect::Destructive, true, "Reject a software curation entry"}},
+    {"replace_software_normalization_pack",
+     {ToolEffect::Destructive, false, "Replace the software normalisation pack"}},
     {"query_software_components", {ToolEffect::ReadOnly, true, "Query software components"}},
     {"get_software_sync_status", {ToolEffect::ReadOnly, true, "Get software sync status"}},
     {"list_dex_app_perf_devices",
@@ -7027,7 +7218,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // mint_upload_grant above). A duplicate name/license_key is REJECTED,
     // never silently reused -> each successful call mints a distinct id ->
     // not idempotent.
-    {"create_offload_target", {ToolEffect::Additive, false, "Create offload target"}},
+    // openWorldHint is true: the server POSTs fleet events to the administrator-supplied url (an
+    // outbound reach beyond Yuzu's own stores, like the CRL-source registration tools below).
+    {"create_offload_target",
+     {ToolEffect::Additive, false, "Create offload target", /*open_world=*/true}},
     {"activate_platform_license", {ToolEffect::Additive, false, "Activate platform license"}},
     // create_software_deployment is ALSO a pure INSERT (same shape as the two
     // above), but its kToolSecurityRows operation is Execute (matching the
@@ -13525,6 +13719,245 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── SAM-29: the software lifecycle-rule and normalisation-curation twins ──
+            // Each tool returns field for field what its REST route returns in `data`, because
+            // both call the SAME function (software_lifecycle_api.cpp, software_curation_api.cpp):
+            // the same gate, limits, refusals and audit rows. The gate is the GLOBAL Inventory
+            // pair the REST routes take (perm_fn: Read for the three reads, Write for the five
+            // writes), after the tier check; a service-scoped token is refused by the generic C8
+            // gate (every row is the default `denied` class), as REST refuses it. Handler order:
+            // tier, permission, store wired, strict arguments, then the shared function. The domain
+            // audit rows (the REST verbs) go through the sink below; the generic mcp.<tool> row is
+            // written here from the Reply kind.
+            if (tool_name == "list_software_lifecycle_rules" ||
+                tool_name == "import_software_lifecycle_rules" ||
+                tool_name == "delete_software_lifecycle_rules" ||
+                tool_name == "get_software_normalization_status" ||
+                tool_name == "list_software_curation_queue" ||
+                tool_name == "curate_software_alias" || tool_name == "reject_software_curation" ||
+                tool_name == "replace_software_normalization_pack") {
+                namespace sla = software_lifecycle_api;
+                namespace sua = software_curation_api;
+                namespace sra = software_read_api;
+                using AT = sra::ArgSpec::Type;
+                // The schema bounds, tied to the constants the shared functions enforce.
+                static_assert(kLifecycleImportNameMaxBytes == 128 &&
+                                  lifecycle_import::kImportMaxBytes == 4194304 &&
+                                  kMaxPackBytes == 1048576 && kMaxFieldBytes == 256 &&
+                                  kCurationQueueMaxLimit == 500 &&
+                                  curation_keys::kMaxKeyBytes == 2402 &&
+                                  (curation_keys::kMaxKeyBytes + 2) / 3 * 4 == 3204 &&
+                                  (curation_keys::kMaxKeyBytes + 24 + 2) / 3 * 4 == 3236 &&
+                                  kLifecycleImportFormatTokens.size() == 2 &&
+                                  kLifecycleImportFormatTokens[0] == "csv" &&
+                                  kLifecycleImportFormatTokens[1] == "cle",
+                              "the SAM-29 tool schemas spell these bounds and format tokens as literals");
+                static constexpr sra::ArgSpec kLifecycleListArgs[] = {{AT::kString, "source", 0, 16}};
+                static constexpr sra::ArgSpec kImportArgs[] = {
+                    {AT::kString, "name", 0, kLifecycleImportNameMaxBytes},
+                    {AT::kString, "format", 0, 8},
+                    {AT::kString, "content", 0, lifecycle_import::kImportMaxBytes}};
+                // The cursor bound 3236 is the key bound plus decode_cursor's 24 bytes of
+                // count/separator slack (software_curation_routes.cpp), both as base64url
+                // upper bounds: the encoder is unpadded, so the exact lengths are no larger.
+                static constexpr sra::ArgSpec kQueueArgs[] = {
+                    {AT::kString, "status", 0, 16},
+                    {AT::kInt, "limit", 1, kCurationQueueMaxLimit},
+                    {AT::kString, "cursor", 0, 3236}};
+                static constexpr sra::ArgSpec kAliasArgs[] = {
+                    {AT::kString, "ecosystem", 0, kMaxFieldBytes},
+                    {AT::kString, "raw_name", 0, kMaxFieldBytes},
+                    {AT::kString, "raw_publisher", 0, kMaxFieldBytes},
+                    {AT::kString, "vendor", 0, kMaxFieldBytes},
+                    {AT::kString, "product", 0, kMaxFieldBytes},
+                    {AT::kString, "edition", 0, kMaxFieldBytes},
+                    {AT::kString, "category", 0, kMaxFieldBytes},
+                    {AT::kString, "cpe_product", 0, kMaxFieldBytes}};
+                // 3204 = base64url of curation_keys::kMaxKeyBytes, rounded up.
+                static constexpr sra::ArgSpec kRejectArgs[] = {{AT::kString, "key", 0, 3204}};
+                static constexpr sra::ArgSpec kPackArgs[] = {{AT::kString, "content", 0, kMaxPackBytes}};
+                constexpr std::span<const sra::ArgSpec> kNoArgs{}; // the tools that take none
+
+                const bool lifecycle_family = tool_name.ends_with("_lifecycle_rules");
+                // The write set is built from kWriteToolsRaw, and the boot validator refuses a
+                // non-Read kToolSecurityRows row missing from it (or a Read row in it), so this
+                // cannot disagree with the rows; the name list above is the one hand-kept copy.
+                const bool is_write = catalogue().writes.contains(tool_name);
+                const char* const inv_op = is_write ? "Write" : "Read";
+                if (!tier_allows(tier, "Inventory", inv_op)) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Inventory", inv_op))
+                    return; // the gate already wrote the A4 error body + status
+                // Wired once at construction: permanent, so no retry hint.
+                if (lifecycle_family ? software_lifecycle_store_ == nullptr
+                                     : product_registry_store_ == nullptr) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   lifecycle_family
+                                                       ? "Software lifecycle store unavailable"
+                                                       : "Product registry store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto strict = [&](std::span<const sra::ArgSpec> allowed) {
+                    if (const auto bad = sra::strict_args_error(args, allowed)) {
+                        res.set_content(error_response(id, kInvalidParams, *bad),
+                                        "application/json"); // retry-hint-exempt: caller-input rejection
+                        return false;
+                    }
+                    return true;
+                };
+                // A string argument that is present (strict has checked the type of anything
+                // present); nullopt when absent.
+                const auto string_arg = [&](const char* key) -> std::optional<std::string> {
+                    if (args.is_object() && args.contains(key) && args[key].is_string())
+                        return args[key].get<std::string>();
+                    return std::nullopt;
+                };
+                // The domain audit rows, REST verbs and target type: the shared functions' sink.
+                const auto audit_sink = [&](const char* verb, const char* result,
+                                            const std::string& target, const std::string& detail_text,
+                                            bool) {
+                    return yuzu::server::detail::try_persist_audit(audit_fn, req, verb, result,
+                                                                   sla::kTargetType, target,
+                                                                   detail_text);
+                };
+                enum class Outcome { kServed, kRefused, kFailed };
+                // One answer for both families: a served body carries audit_persisted:false when
+                // the generic row or a domain outcome row was lost; a refusal is a caller-input
+                // -32602 (a retry fails identically); a store or audit condition is a retryable or
+                // permanent -32603 with the hint the function chose.
+                const auto finish = [&](Outcome outcome, const nlohmann::json& body,
+                                        const std::string& message, const std::string& remediation,
+                                        const std::optional<std::int64_t>& retry_ms,
+                                        bool domain_rows_persisted, const std::string& target) {
+                    switch (outcome) {
+                    case Outcome::kServed: {
+                        const bool audit_ok = mcp_audit("success", target);
+                        auto served = body;
+                        if (!audit_ok || !domain_rows_persisted)
+                            served["audit_persisted"] = false;
+                        res.set_content(
+                            success_response(id, tool_result(software_catalogue::dump_safe(served),
+                                                             kObjectOutputSchema)),
+                            "application/json");
+                        return;
+                    }
+                    case Outcome::kRefused:
+                        mcp_audit("denied", target);
+                        res.set_content(a4_error(kInvalidParams, message, remediation),
+                                        "application/json"); // retry-hint-exempt: caller input, an unknown key or a stored pack version; a retry fails identically
+                        return;
+                    case Outcome::kFailed:
+                        mcp_audit("failure", target);
+                        res.set_content(a4_error(kInternalError, message, remediation,
+                                                 retry_ms ? static_cast<long>(*retry_ms) : -1L),
+                                        "application/json");
+                        return;
+                    }
+                };
+                const auto finish_lifecycle = [&](const sla::Reply& r, const std::string& target) {
+                    using K = sla::Reply::Kind;
+                    finish(r.kind == K::Ok           ? Outcome::kServed
+                           : r.kind == K::BadRequest ? Outcome::kRefused
+                                                     : Outcome::kFailed,
+                           r.body, r.message, r.remediation, r.retry_after_ms, r.audit_persisted,
+                           target);
+                };
+                const auto finish_curation = [&](const sua::Reply& r, const std::string& target) {
+                    using K = sua::Reply::Kind;
+                    finish(r.kind == K::Ok || r.kind == K::Created ? Outcome::kServed
+                           : r.kind == K::Unavailable              ? Outcome::kFailed
+                                                                   : Outcome::kRefused,
+                           r.body, r.message, r.remediation, r.retry_after_ms, true, target);
+                };
+
+                if (tool_name == "list_software_lifecycle_rules") {
+                    if (!strict(kLifecycleListArgs))
+                        return;
+                    const std::string source = param_str(args, "source", "imported");
+                    finish_lifecycle(sla::list_rules(software_lifecycle_store_, source, audit_sink),
+                                     "source=" + audit_token(source.substr(0, 16)));
+                } else if (tool_name == "import_software_lifecycle_rules") {
+                    if (!strict(kImportArgs))
+                        return;
+                    const auto name = string_arg("name");
+                    const auto format = string_arg("format");
+                    const auto content = string_arg("content");
+                    if (!content) {
+                        res.set_content(error_response(id, kInvalidParams, "content is required"),
+                                        "application/json"); // retry-hint-exempt: caller-input rejection
+                        return;
+                    }
+                    finish_lifecycle(
+                        sla::import_rules(software_lifecycle_store_,
+                                          name ? std::optional<std::string_view>{*name} : std::nullopt,
+                                          format ? std::optional<std::string_view>{*format}
+                                                 : std::nullopt,
+                                          *content, audit_sink),
+                        name ? "name=" + audit_token(name->substr(0, kLifecycleImportNameMaxBytes))
+                             : std::string{});
+                } else if (tool_name == "delete_software_lifecycle_rules") {
+                    if (!strict(kNoArgs))
+                        return;
+                    finish_lifecycle(sla::delete_rules(software_lifecycle_store_, audit_sink),
+                                     "source=imported");
+                } else if (tool_name == "get_software_normalization_status") {
+                    if (!strict(kNoArgs))
+                        return;
+                    finish_curation(sua::status(product_registry_store_), std::string{});
+                } else if (tool_name == "list_software_curation_queue") {
+                    if (!strict(kQueueArgs))
+                        return;
+                    const auto status = string_arg("status");
+                    const auto cursor = string_arg("cursor");
+                    const bool has_limit = args.is_object() && args.contains("limit");
+                    const std::string limit_text =
+                        has_limit ? std::to_string(args["limit"].get<std::int64_t>()) : std::string{};
+                    finish_curation(
+                        sua::queue(product_registry_store_,
+                                   status ? std::optional<std::string_view>{*status} : std::nullopt,
+                                   has_limit ? std::optional<std::string_view>{limit_text}
+                                             : std::nullopt,
+                                   cursor ? std::string_view{*cursor} : std::string_view{}),
+                        "status=" + audit_token(status ? status->substr(0, 16) : std::string{"open"}));
+                } else if (tool_name == "curate_software_alias") {
+                    if (!strict(kAliasArgs))
+                        return;
+                    finish_curation(sua::curate_alias(product_registry_store_, args, audit_sink),
+                                    "ecosystem=" +
+                                        audit_token(param_str(args, "ecosystem").substr(0, 64)));
+                } else if (tool_name == "reject_software_curation") {
+                    if (!strict(kRejectArgs))
+                        return;
+                    const auto key = string_arg("key");
+                    if (!key) {
+                        res.set_content(error_response(id, kInvalidParams, "key is required"),
+                                        "application/json"); // retry-hint-exempt: caller-input rejection
+                        return;
+                    }
+                    finish_curation(sua::reject(product_registry_store_, *key, audit_sink),
+                                    std::string{});
+                } else {
+                    // replace_software_normalization_pack
+                    if (!strict(kPackArgs))
+                        return;
+                    const auto content = string_arg("content");
+                    if (!content) {
+                        res.set_content(error_response(id, kInvalidParams, "content is required"),
+                                        "application/json"); // retry-hint-exempt: caller-input rejection
+                        return;
+                    }
+                    finish_curation(sua::replace_pack(product_registry_store_, *content,
+                                                      session->username, audit_sink),
+                                    std::string{});
+                }
+                return;
+            }
+
             // ── Revocation sources (ADR-0070 R1, slice 2b-1a) ─────────────────────────────
             // Twins of /api/v1/crypto/revocation-sources, calling the SAME
             // RevocationSourceService as the REST routes so both transports accept and refuse
@@ -16976,14 +17409,24 @@ McpServer::HandlerFn McpServer::build_handler(
                             return true;
                     return false;
                 };
+            // Denied `result_set.create` row for a refused request. Returns the error.data to
+            // attach: empty when the row persisted (or audit is off), `audit_persisted:false`
+            // when it was lost or the sink threw (the MCP counterpart of REST's
+            // Sec-Audit-Failed). The SQL text never enters the row.
+            const auto rs_audit_refusal = [&](std::string_view rs_reason, std::string_view rs_kind,
+                                              const std::string& rs_target) -> std::string {
+                const bool rs_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "result_set.create", "denied", "ResultSet", rs_target,
+                    "reason=" + std::string(rs_reason) + " source_kind=" + audit_token(rs_kind));
+                return rs_ok ? std::string{} : std::string{R"({"audit_persisted":false})"};
+            };
             auto rs_refuse_nul = [&](std::string_view rs_what, std::string_view rs_kind) {
-                (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                               "reason=field_contains_nul source_kind=" + audit_token(rs_kind));
                 // retry-hint-exempt: caller-input rejection (a NUL byte), not a transient fault.
                 res.set_content(
                     error_response(id, kInvalidParams,
                                    "RESULT_SET_BAD_REQUEST: " + std::string(rs_what) +
-                                       " must not contain a NUL byte"),
+                                       " must not contain a NUL byte",
+                                   rs_audit_refusal("field_contains_nul", rs_kind, "")),
                     "application/json");
             };
 
@@ -18201,14 +18644,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string sql = param_str(args, "sql");
                 if (sql.empty()) {
                     res.set_content(
-                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required"),
+                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required",
+                                       rs_audit_refusal("sql_missing", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
                 if (sql.size() > 100000) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB",
+                                       rs_audit_refusal("sql_too_large", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
@@ -18223,7 +18668,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                       rs_audit_refusal("stale_source", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
@@ -18330,23 +18776,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         rs_refuse_nul("parent_id", source_kind::kInstructionResult);
                         return;
                     }
-                    if (args.contains("matcher") && args["matcher"].is_object()) {
-                        const auto& m = args["matcher"];
-                        auto matcher_field_len = [&m](const char* key) -> std::size_t {
-                            return (m.contains(key) && m[key].is_string())
-                                       ? m[key].template get_ref<const std::string&>().size()
-                                       : 0;
-                        };
-                        if (matcher_field_len("column") > kMatcherColumnMaxLen ||
-                            matcher_field_len("op") > kMatcherOpMaxLen ||
-                            matcher_field_len("value") > kMatcherValueMaxLen) {
-                            reject_field_too_large(std::format(
-                                "a matcher field exceeds its bound (column<={}, op<={}, "
-                                "value<={} bytes)",
-                                kMatcherColumnMaxLen, kMatcherOpMaxLen, kMatcherValueMaxLen));
-                            return;
-                        }
-                    }
                     // #4644: a malformed echo_rows_ge threshold (`n`) is refused here, before
                     // anything is dispatched or stored, like the REST twin.
                     // A PRESENT matcher that is not a JSON object used to be dropped silently
@@ -18354,6 +18783,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (args.contains("matcher")) {
                         if (const auto bad =
                                 yuzu::server::rs_matcher::validate_matcher_object(args["matcher"])) {
+                            // A field or the whole matcher over its size bound is an input bound
+                            // like the fields above: counted and audited by the same responder.
+                            // The REST twin refuses both through this same check.
+                            if (*bad == yuzu::server::rs_matcher::kMatcherFieldTooLargeMessage) {
+                                reject_field_too_large(*bad);
+                                return;
+                            }
+                            if (*bad == yuzu::server::rs_matcher::kMatcherTooLargeMessage) {
+                                reject_field_too_large("RESULT_SET_BAD_REQUEST: " + *bad);
+                                return;
+                            }
                             res.set_content(
                                 error_response(id, kInvalidParams,
                                                "RESULT_SET_BAD_REQUEST: " + *bad),
@@ -18448,7 +18888,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         args.value("params", nlohmann::json::object()), def.parameter_schema)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                       rs_audit_refusal("stale_source", source_kind::kInstructionResult, "")),
                         "application/json");
                     return;
                 }
@@ -18638,7 +19079,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (sql.empty()) {
                         res.set_content(
                             error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: original carries no SQL"),
+                                           "RESULT_SET_BAD_REQUEST: original carries no SQL",
+                                           rs_audit_refusal("sql_missing", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -18653,7 +19095,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (sql.size() > 100000) {
                         res.set_content(
                             error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB",
+                                           rs_audit_refusal("sql_too_large", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -18663,7 +19106,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(
                                 id, kInvalidParams,
-                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                rs_audit_refusal("stale_source", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -18768,7 +19212,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(
                                 id, kInvalidParams,
-                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                rs_audit_refusal("stale_source", source_kind::kInstructionResult, orig->id)),
                             "application/json");
                         return;
                     }
@@ -23223,6 +23668,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             too_large("param_count", std::format("params must have at most {} keys", kExecInstrParamCountMax));
                             return;
                         }
+                        if (auto bad = yuzu::server::check_params_key_shape(p)) {
+                            too_large(bad->reason, bad->message);
+                            return;
+                        }
                         for (const auto& [k, v] : p.items()) {
                             // Key length is NOT expressible in the served schema
                             // (the subset has no propertyNames/maxProperties), so
@@ -24888,7 +25337,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // Destructive (Security:Execute) — approval-gated on supervised, so
             // it only reaches here after a consumed ticket. Records the
             // quarantine (mirror POST /api/v1/quarantine) AND dispatches the live
-            // quarantine-plugin isolation via the same DispatchFn chain.
+            // firewall containment action (`firewall.quarantine`) via the same
+            // DispatchFn chain.
             if (tool_name == "quarantine_device") {
                 // Parsed before the is_open() check below (pure arg-map
                 // reads, no failure mode) so a store-outage audit row can
@@ -25032,7 +25482,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // Server-side input validation BEFORE any store write or dispatch
                 // (governance cppsafety-SHOULD-1 / UP-7). The whitelist ultimately
-                // reaches the agent's netsh/iptables/pf sink; the agent already
+                // reaches the agent's firewall sink (the Windows firewall COM API, or
+                // pf / iptables on macOS / Linux); the agent already
                 // allow-lists each IP (is_safe_ip), but this PR opens the FIRST
                 // reachable path to that sink (REST /quarantine is record-only), so
                 // we validate at the server edge too (deploy-path precedent: reject
@@ -25043,10 +25494,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (whitelist.size() > 512) {
-                    res.set_content(
-                        error_response(id, kInvalidParams, "whitelist exceeds 512 characters"),
-                        "application/json");
+                if (whitelist.size() > kQuarantineWhitelistMaxLen) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   std::string(kWhitelistTooLongMessage)),
+                                    "application/json");
                     return;
                 }
                 // The firewall plugin's exception grammar takes bare IPv4/IPv6 literals, at most
@@ -25057,11 +25508,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (rest_api_v1.cpp's POST /api/v1/quarantine) all call, so this check exists
                 // in exactly one place rather than N hand-rolled copies.
                 if (!map_whitelist_to_exceptions(whitelist)) {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "whitelist must be comma-separated IPv4/IPv6 literals, "
-                                       "at most 32"),
-                        "application/json");
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   std::string(kWhitelistInvalidMessage)),
+                                    "application/json");
                     return;
                 }
                 // NOTE (governance sec-LOW-1 / UP-6): this call sends no server address — but
@@ -25076,6 +25525,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // 1. Persist the quarantine record (store row only; mirror REST).
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
+                // The record this call acts on, for the success audit row (#7628): the new row's
+                // id on `created`, replaced below by the stored row's id when the record was
+                // already there.
+                std::int64_t record_id = quar_res ? *quar_res : 0;
                 // #3127: classify the write onto the pure decision enum
                 // (quarantine_dispatch_decision.hpp). The store emits exactly
                 // one business/state error ("device is already quarantined",
@@ -25209,7 +25662,11 @@ McpServer::HandlerFn McpServer::build_handler(
                             // Not a transient fault: a release is in flight for this record, and
                             // containment is not re-applied under it. The request is refused for
                             // the state the resource is in (kInvalidParams, as the REST twin's
-                            // 400), not a service fault. No retry hint.
+                            // 400), not a service fault. No retry hint. #7588(b), ruled keep: the
+                            // closed code set (mcp_jsonrpc.hpp) has no conflict class, and a
+                            // release can stay pending for as long as the device stays
+                            // unreachable, so no retry interval would be honest; the caller
+                            // reads `GET /api/v1/quarantine` (status releasing) for its end.
                             mcp_audit("failure", "agent_id=" + agent_id +
                                                      ", release in progress; isolation not "
                                                      "dispatched");
@@ -25219,17 +25676,33 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
-                        // store_error / no_active_record: both leave nothing
-                        // durable to dispatch against — retry the whole
-                        // request rather than report isolated on a record
-                        // that turned out not to be there.
+                        // store_error / no_active_record: nothing was dispatched
+                        // by this call — retry the whole request rather than
+                        // report isolated on a record that turned out not to be
+                        // there. no_active_record also covers a refused claim:
+                        // the record is there and another apply holds it, and
+                        // that apply is dispatching the containment or has not had
+                        // its reply read yet, so this call has not contained the
+                        // device. The retry is still right. (An apply that reached
+                        // the device keeps its claim until its reply is consumed or
+                        // the claim window passes, so a retry inside that window is
+                        // refused this way; this path consumes no reply and leaves it to expire.)
                         mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail +
                                                  (record_pre_existing ? "" : " record_persisted=1"));
-                        res.set_content(a4_error(kInternalError, err.detail, "retry the request",
-                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                        "application/json");
+                        // A refused claim on a record that already existed is held for the claim
+                        // window (an upper bound: the reconciler's claim clears sooner), so the
+                        // honest hint is that window, not the store-fault 5 s.
+                        const bool claim_held =
+                            err.kind == ContainmentReapplyErrorKind::no_active_record &&
+                            record_pre_existing;
+                        res.set_content(
+                            a4_error(kInternalError, err.detail, "retry the request",
+                                     /*retry_after_ms=*/claim_held ? kApplyClaimTtlSecs * 1000
+                                                                   : mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
                         return;
                     }
+                    record_id = stored.id;
                     effective_by = stored.quarantined_by;
                     effective_reason = stored.reason;
                     effective_whitelist = stored.whitelist;
@@ -25355,7 +25828,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // device was actually isolated (agents_reached>0) vs recorded-only
                 // (agents_reached=0, agent offline) — governance comp-SHOULD-1.
                 bool audit_ok = mcp_audit(
-                    "success", "agent_id=" + agent_id + " command_id=" + command_id +
+                    "success", "agent_id=" + agent_id + " record_id=" + std::to_string(record_id) +
+                                   " command_id=" + command_id +
                                    " agents_reached=" + std::to_string(agents_reached) +
                                    (record_pre_existing ? " record_pre_existing=1" : "") +
                                    (whitelist_request_ignored ? " whitelist_ignored=1" : ""));
@@ -25535,9 +26009,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto specs = validate_bundle_steps(args["steps"].dump());
+                auto specs = validate_bundle_steps_typed(args["steps"].dump());
                 if (!specs) {
-                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error()),
+                    if (specs.error().kind == BundleStepsError::Kind::kParamKeyInvalid) {
+                        // sg10 / UP-1: counted and audited like every other ingress refusal.
+                        count_param_key_invalid(metrics, "bundle");
+                        (void)audit_fn(req, "bundle.dispatch", "denied", "Execution", "",
+                                       std::string("reason=") + std::string(kReasonParamKeyInvalid));
+                    }
+                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error().message),
                                     "application/json");
                     return;
                 }
@@ -28784,7 +29264,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // store_unavailable/db_error are store/infra degradation
                     // (kInternalError + retry_after_ms) — distinct in the
                     // audit record even where the outcome collapses.
-                    if (result.error() == OffloadWriteError::invalid_input) {
+                    if (result.error() == OffloadWriteError::destination_refused) {
+                        (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
+                                 "destination_refused");
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "target rejected: url host is a link-local, cloud-metadata, "
+                                     "unspecified, multicast or reserved address (or a numeric "
+                                     "spelling of one); offload destinations may not be in those "
+                                     "address classes"),
+                            "application/json");
+                    } else if (result.error() == OffloadWriteError::invalid_input) {
                         (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
                                  "validation_failed");
                         res.set_content(
@@ -30027,6 +30517,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // failure, not a client error → kInternalError, not kInvalidParams.
                 auto result = rbac_store->unassign_role("engine", principal_id, role_name);
                 if (!result) {
+                    // audit_token, as on the user arm: the text can carry control bytes and spaces.
+                    const auto tok = [](std::string_view v) { return audit_token(v.substr(0, 256)); };
+                    spdlog::warn("engine_principal.role.unassigned store fault: principal={} "
+                                 "role={} error={}",
+                                 tok(principal_id), tok(role_name), tok(result.error()));
                     res.set_content(a4_error(kInternalError, result.error(), {},
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
@@ -30523,10 +31018,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // zero administrators (a business-rule conflict, not a store
                 // fault) — is_rbac_last_admin_refusal distinguishes them so
                 // only the genuine fault carries a retry hint.
-                auto result = rbac_store->unassign_role("user", principal_id, role_id);
+                auto result = rbac_store->unassign_role_detailed("user", principal_id, role_id);
                 if (!result) {
+                    // flatten_audit_text: a libpq error carries a trailing newline and a
+                    // CONTEXT line, which would otherwise reach the audit row as extra lines.
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
-                                   result.error());
+                                   flatten_audit_text(result.error()));
                     if (is_rbac_last_admin_refusal(result.error())) {
                         // retry-hint-exempt: business-rule outcome (last
                         // remaining Administrator), not a store fault.
@@ -30539,8 +31036,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
+                    // audit_token, not log_key_token: it maps space, '=' and ',' as well as
+                    // control bytes to '_', so a value cannot forge a `role=x error=y` field
+                    // on this unquoted line. Each value is capped at 256 bytes.
+                    const auto tok = [](std::string_view v) { return audit_token(v.substr(0, 256)); };
+                    spdlog::warn("rbac.role.unassigned store fault: user={} role={} error={}",
+                                 tok(principal_id), tok(role_id), tok(result.error()));
                     // A store fault returns a constant client message; the raw text
-                    // goes only to the audit row above.
+                    // reaches only the audit row above and the server log line, never
+                    // the client.
                     res.set_content(
                         a4_error(kInternalError,
                                  "role unassignment store fault; retry, and if this persists "
@@ -30553,9 +31057,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 // removed=<bool> (governance SHOULD #10) lets an auditor
                 // tell an actual revoke apart from an idempotent no-op from
                 // the log alone.
+                //
+                // An Administrator unassign that ended elevations says so on this
+                // row (suffix) and on one dedicated `role.elevation.revoked` row, both only when
+                // N > 0 and both attempted even if the first fails. Either failing takes the same
+                // 503 as the success row alone always did: the removal and the clear are already
+                // committed, so it reports the audit gap, never a failed removal. The response
+                // payload is unchanged. A no-op (`removed=false`: the user held no such grant)
+                // clears nothing, so it carries neither addition; nor does a retry after a lost
+                // COMMIT acknowledgement, which finds the grant already gone.
+                const int cleared = result->elevations_cleared;
                 bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "rbac.role.unassigned", "success", "User", audit_target_id,
-                    audit_role + "; removed=" + (*result ? "true" : "false"));
+                    audit_role + "; removed=" + (result->removed ? "true" : "false") +
+                        unassign_elevations_cleared_suffix(cleared));
+                if (cleared > 0) {
+                    const bool revoked_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, std::string(kElevationRevokedAuditAction), "ok", "User",
+                        audit_target_id, unassign_elevation_revoked_detail(cleared, audit_role));
+                    audit_ok = audit_ok && revoked_ok;
+                }
                 if (!audit_ok) {
                     mcp_audit("error", "audit_persist_failed");
                     res.set_content(

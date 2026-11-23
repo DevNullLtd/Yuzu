@@ -750,6 +750,7 @@ class WorkflowWiringTests(unittest.TestCase):
                 "'Windows toolchain contract'",
                 "'gateway build wrapper'",
                 "'gateway OTP pin resolution'",
+                "'deploy build DLLs selftest'",
                 "'instructions runner hardening'",
                 "'contract evidence selftest'",
                 "'gateway wrapper guard selftest'",

@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "../test_log_capture.hpp" // F54: the key_provider log line
 #include "key_provider.hpp"
 #include "pg/pg_raii.hpp"
 #include "kek_op_lock.hpp"
@@ -272,6 +273,25 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
         auto r = codec.init(conn.get());
         REQUIRE_FALSE(r.has_value());
         REQUIRE(r.error().kind == SecretCodec::InitError::Kind::kek_unresolvable);
+    }
+    SECTION("forged kcv_alg is neutralised in the InitError message (F54)") {
+        PgResult upd{PQexec(conn.get(),
+                            "UPDATE secrets.kek_meta SET kcv_alg = E'x\\n[error] forged\\x1b[2J'")};
+        REQUIRE(upd.ok());
+        FileKeyProvider provider(keys.path);
+        SecretCodec codec(provider);
+        yuzu::test::LogCapture cap{spdlog::level::err};
+        auto r = codec.init(conn.get());
+        cap.stop();
+        REQUIRE_FALSE(r.has_value());
+        // The key_provider log line folds the same value.
+        CHECK(cap.text().find("unsupported kcv_alg 'x_[error] forged_[2J'") != std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(cap.text()) == 0);
+        CHECK(r.error().message.find('\n') == std::string::npos);
+        CHECK(r.error().message.find('\x1b') == std::string::npos);
+        // F54: an unverifiable algorithm is a corrupt-KEK refusal, naming the folded value.
+        CHECK(r.error().kind == SecretCodec::InitError::Kind::kek_corrupt);
+        CHECK(r.error().message.find("kcv_alg='x_[error] forged_[2J'") != std::string::npos);
     }
     SECTION("corrupt KEK file -> kek_corrupt") {
         // Overwrite the key file with different 32 bytes; fresh provider so

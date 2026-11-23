@@ -196,6 +196,7 @@ Windows sets the status explicitly when the Security-channel query fails. On Lin
 | `OK` | PARTIAL | `subprocess_runner:line_limit` | `primary_user` stopped `last` at its 200-line bound while it was still producing output. This is deliberate truncation, not a failure, and is the normal case on any host with a longer history |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled` | a POSIX tool ran past the 10 second deadline, was cancelled, or was killed by a signal |
 | `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | no binary was found at the probed paths, or the spawn failed (the Linux container sample, which has no `last` or `lastlog`) |
+| `CONSTRAINED` | PARTIAL | `linux:users:local_admins:lookup_failed` / `linux:users:group_members:lookup_failed` | a Linux `getgrnam_r` / `getpwuid_r` lookup failed (an NSS fault, or a record too large for the 1 MiB buffer cap). A group that simply does not exist is not a failure: `local_admins` skips it and `group_members` answers `Group not found`. On failure `local_admins` lists what it could read and `group_members` answers `Group lookup failed` with rc 1 |
 | `PERMISSION_DENIED` | PARTIAL | `users_win_events:access_denied` | Windows Security channel query denied; for `primary_user` only when the ProfileList fallback also failed |
 | `UNAVAILABLE` | PARTIAL | `users_win_events:channel_not_found` | Windows Security channel missing or unavailable |
 | `CONSTRAINED` | PARTIAL | `users_win_events:evt_next_timeout` | the Windows event read made no progress for 10 seconds |
@@ -353,7 +354,7 @@ session_history|error|last command failed
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/users/src/users_macos_last.hpp` · `agents/plugins/users/src/users_plugin.cpp` · `agents/plugins/users/src/users_win_events.hpp`
+- Plugin: `agents/plugins/users/src/users_group_lookup.hpp` · `agents/plugins/users/src/users_macos_last.hpp` · `agents/plugins/users/src/users_plugin.cpp` · `agents/plugins/users/src/users_win_events.hpp`
 - Definitions: `content/definitions/users.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: `tests/unit/test_users_macos_last.cpp` · `tests/unit/test_users_posix_actions.cpp` · `tests/unit/test_users_win_events.cpp`

@@ -1722,6 +1722,24 @@ class BashEntry(unittest.TestCase):
         self.assertEqual(argv[i + 1:i + 3], ["destructive", "forensic"])
         self.assertTrue(argv[i + 3].startswith("--"))
 
+    def test_network_disrupt_runs_the_containment_ceremony_against_the_one_target(self):
+        argv = self.run_bash("--risks", "network-disrupt", "--target-agent-id", "id 1")
+        self.assertTrue(argv[0].endswith("instructions_firewall_containment.py"), argv)
+        self.assertIn("--apply-containment", argv)
+        self.assertEqual(argv[argv.index("--agent-id") + 1], "id 1")
+        self.assertNotIn("p", argv)  # the password goes by environment, not argv
+
+    def test_network_disrupt_without_a_target_or_beside_another_class_is_refused(self):
+        env = dict(os.environ, PATH=f"{self.tmp}{os.pathsep}{os.environ['PATH']}", REC=str(self.rec))
+        for extra in (["--risks", "network-disrupt"],
+                      ["--risks", "safe,network-disrupt", "--target-agent-id", "a"]):
+            with self.subTest(extra=extra):
+                r = subprocess.run(["bash", str(ROOT / "scripts" / "test" / "instructions-tests.sh"),
+                                    "--dashboard", "http://127.0.0.1:1", "--password", "p", *extra],
+                                   env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertFalse(self.rec.exists())  # nothing was started
+
     def test_values_with_spaces_arrive_as_single_arguments(self):
         argv = self.run_bash("--confirm-target", "Host name 1", "--manifest", "/tmp/a b/m.jsonl",
                              "--params-override", "/tmp/o v/x.json", "--target-agent-id", "id 1")

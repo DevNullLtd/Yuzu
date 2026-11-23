@@ -25,6 +25,7 @@
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_principal_lock_gate.hpp" // SqlFault
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
@@ -156,6 +157,36 @@ TEST_CASE("AuthManager::elevate_session sets the window; revoke clears it", "[ji
 }
 
 // ── Follow-up B: clamp to the session's absolute lifetime ──────────────────
+
+TEST_CASE("AuthManager::drop_local_sessions_of_user (store-less) zeroes that user's elevation "
+          "only",
+          "[jit][auth][unassign_elevation]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("alice", "secret123456", Role::user);
+    mgr->upsert_user("bob", "secret123456", Role::user);
+    const auto ta = mgr->authenticate("alice", "secret123456");
+    const auto tb = mgr->authenticate("bob", "secret123456");
+    REQUIRE(ta.has_value());
+    REQUIRE(tb.has_value());
+    REQUIRE(mgr->elevate_session(*ta, std::chrono::seconds(60)).has_value());
+    REQUIRE(mgr->elevate_session(*tb, std::chrono::seconds(60)).has_value());
+    REQUIRE(auth::is_elevated(*mgr->validate_session(*ta)));
+    REQUIRE(auth::is_elevated(*mgr->validate_session(*tb)));
+
+    mgr->drop_local_sessions_of_user("alice");
+
+    const auto sa = mgr->validate_session(*ta);
+    REQUIRE(sa.has_value()); // the session itself survives; only the elevation ends
+    CHECK_FALSE(auth::is_elevated(*sa));
+    CHECK(auth::effective_role(*sa) == Role::user);
+    const auto sb = mgr->validate_session(*tb);
+    REQUIRE(sb.has_value());
+    CHECK(auth::is_elevated(*sb)); // another user's elevation is untouched
+    // Idempotent and safe for an unknown user.
+    mgr->drop_local_sessions_of_user("alice");
+    mgr->drop_local_sessions_of_user("nobody");
+    CHECK(auth::is_elevated(*mgr->validate_session(*tb)));
+}
 
 TEST_CASE("AuthManager::elevate_session clamps the window to the session's own "
          "absolute expiry",
@@ -1019,6 +1050,43 @@ TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[pg][jit][routes
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
+TEST_CASE("POST /api/v1/elevate/revoke audits was_elevated=unknown when the session lookup degrades "
+          "after the route's own validation, and the clear still ends the elevation",
+          "[pg][jit][routes]") {
+    JitHarness h;
+    auto token = h.session_for("alice");
+    REQUIRE(h.post("/api/v1/elevate", token, R"({"justification":"x"})")->status == 200);
+
+    // The route validates (a cold read that works), then revoke_elevation looks the session up
+    // again. The pre-cache hook runs between the two: it breaks `find` (its SELECT names
+    // display_name; the clear's UPDATE does not) and drops the user's cached sessions, so the
+    // revoke finds no entry to read and its durable lookup fails while its clear succeeds.
+    yuzu::test::SqlFault read_fault{
+        h.auth_db.pool(),
+        "ALTER TABLE session_store.sessions RENAME COLUMN display_name TO display_name_gone",
+        "ALTER TABLE session_store.sessions RENAME COLUMN display_name_gone TO display_name"};
+    int hook_calls = 0;
+    h.auth_mgr.set_validate_pre_cache_hook_for_test([&] {
+        if (++hook_calls != 1)
+            return;
+        read_fault.arm();
+        h.auth_mgr.drop_local_sessions_of_user("alice");
+    });
+    const auto res = h.post("/api/v1/elevate/revoke", token, "");
+    h.auth_mgr.set_validate_pre_cache_hook_for_test(nullptr);
+    read_fault.repair();
+
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(hook_calls == 1);
+    CHECK(h.count_audits("role.elevation.revoked", "alice") == 1);
+    // Never `was_elevated=true`: with the lookup degraded the answer is unknown.
+    CHECK(h.audit_detail("role.elevation.revoked", "alice") == "was_elevated=unknown");
+    const auto after = h.auth_mgr.validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK_FALSE(auth::is_elevated(*after));
+}
+
 TEST_CASE("revoking eligibility terminates an active elevation", "[pg][jit][routes]") {
     JitHarness h;
     // alice elevates, then an admin revokes her eligibility — her in-flight
@@ -1032,6 +1100,134 @@ TEST_CASE("revoking eligibility terminates an active elevation", "[pg][jit][rout
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(alice))); // elevation cleared
+}
+
+// The eligibility revoke flips the flag, then clears the durable elevations. If its
+// clear runs before an in-flight /elevate commits, the clear matches no row and the elevation
+// would stand with eligible=false. The route re-reads eligibility after the commit and rolls it
+// back. The post-durable-write hook flips the flag at exactly that point ("elevate" op, after
+// the durable write, before the route's re-read).
+TEST_CASE("POST /api/v1/elevate: eligibility revoked after the durable write commits rolls the "
+          "elevation back and records no grant",
+          "[pg][jit][routes][elevate_race]") {
+    JitHarness h;
+    auto alice = h.session_for("alice");
+    int hook_calls = 0;
+    h.auth_mgr.set_post_durable_write_hook_for_test([&](std::string_view op) {
+        if (op != "elevate")
+            return;
+        ++hook_calls;
+        // The revoke route's own first step: flip the account flag only (no clear).
+        REQUIRE(h.auth_db->set_elevation_eligible("alice", false).has_value());
+    });
+    auto res = h.post("/api/v1/elevate", alice, R"({"justification":"race"})");
+    h.auth_mgr.set_post_durable_write_hook_for_test(nullptr);
+
+    REQUIRE(res);
+    CHECK(hook_calls == 1);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("not authorized to elevate") != std::string::npos);
+    CHECK(h.count_audits("role.elevation.granted", "alice") == 0);
+    CHECK(h.audit_detail("role.elevation.denied", "alice") == "eligibility revoked during elevation");
+    // The durable row is not elevated, and the next request is not admin.
+    auto found = h.sessions.find(auth::AuthManager::sha256_hex(alice));
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    CHECK((*found)->row.elevated_until_ms == 0);
+    auto s = h.auth_mgr.validate_session(alice);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(auth::is_elevated(*s));
+    CHECK(auth::effective_role(*s) != Role::admin);
+}
+
+// The failed re-read: eligibility cannot be confirmed after the commit, so the elevation is
+// rolled back and the route answers 503, never a grant.
+TEST_CASE("POST /api/v1/elevate: an unreadable eligibility after the durable write commits rolls "
+          "the elevation back with a 503 and records no grant",
+          "[pg][jit][routes][elevate_race]") {
+    JitHarness h;
+    auto alice = h.session_for("alice");
+    yuzu::test::SqlFault read_fault{
+        h.auth_db.pool(),
+        "ALTER TABLE auth.users RENAME COLUMN elevation_eligible TO elevation_eligible_gone",
+        "ALTER TABLE auth.users RENAME COLUMN elevation_eligible_gone TO elevation_eligible"};
+    h.auth_mgr.set_post_durable_write_hook_for_test([&](std::string_view op) {
+        if (op == "elevate")
+            read_fault.arm();
+    });
+    auto res = h.post("/api/v1/elevate", alice, R"({"justification":"race"})");
+    h.auth_mgr.set_post_durable_write_hook_for_test(nullptr);
+    read_fault.repair();
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(h.count_audits("role.elevation.granted", "alice") == 0);
+    CHECK(h.audit_detail("role.elevation.denied", "alice") ==
+          "eligibility read failed after elevation");
+    auto found = h.sessions.find(auth::AuthManager::sha256_hex(alice));
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    CHECK((*found)->row.elevated_until_ms == 0);
+    auto s = h.auth_mgr.validate_session(alice);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(auth::is_elevated(*s));
+}
+
+// The compensating revoke fails too: eligibility was revoked after the elevation committed, and
+// the durable clear that would roll the elevation back cannot be done. The elevation may then be
+// live, so the route answers 500 (never 200 or 403), names the means of ending it, logs and
+// audits `rollback_failed=true`, and writes no grant row. The hook flips the flag (the
+// re-read still works, so the 403 branch is reached) and arms a column rename that breaks the
+// session UPDATE of `clear_elevation` and the `find` before it.
+TEST_CASE("POST /api/v1/elevate: a failed rollback after the durable write answers 500 naming the "
+          "manual remedy, audits rollback_failed and records no grant",
+          "[pg][jit][routes][elevate_race]") {
+    JitHarness h;
+    auto alice = h.session_for("alice");
+    yuzu::test::SqlFault clear_fault{
+        h.auth_db.pool(),
+        "ALTER TABLE session_store.sessions RENAME COLUMN elevation_issued_ms TO "
+        "elevation_issued_ms_gone",
+        "ALTER TABLE session_store.sessions RENAME COLUMN elevation_issued_ms_gone TO "
+        "elevation_issued_ms"};
+    int hook_calls = 0;
+    h.auth_mgr.set_post_durable_write_hook_for_test([&](std::string_view op) {
+        if (op != "elevate")
+            return;
+        ++hook_calls;
+        REQUIRE(h.auth_db->set_elevation_eligible("alice", false).has_value());
+        clear_fault.arm();
+    });
+    auto res = h.post("/api/v1/elevate", alice, R"({"justification":"race"})");
+    h.auth_mgr.set_post_durable_write_hook_for_test(nullptr);
+    clear_fault.repair();
+
+    REQUIRE(res);
+    CHECK(hook_calls == 1);
+    CHECK(res->status == 500);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE(body.is_object());
+    CHECK(body["error"]["message"].get<std::string>().find("it may be active") !=
+          std::string::npos);
+    const auto remediation = body["error"]["remediation"].get<std::string>();
+    CHECK(remediation.find("POST /api/v1/elevate/revoke") != std::string::npos);
+    CHECK(remediation.find("elevation-eligibility") != std::string::npos);
+    CHECK(h.count_audits("role.elevation.granted", "alice") == 0);
+    CHECK(h.count_audits("role.elevation.denied", "alice") == 1);
+    CHECK(h.audit_detail("role.elevation.denied", "alice").find("rollback_failed=true") !=
+          std::string::npos);
+    // The compensation did not land: the durable row is still elevated.
+    auto found = h.sessions.find(auth::AuthManager::sha256_hex(alice));
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    CHECK((*found)->row.elevated_until_ms != 0);
+    // The named means works once the store is readable again: the user ends it themselves.
+    auto revoke = h.post("/api/v1/elevate/revoke", alice, "");
+    REQUIRE(revoke);
+    CHECK(revoke->status == 200);
+    auto s = h.auth_mgr.validate_session(alice);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(auth::is_elevated(*s));
 }
 
 TEST_CASE("an elevated operator cannot grant elevation eligibility, but can revoke it",

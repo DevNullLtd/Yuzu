@@ -5,13 +5,16 @@
  * lines, and the stoppable retry loop.
  *
  * Nothing here sleeps or polls: the loop is driven with a zero delay and waited on through
- * futures, and the long-delay and blocked-attempt cases are woken by stop().
+ * promises, and the long-delay and blocked-attempt cases are woken by stop(). A stop() whose
+ * return is under test runs through yuzu::test::must_return_within.
  */
 
 #include "echo_open_retry.hpp"
 #include "echo_status_format.hpp"
+#include "test_bounded_return.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -29,7 +32,16 @@ using namespace std::chrono_literals;
 
 namespace {
 // Generous: only a hang would reach it; every wait below is released by the code under test.
+// A hang backstop on in-memory waits (a zero-delay loop, no I/O), not a performance limit, and the
+// value this file already carried, so it cites no measurement (rule 9 of the Echo test standard).
 constexpr auto kBound = 30s;
+
+// Wait for a promise a worker sets. Every caller's OpenRetryLoop destructor stops and joins the
+// worker on unwind, so a failed REQUIRE here cannot leave a thread behind.
+bool signalled(std::future<void>& f) {
+    // echo-test-ok: every caller's OpenRetryLoop destructor stops and joins the worker on unwind
+    return f.wait_for(kBound) == std::future_status::ready;
+}
 
 // The refusal texts EchoDatabase::open really returns for a failure that is not a v10 migration one
 // (echo_db.cpp: the link, unresolvable-directory, unchecked, busy, unmovable-corrupt, WAL, schema
@@ -167,8 +179,63 @@ TEST_CASE("offline_reason_token: the literals the server's gauge parser mirrors"
     CHECK(offline_reason_token(OfflineReason::free_space) == "free_space");
     CHECK(offline_reason_token(OfflineReason::migration_failed) == "migration_failed");
     CHECK(offline_reason_token(OfflineReason::open_failed) == "open_failed");
+    CHECK(offline_reason_token(OfflineReason::rollback_wedged) == "rollback_wedged");
+    CHECK(kRollbackWedgedToken == "rollback_wedged");
     CHECK(offline_reason_token(OfflineReason::none).empty());
     CHECK(kStorageOfflineKey == "heartbeat.storage_offline");
+}
+
+TEST_CASE("online_offline_tag_action: publish for a store closed at run time, clear a stale tag",
+          "[echo][open_retry]") {
+    // closed store: no key, or another reason's value, is (re)published as rollback_wedged
+    CHECK(online_offline_tag_action(false, false, "") == OfflineTagAction::publish_wedged);
+    CHECK(online_offline_tag_action(false, true, "open_failed") == OfflineTagAction::publish_wedged);
+    CHECK(online_offline_tag_action(false, true, "") == OfflineTagAction::publish_wedged); // key set, value empty
+    // closed store already tagged: left, so a stuck tick does not rewrite the key
+    CHECK(online_offline_tag_action(false, true, "rollback_wedged") == OfflineTagAction::leave);
+    // open store: a key (the previous run's, or a failed delete replayed) is cleared ...
+    CHECK(online_offline_tag_action(true, true, "rollback_wedged") == OfflineTagAction::clear);
+    CHECK(online_offline_tag_action(true, true, "") == OfflineTagAction::clear);
+    // ... and no key is left alone
+    CHECK(online_offline_tag_action(true, false, "") == OfflineTagAction::leave);
+}
+
+TEST_CASE("refused_on_closed_store: the five actions that answer wrongly on a closed store, no others",
+          "[echo][open_retry]") {
+    // The closed set the plugin shell refuses while the write connection is closed (#8099). Each name
+    // here is an echo.yaml action; the honest ones are listed so a new action has to be placed on one
+    // side or the other (its comment in echo_status_format.hpp says which and why).
+    const std::string refused = GENERATE(as<std::string>{}, "collect_fast", "collect_slow", "configure",
+                                         "fleet_snapshot", "rollup");
+    CHECK(refused_on_closed_store(refused));
+}
+
+TEST_CASE("refused_on_closed_store: the honest actions and unknown names are left to answer for themselves",
+          "[echo][open_retry]") {
+    const std::string left = GENERATE(as<std::string>{}, "status", "sql", "compatibility", "query", "export",
+                                      "purge_source", "snapshot", "collect_perf", "collect_software",
+                                      "no_such_action", "");
+    CHECK_FALSE(refused_on_closed_store(left));
+}
+
+TEST_CASE("format_closed_store_refusal: line 0 of the offline status reply, only for a refused action on a "
+          "closed store",
+          "[echo][open_retry]") {
+    // read path present: the line promises `echo sql`; absent: it must not
+    for (const bool query_engine : {true, false}) {
+        const auto line0 = format_storage_offline_lines(query_engine).front();
+        const auto refusal = format_closed_store_refusal("collect_fast", false, query_engine);
+        REQUIRE(refusal.has_value());
+        CHECK(*refusal == line0);
+        CHECK(refusal->starts_with("error|"));
+        CHECK((refusal->find("remains readable via `echo sql`") != std::string::npos) == query_engine);
+    }
+    // an open store runs every action, refused or not
+    CHECK_FALSE(format_closed_store_refusal("collect_fast", true, true));
+    CHECK_FALSE(format_closed_store_refusal("rollup", true, false));
+    // a closed store still lets the honest actions answer
+    CHECK_FALSE(format_closed_store_refusal("status", false, true));
+    CHECK_FALSE(format_closed_store_refusal("sql", false, true));
 }
 
 TEST_CASE("format_storage_refused_lines: error| first, then the reason token, with the retry wait",
@@ -256,7 +323,7 @@ TEST_CASE("OpenRetryLoop: attempts run after each back-off until one succeeds",
             return std::chrono::milliseconds{0};
         },
         /*initial_failures=*/1);
-    REQUIRE(finished.wait_for(kBound) == std::future_status::ready);
+    REQUIRE(signalled(finished));
     loop.stop(); // joins; the thread ended on its own after the success
     // init's own try counts as failed attempt 1, so the first retry is attempt 2
     CHECK(attempts_seen == std::vector<unsigned>{2, 3, 4});
@@ -266,15 +333,25 @@ TEST_CASE("OpenRetryLoop: attempts run after each back-off until one succeeds",
 TEST_CASE("OpenRetryLoop: stop() during a long back-off returns without running an attempt",
           "[echo][open_retry]") {
     std::atomic<int> attempts{0};
+    // Declared before `loop` (see the ordering note above the first case). The loop calls delay()
+    // with its mutex held (echo_open_retry.hpp) and gives the mutex up only by entering the wait,
+    // so once this signal is seen stop() cannot set stop_ until the worker is in its back-off:
+    // the case tests what its name says. delay() is called exactly once here.
+    std::promise<void> waiting;
+    auto in_backoff = waiting.get_future();
     OpenRetryLoop loop;
     loop.start(
         [&](unsigned, const std::function<bool()>&) {
             ++attempts;
             return true;
         },
-        [](unsigned) { return std::chrono::milliseconds{std::chrono::hours{1}}; });
-    auto stopped = std::async(std::launch::async, [&] { loop.stop(); });
-    REQUIRE(stopped.wait_for(kBound) == std::future_status::ready);
+        [&](unsigned) {
+            waiting.set_value();
+            return std::chrono::milliseconds{std::chrono::hours{1}};
+        });
+    REQUIRE(signalled(in_backoff));
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "OpenRetryLoop::stop() during a long back-off",
+                                   [&] { loop.stop(); });
     CHECK(attempts.load() == 0);
     loop.stop(); // idempotent
 }
@@ -297,9 +374,9 @@ TEST_CASE("OpenRetryLoop: stop() cancels an attempt that is blocked on cancelled
             return false; // would be retried, but the loop is stopped
         },
         [](unsigned) { return std::chrono::milliseconds{0}; });
-    REQUIRE(in_attempt.wait_for(kBound) == std::future_status::ready);
-    auto stopped = std::async(std::launch::async, [&] { loop.stop(); });
-    REQUIRE(stopped.wait_for(kBound) == std::future_status::ready);
+    REQUIRE(signalled(in_attempt));
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "OpenRetryLoop::stop() of a blocked attempt",
+                                   [&] { loop.stop(); });
     CHECK(saw_cancel.load());
     CHECK(attempts.load() == 1); // no attempt after the cancel
 }
@@ -318,12 +395,12 @@ TEST_CASE("OpenRetryLoop: an attempt that throws counts as failed and the loop c
             return true;
         },
         [](unsigned) { return std::chrono::milliseconds{0}; });
-    REQUIRE(finished.wait_for(kBound) == std::future_status::ready);
+    REQUIRE(signalled(finished));
     loop.stop();
     CHECK(calls.load() == 2);
 }
 
-TEST_CASE("OpenRetryLoop: with the default back-off the first attempt is a minute away and stop() ends the wait",
+TEST_CASE("OpenRetryLoop: with the default back-off stop() returns before the first attempt, a minute away",
           "[echo][open_retry]") {
     std::atomic<int> attempts{0};
     OpenRetryLoop loop;
@@ -331,7 +408,79 @@ TEST_CASE("OpenRetryLoop: with the default back-off the first attempt is a minut
         ++attempts;
         return true;
     });
-    auto stopped = std::async(std::launch::async, [&] { loop.stop(); });
-    REQUIRE(stopped.wait_for(kBound) == std::future_status::ready);
+    // No delay argument, so this case cannot know the worker is already waiting; the long back-off
+    // case above is the one that proves stop() wakes a wait. This one pins only the default
+    // schedule's first delay (a minute, never an attempt) and that stop() returns. The trade-off:
+    // the bound is 120 s against a 60 s default delay, so a stop() that waited out the default
+    // back-off would still pass here; the long back-off case is the detector for that regression.
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "OpenRetryLoop::stop() with the default back-off",
+                                   [&] { loop.stop(); });
     CHECK(attempts.load() == 0);
+}
+
+// must_return_within itself. The expiry is driven through detail::must_return_within_ms with a tiny
+// limit and a recording action, so no test ends the process or spawns one. Not covered here: the
+// default action's real exit code 3 and stderr text (see test_bounded_return.hpp). None of these
+// sleeps or asserts an elapsed time: the watchdog is joined before each call returns, so every
+// counter read below is ordered after the watchdog's last write.
+TEST_CASE("must_return_within: a call that outlives the limit runs the expiry action once, with the "
+          "call's name and exactly the limit",
+          "[echo][bounded_return]") {
+    std::promise<void> release;
+    auto released = release.get_future();
+    int actions = 0;
+    const char* acted_for = nullptr;
+    std::chrono::milliseconds acted_limit{0};
+    std::thread::id call_thread;
+    bool call_released = false;
+    yuzu::test::detail::must_return_within_ms(
+        1ms, "the call under test",
+        [&] {
+            call_thread = std::this_thread::get_id();
+            // echo-test-ok: the helper under test joins its own watchdog, so this wait cannot outlive the case
+            call_released = released.wait_for(kBound) == std::future_status::ready;
+        },
+        [&](const char* what, std::chrono::milliseconds limit) {
+            ++actions;
+            acted_for = what;
+            acted_limit = limit;
+            release.set_value(); // the call blocks until the expiry action releases it
+        });
+    CHECK(call_released); // a watchdog that never fires fails here after kBound, not by hanging
+    CHECK(actions == 1);
+    REQUIRE(acted_for != nullptr);
+    CHECK(std::string_view{acted_for} == "the call under test");
+    CHECK(acted_limit == 1ms); // exactly the limit given: nothing scales it
+    CHECK(call_thread == std::this_thread::get_id());
+}
+
+TEST_CASE("must_return_within: a call that returns runs on the calling thread and never trips the watchdog",
+          "[echo][bounded_return]") {
+    std::thread::id call_thread;
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "an immediate call",
+                                   [&] { call_thread = std::this_thread::get_id(); });
+    CHECK(call_thread == std::this_thread::get_id());
+
+    // With a one-hour limit the watchdog cannot expire first, so the action never running is
+    // deterministic, not a race.
+    int actions = 0;
+    bool ran = false;
+    yuzu::test::detail::must_return_within_ms(
+        std::chrono::hours{1}, "an immediate call", [&] { ran = true; },
+        [&](const char*, std::chrono::milliseconds) { ++actions; });
+    CHECK(ran);
+    CHECK(actions == 0);
+}
+
+TEST_CASE("must_return_within: a call that throws propagates, joins the watchdog and never trips it",
+          "[echo][bounded_return]") {
+    int actions = 0;
+    // An unjoined std::thread would terminate the process as the exception left must_return_within,
+    // so reaching the checks below also proves the watchdog was joined on the unwind.
+    CHECK_THROWS_AS(yuzu::test::detail::must_return_within_ms(
+                        std::chrono::hours{1}, "a throwing call",
+                        []() -> void { throw std::runtime_error("boom"); },
+                        [&](const char*, std::chrono::milliseconds) { ++actions; }),
+                    std::runtime_error);
+    CHECK(actions == 0);
 }

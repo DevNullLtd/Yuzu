@@ -2,10 +2,12 @@
 # Refuse to publish from a run whose tag no longer points at its commit (#5282,
 # SEC-F2). Two runs for one tag at different commits (a re-tag while a run is
 # in flight; a moved tag whose push webhook never fired) both pass release-guard
-# because no release exists yet; whichever pushes LAST would own :X.Y.Z while
-# the other's release job signs SHA256SUMS for different images. Every image
-# push and the release creation call this immediately before acting, so a run
-# whose tag has moved away from its commit refuses at its next publishing step.
+# because no release exists yet; whichever tags LAST would own :X.Y.Z while
+# the other's release job signs SHA256SUMS for different images. Every image's
+# release-tag move (`scripts/ci/image-publish.sh tag`, WP15/S9; the push before
+# it is by digest or to a candidate tag) and the release creation call this
+# immediately before acting, so a run whose tag has moved away from its commit
+# refuses at its next publishing step.
 # It does NOT detect a tag moved away and back again (A->B->A) while two runs
 # are in flight: cancel in-flight release runs for a tag before re-tagging it
 # (release skill, Recovery; digest check before signing: #5478).
