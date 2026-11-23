@@ -311,9 +311,16 @@ def check_arm_recheck(files):
                    "!(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at)"):
         if clause not in seg:
             bad.append(f"/login/mfa: the transient admit rule must contain `{clause}`")
+    # C-01 (PR #8626 review): an ARMED own read is also tested for supersession, against the own
+    # read's own start: a not-armed read recorded at or after it started refuses.
+    if not re.search(r"const bool armed_ok =\s*gate2\.state == SsoOnlyLocalGate::kBreakGlassArmed &&\s*"
+                     r"!\(gate2\.last_not_armed_at && \*gate2\.last_not_armed_at >= gate2\.read_at\);", seg):
+        bad.append("/login/mfa: armed_ok must be `armed && !(gate2.last_not_armed_at && "
+                   "*gate2.last_not_armed_at >= gate2.read_at)` (an armed own read is superseded "
+                   "by a not-armed read that ended at or after it started)")
     if not re.search(r"const bool admit =\s*arm1\.has_value\(\) &&\s*"
-                     r"\(gate2\.state == SsoOnlyLocalGate::kBreakGlassArmed \|\| transient_ok\);", seg):
-        bad.append("/login/mfa: admit must be `arm1.has_value() && (armed || transient_ok)` "
+                     r"\(armed_ok \|\| transient_ok\);", seg):
+        bad.append("/login/mfa: admit must be `arm1.has_value() && (armed_ok || transient_ok)` "
                    "(a login with no first-re-check snapshot never mints)")
     refuse = seg.find("if (!admit) {")
     if refuse < 0:
@@ -332,6 +339,20 @@ def check_arm_recheck(files):
                        "may sit between the second arm re-check and the mint")
     if 'counter("yuzu_auth_break_glass_pending_refused_total")' in t:
         bad.append("yuzu_auth_break_glass_pending_refused_total must carry reason and stage labels")
+    # SG-1 (governance on the C-01 fix): the "not armed" time only moves forward. Every write is
+    # guarded by `if (!x || *x < v) x = v;`; an own read records its END (`finished`), the shared
+    # refresh its START (`started`, governance UP-1: recording the end there refuses re-armed
+    # logins after the recovery code is spent).
+    nat = "bg_last_not_armed_at_"
+    writes = re.findall(re.escape(nat) + r"\s*=\s*(\w+)\s*;", t)
+    guarded = re.findall(r"if \(!" + re.escape(nat) + r" \|\| \*" + re.escape(nat) +
+                         r" < (\w+)\)\s*" + re.escape(nat) + r" = (\w+);", t)
+    if sorted(writes) != ["finished", "started"]:
+        bad.append(f"{nat}: expected exactly two writes, the own read's `finished` and the shared "
+                   f"refresh's `started`; found {sorted(writes)}")
+    if sorted(g for g, v in guarded if g == v) != sorted(writes):
+        bad.append(f"{nat}: every write must be monotonic, `if (!{nat} || *{nat} < v) {nat} = v;` "
+                   "(a slow shared read must not lower a newer time an own read recorded)")
     # The gate result cannot be compared with, or converted to, the bare state.
     for name, text in files.items():
         if name.startswith("__"):
@@ -618,13 +639,35 @@ def selftest(files):
             sub_cpp("const auto now2 = arm_clock_now();\n            const auto wall2 = arm_wall_clock_now();",
                     "const auto wall2 = arm_wall_clock_now();\n            const auto now2 = arm_clock_now();"))
         mut("wall time used to admit",
-            sub_cpp("(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);",
-                    "(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok || wall2 < arm1->wall_at);"))
+            sub_cpp("(armed_ok || transient_ok);",
+                    "(armed_ok || transient_ok || wall2 < arm1->wall_at);"))
         mut("arm1.has_value() dropped from admit",
-            sub_cpp("const bool admit =\n                arm1.has_value() &&", "const bool admit ="))
+            sub_cpp("const bool admit = arm1.has_value() &&", "const bool admit ="))
         mut("arm1.has_value() only inside the transient rule",
-            sub_cpp("arm1.has_value() &&\n                (gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);",
-                    "(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || (arm1.has_value() && transient_ok));"))
+            sub_cpp("arm1.has_value() && (armed_ok || transient_ok);",
+                    "(armed_ok || (arm1.has_value() && transient_ok));"))
+        # C-01: the armed branch's supersession test.
+        mut("the armed own read skips the supersession test (C-01)",
+            sub_cpp("gate2.state == SsoOnlyLocalGate::kBreakGlassArmed &&\n"
+                    "                !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= gate2.read_at);",
+                    "gate2.state == SsoOnlyLocalGate::kBreakGlassArmed;"))
+        mut("the armed own read is superseded against the first check's start, not its own",
+            sub_cpp("*gate2.last_not_armed_at >= gate2.read_at);", "*gate2.last_not_armed_at >= arm1->read_at);"))
+        mut("admit takes the raw armed state instead of armed_ok",
+            sub_cpp("(armed_ok || transient_ok);",
+                    "(gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);"))
+        # SG-1: the not-armed time is monotonic, own read at its end, shared refresh at its start.
+        mut("the shared refresh's not-armed write is not monotonic (SG-1)",
+            sub_cpp("if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < started)\n"
+                    "        bg_last_not_armed_at_ = started;",
+                    "bg_last_not_armed_at_ = started;"))
+        mut("the own read's not-armed write is not monotonic",
+            sub_cpp("if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < finished)\n"
+                    "                bg_last_not_armed_at_ = finished;",
+                    "bg_last_not_armed_at_ = finished;"))
+        mut("the shared refresh records its END (UP-1)",
+            sub_cpp("*bg_last_not_armed_at_ < started)\n        bg_last_not_armed_at_ = started;",
+                    "*bg_last_not_armed_at_ < finished)\n        bg_last_not_armed_at_ = finished;"))
         r2 = blk2.find("if (!admit) {")
         ret2 = blk2.find("return;", r2)
         if r2 < 0 or ret2 < 0:
