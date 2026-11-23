@@ -14,7 +14,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
+#include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::echo;
@@ -54,6 +58,159 @@ TEST_CASE("compare_versions: non-numeric segment falls back to lexicographic",
     CHECK(compare_versions("1.9.5p2", "1.9.5p3") < 0);
     CHECK(compare_versions("", "") == 0);
     CHECK(compare_versions("1", "") > 0);
+}
+
+// #7482: the old rule fell back to a lexicographic compare whenever EITHER side
+// was non-numeric, so 9 < 10 (numeric), 10 < 1a (lexicographic), 1a < 9
+// (lexicographic) was a cycle, and std::sort over a cycle is undefined.
+TEST_CASE("compare_versions: the cycling triple 9, 10, 1a is transitive",
+          "[echo][software][version]") {
+    CHECK(compare_versions("9", "10") < 0);
+    CHECK(compare_versions("10", "1a") < 0);
+    CHECK(compare_versions("9", "1a") < 0); // the edge that closed the cycle
+    CHECK(compare_versions("1a", "9") > 0);
+}
+
+TEST_CASE("compare_versions: a strict weak order over an adversarial corpus",
+          "[echo][software][version]") {
+    constexpr std::array<std::string_view, 24> kCorpus = {
+        "",      "0",     "00",    "7",     "007",    "9",      "10",       "1a",
+        "1.a",   "a",     "A",     "1.0",   "1.0.0",  "1-0",    "1.9.5p2",  "1.9.5p3",
+        "1.2.3", "1.2.10", ".",    "-",     "1..2",   "a.b-c",  "9999999999999999999999999999999999",
+        "10000000000000000000000000000001",
+    };
+    auto sign = [](int v) { return (v > 0) - (v < 0); };
+    for (auto a : kCorpus) {
+        CHECK(compare_versions(a, a) == 0);
+        for (auto b : kCorpus) {
+            INFO("a='" << a << "' b='" << b << "'");
+            CHECK(sign(compare_versions(a, b)) == -sign(compare_versions(b, a)));
+            for (auto c : kCorpus) {
+                if (compare_versions(a, b) <= 0 && compare_versions(b, c) <= 0) {
+                    INFO("c='" << c << "'");
+                    CHECK(compare_versions(a, c) <= 0);
+                }
+                // Equivalence is transitive too (the other half of a weak order).
+                if (compare_versions(a, b) == 0 && compare_versions(b, c) == 0) {
+                    INFO("c='" << c << "'");
+                    CHECK(compare_versions(a, c) == 0);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("compare_versions: long numeric segments compare by value, not by integer conversion",
+          "[echo][software][version]") {
+    // 30 digits would overflow a long long; the comparison is on the digit string.
+    const std::string big(30, '9');
+    const std::string bigger = "1" + std::string(30, '0');
+    CHECK(compare_versions(big, bigger) < 0);
+    CHECK(compare_versions(bigger, big) > 0);
+    CHECK(compare_versions(big, big) == 0);
+    CHECK(compare_versions("007", "7") == 0);
+    CHECK(compare_versions("1.007", "1.7.0") == 0);
+    // 2^64 + 1 and 2^64 wrap to 1 and 0 in a 64-bit accumulator, so a comparator
+    // that converts the segment calls these pairs equal. The checks above do not
+    // catch that: both of their operands wrap, and still land in the right order.
+    CHECK(compare_versions("18446744073709551617", "1") > 0);
+    CHECK(compare_versions("1", "18446744073709551617") < 0);
+    CHECK(compare_versions("18446744073709551616", "0") > 0);
+}
+
+TEST_CASE("dedup: the kept entry does not depend on input order", "[echo][software][version]") {
+    // The 9 / 10 / 1a triple was a comparator cycle: std::sort on it was undefined
+    // and the survivor depended on the registry enumeration order (#7482).
+    std::vector<SoftwareInfo> triple = {sw("App", "9"), sw("App", "10"), sw("App", "1a")};
+    std::sort(triple.begin(), triple.end(),
+              [](const SoftwareInfo& a, const SoftwareInfo& b) { return a.version < b.version; });
+    int orderings = 0;
+    do {
+        auto apps = triple;
+        dedup(apps);
+        REQUIRE(apps.size() == 1);
+        CHECK(apps[0].name == "App");
+        CHECK(apps[0].version == "1a");
+        ++orderings;
+    } while (std::next_permutation(
+        triple.begin(), triple.end(),
+        [](const SoftwareInfo& a, const SoftwareInfo& b) { return a.version < b.version; }));
+    CHECK(orderings == 6);
+}
+
+// Versions that rank equal under compare_versions can still differ as strings,
+// and compute_software_events compares the string. Without a tie-break the kept
+// one followed the sort's layout, so the diff recorded an upgrade ("1.0" to "1")
+// that never happened.
+TEST_CASE("dedup: equal-ranking versions that differ as strings keep one fixed entry",
+          "[echo][software][version]") {
+    std::vector<std::string> versions = {"01", "1", "1-0", "1.0", "1.0.0"}; // byte-sorted
+    for (const auto& v : versions)
+        REQUIRE(compare_versions(v, "1") == 0);
+    int orderings = 0;
+    do {
+        std::vector<SoftwareInfo> apps;
+        for (const auto& v : versions)
+            apps.push_back(sw("App", v));
+        dedup(apps);
+        REQUIRE(apps.size() == 1);
+        CHECK(apps[0].version == "1.0.0"); // the greatest as bytes
+        ++orderings;
+    } while (std::next_permutation(versions.begin(), versions.end()));
+    CHECK(orderings == 120);
+}
+
+TEST_CASE("dedup: the kept entry is the same in any layout of a large list",
+          "[echo][software][version]") {
+    // std::sort is unstable, so one unrelated entry elsewhere in the list was
+    // enough to change which of the tied entries came first.
+    std::vector<SoftwareInfo> base;
+    for (int i = 0; i < 60; ++i)
+        base.push_back(sw("Other" + std::to_string(i), std::to_string(i)));
+    for (const char* v : {"1.0", "1", "01", "1-0", "1.0.0"})
+        base.push_back(sw("App", v));
+    // Same name and version: publisher, then install_date, settle it.
+    base.push_back(sw("Twin", "2.0"));
+    auto zeta = sw("Twin", "2.0");
+    zeta.publisher = "Zeta";
+    base.push_back(zeta);
+    zeta.install_date = "20270101";
+    base.push_back(zeta);
+
+    auto named = [](const std::vector<SoftwareInfo>& apps, std::string_view name) {
+        auto it = std::find_if(apps.begin(), apps.end(),
+                               [&](const SoftwareInfo& s) { return s.name == name; });
+        REQUIRE(it != apps.end());
+        return *it;
+    };
+    std::mt19937 rng(7482); // fixed seed: the property holds for every layout
+    std::vector<SoftwareInfo> previous;
+    for (int round = 0; round < 200; ++round) {
+        auto apps = base;
+        for (int k = 0; k < round % 7; ++k) // a different length changes the sort's layout
+            apps.push_back(sw("Extra" + std::to_string(k), "1"));
+        std::shuffle(apps.begin(), apps.end(), rng);
+        dedup(apps);
+        CHECK(named(apps, "App").version == "1.0.0");
+        CHECK(named(apps, "Twin").publisher == "Zeta");
+        CHECK(named(apps, "Twin").install_date == "20270101");
+        // The consequence: an unrelated install or removal never reads as an upgrade.
+        for (const auto& e : compute_software_events(previous, apps, 1000, 1))
+            CHECK((round == 0 || e.action != "upgraded"));
+        previous = std::move(apps);
+    }
+}
+
+TEST_CASE("dedup: distinct names are untouched and come back sorted by name",
+          "[echo][software][version]") {
+    std::vector<SoftwareInfo> apps = {sw("Zed", "1"), sw("Alpha", "2"), sw("Alpha", "10"),
+                                      sw("Mid", "3")};
+    dedup(apps);
+    REQUIRE(apps.size() == 3);
+    CHECK(apps[0].name == "Alpha");
+    CHECK(apps[0].version == "10"); // numeric, not lexicographic
+    CHECK(apps[1].name == "Mid");
+    CHECK(apps[2].name == "Zed");
 }
 
 // =============================================================================

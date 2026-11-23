@@ -215,7 +215,8 @@ struct RetentionGuardCounters {
 [[nodiscard]] RetentionGuardCounters retention_guard_counters(const RetentionGuardState& guard);
 
 /// Running total of the events that say the retention pass could not trust this pass's clock:
-/// clock declines plus probe-read and `__clock_state__` failures. Delete failures are NOT
+/// clock declines plus probe-read, `__clock_state__`, `__implausible_now__` and
+/// `__implausible_stored__` failures. Delete failures are NOT
 /// counted: the guard admitted the clock and only a DELETE failed, which says nothing about the
 /// reading the byte budget derives its floors from. The budget pass compares this total before
 /// and after `run_retention` and skips when it rose.
@@ -365,6 +366,22 @@ bool scrub_process_baseline(EchoDatabase& db);
  * unreadable flag is preserved.
  */
 [[nodiscard]] std::string_view canonical_source_enabled(std::string_view stored_value);
+
+/**
+ * Must the in-memory interval-sampler baseline (the previous perf / procperf
+ * reading) be dropped on this `<source>_enabled` write (#1624)? True when the
+ * source is being disabled (a pause must not leak into the next interval) or
+ * when it is enabled from "errored" (nothing maintained the reading across the
+ * errored interval, and the first tick after recovery would otherwise diff
+ * against the pre-error reading and record activity from the gap). `prev_canon`
+ * is `canonical_source_enabled` of the value held BEFORE the write. true->true
+ * and false->true keep the baseline. Pure, so the rule is unit-testable; the
+ * reset itself lives in do_configure.
+ */
+[[nodiscard]] constexpr bool interval_baseline_reset_due(std::string_view prev_canon,
+                                                         std::string_view new_value) noexcept {
+    return new_value == "false" || (new_value == "true" && prev_canon == "errored");
+}
 
 /**
  * The three-state read behind the enable gate: `true` / `false` are CONFIRMED
