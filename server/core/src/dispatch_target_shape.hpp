@@ -6,6 +6,9 @@
 #include <string_view>
 
 #include <nlohmann/json.hpp>
+#include <yuzu/metrics.hpp>
+
+#include "command_capability.hpp" // parameter_key_well_formed (sg10 / UP-1)
 
 /// @file dispatch_target_shape.hpp
 /// The ONE home for the rule that decides whether a caller named a device
@@ -391,6 +394,46 @@ enum class DispatchArm {
     case DispatchArm::None: return "none";
     }
     return "none";
+}
+
+/// The reason token every `param_key_invalid` refusal uses, spelled once.
+inline constexpr std::string_view kReasonParamKeyInvalid = "param_key_invalid";
+
+/// The ONE ingress check for a request's parameter object (sg10 / UP-1): a key with a control byte,
+/// NUL or invalid UTF-8, or a string value with a NUL, is `param_key_invalid`. Called by REST
+/// `/api/command`, `/api/v1/commands`, `/api/instructions/{id}/execute` (legacy and v1), bundle step
+/// validation, schedule create (via `validate_and_canonicalize_schedule_params`), policy-fragment
+/// create, and MCP `execute_instruction` / `execute_instruction_definition`. Each of those answers
+/// 400 (MCP `-32602`) with an audit row and `count_param_key_invalid` on its route label. Any other
+/// path that reaches a dispatch with such a key is refused at the dispatch chokepoint (a Forbidden
+/// denial), and the agent refuses a NUL parameter on its own (`command_params_have_nul`).
+/// Extend this, never copy the loop. A non-object `params` is the caller's own shape check, not
+/// judged here.
+[[nodiscard]] inline std::optional<BoundViolation> check_params_key_shape(const nlohmann::json& params) {
+    if (!params.is_object())
+        return std::nullopt;
+    for (const auto& [k, v] : params.items()) {
+        if (!parameter_key_well_formed(k) ||
+            (v.is_string() && v.get_ref<const std::string&>().find('\0') != std::string::npos))
+            return BoundViolation{kReasonParamKeyInvalid.data(),
+                                  "a params key holds a control byte or invalid UTF-8, or a value "
+                                  "holds a NUL byte"};
+    }
+    return std::nullopt;
+}
+
+/// The one counter bump every `param_key_invalid` refusal uses
+/// (`yuzu_server_dispatch_target_rejected_total{route,reason}`).
+inline void count_param_key_invalid(yuzu::MetricsRegistry* metrics, std::string_view route) noexcept {
+    if (metrics == nullptr)
+        return;
+    try {
+        metrics
+            ->counter("yuzu_server_dispatch_target_rejected_total",
+                      {{"route", std::string(route)}, {"reason", std::string(kReasonParamKeyInvalid)}})
+            .increment();
+    } catch (...) { // NOLINT(bugprone-empty-catch): a counter fault never changes a correct refusal
+    }
 }
 
 /// Did the caller name a target at all?

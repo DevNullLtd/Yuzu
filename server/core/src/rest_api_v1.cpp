@@ -32,7 +32,7 @@
 #include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
-#include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "live_model.hpp" // the ONE live-read kind table + wire-format parsers (pure; #2146)
 #include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
@@ -713,7 +713,7 @@ static std::string reply_dispatch_denied(httplib::Response& res, const std::stri
 
 // Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
 // The wire-format parsing (kind table + field extraction) is shared with the
-// dashboard HTML path via live_kinds.hpp so the two cannot drift (governance S2);
+// dashboard HTML path via live_model.hpp so the two cannot drift (governance S2);
 // this only maps the parsed fields to JSON. The agent sanitizes '|'/CR/LF out of
 // every field, and the parser is bounds-safe on any input regardless.
 std::string live_result_json(const std::string& kind, const std::string& output) {
@@ -2447,7 +2447,7 @@ const std::string& openapi_spec() {
       "post": {"operationId": "postUsersByUsernameUnlock", "summary": "Clear a user's account-lockout counter (admin unlock)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/UsersUnlockResult"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Username empty or malformed"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Requires UserManagement:Write"}, "500": {"description": "Auth store write failed"}, "503": {"description": "Lockout subsystem unavailable (auth store not configured or unreachable \u2014 see --postgres-dsn)"}}}
     },
     "/users/me/password": {
-      "post": {"operationId": "postUsersMePassword", "security": [{"cookieAuth": []}], "summary": "Change your own local-account password", "tags": ["Users"], "description": "Interactive LOCAL cookie session only (API/MCP/engine/service-scoped tokens 403 token_session; SSO sessions 409 not_local). Cookie-session writes require a same-site Origin or Referer: the central check answers first (403, message cross-site request refused) and this route keeps its own copy as defence in depth (403 csrf). Content-Type: application/json is required (415). MFA step-up if enrolled. The current password is checked through the SAME lockout-accounted path as POST /login, so a wrong current password counts toward account lockout; a password that could not be verified (auth store unavailable, or the credential changed concurrently) is a retryable 503 and never counts. Under --auth-mode=sso-only only an ARMED break-glass account may change its password (403 sso_only_local_disabled otherwise, with no password evaluated). New password: 12..1024 BYTES (UTF-8). ONE TRANSACTION under the account's row lock: the credential, the deletion of every session of the account (the caller's own included, durable and cross-replica), the wipe of a provisional (un-enrolled) TOTP secret, and the user.password_change audit row commit or abort together. A refusal changes nothing except that a wrong current password counts a lockout strike (the caller's session stays valid). If the audit row cannot be written the whole change is not made: 503 audit_unavailable + Sec-Audit-Failed. No replacement session is issued: on success the response clears the cookie (Set-Cookie Max-Age=0) and the user signs in again with the new password. A 503 changed nothing unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way. No MCP twin by design.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["current_password", "new_password"], "properties": {"current_password": {"type": "string", "description": "Not length-checked as a request field: a value over 1024 bytes is answered as a wrong current password (403 wrong_current, counts toward lockout) without being hashed, as POST /login does"}, "new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Changed: {username, password_changed, sessions_revoked, session_reissued (always false), provisional_mfa_cleared, audit_emitted (always true)}; Set-Cookie clears the session cookie (Max-Age=0)", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/UsersSelfPasswordChangeResult"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Malformed body, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Wrong current password, including one over 1024 bytes (also returned while the account is locked), token session, cross-origin request, or sso_only_local_disabled"}, "404": {"description": "Account no longer active (nothing changed)"}, "409": {"description": "Not a local account (SSO/SCIM) — not_local; or the password changed concurrently — conflict (nothing changed)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "store_unavailable, audit_unavailable (+ Sec-Audit-Failed), or the password could not be verified (verify_transient); retry_after_ms set. Nothing changed unless the connection was lost at commit"}}}
+      "post": {"operationId": "postUsersMePassword", "security": [{"cookieAuth": []}], "summary": "Change your own local-account password", "tags": ["Users"], "description": "Interactive LOCAL cookie session only (API/MCP/engine/service-scoped tokens 403 token_session; SSO sessions 409 not_local). Cookie-session writes require a same-site Origin or Referer: the central check answers first (403, message cross-site request refused) and this route keeps its own copy as defence in depth (403 csrf). Content-Type: application/json is required (415). MFA step-up if enrolled. The current password is checked through the SAME lockout-accounted path as POST /login, so a wrong current password counts toward account lockout; a password that could not be verified (auth store unavailable, or the credential changed concurrently) is a retryable 503 and never counts. Under --auth-mode=sso-only only an ARMED break-glass account may change its password (403 sso_only_local_disabled otherwise, with no password evaluated). New password: 12..1024 BYTES (UTF-8). ONE TRANSACTION under the account's row lock: the credential, the deletion of every session of the account (the caller's own included, durable and cross-replica), the wipe of a provisional (un-enrolled) TOTP secret, and the user.password_change audit row commit or abort together. A refusal changes nothing except that a wrong current password counts a lockout strike (the caller's session stays valid). If the audit row cannot be written the whole change is not made: 503 audit_unavailable + Sec-Audit-Failed. No replacement session is issued: on success the response clears the cookie (Set-Cookie Max-Age=0) and the user signs in again with the new password. A 503 changed nothing unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way. No MCP twin by design.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["current_password", "new_password"], "properties": {"current_password": {"type": "string", "description": "Not length-checked as a request field: a value over 1024 bytes is answered as a wrong current password (403 wrong_current, counts toward lockout) without being hashed, as POST /login does"}, "new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Changed: {username, password_changed, sessions_revoked, session_reissued (always false), provisional_mfa_cleared, audit_emitted (always true)}; Set-Cookie clears the session cookie (Max-Age=0)", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/UsersSelfPasswordChangeResult"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Malformed body, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Wrong current password, including one over 1024 bytes (also returned while the account is locked), token session, cross-origin request, or sso_only_local_disabled"}, "404": {"description": "Account no longer active (nothing changed)"}, "409": {"description": "Not a local account (SSO/SCIM) — not_local; or the password changed concurrently — conflict (nothing changed)"}, "415": {"description": "Content-Type is not application/json"}, "429": {"description": "pbkdf2_busy: a concurrency limit was reached (the authenticated hashing lane, at most 3 slots per principal, or the per-username stripe waiter limits or bounded wait); nothing was verified or counted toward lockout; Retry-After and retry_after_ms set"}, "503": {"description": "store_unavailable, audit_unavailable (+ Sec-Audit-Failed), or the password could not be verified (verify_transient); retry_after_ms set. Nothing changed unless the connection was lost at commit"}}}
     },
 )json"
         R"json(
@@ -3761,6 +3761,12 @@ void register_password_routes(HttpRouteSink& sink, PasswordRouteWiring wiring) {
         case PasswordCheckOutcome::kStoreUnavailable:
             ctx.store_unavailable();
             return;
+        case PasswordCheckOutcome::kBusy:
+            // WP03 perf-F1: the process-wide PBKDF2 budget is full; nothing ran or counted.
+            ctx.refuse(429, "denied", "pbkdf2_busy",
+                       "too many concurrent authentication attempts",
+                       "retry shortly; the server caps concurrent password hashing", 2000);
+            return;
         case PasswordCheckOutcome::kTransient:
             // Not a guess (store read failed, or the credential changed under
             // the row lock): retryable, never counted toward lockout.
@@ -4461,8 +4467,8 @@ void RestApiV1::register_routes(
     // POST /api/v1/bundles — dispatch (async). Returns the correlation id; poll
     // GET /api/v1/bundles/{id} for the collated result.
     sink.Post("/api/v1/bundles",
-              [auth_fn, scoped_perm_fn, audit_fn, bundle_orch,
-               exec_visible_fn](const httplib::Request& req, httplib::Response& res) {
+              [auth_fn, scoped_perm_fn, audit_fn, bundle_orch, exec_visible_fn,
+               metrics_registry](const httplib::Request& req, httplib::Response& res) {
                   // K-R6-01/CDX-R5-02: a bundle targets ONE device, so
                   // authorization is the per-target scoped gate on agent_id
                   // (below, once parsed) -- NOT the targetless global
@@ -4510,10 +4516,16 @@ void RestApiV1::register_routes(
                       res.set_content(detail::a4_error(res, "steps is required"), "application/json");
                       return;
                   }
-                  auto specs = validate_bundle_steps(body["steps"].dump());
+                  auto specs = validate_bundle_steps_typed(body["steps"].dump());
                   if (!specs) {
+                      if (specs.error().kind == BundleStepsError::Kind::kParamKeyInvalid) {
+                          // sg10 / UP-1: counted and audited like every other ingress refusal.
+                          count_param_key_invalid(metrics_registry, "bundle");
+                          (void)audit_fn(req, "bundle.dispatch", "denied", "Execution", "",
+                                         std::string("reason=") + std::string(kReasonParamKeyInvalid));
+                      }
                       res.status = 400;
-                      res.set_content(detail::a4_error(res, "steps: " + specs.error()), "application/json");
+                      res.set_content(detail::a4_error(res, "steps: " + specs.error().message), "application/json");
                       return;
                   }
                   auto session = auth_fn(req, res);
@@ -19947,7 +19959,7 @@ void RestApiV1::register_routes(
             // The label is the closed set {uptime, processes, unknown} (docs/user-manual/metrics.md):
             // `kind` is caller-chosen text, so an unresolved one is recorded as `unknown`, never as
             // itself (one series per distinct string a caller sends).
-            const auto lk = live::resolve_kind(kind);
+            const auto lk = live::resolve_rest_kind(kind);
             const std::string kind_label = lk ? kind : "unknown";
             struct OutcomeRecorder {
                 yuzu::MetricsRegistry* reg;
@@ -21679,34 +21691,22 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(dex_apps_usage_json(*r)), "application/json");
             return;
         }
-        const DexUsageRefusal& f = r.error();
-        if (f.reason == "invalid_slice") {
-            bad_request(f.detail == "unknown_group" ? "unknown management group" : "invalid slice");
+        // The one refusal table (dex_usage_json.hpp), shared with the MCP twin. Tokens only,
+        // never caller text.
+        const DexUsageRefusalClass c = dex_usage_refusal_class(r.error());
+        if (c.kind == DexUsageRefusalKind::CallerError) {
+            bad_request(c.message);
             return;
         }
-        // Tokens only, never caller text.
-        const std::string message = "fleet application usage unavailable (" + f.reason +
-                                    (f.detail.empty() || f.detail == f.reason ? "" : ": " + f.detail) +
-                                    ")";
         res.status = 503;
-        if (f.reason == "usage_unavailable" && f.detail == "fleet_too_large") {
-            // Sustained statement timeouts: retrying does not help.
-            res.set_content(
-                detail::error_json_a4(
-                    503, message, cid,
-                    detail::A4ErrorOpts{
-                        .remediation = "the usage read no longer fits its time bound for this fleet; "
-                                       "retrying does not help, only a narrower platform scope "
-                                       "reduces the read, and the state clears on the first "
-                                       "successful read (see 'Fleet usage per application' in the "
-                                       "DEX guide, docs/dex/app-usage.md)"}),
-                "application/json");
-        } else if (f.reason == "no_population" || f.reason == "invalid_request") {
-            res.set_content(detail::error_json_a4(503, message, cid), "application/json");
-        } else {
-            res.set_content(detail::error_json_a4(503, message, cid, 2000, "retry shortly"),
-                            "application/json");
-        }
+        res.set_content(
+            detail::error_json_a4(
+                503, c.message, cid,
+                detail::A4ErrorOpts{.retry_after_ms = c.retry_after_ms >= 0
+                                                          ? std::optional<std::int64_t>(c.retry_after_ms)
+                                                          : std::nullopt,
+                                    .remediation = c.remediation}),
+            "application/json");
     });
 
     // ── GET / PUT / DELETE /api/v1/dex/score-policy (#6086) ──
