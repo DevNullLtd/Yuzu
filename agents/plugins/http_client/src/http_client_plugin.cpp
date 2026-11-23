@@ -12,7 +12,15 @@
  * Output: pipe-delimited via write_output()
  *
  * Security: uses cpp-httplib directly — no shell invocation, no command injection.
- *           SSRF protection: blocks requests to private/internal IP ranges.
+ *           SSRF protection: the host is resolved ONCE, every returned address must be a public
+ *           address (agents/shared/outbound_address_policy.hpp), and the connection is pinned to
+ *           the address that was vetted (cpp-httplib's hostname-to-address map, which keeps the
+ *           Host header and TLS SNI/verification on the name) — there is no second lookup to
+ *           rebind.
+ *           Download: the body is held in memory (capped), verified against expected_hash, and only
+ *           then atomically written over the destination; a failed, non-2xx, over-cap or
+ *           unverified transfer writes NOTHING. A destination on a network/device path is
+ *           refused.
  */
 
 #include <yuzu/plugin.hpp>
@@ -27,24 +35,31 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <bcrypt.h>
-#pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
-#include <openssl/evp.h>
 #endif
 
 #include <httplib.h>
 
+#include "http_client_download.hpp" // completeness / finalize rules (pure; unit-tested)
+#include <local_path_policy.hpp>      // refuse a UNC / device / network-mount destination
+#include <outbound_address_policy.hpp> // resolve-once address vetting
+
+#include <charconv>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -58,84 +73,81 @@ bool is_valid_url(std::string_view url) {
     return url.starts_with("http://") || url.starts_with("https://");
 }
 
-// ── SSRF protection: reject private/internal IP addresses ───────────────────
+// ── SSRF protection: resolve once, vet every address, connect to a vetted one ───────────────
 
-bool is_private_ipv4(const struct sockaddr_in* addr) {
-    uint32_t ip = ntohl(addr->sin_addr.s_addr);
-    // 127.0.0.0/8
-    if ((ip >> 24) == 127) return true;
-    // 10.0.0.0/8
-    if ((ip >> 24) == 10) return true;
-    // 172.16.0.0/12
-    if ((ip >> 20) == (172 << 4 | 1)) return true;  // 172.16-31.x.x
-    if ((ip & 0xFFF00000) == 0xAC100000) return true;
-    // 192.168.0.0/16
-    if ((ip >> 16) == (192 << 8 | 168)) return true;
-    if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
-    // 169.254.0.0/16 (link-local)
-    if ((ip >> 16) == (169 << 8 | 254)) return true;
-    if ((ip & 0xFFFF0000) == 0xA9FE0000) return true;
-    // 100.64.0.0/10 (carrier-grade NAT / RFC 6598)
-    if ((ip & 0xFFC00000) == 0x64400000) return true;
-    // 198.18.0.0/15 (benchmarking / RFC 2544)
-    if ((ip & 0xFFFE0000) == 0xC6120000) return true;
-    // 0.0.0.0
-    if (ip == 0) return true;
-    return false;
-}
-
-bool is_private_ipv6(const struct sockaddr_in6* addr) {
-    const uint8_t* b = addr->sin6_addr.s6_addr;
-    // ::1 (loopback)
-    static const uint8_t loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
-    if (std::memcmp(b, loopback, 16) == 0) return true;
-    // :: (unspecified)
-    static const uint8_t unspec[16] = {0};
-    if (std::memcmp(b, unspec, 16) == 0) return true;
-    // fd00::/8 (unique local)
-    if (b[0] == 0xfd) return true;
-    // fc00::/7 (unique local, broader)
-    if ((b[0] & 0xfe) == 0xfc) return true;
-    // fe80::/10 (link-local)
-    if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return true;
-    // ::ffff:0:0/96 (IPv4-mapped) — check the embedded IPv4
-    static const uint8_t v4mapped_prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
-    if (std::memcmp(b, v4mapped_prefix, 12) == 0) {
-        struct sockaddr_in sa4{};
-        sa4.sin_family = AF_INET;
-        std::memcpy(&sa4.sin_addr.s_addr, b + 12, 4);
-        return is_private_ipv4(&sa4);
+struct AddrInfoDeleter {
+    void operator()(struct addrinfo* p) const noexcept {
+        if (p != nullptr)
+            freeaddrinfo(p);
     }
-    return false;
-}
+};
+using AddrInfoPtr = std::unique_ptr<struct addrinfo, AddrInfoDeleter>;
 
-bool hostname_resolves_to_private(const std::string& hostname) {
+// One getaddrinfo for `host`; every answer as raw bytes. The list is owned by AddrInfoPtr from the
+// moment getaddrinfo returns, so an exception from the loop below cannot leak it. Empty = the
+// lookup failed (the caller fails closed).
+std::vector<yuzu::shared::outbound::ResolvedAddress> resolve_all(const std::string& host) {
+    std::vector<yuzu::shared::outbound::ResolvedAddress> out;
     struct addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-
-    struct addrinfo* result = nullptr;
-    int rc = getaddrinfo(hostname.c_str(), nullptr, &hints, &result);
-    if (rc != 0 || !result) return true; // fail-closed: block on resolution failure
-
-    bool is_private = false;
-    for (auto* rp = result; rp != nullptr; rp = rp->ai_next) {
-        if (rp->ai_family == AF_INET) {
-            if (is_private_ipv4(reinterpret_cast<struct sockaddr_in*>(rp->ai_addr))) {
-                is_private = true;
-                break;
-            }
-        } else if (rp->ai_family == AF_INET6) {
-            if (is_private_ipv6(reinterpret_cast<struct sockaddr_in6*>(rp->ai_addr))) {
-                is_private = true;
-                break;
-            }
+    struct addrinfo* raw = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &raw) != 0 || raw == nullptr)
+        return out;
+    const AddrInfoPtr list{raw};
+    for (const struct addrinfo* rp = list.get(); rp != nullptr; rp = rp->ai_next) {
+        yuzu::shared::outbound::ResolvedAddress a;
+        // The sockaddr is copied into a local of the right type, length-checked, rather than cast
+        // from ai_addr, whose alignment is the resolver's business.
+        if (rp->ai_family == AF_INET && rp->ai_addr != nullptr &&
+            static_cast<std::size_t>(rp->ai_addrlen) >= sizeof(struct sockaddr_in)) {
+            struct sockaddr_in sa{};
+            std::memcpy(&sa, rp->ai_addr, sizeof(sa));
+            std::memcpy(a.bytes.data(), &sa.sin_addr, 4);
+        } else if (rp->ai_family == AF_INET6 && rp->ai_addr != nullptr &&
+                   static_cast<std::size_t>(rp->ai_addrlen) >= sizeof(struct sockaddr_in6)) {
+            struct sockaddr_in6 sa{};
+            std::memcpy(&sa, rp->ai_addr, sizeof(sa));
+            a.is_v6 = true;
+            std::memcpy(a.bytes.data(), &sa.sin6_addr, 16);
+        } else {
+            continue;
         }
+        out.push_back(a);
     }
-
-    freeaddrinfo(result);
-    return is_private;
+    return out;
 }
+
+// Numeric text of one vetted address (the cpp-httplib address-map value).
+std::string address_text(const yuzu::shared::outbound::ResolvedAddress& a) {
+    char buf[INET6_ADDRSTRLEN]{};
+    if (a.is_v6) {
+        struct in6_addr x{};
+        std::memcpy(&x, a.bytes.data(), 16);
+        inet_ntop(AF_INET6, &x, buf, sizeof(buf));
+    } else {
+        struct in_addr x{};
+        std::memcpy(&x, a.bytes.data(), 4);
+        inet_ntop(AF_INET, &x, buf, sizeof(buf));
+    }
+    return buf;
+}
+
+// Resolve `host` ONCE and judge every answer. Returns the vetted addresses as numeric text in
+// connect order (IPv4 first); the caller connects to those and must NOT re-resolve the name. Empty
+// means the destination is blocked (refused, or the lookup failed: fail closed).
+std::vector<std::string> vet_destination(const std::string& host) {
+    namespace ob = yuzu::shared::outbound;
+    const auto outcome = ob::vet_host([&] { return resolve_all(host); });
+    std::vector<std::string> ips;
+    if (outcome.verdict.status != ob::VetStatus::ok)
+        return ips;
+    for (const auto& a : ob::connect_order(outcome.answers))
+        ips.push_back(address_text(a));
+    return ips;
+}
+
+constexpr const char* kSsrfBlocked = "SSRF blocked: URL resolves to a private/internal IP address";
 
 // Parse a URL into scheme, host, port, path components
 struct ParsedUrl {
@@ -188,204 +200,252 @@ bool parse_url(std::string_view url, ParsedUrl& out) {
     return !out.host.empty();
 }
 
-// ── SHA-256 file hashing ────────────────────────────────────────────────────
-
-std::string sha256_file(const fs::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return {};
-
-#ifdef _WIN32
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    DWORD hash_len = 0, result_len = 0;
-    BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len), sizeof(hash_len), &result_len, 0);
-    BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0);
-
-    char buf[8192];
-    while (file.read(buf, sizeof(buf)) || file.gcount() > 0) {
-        BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf), static_cast<ULONG>(file.gcount()), 0);
-    }
-
-    std::vector<UCHAR> digest(hash_len);
-    BCryptFinishHash(hash, digest.data(), hash_len, 0);
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(alg, 0);
-
-    std::string hex;
-    for (auto b : digest) hex += std::format("{:02x}", b);
-    return hex;
-#else
-    auto* ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
-
-    char buf[8192];
-    while (file.read(buf, sizeof(buf)) || file.gcount() > 0) {
-        EVP_DigestUpdate(ctx, buf, static_cast<size_t>(file.gcount()));
-    }
-
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned int len = 0;
-    EVP_DigestFinal_ex(ctx, digest, &len);
-    EVP_MD_CTX_free(ctx);
-
-    std::string hex;
-    for (unsigned i = 0; i < len; ++i) hex += std::format("{:02x}", digest[i]);
-    return hex;
-#endif
-}
-
 // ── Safe HTTP operations using cpp-httplib ───────────────────────────────────
 
-// Download a file via httplib (no shell, no command injection)
-int download_url(std::string_view url, const fs::path& dest, std::string& error) {
+constexpr std::chrono::seconds kDownloadTotalTimeout{600}; // whole transfer, not per recv
+constexpr std::chrono::seconds kRequestTotalTimeout{120};
+
+constexpr std::size_t kMaxAttempts = 4; // vetted addresses tried per request, at most
+
+// Run one request through a client pinned to `ip` (the host name stays the Host header and the TLS
+// name). `request` is called with the configured client (Client or SSLClient). An https URL on a
+// build without OpenSSL sets `https_unsupported` and runs nothing. `remaining` is what is left of
+// the request's ONE total deadline (shared by every attempt). Every client turns httplib's response
+// decompression off right after construction: the body is hashed and stored exactly as sent, and
+// `get`/`head` ask for identity encoding (`identity_encoding`).
+template <class Fn>
+httplib::Result run_pinned(const ParsedUrl& parsed, const std::string& ip, int read_timeout_s,
+                           std::chrono::seconds remaining, bool identity_encoding,
+                           bool& https_unsupported, Fn&& request) {
+    const auto setup = [&](auto& cli) {
+        cli.set_hostname_addr_map({{parsed.host, ip}});
+        cli.set_connection_timeout(30);
+        cli.set_read_timeout(read_timeout_s);
+        // A total deadline for the whole exchange: the per-recv timeouts alone let a server that
+        // trickles one byte at a time hold a worker (and, for a download, a growing buffer).
+        cli.set_max_timeout(remaining);
+        if (identity_encoding)
+            cli.set_default_headers({{"Accept-Encoding", "identity"}});
+    };
+    if (parsed.is_https) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        httplib::SSLClient cli(parsed.host, parsed.port);
+        cli.set_decompress(false);
+        setup(cli);
+        cli.enable_server_certificate_verification(true);
+        return request(cli);
+#else
+        https_unsupported = true;
+        return {};
+#endif
+    }
+    httplib::Client cli(parsed.host, parsed.port);
+    cli.set_decompress(false);
+    setup(cli);
+    return request(cli);
+}
+
+// Try the vetted addresses in turn (IPv4 first; at most kMaxAttempts) until a connection is made:
+// a host that answers both families keeps its dual-stack fallback without a second lookup of the
+// name. Only a failure to CONNECT moves on to the next address: once a request may have reached the
+// peer (a read error, a timeout after sending, an HTTP answer of any status) the result stands, so
+// an attempt that produced an answer is never overwritten by a later one. One absolute deadline
+// covers all attempts; `request` starts each attempt from clean state.
+template <class Fn>
+httplib::Result try_vetted(const ParsedUrl& parsed, const std::vector<std::string>& ips,
+                           int read_timeout_s, std::chrono::seconds total_timeout,
+                           bool identity_encoding, bool& https_unsupported, Fn&& request) {
+    const auto deadline = std::chrono::steady_clock::now() + total_timeout;
+    httplib::Result res;
+    std::size_t attempts = 0;
+    for (const auto& ip : ips) {
+        if (attempts++ >= kMaxAttempts)
+            break;
+        const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (left.count() <= 0)
+            break;
+        res = run_pinned(parsed, ip, read_timeout_s, left, identity_encoding, https_unsupported, request);
+        if (res || https_unsupported)
+            break;
+        // Only a failed or timed-out CONNECT moves on (nothing was sent); a read or write error may
+        // have reached the server, so no other address is tried.
+        if (res.error() != httplib::Error::Connection && res.error() != httplib::Error::ConnectionTimeout)
+            break;
+    }
+    return res;
+}
+
+// Fetch a file body into `body` (no shell, no command injection). Nothing touches the filesystem
+// here: only a 2xx answer is accepted (the response handler aborts the transfer for any other
+// status, so an error page is never buffered as "the download"), the body is capped, and it must be
+// COMPLETE: an `expected_hash` verifies completeness itself, otherwise the response must declare
+// its length (Content-Length, or chunked framing that httplib verifies) and the body must match it
+// (a close-delimited body cut short would otherwise look like a finished download).
+int download_url(std::string_view url, std::string& body, bool hash_will_verify, std::string& error) {
     ParsedUrl parsed;
     if (!parse_url(url, parsed)) {
         error = "invalid URL";
         return 1;
     }
 
-    // SSRF check
-    if (hostname_resolves_to_private(parsed.host)) {
-        error = "SSRF blocked: URL resolves to a private/internal IP address";
+    // SSRF check: resolve once; the connection below is pinned to a vetted address.
+    const auto ips = vet_destination(parsed.host);
+    if (ips.empty()) {
+        error = kSsrfBlocked;
         return 1;
     }
 
-    std::string origin = (parsed.is_https ? "https://" : "http://") + parsed.host + ":" + std::to_string(parsed.port);
-
-    std::ofstream ofs(dest, std::ios::binary);
-    if (!ofs) {
-        error = "failed to open destination file for writing";
-        return 1;
-    }
-
-    size_t total_bytes = 0;
     bool size_exceeded = false;
+    int rejected_status = 0;
+    bool has_length = false;
+    bool chunked = false;
+    std::uint64_t declared_length = 0;
+    body.clear();
 
+    auto response_handler = [&](const httplib::Response& r) {
+        if (r.status < 200 || r.status >= 300) {
+            rejected_status = r.status;
+            return false;
+        }
+        chunked = r.get_header_value("Transfer-Encoding").find("chunked") != std::string::npos;
+        if (r.has_header("Content-Length")) {
+            const auto v = r.get_header_value("Content-Length");
+            const auto [ptr, ec] = std::from_chars(v.data(), v.data() + v.size(), declared_length);
+            has_length = ec == std::errc{} && ptr == v.data() + v.size();
+            if (has_length && declared_length > kMaxDownloadSize) {
+                size_exceeded = true;
+                return false;
+            }
+            if (has_length)
+                body.reserve(static_cast<std::size_t>(declared_length)); // one allocation, no doubling
+        }
+        return true;
+    };
     auto content_receiver = [&](const char* data, size_t len) {
-        total_bytes += len;
-        if (total_bytes > kMaxDownloadSize) {
+        if (body.size() + len > kMaxDownloadSize) {
             size_exceeded = true;
             return false; // abort download
         }
-        ofs.write(data, static_cast<std::streamsize>(len));
+        body.append(data, len);
         return true;
     };
 
+    yuzu::http_client::DownloadObservation obs;
+    obs.hash_will_verify = hash_will_verify;
     httplib::Result res;
-    if (parsed.is_https) {
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-        httplib::SSLClient cli(parsed.host, parsed.port);
-        cli.set_connection_timeout(30);
-        cli.set_read_timeout(300);
-        cli.enable_server_certificate_verification(true);
-        res = cli.Get(parsed.path, content_receiver);
-#else
-        ofs.close();
-        error = "HTTPS not supported (OpenSSL not available)";
-        return 1;
-#endif
-    } else {
-        httplib::Client cli(parsed.host, parsed.port);
-        cli.set_connection_timeout(30);
-        cli.set_read_timeout(300);
-        res = cli.Get(parsed.path, content_receiver);
+    try {
+        res = try_vetted(parsed, ips, 300, kDownloadTotalTimeout, /*identity_encoding=*/false,
+                         obs.https_unsupported, [&](auto& cli) {
+                             // Every attempt starts clean: nothing a failed attempt observed may
+                             // describe the next one.
+                             body.clear();
+                             size_exceeded = false;
+                             rejected_status = 0;
+                             has_length = false;
+                             chunked = false;
+                             declared_length = 0;
+                             return cli.Get(parsed.path, response_handler, content_receiver);
+                         });
+    } catch (const std::bad_alloc&) {
+        obs.out_of_memory = true;
+        body.clear();
+        body.shrink_to_fit();
     }
+    obs.size_exceeded = size_exceeded;
+    obs.rejected_status = rejected_status;
+    obs.transport_ok = static_cast<bool>(res);
+    obs.final_status = res ? res->status : 0;
+    obs.has_length = has_length;
+    obs.chunked = chunked;
+    obs.declared_length = declared_length;
+    obs.body_size = body.size();
 
-    ofs.close();
-
-    if (size_exceeded) {
-        std::error_code ec;
-        std::filesystem::remove(dest, ec);
-        error = "download aborted: exceeded maximum size limit (100 MB)";
+    error = yuzu::http_client::download_failure(obs);
+    if (!error.empty()) {
+        body.clear();
         return 1;
     }
-
-    if (!res || res->status < 200 || res->status >= 400) {
-        error = "download failed: HTTP " + (res ? std::to_string(res->status) : "connection error");
-        return 1;
-    }
-
     return 0;
 }
 
 // HTTP GET via httplib (no shell, no command injection)
-std::string http_get(std::string_view url, int& status_code) {
+std::string http_get(std::string_view url, int& status_code, bool& truncated) {
+    truncated = false;
     ParsedUrl parsed;
     if (!parse_url(url, parsed)) {
         status_code = 0;
         return "invalid URL";
     }
 
-    // SSRF check
-    if (hostname_resolves_to_private(parsed.host)) {
+    // SSRF check: resolve once; the connection below is pinned to a vetted address.
+    const auto ips = vet_destination(parsed.host);
+    if (ips.empty()) {
         status_code = 0;
-        return "SSRF blocked: URL resolves to a private/internal IP address";
+        return kSsrfBlocked;
     }
 
-    httplib::Result res;
-    if (parsed.is_https) {
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-        httplib::SSLClient cli(parsed.host, parsed.port);
-        cli.set_connection_timeout(30);
-        cli.set_read_timeout(60);
-        cli.enable_server_certificate_verification(true);
-        res = cli.Get(parsed.path);
-#else
+    bool https_unsupported = false;
+    // The body is received through a capped receiver: the cap aborts the transfer, so a hostile peer
+    // cannot make the agent buffer an unbounded body before the size is judged.
+    // A body over kMaxGetBodyBytes (1 MiB) is cut there and reported as truncated, with the status
+    // the peer answered (a cancelled transfer returns no result, so the status is read in the
+    // response handler).
+    std::string body;
+    int seen_status = 0;
+    auto res = try_vetted(parsed, ips, 60, kRequestTotalTimeout, /*identity_encoding=*/true,
+                          https_unsupported, [&](auto& cli) {
+                              body.clear();
+                              truncated = false;
+                              seen_status = 0;
+                              return cli.Get(
+                                  parsed.path,
+                                  [&](const httplib::Response& r) {
+                                      seen_status = r.status;
+                                      return true;
+                                  },
+                                  [&](const char* data, size_t len) {
+                                      return yuzu::http_client::append_get_body(body, data, len, truncated);
+                                  });
+                          });
+    if (https_unsupported) {
         status_code = 0;
         return "HTTPS not supported (OpenSSL not available)";
-#endif
-    } else {
-        httplib::Client cli(parsed.host, parsed.port);
-        cli.set_connection_timeout(30);
-        cli.set_read_timeout(60);
-        res = cli.Get(parsed.path);
     }
-
+    if (truncated) {
+        status_code = res ? res->status : seen_status;
+        return body;
+    }
     if (!res) {
         status_code = 0;
         return "connection failed";
     }
     status_code = res->status;
-    if (res->body.size() > kMaxDownloadSize) {
-        return "response body exceeds maximum size limit";
-    }
-    return res->body;
+    return body;
 }
 
 // HTTP HEAD via httplib (no shell, no command injection)
-std::string http_head(std::string_view url, int& status_code) {
+std::string http_head(std::string_view url, int& status_code, std::size_t& replaced) {
     ParsedUrl parsed;
     if (!parse_url(url, parsed)) {
         status_code = 0;
         return "invalid URL";
     }
 
-    // SSRF check
-    if (hostname_resolves_to_private(parsed.host)) {
+    // SSRF check: resolve once; the connection below is pinned to a vetted address.
+    const auto ips = vet_destination(parsed.host);
+    if (ips.empty()) {
         status_code = 0;
-        return "SSRF blocked: URL resolves to a private/internal IP address";
+        return kSsrfBlocked;
     }
 
-    httplib::Result res;
-    if (parsed.is_https) {
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-        httplib::SSLClient cli(parsed.host, parsed.port);
-        cli.set_connection_timeout(30);
-        cli.set_read_timeout(60);
-        cli.enable_server_certificate_verification(true);
-        res = cli.Head(parsed.path);
-#else
+    bool https_unsupported = false;
+    auto res = try_vetted(parsed, ips, 60, kRequestTotalTimeout, /*identity_encoding=*/true,
+                          https_unsupported, [&](auto& cli) { return cli.Head(parsed.path); });
+    if (https_unsupported) {
         status_code = 0;
         return "HTTPS not supported (OpenSSL not available)";
-#endif
-    } else {
-        httplib::Client cli(parsed.host, parsed.port);
-        cli.set_connection_timeout(30);
-        cli.set_read_timeout(60);
-        res = cli.Head(parsed.path);
     }
-
     if (!res) {
         status_code = 0;
         return "connection failed";
@@ -397,7 +457,7 @@ std::string http_head(std::string_view url, int& status_code) {
     // by platform).
     std::string headers_str;
     for (const auto& [k, v] : res->headers) {
-        headers_str += k + ": " + v + "\n";
+        yuzu::http_client::append_header_line(headers_str, k, v, replaced);
     }
     return headers_str;
 }
@@ -459,11 +519,20 @@ public:
     void shutdown(yuzu::PluginContext&) noexcept override { g_ctx = nullptr; }
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
-        if (action == "download") return do_download(ctx, params);
-        if (action == "get")      return do_get(ctx, params);
-        if (action == "head")     return do_head(ctx, params);
-        ctx.write_output(std::format("error|unknown action: {}", action));
-        return 1;
+        // The ABI seam: no exception (bad_alloc from a large body, a format failure) may cross it.
+        try {
+            if (action == "download") return do_download(ctx, params);
+            if (action == "get")      return do_get(ctx, params);
+            if (action == "head")     return do_head(ctx, params);
+            ctx.write_output(std::format("error|unknown action: {}", action));
+            return 1;
+        } catch (...) {
+            try {
+                ctx.write_output("error|internal error");
+            } catch (...) { // NOLINT(bugprone-empty-catch): nothing more can be done at the seam
+            }
+            return 1;
+        }
     }
 
 private:
@@ -479,6 +548,16 @@ private:
             return 1;
         }
 
+        // A destination on a UNC / device / network-mount path is refused before any filesystem
+        // call: fs::canonical below would otherwise reach out to the named host.
+        const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot
+        if (const auto refusal = path_guard.refusal(path);
+            yuzu::shared::local_path::refused(refusal)) {
+            ctx.write_output(std::format("error|{}",
+                                         yuzu::shared::local_path::refusal_token(refusal)));
+            return 1;
+        }
+
         // Path traversal protection: reject paths with ".." components
         fs::path dest{std::string{path}};
         {
@@ -490,6 +569,14 @@ private:
                 ctx.write_output(std::format("error|invalid download path: parent directory does not exist"));
                 return 1;
             }
+            // A symlink / junction in the parent can resolve to a network location: judge the
+            // resolved parent too.
+            if (const auto refusal = path_guard.refusal(canonical_parent.string());
+                yuzu::shared::local_path::refused(refusal)) {
+                ctx.write_output(std::format("error|{}",
+                                             yuzu::shared::local_path::refusal_token(refusal)));
+                return 1;
+            }
             dest = canonical_parent / dest.filename();
             // Reject if any component is ".."
             for (const auto& component : fs::path{std::string{path}}) {
@@ -499,22 +586,32 @@ private:
                 }
             }
         }
+
+        // fetch into memory, verify, and only then atomically replace the destination. A
+        // failed, non-2xx, over-cap or hash-mismatched transfer leaves the existing destination
+        // (or its absence) exactly as it was: nothing unverified ever sits at `dest`.
+        std::string body;
         std::string error;
-        if (download_url(url, dest, error) != 0) {
+        const std::string_view expected_param = params.get("expected_hash");
+        if (download_url(url, body, /*hash_will_verify=*/!expected_param.empty(), error) != 0) {
             ctx.write_output(std::format("error|{}", error));
             return 1;
         }
 
-        std::error_code ec;
-        auto size = fs::file_size(dest, ec);
-        auto hash = sha256_file(dest);
-
-        auto expected = params.get("expected_hash");
-        if (!expected.empty() && hash != expected) {
-            fs::remove(dest, ec);
-            ctx.write_output(std::format("error|hash mismatch: expected={}, got={}", expected, hash));
+        const auto done = yuzu::http_client::finalize_download(body, params.get("expected_hash"), dest);
+        if (done.status == yuzu::http_client::FinalizeStatus::hash_mismatch) {
+            std::string expected{params.get("expected_hash")};
+            for (auto& c : expected)
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            ctx.write_output(std::format("error|hash mismatch: expected={}, got={}", expected, done.hash));
             return 1;
         }
+        if (done.status == yuzu::http_client::FinalizeStatus::write_failed) {
+            ctx.write_output(std::format("error|failed to write destination: {}", done.message));
+            return 1;
+        }
+        const std::string& hash = done.hash;
+        const auto size = static_cast<std::uintmax_t>(body.size());
 
         ctx.write_output("status|ok");
         ctx.write_output(std::format("path|{}", dest.string()));
@@ -529,9 +626,19 @@ private:
         if (!is_valid_url(url)) { ctx.write_output("error|only http:// and https:// URLs allowed"); return 1; }
 
         int status = 0;
-        auto body = http_get(url, status);
+        bool truncated = false;
+        auto body = http_get(url, status, truncated);
         ctx.write_output(std::format("status|{}", status));
-        ctx.write_output(std::format("body|{}", body));
+        // A body is peer data: cut at a scalar boundary when truncated and scrubbed to well-formed
+        // UTF-8 without NUL, LF, CR or any other C0 control but TAB before it is one wire row (a NUL
+        // would silently cut the row at the ABI; LF or CR would let the body start a sibling row).
+        auto row = yuzu::http_client::prepare_get_body(std::move(body), truncated);
+        row.body.insert(0, "body|"); // one buffer: no second copy of a body up to 1 MiB
+        ctx.write_output(row.body);
+        if (row.replaced != 0)
+            ctx.write_output(std::format("constrained|body_bytes_replaced:{}", row.replaced));
+        if (truncated)
+            ctx.write_output(std::format("truncated|{}", yuzu::http_client::kMaxGetBodyBytes));
         return status >= 200 && status < 400 ? 0 : 1;
     }
 
@@ -541,9 +648,12 @@ private:
         if (!is_valid_url(url)) { ctx.write_output("error|only http:// and https:// URLs allowed"); return 1; }
 
         int status = 0;
-        auto headers = http_head(url, status);
+        std::size_t replaced = 0;
+        auto headers = http_head(url, status, replaced);
         ctx.write_output(std::format("status|{}", status));
         ctx.write_output(std::format("headers|{}", headers));
+        if (replaced != 0)
+            ctx.write_output(std::format("constrained|headers_bytes_replaced:{}", replaced));
         return status >= 200 && status < 400 ? 0 : 1;
     }
 };
