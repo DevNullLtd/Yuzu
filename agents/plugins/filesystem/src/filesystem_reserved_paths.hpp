@@ -35,7 +35,10 @@ struct Set {
     out.reserve(p.size());
     for (char c : p) {
         char n = c == '\\' ? '/' : c;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
+        // The default volumes on Windows (NTFS) and macOS (APFS) are case-insensitive, so a not-yet-existing
+        // reserved leaf is matched ASCII-case-folded there (an EXISTING reserved file is matched by
+        // identity). Non-ASCII letters are NOT folded on either OS (a documented residual).
         if (n >= 'A' && n <= 'Z')
             n = static_cast<char>(n - 'A' + 'a');
 #endif
@@ -116,7 +119,10 @@ struct Set {
 /// POSIX (macOS in particular): `/dev/fd/N`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` name the
 /// agent's own open descriptors (an inherited secret file, the log). macOS has no `/proc`, so
 /// `is_proc_secret_path` cannot see them; on Linux the same names are symlinks into `/proc/self`.
-/// Refused as a literal or canonical spelling. Pure; never true for a Windows path.
+/// Refused as a literal or canonical spelling, BY PATH NAME and not by file identity: on macOS
+/// `/dev/fd/N` reports the same inode as the real file but a different st_dev (a synthetic devfs value,
+/// measured on macOS 27 arm64), so an identity compare would not match it. Pure; never true for a
+/// Windows path.
 [[nodiscard]] inline bool is_dev_fd_path(std::string_view path_in) {
     // ASCII case is folded: the default macOS volume is case-insensitive, so `/DEV/FD/3` is the same
     // object as `/dev/fd/3`.

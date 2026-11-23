@@ -56,6 +56,24 @@ TEST_CASE("is_agent_reserved_path: a reserved file matches exactly and its rotat
     CHECK_FALSE(rsv::is_agent_reserved_path(s, "/etc/yuzu/agent.keys")); // '.' suffix only
 }
 
+TEST_CASE("is_agent_reserved_path: a not-yet-existing reserved leaf is matched ASCII-case-folded on Windows and "
+          "macOS, case-sensitively elsewhere (macOS case-alias write, Windows probe)",
+          "[agent][filesystem_plugin][reserved][casefold]") {
+    rsv::Set s;
+    s.files = {"/opt/yuzu/keys/agent.key"};
+    CHECK(rsv::is_agent_reserved_path(s, "/opt/yuzu/keys/agent.key"));
+#if defined(_WIN32) || defined(__APPLE__)
+    CHECK(rsv::is_agent_reserved_path(s, "/opt/yuzu/keys/AGENT.KEY"));
+    CHECK(rsv::is_agent_reserved_path(s, "/opt/yuzu/keys/Agent.Key.1"));
+    // Non-ASCII letters are not folded: a documented residual.
+    rsv::Set u;
+    u.files = {"/opt/yuzu/keys/k\xc3\xa9y.key"};
+    CHECK_FALSE(rsv::is_agent_reserved_path(u, "/opt/yuzu/keys/K\xc3\x89Y.KEY"));
+#else
+    CHECK_FALSE(rsv::is_agent_reserved_path(s, "/opt/yuzu/keys/AGENT.KEY"));
+#endif
+}
+
 TEST_CASE("is_agent_reserved_path: an empty set reserves nothing; windows separators normalise",
           "[agent][filesystem_plugin][reserved]") {
     CHECK_FALSE(rsv::is_agent_reserved_path(rsv::Set{}, "/anything"));
@@ -428,7 +446,7 @@ TEST_CASE("filesystem plugin: a hard link into a reserved dir whose PARENT canno
 // NOTE: on Linux these refuse through the /proc rule (the aliases are symlinks into /proc/self), so
 // this runtime case does not discriminate the /dev/fd rule itself: that is pinned by the pure
 // is_dev_fd_path cases above. It exercises the macOS spelling end to end where a macOS run is owed.
-TEST_CASE("filesystem plugin: /dev/fd, /dev/stdin and friends are refused on POSIX",
+TEST_CASE("filesystem plugin: /dev/fd and /dev/stdin and friends are refused on POSIX",
           "[agent][filesystem_plugin][reserved]") {
     auto handle = load_fs_plugin();
     REQUIRE(handle);
