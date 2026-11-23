@@ -11,6 +11,22 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: second-factor failure budget (auth schema v4), first-run password prompt needs a terminal on Linux and macOS
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affects every local account with TOTP MFA, and any automation that pipes the administrator password into the first-run `yuzu-server` prompt.
+
+**What this build does.**
+
+- **Failure budget.** Wrong TOTP/recovery codes at `/login/mfa` and `/login/mfa/stepup` are counted per account and lock the second factor for `--auth-lockout-window-secs` (default 900 s) after `--auth-lockout-threshold` of them. It **cannot be disabled**: threshold `0` falls back to 5 attempts. See [Second-factor failure budget](authentication.md#second-factor-failure-budget).
+- **Auth schema v4.** The `auth` store's migration list ends at v4, which adds `mfa_failed_count`, `mfa_locked_until` and `mfa_last_attempt_at` to `auth.users` (inert defaults). A v4 that cannot apply (the `ALTER TABLE` has a 3 s `lock_timeout`) stops the auth store opening, so the server does not start; see the [recovery runbook](../ops-runbooks/auth-db-recovery.md#second-factor-mfa-lock-429-and-503-on-sign-in).
+- **Process-wide PBKDF2 cap.** Concurrent password hashing is capped by lane (a quarter of the HTTP worker pool, at least 8 and never more than half the pool): a break-glass lane, an unauthenticated lane and an authenticated lane (at most 3 slots per principal); a login that waits more than 150 ms for its username's serialisation stripe also answers `429`. A full lane answers `429` + `Retry-After: 2`; the numbers are in [Authentication](authentication.md#second-factor-failure-budget). `--auth-pbkdf2-per-source-cap` tunes the per-address share.
+- **Break-glass sign-in under `--auth-mode=sso-only`.** The arm window authorises the sign-in, not the session: `POST /login/mfa` checks the arm state before a code is verified and again before the session is created, and refuses with the generic `401` when the arm was removed or its window ended. An arm state that cannot be read is not treated as "not armed" (before verification nothing is spent and the pending token stays usable). A session minted inside the window lives its full 8 hours and is not revoked when the window ends. See [Authentication](authentication.md) and the [recovery runbook](../ops-runbooks/auth-db-recovery.md).
+- **First-run prompt (Linux, macOS).** The administrator password is read with echo off, and the prompt **refuses (exit without writing a config) when stdin is not a terminal** or echo cannot be turned off. Windows still accepts a piped password. A container entrypoint that pipes the password into first-run exits, and under a restart policy crash-loops.
+
+**What to do.** Run first-run interactively once, or pre-create the configuration; tell operators a locked second factor clears after the window or by an operator unlock (`POST /api/v1/users/{name}/unlock`).
+
 ## Behaviour change: the installed-software read routes return `package_id` (#6090)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

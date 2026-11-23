@@ -1,0 +1,5 @@
+gpg-pubkey|b86b3716-61e69f29|(none)|Mon Nov 16 17:58:30 2026
+basesystem|11-13.el9|AlmaLinux|Mon Nov 16 17:59:33 2026
+gmp|6.2.0-13.el9|AlmaLinux|Mon Nov 16 17:59:36 2026
+libgomp|11.5.0-17.el9_9.alma.1|AlmaLinux|Mon Nov 16 17:59:54 2026
+dbus|1.12.20-10.el9|AlmaLinux|Mon Nov 16 17:59:57 2026

@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 (account redacted to jsmith; user-profile paths redacted) · leg-hash 1b150809d05d
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 (account redacted to jsmith; user-profile paths redacted) · leg-hash 41d3c7502afe
 == action=list
 app|50onPaletteServer|1.1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/50onPaletteServer.app|com.apple.50onPaletteIM
 app|ABAssistantService|14.0|-|13/08/2026, 03:51|/System/Library/Frameworks/AddressBook.framework/Versions/A/Helpers/ABAssistantService.app|com.apple.ABAssistantService
