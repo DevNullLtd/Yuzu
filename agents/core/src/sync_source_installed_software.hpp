@@ -79,10 +79,14 @@ struct SwEntry {
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
     // Wire slot 13. Machine-scope roots only: the v3 writer keeps a location only under a known
-    // machine root (installed_software_v3.hpp machine_install_location). Slot 14 (uninstall_string) is
-    // reserved and always sent empty (#5186). Inserted here, between distro_version and
-    // package_id, so the member order stays the wire order.
+    // machine root (installed_software_v3.hpp machine_install_location). Inserted here, between
+    // distro_version and package_id, so the member order stays the wire order.
     std::string install_location;
+    // Wire slot 14: validated `key=value` attributes in the canonical form of
+    // common/include/yuzu/install_row_attributes.hpp (SAM-46; the slot was the reserved
+    // uninstall_string, #5186, always sent empty). Empty = none. The v3 writer keeps only a value
+    // that is already canonical (v3_normal_form), so an adapter builds it with make_attributes.
+    std::string attributes;
     std::string package_id;
     std::string source; // "<plugin>.<action>" that produced the row
 };
@@ -154,10 +158,11 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& o
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out);
 
 /// Adapt `msi_packages` `list_inventory` output (`status|list_inventory|<level>|...` plus
-/// five-token `inv|<product_code>|<name>|<version>|<publisher>`). Each row becomes
-/// {kind=pkg, ecosystem=msi} with package_id = the product code exactly as registered
-/// (no case normalisation). An empty name is seen-not-mapped. The producer strips `|`,
-/// tab, CR, LF and NUL from the fields, so no unescape is needed.
+/// five or six token `inv|<product_code>|<name>|<version>|<publisher>[|<upgrade_code>]`). Each
+/// row becomes {kind=pkg, ecosystem=msi} with package_id = the product code exactly as registered
+/// (no case normalisation); a sixth token that is a braced GUID is kept as the `upgrade_code`
+/// attribute, any other sixth token is ignored. An empty name is seen-not-mapped. The producer
+/// strips `|`, tab, CR, LF and NUL from the fields, so no unescape is needed.
 YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out);
 
 /// Whether the `runtimes` `python` vendor column is read as a vendor on this host's OS: true on

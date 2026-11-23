@@ -731,7 +731,10 @@ TEST_CASE("require_fleet_read: service token - degraded ITServiceOwner permissio
     {
         auto req2 = bearer_request(svc);
         httplib::Response res2;
-        CHECK_FALSE(r.ar->require_scoped_permission(req2, res2, "Response", "Read", "a_p"));
+        // The typed call (the Boolean gate is its `== Admitted` wrapper): the gate's own 503 is
+        // the class Unavailable, not a plain denial and not a degraded authorization read.
+        CHECK(r.ar->require_scoped_permission_outcome(req2, res2, "Response", "Read", "a_p") ==
+              ScopedGateOutcome::Unavailable);
         check_ceiling_degraded_503(res2);
     }
     CHECK(degrade("query_error") == 1.0);
