@@ -7,11 +7,11 @@ Best-effort lexical gate, two checks:
   1. agents/core/src/agent.cpp logs `session_fp={}` via `session_log_fingerprint(` and never
      passes `session_id_` to that spdlog call; dex_linux_collector.cpp wraps subject/reason.
   2. No scanned text file parses `session=` out of that agent line (scanned: the whole checkout
-     except the top-level SKIP_DIRS and build* directories, `node_modules`, `.git` and `_build*`
-     (rebar3 output) at any depth,
-     files over 2 MB, binary files (a NUL in the first 4 KiB), unreadable paths, and this file;
-     directory symlinks are not followed). Backslash continuations are
-     joined, and a `session=` extractor within WINDOW lines of a "Registered with server" mention
+     except the top-level SKIP_DIRS (including the `vcpkg` clone) and build* directories,
+     rebar3's `gateway/_build*`, `node_modules` and `.git` at any depth, files over 2 MB, binary
+     files (a NUL in the first 4 KiB), unreadable paths, and this file; directory symlinks are not
+     followed). Backslash continuations are joined, and a `session=` extractor within WINDOW lines
+     of a "Registered with server" mention
      (a separate-line extractor included) fails. A line that carries the marker
      `tripwire-allow: <reason>` is exempt, so each exemption is visible at its own line (only the
      upgrade note quoting the old line). There is NO other `session=` read of that line.
@@ -27,11 +27,12 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SELF = pathlib.Path(__file__).resolve()
 SKIP_DIRS = {".git", "node_modules", "vcpkg_installed", "vcpkg",
              "scratchpad", "governance.d", ".claude", "changelog.d", "site"}
-# Untracked trees the CI runners keep in the checkout (a vcpkg clone at vcpkg/, rebar3's
-# gateway/_build*: ~110k of the ~120k files on a Big Tam workspace, #8637) are pruned too, so the
-# walk stays far inside the meson timeout under load.
+# Also pruned: the untracked trees the CI runners keep in the checkout (the vcpkg clone at vcpkg/
+# above, and rebar3's gateway/_build* output, gitignored there: ~110k of the ~120k files on a Big
+# Tam workspace, #8637), so the walk stays far inside the meson timeout under load. The rebar3
+# prune is anchored to gateway/ only, so a `_build*` directory anywhere else is still scanned.
 SKIP_ANY_DEPTH = ("node_modules", ".git")
-SKIP_ANY_DEPTH_PREFIX = "_build"
+REBAR3_PARENT, REBAR3_PREFIX = "gateway", "_build"
 # Every top-level build* directory is skipped, not only the three per-OS names: the self-hosted
 # runners build several CI jobs into sibling dirs of one checkout (build-linux-coverage,
 # build-linux-clang-21-debug, ...), whose test logs and coverage reports quote the agent's
@@ -107,7 +108,9 @@ def skipped_dir(rel_parts):
     name = rel_parts[-1]
     if len(rel_parts) == 1 and (name in SKIP_DIRS or name.startswith(SKIP_PREFIX)):
         return True
-    return name in SKIP_ANY_DEPTH or name.startswith(SKIP_ANY_DEPTH_PREFIX)
+    if len(rel_parts) == 2 and rel_parts[0] == REBAR3_PARENT and name.startswith(REBAR3_PREFIX):
+        return True
+    return name in SKIP_ANY_DEPTH
 
 
 def skipped(rel_parts):
@@ -198,13 +201,15 @@ def selftest_walk(bad_line):
         # reach (a widened prefix such as "b", or a case-insensitive match, would skip these).
         # Every top-level name in this tree must stay distinct after case-folding (a bare `build/`
         # would merge with `Build/` on NTFS/APFS and break this assertion on Windows/macOS only).
-        for rel in ("deploy/build-tools/y.sh", "bin/z.sh", "Build/z.sh"):
+        # The rebar3 prune is anchored to gateway/: a `_build*` directory anywhere else is source.
+        still_scanned = ["Build/z.sh", "_build/z.sh", "bin/z.sh", "deploy/build-tools/y.sh",
+                         "gateway/apps/_build_helpers/z.sh", "src/_build_helpers/z.sh"]
+        for rel in still_scanned:
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             (root / rel).write_text(bad_line + "\n")
         visited = []
         flagged = sorted(rel for rel, text in iter_files(root, visited) if check_text(rel, text))
-        assert flagged == ["Build/z.sh", "bin/z.sh", "deploy/build-tools/y.sh", "scripts/x.sh"], \
-            ("selftest walk", flagged)
+        assert flagged == sorted(still_scanned + ["scripts/x.sh"]), ("selftest walk", flagged)
         # Pruned, not just filtered: no skipped tree is ever listed (#8637: another job may be
         # deleting it mid-scan, and listing it costs time against the meson timeout).
         entered = [v for v in visited if any(v == t or v.startswith(t + "/") for t in skipped_trees)]
