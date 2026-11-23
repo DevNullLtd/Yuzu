@@ -373,6 +373,9 @@ spec:
         type: int64
       - name: error
         type: int64
+      - name: blocked
+        type: int64
+        description: Checks policy evaluation did not dispatch because the instruction names an action it does not run; counted as failing
 
   readablePayload: "Fleet compliance summary"
 

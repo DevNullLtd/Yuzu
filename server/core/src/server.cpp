@@ -2929,9 +2929,10 @@ public:
                           "(cumulative per agent since install; a rising value is the signal)",
                           "gauge");
         metrics_.describe("yuzu_fleet_echo_storage_offline",
-                          "Agents whose Echo database is offline and being retried, by reason "
-                          "(free_space, migration_failed, open_failed; anything else sums under "
-                          "unknown). Published for every reason each sweep, 0 included",
+                          "Agents whose Echo database is offline, by reason (free_space, "
+                          "migration_failed, open_failed are retried; rollback_wedged is not and "
+                          "needs an agent restart; anything else sums under unknown). Published "
+                          "for every reason each sweep, 0 included",
                           "gauge");
         metrics_.describe("yuzu_fleet_plugin_init_failed",
                           "Agents reporting a plugin that failed init, by plugin name (absent "
@@ -19757,6 +19758,15 @@ private:
             // flips — same field and wiring as the other three background
             // engines' Deps.
             .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
+            // G01: the capability registry policy evaluation classifies a pair against before it
+            // dispatches (execute gate, Destructive class, reserved rows). Without it the
+            // evaluator refuses every dispatch (`unwired`), so this wiring is what lets a policy
+            // run at all. `capability_registry_` is declared before `policy_evaluator_`, so it
+            // outlives the evaluator.
+            .capability_registry = &capability_registry_,
+            // The `policy.dispatch` / `denied` audit rows; same store the other background
+            // engines write to.
+            .audit_store = audit_store_.get(),
         });
         policy_eval_thread_ = std::thread([this]() {
             spdlog::info("Policy evaluation thread started (cadence=10s, grace=15s)");
@@ -22482,8 +22492,11 @@ private:
                     auto fc = compliance_api->fleet_compliance();
                     if (!fc)
                         return std::nullopt;
-                    return home::ComplianceFigure{fc->total_checks, fc->compliant, fc->non_compliant,
-                                                  fc->unknown, fc->compliance_pct};
+                    // `error` and `blocked` count as failing, like `non_compliant`: the tile,
+                    // the compliance page's readout and its row pills are defined to agree.
+                    return home::ComplianceFigure{fc->total_checks, fc->compliant,
+                                                  fc->non_compliant, fc->unknown,
+                                                  fc->compliance_pct, fc->error, fc->blocked};
                 },
                 .failed_fn = [this]() -> std::optional<std::vector<home::FailedRow>> {
                     if (!execution_tracker_)
