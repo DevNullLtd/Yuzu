@@ -1,4 +1,5 @@
-shared_library(
+# Captured so tests/meson.build can order it ahead of agent_test_exe via link_depends.
+disk_space_plugin_lib = shared_library(
   'disk_space',
   files('src/disk_space_plugin.cpp'),
   name_prefix: '',
