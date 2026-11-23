@@ -1111,7 +1111,7 @@ succeeded. You now get `-32602` instead.
 
 ---
 
-The asynchronous Echo and instruction-result producer tools reject malformed matchers with MCP invalid params (−32602) before dispatch. An explicit Echo matcher needs a recognized `kind`. A `where` clause needs a quantified kind. `any_response` accepts only `kind`, and `echo_rows_ge` accepts only `kind` and `n`. A device whose answer is undecidable contributes to `agents_failed` and is omitted from membership.
+The asynchronous Echo and instruction-result producer tools reject malformed matchers with MCP invalid params (−32602) before dispatch. An explicit Echo matcher needs a recognized `kind`. A `where` clause needs a quantified kind. Both legacy kinds accept `kind` and `n`. As before, `any_response` ignores `n`. A device whose answer is undecidable contributes to `agents_failed` and is omitted from membership.
 
 ## Resources
 

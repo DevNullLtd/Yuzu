@@ -13,7 +13,7 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 
 ## Explicit matchers on asynchronous Echo result sets
 
-The Echo REST and MCP producers now validate an explicit `matcher`. Previously they ignored that field. To keep the previous selection behavior, omit `matcher` and use `include_empty`. An explicit Echo matcher requires a recognized `kind`, including for clients previously sending an empty object. Both producers refuse a `where` clause without a quantified kind and extraneous fields on `any_response` or `echo_rows_ge`. Invalid matchers return HTTP 400 or MCP invalid params before dispatch. Plain instruction pipe rows without a completeness envelope can prove presence but leave absence unknown. Devices with unknown results drop out of the selected scope.
+The Echo REST and MCP producers now validate an explicit `matcher`. Previously they ignored that field. To keep the previous selection behavior, omit `matcher` and use `include_empty`. An explicit Echo matcher requires a recognized `kind`, including for clients previously sending an empty object. Both producers refuse a `where` clause without a quantified kind and fields beyond `kind` and `n` on `any_response` or `echo_rows_ge`. Invalid matchers return HTTP 400 or MCP invalid params before dispatch. Plain instruction pipe rows without a completeness envelope can prove presence but leave absence unknown. Devices with unknown results drop out of the selected scope.
 
 
 ## ⚠️ Breaking: removing a user's Administrator grant ends that user's JIT elevation window, the unassign audit detail and failure modes change, and `POST /api/v1/elevate` can refuse a call that races an eligibility revoke

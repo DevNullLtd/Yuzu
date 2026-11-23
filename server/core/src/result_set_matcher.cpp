@@ -317,7 +317,7 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
         return "matcher.where requires any, none, all or count_where";
     if (kind == "any_response" || kind == "echo_rows_ge") {
         for (const auto& [key, val] : m.items())
-            if (key != "kind" && !(kind == "echo_rows_ge" && key == "n"))
+            if (key != "kind" && key != "n")
                 return "unexpected field for matcher.kind";
     }
     if (kind == "any_response")
