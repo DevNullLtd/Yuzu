@@ -148,6 +148,9 @@ struct RawFile {
         to.QuadPart = static_cast<LONGLONG>(length);
         return SetFilePointerEx(h.h, to, nullptr, FILE_BEGIN) && SetEndOfFile(h.h);
     }
+    /// NTFS gives a sparse or compressed stream its clusters when the cache is written out, not at WriteFile
+    /// (measured: 2 runs unflushed, 80 flushed), so a case that reads physical layout flushes before it probes.
+    bool flush() const { return FlushFileBuffers(h.h) != 0; }
 };
 
 } // namespace
@@ -275,6 +278,7 @@ TEST_CASE("file_search windows shell: facts read size and time from the handle, 
         REQUIRE(sparse.h.ok());
         REQUIRE(sparse.control(FSCTL_SET_SPARSE));
         REQUIRE(sparse.set_length(4u * 1024 * 1024)); // wholly sparse: success with one lcn -1 run
+        REQUIRE(sparse.flush());
     }
     const FileFacts hole = probe.facts("sparse.bin");
     CHECK(hole.extents.state == ExtentsState::ok);
@@ -299,6 +303,7 @@ TEST_CASE("file_search windows shell: a file with 40 separated allocated ranges 
         for (std::uint64_t i = 0; i < 40; ++i)
             REQUIRE(sparse.write_at(i * 256 * 1024, 4096));
         REQUIRE(sparse.set_length(40u * 256 * 1024));
+        REQUIRE(sparse.flush());
     }
     Probe probe(u, label_of(fx.root));
     const FileFacts f = probe.facts("many.bin");
@@ -359,6 +364,7 @@ TEST_CASE("file_search windows shell: an NTFS-compressed file carries the compre
         if (!file.control(FSCTL_SET_COMPRESSION, &format, sizeof(format)))
             SKIP("compression is refused on this volume");
         REQUIRE(file.write_at(0, 1024 * 1024));
+        REQUIRE(file.flush());
     }
     Probe probe(u, label_of(fx.root));
     const FileFacts f = probe.facts("lznt.bin");
