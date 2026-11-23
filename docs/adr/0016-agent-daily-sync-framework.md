@@ -2072,7 +2072,7 @@ so the writer's status-only section keeps the server's stored rows (the `v3:` he
 file and `status.d`; 32 MiB per rpm header; 1 GiB of rpm headers read; and 8 MiB of text KEPT across the rpm headers
 in total, charged apart from the bytes read because one stored string can be named by several fields of a hostile
 header, so what a record keeps is a multiple of what it was charged for reading) and every damaged record
-degrades the whole read instead of returning a shorter roster (except a Berkeley DB hash page that is zeroed or retyped to free or overflow, which has no checksum: #8545). Reading rpm signer data and non-installed dpkg
+degrades the whole read instead of returning a shorter roster (except a Berkeley DB hash page that is zeroed or retyped to free or overflow, or whose item count and item-area start are both damaged, which has no checksum: #8545). Reading rpm signer data and non-installed dpkg
 states onto the wire (slot 14 of the v3 record, which the server consumes without keeping) is NOT part of this
 change; it needs a server change and is tracked as SAM-45b (#8361).
 
