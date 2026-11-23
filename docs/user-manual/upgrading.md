@@ -9088,7 +9088,7 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   and existing consumers filter on the `config|` prefix and ignore unknown
   lines, so nothing breaks. **On the offline path they do break**: when the Echo
   database has been closed after a wedged rollback, `echo status` returns
-  non-zero and emits only an `error|` line followed by `storage_state|offline` -
+  non-zero and emits only an `error|` line followed by `storage_state|offline|rollback_wedged` -
   no `record_count`, no `config|` lines at all. Note the order is REVERSED
   there: `error|` comes first, because server and dashboard consumers key off
   the output starting with `error|`. A consumer keyed on the presence of
