@@ -1227,11 +1227,21 @@ that could not mean anything:
   request) and an expiry at most 92 days out; an expired listing is not in force, and one whose
   `approval_ref` is `pending` is not in force in a release (`--release`). A listed image is
   printed as `NOT COVERED` (and a step warning) on every run. Today four images are listed: the
-  three chisel images and the agent bundle. They are assembled FROM scratch from chisel slices,
-  which leave no dpkg database (and no chisel manifest, because they do not cut
-  `base-files_chisel`), so Trivy 0.70.0 reports "No OS package is detected". **Their libc6,
-  libssl3t64, zlib1g and other slices ship unscanned by Trivy** (grype matches some of them, best
-  effort: "What it does not see" below). The gate learns an image's name from
+  three chisel images and the agent bundle. They are assembled FROM scratch from chisel slices
+  (all four Dockerfiles cut `base-files_{base,etc,var,tmp,release-info}` and no
+  `base-files_chisel`, then `COPY --from=chisel /rootfs /`). The scanners read a dpkg package
+  database, including `/var/lib/dpkg/status.d` (the distroless format), and these images ship
+  none, so Trivy 0.70.0 reports "No OS package is detected". Cutting `base-files_chisel` would not
+  change that: it writes a chisel manifest, and a string check of the Trivy 0.70.0, grype 0.122.0
+  and syft 1.57.2 binaries found `dpkg/status.d` in all three and neither `manifest.wall` nor
+  `var/lib/chisel` in any (string evidence, not a scan, and on grype 0.122.0 rather than the
+  pinned 0.121.3). **Their libc6, libssl3t64, zlib1g and other slices ship unscanned by Trivy**
+  (grype identifies only a few packages, best effort: "What it does not see" below). These four
+  listings expire 2027-02-15 and are not to be renewed; the planned fix, not a shipped one, is a
+  scanner-readable package manifest (dpkg `status.d` stanzas emitted in the chisel stage, #8415).
+  Consequence: from 2027-02-15 the release gate refuses these four images unless #8415 has shipped
+  or a renewal is deliberately approved by the owner.
+  The gate learns an image's name from
   `NAME=IMAGE` (release.yml) or the tag (pre-release.yml); a bare image ID can never match the list.
 - an ignore file that `scripts/ci/image-vuln-gate-checks.py` does not accept (below).
 
@@ -1697,7 +1707,9 @@ journal stays at `push-started`, and the release job does not run.
 **Current packages.** The Debian and Alpine images upgrade their packages in the final stage
 (`apt-get upgrade`, `apk upgrade`; `yuzu-postgres` holds the PGDG server packages so the
 PostgreSQL minor stays the pinned one), and the chisel images cut their slices from the live
-Ubuntu archive. A package index that cannot be fetched fails the build: the Debian runtime
+Ubuntu archive (a fact about build time, not a scan: it is no vulnerability coverage for the
+chisel images, whose OS packages are not scanned; see "What it does not see" in "Release image
+vulnerability gate"). A package index that cannot be fetched fails the build: the Debian runtime
 stages run `apt-get update --error-on=any` (plain `apt-get update` exits 0 when, say, the
 security pocket is unreachable, and the upgrade then ships without it; checked 2026-11-18 on
 bookworm's apt 2.6 and trixie's apt 3.0, both exit 100 with the option), and Alpine's
@@ -2041,11 +2053,17 @@ published images (a tracked gap).
 
 - **The chisel images' and the agent bundle's OS packages, to Trivy** (above): listed as not
   covered, so Trivy matches none of their CVEs in libc6, libssl3t64, zlib1g and the other slices.
-  grype does match some of them (on `yuzu-gateway-chisel` it matched Ubuntu 26.04 advisories to
-  `deb` packages such as busybox and openssl, checked 2026-11-20), and a fixable CRITICAL it reports
-  there fails the image like any other; but the gate proves nothing about that coverage for these
-  images (no canary, no OS cross-check, and the `ubuntu` provider's freshness is checked only for
-  images Trivy covers), so treat it as best effort.
+  grype identifies only the few packages whose binaries name their own package: the committed
+  `yuzu-server-chisel` image SBOM (syft 1.57.2) has exactly two `pkg:deb` components, busybox and
+  openssl, both from `elf-binary-package-cataloger`; libc6, libstdc++6, libpq5 (and its
+  krb5/ldap closure), zlib1g and ca-certificates are not catalogued. On `yuzu-gateway-chisel` grype
+  matched Ubuntu 26.04 advisories to busybox and openssl (checked 2026-11-20), and a fixable
+  CRITICAL it reports there fails the image like any other; but the gate proves nothing about even
+  that coverage (no canary, no OS cross-check, and the `ubuntu` provider's freshness is checked
+  only for images Trivy covers: `want_family` in `image-vuln-gate.sh` is set only when the
+  coverage is `covered`, so a stale `ubuntu` provider is not detected for chisel images). **A
+  passing scan of a chisel image is not evidence about its OS packages.** Use the non-chisel image
+  if you need them covered.
 - **PostgreSQL itself.** In `yuzu-postgres` Trivy lists `postgresql-18`, `libpq5` and
   `postgresql-common` as packages but matches no vulnerability to them: they come from the PGDG
   repository, and Trivy's Debian advisories cover Debian's own packages only. And the image holds
