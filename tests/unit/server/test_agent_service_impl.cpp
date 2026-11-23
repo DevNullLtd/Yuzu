@@ -4164,7 +4164,8 @@ TEST_CASE("Register: notification fires once on first enrollment; webhook/offloa
 // after register_agent). A returning id with an approved enrolment row takes the fast path (no token,
 // no approval), so every non-root membership it already had is still in place afterwards. Driven
 // through the real service with a real Postgres ManagementGroupStore; only the transport context is
-// null. Characterisation test: it passes before the decommission fix because nothing removes the rows.
+// null. The first half (two Registers leave the non-root groups in place) is a characterisation
+// that passes before the decommission fix; the decommission tail pins the behaviour after it.
 TEST_CASE("Register: a returning approved id keeps its non-root groups until decommission",
           "[pg][agent_service][management_group][decommission]") {
     yuzu::test::ManagementGroupStorePg mg_bundle;

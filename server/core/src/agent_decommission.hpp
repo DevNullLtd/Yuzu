@@ -32,9 +32,9 @@
 /// you MUST: (a) append the store here, (b) register it in
 /// `agent_decommission.cpp`'s registration list, (c) bump `kCascadeStoreCount` in
 /// `test_agent_decommission.cpp` (the drift guard, the null-store case's two counts, the
-/// unconfigured-store case's skipped count and the real-store fan-out's counts, including the two
-/// failing-census counts: nine numeric sites in six tests, plus `_MIN_FIELDS` in
-/// `tests/test_decommission_wiring_lexical.py`), (d) add
+/// unconfigured-store case's skipped count and the real-store fan-out's counts, including the
+/// two failing-census counts and the two failing-membership counts: nine numeric sites in six
+/// tests, plus `_MIN_FIELDS` in `tests/test_decommission_wiring_lexical.py`), (d) add
 /// the store to the blast-radius lists in `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete
 /// block, ADR-0024 Decisions 9/11, and `rest-api.md`, (e) hand the live pointer over in
 /// `ServerImpl::decommission_agent` (`server.cpp`). The drift guard in
