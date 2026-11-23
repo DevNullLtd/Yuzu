@@ -135,8 +135,8 @@ and in the server's own `GET /api/v1/openapi.json`.
 
 ## The MCP server
 
-An agentic worker reaches the same data through MCP tools, except fleet usage
-per application (`GET /api/v1/dex/apps/usage`), which has no MCP tool yet.
+An agentic worker reaches the same data through MCP tools. Fleet usage per
+application (`GET /api/v1/dex/apps/usage`) is the `get_dex_apps_usage` tool.
 Conventions:
 
 - **Endpoint and tokens.** `POST /mcp/v1/` with an API token minted with an
@@ -145,7 +145,9 @@ Conventions:
 - **Read tools work at every tier.** The DEX read tools need
   `GuaranteedState:Read` and are available to a `readonly` token. The
   per-device app-usage tool needs `Forensics:Read` instead, and is available at
-  every tier too.
+  every tier too. `get_dex_apps_usage` needs both `GuaranteedState:Read` and
+  `Forensics:Read` (Administrator only while RBAC is off), and is available at
+  every tier.
 - **Same model, same numbers.** A tool answers from the same read model as the
   REST route it mirrors (where the route has a tool), so the two agree figure for
   figure. Tool arguments
@@ -161,7 +163,10 @@ Conventions:
   `mcp.compare_app_perf_versions` row on success and uses `dex.app_perf.compare`
   only for a refusal. Most tools set-and-proceed on MCP, flagging
   `audit_persisted: false` if the row was lost; the per-device app-usage tool
-  withholds data instead.
+  withholds data instead. `get_dex_apps_usage` records `dex.apps.usage.view`
+  before it reads, and does not read if that row cannot be stored; its generic
+  `mcp.get_dex_apps_usage` row follows the outcome and, if lost, only sets
+  `audit_persisted: false`.
 - **Service-scoped tokens.** A tool follows the same rule as the REST route
   it mirrors. A token scoped to one service is refused on every DEX tool
   except the per-device tools (`get_dex_device_score`,
@@ -193,8 +198,7 @@ disagree, they win. See [contributing](contributing.md) for the rule.
 Every route listed here is under `/api/v1`. "Read" means
 `GuaranteedState:Read` unless the row says otherwise. Audit statements describe
 the REST route and its MCP twin, except that `compare_app_perf_versions`
-records `mcp.compare_app_perf_versions` on success and that fleet usage per
-application has no MCP twin yet. The dashboard writes the
+records `mcp.compare_app_perf_versions` on success. The dashboard writes the
 same verb when it opens the same view, with two exceptions: the Overview and
 the application drill-down open without an audit row. Unless a row says
 otherwise, a service-scoped token is refused on the route and on the tool in
@@ -268,7 +272,7 @@ this map; see [network](network.md).
 | Capability | Dashboard | REST | MCP | Fed by | Permission and audit | Page |
 |---|---|---|---|---|---|---|
 | One device's per-executable usage | Device page, Application usage | `GET /api/v1/forensics/agents/{id}/app-usage` | `get_agent_app_usage` | Echo `usage`, `app_usage` plugin, daily sync | `Forensics:Read` scoped to the device; refused to service-scoped tokens, whose role does not hold `Forensics:Read`; audited `app_usage.agent.view`, fails closed | [app usage](app-usage.md) |
-| Fleet usage per application: devices, run time, launches and crashes and hangs per hour of use | Apps tab, Usage view (`GET /fragments/dex/apps/usage`), per hour of use | `GET /api/v1/dex/apps/usage` | Not yet available | Echo `usage`, `app_usage` plugin, daily sync, DEX observer | `Forensics:Read` and `GuaranteedState:Read`, both required (Administrator only while RBAC is off); refused to service-scoped tokens; audited `dex.apps.usage.view` once parameters validate before the read, fails closed (REST `503`; the Usage view draws a panel and reads nothing) | [app usage](app-usage.md#using-it-in-the-dashboard-the-apps-tab-usage-view) |
+| Fleet usage per application: devices, run time, launches and crashes and hangs per hour of use | Apps tab, Usage view (`GET /fragments/dex/apps/usage`), per hour of use | `GET /api/v1/dex/apps/usage` | `get_dex_apps_usage` | Echo `usage`, `app_usage` plugin, daily sync, DEX observer | `Forensics:Read` and `GuaranteedState:Read`, both required (Administrator only while RBAC is off); refused to service-scoped tokens; audited `dex.apps.usage.view` once parameters validate before the read, fails closed on all three surfaces (REST `503`; the Usage view draws a panel and reads nothing; the MCP tool reads nothing and answers a retryable error) | [app usage](app-usage.md#using-it-in-the-dashboard-the-apps-tab-usage-view) |
 
 ### Alerts
 

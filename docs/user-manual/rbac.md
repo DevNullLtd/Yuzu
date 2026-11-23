@@ -155,12 +155,19 @@ Recommended order for a fresh install:
 > §9: the row is written after every check above and before the group is created),
 > `group-from-results` answers `503` with `Sec-Audit-Failed: true` and the toast "The audit record
 > could not be stored. Nothing was created. Retry once the audit store recovers.", and creates
-> nothing. Because that write can wait on the audit store, the session, `ManagementGroup:Write`
-> and the visible agent set are decided again after it: a session that is gone answers `401`, a
-> withdrawn `ManagementGroup:Write` grant the permission gate's refusal (normally `403`),
-> and a visible set that no longer holds any matched
-> agent the `422` above; each creates nothing and records `group.create_from_results` `failure`
-> (`session_revoked`, `permission_revoked name=<group name>`, `scope_revoked`).
+> nothing. Because that write can wait on the audit store, everything the member set was derived
+> under is decided again after it, in this order: the session, `ManagementGroup:Write`, the Search
+> term's `Response:Read` admission (only when a Search term was sent), the Forensics tier and the
+> visible agent set. A session that is gone answers `401`, a withdrawn `ManagementGroup:Write` grant
+> the permission gate's refusal (normally `403`), a withdrawn `Response:Read` admission the gate's
+> own refusal, an undecidable Forensics tier the same `200` and error toast as before the row, and a
+> visible set that no longer holds any matched agent the `422` above; a Forensics tier that narrowed
+> reads the set again under the narrower tier (failing with `503` or `422` when that read cannot be
+> done or was cut by the read cap) and keeps only the agents the caller may still read. Each refusal
+> creates nothing and records `group.create_from_results` `failure` (`session_revoked`,
+> `permission_revoked name=<group name>`, `response_read_revoked name=<group name>`,
+> `forensics_tier_unknown`, `reread_unreadable`, `reread_truncated`, `scope_revoked`), each ending in
+> the request's `cid=<id>`.
 >
 > **Admission on these three routes is unchanged (#1712 follow-up, tracked for
 > ADR-0017 PR-B).** Each route still gates on its own flat
@@ -722,7 +729,7 @@ Eight roles are created automatically and cannot be deleted:
 | `GuaranteedState` | Guardian (Guaranteed State) policy rules, events, and status |
 | `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
-| `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection and the fleet application-usage aggregate (`GET /api/v1/dex/apps/usage` and the Usage view of the dashboard Apps tab, `GET /fragments/dex/apps/usage`, both of which also need `GuaranteedState:Read`); per-app privacy-permission grants; per-account SSH authorized-key fingerprints and sshd settings). Held by default by Administrator and by the read-only `ForensicsAnalyst` role (absent from the Viewer read-list). The stored results of these plugins are served only to a caller who holds `Forensics:Read` in addition to `Response:Read`; to any other reader of the response APIs those rows are absent. With RBAC enforcement off, `Forensics:Read` is administrator-only, so a non-administrator session does not see them either. Only the `plugin` name is stored with a response row, so the filter is per plugin: a plugin that mixed Forensics and ordinary actions would have all of its rows treated as Forensics-tier until the action name is stored too (no such plugin exists today). Every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
+| `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection and the fleet application-usage aggregate (`GET /api/v1/dex/apps/usage`, the MCP tool `get_dex_apps_usage` and the Usage view of the dashboard Apps tab, `GET /fragments/dex/apps/usage`, all of which also need `GuaranteedState:Read`); per-app privacy-permission grants; per-account SSH authorized-key fingerprints and sshd settings). Held by default by Administrator and by the read-only `ForensicsAnalyst` role (absent from the Viewer read-list). The stored results of these plugins are served only to a caller who holds `Forensics:Read` in addition to `Response:Read`; to any other reader of the response APIs those rows are absent. With RBAC enforcement off, `Forensics:Read` is administrator-only, so a non-administrator session does not see them either. Only the `plugin` name is stored with a response row, so the filter is per plugin: a plugin that mixed Forensics and ordinary actions would have all of its rows treated as Forensics-tier until the action name is stored too (no such plugin exists today). Every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
 | `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (nine per-agent stores: five spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`, a sixth `Forensics`-governed store, the `endpoint_state` presence row read on `/hardware` and `/viz/fleet`, the fleet certificate inventory, whose own read securable arrives with the certificate read surface, and the Guardian compliance-census store, read under `GuaranteedState:Read` and so the second `GuaranteedState`-governed member after the app-perf store) in one grant, replacing a hand-maintained per-store conjunction. |
 | `RevocationSource` | Registered CRL sources (ADR-0070 R1): the CAs and the CRL URLs the server may fetch for them (`/api/v1/crypto/revocation-sources*`, six MCP tools). Operations: `Read` (list, get) and `Write` (register, replace, remove, reset the anti-rollback marks; removal is a `Write`, there is no `Delete`). Seeded to **Administrator only**, and **not grantable**: every route and tool ALSO requires a durable Administrator role (the `is_rbac_administrator` check), so a custom role granted `RevocationSource:Read` or `:Write` is still refused, in both RBAC states. The access-review export lists any such grant, which is how it is found. Denied to a service-scoped token. |
 | `SoftwareLicensing` | Discovered software-licence facts synced from endpoints (ADR-0024) |

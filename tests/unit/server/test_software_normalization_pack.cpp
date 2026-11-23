@@ -7,6 +7,7 @@
 #include "software_normalization_pack.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -112,6 +113,36 @@ TEST_CASE("parse rejects an edition column that contradicts raw_name and accepts
     CHECK(it->norm_key == "microsoft:office:professional");
 
     CHECK(contains(error_of(pack(kV, "windows,Foo,,Acme,Foo,gold,other,\n")),
+                   "edition is not a recognised edition token"));
+}
+
+TEST_CASE("an edition column is parsed as an edition, and a lone edition word as a raw_name is a "
+          "title",
+          "[normalization][pack]") {
+    // The edition column takes an edition word on its own, though normalize_title would now read
+    // a leading edition word as a title word.
+    for (const char* edition : {"Pro", "Home", "Standard", "Enterprise x64"}) {
+        CAPTURE(edition);
+        const auto p = parse_normalization_pack(pack(
+            kV, std::string{"windows,Contoso Studio,,Contoso,Studio,"} + edition + ",other,\n"));
+        REQUIRE(p.has_value());
+        const auto it = std::find_if(p->rows.begin(), p->rows.end(), [](const PackRow& r) {
+            return r.raw_name == "contoso studio";
+        });
+        REQUIRE(it != p->rows.end());
+        CHECK(it->edition == normalize_edition(edition));
+        CHECK(it->norm_key == "contoso:studio:" + it->edition);
+    }
+    // A raw_name that is one edition word names a product ("Home"), not an empty title.
+    const auto home = parse_normalization_pack(pack(kV, "macos,Home,,Apple,Home,,other,\n"));
+    REQUIRE(home.has_value());
+    const auto it = std::find_if(home->rows.begin(), home->rows.end(),
+                                 [](const PackRow& r) { return r.raw_name == "home"; });
+    REQUIRE(it != home->rows.end());
+    CHECK(it->edition.empty());
+    CHECK(it->norm_key == "apple:home");
+    // The column still refuses any word that is no edition.
+    CHECK(contains(error_of(pack(kV, "windows,Foo,,Acme,Foo,Pro Display,other,\n")),
                    "edition is not a recognised edition token"));
 }
 
@@ -255,11 +286,120 @@ TEST_CASE("the embedded seed parses with the shipped version and every key in no
           "[normalization][pack]") {
     const auto p = parse_normalization_pack(kSoftwareNormalizationSeed);
     REQUIRE(p.has_value());
-    CHECK(p->pack_version == "2026.11.1");
+    CHECK(p->pack_version == "2026.11.2");
     CHECK(p->rows.size() >= kMinSeedRows);
+    // Idempotence only: the parser already stores alias_key(normalize_title(raw_name)), so this
+    // shows a stored key survives a second normalisation. It cannot see a re-key; the pinned
+    // list in the next test case does.
     for (const auto& r : p->rows) {
         CAPTURE(r.raw_name);
-        CHECK(alias_key(normalize_title(r.raw_name)) == r.raw_name); // keys are in normal form
+        CHECK(alias_key(normalize_title(r.raw_name)) == r.raw_name);
+    }
+}
+
+namespace {
+// The stored alias key of every seed row, as `ecosystem|alias key|alias publisher|product
+// norm_key` (an empty ecosystem or publisher is a wildcard). An added seed row adds one line
+// here. A changed line is a re-key: an install that holds a pack never applies a newer seed row,
+// so the old alias stops resolving until an operator reloads a pack, and the change needs an
+// upgrade note in docs/user-manual/upgrading.md.
+const char* const kPinnedSeedKeys[] = {
+    "|openssl||openssl:openssl",
+    "|openssh-server||openbsd:openssh",
+    "|openssh-client||openbsd:openssh",
+    "|curl||curl:curl",
+    "|libssl3||openssl:openssl",
+    "|libssl1.1||openssl:openssl",
+    "|libcurl4||curl:curl",
+    "|bash||gnu:bash",
+    "|glibc||gnu:glibc",
+    "|libc6||gnu:glibc",
+    "|sudo||sudo_project:sudo",
+    "|nginx||nginx:nginx",
+    "|wget||gnu:wget",
+    "|apache2||apache:http server",
+    "|httpd||apache:http server",
+    "|tomcat9||apache:tomcat",
+    "|tomcat10||apache:tomcat",
+    "|postgresql||postgresql:postgresql",
+    "|postgresql-server||postgresql:postgresql",
+    "|postgresql-18||postgresql:postgresql",
+    "|mariadb-server||mariadb:mariadb",
+    "|mysql-server||oracle:mysql",
+    "|redis-server||redis:redis",
+    "|rabbitmq-server||rabbitmq:rabbitmq",
+    "|mosquitto||eclipse:mosquitto",
+    "|python3||python:python",
+    "|python3.14||python:python",
+    "|nodejs||openjs:node.js",
+    "|git||git-scm:git",
+    "windows|7-zip||igor pavlov:7-zip",
+    "windows|notepad++||notepad++ team:notepad++",
+    "windows|mozilla firefox en-us)||mozilla:firefox",
+    "windows|mozilla thunderbird en-us)||mozilla:thunderbird",
+    "windows|google chrome||google:chrome",
+    "windows|microsoft edge||microsoft:edge",
+    "windows|adobe acrobat reader dc||adobe:acrobat reader dc",
+    "windows|vlc media player||videolan:vlc media player",
+    "windows|git||git-scm:git",
+    "windows|python||python:python",
+    "windows|java(tm) se development kit||oracle:jdk",
+    "windows|java update||oracle:jre",
+    "windows|microsoft .net runtime||microsoft:.net runtime",
+    "windows|microsoft .net sdk||microsoft:.net sdk",
+    "windows|node.js||openjs:node.js",
+    "windows|postgresql||postgresql:postgresql",
+    "windows|mysql server||oracle:mysql",
+    "windows|mariadb||mariadb:mariadb",
+    "windows|mongodb||mongodb:mongodb",
+    "windows|microsoft sql server standard||microsoft:sql server:standard",
+    "windows|microsoft sql server enterprise||microsoft:sql server:enterprise",
+    "windows|microsoft sql server express||microsoft:sql server:express",
+    "windows|visual studio community||microsoft:visual studio:community",
+    "windows|visual studio professional||microsoft:visual studio:professional",
+    "windows|visual studio enterprise||microsoft:visual studio:enterprise",
+    "windows|microsoft office plus professional||microsoft:office:professional",
+    "windows|zoom workplace||zoom:zoom",
+    "windows|winrar||win.rar:winrar",
+    "windows|wireshark||wireshark:wireshark",
+    "windows|putty release||simon tatham:putty",
+    "windows|filezilla client||tim kosse:filezilla",
+    "windows|docker desktop||docker:docker desktop",
+    "windows|oracle vm virtualbox||oracle:virtualbox",
+    "windows|vmware workstation||vmware:workstation",
+    "windows|libreoffice||libreoffice:libreoffice",
+    "macos|firefox||mozilla:firefox",
+    "macos|google chrome||google:chrome",
+    "macos|safari||apple:safari",
+    "macos|visual studio code||microsoft:visual studio code",
+    "macos|docker||docker:docker desktop",
+    "brew|nginx||nginx:nginx",
+    "brew|redis||redis:redis",
+    "brew|git||git-scm:git",
+    "brew|wget||gnu:wget",
+    "brew|curl||curl:curl",
+    "brew|node||openjs:node.js",
+    "brew|openssl||openssl:openssl",
+};
+} // namespace
+
+TEST_CASE("the embedded seed's stored alias keys are exactly the pinned ones",
+          "[normalization][pack]") {
+    const auto p = parse_normalization_pack(kSoftwareNormalizationSeed);
+    REQUIRE(p.has_value());
+    std::set<std::string> got;
+    for (const auto& r : p->rows)
+        got.insert(r.ecosystem + '|' + r.raw_name + '|' + r.raw_publisher + '|' + r.norm_key);
+    const std::set<std::string> want(std::begin(kPinnedSeedKeys), std::end(kPinnedSeedKeys));
+    CHECK(got.size() == p->rows.size()); // no two rows fold into one entry
+    CHECK(want.size() == std::size(kPinnedSeedKeys)); // the list holds no duplicate
+    for (const auto& k : got) {
+        CAPTURE(k);
+        CHECK(want.count(k) == 1); // a re-keyed row, or a seed row with no line above
+    }
+    for (const auto& k : want) {
+        CAPTURE(k);
+        CHECK(got.count(k) == 1); // a pinned line the seed no longer produces
     }
 }
 
@@ -287,4 +427,62 @@ TEST_CASE("the embedded seed gives every product ONE identity", "[normalization]
     CHECK(has_key("libreoffice:libreoffice"));
     CHECK_FALSE(has_key("mysql:mysql"));
     CHECK_FALSE(has_key("the document:libreoffice"));
+}
+
+TEST_CASE("the embedded seed keeps its edition rows and maps python3.14 and postgresql-18 onto "
+          "their existing products",
+          "[normalization][pack]") {
+    const auto p = parse_normalization_pack(kSoftwareNormalizationSeed);
+    REQUIRE(p.has_value());
+    const auto key_of = [&](const char* raw_name) -> std::string {
+        const auto it = std::find_if(p->rows.begin(), p->rows.end(),
+                                     [&](const PackRow& r) { return r.raw_name == raw_name; });
+        return it == p->rows.end() ? std::string{"<no row>"} : it->norm_key;
+    };
+    // The glued-version names are rows of their own: a version inside a name is not stripped.
+    CHECK(key_of("python3.14") == key_of("python3"));
+    CHECK(key_of("python3.14") == "python:python");
+    CHECK(key_of("postgresql-18") == key_of("postgresql"));
+    CHECK(key_of("postgresql-18") == "postgresql:postgresql");
+
+    // Seed rows with an edition column parsed through normalize_edition: one product per edition.
+    const std::set<std::string> want{
+        "microsoft:sql server:standard",    "microsoft:sql server:enterprise",
+        "microsoft:sql server:express",     "microsoft:visual studio:community",
+        "microsoft:visual studio:professional", "microsoft:visual studio:enterprise",
+    };
+    std::set<std::string> got;
+    for (const auto& r : p->rows)
+        if (want.count(r.norm_key) != 0)
+            got.insert(r.norm_key);
+    CHECK(got == want);
+}
+
+TEST_CASE("a title that resolved through a re-keyed seed alias still resolves to the same product "
+          "after the SAM-51 pack bump",
+          "[normalization][pack]") {
+    // Two seed rows changed their stored alias key: the dangling "-" of ".NET Runtime - 8.0.1"
+    // and the "@3" of the Homebrew formula are no longer part of the normalised title. The
+    // key a title now forms is the one the NEW seed holds, and it names the product the old key
+    // named, so a pack loaded from this seed resolves both exactly as before.
+    const auto p = parse_normalization_pack(kSoftwareNormalizationSeed);
+    REQUIRE(p.has_value());
+    const auto key_of = [&](const char* ecosystem, const std::string& alias) -> std::string {
+        const auto it = std::find_if(p->rows.begin(), p->rows.end(), [&](const PackRow& r) {
+            return r.ecosystem == ecosystem && r.raw_name == alias;
+        });
+        return it == p->rows.end() ? std::string{"<no row>"} : it->norm_key;
+    };
+    const std::string dotnet = alias_key(normalize_title("Microsoft .NET Runtime - 8.0.1 (x64)"));
+    CHECK(dotnet == "microsoft .net runtime");
+    CHECK(dotnet != "microsoft .net runtime -"); // the key a pre-SAM-51 pack stored
+    CHECK(key_of("windows", dotnet) == "microsoft:.net runtime");
+
+    const std::string brew = alias_key(normalize_title("openssl@3"));
+    CHECK(brew == "openssl");
+    CHECK(brew != "openssl@3"); // the key a pre-SAM-51 pack stored
+    CHECK(key_of("brew", brew) == "openssl:openssl");
+    // A server that still holds the OLD pack forms the new key `openssl` for `openssl@3`: the
+    // generic any-ecosystem `openssl` row (unchanged by SAM-51) names the same product.
+    CHECK(key_of("", "openssl") == "openssl:openssl");
 }

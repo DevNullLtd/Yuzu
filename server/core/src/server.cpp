@@ -1112,6 +1112,48 @@ public:
                           "clamped to the worker pool). Utilisation = responses / capacity",
                           "gauge");
         metrics_.describe("yuzu_http_worker_pool_size", "Shared HTTP worker pool size", "gauge");
+        metrics_.describe("yuzu_auth_mfa_lockout_applied_total",
+                          "Accounts whose second factor was locked by the per-account failure budget",
+                          "counter");
+        metrics_.describe("yuzu_auth_mfa_lockout_blocked_total",
+                          "Second-factor attempts refused because the account budget was already spent",
+                          "counter");
+        metrics_.describe("yuzu_auth_mfa_budget_unavailable_total",
+                          "Second-factor attempts refused 503 because the attempt could not be "
+                          "reserved in the auth store (nothing was verified)",
+                          "counter");
+        metrics_.describe("yuzu_auth_pbkdf2_budget_rejected_total",
+                          "Password-hash requests refused 429 by the concurrency budget, stripe or "
+                          "break-glass lane (labels: route, class, reason)",
+                          "counter");
+        // Pre-seed so the first lock / refusal reads as an increase from 0, not a new series.
+        for (const char* n : {"yuzu_auth_mfa_lockout_applied_total",
+                              "yuzu_auth_mfa_lockout_blocked_total",
+                              "yuzu_auth_mfa_budget_unavailable_total"})
+            metrics_.counter(n);
+        for (const char* route : {"login", "password_change", "mfa_recovery"})
+            for (const char* cls : {"unauthenticated", "authenticated", "break_glass"})
+                for (const char* reason : {"per_source", "per_principal", "class_full",
+                                           "global_full", "stripe_busy", "stripe_cap"})
+                    metrics_.counter("yuzu_auth_pbkdf2_budget_rejected_total",
+                                     {{"route", route}, {"class", cls}, {"reason", reason}});
+        metrics_.describe("yuzu_auth_pbkdf2_budget_in_flight_peak",
+                          "Peak password-hash (PBKDF2) slots in use since the previous periodic sweep",
+                          "gauge");
+        metrics_.describe("yuzu_auth_login_stripe_waiters",
+                          "Login requests now waiting (at most 150 ms each) for their username's "
+                          "serialisation stripe",
+                          "gauge");
+        metrics_.describe("yuzu_auth_login_stripe_waiter_cap",
+                          "Most login requests that may wait for a username stripe at once (and "
+                          "at most 2 per stripe)",
+                          "gauge");
+        metrics_.describe("yuzu_auth_pbkdf2_budget_break_glass_lane",
+                          "Concurrent break-glass password attempts allowed (one per source "
+                          "address): min(4, cap/4)",
+                          "gauge");
+        metrics_.describe("yuzu_auth_pbkdf2_budget_capacity",
+                          "Process-wide cap on concurrent password-hash (PBKDF2) work", "gauge");
         metrics_.gauge("yuzu_http_held_open_responses").set(0);
         metrics_.describe("yuzu_mcp_streams_handover_pending",
                           "Superseded MCP SSE streams still draining - each still pins a worker",
@@ -4130,6 +4172,31 @@ public:
                           "--auth-mode=sso-only (the TOTP challenge still follows)",
                           "counter");
         metrics_.counter("yuzu_auth_break_glass_login_total");
+        metrics_.describe("yuzu_auth_break_glass_pending_refused_total",
+                          "Break-glass logins refused at the MFA step, by reason (disarmed: the arm "
+                          "was removed; window_ended; transient: the arm state could not be read) "
+                          "and stage (pre_verify: before a code was verified; pre_mint: after "
+                          "verification, before the session)",
+                          "counter");
+        for (const char* reason : {"disarmed", "window_ended", "transient"})
+            for (const char* stage : {"pre_verify", "pre_mint"})
+                metrics_.counter("yuzu_auth_break_glass_pending_refused_total",
+                                 {{"reason", reason}, {"stage", stage}});
+        metrics_.describe("yuzu_auth_break_glass_pending_transient_admitted_total",
+                          "Break-glass logins completed at the MFA step while the arm state could "
+                          "not be re-read, inside the bound taken from the read made before "
+                          "verification",
+                          "counter");
+        metrics_.counter("yuzu_auth_break_glass_pending_transient_admitted_total");
+        metrics_.describe("yuzu_auth_break_glass_arm_gate_total",
+                          "Break-glass arm-state gate answers where the arm state could not be "
+                          "established: read_failed (the bounded database read failed or there is "
+                          "no auth store), refresh_busy (a refresh was in flight and the cache was "
+                          "older than 1 s) and stale_read (a read said armed but started more than "
+                          "4.5 s earlier)",
+                          "counter");
+        for (const char* r : {"read_failed", "refresh_busy", "stale_read"})
+            metrics_.counter("yuzu_auth_break_glass_arm_gate_total", {{"result", r}});
         // HA WS-1(1b), ADR-2002 section 5, and #4990: the dispatch-record
         // table's retention (ExecutionTracker's PG-backed command_execution
         // table: one row per dispatch carrying command_id -> plugin and
@@ -10772,6 +10839,15 @@ public:
                 // this thread's loop or terminate the process: the next tick republishes.
                 try {
                     publish_mfa_binding_gauges(metrics_, auth_db_.get(), session_store_.get());
+                    if (auth_routes_)
+                    {
+                        // Peak since the last sweep: an instantaneous reading is ~0 for a
+                        // 50-150 ms hash.
+                        metrics_.gauge("yuzu_auth_pbkdf2_budget_in_flight_peak")
+                            .set(static_cast<double>(auth_routes_->pbkdf2_budget().take_peak()));
+                        metrics_.gauge("yuzu_auth_login_stripe_waiters")
+                            .set(static_cast<double>(auth_routes_->stripe_waiters()));
+                    }
                 } catch (const std::exception& e) {
                     spdlog::warn("mfa binding gauge publish failed: {}", e.what());
                 } catch (...) {
@@ -17093,6 +17169,45 @@ private:
         // its sibling above, from the same post-clamp number.
         metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
+        // WP03 perf-F1: cap concurrent PBKDF2 (login / recovery-code / password-change proof)
+        // work at a quarter of the worker pool so hashing can never pin every worker.
+        if (auth_routes_) {
+            // One pure sizing function (pbkdf2_budget.hpp, unit-tested at real pool sizes) feeds
+            // the setters, the gauges, the boot log and the boot warning.
+            const auto sz = yuzu::server::login_sizing(pool_max, cfg_.auth_pbkdf2_per_source_cap);
+            auth_routes_->set_pbkdf2_cap(sz.cap);
+            auth_routes_->pbkdf2_budget().set_per_source_cap(cfg_.auth_pbkdf2_per_source_cap);
+            auth_routes_->set_stripe_waiter_cap(sz.stripe_waiters);
+            metrics_.gauge("yuzu_auth_pbkdf2_budget_capacity").set(static_cast<double>(sz.cap));
+            metrics_.gauge("yuzu_auth_login_stripe_waiter_cap")
+                .set(static_cast<double>(sz.stripe_waiters));
+            metrics_.gauge("yuzu_auth_pbkdf2_budget_break_glass_lane")
+                .set(static_cast<double>(sz.break_glass_lane));
+            metrics_.gauge("yuzu_auth_login_stripe_waiters").set(0.0);
+            metrics_.gauge("yuzu_auth_pbkdf2_budget_in_flight_peak").set(0.0);
+            spdlog::info("login concurrency limits: worker pool {}, hashing cap {} (unauthenticated "
+                         "lane {}, authenticated lane {}), stripe waiter cap {} (2 per stripe), "
+                         "break-glass lane {}, per-address cap {}",
+                         pool_max, sz.cap, sz.unauthenticated_lane, sz.authenticated_lane,
+                         sz.stripe_waiters, sz.break_glass_lane, cfg_.auth_pbkdf2_per_source_cap);
+            if (sz.small_pool || sz.pool_crowded) {
+                spdlog::warn("login concurrency limits are reduced by the small HTTP worker pool "
+                             "({} workers): hashing cap {}, stripe waiter cap {}, break-glass lane {} "
+                             "(full size {} from a pool of 64). A modest flood of logins can occupy "
+                             "most of the pool and a few addresses can keep the break-glass lane "
+                             "busy; raise --http-worker-threads",
+                             pool_max, sz.cap, sz.stripe_waiters, sz.break_glass_lane,
+                             yuzu::server::kBreakGlassLaneMax);
+            }
+            if (sz.per_source_covers_lane) {
+                spdlog::warn("--auth-pbkdf2-per-source-cap {} is at or above the unauthenticated "
+                             "login lane ({}): one client address (or every user behind one proxy, "
+                             "load balancer or NAT) can hold the whole lane and every other "
+                             "address's login is answered 429. Lower the cap or raise "
+                             "--http-worker-threads",
+                             cfg_.auth_pbkdf2_per_source_cap, sz.unauthenticated_lane);
+            }
+        }
         // A security-relevant toggle nobody can confirm the state of is an operability
         // gap. --max-sse-streams already surfaces its resolved value as a gauge; this
         // does the same, so an operator can answer "is streamed POST live on this box"
@@ -18213,6 +18328,17 @@ private:
                                      const std::string& type, const std::string& op,
                                      const std::string& agent_id) -> bool {
             return require_scoped_permission(req, res, type, op, agent_id);
+        };
+        // The SAME per-device scoped gate, returning its refusal class (admit, deny, "could not
+        // evaluate", or a degraded authorization read) instead of a bool. It is the one body the
+        // Boolean gate above compares with Admitted, so the response, audit row and metric are the
+        // gate's own either way. Wired into the two Echo purge surfaces that must tell a denial
+        // from an outage (the dashboard fragments and the REST purge); every other consumer keeps
+        // scoped_perm_fn.
+        auto scoped_gate_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& type, const std::string& op,
+                                     const std::string& agent_id) -> yuzu::server::ScopedGateOutcome {
+            return auth_routes_->require_scoped_permission_outcome(req, res, type, op, agent_id);
         };
         // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
         // The fleet guaranteed-state status route's SOLE authorization gate, and the MCP
@@ -22918,7 +23044,8 @@ private:
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
         // #2540: the Echo purge/re-enable POSTs authorize through the SAME per-device scoped
         // gate as the REST purge twin (set before register_routes, per the ordering note above).
-        dashboard_routes_->set_scoped_perm_fn(scoped_perm_fn);
+        // The typed lambda: a degraded authorization read is answered 503, not collapsed into the 404.
+        dashboard_routes_->set_scoped_perm_fn(scoped_gate_fn);
         dashboard_routes_->set_forensics_plugin_set(forensics_plugins()); // #4990
         dashboard_routes_->set_forensics_visibility_fn(forensics_visibility_fn);
         // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
@@ -24174,6 +24301,11 @@ private:
         // register_routes() (captured by value at registration), same timing as the setters above.
         rest_api_v1_->set_forensics_plugin_set(forensics_plugins());
         rest_api_v1_->set_forensics_visibility_fn(forensics_visibility_fn);
+        // The Echo retention-paused purge route's typed scoped gate. The route copies the function
+        // by value when routes register, so this MUST stay above register_routes() (a call after
+        // it leaves the purge on its fail-closed 500 for good); tests/test_echo_security_wiring_lexical.py
+        // pins the order.
+        rest_api_v1_->set_scoped_gate_fn(scoped_gate_fn);
         // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
         // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
         // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT
@@ -24632,12 +24764,14 @@ private:
             // MCP tools can never disagree with the dashboard.
             network_api,
             // lockout_clear_fn — admin unlock (POST /api/v1/users/<name>/unlock).
-            // Wraps AuthDB::clear_failed_logins so RestApiV1 stays decoupled from
+            // Wraps AuthDB::clear_account_lockouts (the password lockout AND the MFA failure
+            // budget in one statement) so RestApiV1 stays decoupled from
             // AuthDB (same injection pattern as session_revoke_fn). SOC 2 CC6.3.
             // Empty/null auth_db ⇒ false ⇒ the route 500s and audits the failure.
             [this](const std::string& username) -> bool {
                 auto* db = auth_mgr_.auth_db_ptr();
-                return db && db->clear_failed_logins(username).has_value();
+                // WP03: ONE statement lifts both the password lockout and the MFA failure budget.
+                return db && db->clear_account_lockouts(username).has_value();
             },
             // Baseline-anchored per-device Guardian status route (trailing optional deps).
             baseline_store_.get(),
@@ -25079,6 +25213,16 @@ private:
                     };
             }
             tool_deps.crypto_access_fn = crypto_access_cb;
+            // Fleet application usage (get_dex_apps_usage): a pure forward of the same DexApi
+            // GET /api/v1/dex/apps/usage calls. Empty when the deployment has no DexApi.
+            if (dex_api) {
+                tool_deps.dex_apps_usage_fn =
+                    [dex_api](const std::string& window, const std::string& platform_scope,
+                              const DexUsageSlice& slice, std::int64_t floor,
+                              const authz::VisibleSet& visible) {
+                        return dex_api->apps_usage(window, platform_scope, slice, floor, visible);
+                    };
+            }
             // #6087: get/set/reset_dex_score_policy. The read closure is the REST GET's
             // reader; the apply closure is a pure forward of apply_dex_score_policy, the one
             // audit-first write path REST PUT/DELETE also call, with the per-request audit
@@ -25526,12 +25670,13 @@ private:
                 // B4 (#2146 API-parity) — backs the unlock_account MCP tool
                 // (twin of POST /api/v1/users/{name}/unlock). Same wiring as the
                 // REST route's lockout_clear_fn above: wraps
-                // AuthDB::clear_failed_logins so McpServer stays decoupled from
+                // AuthDB::clear_account_lockouts so McpServer stays decoupled from
                 // AuthDB. SOC 2 CC6.3. Empty/null auth_db => false => the tool
                 // reports "lockout subsystem unavailable".
                 [this](const std::string& username) -> bool {
                     auto* db = auth_mgr_.auth_db_ptr();
-                    return db && db->clear_failed_logins(username).has_value();
+                    // WP03: ONE statement lifts both the password lockout and the MFA failure budget.
+                    return db && db->clear_account_lockouts(username).has_value();
                 },
                 // B5 (api-parity #2146) — the SAME offload_target_store_ instance
                 // OffloadRoutes::register_routes wires above (a real, non-dormant

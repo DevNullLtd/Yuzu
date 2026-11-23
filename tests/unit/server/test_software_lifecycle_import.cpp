@@ -332,12 +332,20 @@ TEST_CASE("lifecycle import: a PURL name with no title token identifies nothing"
     // unrelated PURLs, so each is an unusable identifier, counted and not stored.
     const auto ev = event(1, "endOfLife", range("vers:npm/*"));
     for (const char* bare : {R"("pkg:npm/2019")", R"("pkg:generic/x64")",
-                             R"("pkg:generic/enterprise")", R"("pkg:generic/acme/2019")"}) {
+                             R"("pkg:generic/acme/2019")"}) {
         const auto r = li::parse(li::Format::cle, doc_with(bare, ev), kRef);
         REQUIRE(r.has_value());
         CHECK(r->rules.empty());
         CHECK(skipped_count(*r, "empty_key") == 1);
     }
+    // An edition word is an edition only after a title word, so a name that is one ("Enterprise")
+    // keeps it as the title and identifies a product.
+    const auto edition =
+        li::parse(li::Format::cle, doc_with(R"("pkg:generic/enterprise")", ev), kRef);
+    REQUIRE(edition.has_value());
+    REQUIRE(edition->rules.size() == 1);
+    CHECK(edition->rules[0].product_key == product_lifecycle_key(norm_key("enterprise", "")));
+    CHECK(edition->skipped.empty());
 }
 
 TEST_CASE("lifecycle import: every unusable alias is counted once per mapped event",

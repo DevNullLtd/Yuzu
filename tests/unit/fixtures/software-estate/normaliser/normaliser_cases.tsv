@@ -1,0 +1,49 @@
+# kind	input	want_title_or_vendor	want_edition	want_version	defect  (tab separated; defect 0 = control row)
+#
+# Defect 1: an edition word that is the whole title normalised to an empty title.
+title	Home	home			1
+# Defect 2: an edition word at the start of a title was taken as a false edition.
+title	Pro Display Calibrator	pro display calibrator			2
+# Defect 3: the word 'edition' after an architecture word survived as 'edition)'.
+title	7-Zip 26.04 (x64 edition)	7-zip		26.04	3
+# Defect 4: a bare '-' separator was left in the title. The 2015-2022 range stays: it names the runtime generation.
+title	Microsoft Visual C++ 2015-2022 Redistributable (x86) - 14.44.35211	microsoft visual c++ 2015-2022 redistributable		14.44.35211	4
+title	Microsoft Visual C++ v14 Redistributable (x64) - 14.50.35719	microsoft visual c++ redistributable		14	4
+title	Windows Software Development Kit - Windows 10.0.26100.7705	windows software development kit windows		10.0.26100.7705	4
+# Defect 5: a legal-suffix word anywhere in a vendor name was stripped, and a vendor could reduce to nothing.
+vendor	macOS Software Signing	macos software signing			5
+vendor	Software AG	software ag			5
+vendor	Software	software			5
+vendor	Example L.L.C.	example			5
+# Defect 6: a Homebrew name@version kept the version in the name. Versions glued into a package name
+# (python3.14, postgresql-18, gcc-15) are legitimate package names and are pinned unchanged.
+title	python@3.14	python		3.14	6
+title	postgresql@18	postgresql		18	6
+title	erlang@28	erlang		28	6
+title	python3.14	python3.14			6
+title	postgresql-18	postgresql-18			6
+title	gcc-15	gcc-15			6
+# Defect 7 (pinned as it is, not fixed here): the 'plus' edition word and the locale suffix stay in the title.
+title	Microsoft Office Professional Plus 2019 - en-us	microsoft office plus en-us	professional	2019	7
+# Controls: titles that must not change.
+title	Windows 11 Pro	windows	pro	11	0
+title	Microsoft Office Home and Business 2019	microsoft office and business	home	2019	0
+title	7-Zip 23.01 (x64)	7-zip		23.01	0
+# Controls: the Visual C++ runtime generations. A single-year title still captures the year as the version
+# and shares one title across generations (filed, not changed here); only the dangling '-' went.
+title	Microsoft Visual C++ 2015-2022 Redistributable (x64) - 14.44.35211	microsoft visual c++ 2015-2022 redistributable		14.44.35211	0
+title	Microsoft Visual C++ 2013 Redistributable (x64) - 12.0.40664	microsoft visual c++ redistributable		2013	0
+title	Microsoft Visual C++ 2010  x64 Redistributable - 10.0.40219	microsoft visual c++ redistributable		2010	0
+# Controls: vendors that must not change.
+vendor	Microsoft Corporation	microsoft			0
+vendor	Adobe Systems Incorporated	adobe			0
+vendor	Oracle America, Inc.	oracle			0
+vendor	Python Software Foundation	python			0
+vendor	The Apache Software Foundation	the apache			0
+vendor	Check Point Software Technologies Ltd.	check point			0
+vendor	L.L.C.	l.l.c.			0
+# Controls: compound legal forms are not reduced (filed, not changed here).
+vendor	Example Software GmbH & Co. KG	example software gmbh & co. kg			0
+vendor	Example S.A.S.	example s.a.s.			0
+vendor	Example KG	example kg			0
+vendor	Example Co	example co			0

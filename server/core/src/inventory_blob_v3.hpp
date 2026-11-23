@@ -16,10 +16,12 @@
 ///                                                                              opens a section
 ///       +    | name | version | publisher | install_date | kind | ecosystem | epoch | release |
 ///              arch | signature_status | distro_id | distro_version | install_location |
-///              <slot 14, reserved, always empty> | package_id | source      an install row
+///              attributes | package_id | source                             an install row
 ///              (publisher is never empty from a v3 writer: the declared vendor, else the
 ///              origin label `via:<ecosystem>`; the parser takes it verbatim, see
-///              product_normalize.hpp kOriginLabelPrefix)
+///              product_normalize.hpp kOriginLabelPrefix; `attributes`, slot 14, is empty or the
+///              canonical `key=value` field of common/include/yuzu/install_row_attributes.hpp, and
+///              a value that is not already canonical refuses the section `bad_attributes`)
 ///       -    | row_hash                                                      a row-hash deletion
 ///       comp | kind | name | version | version_source | path | size | mtime | anchor_app
 ///  - `facet` is a `software_catalog::kSoftwareSources` value or `component_inventory`; `status`
@@ -50,6 +52,8 @@
 #include "software_inventory_types.hpp"
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/install_row_attributes.hpp>
+
 #include <array>
 #include <charconv>
 #include <cstddef>
@@ -74,6 +78,10 @@ inline constexpr std::size_t kV3MaxDeletions = 20000;  ///< `-` records per call
 inline constexpr std::size_t kV3MaxComponents = 20000; ///< `comp` records per call
 inline constexpr std::size_t kV3MaxFieldLen = 1024;
 inline constexpr std::size_t kV3MaxFacetLen = 64;
+// Both sides clamp slot 14 to kV3MaxFieldLen before the validator runs, so a one-sided change
+// would let a clamp cut a value the validator then accepts on one side only.
+static_assert(yuzu::install_attrs::kMaxAttributesLen == kV3MaxFieldLen,
+              "attribute field cap must equal the v3 per-field cap");
 
 inline constexpr std::string_view kV3Header = "\037v3\036";
 inline constexpr std::string_view kComponentInventoryFacet = "component_inventory";
@@ -141,6 +149,7 @@ enum class V3Refusal {
     kBadRecord,        ///< a record missing a required field
     kBadRowHash,       ///< a - record that is not 64 lowercase hex
     kBadVersionSource, ///< a comp record with a version_source outside the closed set
+    kBadAttributes,    ///< a + record whose slot 14 is not canonical (install_row_attributes.hpp)
     kRowCap,           ///< kV3MaxRows / kV3MaxDeletions / kV3MaxComponents exceeded
     kNulByte,          ///< a record holding a NUL byte (it could not be stored as it was hashed)
     kUnterminated,     ///< the last record of the blob lacks its 0x1E terminator (truncated)
@@ -172,6 +181,8 @@ enum class V3Refusal {
         return "bad_row_hash";
     case V3Refusal::kBadVersionSource:
         return "bad_version_source";
+    case V3Refusal::kBadAttributes:
+        return "bad_attributes";
     case V3Refusal::kRowCap:
         return "row_cap";
     case V3Refusal::kNulByte:
@@ -447,6 +458,8 @@ parse_v3_blob(std::string_view blob) {
                 refuse_sec(sec, V3Refusal::kRowCap);
             } else if (f[16] != sec.facet) {
                 refuse_sec(sec, V3Refusal::kSourceMismatch);
+            } else if (!yuzu::install_attrs::canonical_attributes(f[14])) {
+                refuse_sec(sec, V3Refusal::kBadAttributes);
             } else {
                 SoftwareEntry e;
                 e.name = std::move(f[1]);
@@ -462,7 +475,7 @@ parse_v3_blob(std::string_view blob) {
                 e.distro_id = std::move(f[11]);
                 e.distro_version = std::move(f[12]);
                 e.install_location = std::move(f[13]);
-                // f[14] is the reserved uninstall_string slot: consumed, never kept.
+                e.attributes = std::move(f[14]); // validated canonical above
                 e.package_id = std::move(f[15]);
                 e.source = std::move(f[16]);
                 if (!e.name.empty()) { // as the v2 parser: a nameless record is not a row
