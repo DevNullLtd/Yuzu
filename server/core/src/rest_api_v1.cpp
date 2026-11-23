@@ -86,6 +86,7 @@
 #include "admin_gate.hpp"
 #include "engine_no_admin_audit.hpp" // the shared no-admin auditor (REST + MCP)
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
+#include "echo_source_action_rules.hpp" // the shared Echo purge metric vocabulary and refusal mapping
 #include "response_templates_engine.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_catalogue_model.hpp" // shared REST+MCP software catalogue model
@@ -2443,7 +2444,7 @@ const std::string& openapi_spec() {
       "post": {"operationId": "postUsersByUsernameUnlock", "summary": "Clear a user's account-lockout counter (admin unlock)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/UsersUnlockResult"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Username empty or malformed"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Requires UserManagement:Write"}, "500": {"description": "Auth store write failed"}, "503": {"description": "Lockout subsystem unavailable (auth store not configured or unreachable \u2014 see --postgres-dsn)"}}}
     },
     "/users/me/password": {
-      "post": {"operationId": "postUsersMePassword", "security": [{"cookieAuth": []}], "summary": "Change your own local-account password", "tags": ["Users"], "description": "Interactive LOCAL cookie session only (API/MCP/engine/service-scoped tokens 403 token_session; SSO sessions 409 not_local). Cookie-session writes require a same-site Origin or Referer: the central check answers first (403, message cross-site request refused) and this route keeps its own copy as defence in depth (403 csrf). Content-Type: application/json is required (415). MFA step-up if enrolled. The current password is checked through the SAME lockout-accounted path as POST /login, so a wrong current password counts toward account lockout; a password that could not be verified (auth store unavailable, or the credential changed concurrently) is a retryable 503 and never counts. Under --auth-mode=sso-only only an ARMED break-glass account may change its password (403 sso_only_local_disabled otherwise, with no password evaluated). New password: 12..1024 BYTES (UTF-8). ONE TRANSACTION under the account's row lock: the credential, the deletion of every session of the account (the caller's own included, durable and cross-replica), the wipe of a provisional (un-enrolled) TOTP secret, and the user.password_change audit row commit or abort together. A refusal changes nothing except that a wrong current password counts a lockout strike (the caller's session stays valid). If the audit row cannot be written the whole change is not made: 503 audit_unavailable + Sec-Audit-Failed. No replacement session is issued: on success the response clears the cookie (Set-Cookie Max-Age=0) and the user signs in again with the new password. A 503 changed nothing unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way. No MCP twin by design.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["current_password", "new_password"], "properties": {"current_password": {"type": "string", "description": "Not length-checked as a request field: a value over 1024 bytes is answered as a wrong current password (403 wrong_current, counts toward lockout) without being hashed, as POST /login does"}, "new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Changed: {username, password_changed, sessions_revoked, session_reissued (always false), provisional_mfa_cleared, audit_emitted (always true)}; Set-Cookie clears the session cookie (Max-Age=0)", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/UsersSelfPasswordChangeResult"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Malformed body, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Wrong current password, including one over 1024 bytes (also returned while the account is locked), token session, cross-origin request, or sso_only_local_disabled"}, "404": {"description": "Account no longer active (nothing changed)"}, "409": {"description": "Not a local account (SSO/SCIM) — not_local; or the password changed concurrently — conflict (nothing changed)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "store_unavailable, audit_unavailable (+ Sec-Audit-Failed), or the password could not be verified (verify_transient); retry_after_ms set. Nothing changed unless the connection was lost at commit"}}}
+      "post": {"operationId": "postUsersMePassword", "security": [{"cookieAuth": []}], "summary": "Change your own local-account password", "tags": ["Users"], "description": "Interactive LOCAL cookie session only (API/MCP/engine/service-scoped tokens 403 token_session; SSO sessions 409 not_local). Cookie-session writes require a same-site Origin or Referer: the central check answers first (403, message cross-site request refused) and this route keeps its own copy as defence in depth (403 csrf). Content-Type: application/json is required (415). MFA step-up if enrolled. The current password is checked through the SAME lockout-accounted path as POST /login, so a wrong current password counts toward account lockout; a password that could not be verified (auth store unavailable, or the credential changed concurrently) is a retryable 503 and never counts. Under --auth-mode=sso-only only an ARMED break-glass account may change its password (403 sso_only_local_disabled otherwise, with no password evaluated). New password: 12..1024 BYTES (UTF-8). ONE TRANSACTION under the account's row lock: the credential, the deletion of every session of the account (the caller's own included, durable and cross-replica), the wipe of a provisional (un-enrolled) TOTP secret, and the user.password_change audit row commit or abort together. A refusal changes nothing except that a wrong current password counts a lockout strike (the caller's session stays valid). If the audit row cannot be written the whole change is not made: 503 audit_unavailable + Sec-Audit-Failed. No replacement session is issued: on success the response clears the cookie (Set-Cookie Max-Age=0) and the user signs in again with the new password. A 503 changed nothing unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way. No MCP twin by design.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["current_password", "new_password"], "properties": {"current_password": {"type": "string", "description": "Not length-checked as a request field: a value over 1024 bytes is answered as a wrong current password (403 wrong_current, counts toward lockout) without being hashed, as POST /login does"}, "new_password": {"type": "string", "minLength": 12, "maxLength": 1024, "description": "Length is measured in bytes (UTF-8)"}}}}}}, "responses": {"200": {"description": "Changed: {username, password_changed, sessions_revoked, session_reissued (always false), provisional_mfa_cleared, audit_emitted (always true)}; Set-Cookie clears the session cookie (Max-Age=0)", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/UsersSelfPasswordChangeResult"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Malformed body, or new password outside 12..1024 bytes (not audited)"}, "401": {"description": "Unauthenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Wrong current password, including one over 1024 bytes (also returned while the account is locked), token session, cross-origin request, or sso_only_local_disabled"}, "404": {"description": "Account no longer active (nothing changed)"}, "409": {"description": "Not a local account (SSO/SCIM) — not_local; or the password changed concurrently — conflict (nothing changed)"}, "415": {"description": "Content-Type is not application/json"}, "429": {"description": "pbkdf2_busy: a concurrency limit was reached (the authenticated hashing lane, at most 3 slots per principal, or the per-username stripe waiter limits or bounded wait); nothing was verified or counted toward lockout; Retry-After and retry_after_ms set"}, "503": {"description": "store_unavailable, audit_unavailable (+ Sec-Audit-Failed), or the password could not be verified (verify_transient); retry_after_ms set. Nothing changed unless the connection was lost at commit"}}}
     },
 )json"
         R"json(
@@ -2961,7 +2962,7 @@ const std::string& openapi_spec() {
       "get": {"operationId": "getSettingsAnalytics", "summary": "Analytics drain + ClickHouse integration settings", "tags": ["Settings"], "description": "REST v1 read-twin of GET /fragments/settings/analytics. Requires AnalyticsConfig:Read (dedicated securable). Audited fail-closed (settings.analytics.read) because the page can expose embedded credentials. clickhouse_url is sanitized of embedded userinfo credentials before being returned, and the raw password is never returned, only clickhouse_password_set. MCP: deliberately REST-only (MCP tokens are barred from server-administration surfaces such as settings; see /settings/tls).", "responses": {"200": {"description": "{data: {enabled, drain_interval_seconds, batch_size, clickhouse_configured, clickhouse_url (userinfo-sanitized), clickhouse_database, clickhouse_table, clickhouse_username, clickhouse_password_set, jsonl_export_path}, meta}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SettingsAnalyticsResponse"}}}}, "403": {"description": "Permission denied (AnalyticsConfig:Read)"}, "503": {"description": "Audit subsystem unavailable — refuses to serve without durable evidence"}}}
     },
     "/echo/retention-paused/purge": {
-      "post": {"operationId": "postEchoRetentionPausedPurge", "summary": "Dispatch a destructive single-device Echo source purge", "tags": ["Dashboard Echo"], "description": "Requires Infrastructure:Delete, enforced per-device and management-group-scoped (fail-closed: refused with 500 if the per-device check is not configured). JSON twin of POST /fragments/echo/retention-paused/purge: permanently drops every warehouse row for a paused source on one device while leaving the collector paused. IRREVERSIBLE. Audit (echo.source.purge, result=requested) is written BEFORE dispatch, fail-closed — the purge is never dispatched without durable evidence. Async: agent computes rows_deleted (and the agent-side source_not_paused refusal, if the source was re-enabled between scan and purge, or config_unreadable if the enable flag could not be read) into the command's response record, polled by command_id, not returned in the 202 body. Requires an agent implementing echo.purge_source (v0.14.0+).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["device_id", "source"], "properties": {"device_id": {"type": "string", "description": "Target agent; must be within the caller's management scope."}, "source": {"type": "string", "enum": ["process", "tcp", "service", "user"]}}}}}}, "responses": {"202": {"description": "{command_id, device_id, source, agents_reached}. X-Correlation-Id header on every response.", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "object", "properties": {"command_id": {"type": "string"}, "device_id": {"type": "string"}, "source": {"type": "string", "enum": ["process", "tcp", "service", "user"]}, "agents_reached": {"type": "integer", "description": "Number of agents the purge was dispatched to (at least 1 on this path)."}}, "required": ["command_id", "device_id", "source", "agents_reached"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Invalid JSON, missing device_id/source, or source not one of process|tcp|service|user"}, "403": {"description": "Permission denied by the scoped Infrastructure:Delete gate, including when that gate refuses after the requested audit row was written (its own 403 body; nothing dispatched; a failure audit row with detail permission_revoked closes the requested row); or the dispatch chokepoint refused the pair for the caller (error message dispatch denied: reason=forbidden|approval_required|anonymous_operator|kill_switched, audit detail dispatch_denied reason=<token>). permission_revoked, dispatch_denied and caller_unresolved are audit-detail and metric tokens, not an error.reason field. A caller that no longer resolves after the requested row gets the resolver's own authentication refusal (audit detail caller_unresolved)"}, "404": {"description": "Device out of scope, or dispatch reached zero agents (device offline/quarantined/containment-withheld)"}, "500": {"description": "Scope gate not configured (server misconfiguration), or a server catalogue fault: the dispatch chokepoint reported the server-named pair as unclassified or ambiguous (dispatch_denied, reason=unclassified|ambiguous)"}, "503": {"description": "Command dispatch unavailable, or the pre-dispatch audit row could not be persisted (Sec-Audit-Failed header; purge not dispatched)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the mutation succeeded but its own audit row failed to persist."}}}}}
+      "post": {"operationId": "postEchoRetentionPausedPurge", "summary": "Dispatch a destructive single-device Echo source purge", "tags": ["Dashboard Echo"], "description": "Requires Infrastructure:Delete, enforced per-device and management-group-scoped (fail-closed: refused with 500 if the per-device check is not configured). JSON twin of POST /fragments/echo/retention-paused/purge: permanently drops every warehouse row for a paused source on one device while leaving the collector paused. IRREVERSIBLE. Audit (echo.source.purge, result=requested) is written BEFORE dispatch, fail-closed — the purge is never dispatched without durable evidence. Async: agent computes rows_deleted (and the agent-side source_not_paused refusal, if the source was re-enabled between scan and purge, or config_unreadable if the enable flag could not be read) into the command's response record, polled by command_id, not returned in the 202 body. Requires an agent implementing echo.purge_source (v0.14.0+).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["device_id", "source"], "properties": {"device_id": {"type": "string", "description": "Target agent; must be within the caller's management scope."}, "source": {"type": "string", "enum": ["process", "tcp", "service", "user"]}}}}}}, "responses": {"202": {"description": "{command_id, device_id, source, agents_reached}. X-Correlation-Id header on every response.", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "object", "properties": {"command_id": {"type": "string"}, "device_id": {"type": "string"}, "source": {"type": "string", "enum": ["process", "tcp", "service", "user"]}, "agents_reached": {"type": "integer", "description": "Number of agents the purge was dispatched to (at least 1 on this path)."}}, "required": ["command_id", "device_id", "source", "agents_reached"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "Invalid JSON, missing device_id/source, or source not one of process|tcp|service|user"}, "403": {"description": "Permission denied by the scoped Infrastructure:Delete gate, including when that gate refuses after the requested audit row was written (its own 403 body; nothing dispatched; a failure audit row with detail permission_revoked closes the requested row, or store_unavailable store=<mgmt_group_store|rbac_store> when a RBAC or management-group read failed); or the dispatch chokepoint refused the pair for the caller (error message dispatch denied: reason=forbidden|approval_required|anonymous_operator|kill_switched, audit detail dispatch_denied reason=<token>). permission_revoked, store_unavailable, dispatch_denied and caller_unresolved are audit-detail tokens, not an error.reason field. A caller that no longer resolves after the requested row gets the resolver's own authentication refusal (audit detail caller_unresolved)"}, "404": {"description": "Device out of scope, or dispatch reached zero agents (device offline/quarantined/containment-withheld)"}, "500": {"description": "Scope gate not configured (server misconfiguration), or a server catalogue fault: the dispatch chokepoint reported the server-named pair as unclassified or ambiguous (dispatch_denied, reason=unclassified|ambiguous)"}, "503": {"description": "Command dispatch unavailable; the scoped gate itself could not evaluate authority (its own 503, and a failure audit row with detail scoped_gate_unavailable closes the requested row when it refuses after that row was written); or the pre-dispatch audit row could not be persisted (Sec-Audit-Failed header; purge not dispatched)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the mutation succeeded but its own audit row failed to persist."}}}}}
     },
 )json"
         R"json(
@@ -3757,6 +3758,12 @@ void register_password_routes(HttpRouteSink& sink, PasswordRouteWiring wiring) {
         case PasswordCheckOutcome::kStoreUnavailable:
             ctx.store_unavailable();
             return;
+        case PasswordCheckOutcome::kBusy:
+            // WP03 perf-F1: the process-wide PBKDF2 budget is full; nothing ran or counted.
+            ctx.refuse(429, "denied", "pbkdf2_busy",
+                       "too many concurrent authentication attempts",
+                       "retry shortly; the server caps concurrent password hashing", 2000);
+            return;
         case PasswordCheckOutcome::kTransient:
             // Not a guess (store read failed, or the credential changed under
             // the row lock): retryable, never counted toward lockout.
@@ -4166,6 +4173,9 @@ void RestApiV1::register_routes(
     // The device-table roster behind the software lookup routes' `hostname` — see
     // set_hostnames_fn's doc comment in the .hpp.
     HostnamesFn hostnames_fn = hostnames_fn_;
+    // The Echo purge route's typed per-device gate - see set_scoped_gate_fn's doc comment in the
+    // .hpp. Copied here, at registration, which is why the setter must run first.
+    ScopedGateFn scoped_gate_fn = scoped_gate_fn_;
     // Cancel/rerun twins: bound to the tracker unless a test installed fake ports (see
     // set_execution_mutation_ports_for_test). Snapshotted like the members above.
     ExecutionMutationPorts execution_mutation_ports =
@@ -4616,21 +4626,24 @@ void RestApiV1::register_routes(
     // POST /api/v1/echo/retention-paused/purge — A1 structured surface for the
     // DESTRUCTIVE Echo source purge (dashboard parity with the HTML fragment
     // /fragments/echo/retention-paused/purge). Per-device gated on
-    // Infrastructure:Delete + management-group scope via scoped_perm_fn (fail-closed),
+    // Infrastructure:Delete + management-group scope via scoped_gate_fn (fail-closed),
     // audited fail-closed (no dispatch without durable evidence), async: returns the
     // command_id. rows_deleted and the agent-side source_not_paused refusal live in
     // the command's response record (the dispatch is fire-and-forget). Governance
-    // HIGH #3/#4.
+    // HIGH #3/#4. The gate answers with its own status, body and audit row, and also
+    // returns its refusal class, which only picks the metric `result` (and the detail of
+    // the recheck's failure row when the gate answered 503 itself or an authorization read
+    // was degraded): the status and body of every refusal are the gate's. There is no repeat
+    // bound on this surface.
     sink.Post(
         "/api/v1/echo/retention-paused/purge",
-        [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry,
+        [scoped_gate_fn, command_dispatch_fn, audit_fn, metrics_registry,
          resolve_secondary_caller](const httplib::Request& req, httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            auto bump = [&](const char* result) {
-                if (metrics_registry)
-                    metrics_registry->counter("yuzu_echo_source_purge_total", {{"result", result}})
-                        .increment();
+            auto bump = [&](std::string_view result) {
+                echo_source::count(metrics_registry, echo_source::kPurgeTotal,
+                                   echo_source::kSurfaceRest, result);
             };
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded() || !body.is_object()) {
@@ -4661,20 +4674,21 @@ void RestApiV1::register_routes(
             // Per-device scope gate: Infrastructure:Delete + management-group scope,
             // fail-closed if unwired (never widen to a global gate). Emits its own
             // 403/404 + A4 envelope on denial; we only tally the metric.
-            if (!scoped_perm_fn) {
+            if (!scoped_gate_fn) {
                 res.status = 500;
-                bump("denied");
+                bump("infra_unavailable");
                 res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
                                 "application/json");
                 return;
             }
-            if (!scoped_perm_fn(req, res, "Infrastructure", "Delete", device_id)) {
-                bump("denied");
+            if (const auto gate = scoped_gate_fn(req, res, "Infrastructure", "Delete", device_id);
+                gate != ScopedGateOutcome::Admitted) {
+                bump(echo_source::refusal_result(gate, false));
                 return;
             }
             if (!command_dispatch_fn) {
                 res.status = 503;
-                bump("denied");
+                bump("infra_unavailable");
                 res.set_content(
                     detail::error_json_a4(503, "command dispatch unavailable", cid, 5000, ""),
                     "application/json");
@@ -4686,7 +4700,7 @@ void RestApiV1::register_routes(
                                       "REST purge source=" + source + " cid=" + cid)) {
                 res.status = 503;
                 res.set_header("Sec-Audit-Failed", "true");
-                bump("denied");
+                bump("audit_unavailable");
                 res.set_content(
                     detail::error_json_a4(503,
                                           "audit subsystem unavailable; refusing to dispatch "
@@ -4707,14 +4721,18 @@ void RestApiV1::register_routes(
             };
             // #7110: the `requested` row is stored, so decide the per-device gate AGAIN: a
             // grant or a JIT elevation withdrawn while the row was being written dispatches
-            // nothing. The gate has already written its own 403; the row that already exists
-            // gets its outcome.
-            if (!scoped_perm_fn(req, res, "Infrastructure", "Delete", device_id)) {
-                fail("permission_revoked");
-                bump("denied");
+            // nothing. The gate has already written its own refusal; the row that already
+            // exists gets its outcome: `permission_revoked`, `scoped_gate_unavailable` when the gate
+            // itself answered 503, or, when an authorization read was degraded (the gate's 403
+            // deny-on-degrade), the shared `store_unavailable store=<mgmt_group_store|rbac_store>`
+            // token, so the row says why.
+            if (const auto recheck = scoped_gate_fn(req, res, "Infrastructure", "Delete", device_id);
+                recheck != ScopedGateOutcome::Admitted) {
+                fail(std::string(echo_source::refusal_detail(recheck, true)));
+                bump(echo_source::refusal_result(recheck, true));
                 return;
             }
-            // #1788 defense-in-depth: `scoped_perm_fn` above is the PRIMARY gate
+            // #1788 defense-in-depth: `scoped_gate_fn` above is the PRIMARY gate
             // and has already authorized this exact device_id, so the seam's
             // intersection is a second, independent check rather than the thing
             // standing between this caller and the fleet.
@@ -4737,7 +4755,7 @@ void RestApiV1::register_routes(
                 const auto token = reply_dispatch_denied(res, cid, *dispatch_outcome.denied,
                                                          "echo", "purge_source");
                 fail("dispatch_denied reason=" + token);
-                bump(token.c_str());
+                bump(token);
                 return;
             }
             if (sent == 0) {
@@ -4746,7 +4764,7 @@ void RestApiV1::register_routes(
                 // being indistinguishable is deliberate — a distinct status
                 // would disclose that a device exists but is out of reach. The
                 // METRIC is a known small imprecision, and the path is only
-                // reachable at all if scoped_perm_fn and the derived set
+                // reachable at all if scoped_gate_fn and the derived set
                 // disagree about this device, which is itself a bug.
                 // #881: this can also mean the device is QUARANTINED — a
                 // permanent policy denial, not a transient reachability
@@ -21645,34 +21663,22 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(dex_apps_usage_json(*r)), "application/json");
             return;
         }
-        const DexUsageRefusal& f = r.error();
-        if (f.reason == "invalid_slice") {
-            bad_request(f.detail == "unknown_group" ? "unknown management group" : "invalid slice");
+        // The one refusal table (dex_usage_json.hpp), shared with the MCP twin. Tokens only,
+        // never caller text.
+        const DexUsageRefusalClass c = dex_usage_refusal_class(r.error());
+        if (c.kind == DexUsageRefusalKind::CallerError) {
+            bad_request(c.message);
             return;
         }
-        // Tokens only, never caller text.
-        const std::string message = "fleet application usage unavailable (" + f.reason +
-                                    (f.detail.empty() || f.detail == f.reason ? "" : ": " + f.detail) +
-                                    ")";
         res.status = 503;
-        if (f.reason == "usage_unavailable" && f.detail == "fleet_too_large") {
-            // Sustained statement timeouts: retrying does not help.
-            res.set_content(
-                detail::error_json_a4(
-                    503, message, cid,
-                    detail::A4ErrorOpts{
-                        .remediation = "the usage read no longer fits its time bound for this fleet; "
-                                       "retrying does not help, only a narrower platform scope "
-                                       "reduces the read, and the state clears on the first "
-                                       "successful read (see 'Fleet usage per application' in the "
-                                       "DEX guide, docs/dex/app-usage.md)"}),
-                "application/json");
-        } else if (f.reason == "no_population" || f.reason == "invalid_request") {
-            res.set_content(detail::error_json_a4(503, message, cid), "application/json");
-        } else {
-            res.set_content(detail::error_json_a4(503, message, cid, 2000, "retry shortly"),
-                            "application/json");
-        }
+        res.set_content(
+            detail::error_json_a4(
+                503, c.message, cid,
+                detail::A4ErrorOpts{.retry_after_ms = c.retry_after_ms >= 0
+                                                          ? std::optional<std::int64_t>(c.retry_after_ms)
+                                                          : std::nullopt,
+                                    .remediation = c.remediation}),
+            "application/json");
     });
 
     // ── GET / PUT / DELETE /api/v1/dex/score-policy (#6086) ──
