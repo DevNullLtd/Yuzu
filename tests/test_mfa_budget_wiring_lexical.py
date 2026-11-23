@@ -279,6 +279,12 @@ def check_arm_recheck(files):
     if "arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at, gate1.read_wall_at};" not in body[g1:res]:
         bad.append("/login/mfa: the first arm re-check must record arm1 from the armed answer, with the wall "
                    "time at which THAT read started (gate1.read_wall_at), not a sample taken after the gate returned")
+    for stmt in ("const bool superseded1 = gate1.state == SsoOnlyLocalGate::kBreakGlassArmed && "
+                 "gate1.last_not_armed_at && *gate1.last_not_armed_at >= gate1.read_at;",
+                 "if (gate1.state == SsoOnlyLocalGate::kBreakGlassArmed && !superseded1) {"):
+        if stmt not in _ws(body[g1:res]):
+            bad.append(f"/login/mfa: the first arm re-check must contain `{stmt}` (an armed answer older "
+                       "than a not-armed read this server holds is refused before anything is spent)")
     if "arm_wall_clock_now()" in body[g1:res]:
         bad.append("/login/mfa: no wall-clock sample between the first gate call and the reservation "
                    "(the anchor is the read's start, carried by the gate)")
@@ -569,6 +575,10 @@ def selftest(files):
             lambda m: move_text(m, blk1, "bool matched = false;"))
         mut("first re-check moved after the first verifier",
             lambda m: move_text(m, blk1, "if (store_unavailable) {"))
+        mut("first re-check accepts an armed answer older than a not-armed read",
+            sub_cpp("kBreakGlassArmed && !superseded1) {", "kBreakGlassArmed) {"))
+        mut("first re-check never sees a superseded answer",
+            sub_cpp("gate1.last_not_armed_at && *gate1.last_not_armed_at >= gate1.read_at;", "false;"))
         mut("first re-check does not record arm1",
             sub_cpp("arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at, gate1.read_wall_at};", ""))
         mut("first re-check anchors the wall time after the gate returned",

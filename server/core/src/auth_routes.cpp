@@ -3608,7 +3608,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         };
         if (entry.break_glass) {
             const SsoOnlyGateResult gate1 = sso_only_local_password_gate(entry.username);
-            if (gate1.state == SsoOnlyLocalGate::kBreakGlassArmed) {
+            // The request that performed the shared refresh can be given an "armed" answer whose read
+            // started at or before a not-armed read this server holds (another login's own read
+            // finished inside it). That answer is superseded: refuse it here, as a disarm, before
+            // anything is verified or spent.
+            const bool superseded1 = gate1.state == SsoOnlyLocalGate::kBreakGlassArmed &&
+                                     gate1.last_not_armed_at && *gate1.last_not_armed_at >= gate1.read_at;
+            if (gate1.state == SsoOnlyLocalGate::kBreakGlassArmed && !superseded1) {
                 arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at, gate1.read_wall_at};
             } else if (gate1.state == SsoOnlyLocalGate::kTransient) {
                 const std::string uname = entry.username;

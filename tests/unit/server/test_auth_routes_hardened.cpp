@@ -1209,6 +1209,44 @@ TEST_CASE("break-glass MFA step: a suspend between the cached read and the first
     }
 }
 
+// N-2 (governance round 11): the request whose own call performs the shared refresh is answered with
+// a snapshot that started BEFORE a not-armed read this server holds. Its first check must refuse
+// before a code is spent, not spend it and refuse at the second check.
+TEST_CASE("break-glass MFA step: a first check answered by a refresh older than a not-armed read refuses before a code is spent",
+          "[pg][auth][hardened][routes][fail-closed][wp03]") {
+    HardenedHarness h("sso-only", "admin");
+    const auto mfa = enroll_with_codes(h, "admin");
+    ArmCtl ctl;
+    install_arm_hook(h, ctl);
+    auto& r = *h.auth_routes;
+    const auto pending = login_step1(h);
+    r.advance_arm_clock_for_test(1100); // the cache is expired: the first check refreshes
+    // Inside that refresh's database read, another login's own read (10 ms later) sees "not armed";
+    // then this read answers "armed" with its older snapshot.
+    ctl.before_answer = [&] {
+        r.advance_arm_clock_for_test(10);
+        ctl.mode = ArmCtl::kNotArmed;
+        const auto own = r.sso_only_local_password_gate("admin", SsoOnlyArmRead::kOwnFreshRead);
+        CHECK(own.state == SsoOnlyLocalGate::kRefused);
+        ctl.mode = ArmCtl::kArmed;
+    };
+    r.set_mfa_verify_barrier_for_test([&](std::string_view, const auto&) {
+        r.advance_arm_clock_for_test(1100);
+        ctl.mode = ArmCtl::kNotArmed; // what the second check would see
+    });
+    auto res = login_step2(h, pending, mfa.codes[0]);
+    CHECK(res->status == 401);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(refused(h, "disarmed", "pre_verify") == 1.0);
+    CHECK(refused_total(h) == 1.0);
+    // The recovery code was NOT spent: with the arm back, the same code signs in.
+    r.set_mfa_verify_barrier_for_test(nullptr);
+    ctl.mode = ArmCtl::kArmed;
+    r.advance_arm_clock_for_test(1100);
+    auto again = login_step2(h, login_step1(h), mfa.codes[0]);
+    CHECK(again->status == 200);
+}
+
 // T2 (and T7)
 TEST_CASE("break-glass MFA step: an unreadable arm state after the window's end refuses as window_ended",
           "[pg][auth][hardened][routes][fail-closed][wp03]") {
