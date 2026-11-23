@@ -1997,10 +1997,12 @@ except the agent bundle:
      section (the provider, its capture age, the waiver's expiry and `approval_ref`, taken from
      the published attempt's own `.gate.txt` by `scripts/ci/release-degraded.sh`, linking
      `docs/user-manual/release-verification.md` "A degraded pass"), and
-     `scripts/check-release-artifacts.sh` prints a non-fatal `::warning::` with the same lines. A
+     `scripts/check-release-artifacts.sh` prints a non-fatal `::warning::` and the same lines (to its
+     output and the step summary). The agent-bundle image is scanned after the notes are written, so
+     the statement does not cover it. A
      report whose marker cannot be read is stated as undetermined, never omitted. Neither changes
      `gate: pass` or what the publish journal accepts. After the publish legs,
-     `grep -H -e '^gate:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt` over the run's reports lists
+     `grep -H -e '^gate:' -e '^provider waiver:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt` over the run's reports lists
      every attempt's verdict and any DEGRADED line; only the highest attempt whose publish journal
      ends `publish: tagged` counts, because a refused attempt's report is attached too.
   4. Remove the waiver in a follow-up pull request as soon as the provider is current again (on
