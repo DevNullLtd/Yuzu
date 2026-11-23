@@ -3906,48 +3906,35 @@ TEST_CASE("linux_snapshot_rung: inactive is never answered from one snapshot", "
                                    "error|iptables:snapshot:failed"});
 }
 
-namespace {
-
-/// A second read that gives no answer after a first read of `inactive`, and the row that says why.
-struct Unconfirmed {
-    Reply second;
-    std::string error;
-};
-
-std::vector<Unconfirmed> unconfirmed_seconds() {
-    std::vector<Unconfirmed> all;
-    // a failed read on either transport: the reader's token, or the helper's own
-    for (const char* token : {"timeout", "io_error", "oversized", "peer_not_root", "connect:refused",
-                              "connect:busy", "connect:eacces", "helper:timeout", "helper:exit:1",
-                              "helper:truncated", "helper:not_run"})
-        all.push_back(
-            {Reply{std::unexpected(std::string{token})}, std::string{"error|snapshot:"} + token});
-    // the transport that answered the first read is gone: the reader finds none
-    all.push_back({kNoTransport, "error|snapshot:gone"});
-    // a reply that fails the framing: empty, no end line, not a listing
-    all.push_back({Reply{std::string{}}, "error|snapshot:empty"});
-    all.push_back({Reply{kEmptyHost.substr(0, kEmptyHost.size() - 7)}, "error|snapshot:truncated"});
-    all.push_back({Reply{std::string{"not a listing\n"}}, "error|snapshot:malformed"});
-    // a snapshot that declines: nft vanished between the reads and nothing read shows content
-    all.push_back(
-        {Reply{snap(kAbsent, kTablesNone, kTablesNone)}, "error|nftables:snapshot:absent"});
-    return all;
-}
-
-} // namespace
-
 TEST_CASE("linux_snapshot_rung: a first inactive that the second read cannot confirm is unknown",
           "[firewall]") {
     // the rung owns the answer once the first snapshot reads inactive: the ladder never goes on to
     // the ufw and `iptables -S` rungs, which read less and can print inactive for the same host
-    for (const auto& c : unconfirmed_seconds()) {
-        INFO(c.error);
+    // Each case is a second read that gives no answer, and the row that says why.
+    std::vector<std::pair<Reply, std::string>> cases;
+    // a failed read on either transport: the reader's token, or the helper's own
+    for (const char* token : {"timeout", "io_error", "oversized", "peer_not_root", "connect:refused",
+                              "connect:busy", "connect:eacces", "helper:timeout", "helper:exit:1",
+                              "helper:truncated", "helper:not_run"})
+        cases.push_back(
+            {Reply{std::unexpected(std::string{token})}, std::string{"error|snapshot:"} + token});
+    // the transport that answered the first read is gone: the reader finds none
+    cases.push_back({kNoTransport, "error|snapshot:gone"});
+    // a reply that fails the framing: empty, no end line, not a listing
+    cases.push_back({Reply{std::string{}}, "error|snapshot:empty"});
+    cases.push_back({Reply{kEmptyHost.substr(0, kEmptyHost.size() - 7)}, "error|snapshot:truncated"});
+    cases.push_back({Reply{std::string{"not a listing\n"}}, "error|snapshot:malformed"});
+    // a snapshot that declines: nft vanished between the reads and nothing read shows content
+    cases.push_back(
+        {Reply{snap(kAbsent, kTablesNone, kTablesNone)}, "error|nftables:snapshot:absent"});
+    for (const auto& [second, error] : cases) {
+        INFO(error);
         for (const auto action : {FwReadAction::state, FwReadAction::rules}) {
-            const auto run = run_rung({kEmptyHost, c.second}, false, false, action);
+            const auto run = run_rung({kEmptyHost, second}, false, false, action);
             const char* verdict = action == FwReadAction::state ? "state|unknown" : "rules|unknown";
             CHECK(run.reads == 2);
             CHECK(run.rung.answered);
-            CHECK(run.rung.rows == Rows{"backend|nftables", verdict, "ruleset|unknown", c.error});
+            CHECK(run.rung.rows == Rows{"backend|nftables", verdict, "ruleset|unknown", error});
             const auto& rows = run.rung.rows;
             CHECK(std::none_of(rows.begin(), rows.end(), [](const std::string& r) {
                 return r == "state|inactive" || r == "ruleset|0";

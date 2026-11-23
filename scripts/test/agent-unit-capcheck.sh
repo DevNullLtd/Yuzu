@@ -52,9 +52,9 @@
 #       the ruleset (CI logs are public)
 #     * a control copy of the template whose ExecStart prints /proc/self/status shows the sandbox
 #       the shipped service has: CapBnd = CapEff = 0x3000 (CAP_NET_ADMIN, CAP_NET_RAW),
-#       NoNewPrivs = 0 (the service deliberately does not set it: SELinux denies the tools' domain
-#       transition under it, see the unit) with Seccomp = 2 (the system call filter is installed
-#       without it)
+#       NoNewPrivs = 0 (the service deliberately does not set it: with SELinux enforcing the exec
+#       of nft under it was a denied nnp_transition, see the unit) with Seccomp = 2 (the system
+#       call filter is installed without it)
 #     * an account outside the socket's group cannot connect (EACCES), and the socket file is
 #       root:yuzu-agent 0660
 #     * the real yuzu-fw-snapshot.socket is left in the state it was found in: the salted agent

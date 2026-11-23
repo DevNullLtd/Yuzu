@@ -116,9 +116,10 @@ spec:
           refused/failed dump, nftables:generation:<changed|torn_persistent>
           when clean dumps disagreed on the ruleset generation, or
           fd_exhausted for EMFILE/ENFILE on the nftables socket, or ufw:unrecognised_output / iptables:unrecognised_output
-          for output that finished but is not in the expected shape; snapshot:<token> when the root snapshot socket
+          for output that finished but is not in the expected shape; snapshot:<token> when the snapshot
           could not be read (connect:eacces, connect:refused, connect:busy, connect:errno:<n>, peer_not_root, timeout,
-          io_error, oversized, empty, truncated, malformed or gone); snapshot:helper:<token> when the
+          io_error or oversized from the root socket; empty, truncated or malformed from either transport; gone when
+          the second snapshot of a read found neither the socket nor a usable helper); snapshot:helper:<token> when the
           root helper's snapshot word run through sudo timed out, was clipped, was refused or failed
           (not_run, timeout, truncated, exit:<n>);
           nftables:snapshot:failed, nftables:snapshot:absent, nftables:unrecognised_output, iptables:snapshot:failed,
@@ -255,10 +256,12 @@ spec:
           pf:rules:<token>; Windows: rule_property:<rules>:0x<hresult>, the
           number of rules with a property that could not be read and the
           first HRESULT, written before the ruleset row; Linux:
-          snapshot:<token> when the root snapshot socket could not be read
+          snapshot:<token> when the snapshot could not be read
           (connect:eacces, connect:refused, connect:busy, connect:errno:<n>,
-          peer_not_root, timeout, io_error, oversized, empty, truncated,
-          malformed or gone), snapshot:helper:<token> when the root helper's snapshot
+          peer_not_root, timeout, io_error or oversized from the root socket;
+          empty, truncated or malformed from either transport; gone when the
+          second snapshot of a read found neither the socket nor a usable
+          helper), snapshot:helper:<token> when the root helper's snapshot
           word run through sudo timed out, was clipped, was refused or failed,
           nftables:snapshot:failed, nftables:snapshot:absent,
           nftables:unrecognised_output, iptables:snapshot:failed,

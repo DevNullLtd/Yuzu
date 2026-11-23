@@ -60,44 +60,55 @@ breaks any of them is outside this ADR and needs its own threat model.
    at the end of this clause. It reads two kernel rulesets, one reader each: the nf_tables ruleset
    with `/usr/sbin/nft -a list ruleset`, and the legacy xtables tables of each address family with
    that family's legacy save tool under its own name, `/usr/sbin/iptables-legacy-save` and
-   `/usr/sbin/ip6tables-legacy-save`, run with no argument, which list every instantiated table. The alternatives-selected `iptables` and
-   `ip6tables` are never run: on an nft-backed host they are the shim, whose listing repeats rules
-   the nft section lists and says nothing of the legacy tables. Two decisions are made before a
-   tool runs, from host state and never from input. If `/proc/net/dev` cannot be stat'ed, the
-   process cannot see the kernel's tables, and a save tool reads a missing table list as no table,
-   so both legacy sections are `[failed]` and no tool is run. If a family has no legacy save tool,
-   nothing here can list its tables, so the kernel's own list of them is printed under `[tables]`;
-   the family's table list under `/proc/net` is absent exactly while the family's core module is
-   not loaded. A table list that cannot be stat'ed is read as no table, behind the `/proc/net`
-   check, which rules out every cause at directory level. `head` is named by name under the reset
-   `PATH`, as the size cut is. The legacy save tools were measured on Ubuntu 26.04 ARM64 (kernel
-   7.0.0-43, systemd 259, iptables 1.8.11, 2026-11-23) unconfined and in the sandbox of the
-   shipped unit: they loaded no module, ran no `modprobe` and created no `/run/xtables.lock`. The
-   broker's processes ran unconfined by AppArmor there. A save tool that cannot open its table-list
-   file for a reason other than the file not existing must exit non-zero, which the script prints as
-   `[failed]`: `for_each_table` in `iptables/iptables-save.c` returns quietly only for `ENOENT` and
-   prints `Failed to list table names` and calls `exit(1)` for any other error number, as read in the
-   Debian archive's source at iptables 1.8.2-4, 1.8.7-1, 1.8.9-2, 1.8.11-2 and 1.8.13-1 (and in
-   `ip6tables-save.c` at 1.8.2-4; one file serves both families from 1.8.7), and as measured on
-   1.8.11 in the broker's sandbox. A release not named here is not covered by that statement. Release
-   1.6.0 returns quietly on any failure, but it has no `-legacy-save` name, so the script never runs
-   it. Two reads can make the kernel load a module, and both are measured. First, an nft read on a
-   host where nf_tables is not loaded makes the kernel load nf_tables (an empty ruleset: no table,
-   no rule). Second, a save tool that asks for a table whose module is not loaded makes the kernel
-   itself request and load that table's module, and the tool then lists the table the kernel has
-   just made, which is empty: measured on Ubuntu 26.04 ARM64 (kernel 7.0.0-43, iptables 1.8.11,
-   2026-11-23) with `iptables-legacy-save -t raw` while `iptable_raw` was not loaded, unconfined and
-   in an instance of the shipped unit. The request came from the kernel
-   (`xt_request_find_table_lock`), `modprobe` was started by a kernel worker and not by the tool,
-   the tool exited 0, and `ProtectKernelModules` did not stop the load: that directive bounds what a
-   process of the instance loads, not what the kernel loads on demand. The script's tools are run
-   with no argument and ask only for the tables the kernel has just listed (`for_each_table`), so
-   the second case is reached only when a table is removed between the kernel listing it and the
-   tool asking for it, which puts the tool in the measured position: the kernel loads the module
-   again and the section lists the table it then holds. Neither load can be avoided inside this
-   contract: skipping nft needs proof that nf_tables is absent, and no existence test gives it on a
-   kernel that builds nf_tables in; and nothing the script can test closes the time between the
-   kernel's list and the tool's request.
+   `/usr/sbin/ip6tables-legacy-save`, run with no argument, which list every instantiated table. The
+   alternatives-selected `iptables` and `ip6tables` are never run: on an nft-backed host they are
+   the shim, whose listing repeats rules the nft section lists and says nothing of the legacy
+   tables. Two decisions are made before a tool runs, from host state and never from input. If
+   `/proc/net/dev` cannot be stat'ed, the process cannot see the kernel's tables, and a save tool
+   reads a missing table list as no table, so both legacy sections are `[failed]` and no tool is
+   run. If a family has no legacy save tool, nothing here can list its tables, so the kernel's own
+   list of them is printed under `[tables]`; the family's table list under `/proc/net` is absent
+   exactly while the family's core module is not loaded. A table list that cannot be stat'ed is read
+   as no table, behind the `/proc/net` check, which rules out every cause at directory level. `head`
+   is named by name under the reset `PATH`, as the size cut is. The legacy save tools were measured
+   on Ubuntu 26.04 ARM64 (kernel 7.0.0-43, systemd 259, iptables 1.8.11, 2026-11-23) unconfined and
+   in the sandbox of the shipped unit: they loaded no module, ran no `modprobe` and created no
+   `/run/xtables.lock`. The broker's processes ran unconfined by AppArmor there. A save tool that
+   cannot open its table-list file for a reason other than the file not existing must exit non-zero,
+   which the script prints as `[failed]`: `for_each_table` in `iptables/iptables-save.c` returns
+   quietly only for `ENOENT` and prints `Failed to list table names` and calls `exit(1)` for any
+   other error number, as read in the Debian archive's source at iptables 1.8.2-4, 1.8.7-1, 1.8.9-2,
+   1.8.11-2 and 1.8.13-1 (and in `ip6tables-save.c` at 1.8.2-4; one file serves both families from
+   1.8.7), and as measured on 1.8.11 in the broker's sandbox. A release not named here is not
+   covered by that statement. Release 1.6.0 returns quietly on any failure, but it has no
+   `-legacy-save` name, so the script never runs it. Two reads can make the kernel load a module,
+   and both are measured. First, an nft read on a host where nf_tables is not loaded makes the
+   kernel load nf_tables (an empty ruleset: no table, no rule). Second, a save tool that asks for a
+   table whose module is not loaded makes the kernel itself request and load that table's module,
+   and the tool then lists the table the kernel has just made, which is empty: measured on Ubuntu
+   26.04 ARM64 (kernel 7.0.0-43, iptables 1.8.11, 2026-11-23) with `iptables-legacy-save -t raw`
+   while `iptable_raw` was not loaded, unconfined and in an instance of the shipped unit. The
+   request came from the kernel (`xt_request_find_table_lock`), `modprobe` was started by a kernel
+   worker and not by the tool, the tool exited 0, and `ProtectKernelModules` did not stop the load:
+   that directive bounds what a process of the instance loads, not what the kernel loads on demand.
+   The script's tools are run with no argument and ask only for the tables the kernel has just
+   listed (`for_each_table`), so the second case is reached only when a table is removed between the
+   kernel listing it and the tool asking for it, which puts the tool in the measured position: the
+   kernel loads the module again and the section lists the table it then holds. The tool starts
+   `modprobe` itself in one narrower case, read in the source and not measured. When its request for
+   a table fails, `do_output` (`iptables/iptables-save.c`) calls `xtables_load_ko`
+   (`libxtables/xtables.c`) and asks again, and ends with `Cannot initialize` when that fails too;
+   `xtables_load_ko` returns at once while the family's table list under `/proc/net` exists, and
+   otherwise runs `modprobe` for the family's core module (`ip_tables` or `ip6_tables`). Both
+   functions were read in the Debian archive's source at iptables 1.8.2-4, 1.8.7-1, 1.8.9-2 and
+   1.8.11-2; the exit status (1) and the program it starts (the one `/proc/sys/kernel/modprobe`
+   names) at 1.8.11-2. The script reaches this only when a table's module and the family's core
+   module are both removed between the kernel listing the table and the tool asking for it. In the
+   instance `ProtectKernelModules` refuses a module load by the instance's processes; the
+   installer's helper has no such sandbox. What the section then holds in either is not measured.
+   Neither of the two measured loads can be avoided inside this contract: skipping nft needs proof
+   that nf_tables is absent, and no existence test gives it on a kernel that builds nf_tables in;
+   and nothing the script can test closes the time between the kernel's list and the tool's request.
 4. **Bounded.** The output is cut at 4 MiB (4194304 bytes), the same number as the cap on the
    plugin's netlink dumps (`kNftDumpMaxBytes`); the two bound different encodings, this one the text
    listing and that one the netlink dump, so a ruleset can fit one and not the other. The instance
@@ -105,7 +116,19 @@ breaks any of them is outside this ADR and needs its own threat model.
    deadline and the same size cap (the installer helper's run is capped at twice that). A listing
    over the cap is cut and read as unknown, never as a shorter ruleset. Both snapshots of a read
    that reaches `inactive` share the client's one 5 second deadline: a host on which they do not
-   fit reads `error|snapshot:timeout` and `unknown`, never `inactive`.
+   fit reads `error|snapshot:timeout` (`error|snapshot:helper:timeout` through the installer's
+   helper) and `unknown`, never `inactive`. The socket also keeps the service manager's own
+   activation limit, which the unit does not set: 200 activations in 2 seconds on the hosts
+   measured (`TriggerLimitIntervalUSec=2s`, `TriggerLimitBurst=200` from `systemctl show`), and a
+   connection refused at `MaxConnections` counts toward it. Measured on Rocky 9.9 (systemd 252,
+   2026-11-23): 200 connections at once left the socket active, and 201 inside 2 seconds put it in
+   the failed state (`Result=trigger-limit-hit`) and removed the socket file until
+   `systemctl reset-failed` and `systemctl start`. On Ubuntu 26.04 (systemd 259) 600 connections at
+   once did not fail it. A failed socket reads as a host with no broker does, `unknown` and never
+   `inactive`. The limit is kept on purpose: only root and the agent's group can connect, a read
+   makes at most two connections, so the agent's own reads pass it only above 100 reads of one host
+   inside 2 seconds, and without it nothing in the unit bounds how often those clients can make the
+   service manager accept and close a connection.
 5. **Authorisation is the socket.** Who may connect is the socket's owner, group and mode. That
    proves identity and not authenticity, so only data that is acceptable to disclose to the agent
    account may be served. What the firewall snapshot serves is the host's full nftables ruleset
@@ -121,27 +144,26 @@ breaks any of them is outside this ADR and needs its own threat model.
    the parser does not recognise. What each section vouches for: the nft section, the whole
    nf_tables ruleset; each legacy section, every instantiated legacy table of its family, from the
    save tool's listing or, with no tool, from the kernel's list. A section is READ when it vouches
-   for its own ruleset: nft text that parses;
-   a legacy save listing in the shape the client knows (empty output is a family that holds no
-   table); `[tables]` with no name after it. It is UNREAD otherwise: `[absent]`, `[failed]`, text
-   that does not parse, and `[tables]` followed by a name (tables exist that nothing listed). The
-   decision: `active` when any READ section shows content; `unknown` when none does and a section
-   is UNREAD; `inactive` when all three sections were READ and none shows content in two snapshots
-   taken one after the other (the second is taken only when the first reads `inactive`, and its
-   answer is the answer; when the second snapshot cannot be taken or framed, or declines, the
-   answer is `unknown` with the row that says why, and no count), and then `unknown` again if the
-   netlink read saw a table. A rule count is
-   written whenever all three sections of the answering snapshot were READ and the netlink read did
-   not turn the state to `unknown`: the nft rules plus the `-A` rules of both legacy families.
-   `inactive` therefore means that, twice in a row, the nf_tables ruleset (every family nft lists,
-   arp and bridge included) and every legacy IPv4 and IPv6 table held no rule, no user-defined chain
-   and no policy other than accept. Outside that statement: legacy `arptables` and `ebtables`
-   tables, which no read of this plugin lists; a family with no save tool whose table list cannot be
-   stat'ed while `/proc/net/dev` can (read as no table, clause 3); and rules that move between
-   rulesets more than once inside one read. The count is the sum of one pass of three reads, so a
-   rule that moves during it can be counted twice or not at all. An `[absent]` nft section is never
-   evidence of an empty ruleset, so with no content anywhere the rung declines and the read ladder
-   goes on, and a reply that failed or was cut is never read as empty.
+   for its own ruleset: nft text that parses; a legacy save listing in the shape the client knows
+   (empty output is a family that holds no table); `[tables]` with no name after it. It is UNREAD
+   otherwise: `[absent]`, `[failed]`, text that does not parse, and `[tables]` followed by a name
+   (tables exist that nothing listed). The decision: `active` when any READ section shows content;
+   `unknown` when none does and a section is UNREAD; `inactive` when all three sections were READ
+   and none shows content in two snapshots taken one after the other (the second is taken only when
+   the first reads `inactive`, and its answer is the answer; when the second snapshot cannot be
+   taken or framed, finds no transport (`error|snapshot:gone`) or declines, the answer is `unknown`
+   with the row that says why, and no count), and then `unknown` again if the netlink read saw a
+   table. A rule count is written whenever all three sections of the answering snapshot were READ
+   and the netlink read did not turn the state to `unknown`: the nft rules plus the `-A` rules of
+   both legacy families. `inactive` therefore means that, twice in a row, the nf_tables ruleset
+   (every family nft lists, arp and bridge included) and every legacy IPv4 and IPv6 table held no
+   rule, no user-defined chain and no policy other than accept. Outside that statement: legacy
+   `arptables` and `ebtables` tables, which no read of this plugin lists; a family with no save tool
+   whose table list cannot be stat'ed while `/proc/net/dev` can (read as no table, clause 3); and
+   rules that move between rulesets more than once inside one read. The count is the sum of one pass
+   of three reads, so a rule that moves during it can be counted twice or not at all. An `[absent]`
+   nft section is never evidence of an empty ruleset, so with no content anywhere the rung declines
+   and the read ladder goes on, and a reply that failed or was cut is never read as empty.
 7. **The helper has its own minimum sandbox, and the agent unit never changes.** The helper
    service runs with its own bounding set, system call filter, address families and file system
    protections, each documented where it is set. The helper service does not set

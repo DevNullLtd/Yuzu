@@ -1537,8 +1537,10 @@ void do_state_linux(yuzu::CommandContext& ctx) {
         return;
 
     // The packaged unit cannot read nftables or iptables itself: the root snapshot broker can. When
-    // it answers, the table dump's deferred row is dropped (the read succeeded, so the EPERM row
-    // would mislead); when it does not, the row is written and the ladder goes on as before.
+    // the rung answers, the table dump's deferred row is dropped: the answer is then the snapshot
+    // rung's, unknown included, and that rung's own error| rows say what it could not read, so the
+    // refused netlink read beside them would name a read the answer does not rest on. When it does
+    // not answer, the row is written and the ladder goes on as before.
     if (try_snapshot(ctx, info, yuzu::firewall::FwReadAction::state))
         return;
     for (const auto& row : info.pending_rows)

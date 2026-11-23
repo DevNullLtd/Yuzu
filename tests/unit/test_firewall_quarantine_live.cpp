@@ -243,12 +243,17 @@ std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall()
 
 /// Runs a tool and returns the whole result, stderr merged unless asked otherwise. A caller that
 /// must tell "it ran and printed nothing" from "it did not run, timed out, was clipped or failed"
-/// needs the exit code and the flags, which capture() drops.
+/// needs the exit code and the flags, which capture() drops. Every capture of this harness takes
+/// twice the snapshot cut, the cap the plugin gives its own helper run: a listing clipped at the
+/// runner's 1,000,000-byte default would be this harness's own limit read as a failed snapshot.
 [[nodiscard]] yuzu::agent::SubprocessResult capture_result(const std::vector<std::string>& argv,
                                                            std::chrono::milliseconds deadline = 60s,
                                                            bool merge_stderr = true) {
     return yuzu::agent::run_bounded_subprocess(
-        argv, yuzu::agent::SubprocessOptions{.deadline = deadline, .merge_stderr = merge_stderr});
+        argv, yuzu::agent::SubprocessOptions{.deadline = deadline,
+                                             .merge_stderr = merge_stderr,
+                                             .output_cap_bytes =
+                                                 2 * yuzu::firewall::kFwSnapshotMaxBytes});
 }
 
 /// Runs a tool and returns its combined output ("" when it did not run). For a caller that only

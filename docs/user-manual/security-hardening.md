@@ -148,18 +148,27 @@ bound.
   hierarchy; its address-family list is what bounds its sockets. The agent unit keeps
   `NoNewPrivileges=true`.
 - If a read answers `unknown` with no `error|snapshot:` row on a packaged host, there is no socket
-  file: the socket was stopped, masked or has failed. Run `systemctl status
-  yuzu-fw-snapshot.socket`; then `systemctl reset-failed yuzu-fw-snapshot.socket` and `systemctl
-  start yuzu-fw-snapshot.socket`, or restart `yuzu-agent`. `journalctl -u
-  'yuzu-fw-snapshot@*'` shows each instance.
+  file: the socket was stopped, masked or has failed. A read whose first snapshot was `inactive` and
+  whose second found the socket gone answers `unknown` with `error|snapshot:gone`, for the same
+  reason. The socket fails when systemd's activation limit is passed: more than 200 connections
+  inside 2 seconds, with those refused at `MaxConnections` counted (measured on Rocky 9.9, systemd
+  252: `systemctl show -p Result yuzu-fw-snapshot.socket` printed `trigger-limit-hit` and the socket
+  file was removed; on Ubuntu 26.04, systemd 259, 600 connections at once did not fail it). A
+  `state` or `rules` read makes at most two connections, so the agent's own reads pass that limit
+  only above 100 reads of one host inside 2 seconds. Run `systemctl status yuzu-fw-snapshot.socket`;
+  then `systemctl reset-failed yuzu-fw-snapshot.socket` and
+  `systemctl start yuzu-fw-snapshot.socket`, or restart `yuzu-agent`.
+  `journalctl -u 'yuzu-fw-snapshot@*'` shows each instance.
 - If a read answers `error|snapshot:empty` or `error|snapshot:timeout`, the broker was reached and
   did not reply in full: either four reads were already in flight (`MaxConnections=4`; a connection
-  over the limit is accepted and closed at once, the read is not retried and the next read
-  answers) or the instance could not start or finish. `journalctl -u yuzu-fw-snapshot.socket`
-  shows a connection dropped at the limit (on Ubuntu 26.04, systemd 259: "Too many incoming
-  connections (4), dropping connection."), `systemctl list-units 'yuzu-fw-snapshot@*'` shows the
-  instances that are running, and `journalctl -u 'yuzu-fw-snapshot@*'` shows one that failed. A
-  host that reads `inactive` makes two connections per read.
+  over the limit is accepted and closed at once, the read is not retried and the next read answers)
+  or the instance could not start or finish, or, on a host whose first snapshot read `inactive`, the
+  two snapshots did not fit the one 5 second deadline they share.
+  `journalctl -u yuzu-fw-snapshot.socket` shows a connection dropped at the limit (on Ubuntu 26.04,
+  systemd 259: "Too many incoming connections (4), dropping connection."),
+  `systemctl list-units 'yuzu-fw-snapshot@*'` shows the instances that are running, and
+  `journalctl -u 'yuzu-fw-snapshot@*'` shows one that failed. A host that reads `inactive` makes two
+  connections per read.
 - To opt out, run `systemctl stop yuzu-fw-snapshot.socket` and then `systemctl mask
   yuzu-fw-snapshot.socket`; to keep the broker from ever starting, run `systemctl mask
   yuzu-fw-snapshot.socket` before the package is installed, and the agent starts without it. The

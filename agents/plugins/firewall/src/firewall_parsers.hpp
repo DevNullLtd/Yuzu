@@ -2036,10 +2036,10 @@ namespace detail {
 /// tool writes a rule comment or log prefix raw between double quotes and escapes only the double
 /// quote, the backslash and the single quote, so a newline inside one leaves the first line open:
 /// the listing is unread, it does not become further lines. Only what stands between double quotes
-/// is covered. A field outside them (an interface, chain or target name) is taken as it stands: a
-/// double quote there leaves the line open, so the listing is unread on every read until the name
-/// changes, and a newline there reads as a line break, which can add a line (a row and a count) and
-/// never removes one.
+/// is covered. A field outside them (an interface, chain or target name) is taken as it stands: an
+/// unpaired double quote there leaves the line open, so the listing is unread on every read until
+/// the name changes, and a newline there reads as a line break, which can add a line (a row and a
+/// count) and never removes one.
 [[nodiscard]] inline bool save_quotes_closed(std::string_view line) noexcept {
     bool quoted = false;
     for (std::size_t i = 0; i < line.size(); ++i)
@@ -2410,10 +2410,11 @@ struct LinuxSnapshotRung {
 };
 
 /// Runs the snapshot rung. `read` is the transport: a callable that takes one whole snapshot and
-/// returns its text, or the token that says why there is none (an EMPTY token: no transport is
-/// provisioned on this host, which is not reported). `firewalld_held` is true while firewalld's own
-/// answer is held: only an `active` answer is then accepted, and any other writes just its `error|`
-/// rows, so the refusals that explain what was not read are still reported.
+/// returns its text, or the token that says why there is none (an EMPTY token: no transport. The
+/// first read does not report it; the second read of a pair reports it as `error|snapshot:gone`).
+/// `firewalld_held` is true while firewalld's own answer is held: only an `active` answer is then
+/// accepted, and any other writes just its `error|` rows, so the refusals that explain what was not
+/// read are still reported.
 ///
 /// `inactive` is never answered from one snapshot. The three sections are read one after another
 /// and are three separate kernel rulesets, so a rule set that moves from one backend to another
@@ -2428,13 +2429,17 @@ struct LinuxSnapshotRung {
 /// declines is `unknown` with the row that says why, and no count, because the ufw rung and the
 /// `iptables -S` rung behind it read less and can print `inactive` for a host whose netlink read
 /// failed. A first read that fails, finds no transport, declines, is clamped or is not `inactive`,
-/// like a held firewalld, is one read and is answered or declined on its own. The six reads run in
-/// the order nft, IPv4, IPv6, nft, IPv4, IPv6, so for content to move from one ruleset to another
-/// unseen every read of the one must follow the move and every read of the other must precede it,
-/// which no pair of reads allows: every single move is seen. Two or more moves between rulesets
-/// inside one read can still be missed, and the count of an `active` answer is the sum of one pass,
-/// so a rule in motion can be counted twice or not at all (ADR-3007, clause 6). Only a host that
-/// reads `inactive` pays the second read, and the caller gives both reads one deadline.
+/// like a held firewalld, is one read and is answered or declined on its own. When the first read
+/// fails, finds no transport or declines, the rung does not answer and the ladder goes on: the ufw
+/// and iptables -S rungs behind it are then called exactly as they are on a host without this rung,
+/// so what they print for an agent whose netlink read failed is those rungs' own behaviour, which
+/// this rung does not change. The six reads run in the order nft, IPv4, IPv6, nft, IPv4, IPv6, so
+/// for content to move from one ruleset to another unseen every read of the one must follow the
+/// move and every read of the other must precede it, which no pair of reads allows: every single
+/// move is seen. Two or more moves between rulesets inside one read can still be missed, and the
+/// count of an `active` answer is the sum of one pass, so a rule in motion can be counted twice or
+/// not at all (ADR-3007, clause 6). Only a host that reads `inactive` pays the second read, and the
+/// caller gives both reads one deadline.
 template <typename Reader>
 [[nodiscard]] LinuxSnapshotRung linux_snapshot_rung(Reader&& read, bool tables_seen, bool firewalld_held,
                                                     FwReadAction action) {

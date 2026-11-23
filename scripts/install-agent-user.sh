@@ -798,8 +798,10 @@ generate_fw_helper_content() {
 # alone is a family that holds no table). The listing ends with `== end`, the whole of it is cut at
 # 4194304 bytes, and the exit status is 0. A listing that was cut has no `== end`. The tools are run
 # with their own fixed arguments and nothing from the caller. It reads the host ruleset, which
-# includes rule handles, and changes no ruleset and writes no file. An nft read on a host where
-# nf_tables is not loaded makes the kernel load it.
+# includes rule handles, and changes no ruleset and writes no file. Two reads can make the kernel
+# load a module, both measured (ADR-3007, clause 3): an nft read on a host where nf_tables is not
+# loaded makes the kernel load nf_tables, and a save tool that asks for a table whose module is not
+# loaded makes the kernel load that module.
 #
 # nft load <path> and pf load <path>: <path> is absolute, at most 512 characters with no control
 # character, in a directory named firewall-staging, and its file name is yuzu-fwq-<letters, digits,
