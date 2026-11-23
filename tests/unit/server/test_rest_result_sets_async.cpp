@@ -436,7 +436,64 @@ TEST_CASE("from-echo-query: 202 pending, dispatch to __all__ when no parent",
     REQUIRE(row->matcher.find("echo_rows_ge") != std::string::npos);
 }
 
-TEST_CASE("An authorized async producer enforces the distinct member cap at fill",
+TEST_CASE("The async producer counts response rows independently of distinct matched members",
+          "[pg][result_set][async][member_cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AsyncHarness h(pool);
+    ResponseStore responses{pool};
+    REQUIRE(responses.is_open());
+    int status = 0;
+    const auto created = h.post("/api/v1/result-sets/from-echo-query",
+                                R"({"sql":"SELECT pid FROM $Process_Hourly"})", status);
+    REQUIRE(status == 202);
+    const auto id = created["data"]["id"].get<std::string>();
+    const auto pending = h.store->list_pending();
+    REQUIRE(pending.size() == 1);
+    REQUIRE(pending.front().id == id);
+    auto seed = pool.acquire();
+    REQUIRE(seed);
+    // Seed the response store in one statement. The production fill still pages and
+    // matches all rows under the normal Forensics filter.
+    bool overflow = false;
+    SECTION("exactly 100,000 matching responses from distinct devices materialize") {}
+    SECTION("one additional response from the same nonmatching device exhausts the row budget") {
+        overflow = true;
+    }
+    auto rows = pg::exec_params(
+        seed.get(),
+        "INSERT INTO response_store.responses "
+        "(instruction_id, agent_id, timestamp, status, output, plugin, execution_id) "
+        "SELECT 'echo', CASE WHEN $2::boolean THEN 'same' ELSE 'dev-' || n END, n, 1, "
+        "CASE WHEN $2::boolean THEN '__total__|0' ELSE E'__schema__|pid\n1\n__total__|1' END, "
+        "$3, $1 FROM generate_series(1, $4::int) AS n",
+        std::vector<std::string>{pending.front().source_execution_id, overflow ? "true" : "false",
+                                 yuzu::server::test::kOrdinaryPlugin,
+                                 std::to_string(ResultSetStore::kMaxMembersPerSet + overflow)});
+    REQUIRE(rows.status() == PGRES_COMMAND_OK);
+    const auto fill = fill_pending_result_set(
+        *h.store, &responses, &yuzu::server::test::forensics_plugin_set(), pending.front(), 0);
+    const auto row = get_ok(*h.store, id);
+    REQUIRE(row.has_value());
+    const auto detail = h.sink.dispatch("GET", "/api/v1/result-sets/" + id, "");
+    REQUIRE(detail);
+    REQUIRE(detail->status == 200);
+    const auto data = nlohmann::json::parse(detail->body)["data"];
+    CHECK_FALSE(data.contains("source_payload"));
+    if (overflow) {
+        CHECK(fill == ResultSetFill::Failed);
+        CHECK(data["status"] == "failed");
+        CHECK(data["device_count"] == 0);
+        CHECK(nlohmann::json::parse(row->source_payload)["failure"] ==
+              "response rows exceed the members read bound");
+    } else {
+        CHECK(fill == ResultSetFill::Materialized);
+        CHECK(data["status"] == "materialized");
+        CHECK(data["device_count"] == ResultSetStore::kMaxMembersPerSet);
+    }
+}
+
+TEST_CASE("ResultSetStore caps direct fills of an authorized producer's pending row",
           "[pg][result_set][async][member_cap]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -464,7 +521,7 @@ TEST_CASE("An authorized async producer enforces the distinct member cap at fill
         CHECK(members->contains("dev-0"));
         CHECK_FALSE(members->contains(""));
     }
-    SECTION("a failure to record the refusal stays retryable") {
+    SECTION("a failed refusal write returns DbError and the pending row can still fill") {
         ids.emplace_back("one-too-many");
         exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets ADD CHECK (status <> 'failed')");
         const auto fill = h.store->materialize(id, ids);
@@ -5193,16 +5250,13 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     REQUIRE(retry_at != std::string::npos);
     CHECK(retry_at - skip_at < 900); // the throttled warn's arguments, nothing else, in between
     const auto unanswered_at = src.find("const int64_t agents_unanswered", retry_at);
-    const auto members_at = src.find("result_set_members(*response_store_, forensics_plugins(), p)",
-                                     unanswered_at);
-    REQUIRE(members_at != std::string::npos);
-    CHECK(members_at - unanswered_at < 2000);
-    // get_summary no longer carries the count: the tick reads it only for a set about to fill.
-    CHECK(src.find("agents_response_dropped") == std::string::npos);
     const std::string materialize_call =
-        "if (result_set_store_->materialize(p.id, members, agents_failed, agents_unanswered)) {";
+        "fill_pending_result_set(*result_set_store_, response_store_.get(), forensics_plugins(), "
+        "p, agents_unanswered)";
+    const auto members_at = src.find(materialize_call, unanswered_at);
+    REQUIRE(members_at != std::string::npos);
     CHECK(count_in(src, materialize_call) == 1);
-    CHECK(src.find(materialize_call, members_at) != std::string::npos);
+    CHECK(src.find("agents_response_dropped") == std::string::npos);
     // count_unreadable is counted once, only inside the successful fill, never at the decision.
     const std::string forced_fill_count =
         "if (count_unreadable) metrics_ .counter(\"yuzu_result_sets_total\", "
@@ -5211,30 +5265,13 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     const auto materialized_at = src.find(materialize_call, members_at);
     const auto forced_at = src.find(forced_fill_count, materialized_at);
     REQUIRE(forced_at != std::string::npos);
-    CHECK(forced_at - materialized_at < 400); // after the materialized counter, before the else
+    CHECK(forced_at - materialized_at < 550); // after the materialized counter, before the else
     const auto else_at = src.find("} else {", materialized_at);
     REQUIRE(else_at != std::string::npos);
     CHECK(else_at > forced_at); // inside the successful fill, not the materialize_failed branch
     // The parent's completeness is snapshotted onto the pending row at create time
     // (inherit_completeness); the tick never reads the parent.
     CHECK(src.find("fold_parent_completeness") == std::string::npos);
-    CHECK(src.find("agents_failed = found->agents_failed;") != std::string::npos);
-    // The truncated branch: between its `if` and the line that adopts the membership, the set
-    // is marked failed and the branch ends in `continue;` with nothing but the closing brace
-    // after it, so a truncated read can never fall through into `materialize`.
-    const auto open = src.find("if (found->truncated) {");
-    REQUIRE(open != std::string::npos);
-    const auto adopt = src.find("agents_failed = found->agents_failed;", open);
-    REQUIRE(adopt != std::string::npos);
-    const std::string branch = src.substr(open, adopt - open);
-    const auto marked = branch.find("result_set_store_->mark_failed(");
-    REQUIRE(marked != std::string::npos);
-    const auto cont = branch.rfind("continue;");
-    REQUIRE(cont != std::string::npos);
-    CHECK(cont > marked);
-    CHECK(branch.substr(cont + std::string("continue;").size()).find_first_not_of(" }") ==
-          std::string::npos);
-    CHECK(marked < 800);
 }
 
 TEST_CASE("ingest: every response-store site records a lost frame beside the agent's status",

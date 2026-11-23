@@ -15,6 +15,7 @@
  */
 
 #include "result_set_store.hpp"
+#include "test_principal_lock_gate.hpp"
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -870,11 +871,57 @@ TEST_CASE("ResultSetStore: per-set member cap is enforced", "[pg][result_set][ca
     for (int i = 0; i <= ResultSetStore::kMaxMembersPerSet; ++i)
         members.push_back("dev-" + std::to_string(i));
 
-    auto request = req("alice", "toobig");
-    request.source_kind = "criteria_run"; // Generic create accepts an arbitrary client label.
-    auto rs = store.create_materialized(request, members);
+    auto rs = store.create_materialized(req("alice", "toobig"), members);
     REQUIRE_FALSE(rs.has_value());
     CHECK(rs.error() == ResultSetError::TooManyMembers);
+}
+
+TEST_CASE("ResultSetStore: only the locked pending row can admit a fill",
+          "[pg][result_set][async][member_cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResultSetStore store(pool);
+    const auto pending = store.create_pending(req("alice", "race"), "exec");
+    REQUIRE(pending.has_value());
+    SECTION("a concurrent transition wins before fill attempts any insert") {
+        PgConn winner{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(winner.get()) == CONNECTION_OK);
+        REQUIRE(PgResult{PQexec(winner.get(), "BEGIN")}.ok());
+        REQUIRE(pg::exec_params(
+                    winner.get(),
+                    "UPDATE result_set_store.result_sets SET status = 'failed' WHERE id = $1",
+                    std::vector<std::string>{pending->id})
+                    .ok());
+        // Even a rolled-back INSERT would advance this sequence.
+        exec_sql(db.dsn(),
+                 "CREATE SEQUENCE attempted_fill;"
+                 "CREATE FUNCTION count_insert() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                 "BEGIN PERFORM nextval('attempted_fill'); RETURN NEW; END $$;"
+                 "CREATE TRIGGER count_insert BEFORE INSERT ON result_set_store.result_set_members "
+                 "FOR EACH ROW EXECUTE FUNCTION count_insert()");
+        std::expected<void, ResultSetError> lost;
+        yuzu::test::Workers workers([&] { winner.reset(); });
+        workers.add([&] { lost = store.materialize(pending->id, {"late"}); });
+        REQUIRE(yuzu::test::wait_for_lock_waiter(pool));
+        REQUIRE(PgResult{PQexec(winner.get(), "COMMIT")}.ok());
+        workers.join_all();
+        REQUIRE_FALSE(lost.has_value());
+        CHECK(lost.error() == ResultSetError::NotFound);
+        CHECK(query_scalar(db.dsn(), "SELECT is_called FROM attempted_fill") == "f");
+        CHECK_FALSE(contains_ok(store, pending->id, "late"));
+    }
+    SECTION("a materialized, failed, or absent row admits no new fill") {
+        auto ready = store.create_materialized(req("alice", "ready"), {"kept"});
+        REQUIRE(ready.has_value());
+        store.mark_failed(pending->id, "previous failure");
+        for (const auto& id : {ready->id, pending->id, std::string{"rs_absent"}}) {
+            auto filled = store.materialize(id, {"late"});
+            REQUIRE_FALSE(filled.has_value());
+            CHECK(filled.error() == ResultSetError::NotFound);
+            CHECK_FALSE(contains_ok(store, id, "late"));
+        }
+        CHECK(contains_ok(store, ready->id, "kept"));
+    }
 }
 
 TEST_CASE("ResultSetStore: device_count reflects distinct members", "[pg][result_set][dedup]") {

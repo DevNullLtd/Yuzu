@@ -287,6 +287,7 @@ distinct_members(const std::vector<std::string>& members, std::size_t limit) {
     return ids;
 }
 
+// A missing or terminal row needs no update. A materializer already owns the pending row lock.
 bool mark_failed_on(PGconn* conn, const std::string& id, const std::string& reason);
 
 // Shared by pin() (same connection, no extra round trip) and the public
@@ -1059,13 +1060,12 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         // Read and lock the authoritative pending row before allocating for the
         // fill. Concurrent fillers cannot select a kind or install stale members.
-        auto pending = pg::exec_params(
-            conn,
-            "SELECT source_kind FROM result_set_store.result_sets "
-            "WHERE id = $1 AND status = 'pending' FOR UPDATE",
-            std::vector<std::string>{id});
+        auto pending = pg::exec_params(conn,
+                                       "SELECT source_kind FROM result_set_store.result_sets "
+                                       "WHERE id = $1 AND status = 'pending' FOR NO KEY UPDATE",
+                                       std::vector<std::string>{id});
         if (pending.status() != PGRES_TUPLES_OK) {
-            spdlog::error("ResultSetStore::materialize: pending row read failed: {}",
+            spdlog::error("ResultSetStore::materialize: could not lock pending row: {}",
                           PQerrorMessage(conn));
             return false;
         }
