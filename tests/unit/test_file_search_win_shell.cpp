@@ -442,7 +442,6 @@ TEST_CASE("file_search windows shell: the cursor key draws non-zero, fresh bytes
     CursorKey b{};
     REQUIRE(os_draw_cursor_key(b));
     CHECK(a != b); // each draw is fresh random bytes
-    // init succeeds on every call
     CHECK(init_cursor_key());
     CHECK(init_cursor_key());
 }

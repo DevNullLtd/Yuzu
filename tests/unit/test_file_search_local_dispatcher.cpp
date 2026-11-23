@@ -862,10 +862,8 @@ TEST_CASE("file_search plugin: the heartbeat totals count from this process's st
 
 #endif // !_WIN32
 
-// Runs on every OS, after the pin and heartbeat cases on purpose: this one inits the plugin three times. It
-// proves the three wiring lines that make a shutdown stop a running search: shutdown sets the stop flag, init
-// clears it, and the shell hands the flag to the driver. The driver's own handling of the flag is pinned in
-// test_file_search_driver.cpp ("a stop request ends the slice cancelled").
+// Runs after the pin and heartbeat cases on purpose: it inits the plugin twice. Wiring only: the driver's
+// handling of the flag is pinned in test_file_search_driver.cpp ("a stop request ends the slice cancelled").
 TEST_CASE("file_search plugin: shutdown ends the next search cancelled and the next init clears it",
           "[file_search][file_search_dispatcher][file_search_shutdown]") {
     auto plugin = load_plugin();

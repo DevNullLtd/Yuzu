@@ -445,6 +445,7 @@ struct RetrievalInput {
     std::uint64_t cluster_bytes{0};
     std::uint64_t file_size{0};
     std::uint32_t attributes{0};
+    std::string_view note{};
 };
 
 /// The extents of one file from the answer of FSCTL_GET_RETRIEVAL_POINTERS, mapped onto the existing flag
@@ -460,7 +461,10 @@ struct RetrievalInput {
 /// sets total = runs + 1 and total_exact false. Any other error fails, ERROR_INSUFFICIENT_BUFFER (122)
 /// included: a buffer under 32 bytes answers it, and the shell's buffer size rules that out. ONE call, no
 /// paging: the row lists at most kMaxExtents runs and already reads `>=33` for a longer file, and a bounded
-/// page loop would still answer a lower bound for the files that need it.
+/// page loop would still answer a lower bound for the files that need it. `note` is carried on the two
+/// answered returns only (end of file, mapped runs): a fully local cloud file reads `ok:cloud`, and a failed
+/// or unsupported answer carries none, so no `failed:cloud` or `unsupported:cloud` is ever printed (the
+/// README lists exactly the tokens that remain).
 [[nodiscard]] inline FileExtents map_retrieval_pointers(const RetrievalInput& in) {
     FileExtents out;
     out.state = ExtentsState::failed;
@@ -468,6 +472,7 @@ struct RetrievalInput {
         return out;
     if (in.win32_error == kErrorHandleEof) {
         out.state = ExtentsState::ok;
+        out.note = in.note;
         if (in.file_size > 0)
             out.add({0, 0, in.file_size, kResident});
         return out;
@@ -506,20 +511,12 @@ struct RetrievalInput {
         vcn = run.next_vcn;
     }
     mapped.state = ExtentsState::ok;
+    mapped.note = in.note;
     if (in.win32_error == kErrorMoreData) {
         ++mapped.total;
         mapped.total_exact = false;
     }
     return mapped;
-}
-
-/// The mapped extents with the decision's note attached, on an answered list only: a fully local cloud file
-/// reads `ok:cloud`, and a failed or unsupported answer carries no note, so no `failed:cloud` or
-/// `unsupported:cloud` is ever printed (the README lists exactly the tokens that remain).
-[[nodiscard]] inline FileExtents with_note(FileExtents extents, std::string_view note) {
-    if (extents.state == ExtentsState::ok)
-        extents.note = note;
-    return extents;
 }
 
 // ---- identity: ONE policy ----

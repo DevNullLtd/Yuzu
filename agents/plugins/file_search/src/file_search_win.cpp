@@ -402,9 +402,9 @@ public:
             for (std::size_t i = 0; i < n; ++i)
                 runs.push_back({static_cast<std::uint64_t>(out->Extents[i].NextVcn.QuadPart), out->Extents[i].Lcn.QuadPart});
         }
-        f.extents = wr::with_note(
-            wr::map_retrieval_pointers({error, starting_vcn, runs, cluster_bytes(), opened.size, opened.attributes}),
-            now->note); // a fully local cloud file reads ok:cloud
+        // now->note is a fully local cloud file's `cloud`: the mapper attaches it to an answered list only.
+        f.extents = wr::map_retrieval_pointers(
+            {error, starting_vcn, runs, cluster_bytes(), opened.size, opened.attributes, now->note});
         return f;
     }
 

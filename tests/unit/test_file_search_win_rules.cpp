@@ -270,8 +270,8 @@ namespace {
 constexpr std::uint64_t kCluster = 4096;
 
 FileExtents map(std::uint32_t err, std::vector<Run> runs, std::uint64_t size = 100000, std::uint32_t attrs = 0x20,
-                std::uint64_t cluster = kCluster, std::uint64_t start = 0) {
-    return map_retrieval_pointers({err, start, runs, cluster, size, attrs});
+                std::uint64_t cluster = kCluster, std::uint64_t start = 0, std::string_view note = {}) {
+    return map_retrieval_pointers({err, start, runs, cluster, size, attrs, note});
 }
 
 } // namespace
@@ -382,16 +382,21 @@ TEST_CASE("format_extents_row prints the note after the state and leaves existin
     CHECK(format_extents_row({1, 2}, failed) == "extents|0000000000000001:0000000000000002|failed|0|-");
 }
 
-TEST_CASE("with_note: an answered list keeps the note, a failed or unsupported one carries none",
-          "[file_search][win_rules]") {
-    CHECK(with_note(map(0, {{8, 100}}), "cloud").note == "cloud");
-    CHECK(with_note(map(0, {{8, 100}}), {}).note.empty());
-    const auto failed = with_note(map(1117, {}), "cloud"); // an I/O error: failed
+TEST_CASE("map_retrieval_pointers: the note rides an answered list only", "[file_search][win_rules]") {
+    constexpr std::uint32_t kAttrs = 0x20;
+    for (const std::uint32_t code : {0u, 234u}) // success, and more data (a partial answer is an answer)
+        CHECK(map(code, {{8, 100}}, 100000, kAttrs, kCluster, 0, "cloud").note == "cloud");
+    CHECK(map(38, {}, 500, kAttrs, kCluster, 0, "cloud").note == "cloud"); // end of file: resident
+    CHECK(map(38, {}, 0, kAttrs, kCluster, 0, "cloud").note == "cloud");   // end of file: empty
+    // a failed or unsupported answer carries none
+    const auto failed = map(1117, {}, 100000, kAttrs, kCluster, 0, "cloud"); // an I/O error
     CHECK(failed.state == ExtentsState::failed);
     CHECK(failed.note.empty());
-    const auto unsupported = with_note(map(1, {}), "cloud"); // ERROR_INVALID_FUNCTION: unsupported
+    const auto unsupported = map(1, {}, 100000, kAttrs, kCluster, 0, "cloud");
     CHECK(unsupported.state == ExtentsState::unsupported);
     CHECK(unsupported.note.empty());
+    CHECK(map(0, {{8, 100}}, 100000, kAttrs, 0, 0, "cloud").note.empty()); // a zero cluster size
+    CHECK(map(0, {{8, 100}}).note.empty());                                // no note given
 }
 
 // ---- identity ----

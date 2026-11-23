@@ -187,6 +187,10 @@ def selftest() -> int:
            "plugin-name-outside: the plugin named in another file was NOT detected")
     expect("plugin-name-outside" not in ids(dict(base, **{outside: canonical('// "file_search" in a comment')})),
            "plugin-name-outside: a comment mention must not count")
+    server_cpp = os.path.join(SRC, "server.cpp")  # the removed default-off seed must not come back
+    seed = canonical('seed_kill_switch_default_off("file_search");')
+    expect("plugin-name-outside" in ids(dict(base, **{server_cpp: base.get(server_cpp, "") + seed})),
+           "plugin-name-outside: a file_search seed in server.cpp was NOT detected")
     for what, spelling in (("a SQL literal", 'auto q = "WHERE plugin = \'file_search\'";'),
                            ("a case variant", 'if (p == "File_Search") {}'),
                            ("a raw string", 'auto r = R"(file_search)";')):

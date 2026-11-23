@@ -32,9 +32,7 @@ namespace yuzu::shared::file_search {
 // `name_too_long` gap instead.
 inline constexpr std::size_t kMaxNameBytes = 765;
 // The deepest directory a Position names (a deeper one is a `depth` gap). 61 is the deepest position of
-// kMaxNameBytes names whose cursor token, with the request allowance (file_search_request.hpp), still fits
-// the server's 64 KiB limit on one instruction parameter (kMaxParamValueLen, bundle_service.hpp): a cursor
-// over that limit could not be passed back on any surface. file_search_cursor.hpp asserts the fit.
+// kMaxNameBytes names that fits kMaxCursorTokenBytes (62 needs 65,824 against 65,408): file_search_cursor.hpp.
 inline constexpr std::size_t kMaxPositionDepth = 61;
 
 enum class GapCause {
