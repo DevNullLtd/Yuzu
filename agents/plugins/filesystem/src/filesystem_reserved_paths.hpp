@@ -12,8 +12,8 @@
 /// (`agent.data_dir`, `agent.cert_dir`, `agent.log_file`, `agent.tls_*`) and canonicalises each
 /// request path with symlinks resolved before asking. CONFINEMENT IS BEST EFFORT against a writer
 /// who controls a parent directory (a check-then-open window remains); it is not absolute and
-/// must not be described as such. Matching is segment-boundary, never a bare prefix; on Windows
-/// it is ASCII-case-insensitive.
+/// must not be described as such. Matching is segment-boundary, never a bare prefix; for a
+/// not-yet-existing leaf it is ASCII-case-insensitive on Windows and macOS.
 
 #include <cstddef>
 #include <string>
@@ -29,8 +29,27 @@ struct Set {
     [[nodiscard]] bool empty() const noexcept { return dirs.empty() && files.empty(); }
 };
 
-/// Normalise for comparison: '\' -> '/', collapse a trailing '/', fold ASCII case on Windows.
-[[nodiscard]] inline std::string normalise(std::string_view p) {
+/// macOS: the Data volume is reachable both as `/Users/x/f` and, through a firmlink (not a symlink, so
+/// no canonicalising call collapses it), as `/System/Volumes/Data/Users/x/f`. The spelling is removed
+/// before a not-yet-existing reserved leaf is compared, on both sides. Pure and platform-neutral so it
+/// is unit-tested on Linux; the comparison applies it on `__APPLE__` only.
+[[nodiscard]] inline std::string strip_apple_data_firmlink(std::string_view p) {
+    constexpr std::string_view kPrefix = "/System/Volumes/Data";
+    if (p.size() >= kPrefix.size() && p.compare(0, kPrefix.size(), kPrefix) == 0 &&
+        (p.size() == kPrefix.size() || p[kPrefix.size()] == '/' || p[kPrefix.size()] == '\\'))
+        p.remove_prefix(kPrefix.size());
+    return std::string(p);
+}
+
+/// Normalise for comparison: '\' -> '/', collapse a trailing '/', fold ASCII case (A-Z only) on Windows
+/// and macOS, and on macOS drop a leading `/System/Volumes/Data` firmlink spelling.
+[[nodiscard]] inline std::string normalise(std::string_view p_in) {
+#ifdef __APPLE__
+    const std::string stripped = strip_apple_data_firmlink(p_in);
+    const std::string_view p{stripped};
+#else
+    const std::string_view p = p_in;
+#endif
     std::string out;
     out.reserve(p.size());
     for (char c : p) {
@@ -124,8 +143,9 @@ struct Set {
 /// measured on macOS 27 arm64), so an identity compare would not match it. Pure; never true for a
 /// Windows path.
 [[nodiscard]] inline bool is_dev_fd_path(std::string_view path_in) {
-    // ASCII case is folded: the default macOS volume is case-insensitive, so `/DEV/FD/3` is the same
-    // object as `/dev/fd/3`.
+    // ASCII case is folded: the default macOS volume is case-insensitive and whether /dev folds case
+    // was not measured, so a case variant is refused rather than assumed to be another object
+    // (harmless over-refusal on a case-sensitive volume).
     std::string path(path_in);
     for (char& c : path)
         if (c >= 'A' && c <= 'Z')
@@ -139,7 +159,8 @@ struct Set {
 }
 
 /// macOS: `/.vol/<dev>/<ino>` opens any file by inode number, so a literal `/.vol/` path names a
-/// reserved file without spelling its path. Refused as a literal (ASCII case folded). Pure; the
+/// reserved file without spelling its path. Refused as a literal (ASCII case folded: over-refusal, since
+/// `/.VOL` does not exist on the macOS host measured). Pure; the
 /// plugin applies it on `__APPLE__` only.
 [[nodiscard]] inline bool is_apple_vol_path(std::string_view path_in) {
     std::string path(path_in);

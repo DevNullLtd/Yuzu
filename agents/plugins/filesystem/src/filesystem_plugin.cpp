@@ -229,8 +229,8 @@ Ident identity_of(const fs::path& a, const fs::path& b) {
 // planted at it after the snapshot is followed.
 bool path_is_reserved_unguarded(const fs::path& p) {
     // path_bytes (UTF-8), never p.string(): on MSVC string() throws for a name the active code page
-    // cannot hold, and the guard turns a throw into a refusal, which refused every such name as if it
-    // were reserved (a file named U+96EA.txt could not be read, listed or hashed).
+    // cannot hold, and the guard turns a throw into a refusal, so such a name would be refused as if it
+    // were reserved.
     if (yuzu::filesystem::reserved::contains_nul(path_bytes(p)))
         return true;
 #ifdef _WIN32
@@ -1292,7 +1292,8 @@ private:
             // A reserved entry is not listed: its name and size are metadata of a refused object.
             if (path_is_reserved(entry.path()))
                 continue;
-            std::string entry_name = entry.path().filename().string();
+            // UTF-8 and non-throwing: path::string() throws on MSVC for a name the active code page cannot hold.
+            std::string entry_name = yuzu::filesystem::find_by_hash::path_utf8(entry.path().filename());
             std::string entry_type = "other";
             std::uintmax_t entry_size = 0;
 

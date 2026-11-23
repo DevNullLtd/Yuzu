@@ -74,6 +74,26 @@ TEST_CASE("is_agent_reserved_path: a not-yet-existing reserved leaf is matched A
 #endif
 }
 
+TEST_CASE("strip_apple_data_firmlink: only a leading /System/Volumes/Data path component is removed (pure)",
+          "[agent][filesystem_plugin][reserved][firmlink]") {
+    CHECK(rsv::strip_apple_data_firmlink("/System/Volumes/Data/Users/x/f") == "/Users/x/f");
+    CHECK(rsv::strip_apple_data_firmlink("/System/Volumes/Data") == "");
+    CHECK(rsv::strip_apple_data_firmlink("/System/Volumes/DataX/f") == "/System/Volumes/DataX/f");
+    CHECK(rsv::strip_apple_data_firmlink("/Users/x/System/Volumes/Data/f") == "/Users/x/System/Volumes/Data/f");
+    CHECK(rsv::strip_apple_data_firmlink("/etc/hosts") == "/etc/hosts");
+    rsv::Set s;
+    s.files = {"/Users/x/keys/agent.key"};
+#ifdef __APPLE__
+    // The firmlink spelling of a not-yet-existing reserved leaf is the same file on macOS.
+    CHECK(rsv::is_agent_reserved_path(s, "/System/Volumes/Data/Users/x/keys/agent.key"));
+    rsv::Set d;
+    d.files = {"/System/Volumes/Data/Users/x/keys/agent.key"};
+    CHECK(rsv::is_agent_reserved_path(d, "/Users/x/keys/agent.key"));
+#else
+    CHECK_FALSE(rsv::is_agent_reserved_path(s, "/System/Volumes/Data/Users/x/keys/agent.key"));
+#endif
+}
+
 TEST_CASE("is_agent_reserved_path: an empty set reserves nothing; windows separators normalise",
           "[agent][filesystem_plugin][reserved]") {
     CHECK_FALSE(rsv::is_agent_reserved_path(rsv::Set{}, "/anything"));
@@ -678,6 +698,32 @@ TEST_CASE("filesystem plugin: write_content refuses every alias spelling of an a
         CHECK(w.rc != 0);
         CHECK_FALSE(fs::exists(reserved));
     }
+    handle->descriptor()->shutdown(ctx.get());
+}
+
+// WP06 F55 (Windows only): a directory entry whose name the active code page cannot hold is listed (it is
+// not refused as reserved and path::string() is not called on it).
+TEST_CASE("filesystem plugin: list_dir lists a file whose name the code page cannot hold",
+          "[agent][filesystem_plugin][reserved][winnonacp]") {
+    const auto plugin_path = sup::find_plugin();
+    if (plugin_path.empty())
+        SKIP("filesystem plugin library not found");
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    if (!handle.has_value() || !handle->descriptor())
+        SKIP("filesystem plugin did not load");
+    yuzu::test::TempDir root{"yuzu_test_fs_nonacp_"};
+    {
+        std::ofstream o(root.path / L"\u96ea.txt");
+        o << "snow";
+    }
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    const std::string rp = root.path.string();
+    const std::array<YuzuParam, 1> params{{{"path", rp.c_str()}}};
+    yuzu::agent::LocalDispatcher d;
+    auto r = d.run(handle->descriptor(), "list_dir", params);
+    CHECK(r.rc == 0);
+    CHECK(r.captured.find("\xe9\x9b\xaa.txt") != std::string::npos); // UTF-8 for U+96EA
     handle->descriptor()->shutdown(ctx.get());
 }
 
