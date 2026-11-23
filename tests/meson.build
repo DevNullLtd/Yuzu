@@ -552,6 +552,7 @@ agent_test_exe = executable(
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (macOS and Windows, self-gated)
     'unit/test_msi_packages_inventory.cpp',   # pure list_inventory builder over the committed Kingsley REAL CAPTURE (fixture via YUZU_TEST_FIXTURE_DIR; runs on every OS)
+    'unit/test_install_row_attributes.cpp',   # SAM-46: shared install-row attribute field (canonical form, closed key table), portable
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
     'unit/test_installed_apps_macos_receipts.cpp', # round-3 sync-speed fix: pure receipt-plist byte
@@ -2351,6 +2352,12 @@ if build_server
                # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
                '-DYUZU_API_PARITY_LEDGER_DIR="' +
                (meson.project_source_root() / 'scripts' / 'ci' / 'api-parity').replace('\\', '/') +
+               '"',
+               # test_product_normalize.cpp reads the committed normaliser fixture
+               # (tests/unit/fixtures/software-estate/normaliser/normaliser_cases.tsv) at run time; same
+               # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
+               '-DYUZU_TEST_FIXTURE_DIR="' +
+               (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
                '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # MSVC's default 1 MiB thread stack reserve is marginal for this binary's
