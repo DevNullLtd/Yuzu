@@ -615,16 +615,21 @@ else
 fi
 
 # install_broker NAME EXEC_LINE: the shipped socket and template service under NAME, with path-only
-# drop-ins (the socket path, and the one ExecStart line).
+# drop-ins (the socket path, and the one ExecStart line). The socket file is named fwsnap.sock or
+# fwctl.sock inside the per-run directory, never after the long salted unit name: a unix socket path
+# is limited to 108 bytes and systemd refuses a longer ListenStream as a bad unit file setting (CI
+# ids carry the run id, the runner name and the pid, which made the long form 120 bytes).
 install_broker() {
     local name=$1 exec_line=$2
+    local sock=$run_dir/${name##*-}.sock
+    (( ${#sock} <= 100 )) || die "broker socket path '$sock' is ${#sock} bytes (limit 108)"
     as_root install -m 0644 "$SNAP_SOCKET_FILE" "$sysd/$name.socket"
     as_root install -m 0644 "$SNAP_SERVICE_FILE" "$sysd/$name@.service"
     as_root install -d -m 0755 "$sysd/$name.socket.d" "$sysd/$name@.service.d"
     as_root tee "$sysd/$name.socket.d/00-capcheck-paths.conf" >/dev/null <<EOF
 [Socket]
 ListenStream=
-ListenStream=$run_dir/$name.sock
+ListenStream=$sock
 EOF
     as_root tee "$sysd/$name@.service.d/00-capcheck-paths.conf" >/dev/null <<EOF
 [Service]
@@ -715,9 +720,9 @@ command -v runuser >/dev/null || precondition "runuser is required for the broke
 as_root systemctl start "$snap.socket" || fail "broker socket failed to start"
 eq "broker socket: active" "$(as_root systemctl is-active "$snap.socket" 2>/dev/null)" "active"
 eq "broker socket: owner, group and mode" \
-   "$(as_root stat -c '%U:%G %a' "$run_dir/$snap.sock" 2>/dev/null || echo missing)" "root:$SVC_USER 660"
+   "$(as_root stat -c '%U:%G %a' "$run_dir/fwsnap.sock" 2>/dev/null || echo missing)" "root:$SVC_USER 660"
 
-reply=$(snap_client "$SVC_USER" "$run_dir/$snap.sock" 1 listing) || true
+reply=$(snap_client "$SVC_USER" "$run_dir/fwsnap.sock" 1 listing) || true
 eq "broker reply: starts with the nft section header" "$(kv "$reply" starts)" "1"
 # A reset after the junk is acceptable only once the end line has arrived: ends=1 is that proof.
 eq "broker reply: ends with the end line" "$(kv "$reply" ends)" "1"
@@ -739,14 +744,14 @@ else
 fi
 
 as_root systemctl start "$snapctl.socket" || fail "broker control socket failed to start"
-status=$(snap_client "$SVC_USER" "$run_dir/$snapctl.sock" 0 status) || true
+status=$(snap_client "$SVC_USER" "$run_dir/fwctl.sock" 0 status) || true
 eq "broker service: CapBnd" "$(kv "$status" status_CapBnd)" "0000000000003000"
 eq "broker service: CapEff" "$(kv "$status" status_CapEff)" "0000000000003000"
 eq "broker service: NoNewPrivs (deliberately not set)" "$(kv "$status" status_NoNewPrivs)" "0"
 eq "broker service: Seccomp (filter)" "$(kv "$status" status_Seccomp)" "2"
 
 if getent passwd nobody >/dev/null && ! id -nG nobody | tr ' ' '\n' | grep -qx "$SVC_USER"; then
-    outside=$(snap_client nobody "$run_dir/$snap.sock" 0 listing) || true
+    outside=$(snap_client nobody "$run_dir/fwsnap.sock" 0 listing) || true
     eq "broker socket: an account outside the group cannot connect (errno)" "$(kv "$outside" connect_errno)" "13"
 else
     echo "NOTE: no account outside the $SVC_USER group to test the group gate with"
