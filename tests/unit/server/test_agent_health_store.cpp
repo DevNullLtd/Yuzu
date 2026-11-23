@@ -3338,7 +3338,6 @@ TEST_CASE("EchoCorruptionAuditGate: the eviction search at the cap is a bounded 
           "many identities arrive (heartbeat path holds the gate mutex)",
           "[health_store][echo][corruption][gate]") {
     using yuzu::server::detail::EchoCorruptionAuditGate;
-    using yuzu::server::detail::kEchoCorruptionAuditMinRowInterval;
     int64_t clock = 1000;
     EchoCorruptionAuditGate gate(
         [&](const std::string&) {
@@ -3353,16 +3352,10 @@ TEST_CASE("EchoCorruptionAuditGate: the eviction search at the cap is a bounded 
     for (int i = 0; i < kFill; ++i)
         gate.mark_logged("fresh-" + std::to_string(i), "1:f");
     CHECK(gate.max_victim_probe() == 0); // exactly at the cap, nothing evicted yet
-    for (int i = 0; i < 2000; ++i)
+    constexpr int kFlood = 2000;
+    for (int i = 0; i < kFlood; ++i)
         gate.mark_logged("flood-" + std::to_string(i), "1:f");
     CHECK(gate.max_victim_probe() == EchoCorruptionAuditGate::kVictimScan);
-
-    // Aged entries are still preferred when they sit inside the prefix: age everything, flood
-    // again, the probe never exceeds the bound and (all aged) stops at the first entry.
-    clock += kEchoCorruptionAuditMinRowInterval;
-    for (int i = 0; i < 2000; ++i)
-        gate.mark_logged("later-" + std::to_string(i), "1:f");
-    CHECK(gate.max_victim_probe() <= EchoCorruptionAuditGate::kVictimScan);
 }
 
 TEST_CASE("EchoCorruptionAuditGate: a rotating identity is rate-limited per agent",

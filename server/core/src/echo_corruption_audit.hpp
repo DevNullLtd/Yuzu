@@ -234,8 +234,8 @@ public:
     /// contained lookups a failing store sees per retry period.
     static constexpr std::size_t kMaxFailing = 16;
 
-    /// Most entries any single eviction has examined (never above kVictimScan): lets a test pin
-    /// that the search stays bounded.
+    /// TEST SEAM: the most entries any single eviction has examined (never above kVictimScan), so a
+    /// test can pin that the search stays bounded without a timing assertion.
     [[nodiscard]] std::size_t max_victim_probe() const {
         std::lock_guard lock(mu_);
         return max_victim_probe_;

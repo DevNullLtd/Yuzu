@@ -144,13 +144,11 @@ def problems(server_src, header_src):
 
     # 2b. A closed audit store is counted, once, in the sink before the audit call: the quarantine
     # counter cannot move then, so without this the signal is silent exactly when the store is down.
-    closed_inc = find(f'metrics_.counter("{STORE_CLOSED}").increment();',
-                      f"increment of {STORE_CLOSED} (a closed audit store must be counted)")
     closed_guard = find("if (!audit_store_ || !audit_store_->is_open()) { "
                         f'metrics_.counter("{STORE_CLOSED}").increment(); return; }}',
                         f"closed-store branch that counts {STORE_CLOSED} before it returns")
-    if closed_inc is not None and call is not None and not closed_inc < call:
-        out.append(f"the {STORE_CLOSED} increment must come before the log_echo_corruption_once call")
+    if closed_guard is not None and call is not None and not closed_guard < call:
+        out.append(f"the {STORE_CLOSED} closed-store branch must come before the log_echo_corruption_once call")
 
     # 3. The observer counts under its argument's token and is the gate's third argument.
     find('auto on_degraded = [this](detail::DegradedCause cause) { '
@@ -221,9 +219,7 @@ MUTATIONS = [
     ("closed-store pre-seed removed", "s", f'metrics_.counter("{STORE_CLOSED}");', "",
      "pre-seed `metrics_.counter(\"" + STORE_CLOSED),
     ("closed-store increment removed", "s", f'metrics_.counter("{STORE_CLOSED}").increment();', "",
-     f"increment of {STORE_CLOSED}"),
-    ("closed-store branch returns without counting", "s", f'metrics_.counter("{STORE_CLOSED}").increment(); return;',
-     "return;", f"increment of {STORE_CLOSED}"),
+     f"closed-store branch that counts {STORE_CLOSED}"),
     ("the sweep gauge removed", "s", GAUGE, "", "sweep that sets"),
     ("the sweep gauge kept only in a comment", "s", GAUGE, "/* " + GAUGE + " */", "sweep that sets"),
     ("the sweep gauge made conditional", "s", GAUGE, "if (stream_budget_) { " + GAUGE + " }",

@@ -620,6 +620,13 @@ TEST_CASE("retired_tar_only_count counts only tar-without-echo sessions",
     CHECK(registry.retired_tar_only_count() == 1);
     registry.remove_agent("dev-c");
     CHECK(registry.retired_tar_only_count() == 0);
+    // The other replace direction: an echo session replaced by a tar-only one starts counting.
+    register_with("dev-flip", {"echo"});
+    CHECK(registry.retired_tar_only_count() == 0);
+    register_with("dev-flip", {"tar"});
+    CHECK(registry.retired_tar_only_count() == 1);
+    registry.remove_agent("dev-flip");
+    CHECK(registry.retired_tar_only_count() == 0);
 }
 
 TEST_CASE("an agent reporting `echo` has it and send_to / send_to_all write `echo` to the wire",
