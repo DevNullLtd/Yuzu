@@ -130,9 +130,25 @@ class RegistryDeleteKey(unittest.TestCase):
         words = _words(defn["metadata"]["description"])
         self.assertIn("An earlier registry agent (1.x or 2.0.x) is unsupported: reprovision it.", words)
         self.assertIn("deletes a childless key", words)
+        self.assertIn("empty `REG_SZ` over the existing value", words)
         self.assertIn("#6484", words)
         for banned in ("MIXED FLEETS", "kill switch", "upgrade the server, then the agents"):
             self.assertNotIn(banned, words)
+
+    def test_the_hazard_sentence_is_identical_on_every_surface(self):
+        # ONE sentence, byte-identical (whitespace-normalised) in the definition, the generated JSON, the README and
+        # upgrading.md; the README's former fourth sentence ("means the key was deleted") is gone.
+        root = Path(__file__).resolve().parent.parent
+        sentence = ("It ignores `dry_run` and `recursive`, so a `delete_key` with `dry_run=true` sent to it deletes a "
+                    "childless key; a 1.x agent also answers a `data_hex`-only `set_value` by writing an empty `REG_SZ` "
+                    "over the existing value and replying `status|ok`. The server does not compare plugin versions (#6484).")
+        for rel in ("content/definitions/registry.yaml", "content/plugin-docs/registry.json",
+                    "agents/plugins/registry/README.md", "docs/user-manual/upgrading.md"):
+            with self.subTest(surface=rel):
+                text = _words((root / rel).read_text(encoding="utf-8"))
+                self.assertIn(sentence, text.replace('\\"', '"'))
+        readme = _words((root / "agents/plugins/registry/README.md").read_text(encoding="utf-8"))
+        self.assertNotIn("means the key was deleted", readme)
 
     def test_min_agent_version_is_declared_as_the_input_to_the_dispatch_gate(self):
         # Declared and exported, not compared at dispatch today (#6484); pinned so the gate is correct the day it lands.
