@@ -1303,9 +1303,8 @@ after Trivy:
   on its OS. A missing provider, or a capture time that is unreadable or more than an hour in the
   future, always fails; a capture that is only older than 72 hours fails unless a reviewed provider
   waiver for that provider is in force ("Provider waivers" below), and then the image passes
-  DEGRADED.
-  Every scan runs with DB updates and the
-  update check off and grype's own 72-hour age check on, so grype never fetches a DB of its own.
+  DEGRADED. Every scan runs with DB updates and the update check off and grype's own 72-hour age
+  check on, so grype never fetches a DB of its own.
   **The listing is not signed upstream:** TLS to its host and the recorded URL and checksum are
   the only evidence of which DB was used, exactly as for Trivy's DB.
 - grype reads only a config the checker generates from `.grypeignore.yaml` (`-c`, holding nothing
@@ -1810,15 +1809,16 @@ provider_waivers:
 - Nothing else enables one: no workflow input, environment variable or option of the gate does
   (`YUZU_GRYPEIGNORE` is limited to the repository's file on GitHub Actions, above). A waiver is a
   commit, so it is in the tag a release builds.
-- An image judged with a waiver passes DEGRADED, and says so: its grype `.gate.txt` keeps
+- An image that PASSES under a waiver is DEGRADED, and says so: its grype `.gate.txt` keeps
   `gate: pass` (so the publish journal opens) and adds `provider waiver: provider <name> captured
   <time>, <N> hours old (over the 72-hour limit), admitted by the provider waiver at
   .grypeignore.yaml:<line>: expires ..., approved_by ..., approval_ref ..., approved_on ...` and
-  `DEGRADED: provider waiver in force (<name>)`; the step summary opens with **DEGRADED: provider
-  waiver in force** (an `nvd` waiver, which every image judged while it is in force uses) and marks
-  each degraded row; the log
-  prints a `::warning::` per waiver used. A report that used none says `provider waiver: none used`.
-  A waiver in force for a provider that is current is not used and changes nothing.
+  `DEGRADED: provider waiver in force (<name>)`; its step-summary row says so, the log prints a
+  `::warning::` per image-level waiver used, and the end-of-run line (log and summary) counts the
+  images that passed under a waiver. The word DEGRADED appears nowhere else: an image that did not
+  pass is never DEGRADED, whatever the waiver, and the start of the run announces a waiver in force
+  without the word. A report that used none says `provider waiver: none used`. A waiver in force
+  for a provider that is current is not used and changes nothing.
 - **Decision record (2026-11-21).** The project owner decided that a release must be able to
   ship through a stalled upstream grype provider, under the bounds above (one named provider, at
   most 14 days, the committed file only, every use reported DEGRADED), and fixed that design for
@@ -1843,12 +1843,19 @@ provider_waivers:
   turns that scan red while the provider is still stale.
 - A run that starts on an `nvd` waiver re-checks it for each image, before the image's own
   provider check, so an image judged after the waiver lapsed (a run crossing UTC midnight on its
-  expiry day) fails (`provider waiver lapsed during the run`; its report names only the lapsed
-  waiver as lapsed and says nothing DEGRADED), and a waivers file that cannot be read again fails
-  it as `provider waivers unreadable`. An image the gate never judged (a stop or a cancel) records
-  `provider waiver: in force for this run (...), but the image was not judged` (or `lapsed during
-  this run (...), and the image was not judged`) instead of DEGRADED, and the `ignore file:` line
-  counts the waivers in force and those pending approval (and how many of them were not honoured).
+  expiry day) fails (`provider waiver lapsed during the run`). A lapse is reported only on the
+  checker's positive answer that the provider is stale and no waiver admits it, with an explicit
+  `provider waiver: stale and not waived: the <name> waiver lapsed during this run ...` line. A
+  waivers file that cannot be read again fails the image as `provider waivers unreadable`
+  (`provider waiver: not admitted: the waivers file could not be read again`), and any other
+  re-check failure as `provider waiver re-check failed` (`provider waiver: not admitted:
+  re-checking ...`); neither is called a lapse. An image that failed for any other reason with a
+  waiver in force says `provider waiver: in force (...), but the image did not pass, so nothing was
+  admitted by it`. An image the gate never judged (a stop or a cancel) records `provider waiver: in
+  force for this run (...), but the image was not judged` (or `stale and not waived: ... lapsed
+  during this run, and the image was not judged`). None of these is DEGRADED, and the `ignore file:`
+  line counts the waivers in force and those pending approval (and how many of them were not
+  honoured).
 
 **What the approval fields are, and what the control is.** `approved_by`, `approved_on` and
 `approval_ref` are a RECORDED REFERENCE: the gate checks that they are present and well formed (a
@@ -1858,7 +1865,7 @@ with a date passes it exactly like a real approval. They are not a verified appr
 document may present them as one. The control is human review of every change to
 `.trivyignore.yaml`, `.grypeignore.yaml`, `scripts/ci/image-vuln-gate-not-covered.txt`, the gate scripts
 (`scripts/ci/image-vuln-gate.sh`, `scripts/ci/image-vuln-gate-checks.py`,
-`scripts/ci/image-identity.sh`, `scripts/ci/image-publish.sh`, `scripts/check-release-artifacts.sh`) and the workflows that run them
+`scripts/ci/image-identity.sh`, `scripts/ci/image-publish.sh`, `scripts/ci/release-degraded.sh`, `scripts/check-release-artifacts.sh`) and the workflows that run them
 (`release.yml`, `pre-release.yml`): the approval is the review of the pull request that adds or
 changes the entry, and the fields record where to find it. That review is as strong as the branch
 protection that requires it.
@@ -1985,18 +1992,23 @@ except the agent bundle:
      a re-run after it expires refuses the whole file), and the approval recorded as
      "Recording an approval" above describes. A pending waiver is not honoured by the release.
   3. Merge, run the pre-tag `pending` check, and re-tag (the waiver is a commit). Every image that
-     needed the provider passes DEGRADED; check that each grype `.gate.txt` names the waiver, and
-     say in the release notes that the release was scanned degraded (which provider, its capture
-     age, the waiver's expiry and `approval_ref`), linking
-     `docs/user-manual/release-verification.md` "A degraded pass". After the publish legs,
-     `grep -H '^DEGRADED:' grype-*.attempt-*.gate.txt` over the run's reports shows which images
-     were scanned degraded; nothing enforces the release-notes statement but this procedure.
+     needed the provider passes DEGRADED; check that each grype `.gate.txt` names the waiver. The
+     release workflow writes the release notes' statement itself, an "Image scan: DEGRADED"
+     section (the provider, its capture age, the waiver's expiry and `approval_ref`, taken from
+     the published attempt's own `.gate.txt` by `scripts/ci/release-degraded.sh`, linking
+     `docs/user-manual/release-verification.md` "A degraded pass"), and
+     `scripts/check-release-artifacts.sh` prints a non-fatal `::warning::` with the same lines. A
+     report whose marker cannot be read is stated as undetermined, never omitted. Neither changes
+     `gate: pass` or what the publish journal accepts. After the publish legs,
+     `grep -H -e '^gate:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt` over the run's reports lists
+     every attempt's verdict and any DEGRADED line; only the highest attempt whose publish journal
+     ends `publish: tagged` counts, because a refused attempt's report is attached too.
   4. Remove the waiver in a follow-up pull request as soon as the provider is current again (on
      the default branch too, which the post-release scan reads); once it expires the gate refuses
      the whole file until it is removed. Then dispatch `pre-release.yml` for the degraded release
      (`gh workflow run pre-release.yml --repo DevNullLtd/Yuzu -f tag=vX.Y.Z`), so its images are
-     scanned again with the
-     provider current: a fixable CRITICAL the stale capture hid surfaces there, and is then handled
+     scanned again with the provider current: a fixable CRITICAL the stale capture hid surfaces
+     there, and is then handled
      as a CRITICAL in a published release (a patch release; the security policy's advisory path
      if it is exploitable).
 
@@ -2071,7 +2083,7 @@ same holds for a not-covered listing. A grype provider waiver admits ONE named p
 GitHub Actions from the committed `.grypeignore.yaml` only, on the same approval terms; it waives no
 finding, no missing provider or unreadable capture time, no DB age, checksum, status or schema check, no coverage or
 component check, and an image judged with one says DEGRADED in its grype `.gate.txt` and the step
-summary. Those fields are a recorded reference, checked for format only;
+summary only when the image passed. Those fields are a recorded reference, checked for format only;
 the review of the change is the control. Trivy reads only the checker's canonical copy of the ignore
 file, and the DB only from this run's fresh cache, pinned by digest. A grype acceptance is in force on
 the same terms with a package name AND version as its scope; grype reads only the generated `ignore:`

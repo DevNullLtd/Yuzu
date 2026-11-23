@@ -1664,7 +1664,9 @@ class ProviderWaiver(unittest.TestCase):
         self.assertIn("DEGRADED: provider waiver in force (nvd)", g)
         self.assertIn("1 provider waiver(s) in force", g)
         s = summ.read_text(encoding="utf-8")
-        self.assertIn("**DEGRADED: provider waiver in force** for grype DB provider(s) nvd", s)
+        self.assertIn("**Provider waiver in force** for grype DB provider(s) nvd", s)
+        self.assertIn("**DEGRADED: provider waiver in force** for grype DB provider(s) nvd (older than 72 hours): "
+                      "1 image(s) passed under it", s)
         self.assertIn("| pass (DEGRADED: provider waiver in force: nvd) |", s)
         self.assertIn("DEGRADED: provider waiver in force for grype DB provider(s) nvd", r.stdout)
         # Trivy's verdict is untouched, and the publish journal still opens on it.
@@ -1852,7 +1854,7 @@ class ProviderWaiver(unittest.TestCase):
         # Simulate the waiver lapsing after the run-wide nvd check (a run
         # crossing UTC midnight on its expiry day): the generated waivers file
         # is emptied once the run's nvd waiver has been read.
-        lapse = ('[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    DEGRADED: provider waiver in force for $(waived_desc): '
+        lapse = ('[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    provider waiver in force for $(waived_desc): '
                  'every image judged while it is in force uses it"\n')
         def gate_copy(label, extra_edits=()):
             return GrypeMutants.mutant(self, label, [(lapse, lapse + 'echo "[]" > "$GRYPE_WAIVERS"\n'),
@@ -1863,8 +1865,8 @@ class ProviderWaiver(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         g = (rep / "grype-img.gate.txt").read_text(encoding="utf-8")
         self.assertIn("gate: FAIL: provider waiver lapsed during the run", g)
-        self.assertIn("provider waiver: lapsed during this run (nvd)", g)
-        self.assertNotIn("DEGRADED", g)
+        self.assertIn("provider waiver: stale and not waived: the nvd waiver lapsed during this run", g)
+        self.assertNotIn("DEGRADED", g + r.stdout)
         # Without the per-image re-check, the lapsed waiver would still admit it.
         m = gate_copy("lapse-no-recheck", [('    if [ "${#GRYPE_DB_WAIVERS[@]}" -gt 0 ] && ! "${CHECKS[@]}" '
                                             'grype-db-providers "$WORK/grype-db-providers.json" \\',
@@ -1874,7 +1876,7 @@ class ProviderWaiver(unittest.TestCase):
                           gate=m)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         # With an OS-provider waiver too, only the nvd waiver is named as
-        # lapsed, the debian one the image used is still listed, and nothing
+        # lapsed (the OS check never runs on a lapsed image), and nothing
         # calls the failed image degraded.
         rep2 = self.tmp / "rep-lapse-os"
         r = self.run_gate("img:1", grype_ignore=self.waived(waiver(), waiver(provider="debian"), name="w3.yaml"),
@@ -1883,17 +1885,82 @@ class ProviderWaiver(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         g = (rep2 / "grype-img.gate.txt").read_text(encoding="utf-8")
         self.assertIn("gate: FAIL: provider waiver lapsed during the run", g)
-        self.assertIn("provider waiver: lapsed during this run (nvd), so it did not admit", g)
-        self.assertNotIn("DEGRADED", g)
-        self.assertNotIn("DEGRADED: provider waiver in force: grype DB provider debian", r.stdout)
+        self.assertIn("provider waiver: stale and not waived: the nvd waiver lapsed during this run, so it did not admit", g)
+        self.assertNotIn("DEGRADED", g + r.stdout)
+        self.assertNotIn("provider debian", g)
         # A waivers file that cannot be read again is not called a lapse.
         rep3 = self.tmp / "rep-unreadable"
         broken = GrypeMutants.mutant(self, "unreadable", [(lapse, lapse + 'echo "{" > "$GRYPE_WAIVERS"\n')], [])
         r = self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=self.waived(waiver(), name="w4.yaml"),
                           gate=broken, extra=("--report-dir", str(rep3)))
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
-        self.assertIn("gate: FAIL: provider waivers unreadable",
-                      (rep3 / "grype-img.gate.txt").read_text(encoding="utf-8"))
+        g = (rep3 / "grype-img.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("gate: FAIL: provider waivers unreadable", g)
+        # (p3-1) the report does not call an image it failed admitted or degraded
+        self.assertIn("provider waiver: not admitted: the waivers file could not be read again", g)
+        self.assertNotIn("DEGRADED", g + r.stdout)
+        self.assertNotIn("stale and not waived", g)
+
+    def test_a_failed_recheck_that_is_not_a_lapse_is_not_called_one(self):
+        # (p3-4) the re-check fails because the providers listing lost nvd, not
+        # because the waiver lapsed: it is a failed re-check, never "lapsed".
+        gate = GrypeMutants.mutant(self, "recheck-fails-not-lapse", [
+            ('    # A waivers file that cannot be read is told apart from a lapse, and a lapse\n',
+             '    echo "[]" > "$WORK/grype-db-providers.json"\n'
+             '    # A waivers file that cannot be read is told apart from a lapse, and a lapse\n')], [])
+        rep = self.tmp / "rep-recheck"
+        r = self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=self.waived(waiver()),
+                          gate=gate, extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        g = (rep / "grype-img.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("gate: FAIL: provider waiver re-check failed", g)
+        self.assertIn("provider waiver: not admitted: re-checking", g)
+        self.assertNotIn("stale and not waived", g)
+        self.assertNotIn("lapsed", g + r.stdout)
+        self.assertNotIn("DEGRADED", g + r.stdout)
+
+    def test_degraded_is_only_for_an_image_that_passed_under_the_waiver(self):
+        # (p3-3/p3-5) an image that failed for another reason, with the waiver
+        # in force, is not DEGRADED anywhere: report, summary, log, footer.
+        rep = self.tmp / "rep-failed"
+        summ = self.tmp / "summary-failed.md"
+        stale = {"STUB_GRYPE_PROVIDERS": "provider-stale,provider-os-stale"}
+        r = self.run_gate("img:1", grype_mode="findings", grype_ignore=self.waived(waiver()),
+                          extra=("--report-dir", str(rep)),
+                          env_extra={**stale, "GITHUB_STEP_SUMMARY": str(summ)})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        g = (rep / "grype-img.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("gate: FAIL: fixable CRITICAL", g)
+        self.assertIn("but the image did not pass, so nothing was admitted by it", g)
+        self.assertNotIn("DEGRADED", g + r.stdout + summ.read_text(encoding="utf-8"))
+
+    def test_the_end_of_run_line_counts_only_the_images_that_passed_under_a_waiver(self):
+        # Image a passes under the nvd waiver; the waiver then lapses (the
+        # waivers file is emptied after a), so b is refused as stale and not
+        # waived. The footer counts a alone, and b's report has no DEGRADED.
+        rep = self.tmp / "rep-mixed"
+        done = '    grype_reported[$n]=1\n    IMAGE_WAIVERS=()\n'
+        gate = GrypeMutants.mutant(self, "waiver-lapses-after-a", [
+            (done, '    grype_reported[$n]=1\n    [ "$n" != a ] || echo "[]" > "$GRYPE_WAIVERS"\n    IMAGE_WAIVERS=()\n')], [])
+        r = self.run_gate("a=img:1", "b=img:2", grype_mode="provider-stale", grype_ignore=self.waived(waiver()),
+                          gate=gate, extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        ga = (rep / "grype-a.gate.txt").read_text(encoding="utf-8")
+        gb = (rep / "grype-b.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("DEGRADED: provider waiver in force (nvd)", ga)
+        self.assertIn("provider waiver: stale and not waived", gb)
+        self.assertNotIn("DEGRADED", gb)
+        self.assertIn("(older than 72 hours): 1 image(s) passed under it", r.stdout)
+        # Every image lapsed before any passed: no DEGRADED line at the end.
+        rep2 = self.tmp / "rep-all-lapsed"
+        lapse = ('[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    provider waiver in force for $(waived_desc): '
+                 'every image judged while it is in force uses it"\n')
+        gate2 = GrypeMutants.mutant(self, "waiver-lapses-at-start", [(lapse, lapse + 'echo "[]" > "$GRYPE_WAIVERS"\n')], [])
+        r = self.run_gate("a=img:1", "b=img:2", grype_mode="provider-stale",
+                          grype_ignore=self.waived(waiver(), name="w5.yaml"), gate=gate2,
+                          extra=("--report-dir", str(rep2)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("DEGRADED", r.stdout)
 
     def test_an_image_never_judged_is_not_reported_degraded(self):
         import subprocess as sp
@@ -2073,15 +2140,46 @@ class ProviderWaiverMutants(unittest.TestCase):
         self.assertIn("DEGRADED: provider waiver in force (nvd)", g)
         self.assertIn("DEGRADED: provider waiver in force", s)
         g, _ = degraded_reports(self.mutant("waiver not in the report", [
-            ('        echo "grype db: $GRYPE_DB_REF"\n        waiver_lines\n', '        echo "grype db: $GRYPE_DB_REF"\n')]))
+            ('        echo "grype db: $GRYPE_DB_REF"\n        waiver_lines "$res"\n', '        echo "grype db: $GRYPE_DB_REF"\n')]))
         self.assertNotIn("DEGRADED", g)
         _, s = degraded_reports(self.mutant("waiver not in the summary", [
-            ('    if [ "${#GRYPE_DB_WAIVERS[@]}" -gt 0 ]; then\n        summary "**DEGRADED',
-             '    if false; then\n        summary "**DEGRADED'),
             ('        summary "| $n (grype) | - | distro ${distro:-none} | $gres (DEGRADED: provider waiver in force: '
              '$wdesc) |"', '        summary "| $n (grype) | - | distro ${distro:-none} | $gres |"'),
             ('    summary "**DEGRADED: provider waiver in force** for grype DB provider(s) $wsum', '    summary "x $wsum')]))
         self.assertNotIn("DEGRADED", s)
+        # DEGRADED only on a PASS: the same waiver-in-force run, with a finding
+        # that fails the image, must read DEGRADED nowhere.
+        def failed_reports(gate):
+            rep = self.tmp / ("rep-" + str(len(list(self.tmp.glob("rep-*")))))
+            summ = rep.with_suffix(".md")
+            r = self.run_gate("img:1", grype_mode="findings", grype_ignore=self.waived(waiver()), gate=gate,
+                              extra=("--report-dir", str(rep)),
+                              env_extra={"STUB_GRYPE_PROVIDERS": "provider-stale,provider-os-stale",
+                                         "GITHUB_STEP_SUMMARY": str(summ)})
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            return (rep / "grype-img.gate.txt").read_text(encoding="utf-8") + summ.read_text(encoding="utf-8") + r.stdout
+        self.assertNotIn("DEGRADED", failed_reports(GATE))
+        self.assertIn("DEGRADED", failed_reports(self.mutant("failed image reads degraded", [
+            ('    if [ "$res" != pass ]; then\n', '    if false; then\n')])))
+        self.assertIn("DEGRADED", failed_reports(self.mutant("failed image counted degraded", [
+            ('    if [ "$gres" = pass ]; then\n', '    if true; then\n')])))
+        # A re-check failure that is not the checker's stale-and-not-waived answer is no lapse.
+        def recheck(gate):
+            rep = self.tmp / ("rep-" + str(len(list(self.tmp.glob("rep-*")))))
+            self.run_gate("img:1", grype_mode="provider-stale", grype_ignore=self.waived(waiver(), name="rc.yaml"),
+                          gate=gate, extra=("--report-dir", str(rep)))
+            return (rep / "grype-img.gate.txt").read_text(encoding="utf-8")
+        broken = self.mutant("recheck fails", [
+            ('    # A waivers file that cannot be read is told apart from a lapse, and a lapse\n',
+             '    echo "[]" > "$WORK/grype-db-providers.json"\n'
+             '    # A waivers file that cannot be read is told apart from a lapse, and a lapse\n')])
+        self.assertNotIn("stale and not waived", recheck(broken))
+        self.assertIn("stale and not waived", recheck(self.mutant("any recheck failure is a lapse 2", [
+            ('    # A waivers file that cannot be read is told apart from a lapse, and a lapse\n',
+             '    echo "[]" > "$WORK/grype-db-providers.json"\n'
+             '    # A waivers file that cannot be read is told apart from a lapse, and a lapse\n'),
+            ('        elif grep -q \'only a reviewed provider waiver for\' "$WORK/grype-recheck.err"; then',
+             '        elif true; then')])))
         # The Actions-only refusal of another acceptance file.
         def actions(gate):
             return self.run_gate("img:1", grype_ignore=self.waived(waiver(), name="act.yaml"), gate=gate,

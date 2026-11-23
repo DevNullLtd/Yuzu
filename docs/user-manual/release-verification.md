@@ -171,16 +171,31 @@ the capture, so a fix published upstream since then may be missing from the verd
 <time>, <N> hours old (over the 72-hour limit), admitted by the provider waiver at
 .grypeignore.yaml:<line>: expires ..., approved_by ..., approval_ref ..., approved_on ...` line and a
 `DEGRADED: provider waiver in force (<name>)` line; a scan that used none says `provider waiver:
-none used`. To see whether any image of a release was scanned degraded (in the directory of its
-verified assets):
+none used`. `DEGRADED:` appears only for an image that passed under a waiver. The release notes
+of such a release carry an "Image scan: DEGRADED" section, written from the published
+attempt's own reports. To see it yourself (in the directory of its verified assets):
 
 ```bash
-grep -H -e '^provider waiver:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt
+grep -H -e '^gate:' -e '^provider waiver:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt
 ```
 
-A grype `.gate.txt` with no `provider waiver:` line at all records nothing either way. A
-`gate: pass` line alone therefore does not say whether a pass was degraded; read the
-`DEGRADED:` line too. The waiver bounds how long it is in force (14 days), not how old the
+Only the highest attempt of each image whose publish journal ends `publish: tagged` counts: the
+release also attaches the reports of refused earlier attempts. A grype `.gate.txt` with no
+`provider waiver:` line at all records nothing either way. A `gate: pass` line alone therefore
+does not say whether a pass was degraded; read the `DEGRADED:` line too. A report that is not a
+pass can carry one of these `provider waiver:` lines instead, and none of them is a degraded
+pass:
+
+- `stale and not waived: the <name> waiver lapsed during this run ...`: the waiver's date passed
+  while the release was being scanned, so the stale provider was not admitted for that image and
+  its `gate:` line is a `FAIL`.
+- `not admitted: the waivers file could not be read again ...` or `not admitted: re-checking the
+  run's provider waiver failed ...`: the gate could not confirm the waiver for that image and
+  refused it (a `FAIL`); this is not a lapse.
+- `in force (<name>), but the image did not pass, so nothing was admitted by it`: the image failed
+  for another reason.
+- `in force for this run (<name>), but the image was not judged`, or `stale and not waived ...
+  and the image was not judged`: the gate stopped (or was cancelled) before this image. The waiver bounds how long it is in force (14 days), not how old the
 capture it admits may be: the capture's age is on the `provider waiver:` line. The project's
 release procedure requires the release notes of a release scanned degraded to say so; the
 reports are the record either way. Follow the waiver's `approval_ref` to audit it,

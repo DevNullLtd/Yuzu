@@ -3629,6 +3629,19 @@ jobs:
             echo "" >> release-notes.md
           fi
 
+          # An image that passed the grype gate under a provider waiver says so
+          # here, from the published attempt's own report (fail-safe: a report
+          # that cannot be read is stated as undetermined, never omitted).
+          deg_rc=0
+          deg="$(bash scripts/ci/release-degraded.sh artifacts)" || deg_rc=$?
+          if [ "$deg_rc" -ne 0 ]; then
+            if [ -n "$deg" ]; then
+              printf '%s\n\n' "$deg" >> release-notes.md
+            else
+              printf '%s\n\n' "## Image scan: DEGRADED" "Whether this release's images were scanned degraded could not be determined; treat them as degraded until verified." >> release-notes.md
+            fi
+          fi
+
           cat >> release-notes.md <<NOTES_EOF
           ## Enterprise installers
 

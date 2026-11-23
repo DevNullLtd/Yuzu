@@ -68,7 +68,7 @@ def journal_text(img: str, attempt: int, upto: str = "tagged", digest: str = "a"
 
 
 def write_reports(d: Path, img: str, attempt: int, verdict: str = "pass", scanner: str | None = None,
-                  upto=None) -> None:
+                  upto=None, waiver_lines: str = "provider waiver: none used\n") -> None:
     """One attempt's gate reports, both scanners' (Trivy and grype, as the gate
     writes them) unless `scanner` names one; with `upto`, its publish journal
     too. A passing two-scanner attempt gets a `tagged` journal unless upto says
@@ -77,7 +77,8 @@ def write_reports(d: Path, img: str, attempt: int, verdict: str = "pass", scanne
         stem = f"{sc}-{img}.attempt-{attempt}"
         (d / f"{stem}.json").write_text(json.dumps({"ArtifactName": img}))
         (d / f"{stem}.txt").write_text("table\n")
-        (d / f"{stem}.gate.txt").write_text(f"image: {img}\nrun attempt: {attempt}\ngate: {verdict}\n")
+        extra = waiver_lines if sc == "grype" else ""
+        (d / f"{stem}.gate.txt").write_text(f"image: {img}\nrun attempt: {attempt}\n{extra}gate: {verdict}\n")
     if upto is None and scanner is None and verdict == "pass":
         upto = "tagged"
     if upto:
@@ -413,6 +414,102 @@ class GateReports(unittest.TestCase):
                 r = self.run_script(d)
                 self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
                 self.assertIn(f"{stray} is not a gate report named", r.stderr)
+
+
+DEGRADED_LINES = ("provider waiver: provider nvd captured 2001-01-01T00:00:00Z, 99 hours old (over the 72-hour "
+                  "limit), admitted by the provider waiver at .grypeignore.yaml:3: expires 2030-01-01, approved_by "
+                  "some-login, approval_ref #1234, approved_on 2029-12-30\n"
+                  "DEGRADED: provider waiver in force (nvd): grype judged this image with a DB provider older "
+                  "than 72 hours\n")
+DEGRADED_SCRIPT = SCRIPT.parent / "ci" / "release-degraded.sh"
+
+
+@unittest.skipIf(os.name == "nt" or shutil.which("bash") is None, "needs a POSIX bash")
+class DegradedPass(unittest.TestCase):
+    """A grype pass under a provider waiver keeps `gate: pass` (the release is
+    not refused), but the published attempt's DEGRADED marking surfaces in the
+    release check and in the notes' statement; an unreadable marker shows it too."""
+
+    def run_script(self, d: Path, summary: Path | None = None) -> subprocess.CompletedProcess:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
+        if summary is not None:
+            env["GITHUB_STEP_SUMMARY"] = str(summary)
+        return subprocess.run(["bash", str(SCRIPT), str(d), VERSION], capture_output=True, text=True, env=env)
+
+    def statement(self, d: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(DEGRADED_SCRIPT), str(d)], capture_output=True, text=True)
+
+    def test_a_clean_release_says_nothing(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            d = Path(t)
+            make_artifacts(d)
+            r = self.run_script(d)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertNotIn("DEGRADED", r.stdout + r.stderr)
+            s = self.statement(d)
+            self.assertEqual((s.returncode, s.stdout), (0, ""), s.stderr)
+
+    def test_a_degraded_published_attempt_is_reported_but_not_refused(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            d = Path(t)
+            make_artifacts(d)
+            write_reports(d, "yuzu-gateway", 1, waiver_lines=DEGRADED_LINES)
+            summ = d.parent / (d.name + "-summary.md")
+            self.addCleanup(lambda: summ.unlink(missing_ok=True))
+            r = self.run_script(d, summ)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("::warning::DEGRADED", r.stderr)
+            self.assertIn("yuzu-gateway (attempt 1)", r.stdout)
+            self.assertIn("approval_ref #1234", r.stdout)
+            self.assertIn("DEGRADED: provider waiver in force (nvd)", summ.read_text(encoding="utf-8"))
+            s = self.statement(d)
+            self.assertEqual(s.returncode, 10, s.stderr)
+            self.assertIn("## Image scan: DEGRADED", s.stdout)
+            self.assertNotIn("yuzu-server (attempt", s.stdout)
+
+    def test_only_the_published_attempt_counts(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            d = Path(t)
+            make_artifacts(d)
+            # attempt 1 degraded but superseded by a clean tagged attempt 2
+            write_reports(d, "yuzu-gateway", 1, waiver_lines=DEGRADED_LINES)
+            write_reports(d, "yuzu-gateway", 2)
+            self.assertEqual(self.statement(d).returncode, 0)
+            # attempt 3 degraded but never tagged: attempt 2 stays published
+            write_reports(d, "yuzu-gateway", 3, waiver_lines=DEGRADED_LINES, upto="verified")
+            self.assertEqual(self.statement(d).returncode, 0)
+            # ... and a degraded attempt that did tag is the published one
+            write_reports(d, "yuzu-gateway", 4, waiver_lines=DEGRADED_LINES)
+            s = self.statement(d)
+            self.assertEqual(s.returncode, 10)
+            self.assertIn("yuzu-gateway (attempt 4)", s.stdout)
+
+    def test_a_marker_that_cannot_be_read_shows_as_undetermined(self):
+        cases = {"no waiver line at all": "", "an empty report": None, "an unrecognised waiver line":
+                 "provider waiver: lapsed somehow\n"}
+        for label, lines in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                f = d / "grype-yuzu-gateway.attempt-1.gate.txt"
+                if lines is None:
+                    f.write_text("")
+                else:
+                    write_reports(d, "yuzu-gateway", 1, waiver_lines=lines)
+                s = self.statement(d)
+                self.assertEqual(s.returncode, 10, s.stdout + s.stderr)
+                self.assertIn("could not be determined", s.stdout)
+                self.assertIn("yuzu-gateway", s.stdout)
+
+    def test_the_release_notes_step_appends_the_statement(self):
+        wf = (SCRIPT.parent.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        start = wf.index("- name: Generate release notes")
+        step = wf[start:wf.index("- name: Refuse to publish if the tag moved", start)]
+        self.assertIn('bash scripts/ci/release-degraded.sh artifacts', step)
+        self.assertLess(step.index("release-degraded.sh"), step.index("<<NOTES_EOF"))
+        self.assertIn(">> release-notes.md", step[step.index("release-degraded.sh"):step.index("<<NOTES_EOF")])
+        # a failing statement script still states the uncertainty (fail-safe)
+        self.assertIn("could not be determined", step)
 
 
 if __name__ == "__main__":
