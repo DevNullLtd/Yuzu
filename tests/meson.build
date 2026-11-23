@@ -1856,6 +1856,8 @@ if build_server
       'unit/server/test_yaml_scan.cpp',
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
+      # G01: the refusal seam policy evaluation applies before it dispatches a pair (pure, no store, no [pg])
+      'unit/server/test_policy_dispatch_seam.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
       'unit/server/test_census_ordering_store.cpp', # #5690 PR2a-1: census ordering key, durable pending evidence, schema v4
       'unit/server/test_census_pair_order.cpp', # #5690 UP-14 PR B: census order decision on the agent's (boot_epoch, emit_seq) pair
@@ -4614,6 +4616,18 @@ test('Echo scrub-wiring lexical gate (WP07)',
   timeout: 30,
 )
 
+# #8099: lexical pin over echo_plugin.cpp's do_collect_slow -- the slow-tick reconcile that
+# publishes the rollback_wedged storage-offline tag or clears a stale one. The decision and the
+# store seam have unit tests; EchoPlugin is TU-local, so the shell that calls the decision and does
+# the storage_set / storage_delete is reachable by none. Carries its own in-memory mutation
+# self-test. Source text only, so Python, no build needed.
+test('Echo storage-offline reconcile wiring lexical gate (#8099)',
+  _python3_test,
+  args: [files('test_echo_storage_offline_reconcile_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # WP07: lexical pins for the agent's output-dropped counter increment and the server's boot call to
 # pg::report_server_encoding (neither is reachable from a unit test). Source text only.
 test('WP07 metrics wiring lexical gate',
@@ -5612,6 +5626,23 @@ test('software read wiring lexical',
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# G01: policy evaluation keeps applying the execute gate before it dispatches. server.cpp must hand
+# the PolicyEvaluator its capability registry (an evaluator without one refuses every dispatch, so a
+# dropped line stops every policy and no unit test notices), and policy_evaluator.cpp must reach
+# dispatch_fn from one place only, after the seam. Lexical gate + a selftest that mutates each
+# required statement in memory; both also run in .github/workflows/docs-lint.yml.
+test('policy dispatch wiring lexical',
+  _python3_test,
+  args: [files('test_policy_dispatch_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('policy dispatch wiring lexical selftest',
+  _python3_test,
+  args: [files('test_policy_dispatch_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 30,
 )

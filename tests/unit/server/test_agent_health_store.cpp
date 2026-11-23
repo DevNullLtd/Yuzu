@@ -2042,10 +2042,12 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_echo_storage_offline counts agents 
     beat_tags(store, "d", {{k, "open_failed"}});
     beat_tags(store, "e", {});
     beat_tags(store, "f", {{k, ""}});
+    beat_tags(store, "g", {{k, "rollback_wedged"}});
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     CHECK(gauge("free_space") == 1.0);
     CHECK(gauge("migration_failed") == 2.0);
     CHECK(gauge("open_failed") == 1.0);
+    CHECK(gauge("rollback_wedged") == 1.0);
     CHECK(gauge("unknown") == 0.0);
 
     // An agent that recovers (its next heartbeat drops the tag) leaves the count.
@@ -2053,11 +2055,12 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_echo_storage_offline counts agents 
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     CHECK(gauge("migration_failed") == 1.0);
 
-    // Every snapshot pruned: all four series are still PUBLISHED, at 0 (server-owned counts).
+    // Every snapshot pruned: all five series are still PUBLISHED, at 0 (server-owned counts).
     store.recompute_metrics(metrics, std::chrono::seconds{0});
     CHECK(gauge("free_space") == 0.0);
     CHECK(gauge("migration_failed") == 0.0);
     CHECK(gauge("open_failed") == 0.0);
+    CHECK(gauge("rollback_wedged") == 0.0);
     CHECK(gauge("unknown") == 0.0);
 }
 
@@ -2079,16 +2082,20 @@ TEST_CASE("REAL AgentHealthStore: an unrecognised storage-offline value counts u
     CHECK(text.find("INJECTED") == std::string::npos);
 }
 
-TEST_CASE("parse_echo_storage_offline: the tag and the three tokens are pinned, anything else is unknown",
+TEST_CASE("parse_echo_storage_offline: the tag and the four tokens are pinned, anything else is unknown",
           "[health_store][echo][storage_offline]") {
     using namespace yuzu::server::detail;
     CHECK(std::string_view{kEchoTagStorageOffline} == "yuzu.plugin.echo.storage_offline");
     CHECK(parse_echo_storage_offline("free_space") == std::optional<std::size_t>{0});
     CHECK(parse_echo_storage_offline("migration_failed") == std::optional<std::size_t>{1});
     CHECK(parse_echo_storage_offline("open_failed") == std::optional<std::size_t>{2});
+    // rollback_wedged has its own index, not the last (unknown) one
+    CHECK(parse_echo_storage_offline("rollback_wedged") == std::optional<std::size_t>{3});
     CHECK(parse_echo_storage_offline("") == std::nullopt);
-    CHECK(parse_echo_storage_offline("garbage") == std::optional<std::size_t>{3});
-    CHECK(kEchoStorageOfflineReasons[3] == "unknown");
+    CHECK(parse_echo_storage_offline("garbage") == std::optional<std::size_t>{4});
+    CHECK(kEchoStorageOfflineReasons.size() == 5);
+    CHECK(kEchoStorageOfflineReasons[3] == "rollback_wedged");
+    CHECK(kEchoStorageOfflineReasons[4] == "unknown");
 }
 
 // The corruption gate and the fleet gauge read the `yuzu.plugin.echo.` tag keys only: the retired
