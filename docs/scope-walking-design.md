@@ -53,7 +53,7 @@ CREATE TABLE result_sets (
   name            TEXT,                    -- nullable; operator-supplied alias (unique per owner)
   owner_principal TEXT NOT NULL,           -- session principal; result sets are per-operator
   created_at      INTEGER NOT NULL,        -- epoch seconds
-  ttl_at          INTEGER NOT NULL,        -- epoch seconds; row is GC'd when CURRENT_TIMESTAMP > ttl_at AND pinned=0
+  ttl_at          INTEGER NOT NULL,        -- epoch seconds; row is GC'd when the serving replica's clock > ttl_at AND pinned=0
   pinned          INTEGER NOT NULL DEFAULT 0,
   parent_id       TEXT REFERENCES result_sets(id) ON DELETE SET NULL,  -- lineage edge (nullable for ground sets)
   source_kind     TEXT NOT NULL,           -- 'inventory_query' | 'echo_query' | 'instruction_result' | 'manual_curate'
@@ -112,15 +112,50 @@ All shapes carry enough information to **re-evaluate the query against the curre
 
 `evaluated_at` is informational; it does **not** make the membership list stale by itself — re-eval is operator-driven. See §5 for staleness semantics.
 
+Each server process caches immutable member IDs for materialized result sets. The cache
+charges estimated bytes for the IDs, string capacities, hash buckets and entry overhead
+against a 16 MiB budget. It evicts the oldest inserted sets first. A set larger than the
+budget serves the current evaluation without entering the cache. An in-flight evaluation
+keeps its snapshot through eviction, so the budget covers retained entries only.
+
+Every scope evaluation still reads the set header from PostgreSQL. This checks ownership,
+expiry, readiness, completeness and the materialization generation before using cached IDs.
+The generation identifies the committed membership even if PostgreSQL failover rolls back a
+previous materialization of the same pending set. A generation mismatch reloads the IDs.
+A set without a generation uses the ordinary joined read. An expired, unpinned set
+is refused as a `from_result_set:` scope even before the GC sweep removes it (`get`, `members`,
+`list_by_owner` and `resolve_alias` still return it; follow-up in ADR-0036); expiry is judged on the serving replica's
+clock, the clock that writes `ttl_at` and that the GC sweep deletes by. The caller's current
+device visibility still bounds the result.
+
+Reusing cached IDs is sound only because a set's members never change while its generation
+stays the same. The two server writers stamp a new generation in the transaction that writes
+the members, and triggers on `result_set_members` (store migration v7) re-stamp it for any
+other writer: an INSERT or UPDATE re-stamps, per statement, the sets it touched; a DELETE
+re-stamps the set of each row it removes, once per run of one set's rows (also when issued
+from inside another trigger); a TRUNCATE re-stamps every set that has a generation. Each
+INSERT, UPDATE or DELETE re-stamp locks the set's header, also a pending one, so an out-of-band
+write and the fill of a pending set are ordered and the fill's generation covers the write (a
+TRUNCATE is ordered by its exclusive lock on the member table). A
+bulk load costs one header update per set per statement, never one per member row. A delete
+that cascades from `result_sets` writes nothing, since the header is gone and every cached copy
+reads it as not found; DELETE is a BEFORE row trigger so that such a cascade (the GC sweep's)
+never captures its rows into temporary files or an in-memory event queue. A server whose store opens without the four triggers in
+force logs an error and serves membership uncached. A writer that disables the triggers, or
+writes the generation column directly, bypasses this; the
+operator procedure is in the server administration guide, "Result-set membership after a
+restore or repair".
+
 ### 3.3 TTLs and GC
 
 | Lifecycle stage | TTL behaviour |
 |---|---|
 | Default creation | `ttl_at = now + 3600` (1 hour) — enough for an active operator session, short enough that abandoned sets do not accumulate |
-| Pin | `pinned = 1`, `ttl_at = INT64_MAX`. Audit row written. Pin is reversible — unpinning restores `ttl_at = max(now + 3600, original_ttl_at)` |
+| Pin | `pinned = 1`, `ttl_at = INT64_MAX`. Audit row written. Pin is reversible — unpinning sets `ttl_at = now + 3600` (the pinned value was `INT64_MAX`, so there is no original to restore) |
 | Use as input scope | Touching a set as the scope of a new query or action extends `ttl_at` to `max(ttl_at, now + 3600)` so an operator working a chain does not lose the head of the chain mid-investigation |
 | Pin storm guard | Per-operator cap of 50 pinned result sets; further pins return `409 PIN_LIMIT`. Operator must unpin or delete before pinning more |
-| GC | Background sweep every 5 minutes deletes rows where `ttl_at < now AND pinned = 0`. Cascades via `ON DELETE CASCADE` to `result_set_members`. Audit row written summarising count of GC'd sets. Post-ADR-0036: one replica sweeps per pass (Postgres advisory lock); a retention-clock anomaly (unusable prior reading, big step, would-wipe) declines the pass once per distinct anomaly fact-set (routed-concern "Clock-guarded retention"); every accepted pass is capped (5,000 deletes) |
+| Expiry before GC | From the moment `ttl_at` passes, an unpinned set is refused as a `from_result_set:` scope (not found, `404`), before the sweep deletes it. Using it as a scope no longer extends it. Pin a set that a recurring job targets; pinning an expired set the sweep has not yet removed makes it usable again |
+| GC | Background sweep every 5 minutes deletes rows where `ttl_at < now AND pinned = 0`. Cascades via `ON DELETE CASCADE` to `result_set_members`. Counted in `yuzu_result_set_gc_total` and logged at info; no audit row is written. Post-ADR-0036: one replica sweeps per pass (Postgres advisory lock); a retention-clock anomaly (unusable prior reading, big step, would-wipe) declines the pass once per distinct anomaly fact-set (routed-concern "Clock-guarded retention"); every accepted pass is capped (5,000 sets, and within those the oldest-first prefix whose summed `device_count` stays within 5,000,000 member rows; the first set always goes), so one pass's cascade of server-filled sets stays well inside the 30 s statement timeout instead of rolling back and retrying the same sets forever (best-effort for member rows written out of band, which `device_count` does not count) |
 
 Hard maximum cap: **10,000 result sets per operator** (enforced at create time, returns `429 RESULT_SET_QUOTA`). Prevents a runaway script from filling the table.
 
@@ -288,7 +323,7 @@ dispatched, nothing needs cancelling — and is audited as `result_set.create|de
 (that family's `reason` label set is closed and boot-pre-seeded from `dispatch_target_shape.hpp`;
 widening it is a separate, reviewed decision).
 
-Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT`, `RESULT_SET_EXPIRED`, and (ADR-0036, 2026-07-25) `RESULT_SET_STORE_UNAVAILABLE` (**503**) — returned when the store itself (not the requested row) could not answer, e.g. a Postgres error mid-read on `get`/`resolve_alias`. This list is illustrative, not exhaustive: #4306 widened the same 503 to also cover a degraded `members`/`list_by_owner`/`lineage` page read and the async producers' pre-dispatch per-owner quota check (a post-dispatch store fault after that quota check maps to `500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH` instead, not a 503) — the exhaustive per-route list lives in `docs/user-manual/rest-api.md`. This is deliberately **type-distinguishable from 404**: a `RESULT_SET_NOT_FOUND`/404 tells the caller "there is definitely no such row, or it is not yours" (safe to treat as a clean not-found for retry/UI purposes), while a 503 tells the caller "we could not determine the answer at all" — collapsing the two would let a transient database blip on an authorization-relevant read (ownership check, alias resolution, `from_result_set:` membership) masquerade as a confident "not found," which for a `NOT`-combined scope expression is a fail-open (see `docs/postgres-store-playbook.md` "Authoritative reads must be type-distinguishable").
+Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT` (`RESULT_SET_EXPIRED` is reserved; expired scope inputs return not found), and (ADR-0036, 2026-07-25) `RESULT_SET_STORE_UNAVAILABLE` (**503**) — returned when the store itself (not the requested row) could not answer, e.g. a Postgres error mid-read on `get`/`resolve_alias`. This list is illustrative, not exhaustive: #4306 widened the same 503 to also cover a degraded `members`/`list_by_owner`/`lineage` page read and the async producers' pre-dispatch per-owner quota check (a post-dispatch store fault after that quota check maps to `500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH` instead, not a 503) — the exhaustive per-route list lives in `docs/user-manual/rest-api.md`. This is deliberately **type-distinguishable from 404**: a `RESULT_SET_NOT_FOUND`/404 tells the caller "there is definitely no such row, or it is not yours" (safe to treat as a clean not-found for retry/UI purposes), while a 503 tells the caller "we could not determine the answer at all" — collapsing the two would let a transient database blip on an authorization-relevant read (ownership check, alias resolution, `from_result_set:` membership) masquerade as a confident "not found," which for a `NOT`-combined scope expression is a fail-open (see `docs/postgres-store-playbook.md` "Authoritative reads must be type-distinguishable").
 
 ## 7. YAML DSL surface
 
@@ -368,7 +403,7 @@ The chip dropdown lists the operator's active result sets plus the standard scop
 
 ## 9. Audit and observability
 
-Every state transition writes an `AuditEvent` per `docs/observability-conventions.md`. Action codes:
+Action codes, written as `AuditEvent`s per `docs/observability-conventions.md` except where a row says the verb is not written; the background fill pass and the GC sweep write no audit row:
 
 | Action | Result | Notes |
 |---|---|---|
@@ -377,7 +412,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 | `result_set.heal` | `success` / `failure` | #4493: written by REST `/re-eval` and MCP `reevaluate_result_set` when the stored `source_payload` is found nested past `kMcpMaxJsonDepth`. `success` = `heal_poisoned_payload` discarded the poisoned payload; `failure` = the caller's own depth check found poison but `heal_poisoned_payload`'s return was `false` - a genuine write failure (row unchanged, still poisoned), a benign race where a concurrent caller already healed the row first (row unchanged, already healthy), or the row was deleted between heal's own SELECT and UPDATE (#4540: a concurrent `delete_set` or the TTL GC sweep, neither holding a shared lock) and no longer exists at all - the three are not currently distinguished (#4524). Not written on a row already healthy at the caller's own check (heal is a no-op there, nothing to audit). |
 | `result_set.pin` / `result_set.unpin` | `success` | |
 | `result_set.delete` | `success` | Pinned sets require explicit unpin first; `delete` of an unpinned set is single-action |
-| `result_set.gc_sweep` | `success` | Aggregate row, written once per sweep with the count |
+| `result_set.gc_sweep` | — | Not written: no code emits this verb. A GC pass writes no audit row; it is counted in `yuzu_result_set_gc_total` and logged at info |
 | `instruction.scope_resolution_failed` | `failure` | When invocation-time resolve fails (set absent, expired, or not owned). `detail` = `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<result-set id-or-alias> reason=...`; `target_id` = the ref. The `command_id` is the per-dispatch correlation id (joins to the execution/response records). Also increments `yuzu_scope_resolution_failed_total`. |
 
 Prometheus metrics:

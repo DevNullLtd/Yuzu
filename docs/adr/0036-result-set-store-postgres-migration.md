@@ -382,3 +382,74 @@ changed from `std::optional<std::vector<std::string>>` to
 `std::expected<std::vector<std::string>, ScopeEvalError>` (`scope_eval_error.hpp`) to carry
 both this new `OwnerCheckFailed` case and the new `PresenceDegraded` case without further
 overloading a bare `nullopt`.
+
+## Update (2026-11-21) — replica-local member cache; migrations v6/v7
+
+`member_set_owned` now keeps a bounded (16 MiB, byte-estimated, FIFO) per-process cache of a
+materialized set's member IDs. The 2026-09-26 Update's guarantee is restated, not weakened:
+every call still makes ONE live, snapshot-consistent read of the set's header (existence,
+expiry, ownership, readiness, completeness), so a set deleted, re-owned or moved out of
+`materialized` before that read is refused exactly as before (expiry is new: see below). What
+changes is where the IDs come from on a hit: a cache entry read under the same
+`membership_generation` (v6, a random UUID, so a promoted standby that redid a lost fill
+carries a different value). A changed or NULL generation takes the original joined read.
+
+That equivalence holds only under one invariant: **a set's member rows never change while its
+generation stays the same.** Every write to `result_set_members` must re-stamp the generation of
+each affected set in the writing transaction. The two writers (`insert_row_impl`, `materialize`)
+stamp it themselves; v7 enforces it for every other writer with `ENABLE ALWAYS` triggers:
+INSERT and UPDATE are statement-level and re-stamp the sets in their transition tables, so a bulk
+load costs one header update per affected set per statement, never one per row; DELETE is a
+BEFORE row trigger, at any trigger depth, whose `WHEN` clause skips the rest of a run of one
+set's rows (a transaction-ID-keyed, transaction-local, single-slot marker: interleaved sets
+re-stamp more often, never less); TRUNCATE re-stamps every stamped set. Every INSERT, UPDATE and
+DELETE re-stamp writes the header row whatever its generation (NULL stays NULL), so it holds the
+header lock to commit and is ordered against `materialize`'s stamping UPDATE of a pending set;
+TRUNCATE is ordered by its ACCESS EXCLUSIVE lock on the member table instead. DELETE is neither a
+transition table, which would capture every member row a `gc_sweep` cascade removes, spill to
+temporary files and fail the sweep under a `temp_file_limit` on every pass, nor an AFTER row
+trigger, which queues one in-memory event per cascaded row for the whole pass. INSERT and UPDATE
+keep their transition tables, at the cost of about 5 MB more temporary space for a
+100,000-member fill (measured on PostgreSQL 16 at the default `work_mem`: 4.7 MB of
+temporary files without the trigger, 9.9 MB with it): DELETE's single-slot marker would write
+the header once per change of set in a bulk load that interleaves sets. A cascade from a
+`result_sets` delete writes nothing, because the header is gone: one key probe per set and one
+expression per row (about 0.55 s instead of 0.45 s for a 1M-row cascade, measured once on
+PostgreSQL 16). Because the trigger adds that cost to every cascaded row, `gc_sweep` now also
+bounds each pass by member rows: within its 5,000-set cap it deletes only the oldest-first prefix
+whose summed `device_count` stays within 5,000,000 (the first set always goes; a 5M-row pass with
+the trigger took 3.13 to 3.35 s, and 3.65 s in a second reviewer's run, in Gate 8 measurements on
+scratch PostgreSQL 16 on 2026-11-21), so a backlog of sets the server filled can no longer make a
+pass exceed the 30 s statement timeout, roll back and retry the same sets forever (a defect the set
+cap alone already had). The budget reads the server-maintained `device_count`: member rows written
+out of band are not counted, so for them the bound is best-effort and the 5,000-set cap still
+applies. A full-budget pass of 36-character device IDs wrote 939 MB of WAL (a Gate 8 measurement on
+PostgreSQL 16.16, 2026-11-21); the volume depends on device-ID length and on full-page writes. Each
+server runs at most one pass per 5-minute tick, so one server drains at most 60M server-counted
+member rows an hour; passes from several servers never overlap (the advisory lock) but each server
+takes its own. A capped pass deletes fewer rows than the uncapped query did only when the stored
+counts (`device_count`) of the oldest 5,000 expired sets sum to more than 5,000,000 and the uncapped
+pass over them would still have finished inside the timeout. That depends on the rows in the pass,
+not on set size alone (5,000 sets of 1,001 members already qualify if their pass fits). The uncapped
+query finished a 20M-row pass in 13.35 s (a Gate 8 measurement on PostgreSQL 16, 2026-11-21). Where
+the uncapped pass would have exceeded the timeout it deleted nothing, and the cap is a pure gain;
+the row count at which that starts was not independently measured. Running further passes in the
+same tick is an open follow-up with no tracking issue yet (no issue was authorized in this change).
+At open the store checks that the four triggers are present,
+`ENABLE ALWAYS`, of v7's shape and bound to v7's function bodies; otherwise, or if the check cannot be read, it
+logs an error and serves membership uncached. A writer that disables the triggers while servers run, or writes
+`membership_generation` directly, breaks the
+invariant and requires a restart of every replica (`docs/user-manual/server-admin.md`, "Result-set
+membership after a restore or repair"). A new member writer keeps the stamp and never disables
+the triggers.
+
+Also in this change: an unpinned set past `ttl_at` is refused (`NotFound`) by `member_set_owned`
+before `gc_sweep` deletes it, judged on the serving replica's clock (the clock that writes
+`ttl_at` and that `gc_sweep` deletes by). The admission quota and its preflight count pinned
+sets and unexpired sets on that same clock. Clock synchronization between replicas still matters:
+preflight and admission on different replicas can disagree near expiry. A forward step can make
+old sets stop counting before the collector's clock guard permits deletion; repeated jumps can
+grow that backlog. A backward step can keep sets in the count longer. The quota remains a soft
+admission guard. Moving the store's clock authority to PostgreSQL is tracked in
+[#2914](https://github.com/DevNullLtd/Yuzu/issues/2914). `get`, `members`, `list_by_owner` and `resolve_alias`
+continue to return an expired, unswept set.

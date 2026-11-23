@@ -38,9 +38,13 @@
 /// invert(NOT)/report success? If yes, fail closed (abort/503) on `DbError`
 /// — never treat it as empty-container."
 ///
-/// **`member_set_owned` (#4981 PR-1, Finding A) is a single, snapshot-consistent
-/// SELECT — existence, ownership, and membership are read together under one
-/// Postgres statement/snapshot, closing a TOCTOU window the pre-#4981 two-fact
+/// **`member_set_owned` (#4981 PR-1, Finding A) decides from one live, snapshot-consistent
+/// read of the set's header: existence, expiry, ownership, readiness and completeness are
+/// always read in that statement. A miss joins the header and membership in one statement. A
+/// hit (a replica-local cache of a previous read's member IDs) reads the header alone and
+/// reuses the cached IDs only when the header's materialization generation equals the one
+/// they were read under; a changed generation reloads header and members together. This
+/// closes the TOCTOU window the pre-#4981 two-fact
 /// query (existence via a separate `get()` gate, membership via a plain owner-
 /// filtered JOIN) left open.** Pre-#4981, a result set deleted (`delete_set` or
 /// `gc_sweep`, both FK-cascading) BETWEEN a caller's own pre-dispatch ownership
@@ -58,8 +62,33 @@
 /// caller — the same "not-owned is indistinguishable from not-found"
 /// oracle-safety contract this store has always held for `get()`'s consumers).
 /// An owned set with ZERO members is now a REAL, DISTINGUISHABLE success case
-/// (an empty-but-present `std::unordered_set`) — the case the pre-#4981
+/// (`OwnedMembers::ids` points at an empty set) — the case the pre-#4981
 /// contract could not express at all.
+///
+/// **Member cache invariant (migration v6/v7).** A cache hit is equivalent to the joined read
+/// ONLY because a set's member rows never change while its `membership_generation` stays the
+/// same: every write to `result_set_members` re-stamps the generation of each affected set
+/// that carries one, in the writing transaction. The two C++ writers stamp it themselves
+/// (`insert_row_impl` in the header INSERT, `materialize` in its status-guarded UPDATE), and
+/// the v7 triggers enforce it for every other writer (manual SQL, a data-only restore, a
+/// delete issued from another trigger, a future code path): INSERT and UPDATE re-stamp, per
+/// statement, the sets named in their transition tables; DELETE (BEFORE, per row) re-stamps the
+/// set the row belonged to, skipping the following rows of the same set by a single-slot
+/// per-transaction marker; TRUNCATE re-stamps every set that carries a generation. Every INSERT,
+/// UPDATE and DELETE re-stamp locks the header row, a pending one included, so an out-of-band
+/// write is ordered against `materialize`'s stamping UPDATE; TRUNCATE is ordered by its ACCESS
+/// EXCLUSIVE lock on `result_set_members` instead. A delete that cascades from `result_sets`
+/// (`delete_set`, `gc_sweep`) writes nothing: its header is gone and every cached copy reads
+/// `NotFound`. The constructor checks that the four triggers are present, ENABLE ALWAYS, of v7's
+/// shape and bound to v7's function bodies; when they are not, or the check cannot be read, it
+/// retains nothing, so every read takes the joined read. The status check logs database errors;
+/// the constructor also reports unusable triggers when the cache budget is nonzero.
+/// A writer that bypasses triggers (`ALTER TABLE ... DISABLE TRIGGER`, `pg_restore
+/// --disable-triggers`), or that writes `membership_generation` directly, while servers are
+/// running breaks the invariant; every replica must then be restarted
+/// (`docs/user-manual/server-admin.md`, "Result-set membership after a restore or repair").
+/// A new member writer must keep the generation stamp; never add one that disables the
+/// triggers.
 ///
 /// `list_by_owner`, `members`, `lineage`, and `count_for_owner` are thin
 /// `.value_or(...)` wrappers over their `_checked` twins above, kept for API
@@ -106,8 +135,14 @@
 
 #include "authz_model.hpp" // authz::VisibleSet: the members read's visibility scope
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
+#include <list>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -182,10 +217,13 @@ struct ResultSet {
     int64_t agents_unanswered{0};
 };
 
+using MembershipIds = std::unordered_set<std::string>;
+
 /// The membership `member_set_owned` returns for a `materialized` set: the member ids, plus
 /// whether the set is complete (no agent failed and none went unanswered). An incomplete set
 /// can only under-match, so it is safe to include and unsafe to exclude.
-struct OwnedMembers : std::unordered_set<std::string> {
+struct OwnedMembers {
+    std::shared_ptr<const MembershipIds> ids;
     bool complete{true};
 };
 
@@ -209,8 +247,9 @@ struct PendingSet {
 };
 
 /// Typed failure surface; the REST layer maps these to the error taxonomy
-/// (RESULT_SET_NOT_FOUND, RESULT_SET_NOT_OWNER, RESULT_SET_QUOTA, PIN_LIMIT,
-/// RESULT_SET_EXPIRED) and the corresponding HTTP status.
+/// (RESULT_SET_NOT_FOUND, RESULT_SET_NOT_OWNER, RESULT_SET_QUOTA, PIN_LIMIT)
+/// and the corresponding HTTP status. RESULT_SET_EXPIRED is reserved; scope use of an
+/// expired set returns NotFound.
 enum class ResultSetError {
     NotFound,
     NotOwner,
@@ -296,10 +335,16 @@ public:
     static constexpr int kMaxPinsPerOwner = 50;          // pin-storm guard
     static constexpr int kLineageDepthCap = 10;          // breadcrumb truncation
 
+    static constexpr std::size_t kDefaultMemberCacheBytes = 16 * 1024 * 1024;
+
     /// Borrows the shared pool and runs the `result_set_store` schema
     /// migration on a pinned lease. `is_open()` is false if the lease was
-    /// empty or the migration failed.
-    explicit ResultSetStore(pg::PgPool& pool);
+    /// empty or the migration failed. Zero cache budget disables retention.
+    /// The clock supplies replica wall time in Unix seconds. Tests can supply a clock
+    /// independent of PostgreSQL to exercise TTL boundaries. An empty callback uses the system clock.
+    explicit ResultSetStore(pg::PgPool& pool,
+                            std::size_t member_cache_bytes = kDefaultMemberCacheBytes,
+                            std::function<int64_t()> epoch_seconds = system_epoch_seconds);
 
     ResultSetStore(const ResultSetStore&) = delete;
     ResultSetStore& operator=(const ResultSetStore&) = delete;
@@ -403,10 +448,12 @@ public:
     /// `result.value()`) for the actual boolean membership answer.
     std::expected<bool, ResultSetError> contains(const std::string& id,
                                                  const std::string& device_id);
-    /// #4981 PR-1 (Finding A/A1) rewrite: a SINGLE snapshot-consistent SELECT
-    /// (existence + ownership + membership together, see the file-header note
-    /// above) rather than the pre-#4981 owner-filtered JOIN alone. Outcomes:
-    /// `id` absent entirely -> `std::unexpected(ResultSetError::NotFound)`;
+    /// The decision comes from one live header read in one statement snapshot; the IDs come
+    /// from that statement on a miss, or from a cache entry read under the same
+    /// materialization generation on a hit (see the file-header note and its "Member cache
+    /// invariant"). Expiry uses this replica's clock, the clock that writes `ttl_at` and that
+    /// `gc_sweep` deletes by.
+    /// `id` absent or expired and unpinned -> `std::unexpected(ResultSetError::NotFound)`;
     /// `id` exists but `owner` does not own it ->
     /// `std::unexpected(ResultSetError::NotOwner)`; `id` exists, owned, ZERO
     /// members -> a REAL SUCCESS, an empty (but present) set — the case the
@@ -542,8 +589,33 @@ public:
     int gc_sweep();
 
 private:
+    static int64_t system_epoch_seconds();
     pg::PgPool& pool_;
+    const std::function<int64_t()> epoch_seconds_;
     bool open_{false};
+
+    struct CachedMembership {
+        std::string generation;
+        std::shared_ptr<const MembershipIds> members;
+    };
+    struct MemberCacheEntry {
+        std::string id;
+        CachedMembership snapshot;
+        std::size_t bytes;
+    };
+    const std::size_t member_cache_budget_;
+    // Set once in the constructor, before the store is shared: migration v7's triggers were
+    // verified in force. When false nothing is retained, so every read takes the joined read.
+    bool member_cache_enforced_{false};
+    std::mutex member_cache_mutex_;
+    std::size_t member_cache_bytes_{0};
+    std::list<MemberCacheEntry> member_cache_fifo_;
+    // Views refer to stable list nodes. Erase an index entry before removing its node.
+    std::map<std::string_view, std::list<MemberCacheEntry>::iterator> member_cache_index_;
+    CachedMembership cached_members(const std::string& id);
+    void forget_members(const std::string& id);
+    void retain_members(const std::string& id, CachedMembership snapshot,
+                        std::size_t bytes);
 
     static std::string generate_id();
     // Shared body for create_materialized/create_pending: dedups members,

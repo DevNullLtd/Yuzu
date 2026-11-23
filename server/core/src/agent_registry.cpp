@@ -2193,7 +2193,7 @@ static void collect_completeness_dependent_result_set_ids(const yuzu::scope::Exp
 namespace {
 
 using ScopeAttrMap = std::unordered_map<std::string, std::string>;
-using ScopeResultSetMembers = std::unordered_map<std::string, std::unordered_set<std::string>>;
+using ScopeResultSetMembers = std::unordered_map<std::string, std::shared_ptr<const MembershipIds>>;
 
 // The identity and pre-resolved store rows ONE agent contributes to scope
 // evaluation. The fleet loop (local sessions AND presence-only ids) and the
@@ -2240,7 +2240,7 @@ std::string resolve_scope_attribute(const ScopeAttributeSource& src, std::string
         if (src.rs_members == nullptr)
             return {};
         auto it = src.rs_members->find(std::string(key.substr(16)));
-        return (it != src.rs_members->end() && it->second.contains(src.agent_id)) ? "true"
+        return (it != src.rs_members->end() && it->second->contains(src.agent_id)) ? "true"
                                                                                  : "";
     }
     if (key == "ostype")
@@ -2306,12 +2306,12 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                                    bool touch_referenced_result_sets) const {
     // Preload owner-checked membership for every from_result_set:<id> the
     // expression references — once per set, before the agent loop, rather than a
-    // store query per agent while holding mu_ (review finding F). The owner join
+    // store query per agent while holding mu_ (review finding F). The live owner check
     // in member_set_owned is the authorization gate: a set `principal` does not
     // own now ABORTS the whole evaluation (#4981 PR-1 A1/A3), so an operator
     // cannot target another operator's set by id (review finding B1). Aliases
     // are not resolved here; callers that accept aliases pre-resolve them.
-    std::unordered_map<std::string, std::unordered_set<std::string>> rs_members;
+    ScopeResultSetMembers rs_members;
     {
         // B2 fail-closed (2026-07-26 hardening round; widened per governance
         // H1, 2026-07-29): a scope that references from_result_set: can only
@@ -2388,10 +2388,16 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                                         "failed");
                     const bool owner_check_failed = mem.error() == ResultSetError::NotFound ||
                                                     mem.error() == ResultSetError::NotOwner;
-                    spdlog::error("AgentRegistry::evaluate_scope: member_set_owned {} for "
-                                  "result-set '{}' (owner={}) — aborting scope evaluation",
-                                  owner_check_failed ? "owner-check failed" : "degraded", rsid,
-                                  owner);
+                    if (owner_check_failed) {
+                        spdlog::warn("AgentRegistry::evaluate_scope: member_set_owned not found, "
+                                     "not owned or expired for result-set '{}' (owner={}) — "
+                                     "aborting scope evaluation",
+                                     ::yuzu::log_id_token(rsid), ::yuzu::log_id_token(owner));
+                    } else {
+                        spdlog::error("AgentRegistry::evaluate_scope: member_set_owned degraded "
+                                      "for result-set '{}' (owner={}) — aborting scope evaluation",
+                                      ::yuzu::log_id_token(rsid), ::yuzu::log_id_token(owner));
+                    }
                     return std::unexpected(
                         ScopeEvalError{owner_check_failed ? ScopeEvalError::Kind::OwnerCheckFailed
                                                           : ScopeEvalError::Kind::StoreDegraded,
@@ -2419,7 +2425,7 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                 // leaves this at its default `true` and is unaffected.
                 if (touch_referenced_result_sets)
                     rs_store->touch(rsid);
-                rs_members.emplace(rsid, std::move(*mem));
+                rs_members.emplace(rsid, std::move(mem->ids));
             }
         }
     }

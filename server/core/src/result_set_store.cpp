@@ -19,7 +19,9 @@
 #include <cerrno>
 #include <cstdlib>
 #include <format>
+#include <iterator>
 #include <limits>
+#include <new>
 #include <random>
 #include <string_view>
 #include <utility>
@@ -28,7 +30,7 @@ namespace yuzu::server {
 
 // ── Small helpers ────────────────────────────────────────────────────────────
 
-static int64_t now_epoch() {
+int64_t ResultSetStore::system_epoch_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
@@ -147,6 +149,77 @@ constexpr std::chrono::milliseconds kWriteTimeout{4000};
 constexpr const char* kPoisonedPayloadNote =
     "original source_payload exceeded the JSON nesting limit and was discarded";
 
+// Migration v7's trigger function bodies (the text between the dollar quotes). Kept as constants
+// so member_triggers_in_force can compare pg_proc.prosrc byte for byte with what v7 installed.
+// Editing either body needs a NEW migration that installs it: an existing database still holds
+// the old body, the open-time check then fails and every server serves membership uncached.
+//
+// Every re-stamp UPDATE writes the header row whatever its generation (a NULL stays NULL), so the
+// member write holds the header's row lock until it commits. That orders it against the
+// materialize fill of a pending set: the fill stamps its generation by updating the same row, so
+// either the fill waits for this write to commit and its generation covers it, or this write
+// waits for the fill and re-stamps the generation the fill committed. Filtering on "generation
+// IS NOT NULL" instead would match nothing on a pending set, take no lock and let the fill commit
+// a generation that a reader caches without this write (the race is in the tests).
+//
+// Statement-level INSERT/UPDATE/TRUNCATE: re-stamp the sets the transition tables name (TRUNCATE:
+// every set, under its ACCESS EXCLUSIVE lock, so no fill can interleave). The primary-key lookup
+// keeps a one-set statement off a result_sets scan.
+constexpr std::string_view kRestampStatementBody = R"sql(
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    UPDATE result_set_store.result_sets r
+       SET membership_generation = CASE WHEN r.membership_generation IS NULL THEN NULL
+                                        ELSE gen_random_uuid() END
+     WHERE r.id = ANY (ARRAY(SELECT DISTINCT a.result_set_id FROM added a));
+  ELSIF TG_OP = 'UPDATE' THEN
+    UPDATE result_set_store.result_sets r
+       SET membership_generation = CASE WHEN r.membership_generation IS NULL THEN NULL
+                                        ELSE gen_random_uuid() END
+     WHERE r.id = ANY (ARRAY(SELECT a.result_set_id FROM added a
+                             UNION SELECT d.result_set_id FROM removed d));
+  ELSE
+    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
+     WHERE r.membership_generation IS NOT NULL;
+  END IF;
+  RETURN NULL;
+END )sql";
+
+// Row-level BEFORE DELETE: re-stamp (and lock) the row's set, then remember it in a single-slot
+// marker. The trigger's WHEN clause (kRestampDeletedWhen) compares the marker before the function
+// is called, so the following rows of the same set cost one expression each and no call. BEFORE,
+// not AFTER: an AFTER row trigger queues an event per deleted row in memory until the statement
+// ends, which for a gc_sweep cascade grows with every member row of the pass. A BEFORE trigger
+// runs as each row goes and queues nothing. Rows of several sets that interleave re-stamp a set
+// again each time its rows resume: extra writes, never a missed one. The marker is a
+// transaction-local setting keyed on the transaction ID, so a value left in the session by an
+// earlier transaction never matches, and a rolled-back savepoint reverts the marker together
+// with the UPDATE and lock it recorded; skipping is safe because the header row stays locked by
+// this transaction until it commits. The marker is set whether or not a row was updated: a header
+// that is gone (a cascade) cannot be served from a cache. A writer who sets the marker on purpose
+// skips the re-stamp; that needs only DELETE on result_set_members (setting a custom setting needs
+// no privilege), and is the documented bypass alongside a direct membership_generation UPDATE.
+constexpr std::string_view kRestampDeletedBody = R"sql(
+BEGIN
+  UPDATE result_set_store.result_sets r
+     SET membership_generation = CASE WHEN r.membership_generation IS NULL THEN NULL
+                                      ELSE gen_random_uuid() END
+   WHERE r.id = OLD.result_set_id;
+  PERFORM set_config('result_set_store.restamped',
+                     pg_current_xact_id()::text || '/' || OLD.result_set_id, true);
+  RETURN OLD;
+END )sql";
+
+// The DELETE trigger's WHEN clause as v7 writes it, and as PostgreSQL 16 to 18 deparse it
+// (pg_get_expr). member_triggers_in_force compares the deparsed text; a server version that
+// deparses it differently reads as "not in force" and serves membership uncached, never stale.
+constexpr std::string_view kRestampDeletedWhen =
+    "pg_catalog.current_setting('result_set_store.restamped', true) IS DISTINCT FROM "
+    "pg_catalog.pg_current_xact_id()::text || '/' || OLD.result_set_id";
+constexpr std::string_view kRestampDeletedWhenDeparsed =
+    "(current_setting('result_set_store.restamped'::text, true) IS DISTINCT FROM "
+    "(((pg_current_xact_id())::text || '/'::text) || result_set_id))";
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
     // the migration transaction, so `result_sets` et al. land in
@@ -218,6 +291,69 @@ const std::vector<pg::PgMigration>& migrations() {
         {5,
          "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS agents_unanswered BIGINT NOT NULL "
          "DEFAULT 0;"},
+        // v6: the materialization generation a replica's member cache is keyed on. A promoted
+        // standby may fill the same pending ID differently after asynchronous replication loses
+        // a committed fill, so the generation is a random UUID, never a counter. The writer
+        // committing the members stamps it (insert_row_impl, materialize). NULL means "never
+        // cached": every read of such a set takes the joined read.
+        {6, "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS membership_generation UUID;"},
+        // v7: enforce the cache invariant in the database, not only in the two C++ writers: any
+        // write to result_set_members that a cache could have observed re-stamps the generation
+        // of every affected set that carries one, in the writing transaction (see the header's
+        // "Member cache invariant"). The trigger set and both function bodies are verified at
+        // open (member_triggers_in_force); the cache stays off when they are not in force. Each
+        // re-stamp locks the header row, also a pending one (see the bodies above).
+        //   INSERT/UPDATE: statement-level, the transition tables name the affected sets, so a
+        //     bulk load costs one header UPDATE per affected set per statement, never one per row.
+        //     The price is a transition tuplestore of the inserted rows: a 100,000-member fill
+        //     needs about 5 MB more temporary space than before v7 (measured on PostgreSQL 16 at
+        //     the default work_mem: 4.7 MB of temporary files without the trigger, 9.9 MB with it;
+        //     it failed under temp_file_limit 8 MB and succeeded at 12 MB). Not DELETE's
+        //     single-slot marker shape: a bulk load interleaving sets would then write the header
+        //     once per change of set, which is per-row generation writes on a large load.
+        //   DELETE: BEFORE, row-level, at any trigger depth (a DELETE issued from another
+        //     trigger is re-stamped too), with a single-slot per-transaction marker tested in the
+        //     WHEN clause, so a run of one set's rows calls the function once. Not a DELETE
+        //     transition table (gc_sweep's cascade would capture every cascaded member row and
+        //     spill to temporary files, failing the sweep under a temp_file_limit every pass) and
+        //     not AFTER (one queued event per cascaded row, held in memory for the whole pass). A
+        //     cascade from a result_sets delete finds its own header already gone, so it writes
+        //     nothing: one primary-key probe per set plus one expression per row (measured once
+        //     on PostgreSQL 16, local disk: a 200-set x 5,000-member cascade, 1M rows, took about
+        //     0.55 s instead of 0.45 s, and succeeded under temp_file_limit and work_mem 64 kB).
+        //   TRUNCATE has no rows: every set carrying a generation is re-stamped.
+        // ENABLE ALWAYS: also fires under session_replication_role = replica. It does not fire
+        // when the trigger is disabled (ALTER TABLE ... DISABLE TRIGGER, pg_restore
+        // --disable-triggers): the operator doc requires a restart of every replica then.
+        // Idempotent (OR REPLACE / IF EXISTS) so a test that rolls the version back re-runs it.
+        {7, std::string(R"sql(
+SET LOCAL client_min_messages = warning;
+CREATE OR REPLACE FUNCTION result_set_store.result_set_members_restamp() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$)sql") +
+                std::string(kRestampStatementBody) + std::string(R"sql($$;
+CREATE OR REPLACE FUNCTION result_set_store.result_set_members_restamp_deleted() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$)sql") +
+                std::string(kRestampDeletedBody) + std::string(R"sql($$;
+DROP TRIGGER IF EXISTS result_set_members_restamp_ins ON result_set_members;
+DROP TRIGGER IF EXISTS result_set_members_restamp_upd ON result_set_members;
+DROP TRIGGER IF EXISTS result_set_members_restamp_del ON result_set_members;
+DROP TRIGGER IF EXISTS result_set_members_restamp_trunc ON result_set_members;
+CREATE TRIGGER result_set_members_restamp_ins AFTER INSERT ON result_set_members
+  REFERENCING NEW TABLE AS added
+  FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
+CREATE TRIGGER result_set_members_restamp_upd AFTER UPDATE ON result_set_members
+  REFERENCING OLD TABLE AS removed NEW TABLE AS added
+  FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
+CREATE TRIGGER result_set_members_restamp_del BEFORE DELETE ON result_set_members
+  FOR EACH ROW WHEN ()sql") + std::string(kRestampDeletedWhen) + std::string(R"sql()
+  EXECUTE FUNCTION result_set_store.result_set_members_restamp_deleted();
+CREATE TRIGGER result_set_members_restamp_trunc AFTER TRUNCATE ON result_set_members
+  FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
+ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_ins;
+ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_upd;
+ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_del;
+ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_trunc;
+)sql")},
     };
     return kMigrations;
 }
@@ -229,6 +365,77 @@ std::int64_t to_i64(const char* s) {
 }
 int to_int(const char* s) { return static_cast<int>(to_i64(s)); }
 bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
+
+// InForce only when migration v7's four triggers are present, ENABLE ALWAYS, of the shape v7
+// creates (no column list, a WHEN clause on the DELETE trigger only, the transition tables) and
+// bound to the v7 function bodies, pinned search_path and no SECURITY DEFINER included (the
+// auth_db check_factor_trigger precedent). pg_restore's DISABLE/ENABLE TRIGGER ALL leaves them
+// enabled ORIGIN only ('O'), which does not fire under session_replication_role = replica, so
+// 'O' fails the check too. NotInForce and Unreadable both keep the member cache off.
+enum class MemberTriggerCheck { InForce, NotInForce, Unreadable };
+
+[[nodiscard]] MemberTriggerCheck query_member_triggers(PGconn* conn) {
+    // tgattr: a column list exists only on UPDATE OF, and PostgreSQL refuses one on a trigger
+    // with transition tables, so this conjunct cannot fail for a trigger that passes the rest;
+    // it is defence in depth only.
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT count(*) = 4 AND COALESCE(bool_and("
+        "  t.tgenabled = 'A'"
+        "  AND pg_catalog.pg_get_expr(t.tgqual, t.tgrelid) IS NOT DISTINCT FROM CASE t.tgname"
+        "        WHEN 'result_set_members_restamp_del' THEN $3::text END"
+        "  AND (t.tgtype & 127) = CASE t.tgname"
+        "        WHEN 'result_set_members_restamp_ins' THEN 4"
+        "        WHEN 'result_set_members_restamp_upd' THEN 16"
+        "        WHEN 'result_set_members_restamp_del' THEN 11"
+        "        ELSE 32 END"
+        "  AND cardinality(t.tgattr::int2[]) = 0"
+        "  AND t.tgoldtable::text IS NOT DISTINCT FROM CASE t.tgname"
+        "        WHEN 'result_set_members_restamp_upd' THEN 'removed' END"
+        "  AND t.tgnewtable::text IS NOT DISTINCT FROM CASE t.tgname"
+        "        WHEN 'result_set_members_restamp_ins' THEN 'added'"
+        "        WHEN 'result_set_members_restamp_upd' THEN 'added' END"
+        "  AND p.pronamespace = 'result_set_store'::regnamespace"
+        "  AND p.prolang = (SELECT oid FROM pg_catalog.pg_language WHERE lanname = 'plpgsql')"
+        "  AND NOT p.prosecdef"
+        "  AND COALESCE(p.proconfig = ARRAY['search_path=pg_catalog, pg_temp']::text[], false)"
+        "  AND CASE WHEN t.tgname = 'result_set_members_restamp_del'"
+        "        THEN p.proname = 'result_set_members_restamp_deleted' AND p.prosrc = $2::text"
+        "        ELSE p.proname = 'result_set_members_restamp' AND p.prosrc = $1::text END"
+        "), false) "
+        "FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid "
+        "WHERE t.tgrelid = 'result_set_store.result_set_members'::regclass AND NOT t.tgisinternal"
+        "  AND t.tgname IN ('result_set_members_restamp_ins', 'result_set_members_restamp_upd',"
+        "                   'result_set_members_restamp_del', 'result_set_members_restamp_trunc')",
+        std::vector<std::string>{std::string(kRestampStatementBody),
+                                 std::string(kRestampDeletedBody),
+                                 std::string(kRestampDeletedWhenDeparsed)});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+        spdlog::error("ResultSetStore: could not read the result_set_members re-stamp triggers "
+                      "from the catalogue: {}",
+                      PQerrorMessage(conn));
+        return MemberTriggerCheck::Unreadable;
+    }
+    return to_bool(PQgetvalue(res.get(), 0, 0)) ? MemberTriggerCheck::InForce
+                                                : MemberTriggerCheck::NotInForce;
+}
+
+// pg_get_expr qualifies a name that the session's search_path would resolve elsewhere, so the
+// deparse comparison runs under a pinned search_path, in a transaction that is rolled back.
+[[nodiscard]] MemberTriggerCheck member_triggers_in_force(PGconn* conn) {
+    {
+        pg::PgResult begin{PQexec(conn, "BEGIN; SET LOCAL search_path = pg_catalog, pg_temp")};
+        if (!begin.ok()) {
+            spdlog::error("ResultSetStore: could not start the re-stamp trigger check: {}",
+                          PQerrorMessage(conn));
+            pg::PgResult rollback{PQexec(conn, "ROLLBACK")};
+            return MemberTriggerCheck::Unreadable;
+        }
+    }
+    const MemberTriggerCheck check = query_member_triggers(conn);
+    pg::PgResult rollback{PQexec(conn, "ROLLBACK")};
+    return check;
+}
 
 constexpr const char* kRowCols =
     "id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, "
@@ -270,6 +477,11 @@ std::vector<std::string_view> as_views(const std::vector<std::string>& v) {
     return out;
 }
 
+// Admission and its preflight count expiry against the same clock that authors ttl_at.
+constexpr char kCountActiveForOwner[] =
+    "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
+    "AND (pinned OR ttl_at >= $2::bigint)";
+
 // Shared by pin() (same connection, no extra round trip) and the public
 // count_pinned_for_owner(). Returns -1 on query error so callers can
 // distinguish "zero pinned" from "could not determine" (authoritative posture
@@ -289,7 +501,10 @@ int count_pinned_on(PGconn* conn, const std::string& owner) {
 
 // ── Construction ─────────────────────────────────────────────────────────────
 
-ResultSetStore::ResultSetStore(pg::PgPool& pool) : pool_(pool) {
+ResultSetStore::ResultSetStore(pg::PgPool& pool, std::size_t member_cache_bytes,
+                               std::function<int64_t()> epoch_seconds)
+    : pool_(pool), epoch_seconds_(epoch_seconds ? std::move(epoch_seconds) : system_epoch_seconds),
+      member_cache_budget_(member_cache_bytes) {
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("ResultSetStore: no database connection at construction ({}) — result-set "
@@ -301,6 +516,16 @@ ResultSetStore::ResultSetStore(pg::PgPool& pool) : pool_(pool) {
         spdlog::error("ResultSetStore: schema migration failed — result-set persistence disabled");
         return;
     }
+    const MemberTriggerCheck triggers = member_triggers_in_force(lease.get());
+    member_cache_enforced_ = triggers == MemberTriggerCheck::InForce;
+    if (triggers == MemberTriggerCheck::NotInForce && member_cache_budget_ > 0)
+        spdlog::error("ResultSetStore: the result_set_members re-stamp triggers are missing, "
+                      "disabled, not ENABLE ALWAYS or altered; result-set membership is served "
+                      "uncached on this server until they are restored (see the server admin "
+                      "guide, \"Result-set membership after a restore or repair\")");
+    else if (triggers == MemberTriggerCheck::Unreadable && member_cache_budget_ > 0)
+        spdlog::error("ResultSetStore: result-set membership is served uncached on this server "
+                      "until a restart can verify the re-stamp triggers");
     open_ = true;
 }
 
@@ -333,7 +558,7 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
     row.id = generate_id();
     row.name = req.name;
     row.owner_principal = req.owner_principal;
-    row.created_at = now_epoch();
+    row.created_at = epoch_seconds_();
     row.ttl_at = row.created_at + kDefaultTtlSeconds;
     row.last_used_at = row.created_at;
     row.pinned = false;
@@ -359,10 +584,8 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
         // UP-6): a stalled gc sweep would otherwise convert GC debt into
         // spurious operator Quota failures. Still soft-guard-grade.
         pg::PgResult qc = pg::exec_params(
-            conn,
-            "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
-            "AND (pinned OR ttl_at >= extract(epoch from now())::bigint)",
-            std::vector<std::string>{req.owner_principal});
+            conn, kCountActiveForOwner,
+            std::vector<std::string>{req.owner_principal, std::to_string(row.created_at)});
         if (qc.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResultSetStore::insert_row_impl: quota check failed: {}",
                           PQerrorMessage(conn));
@@ -378,9 +601,10 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
             "INSERT INTO result_set_store.result_sets "
             "(id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, "
             " source_kind, source_payload, status, source_execution_id, matcher, device_count, "
-            " agents_failed, agents_unanswered) "
+            " agents_failed, agents_unanswered, membership_generation) "
             "VALUES ($1,$2,$3,$4::bigint,$5::bigint,$6::bigint,false,$7,$8,$9,$10,$11,$12,"
-            "$13::bigint,$14::bigint,$15::bigint) RETURNING id",
+            "$13::bigint,$14::bigint,$15::bigint,"
+            "CASE WHEN $10 = 'materialized' THEN pg_catalog.gen_random_uuid() END) RETURNING id",
             std::vector<std::optional<std::string>>{
                 row.id, row.name.empty() ? std::nullopt : std::optional<std::string>(row.name),
                 row.owner_principal, std::to_string(row.created_at), std::to_string(row.ttl_at),
@@ -674,6 +898,58 @@ std::expected<bool, ResultSetError> ResultSetStore::contains(const std::string& 
     return PQntuples(res.get()) > 0;
 }
 
+ResultSetStore::CachedMembership ResultSetStore::cached_members(const std::string& id) {
+    std::lock_guard lock(member_cache_mutex_);
+    const auto it = member_cache_index_.find(id);
+    return it == member_cache_index_.end() ? CachedMembership{} : it->second->snapshot;
+}
+
+void ResultSetStore::forget_members(const std::string& id) {
+    // Declared before the lock: the dropped entry (possibly the last reference to a large
+    // member set) is destroyed after the mutex is released, never under it.
+    std::list<MemberCacheEntry> dropped;
+    std::lock_guard lock(member_cache_mutex_);
+    if (auto it = member_cache_index_.find(id); it != member_cache_index_.end()) {
+        const auto entry = it->second;
+        member_cache_bytes_ -= entry->bytes;
+        member_cache_index_.erase(it); // the key views the node's id: erase it first
+        dropped.splice(dropped.end(), member_cache_fifo_, entry);
+    }
+}
+
+void ResultSetStore::retain_members(const std::string& id,
+                                    CachedMembership snapshot,
+                                    std::size_t bytes) {
+    if (!member_cache_enforced_ || bytes > member_cache_budget_)
+        return;
+    // Evicted and replaced entries are moved here and destroyed after the mutex is released.
+    std::list<MemberCacheEntry> dropped;
+    std::lock_guard lock(member_cache_mutex_);
+    if (auto it = member_cache_index_.find(id); it != member_cache_index_.end()) {
+        auto entry = it->second;
+        if (entry->snapshot.generation == snapshot.generation)
+            return; // A concurrent miss retained this generation.
+        member_cache_bytes_ -= entry->bytes;
+        member_cache_index_.erase(it);
+        dropped.splice(dropped.end(), member_cache_fifo_, entry);
+    }
+    while (member_cache_bytes_ > member_cache_budget_ - bytes) {
+        const auto oldest = member_cache_fifo_.begin();
+        member_cache_bytes_ -= oldest->bytes;
+        member_cache_index_.erase(oldest->id);
+        dropped.splice(dropped.end(), member_cache_fifo_, oldest);
+    }
+    member_cache_fifo_.push_back({id, std::move(snapshot), bytes});
+    const auto entry = std::prev(member_cache_fifo_.end());
+    try {
+        member_cache_index_.emplace(entry->id, entry);
+    } catch (...) {
+        member_cache_fifo_.pop_back();
+        throw;
+    }
+    member_cache_bytes_ += bytes;
+}
+
 std::expected<OwnedMembers, ResultSetError>
 ResultSetStore::member_set_owned(const std::string& id, const std::string& owner) {
     if (!open_)
@@ -683,25 +959,44 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         spdlog::error("ResultSetStore::member_set_owned: no connection ({})", pool_.last_error());
         return std::unexpected(ResultSetError::DbError);
     }
-    // #4981 PR-1 (Finding A/A1): a SINGLE statement, one Postgres snapshot,
-    // existence + ownership + membership together — closes the TOCTOU window
-    // the pre-#4981 plain owner-filtered JOIN left open (a set deleted
-    // between a caller's own pre-dispatch ownership gate and this read used
-    // to surface here as a SUCCESSFUL EMPTY set, not an error — see the
-    // header's file-level note). The LEFT JOIN's ON-clause carries the owner
-    // predicate (not a WHERE clause) so a row for `id` is ALWAYS returned
-    // when `id` exists regardless of who owns it — the `owned` column tells
-    // the caller which case it is — while `m.device_id` is NULL on every row
-    // when the owner predicate didn't match (or when `id` has zero members).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT (r.owner_principal = $2) AS owned, m.device_id, r.status, r.agents_failed, "
-        "r.agents_unanswered "
-        "FROM result_set_store.result_sets r "
+    // Read a live header on every use. The UUID identifies the materialization across
+    // divergent PostgreSQL timelines. A generation mismatch takes the full joined read,
+    // with its own complete owner/readiness/TTL check in the snapshot returning the IDs.
+    // No database access takes place under the cache mutex. Reusing cached IDs is sound only
+    // under the header's "Member cache invariant": every write to a set's member rows
+    // re-stamps its generation in the same transaction (migration v7 enforces it in SQL).
+    //
+    // Expiry is judged on this replica's clock ($3), the clock that wrote ttl_at
+    // (insert_row_impl, touch, unpin) and that gc_sweep deletes by, so a set is refused here
+    // exactly when this replica's GC would treat it as expired. A comparison against the
+    // database clock would refuse a set up to the skew before its expiry on a replica whose
+    // clock runs behind the database.
+    static constexpr std::string_view columns =
+        "SELECT (r.owner_principal = $2) AS owned, r.status, r.agents_failed, "
+        "r.agents_unanswered, r.membership_generation ";
+    static constexpr std::string_view live_row =
+        "WHERE r.id = $1 AND (r.pinned OR r.ttl_at >= $3::bigint)";
+    static const auto header_sql = std::format("{}FROM result_set_store.result_sets r {}",
+                                               columns, live_row);
+    static const auto members_sql = std::format(
+        "{}, m.device_id FROM result_set_store.result_sets r "
         "LEFT JOIN result_set_store.result_set_members m "
-        "ON m.result_set_id = r.id AND r.owner_principal = $2 "
-        "WHERE r.id = $1",
-        std::vector<std::string>{id, owner});
+        "ON m.result_set_id = r.id AND r.owner_principal = $2 {}", columns, live_row);
+    auto cached = cached_members(id);
+    const std::vector<std::string> params{id, owner, std::to_string(epoch_seconds_())};
+    pg::PgResult res;
+    if (cached.members) {
+        res = pg::exec_params(lease.get(), header_sql.c_str(), params);
+        if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 0) {
+            forget_members(id); // deleted or expired: free its budget now, not at eviction
+            return std::unexpected(ResultSetError::NotFound);
+        }
+        if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1 &&
+            cached.generation != PQgetvalue(res.get(), 0, 4))
+            cached = {};
+    }
+    if (!cached.members)
+        res = pg::exec_params(lease.get(), members_sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::member_set_owned: query failed: {}",
                       PQerrorMessage(lease.get()));
@@ -723,7 +1018,7 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         return std::unexpected(ResultSetError::NotOwner);
     // Only a `materialized` set has a membership that means anything: a pending set has none
     // yet and a failed set never will. Both are errors here, never an empty success.
-    switch (result_set_status_from(PQgetvalue(res.get(), 0, 2))) {
+    switch (result_set_status_from(PQgetvalue(res.get(), 0, 1))) {
     case ResultSetStatus::Materialized:
         break;
     case ResultSetStatus::Pending:
@@ -731,16 +1026,40 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
     case ResultSetStatus::Failed:
         return std::unexpected(ResultSetError::Failed);
     }
-    OwnedMembers out;
-    out.complete =
-        to_i64(PQgetvalue(res.get(), 0, 3)) == 0 && to_i64(PQgetvalue(res.get(), 0, 4)) == 0;
-    out.reserve(static_cast<std::size_t>(rows));
+    const bool complete =
+        to_i64(PQgetvalue(res.get(), 0, 2)) == 0 && to_i64(PQgetvalue(res.get(), 0, 3)) == 0;
+    if (cached.members)
+        return OwnedMembers{std::move(cached.members), complete};
+
+    auto members = std::make_shared<MembershipIds>();
+    members->reserve(static_cast<std::size_t>(rows));
+    // Account for retained keys, the shared object, list/tree nodes and hash buckets.
+    // Charge string capacity even for small strings stored inline. The per-node allowance
+    // includes links, cached hashes and allocation overhead on the supported platforms.
+    constexpr std::size_t node_overhead = 4 * sizeof(void*);
+    std::size_t bytes = sizeof(MemberCacheEntry) + id.size() + 1 + sizeof(MembershipIds) +
+                        sizeof(decltype(member_cache_index_)::value_type) + 4 * node_overhead +
+                        members->bucket_count() * sizeof(void*);
     for (int i = 0; i < rows; ++i) {
-        if (PQgetisnull(res.get(), i, 1))
-            continue; // owned, zero members: every row's device_id is NULL
-        out.insert(PQgetvalue(res.get(), i, 1));
+        if (PQgetisnull(res.get(), i, 5))
+            continue; // owned, zero members
+        const auto& member = *members->emplace(PQgetvalue(res.get(), i, 5)).first;
+        bytes += sizeof(member) + member.capacity() + 1 + node_overhead;
     }
-    return out;
+    if (!PQgetisnull(res.get(), 0, 4)) {
+        // Retention is an optimisation: an allocation failure while retaining must not fail
+        // a read that is already complete and authorised. retain_members leaves the cache
+        // consistent when it throws.
+        try {
+            std::string generation{PQgetvalue(res.get(), 0, 4)};
+            bytes += generation.capacity() + 1;
+            retain_members(id, {std::move(generation), members}, bytes);
+        } catch (const std::bad_alloc&) {
+            spdlog::warn("ResultSetStore::member_set_owned: out of memory while caching a "
+                         "membership; served uncached");
+        }
+    }
+    return OwnedMembers{std::move(members), complete};
 }
 
 std::expected<std::optional<std::string>, ResultSetError>
@@ -785,13 +1104,11 @@ std::expected<int, ResultSetError> ResultSetStore::count_for_owner_checked(
     // OVER-counts relative to the authoritative check and could reject a
     // dispatch the authoritative check would have allowed (a stalled GC
     // sweep converting GC debt into a spurious operator quota failure).
-    // Keeping the two predicates identical means this pre-check predicts the
-    // authoritative check exactly.
+    // Both calls use the same predicate and replica clock. Time or the rows may change
+    // before admission performs its own authoritative read.
     pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
-        "AND (pinned OR ttl_at >= extract(epoch from now())::bigint)",
-        std::vector<std::string>{owner});
+        lease.get(), kCountActiveForOwner,
+        std::vector<std::string>{owner, std::to_string(epoch_seconds_())});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::count_for_owner_checked: query failed: {}",
                       PQerrorMessage(lease.get()));
@@ -935,7 +1252,7 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::unpin(const std::string
     // Restore ttl_at = now + default (design §3.3). The original was
     // INT64_MAX while pinned, so this clamps rather than "restoring" a prior
     // value — same behavior as the SQLite implementation.
-    int64_t new_ttl = now_epoch() + kDefaultTtlSeconds;
+    int64_t new_ttl = epoch_seconds_() + kDefaultTtlSeconds;
     std::string sql = std::string("UPDATE result_set_store.result_sets SET pinned = false, "
                                   "ttl_at = $1::bigint WHERE id = $2 RETURNING ") +
                       kRowCols;
@@ -958,7 +1275,7 @@ void ResultSetStore::touch(const std::string& id) {
         spdlog::error("ResultSetStore::touch: no connection ({})", pool_.last_error());
         return;
     }
-    int64_t now = now_epoch();
+    int64_t now = epoch_seconds_();
     // Do not shorten a pinned set's INT64_MAX ttl; only ever extend.
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -1083,6 +1400,7 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
             // The counters ADD to what the pending row carries: a child inherits its parent's
             // at create time (inherit_completeness), so the fill never reads the parent.
             "UPDATE result_set_store.result_sets SET status = 'materialized', "
+            "membership_generation = pg_catalog.gen_random_uuid(), "
             "device_count = $1::bigint, agents_failed = agents_failed + $2::bigint, "
             "agents_unanswered = agents_unanswered + $3::bigint "
             "WHERE id = $4 AND status = 'pending' RETURNING id",
@@ -1257,6 +1575,15 @@ bool ResultSetStore::heal_poisoned_payload(const std::string& id) {
 // operation and a first pass against it deletes at most 1-hour-old scratch).
 namespace {
 constexpr int64_t kGcSweepCapPerPass = 5000;      // part 5: unconditional
+// part 5, second half: a pass also stops at this many member rows (summed device_count, the
+// stored member count), always taking at least one set. The set cap alone let one pass cascade
+// up to 5000 x kMaxMembersPerSet server-written rows; past the 30 s statement_timeout the pass
+// rolls back and the next one retries the same oldest-first cohort forever. With the v7 DELETE
+// trigger, this statement deleting 5M rows took 3.13 to 3.35 s, and 3.65 s in a second run, in
+// Gate 8 measurements on scratch PostgreSQL 16 (2026-11-21): well inside the timeout.
+// device_count is the server's own count; a member row written out of band is not in it, so the
+// budget is best-effort and the set cap still always applies.
+constexpr int64_t kGcSweepRowBudgetPerPass = 5'000'000;
 constexpr int64_t kGcBigStepSecs = 86'400;        // part 7: absolute, ~1 day
 constexpr int64_t kGcImplausiblyAheadSecs = 604'800; // part 1: probe excludes
 } // namespace
@@ -1280,7 +1607,7 @@ int ResultSetStore::gc_sweep() {
         if (!to_bool(PQgetvalue(lk.get(), 0, 0)))
             return true; // another replica holds the sweep
 
-        const int64_t now = now_epoch();
+        const int64_t now = epoch_seconds_();
 
         // Load the persisted reading + last-reported anomaly fact set.
         pg::PgResult meta = pg::exec_params(
@@ -1434,16 +1761,25 @@ int ResultSetStore::gc_sweep() {
             return true; // nothing to drain
 
         // part 5: cap every accepted pass UNCONDITIONALLY — the detectors
-        // above are best-effort, the cap always applies. DELETE ... RETURNING
-        // counts what the statement actually removed (the #1033-banning
-        // idiom). Cascades to result_set_members via the FK.
+        // above are best-effort, the cap always applies: at most
+        // kGcSweepCapPerPass sets, oldest first, and within those only the
+        // prefix whose summed device_count stays within kGcSweepRowBudgetPerPass
+        // (the first set always goes, so a pass is never empty while sets are
+        // expired). DELETE ... RETURNING counts what the statement actually
+        // removed (the #1033-banning idiom). Cascades to result_set_members via
+        // the FK.
         pg::PgResult res = pg::exec_params(
             conn,
             "DELETE FROM result_set_store.result_sets WHERE id IN ("
-            "SELECT id FROM result_set_store.result_sets "
+            "SELECT id FROM ("
+            "SELECT id, row_number() OVER w AS n, sum(GREATEST(device_count, 0)) OVER w AS rows_through "
+            "FROM (SELECT id, ttl_at, device_count FROM result_set_store.result_sets "
             "WHERE pinned = false AND ttl_at < $1::bigint "
-            "ORDER BY ttl_at ASC LIMIT $2) RETURNING id",
-            std::vector<std::string>{std::to_string(now), std::to_string(kGcSweepCapPerPass)});
+            "ORDER BY ttl_at ASC, id ASC LIMIT $2) cohort "
+            "WINDOW w AS (ORDER BY ttl_at ASC, id ASC ROWS UNBOUNDED PRECEDING)) ranked "
+            "WHERE n = 1 OR rows_through <= $3::bigint) RETURNING id",
+            std::vector<std::string>{std::to_string(now), std::to_string(kGcSweepCapPerPass),
+                                     std::to_string(kGcSweepRowBudgetPerPass)});
         if (res.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResultSetStore::gc_sweep: delete failed: {}", PQerrorMessage(conn));
             return false;

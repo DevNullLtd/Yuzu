@@ -105,10 +105,11 @@ std::expected<std::string, ResultSetError> resolve_scope_aliases(std::string_vie
                                                                  ResultSetStore* store);
 
 /// Return the `from_result_set:<ref>` atoms in an (already alias-resolved)
-/// expression that fail the owner check: the set is absent/expired
-/// (store->get == nullopt) or owned by another principal. A set that exists, is
-/// owned, and is legitimately empty is NOT reported. Empty when `owner` is empty
-/// or `store` is null (no owner context to check against). Drives the
+/// expression that fail the owner check: the set is absent (store->get ==
+/// nullopt) or owned by another principal. `get` has no TTL predicate, so an
+/// expired but unswept set passes here and is refused later by the binding
+/// check. A set that exists, is owned, and is legitimately empty is NOT reported.
+/// Empty when `owner` is empty or `store` is null (no owner context to check against). Drives the
 /// invocation-time INSTRUCTION_SCOPE_RESOLUTION_FAILED audit row (design §7).
 ///
 /// **#4981 PR-1 (Finding A/A2): this is an EARLY, per-ref FORENSIC pass —
@@ -116,7 +117,8 @@ std::expected<std::string, ResultSetError> resolve_scope_aliases(std::string_vie
 /// `store->get()` (a plain existence+ownership read). The BINDING check is
 /// `AgentRegistry::evaluate_scope`'s own `member_set_owned` preload, which
 /// runs later (after parsing, at actual registry evaluation) against the
-/// SAME store in a single snapshot-consistent statement (A1) — so a set that
+/// SAME store from one live header read (A1; the member IDs come from that read or from a
+/// cache entry under the same materialization generation) — so a set that
 /// passes THIS check can still be deleted/expired in the window between here
 /// and that later read (a real TOCTOU race: `delete_set`/`gc_sweep` both
 /// cascade via an FK), and `evaluate_scope` aborts fail-closed

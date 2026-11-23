@@ -875,13 +875,16 @@ TEST_CASE("Echo rename: result_set_store v3 rewrites the source kind and matcher
                   " '{\"kind\":\"tar_rows_ge\",\"n\":1}'), "
                   "('rs_control1', 'p', 1, 2, 1, 'plugin_query', "
                   " '{\"instruction_id\":\"crossplatform.o.q\"}', '{\"kind\":\"rows_ge\"}')");
+    exec_sql(dsn, "ALTER TABLE result_set_store.result_sets DROP COLUMN membership_generation");
+    exec_sql(dsn, "DROP FUNCTION result_set_store.result_set_members_restamp() CASCADE");
+    exec_sql(dsn, "DROP FUNCTION result_set_store.result_set_members_restamp_deleted() CASCADE");
     roll_back(dsn, "result_set_store", 2);
     {
         PgPool pool{{.conninfo = dsn, .size = 2}};
         yuzu::server::ResultSetStore store{pool};
         REQUIRE(store.is_open());
     }
-    CHECK(version_of(dsn, "result_set_store") == "5"); // v3 rewrote the rows, v4 adds agents_failed, v5 agents_unanswered
+    CHECK(version_of(dsn, "result_set_store") == "7");
     CHECK(one(dsn, "SELECT source_kind || '|' || matcher FROM result_set_store.result_sets WHERE "
                    "id = 'rs_legacy1'") == "echo_query|{\"kind\":\"echo_rows_ge\",\"n\":1}");
     CHECK(one(dsn, "SELECT source_kind || '|' || matcher FROM result_set_store.result_sets WHERE "
