@@ -1087,8 +1087,10 @@ struct NftFallthroughInfo {
     std::vector<yuzu::firewall::NftFailedDump> failed;
     unsigned churn_streak = 0;
     /// Rows the dispatcher writes only when no later rung answers: the table dump's own row waits
-    /// here, because the snapshot rung that follows may read the very ruleset the dump was refused,
-    /// and an EPERM row beside a successful read would mislead.
+    /// here while no table has been seen, because the snapshot rung that follows may read the very
+    /// ruleset the dump was refused, and an EPERM row beside a successful read would mislead.
+    /// Once a table has been seen nothing waits: the snapshot rung's unknown can then rest on the
+    /// netlink read (nft_fallthrough_clamp), so run_nft_probe writes the row at once.
     std::vector<std::string> pending_rows;
 };
 
@@ -1186,12 +1188,21 @@ struct NftProbeResult {
             // discard table_res silently, making the documented troubleshooting token unreachable).
             // An error| row, not fallthrough|: nftables has not committed as the live backend yet.
             // On a re-run this is the same path: the earlier pass's churn is superseded.
-            // The socket-open diagnostics (fd_exhausted, a refused open) are written at once, as ever;
-            // the table-dump row is deferred to the dispatcher (NftFallthroughInfo::pending_rows).
+            // The socket-open diagnostics (fd_exhausted, a refused open) are written at once, as
+            // ever. The table-dump row is deferred to the dispatcher
+            // (NftFallthroughInfo::pending_rows) only while no table has been seen, which is the
+            // account that cannot read at all. On a re-run whose first pass saw a table the row is
+            // written at once, as the fallthrough rows of a pass that got past its table dump are:
+            // the snapshot rung then turns an empty listing to unknown on the strength of this
+            // read and writes no error row of its own for it.
             for (const auto& row : yuzu::firewall::nft_open_diag_rows(open_errnos))
                 ctx.write_output(row);
-            if (!table.open_errno)
-                info.pending_rows.push_back(yuzu::firewall::nft_diag_row("table", table.res));
+            if (!table.open_errno) {
+                if (info.tables_seen)
+                    ctx.write_output(yuzu::firewall::nft_diag_row("table", table.res));
+                else
+                    info.pending_rows.push_back(yuzu::firewall::nft_diag_row("table", table.res));
+            }
             note_probe_end(/*ended_in_churn=*/false);
             return std::nullopt; // unreachable -- fall through
         }
@@ -1536,11 +1547,12 @@ void do_state_linux(yuzu::CommandContext& ctx) {
     if (try_nftables_state(ctx, info))
         return;
 
-    // The packaged unit cannot read nftables or iptables itself: the root snapshot broker can. When
-    // the rung answers, the table dump's deferred row is dropped: the answer is then the snapshot
-    // rung's, unknown included, and that rung's own error| rows say what it could not read, so the
-    // refused netlink read beside them would name a read the answer does not rest on. When it does
-    // not answer, the row is written and the ladder goes on as before.
+    // The packaged unit cannot read nftables or iptables itself: the root snapshot broker can. A
+    // row waits in pending_rows only when the netlink read saw no table (run_nft_probe), so when
+    // the rung answers and the row is dropped, the answer is the snapshot rung's alone, unknown
+    // included: that rung's own error| rows say what it could not read, and the refused netlink
+    // read beside them would name a read the answer does not rest on. When it does not answer,
+    // the row is written and the ladder goes on as before.
     if (try_snapshot(ctx, info, yuzu::firewall::FwReadAction::state))
         return;
     for (const auto& row : info.pending_rows)

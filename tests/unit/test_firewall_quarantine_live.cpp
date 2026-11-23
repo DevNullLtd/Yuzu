@@ -243,9 +243,11 @@ std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall()
 
 /// Runs a tool and returns the whole result, stderr merged unless asked otherwise. A caller that
 /// must tell "it ran and printed nothing" from "it did not run, timed out, was clipped or failed"
-/// needs the exit code and the flags, which capture() drops. Every capture of this harness takes
-/// twice the snapshot cut, the cap the plugin gives its own helper run: a listing clipped at the
-/// runner's 1,000,000-byte default would be this harness's own limit read as a failed snapshot.
+/// needs the exit code and the flags, which capture() drops. Every read through this function
+/// (capture() included) takes twice the snapshot cut, the cap the plugin gives its own helper run:
+/// a listing clipped at the runner's 1,000,000-byte default would be this harness's own limit read
+/// as a failed snapshot. The forced-failure runner (FlakyLoadRunner::fn) calls the runner itself
+/// with the default cap: it runs the containment's commands and never the snapshot word.
 [[nodiscard]] yuzu::agent::SubprocessResult capture_result(const std::vector<std::string>& argv,
                                                            std::chrono::milliseconds deadline = 60s,
                                                            bool merge_stderr = true) {

@@ -56,9 +56,10 @@ breaks any of them is outside this ADR and needs its own threat model.
 3. **Fixed, read-only work.** The program is a root-owned file shipped by the package. It names
    each tool by its literal absolute path with literal arguments, under a reset `PATH` and locale,
    and changes no ruleset, writes no file and takes no lock. For the tables the kernel lists its
-   legacy reads load no kernel module; the two reads that can make the kernel load one are stated
-   at the end of this clause. It reads two kernel rulesets, one reader each: the nf_tables ruleset
-   with `/usr/sbin/nft -a list ruleset`, and the legacy xtables tables of each address family with
+   legacy reads load no kernel module; the two reads that can make the kernel load one, and the one
+   race in which a save tool starts `modprobe` itself, are stated at the end of this clause. It
+   reads two kernel rulesets, one reader each: the nf_tables ruleset with
+   `/usr/sbin/nft -a list ruleset`, and the legacy xtables tables of each address family with
    that family's legacy save tool under its own name, `/usr/sbin/iptables-legacy-save` and
    `/usr/sbin/ip6tables-legacy-save`, run with no argument, which list every instantiated table. The
    alternatives-selected `iptables` and `ip6tables` are never run: on an nft-backed host they are
@@ -124,11 +125,12 @@ breaks any of them is outside this ADR and needs its own threat model.
    2026-11-23): 200 connections at once left the socket active, and 201 inside 2 seconds put it in
    the failed state (`Result=trigger-limit-hit`) and removed the socket file until
    `systemctl reset-failed` and `systemctl start`. On Ubuntu 26.04 (systemd 259) 600 connections at
-   once did not fail it. A failed socket reads as a host with no broker does, `unknown` and never
-   `inactive`. The limit is kept on purpose: only root and the agent's group can connect, a read
-   makes at most two connections, so the agent's own reads pass it only above 100 reads of one host
-   inside 2 seconds, and without it nothing in the unit bounds how often those clients can make the
-   service manager accept and close a connection.
+   once did not fail it. With the socket file gone the packaged agent answers as a host without the
+   broker does: firewalld's own rows on a firewalld host and `unknown` elsewhere, after the error
+   rows of the reads it was refused, and never `inactive`. The limit is kept on purpose: only root
+   and the agent's group can connect, a read makes at most two connections, so the agent's own
+   reads pass it only above 100 reads of one host inside 2 seconds, and without it nothing in the
+   unit bounds how often those clients can make the service manager accept and close a connection.
 5. **Authorisation is the socket.** Who may connect is the socket's owner, group and mode. That
    proves identity and not authenticity, so only data that is acceptable to disclose to the agent
    account may be served. What the firewall snapshot serves is the host's full nftables ruleset
@@ -198,6 +200,10 @@ breaks any of them is outside this ADR and needs its own threat model.
     containment, for example) needs its own threat model and its own ADR. The kernel loading
     a module on demand, in the two cases clause 3 records, is a side effect of a read, not work the
     helper does.
+    So is the third path clause 3 records, a save tool that starts `modprobe` for its family's core
+    module in a removal race (read in the source): there a process of the helper asks for the load,
+    `ProtectKernelModules` is the bound on it in the broker's instance, and the installer's helper,
+    which has no sandbox, has none.
 
 ## What this discharges
 

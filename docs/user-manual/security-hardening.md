@@ -147,17 +147,20 @@ bound.
   no input. The service unit's IP egress filter takes effect only on hosts with the unified cgroup
   hierarchy; its address-family list is what bounds its sockets. The agent unit keeps
   `NoNewPrivileges=true`.
-- If a read answers `unknown` with no `error|snapshot:` row on a packaged host, there is no socket
-  file: the socket was stopped, masked or has failed. A read whose first snapshot was `inactive` and
-  whose second found the socket gone answers `unknown` with `error|snapshot:gone`, for the same
-  reason. The socket fails when systemd's activation limit is passed: more than 200 connections
+- A packaged host with no socket file answers as a host without the broker does: after the error
+  row of the refused netlink read (`error|nftables:table:eperm`), firewalld's own rows on a
+  firewalld host (`backend|firewalld`, `state|running`, `ruleset|unknown`) and `unknown` elsewhere,
+  with no row that names the snapshot. If a read answers so, look at the socket: its file is gone
+  when the socket was stopped, was masked before it ever started, or has failed (below). A read
+  whose first snapshot was `inactive` and whose second found the socket gone answers `unknown` with
+  `error|snapshot:gone`, for the same reason. The socket fails when systemd's activation limit is passed: more than 200 connections
   inside 2 seconds, with those refused at `MaxConnections` counted (measured on Rocky 9.9, systemd
   252: `systemctl show -p Result yuzu-fw-snapshot.socket` printed `trigger-limit-hit` and the socket
   file was removed; on Ubuntu 26.04, systemd 259, 600 connections at once did not fail it). A
   `state` or `rules` read makes at most two connections, so the agent's own reads pass that limit
   only above 100 reads of one host inside 2 seconds. Run `systemctl status yuzu-fw-snapshot.socket`;
   then `systemctl reset-failed yuzu-fw-snapshot.socket` and
-  `systemctl start yuzu-fw-snapshot.socket`, or restart `yuzu-agent`.
+  `systemctl start yuzu-fw-snapshot.socket`.
   `journalctl -u 'yuzu-fw-snapshot@*'` shows each instance.
 - If a read answers `error|snapshot:empty` or `error|snapshot:timeout`, the broker was reached and
   did not reply in full: either four reads were already in flight (`MaxConnections=4`; a connection

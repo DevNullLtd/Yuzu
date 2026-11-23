@@ -606,7 +606,10 @@ EOF
 # host ruleset through this same line. Two reads can make the kernel load a module, both measured
 # (ADR-3007, clause 3): an nft read on a host where nf_tables is not loaded makes the kernel load
 # nf_tables, and a save tool that asks for a table whose module is not loaded makes the kernel load
-# that module.
+# that module. In one removal race a save tool starts modprobe itself, for its family's core
+# module, when that module and a table's module are both removed between the kernel listing the
+# table and the tool asking for it (read in the tool's source; ADR-3007, clause 3); the helper has
+# no sandbox that refuses that load.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 
 # firewall plugin — nftables containment (own table inet yuzu_quarantine). The ruleset is loaded
@@ -801,7 +804,11 @@ generate_fw_helper_content() {
 # includes rule handles, and changes no ruleset and writes no file. Two reads can make the kernel
 # load a module, both measured (ADR-3007, clause 3): an nft read on a host where nf_tables is not
 # loaded makes the kernel load nf_tables, and a save tool that asks for a table whose module is not
-# loaded makes the kernel load that module.
+# loaded makes the kernel load that module. In one removal race a save tool starts modprobe itself,
+# for its family's core module (ip_tables or ip6_tables): when that module and a table's module are
+# both removed between the kernel listing the table and the tool asking for it (read in the tool's
+# source; ADR-3007, clause 3). This helper runs as root with no sandbox, so nothing in it refuses
+# that load.
 #
 # nft load <path> and pf load <path>: <path> is absolute, at most 512 characters with no control
 # character, in a directory named firewall-staging, and its file name is yuzu-fwq-<letters, digits,
