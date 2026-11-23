@@ -237,7 +237,8 @@ struct SsoOnlyGateResult {
     /// the read and the first check is seen too. Not set by the second check's own read.
     std::chrono::system_clock::time_point read_wall_at{};
     /// The newest "not armed" time this server holds (unset when there was none): an own read
-    /// records when it ENDED, a shared refresh when it STARTED, and the time never moves back.
+    /// records when it ENDED, a shared refresh when it STARTED, and the time never moves back
+    /// (only the test seam `reset_break_glass_arm_cache_for_test` clears it).
     std::optional<std::chrono::steady_clock::time_point> last_not_armed_at;
 
     /// The ONE admit set for "evaluate a local password": open mode or an armed break-glass
@@ -342,7 +343,9 @@ public:
     }
     /// Test seam: freeze the clock the arm gate and the MFA step's re-checks read, at `ms` after
     /// the steady-clock epoch, and move it by hand. Atomic, so a test may advance it while request
-    /// threads run. Never set in production (a negative value means the real clock).
+    /// threads run. Never set in production (a negative value means the real clock). Move it
+    /// FORWARD only, or call `reset_break_glass_arm_cache_for_test()` first: the "not armed" time
+    /// never moves back, so a clock set behind it refuses every armed read.
     void set_arm_clock_for_test(std::int64_t ms) { arm_clock_test_ms_.store(ms); }
     void advance_arm_clock_for_test(std::int64_t ms) { arm_clock_test_ms_.fetch_add(ms); }
     /// Test seam: freeze the WALL clock the MFA step's second re-check reads (see

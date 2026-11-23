@@ -2689,8 +2689,8 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
     //    answer is never cached and is never recorded as "not armed".
     // The refresh itself is bounded in time (break_glass_status caps the pool acquire, the lock
     // wait and the statement). Two facts are kept across failed reads for the MFA step's second
-    // re-check: the id of the last definitive armed read and when the last definitive not-armed
-    // read started.
+    // re-check: the id of the last definitive armed read and the newest "not armed" time (an
+    // own read's end, a shared refresh's start; it never moves back).
     auto* metrics = auth_mgr_.metrics_registry();
     const auto count = [metrics](const char* result) {
         if (metrics)
@@ -3859,8 +3859,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // An armed own read is honoured only if the "not armed" time this server holds is
             // before it STARTED; a time at or after that is the newer fact (C-01, PR #8626
             // review). An own read records that time at its END, a shared refresh at its START,
-            // so a shared "not armed" read that started before this read is not seen (a
-            // documented residual, auth-architecture.md arm-gate invariant (2)).
+            // so a shared "not armed" read that started before this read but finished during it
+            // does not refuse it (a documented residual, auth-architecture.md arm-gate
+            // invariant (2)).
             const bool armed_ok =
                 gate2.state == SsoOnlyLocalGate::kBreakGlassArmed &&
                 !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= gate2.read_at);

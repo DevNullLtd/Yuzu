@@ -750,7 +750,9 @@ struct ArmCtl {
     std::atomic<int> real_sleep_in_read_ms{0};       // the read blocks this long in REAL time
     std::atomic<int> reads{0};
     std::atomic<bool> block{false}; // the NEXT read to arrive is held until release() (one-shot)
-    /// Run once, on the reading thread, at the start of the next read (single-threaded cases only).
+    /// Run once, on the reading thread, at the start of the next read. Set it only while no other
+    /// thread can start a read (for example after `hold_a_refresh` returns, when the held reader
+    /// has already passed this point).
     std::function<void()> before_answer;
     std::atomic<int> blocked{0};
     std::mutex mu;
@@ -1851,6 +1853,13 @@ TEST_CASE("break-glass MFA step: the second re-check reads the arm state itself"
     install_arm_hook(h, ctl);
     auto& r = *h.auth_routes;
     std::optional<yuzu::test::JoiningThread> refresher;
+    // Declared AFTER `refresher`, so it is destroyed first: a failing REQUIRE (some run inside the
+    // barrier, before the held refresh is released) cannot leave the refresher blocked on the
+    // condition variable with its join waiting for it (Gate 8, CX-1/CS-G8-1).
+    struct ReleaseFirst {
+        ArmCtl& c;
+        ~ReleaseFirst() { c.release(); }
+    } release_first{ctl};
     const auto hold_a_refresh = [&] {
         ctl.block = true;
         refresher.emplace([&] { (void)r.sso_only_local_password_gate("admin"); });
@@ -2053,6 +2062,13 @@ TEST_CASE("break-glass MFA step: the second re-check reads the arm state itself"
         // code is spent (governance UP-1). Changing this is a deliberate design decision.
         CHECK(res->status == 200);
         CHECK(refused_total(h) == 0.0);
+        // And the shared read DID record its not-armed answer, at its START (a dropped shared
+        // write, or one recording the end, fails here; Gate 8 F1).
+        r.set_mfa_verify_barrier_for_test(nullptr);
+        const auto g = r.sso_only_local_password_gate("admin", SsoOnlyArmRead::kOwnFreshRead);
+        REQUIRE(g.last_not_armed_at.has_value());
+        CHECK(*g.last_not_armed_at ==
+              std::chrono::steady_clock::time_point(std::chrono::milliseconds(kT0 + 1100)));
     }
     SECTION("an own read that says armed is honoured when the only not-armed read ended before it started") {
         const auto pending = login_step1(h);
