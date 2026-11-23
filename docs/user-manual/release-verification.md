@@ -202,7 +202,8 @@ What this does **not** gate:
   says `coverage: not-covered`. A passing scan of a chisel image is not evidence about its OS packages.
   Use the non-chisel image if you need them covered. The four not-covered listings expire 2027-02-15 and
   are not to be renewed; the planned fix is a scanner-readable package manifest emitted at build time
-  (#8415), a plan and not something shipped.
+  (#8415), a plan and not something shipped; until it ships, these images stop passing the release
+  gate after that date.
 - PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
   which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
 - Anything statically linked into the server and agent binaries. The gateway's bundled Erlang/OTP

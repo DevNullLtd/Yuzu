@@ -1239,6 +1239,8 @@ that could not mean anything:
   (grype identifies only a few packages, best effort: "What it does not see" below). These four
   listings expire 2027-02-15 and are not to be renewed; the planned fix, not a shipped one, is a
   scanner-readable package manifest (dpkg `status.d` stanzas emitted in the chisel stage, #8415).
+  Consequence: from 2027-02-15 the release gate refuses these four images unless #8415 has shipped
+  or a renewal is deliberately approved by the owner.
   The gate learns an image's name from
   `NAME=IMAGE` (release.yml) or the tag (pre-release.yml); a bare image ID can never match the list.
 - an ignore file that `scripts/ci/image-vuln-gate-checks.py` does not accept (below).
@@ -1706,8 +1708,9 @@ journal stays at `push-started`, and the release job does not run.
 **Current packages.** The Debian and Alpine images upgrade their packages in the final stage
 (`apt-get upgrade`, `apk upgrade`; `yuzu-postgres` holds the PGDG server packages so the
 PostgreSQL minor stays the pinned one), and the chisel images cut their slices from the live
-Ubuntu archive (a fact about build time, not a scan: it is no vulnerability coverage for the chisel
-images, whose OS packages are not scanned, "What it does not see" below). A package index that cannot be fetched fails the build: the Debian runtime
+Ubuntu archive (a fact about build time, not a scan: it is no vulnerability coverage for the
+chisel images, whose OS packages are not scanned; see "What it does not see" in "Release image
+vulnerability gate"). A package index that cannot be fetched fails the build: the Debian runtime
 stages run `apt-get update --error-on=any` (plain `apt-get update` exits 0 when, say, the
 security pocket is unreachable, and the upgrade then ships without it; checked 2026-11-18 on
 bookworm's apt 2.6 and trixie's apt 3.0, both exit 100 with the option), and Alpine's
