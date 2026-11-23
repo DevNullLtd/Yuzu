@@ -140,6 +140,7 @@ yuzu::test::PgTestTemplate twins_instr_tpl{"optwinsinstr", [](const std::string&
     yuzu::server::pg::PgPool twins_pool_fx_{{.conninfo = twins_db_fx_.dsn(), .size = 4}};          \
     REQUIRE(twins_pool_fx_.valid());                                                               \
     RbacStore store_var{twins_pool_fx_};                                                           \
+    store_var.use_no_session_store_for_test(); /* no session_store schema in this fixture */       \
     REQUIRE(store_var.is_open())
 
 #define TWINS_INSTR(pool_var)                                                                      \
@@ -378,6 +379,7 @@ TEST_CASE("arming_check (auto path): a schedule whose creator lost the required 
     yuzu::test::AuthDbPg twins_auth_fx_;
     RbacStore rbac{twins_auth_fx_.pool()};
     REQUIRE(rbac.is_open());
+    rbac.use_no_session_store_for_test(); // no session_store schema in this fixture
     TWINS_INSTR(instr_pool);
     Harness h{instr_pool, rbac};
     // A second Administrator holder so unassigning carol's grant below doesn't
@@ -420,6 +422,7 @@ TEST_CASE("arming_check (approval path): a schedule whose creator lost the requi
     yuzu::test::AuthDbPg twins_auth_fx_;
     RbacStore rbac{twins_auth_fx_.pool()};
     REQUIRE(rbac.is_open());
+    rbac.use_no_session_store_for_test(); // no session_store schema in this fixture
     TWINS_INSTR(instr_pool);
     Harness h{instr_pool, rbac};
     // A second Administrator holder — see the identical comment in the
