@@ -128,12 +128,11 @@ using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 
 // ── Path validation ─────────────────────────────────────────────────────
 
-// A path as UTF-8 bytes: path::string() throws on Windows for a name the active code page cannot
-// represent, and a throw out of the reserved-path decision must never become an allow.
-std::string path_bytes(const fs::path& p) {
-    const auto u = p.u8string();
-    return std::string(reinterpret_cast<const char*>(u.data()), u.size());
-}
+// A path as UTF-8 bytes, NON-THROWING: path::string() throws on Windows for a name the active code
+// page cannot represent and u8string() throws for a name with an unpaired UTF-16 surrogate (which
+// Windows allows). The shared converter (find_by_hash::path_utf8, from_wide on Windows) does neither:
+// such a unit becomes U+FFFD. Used for comparison only, never to open a file.
+std::string path_bytes(const fs::path& p) { return yuzu::filesystem::find_by_hash::path_utf8(p); }
 
 // WP06 F55: the agent's own data dir, log file and TLS key/cert/CA paths, captured at init and
 // refused by every validate_path* below (best effort, see filesystem_reserved_paths.hpp).
@@ -459,7 +458,7 @@ void add_reserved(yuzu::filesystem::reserved::Set& set, std::string_view raw, bo
 
 // Canonicalize a path and optionally enforce a base directory restriction.
 // Returns empty string on failure (path doesn't exist, escapes base_dir, etc.)
-std::string validate_path(std::string_view raw_path, std::string_view base_dir) {
+std::string validate_path_impl(std::string_view raw_path, std::string_view base_dir) {
     if (raw_path.empty())
         return {};
     if (path_refused_as_network(raw_path))
@@ -508,8 +507,19 @@ std::string validate_path(std::string_view raw_path, std::string_view base_dir) 
     return canonical.string();
 }
 
+// A refusal, never a throw: path::string() throws on MSVC for a canonical name the active code page
+// cannot hold (a long name an 8.3 short name expands to included), and an exception here would leave
+// the action half-run. Any throw is a clean refusal (an empty answer).
+std::string validate_path(std::string_view raw_path, std::string_view base_dir) {
+    try {
+        return validate_path_impl(raw_path, base_dir);
+    } catch (...) {
+        return {};
+    }
+}
+
 // For paths that might not exist yet (exists check), validate the parent
-std::string validate_path_or_parent(std::string_view raw_path, std::string_view base_dir) {
+std::string validate_path_or_parent_impl(std::string_view raw_path, std::string_view base_dir) {
     if (raw_path.empty())
         return {};
     if (path_refused_as_network(raw_path))
@@ -580,6 +590,15 @@ std::string validate_path_or_parent(std::string_view raw_path, std::string_view 
 
     // Return the original path (parent is validated, file just doesn't exist)
     return path_str;
+}
+
+// Same contract as validate_path: a throw is a clean refusal.
+std::string validate_path_or_parent(std::string_view raw_path, std::string_view base_dir) {
+    try {
+        return validate_path_or_parent_impl(raw_path, base_dir);
+    } catch (...) {
+        return {};
+    }
 }
 
 #ifdef _WIN32

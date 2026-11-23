@@ -76,6 +76,14 @@ def main() -> int:
     for name, rx in pins.items():
         if not re.search(rx, flat):
             problems.append(f"whole-statement pin {name!r} not found (condition weakened or removed)")
+    # path_bytes must be the NON-throwing shared converter (u8string() throws on MSVC for an unpaired
+    # surrogate), and validate_path / validate_path_or_parent must turn any throw into a refusal.
+    if "u8string()" in code[code.index("std::string path_bytes("):code.index("std::string path_bytes(") + 400]:
+        problems.append("path_bytes calls u8string(): it throws on MSVC for an unpaired surrogate; use find_by_hash::path_utf8")
+    for fn in ("validate_path", "validate_path_or_parent"):
+        w = re.search(r"std::string " + fn + r"\(std::string_view raw_path, std::string_view base_dir\) \{\s*try \{\s*return " + fn + r"_impl\(raw_path, base_dir\);\s*\} catch \(\.\.\.\) \{\s*return \{\};", code)
+        if not w:
+            problems.append(f"{fn} is not a try/catch(...) wrapper returning an empty refusal over {fn}_impl")
     # path::string() throws on MSVC for a name the active code page cannot hold, and the guard turns a throw
     # into a REFUSAL: every non-ACP file name was refused as reserved. The decision converts through
     # path_bytes (UTF-8) only.

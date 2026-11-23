@@ -737,6 +737,9 @@ TEST_CASE("filesystem plugin: list_dir lists a file whose name the code page can
     if (!handle.has_value() || !handle->descriptor())
         SKIP("filesystem plugin did not load");
     yuzu::test::TempDir root{"yuzu_test_fs_nonacp_"};
+    std::error_code mkec;
+    fs::create_directories(root.path, mkec); // TempDir names the directory, it does not create it
+    REQUIRE_FALSE(mkec);
     {
         std::ofstream o(root.path / L"\u96ea.txt");
         o << "snow";
