@@ -55,6 +55,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h> // timeval for SO_RCVTIMEO
 #include <unistd.h>
 
 #include <atomic>
