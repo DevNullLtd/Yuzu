@@ -352,8 +352,9 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    legacy row into the interned table (an average becomes `avg * samples`, a sum column is rebuilt
    from it, the keys intern through the dictionary).
 3. Finish the tier-to-tier roll-ups the old aggregator had not yet performed, using each source's
-   `rollup_<src>_<to>_at` mark (absent means "fold all"), then fold the raw rows at or after the
-   first old tier's mark (`ts >= mark`: a mark is the half-open end of the last rolled bucket).
+   `rollup_<src>_<to>_at` mark (absent means "fold all"), then fold the raw rows below the first
+   old tier's stored mark that its converted tier does not hold (the held-bucket rule, below), then
+   the raw rows at or after it (`ts >= mark`: a mark is the half-open end of the last rolled bucket).
    The marks are read once and validated before any of this: a mark that is not an integer, a
    populated old tier whose own mark is absent, or a coarser tier's mark ahead of its finer tier's
    fails the migration with the key, value and table named (an absent mark means "fold everything
@@ -364,8 +365,8 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    becomes the end of the newest bucket at or before the clock that the converted tier holds (what
    was provably summarised; a bucket the excursion itself wrote is ahead of the clock too and is
    never the floor, or every raw row written since the clock healed would be dropped as
-   summarised), clamped to the clock, the decision is logged once per mark with the figures, and
-   the rows below that floor are counted in the "older than the mark" figure. A converted tier
+   summarised), clamped to the clock, and the decision is logged once per mark with the figures.
+   The substitute floor only decides where the held-bucket rule applies; it drops nothing. A converted tier
    with no bucket at or before the clock cannot bound the fold: folding everything would add every
    raw row on top of the upper tiers that already hold them, so the migration refuses with the
    source, tier, mark and clock named, unless the source holds no raw row and no converted bucket
@@ -375,26 +376,57 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    `mark > now` (no tolerance, `acd22e776` `echo_aggregator.cpp` `raw_budget_candidates`), so a
    migration clock behind every stored mark (a restored snapshot, a reset real-time clock) takes
    the same path: bounded by the converted tier, or refused until the clock or the mark is
-   repaired. Known limit, two triggers of one mechanism: a raw row the excursion itself stamped
-   ahead of the clock folds again on top of the converted future bucket that already holds it;
-   and a migration clock set back from a SANE mark (a restored snapshot, an NTP step) makes the
-   mark untrusted by the same rule, and the clamp to the clock folds the raw rows between the
-   clock and the mark again on top of the buckets that hold them (an upper bound on the raw read
-   would close both; not built). A sane mark is used exactly as stored; the migration does not
-   otherwise decide per row whether a below-mark raw row was summarised.
+   repaired.
+   The held-bucket rule. A raw row below the STORED mark of the source's first old tier (the
+   stored figure, not the substitute floor) is folded only when (a) its bucket is strictly newer
+   than the converted tier's oldest bucket and (b) the converted tier holds no row for its bucket
+   and the key columns the old `GROUP BY` carried. (a): the pre-v10 build aged first-tier buckets
+   out oldest first (retention: hourly rows after 24 hours, 31 days for `perf` and `procperf`,
+   daily rows after 31 days; its byte budget sooner, on a build that had one) while raw rows, kept
+   by row count, survived, so an absent bucket inside the evicted range does
+   not mean "never summarised" and folding there would count the row again in the daily and
+   monthly tiers; an empty tier admits nothing. (b): the tier's other key columns are enrichment
+   the old pass never wrote (blank or 0 in every converted row), so they are not compared. The
+   converted tier is read as it stood before the pass: a watermark (its highest id before any
+   fold) keeps the pass's own writes out, so the answer for a (bucket, keys) is the same in every
+   chunk; answers are cached per chunk, so memory stays bounded by one chunk. Rows at or above the stored mark fold as they are. This
+   closes both triggers that used to fold a row twice (a raw row the excursion itself stamped
+   ahead of the clock sits in a converted future bucket; a migration clock set back from a SANE
+   mark, a restored snapshot or an NTP step, makes the mark untrusted by the same rule and put the
+   rows between the clock and the mark on top of the buckets that hold them), and it folds, once,
+   rows the old clock-gap clamp skipped and rows a process-event backfill wrote, where they pass both
+   tests, which used to be
+   dropped. The tier-to-tier finish has the same two triggers and runs first, so it carries the
+   rule itself: when the upper tier's mark is untrusted, a finer row at or above the floor goes up
+   only into an (upper bucket, key) the upper tier does not hold (`fold_tier_from_tier_sql`'s
+   `only_absent`; the old pass rolled whole upper buckets, so a bucket and key the tier holds were
+   rolled in full). A sane mark keeps the statement as it was. Cursor sources are outside the
+   held-bucket test and keep the single pass at the floor; no shipped schema gave `power`,
+   `removable` or `registry` a summary tier or a mark, so no file in the field takes that path (a
+   file that did would keep the old rule, with both gaps).
+   Three residuals remain, each leaving a total low and none adding a row twice: a raw row at or
+   before the oldest bucket (hour, or day) the converted tier holds is left out, because the older
+   build's retention (or its byte budget, where it had one) had already removed the buckets there
+   and their absence proves nothing; a raw row whose bucket and keys the converted tier already
+   holds is left out even when the row itself was never summarised (a backfilled row beside
+   summarised ones, or an event kind the old tier did not count), because the old summary kept no
+   row identity; and a month the monthly tier already holds is not completed (the days after a
+   mid-month start left by the old clock-gap clamp, and a day the daily tier only gains in this
+   migration). The rule is bounded by what the migration
+   can read: the old tiers carried no unique index, so a re-rolled range wrote a second row and the
+   conversion merged it; the rule never counts that range twice and never completes it.
    Sixteen decoders read the raw columns through `legacy_live_columns()`; a row the delta rules
-   reject is counted and dropped. Raw rows older than that mark are dropped with the raw tables, by
-   design: the old roll-up already summarised them, except rows a process-event backfill wrote with
-   historical timestamps and rows the old aggregator's clock-gap clamp skipped while the mark still
-   advanced. The old `GROUP BY` destroyed the row identity that would tell the two apart, so folding
-   them would double-count the first group; the migration logs how many it left unfolded. The usage
+   reject is counted and dropped. A raw row the rule leaves out is dropped with the raw tables; the log
+   line says how many rows below the stored mark were read, how many events folded and how many
+   were skipped, and how many tier-to-tier rows were left out because the upper tier already held
+   them. The usage
    fold read the raw process rows through its own cursor, `usage_hwm_id`: the process rows past it
    (the stored `usage_lag_events`, normally 0) are fed to `usage_fold_in` in this same transaction,
    so a lagging usage fold loses nothing it would have credited when the cursor is deleted; the
    log line carries the rows past the cursor, the stored counter and how many of them were folded
-   (a row past the cursor but below the roll-up floor is not folded into the tiers, and is in the
-   "older than the mark" figure, but usage still gets it: usage is fed in one id-ordered walk over
-   every row past the cursor, whatever its ts, so a run that straddles the floor pairs start first). They are fed only when the usage fold would have credited them, through the
+   (a row past the cursor that the rule leaves out of the tiers still reaches usage: usage is fed in
+   one id-ordered walk over every row past the cursor, whatever its ts, so a run that straddles the
+   stored mark pairs start first). They are fed only when the usage fold would have credited them, through the
    fold's own predicate (`usage_active_in`): usage enabled and the lifecycle Active, with the
    active generation parsed as `usage_lifecycle_state` parses it (an empty or malformed
    `usage_active_generation` is 0 and reads Active against an absent or 0 `usage_generation`,
@@ -403,7 +435,8 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    cursor in place while process was disabled and credited the rows once process was re-enabled,
    and the migration folds the raw rows into the process tiers regardless, so the rows reach usage
    now or never (`usage_fold_in` credits the events it is handed while process is disabled; only
-   its event-less sweep stays idle). Decided ONCE before the chunk loop; a PendingBaseline tick
+   its event-less live sweep stays idle, and the walk's closing call below is not that sweep).
+   Decided ONCE before the chunk loop; a PendingBaseline tick
    stamps a baseline and folds nothing, so the migration feeds nothing and stamps nothing (decided
    per chunk, the first chunk's stamp would turn the next into a retrospective fold of the rows
    the baseline excluded). An Active lifecycle with no cursor row is the damage the pre-v10 fold
@@ -411,7 +444,22 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    repair named (`DELETE FROM echo_config WHERE key = 'usage_active_generation';`: usage then
    re-baselines on the first tick, which deletes `usage_live`, so the open usage runs are
    forgotten and the lagged rows are not credited); a malformed `usage_lag_events`
-   (informational) is logged and the migration continues. A migrated tier
+   (informational) is logged and the migration continues. The walk defers the open-run sweep
+   (`UsageSweep::kDefer`: no anchor read, no expiry, no cap, no `usage_last_fold_ts` write) on
+   every chunk. When it fed at least one row, it ends with one event-less
+   `usage_fold_in(..., UsageSweep::kClose)`, whether or not `process` is enabled. `kClose` is
+   `kRun` without the idle return for a disabled process source: the walk credited its rows in
+   that state, so it is owed the same sweep. The whole walk is then one logical fold tick, judged
+   against the anchor as it stood before it, and a run older than seven days whose stop lands in a
+   later chunk is credited, not expired at a chunk edge. A walk that fed no rows sweeps nothing.
+   Until the closing call, the open-run set can hold one run per lagged `started` row in the v9
+   `process_live` table past the cursor. The call caps it at `kMaxOpenRuns` (20,000). A failure of
+   the closing call fails the migration and the file stays at v9. Accepted residuals, no code
+   (#7124): the usage walk has no deadline of its own and decodes the lagged process rows twice
+   (tiers, then usage), bounded by the size of the v9 `process_live` table and run once, at the
+   upgrade; and a stale `-wal` left by a crash can inflate the free-space demand of the first
+   refused open, whose refusal closes the connection and so checkpoints, after which the next
+   open succeeds. A migrated tier
    row carries the columns v9 did not have (`parent_name`, `abnormal_exit_count`, tcp `failed_count`
    and `listen_*`, user `disconnect_count`, removable `partition_count`) as blank or 0, so a bucket
    spanning the upgrade holds two process rows per (name, user): the migrated one with a blank
@@ -426,8 +474,9 @@ A failure at any step, a crash or a power loss before the commit leaves the reti
 next open retries from v9. After the commit `open()` refuses if the connection is not in autocommit mode
 (a wedged connection is never published), checkpoints and truncates the WAL, and runs one `VACUUM`
 when the volume holds twice the new file free (else it records `auto_vacuum_deferred_at` and the daily
-maintenance pass retries). The log line carries the duration, rows converted, rows folded, rows
-rejected, replay keys seeded, tables dropped, file sizes and the WAL size at commit. The migration needs
+maintenance pass retries). The log line carries the duration, rows converted, rows folded, the rows
+read below the stored mark with the events folded and skipped, the tier-to-tier rows left out as
+held, rows rejected, replay keys seeded, tables dropped, file sizes and the WAL size at commit. The migration needs
 the retired tables' own column lists, which live in `echo_fold_schema.cpp` (`legacy_live_columns`); they
 are the last copy of the raw schema and exist only to read old files.
 
@@ -447,6 +496,19 @@ Consequences for code that reads the store:
   (`usage_fold_in` rides `fold_rows`'s `extra` hook), so there is no read marker and no lag;
   `PendingBaseline` stamps and folds nothing. A fault in either half rolls back both, and the retried
   tick folds both once.
+- **The joint transaction couples the two halves' faults (#7121, decided: kept).** A persistent
+  failure inside `usage_fold_in` (a damaged page in `usage_live`, an unreadable or malformed
+  `usage_generation`) fails the whole tick, so the process tiers record nothing while usage is
+  enabled. Nothing isolates it, by design: the consistency the joint commit buys outweighs a
+  rare, visible fault. The symptom is the process roll-up row counts (`process_rows`) not moving
+  while `usage_enabled` is true, with the fold's error in the agent log on every tick; the
+  operator recovery is in the manual's "Process roll-ups stopped while usage is enabled". If this
+  is ever decided the other way, this bullet and that manual entry are the two places to change.
+- `usage_generation` is read strictly at every site that decides on it (`usage_lifecycle_state`,
+  `usage_set_enabled`, `usage_ensure_baselined`, and the fold): an absent row is 0, an unreadable
+  or malformed value is a fault. The lifecycle then reads `PendingBaseline`, an enable or
+  disable edge is refused (`false`, nothing written) and a baseline attempt returns the error and
+  stamps nothing, so a fault is never taken for generation 0 and never deletes `usage_live`.
 - `purge_source` deletes the source's `_r` rows and `echo_fold_seen` rows and sweeps the dictionary.
 - The status counts (`<src>_rows`, `<src>_oldest_ts`) read the finest tier.
 - `is_fold_view` is case-sensitive: a query that names a view `Process_Hourly` does not reach it.
@@ -525,7 +587,7 @@ break the all-or-nothing rule and re-enable every source an operator had paused.
 | **Reinstall over an existing data dir** | The new binary opens the existing echo.db, runs migration if the schema version differs, and resumes collection. State in `echo_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/echo.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no echo.db — the next collect_fast creates it from scratch. The old echo.db at the previous path is orphaned but not deleted. Operator concern, not Echo's. |
 | **An older agent on a migrated file (not supported)** | No earlier build checks `schema_version` against a ceiling, so an older agent opens a v10 file without refusing it. Not supported: never run an older agent on a migrated file; there is no return to an earlier agent build. An automatic OTA rollback (the updater rolling back a build that failed to verify) lands on the same file and the same applies (`docs/user-manual/upgrading.md` "Returning to an earlier agent build is not supported"). |
-| **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (the move is `claim_quarantine_name` / `quarantine_corrupt_db` in `agents/shared/sqlite_quarantine.hpp`, shared with the command-dedup store; a sidecar that can't be renamed is copied to its quarantine name and then removed, so the new DB can't replay it and the evidence is kept when the copy succeeds; on Windows the copied sidecar is re-secured with the protected DACL afterwards, best effort and logged (`secure_quarantined_sidecars`; a quarantine sidecar name that is foreign-owned or carries a second hard link is skipped and logged, because re-securing a hard link would rewrite its target's DACL); a sidecar that can be neither renamed nor copied is still removed and the loss is logged; the claim is bound to the regular file the check judged: `open()` reads its `lstat` identity while the connection still holds it, the claim refuses a link at the name, releases a claim whose name is not that file after the link or whose original is not that file right before it is dropped, and the mode change never follows a link, so a swapped-in link or a second recovery's fresh file at the name is left alone and open fails closed). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the operator recovers the quarantined copy, but only the newest three `echo.db.corrupt-*` groups are kept: each quarantine deletes older ones through `prune_old_quarantines` in `agents/shared/sqlite_quarantine.hpp`, never the group just made (#2155). Groups are ordered by the number in the name, so a name left by a clock once set far ahead sorts newest and holds one of the three slots (the same statement `docs/command-dedup.md` makes for the dedup store). The prune is per file and best effort (a file that cannot be removed is logged and retried at the next recovery) and runs only after a successful quarantine, so open still fails closed. If the corrupt file can't be moved aside (read-only/locked/perms, or a data directory on a filesystem without hard links: the quarantine name is claimed with a hard link so it can never overwrite an earlier quarantine, and there is deliberately no rename fallback), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **A busy database is not a corrupt one** (#7286): `busy_timeout` is set before the integrity check, and if another connection still holds the file past it (`SQLITE_BUSY` / `SQLITE_LOCKED`) open returns a busy error, quarantines nothing and leaves the file in place; the next start retries. **Only an explicit integrity failure quarantines** (a non-`ok` integrity row, `SQLITE_CORRUPT` or `SQLITE_NOTADB`, the command-dedup store's rule): any other failure to read the file (an I/O error, `SQLITE_CANTOPEN`, permission, read-only, disk full, WAL lock `PROTOCOL`) is *unreadable*, so open refuses with `echo.db could not be checked (sqlite rc N)`, quarantines nothing and retries on the next start, because a quarantine would replace a healthy file with a fresh database that re-enables every paused source. **A symlink (or, on Windows, any reparse point such as a junction) at `echo.db` or a sidecar is refused** before anything is opened, moved or secured, and again before the reopen that follows a quarantine; both Echo connections (the main one and the read-only query connection) are opened with `SQLITE_OPEN_NOFOLLOW`, which closes the check-to-open window on POSIX (the Windows VFS ignores the flag; that residual and what bounds it are recorded in the DACL block comment in `echo_db.cpp`); the operator removes the link. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
+| **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (the move is `claim_quarantine_name` / `quarantine_corrupt_db` in `agents/shared/sqlite_quarantine.hpp`, shared with the command-dedup store; a sidecar that can't be renamed is copied to its quarantine name and then removed, so the new DB can't replay it and the evidence is kept when the copy succeeds; the copy runs only when no directory entry of any kind, a dangling link included (examined without following it), is at the quarantine name, otherwise nothing is written or removed there and the sidecar's content is not kept; a copy that fails part-way has its partial file removed from the set where possible, and the log says whether it was (#7472); on Linux and macOS the copy is by descriptor (the sidecar is opened without following a link and must be a regular file, the bytes are written owner-only to a temporary beside the quarantine name and linked into place only when complete (a crash mid-copy leaves a stray temporary, never a truncated file at the quarantine name), and a failed flush to disk keeps the complete copy and says so); on Windows the copied sidecar is re-secured with the protected DACL afterwards, best effort and logged (`secure_quarantined_sidecars`; a quarantine sidecar name that is foreign-owned or carries a second hard link is skipped and logged, because re-securing a hard link would rewrite its target's DACL); a sidecar that can be neither renamed nor copied is still removed and the loss is logged; the claim is bound to the regular file the check judged: `open()` reads its `lstat` identity while the connection still holds it, the claim refuses a link at the name, releases a claim whose name is not that file after the link or whose original is not that file right before it is dropped, and the mode change never follows a link, so a swapped-in link or a second recovery's fresh file at the name is left alone and open fails closed). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the operator recovers the quarantined copy, but only the newest three `echo.db.corrupt-*` groups are kept: each quarantine deletes older ones through `prune_old_quarantines` in `agents/shared/sqlite_quarantine.hpp`, never the group just made (#2155). Groups are ordered by the number in the name, so a name left by a clock once set far ahead sorts newest and holds one of the three slots (the same statement `docs/command-dedup.md` makes for the dedup store). The prune is per file and best effort (a file that cannot be removed is logged and retried at the next recovery) and runs only after a successful quarantine, so open still fails closed. If the corrupt file can't be moved aside (read-only/locked/perms, or a data directory on a filesystem without hard links: the quarantine name is claimed with a hard link so it can never overwrite an earlier quarantine, and there is deliberately no rename fallback), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **A busy database is not a corrupt one** (#7286): `busy_timeout` is set before the integrity check, and if another connection still holds the file past it (`SQLITE_BUSY` / `SQLITE_LOCKED`) open returns a busy error, quarantines nothing and leaves the file in place; the next start retries. **Only an explicit integrity failure quarantines** (a non-`ok` integrity row, `SQLITE_CORRUPT` or `SQLITE_NOTADB`, the command-dedup store's rule): any other failure to read the file (an I/O error, `SQLITE_CANTOPEN`, permission, read-only, disk full, WAL lock `PROTOCOL`) is *unreadable*, so open refuses with `echo.db could not be checked (sqlite rc N)`, quarantines nothing and retries on the next start, because a quarantine would replace a healthy file with a fresh database that re-enables every paused source. **A symlink (or, on Windows, any reparse point such as a junction) at `echo.db` or a sidecar is refused** before anything is opened, moved or secured, and again before the reopen that follows a quarantine; both Echo connections (the main one and the read-only query connection) are opened with `SQLITE_OPEN_NOFOLLOW`, which closes the check-to-open window on POSIX (the Windows VFS ignores the flag; that residual and what bounds it are recorded in the DACL block comment in `echo_db.cpp`); the operator removes the link. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
 state stores. If a customer asks for "delete echo data on uninstall",
@@ -762,8 +824,8 @@ header):
    (`render_echo_capture_sources`) lists the eleven core sources (the original ten plus
    `registry`, which also adds the sixth `System` category chip) in a static array
    (`kSources` in `echo_process_tree.cpp`, plus the Push allowlist in
-   `echo_tree_routes.cpp` and `kSrc` in `device_routes.cpp`); a new source is toggled through `echo.configure`
-   until it is added to both; presentation metadata (category, always-on, `$`-name, badges)
+   `echo_tree_routes.cpp` and `kSrc` in `live_model.cpp`'s `parse_capture_sources`); a new source is toggled through `echo.configure`
+   until it is added to all three; presentation metadata (category, always-on, `$`-name, badges)
    lives in that render function. Device-level panels (no pid) go in the
    process-tree pane (`render_echo_*_panel` + an `echo_tree_routes` fragment).
 10. **Tests** — extend `test_echo_schema_registry.cpp` (every source has all three

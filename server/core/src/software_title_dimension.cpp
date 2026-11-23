@@ -144,7 +144,7 @@ TitleResolution resolve_title(const TitleKey& key,
     out.title_version = nt.version;
     out.purl_type = std::string{purl_type_for(key.ecosystem)};
 
-    // A name with no title token ("2019", "(x64)", "Pro") identifies nothing; it never reaches
+    // A name with no title token ("2019", "(x64)") identifies nothing; it never reaches
     // an alias or a product, whatever the key it would form.
     if (nt.title.empty())
         return out;

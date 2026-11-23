@@ -113,7 +113,7 @@ Run each component under its own system user:
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
 > the agent listener (a `tls` map in its `{yuzu_gw, grpc_listeners}` entry with
-> `verify => verify_none`, `fail_if_no_peer_cert => false`; see
+> `verify => verify_peer`, `fail_if_no_peer_cert => false`, `witness_client_cert => true`; see
 > `gateway/config/sys.config.prod`) and ship the
 > CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
 > cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.
@@ -525,7 +525,7 @@ The agent deduplicates commands by `command_id` so a captured or redelivered com
   - **What and where.** The corrupt file becomes `command_dedup.db.corrupt-<unix-epoch-seconds>` in the data directory, with `-<n>` appended if that name is taken and any non-empty `-wal`/`-shm`/`-journal` files alongside as `<that name>-wal` and so on. The number is the time of the recovery in Unix seconds: `date -r N` on macOS, `date -d @N` on Linux.
   - **What you lose.** **The command history in the corrupt file is lost**, so a command that already ran and is redelivered afterwards may run again.
   - **How you see it.** The agent logs an error naming the quarantined file, increments the agent-local counter `yuzu_agent_dedup_quarantined_total`, and reports the `yuzu.dedup_quarantined` heartbeat tag. `yuzu.dedup_degraded` stays `0` because protection is active again. The tag is a per-process value, so it returns to 0 when the agent restarts even though the quarantined files remain; the log line and the files themselves are the lasting record.
-  - **What is kept.** Only the **newest 3** quarantined files are kept; older ones are removed automatically at the end of each recovery. They hold the same saved command responses as the live store (status, exit code and short error text, not streamed output), so treat them as sensitive as a precaution. Once reviewed they are safe to delete: remove every file matching `<data-dir>/command_dedup.db.corrupt-*`, which includes the `-wal`, `-shm` and `-journal` files that travelled with them. A normal uninstall does not remove them.
+  - **What is kept.** Only the **newest 3** quarantined files are kept; older ones are removed automatically at the end of each recovery (a stray `.partial-<pid>-<n>` file left by a copy whose process died is not counted and not pruned; delete it by hand). They hold the same saved command responses as the live store (status, exit code and short error text, not streamed output), so treat them as sensitive as a precaution. Once reviewed they are safe to delete: remove every file matching `<data-dir>/command_dedup.db.corrupt-*`, which includes the `-wal`, `-shm` and `-journal` files that travelled with them. A normal uninstall does not remove them.
   - **What is not replaced.** A file that still opens but has a few damaged pages is deliberately **not** replaced (that would discard commands that are still running); the agent keeps using it and only the commands that hit a damaged page run undeduplicated, counted in `yuzu.dedup_claim_errors`.
   - **If it cannot recover.** If the file cannot be moved aside (for example a read-only directory, or a data directory on a filesystem without hard links, for example exFAT, or a network share whose server does not provide them: the quarantine claims its name with a hard link and never falls back to a plain rename), or the fresh store cannot be created afterwards (for example a full disk), the agent falls back to degraded mode as described above and `yuzu.dedup_degraded` is `1`; in the second case the history is already lost and the error names the kept file. Fix the directory's permissions, move the data directory to a filesystem with hard links (NTFS, ReFS, ext4, xfs or APFS), or free the space, or move the file away by hand, and restart the agent. Repeated `.corrupt-*` files on one endpoint mean the disk is corrupting the file on successive boots; check that disk.
   - **Unsupported.** Running two agent processes against one data directory is not supported; recovery protects the quarantined evidence from being overwritten, not the live store from the other process.
@@ -822,6 +822,8 @@ Two consequences worth planning for:
 
 ### Reconnect re-application (#3425), re-verify and drift
 
+The reserved lane governs worker admission while a pool is running. It does not bound pool teardown. When the stream drops the agent destroys the pool. A queued ordinary task that has not started is answered REJECTED ("agent reconnecting") without running and an ordinary command's stagger sleep ends within about a second. A queued protective action is never rejected: it runs, with no stagger sleep, before the pool is destroyed. The agent then waits, with no bound, for every task already RUNNING its plugin to return before it reconnects; a command blocked in the kernel holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` sent after the drop is not received until it returns (#8247). The 20 s shutdown watchdog does not cover this wait. On Linux the `yuzu-agent` unit sets `TimeoutStopSec=60`: a stop still waiting at 60 s ends in SIGKILL (`status=9/KILL`), and the unit is left `failed` (`Result=timeout`) and stopped: systemd does not restart a unit whose stop was requested, so it stays down until it is started again. A reconnect teardown has no such budget.
+
 A device quarantined while **offline** is contained at the control plane immediately (the gate above
 refuses it), but its own firewall cannot be touched until a dispatch reaches it. The
 `QuarantineContainmentReconciler` closes that automatically. For every record not yet confirmed:
@@ -1005,3 +1007,60 @@ When using OIDC (for example with Keycloak or Microsoft Entra ID):
 > rotation, so the old one must be **deleted** at the IdP; and deletion does not reach what was
 > already issued under it — access tokens stay valid until they expire, and sessions have to be
 > ended separately at the IdP and in Yuzu.
+
+## Agent re-registration proof: alert runbook
+
+The alerts below belong to `--agent-reregistration-proof` (see [Upgrading: re-registration proof](upgrading.md#behaviour-change-re-registering-an-already-enrolled-agent-can-require-proof-of-its-identity-wp01) for the modes, the soak and the recovery rules). Each heading is the alert name; every `runbook_url` in `docs/prometheus/yuzu-alerts.yml` for these alerts points here. These are sample rules: `docs/prometheus/yuzu-alerts.yml` is not loaded by anything this repo ships (no compose file mounts it, no Alertmanager configuration ships), so they fire only where an operator has wired the rules and routed their severities. The authoritative count of decisions is always `yuzu_register_reregistration_total`; audit rows are bounded and can be dropped.
+
+### YuzuAgentReregistrationWouldRefuse
+
+`audit` mode admitted a re-registration that `enforce` would refuse. For each `outcome` in `yuzu_register_reregistration_total{mode="audit"}`: `no_proof` (no certificate or token shown for a live-leaf id), `unattested_gateway` (a gateway that cannot witness certificates: set `witness_client_cert` on its agent listener; the gateway reads its configuration at boot), `revoked_identity`, `lookup_failed` (the CA store could not be read). Look at the `agent.reregistration_unproven` rows for the agent ids and addresses. Do not switch to `enforce` while real agents appear here.
+
+### YuzuAgentReregistrationUnattestedGateway
+
+A gateway reported that it cannot witness client certificates. Under `enforce` every leaf-holding agent behind it is refused. Fix the gateway's agent listener (`verify => verify_peer`, `fail_if_no_peer_cert => false`, `witness_client_cert => true`; the gateway reads its configuration at boot, so the change is in effect on a gateway process started afterwards); a wizard, demo, UAT or plaintext gateway cannot be enforced.
+
+### YuzuAgentReregistrationRefused
+
+`enforce` refused re-registrations. Check the `agent.reregistration_refused` rows. A real agent that lost its key: if it has no certificate file, give it a fresh single-use token (`max_uses` 1); if it still holds a certificate file, remove its `cert_dir`, restart it and give it the token. Unexpected ids and addresses are the takeover attempt the control stops.
+
+### YuzuAgentReregistrationLookupFailed
+
+The CA store could not be read, so every re-registration is refused `UNAVAILABLE` (retryable). Restore the PostgreSQL/CA store; agents retry on their own backoff.
+
+### YuzuAgentReenrolTokenRefusedBurst
+
+More than five re-enrolment tokens were refused in 15 minutes. Read `yuzu_register_reenrol_token_refused_total{reason}`: `multi_use_token` means the wrong kind of token was minted (re-enrolment needs `max_uses` 1; the single-token form defaults to 100); `already_consumed`, `expired`, `revoked` mean a spent or dead token is being retried; `not_found` repeated across ids means token guessing.
+
+### YuzuAgentReenrolTokenRefusedFirstWeeks
+
+A first-weeks-after-flip alert: it fires on ANY refused token re-enrolment (`increase(yuzu_register_reenrol_token_refused_total[1h]) > 0`). The audit-mode soak cannot exercise the token path, so for the first weeks after `--agent-reregistration-proof=enforce` is switched on each refusal is a lost-key agent that still cannot get back in, or a wrong token. Read the `reason` label: `multi_use_token` (re-enrolment needs `max_uses` 1; the single-token form defaults to 100), `already_consumed` / `expired` / `revoked` (a spent or dead token: mint a new one), `not_found` (a mistyped token, or a guess), `invalid_input_length`. Mint a fresh single-use token; if the agent still holds a certificate file, remove its `cert_dir` and restart it first. It is a standing rule with no end date: once the fleet has settled and the alert is only noise, silence it in Alertmanager or remove the rule; `YuzuAgentReenrolTokenRefusedBurst` keeps watching for bursts.
+
+### YuzuAgentReenrolTokenNoLeaf
+
+A single-use token was consumed to re-enrol a live-leaf id but no leaf was issued (`yuzu_register_reenrol_token_no_leaf_total{reason}`). `no_csr`: the agent's certificate file is inside its first two thirds of life, so it sent no CSR (it sends one only when the certificate is missing, unreadable, not matching its key, expired or past two thirds of its life). On that endpoint remove `cert_dir`, restart the agent and give it a fresh single-use token. `no_signer`: the server has no CA signer wired. `signer_failed` or `signer_threw`: read the server log for the signer error (a per-agent rate limit is one cause). The spent token cannot be reused; the older leaf is not superseded. Tracked: #8252, #8253.
+
+### YuzuAgentReregistrationAuditWriteFailed
+
+A re-registration audit row could not be written (`reason` `store_unavailable` or `write_failed`). Restore the audit store. The decision still happened and is counted in `yuzu_register_reregistration_total`; the call itself is not changed by the failed write.
+
+### YuzuAgentReregistrationRefusalAuditDropped
+
+An enforce-mode `agent.reregistration_refused` audit row lost its per-key budget (10 rows per outcome and agent id, 64 distinct keys, then one overflow allowance per outcome, per 10 s window) and was not written. Unlike the audit-mode `agent.reregistration_unproven` rows, a dropped refusal row has no chunked summary: it is counted only by action in `yuzu_register_reregistration_audit_dropped_total{action="agent.reregistration_refused"}`, its id is named nowhere, and `yuzu_register_reregistration_audit_ids_truncated_total` does not count it. The unbudgeted `yuzu_register_reregistration_total{mode="enforce"}` still counts every refusal. A sustained rise means one source is looping refusals or many ids are being refused at once: find it in the gateway and firewall logs and in the refusal rows that were written.
+
+### YuzuAgentReregistrationAuditIdsTruncated
+
+Agent ids that no summary row names are being counted (an upper bound: each repeat of an over-cap id counts again): more than 20000 DISTINCT ids were dropped inside one 10 s window (`ids_beyond_cap_max=N` on each summary row), or a summary chunk was dropped or never built (see the next alert). Treat it as a sustained flood of re-registrations for ids that hold live leaves. The unbudgeted `yuzu_register_reregistration_total` still counts every one; find the source in the per-source counts of the `agent.reregistration_unproven` aggregate rows (`sources=`) and in gateway and firewall logs.
+
+### YuzuAgentReregistrationAuditSummaryDropped
+
+A dropped-row summary chunk was not written (`reason`: `queue_full`, the 128-row queue overflowed; `write_failed`, three failed writes; `shutdown`, still queued when the server stopped; `alloc_failed`, the window's summary could not be built). Restore the audit store if `write_failed`. The ids that chunk would have named are now UNNAMED: they are counted by id in `yuzu_register_reregistration_audit_ids_truncated_total` (`yuzu_register_reregistration_audit_dropped_total` counts rows, not ids), and the unbudgeted `yuzu_register_reregistration_total` still counts every decision.
+
+### YuzuAgentLeafSupersedeFailed
+
+After a token re-enrolment issued a fresh leaf, revoking the agent's OLDER leaves failed or threw. A failure writes a `ca.cert.supersede_failed` audit row; **a throw writes no audit row**, only a server log line and `yuzu_server_ca_supersede_failed_total`. The older, possibly lost or stolen leaf stays valid until it expires (about 365 days) or you revoke it. Revoke it by hand: `GET /api/v1/ca/issued` (needs `Security:Read`), find the agent's leaves, and `POST /api/v1/ca/revoke` the serial of the OLDER one (`Security:Delete`; irreversible for that serial). Tracked: #8254.
+
+### YuzuAgentReregistrationModeMixed
+
+Server replicas run different `--agent-reregistration-proof` values for more than 10 minutes. The flag is per process, so the fleet is only as enforced as its weakest replica: set the same value on every replica. A throwaway `enforce` replica used for the soak test raises this alert by design; stop it when the test is done.
+

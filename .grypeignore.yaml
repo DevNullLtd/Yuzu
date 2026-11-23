@@ -1,0 +1,81 @@
+# Accepted vulnerabilities for the release image gate's second scanner, grype
+# (WP15/S9).
+#
+# Read by scripts/ci/image-vuln-gate.sh, which release.yml runs on every
+# published image BEFORE it is pushed (and pre-release.yml runs again on the
+# published tags). The gate fails on any CRITICAL vulnerability with a fix
+# that EITHER scanner reports and its acceptance file does not accept: Trivy's
+# findings are accepted in .trivyignore.yaml, grype's here. One finding seen by
+# both scanners needs an entry in each.
+#
+# This is NOT a grype config file, and grype never reads it (the name is not
+# `.grype.yaml` so that a grype run in this directory does not pick it up).
+# scripts/ci/image-vuln-gate-checks.py parses it and the gate refuses it
+# unless every entry follows the rules below, in this exact block-style shape
+# (no flow style, anchors or comments after a value). grype reads a generated
+# config holding only `ignore:` rules for the entries in force.
+#   - `id`, first: the vulnerability id grype reports.
+#   - `package_name` and `package_version`: the package exactly as grype
+#     reports it (the NAME and INSTALLED columns of the gate's grype table);
+#     both are required, so an entry never hides the vulnerability in every
+#     package or in every version of one. `package_type` (the TYPE column,
+#     e.g. apk, binary) narrows it further and is optional. No whitespace or
+#     glob character in any of them. grype reads the NAME as a regular
+#     expression, so a name may also hold no `+`, brackets, `|`, `\`, `^`, `$`,
+#     `*`, `?`, parentheses or braces: a package such as `libstdc++` cannot be
+#     accepted here, and its finding fails the gate until it is fixed.
+#   - `statement`, `expired_at`, `approved_by`, `approval_ref` and
+#     `approved_on`: exactly as in .trivyignore.yaml (its header has the
+#     rules): why the finding does not apply, with the evidence; an unquoted
+#     date at most 92 days out; the approver's GitHub login; the approving
+#     pull request ("#1234" or its URL) and the date of that approval, or
+#     `approval_ref: pending` and no `approved_on`, which the release gate
+#     (--release) does NOT honour. These three fields are a RECORDED REFERENCE
+#     that the gate checks for format only: nothing verifies that the pull
+#     request exists or that the named person approved it. The control is the
+#     review of the pull request that changes this file. Procedure:
+#     docs/ci-architecture.md "Recording an approval".
+#   - Remove the entry as soon as the image no longer carries the finding.
+#
+# PROVIDER WAIVERS (optional `provider_waivers:` section, same parser and
+# shape rules; each entry starts with `- provider:`). One lets the gate pass
+# DEGRADED when that grype DB provider's capture is older than 72 hours
+# because its upstream source has stalled, and waives NOTHING else: never a
+# finding, a missing provider, an unreadable or future capture time, the DB's
+# own age, checksum, status or schema, coverage or the gateway's erlang.
+#   - `provider`, first: nvd, alpine, debian or ubuntu, at most one entry each.
+#   - `statement`: why the release cannot wait, with the evidence of the stall.
+#   - `expired_at`: an unquoted date at most 14 days out. An EXPIRED waiver
+#     refuses this whole file (remove it), unlike an expired entry.
+#   - `approved_by`, `approval_ref`, `approved_on`: as for an entry; a
+#     `pending` waiver is not honoured by the release gate.
+#   - No flag, workflow input or variable enables one on GitHub Actions
+#     (the gate reads only this committed file there). Each image judged
+#     with one says `DEGRADED: provider waiver in force` in its grype
+#     .gate.txt and the step summary. Remove the waiver as soon as the
+#     provider is current. Procedure: docs/ci-architecture.md "A
+#     grype DB provider is stale".
+#
+# Example (not in force: it is a comment):
+#   - id: CVE-2026-0000
+#     package_name: erlang
+#     package_version: 28.5.0.2
+#     package_type: binary
+#     statement: >-
+#       Why it does not apply, with the evidence.
+#     expired_at: 2027-02-15
+#     approved_by: some-login
+#     approved_on: 2026-11-18
+#     approval_ref: "#1234"
+#
+# Provider waiver example (not in force: it is a comment):
+#   provider_waivers:
+#     - provider: nvd
+#       statement: >-
+#         Why the release cannot wait, and the evidence that NVD is stalled.
+#       expired_at: 2026-12-01
+#       approved_by: some-login
+#       approved_on: 2026-11-21
+#       approval_ref: "#1234"
+
+vulnerabilities:
