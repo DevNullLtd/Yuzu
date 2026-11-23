@@ -1388,6 +1388,7 @@ std::vector<SwEntry> entries_of(const V3Sec& sec) {
         e.distro_id = f[10];
         e.distro_version = f[11];
         e.install_location = f[12];
+        e.attributes = f[13];
         e.package_id = f[14];
         e.source = f[15];
         out.push_back(std::move(e));
@@ -2315,13 +2316,45 @@ TEST_CASE("msi_packages adapter: status grammar", "[sync][parse][adapter][msi_pa
 TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_packages]") {
     const std::string ok_status = "status|list_inventory|supported|-";
     const std::string good = "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub";
-    SECTION("a 4-token and a 6-token inv row are dropped, never truncated or padded") {
-        // MUTATION: split_tokens truncation to 5 would map the 6-token row.
+    SECTION("a 4-token and a 7-token inv row are dropped, never truncated or padded") {
+        // MUTATION: split_tokens truncation to 6 would map the 7-token row.
         const auto r = parse_msi_packages_list_inventory_output(
-            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0", good + "|extra",
-                good + "|extra|more"}));
+            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0",
+                good + "|{BBBBBBBB-0000-0000-0000-000000000002}|more",
+                good + "|a|b|c|d|e"}));
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
+    }
+    SECTION("a 5-token row maps with no attributes") {
+        const auto r = parse_msi_packages_list_inventory_output(nl({ok_status, good}));
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].attributes.empty());
+    }
+    SECTION("a 6-token row with a braced GUID sets upgrade_code, upper-cased") {
+        const auto r = parse_msi_packages_list_inventory_output(
+            nl({ok_status, good + "|{12345678-90ab-cdef-1234-567890abcdef}",
+                "inv|{AAAAAAAA-0000-0000-0000-000000000002}|App2|1.0|Pub|"
+                "{12345678-90AB-CDEF-1234-567890ABCDEF}"}));
+        REQUIRE(r.entries.size() == 2);
+        CHECK(r.entries[0].attributes == "upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}");
+        CHECK(r.entries[1].attributes == "upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}");
+        // The attribute is part of the row the writer hashes.
+        SwEntry bare = r.entries[0];
+        bare.attributes.clear();
+        CHECK(yuzu::agent::v3_row_hash(r.entries[0]) != yuzu::agent::v3_row_hash(bare));
+    }
+    SECTION("a 6th token that is empty or not a braced GUID keeps the row without attributes") {
+        for (const char* tail : {"", "extra", "12345678-90AB-CDEF-1234-567890ABCDEF",
+                                 "{12345678-90AB-CDEF-1234-567890ABCDE}",
+                                 "{12345678-90AB-CDEF-1234-567890ABCDEG}",
+                                 "{12345678-90AB-CDEF-1234-567890ABCDEF};x=1"}) {
+            CAPTURE(tail);
+            const auto r =
+                parse_msi_packages_list_inventory_output(nl({ok_status, good + "|" + tail}));
+            REQUIRE(r.entries.size() == 1);
+            CHECK(r.entries[0].name == "App");
+            CHECK(r.entries[0].attributes.empty());
+        }
     }
     SECTION("an empty code is mapped with an empty package_id (the adapter invents no key)") {
         const auto r = parse_msi_packages_list_inventory_output(nl({ok_status, "inv||name|1|pub"}));
@@ -2345,7 +2378,7 @@ TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_package
 
 TEST_CASE("collector: msi_packages rows carry package_id and source, and a constrained answer is status-only",
           "[sync][collector][msi_packages]") {
-    SECTION("Windows-shaped run: msi records carry package_id and source, slots 13-14 stay empty") {
+    SECTION("Windows-shaped run: msi records carry package_id and source; slot 13 stays empty and slot 14 is none until the producer sends an upgrade code") {
         fake_windows();
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
@@ -2359,7 +2392,7 @@ TEST_CASE("collector: msi_packages rows carry package_id and source, and a const
             CHECK(f[4] == "pkg");
             CHECK(f[5] == "msi");
             CHECK(f[12].empty()); // install_location (reserved, #5186)
-            CHECK(f[13].empty()); // uninstall_string (reserved, #5186)
+            CHECK(f[13].empty()); // attributes (the captured rows have no 6th token)
             CHECK(f[14].size() == 38); // {GUID}
         }
         CHECK(msi_records == msi_sample_mapped_rows());
@@ -2839,7 +2872,7 @@ TEST_CASE("collector: installed_software carries the 01:00-05:00 local nightly w
 // --- Adapter characterisation: the whole observable result of each status-row adapter ---
 //
 // Every cell asserts the whole observable result of an adapter: status, reason, entry count and
-// ALL fifteen fields of every entry. The cells reach the adapters only through the four binders
+// ALL sixteen fields of every entry. The cells reach the adapters only through the four binders
 // below, so how an adapter is bound is the binders' concern alone and the expectations stay put. Status rows are written as raw text (not through a formatter) so
 // they are independent of the producer.
 
@@ -2849,8 +2882,8 @@ std::string show_entry(const SwEntry& e) {
     std::string s;
     for (const std::string* f : {&e.name, &e.version, &e.publisher, &e.install_date, &e.kind,
                                  &e.ecosystem, &e.epoch, &e.release, &e.arch, &e.signature_status,
-                                 &e.distro_id, &e.distro_version, &e.install_location, &e.package_id,
-                                 &e.source}) {
+                                 &e.distro_id, &e.distro_version, &e.install_location,
+                                 &e.attributes, &e.package_id, &e.source}) {
         s += *f;
         s += ',';
     }
@@ -3166,8 +3199,18 @@ TEST_CASE("characterisation: msi list_inventory",
               res("ok", "",
                   {entry_of("n", "", "", "pkg", "msi", "{aaaaaaaa-0000-0000-0000-000000000001}")}));
     }
+    SECTION("an optional sixth token is the upgrade code: a row of that width is mapped, never "
+            "dropped") {
+        // `show` renders the attributes field, so a sixth token that is not a braced GUID is
+        // pinned here to leave it empty; a valid upgrade code is pinned in "msi_packages adapter:
+        // row shape".
+        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|extra"}) ==
+              res("ok", "", {entry_of("App", "1.0", "Pub", "pkg", "msi", code)}));
+        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|"}) ==
+              res("ok", "", {entry_of("App", "1.0", "Pub", "pkg", "msi", code)}));
+    }
     SECTION("rows that are not mapped") {
-        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|extra"}) == res("ok", ""));
+        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|extra|more"}) == res("ok", ""));
         CHECK(run({sup, "msi|" + code + "|App|1.0|-"}) == res("ok", ""));
         CHECK(run({sup, "package|homebrew|a|1|formula"}) == res("ok", ""));
         CHECK(run({sup, "INV|" + code + "|App|1.0|Pub"}) == res("ok", ""));
