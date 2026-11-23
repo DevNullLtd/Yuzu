@@ -7059,7 +7059,9 @@ public:
                     if (!audit_store_ || !audit_store_->is_open()) {
                         // No row can be written, so the quarantine counter cannot move: say so, or
                         // the corruption signal would be silent exactly when the store is down.
-                        metrics_.counter("yuzu_server_echo_corruption_audit_store_closed_total").increment();
+                        metrics_
+                            .counter("yuzu_server_echo_corruption_audit_store_closed_total")
+                            .increment();
                         return;
                     }
                     // log_echo_corruption_once admits via the gate and completes the reservation

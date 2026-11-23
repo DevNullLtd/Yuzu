@@ -8,9 +8,11 @@
  * parse (valid tag pair); the gate provides the dedup: ONE map entry per agent
  * (agent_id -> last known quarantine identity + time of the last row this
  * process wrote), bounded by kMaxAgents (one entry is evicted at the cap, never a
- * wholesale clear: the first whose rate-limit window has already elapsed, so an
- * agent still inside its window keeps its limit; an arbitrary entry only when every
- * entry is still inside its window), and, on a miss, ONE lookup of the newest
+ * wholesale clear: the first of the first kVictimScan entries whose rate-limit window
+ * has already elapsed, else the one of them written longest ago, a constant amount
+ * of work under the mutex; an agent still inside its window can therefore be
+ * forgotten and admitted again sooner when the examined entries are all inside
+ * theirs), and, on a miss, ONE lookup of the newest
  * `echo.db.corruption_quarantined` audit row for the agent. Net effect: exactly
  * one audit row per (agent, quarantine identity) across store prunes, server
  * restarts and HA node switches (per server process: another HA node ingesting
@@ -108,6 +110,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -423,11 +426,15 @@ private:
             // agent still inside its window keeps its limit, but look only at the first
             // kVictimScan entries: a scan of the whole map at the cap cost about 10 ms per new
             // identity under mu_ during a mass quarantine (the event this gate exists to report).
-            // When none of them has elapsed the first entry goes (the O(1) fallback): an agent
-            // still inside its window may then be forgotten and be admitted again sooner, and the
-            // lookup backs the evicted entry. An LRU or expiry-ordered index is the upgrade if a
-            // fleet is ever seen to evict in-window agents routinely.
+            // When none of them has elapsed, the one written longest ago goes, never begin():
+            // that is the most recently inserted node, so two agents writing at the cap would
+            // evict each other's live window on every call and each write a row every time. An
+            // agent still inside its window can still be forgotten and admitted again sooner when
+            // the whole examined prefix is in-window; the lookup backs the evicted entry. An LRU
+            // or expiry-ordered index is the upgrade if a fleet is ever seen to rely on the limit
+            // at the cap.
             auto victim = agents_.begin();
+            int64_t oldest = std::numeric_limits<int64_t>::max();
             std::size_t examined = 0;
             for (auto it = agents_.begin(); it != agents_.end() && examined < kVictimScan; ++it) {
                 ++examined;
@@ -435,6 +442,10 @@ private:
                 if (!at || now - *at >= kEchoCorruptionAuditMinRowInterval) {
                     victim = it;
                     break;
+                }
+                if (*at < oldest) {
+                    oldest = *at;
+                    victim = it;
                 }
             }
             max_victim_probe_ = std::max(max_victim_probe_, examined);
@@ -447,7 +458,8 @@ private:
     DegradedFn on_degraded_;
     mutable std::mutex mu_;
     std::unordered_map<std::string, Entry> agents_;
-    std::size_t max_victim_probe_{0}; // most entries any eviction examined (test pin of kVictimScan)
+    // Most entries any eviction examined (test seam pinning kVictimScan).
+    std::size_t max_victim_probe_{0};
     int64_t degraded_until_{0};
     // Agents whose last lookup or write failed (each until it succeeds), with the end of each
     // one's own wait. Bounded by kMaxFailing.

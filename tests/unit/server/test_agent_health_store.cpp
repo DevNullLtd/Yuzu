@@ -3301,39 +3301,6 @@ TEST_CASE("EchoCorruptionAuditGate: per-agent map is bounded by fleet, never wip
     CHECK(lookups == 1);
 }
 
-TEST_CASE("EchoCorruptionAuditGate: eviction at the cap spares an agent still inside its "
-          "rate-limit window (#5034)",
-          "[health_store][echo][corruption][gate]") {
-    using yuzu::server::detail::EchoCorruptionAuditGate;
-    using yuzu::server::detail::kEchoCorruptionAuditMinRowInterval;
-    int lookups = 0;
-    int64_t clock = 1000;
-    EchoCorruptionAuditGate gate(
-        [&](const std::string&) {
-            ++lookups;
-            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
-        },
-        [&] { return clock; });
-    constexpr int kFill = static_cast<int>(EchoCorruptionAuditGate::kMaxAgents) - 1;
-    for (int i = 0; i < kFill; ++i)
-        gate.mark_logged("old-" + std::to_string(i), "1:f");
-    // Age them past the interval, then record the one agent whose window is still open.
-    clock += kEchoCorruptionAuditMinRowInterval;
-    gate.mark_logged("limited", "1:f"); // map is now exactly at the cap
-    // A flood of new agents at the cap: each evicts an aged entry, never "limited".
-    for (int i = 0; i < 1000; ++i)
-        gate.mark_logged("new-" + std::to_string(i), "1:f");
-    clock += 1;
-    const int before = lookups;
-    // The rotating-identity rate limit still holds for "limited": refused with no lookup.
-    CHECK_FALSE(gate.should_log("limited", "2:g"));
-    CHECK(lookups == before);
-    // Once its own window ends it is admitted.
-    clock += kEchoCorruptionAuditMinRowInterval;
-    CHECK(gate.should_log("limited", "2:g"));
-    gate.mark_logged("limited", "2:g");
-}
-
 TEST_CASE("EchoCorruptionAuditGate: the eviction search at the cap is a bounded prefix, however "
           "many identities arrive (heartbeat path holds the gate mutex)",
           "[health_store][echo][corruption][gate]") {
@@ -3345,6 +3312,9 @@ TEST_CASE("EchoCorruptionAuditGate: the eviction search at the cap is a bounded 
         },
         [&] { return clock; });
     constexpr int kFill = static_cast<int>(EchoCorruptionAuditGate::kMaxAgents);
+    // The earlier guarantee that an agent still inside its rate-limit window is never the victim
+    // (#5034) is now best effort: only the first kVictimScan entries are searched, and which
+    // entries those are depends on the standard library's iteration order, so it is not asserted.
     // Sustained all-fresh at the cap: every entry is inside its rate-limit window, so no
     // eviction finds an aged victim; each one must stop at the prefix bound and fall back to the
     // first entry. A whole-map scan per new identity (about 10 ms each at this size) would have
@@ -3356,6 +3326,40 @@ TEST_CASE("EchoCorruptionAuditGate: the eviction search at the cap is a bounded 
     for (int i = 0; i < kFlood; ++i)
         gate.mark_logged("flood-" + std::to_string(i), "1:f");
     CHECK(gate.max_victim_probe() == EchoCorruptionAuditGate::kVictimScan);
+}
+
+TEST_CASE("EchoCorruptionAuditGate: agents writing at the cap do not evict each other's live "
+          "window",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [&] { return clock; });
+    constexpr int kFill = static_cast<int>(EchoCorruptionAuditGate::kMaxAgents);
+    for (int i = 0; i < kFill; ++i)
+        gate.mark_logged("fresh-" + std::to_string(i), "1:f"); // every window opened at 1000
+    // New agents write one second later, so each is the NEWEST entry in the map. When the
+    // examined prefix has no elapsed window the victim must be the oldest entry, never the one
+    // just inserted: evicting the newest node let two agents erase each other's window, so each
+    // wrote a row on every call.
+    constexpr int kRounds = 8; // fewer new entries than kVictimScan, so old entries stay in view
+    for (int r = 1; r <= kRounds; ++r) {
+        clock = 1000 + r;
+        const std::string a = "a-" + std::to_string(r);
+        const std::string b = "b-" + std::to_string(r);
+        REQUIRE(gate.should_log(a, "1:f"));
+        gate.mark_logged(a, "1:f");
+        REQUIRE(gate.should_log(b, "1:f"));
+        gate.mark_logged(b, "1:f");
+    }
+    for (int r = 1; r <= kRounds; ++r) {
+        // Each new agent's window is still live: a rotated identity is refused, not admitted.
+        CHECK_FALSE(gate.should_log("a-" + std::to_string(r), "2:g"));
+        CHECK_FALSE(gate.should_log("b-" + std::to_string(r), "2:g"));
+    }
 }
 
 TEST_CASE("EchoCorruptionAuditGate: a rotating identity is rate-limited per agent",

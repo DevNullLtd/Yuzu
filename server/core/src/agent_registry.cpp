@@ -226,12 +226,15 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         }
         if (it != agents_.end() && !it->second->session_id.empty())
             session_to_agent_.erase(it->second->session_id);
-        // retired_tar_only_n_ follows agents_ at every insert, replace and erase (O(1) read).
-        if (it != agents_.end() && it->second->retired_tar_only)
+        // retired_tar_only_n_ follows agents_ at every insert, replace and erase (O(1) read). The
+        // assignment comes first: a first registration allocates and can throw, and the counter
+        // must not have moved for a session that was never installed.
+        const bool was_tar = it != agents_.end() && it->second->retired_tar_only;
+        agents_[info.agent_id()] = session;
+        if (was_tar)
             --retired_tar_only_n_;
         if (session->retired_tar_only)
             ++retired_tar_only_n_;
-        agents_[info.agent_id()] = session;
     }
     metrics_.counter("yuzu_agents_registered_total").increment();
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));

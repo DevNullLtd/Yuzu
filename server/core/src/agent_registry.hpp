@@ -1330,8 +1330,9 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;
-    /// Entries of agents_ with retired_tar_only, kept at every insert, replace and erase (guarded by
-    /// mu_), so the health sweep reads it in O(1) instead of scanning the fleet under the routing lock.
+    /// Entries of agents_ with retired_tar_only, kept at every insert, replace and erase (guarded
+    /// by mu_), so the health sweep reads it in O(1) instead of scanning the fleet under the
+    /// routing lock.
     std::size_t retired_tar_only_n_ = 0;
     std::unordered_map<std::string, std::string> session_to_agent_;
     EventBus& bus_;
