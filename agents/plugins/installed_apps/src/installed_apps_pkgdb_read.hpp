@@ -342,16 +342,24 @@ read_dpkg_status_d(const std::string& root, const Limits& lim, PkgDbBudget& budg
             out.failure = failure_token(kSource, parsed.error());
             return out;
         }
-        // A status.d control file holds exactly one stanza (one package). A zero-byte or comment-only
-        // file, or one that parses to nothing or to several, is a damaged record: carrying on would
-        // publish a roster one package short as complete (ADR-0016, 2026-11-20: a package is never
-        // silently left out of a roster published as complete). The status FILE may still be empty.
-        if (parsed->size() != 1) {
+        // A status.d control file holds exactly one INSTALLED stanza (one package). A zero-byte or
+        // comment-only file, one that parses to nothing or to several stanzas, or whose one stanza is in
+        // another state (config-files, half-installed, triggers-pending...: the mapper would drop it
+        // silently), is a damaged record: carrying on would publish a roster one package short as
+        // complete (ADR-0016, 2026-11-20: a package is never silently left out of a roster published as
+        // complete). The status FILE may still be empty.
+        if (parsed->size() != 1 || parsed->front().status != "installed") {
             out.failure = failure_token(kSource, PkgDbCause::corrupt);
             return out;
         }
         collected.insert(collected.end(), std::make_move_iterator(parsed->begin()),
                          std::make_move_iterator(parsed->end()));
+    }
+    // Two distinct control files claiming one (Package, Architecture) is an ambiguous roster: keeping the
+    // first would hide the package whose own file went missing or was overwritten with another's record.
+    if (yuzu::shared::has_duplicate_package(collected)) {
+        out.failure = failure_token(kSource, PkgDbCause::corrupt);
+        return out;
     }
     yuzu::shared::merge_dpkg_status_d(out.packages, std::move(collected));
     return out;
@@ -672,20 +680,42 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
     return std::nullopt;
 }
 
-/// The directory `dir_path` resolves to when it is a symlink with a database file behind it, else
-/// nothing (not a link, a dangling one, or no database file). stat only, which follows the whole
-/// chain (a link to a link resolves to the same directory): nothing is opened or read through it.
-[[nodiscard]] inline std::optional<DirId> symlink_hides_database(const std::string& dir_path) {
+/// What looking behind a skipped symlinked database directory showed.
+struct LinkProbe {
+    std::optional<DirId> hidden; ///< the directory the link resolves to, when a database file is behind it
+    bool refused = false;        ///< the inspection itself was refused (EACCES and the like): unknown, not absent
+};
+
+/// An errno that says "nothing there" (a dangling link, a missing name, a link loop, a name too long). Any
+/// other stat failure is a refusal: a database we cannot show absent (the rule read_rpm_dir states below).
+[[nodiscard]] inline bool means_absent(int err) noexcept {
+    return err == ENOENT || err == ENOTDIR || err == ELOOP || err == ENAMETOOLONG;
+}
+
+/// Looks behind `dir_path` when it is a symlink: the directory it resolves to when a database file is behind
+/// it, or `refused` when the agent's account cannot search the target, so that a refusal is never read as
+/// "no database behind the link" (a different, populated directory would then be published as complete). Not a
+/// link, a dangling one, or no database file behind it is neither. stat only, which follows the whole chain (a
+/// link to a link resolves to the same directory): nothing is opened or read through it.
+[[nodiscard]] inline LinkProbe symlink_hides_database(const std::string& dir_path) {
+    LinkProbe out;
     struct stat st {};
     if (::lstat(dir_path.c_str(), &st) != 0 || !S_ISLNK(st.st_mode))
-        return std::nullopt;
+        return out;
     struct stat target {};
-    if (::stat(dir_path.c_str(), &target) != 0)
-        return std::nullopt;
-    for (const char* name : {"rpmdb.sqlite", "Packages.db", "Packages", "data.mdb"})
-        if (::stat((dir_path + '/' + name).c_str(), &st) == 0)
-            return dir_id_of(target);
-    return std::nullopt;
+    if (::stat(dir_path.c_str(), &target) != 0) {
+        out.refused = !means_absent(errno);
+        return out;
+    }
+    for (const char* name : {"rpmdb.sqlite", "Packages.db", "Packages", "data.mdb"}) {
+        if (::stat((dir_path + '/' + name).c_str(), &st) == 0) {
+            out.hidden = dir_id_of(target);
+            return out;
+        }
+        if (!means_absent(errno))
+            out.refused = true; // keep looking: a later name may still show the database
+    }
+    return out;
 }
 
 /// Reads the rpm database in `rel_dir`, if there is one. `found == false` with no failure means this
@@ -713,7 +743,13 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
                 out.failure = failure_token("rpmdb", PkgDbCause::not_regular);
                 return out;
             }
-            out.symlinked_db = symlink_hides_database(dir_path);
+            const auto link = symlink_hides_database(dir_path);
+            if (link.refused && !link.hidden) {
+                out.found = true;
+                out.failure = failure_token("rpmdb", PkgDbCause::unreadable);
+                return out;
+            }
+            out.symlinked_db = link.hidden;
             return out;
         }
         out.found = true;

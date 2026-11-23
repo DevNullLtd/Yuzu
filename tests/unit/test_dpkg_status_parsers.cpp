@@ -436,6 +436,17 @@ TEST_CASE("dpkg status: row cap, expired clock and empty input", "[dpkg][pkgdb]"
     }
 }
 
+TEST_CASE("dpkg has_duplicate_package: one (name, architecture) twice, a multi-arch sibling is not", "[dpkg][pkgdb]") {
+    const DpkgPackage a{"libc6", "2.36", "amd64", "M", "install", "ok", "installed"};
+    const DpkgPackage b{"libc6", "2.36", "i386", "M", "install", "ok", "installed"};
+    const DpkgPackage c{"bash", "5.2", "amd64", "M", "install", "ok", "installed"};
+    CHECK_FALSE(has_duplicate_package({}));
+    CHECK_FALSE(has_duplicate_package({a, b, c}));
+    DpkgPackage a2 = a;
+    a2.version = "9.9"; // another version of the same package and architecture is still a duplicate
+    CHECK(has_duplicate_package({a, c, a2}));
+}
+
 TEST_CASE("dpkg status.d merge: the status entry wins; a multi-arch sibling is not a duplicate",
           "[dpkg][pkgdb]") {
     std::vector<DpkgPackage> status{{"libc6", "2.36", "amd64", "M", "install", "ok", "installed"},

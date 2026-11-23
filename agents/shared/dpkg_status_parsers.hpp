@@ -255,15 +255,32 @@ parse_dpkg_status(std::string_view text, PkgDbBudget& budget,
     return out;
 }
 
+/// A package is its (name, architecture) pair, compared exactly.
+[[nodiscard]] inline std::string dpkg_package_key(const DpkgPackage& p) {
+    return p.name + '\x1f' + p.architecture;
+}
+
+/// True when two entries share a (name, architecture): within status.d that is two control files claiming
+/// one package, which the reader refuses rather than letting the first hide the other.
+[[nodiscard]] inline bool has_duplicate_package(const std::vector<DpkgPackage>& pkgs) {
+    std::unordered_set<std::string> seen;
+    seen.reserve(pkgs.size());
+    for (const auto& p : pkgs)
+        if (!seen.insert(dpkg_package_key(p)).second)
+            return true;
+    return false;
+}
+
 /// Merges the packages of status.d into those of the status file: a package
 /// present in both keeps the status entry (the status file is dpkg's own record;
 /// status.d is the layout minimal images use in its place). A package is its
 /// (name, architecture) pair, so a multi-arch sibling is never mistaken for a
-/// duplicate. Within status.d the first occurrence wins. Compared exactly. Each call
-/// indexes all of `status`, so call it once per collection, never once per file.
+/// duplicate. The status.d reader refuses two files that claim one package (has_duplicate_package) before it
+/// merges, so the first-occurrence rule here is only a backstop. Compared exactly. Each call indexes all of
+/// `status`, so call it once per collection, never once per file.
 inline void merge_dpkg_status_d(std::vector<DpkgPackage>& status,
                                 std::vector<DpkgPackage>&& status_d) {
-    const auto key = [](const DpkgPackage& p) { return p.name + '\x1f' + p.architecture; };
+    const auto key = [](const DpkgPackage& p) { return dpkg_package_key(p); };
     std::unordered_set<std::string> have;
     have.reserve(status.size() + status_d.size());
     for (const auto& p : status)

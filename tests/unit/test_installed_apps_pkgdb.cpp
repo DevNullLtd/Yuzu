@@ -43,6 +43,8 @@
 #include "test_helpers.hpp"
 
 #include <sqlite3.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -677,6 +679,64 @@ TEST_CASE("pkgdb detection: format by file name, a lone data.mdb, and nothing at
 
 // ── dpkg refusals and status.d ──────────────────────────────────────────────
 
+namespace {
+// Drops a directory's permission bits for a test and restores them on scope exit, so TempDir cleanup works.
+struct ScopedNoAccess {
+    fs::path path;
+    explicit ScopedNoAccess(fs::path p) : path(std::move(p)) {
+        fs::permissions(path, fs::perms::none, fs::perm_options::replace);
+    }
+    ~ScopedNoAccess() {
+        std::error_code ec;
+        fs::permissions(path, fs::perms::owner_all, fs::perm_options::replace, ec);
+    }
+};
+} // namespace
+
+TEST_CASE("pkgdb rpm: a link whose target the agent cannot search is a refusal, never 'no database behind it'",
+          "[installed_apps][pkgdb]") {
+    if (::geteuid() == 0)
+        SKIP("root bypasses directory permissions, so the target cannot be made unsearchable");
+    const fs::path alma9 = default_fixture_root() / "alma9" / "rpmdb.sqlite";
+    const fs::path fedora = default_fixture_root() / "fedora41" / "rpmdb.sqlite";
+    SECTION("the target directory has no search permission: its database cannot be shown absent") {
+        Root root;
+        root.put("elsewhere/rpmdb.sqlite", fedora);
+        root.put("var/lib/rpm/rpmdb.sqlite", alma9); // a different, populated candidate after the link
+        fs::create_directories(root.at("usr/lib/sysimage"));
+        fs::create_directory_symlink(root.at("elsewhere"), root.at("usr/lib/sysimage/rpm"));
+        {
+            ScopedNoAccess no_access{root.at("elsewhere")};
+            const auto h = read_root(root);
+            CHECK(h.failure == "rpmdb:unreadable");
+            CHECK(h.ecosystem == Eco::none);
+            CHECK(h.rpm.empty()); // never the other directory's five rows
+        }
+        // Permission restored: the link has a database behind it again, so it is the named refusal.
+        CHECK(read_root(root).failure == "rpmdb:symlink_refused");
+    }
+    SECTION("the link target's parent cannot be searched either") {
+        Root root;
+        root.put("hidden/elsewhere/rpmdb.sqlite", fedora);
+        root.put("var/lib/rpm/rpmdb.sqlite", alma9);
+        fs::create_directories(root.at("usr/lib/sysimage"));
+        fs::create_directory_symlink(root.at("hidden/elsewhere"), root.at("usr/lib/sysimage/rpm"));
+        ScopedNoAccess no_access{root.at("hidden")};
+        const auto h = read_root(root);
+        CHECK(h.failure == "rpmdb:unreadable");
+        CHECK(h.rpm.empty());
+    }
+    SECTION("a dangling link is still absent, not a refusal") {
+        Root root;
+        root.put("var/lib/rpm/rpmdb.sqlite", alma9);
+        fs::create_directories(root.at("usr/lib/sysimage"));
+        fs::create_directory_symlink(root.at("does-not-exist"), root.at("usr/lib/sysimage/rpm"));
+        const auto h = read_root(root);
+        CHECK(h.failure.empty());
+        CHECK(h.ecosystem == Eco::rpm);
+    }
+}
+
 TEST_CASE("pkgdb dpkg refusals: a symlinked status, a directory and an over-cap file",
           "[installed_apps][pkgdb]") {
     const fs::path debian = default_fixture_root() / "debian12" / "status";
@@ -882,10 +942,47 @@ TEST_CASE("pkgdb status.d: a control file that is not exactly one stanza is corr
     SECTION("a stanza whose own Status is not-installed parses to nothing") {
         refused(with_base_files(netbase + "Status: install ok not-installed\n"));
     }
+    SECTION("a single stanza in another state is refused, not dropped later by the mapper") {
+        for (const char* state : {"deinstall ok config-files", "install ok half-installed",
+                                  "install ok triggers-pending", "install ok unpacked"}) {
+            INFO(state);
+            refused(with_base_files(netbase + "Status: " + state + "\n"));
+        }
+    }
+    SECTION("one installed stanza beside a config-files one is refused") {
+        refused(with_base_files(read_text(kStatusDCapture / "base-files") + "\n" + netbase +
+                                "Status: deinstall ok config-files\n"));
+    }
     SECTION("an empty status FILE is still accepted: it falls through, as before") {
         Root root;
         root.put_text("var/lib/dpkg/status", "");
         CHECK(read_root(root).failure.empty());
+    }
+}
+
+TEST_CASE("pkgdb status.d: two control files claiming one (Package, Architecture) are corrupt; a multiarch "
+          "sibling is not a duplicate",
+          "[installed_apps][pkgdb]") {
+    const std::string netbase = read_text(kStatusDCapture / "netbase");
+    SECTION("base-files holds a copy of netbase's record: refused, never {netbase, media-types}") {
+        Root root;
+        put_status_d_capture(root);
+        root.put_text("var/lib/dpkg/status.d/base-files", netbase);
+        const auto h = read_root(root);
+        CHECK(h.failure == "dpkg_status_d:corrupt");
+        CHECK(h.dpkg.empty());
+    }
+    SECTION("the same package on another architecture is a sibling, both are kept") {
+        Root root;
+        put_status_d_capture(root);
+        std::string other = netbase;
+        const std::size_t a = other.find("Architecture: all");
+        REQUIRE(a != std::string::npos);
+        other.replace(a, std::string_view{"Architecture: all"}.size(), "Architecture: i386");
+        root.put_text("var/lib/dpkg/status.d/netbase-i386", other);
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        CHECK(h.dpkg.size() == 4);
     }
 }
 

@@ -521,6 +521,11 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
                 (j > 0 && off[j] >= off[j - 1]))
                 return std::unexpected(PkgDbCause::corrupt);
         }
+        // hf_offset (header bytes 22-23) is where the item area starts: the lowest item offset, or the page
+        // size when the page is empty (a 64 KiB page wraps to 0 in the 16-bit field). A zeroed or lowered
+        // item count leaves it behind, so a bucket dropped by a damaged count is seen here.
+        if (load_u16(page, 22, be) != ((n == 0 ? std::size_t{pagesize} : off[n - 1]) & 0xFFFFu))
+            return std::unexpected(PkgDbCause::corrupt);
         const auto item_end = [&](std::size_t j) { return j == 0 ? std::size_t{pagesize} : off[j - 1]; };
 
         for (std::size_t i = 0; i < n; i += 2) { // n is even, so i + 1 < n

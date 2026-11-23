@@ -919,6 +919,24 @@ TEST_CASE("bdb hostile: edited real file with a bad magic, version, page size, c
                 CHECK(cause(f) == PkgDbCause::corrupt);
             }
         }
+        SECTION("a zeroed or lowered item count on an occupied hash page is corrupt, not a dropped bucket") {
+            // The page header records where the items start (hf_offset, bytes 22-23): a damaged count leaves
+            // it behind, so the bucket is not silently left out of a roster reported complete.
+            const std::size_t n = get16(good, page_base + 20, be);
+            REQUIRE(n >= 2);
+            REQUIRE(n % 2 == 0);
+            Bytes zeroed = good;
+            put16(zeroed, page_base + 20, 0, be);
+            CHECK(cause(zeroed) == PkgDbCause::corrupt);
+            if (n >= 4) {
+                Bytes lowered = good;
+                put16(lowered, page_base + 20, static_cast<std::uint16_t>(n - 2), be);
+                CHECK(cause(lowered) == PkgDbCause::corrupt);
+            }
+            Bytes bad_hf = good; // the header field itself damaged
+            put16(bad_hf, page_base + 22, static_cast<std::uint16_t>(get16(good, page_base + 22, be) + 2), be);
+            CHECK(cause(bad_hf) == PkgDbCause::corrupt);
+        }
         SECTION("a free page (type 0) is skipped: a long-lived host's file carries them") {
             // Neither fixture holds one (their pages are only hash 13 and overflow 7), so append a
             // zeroed page, which BDB marks P_INVALID, and count it in last_pgno: the read must still
