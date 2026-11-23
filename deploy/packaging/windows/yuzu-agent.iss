@@ -27,6 +27,7 @@ DefaultDirName={autopf}\Yuzu
 DefaultGroupName=Yuzu
 OutputBaseFilename=YuzuAgentSetup-{#AppVersion}
 OutputDir=output
+OutputManifestFile=YuzuAgentSetup.manifest.txt
 Compression=lzma2/ultra64
 SolidCompression=yes
 PrivilegesRequired=admin
@@ -57,14 +58,36 @@ Name: "plugins"; Description: "Agent plugins"; Types: full custom
 Name: "plugins\system"; Description: "System info (OS, hardware, storage, users)"; Types: full custom
 Name: "plugins\network"; Description: "Network (config, diagnostics, actions, WiFi, WoL)"; Types: full custom
 Name: "plugins\security"; Description: "Security (antivirus, BitLocker, certificates, firewall, exploit-mitigation posture)"; Types: full custom
-Name: "plugins\windows"; Description: "Windows (event logs, registry, WMI, updates, SCCM)"; Types: full custom
+Name: "plugins\windows"; Description: "Windows (event logs, registry, WMI, updates, SCCM, RDP)"; Types: full custom
 Name: "plugins\management"; Description: "Management (processes, services, software, scripts)"; Types: full custom
 Name: "plugins\advanced"; Description: "Advanced (discovery, IOC, vuln scan)"; Types: full custom
 
 [Files]
+; Every plugin the build produces (each subdir('agents/plugins/<dir>') in the
+; root meson.build) has exactly one Source line below, or a recorded
+; exclusion comment in this section of the form
+;   ; plugin-not-installed: <dir>: <why it is left out>
+; tests/test_agent_installer_plugin_coverage_lint.py fails otherwise (#4867).
+; The release zip takes every plugin by glob, so a plugin missing here ships in
+; the zip and silently not in the installer. One plugin is excluded today:
+; plugin-not-installed: license_scan: ADR-3006 D10, follow-up #8309. Installing it starts the agent's daily software_licensing collection on every device the installer is run on, with no operator action, and no release may add a unit that runs by default until the fleet-level additions setting exists. The release zip still carries it.
 ; --- Core agent ---
+; The Microsoft Visual C++ runtime that the agent, its plugins and the vcpkg
+; DLLs import (vcruntime140*.dll, msvcp140*.dll), installed app-local next to
+; yuzu-agent.exe so the agent runs on a machine with no Visual C++
+; Redistributable installed. release.yml copies them into the build directory's
+; msvc-runtime folder from the build machine's Visual Studio redistributable
+; directory (stage-msvc-runtime.ps1 in this folder). No skipifsourcedoesntexist:
+; a build that did not stage them fails to compile rather than ship without them.
+; Setup copies [Files] in order, so the runtime is placed before
+; yuzu-agent.exe; an install that stops part-way never leaves the executable
+; without its runtime.
+; tests/test_windows_payload_imports.py pins the order.
+Source: "{#BuildDir}\msvc-runtime\*.dll"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
 Source: "{#BuildDir}\agents\core\yuzu-agent.exe"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
 Source: "{#BuildDir}\agents\core\*.dll"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
+; Third-party attribution, including the Microsoft Visual C++ runtime above.
+Source: "{#BuildDir}\NOTICE"; DestDir: "{app}"; Components: core; Flags: ignoreversion
 
 ; --- Plugins: core (always installed) ---
 Source: "{#BuildDir}\agents\plugins\status\status.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
@@ -97,10 +120,13 @@ Source: "{#BuildDir}\agents\plugins\autoruns\autoruns.dll"; DestDir: "{app}\plug
 ; its dependency being present (governance Gate 7, cross-platform finding).
 Source: "{#BuildDir}\agents\plugins\app_usage\app_usage.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\execution_artifacts\execution_artifacts.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\privacy_permissions\privacy_permissions.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\runtimes\runtimes.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\windows_optional_features\windows_optional_features.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\peripherals\peripherals.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\printing\printing.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\browser_policy\browser_policy.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\browser_inventory\browser_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\pkg_inventory\pkg_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\middleware\middleware.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\component_inventory\component_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
@@ -115,6 +141,7 @@ Source: "{#BuildDir}\agents\plugins\netstat\netstat.dll"; DestDir: "{app}\plugin
 Source: "{#BuildDir}\agents\plugins\wifi\wifi.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\wol\wol.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\http_client\http_client.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\netprobe\netprobe.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 
 ; --- Plugins: security ---
 Source: "{#BuildDir}\agents\plugins\antivirus\antivirus.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
@@ -139,6 +166,7 @@ Source: "{#BuildDir}\agents\plugins\registry\registry.dll"; DestDir: "{app}\plug
 Source: "{#BuildDir}\agents\plugins\wmi\wmi.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\windows_updates\windows_updates.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\sccm\sccm.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\rdp_control\rdp_control.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
 
 ; --- Plugins: management ---
 Source: "{#BuildDir}\agents\plugins\processes\processes.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
@@ -241,9 +269,10 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Com
 ; that was never actually startable, so a flat delay is no longer sufficient --
 ; poll for STOPPED (bounded to 15s, same pattern as PrepareToInstall's install-
 ; time poll) instead of a fixed 3s wait (Gate 3 release-deploy finding,
-; governance re-run). Falls through regardless of outcome: --remove-service and
-; file deletion below are safe even if the process is still exiting (marks for
-; delete / falls back to delete-on-reboot for a locked exe), same as before.
+; governance re-run). Falls through regardless of outcome: --remove-service
+; marks the service for deletion even if the process is still exiting, and a
+; file still locked when the uninstaller deletes files is left in place (no
+; [Files] entry uses uninsrestartdelete, so nothing is deleted at a reboot).
 ; Deliberately NOT gated on StopResultCode the way PrepareToInstall's poll is
 ; (that skip matters there because installs may be scripted/repeated across a
 ; fleet -- worth optimizing the dominant case); this always polls, so a
@@ -285,8 +314,41 @@ Type: files; Name: "{app}\plugins\tar.dll"
 ; The same rule applies: a stale quarantine.dll left in the plugin directory would be loaded by
 ; the glob beside firewall.dll and register the retired actions again.
 Type: files; Name: "{app}\plugins\quarantine.dll"
+; Agent self-update leftovers (agents/core/src/updater.cpp): the previous executable and the
+; marker the new one writes when it registers. Deleted so that no older executable is left beside the
+; one this installer lays down. The agent writes the marker when it registers, before its one
+; rollback check, so it rolls back to yuzu-agent.old.exe only when that write fails (and never
+; with self-update disabled). [InstallDelete] runs after PrepareToInstall has stopped the
+; service; a file still in use (an old.exe that is still a running image after the 15 s stop
+; poll) is skipped silently, and its marker may still be deleted: the next registration writes
+; the marker again before the check, which then removes old.exe. Exact names only; the same two
+; are in [UninstallDelete].
+Type: files; Name: "{app}\bin\yuzu-agent.old.exe"
+Type: files; Name: "{app}\bin\.yuzu-update-verified"
 
 [UninstallDelete]
+; Three files the installer does not install, deleted by exact name: the
+; uninstaller removes only what [Files] installed, and the plugin loader loads
+; every DLL in {app}\plugins, so without these an uninstall can leave loadable
+; Yuzu code in the install directory.
+;   - plugins\license_scan.dll: not installed by this installer (see the
+;     plugin-not-installed record in [Files], #8309) but carried by the release
+;     zip, so an operator may have copied it in.
+;   - bin\yuzu-agent.old.exe and bin\.yuzu-update-verified: written by agent
+;     self-update (agents/core/src/updater.cpp: the previous executable kept
+;     for rollback, and the marker that the new one registered). See the
+;     [InstallDelete] note on when the agent rolls back to old.exe.
+; Exact names only, never a wildcard. [UninstallRun], which runs first, stops
+; the service; a file still locked after that is not deleted. Randomly named
+; temporaries that an interrupted self-update can leave in bin
+; (yuzu-update-*.tmp, .yuzu-update-verified.tmp.*) are not removed; nothing
+; loads them. docs/user-manual/README.md ("What uninstalling removes") lists
+; what uninstall keeps.
+; tests/test_agent_installer_plugin_coverage_lint.py pins these entries (one
+; for every plugin-not-installed record).
+Type: files; Name: "{app}\plugins\license_scan.dll"
+Type: files; Name: "{app}\bin\yuzu-agent.old.exe"
+Type: files; Name: "{app}\bin\.yuzu-update-verified"
 Type: filesandordirs; Name: "{app}\logs"
 Type: files; Name: "{commonappdata}\Yuzu\enrollment-token"
 Type: dirifempty; Name: "{commonappdata}\Yuzu\enrollment-token.stage"

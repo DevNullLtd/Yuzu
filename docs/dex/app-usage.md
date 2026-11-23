@@ -1,12 +1,14 @@
 # App usage: which executables ran on a device
 
 DEX (Digital Employee Experience) app usage answers one question for one
-device: which executables ran there recently, how often and for how long.
+device: which executables ran there recently, how often and for how long. A
+second read, [fleet usage per application](#fleet-usage-per-application), answers
+it across the fleet for each application on the Apps list.
 
 [Back to the hub](README.md) | [Surface map](surfaces.md)
 
-App usage is **per device**. It is not a fleet rollup, and it is not
-interactive-use or foreground time.
+The dashboard panel and the per-device route are **per device**. Neither is
+interactive-use or foreground time, and nor is the fleet read.
 
 ## What it is
 
@@ -67,7 +69,300 @@ empty `200`.
 
 ## MCP
 
-`get_agent_app_usage` takes `agent_id` and returns the same data.
+`get_agent_app_usage` takes `agent_id` and returns the same data. The fleet read
+below is the `get_dex_apps_usage` tool, which takes the route's query parameters
+(`window`, `platform`, `slice`, `group`, `tag_key`, `floor`) as arguments and
+returns the same body as the route's `data` object. It is strict: an unknown
+argument, a value of the wrong type or an out-of-range value is refused with an
+invalid-params error that names the argument, and nothing is clamped.
+
+## Fleet usage per application
+
+`GET /api/v1/dex/apps/usage` answers, for each application on the Apps list, how
+many devices ran it, for how long and how often, and how often it crashed or hung
+per hour of use. The rows are the Apps rows, in the same order (at most 100
+applications). The dashboard shows the same figures as the Usage view of the Apps
+tab, described [below](#using-it-in-the-dashboard-the-apps-tab-usage-view), and the MCP tool `get_dex_apps_usage` serves the same read.
+
+Parameters, all optional:
+
+| Parameter | Values | Default |
+|---|---|---|
+| `window` | `24h`, `7d`, `30d`, `all` | `7d` |
+| `platform` | `all`, `windows`, `macos`, `linux` | `all` |
+| `slice` | `fleet`, `platform`, `group`, `tag` | `fleet` |
+| `group` | a management group id, at most 256 bytes of text with no control characters (valid UTF-8); required with `slice=group`, refused otherwise | none |
+| `tag_key` | a device tag key; refused unless `slice=tag` | `model` |
+| `floor` | an integer from 1 to 10000 | `1` |
+
+An off-enum or out-of-range value, a parameter given outside its slice and a
+`group` that cannot name a group (empty, over 256 bytes, a control character or
+invalid UTF-8) are a `400` that leaves no audit row and runs no read. A `group`
+that is well formed but names no management group is also a `400`
+(`unknown management group`); it is never a `200` with the whole fleet in the
+`other` cell, and it does leave its audit row (see
+[Fleet permissions and audit](#fleet-permissions-and-audit)).
+
+Each application carries:
+
+- `state`: `matched`, `no_usage` (no reporting device ran it) or `ambiguous_name`
+  (its usage name is shared by two applications, so neither is attributed);
+- `devices`, `run_seconds_30d` and `launches_30d`, summed over the devices that
+  reported usage for it. `devices` is the real count when the figures are below
+  the floor, `0` for `no_usage`, and `null` for `ambiguous_name`;
+- `cells`: the same figures per cell of the slice (`fleet`; a platform; the group
+  and everyone else; each tag value);
+- `exposure_rate`: crashes plus hangs per process-hour of use (`per_hour`, an
+  object of `estimate`, `lower`, `upper` and `reliable`, at the score policy's
+  confidence level; `estimate` and `upper` are `null` when not finite), the
+  `hours` of use it divides by, the raw `crashes` and `hangs`, and the `basis`;
+  or `null` with `rate_withheld` naming why.
+
+### Using it in the dashboard: the Apps tab Usage view
+
+The Digital Employee Experience Apps tab has a **View** row with two chips,
+**Stability** and **Usage**. **Usage** opens `GET /fragments/dex/apps/usage`, which
+reads the same model the REST route serializes, in the server and through the same
+30-second answer cache and read budget, so the page and the payload cannot
+disagree. It makes no HTTP call.
+
+The table has one row per application: the application name (it links to the
+existing per-application drill-down), **Devices that ran it**, **Run time, 30
+days** (process-hours), **Launches, 30 days**, and **Crashes and hangs per hour of
+use**. The rate is printed from the same figure the REST route returns, per hour
+of use, rounded to about four significant digits, so a small value keeps its
+digits instead of reading as zero. Beside the estimate sit its interval, the
+counts and the hours it divides, a tag **estimated from 30-day usage** on every
+rate, and **under 20 events** when the rate rests on fewer than 20 events.
+
+The crashes and hangs shown beside a rate are those on devices that reported
+usage for the application in the last 48 hours, so they can be fewer than the Crashes and Hangs on the
+Stability view for the same application, window and platform.
+
+Controls, each a request to the same fragment:
+
+| Control | REST parameter |
+|---|---|
+| Platform chips, Window chips | `platform`, `window` |
+| Slice: Whole fleet, By platform, By tag | `slice=fleet`, `slice=platform`, `slice=tag` |
+| Tag key box (default `model`) | `tag_key`, with `slice=tag` |
+| Management group list | `group`, with `slice=group` |
+
+Every control keeps the other current parameters and never repeats its own, so the
+request always carries each parameter once. A non-fleet slice adds an expander on
+each application row (**N cells**) that shows the cell rows under it. There is no
+reporting-floor control and no name filter: the page always reads at the default
+floor of 1 and prints it, with the reminder that the floor guards one table only.
+The view is application to cells. The usage model carries no version and no
+device, so versions and the device list stay on the Stability view and on the
+per-application drill-down.
+
+Two conventions differ from the REST route on purpose:
+
+- An unknown `window` reads as `7d`, as on every other Digital Employee
+  Experience tab. The lit chip and the audit row show the window in force. REST
+  answers `400`.
+- `floor` is not read. The page always reads at the default floor and prints it.
+  REST accepts it.
+
+Everything else follows REST: `platform` and `slice` must be on their lists,
+`group` is refused outside `slice=group` and `tag_key` outside `slice=tag`, a
+`group` must be a clean group id, and a `tag_key` must be a valid tag key. A
+refused parameter draws a panel in words, writes no audit row and runs no read.
+
+Every state reads in words and never as a number:
+
+- **Captions.** Population (devices online now in the platform scope, how many
+  reported usage in the last 48 hours and are counted, how many last reported
+  earlier and are not, and how many have never reported), the basis (estimated
+  from 30-day usage and the time of the read; an answer is reused for up to 30
+  seconds), the floor (per table) and, for a slice, what it splits by.
+- **Reporting population beside every count.** A device count in an application
+  row reads "of R reporting", and in a cell row "of all R reporting". A cell's own
+  size is not returned by this read, so a cell's count is read against all
+  reporting devices, not against the cell.
+- **Below the floor.** The real device count with "count only", and "below the
+  reporting floor" for run time and launches.
+- **No usage.** "no device online", "no device has reported usage", or "no
+  reporting device ran it", by population and reporting.
+- **Ambiguous name.** "withheld: the name is shared", with no device count.
+  Linux keeps only the first 15 bytes of a process name, so a cut name that
+  matches more than one application is attributed to none of them.
+- **No rate.** One sentence per reason: the name is shared, no usage reported,
+  below the reporting floor, the All window has no length, the window is longer
+  than the crash and hang history kept, no run time recorded, or no statistic for
+  these counts. Any other reason is printed as its token. An end of the interval
+  that is not finite reads "no upper bound" or "no estimate".
+- **Residual cells.** The `other` cell is named for what it holds: for a platform
+  slice, devices on a platform other than Windows, Linux or macOS; for a group
+  slice, devices outside the group; for a tag slice, devices whose value is not
+  among the 50 most common. Only above a floor of 1 does it also hold cells
+  merged in so that no row is below the floor, and then the label says so. A cell
+  with no value for the tag reads "Devices with no value for this tag", and a
+  cell below 30 devices carries "under 30 devices". A tag value or group name is
+  printed escaped, so a tag value of `other` or `(untagged)` prints as that value.
+- **Refusals.** One panel per cause, naming the lever that helps: busy, a read
+  that does not fit its time limit (`fleet_too_large`, where only a single
+  platform shrinks the read; the first successful read clears the state), an application list or group or tag read that failed, no fleet
+  source, an unknown group, a slice that does not fit together, and an audit
+  record that could not be stored. A refusal prints the page chrome and the
+  controls and nothing derived from a model.
+
+An operator without `Forensics:Read` still sees the **Usage** chip. Choosing it
+shows the Stability page as it is, with one line: "Usage is not shown: it needs the
+Forensics read permission, which this account does not hold". The fleet-read
+permission gate records the refusal as an `auth.fleet_read_required` audit row, as
+it does for the REST route. An administrator grants the permission by assigning a
+role that holds `Forensics:Read` (see [Role-Based Access Control](../user-manual/rbac.md)).
+If the permission check itself fails, the same page shows "the permission check
+could not be completed". The view checks `GuaranteedState:Read` first, whose
+refusal leaves `auth.permission_required`, and then `Forensics:Read`, in the REST
+route's order.
+
+Each Usage view that passes its parameter checks writes one `dex.apps.usage.view`
+audit row (the verb REST writes, target type `Forensics`, empty target, detail
+starting `dashboard`) before the read. If the row cannot be stored the page says
+so and nothing is read. As with REST, a refusal by the read itself still leaves the
+row.
+
+### How to read the figures
+
+- **Estimated.** The agent reports a trailing 30-day total, so every response says
+  `basis: estimated_from_30_day_usage`. The rate scales run time to the window
+  (window days over 30). `window=all` has no length, and a window longer than the
+  observation retention would need a second estimate, so those give
+  `rate_withheld` of `unbounded_window` or `window_exceeds_retention` and no rate.
+- **A withheld figure is `null`, never `0`.** An `ambiguous_name` application
+  withholds its `devices` as well. `rate_withheld` is one of
+  `below_floor`, `no_usage`, `ambiguous_name`, `unbounded_window`,
+  `window_exceeds_retention`, `zero_usage` or `no_statistic`.
+- **Fresh devices only.** A device counts only when the server received its usage
+  state in the last 48 hours of the database clock (`freshness_window_hours`), so a
+  replica clock that is out of step cannot change the count. `reporting_devices`
+  and `stale_devices` count the devices that have reported usage at least once (a
+  fresh and an older usage state respectively); `population` minus both is the
+  devices that never have. A stale device adds to no figure. `population` is the
+  devices in the platform scope online now, and `0` is a valid answer: every
+  application then reads `no_usage`. A new fleet reads `no_usage` everywhere until
+  the first daily usage sync lands.
+- **Process-hours, not user hours.** Run time is summed per process run, so
+  concurrent instances add up.
+- **Raw crash and hang counts.** They are not capped per device. Events clustered
+  on one crash-looping device make the interval falsely narrow, so read a narrow
+  interval on a few devices with that in mind.
+- **Cell kind is the key; a label is data.** A cell has a `kind` of `named`,
+  `untagged` or `other`. A tag value of `other` or `(untagged)` is a `named` cell
+  with that label, never the residual, so a consumer keys on `kind` and escapes
+  the `label`.
+- **At the default floor of 1 a cell can be one device's figures.** Raise `floor`
+  to publish only cells of at least that many devices.
+
+### The floor applies to one table only
+
+`floor` is the least number of devices a published figure needs. A cell below it
+merges into the `other` cell, and an application whose total is below it
+publishes its device count only. That protects the table in front of you and
+nothing else: two slices, two windows or a slice and the fleet total can be
+subtracted to isolate a small group. Treat the floor as a guard on one response,
+not on the set of responses a caller can ask for.
+
+### Fleet permissions and audit
+
+The route needs both `GuaranteedState:Read` and `Forensics:Read`, because the body
+names the applications that crash. While RBAC is off, `Forensics:Read` is
+administrator-only, so only an administrator can call it. Under RBAC the
+permissions are checked across all of a principal's roles, so the route is open to
+the Administrator role and to a principal assigned both the built-in Viewer role
+(`GuaranteedState:Read`) and the ForensicsAnalyst role (`Forensics:Read`).
+ForensicsAnalyst alone is refused because it lacks `GuaranteedState:Read`. A
+service-scoped token is refused. The MCP tool needs the same two permissions and
+declares `GuaranteedState:Read` as its permission pair, so a token's tier, the
+service-scope check and the tool's approval rules act on that pair; the handler
+then requires `Forensics:Read` as well, in the route's order. The tool is
+readable at every MCP tier.
+
+Every request that passes parameter validation writes a `dex.apps.usage.view`
+audit row **before** the read, with an empty target and the request shape (window,
+platform, slice, the tag key or group id asked for, floor). The row names no
+device and no agent id. If the row cannot be stored the route answers `503` with
+`Sec-Audit-Failed: true` and does not read. The row records the request that was
+admitted, not its outcome: an unknown-group `400` or a `503` after the row still
+leaves it, while a `400` for a malformed parameter is refused before it and leaves
+none. Every admitted request writes its own row, a retry of a refused read
+included. Unlike the Apps list, this aggregate is audited, because it reads
+Forensics-tier usage and at the default floor of 1 a cell can be one device's
+figures.
+
+The MCP tool writes the same `dex.apps.usage.view` row before it reads and fails
+closed the same way: if the row cannot be stored the tool does not read and
+answers a retryable error (`retry_after_ms` 5000) with no data. It also records
+the generic `mcp.get_dex_apps_usage` row after the outcome. That second row does
+not withhold data: if it cannot be stored the answer is served with
+`audit_persisted: false`, because the access evidence was already durable before
+the read. This differs from `get_agent_app_usage`, which withholds data when
+either of its rows is lost.
+
+Refusals follow the route's table. An invalid or unknown group is a caller error
+(invalid params, no retry hint). `fleet_too_large`, `no_population` and
+`invalid_request` are terminal and carry no retry hint. Every other refusal is
+retryable with `retry_after_ms` 2000, and a failed read is never an answer with
+zero figures. Because each admitted call writes its own audit row, wait the
+hinted time before a retry.
+
+The usage figures are computed over the caller's visible devices only: the route
+hands the caller's device scope to the model, which filters its device list before
+the figures are built. The application list itself is the fleet list that
+`GuaranteedState:Read` already serves, so it is not filtered. The filter is inert
+for every caller admitted today (with RBAC off only an administrator passes, and
+`Forensics:Read` has no group-scoped tier), so this is not per-group confinement.
+
+### Cache, budget and failure
+
+- A built answer is reused for 30 seconds after its build completes, for an
+  identical request and an identical visible device set. `as_of` is the build
+  snapshot time, taken when the build began, so a slow build can leave a cached
+  answer older than 30 seconds. A failure is never cached.
+- At most 4 fleet usage reads run at once. A request over that is a `503` with
+  `concurrency_budget`, retryable. A usage request also takes one slot of the
+  Apps list's own read budget, so heavy use of one can make the other answer
+  `concurrency_budget`.
+- A failed read is a `503` that names the reason, never a `200` with zero figures:
+  `pool_acquire_timeout`, `query_error`, `statement_timeout`, `concurrency_budget`,
+  `apps_degraded`, `group_unavailable` or `tag_unavailable` carry `retry_after_ms`
+  2000. `no_population` (no fleet source wired) and `invalid_request` carry no retry
+  hint, and so does `fleet_too_large` below. The four owner reasons
+  (`pool_acquire_timeout`, `query_error`, `statement_timeout`, `concurrency_budget`)
+  count `yuzu_server_guardian_read_degrade_total` with source `dex_usage`; the other
+  causes count on the underlying store's own degrade family (`apps_degraded` on
+  source `guardian_state` when the Apps read itself degraded, and on none when the
+  score policy was unreadable, `group_unavailable` on
+  `yuzu_server_mgmt_group_read_degrade_total`, `tag_unavailable` on
+  `yuzu_server_tag_store_read_degrade_total`).
+
+### Runbook: `fleet_too_large`
+
+`fleet_too_large` means at least 3 consecutive statement timeouts spanning at
+least 2 minutes with no success in between: the on-request read no longer fits its
+10-second bound. A stall shorter than 2 minutes stays a retryable
+`statement_timeout`; a database-wide stall of 2 minutes or more can reach
+`fleet_too_large` too, and the first successful read clears it. The `503` carries
+no `retry_after_ms`, because retrying a read that is over its bound does not help.
+
+- **Scale.** Measured on one test host over a synthetic dataset of about 205 usage
+  rows per device, the read costs about 68 microseconds per online device: 4.1
+  seconds at 60,000 devices. By extrapolation the 10-second bound is reached near
+  150,000 online devices. That is a measurement on one host, not a guaranteed
+  ceiling; the read has not been measured past 60,000 devices.
+- **What helps.** Only `platform=` narrows the read. The `group` and `tag` slices
+  only assign cells, so they read the whole platform scope. An index on the
+  executable key did not change the query plan in that measurement. There is no
+  operator-side fix today; the state clears on the first successful read.
+- **What is unaffected.** Other DEX routes, including the Apps list, keep working.
+- **Pool pressure.** Usage reads and Apps reads each have their own budget of 4 (a
+  usage request holds an Apps slot only while it reads the Apps list), so up
+  to 8 pool leases can be in use at once. If reads time out together with slow
+  acquires, check `yuzu_pg_pool_in_use` and `yuzu_pg_acquire_wait_seconds`, and
+  raise `--postgres-pool-size` if they show pressure.
 
 ## Using the plugin directly
 
@@ -86,12 +381,14 @@ Read the health row of `summary` before treating a result as complete.
 
 | Surface | Permission | Audit |
 |---|---|---|
-| REST route, MCP tool, dashboard panel | `Forensics:Read`, scoped to the device. Administrator and ForensicsAnalyst hold it by default. | `app_usage.agent.view`, written before any data is served. If the row cannot be stored the read fails closed: REST answers `503` with `Sec-Audit-Failed: true`, MCP answers with an error and no data, and the dashboard panel shows a note instead of the figures. |
+| Per-device REST route, MCP tool, dashboard panel | `Forensics:Read`, scoped to the device. Administrator and ForensicsAnalyst hold it by default. | `app_usage.agent.view`, written before any data is served. If the row cannot be stored the read fails closed: REST answers `503` with `Sec-Audit-Failed: true`, MCP answers with an error and no data, and the dashboard panel shows a note instead of the figures. |
 | `app_usage` plugin actions | `Forensics:Read`, administrator or approval | Standard command audit |
+| Fleet REST route, Apps tab Usage view and MCP tool `get_dex_apps_usage` | `Forensics:Read` and `GuaranteedState:Read` | `dex.apps.usage.view`, written before the read (after parameter validation) and failing closed, as described [above](#fleet-permissions-and-audit); the Usage view's detail starts `dashboard` and a failed audit write draws a panel instead of a `503`. The MCP tool also records `mcp.get_dex_apps_usage` after the outcome, which does not withhold data. |
 
 A service-scoped token is refused on the REST route and the MCP tool, and the
 dashboard panel shows a permission note instead of data, because the service
-owner role does not hold `Forensics:Read`.
+owner role does not hold `Forensics:Read`. The Apps tab Usage view likewise shows
+no usage figures to a service-scoped token.
 
 ## Limits and privacy
 

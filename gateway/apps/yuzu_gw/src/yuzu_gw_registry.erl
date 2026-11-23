@@ -662,12 +662,17 @@ list_agents(Limit, Cursor) ->
 %% `{error, superseded}' when a newer Register of the same agent id on the
 %% connection committed first: the row is not stored and the registry is healthy.
 -spec store_pending(binary(), map()) ->
-          ok | {error, registry_unavailable | session_limit | superseded}.
+          ok | {error, registry_unavailable | session_limit | superseded | invalid_session}.
 store_pending(SessionId, Info) ->
     store_pending(SessionId, Info, undefined).
 
 -spec store_pending(binary(), map(), reference() | undefined) ->
-          ok | {error, registry_unavailable | session_limit | superseded}.
+          ok | {error, registry_unavailable | session_limit | superseded | invalid_session}.
+store_pending(SessionId, _Info, _Reservation) when not is_binary(SessionId);
+                                                   SessionId =:= <<>> ->
+    %% An empty key is what a refused Register decodes to (session_id defaults
+    %% to <<>>), and take_pending(<<>>) would then complete it (F29).
+    {error, invalid_session};
 store_pending(SessionId, Info, Reservation) ->
     case maps:get(conn_key, Info, undefined) of
         undefined ->
@@ -868,6 +873,8 @@ warn_session_limit(Cap) ->
 %% {error, registry_unavailable}, caught here for the reason store_pending/2
 %% gives.
 -spec take_pending(binary()) -> map() | undefined | {error, registry_unavailable}.
+take_pending(SessionId) when not is_binary(SessionId); SessionId =:= <<>> ->
+    undefined;
 take_pending(SessionId) ->
     try ets:take(?PENDING_TABLE, SessionId) of
         [{_, Info, _}] ->

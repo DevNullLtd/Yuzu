@@ -61,6 +61,8 @@ agent_service_wire_test_() ->
           fun() -> register_proxy_protocol_untrusted(State) end},
          {"Register: with no origin at all the observation is empty and the stored peer is unknown",
           fun() -> register_without_origin(State) end},
+         {"Register overwrites the witnessed client certificate fields (WP01)",
+          fun() -> register_attestation_overwritten(State) end},
          {"Register: x-forwarded-for from a peer that is not a trusted proxy is ignored",
           fun() -> register_forwarded_for_untrusted(State) end},
          {"Register: a listener with no forwarded_for origin ignores x-forwarded-for",
@@ -71,6 +73,16 @@ agent_service_wire_test_() ->
           fun() -> register_registry_unavailable(State) end},
          {"Register: a failed upstream is INTERNAL (13) and the reservation is released",
           fun() -> register_upstream_failed(State) end},
+         {"Register: a server-rejected Register (accepted=false) stores no pending row",
+          fun() -> register_server_rejected(State) end},
+         {"Register: accepted=false stores no pending row even when a session id is present",
+          fun() -> register_rejected_with_sid(State) end},
+         {"Register: a registry refusal of the session key is INTERNAL (13)",
+          fun() -> register_invalid_session(State) end},
+         {"Register: an accepted answer with an empty session id stores no pending row",
+          fun() -> register_empty_session(State) end},
+         {"Subscribe with an empty x-yuzu-session-id is INVALID_ARGUMENT (3), no lookup",
+          fun() -> subscribe_empty_session(State) end},
          {"ExecuteCommand is server-streaming and ends with UNIMPLEMENTED (12)",
           fun() -> execute_unimplemented(State) end},
          {"Subscribe without x-yuzu-session-id is INVALID_ARGUMENT (3)",
@@ -146,6 +158,14 @@ cleanup(#{listeners := Listeners, relays := Relays} = State) ->
 mock_boundaries() ->
     meck:expect(yuzu_gw_upstream, proxy_register,
                 fun(#{info := #{agent_id := <<"upstream-fails">>}}, _Opts) -> {error, unavailable};
+                   (#{info := #{agent_id := <<"server-rejects">>}}, _Opts) ->
+                       {ok, #{session_id => <<>>, accepted => false}};
+                   (#{info := #{agent_id := <<"rejected-with-sid">>}}, _Opts) ->
+                       {ok, #{session_id => <<"sess-minted-anyway">>, accepted => false}};
+                   (#{info := #{agent_id := <<"registry-refuses-key">>}}, _Opts) ->
+                       {ok, #{session_id => <<"sess-refused-key">>, accepted => true}};
+                   (#{info := #{agent_id := <<"empty-session">>}}, _Opts) ->
+                       {ok, #{session_id => <<>>, accepted => true}};
                    (#{info := #{agent_id := Id}}, _Opts) ->
                        {ok, #{session_id => <<"sess-", Id/binary>>, accepted => true}}
                 end),
@@ -154,7 +174,10 @@ mock_boundaries() ->
                    (_Key, <<"registry-down">>) -> {error, registry_unavailable};
                    (_Key, _AgentId) -> {ok, make_ref()}
                 end),
-    meck:expect(yuzu_gw_registry, store_pending, fun(_Session, _Info, _Reservation) -> ok end),
+    meck:expect(yuzu_gw_registry, store_pending,
+                fun(<<"sess-refused-key">>, _Info, _Reservation) -> {error, invalid_session};
+                   (_Session, _Info, _Reservation) -> ok
+                end),
     meck:expect(yuzu_gw_registry, release_session, fun(_Reservation) -> ok end),
     meck:expect(yuzu_gw_registry, take_pending,
                 fun(<<"registry-down">>) -> {error, registry_unavailable};
@@ -260,6 +283,47 @@ register_without_origin(_State) ->
     ?assertEqual(<<"unknown">>, maps:get(peer_addr, Info)),
     ?assertEqual(<<>>, maps:get(gateway_observed_peer, maps:get(register_req, Info))).
 
+%% WP01: gateway_attested_peer_cert_pem / gateway_attests_peer_cert are
+%% gateway-authoritative. An agent that fills them (to name a certificate it does
+%% not hold, or to claim an attestation) has them discarded: with no TLS client
+%% certificate the PEM is EMPTY and the marker is true (this gateway ran the
+%% overwrite); with one, the PEM of exactly that certificate.
+register_attestation_overwritten(_State) ->
+    reset(),
+    ForgedPem = <<"-----BEGIN CERTIFICATE-----\nZm9yZ2Vk\n-----END CERTIFICATE-----\n">>,
+    Request = #{info => #{agent_id => <<"agent-w">>, hostname => <<"h">>},
+                gateway_attested_peer_cert_pem => ForgedPem,
+                gateway_attests_peer_cert => false},
+    NoCert = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, undefined, true),
+    ?assertMatch({ok, #{session_id := <<"sess-agent-w">>}, _},
+                 yuzu_gw_agent_service:register(NoCert, Request)),
+    Sent = meck:capture(last, yuzu_gw_upstream, proxy_register, '_', 1),
+    ?assertEqual(<<>>, maps:get(gateway_attested_peer_cert_pem, Sent)),
+    ?assertEqual(true, maps:get(gateway_attests_peer_cert, Sent)),
+    %% CH-5: a listener that CANNOT witness (plaintext, or TLS without
+    %% witness_client_cert) must not claim to have: the agent-supplied `true' is
+    %% overwritten with false, so the server logs unattested_gateway, not no_proof.
+    reset(),
+    NoWitness = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, undefined),
+    ?assertMatch({ok, #{session_id := <<"sess-agent-w">>}, _},
+                 yuzu_gw_agent_service:register(NoWitness, Request#{gateway_attests_peer_cert => true})),
+    SentNW = meck:capture(last, yuzu_gw_upstream, proxy_register, '_', 1),
+    ?assertEqual(false, maps:get(gateway_attests_peer_cert, SentNW)),
+    ?assertEqual(<<>>, maps:get(gateway_attested_peer_cert_pem, SentNW)),
+    reset(),
+    %% and with a witnessed certificate the PEM is that certificate's
+    Der = <<48, 3, 2, 1, 1>>,
+    WithCert = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, Der, true),
+    reset(),
+    ?assertMatch({ok, #{session_id := <<"sess-agent-w">>}, _},
+                 yuzu_gw_agent_service:register(WithCert, Request)),
+    Sent2 = meck:capture(last, yuzu_gw_upstream, proxy_register, '_', 1),
+    ?assertEqual(public_key:pem_encode([{'Certificate', Der, not_encrypted}]),
+                 maps:get(gateway_attested_peer_cert_pem, Sent2)),
+    ?assertEqual(true, maps:get(gateway_attests_peer_cert, Sent2)),
+    {_, Info, _} = stored(),
+    ?assertEqual(true, maps:get(gateway_attests_peer_cert, maps:get(register_req, Info))).
+
 register_forwarded_for_untrusted(#{other := Chan}) ->
     reset(),
     {ok, _, _} = register(Chan, <<"agent-u">>, ?FORGED, ?CLIENT),
@@ -290,6 +354,36 @@ register_upstream_failed(#{plain := Chan}) ->
     ?assertEqual(0, meck:num_calls(yuzu_gw_registry, store_pending, '_')),
     %% the slot reserved for the Register is given back
     ?assertEqual(1, meck:num_calls(yuzu_gw_registry, release_session, '_')).
+
+register_server_rejected(#{plain := Chan}) ->
+    reset(),
+    %% the agent still gets the server's refusal, verbatim
+    ?assertMatch({ok, #{accepted := false}, _}, register(Chan, <<"server-rejects">>, <<>>)),
+    ?assertEqual(0, meck:num_calls(yuzu_gw_registry, store_pending, '_')),
+    ?assertEqual(1, meck:num_calls(yuzu_gw_registry, release_session, '_')).
+
+register_empty_session(#{plain := Chan}) ->
+    reset(),
+    ?assertMatch({error, {<<"13">>, _}, _}, register(Chan, <<"empty-session">>, <<>>)),
+    ?assertEqual(0, meck:num_calls(yuzu_gw_registry, store_pending, '_')),
+    ?assertEqual(1, meck:num_calls(yuzu_gw_registry, release_session, '_')).
+
+register_rejected_with_sid(#{plain := Chan}) ->
+    reset(),
+    ?assertMatch({ok, #{accepted := false}, _}, register(Chan, <<"rejected-with-sid">>, <<>>)),
+    ?assertEqual(0, meck:num_calls(yuzu_gw_registry, store_pending, '_')),
+    ?assertEqual(1, meck:num_calls(yuzu_gw_registry, release_session, '_')).
+
+register_invalid_session(#{plain := Chan}) ->
+    reset(),
+    ?assertMatch({error, {<<"13">>, _}, _}, register(Chan, <<"registry-refuses-key">>, <<>>)),
+    ?assertEqual(1, meck:num_calls(yuzu_gw_registry, store_pending, '_')),
+    ?assertEqual(1, meck:num_calls(yuzu_gw_registry, release_session, '_')).
+
+subscribe_empty_session(#{plain := Chan}) ->
+    reset(),
+    ?assertMatch({<<"3">>, _}, subscribe_status(Chan, <<>>)),
+    ?assertEqual(0, meck:num_calls(yuzu_gw_registry, take_pending, '_')).
 
 %%--------------------------------------------------------------------
 %% ExecuteCommand

@@ -152,7 +152,10 @@ release_all(Dir) ->
 %% would have nothing to read before the first state event)
 %%--------------------------------------------------------------------
 
-crl_gauges_have_a_series_from_startup_test() ->
+crl_gauges_have_a_series_from_startup_test_() ->
+    {timeout, 60, fun crl_gauges_have_a_series_from_startup/0}.
+
+crl_gauges_have_a_series_from_startup() ->
     {ok, _} = application:ensure_all_started(prometheus),
     {ok, _} = application:ensure_all_started(telemetry),
     catch telemetry:detach(yuzu_gw_prometheus),

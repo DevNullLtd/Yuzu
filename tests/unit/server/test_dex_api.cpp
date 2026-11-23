@@ -45,6 +45,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -1699,6 +1701,469 @@ TEST_CASE("DexApi: an observer provider that throws leaves a successful Apps rea
     for (auto p = log.find(line); p != std::string::npos; p = log.find(line, p + 1))
         ++n;
     CHECK(n == 1);
+}
+
+// ── apps_usage: the fleet usage read at one request instant ───────────────────
+
+namespace {
+
+using yuzu::server::DexAppsUsageModel;
+using yuzu::server::DexUsageQuery;
+using yuzu::server::DexUsageRead;
+using yuzu::server::DexUsageRefusal;
+using yuzu::server::DexUsageSlice;
+using yuzu::server::DexUsageSliceKind;
+using yuzu::server::DexUsageState;
+using yuzu::server::DexUsageWiring;
+using Visible = std::optional<std::unordered_set<std::string>>;
+
+// A wiring whose usage read counts its calls, keeps the last query and returns `result`.
+struct UsageProbe {
+    int reads{0};
+    DexUsageQuery last;
+    std::expected<DexUsageRead, std::string> result{DexUsageRead{}};
+    std::expected<std::vector<std::string>, std::string> group{std::vector<std::string>{}};
+    int group_reads{0};
+
+    DexUsageWiring wiring() {
+        DexUsageWiring w;
+        w.read = [this](const DexUsageQuery& q) {
+            ++reads;
+            last = q;
+            return result;
+        };
+        w.group_members = [this](const std::string&) {
+            ++group_reads;
+            return group;
+        };
+        w.tag_values = [](const std::string&) {
+            return std::optional<std::unordered_map<std::string, std::string>>{
+                std::unordered_map<std::string, std::string>{}};
+        };
+        w.observation_retention_days = 30;
+        return w;
+    }
+};
+
+std::int64_t wall_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+const DexUsageSlice kFleetSlice{DexUsageSliceKind::Fleet, ""};
+
+// An engaged visible set of exactly these ids (a braced list of two literals would read as an
+// iterator range).
+Visible visible_of(std::initializer_list<std::string> ids) {
+    return Visible{std::unordered_set<std::string>(ids)};
+}
+
+} // namespace
+
+// Every refusal before the Apps read needs no store: the order is scope, policy, fleet, wiring.
+TEST_CASE("DexApi: apps_usage refuses an unknown scope, an unreadable policy, no fleet and no wiring "
+          "before any read",
+          "[dex][dex_api][usage]") {
+    SECTION("unknown platform scope") {
+        auto api = make_local_dex_api(nullptr, fleet23);
+        const auto r = api->apps_usage("7d", "darwin", kFleetSlice, 1, std::nullopt);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().reason == "apps_degraded");
+        CHECK(r.error().detail == "invalid_scope");
+    }
+    SECTION("policy unavailable never takes the fleet snapshot") {
+        int fleet_calls = 0;
+        auto api = make_local_dex_api(
+            nullptr,
+            [&fleet_calls] {
+                ++fleet_calls;
+                return DexFleet{};
+            },
+            []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+                return std::unexpected(std::string("store down"));
+            });
+        const auto r = api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().reason == "apps_degraded");
+        CHECK(r.error().detail == "score_policy_unavailable");
+        CHECK(fleet_calls == 0);
+    }
+    SECTION("no FleetFn is no_population") {
+        UsageProbe probe;
+        auto api = make_local_dex_api(nullptr, {}, {}, {}, probe.wiring());
+        const auto r = api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().reason == "no_population");
+        CHECK(probe.reads == 0);
+    }
+    SECTION("empty wiring is usage_unavailable/not_wired") {
+        int fleet_calls = 0;
+        auto api = make_local_dex_api(nullptr, [&fleet_calls] {
+            ++fleet_calls;
+            return fleet23();
+        });
+        const auto r = api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().reason == "usage_unavailable");
+        CHECK(r.error().detail == "not_wired");
+        CHECK(fleet_calls == 0);
+    }
+}
+
+TEST_CASE("DexApi: apps_usage reads the Apps list and the usage at one request instant",
+          "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    int fleet_calls = 0;
+    int observer_calls = 0;
+    auto api = make_local_dex_api(
+        &store,
+        [&fleet_calls] {
+            ++fleet_calls;
+            return fleet23();
+        },
+        {},
+        [&observer_calls](const std::vector<std::string>& ids) {
+            ++observer_calls;
+            return std::vector<yuzu::server::DexObserverState>(ids.size());
+        },
+        probe.wiring());
+
+    const auto before = wall_epoch();
+    const auto r = api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt);
+    const auto after = wall_epoch();
+    REQUIRE(r.has_value());
+    CHECK(fleet_calls == 1); // ONE snapshot
+    CHECK(probe.reads == 1);
+    CHECK(r->as_of_epoch >= before);
+    CHECK(r->as_of_epoch <= after);
+    // Every cut derives from that one instant.
+    CHECK(probe.last.until_iso == yuzu::server::dex_iso_at(r->as_of_epoch));
+    CHECK(probe.last.since_iso == yuzu::server::dex_iso_since_at(r->as_of_epoch, 7));
+    // The freshness cut is a width, measured by the owner against the database clock.
+    CHECK(probe.last.fresh_secs == yuzu::server::kDexUsageFreshSecs);
+    CHECK(r->population == 23);
+    // A usage read never pays the observer pass.
+    CHECK(observer_calls == 0);
+    // The rows are the Apps rows, in order.
+    const auto apps = api->apps("7d", "all");
+    REQUIRE_FALSE(apps.degraded);
+    REQUIRE(r->apps.size() == apps.apps.size());
+    for (std::size_t i = 0; i < apps.apps.size(); ++i)
+        CHECK(r->apps[i].subject == apps.apps[i].subject);
+    CHECK(observer_calls == 1); // apps() still does
+}
+
+TEST_CASE("DexApi: apps_usage builds the population from the admitted device set", "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    auto api = make_local_dex_api(&store, fleet23, {}, {}, probe.wiring());
+
+    const auto one = api->apps_usage("7d", "all", kFleetSlice, 1, visible_of({"a1"}));
+    REQUIRE(one.has_value());
+    CHECK(one->population == 1);
+    REQUIRE(probe.last.devices.size() == 1);
+    CHECK(probe.last.devices[0].agent_id == "a1");
+
+    // Engaged-empty is a model of nothing visible, not a refusal: population 0, every row no_usage.
+    const auto none = api->apps_usage("7d", "all", kFleetSlice, 1, Visible{std::unordered_set<std::string>{}});
+    REQUIRE(none.has_value());
+    CHECK(none->population == 0);
+    CHECK(probe.last.devices.empty());
+    REQUIRE_FALSE(none->apps.empty());
+    for (const auto& a : none->apps) {
+        CHECK(a.state == DexUsageState::NoUsage);
+        CHECK(a.rate_withheld == "no_usage");
+    }
+
+    // The platform scope narrows within the admitted set.
+    const auto linux_only = api->apps_usage("7d", "linux", kFleetSlice, 1, visible_of({"a1", "l1"}));
+    REQUIRE(linux_only.has_value());
+    CHECK(linux_only->population == 1);
+    CHECK(probe.last.devices[0].agent_id == "l1");
+}
+
+TEST_CASE("DexApi: apps_usage maps a failed read and a failed group read to a refusal that names the cause",
+          "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    auto api = make_local_dex_api(&store, fleet23, {}, {}, probe.wiring());
+
+    probe.result = std::unexpected(std::string("concurrency_budget"));
+    const auto budget = api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt);
+    REQUIRE_FALSE(budget.has_value());
+    CHECK(budget.error().reason == "usage_unavailable");
+    CHECK(budget.error().detail == "concurrency_budget");
+
+    // The read succeeded but names a subject the Apps list does not have: the model refuses it.
+    DexUsageRead bad;
+    bad.cells.push_back({999, 0, 1, 1, 0, 1, 1});
+    probe.result = bad;
+    const auto invalid = api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt);
+    REQUIRE_FALSE(invalid.has_value());
+    CHECK(invalid.error().reason == "usage_unavailable");
+    CHECK(invalid.error().detail == "invalid_read");
+    probe.result = DexUsageRead{};
+
+    const DexUsageSlice group{DexUsageSliceKind::Group, "g1"};
+    probe.group = std::unexpected(std::string("unknown_group"));
+    const auto unknown = api->apps_usage("7d", "all", group, 1, std::nullopt);
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error().reason == "invalid_slice");
+    CHECK(unknown.error().detail == "unknown_group");
+
+    probe.group = std::unexpected(std::string("group_unavailable"));
+    const auto down = api->apps_usage("7d", "all", group, 1, std::nullopt);
+    REQUIRE_FALSE(down.has_value());
+    CHECK(down.error().reason == "group_unavailable");
+    CHECK(down.error().detail == "group_unavailable");
+
+    // A group that exists puts its members in cell 0 and everyone else in the residual cell.
+    probe.group = std::vector<std::string>{"a1", "l1"};
+    const auto ok = api->apps_usage("7d", "all", group, 1, std::nullopt);
+    REQUIRE(ok.has_value());
+    int in_group = 0;
+    for (const auto& d : probe.last.devices)
+        in_group += d.cell == 0 ? 1 : 0;
+    CHECK(in_group == 2);
+    CHECK(ok->slice.key == "g1");
+}
+
+TEST_CASE("DexApi: apps_usage caches a model for the exact request and the visible set, never a refusal",
+          "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    int fleet_calls = 0;
+    auto api = make_local_dex_api(
+        &store,
+        [&fleet_calls] {
+            ++fleet_calls;
+            return fleet23();
+        },
+        {}, {}, probe.wiring());
+
+    const auto first = api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt);
+    REQUIRE(first.has_value());
+    REQUIRE(probe.reads == 1);
+    const auto again = api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt);
+    REQUIRE(again.has_value());
+    CHECK(probe.reads == 1); // a hit skips the usage read
+    CHECK(again->as_of_epoch == first->as_of_epoch);
+    CHECK(fleet_calls == 2); // the snapshot is still taken: it is part of the key
+
+    // Anything that changes the answer changes the key.
+    (void)api->apps_usage("7d", "all", kFleetSlice, 5, std::nullopt); // floor
+    CHECK(probe.reads == 2);
+    (void)api->apps_usage("7d", "all", {DexUsageSliceKind::Platform, ""}, 1, std::nullopt); // slice
+    CHECK(probe.reads == 3);
+    (void)api->apps_usage("30d", "all", kFleetSlice, 1, std::nullopt); // window
+    CHECK(probe.reads == 4);
+    (void)api->apps_usage("7d", "windows", kFleetSlice, 1, std::nullopt); // platform
+    CHECK(probe.reads == 5);
+    (void)api->apps_usage("7d", "all", kFleetSlice, 1, visible_of({"a1"})); // a narrower visible set
+    CHECK(probe.reads == 6);
+    (void)api->apps_usage("7d", "all", kFleetSlice, 1, visible_of({"a1", "a2"}));
+    CHECK(probe.reads == 7);
+    // The same visible set in any order is one entry; a confined caller never reads the wider one.
+    (void)api->apps_usage("7d", "all", kFleetSlice, 1, visible_of({"a2", "a1"}));
+    CHECK(probe.reads == 7);
+    (void)api->apps_usage("7d", "all", kFleetSlice, 1, visible_of({"a1"}));
+    CHECK(probe.reads == 7);
+
+    // A tag slice with no key and one with the default key are the same request.
+    const auto implicit = api->apps_usage("7d", "all", {DexUsageSliceKind::Tag, ""}, 1, std::nullopt);
+    REQUIRE(implicit.has_value());
+    CHECK(implicit->slice.key == yuzu::server::kDexDefaultCohortKey);
+    const int after_tag = probe.reads;
+    (void)api->apps_usage("7d", "all", {DexUsageSliceKind::Tag, yuzu::server::kDexDefaultCohortKey}, 1,
+                          std::nullopt);
+    CHECK(probe.reads == after_tag);
+    (void)api->apps_usage("7d", "all", {DexUsageSliceKind::Tag, "ring"}, 1, std::nullopt);
+    CHECK(probe.reads == after_tag + 1);
+
+    // A floor below one is applied as one, so it shares the entry of floor 1.
+    (void)api->apps_usage("7d", "all", kFleetSlice, 0, std::nullopt);
+    CHECK(probe.reads == after_tag + 1);
+}
+
+TEST_CASE("DexApi: apps_usage never caches a refusal", "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    auto api = make_local_dex_api(&store, fleet23, {}, {}, probe.wiring());
+
+    probe.result = std::unexpected(std::string("statement_timeout"));
+    CHECK_FALSE(api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt).has_value());
+    probe.result = DexUsageRead{};
+    CHECK(api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt).has_value());
+    CHECK(probe.reads == 2); // the failure left nothing behind
+}
+
+// The cache is bounded in time and in size. Both bounds are reached through the wiring's test-only
+// fields, so neither case waits or sleeps.
+TEST_CASE("DexApi: a cached usage model expires, and the cache holds 32 models", "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    auto wiring = probe.wiring();
+    SECTION("an entry past its ttl is read again") {
+        wiring.cache_ttl = std::chrono::seconds{0}; // every entry is already expired
+        auto api = make_local_dex_api(&store, fleet23, {}, {}, std::move(wiring));
+        REQUIRE(api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt).has_value());
+        REQUIRE(api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt).has_value());
+        CHECK(probe.reads == 2);
+    }
+    SECTION("a 33rd distinct request clears a full cache") {
+        wiring.cache_ttl = std::chrono::hours{1}; // nothing expires: only the cap can evict
+        auto api = make_local_dex_api(&store, fleet23, {}, {}, std::move(wiring));
+        const auto ask = [&](std::int64_t floor) {
+            REQUIRE(api->apps_usage("7d", "all", kFleetSlice, floor, std::nullopt).has_value());
+        };
+        for (std::int64_t floor = 1; floor <= 32; ++floor) // the floor is part of the key
+            ask(floor);
+        REQUIRE(probe.reads == 32);
+        ask(1);
+        CHECK(probe.reads == 32); // a full cache still answers
+        ask(33);
+        CHECK(probe.reads == 33);
+        ask(1); // cleared to admit the 33rd
+        CHECK(probe.reads == 34);
+    }
+}
+
+// The policy revision and each visible device's platform are part of the key: a stale model for
+// another policy or another platform split is never served.
+TEST_CASE("DexApi: apps_usage reads again when the policy revision or a device's platform changes",
+          "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    std::string revision = "r1";
+    DexFleet fleet = fleet23();
+    auto api = make_local_dex_api(
+        &store, [&fleet] { return fleet; },
+        [&revision]() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+            yuzu::server::DexPolicyInForce p;
+            p.revision = revision;
+            return p;
+        },
+        {}, probe.wiring());
+    const auto ask = [&] { REQUIRE(api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt).has_value()); };
+    ask();
+    ask();
+    CHECK(probe.reads == 1);
+    revision = "r2";
+    ask();
+    CHECK(probe.reads == 2);
+    ask();
+    CHECK(probe.reads == 2);
+    fleet.connected_agents.back().second = "linux"; // m1 was macos
+    ask();
+    CHECK(probe.reads == 3);
+    ask();
+    CHECK(probe.reads == 3);
+}
+
+TEST_CASE("DexApi: a tag slice with no tag source or an unreadable one is tag_unavailable",
+          "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    UsageProbe probe;
+    auto wiring = probe.wiring();
+    SECTION("no tag source is wired") {
+        wiring.tag_values = {};
+    }
+    SECTION("the read fails") {
+        wiring.tag_values = [](const std::string&) {
+            return std::optional<std::unordered_map<std::string, std::string>>{};
+        };
+    }
+    auto api = make_local_dex_api(&store, fleet23, {}, {}, std::move(wiring));
+    const auto r = api->apps_usage("7d", "all", {DexUsageSliceKind::Tag, "ring"}, 1, std::nullopt);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().reason == "tag_unavailable");
+    CHECK(probe.reads == 0); // refused before the usage read
+}
+
+// The injected instant is the API's one clock: the Apps window is cut at it, not at the wall clock.
+TEST_CASE("DexApi: apps_usage cuts the Apps window at the request instant", "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    // The instant is ten days back and the only row is a day before it: inside the 7 day window
+    // cut at that instant, eleven days old at the wall clock.
+    const std::int64_t at = wall_epoch() - 10 * 86400;
+    seed_obs_v(store, "old1", "a1", "old.exe", "process.crashed", "1.0",
+               yuzu::server::dex_iso_at(at - 86400));
+    UsageProbe probe;
+    auto wiring = probe.wiring();
+    wiring.now_epoch = [at] { return at; };
+    auto api = make_local_dex_api(&store, fleet23, {}, {}, std::move(wiring));
+
+    const auto r = api->apps_usage("7d", "all", kFleetSlice, 1, std::nullopt);
+    REQUIRE(r.has_value());
+    CHECK(r->as_of_epoch == at);
+    REQUIRE(r->apps.size() == 1);
+    CHECK(r->apps[0].subject == "old.exe");
+    CHECK(probe.last.until_iso == yuzu::server::dex_iso_at(at));
+    // A skewed instant moves the observation window only: the freshness width is the constant.
+    CHECK(probe.last.fresh_secs == yuzu::server::kDexUsageFreshSecs);
+    // apps() takes its instant from the same source.
+    const auto apps = api->apps("7d", "all");
+    REQUIRE_FALSE(apps.degraded);
+    REQUIRE(apps.apps.size() == 1);
+}
+
+TEST_CASE("DexApi: apps is unchanged by the shared window cut", "[pg][dex_api][usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    // One fixed instant for the seam and the oracle, so a clock tick cannot separate them.
+    const std::int64_t now = wall_epoch();
+    DexUsageWiring wiring;
+    wiring.now_epoch = [now] { return now; };
+    auto api = make_local_dex_api(&store, fleet23, {}, {}, std::move(wiring));
+    // The same read through the shared builder at the same cut, over the same fleet.
+    const auto fleet = fleet23();
+    const auto oracle = yuzu::server::build_dex_apps_model(
+        &store, "7d", yuzu::server::dex_iso_since_at(now, 7), "all",
+        std::optional<std::vector<std::string>>{yuzu::server::dex_apps_online_ids(fleet, "all")},
+        yuzu::server::DexPolicyInForce{});
+    REQUIRE_FALSE(oracle.degraded);
+    const auto through_seam = api->apps("7d", "all");
+    REQUIRE_FALSE(through_seam.degraded);
+    CHECK(yuzu::server::dex_apps_json(through_seam) == yuzu::server::dex_apps_json(oracle));
 }
 
 // The route-level cases (throwing or unwired DexApi) live in test_dex_routes.cpp.

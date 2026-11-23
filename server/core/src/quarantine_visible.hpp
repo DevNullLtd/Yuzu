@@ -3,8 +3,10 @@
 /// @file quarantine_visible.hpp
 /// The ONE admit-then-filter read of the active quarantine set, shared by the REST
 /// `GET /api/v1/quarantine` route and the dashboard fragments (Quarantined panel, list
-/// pill) so the surfaces can never disagree on who may see which record. Pure: the store
-/// read is an injected callable; no I/O here.
+/// pill) and the MCP `list_quarantined_devices` twin, so the surfaces can never disagree on
+/// who may see which record. `quarantine_visible_with_owed` is the one place the optional
+/// release-owed records are appended (#7624). Pure: the store read is an injected callable; no
+/// I/O here.
 ///
 /// ADR-0017 (World A): the caller resolves its authority ONCE through the list chokepoint
 /// (`fleet_read_fn(req, res, "Security", "Read")`, i.e. `AuthRoutes::require_fleet_read`)
@@ -100,6 +102,30 @@ inline QuarantineVisible quarantine_visible_records(const authz::VisibleSet& sco
         out.records.resize(opt.max_visible);
         out.more = true;
     }
+    return out;
+}
+
+/// #7624: the active records, then, only when `include_owed`, the records ended by force whose
+/// device still owes a release, read through the same scope and options (each list capped on its
+/// own) and appended after the active ones. `more` is true if either list was cut. Either read
+/// degraded makes the whole answer `StoreDegraded`, and the owed read is not made once the
+/// active one has failed. `owed_fn` is called only when `include_owed`; an unwired one is
+/// `StoreDegraded`, like any list read.
+inline QuarantineVisible quarantine_visible_with_owed(const authz::VisibleSet& scope,
+                                                      const QuarantineListFn& active_fn,
+                                                      const QuarantineListFn& owed_fn,
+                                                      bool include_owed,
+                                                      const QuarantineVisibleOptions& opt = {}) {
+    auto out = quarantine_visible_records(scope, active_fn, opt);
+    if (!include_owed || out.status == QuarantineReadStatus::StoreDegraded)
+        return out;
+    const auto owed = quarantine_visible_records(scope, owed_fn, opt);
+    if (owed.status == QuarantineReadStatus::StoreDegraded) {
+        out.status = QuarantineReadStatus::StoreDegraded;
+        return out;
+    }
+    out.records.insert(out.records.end(), owed.records.begin(), owed.records.end());
+    out.more = out.more || owed.more;
     return out;
 }
 

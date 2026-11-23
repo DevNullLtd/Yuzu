@@ -18,7 +18,10 @@
 # debian:trixie-slim builder (proven + fast); chiselled Ubuntu 26.04 runtime.
 # build-old-glibc / run-new-glibc is the safe direction. Swap BUILDER_IMAGE to
 # ubuntu:26.04 to compile on Ubuntu itself.
-ARG BUILDER_IMAGE=debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b
+# Digest held in an ARG default, which Dependabot does not see: refresh it by
+# hand (last: 2026-11-17, the trixie-slim built 2026-11-04, same as
+# Dockerfile.server). Build stage only; nothing from it ships but the binary.
+ARG BUILDER_IMAGE=debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 FROM ${BUILDER_IMAGE} AS builder
 
 # TRIPLET may be passed explicitly (--build-arg TRIPLET=arm64-linux, as the
@@ -111,7 +114,13 @@ RUN set -eux; \
 # Retry loop: `chisel cut` downloads the Ubuntu archive indices (main +
 # universe) over the network and the large universe index occasionally EOFs
 # mid-fetch. Retrying keeps release rebuilds reliable.
+# YUZU_PACKAGE_REFRESH: release.yml passes a value that changes on every run
+# attempt, so the cut below fetches the current archive (security and updates
+# pockets) instead of being served from the runner's persistent build cache.
+# Local builds leave it empty and cache as usual.
+ARG YUZU_PACKAGE_REFRESH=
 RUN set -eux; mkdir -p /rootfs; \
+    : "package refresh: ${YUZU_PACKAGE_REFRESH}"; \
     SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
       base-files_release-info base-passwd_data netbase_config \
       ca-certificates_data openssl_config libc6_libs libgcc-s1_libs \

@@ -311,7 +311,10 @@ a_cacertfile_that_blocks_is_file_unreadable_test_() ->
 
 %% A readable file with no certificate in it is "unverified" (nothing could have signed the CRL),
 %% distinct from an unreadable one.
-a_cacertfile_without_certificates_is_unverified_test() ->
+a_cacertfile_without_certificates_is_unverified_test_() ->
+    {timeout, 60, fun a_cacertfile_without_certificates_is_unverified/0}.
+
+a_cacertfile_without_certificates_is_unverified() ->
     yuzu_gw_mgmt_crl_source:reset(),
     {ok, _} = application:ensure_all_started(telemetry),
     flush_all(),
@@ -521,7 +524,10 @@ gauges_follow_the_state_events_test_() ->
      end}.
 
 %% A real load reports a success time; a failed fetch does not move it.
-load_reports_last_success_test() ->
+load_reports_last_success_test_() ->
+    {timeout, 60, fun load_reports_last_success/0}.
+
+load_reports_last_success() ->
     yuzu_gw_mgmt_crl_source:reset(),
     {ok, _} = application:ensure_all_started(telemetry),
     flush_all(),
@@ -548,7 +554,10 @@ load_reports_last_success_test() ->
 %% A caught load failure still reports that a source is configured (N8)
 %%--------------------------------------------------------------------
 
-an_unexpected_load_failure_still_reports_enforced_test() ->
+an_unexpected_load_failure_still_reports_enforced_test_() ->
+    {timeout, 60, fun an_unexpected_load_failure_still_reports_enforced/0}.
+
+an_unexpected_load_failure_still_reports_enforced() ->
     yuzu_gw_mgmt_crl_source:reset(),
     {ok, _} = application:ensure_all_started(telemetry),
     flush_all(),

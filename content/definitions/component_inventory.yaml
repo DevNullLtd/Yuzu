@@ -1,7 +1,9 @@
 ## Component Inventory Definitions
-## Reports Java archives and the libraries nested inside them, found by reading application
-## trees. Read-only, zero subprocess.
-## Plugin: component_inventory | Action: scan
+## Reports Java archives and the libraries nested inside them (action scan), and versioned shared
+## libraries (action native), found by reading application trees. Read-only, zero subprocess.
+## Plugin: component_inventory | Actions: scan, native (the native definition follows the scan one)
+##
+## ---- scan ----
 ##
 ## SHIPPED LEGS: Linux and macOS, machine-wide roots only (the root list holds no per-user location).
 ## Windows is planned: it answers one `unsupported` status row (`windows:planned`).
@@ -109,7 +111,7 @@ spec:
         platforms: [darwin, linux]
       - name: path
         type: string
-        description: 'Absolute path of the archive; a nested library is <archive path>!<entry name>. A NUL or a byte outside valid UTF-8 in a folder, file or entry name is shown as ?.'
+        description: 'Absolute path of the archive; a nested library is <archive path>!<entry name>. A NUL, another control character or a byte outside valid UTF-8 in a folder, file or entry name is shown as ?.'
         example: /opt/app/lib/app.war!WEB-INF/lib/log4j-core-2.17.1.jar
         platforms: [darwin, linux]
       - name: size
@@ -124,11 +126,164 @@ spec:
         platforms: [darwin, linux]
       - name: anchor_app
         type: string
-        description: 'First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root). A NUL or a byte outside valid UTF-8 in the name is shown as ?.'
+        description: 'First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?.'
         example: app
         platforms: [darwin, linux]
 
   readablePayload: "Scan application trees for Java components"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [component_inventory]
+
+status:
+  phase: active
+
+## ---- native ----
+## Versioned shared libraries shipped inside applications: ELF .so files on Linux, Mach-O .dylib
+## files on macOS. Read-only, zero subprocess. SWITCHED OFF BY DEFAULT: the server refuses this
+## action until an operator enables it with PUT /api/v1/plugin-config/component_inventory/kill-switch
+## and action=native (an action-level row; component_inventory.scan is unaffected).
+##
+## SHIPPED LEGS: Linux and macOS, machine-wide roots only. Windows is planned: it answers one
+## `unsupported` status row (`windows:planned`).
+##   Linux:   /opt and /usr/local/lib. The package manager's own trees (/usr/lib and the other
+##            system library directories) are not walked at all.
+##   macOS:   /Applications, /usr/local and /opt/homebrew. The Homebrew package trees
+##            /usr/local/Cellar and /opt/homebrew/Cellar are not entered; they are counted and
+##            reported as the informational token `package_tree_skipped`, never skipped silently.
+##   Both:    the same root, link and network-mount rules as scan: a missing root is not an error,
+##            a root reached through a link or on a network mount is dropped and reported, and no
+##            link is followed at any path component.
+## Candidates are files named <stem>.so or <stem>.so.<digits and dots> (Linux) and <stem>.dylib
+## (macOS). Each candidate is opened once and its header is read in-process by the shared bounded
+## readers within fixed bounds (at most 128 ELF program headers, 4,096 dynamic entries, 1,024
+## Mach-O load commands in 512 KiB; a universal file uses its first readable dynamic-library slice).
+## The name and version a file declares are its own claim; no signature is checked. A file whose name matches
+## but whose header says it is not a shared library gives no row. A shared library whose header
+## cannot be read inside those bounds still gives a row, named from its file name, with the version
+## the file name carries or `unreadable`. Extension-less macOS framework binaries are not read.
+## The name is the SONAME (Linux) or install name (macOS) without its .so or .dylib suffix and
+## version. Linux: the version is the file name's .so.<version> suffix, else the SONAME's suffix.
+## macOS: the version is the Mach-O current_version when it is not 0.0.0, else the file name's
+## version (libfoo.1.2.dylib reads 1.2).
+##
+## BOUNDS: 400,000 directory entries, 45 seconds for the whole scan, 32 directory levels, 50,000
+## entries per directory listing, 3,000 rows per top-level application folder, 5,000 rows in all.
+##
+## Output: one `status|native|<level>|<tokens>` row FIRST, then zero or more
+## `comp|native|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>` rows.
+## A `supported` status means the scan finished with no bound reached; informational tokens ride it
+## (`root_link_skipped`, `link_skipped`, `network_fs_skipped`, `version_unreadable`,
+## `package_tree_skipped`). A `constrained` status names its one cause; the rows already read are
+## still returned.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.components.native
+  displayName: Native Library Inventory
+  version: 1.0.0
+  description: >
+    Reports versioned shared libraries (ELF .so on Linux, Mach-O .dylib on macOS) shipped inside
+    applications under the machine-wide application roots: one row per library (name, version and
+    where the version came from, path, size, modification time and the application folder it sits
+    under), at most 5,000 rows. This action is switched off until an operator enables it with PUT
+    /api/v1/plugin-config/component_inventory/kill-switch and action=native; until then the server
+    refuses it. Linux reads /opt and /usr/local/lib and never the package manager's own trees;
+    macOS reads /Applications, /usr/local and /opt/homebrew and does not enter the Homebrew Cellar
+    trees, naming that in the package_tree_skipped token. Extension-less macOS framework binaries
+    are not read; per-user locations are not read; Windows is not read yet. No process is started.
+    A `supported` status means the scan finished with no bound reached; a `constrained` status
+    means a bound was hit or something could not be read in full, so the list may be incomplete,
+    and it names its one cause. A library whose header cannot be read inside the fixed bounds still
+    gets a row from its file name. `supported` with no rows means none was found at those roots,
+    not that none is installed. The result is a live read made when the instruction runs, not a
+    stored snapshot, at a cost of up to 45 seconds and 400,000 directory entries, and it cannot be
+    cancelled once started. For Java archives use crossplatform.components.scan, and for packaged
+    applications crossplatform.software.inventory. Terminal causes (a repeat gives the same
+    answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated. Retryable causes:
+    budget_time, dir_unreadable, archive_changed (a library changed or vanished while read),
+    mount_table_unreadable, internal_error.
+  tags: [components, native, inventory]
+
+spec:
+  type: question
+  platforms: [darwin, linux]
+
+  execution:
+    plugin: component_inventory
+    action: native
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|native|<level>|<tokens or ->   (always first)
+    # comp|native|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), comp (one per shared library found).'
+        values: [status, comp]
+        example: comp
+        platforms: [darwin, linux]
+      - name: kind
+        type: string
+        description: 'Component kind. Values: native. Status rows: the action name (native).'
+        example: native
+        platforms: [darwin, linux]
+      - name: name
+        type: string
+        description: 'Library name: the SONAME (Linux) or install-name leaf (macOS) without its .so or .dylib suffix and version, or the file name''s equivalent when the library declares none (libssl.so.3 reads libssl). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported).'
+        example: libssl
+        platforms: [darwin, linux]
+      - name: version
+        type: string
+        description: 'Linux: the version in the file name (libssl.so.3.0.13 reads 3.0.13), else the SONAME suffix. macOS: the Mach-O current_version when it is not 0.0.0, else the version in the file name (libfoo.1.2.dylib reads 1.2). Empty when none gives one. Status rows: the comma-joined cause tokens, or -.'
+        example: 3.0.13
+        platforms: [darwin, linux]
+      - name: version_source
+        type: string
+        description: 'Where the version came from. Values: filename, elf (the SONAME, Linux), macho (current_version, macOS), unreadable (no source gave a version, or the header could not be read inside the fixed bounds; the row is still listed and the scan is not made incomplete by it).'
+        values: [filename, elf, macho, unreadable]
+        example: filename
+        platforms: [darwin, linux]
+      - name: path
+        type: string
+        description: 'Absolute path of the library file. A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?.'
+        example: /opt/app/lib/libssl.so.3.0.13
+        platforms: [darwin, linux]
+      - name: size
+        type: int64
+        description: 'Size of the library file in bytes.'
+        example: "3086784"
+        platforms: [darwin, linux]
+      - name: mtime
+        type: int64
+        description: 'Modification time of the library file as Unix seconds.'
+        example: "1700000000"
+        platforms: [darwin, linux]
+      - name: anchor_app
+        type: string
+        description: 'First path component below the scanned root: the application folder the library sits under (the file name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?.'
+        example: app
+        platforms: [darwin, linux]
+
+  readablePayload: "Scan application trees for native libraries"
 
   gather:
     ttlSeconds: 300

@@ -515,13 +515,17 @@ default settings) did not notice the lost `Subscribe` stream across that restart
 heartbeats got `NOT_FOUND`, and rc6 and v0.13.0 then wedged as described above (restart
 them). A `GOAWAY` originating from the gateway on its own was not observed.
 
-*On the Cowboy listeners.* Read from the Cowboy 2.19.0 source (`cowboy_http2`), not
+*On the Cowboy listeners.* Read from the Cowboy 2.21.0 source (`cowboy_http2.erl`, `initiate_closing/2`, `closing/2`, `terminate/2` and `loop/2`, re-read in full against 2.21.0), not
 measured: when the listener's supervisor stops its connection processes (a gateway stop,
 or a listener restart), each HTTP/2 connection sends a first `GOAWAY` with last stream id
 2^31-1 and `NO_ERROR`, waits `goaway_initial_timeout` (1 s), sends a second `GOAWAY` with
 the real last stream id, and, if streams are still open (a `Subscribe` stream always is),
 waits up to `goaway_complete_timeout` (3 s) before closing. The two options are not set by
-the gateway, so these are Cowboy's defaults. The listeners are the last children of the
+the gateway, so these are Cowboy's defaults. When the connection finally closes, Cowboy shuts the
+socket's write side, then sets `{linger, {true, 0}}` on the socket, then waits up to
+`linger_timeout` (1 s) for the peer; the close then releases the socket with a reset and discards
+unsent data; what an
+agent sees from that was not measured. The listeners are the last children of the
 supervision tree, so they stop first. The gateway's own 10 s wait for in-flight commands
 (`drain_pending`, in `yuzu_gw_app:stop/1`) runs after the tree is down (INFERRED from OTP,
 which calls `stop/1` after the application's processes have stopped), so it does not hold
@@ -1247,8 +1251,9 @@ This is the production shape, from `gateway/config/sys.config.prod` (comments sh
           tls => #{certfile   => "/etc/yuzu/certs/default-gateway.pem",
                    keyfile    => "/etc/yuzu/certs/default-gateway.key",
                    cacertfile => "/etc/yuzu/certs/default-ca.pem",
-                   verify => verify_none,
-                   fail_if_no_peer_cert => false},
+                   verify => verify_peer,
+                   fail_if_no_peer_cert => false,
+                   witness_client_cert => true},
           acceptors => 32,
           http2 => #{idle_timeout => 180000, max_concurrent_streams => 32}},
 
@@ -1274,11 +1279,11 @@ This is the production shape, from `gateway/config/sys.config.prod` (comments sh
 | `service_protos` | The proto modules (`agent_pb`, `management_pb`) that describe the services the listener serves. |
 | `services` | `#{ServiceName => Module}`: the module that serves each service. |
 | `listen` | `#{port, ip, socket_opts}`. `ip` defaults to `0.0.0.0`. `port => 0` binds any free port (tests). An optional `socket_opts` list is appended to the socket options; it may not carry `ip`, `ifaddr`, `fd`, `port` or `{local, _}`, which would move the bind away from `listen` (boot refuses them on every listener, because an `ifaddr` of `0.0.0.0` on a listener whose `ip` says loopback would publish the plaintext management plane to the network). It may not carry `client_renegotiation` or `secure_renegotiate` either: the gateway fixes both (see `tls`), and boot refuses them (`listen_socket_opts_set_tls_policy`). |
-| `tls` | Keys: `certfile`, `keyfile`, `cacertfile`, `verify`, `fail_if_no_peer_cert`, `ciphers`. Omit the map for plaintext HTTP/2 (an explicit choice: a listener with no `tls` map is plaintext whatever certificates are mounted next to it). When present, `certfile`, `keyfile` **and** `cacertfile` are all required and an incomplete map refuses boot. A listener that still carries certificate settings under a legacy key (`transport_opts`, `ssl`) refuses boot rather than running plaintext, so "certificates configured but plaintext" cannot come from a half-converted entry. `verify` defaults to `verify_peer` and `fail_if_no_peer_cert` to `true` (mutual TLS); `verify => verify_none` is one-way TLS and then `fail_if_no_peer_cert` defaults to `false`. TLS 1.2 only. Cipher suites follow the certificate's key type when `ciphers` is unset: ECDHE-ECDSA AEAD suites for an EC key (the generated default certificates), ECDHE-RSA AES-GCM suites for an RSA key (a bring-your-own certificate); an explicit `ciphers` list always wins. FIPS mode is not claimed. The listener also sets `reuse_sessions => false` (every reconnect is a full TLS handshake, so a reconnect herd costs more CPU than with session resumption), `honor_cipher_order => true` (the gateway's list decides the suite, not the client's), and `client_renegotiation => false` with `secure_renegotiate => true` on every TLS listener, agent and management (the gateway answers a client's renegotiation request with a `no_renegotiation` warning alert and does not renegotiate, so a peer cannot make the gateway run one full handshake after another on one connection; an OTP client then carries on unchanged, but an OpenSSL-family client, measured with LibreSSL `s_client`, treats the refusal as fatal (`handshake_failure`) and the connection closes; OTP's own server default allows renegotiation; this is not configurable). Yuzu agents and the server do not ask to renegotiate (not measured against them; gRPC's TLS stack does not initiate renegotiation). A TLS-terminating or re-encrypting load balancer or proxy in front of a gateway listener must not renegotiate toward it either (for example a backend TLS profile with periodic renegotiation): its connections close, and the gateway log has a NOTICE `TLS server: In state connection received CLIENT ALERT: Fatal - Handshake Failure` for each one (observed with LibreSSL `s_client` against the gateway's settings). Pass TLS through, or turn renegotiation off on that profile; listeners built from the old `{grpcbox, [{servers, ...}]}` shape took OTP's defaults for both. **Not supported:** the `tls` map is closed, so an encrypted private key (`password`) and the ssl options `depth`, `crl_check`, `partial_chain` and `versions` that a `transport_opts` map could carry refuse boot. Decrypt the key first (`openssl pkey -in encrypted.key -out gateway.key`, with the file readable by the gateway user only) and use the defaults; supporting them is a follow-up, not something to work around. **Decrypting removes the passphrase protection the key had at rest**: if you answer "are private keys encrypted at rest?" for this key, the answer is now "protected by file permissions and the secret store that mounts it". |
+| `tls` | Keys: `certfile`, `keyfile`, `cacertfile`, `verify`, `fail_if_no_peer_cert`, `ciphers`, `witness_client_cert`. `witness_client_cert => true` (needs `verify => verify_peer` and `fail_if_no_peer_cert => false` SET EXPLICITLY or at those effective values: `verify_peer` alone defaults `fail_if_no_peer_cert` to `true`, a certificate required, so boot refuses a map that sets only `witness_client_cert`) asks every client for a certificate **without** aborting the handshake on one the gateway cannot validate (expired, issued by another CA) and without requiring one: the certificate is only **witnessed** (`yuzu_grpc:peer_cert/1`) and forwarded to the server as `RegisterRequest.gateway_attested_peer_cert_pem`, which verifies it itself. The TLS handshake still proves the client holds the certificate's key. `sys.config.prod` and `deploy/docker/reference-gateway-sys.config` set it on the agent listener. Omit the map for plaintext HTTP/2 (an explicit choice: a listener with no `tls` map is plaintext whatever certificates are mounted next to it). When present, `certfile`, `keyfile` **and** `cacertfile` are all required and an incomplete map refuses boot. A listener that still carries certificate settings under a legacy key (`transport_opts`, `ssl`) refuses boot rather than running plaintext, so "certificates configured but plaintext" cannot come from a half-converted entry. `verify` defaults to `verify_peer` and `fail_if_no_peer_cert` to `true` (mutual TLS); `verify => verify_none` is one-way TLS and then `fail_if_no_peer_cert` defaults to `false`. TLS 1.2 only. Cipher suites follow the certificate's key type when `ciphers` is unset: ECDHE-ECDSA AEAD suites for an EC key (the generated default certificates), ECDHE-RSA AES-GCM suites for an RSA key (a bring-your-own certificate); an explicit `ciphers` list always wins. FIPS mode is not claimed. The listener also sets `reuse_sessions => false` (every reconnect is a full TLS handshake, so a reconnect herd costs more CPU than with session resumption), `honor_cipher_order => true` (the gateway's list decides the suite, not the client's), and `client_renegotiation => false` with `secure_renegotiate => true` on every TLS listener, agent and management (the gateway answers a client's renegotiation request with a `no_renegotiation` warning alert and does not renegotiate, so a peer cannot make the gateway run one full handshake after another on one connection; an OTP client then carries on unchanged, but an OpenSSL-family client, measured with LibreSSL `s_client`, treats the refusal as fatal (`handshake_failure`) and the connection closes; OTP's own server default allows renegotiation; this is not configurable). Yuzu agents and the server do not ask to renegotiate (not measured against them; gRPC's TLS stack does not initiate renegotiation). A TLS-terminating or re-encrypting load balancer or proxy in front of a gateway listener must not renegotiate toward it either (for example a backend TLS profile with periodic renegotiation): its connections close, and the gateway log has a NOTICE `TLS server: In state connection received CLIENT ALERT: Fatal - Handshake Failure` for each one (observed with LibreSSL `s_client` against the gateway's settings). Pass TLS through, or turn renegotiation off on that profile; listeners built from the old `{grpcbox, [{servers, ...}]}` shape took OTP's defaults for both. **Not supported:** the `tls` map is closed, so an encrypted private key (`password`) and the ssl options `depth`, `crl_check`, `partial_chain` and `versions` that a `transport_opts` map could carry refuse boot. Decrypt the key first (`openssl pkey -in encrypted.key -out gateway.key`, with the file readable by the gateway user only) and use the defaults; supporting them is a follow-up, not something to work around. **Decrypting removes the passphrase protection the key had at rest**: if you answer "are private keys encrypted at rest?" for this key, the answer is now "protected by file permissions and the secret store that mounts it". |
 | `auth_fun` | Management listener only: `fun(Der) -> {true, Id} \| true \| false`, run by the stream handler on the peer certificate before a handler exists. Needs `tls`. **Boot refuses an `auth_fun` on any listener that serves the agent service** (`auth_fun_on_agent_listener`), that is, whose `service_protos` include `agent_pb` **or** whose `services` map has `'yuzu.agent.v1.AgentService'` as a key (the management proto embeds the AgentService definition, so `service_protos` alone would miss it), including a combined agent-and-management listener that has one; a combined listener without an `auth_fun` is valid (the integration test uses one). That refusal and the boot and `/readyz` rule are two different tests: the refusal asks whether the entry *serves* the agent service by either route, while boot and `/readyz` require at least one entry that *routes* it (the `services` key). |
 | `origin` | Keys: `mode`, `sources`, `trusted_hops`. How the caller's address is decided; default `#{mode => transport}`. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy). |
 | `acceptors` | Acceptor processes, a positive integer (default 4). `sys.config.prod` and the reference configs give the agent listener 32 for reconnect storms; the plaintext default, demo and UAT configs set nothing and so run 4. |
-| `http2` | Overrides of the Cowboy HTTP/2 options, by Cowboy's own option names; the options the layer owns and any unknown name are refused. Defaults: `idle_timeout` 600000 ms, `max_concurrent_streams` 1024, `max_frame_size_received` 16384, `linger_timeout` 1000, and, on a listener whose `services` map has `'yuzu.server.v1.ManagementService'` as a key (a combined agent-and-management listener included), `max_received_frame_rate` `{100000, 10000}`: 100000 received frames per 10 s. A listener that routes only the AgentService leaves `max_received_frame_rate` unset and so keeps Cowboy's own `{10000, 10000}`, the flood guard for the agents' unauthenticated connections. The management value is ten times Cowboy's because the server sends every command of a fan-out over its one connection to the management listener, at about 2 received frames per call: Cowboy's ceiling is about 5000 calls per 10 s, and past it Cowboy closes the whole connection with GOAWAY `enhance_your_calm` and every call in flight on it fails (`stream_error`). `{100000, 10000}` is about 5000 calls per second, far above the ~205 responses per second measured per server channel even with 8 channels to one gateway, and it is still finite. Raising `max_concurrent_streams` does not help: the ceiling counts frames, not streams. A listener that routes the `ManagementService` also defaults `max_concurrent_streams` to 4096 instead of 1024. The server sends each forwarded command as its own call over its one connection and queues the calls past the cap, so a fan-out takes about the agents' answer time or (agents x mean answer time / cap), whichever is longer. Measured over one loopback connection with 5,000 agents answering uniformly in 0 to 10 s: 30.7 s at 1024, 18.8 s at 2048, 11.9 s at 4096 and 10.1 s at 8192 (25,000 agents: 37.1 s at 4096, 21.7 s at 8192). 4096 brings 5,000 agents to within about 2 s of the answer time. It is not higher because the cap also bounds the memory the management connection can hold: each call in flight can have one response waiting to be written when agents answer faster than the server reads, and 5,000 answers of 256 KiB inside 1 s peaked at about 1 GB in the connection at 4096 and 1.2 GB at 8192. Past 5,000 agents per gateway, more server connections or one message per fan-out (#5956) is the way forward, not a larger cap. The measurement used a gun client that keeps at most the cap in flight, as the server's gRPC C++ client does; it was not repeated with the server itself. `sys.config.prod` and `deploy/docker/reference-gateway-sys.config` set `max_received_frame_rate => {100000, 10000}` and `max_concurrent_streams => 4096` on the management listener explicitly; every other shipped config gets them from the default. `sys.config.prod` and the reference configs set the agent listener's `idle_timeout` to 180000 because agents ping every 60 s (the 60 s default would race the ping) and `max_concurrent_streams` to 32. The shipped plaintext default, demo and UAT configs set neither and so inherit 600000 ms and 1024 streams. The management client pings every 30 s, idle or not, so its connection never reaches the idle timeout. |
+| `http2` | Overrides of the Cowboy HTTP/2 options, by Cowboy's own option names; the options the layer owns and any unknown name are refused. Defaults: `idle_timeout` 600000 ms, `max_concurrent_streams` 1024, `max_frame_size_received` 16384, `linger_timeout` 1000, and, on a listener whose `services` map has `'yuzu.server.v1.ManagementService'` as a key (a combined agent-and-management listener included), `max_received_frame_rate` `{100000, 10000}`: 100000 received frames per 10 s. A listener that routes only the AgentService leaves `max_received_frame_rate` unset and so keeps Cowboy's own `{10000, 10000}`, the flood guard for the agents' unauthenticated connections. The management value is ten times Cowboy's because the server sends every command of a fan-out over its one connection to the management listener, at about 2 received frames per call: Cowboy's ceiling is about 5000 calls per 10 s, and past it Cowboy closes the whole connection with GOAWAY `enhance_your_calm` and every call in flight on it fails (`stream_error`). `{100000, 10000}` is about 5000 calls per second, far above the ~205 responses per second measured per server channel even with 8 channels to one gateway, and it is still finite. Raising `max_concurrent_streams` does not help: the ceiling counts frames, not streams. A listener that routes the `ManagementService` also defaults `max_concurrent_streams` to 4096 instead of 1024. The server sends each forwarded command as its own call over its one connection and queues the calls past the cap, so a fan-out takes about the agents' answer time or (agents x mean answer time / cap), whichever is longer. Measured over one loopback connection with 5,000 agents answering uniformly in 0 to 10 s: 30.7 s at 1024, 18.8 s at 2048, 11.9 s at 4096 and 10.1 s at 8192 (25,000 agents: 37.1 s at 4096, 21.7 s at 8192). 4096 brings 5,000 agents to within about 2 s of the answer time. It is not higher because the cap also bounds the memory the management connection can hold: each call in flight can have one response waiting to be written when agents answer faster than the server reads, and 5,000 answers of 256 KiB inside 1 s peaked at about 1 GB in the connection at 4096 and 1.2 GB at 8192. Past 5,000 agents per gateway, more server connections or one message per fan-out (#5956) is the way forward, not a larger cap. The measurement used a gun client that keeps at most the cap in flight, as the server's gRPC C++ client does; it was not repeated with the server itself. `sys.config.prod` and `deploy/docker/reference-gateway-sys.config` set `max_received_frame_rate => {100000, 10000}` and `max_concurrent_streams => 4096` on the management listener explicitly; every other shipped config gets them from the default. `sys.config.prod` and the reference configs set the agent listener's `idle_timeout` to 180000 because agents ping every 60 s (the 60 s default would race the ping) and `max_concurrent_streams` to 32. The shipped plaintext default, demo and UAT configs set neither and so inherit 600000 ms and 1024 streams. The management client pings every 30 s, idle or not, so its connection never reaches the idle timeout. Header-list bound: cowlib 2.22.0 enforces `max_header_list_size` on every request header block (CVE-2026-113431) at 32768 octets (RFC 9113 sizing: name + value + 32 per header). A larger list is refused with a stream error `enhance_your_calm`; see "Connection ceilings and the unauthenticated ports" for what a burst of refusals does to the connection. The gateway sets nothing, so every listener has the bound; `http2` deliberately does NOT accept `max_header_list_size` (a tunable could only weaken it), and `max_headers` (Cowboy's count limit, 100) and `max_fragmented_header_block_size` are accepted keys that no shipped config sets, and they must stay unset, because the bound is the three together. Pins in `yuzu_grpc_listener_tests` and `yuzu_grpc_wire_tests` fail if the listener defaults for any of that change; they do not stop an operator setting either key. |
 | `limits` | Keys: `max_connections` (a positive integer or `infinity`, the default; the most simultaneous connections the listener holds, over which Ranch stops accepting until one closes), `max_message_bytes` (a positive integer, default 4194304), `send_timeout_ms` (a positive integer or `infinity`, default 30000), `max_connection_memory_bytes` (a positive integer at least 1048576, or `infinity`; default eight times `max_message_bytes`, i.e. 32 MiB for the 4 MiB default, except on a listener that routes the `ManagementService` and does not serve the agent service, where the default is no ceiling) and `request_timeout_ms` (a positive integer or `infinity`, default 30000). A request message larger than `max_message_bytes` is refused before it is buffered, but a message that fits is decoded in full, so a smaller `max_message_bytes` also bounds the memory one stream can make the gateway decode. `max_connection_memory_bytes` caps a single connection's memory (a `max_heap_size` on the Cowboy connection process that counts the refc buffers its streams hold); a connection that buffers more than this of half-finished requests is killed by the VM and the kill is counted in `yuzu_gw_grpc_connection_killed_total`. The VM checks the ceiling when the connection collects its garbage and counts the binaries that are already dead, so the default is sized from what one well-behaved connection was measured to reach, not from the bytes in flight alone: one message of `max_message_bytes` costs the connection three times its size at its peak (the received chunks, the joined message and the decoded request) plus under 1 MiB, so the 32 MiB default lets two full-size messages complete at once with room to spare and kills a peer holding half-sent full-size streams at about the eighth. Do not set it below about four times `max_message_bytes`: an agent sending one full-size message can then be killed. The ceiling also counts the responses waiting to be written, which is why the management listener has none by default: its one peer is the pinned server sending a whole fan-out over one connection, and when the agents answered together with large responses the ceiling (then 16 MiB, equal to Cowboy's own 16 MB output-buffer alarm) killed that connection, and every call on it, before Cowboy's backpressure could act. Without it, Cowboy's buffer alarm paces the senders and the connection holds about 16 MB plus one response per stream in flight; set `max_connection_memory_bytes` on the management listener to keep a hard cap anyway. A combined agent-and-management listener serves anonymous agents and keeps the ceiling. `request_timeout_ms` is how long a unary or server-streaming stream may buffer its one request before it is aborted `DEADLINE_EXCEEDED` (counted in `yuzu_gw_grpc_recv_timeout_total`) and its buffer dropped; it never cuts a bidirectional or client-streaming handler (an agent's long-lived `Subscribe`), which runs before any message, and a `grpc-timeout` the client sent runs alongside it with the earlier of the two winning. The gateway ends a call that carries a `grpc-timeout` with `DEADLINE_EXCEEDED` a tenth of that timeout early, at most 1 s early (299 s for the server's 300 s calls), so the client receives the status before its own deadline instead of resetting the stream: when thousands of the server's calls expire together, their resets exceed Cowboy's `max_cancel_stream_rate` (500 per 10 s) and Cowboy closes the whole management connection. Tested with a gun client; that the server's gRPC C++ client then sends no reset is standard gRPC behaviour but was not observed against the server. Together these two bound an unauthenticated peer that opens streams and stalls them half-sent (see "Connection ceilings and the unauthenticated ports" below). `max_connections` bounds the file descriptors a listener's connections can take. It is **not protection against a hostile peer**: see that same section for what it does and does not do on each listener. `sys.config.prod`, the reference configs and the packaged release config (`gateway/config/sys.config`, the one the release packages and the systemd unit run) set `max_connections => 60000` on the agent listener (the systemd unit's `LimitNOFILE` of 65536 less about 5500 of headroom for the upstream channel, the health and metrics ports, the management listener, Erlang distribution and files, so it holds to a fleet of about 30000 agents; raise it together with `LimitNOFILE` and keep about 5500 below it, lower it if the limit is lower) and `max_connections => 256` on the management listener. Both set `max_message_bytes => 4194304` explicitly, which is the default and gRPC's default receive limit: it is not lowered on the agent listener because an agent's installed-software inventory blob may be 3 MiB by design. The agent listener also sets `max_connection_memory_bytes => 33554432` and `request_timeout_ms => 30000` explicitly (both the defaults). The demo and UAT configs set no `limits`, so `max_connections` is `infinity` there, but the memory ceiling and request deadline still apply at their defaults. Size the file-descriptor limit for the listener's `max_connections` plus the other sockets (about 1.5 to 2 times the agent count plus 200 in use). |
 
 **Connection ceilings and the unauthenticated ports (known residual risk).**
@@ -1295,7 +1300,7 @@ peer that wants to hold connections, and this is what it does on each listener:
   (about 1 s) or the TLS handshake (10 s) is closed on those timers, and one that then sends
   nothing is closed by the listener's `idle_timeout`. A connection that keeps sending is
   **not**: any received data, a `PING` included, resets Cowboy's idle counter
-  (`cowboy_http2.erl` in Cowboy 2.19.0, read from the source, not measured), so a peer that
+  (`cowboy_http2.erl` `loop/2` in Cowboy 2.21.0, read from the source, not measured), so a peer that
   has completed the handshake can hold the connection open for as long as it likes. A peer that holds
   60000 of them fills the ceiling; new connections then wait in the kernel's listen
   backlog while the agents already connected are unaffected until they reconnect, and
@@ -1310,6 +1315,22 @@ peer that wants to hold connections, and this is what it does on each listener:
   single stalled request, and node-wide memory shedding (below) suspends the whole listener
   before the node runs out. A held but quiet connection still occupies a slot; those three
   stop a held connection from being turned into a memory-exhaustion attack.
+- *Header-list refusals on the agent listener (`:50051`) and the management listener (`:50063`).*
+  A request whose decoded header list is over 32768 octets is refused as a **stream error**
+  (RST_STREAM `enhance_your_calm`, the handler never runs) and the connection keeps serving. A
+  burst is different: Cowboy's `max_reset_stream_rate` (default 10 resets per 10 s) closes the
+  whole connection with GOAWAY `enhance_your_calm` at about the tenth refusal in 10 s, and every
+  stream in flight on that connection dies with it. Behind an L7 HTTP/2 load balancer that shares
+  one upstream connection across agents, one agent's refusals therefore kill the other agents'
+  streams on it: such a proxy must not share one upstream connection across agents. The closure
+  shows as `yuzu_gw_grpc_connections_closed_total{reason="enhance_your_calm"}`; a single
+  refusal has no counter. Measured bounds (one-off runs, not part of the test suite): a flood of 200 connections x 8 streams x 90 headers x 4000 B peaked at 163 MB over a
+  107 MB baseline with 0 handler calls, (a comparison run without the bound reached 713 MB and
+  1600 handler runs); `max_headers` (100) closes the connection at 98 to 101 headers (the count is
+  every decoded field, pseudo-headers included); a header block over 16384 octets gets
+  `FRAME_SIZE_ERROR`. The limit is deliberately not tunable: `max_header_list_size` is refused by
+  the `http2` allow-list, which fails safe (`max_headers` and `max_fragmented_header_block_size`
+  stay accepted keys; see the `http2` row).
 - *Management listener (`:50063`), 256.* The only peers that need it are the server's
   replicas, one connection each. Who can hold the other slots depends on how far the
   connection gets. **Before the TLS handshake**, anyone with layer-4 reach to the port can
@@ -1931,7 +1952,7 @@ five that say the request itself was wrong. `INVALID_ARGUMENT`, `NOT_FOUND`,
 `ALREADY_EXISTS`, `FAILED_PRECONDITION` and `OUT_OF_RANGE` are the server answering
 correctly, so they leave the breaker as it is: not a failure, and not a success either
 (they do not reset the run of consecutive failures or close a half-open breaker).
-`PERMISSION_DENIED`, `UNAUTHENTICATED` and `RESOURCE_EXHAUSTED` are counted;
+One more answer is neutral in the same way: the server's uniform refusal of a re-registration that shows no proof of the agent's identity (`--agent-reregistration-proof=enforce`: `UNAUTHENTICATED` with the exact message `re-registration requires proof of the agent identity`). It is one caller's refusal from a healthy server, so refusals of that kind, however many, never open the breaker for the whole gateway and a refused half-open probe leaves it half open. Any other `UNAUTHENTICATED` answer (for example the server's gateway-peer guard refusing this gateway) is still counted. `PERMISSION_DENIED`, other `UNAUTHENTICATED` answers and `RESOURCE_EXHAUSTED` are counted;
 `RESOURCE_EXHAUSTED` because it is the only brake the gateway has until the server sends
 explicit backpressure.
 
@@ -2222,7 +2243,7 @@ What this warning does **not** cover:
 | Hop | State | Notes |
 |---|---|---|
 | gateway → server upstream (`:50055`) | **mutual TLS in `sys.config.prod`; the gateway itself enforces only server verification** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. The gateway refuses to boot on `https` without `verify_peer` and a CA of its own, and on a channel mixing `http` and `https`; it does **not** require a client certificate, so mutual TLS holds only where the endpoint carries `certfile` and `keyfile` and the server demands them (SPKI pin, see [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)). Plaintext `http` boots as the lab/UAT posture. |
-| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `tls => #{certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` in its `grpc_listeners` entry. Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or a UAT/demo `sys.config` (inline in `docker-compose.uat.yml`, mounted as a file by the others); the remaining composes do not run the gateway. Heartbeats and inventory reports are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. Client-initiated TLS renegotiation is refused; a proxy or load balancer that renegotiates toward `:50051` loses its connections (see the `tls` key under "gRPC listeners"). |
+| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `tls => #{certfile, keyfile, cacertfile, verify => verify_peer, fail_if_no_peer_cert => false, witness_client_cert => true}` in its `grpc_listeners` entry (WP01: the listener asks for a client certificate and only witnesses it for the server, see stage 2a under "Moving the agent edge to mutual TLS"; a certificate is still not required, so it is bootstrap-safe). Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or a UAT/demo `sys.config` (inline in `docker-compose.uat.yml`, mounted as a file by the others); the remaining composes do not run the gateway. Heartbeats and inventory reports are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. Client-initiated TLS renegotiation is refused; a proxy or load balancer that renegotiates toward `:50051` loses its connections (see the `tls` key under "gRPC listeners"). |
 | server → gateway mgmt (`:50063`) | **strict mTLS + peer authorization: SPKI pin (#1422) and/or the server identity (#6016)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert` from the `tls` map) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_auth_mode}` choosing what admits the server (an unset key is `pin`; both shipped configs set `identity` with no pin, and `pin` is the explicit mode for certificates without the identity: its SPKI pin from `{yuzu_gw, mgmt_peer_pins}`, the identity URI SAN `yuzu://<install>/server` that the install CA puts on the server's built-in certificate, or either; see [Authorizing the server by its identity](#authorizing-the-server-by-its-identity)) — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs carry no server identity, so set `{mgmt_peer_auth_mode, pin}` and point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one — within `mgmt_pin_refresh_ms` (default 5 s, see "Management-pin refresh"): the `yuzu_gw_mgmt_pins` watcher re-reads the file on its own timer (comparing a SHA-256 of its contents, so a new key of the same size with a preserved mtime is still picked up) and the per-stream check reads its published key, never the file, so a rotated server leaf can be refused for up to one interval (fail closed). The server does not retry a refused command: it fails terminally as `gateway_unauthenticated` and must be submitted again (#5988 tracks a server-side retry). |
 
 TLS is configured in two places: the `tls` map of each `grpc_listeners` entry (the
@@ -2296,7 +2317,8 @@ cp /etc/yuzu/certs/default-ca.pem ./install-ca.pem   # or GET /api/v1/ca/root
 #    the agent-listener one-way TLS (PR5c) — both live in sys.config.prod:
 #      {yuzu_gw,[{upstream_client,#{channels=>[{default_channel,[{https,...,[{certfile,...},...]}],#{}}]}}]}   % upstream mTLS
 #      grpc_listeners agent entry: tls => #{certfile, keyfile, cacertfile,
-#                                   verify=>verify_none, fail_if_no_peer_cert=>false}
+#                                   verify=>verify_peer, fail_if_no_peer_cert=>false,
+#                                   witness_client_cert=>true}
 
 # 2. Distribute install-ca.pem to every agent and have them dial the gateway over
 #    TLS, verifying that CA:
@@ -3324,19 +3346,33 @@ discarded in a state that must not run a handler (`extra_request_data`, `stream_
 
 ### Moving the agent edge to mutual TLS
 
-Agent identity at the gateway is application-layer: the agent listener is **one-way
-TLS**, encrypting the hop and authenticating the gateway to the agent, and a client
-certificate is neither requested nor checked. The move to client certificates has three
-stages. Only the first two exist in code today, and the second enforces nothing.
+Agent identity at the gateway is application-layer: the agent listener encrypts the hop and
+authenticates the gateway to the agent. On a listener with `witness_client_cert` (stage 2a, the
+shipped `sys.config.prod` and reference configs) a client certificate is requested and only
+**witnessed** and forwarded to the server, which verifies it; the gateway itself checks nothing and
+serves peers with no certificate. On a listener without it (stage 1) a certificate is neither
+requested nor checked. The move to client certificates has three stages. Only the first two (with
+2a) exist in code today, and the second enforces nothing.
 
-1. **One-way TLS (today, shipped).** `tls => #{..., verify => verify_none,
-   fail_if_no_peer_cert => false}`. This is the shape in `sys.config.prod`.
+1. **One-way TLS.** `tls => #{..., verify => verify_none,
+   fail_if_no_peer_cert => false}`. The shape of a listener without `witness_client_cert` (stage 2a below adds it).
+2a. **Witness the certificate for the server (shipped, WP01).** `tls => #{..., verify => verify_peer,
+   fail_if_no_peer_cert => false, witness_client_cert => true}`, which is what `sys.config.prod` and the
+   reference configs now carry. The listener asks for a client certificate, accepts whatever the client
+   presents at the TLS layer (so a stale or foreign leaf cannot lock an agent out, which stage 2 below
+   would), and `yuzu_gw_agent_service:register_checked` puts it in `RegisterRequest.gateway_attested_peer_cert_pem`
+   with `gateway_attests_peer_cert => true`, **overwriting** whatever the agent sent. The server decides
+   whether it proves the agent id (chains to its own CA, valid now, an agent leaf, CN equals the id, not
+   revoked) before it re-admits an already-enrolled id; see `docs/pki-architecture.md` "Re-registration
+   proof (WP01)" and [Upgrading](upgrading.md#behaviour-change-re-registering-an-already-enrolled-agent-can-require-proof-of-its-identity-wp01). The gateway enforces nothing itself and a peer with no
+   certificate is still served.
 2. **Request a certificate, enforce nothing (available now, configuration only).**
    `tls => #{..., verify => verify_peer, fail_if_no_peer_cert => false}` asks every client
    for a certificate and still serves agents that have none (an agent that has not
    enrolled yet has none). A handler can see the certificate the client presented
-   (`yuzu_grpc:peer_cert/1` returns its DER, or `undefined`); no shipped handler reads it
-   and nothing refuses a call because of it. A certificate that is presented but invalid
+   (`yuzu_grpc:peer_cert/1` returns its DER, or `undefined`); `yuzu_gw_agent_service:register_checked`
+   reads it only on a listener that sets `witness_client_cert` (stage 2a) and nothing at the
+   gateway refuses a call because of it. A certificate that is presented but invalid
    (expired, wrong CA) still aborts the handshake under `verify_peer`, whatever
    `fail_if_no_peer_cert` says, so an agent with a stale leaf would be locked out: check
    that before using this stage on a fleet.
@@ -3371,12 +3407,67 @@ Supply it at boot from the `YUZU_GW_COOKIE` environment variable:
 export YUZU_GW_COOKIE="$(openssl rand -hex 32)"   # strong, unique per cluster
 ```
 
-If `YUZU_GW_COOKIE` is unset, `vm.args.src` falls back to the historical
-default and the boot guard (`yuzu_gw_app:check_distribution_cookie/0`)
-**refuses to start** — it fails closed, because a known cookie is
-unauthenticated RCE (#659). For local dev/CI where distribution is not
-exposed, override the guard with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`. All nodes
-in a cluster must share the same cookie.
+`vm.args.src` carries **no fallback cookie**. A cookie committed to the
+repository is unauthenticated RCE (#659), and the in-VM boot guard
+(`yuzu_gw_app:check_distribution_cookie/0`) only runs after distribution is
+already listening, so the refusal is made **before the VM starts**. One shell
+policy, `deploy/docker/gateway-cookie-policy.sh` (installed as
+`/opt/yuzu_gw/gateway-cookie-policy.sh`), is shared by both callers: the cookie
+must be 32 to 255 characters from `[A-Za-z0-9._~+=-]`, must not start with `-`
+or `+`, and must not be the published default. (Whitespace, CR/LF, backslash,
+`&` and `$` are refused: busybox and GNU awk disagree on a backslash, so
+replicas would compute different cookies, and a `\&` makes the release start
+script loop forever.)
+
+- The container entrypoint (`deploy/docker/gateway-entrypoint.sh`) exits 1 with
+  the reason when the cookie breaks the policy.
+- The systemd unit refuses the same in an `ExecStartPre`, with **no override**.
+- `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` (single ephemeral dev/CI node only) does not
+  restore a known cookie: when the cookie is empty or *exactly* the published
+  default, the entrypoint substitutes a fresh random per-boot cookie that is never
+  logged. The override replaces nothing else: a custom cookie that is shorter
+  than 32 characters, or that **starts with** the published literal, is refused
+  like any other weak cookie. A real shared cookie that contains the literal
+  elsewhere is kept, so replicas still agree. **N replicas on the override are N singletons that cannot
+  cluster** (each draws its own cookie). A node advertising `127.0.0.1` (the
+  single-node default) also has its distribution listener and EPMD bound to
+  loopback; a node advertising a routable address is protected by the random
+  cookie only.
+- **Tarball / manual installs:** the unit needs `/opt/yuzu_gw/gateway-cookie-policy.sh`.
+  The release tarball ships it (and `yuzu-gateway.service`) inside its single
+  top-level directory `yuzu-gateway-<version>-linux-x64/`, so extract it with
+  `mkdir -p /opt/yuzu_gw && tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/yuzu_gw --strip-components=1`
+  and install the bundled unit to `/etc/systemd/system/` (then `systemctl daemon-reload`)
+  (or copy `deploy/docker/gateway-cookie-policy.sh` from the source tree into
+  `/opt/yuzu_gw/`). If it is missing the unit fails with
+  `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2)
+  and, after the restart limit, `start-limit-hit`.
+- A start that bypasses both (running `bin/yuzu_gw` by hand, the
+  `Dockerfile.gateway.chisel` demo image, which has no entrypoint) boots with
+  OTP's own per-host random `~/.erlang.cookie` (the empty `-setcookie` line that
+  `vm.args.src` leaves when `YUZU_GW_COOKIE` is unset is accepted by the VM, which
+  creates that 20-character file, mode 0400, and uses it; checked against a real
+  release boot and by case V of `tests/shell/test_gateway_entrypoint_cookie.sh`),
+  which the in-VM guard then refuses (too short) unless the override is set. If `$HOME` is unwritable the VM
+  cannot create that file and crash-loops; supply `YUZU_GW_COOKIE`. On these
+  paths there is also no character check: a cookie containing `\&` makes the
+  release script's `replace_os_vars` awk loop forever at 100% CPU with no log, and
+  a backslash is dropped by busybox awk but kept by GNU awk. Keep `YUZU_GW_COOKIE`
+  to `[A-Za-z0-9._~+=-]` there too.
+
+All nodes in a cluster must share the same `YUZU_GW_COOKIE`. A single-node
+deployment sets either a strong cookie, or `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` for
+a throwaway rig.
+
+**Distribution is not encrypted.** Erlang distribution here is plain TCP: the
+cookie authenticates the connection handshake only, it gives no confidentiality
+or per-message integrity. Cross-node command traffic (including plugin
+parameters) therefore must only cross a network you trust. Keep EPMD and the
+distribution range on a dedicated cluster network and firewalled to the other
+gateway nodes. There is no encryption and the cluster network must be trusted and
+firewalled; TLS distribution (`-proto_dist inet_tls`) is not shipped and is
+tracked as #8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). Do not run
+a multi-node gateway cluster across an untrusted network.
 
 The same guard also **refuses a cookie shorter than 32 characters** (HA WS-4
 `#4555`): DNS-based cluster discovery means a node dials addresses it did not
@@ -3384,8 +3475,15 @@ choose by hand, and the distribution handshake's initiator sends the cookie
 hash first — a short cookie is brute-forceable offline from a
 legitimately-dialing node, a materially different exposure than a hand-typed
 static seed list carried. `openssl rand -hex 32` above already clears this
-floor with room to spare; the same `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override
-bypasses the length check too.
+floor with room to spare. The in-VM guard
+(`yuzu_gw_app:evaluate_cookie`) under `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` tolerates
+an **empty, short, exactly-default or literal-containing** cookie on an
+entrypoint-less start (`docker run --entrypoint`, a hand-run `bin/yuzu_gw`, the
+chisel image). The container entrypoint is stricter, and the systemd unit has no
+override: the entrypoint replaces only an empty or exactly-default cookie and
+refuses a short cookie or one that starts with the literal even with the
+override. A unit test pins the in-VM tolerance, so changing it is a visible
+decision.
 
 **Firewall ports for multi-node clustering (HA WS-4 `#4555`).** Alongside
 EPMD (TCP 4369, above), a clustered gateway also needs the Erlang
@@ -3408,8 +3506,9 @@ network is still the first line of defense.
 > at 0 is the signal to check for this. AAAA support is tracked as a
 > follow-up.
 
-> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It disables the
-> boot guard and restores the unauthenticated inter-node RPC surface (#659); it
+> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It lets a node
+> start without an operator-supplied cookie (a random per-boot one is used by the
+> entrypoint; the in-VM guard only warns for a start that bypasses the entrypoint); it
 > exists only for ephemeral dev/CI stacks (where it appears in the UAT compose
 > files). On `.deb`/`.rpm` installs the cookie is auto-generated into
 > `/etc/yuzu/gateway.env`. **Rotate** it by writing a new value there — and to
@@ -5383,8 +5482,8 @@ This starts the gateway with all applications loaded, useful for debugging.
 
 | Dependency | Version | Purpose |
 |---|---|---|
-| cowboy / ranch | 2.19.0 / 2.3.0 | HTTP/2 server and listener behind the gateway's own gRPC layer (`yuzu_grpc*`) |
-| gun | 2.5.0 | HTTP/2 client behind the upstream gRPC client (`yuzu_grpc_client`); needs cowlib, which cowboy brings too |
+| cowboy / cowlib / ranch | 2.21.0 / 2.22.0 / 2.3.0 | HTTP/2 server and listener behind the gateway's own gRPC layer (`yuzu_grpc*`) |
+| gun | 2.8.0 | HTTP/2 client behind the upstream gRPC client (`yuzu_grpc_client`); needs cowlib 2.22.0 or later (pinned explicitly so the lock cannot resolve a cowlib below 2.22.0) |
 | ctx | 0.6.0 | The request-context type of the gRPC layer |
 | gpb | 4.21.7 | Protobuf compiler and runtime |
 | telemetry | 1.3.0 | Metrics event API |

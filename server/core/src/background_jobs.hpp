@@ -94,7 +94,7 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (54 passes). Verified against the source sweep
+/// The exhaustive inventory (55 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
@@ -107,7 +107,7 @@ struct BackgroundJobDecl {
 /// `software_inventory_store.run_retention_prune_changes`, the SAM-17 addition of
 /// `software_catalog_rollup.refresh_component_rollup`, the SAM-33 addition of
 /// `software_catalog_rollup.refresh_fleet_snapshot`, and the collation-version recheck
-/// `pg_collation_recheck.tick`); keep the count
+/// `pg_collation_recheck.tick`, and the WP01 addition of `reregistration_audit.flush_summary`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -237,7 +237,7 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "effectively-once holds via the stable command_id + agent dedup, but the leader gate keeps a "
      "second replica from redundantly re-driving"},
 
-    // ---- quarantine_reconcile_thread_ (20s tick) ----
+    // ---- quarantine_reconcile_thread_ (1 s heartbeat drain and 20 s tick, one job class) ----
     {"quarantine_reconciler.tick", "quarantine_reconcile_thread_",
      BackgroundJobClass::FencedLeaderOnly,
      "side-effecting containment re-dispatch (WS-3 3.2; confirm WS-4/5 stream-locality "
@@ -276,6 +276,14 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "per-replica in-memory (#5513): bounded erase of stale per-agent heartbeat-reconcile claims "
      "in THIS replica's gate; steady_clock cutoff over no store, no shared state, never "
      "leader-gated"},
+
+    // ---- reregistration_flush_thread_ (5s tick, its own thread so a slow audit store cannot delay
+    // the revocation sweep on health_recompute_thread_) ----
+    {"reregistration_audit.flush_summary", "reregistration_flush_thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "per-replica in-memory (WP01): writes THIS replica's closed-window dropped-audit-row summary "
+     "chunks from its own budget to the audit log; no shared state, so never leader-gated (a "
+     "gated flush would lose every non-leader replica's evidence)"},
 
     // ---- engine_rotation_sweep_thread_ (60s tick) ----
     {"api_token_store.sweep_expired_rotations", "engine_rotation_sweep_thread_",

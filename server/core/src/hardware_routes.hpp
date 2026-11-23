@@ -35,6 +35,7 @@
 #include "audited_write.hpp"         // WriteGate (same-site gate for the sync POSTs)
 #include "software_sync_decision.hpp" // software_sync::{Selector, Resolved, DispatchResult}
 #include "software_sync_runner.hpp"   // software_sync::Runner (the shared fleet-run sequence)
+#include "software_sync_status.hpp"   // software_sync::{StatusReadFn, UnfilteredFn, sync_status}
 
 #include <atomic>
 #include <cstdint>
@@ -325,11 +326,11 @@ public:
                                           const std::string& operation)>;
     /// One tracker row by id for `GET /api/v1/hardware/sync/{execution_id}`: `unexpected` = the read
     /// degraded (the route answers a retryable 503); an empty optional = no such execution.
-    using SyncStatusFn = std::function<std::expected<std::optional<Execution>, std::string>(
-        const std::string& execution_id)>;
+    /// The MCP tool `get_software_sync_status` reads through the same two types.
+    using SyncStatusFn = software_sync::StatusReadFn;
     /// Does the session hold an unfiltered Execution:Execute (it may read any sync run, not only
     /// its own)? Empty answers no.
-    using SyncUnfilteredFn = std::function<bool(const auth::Session&)>;
+    using SyncUnfilteredFn = software_sync::UnfilteredFn;
     struct Deps {
         AuthFn auth_fn;
         ScopedPermFn scoped_perm_fn;

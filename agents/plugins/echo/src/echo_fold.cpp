@@ -258,7 +258,7 @@ std::expected<void, std::string> EchoFold::install_fold_schema(EchoDatabase& db)
         // EXISTS would then silently do nothing: drop the legacy table first. An empty
         // one is dropped; one that holds rows refuses the install, so it destroys no data.
         for (const auto& name : fold_view_names()) {
-            StmtPtr st = prep(h, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?");
+            StmtPtr st = prep(h, "SELECT type FROM sqlite_master WHERE type IN ('table','view') AND name = ? COLLATE NOCASE");
             if (!st)
                 return std::unexpected(h.error());
             bind_text(st.get(), 1, name);
@@ -267,9 +267,21 @@ std::expected<void, std::string> EchoFold::install_fold_schema(EchoDatabase& db)
                 fail_sql(h, "schema probe failed");
                 return std::unexpected(h.error());
             }
-            st.reset(); // finalize the probe first: DROP TABLE needs the table unlocked
-            if (rc != SQLITE_ROW)
+            if (rc != SQLITE_ROW) {
+                st.reset();
                 continue;
+            }
+            const bool is_view = std::string_view(
+                                     reinterpret_cast<const char*>(sqlite3_column_text(st.get(), 0))) ==
+                                 "view";
+            st.reset(); // finalize the probe first: DROP needs the object unlocked
+            if (is_view) {
+                // A foreign view of this name would make CREATE VIEW IF NOT EXISTS a no-op;
+                // drop it so the DDL below recreates the current definition.
+                if (!h.exec("DROP VIEW " + name))
+                    return std::unexpected(h.error());
+                continue;
+            }
             st = prep(h, "SELECT count(*) FROM " + name);
             if (!st || sqlite3_step(st.get()) != SQLITE_ROW) {
                 if (st)
@@ -428,6 +440,11 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
         }
         int64_t seq = sqlite3_column_int64(max_seq.get(), 0);
         sqlite3_reset(max_seq.get()); // no read cursor left open across the writes below
+        // seq + 1 is bound per row: refuse before any insert rather than wrap the ring.
+        if (seq > std::numeric_limits<int64_t>::max() - static_cast<int64_t>(kept.size())) {
+            h.fail("replay ring: sequence would overflow");
+            return std::unexpected(h.error());
+        }
 
         TierAccumulator acc(*def);
         for (const KeyedContribution* c : kept) {
@@ -518,9 +535,13 @@ EchoFold::fold_cursor_rows(EchoDatabase& db, std::string_view source,
 }
 
 std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
-                                                             Clock::time_point deadline) {
+                                                             Clock::time_point deadline,
+                                                             const std::function<bool()>& cancelled) {
     std::lock_guard lock(op_mu_);
     GcResult out;
+    const auto expired = [this, deadline, &cancelled] {
+        return now() >= deadline || (cancelled && cancelled());
+    };
     // Run `sqls` in ONE transaction under the pass deadline. The RETURNING rows they
     // produced, or nullopt when the deadline fired (that transaction rolled back).
     const auto timed = [&](std::initializer_list<std::string> sqls)
@@ -528,7 +549,7 @@ std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
         int64_t rows = 0;
         bool hit = false;
         const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
-            ScopedProgressHandler guard(h.raw(), [this, deadline] { return now() >= deadline; });
+            ScopedProgressHandler guard(h.raw(), expired);
             for (const auto& sql : sqls) {
                 // A prepare can be interrupted too (it may re-load the schema after a VACUUM).
                 const StmtPtr st = prep(h, sql);
@@ -550,7 +571,7 @@ std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
 
     // Cooperative: checked before each batch starts and by the progress handler inside a statement
     // (the batch rolls back). Not mutex acquisition, BEGIN IMMEDIATE's busy wait or COMMIT I/O.
-    if (now() >= deadline) {
+    if (expired()) {
         out.deadline_hit = true;
         return out;
     }
@@ -580,7 +601,7 @@ std::expected<GcResult, std::string> EchoFold::gc_dictionary(EchoDatabase& db,
     const std::string del_orphan =
         std::format("DELETE FROM temp.{} WHERE id IN ({})", kGcOrphanTable, batch);
     for (;;) {
-        if (now() >= deadline) {
+        if (expired()) {
             out.deadline_hit = true;
             break;
         }

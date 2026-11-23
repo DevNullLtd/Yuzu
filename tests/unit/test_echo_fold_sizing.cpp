@@ -221,7 +221,7 @@ Sizes measure(const FoldSourceDef& def) {
 
 } // namespace
 
-TEST_CASE("roll-up size: bytes per row stay under the pinned ceilings, for every fold source",
+TEST_CASE("roll-up size: bytes per row stay under the pinned ceilings; for every fold source",
           "[echo][fold][fold_sizing]") {
     // Ceilings, bytes per row (table + unique index, all tiers). process, tcp, module, registry and
     // perf have round ceilings fixed up front. The rest are the figure measured at 100,000 keys x 1.25 rounded

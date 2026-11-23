@@ -176,3 +176,47 @@ TEST_CASE("filesystem plugin: replace persists through the shared atomic write",
     CHECK((st.st_mode & 0777) == (0666 & ~u));
 #endif
 }
+
+// F9 (CWE-674): operator-pattern regex runs only on bounded subjects. An over-cap line is a typed
+// `skipped|` row and a regex replace over an over-cap file is refused, never handed to the
+// recursive libstdc++ executor (a long subject overflows the worker stack, uncatchable).
+TEST_CASE("filesystem plugin: regex search and replace refuse an over-cap subject",
+          "[agent][filesystem_plugin][regex_bound]") {
+    auto path = find_filesystem_plugin();
+    if (path.empty()) {
+        require_plugin_or_skip();
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(path);
+    REQUIRE(handle.has_value());
+
+    yuzu::test::TempDir dir{"yuzu_test_fs_rx_"};
+    fs::create_directories(dir.path);
+    const auto file = dir.path / "big.txt";
+    {
+        std::ofstream f(file, std::ios::binary);
+        f << "xay aax\n" << std::string(200 * 1024, 'a') << "\nlast aaa\n";
+    }
+    const std::string path_str = file.string();
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    {
+        const std::array<YuzuParam, 3> params{
+            {{"path", path_str.c_str()}, {"pattern", "a.*a"}, {"regex", "true"}}};
+        auto r = dispatcher.run(handle->descriptor(), "search", params);
+        CHECK(r.rc == 0);
+        CHECK(r.captured.find("skipped|2|") != std::string::npos);
+        CHECK(r.captured.find("match|1|xay aax") != std::string::npos);
+        CHECK(r.captured.find("match|3|last aaa") != std::string::npos);
+    }
+    {
+        const std::array<YuzuParam, 4> params{{{"path", path_str.c_str()},
+                                               {"search", "a+"},
+                                               {"replacement", "b"},
+                                               {"regex", "true"}}};
+        auto r = dispatcher.run(handle->descriptor(), "replace", params);
+        CHECK(r.rc == 1);
+        CHECK(r.captured.find("regex replace refused") != std::string::npos);
+        CHECK(read_all(file).size() > 200 * 1024); // file untouched
+    }
+}

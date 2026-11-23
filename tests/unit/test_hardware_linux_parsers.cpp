@@ -15,6 +15,7 @@
  */
 
 #include "hardware_linux_parsers.hpp"
+#include "sync_source_device_ci.hpp" // build_device_ci_record: the reader of these rows (#7040)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -77,6 +78,48 @@ Memory Device
     REQUIRE(rows.size() == 2);
     CHECK(rows[0] == "dimm|ChannelA-DIMM0|16384|DDR4|3200|-|-|-");
     CHECK(rows[1] == "dimm|ChannelB-DIMM0|16384|DDR4|3200|-|-|-");
+}
+
+TEST_CASE("parse_dmidecode_memory: a pipe in the locator is escaped and shifts no column (#7040)",
+          "[hardware][linux][memory]") {
+    static constexpr const char* kDmi = R"(Handle 0x0024, DMI type 17, 40 bytes
+Memory Device
+	Locator: Bank|0 DIMM
+	Size: 8192 MB
+	Type: DDR|4
+	Speed: 26|66 MT/s
+)";
+    auto rows = parse_dmidecode_memory(kDmi);
+    REQUIRE(rows.size() == 1);
+    // slot, type and speed are all firmware text, so each is escaped
+    CHECK(rows[0] == "dimm|Bank\\|0 DIMM|8192|DDR\\|4|26\\|66|-|-|-");
+}
+
+TEST_CASE("parse_dmidecode_memory: a locator with a pipe still adds up in the device-CI RAM total "
+          "(writer and reader agree) (#7040)",
+          "[hardware][linux][memory][device_ci]") {
+    static constexpr const char* kDmi = R"(Handle 0x0024, DMI type 17, 40 bytes
+Memory Device
+	Locator: Bank|0 DIMM
+	Size: 8192 MB
+	Type: DDR4
+	Speed: 3200 MT/s
+
+Handle 0x0026, DMI type 17, 40 bytes
+Memory Device
+	Locator: ChannelB-DIMM0
+	Size: 8192 MB
+	Type: DDR4
+	Speed: 3200 MT/s
+)";
+    std::string memory;
+    for (const auto& row : parse_dmidecode_memory(kDmi))
+        memory += row + "\n";
+    yuzu::agent::CiPluginOutputs o;
+    o.memory = memory;
+    // both DIMMs counted: the pipe in the first locator shifted no column
+    CHECK(yuzu::agent::build_device_ci_record(o).ram_bytes ==
+          std::to_string(16384LL * 1024 * 1024));
 }
 
 TEST_CASE("parse_dmidecode_memory: empty slot ('No Module Installed') is skipped",

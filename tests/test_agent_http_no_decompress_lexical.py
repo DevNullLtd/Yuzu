@@ -32,11 +32,39 @@ REQ = r"(?:Get|Post|Put|Patch|Delete|Head|Options|send|Send|open_stream)"
 
 
 def blank(text):
-    def keep_nl(m):
-        return re.sub(r"[^\n]", " ", m.group(0))
-    text = re.sub(r"/\*.*?\*/", keep_nl, text, flags=re.S)
-    text = re.sub(r"//[^\n]*", keep_nl, text)
-    return re.sub(r'"(?:\\.|[^"\\\n])*"', keep_nl, text)
+    """Blank comments and string/char literals in ONE left-to-right pass (offsets and newlines kept).
+
+    A single pass is required: separate regexes for comments then strings let a `//` inside a
+    string (`"http://x"`) swallow the rest of the line, and a quote inside a comment open a string.
+    """
+    out, i, n = [], 0, len(text)
+
+    def blank_span(a, b):
+        out.append(re.sub(r"[^\n]", " ", text[a:b]))
+
+    while i < n:
+        c = text[i]
+        if c == "/" and text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank_span(i, j)
+            i = j
+        elif c == "/" and text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank_span(i, j)
+            i = j
+        elif c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            j = min(j + 1, n) if j < n and text[j] == c else j
+            blank_span(i, j)
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def sources():
@@ -123,6 +151,60 @@ def problems(srcs):
     return found
 
 
+# --- `get` wiring pin -------------------------------------------------------------------------
+# The pure decision (http_client_get_output.hpp) is unit-tested, but nothing executes do_get (the
+# SSRF filter refuses loopback), so a do_get that stopped consulting it would stay green. Pin the
+# shape lexically: http_get collects EVERY Content-Encoding line (equal_range) in the response
+# handler, and do_get applies encoding_refusal_row to what it collected BEFORE its first `body|`.
+PLUGIN = "agents/plugins/http_client/src/http_client_plugin.cpp"
+
+
+def func_body(text, signature_rx):
+    m = re.search(signature_rx, text)
+    if not m:
+        return None
+    i = text.index("{", m.end())
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
+    return None
+
+
+def wiring_problems(raw):
+    t = blank(raw)
+    out = []
+    hg = func_body(t, r"std::string\s+http_get\s*\(")
+    if hg is None:
+        return ["http_get not found"]
+    rawhg = func_body(raw, r"std::string\s+http_get\s*\(") or ""
+    if not re.search(r'equal_range\s*\(\s*"Content-Encoding"\s*\)', rawhg):
+        out.append("http_get must read every Content-Encoding line with equal_range")
+    dg = func_body(t, r"int\s+do_get\s*\(")
+    if dg is None:
+        return out + ["do_get not found"]
+    refuse = dg.find("encoding_refusal_row")
+    if refuse < 0:
+        out.append("do_get does not call encoding_refusal_row")
+    if "http_get(" not in dg or "content_encodings" not in dg:
+        out.append("do_get must pass the collected content_encodings from http_get to the refusal")
+    # `body|` is a string literal, so it is blank in `t`; find it in the raw text of do_get.
+    rawdg = func_body(raw, r"int\s+do_get\s*\(") or ""
+    body_at = rawdg.find('"body|')
+    ref_raw = rawdg.find("encoding_refusal_row")
+    if body_at < 0:
+        out.append("do_get no longer writes a body| row: pin is stale")
+    elif ref_raw < 0 or ref_raw > body_at:
+        out.append("do_get writes body| before applying encoding_refusal_row")
+    if len(re.findall(r'"body\|', rawdg)) != 1:
+        out.append("do_get must write the body through exactly one body| site")
+    return out
+
+
 class NoDecompress(unittest.TestCase):
     def test_every_client_disables_decompression(self):
         self.assertEqual(problems(sources()), [])
@@ -139,7 +221,9 @@ class NoDecompress(unittest.TestCase):
                 p = [v2 for v2, pr, _ in check(mutated) if pr]
                 self.assertIn(var, p, (name, var, idx))
                 hit += 1
-        self.assertGreater(hit, 11)
+        # 8 construction sites at the time of writing (http_client's run_pinned folds its legs into
+        # two); a drop below that means the discovery regex stopped seeing sites, not that sites went.
+        self.assertGreaterEqual(hit, 8)
 
     def test_selftest_blind_spot_shapes(self):
         bad = {
@@ -158,6 +242,30 @@ class NoDecompress(unittest.TestCase):
         good = ("void f(){ if(a){ httplib::SSLClient c(h); c.set_decompress(false); c.Get(p);}"
                 " else { httplib::Client c(h); c.set_decompress(false); c.Get(p);} }")
         self.assertEqual(problems({"ok": good}), [])
+
+    def test_get_wiring(self):
+        raw = (ROOT / PLUGIN).read_text(encoding="utf-8")
+        self.assertEqual(wiring_problems(raw), [])
+
+    def test_selftest_wiring_mutations_are_caught(self):
+        raw = (ROOT / PLUGIN).read_text(encoding="utf-8")
+        muts = {
+            "refusal call deleted": raw.replace("encoding_refusal_row(content_encodings)", "std::string{}", 1),
+            "only first header": raw.replace("equal_range(", "find_first_of(", 1),
+            "body before refusal": raw.replace("ctx.write_output(std::format(\"status|{}\", status));\n        // The client",
+                                               "ctx.write_output(std::format(\"status|{}\", status));\n        ctx.write_output(\"body|x\");\n        // The client", 1),
+        }
+        for name, m in muts.items():
+            self.assertNotEqual(m, raw, name + ": mutation did not apply")
+            self.assertTrue(wiring_problems(m), name)
+
+    def test_blank_single_pass(self):
+        # a `//` inside a string must not hide the rest of the line; a quote in a comment opens nothing
+        t = blank('x = "http://a"; httplib::Client c(h); // it\'s "q"\nY')
+        self.assertIn("httplib::Client c(h)", t)
+        self.assertNotIn("http:", t)
+        self.assertTrue(t.endswith("\nY"))
+        self.assertEqual(len(t), len('x = "http://a"; httplib::Client c(h); // it\'s "q"\nY'))
 
 
 if __name__ == "__main__":

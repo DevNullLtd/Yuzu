@@ -288,6 +288,7 @@ struct RegistryReader {
        read_offline_hive;
     std::function<std::int64_t()> now_ts;                  // FILETIME, the ETW header's clock
     std::function<bool()> etw_running;         // the write-event session is delivering
+    std::function<unsigned long()> etw_start_error; // Win32 code the last start() ended with; 0 = started or never tried; may be null
     std::function<SessionLoss()> session_loss; // the session's own loss counters
     std::function<int()> current_control_set; // HKLM\SYSTEM\Select\Current, 0 unknown
     std::function<void(const std::vector<std::string>&)> watch_roots; // (re)arm the key watch
@@ -333,6 +334,12 @@ private:
     bool force_all_{false};   // first tick after a restart reads every root
     std::int64_t events_since_{0}; // the buffer holds nothing from before this instant (0 = n/a)
     bool was_disabled_{false};
+
+    // `now` of the first tick whose commit failed since the last commit, in the reader's
+    // clock. The next collect that commits records the window as one `commit_stalled` gap row
+    // in the same atomic commit, then clears it. In memory only: a restart during the failure
+    // loses it (the restart gap row is then the only record).
+    std::optional<std::int64_t> commit_failing_since_;
 
     std::vector<std::string> armed_roots_;
     // The last profile discovery was incomplete (warn once per transition).

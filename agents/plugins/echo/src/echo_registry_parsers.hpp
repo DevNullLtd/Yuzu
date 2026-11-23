@@ -82,6 +82,7 @@
 
 #include <nlohmann/json.hpp>
 #include <sha256.hpp>
+#include <list_walk.hpp>          // ListStep, ListWalk, walk_enumeration
 #include <user_profile_model.hpp> // yuzu::profiles::reg_type_name
 
 #include <algorithm>
@@ -209,7 +210,28 @@ struct HiveSweepResult {
     // the unload was refused or failed (a holder has it open, it was already gone, or the
     // privilege was not held)
     std::vector<std::string> retained;
+    // Non-empty when the HKEY_USERS listing failed or never settled (the cause, from the shared
+    // listing's `error`): the sweep could not tell which mounts are stale, nothing was offered to
+    // `unload`, and the sweep is NOT a statement that none are left.
+    std::string listing_error;
 };
+
+/// What a COMPLETED sweep means for the start-up sweep's pending flag. A sweep that could not
+/// list HKEY_USERS stays pending for exactly ONE retry (`retried`, owned by the caller), then
+/// completes with a warning: a listing that fails deterministically is not retried every tick.
+struct SweepSettle {
+    bool pending;
+    bool warn;
+};
+[[nodiscard]] inline SweepSettle settle_sweep(const HiveSweepResult& r, bool& retried) {
+    if (r.listing_error.empty())
+        return {false, false};
+    if (!retried) {
+        retried = true;
+        return {true, false};
+    }
+    return {false, true};
+}
 
 /// Offers every name to `unload` (true = the mount is gone), in order. A refusal is recorded and
 /// the rest are still attempted, so one held hive never keeps another leaked mount loaded.
@@ -640,16 +662,23 @@ struct RegistryValueRead {
 /// Every visited key is present, with an empty map when it holds no values, so a
 /// vanished key is distinguishable from a key that never had values.
 ///
-/// `skipped` names the child keys the reader was denied access to (full paths, at
-/// most kSkippedCap; one more makes the read Capped). They are absent from `keys`,
-/// and the diff keeps whatever the baseline holds at or under them rather than
-/// reading their absence as a deletion. A denied child therefore never blinds the
-/// rest of its root. `Unreadable` means the root, or any key beneath it other than an
-/// access-denied child, could not be read.
+/// `skipped` names the child keys the reader did not read (full paths, at most kSkippedCap):
+/// those it was denied access to, and those whose name holds U+0000, which are never opened. They
+/// are absent from `keys`, and the diff keeps whatever the baseline holds at or under them rather
+/// than reading their absence as a deletion. A skipped child therefore never blinds the rest of
+/// its root. `Unreadable` means the root, or any key beneath it other than an access-denied
+/// child, could not be read.
+///
+/// `skipped_overflow` counts the children skipped past kSkippedCap: the walk reads on (a 33rd
+/// child is counted, not a stop; every later sibling is read, so adds and changes land) but
+/// cannot name them. A read that has any ends Capped and derives no removal (an unnamed child's
+/// baseline cannot be protected by name). Key and value maps are case-exact: two names
+/// differing only in case are two names.
 struct SubtreeRead {
     RegistryReadStatus status{RegistryReadStatus::Unreadable};
     std::map<std::string, std::map<std::string, RegistryValueRead>> keys;
     std::vector<std::string> skipped;
+    std::size_t skipped_overflow{0};
     /// Empty for an ordinary read. An Unreadable read can name its cause, which the gap row
     /// quotes: an offline read that could not mount its hive carries the refusal
     /// (`offline:<token>`), and a live read whose whole hive was unloaded under it carries
@@ -692,6 +721,12 @@ struct OfflineHiveRead {
 class RegistryReadBudget {
 public:
     [[nodiscard]] bool admit_key() { return ++keys_ <= kBaselineKeyCap; }
+    /// One key charged against the key budget and the deadline (`now` and `deadline` are
+    /// FILETIME 100 ns). The reader charges every key it visits AND every child it skips through
+    /// this, so a key with a very large number of unopenable children cannot loop unchecked.
+    [[nodiscard]] bool admit_key_by(std::int64_t now, std::int64_t deadline) {
+        return admit_key() && now < deadline;
+    }
     [[nodiscard]] bool admit_value(std::size_t bytes) {
         bytes_ += bytes;
         return ++values_ <= kBaselineValueCap && bytes_ <= kBaselineBytesCap;
@@ -701,6 +736,60 @@ public:
 private:
     std::size_t keys_{0}, values_{0}, bytes_{0};
 };
+
+/// The one identity encoding for a registry value or key name, injective: two different names
+/// never share a string. Valid UTF-16 is the same UTF-8 the lossy conversion wrote, except that
+/// a literal U+FFFD is written twice; a lone surrogate is written as U+FFFD followed by its four
+/// upper-case hex digits (U+D800 -> U+FFFD "D800"). Read left to right a U+FFFD is followed
+/// either by a second U+FFFD (a literal one) or by four hex digits starting with `D` (a lone
+/// surrogate), so the output decodes one way only. A backslash escape would have to escape its
+/// own introducer, and value names routinely contain backslashes. U+0000 is kept as a NUL byte.
+[[nodiscard]] inline std::string registry_name_utf8(std::u16string_view w) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    const auto put = [](std::string& o, char32_t cp) {
+        if (cp < 0x80) {
+            o += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            o += static_cast<char>(0xC0 | (cp >> 6));
+            o += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            o += static_cast<char>(0xE0 | (cp >> 12));
+            o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            o += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            o += static_cast<char>(0xF0 | (cp >> 18));
+            o += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            o += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            o += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    };
+    std::string out;
+    out.reserve(w.size());
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        const char16_t c = w[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < w.size() && w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF) {
+            put(out, 0x10000 + ((static_cast<char32_t>(c) - 0xD800) << 10) + (w[i + 1] - 0xDC00));
+            ++i;
+        } else if (c >= 0xD800 && c <= 0xDFFF) { // lone surrogate
+            put(out, 0xFFFD);
+            for (int shift = 12; shift >= 0; shift -= 4)
+                out += kHex[(c >> shift) & 0xF];
+        } else if (c == 0xFFFD) { // literal replacement character: doubled
+            put(out, 0xFFFD);
+            put(out, 0xFFFD);
+        } else {
+            put(out, c);
+        }
+    }
+    return out;
+}
+
+/// Records `v` under `name` unless the key already holds that name: the first entry is kept and
+/// false is returned, so the caller marks the read partial instead of overwriting.
+template <class Map, class V>
+[[nodiscard]] bool record_registry_name(Map& m, std::string name, V&& v) {
+    return m.try_emplace(std::move(name), std::forward<V>(v)).second;
+}
 
 /// What the baseline remembers about a value: type, full stored size, a hash of
 /// every byte read (R8: a change anywhere in the value shows), `d` (a rendered prefix of the
@@ -734,6 +823,9 @@ struct BaselineEntry {
     return e;
 }
 
+/// Key and value names are case-exact identities: two names that differ only in case are two
+/// entries, and a case-only rename reads as one removed and one added row. That is accepted
+/// behaviour (no case folding).
 struct RegistryBaseline {
     std::map<std::string, std::map<std::string, BaselineEntry>> keys;
     bool operator==(const RegistryBaseline&) const = default;
@@ -877,9 +969,9 @@ struct DiffResult {
 }
 
 /// Diffs a read against a root's baseline. Removals are derived ONLY from a
-/// Complete or Absent read (a partial read cannot prove anything is gone) and
-/// never for a key at or under one of `read.skipped`, whose baseline is kept as
-/// it was; Unreadable changes nothing; Capped adds/updates what it visited and
+/// Complete or Absent read with no unnamed skipped child (a partial read cannot prove
+/// anything is gone) and never for a key at or under one of `read.skipped`, whose baseline
+/// is kept as it was; Unreadable changes nothing; Capped adds/updates what it visited and
 /// retains the rest. `suppress` returns the new baseline with no candidates (the
 /// first read of a root). Every candidate carries its `root` and `window`.
 [[nodiscard]] inline DiffResult diff_registry_snapshot(const RegistryBaseline& base,
@@ -894,8 +986,11 @@ struct DiffResult {
         r.baseline = base;
         return r;
     }
-    const bool authoritative =
-       read.status == RegistryReadStatus::Complete || read.status == RegistryReadStatus::Absent;
+    // An unnamed skipped child (skipped_overflow) protects nothing by name, so such a read proves
+    // no deletion whatever its status says: the guard sits here, where removals are derived.
+    const bool authoritative = (read.status == RegistryReadStatus::Complete ||
+                                read.status == RegistryReadStatus::Absent) &&
+                               read.skipped_overflow == 0;
     r.baseline = authoritative ? RegistryBaseline{} : base;
 
     auto make = [&](const std::string& key, const std::string& value, const char* action) {
@@ -1314,6 +1409,12 @@ struct RegistryRootState {
     // deferred keeps status "unreadable" (one gap row per transition) and is still retried
     // next tick.
     bool deferred{false};
+    // The children the last Capped read skipped past kSkippedCap and could not name
+    // (SubtreeRead::skipped_overflow). An increase is a gain, like a new name in `skipped`, so the
+    // gap row says the blind area grew. A Capped read raises it and never lowers it; any other
+    // read sets it (0 by construction). Optional on decode and written only when set, so every
+    // existing cursor row stays byte-identical.
+    std::size_t skipped_overflow{0};
     bool operator==(const RegistryRootState&) const = default;
 };
 
@@ -1455,6 +1556,7 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
             st.armed = r.at("armed").get<bool>();
             st.skipped = r.value("skipped", std::vector<std::string>{});
             st.deferred = r.value("deferred", false);
+            st.skipped_overflow = r.value("skipped_overflow", std::size_t{0});
             cur.roots.emplace(name, std::move(st));
         }
         // Optional: a cursor written before held/loss existed has neither, and holds no
@@ -1496,6 +1598,8 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
                        {"skipped", st.skipped}};
         if (st.deferred)
             roots[name]["deferred"] = true; // optional on decode: only written when set
+        if (st.skipped_overflow > 0)
+            roots[name]["skipped_overflow"] = st.skipped_overflow; // likewise
     }
     j["roots"] = std::move(roots);
     auto held = nlohmann::json::array();
@@ -1595,40 +1699,11 @@ struct DecodedBaseline {
 }
 
 // ── Walking an index-driven OS list (RegEnumKeyExW and its kin) ─────────────────────
+// The walk decision lives in agents/shared/list_walk.hpp (one copy, shared with the HKEY_USERS
+// listing in win_profiles.hpp); Echo uses it under its own names.
 
-/// What an index-driven enumerator answers for one index.
-enum class ListStep { Item, End, Error };
-
-/// The result of walking such a list. `error` is empty exactly when the walk ended at the
-/// list's end. A walk that ended on an error is a FAILED READ, never a short list: `names` is
-/// then empty, so a partial list cannot be mistaken for a complete one.
-struct ListWalk {
-    std::vector<std::string> names;
-    std::string error; // "index <i> (<the detail the step supplied>)" when the walk failed
-};
-
-/// Walk `step(i, name, err)` from index 0: it fills `name` and answers Item, answers End at
-/// the end of the list, or fills `err` and answers Error. Only End completes a walk. (An
-/// index-driven walk can still skip a hive that loads or unloads while it runs, with no
-/// error code; the next name-watch or hourly pass lists it.)
-template <class Step>
-[[nodiscard]] ListWalk walk_enumeration(Step&& step) {
-    ListWalk walk;
-    for (unsigned i = 0;; ++i) {
-        std::string name;
-        std::string err;
-        switch (step(i, name, err)) {
-        case ListStep::Item:
-            walk.names.push_back(std::move(name));
-            break;
-        case ListStep::End:
-            return walk;
-        case ListStep::Error:
-            walk.names.clear();
-            walk.error = "index " + std::to_string(i) + " (" + err + ")";
-            return walk;
-        }
-    }
-}
+using yuzu::shared::ListStep;
+using yuzu::shared::ListWalk;
+using yuzu::shared::walk_enumeration;
 
 } // namespace yuzu::echo

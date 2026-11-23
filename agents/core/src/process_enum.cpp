@@ -205,6 +205,11 @@ void parse_proc_status(std::istream& in, ProcessInfo& pi) noexcept {
                 const auto pos = line.find_first_not_of(" \t", 5);
                 if (pos != std::string::npos)
                     pi.name = line.substr(pos);
+                // F16: the name is attacker-chosen bytes (prctl(PR_SET_NAME), the
+                // exe file name; the kernel escapes only '\n' and '\\'). Scrub to
+                // well-formed UTF-8 at collection so no downstream JSON/proto
+                // serialiser can be made to throw on it.
+                yuzu::shared::scrub_wire_bytes(pi.name);
                 got_name = true;
             } else if (!got_ppid && line.starts_with("PPid:")) {
                 if (const auto ppid = status_u32(line, 5))
@@ -318,6 +323,7 @@ std::vector<ProcessInfo> enumerate_processes() {
                 // Trim trailing space
                 while (!raw.empty() && raw.back() == ' ')
                     raw.pop_back();
+                yuzu::shared::scrub_wire_bytes(raw); // F16: argv bytes are process-controlled
                 pi.cmdline = std::move(raw);
             }
         }
@@ -373,6 +379,7 @@ std::vector<ProcessInfo> enumerate_processes() {
         pi.pid = static_cast<uint32_t>(kprocs[i].kp_proc.p_pid);
         pi.ppid = static_cast<uint32_t>(kprocs[i].kp_eproc.e_ppid);
         pi.name = kprocs[i].kp_proc.p_comm;
+        yuzu::shared::scrub_wire_bytes(pi.name); // F16
 
         // User from credential UID
         uid_t uid = kprocs[i].kp_eproc.e_ucred.cr_uid;

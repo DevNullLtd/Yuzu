@@ -1,0 +1,25 @@
+# The MSVC toolset (major.minor) that builds the Windows release, checked by
+# stage-msvc-runtime.ps1 against $env:VCToolsVersion in release.yml's
+# build-windows job: the release fails when the toolset differs.
+#
+# Why it is pinned: the Windows agent carries the Visual C++ runtime app-local
+# in its bin directory, and agent self-update (OTA) replaces only
+# yuzu-agent.exe, never that runtime (#8219, decision #8218). An executable
+# built by a newer toolset can need runtime exports an older copy lacks, and
+# then does not start. A device whose agent was updated by OTA mixes builds and
+# is outside the hard-cutover deployment contract (docs/user-manual/upgrading.md,
+# "Deployment contract (hard cutover)"); the pin does not make it supported.
+#
+# Bumping it is a deliberate, reviewed change. Its changelog fragment (a
+# changelog.d/<PR>-<slug>.changed.md, see changelog.d/README.md) and the
+# release notes must state that agent self-update does not carry the new
+# runtime, until #8219/#8218 change what OTA delivers. Keep
+# docs/windows-build.md's toolchain table and the Wee Tam runner
+# (deploy/windows/README.md) on the same toolset. Before each release the
+# release skill (Phase 0) has the release manager check, by hand, for a newer
+# toolset of the Visual Studio on Wee Tam; release-preflight.sh does not check
+# it. Wee Tam's Visual Studio 2022 offers nothing past 14.44, so moving past it
+# needs Wee Tam's Visual Studio upgraded first, a separate reviewed change. Why
+# the runtime is app-local, and the residual that leaves: docs/windows-build.md,
+# "Decision record: app-local Visual C++ runtime (2026-11-18)".
+14.44

@@ -332,8 +332,13 @@ scope here.
   `AuthRoutes`, not the database, so it still only serializes attempts within
   one server process. A DB-atomic attempt-reservation (now straightforward on
   Postgres — e.g. `UPDATE ... WHERE failed_login_count < threshold RETURNING`)
-  is the multi-replica-correct form and remains a tracked follow-up, not
-  something this migration delivered incidentally. `login_rate_limit` remains
+  is the multi-replica-correct form and remains a tracked follow-up (#8215), not
+  something this migration delivered incidentally. The stripe wait is bounded
+  (150 ms) and the number of waiters capped (2 per stripe, `max(2, pool/8)` overall), so a
+  flood of one name cannot queue unboundedly; the stripe is per process (N replicas:
+  about threshold + (N - 1) guesses per window, because each replica can have one
+  attempt in flight per name past its lockout check and the failure counter itself
+  is a database-atomic increment). `login_rate_limit` remains
   the companion control for the distributed vector.
   - *On failure*: `record_failed_login` increments the counter and arms
     `locked_until` on the threshold-th failure. A window that has **fully
@@ -1062,9 +1067,13 @@ by each handler.
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (83 rows: 33 `kExempt`, 50
+  a second table, `step_up_mcp_policy.hpp` (88 rows: 38 `kExempt`, 50
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
-  behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
+  behaviour. The exempt rows draw on a closed list of 11 reasons; the two newest
+  (`kLifecycleRules`, `kReferenceDataReplace`) are the REST twins' own reasons,
+  carried by the five software lifecycle-rule and curation writes (SAM-29), whose
+  REST rows are exempt pending an owner ruling on MFA step-up: when it comes, the
+  REST and MCP rows move together. The pending rows are a frozen baseline of 44 whose count only goes down,
   plus a separate list of tools added after it (today six), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
@@ -1908,6 +1917,32 @@ account policy)"* — this ships **both** halves.
   the password is never evaluated; wrong attempts are still audited
   (`auth.login_failed`) + per-IP rate-limited. Normal lockout still applies in
   standard mode.
+- **The second-factor failure budget is NOT exempted for break-glass (WP03).** The
+  lockout exemption above covers failed *passwords* only. Wrong TOTP/recovery codes
+  count against the durable per-account MFA budget (`auth.users.mfa_failed_count` /
+  `mfa_locked_until` / `mfa_last_attempt_at`; reserve-before-verify in ONE row-locked DB
+  statement, so an attempt that cannot be counted is never verified and answers 503;
+  a verified code refunds only its own reservation) for the break-glass account like
+  any other, because exempting it would leave the only protected factor of the
+  highest-value account open to online guessing by anyone who knows the password.
+  Accepted trade-off: an attacker who already knows the break-glass PASSWORD can keep
+  its MFA locked for one window at a time (`auth.mfa.lockout.applied`). The lock is
+  time-boxed and self-clearing. What clears it early: an operator unlock
+  (`POST /api/v1/users/{name}/unlock` / MCP `unlock_account`), an administrative
+  password reset, reactivation, `--mfa-reset`, and **`--break-glass-arm`** (the
+  out-of-band recovery: it resets the budget in the same statement that arms, and its
+  `auth.breakglass.armed` audit row says so). A self-service password change does NOT
+  clear it. Sole-administrator wedge (sole admin, enrolled factor, no API token, locked
+  at step-up): the only host-CLI remedies are `--break-glass-arm` (if that account is the
+  configured break-glass user) or `--mfa-reset <user>` then re-enrol; otherwise wait out
+  the window.
+- **Lock windows follow the database clock.** The MFA failure budget's `mfa_locked_until` and
+  `mfa_last_attempt_at` are authored from, and compared against, the Postgres `now()` (DB-clock
+  authority, #3715) like the password lockout and the sessions. A forward step of the database
+  clock of at least the remaining lock time ends a live lock early and starts a fresh failure
+  count (a new set of guesses); a backward step lengthens the lock. This is a limit of
+  database-clock authority shared with the password lockout; an operator unlock still clears a
+  lock. Accepted by the owner (2026-11-18) as a documented residual.
 - **Arming is an out-of-band host operation, never a session route.** The IdP
   being down is *why* you break the glass, so arming cannot depend on a login.
   `yuzu-server --break-glass-arm` (with `--break-glass-user` + `--postgres-dsn`
@@ -1922,6 +1957,31 @@ account policy)"* — this ships **both** halves.
   (`resolve_os_principal`, not the forgeable `USER` env var), `principal_role =
   break-glass`. Refuses to arm — and exits non-zero — if any check fails or the
   audit row can't persist.
+
+The gate is tri-state (`SsoOnlyGateResult`: `kOpen`, `kBreakGlassArmed`, `kRefused` for a
+definitive answer, `kTransient` when the arm state could not be established) and has four
+callers: `POST /login`, the password-change verify function, and the MFA step
+(`POST /login/mfa`) before a code is spent and again before the session is minted.
+Standing invariants, pinned by `tests/test_mfa_budget_wiring_lexical.py`: (1) the ONE admit set
+is `SsoOnlyGateResult::admits_password_evaluation()` (open or armed), and `kTransient` is a
+refusal for every caller except the MFA step's second check; (2) a failed, stale or
+in-flight read is never recorded as "not armed" and never cached, and an "armed" snapshot whose read
+started at or before a "not armed" read this server holds is never served from the cache, and the first MFA
+check refuses such an answer as a disarm before anything is verified or spent; (3) no "armed" read is
+honoured more than `kArmSnapshotMaxAge` (4.5 s) after it started, one comparison
+(`arm_observation_fresh`, on the steady clock) at every site; (4) the first MFA check uses the cached
+single-flight mode (its snapshot is what the second check's bounded rule relies on) and puts
+the pending token back on a transient answer; the second check reads the arm state itself
+(`SsoOnlyArmRead::kOwnFreshRead`), never writes the armed cache, and may admit on a failed read
+only inside that bounded rule (before the first snapshot's window end, at most 4.5 s after that
+read started, the same non-empty arm id, no "not armed" read recorded on this server
+since, and at most 4.5 s of WALL time since that read started), with one sample of each clock taken
+after the gate returns. The steady clock does not advance while the host is suspended, so every
+bound above except the wall-time one is measured on it and cannot see a suspend; the wall clock is therefore sampled
+when each shared read starts (the first check carries that sample) and once after the second
+gate call, ONLY to refuse (a wall clock that moved backward changes nothing, and wall time
+never admits). It sees a suspend only if the wall clock moves forward across it. Operator
+text: [Authentication](user-manual/authentication.md) and the break-glass runbook.
 
 Implementation: gate at `auth_routes.cpp` `POST /login` (between the lockout
 pre-check and `verify_password`); accessors `AuthDB::break_glass_status` /
@@ -2142,8 +2202,11 @@ user-editable IdP profile field, controls it. `detail` is a flat
 inject `;`/`=` to forge additional fields or `\r`/`\n`/other control
 bytes to inject fake log lines. `detail::sanitize_detail_value`
 (`auth_routes.hpp`/`.cpp`) is the single chokepoint that neutralises
-this: it replaces `;`, `=`, `\r`, `\n`, and any control byte (incl. DEL)
-with `_`, then truncates to 128 bytes on a UTF-8 code-point boundary.
+this: it first folds the value through `log_key_token` (C0, DEL, well-formed C1
+(U+0080-U+009F), U+2028 and U+2029 become `_`; input over 256 bytes is shortened
+before the 128-byte head clip), then replaces `;`, `=`, `\r`, `\n` and any
+remaining control byte with `_`, then truncates to 128 bytes on a UTF-8
+code-point boundary.
 Every `display=`/`email=`/`oidc_sub`/`name` value attached in
 `/auth/callback` is run through it before concatenation. **It is
 audit-detail-field-injection defense only — it does NOT strip HTML
@@ -2515,7 +2578,7 @@ applies to these two flags).
 | Action | Result | When |
 |---|---|---|
 | `auth.saml_login` | `ok` | ACS validation passed; session minted |
-| `auth.saml_login_failed` | `error` | ACS validation failed (signature, audience, expiry, replay, etc.) |
+| `auth.saml_login_failed` | `error` | ACS validation failed (signature, audience, expiry, replay, etc.). Detail = `detail::neutralise_saml_error`: `log_key_token` (folds C0/C1/Unicode line separators, caps 256) then `sanitize_detail_value` (`;`/`=` to `_`, head-only clip to 128 bytes, no marker); the log line uses `log_key_token` alone (256) |
 
 ### Security posture
 
@@ -3973,7 +4036,7 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
   - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution on Windows and on POSIX (Linux and macOS): there `resolve_host_addresses_status` runs the lookup on a detached worker through `bounded_resolve` (`bounded_resolver.hpp`) with an OIDC-owned pool (cap 16, gauge `yuzu_server_oidc_resolver_in_flight`) and the caller stops waiting at the per-lookup bound, so the IdP GETs, the check before the token-exchange POST connects (`exchange_code` -> `vet_egress_target`) and the one-time NAT64 probe lookup, and with them sign-in and Test Connection, are held to the 10 s figure (on a glibc build the OIDC name lookups could wait about 30 s past the intended 10 s bound; they now stop waiting at the bound). A lookup still running keeps its slot until the resolver returns, and a full pool fails closed at once as "the host name lookup was not started" instead of waiting, as does a name whose lookup was refused or timed out in the last 3 s (`HostLookupAdmission`, `resolver_host_admission.hpp`: at most 8 lookups outstanding per name and 64 names tracked, the count held by the lookup until the resolver returns; a refused name remembered for 3 s, at most 32 names, the refusal never extended, no success cached, the NAT64 probe exempt from both the limit and that memory, so only the pool's cap bounds it; the pool, the limit and the memory are per process, so per replica under high availability; discovery does not remember that refusal: the next attempt looks the name up again, where any other failed discovery arms the 30 s no-retry window). On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
   - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib (0.37.1 and 0.59.0) waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
   - The token-exchange POST has per-operation timeouts only (10/15/15 s on Linux and macOS; Windows uses the WinHTTP defaults) and no total bound. Its response is capped at 256 KiB on every platform (on Windows the size of each chunk is checked against the remaining allowance before it is allocated), and the Windows request sets the WinHTTP redirect policy to never and accepts only HTTP status 200 (`WinHttpQueryHeaders`), so a 3xx answer fails the sign-in instead of being followed to an unchecked host or parsed as a token response.
-  - Every IdP-directed fetch is vetted first (`oidc_egress_policy.hpp`): the host is resolved, every address classified, and the connection pinned to a permitted address; the Windows token POST is only pre-checked, and because WinHTTP may pick any address of its own answer the pre-check is strict there: one refused address in a mixed answer refuses the request outright (the other paths pin the permitted member instead). DNS rebinding between the check and WinHTTP's own lookup is not covered there (it does not follow redirects). Classification also treats the non-global parts of `2001::/23` (Teredo `2001::/32`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, the unallocated rest) as non-global, except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable (`2001:1::1`-`2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). NAT64 prefixes learned from `ipv4only.arpa` are only ever added (union across answers, kept for the process lifetime; the TTL controls when to look again, never what is kept), at most 64: an answer that would exceed that is not installed partially, the fetch is refused with a fixed reason. A configured `--oidc-nat64-prefix` is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is immutable. Host names are ASCII only (`authority_well_formed` refuses a byte >= 0x80; an internationalized name is given as punycode), so the check and WinHTTP cannot be asked for different names. The process flag `--oidc-allow-private-networks` is the general private-network override (a configured NAT64 prefix has the classification exception above); see `docs/user-manual/authentication.md` "Network and trust".
+  - Every IdP-directed fetch is vetted first (`oidc_egress_policy.hpp`): the host is resolved, every address classified, and the connection pinned to a permitted address; the Windows token POST is only pre-checked, and because WinHTTP may pick any address of its own answer the pre-check is strict there: one refused address in a mixed answer refuses the request outright (the other paths pin the permitted member instead). DNS rebinding between the check and WinHTTP's own lookup is not covered there (it does not follow redirects). Classification also treats the non-global parts of `2001::/23` (Teredo `2001::/32`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, the unallocated rest) as non-global, except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable (`2001:1::1`-`2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). NAT64 prefixes learned from `ipv4only.arpa` are only ever added (union across answers, kept for the process lifetime; the TTL controls when to look again, never what is kept), at most 64: an answer that would exceed that is not installed partially, the fetch is refused with a fixed reason. A configured `--oidc-nat64-prefix` is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is immutable. SIIT (`::ffff:0:0:0/96`) and IPv4-compatible (`::/96`) addresses are classified by the embedded IPv4 address but never wider than non-global (`embeds_public_ipv4` makes the cleartext rule treat such a form of a public address as public), and a local-use NAT64 address (`64:ff9b:1::/48`) that no configured or learned prefix covers is refused in `vet_egress_target`, since it cannot be decoded. Host names are ASCII only (`authority_well_formed` refuses a byte >= 0x80; an internationalized name is given as punycode), so the check and WinHTTP cannot be asked for different names. The process flag `--oidc-allow-private-networks` is the general private-network override (a configured NAT64 prefix has the classification exception above); see `docs/user-manual/authentication.md` "Network and trust".
   - Exactly one thread fetches discovery at a time (the in-flight mark is cleared by an RAII guard on every exit) and any other caller that needs it fails fast; a failed attempt is remembered for 30 s and a success for the provider's lifetime. Signing keys are not cached: every verification calls `fetch_jwks_snapshot()` and works from the answer it just obtained, so a key the IdP stops publishing stops verifying at the next login (#1901 UP-19; a failed or non-JWKS answer is `kJwksUnavailable`, with no stale-key fallback; related: #1900, #5983), and a token naming a `kid` the key set lacks is refused rather than checked against another key, while a token with no `kid` is checked against each usable key in turn (at most the first 16, in the order published). An RSA key with a modulus under 2048 bits, or an exponent below 3, even or over 32 bits, is skipped at parse: defence in depth against a weak IdP key, not against a tampered JWKS. Provider swaps: a Settings save is serialized by `oidc_save_mu_` (stored-secret read, provider build, swap, persist), replaces the provider under the exclusive `oidc_mu_`, and retires the old one after the lock drops; `/auth/oidc/start` and `/auth/callback` hold a `Lease` (taken under the shared lock) instead of the lock, and the callback compares the published provider with its leased one right after `handle_callback` (lease still held, so the address cannot be reused) and refuses with audit reason `provider_replaced` before any group, role or session work.
   - Verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy); Entra ID is supported by the standard but not verified by the project.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
@@ -5766,6 +5829,8 @@ Issuance happens on **both** the direct `Register` and the gateway-proxied
 gateway specifics (the agent↔gateway hop is one-way TLS in M1, so through the gateway the
 agent's address is attributed by the app-layer `gateway_observed_peer` — attribution, not
 authentication — until gateway mTLS lands).
+
+**Re-registration proof (WP01).** An already-`approved` agent id is not re-admitted on the caller's say-so: when the id holds a live leaf in `ca_issued`, `Register` and `ProxyRegister` require the current leaf (direct: the mTLS peer certificate; through the gateway: the certificate the gateway witnessed, `RegisterRequest.gateway_attested_peer_cert_pem`) or a fresh single-use enrollment token, and refuse a revoked identity, with a gRPC status before any session state is touched. One shared decision (`agent_reregistration_gate.hpp`); `--agent-reregistration-proof off|audit|enforce` (default `audit`). Full statement and the not-covered list (`--no-tls`, plain TLS, operator-CA agents, expired leaves): `docs/pki-architecture.md` "Re-registration proof (WP01)".
 
 **Bootstrap (chicken-and-egg) — resolved on one port.** The agent has no client
 cert on first boot, but the data plane requires one. Resolution:

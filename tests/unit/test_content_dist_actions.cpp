@@ -282,10 +282,12 @@ public:
     BrotliLoopbackServer(const BrotliLoopbackServer&) = delete;
     BrotliLoopbackServer& operator=(const BrotliLoopbackServer&) = delete;
     [[nodiscard]] int port() const noexcept { return port_; }
+    /// Connections fully handled so far; a test that needs the server to have been HIT checks this.
+    [[nodiscard]] int served() const noexcept { return served_.load(); }
 
 private:
     void serve() {
-        for (int served = 0; served < max_requests_ && !stop_.load();) {
+        while (served_.load() < max_requests_ && !stop_.load()) {
             pollfd pfd{listen_fd_.get(), POLLIN, 0};
             const int pr = ::poll(&pfd, 1, 100);
             if (pr < 0 && errno == EINTR)
@@ -299,8 +301,13 @@ private:
             const int one = 1;
             ::setsockopt(conn.get(), SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
+            // A peer that connects and never sends a request must not park this thread (and so the
+            // destructor's join) forever.
+            timeval tv{};
+            tv.tv_sec = 5;
+            ::setsockopt(conn.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
             handle(conn.get());
-            ++served;
+            served_.fetch_add(1);
         }
     }
 
@@ -340,6 +347,7 @@ private:
     yuzu::agent::ScopedFd listen_fd_;
     int port_{0};
     std::atomic<bool> stop_{false};
+    std::atomic<int> served_{0};
     std::thread thread_; // last: started in the constructor body, joined first
 };
 
@@ -403,6 +411,13 @@ TEST_CASE("content_dist plugin: stage hashes the RAW bytes on the wire, never a 
         {"url", url.c_str()}, {"filename", "wp14a-br-ok.bin"}, {"sha256", wire_hash.c_str()}};
     auto ok = dispatcher.run(plugin->descriptor, "stage", ok_params);
     CHECK(ok.captured.find("hash mismatch") == std::string::npos);
+
+    // Both runs must have reached the loopback server: without this a run that failed before
+    // connecting (so no hash mismatch to find) would pass the positive control vacuously. The
+    // server counts a connection after it has answered, which can trail the client's return.
+    for (int i = 0; i < 100 && server.served() < 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(server.served() == 2);
 }
 
 #endif // !_WIN32

@@ -10,6 +10,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp" // stray_control_bytes
 
 #include <libpq-fe.h>
 
@@ -284,4 +285,88 @@ TEST_CASE("PgTxn commit() and an aborted transaction", "[pg][raii]") {
         CHECK(PQtransactionStatus(conn.get()) == PQTRANS_IDLE);
         CHECK(count_rows(conn.get()) == 1);
     }
+}
+
+// ── connect_failure_cause (F56): fixed causes, nothing copied from libpq text ──
+
+TEST_CASE("connect_failure_cause never echoes libpq text", "[raii][log_injection][F56]") {
+    using yuzu::server::pg::connect_failure_cause;
+    // A URI DSN whose password contained '/' leaves a fragment of it in the port/dbname libpq
+    // quotes; the cause must be a constant that contains none of it.
+    const std::string leaky =
+        "connection to server at \"db\" (10.0.0.1), port s3cr3tfrag failed: Connection refused\n"
+        "\tIs the server running on that host and accepting TCP/IP connections?\n";
+    const std::string cause = connect_failure_cause(leaky);
+    CHECK(cause.find("s3cr3tfrag") == std::string::npos);
+    CHECK(cause.find('\n') == std::string::npos);
+
+    const std::string generic = connect_failure_cause("weird\nforged line s3cr3tfrag");
+    CHECK(generic.find("s3cr3tfrag") == std::string::npos);
+    CHECK(generic == yuzu::server::pg::kConnectFailureGeneric);
+}
+
+TEST_CASE("query_failure_detail keeps the step and a folded, capped first line (WP04-X)",
+          "[raii][F56]") {
+    using yuzu::server::pg::query_failure_detail;
+    // An ordinary failover is NOT a certificate problem.
+    const auto d = query_failure_detail("connection lost during probe",
+                                        "server closed the connection unexpectedly\n\tThis probably means...");
+    CHECK(d == "connection lost during probe: server closed the connection unexpectedly");
+    const auto e = query_failure_detail("connection lost during probe", "SSL SYSCALL error: EOF detected\n");
+    CHECK(e.find("TLS negotiation") == std::string::npos);
+    CHECK(e.find("EOF detected") != std::string::npos);
+    // Folded and capped; empty text keeps just the step.
+    const auto f = query_failure_detail("s", std::string("a\x1b[2J\xC2\x9B") + std::string(500, 'x'));
+    CHECK(yuzu::test::stray_control_bytes(f) == 0);
+    CHECK(f.size() <= 1 + 3 + 120 + 8);
+    CHECK(query_failure_detail("step", "") == "step");
+    // The 120-byte cut backs up over a UTF-8 continuation byte: no dangling lead byte.
+    const auto g = query_failure_detail("s", std::string(119, 'x') + "\xC3\xA9" + "tail");
+    CHECK(g == "s: " + std::string(119, 'x')); // the 2-byte character is dropped whole
+    for (const unsigned char c : g)
+        CHECK(c < 0x80);
+    // Malformed input: stray continuation bytes after ASCII do not cost the ASCII byte before them.
+    const auto h = query_failure_detail("s", std::string(120, 'y') + "\x80\x80more");
+    CHECK(h.substr(0, 3 + 120) == "s: " + std::string(120, 'y'));
+}
+
+TEST_CASE("connect_failure_cause: each branch, and the mis-bucketing cases", "[raii][F56]") {
+    using yuzu::server::pg::connect_failure_cause;
+    using yuzu::server::pg::kConnectFailureGeneric;
+    const auto is = [](const char* in, std::string_view needle) {
+        return std::string_view{connect_failure_cause(in)}.find(needle) != std::string_view::npos;
+    };
+    CHECK(is("FATAL:  password authentication failed for user \"app\"", "authentication failed"));
+    CHECK(is("FATAL:  no pg_hba.conf entry for host \"1.2.3.4\"", "pg_hba.conf"));
+    CHECK(is("SSL error: certificate verify failed", "TLS"));
+    CHECK(is("FATAL:  database \"x\" does not exist", "does not exist"));
+    CHECK(is("could not translate host name \"h\" to address", "could not be resolved"));
+    CHECK(is("connection to server failed: timeout expired", "timed out"));
+    CHECK(is("connection failed: Connection refused", "not reachable"));
+    CHECK(is("FATAL:  the database system is starting up", "not accepting"));
+    // #4943 discriminator: the reserve-slots refusal and plain max_connections are NOT generic.
+    using yuzu::server::pg::kConnectNoFreeSlots;
+    using yuzu::server::pg::kConnectNoWritableHost;
+    CHECK(std::string_view{connect_failure_cause(
+              "connection to server at \"h\" (1.2.3.4), port 5432 failed: FATAL:  remaining connection "
+              "slots are reserved for roles with privileges of the \"pg_use_reserved_connections\" role")} ==
+          kConnectNoFreeSlots);
+    CHECK(std::string_view{connect_failure_cause("FATAL:  sorry, too many clients already")} ==
+          kConnectNoFreeSlots);
+    // target_session_attrs=read-write refused every host.
+    CHECK(std::string_view{connect_failure_cause(
+              "connection to server failed: session is read-only")} == kConnectNoWritableHost);
+    CHECK(std::string_view{connect_failure_cause(
+              "connection to server failed: server is in hot standby mode")} == kConnectNoWritableHost);
+    // Ordering: a role merely NAMED like a cause stays a missing role; auth beats slots.
+    CHECK(is("FATAL:  role \"hot standby\" does not exist", "does not exist"));
+    CHECK(is("FATAL:  database \"remaining connection slots\" does not exist", "does not exist"));
+    CHECK(is("FATAL:  password authentication failed ... remaining connection slots", "authentication failed"));
+    CHECK(is("out of memory", "out of memory"));
+    CHECK(std::string_view{connect_failure_cause("something else")} == kConnectFailureGeneric);
+    // A missing sslrootcert says "does not exist" but is a TLS failure, not a missing database.
+    CHECK(is("root certificate file \"/x/root.crt\" does not exist", "TLS"));
+    // A database or role that merely CONTAINS "SSL" is a missing database, not a TLS failure.
+    CHECK(is("FATAL:  database \"SSL_prod\" does not exist", "does not exist"));
+    CHECK(is("FATAL:  role \"No such file or directory\" does not exist", "does not exist"));
 }

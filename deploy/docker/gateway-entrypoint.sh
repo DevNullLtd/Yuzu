@@ -43,6 +43,48 @@ log() {
     printf '[gateway-entrypoint] %s\n' "$1" >&2
 }
 
+# F24: the distribution cookie is validated HERE, before the BEAM exists. The
+# in-VM guard (yuzu_gw_app:check_distribution_cookie/0) runs in the application
+# start callback, AFTER the kernel has started net_kernel under the -name in
+# vm.args.src, so a node with a known cookie is reachable for the whole boot
+# window. This check refuses (exit 1) while nothing is listening. The policy
+# (floor, character allow-list, published default) lives in ONE file shared with
+# the systemd unit: gateway-cookie-policy.sh.
+#
+# YUZU_GW_ALLOW_DEFAULT_COOKIE=1 (single ephemeral node, dev/CI) does not mean
+# "run with the published default": a cookie that is unset, empty or EXACTLY the
+# published default is replaced by a fresh random per-boot value that is never
+# logged. Nothing else is tolerated: a short cookie, or one that STARTS with the
+# published literal, is refused. A real shared cookie that contains the literal
+# elsewhere is passed through unchanged, so replicas keep agreeing. N replicas on the override are N
+# singletons that cannot cluster (each draws its own cookie).
+. "$(dirname "$0")/gateway-cookie-policy.sh"
+
+yuzu_gw_cookie_classify && cookie_rc=0 || cookie_rc=$?
+if [ "${YUZU_GW_ALLOW_DEFAULT_COOKIE:-}" = "1" ]; then
+    case "$cookie_rc" in
+        10)
+            if ! YUZU_GW_COOKIE="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
+               || [ "${#YUZU_GW_COOKIE}" -lt 64 ]; then
+                log "FATAL: could not generate a random distribution cookie (reading /dev/urandom through head/od/tr failed)"
+                exit 1
+            fi
+            export YUZU_GW_COOKIE
+            log "YUZU_GW_COOKIE is unset or the published default and YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set: using a random per-boot cookie (single node only; this node cannot join a cluster)"
+            cookie_rc=0
+            ;;
+        # The override replaces ONLY an empty or exactly-default cookie (code 10). A
+        # short cookie (12) or one that starts with the published literal (13) is
+        # refused; a real shared cookie with the literal elsewhere (13, not a prefix)
+        # passes through unchanged so replicas still agree.
+        13) case "$YUZU_GW_COOKIE" in "$YUZU_GW_COOKIE_PUBLISHED_DEFAULT"*) ;; *) cookie_rc=0 ;; esac ;;
+    esac
+fi
+if [ "$cookie_rc" -ne 0 ]; then
+    log "FATAL: $(yuzu_gw_cookie_message "$cookie_rc")"
+    exit 1
+fi
+
 # Local, non-loopback IPv4 addresses this container actually owns.
 local_addrs() {
     ip -4 -o addr show scope global 2>/dev/null \
@@ -103,6 +145,15 @@ else
     fi
 
     export YUZU_GW_ADVERTISE_ADDR="$advertise"
+fi
+
+# A node advertising the loopback literal is single-node by construction (no
+# peer can dial 127.0.0.1): keep its distribution listener and epmd off every
+# other interface (F24). A clustered node advertises a routable address and is
+# left alone; its transport is documented in docs/user-manual/gateway.md.
+if [ "$YUZU_GW_ADVERTISE_ADDR" = "127.0.0.1" ]; then
+    export ERL_EPMD_ADDRESS="127.0.0.1"
+    export ERL_AFLAGS="${ERL_AFLAGS:+$ERL_AFLAGS }-kernel inet_dist_use_interface '{127,0,0,1}'"
 fi
 
 exec /opt/yuzu_gw/bin/yuzu_gw "$@"

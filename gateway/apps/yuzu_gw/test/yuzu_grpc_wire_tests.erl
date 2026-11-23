@@ -95,7 +95,11 @@ plaintext_test_() ->
          {"the unary key equals the bidi key on the same connection",
           fun() -> conn_key_unary_vs_bidi(State) end},
          {"the connection ending while a handler sends ends the handler quietly",
-          {timeout, 20, fun() -> send_after_disconnect(State) end}}]
+          {timeout, 20, fun() -> send_after_disconnect(State) end}},
+         {"an over-limit request header list is refused with a stream error and the connection serves the next request",
+          {timeout, 20, fun() -> header_list_over_limit(State) end}},
+         {"a trailers-only gRPC status survives Cowboy's early reset of a still-open request body",
+          {timeout, 20, fun() -> early_reset_keeps_status(State) end}}]
      end}.
 
 plain_setup() ->
@@ -116,6 +120,55 @@ plain_cleanup(#{listener := Pid, chans := Chans}) ->
     _ = logger:remove_handler(?MODULE),
     [yuzu_gw_test_listener:stop_channel(C) || C <- Chans],
     yuzu_gw_test_listener:stop(Pid).
+
+%% CVE-2026-113431 on a REAL listener (see yuzu_grpc_listener_tests:
+%% http2_header_list_bound_test_/0): a request whose decoded header list is over
+%% cowlib's default 32768-octet bound (nine copies of one 4000-octet user-agent:
+%% HPACK sends the first as an indexed literal and the other eight as one-octet
+%% table references, so the block is about 2.5 KB on the wire and the frame-size
+%% and fragmented-block limits do not catch it) is refused with RST_STREAM
+%% enhance_your_calm, the handler never runs, and the SAME connection then
+%% serves an ordinary request (an unknown method answers a gRPC status, HTTP 200).
+header_list_over_limit(#{port := Port}) ->
+    yuzu_grpc_stub_svc:reset(),
+    {ok, Conn} = gun:open("localhost", Port, #{protocols => [http2], retry => 0}),
+    try
+        {ok, http2} = gun:await_up(Conn, 5000),
+        Base = [{<<"content-type">>, <<"application/grpc">>}, {<<"te">>, <<"trailers">>}],
+        Pad = fun(N) -> lists:duplicate(N, {<<"user-agent">>, binary:copy(<<$a>>, 4000)}) ++ Base end,
+        %% 8 copies are inside the bound: the handler runs (a control: the count below must not move)
+        Under = gun:post(Conn, ?HEARTBEAT, Pad(8), <<0, 0:32>>),
+        ?assertMatch({response, _, 200, _}, gun:await(Conn, Under, 5000)),
+        ?assertEqual(1, yuzu_grpc_stub_svc:calls()),
+        Big = gun:post(Conn, ?HEARTBEAT, Pad(9), <<0, 0:32>>),
+        ?assertMatch({error, {stream_error, {stream_error, enhance_your_calm, _}}},
+                     gun:await(Conn, Big, 5000)),
+        ?assertEqual(1, yuzu_grpc_stub_svc:calls()),
+        Ok = gun:post(Conn, <<"/yuzu.agent.v1.AgentService/NoSuchMethod">>, Base, <<0, 0:32>>),
+        ?assertMatch({response, _, 200, Headers} when is_list(Headers), gun:await(Conn, Ok, 5000)),
+        ?assert(is_pid(Conn) andalso is_process_alive(Conn))
+    after
+        gun:close(Conn)
+    end.
+
+%% Cowboy answers a request whose body is still open (here: HEADERS sent, no DATA
+%% and no END_STREAM) and then resets the stream with NO_ERROR. The gRPC status
+%% of that answer (UNIMPLEMENTED, grpc-status 12, in a trailers-only response)
+%% must reach the client intact, and the connection must stay usable.
+early_reset_keeps_status(#{port := Port}) ->
+    {ok, Conn} = gun:open("localhost", Port, #{protocols => [http2], retry => 0}),
+    try
+        {ok, http2} = gun:await_up(Conn, 5000),
+        Base = [{<<"content-type">>, <<"application/grpc">>}, {<<"te">>, <<"trailers">>}],
+        Ref = gun:headers(Conn, <<"POST">>, <<"/yuzu.agent.v1.AgentService/NoSuchMethod">>, Base),
+        {response, _, 200, Headers} = gun:await(Conn, Ref, 5000),
+        ?assertEqual({<<"grpc-status">>, <<"12">>}, lists:keyfind(<<"grpc-status">>, 1, Headers)),
+        Next = gun:post(Conn, <<"/yuzu.agent.v1.AgentService/NoSuchMethod">>, Base, <<0, 0:32>>),
+        ?assertMatch({response, _, 200, _}, gun:await(Conn, Next, 5000)),
+        ?assert(is_process_alive(Conn))
+    after
+        gun:close(Conn)
+    end.
 
 %%--------------------------------------------------------------------
 %% Unary

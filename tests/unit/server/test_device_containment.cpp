@@ -747,6 +747,10 @@ TEST_CASE("yuzu-estate.js: the release dialog says the record ends when the devi
     CHECK(contains(js, "If the device is offline, the release is applied when it next connects."));
     CHECK(contains(js, "submitLabel: 'Release device'"));
     CHECK_FALSE(contains(js, "Release record"));
+    // The whitelist hint names the security-hardening heading as it is written (#7641): the old
+    // title no longer exists, so a reader searching for it found nothing.
+    CHECK(contains(js, "The whitelist (read ' +\n                'this before quarantining a dual-stack host)"));
+    CHECK_FALSE(contains(js, "Whitelisting on a "));
     CHECK(contains(js, "except the addresses you list, the Yuzu server, "));
     CHECK(contains(js, "DHCP and the device's DNS resolvers."));
     for (const auto& removed : kRemovedWording())

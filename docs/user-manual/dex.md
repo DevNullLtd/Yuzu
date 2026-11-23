@@ -194,6 +194,17 @@ decomposition (the share and rate count only affected devices that are online no
 (`GET /api/v1/dex/perf/app`) is separate from the per-version figures this tab shows: see
 "Fleet-wide application performance" under Drill-downs.
 
+**Usage view.** A **View** row above the platform chips switches between **Stability** and **Usage**. **Usage**
+shows each application's devices, run time and launches over the last 30 days and its crashes and hangs per hour
+of use, marked *estimated from 30-day usage*, and can be split by platform, tag or management group. The crashes
+and hangs counted beside a rate are only those on devices that reported usage for the application in the last 48
+hours, so they can be
+fewer than the Crashes and Hangs on the Stability view. It needs
+`Forensics:Read` as well as `GuaranteedState:Read` (administrators only while RBAC is off); without
+`Forensics:Read` the **Usage** chip shows the Stability page and one line saying so. Each Usage view is audited as
+`dex.apps.usage.view` before it is read, and a view whose audit row cannot be stored reads nothing. Slice controls,
+withheld states and page conventions: [app usage](../dex/app-usage.md#using-it-in-the-dashboard-the-apps-tab-usage-view).
+
 ### Scoring
 
 The **Scoring** tab (`/fragments/dex/scoring`) shows the score policy in force and lets an
@@ -652,6 +663,13 @@ does (agentic-first parity):
   names devices fleet-wide.
 - **`GET /api/v1/dex/apps?window=&platform=`**, the application stability list (a distinct
   device count per application, no `agent_id`; not audited).
+- **`GET /api/v1/dex/apps/usage?window=&platform=&slice=&group=&tag_key=&floor=`**, fleet usage per
+  application: for each application on the Apps list, the devices that ran it, its run time and
+  launches over a 30-day basis and its crashes and hangs per hour of use, marked as estimated. It
+  needs `Forensics:Read` as well as `GuaranteedState:Read` (administrators only while RBAC is off) and
+  is audited fail-closed as `dex.apps.usage.view` once its parameters validate. The device floor applies per table only. No
+  agent ids appear. The Apps tab shows it as the [Usage view](#apps), and the MCP tool `get_dex_apps_usage` serves the same read. See
+  [app usage](../dex/app-usage.md#fleet-usage-per-application).
 - **`GET /api/v1/dex/catalogue?os=&window=`**, the Catalogue family cards, fleet
   coverage and the uncatalogued list, and **`GET /api/v1/dex/catalogue/group?name=&os=&window=`**,
   one signal family's member signals (404 for an unknown family). Aggregates, not
@@ -713,7 +731,9 @@ version-row devices drill has its own MCP twin `list_dex_app_perf_devices`
 per-device app-perf drill is exposed via REST, the dashboard device drill
 (the "Application performance over time" panel) and the MCP tool
 `get_dex_device_app_perf` (all three write the same `dex.device.app_perf.view`
-audit). Full request/response
+audit). Fleet application usage (`GET /api/v1/dex/apps/usage`) is the MCP tool `get_dex_apps_usage`, which needs
+`Forensics:Read` as well as `GuaranteedState:Read` and writes the same `dex.apps.usage.view` audit row
+before it reads. Full request/response
 shapes are in [`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
 `GET /api/v1/openapi.json`.
 

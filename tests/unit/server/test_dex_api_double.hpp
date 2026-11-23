@@ -31,9 +31,12 @@
 #include "dex_api.hpp"
 #include "dex_window.hpp" // dex_normalize_os_filter -- PURE, needed for the catalogue() default's os echo
 
+#include <cstdint>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -51,6 +54,10 @@ public:
                                                            const std::string& window)>;
     using AppsFn = std::function<yuzu::server::DexAppsModel(const std::string& window,
                                                             const std::string& platform_scope)>;
+    using AppsUsageFn = std::function<std::expected<yuzu::server::DexAppsUsageModel, yuzu::server::DexUsageRefusal>(
+        const std::string& window, const std::string& platform_scope,
+        const yuzu::server::DexUsageSlice& slice, std::int64_t floor,
+        const std::optional<std::unordered_set<std::string>>& visible)>;
     using CatalogueFn = std::function<yuzu::server::DexCatalogueModel(
         const std::string& os_filter, const std::string& window)>;
     using CatalogueGroupFn = std::function<std::optional<yuzu::server::DexCatalogueGroupModel>(
@@ -131,6 +138,18 @@ public:
             return m;
         }
         return apps_fn_(window, platform_scope);
+    }
+
+    /// Not a constructor parameter, so the many positional constructions stay valid.
+    void set_apps_usage(AppsUsageFn fn) { apps_usage_fn_ = std::move(fn); }
+
+    [[nodiscard]] std::expected<yuzu::server::DexAppsUsageModel, yuzu::server::DexUsageRefusal>
+    apps_usage(const std::string& window, const std::string& platform_scope,
+               const yuzu::server::DexUsageSlice& slice, std::int64_t floor,
+               const std::optional<std::unordered_set<std::string>>& visible) const override {
+        if (!apps_usage_fn_) // the honest degrade: an unwired read is a refusal, never a model of zeros
+            return std::unexpected(yuzu::server::DexUsageRefusal{"usage_unavailable", "not_wired"});
+        return apps_usage_fn_(window, platform_scope, slice, floor, visible);
     }
 
     [[nodiscard]] yuzu::server::DexCatalogueModel
@@ -217,6 +236,7 @@ private:
     ObservationFn observation_fn_;
     AppFn app_fn_;
     AppsFn apps_fn_;
+    AppsUsageFn apps_usage_fn_;
     CatalogueFn catalogue_fn_;
     CatalogueGroupFn catalogue_group_fn_;
     HealthFn health_fn_;

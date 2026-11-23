@@ -1,70 +1,129 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 20c66f1c0618
-== action=scan
-HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
-MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
-INFO|config|Gatekeeper|Enabled - only verified apps can run
-INFO|config|FileVault Disk Encryption|Enabled
-INFO|config|System Integrity Protection (SIP)|Enabled
-MEDIUM|config|Application Firewall|Disabled
-MEDIUM|config|Remote Login (SSH)|Enabled - SSH access is open
-INFO|config|Automatic Software Updates|Enabled
-[result_status] UNDECLARED / UNKNOWN / 
-
-== action=cve_scan
-HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
-MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
-[result_status] UNDECLARED / UNKNOWN / 
-
+captured: macos macOS 27.0.1 arm64 · bare-metal · 2026-11-18 · euid 501 (interactive user) · leg-hash e452c8f620c9
 == action=config_scan
 INFO|config|Gatekeeper|Enabled - only verified apps can run
 INFO|config|FileVault Disk Encryption|Enabled
 INFO|config|System Integrity Protection (SIP)|Enabled
 MEDIUM|config|Application Firewall|Disabled
-MEDIUM|config|Remote Login (SSH)|Enabled - SSH access is open
-INFO|config|Automatic Software Updates|Enabled
-[result_status] UNDECLARED / UNKNOWN / 
+UNREADABLE|config|Remote Login (SSH)|Unknown (read failed)
+INFO|config|Automatic update check|Automatic update check: not set (macOS default applies)
+UNREADABLE|config|Open Ports|open-port check is not available on macOS
+UNREADABLE|scan|Coverage|One or more macOS configuration checks could not be read; each is reported as an UNREADABLE row, not as a finding
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:config_unreadable
 
-== action=summary
-summary|TOTAL|8 findings (4 issues)
-summary|CRITICAL|0
-summary|HIGH|1
-summary|MEDIUM|3
-summary|LOW|0
-summary|INFO|4
-[result_status] UNDECLARED / UNKNOWN / 
+== action=cve_scan
+HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
+MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
+HIGH|cve|CVE-2023-44487: HTTP/2 Rapid Reset denial of service|NodeMCU PyFlasher 5.0.0 (fixed in 20.8.1)
+HIGH|cve|CVE-2024-22019: Reading unprocessed HTTP request with unbounded chunk extension|NodeMCU PyFlasher 5.0.0 (fixed in 20.11.1)
+CRITICAL|cve|CVE-2024-29944: Privileged JavaScript execution via event handler|Firefox 106.0.5 (fixed in 124.0.1)
+CRITICAL|cve|CVE-2024-9680: Animation timeline use-after-free|Firefox 106.0.5 (fixed in 131.0.2)
+INFO|scan|Coverage|Homebrew formulae and casks are not scanned
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:homebrew_not_scanned
 
 == action=inventory
 App Store|3.0
 Apps|1.0
 Automator|2.10
-Books|8.5
+Books|9.0
 Calculator|12.0
-Calendar|16.0
+Calendar|27.0
 Chess|3.18
 Clock|1.1
 Contacts|14.0
 Dictionary|2.3.0
 FaceTime|36
-Find My|4.0
+Find My|5.0
 Font Book|11.0
-Freeform|4.5
+Freeform|5.0
 Games|1.0
-Home|10.0
+Home|11.0
 Image Capture|8.0
 Image Playground|1.0
-Journal|2.0
+Journal|3.0
 Mail|16.0
 Maps|3.0
 Messages|26.0
 Mission Control|1.2
-Music|1.6.6
-ShortcutsActions|
-Siri|3525.5.2
-Software Update|6
-SpacesTouchBarAgent|1.0
-Spotlight|1.0
-StageManagerOnboarding|1.0
-System Events|1.3.6
+Music|1.7
+News|12.0
+Notes|4.13
+Passwords|3.0.1
+Phone|1.0
+Photo Booth|13.1
+Photos|12.0
+Podcasts|1.1.0
+Preview|11.0
+QuickTime Player|10.5
+Reminders|7.0
+Shortcuts|10.0
+Siri|1.0
+Siri|1.0
+Stickies|10.3
+Stocks|8.0
+System Settings|1.0
+TV|1.7
+Contacts|1.0
+PowerChime|1.0
+PreviewShell|16.0
+PreviewShellMac|16.0
+Pro Display Calibrator|213.20
+Problem Reporter|10.13
+Profile Installer|1.0
+RapportUIAgent|7.1
+RegisterPluginIMApp|26.200
+ARDAgent|3.9.8
+Remote Desktop Message|3.9.8
+SSMenuAgent|3.9.8
+Rosetta 2 Updater|1.0
+Screen Time|3.0
+ScreenSaverEngine|5.0
+Script Menu|1
+ScriptMonitor|1.0.1
+SettingsPlaceholder|1.0
+Setup Assistant|10.10
+TextEdit|1.21
+Time Machine|1.3
+Tips|27.0
+Activity Monitor|10.14
+AirPort Utility|6.3.9
+Audio MIDI Setup|3.9
+Bluetooth File Exchange|9.0
+ColorSync Utility|12.2.0
+Console|1.1
+Digital Colour Meter|6.11
+Disk Utility|22.7
+Grapher|2.8
+Magnifier|1.0
+Migration Assistant|1.0
+Print Centre|1.0
+Screen Sharing|7.0
+Screenshot|1.0
+Script Editor|2.11
+System Information|11.0
+Terminal|2.15
+VoiceOver Utility|10
+Voice Memos|4.0
+Weather|6.0
+iPhone Mirroring|2.0
+About This Mac|1.0
+Archive Utility|10.15
+DVD Player|6.0
+Desk View|2.0
+Directory Utility|7.0
+Expansion Slot Utility|2.0
+Feedback Assistant|5.1
+Folder Actions Setup|1.2
+Keychain Access|11.0
+Ticket Viewer|4.1
+Wireless Diagnostics|11.0
+iOS App Installer|1.0
+Finder|27.0
+AirDrop|27.0
+Computer|27.0
+Network|27.0
+Recents|27.0
+iCloud Drive|27.0
+UASharedPasteboardProgressUI|54.1
 SystemIntents|1.0
 SystemUIServer|1.7
 TextInputMenuAgent|1.0
@@ -82,158 +141,35 @@ Wallpaper|1.0
 Watch Face Help|1.0
 WiFiAgent|1.0
 WidgetKit Simulator|1.0
-WindowManager|341.6.1
-WindowManagerShowDesktopEducation|1.0
+WidgetRenderer_Activities|1.0
+WindowManager|1.0
 WorkoutAlert-Mac|1.0
 iCloud+|1.0
 iCloud|1.0
 liquiddetectiond|
 loginwindow|9.0
-rcd|362
+rcd|363
 screencaptureui|1.0
-AddressBookSync|14.0
-ABAssistantService|14.0
-AddressBookManager|14.0
-AddressBookSourceSync|14.0
-FontRegistryUIAgent|81.0
-System Speech|9.2.22
-CinematicFramingOnboardingUI|1.0
-ContinuityCaptureOnboardingUI|1.0
-SmartCard Pairing|1.0
-LinkedNotesUIService|1.0
-qlmanage|1.0
-quicklookd|5.0
-Quick Look Simulator|1.0
-QuickLookUIHelper|5.0
-SyncServer|8.1
-Wish|8.5.9
-Build Web Page|10.1
-MakePDF|10.1
-AirScanScanner|18
-50onPaletteServer|1.1.0
-AinuIM|1.0
-Assistive Control|2.0
-CharacterPalette|2.0.1
-Dictation|6.2.47
-EmojiFunctionRowIM|1.0
-JapaneseIM-KanaTyping|6.3
-JapaneseIM-RomajiTyping|6.3
-KoreanIM|1.0
-PluginIM|26.200
-PressAndHold|1.0
-SCIM|104
-TCIM|104
-TYIM|104
-TamilIM|1.6
-TrackpadIM|1.0
-TransliterationIM|1.0
-VietnameseIM|1.0
-iCloudUserNotificationsd|1.0
-AOSAlertManager|1.07
-AOSHeartbeat|1.07
-AOSPushRelay|1.07
-Live Captions|1.0
-LiveSpeech|1.0
-AccessibilityVisualsAgent|1.0
-Calibration Assistant|1.0
-AppSSOAgent|1.0
-KerberosMenuExtra|1.0
-AMSEngagementViewService|1.0
-AskPermissionUI|129.6.2
-AutoFillPanelService|1.0
-AutomationModeUI|1.0
-BackgroundTaskManagementAgent|1.0
-storeuid|1.0
-CIMFindInputCodeTool|104
-FollowUpUI|1.0
-DiskImages UI Agent|683.160.3
-eaptlstrust|13.0
-ParentalControls|4.1
-FeedbackRemoteView|1.0
-FindMyMacMessenger|4.1
-identityservicesd|10.0
-IDSRemoteURLConnectionAgent|10.0
-imagent|10.0
-IMAutomaticHistoryDeletionAgent|10.0
-IMTransferAgent|10.0
-nbagent|1.0
-privatecloudcomputed|1.0
-ScreenReaderUIServer|10
-VoiceOver Quickstart|10
-AquaAppearanceHelper|1.0
-sociallayerd|1.0
-SoftwareUpdateNotificationManager|1.0
-Speech Downloader|10
-SpeechRecognitionServer|10
-STMUIHelper|1.0
-Conflict Resolver|8.1
-syncuid|8.1
-AXVisualSupportAgent|1.0
-Accessibility Tutorial|1.0
-DFRHUD|1.0
-universalAccessAuthWarn|1.0
-UASharedPasteboardProgressUI|54.1
-iCloud Drive|1.0
-AppleSpell|2.4
-ChineseTextConverterService|2.1
-OpenSpell|1.0
-SpeechService|9.2.22
-Spotlight|3.0
-Summary Service|2.0
-Time Machine|1.3
-Tips|26.6
-Activity Monitor|10.14
-AirPort Utility|6.3.9
-Audio MIDI Setup|3.8
-Bluetooth File Exchange|9.0
-Boot Camp Assistant|6.1.0
-ColorSync Utility|12.2.0
-Console|1.1
-Digital Colour Meter|6.11
-Disk Utility|22.7
-Grapher|2.8
-Magnifier|1.0
-Migration Assistant|26.6
-Print Centre|1.0
-Screen Sharing|6.1
-Screenshot|1.0
-Script Editor|2.11
-System Information|11.0
-Terminal|2.15
-VoiceOver Utility|10
-Voice Memos|3.2
-Weather|6.0
-iPhone Mirroring|1.6
-About This Mac|1.0
-Archive Utility|10.15
-DVD Player|6.0
-Desk View|2.0
-Directory Utility|7.0
-Expansion Slot Utility|2.0
-Feedback Assistant|5.1
-Folder Actions Setup|1.2
-Keychain Access|11.0
-Ticket Viewer|4.1
-Wireless Diagnostics|11.0
-iOS App Installer|1.0
-Finder|26.4
-AirDrop|26.4
-Computer|26.4
-Network|26.4
-Recents|26.4
-iCloud Drive|26.4
-ClassroomStudentMenuExtra|1.0
-Display Calibrator|4.19
+ShortcutDroplet|1.0
+Shortcuts Events|1.0
+ShortcutsActions|
+Siri|3600.46.19.14.4
+Software Update|6
+SpacesTouchBarAgent|1.0
+Spotlight|1.0
+StageManagerOnboarding|1.0
+System Events|1.3.6
 AOSUIPrefPaneLauncher|1.0
-AVB Configuration|1440.7
+AVB Configuration|1500.16
 Accessibility Reader|1.0
 AccessibilityUIServer|1.0
 AddPrinter|607
 AddressBookUrlForwarder|14.0
+AirDropUI|1.0
 AirPlayUIAgent|2.0
-AirPort Base Station Agent|2.2.1
 Apple Diagnostics|1.0
 AppleScript Utility|1.1.2
+AuthorizationPromptService|1.0
 Automator Application Stub|1.3
 Automator Installer|2.10
 Batteries|1.0
@@ -243,12 +179,14 @@ BluetoothUIService|1.0
 CalendarFileHandler|8.0
 Captive Network Assistant|5.0
 Certificate Assistant|5.0
+ClockAngel|1.0
 Control Centre|1.0
 ControlStrip|1.0
-CoreLocationAgent|3077.0.4
+CoreLocationAgent|3185.0.6
 CoreServicesUIAgent|369
 Coverage Details|1.0
 Database Events|1.0.6
+LaunchPolicyAlertAgent|1.0
 Diagnostics Reporter|1.0
 DiscHelper|1.0
 DiskImageMounter|1.0
@@ -263,10 +201,10 @@ FileProvider-Feedback|1.0
 FolderActionsDispatcher|1.0
 Game Center|1.0
 GameOverlayUI|1.0
-Games|820.6.10.1.1
+Games|821.0.25
 IOUIAgent|1.0
 Image Events|1.1.6
-Install Command Line Developer Tools|2416
+Install Command Line Developer Tools|2418
 Install in Progress|3.0
 Installer Progress|1.0
 Installer|6.2.0
@@ -276,10 +214,13 @@ KeyboardSetupAssistant|1.0
 Keychain Circle Notification|1.0
 Language Chooser|1.0
 MDMMigrationTrampoline|1.0
-MTLReplayer|314.14
+MTLReplayer|2027.0.39
 ManagedClient|18.0
+MediaRemoteUI|1.0
+MediaRemoteUIService|1.0
 Medical Imaging Calibrator|1.0
 Memory Slot Utility|1.5.3
+MenuBarAgent|1.0
 Music Recognition|1.0
 NetAuthAgent|6.2
 Notification Centre|1.0
@@ -291,135 +232,353 @@ Paired Devices|7.1
 Pass Viewer|1.0
 PassViewer|
 PeopleMessageService|1.0
-Contacts|1.0
-PowerChime|1.0
-PreviewShell|16.0
-PreviewShellMac|16.0
-Pro Display Calibrator|212.35
-Problem Reporter|10.13
-Profile Installer|1.0
-RapportUIAgent|7.1
-RegisterPluginIMApp|26.200
-ARDAgent|3.9.8
-Remote Desktop Message|3.9.8
-SSMenuAgent|3.9.8
-Rosetta 2 Updater|1.0
-Screen Time|3.0
-ScreenSaverEngine|5.0
-Script Menu|1
-ScriptMonitor|1.0.1
-Setup Assistant|10.10
-ShortcutDroplet|1.0
-Shortcuts Events|1.0
-News|11.5
-Notes|4.13
-Passwords|2.6.2
-Phone|1.0
-Photo Booth|13.1
-Photos|11.0
-Podcasts|1.1.0
-Preview|11.0
-QuickTime Player|10.5
-Reminders|7.0
-Shortcuts|7.0
-Siri|1.0
-Stickies|10.3
-Stocks|8.5
-System Settings|15.0
-TV|1.6.6
-TextEdit|1.20
-Keynote|15.1.1
-Pages|15.1.1
-Numbers|15.1
-iMovie|10.4.4
+AppleSpell|2.4
+ChineseTextConverterService|2.1
+OpenSpell|1.0
+SpeechService|9.2.22
+Spotlight|3.0
+Summary Service|2.0
+ClassroomAppLockHelper|1.0
+ClassroomStudentMenuExtra|1.0
+Display Calibrator|4.19
+Build Web Page|10.1
+MakePDF|10.1
+AirScanScanner|18
+50onPaletteServer|1.1.0
+AinuIM|1.0
+Assistive Control|2.0
+CharacterPalette|2.0.1
+Dictation|6.2.67
+EmojiFunctionRowIM|1.0
+JapaneseIM-KanaTyping|6.3
+JapaneseIM-RomajiTyping|6.3
+KoreanIM|1.0
+PluginIM|26.200
+PressAndHold|1.0
+SCIM|104
+TCIM|104
+TYIM|104
+TamilIM|1.6
+TrackpadIM|1.0
+TransliterationIM|1.0
+VietnameseIM|1.0
+PlatformSSOUIAgent|1.0
+iCloud Drive|1.0
+IMTransferAgent|10.0
+AuthKitUIMacService|1
+AutoFillPanelService|1.0
+Live Captions|1.0
+Live Speech|1.0
+CIMFindInputCodeTool|104
+AXVisualSupportAgent|1.0
+Accessibility Tutorial|1.0
+DFRHUD|1.0
+universalAccessAuthWarn|1.0
+STMUIHelper|1.0
+FindMyMacMessenger|4.1
+iCloudUserNotificationsd|1.0
+AOSAlertManager|1.07
+AOSHeartbeat|1.07
+AOSPushRelay|1.07
+sociallayerd|1.0
+imagent|10.0
+IMAutomaticHistoryDeletionAgent|10.0
+BackgroundTaskManagementAgent|1.0
+eaptlstrust|13.0
+AskPermissionUI|130.0.29
+storeuid|1.0
+ScreenReaderUIServer|10
+VoiceOver Quickstart|10
+SoftwareUpdateNotificationManager|1.0
+Speech Downloader|10
+SpeechRecognitionServer|10
+DiskImages UI Agent|704
+ParentalControls|4.1
+FeedbackRemoteView|1.0
+FollowUpUI|1.0
+AutomationModeUI|1.0
+privatecloudcomputed|1.0
+Conflict Resolver|8.1
+syncuid|8.1
+AppSSOAgent|1.0
+KerberosMenuExtra|1.0
+AMSEngagementViewService|1.0
+AquaAppearanceHelper|1.0
+Calibration Assistant|1.0
+identityservicesd|10.0
+IDSRemoteURLConnectionAgent|10.0
+AccessibilityVisualsAgent|1.0
+SyncServer|8.1
+qlmanage|1.0
+quicklookd|5.0
+FontRegistryUIAgent|81.0
+LinkedNotesUIService|1.0
+SmartCard Pairing|1.0
+Virtual Machine Accessories|1.0
+AddressBookSync|14.0
+ABAssistantService|14.0
+AddressBookManager|14.0
+AddressBookSourceSync|14.0
+Quick Look Simulator|1.0
+QuickLookUIHelper|5.0
+Wish|8.5.9
+CinematicFramingOnboardingUI|1.0
+ContinuityCaptureOnboardingUI|1.0
+System Speech|9.2.22
+Raspberry Pi Imager|1.8.5
+Camera Settings|3.0.23
+OpenCPN|5.8.4-0+1637c28
+Claude|6.6395.0
+Microsoft OneNote|16.115.1
+Microsoft PowerPoint|16.115.1
+Microsoft Word|16.115.1
+WhatsApp|26.46.17
+Developer|11.1.2
+iTerm|3.7.7
+iMovie|10.4.3
+Keynote|14.4
+Numbers|14.4
+Pages|14.4
 GarageBand|10.4.13
-Tailscale|1.102.2
-Hush|1.0.19
-Visual Studio Code|1.136.1
+Logi Options+ Installer|1.48.0.437015
+ADPClientService|4.5.0.0
+AdpSDKUtil|4.5.0.0
+PHSPBETA_27_6_32|6.9.0.618
+Uninstall_Citrix_Endpoint_Analysis|26.07.20
+RealVNC Connect Viewer|8.5.0
+Spotify|1.3.9.2055
+ChatGPT|26.1106.51428
+Hermes|0.0.1
+Jellyfin Media Player|1.12.0
 group.is.workflow|
-MRT|1.93
-XProtect|157
-Signal|8.26.0
-Python|3.9.6
-Install Spotify|1.2.96.518
 com.apple.ctcategories|
-Spotify|1.2.98.301
+com.dxo|
+com.dxo|
+Inkscape|1.4.2
+Loupedeck|5.3.2.14477
+Meshmixer|11.5.474
+SD Card Formatter|5.0.1-b6e25b8
+CI_Launcher|1.0
+NavService|0.1
+nwjs|56.0.2924.87
+nwlauncher|1.0
+uninstall|3.0
+Google Chrome|157.0.8103.79
+Perspective Efex Launcher|
+nondestructive_util|
+Uninstall Citrix BCR Overlay|26.07.3
+Apple Configurator|2.21
+CodeRunner|4.2.1
+PrusaSlicer|PrusaSlicer PrusaSlicer-2.9.4
+UTM|4.7.5
+Uninstall Zoom VDI Plugin Management|7.0.13 (27170)
+Zoom VDI Plugin Management|7.0.13 (27170)
+Firefox|106.0.5
+WhatsApp|26.1.56
+NodeMCU PyFlasher|5.0.0
+QGIS|3.32.3
+OBSBOT Center|2.0.12
+Adobe Photoshop (Beta)|27.6.0
+Virtual Desktop Streamer|1.0
+Atom|1.60.0
+Python|3.9.6
+Sweet Home 3D|7.5
+DxO PhotoLab 5|5.9.0
+VNC Viewer|7.6.0 (r50657)
+Authy Desktop|2.2.2
+CodeRunner|4.5
+BambuSuite|Bambu Suite 01.01.03.52
+Postman|9.16.0
+Arduino|1.8.15
+Adobe Photoshop 2025|26.11.8
+ACAI_0_5_3|5.10.0.573
+COCM_1_0_32|5.9.0.373
+COMP_1_4_32|6.8.0.821
+COPS_1_0_32|5.9.0.373
+CORE_1_0_32|5.9.0.373
+CORG_1_1_32|5.9.0.373
+PHSP_24_7_5_32|6.3.0.207
+PHSP_25_12_4_32|6.7.0.278
+SEPS_0_25_1|6.8.0.821
+NativeMessagingHost|7.0
+ModBus Probe|1.0.0
+AnythingLLM|1.11.2
+Creative Cloud|7.0.6.10
+KANC_7_0_6|6.9.0.618
+balenaEtcher|2.1.6
+xTool Studio|1.7.30
+AionUi|1.9.23
+Voicebox|0.5.0
+Xcode|27.2
+Create ML|6.2
+Instruments|27.2
+Device Hub|27.2
+FileMerge|2.11
+Icon Composer|27.2
+Accessibility Inspector|5.0
+BibDesk|1.9.10
+TeX Live Utility|1.55
+Claude Code URL Handler|1.0
+Signal|8.35.0
+Updater|2.8.1
+SABnzbd|5.0.3
+LaTeXiT|2.16.6
+TeXShop|5.57
+hintview|Version 2.0
+PHSP_26_11_8_32|6.10.0.252
+UAM_1_50|6.9.0.618
+installd|2.3.10
+Avira Updater|2.3.10
+UninstallerHelper|4.0.2
+WiFiman Desktop|1.2.8
+sh|
+sh|
+fuse-t|0.1.3
+com|
+TorGuard|4.8.30
+Avira Security|2.3.10
+Avira Security Helper|2.3.10
+Avira Security Agent|2.3.10
+1Password for Safari|8.12.44
+Cloudflare WARP|2026.8.2115.0
+Telegram|13.1.0
+Amphetamine|5.3.2
+RevoScan5|5.4.12.1525
+Magnet|3.0.7
+VLC|3.0.21
+Analog Efex Pro 3|
+Color Efex Pro 5|
+Dfine2|5.0.5
+HDR Efex Pro 2|5.0.5
+Perspective Efex|5.0
+Sharpener Pro 3 Output Sharpening|5.0.5
+Sharpener Pro 3 Raw Presharpening|5.0.5
+Silver Efex Pro 3|
+Uninstaller|1.0
+Viveza 3|
+OBS|28.1.2
+Virtual Desktop Updater|1.0
+Adobe Photoshop 2026|27.11.1
+ChatGPT (Classic)|1.2026.184
+ESPHome-Flasher|0.0.0
+ESPHome-Flasher|0.0.0
+Core Sync|7.10.0.1
+Microsoft AutoUpdate|4.86
+COSY_7_10_0|6.10.0.252
+Creative Cloud|6.11.0.479
+Creative Cloud Uninstaller|6.11.0.479
+Windows App|11.4.1
+CCLibrary|4.19.5
+Creative Cloud Content Manager|7.17.0-4
+Adobe Acrobat|26.003.22110
+Google Drive|
+YouTube|
+Sheets|
+Gmail|
+Slides|
+Docs|
+AdobeCleanUpUtility|9.1.0.50
+AdobeGCClient|9.1.0.50
+cai-helper|0.5.3
+Acrobat Update Helper|1 . 2 . 6
+Adobe Acrobat Updater|1 . 2 . 6
+Autodesk Fusion|2605.1.52
+io|
+io|
+Uninstall Citrix Workspace|26.09.0
+Citrix Workspace|26.09.0
+CitrixBcrOverlay|26.07.3
+Zoom|7.1.9 (88375)
+Autodesk Fusion Service Utility|2605.1.52
+Autodesk Fusion|2605.1.52
+Remove Autodesk Fusion|2605.1.52
+Transmission|4.1.3
+BambuStudio|02.08.03.66
+Install Spotify|1.2.79.427
+MRT|1.93
+NativeMessagingHost|7.0
 AppleMobileDeviceHelper|5.0
 MobileDeviceUpdater|1.0
 AppleMobileSync|5.0
 AirScanLegacyDiscovery|607
-Docker|4.89.0
-uBlock Origin Lite|2026.901.1442
-NordVPN|10.9.0
-WhatsApp|26.34.24
 Recursive File Processing Droplet|1.0
 Droplet with Settable Properties|1.0
 Recursive Image File Processing Droplet|1.0
 Cocoa-AppleScript Applet|1.0
-actionlint|1.7.12
-ada-url|4.0.0
-autoconf|2.73
-automake|1.18.1_1
-bash|5.3.15
-blake3|1.8.7
-brotli|1.2.0
-c-ares|1.34.8
-ca-certificates|2026-08-13
-ccache|4.13.6_1
-cmake|4.4.2
-erlang@28|28.5.0.5
-fmt|12.2.0
-gettext|1.0
-gh|2.97.0
-giflib|6.1.3
-git|2.55.0
-gmp|6.3.0
-hdrhistogram_c|0.11.10
-hiredis|1.4.1
-icu4c@78|78.3
-isl|0.28
-jpeg-turbo|3.2.0
-json-c|0.19
-krb5|1.22.2
-libffi|3.8.0
-libmpc|1.4.1
-libnghttp2|1.70.0
-libnghttp3|1.18.0
-libngtcp2|1.25.0
-libpng|1.6.58
-libtiff|4.7.2
-libtool|2.6.2
-libunistring|1.4.2
-libuv|1.52.1
-llhttp|9.4.3
-lz4|1.10.0
-m4|1.4.21
-merve|1.2.2_2
-meson|1.12.0
-mingw-w64|14.0.0_3
-mpdecimal|4.0.1
-mpfr|4.2.2
-nbytes|0.1.4
-ncurses|6.6
-ninja|1.13.2
-node|26.7.0
-openssl@3|3.6.3
-pcre2|10.47_1
-pkgconf|3.0.5
-postgresql@18|18.6
-python@3.14|3.14.7
-readline|8.3.3
-rebar3|3.27.0
-shellcheck|0.11.0
-simdjson|4.6.7
-simdutf|9.1.0
-sqlite|3.53.4
-unixodbc|2.3.14
-uvwasi|0.0.23
-webp|1.6.0
-wxwidgets@3.2|3.2.11
-xxhash|0.8.3
-xz|5.8.3
-zstd|1.5.7_1
-[result_status] UNDECLARED / UNKNOWN / 
+LIBS_4_19_5|6.11.0.478
+com|
+immurok|1.6.7
+Adobe Photoshop 2027|28.0.0
+ZoomVDIUninstaller|7.0.13 (27170)
+ZoomVDI|7.0.13 (27170)
+Final Cut Pro|12.4
+MsTeamsVdi.Plugin|2026.35.01.1
+CitrixEndpointAnalysis|26.07.20
+deviceTRUST Location|26.7
+Creative Cloud Desktop App|6.11.0.479
+CC Troubleshooter|6.11.0.479
+LogTransport|2026.10.0
+Adobe Crash Processor|2026.10.0
+Adobe Crash Reporter|2026.10.0
+Creative Cloud Installer|6.11.0.479
+UnifiedPluginInstallerAgent|8.6.0.49
+adobe_licensing_helper|1.0.0.148
+Adobe Desktop Service|6.11.0.483
+Creative Cloud Helper|6.11.0.483
+AdobeIPCBroker|7.3.0.41
+LogTransport|2026.10.0
+Adobe Crash Processor|2026.10.0
+Adobe Crash Reporter|2026.10.0
+Adobe Update Helper|6.11.0.478
+Uninstaller|6.11.0.478
+Install|6.11.0.478
+Adobe Creative Cloud Diagnostics|1.4.0.15
+Tailscale|1.104.6
+CCXP_7_17_0|6.11.0.478
+OneDrive|26.189.0928
+Orca|2026.44.1
+XProtect|170
+Microsoft Teams|26289.204.5281.6363
+1Password|8.12.44
+claude|2.1.326
+PHSP_28_0_32|6.11.0.478
+ACR_19_0_32|6.11.0.478
+LTRM_16_0_32|6.11.0.478
+PHSP_27_11_1_32|6.11.0.478
+Adobe Lightroom Classic|16.0
+GoogleUpdater|159.0.8140.0
+Microsoft Excel|16.115
+VictronConnect|6.43.1
+Spotify|1.3.10.2586
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:homebrew_not_scanned
+
+== action=scan
+HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
+MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
+HIGH|cve|CVE-2023-44487: HTTP/2 Rapid Reset denial of service|NodeMCU PyFlasher 5.0.0 (fixed in 20.8.1)
+HIGH|cve|CVE-2024-22019: Reading unprocessed HTTP request with unbounded chunk extension|NodeMCU PyFlasher 5.0.0 (fixed in 20.11.1)
+CRITICAL|cve|CVE-2024-29944: Privileged JavaScript execution via event handler|Firefox 106.0.5 (fixed in 124.0.1)
+CRITICAL|cve|CVE-2024-9680: Animation timeline use-after-free|Firefox 106.0.5 (fixed in 131.0.2)
+INFO|config|Gatekeeper|Enabled - only verified apps can run
+INFO|config|FileVault Disk Encryption|Enabled
+INFO|config|System Integrity Protection (SIP)|Enabled
+MEDIUM|config|Application Firewall|Disabled
+UNREADABLE|config|Remote Login (SSH)|Unknown (read failed)
+INFO|config|Automatic update check|Automatic update check: not set (macOS default applies)
+UNREADABLE|config|Open Ports|open-port check is not available on macOS
+INFO|scan|Coverage|Homebrew formulae and casks are not scanned
+UNREADABLE|scan|Coverage|One or more macOS configuration checks could not be read; each is reported as an UNREADABLE row, not as a finding
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:config_unreadable
+
+== action=summary
+summary|TOTAL|13 findings (7 issues)
+summary|CRITICAL|2
+summary|HIGH|3
+summary|MEDIUM|2
+summary|LOW|0
+summary|INFO|4
+summary|UNREADABLE|2
+summary|COVERAGE|Homebrew formulae and casks are not scanned
+summary|COVERAGE|One or more macOS configuration checks could not be read; each is reported as an UNREADABLE row, not as a finding
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:config_unreadable
 

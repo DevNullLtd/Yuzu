@@ -2,7 +2,7 @@
 
 /// @file certificate_inventory_store.hpp
 /// Born-on-Postgres fleet certificate inventory store (slice-2 PR 2a-2a, schema
-/// `cert_inventory`, ADR-0070 D12, ADR-0016 §5, ADR-0006/0012): the server half of the
+/// `certificate_inventory_store`, ADR-0070 D12, ADR-0016 §5, ADR-0006/0012): the server half of the
 /// `certificate_inventory` daily-sync source. Design:
 /// `docs/crypto-slice2-certificate-design.md`, "Server: store, ingest and lifecycle".
 ///
