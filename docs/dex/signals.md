@@ -49,7 +49,7 @@ Windows, Linux and macOS, and is switched off per agent with `--dex-disable`
 what the switch does and does not stop, are in
 [collectors and plugins](collectors-and-plugins.md#the-dex-observer).
 
-On the REST route, "Get live info" does not read stored signals. It dispatches
+On the REST route and the MCP tool, "Get live info" does not read stored signals. It dispatches
 the `os_info` plugin (`uptime`) or the `processes` plugin (`list_hashed`) to the
 device; see
 [collectors and plugins](collectors-and-plugins.md#plugins-a-dex-drill-dispatches).
@@ -109,12 +109,17 @@ running processes. The device page offers more, each with its own
   a `404`.
 - `POST /api/v1/dex/devices/{id}/live` takes `kind=uptime` or `kind=processes`,
   dispatches a read-only instruction to the device and waits up to about 20
-  seconds for the answer. It answers `429` when more live queries are already
-  running than the server allows at once. It answers `502` when the instruction
-  failed on the device, the device reported an error or its output was over
-  4 MiB. It answers `503` when the device is offline or the audit row cannot be
-  stored, and in the second case nothing is sent. It answers `504` when the
-  device did not answer in time; that does not cancel the instruction.
+  seconds for the answer. It answers `429` when the caller already has 2 live
+  queries running, or the server already has 4 (the MCP tool and the
+  quarantine release wait draw on the same limit). It answers `502` when the
+  instruction failed on the device, the device reported an error or its output
+  was over 4 MiB. It answers `409` when the device is quarantined, `422` when
+  the device does not report the plugin, and `403` when the action is switched
+  off for the device's operating system; none of the three is worth retrying.
+  It answers `503` when the device is offline or its state could not be read
+  (the answer carries a `reason` and is worth retrying), or when the audit row
+  cannot be stored, and in the last case nothing is sent. It answers `504` when
+  the device did not answer in time; that does not cancel the instruction.
 
 ## MCP
 
@@ -128,15 +133,16 @@ running processes. The device page offers more, each with its own
 | `get_dex_device_score` | One device's score and signal summary. |
 | `get_dex_device_history` | One device's signal history. |
 | `get_dex_observation` | One observation in detail. |
+| `get_device_live` | One device's live uptime or process list (`kind` `uptime` or `processes`), up to about 20 seconds, at most 1000 process rows. |
 
-There is no MCP tool for live info. Arguments match the REST parameters above,
+`get_device_live` is the MCP tool for live info; it takes `agent_id` and `kind`, and refuses a `readonly` or `supervised` token and `--mcp-read-only`, because it sends a probe to the device. Arguments match the REST parameters above,
 except that the per-device tools take the device as `agent_id` where the REST
 routes carry it in the path as `{id}`.
 
 ## Permissions and audit
 
 All reads need `GuaranteedState:Read`. The live-info route additionally needs
-`Execution:Execute`; both are checked against the device you target. The two
+`Execution:Execute`, on REST and MCP alike; both are checked against the device you target. The two
 actions it dispatches (`os_info` `uptime` and `processes` `list_hashed`) are
 `Inventory:Read` actions, and that permission is checked when the command is
 dispatched, after the request's audit row is written. A custom role needs all
@@ -147,11 +153,11 @@ three.
 | Signal drill-down by type | `dex.signal.view` |
 | Device score, device history | `dex.device.view` |
 | One observation | `dex.observation.view` |
-| Live uptime or processes | `device.live.uptime` or `device.live.processes`, written before the dispatch |
+| Live uptime or processes | `device.live.uptime` or `device.live.processes`, written before the dispatch, on REST and on the MCP tool |
 | Catalogue, rollup and scope | Not audited |
 
 On REST, an audited read refuses to answer if its audit row cannot be stored
-(`503` with `Sec-Audit-Failed: true`). A service-scoped token is refused on the
+(`503` with `Sec-Audit-Failed: true`; the MCP live-info tool returns a retryable error instead). A service-scoped token is refused on the
 catalogue, rollup, scope and signal drill-down reads. The per-device reads and
 live info accept such a token only for a device tagged with its own service.
 See [surfaces](surfaces.md#the-rest-api).

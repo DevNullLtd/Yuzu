@@ -691,8 +691,10 @@ does (agentic-first parity):
   info" read: it dispatches a read-only instruction to the device and waits up to
   about 20 seconds for the result (hence POST, not GET). Needs scoped `Read` and
   `Execute`, audited before dispatch (`device.live.uptime` or
-  `device.live.processes`), and answers 429, 502, 503 or 504 when the device
-  cannot answer in time.
+  `device.live.processes`), and answers 409, 422, 403, 429, 502, 503 or 504
+  when the device cannot answer (see the REST reference). The MCP tool
+  `get_device_live` is its twin and shares its limit of 2 reads per caller and
+  4 in all.
 
 The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all` (and the
 catalogue rollup + per-signal drill-down additionally take the optional `os`

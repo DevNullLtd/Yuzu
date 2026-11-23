@@ -1123,7 +1123,7 @@ Not implemented. Configure which events generate notifications.
 
 ### 21.6 Behavioral-PII Access-Audit Chokepoint :white_check_mark: `T2` *(new row, v4.0)* *(verified 2026-09-07)*
 
-Every behavioural-PII read (device-live-info, process/network drill, DEX perf, etc.) funnels through the single `emit_behavioral_audit` chokepoint (#1647) — with one tracked exception: the REST `device.live.*` incarnation still uses an inline bool-capture (tracked under #1647, open; #1703 was closed unverified in the 2026-07-14 backlog reset — re-confirmed live 2026-11-14 at the `POST /api/v1/dex/devices/{id}/live` handler, `rest_api_v1.cpp:~19381-19490`, which calls `audit_fn` inline; the dashboard's `device.live.*` routes in `device_routes.cpp` do use the chokepoint) — REST fail-closed 503 + `Sec-Audit-Failed` header on an audit-write failure, dashboard/MCP set-and-proceed. Standing invariant: no new PII route may reintroduce an inline bool-capture bypassing the chokepoint. *(Evidence: `server/core/src/rest_audit.hpp` `emit_behavioral_audit`; verified 2026-09-07.)*
+Every behavioural-PII read (device-live-info, process/network drill, DEX perf, etc.) funnels through the single `emit_behavioral_audit` chokepoint (#1647) (the REST `device.live.*` route, `POST /api/v1/dex/devices/{id}/live`, is on it too) — REST fail-closed 503 + `Sec-Audit-Failed` header on an audit-write failure, dashboard/MCP set-and-proceed; the one MCP exception is `get_device_live`, whose `requested` row is fail-closed too (a probe that hashes executables is usage-class data). Standing invariant: no new PII route may reintroduce an inline bool-capture bypassing the chokepoint. *(Evidence: `server/core/src/rest_audit.hpp` `emit_behavioral_audit`; verified 2026-09-07.)*
 
 ---
 
@@ -1550,11 +1550,11 @@ Deferred — `yuzu.net_degraded` is retired per the routed-concerns table (gauge
 
 ### 34.2 Live Snapshot ("Get live info") :white_check_mark: `T2` *(verified 2026-09-07)*
 
-Dispatch-and-poll card grid with 20+ live kinds — process tree, services, users, netconfig, ARP/DNS on Windows, listening/connections, capture sources, hardware disks/memory/processors/drivers, battery, thermal, SMART, volumes, adapters, WiFi, disk free and uptime — each with its own `device.live.<kind>` audit verb, gated on `Execution:Execute` (`server/core/src/device_routes.cpp`).
+Dispatch-and-poll card grid with 20+ live kinds — process tree, services, users, netconfig, ARP/DNS on Windows, listening/connections, capture sources, hardware disks/memory/processors/drivers, battery, thermal, SMART, volumes, adapters, WiFi, disk free and uptime — each with its own `device.live.<kind>` audit verb, gated on `Execution:Execute` (`server/core/src/device_routes.cpp`). Uptime and processes are also served over REST (`POST /api/v1/dex/devices/{id}/live`) and MCP (`get_device_live`), sharing one limit of 2 reads per principal and 4 in all.
 
 ### 34.3 Agentic REST Parity for Device Surfaces :white_check_mark: `T2` *(verified 2026-09-07)*
 
-REST parity for the live-snapshot surface — though the REST live read (`POST /api/v1/dex/devices/{id}/live`) supports only `kind=uptime|processes`, 2 of the dashboard's 20+ kinds — funneling behavioural-PII reads through the `emit_behavioral_audit` chokepoint (§21.6) — except the REST `device.live.*` route itself, still an inline bool-capture (tracked under #1647, open; #1703 was closed unverified in the 2026-07-14 backlog reset — re-confirmed live 2026-11-14 at `rest_api_v1.cpp:~19381-19490`, `POST /api/v1/dex/devices/{id}/live`) — fail-closed 503 + `Sec-Audit-Failed` when the audit row cannot persist. *(Evidence: `server/core/src/rest_audit.hpp`.)*
+REST parity for the live-snapshot surface — though the REST live read (`POST /api/v1/dex/devices/{id}/live`) supports only `kind=uptime|processes`, 2 of the dashboard's 20+ kinds — funneling behavioural-PII reads through the `emit_behavioral_audit` chokepoint (§21.6), including the REST `device.live.*` route itself — fail-closed 503 + `Sec-Audit-Failed` when the audit row cannot persist, and an MCP twin, `get_device_live`, over the same two kinds. *(Evidence: `server/core/src/rest_audit.hpp`.)*
 
 ---
 
