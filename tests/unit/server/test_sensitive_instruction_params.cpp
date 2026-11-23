@@ -94,3 +94,98 @@ TEST_CASE("schedule_params_contain_sensitive_key fails closed-to-false on malfor
     CHECK_FALSE(schedule_params_contain_sensitive_key("[1,2,3]"));
     CHECK_FALSE(schedule_params_contain_sensitive_key(""));
 }
+
+// ── WP06 F12: approval-ticket subject redaction ──────────────────────────
+
+TEST_CASE("redact_tool_args_for_ticket replaces every secret-bearing value at any depth",
+          "[server][sensitive_params]") {
+    const std::string kSecret = "yuzu_test_sentinel_secret_value";
+    auto args = nlohmann::json::parse(R"({
+        "secret": ")" + kSecret + R"(",
+        "name": "keep-me",
+        "params": {"grant_secret": ")" + kSecret + R"(", "client_secret": ")" + kSecret + R"(", "path": "/x"},
+        "steps": [{"params": {"x": 1}}, {"params": {"grant_id": ")" + kSecret + R"("}},
+                  [{"deep": {"secret": ")" + kSecret + R"("}}]]
+    })");
+    auto out = redact_tool_args_for_ticket(args);
+    REQUIRE(out.has_value());
+    const std::string dumped = out->dump();
+    CHECK(dumped.find(kSecret) == std::string::npos);
+    CHECK(dumped.find("keep-me") != std::string::npos);
+    CHECK(dumped.find("/x") != std::string::npos);
+    CHECK((*out)["secret"].get<std::string>().starts_with("<redacted:sha256:"));
+    // Deterministic, and the input is untouched (taken by value).
+    CHECK(redact_tool_args_for_ticket(args)->dump() == dumped);
+    CHECK(args["secret"] == kSecret);
+}
+
+TEST_CASE("redact_tool_args_for_ticket binds the secret: a different value gives a different "
+          "subject, the same value the same",
+          "[server][sensitive_params]") {
+    nlohmann::json a = {{"secret", "one"}}, b = {{"secret", "two"}}, c = {{"secret", "one"}};
+    CHECK(redact_tool_args_for_ticket(a)->dump() != redact_tool_args_for_ticket(b)->dump());
+    CHECK(redact_tool_args_for_ticket(a)->dump() == redact_tool_args_for_ticket(c)->dump());
+    // Non-string secret values are redacted too.
+    nlohmann::json n = {{"secret", {{"k", "sentinel_obj"}}}};
+    CHECK(redact_tool_args_for_ticket(n)->dump().find("sentinel_obj") == std::string::npos);
+}
+
+TEST_CASE("redact_tool_args_for_ticket fails closed past the depth bound",
+          "[server][sensitive_params]") {
+    nlohmann::json deep = "leaf";
+    for (int i = 0; i < kTicketRedactMaxDepth + 5; ++i)
+        deep = nlohmann::json{{"k", deep}};
+    CHECK_FALSE(redact_tool_args_for_ticket(deep).has_value());
+}
+
+TEST_CASE("redact_tool_args_for_ticket reports over-depth as a caller fault, and pins the "
+          "documented residual: a secret inside a string VALUE is not parsed",
+          "[server][sensitive_params]") {
+    nlohmann::json deep = "leaf";
+    for (int i = 0; i < kTicketRedactMaxDepth + 5; ++i)
+        deep = nlohmann::json{{"k", deep}};
+    bool over = false;
+    CHECK_FALSE(redact_tool_args_for_ticket(deep, &over).has_value());
+    CHECK(over);
+
+    // Residual (documented in the header): text embedded in a string value is not interpreted.
+    nlohmann::json embedded = {{"features_json", R"({"secret":"yuzu_test_embedded"})"}};
+    auto out = redact_tool_args_for_ticket(embedded);
+    REQUIRE(out.has_value());
+    CHECK(out->dump().find("yuzu_test_embedded") != std::string::npos);
+}
+
+TEST_CASE("redact_tool_args_for_ticket: the string \"5\" and the number 5 bind different markers; "
+          "invalid UTF-8 in a secret does not throw",
+          "[server][sensitive_params]") {
+    nlohmann::json as_string = {{"secret", "5"}}, as_number = {{"secret", 5}},
+                   as_string2 = {{"secret", "5"}};
+    CHECK(redact_tool_args_for_ticket(as_string)->dump() !=
+          redact_tool_args_for_ticket(as_number)->dump());
+    CHECK(redact_tool_args_for_ticket(as_string)->dump() ==
+          redact_tool_args_for_ticket(as_string2)->dump());
+    // A non-string secret holding an invalid-UTF-8 string: dump() must not raise type_error 316.
+    nlohmann::json bad = {{"secret", {{"k", std::string("\xff\xfe bad")}}}};
+    CHECK_NOTHROW(redact_tool_args_for_ticket(bad));
+}
+
+TEST_CASE("redact_tool_args_for_ticket: a url's userinfo never reaches the ticket subject, the rest "
+          "of the url stays and a different userinfo binds a different subject (WP06 F12)",
+          "[server][sensitive_params]") {
+    const std::string kCred = "yuzu_test_user:yuzu_test_pw";
+    nlohmann::json a = {{"crl_urls", nlohmann::json::array({{{"url", "https://" + kCred + "@crl.example.test:8443/a.crl?x=1"}}})}};
+    nlohmann::json b = {{"crl_urls", nlohmann::json::array({{{"url", "https://other:cred@crl.example.test:8443/a.crl?x=1"}}})}};
+    auto ra = redact_tool_args_for_ticket(a);
+    auto rb = redact_tool_args_for_ticket(b);
+    REQUIRE(ra.has_value());
+    REQUIRE(rb.has_value());
+    const std::string da = ra->dump();
+    CHECK(da.find("yuzu_test_pw") == std::string::npos);
+    CHECK(da.find("yuzu_test_user") == std::string::npos);
+    CHECK(da.find("@crl.example.test:8443/a.crl?x=1") != std::string::npos); // the rest stays readable
+    CHECK(da.find("<redacted:sha256:") != std::string::npos);
+    CHECK(da != rb->dump());
+    // A url without userinfo (including an '@' in its path or query) is untouched.
+    nlohmann::json plain = {{"url", "https://crl.example.test/a@b?c=d@e"}};
+    CHECK(redact_tool_args_for_ticket(plain)->dump() == plain.dump());
+}

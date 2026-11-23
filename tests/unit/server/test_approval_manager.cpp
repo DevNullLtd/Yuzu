@@ -1428,7 +1428,7 @@ TEST_CASE("Clock tripwires: every banned needle can actually match (positive con
 // (created_at, last_executed_at, next_execution_at and the due-ness comparison) are
 // process-clock due-ness bookkeeping and are INFORMATIONAL for approvals now: no approval
 // decision compares a ticket's database-authored stamp with them. ScheduleRunner reads the
-// process clock only for the timestamp on its audit rows. If you are adding a read to either
+// process clock only for the timestamp on its audit rows and the arming-hold lapse time. If you are adding a read to either
 // file, decide consciously that it cannot feed an approval decision, then bump the count.
 TEST_CASE("Schedule path: the process-clock reads are an allow-listed, documented set "
           "(#6096)",
@@ -1436,10 +1436,12 @@ TEST_CASE("Schedule path: the process-clock reads are an allow-listed, documente
     const std::string runner = server_code_without_comments("schedule_runner.cpp");
     const std::string engine = server_code_without_comments("schedule_engine.cpp");
 
-    // Runner: exactly one clock read (now_epoch(), used only by audit()), called once.
+    // Runner: exactly one clock read (now_epoch()), called at two sites: audit()'s timestamp and the
+    // arming hold's default clock (WP06 F53: when to ask an UNAVAILABLE arming check again; it decides
+    // nothing about a ticket and a test replaces it with Deps::now_epoch_fn).
     CHECK(count_occurrences(runner, "::now(") == 1);
     CHECK(count_occurrences(runner, "system_clock::now") == 1);
-    CHECK(count_occurrences(runner, "now_epoch(") == 2); // definition + audit()'s timestamp
+    CHECK(count_occurrences(runner, "now_epoch(") == 3); // definition + audit() + the hold clock
     // Engine: exactly one clock read (now_epoch()), called at its four due-ness stamp sites
     // (next-due computation, create's created_at, evaluate_due, advance's last_executed_at).
     CHECK(count_occurrences(engine, "::now(") == 1);

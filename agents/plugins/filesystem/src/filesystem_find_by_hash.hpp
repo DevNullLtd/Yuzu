@@ -409,6 +409,15 @@ struct WalkEnv {
     std::function<bool(const fs::path&)> can_enter = [](const fs::path&) {
         return true;
     };
+    /// WP06 F55: true = the entry is refused (a reserved agent path). It canonicalises, so it is
+    /// asked only AFTER the mount check and the symlink_status classification: for a directory (before
+    /// can_enter; a refused one is not descended into and not visited) and for a regular file (before
+    /// the visitor, so the walk cannot be used as a content-hash oracle on one). Never asked for a
+    /// symlink, a junction, a FIFO, a device, a socket or an entry under a mount. A refused entry is
+    /// counted as unreadable.
+    std::function<bool(const fs::path&)> is_refused = [](const fs::path&) {
+        return false;
+    };
     /// Mount points whose subtrees are refused. Empty = no guard.
     std::vector<std::string> network_mounts;
     /// False when the mount table could not be read in full: the list above is then empty or
@@ -461,11 +470,14 @@ private:
 #endif
 
 /// THE bounded, symlink-safe walker of the plugin: `root` to `max_depth` (root's children are
-/// depth 1). The ORDER of the checks is the safety property: the mount check is a string comparison
-/// that precedes every call touching the path. `visit(entry, kind, budget, counters)` is called for
-/// a directory AFTER its depth and can_enter decisions were applied (so it may be asked about one
-/// that is never opened), and for a regular file; a symlink, junction, FIFO, device or socket is
-/// counted and never reaches it. find_by_hash and search_dir are both thin visitors over this.
+/// depth 1). The ORDER of the checks is the safety property: the mount check is a string
+/// comparison that precedes every call touching the path, and `env.is_refused` (which
+/// canonicalises, and so follows a link) is asked only for a directory or regular file that is
+/// neither under a mount nor a link. `visit(entry, kind, budget, counters)` is called for a
+/// directory AFTER its depth and can_enter decisions were applied (so it may be asked about one
+/// that is never opened), and for a regular file; a symlink, junction, FIFO, device, socket or
+/// refused entry is counted and never reaches it. find_by_hash and search_dir are both thin
+/// visitors over this.
 template <class VisitFn>
 WalkOutcome walk_bounded(const std::string& root, int max_depth, const WalkLimits& limits,
                          const WalkEnv& env, VisitFn visit) {
@@ -529,18 +541,28 @@ WalkOutcome walk_bounded(const std::string& root, int max_depth, const WalkLimit
             ++c.skipped_symlink;
             it.disable_recursion_pending();
         } else if (fs::is_directory(st)) {
-            // Children of a directory at depth d sit at d + 1: a directory AT the limit is never
-            // opened, and one we cannot list is counted instead of being skipped silently.
-            if (it.depth() + 1 >= max_depth) {
+            // The reserved decision (it canonicalises, so it follows links) is asked ONLY for an
+            // entry that is neither under a mount nor a link, never before the mount check and the
+            // symlink_status classification above. A refused directory is not descended into.
+            bool refused_dir = false;
+            if (env.is_refused(path)) {
+                refused_dir = true;
+                ++c.skipped_unreadable;
+                it.disable_recursion_pending();
+            } else if (it.depth() + 1 >= max_depth) {
                 it.disable_recursion_pending();
             } else if (!env.can_enter(path)) {
                 ++c.skipped_unreadable;
                 it.disable_recursion_pending();
             }
-            verdict = visit(entry, EntryKind::directory, budget, c);
+            if (!refused_dir)
+                verdict = visit(entry, EntryKind::directory, budget, c);
         } else if (st.type() != fs::file_type::regular) {
             // FIFO, device, socket: never opened (an open of a FIFO can block).
             ++c.skipped_not_regular;
+        } else if (env.is_refused(path)) {
+            // A refused file is counted as unreadable and never hashed or matched.
+            ++c.skipped_unreadable;
         } else {
             verdict = visit(entry, EntryKind::regular, budget, c);
         }

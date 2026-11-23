@@ -34,9 +34,32 @@
 ///
 /// EXTEND this list for the next secret-carrying instruction parameter
 /// — never hand-roll a second per-callsite redaction or rejection.
+///
+/// WP06 F12: the MCP approval ticket's bound subject (`approvals.scope_expression`,
+/// a plain TEXT column returned by every approvals read) used to be the raw
+/// tool arguments. `redact_tool_args_for_ticket` below is the ONE function that
+/// turns tool arguments into that subject's persisted form: every secret-bearing
+/// key at ANY depth (the keys above plus `kRedactedToolArgKeys`) is replaced by
+/// an unkeyed, domain-separated SHA-256 marker. A changed secret still changes
+/// the marker (so a recall with different arguments mismatches), and the same
+/// secret recalls exactly, with no key custody (stable across restarts and
+/// replicas, ADR-0010 posture: never a plain secret column). Fails CLOSED
+/// (nullopt) on over-depth or a digest failure: the caller refuses the mint.
+///
+/// ACCEPTED DESIGN TRADE-OFFS (recorded, not defects): the marker is UNKEYED, so a low-entropy
+/// value (a short `grant_id`, a guessable secret) could be confirmed offline by someone who can
+/// read `approvals.scope_expression` (Approval:Read) - `grant_id` is the lookup key of a
+/// single-redemption credential and `secret` is a high-entropy bearer value, and a keyed digest
+/// would need key custody that survives restarts and replicas for no gain on those values; and
+/// the marker of a typed value hashes its JSON text, so the same secret sent as a string and as
+/// a number binds two different markers (a recall must repeat the original argument exactly). A
+/// `url` string value has only its userinfo (`user:pass@`) replaced by the same kind of marker.
+
+#include "sha256_hex.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -51,6 +74,112 @@ inline constexpr std::string_view kRedactedInstructionParamKeys[] = {"grant_secr
         if (key == redacted)
             return true;
     return false;
+}
+
+/// Tool-argument keys redacted in an approval ticket subject beyond the
+/// instruction-param keys above: `secret` is `confirm_engine_rotation` /
+/// `confirm_api_token_rotation`'s raw successor bearer credential.
+inline constexpr std::string_view kRedactedToolArgKeys[] = {"secret"};
+
+[[nodiscard]] inline bool is_redacted_tool_arg_key(std::string_view key) {
+    if (is_redacted_instruction_param_key(key))
+        return true;
+    for (auto redacted : kRedactedToolArgKeys)
+        if (key == redacted)
+            return true;
+    return false;
+}
+
+inline constexpr int kTicketRedactMaxDepth = 64;
+
+namespace detail {
+[[nodiscard]] inline bool ticket_depth_exceeded_impl(const nlohmann::json& node, int depth) {
+    if (depth > kTicketRedactMaxDepth)
+        return true;
+    if (node.is_object()) {
+        for (auto it = node.begin(); it != node.end(); ++it)
+            if (ticket_depth_exceeded_impl(it.value(), depth + 1))
+                return true;
+    } else if (node.is_array()) {
+        for (const auto& el : node)
+            if (ticket_depth_exceeded_impl(el, depth + 1))
+                return true;
+    }
+    return false;
+}
+[[nodiscard]] inline bool ticket_depth_exceeded(const nlohmann::json& node) {
+    return ticket_depth_exceeded_impl(node, 0);
+}
+[[nodiscard]] inline bool redact_ticket_node(nlohmann::json& node, int depth) {
+    if (depth > kTicketRedactMaxDepth)
+        return false;
+    if (node.is_object()) {
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            if (it.key() == "url" && it.value().is_string()) {
+                // A destination URL may embed credentials (`https://user:pass@host/..`). The
+                // userinfo is replaced by a SHA-256 marker (the rest stays readable), so an
+                // approvals read never returns it and a recall with different userinfo still
+                // mismatches.
+                const std::string url = it.value().get<std::string>();
+                const auto scheme = url.find("://");
+                if (scheme != std::string::npos) {
+                    const auto auth_begin = scheme + 3;
+                    const auto auth_end = url.find_first_of("/?#", auth_begin);
+                    const auto authority = url.substr(
+                        auth_begin, auth_end == std::string::npos ? std::string::npos : auth_end - auth_begin);
+                    if (const auto at = authority.rfind('@'); at != std::string::npos) {
+                        auto h = sha256_hex(std::string("yuzu-ticket-arg-v1\0", 19) + authority.substr(0, at));
+                        if (!h)
+                            return false;
+                        it.value() = url.substr(0, auth_begin) + "<redacted:sha256:" + *h + ">@" +
+                                     authority.substr(at + 1) +
+                                     (auth_end == std::string::npos ? std::string{} : url.substr(auth_end));
+                    }
+                }
+            } else if (is_redacted_tool_arg_key(it.key())) {
+                // The TYPED JSON text, for strings too: the string "5" and the number 5 are
+                // different arguments and must bind different markers. `replace` keeps invalid
+                // UTF-8 from throwing out of the handler.
+                const std::string raw =
+                    it.value().dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+                auto h = sha256_hex(std::string("yuzu-ticket-arg-v1\0", 19) + raw);
+                if (!h)
+                    return false;
+                it.value() = "<redacted:sha256:" + *h + ">";
+            } else if (!redact_ticket_node(it.value(), depth + 1)) {
+                return false;
+            }
+        }
+    } else if (node.is_array()) {
+        for (auto& el : node)
+            if (!redact_ticket_node(el, depth + 1))
+                return false;
+    }
+    return true;
+}
+} // namespace detail
+
+/// The persisted/bound form of MCP tool arguments for an approval ticket
+/// subject. nullopt = could not be computed (over-depth or digest failure): refuse the
+/// mint, never fall back to the raw arguments. `*over_depth` (optional) is set when the cause is
+/// the caller's nesting (a request fault, not retryable) rather than a digest fault.
+///
+/// SCOPE OF THE REDACTION: keys are matched in the JSON structure. A secret embedded as text
+/// INSIDE a string value (a JSON or YAML document passed as one string argument) is NOT parsed:
+/// no approval-gated MCP tool takes such an argument that carries a credential today (the
+/// string-typed document arguments are `yaml_source`/`features_json`-style definitions, which hold
+/// no secret keys), and a NEW tool that does must pass the credential as its own key. This is a
+/// documented residual, pinned by tests/unit/server/test_sensitive_instruction_params.cpp.
+[[nodiscard]] inline std::optional<nlohmann::json> redact_tool_args_for_ticket(nlohmann::json args,
+                                                                               bool* over_depth = nullptr) {
+    if (over_depth)
+        *over_depth = false;
+    if (!detail::redact_ticket_node(args, 0)) {
+        if (over_depth)
+            *over_depth = detail::ticket_depth_exceeded(args);
+        return std::nullopt;
+    }
+    return args;
 }
 
 /// Strip every redacted key from a copy of `params`. Call this ONLY at a

@@ -11010,6 +11010,148 @@ tests:
         eval_time: 17m
         exp_samples: []
 
+  # ── YuzuServerMetricsScrapeDown (/metrics authentication) ────────────────────
+  #
+  # CASE - a scrape that fails for a long time fires (a job sending no credential reads 401, so
+  # `up` is 0). RED if the comparison is inverted or the job label drifts from the shipped
+  # prometheus.yml's `yuzu-server`. This case does NOT pin the `for:` clause (s1 is down for 9
+  # minutes at the check, which fires under any `for:` up to 8m); the next case does.
+  - interval: 1m
+    name: metrics scrape down - sustained up==0 fires
+    input_series:
+      - series: 'up{job="yuzu-server",instance="s1"}'
+        values: "1x3 0x10"
+      - series: 'up{job="yuzu-server",instance="s2"}'
+        values: "1x13"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerMetricsScrapeDown", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerMetricsScrapeDown", alertstate="firing", instance="s1", job="yuzu-server", severity="critical"}'
+            value: 1
+
+  # CASE - a one-scrape blip stays quiet, and the gateway job is not this rule's business.
+  - interval: 1m
+    name: metrics scrape down - a blip and other jobs stay quiet
+    input_series:
+      - series: 'up{job="yuzu-server",instance="s1"}'
+        values: "1x5 0 1x10"
+      - series: 'up{job="yuzu-gateway",instance="g1"}'
+        values: "0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerMetricsScrapeDown"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # ── YuzuAgentPluginMetaDropped ────────────────────────────────────────────
+  - interval: 1m
+    name: plugin meta dropped - an increase fires per field, a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_server_agent_registry_plugin_meta_dropped_total{job="yuzu-server",instance="s1",field="name"}'
+        values: "0x5 3x10"
+      - series: 'yuzu_server_agent_registry_plugin_meta_dropped_total{job="yuzu-server",instance="s1",field="version"}'
+        values: "0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentPluginMetaDropped", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAgentPluginMetaDropped", alertstate="firing", field="name", severity="warning"}'
+            value: 1
+
+  # CASE - the `for: 5m` clause is pinned from both sides. s_short is down for 4 samples
+  # (t=4..7m, a 3m span): it must NOT be firing at 7m. s_long is down from t=4m to 12m: pending at
+  # 8m, firing at 10m. RED if `for:` is dropped or shortened to 1m (s_short fires at 7m) and RED if
+  # it is lengthened to 8m (s_long is not firing at 10m).
+  - interval: 1m
+    name: metrics scrape down - for 5m is pinned from both sides
+    input_series:
+      - series: 'up{job="yuzu-server",instance="s_short"}'
+        values: "1x3 0x4 1x10"
+      - series: 'up{job="yuzu-server",instance="s_long"}'
+        values: "1x3 0x9"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerMetricsScrapeDown", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuServerMetricsScrapeDown", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerMetricsScrapeDown", alertstate="firing", instance="s_long", job="yuzu-server", severity="critical"}'
+            value: 1
+
+  # ── YuzuScheduleArmingUnavailable / YuzuCommandOutboxArmingUnavailable ────
+  # CASE 1 - `for: 15m` is pinned from both sides on a counter that increases every minute from
+  # t=1m (the condition is true from 1m over a 5m window, so the rule is pending from 1m and fires
+  # at 16m). Not firing at 14m, firing at 18m: RED if `for:` is dropped, shortened (to 10m) or
+  # lengthened (to 20m). A flat counter stays quiet on BOTH rules (the outbox flat series is what
+  # makes a `> 0` -> `>= 0` mutation RED).
+  - interval: 1m
+    name: arming unavailable - for 15m pinned, a steady fault fires and a flat counter does not
+    input_series:
+      - series: 'yuzu_schedule_arming_unavailable_total{job="yuzu-server",instance="s_steady"}'
+        values: "0+1x30"
+      - series: 'yuzu_schedule_arming_unavailable_total{job="yuzu-server",instance="s_flat"}'
+        values: "0x30"
+      - series: 'yuzu_server_command_outbox_deliver_arming_unavailable_total{job="yuzu-server",instance="s_steady"}'
+        values: "0+1x30"
+      - series: 'yuzu_server_command_outbox_deliver_arming_unavailable_total{job="yuzu-server",instance="s_flat"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuScheduleArmingUnavailable|YuzuCommandOutboxArmingUnavailable", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuScheduleArmingUnavailable|YuzuCommandOutboxArmingUnavailable", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScheduleArmingUnavailable", alertstate="firing", instance="s_steady", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCommandOutboxArmingUnavailable", alertstate="firing", instance="s_steady", severity="warning"}'
+            value: 1
+
+  # CASE 2 - a SHORT fault that has already cleared must not page. The counter rises 2,4,6 over
+  # minutes 2-4 and then stays flat for 40 minutes; with the old [15m] window the rule fired 16-17
+  # minutes in on a fault that had ended at minute 4. With a [5m] window the condition is false from
+  # about minute 9, so the 15m hold never completes: nothing firing at 17m or later.
+  - interval: 1m
+    name: arming unavailable - a short fault that cleared does not fire (5m window, 15m hold)
+    input_series:
+      - series: 'yuzu_schedule_arming_unavailable_total{job="yuzu-server",instance="s_short"}'
+        values: "0 0 2 4 6 6x40"
+      - series: 'yuzu_server_command_outbox_deliver_arming_unavailable_total{job="yuzu-server",instance="s_short"}'
+        values: "0 0 2 4 6 6x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuScheduleArmingUnavailable|YuzuCommandOutboxArmingUnavailable", alertstate="firing"}'
+        eval_time: 17m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuScheduleArmingUnavailable|YuzuCommandOutboxArmingUnavailable", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # ── YuzuScheduleDueHeld ───────────────────────────────────────────────────
+  # CASE - a gauge held above zero fires once min_over_time[5m] has been above zero for the 5m hold
+  # (the gauge is above zero from 10m, the condition is true from 14m and the rule fires at 19m):
+  # not firing at 17m, firing at 22m. A gauge that is 0, and one that
+  # blips for 2 minutes and clears, stay quiet. RED if `for:` is dropped or shortened to 2m (the
+  # blip would fire), or if `> 0` becomes `>= 0` (the zero gauge would fire).
+  - interval: 1m
+    name: due held - sustained hold fires, a zero gauge and a short blip do not
+    input_series:
+      - series: 'yuzu_schedule_due_held{job="yuzu-server",instance="s_held"}'
+        values: "0x9 2x30"
+      - series: 'yuzu_schedule_due_held{job="yuzu-server",instance="s_zero"}'
+        values: "0x30"
+      - series: 'yuzu_schedule_due_held{job="yuzu-server",instance="s_blip"}'
+        values: "0 3 3 0x38"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScheduleDueHeld", alertstate="firing"}'
+        eval_time: 17m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuScheduleDueHeld", alertstate="firing"}'
+        eval_time: 22m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScheduleDueHeld", alertstate="firing", instance="s_held", severity="warning"}'
+            value: 1
+
   # ── WP01 agent re-registration proof rollout ─────────────────────────────
   - interval: 1m
     name: reregistration would-refuse in audit mode fires

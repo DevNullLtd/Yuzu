@@ -513,12 +513,17 @@ bool ScheduleEngine::set_enabled(const std::string& id, bool enabled,
 // ---------------------------------------------------------------------------
 
 std::vector<InstructionSchedule> ScheduleEngine::evaluate_due() const {
+    auto r = evaluate_due_checked();
+    return r ? std::move(*r) : std::vector<InstructionSchedule>{};
+}
+
+std::expected<std::vector<InstructionSchedule>, std::string> ScheduleEngine::evaluate_due_checked() const {
     std::vector<InstructionSchedule> results;
     if (!open_)
-        return results;
+        return std::unexpected(std::string("schedule store not open"));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return results;
+        return std::unexpected(std::string("schedule store unavailable"));
 
     auto now = now_epoch();
 
@@ -526,14 +531,14 @@ std::vector<InstructionSchedule> ScheduleEngine::evaluate_due() const {
                       " FROM schedule_engine.schedules WHERE enabled = TRUE"
                       " AND next_execution_at > 0"
                       " AND next_execution_at <= $1"
-                      " ORDER BY next_execution_at ASC";
+                      " ORDER BY next_execution_at ASC, id ASC";
 
     pg::PgResult res =
         pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(now)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ScheduleEngine::evaluate_due: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return results;
+        return std::unexpected(std::string("schedule query failed"));
     }
 
     const int rows = PQntuples(res.get());
