@@ -34,10 +34,23 @@ struct Set {
 /// before a not-yet-existing reserved leaf is compared, on both sides. Pure and platform-neutral so it
 /// is unit-tested on Linux; the comparison applies it on `__APPLE__` only.
 [[nodiscard]] inline std::string strip_apple_data_firmlink(std::string_view p) {
-    constexpr std::string_view kPrefix = "/System/Volumes/Data";
-    if (p.size() >= kPrefix.size() && p.compare(0, kPrefix.size(), kPrefix) == 0 &&
-        (p.size() == kPrefix.size() || p[kPrefix.size()] == '/' || p[kPrefix.size()] == '\\'))
-        p.remove_prefix(kPrefix.size());
+    // The prefix is compared ASCII-case-insensitively: the default volume is case-insensitive and a
+    // caller may type any case. An exact match of the prefix alone is the volume root, "/".
+    constexpr std::string_view kPrefix = "/system/volumes/data";
+    if (p.size() < kPrefix.size())
+        return std::string(p);
+    for (std::size_t i = 0; i < kPrefix.size(); ++i) {
+        char c = p[i];
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+        if (c != kPrefix[i])
+            return std::string(p);
+    }
+    if (p.size() == kPrefix.size())
+        return "/";
+    if (p[kPrefix.size()] != '/' && p[kPrefix.size()] != '\\')
+        return std::string(p);
+    p.remove_prefix(kPrefix.size());
     return std::string(p);
 }
 
@@ -68,6 +81,33 @@ struct Set {
     return out;
 }
 
+/// The rotated siblings the agent's own log sink writes: for a reserved file `<dir>/<stem>.<ext>`,
+/// spdlog's rotating sink names generation N `<dir>/<stem>.<N>.<ext>` (`yuzu-agent.log` ->
+/// `yuzu-agent.1.log`), which the `<file>.<suffix>` rule does not cover. A file whose last component has
+/// no extension rotates to `<file>.<N>`, which that rule already covers. Pure; `f` and `p` are normalised.
+[[nodiscard]] inline bool is_rotated_sibling_of(std::string_view f, std::string_view p) {
+    const std::size_t slash = f.rfind('/');
+    const std::size_t name_start = slash == std::string_view::npos ? 0 : slash + 1;
+    const std::size_t dot = f.rfind('.');
+    if (dot == std::string_view::npos || dot <= name_start)
+        return false; // no extension (or a dotfile): nothing of the `<stem>.<N>.<ext>` shape
+    const std::string_view stem = f.substr(0, dot);
+    const std::string_view ext = f.substr(dot); // includes the dot
+    // p == stem + "." + digits + ext
+    if (p.size() <= stem.size() + 1 + ext.size() || p.compare(0, stem.size(), stem) != 0 ||
+        p[stem.size()] != '.')
+        return false;
+    if (p.compare(p.size() - ext.size(), ext.size(), ext) != 0)
+        return false;
+    const std::string_view digits = p.substr(stem.size() + 1, p.size() - stem.size() - 1 - ext.size());
+    if (digits.empty())
+        return false;
+    for (char c : digits)
+        if (c < '0' || c > '9')
+            return false;
+    return true;
+}
+
 /// True when `canonical_path` (symlinks already resolved by the caller) names a reserved dir,
 /// something under one, or a reserved file (or its rotated sibling `<file>.<suffix>`).
 [[nodiscard]] inline bool is_agent_reserved_path(const Set& set, std::string_view canonical_path) {
@@ -91,6 +131,8 @@ struct Set {
         if (p == f)
             return true;
         if (p.size() > f.size() && p.compare(0, f.size(), f) == 0 && p[f.size()] == '.')
+            return true;
+        if (is_rotated_sibling_of(f, p))
             return true;
     }
     return false;

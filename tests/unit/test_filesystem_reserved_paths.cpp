@@ -77,7 +77,9 @@ TEST_CASE("is_agent_reserved_path: a not-yet-existing reserved leaf is matched A
 TEST_CASE("strip_apple_data_firmlink: only a leading /System/Volumes/Data path component is removed (pure)",
           "[agent][filesystem_plugin][reserved][firmlink]") {
     CHECK(rsv::strip_apple_data_firmlink("/System/Volumes/Data/Users/x/f") == "/Users/x/f");
-    CHECK(rsv::strip_apple_data_firmlink("/System/Volumes/Data") == "");
+    CHECK(rsv::strip_apple_data_firmlink("/System/Volumes/Data") == "/");
+    CHECK(rsv::strip_apple_data_firmlink("/system/volumes/data/Users/x/f") == "/Users/x/f");
+    CHECK(rsv::strip_apple_data_firmlink("/SYSTEM/Volumes/DATA/Users/x/f") == "/Users/x/f");
     CHECK(rsv::strip_apple_data_firmlink("/System/Volumes/DataX/f") == "/System/Volumes/DataX/f");
     CHECK(rsv::strip_apple_data_firmlink("/Users/x/System/Volumes/Data/f") == "/Users/x/System/Volumes/Data/f");
     CHECK(rsv::strip_apple_data_firmlink("/etc/hosts") == "/etc/hosts");
@@ -86,12 +88,35 @@ TEST_CASE("strip_apple_data_firmlink: only a leading /System/Volumes/Data path c
 #ifdef __APPLE__
     // The firmlink spelling of a not-yet-existing reserved leaf is the same file on macOS.
     CHECK(rsv::is_agent_reserved_path(s, "/System/Volumes/Data/Users/x/keys/agent.key"));
+    CHECK(rsv::is_agent_reserved_path(s, "/system/volumes/data/Users/x/keys/agent.key"));
+    CHECK(rsv::is_agent_reserved_path(s, "/System/Volumes/DATA/Users/x/keys/AGENT.KEY"));
+    rsv::Set rd;
+    rd.dirs = {"/Users/x/res"};
+    CHECK(rsv::is_agent_reserved_path(rd, "/SYSTEM/Volumes/Data/Users/x/res/new"));
     rsv::Set d;
     d.files = {"/System/Volumes/Data/Users/x/keys/agent.key"};
     CHECK(rsv::is_agent_reserved_path(d, "/Users/x/keys/agent.key"));
 #else
     CHECK_FALSE(rsv::is_agent_reserved_path(s, "/System/Volumes/Data/Users/x/keys/agent.key"));
 #endif
+}
+
+TEST_CASE("is_agent_reserved_path: the agent's rotated log generations (spdlog names them <stem>.<N>.<ext>) are reserved",
+          "[agent][filesystem_plugin][reserved][rotated]") {
+    rsv::Set s;
+    s.files = {"/var/log/yuzu/yuzu-agent.log", "/etc/yuzu/token"};
+    CHECK(rsv::is_agent_reserved_path(s, "/var/log/yuzu/yuzu-agent.log"));
+    CHECK(rsv::is_agent_reserved_path(s, "/var/log/yuzu/yuzu-agent.1.log"));
+    CHECK(rsv::is_agent_reserved_path(s, "/var/log/yuzu/yuzu-agent.12.log"));
+    CHECK(rsv::is_agent_reserved_path(s, "/var/log/yuzu/yuzu-agent.log.1")); // the older shape stays reserved
+    CHECK(rsv::is_agent_reserved_path(s, "/etc/yuzu/token.1"));              // no extension: <file>.<N>
+    CHECK_FALSE(rsv::is_agent_reserved_path(s, "/var/log/yuzu/yuzu-agent..log"));
+    CHECK_FALSE(rsv::is_agent_reserved_path(s, "/var/log/yuzu/yuzu-agent.x.log"));
+    CHECK_FALSE(rsv::is_agent_reserved_path(s, "/var/log/yuzu/yuzu-agent.1.txt"));
+    CHECK_FALSE(rsv::is_agent_reserved_path(s, "/var/log/yuzu/other.1.log"));
+    CHECK_FALSE(rsv::is_agent_reserved_path(s, "/var/log/yuzu/yuzu-agent.1.log/x"));
+    CHECK(rsv::is_rotated_sibling_of("/a/b.log", "/a/b.7.log"));
+    CHECK_FALSE(rsv::is_rotated_sibling_of("/a/.hidden", "/a/.1hidden"));
 }
 
 TEST_CASE("is_agent_reserved_path: an empty set reserves nothing; windows separators normalise",
