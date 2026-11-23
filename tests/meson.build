@@ -2351,6 +2351,12 @@ if build_server
                # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
                '-DYUZU_API_PARITY_LEDGER_DIR="' +
                (meson.project_source_root() / 'scripts' / 'ci' / 'api-parity').replace('\\', '/') +
+               '"',
+               # test_product_normalize.cpp reads the committed normaliser fixture
+               # (tests/unit/fixtures/software-estate/normaliser/normaliser_cases.tsv) at run time; same
+               # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
+               '-DYUZU_TEST_FIXTURE_DIR="' +
+               (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
                '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # MSVC's default 1 MiB thread stack reserve is marginal for this binary's
