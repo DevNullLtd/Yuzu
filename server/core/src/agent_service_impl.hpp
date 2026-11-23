@@ -28,6 +28,7 @@
 #include <yuzu/server/auto_approve.hpp>
 #include "agent.grpc.pb.h"
 #include "agent_registry.hpp"
+#include "agent_reregistration_gate.hpp"
 #include "bounded_audit_budget.hpp"
 #include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
@@ -372,6 +373,22 @@ public:
     }
     void set_require_client_identity(bool v) { require_client_identity_ = v; }
 
+    /// WP01: proof of identity when an already-enrolled agent id re-registers (see
+    /// agent_reregistration_gate.hpp). `hooks` is wired by ServerImpl only when this install has
+    /// its own issuing CA (null = the gate is inert); `mode` is `--agent-reregistration-proof`.
+    /// Both are set once during bring-up, before the dispatcher accepts traffic, and cleared at
+    /// shutdown, exactly like `set_agent_cert_signer`.
+    void set_agent_identity_hooks(std::shared_ptr<const AgentIdentityHooks> hooks) {
+        agent_identity_hooks_ = std::move(hooks);
+    }
+    void set_reregistration_proof_mode(ReregistrationProofMode m) { reregistration_mode_ = m; }
+    /// TEST SEAM (empty in production, like `override_command_record_lookup`): a unit test cannot
+    /// build a gRPC auth context carrying a peer certificate, so it supplies the verdict "the
+    /// presented client certificate proves this agent id" directly.
+    void override_cert_proof_for_test(std::function<bool(const std::string& agent_id)> fn) {
+        cert_proof_override_for_test_ = std::move(fn);
+    }
+
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
                           pb::RegisterResponse* response) override;
 
@@ -692,6 +709,9 @@ private:
 
     // PR3 per-agent mTLS (set post-bootstrap; empty = disabled / legacy path).
     AgentCertSigner agent_cert_signer_;
+    std::shared_ptr<const AgentIdentityHooks> agent_identity_hooks_;
+    ReregistrationProofMode reregistration_mode_{ReregistrationProofMode::Audit};
+    std::function<bool(const std::string&)> cert_proof_override_for_test_;
     std::function<bool(const std::string&)> revocation_checker_;
     std::function<bool(const std::string&)> peer_cert_recognizer_;
 

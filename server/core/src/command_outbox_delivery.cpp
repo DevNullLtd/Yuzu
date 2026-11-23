@@ -6,6 +6,7 @@
 #include "command_outbox_store.hpp"
 #include "execution_tracker.hpp"
 #include "leader_elector.hpp" // kServerBackgroundLeaderLock, LeaderElector::epoch()
+#include "schedule_arming_params.hpp" // decode_arming_parameters (sg10)
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "refusal_log_throttle.hpp" // RefusalLogThrottle: bounded log lines for repeated holds (#3678)
 
@@ -61,7 +62,9 @@ bool decode_payload(const OutboxCommand& c, std::vector<std::string>& agent_ids,
     } catch (const nlohmann::json::exception&) {
         return false;
     }
-    return true;
+    // sg10 / UP-1: a parameter key the agent would truncate (NUL / control byte / invalid UTF-8)
+    // or a value with a NUL is a malformed payload, never a dispatch.
+    return yuzu::server::parameters_well_formed(params);
 }
 
 } // namespace
@@ -188,9 +191,14 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                                     std::int64_t epoch) {
     // 1. Re-authorize at SEND time — authority may have been revoked since
     //    enqueue. Fail-closed on an unset check. A denial is PERMANENT.
+    // sg10: judged on the row's own parameters. Text that does not decode (or holds a malformed key) yields an
+    // empty map here ONLY because that row is failed permanently by the depth/decode guards below
+    // (`decode_payload` also refuses a malformed key) before any send; it never reaches a dispatch.
+    const auto arming_params =
+        decode_arming_parameters(c.parameters).value_or(std::unordered_map<std::string, std::string>{});
     std::expected<bool, std::string> arming{false};
     if (d_.arming_check)
-        arming = d_.arming_check(c.principal, c.plugin, c.action);
+        arming = d_.arming_check(c.principal, c.plugin, c.action, arming_params);
     if (!arming) {
         // Could not be determined (a transient auth-store fault): NOT a denial. Reschedule with
         // back-off; never mark the occurrence failed as "authority_denied".

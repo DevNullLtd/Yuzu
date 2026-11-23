@@ -9,6 +9,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
+#include "schedule_arming_params.hpp" // decode_arming_parameters
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
 
@@ -178,9 +179,14 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
     // lockdown) denies the fire exactly like an explicit `false`. Always
     // advance so a permanently-denied schedule cannot spin retrying every
     // tick forever.
+    // sg10: the arming check judges the schedule's own stored parameters (a parameter-escalated
+    // securable, e.g. patch_connectivity + `targets`, is the arming principal's to hold). Stored
+    // parameters that do not decode are a DENIAL (never a hold): authority is never decided on a
+    // guess, and the check is not asked at all.
+    const auto arming_params = decode_arming_parameters(s.parameter_values);
     std::expected<bool, std::string> arming{false};
-    if (d_.arming_check)
-        arming = d_.arming_check(s.created_by, def.plugin, def.action);
+    if (d_.arming_check && arming_params)
+        arming = d_.arming_check(s.created_by, def.plugin, def.action, *arming_params);
     if (arming)
         arming_held_until_.erase(s.id); // any definitive answer ends the hold
     if (!arming) {
@@ -202,7 +208,8 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
                      "principal='{}' target={}.{}",
                      s.name, s.id, s.created_by, def.plugin, def.action);
         audit(s, "instruction.schedule_fired", "denied",
-              "arming_check_denied schedule_id=" + s.id + " principal=" + s.created_by +
+              std::string(arming_params ? "arming_check_denied" : "arming_parameters_undecodable") +
+                  " schedule_id=" + s.id + " principal=" + s.created_by +
                   " plugin=" + def.plugin + " action=" + def.action);
         d_.schedule_engine->advance_schedule(s.id);
         return;

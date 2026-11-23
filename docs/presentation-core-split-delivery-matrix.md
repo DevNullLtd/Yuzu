@@ -283,7 +283,8 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   link test, and adding Drogon/trantor/jsoncpp to `NOTICE`'s third-party attribution list once a shipped
   binary links them. (Drogon's transitive tree already appears in the release SBOM today — `release.yml`'s Syft
   scan covers `path: .` incl. `vcpkg_installed`, per this PR's changelog fragment — so SBOM pickup is
-  NOT a WS-B2 deferral.)
+  NOT a WS-B2 deferral. Since supply-chain S8 the release SBOMs no longer scan `path: .`: Drogon and
+  its tree are listed, from the installed vcpkg tree, in the SBOM of each file that holds `yuzu-server`.)
   **Superseded by ADR-0035 ladder step 1 (2026-11-10):** the Windows and macOS legs of `ci.yml`
   are agent-only (`-Dbuild_server=false` at step 1, the `server` option's `auto` since step 3), so the Drogon canary now builds on Linux only and the
   Windows dynamic-DLL LOAD assertion above no longer runs in CI. The #4296 "the canary must not

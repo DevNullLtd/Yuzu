@@ -271,6 +271,15 @@ typedef enum {
 /**
  * Send a line of UTF-8 output text back to the server.
  * May be called multiple times from within execute() for streaming output.
+ *
+ * Host guarantees (WP07): the host replaces any byte that is not well-formed
+ * UTF-8 (RFC 3629) or is NUL with '?' before the text is buffered. If a write
+ * cannot be buffered (allocation failure) it is DROPPED and the host forces the
+ * command's typed result to YUZU_RESULT_STATUS_CONSTRAINED with completeness
+ * YUZU_RESULT_COMPLETENESS_PARTIAL (provenance "host:output_dropped" when the
+ * plugin gave none), even if the plugin later reports OK; a worse reported
+ * status (UNAVAILABLE, PERMISSION_DENIED) stands. A capture consumer sees the
+ * capture as truncated. The call itself never throws and returns nothing.
  */
 YUZU_EXPORT void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text);
 

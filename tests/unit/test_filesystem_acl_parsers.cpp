@@ -14,6 +14,8 @@
 #include "filesystem_acl_parsers.hpp"
 #include "test_helpers.hpp"
 
+#include <wire_utf8.hpp>
+
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -81,6 +83,25 @@ TEST_CASE("row_field: folds CR/LF and a trailing backslash, keeps interior backs
     CHECK(row_field("name\\") == "name/");
     CHECK(row_field("a|b") == "a\\|b");
     CHECK(row_field("") == "");
+}
+
+TEST_CASE("row_field: bytes that are not well-formed UTF-8 show as '?', valid text is unchanged",
+          "[filesystem][acl]") {
+    // Mutation notes: dropping the scrub from row_field fails every CHECK in this case.
+    using yuzu::shared::count_invalid_wire_bytes;
+    const std::string bad_ff = row_field(std::string_view{"a\xff" "b"});
+    CHECK(bad_ff == "a?b");
+    const std::string overlong = row_field(std::string_view{"x\xc0\xaf" "y"});
+    CHECK(overlong == "x??y");
+    const std::string lone = row_field(std::string_view{"p\x80" "q"});
+    CHECK(lone == "p?q");
+    CHECK(count_invalid_wire_bytes(bad_ff) == 0);
+    CHECK(count_invalid_wire_bytes(overlong) == 0);
+    CHECK(count_invalid_wire_bytes(lone) == 0);
+
+    // U+00E9 and U+1F600 are byte-identical.
+    const std::string valid = "caf\xc3\xa9 \xf0\x9f\x98\x80";
+    CHECK(row_field(valid) == valid);
 }
 
 // ── Linux ───────────────────────────────────────────────────────────────────

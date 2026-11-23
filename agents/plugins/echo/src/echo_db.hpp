@@ -552,10 +552,21 @@ struct OpenSeams {
     /// (#1527). Production never sets it.
     std::function<void()> before_integrity_check;
     /// The filesystem steps of the quarantine that follows a corrupt verdict (the hard-link
-    /// claim, a sidecar move, a remove), forwarded to `quarantine_corrupt_db`. An empty member is
-    /// the real call. A test's `link` runs between the verdict and the claim, which is where a
-    /// swapped-in link has to be caught (#1527). Production never sets one.
+    /// claim, a sidecar move, a sidecar copy, a remove), forwarded to `quarantine_corrupt_db`. An
+    /// empty member is the real call. A test's `link` runs between the verdict and the claim, which
+    /// is where a swapped-in link has to be caught (#1527). Production never sets one.
     yuzu::shared::sqlite_quarantine::FsOps quarantine_ops;
+    /// Called by the v10 migration after its pre-transaction reads, right before BEGIN IMMEDIATE,
+    /// with the migrating connection. It stands in for another process acting in the gap between
+    /// the pre-checks and the write lock (a second opener, a held lock, a full volume). Production
+    /// never sets it.
+    std::function<void(sqlite3*)> v10_before_begin;
+    /// Override of the v10 migration's wall-clock deadline (default: v10_migration_deadline of the
+    /// file size). A test sets 0 to hit it at once; production leaves it empty.
+    std::optional<std::chrono::milliseconds> v10_deadline;
+    /// True = abandon the v10 migration (rolled back, the file untouched). Production: the open
+    /// retry loop's stop flag, so a shutdown does not wait out a long attempt.
+    std::function<bool()> v10_cancel;
 };
 
 /// What `PRAGMA integrity_check` says about echo.db at open (#559, #7286). Only `corrupt` moves the
@@ -571,6 +582,10 @@ enum class IntegrityCheck {
 /// Classify the sqlite result code that a failed `PRAGMA integrity_check` (prepare or step) ended
 /// with. Pure; `rc` may be an extended code, only its primary (low) byte counts. Never returns `ok`.
 IntegrityCheck classify_integrity_rc(int rc) noexcept;
+
+/// The integer in an echo_config `schema_version` value; an unparseable one reads as 0. Shared by
+/// the open path and the v10 migration's in-transaction re-read so both agree on malformed text.
+int parse_schema_version(const std::string& text);
 
 class EchoDatabase {
 public:
@@ -803,6 +818,14 @@ public:
     /// failure there is warned and tolerated, echo_db.cpp), and promising a read
     /// path that is not there is worse than admitting the store is dark.
     [[nodiscard]] bool query_engine_available() const noexcept { return query_db_ != nullptr; }
+
+    /// False when open() succeeded but `create_warehouse_tables` failed (a broken
+    /// table or index DDL on an otherwise readable file): the store is open and
+    /// its config and state rows work, but the registry-declared warehouse tables
+    /// are incomplete. Set once in open() before the object is published, so it
+    /// needs no lock. Reported on the `echo status` surface as
+    /// `config|warehouse_tables_ok` (#2626).
+    [[nodiscard]] bool warehouse_tables_ok() const noexcept { return warehouse_tables_ok_; }
 
     /// Epoch at which THIS open() quarantined a corrupt echo.db; nullopt for a
     /// clean open. Drives only the echo.status db_health value — the durable
@@ -1043,22 +1066,30 @@ public:
      * referenced. Backs the `echo.purge_source` action (retention-paused frame, Phase 15.A): it
      * drops a deliberately paused source's accumulated forensic data WITHOUT re-enabling
      * collection. The rows go in one transaction (all or none); the dictionary sweep follows
-     * it under `dictionary_deadline` (60 s: operator-initiated and rare) and, if it outruns the
-     * deadline or fails, the strings stay until the weekly GC: that is REPORTED
+     * it under `dictionary_deadline` (kPurgeDictionaryDeadline: operator-initiated and rare) and,
+     * if it outruns the deadline or fails, the strings stay until the weekly GC: that is REPORTED
      * (`dictionary_pending`, counted in `dict_gc_starved_total`), never a silent success, since
      * the purge is promised as forensic erasure and the strings of the purged rows are forensic
      * data too. The deadline is a parameter so a test can drive that path (gc_dictionary's
-     * deadline is the seam).
-     * @return the rows deleted and whether the dictionary sweep is pending, or an error string
-     *         (unknown source / SQL error).
+     * deadline is the seam). `cancelled`, when set, is the caller's stop request (agent
+     * shutdown): the sweep gives up at its next check, as at a deadline, and the TRUNCATE
+     * checkpoint is skipped, both reported as pending. A sweep ended by a stop request is not
+     * counted in `dict_gc_starved_total`: it was not starved. The final TRUNCATE checkpoint never
+     * waits (busy timeout 0): a reader that pins the WAL leaves the pre-delete page images in the
+     * -wal file, which is REPORTED too (`wal_pending`), as the forensic residue it is.
+     * @return the rows deleted and whether the dictionary sweep and the WAL checkpoint are
+     *         pending, or an error string (unknown source / SQL error).
      */
     struct PurgeResult {
         int rows_deleted{0};
         bool dictionary_pending{false}; ///< strings of the purged rows remain until the weekly GC
+        bool wal_pending{false};        ///< the WAL was not truncated: purged pages may linger in it
     };
+    static constexpr std::chrono::seconds kPurgeDictionaryDeadline{60};
     std::expected<PurgeResult, std::string> purge_source(
         const std::string& source,
-        std::chrono::steady_clock::duration dictionary_deadline = std::chrono::seconds(60));
+        std::chrono::steady_clock::duration dictionary_deadline = kPurgeDictionaryDeadline,
+        const std::function<bool()>& cancelled = {});
 
 private:
     explicit EchoDatabase(sqlite3* db);
@@ -1111,6 +1142,7 @@ private:
     // so there is no concurrent writer to race with.
     sqlite3* query_db_{nullptr};
     std::optional<int64_t> quarantined_at_{};
+    bool warehouse_tables_ok_{true}; // cleared by open() when create_warehouse_tables fails (#2626)
     /// The ONE roll-up writer for this database (echo_fold.hpp: one instance per database is a
     /// construction rule, so it lives here). Built by open(); null only in a moved-from object.
     std::unique_ptr<EchoFold> fold_;

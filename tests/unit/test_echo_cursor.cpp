@@ -725,3 +725,54 @@ TEST_CASE("BoundedPendingQueue: the dropped count surfaces in the next capture_g
     REQUIRE(res->rows.size() == 1);
     CHECK(res->rows[0][0] == "dropped=3");
 }
+
+// ── CursorRetry: the cursor driver's backoff policy (contract rule 1) ─────────
+
+TEST_CASE("cursor retry: delays grow 1 2 4 8 then hold at 12 ticks", "[echo][cursor][retry]") {
+    constexpr std::int64_t kTick = 300;
+    constexpr std::int64_t t0 = 1'000'000;
+    CursorRetry r;
+    CHECK(r.due(t0)); // no failure on record
+
+    const std::int64_t expected_ticks[] = {1, 2, 4, 8, 12, 12, 12};
+    std::int64_t now = t0;
+    for (const auto k : expected_ticks) {
+        r.note_failure(now, kTick);
+        CHECK_FALSE(r.due(now));                          // not on the failing tick
+        CHECK_FALSE(r.due(now + (k - 1) * kTick));        // not one tick early
+        CHECK(r.due(now + k * kTick));                    // due after exactly k ticks
+        CHECK(r.due(now + k * kTick - kTick / 2));        // half a tick of jitter is tolerated
+        now += k * kTick;                                 // the retry fails again
+    }
+}
+
+TEST_CASE("cursor retry: one success clears the backoff", "[echo][cursor][retry]") {
+    CursorRetry r;
+    r.note_failure(100, 60);
+    r.note_failure(160, 60);
+    REQUIRE_FALSE(r.due(161));
+    r.note_success();
+    CHECK(r.due(161));
+    CHECK(r.failures == 0);
+    CHECK(r.first_failure_ts == 0); // the first failure time is forgotten
+    r.note_failure(200, 60); // the streak starts again at one tick, not three
+    CHECK(r.first_failure_ts == 200); // a fresh streak, not the old first failure
+    CHECK(r.due(260));
+}
+
+TEST_CASE("cursor retry: a clock stepped back before the first failure makes the source due",
+          "[echo][cursor][retry]") {
+    CursorRetry r;
+    r.note_failure(1'000'000, 300);
+    r.note_failure(1'000'300, 300);
+    CHECK_FALSE(r.due(1'000'301));
+    CHECK(r.due(999'999)); // the clock went back past the first failure
+}
+
+TEST_CASE("cursor retry: the tick period comes from the config string, defaulting to 300",
+          "[echo][cursor][retry]") {
+    CHECK(parse_tick_seconds("60") == 60);
+    CHECK(parse_tick_seconds("7200") == 7200);
+    for (const char* bad : {"", "abc", "0", "-5", "30s", " 60"})
+        CHECK(parse_tick_seconds(bad) == 300);
+}

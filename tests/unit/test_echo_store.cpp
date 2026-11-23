@@ -7,15 +7,20 @@
 
 #include "echo_aggregator.hpp" // run_budget: the failed-measurement case
 #include "echo_db.hpp"
+#include "echo_fold.hpp" // gc_dictionary: the cancellable sweep
 #include "echo_test_db.hpp"
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
 #include "echo_sql_executor.hpp"
 #include "echo_sqlite_progress.hpp"
+#include "echo_status_format.hpp" // format_schema_status_lines (#2626)
+#include "test_bounded_return.hpp"
 #include "test_helpers.hpp"
 #include "test_log_capture.hpp"
 
 #include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption
+
+#include <sqlite_quarantine.hpp> // prune_old_quarantines: the quarantine bound (#2155)
 
 #include <sqlite3.h> // raw handle for the reopen-after-DROP upgrade simulation
 
@@ -34,6 +39,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -754,7 +760,7 @@ TEST_CASE("EchoDatabase: purge old records via execute_sql_range", "[echo][store
 
     auto remaining = t.db.execute_query("SELECT hour_ts FROM process_hourly ORDER BY hour_ts");
     REQUIRE(remaining.has_value());
-    CHECK(remaining->rows.size() == 5);
+    REQUIRE(remaining->rows.size() == 5);
     CHECK(remaining->rows[0][0] == "18000");
 }
 
@@ -892,7 +898,7 @@ TEST_CASE("execute_user_query: SELECT on an allowlisted table succeeds",
 TEST_CASE("execute_user_query: the DEX per-app canned aggregate shape stays authorizer-compatible",
           "[echo][store][sandbox][procperf][pin]") {
     // The server's /dex per-app panel dispatches this exact SQL shape
-    // (dex_routes.cpp dex_procperf_sql(), with $ProcPerf_Hourly translated to
+    // (dex_perf_model.cpp dex_procperf_sql(), with $ProcPerf_Hourly translated to
     // procperf_hourly). No other test runs aggregates through the REAL
     // authorizer on this table — an authorizer tightening that drops
     // SUM/MAX/CAST/COUNT/GROUP BY/ORDER BY-alias/LIMIT would otherwise break
@@ -1664,6 +1670,54 @@ TEST_CASE("EchoDatabase: create_warehouse_tables joins a transaction the caller 
     CHECK(boot_tables() == "1");
     auto q = t.db.execute_query("SELECT COUNT(*) FROM netqual_boot");
     REQUIRE(q.has_value());
+}
+
+TEST_CASE("EchoDatabase: a failed warehouse table create opens the store and says so (#2626)",
+          "[echo][store][lifecycle][ddl-batch]") {
+    // open() tolerates a failed create_warehouse_tables (config and state still work), but used
+    // to log a warning and report a healthy store. A table that exists with the wrong columns
+    // makes the registry's `CREATE INDEX ... ON <table>(ts)` fail the whole batch on every open.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_2626_");
+    auto ok_tmp = yuzu::test::unique_temp_path("yuzu_test_echo_2626_ok_");
+    {
+        auto seeded = EchoDatabase::open(tmp);
+        REQUIRE(seeded.has_value());
+        CHECK(seeded->warehouse_tables_ok()); // a healthy open reports true
+        REQUIRE(seeded->execute_query("DROP TABLE netqual_boot").has_value());
+        REQUIRE(seeded->execute_query("CREATE TABLE netqual_boot (id INTEGER PRIMARY KEY)")
+                    .has_value());
+    }
+
+    {
+        auto db = EchoDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->is_open());
+        CHECK(db->schema_version() == 10);
+        CHECK_FALSE(db->warehouse_tables_ok());
+
+        // The flag survives both moves, so the plugin's stored handle still reports it.
+        EchoDatabase moved{std::move(*db)};
+        CHECK_FALSE(moved.warehouse_tables_ok());
+        EchoDatabase assigned = std::move(moved);
+        CHECK_FALSE(assigned.warehouse_tables_ok());
+        auto healthy = EchoDatabase::open(ok_tmp);
+        REQUIRE(healthy.has_value());
+        healthy = std::move(assigned);
+        CHECK_FALSE(healthy->warehouse_tables_ok());
+    }
+
+    std::error_code ec;
+    for (const auto& base : {tmp, ok_tmp})
+        for (const char* suffix : {"", "-wal", "-shm", "-journal"})
+            fs::remove(fs::path{base.string() + suffix}, ec);
+}
+
+TEST_CASE("format_schema_status_lines: the two always-present config lines, in order (#2626)",
+          "[echo][store][status]") {
+    CHECK(yuzu::echo::format_schema_status_lines(10, true) ==
+          std::vector<std::string>{"config|schema_version|10", "config|warehouse_tables_ok|true"});
+    CHECK(yuzu::echo::format_schema_status_lines(10, false) ==
+          std::vector<std::string>{"config|schema_version|10", "config|warehouse_tables_ok|false"});
 }
 
 TEST_CASE("EchoDatabase: a v3 database with pre-version procperf tables upgrades to the roll-up tiers",
@@ -4032,7 +4086,7 @@ std::vector<std::string> names_with_prefix(const fs::path& dir, const std::strin
 fs::path make_healthy_echo_db(const fs::path& dir) {
     REQUIRE(fs::create_directories(dir));
     const auto db = dir / "echo.db";
-    auto opened = EchoDatabase::open(db);
+    auto opened = yuzu::test::open_echo_db(db); // the migrated template, not a per-test migration
     REQUIRE(opened.has_value());
     REQUIRE(opened->set_config("process_enabled", "false")); // a paused source: must survive
     return db;
@@ -4201,6 +4255,180 @@ TEST_CASE("EchoDatabase: a genuinely corrupt echo.db is still quarantined and it
     sqlite3_busy_timeout(o.db, 0);
     CHECK(sqlite3_exec(o.db, "BEGIN EXCLUSIVE", nullptr, nullptr, nullptr) == SQLITE_OK);
     sqlite3_exec(o.db, "ROLLBACK", nullptr, nullptr, nullptr);
+}
+
+// #2155. Repeated corruption must not fill the volume: after a quarantine only the newest three
+// `echo.db.corrupt-*` groups stay. The groups below are seeded with epochs far older than "now",
+// so the one this open creates is the newest.
+TEST_CASE("quarantine: a fourth corrupt database leaves the newest three groups (#2155)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qbound_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    for (const char* sfx : {"-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{db.string() + sfx}, ec);
+    }
+    for (const char* epoch : {"100", "200", "300"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "old evidence");
+    spit_file(db, "this is not a SQLite database -- fourth corruption");
+
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->quarantined_this_open().has_value());
+
+    auto names = names_with_prefix(dir.path, "echo.db.corrupt-");
+    std::sort(names.begin(), names.end());
+    auto expected = std::vector<std::string>{
+        "echo.db.corrupt-200", "echo.db.corrupt-300",
+        "echo.db.corrupt-" + std::to_string(*reopened->quarantined_this_open())};
+    std::sort(expected.begin(), expected.end());
+    CHECK(names == expected); // the oldest seeded group (100) went; the new one stayed
+}
+
+TEST_CASE("quarantine: the group just created is never removed even when its name sorts oldest (#2155)",
+          "[echo][store][corruption]") {
+    // A backward clock step makes the new group's epoch the smallest: ordered by name alone it
+    // would be the first candidate, and the prune would delete the evidence it was just handed.
+    yuzu::test::TempDir dir{"yuzu_test_echo_qclock_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"1", "500", "600", "700"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-1", 3);
+
+    CHECK(pruned.notes.empty());
+    auto names = names_with_prefix(dir.path, "echo.db.corrupt-");
+    std::sort(names.begin(), names.end());
+    // 4 groups, keep 3: the oldest NON-protected group (500) goes, never the protected "1".
+    CHECK(names == std::vector<std::string>{"echo.db.corrupt-1", "echo.db.corrupt-600",
+                                            "echo.db.corrupt-700"});
+}
+
+TEST_CASE("quarantine: a group's sidecars are removed with it (#2155)", "[echo][store][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qside_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"10", "20", "30", "40"}) {
+        for (const char* sfx : {"", "-wal", "-shm", "-journal"})
+            spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch + sfx), "evidence");
+    }
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.size() == 4); // the main file and its three sidecars
+    CHECK(pruned.notes.empty());
+    const auto names = names_with_prefix(dir.path, "echo.db.corrupt-");
+    CHECK(names.size() == 12); // three groups of four remain, none partial
+    CHECK(std::none_of(names.begin(), names.end(), [](const std::string& n) {
+        return n.starts_with("echo.db.corrupt-10");
+    }));
+}
+
+TEST_CASE("quarantine: planted files and look-alike names are never touched (#2155)",
+          "[echo][store][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qlook_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"10", "20", "30", "40"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+    const std::vector<std::string> untouched = {
+        "echo.db.planted-5",        // a different recovery's evidence
+        "echo.db.corrupt-",         // no digits
+        "echo.db.corrupt-5x",       // trailing junk
+        "echo.db.corrupt--5",       // a sign
+        "echo.db.corrupt-5-bak",    // not a sidecar suffix
+        "echo.db.corrupt-1-2-3",    // a third number
+        "other.db.corrupt-5",       // another database's quarantine
+        "echo.db",                  // the live database
+        "echo.db-wal",
+    };
+    for (const auto& n : untouched)
+        spit_file(dir.path / n, "not ours");
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.size() == 1);
+    for (const auto& n : untouched) {
+        INFO(n);
+        CHECK(fs::exists(dir.path / n));
+        CHECK(slurp_file(dir.path / n) == "not ours");
+    }
+    CHECK_FALSE(fs::exists(dir.path / "echo.db.corrupt-10"));
+}
+
+TEST_CASE("quarantine: a group with one file that cannot be removed loses its other files and the stuck file is reported and left (#2155)",
+          "[echo][store][corruption]") {
+    // A non-empty directory under a quarantine name cannot be removed by std::filesystem::remove,
+    // on any platform: the stand-in for a file another process holds open.
+    yuzu::test::TempDir dir{"yuzu_test_echo_qstuck_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"10", "20", "30", "40"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+    spit_file(dir.path / "echo.db.corrupt-10-wal", "evidence");
+    const auto stuck = dir.path / "echo.db.corrupt-10-shm";
+    REQUIRE(fs::create_directories(stuck));
+    spit_file(stuck / "inside", "held");
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.size() == 2); // the main file and the -wal went
+    REQUIRE(pruned.notes.size() == 1);
+    CHECK(pruned.notes[0].find(stuck.string()) != std::string::npos);
+    CHECK_FALSE(fs::exists(dir.path / "echo.db.corrupt-10"));
+    CHECK_FALSE(fs::exists(dir.path / "echo.db.corrupt-10-wal"));
+    CHECK(fs::exists(stuck)); // reported and left
+    for (const char* epoch : {"20", "30", "40"})
+        CHECK(fs::exists(dir.path / (std::string{"echo.db.corrupt-"} + epoch)));
+}
+
+TEST_CASE("quarantine: a stuck file left by an earlier prune is counted as a group and removed by a later one (#2155)",
+          "[echo][store][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qretry_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"20", "30", "40"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+    // What an earlier prune left: group 10 reduced to the one file that could not be removed.
+    const auto stuck = dir.path / "echo.db.corrupt-10-shm";
+    REQUIRE(fs::create_directories(stuck));
+    spit_file(stuck / "inside", "held");
+
+    // Still held: it counts as a fourth group, is tried, is reported, and stays.
+    auto first = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+    CHECK(first.removed.empty());
+    CHECK(first.notes.size() == 1);
+    CHECK(fs::exists(stuck));
+
+    // Released: the next prune removes it.
+    fs::remove(stuck / "inside");
+    auto second = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+    CHECK(second.notes.empty());
+    CHECK(second.removed.size() == 1);
+    CHECK_FALSE(fs::exists(stuck));
+}
+
+TEST_CASE("quarantine: a directory that cannot be listed deletes nothing and is reported (#2155)",
+          "[echo][store][corruption]") {
+    // The database's directory does not exist, so the listing fails on every platform with no
+    // permission tricks. Nothing can be removed from a directory that was not read, and the
+    // function reports it instead of throwing.
+    yuzu::test::TempDir dir{"yuzu_test_echo_qlist_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto missing = dir.path / "missing";
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        missing / "echo.db", missing / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.empty());
+    REQUIRE(pruned.notes.size() == 1);
+    CHECK(pruned.notes[0].starts_with("could not list"));
 }
 
 // #1527. A link at the database path (or a sidecar) is refused before anything is opened, moved or
@@ -4604,6 +4832,371 @@ TEST_CASE("EchoDatabase: a rollback journal beside echo.db is owner-only after o
     const auto db = make_healthy_echo_db(dir.path);
     const fs::path journal{db.string() + "-journal"};
     spit_file(journal, ""); // empty: not hot, so SQLite leaves it and open() only re-modes it
+    std::error_code ec;
+    fs::permissions(journal, fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read |
+                                 fs::perms::others_read,
+                    fs::perm_options::replace, ec);
+    REQUIRE_FALSE(ec);
+
+    auto opened = EchoDatabase::open(db);
+    REQUIRE(opened.has_value());
+    REQUIRE(fs::exists(journal));
+    CHECK((fs::status(journal).permissions() & fs::perms::mask) ==
+          (fs::perms::owner_read | fs::perms::owner_write));
+}
+
+// #7472 end to end. The sidecar cannot be renamed and its copy fails part-way (the injected copy
+// writes a few bytes and reports a full disk). A truncated `<claimed>-wal` left in the set would
+// pass for the real one, so the primitive removes it; the fresh database must open with nothing
+// of the old sidecar beside it. The shared primitive's own cases are in test_command_dedup_store.cpp.
+TEST_CASE("EchoDatabase: a corrupt open whose sidecar move and copy both fail leaves no partial sidecar (#7472)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_partialwal_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    const fs::path wal{db.string() + "-wal"};
+    // A second connection keeps a real, non-empty WAL alive across the corrupt reopen (closing the
+    // last connection would checkpoint and delete it, and a garbage -wal does not survive that).
+    SqliteOwner keeper;
+    REQUIRE(sqlite3_open_v2(db.string().c_str(), &keeper.db, SQLITE_OPEN_READWRITE, nullptr) ==
+            SQLITE_OK);
+    exec_sql(keeper.db, "PRAGMA journal_mode=WAL");
+    exec_sql(keeper.db, "PRAGMA wal_autocheckpoint=0");
+    exec_sql(keeper.db, "INSERT OR REPLACE INTO echo_config(key, value) VALUES ('wal_row', 'x')");
+    REQUIRE(fs::exists(wal));
+    REQUIRE(fs::file_size(wal) > 0);
+    const std::string wal_bytes = slurp_file(wal);
+    spit_file(db, "this is not a SQLite database -- corrupt main file beside a live WAL");
+
+    std::vector<std::string> copied; // the sidecars that reached the copy step (-wal, and -shm)
+    OpenSeams seams;
+    seams.quarantine_ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    seams.quarantine_ops.copy = [&](const fs::path& from, const fs::path& to, std::error_code& ec) {
+        copied.push_back(from.filename().string());
+        spit_file(to, "partial"); // the part that landed before the volume filled
+        ec = std::make_error_code(std::errc::no_space_on_device);
+    };
+
+    // The primitive's notes reach the operator through spdlog; echo_db.cpp is compiled into this
+    // binary, so the capture reaches it (see the caveat in test_log_capture.hpp).
+    yuzu::test::LogCapture logs;
+    auto opened = EchoDatabase::open(db, seams);
+    logs.stop();
+    REQUIRE(std::find(copied.begin(), copied.end(), "echo.db-wal") != copied.end()); // not vacuous
+    REQUIRE(opened.has_value());
+    CHECK(logs.text().find("its content is not kept") != std::string::npos);
+    CHECK(logs.text().find("partial copy") != std::string::npos);
+    REQUIRE(opened->quarantined_this_open().has_value());
+    const auto kept = names_with_prefix(dir.path, "echo.db.corrupt-");
+    REQUIRE(kept.size() == 1); // the main file alone: no `-wal` or `-shm` partial in the set
+    CHECK(kept[0].find("-wal") == std::string::npos);
+    CHECK(kept[0].find("-shm") == std::string::npos);
+    CHECK((!fs::exists(wal) || slurp_file(wal) != wal_bytes)); // nothing stale beside the fresh file
+    CHECK(opened->get_config("process_enabled", "true") == "true"); // a fresh database
+    CHECK(opened->get_config("wal_row", "absent") == "absent");     // the old WAL's row did not replay
+}
+
+// #7473. A directory whose filesystem cannot hard-link answers the claim with ENOTSUP: the open
+// fails closed, the corrupt file stays where it is byte for byte, and nothing carries a quarantine
+// name. The refusal names the cause in the log (the primitive's note), not in the open error.
+TEST_CASE("EchoDatabase: a filesystem that cannot hard-link refuses the open and moves nothing (#7473)",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_nolink_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    const std::string bytes = "this is not a SQLite database -- no hard links here";
+    spit_file(db, bytes);
+
+    int link_calls = 0;
+    yuzu::shared::sqlite_quarantine::FsOps ops;
+    ops.link = [&](const fs::path&, const fs::path&, std::error_code& ec) {
+        ++link_calls;
+        ec = std::make_error_code(std::errc::operation_not_supported);
+    };
+    OpenSeams seams;
+    seams.quarantine_ops = ops;
+
+    auto refused = EchoDatabase::open(db, seams);
+    REQUIRE(link_calls == 1);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("corrupt and unmovable") != std::string::npos);
+    CHECK(slurp_file(db) == bytes);
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+
+    // The log line the operator reads comes from the primitive's note: it names hard links.
+    const auto direct = yuzu::shared::sqlite_quarantine::quarantine_corrupt_db(db, 1, ops);
+    CHECK_FALSE(direct.dest.has_value());
+    REQUIRE(direct.notes.size() == 1);
+    CHECK(direct.notes[0].find("hard links") != std::string::npos);
+    CHECK(slurp_file(db) == bytes);
+}
+
+// #7473. A non-empty WAL with no main file is not a database: SQLite creates the main file fresh
+// and discards the orphan WAL instead of replaying its frames into it.
+TEST_CASE("EchoDatabase: a non-empty -wal beside an absent echo.db is not replayed (#7473)",
+          "[echo][store][lifecycle][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_orphanwal_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    const fs::path wal{db.string() + "-wal"};
+    std::string wal_bytes;
+    {
+        SqliteOwner keeper;
+        REQUIRE(sqlite3_open_v2(db.string().c_str(), &keeper.db, SQLITE_OPEN_READWRITE, nullptr) ==
+                SQLITE_OK);
+        exec_sql(keeper.db, "PRAGMA journal_mode=WAL");
+        exec_sql(keeper.db, "PRAGMA wal_autocheckpoint=0");
+        exec_sql(keeper.db, "INSERT OR REPLACE INTO echo_config(key, value) VALUES ('wal_row', 'x')");
+        REQUIRE(fs::exists(wal));
+        REQUIRE(fs::file_size(wal) > 0);
+        wal_bytes = slurp_file(wal); // taken while the keeper holds it: closing checkpoints it away
+    }
+    for (const char* sfx : {"", "-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{db.string() + sfx}, ec);
+    }
+    spit_file(wal, wal_bytes);
+    REQUIRE_FALSE(fs::exists(db));
+
+    auto opened = EchoDatabase::open(db);
+    REQUIRE(opened.has_value());
+    CHECK_FALSE(opened->quarantined_this_open().has_value());
+    CHECK(opened->get_config("wal_row", "absent") == "absent");
+    CHECK(opened->get_config("process_enabled", "true") == "true"); // an empty, fresh database
+}
+
+// #7470. The state an interrupted claim leaves on POSIX: the corrupt file under echo.db AND under
+// echo.db.corrupt-<epoch>. The link seam plants the first name (a real hard link) and then runs
+// the real claim, which finds the name taken and moves on to the next suffix.
+TEST_CASE("EchoDatabase: a corrupt echo.db already hard-linked to a quarantine name is quarantined again under the next name (#7470)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_relinked_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    spit_file(db, "this is not a SQLite database -- interrupted claim");
+
+    int link_calls = 0;
+    OpenSeams seams;
+    seams.quarantine_ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& ec) {
+        if (++link_calls == 1) {
+            fs::create_hard_link(from, to, ec); // the earlier, interrupted claim
+            REQUIRE_FALSE(ec);
+        }
+        fs::create_hard_link(from, to, ec); // first call: EEXIST; later calls: the real claim
+    };
+
+    auto opened = EchoDatabase::open(db, seams);
+    REQUIRE(link_calls == 2);
+    REQUIRE(opened.has_value());
+    REQUIRE(opened->quarantined_this_open().has_value());
+    const auto kept = names_with_prefix(dir.path, "echo.db.corrupt-");
+    REQUIRE(kept.size() == 2);
+    CHECK(fs::equivalent(dir.path / kept[0], dir.path / kept[1])); // one inode, two names
+    CHECK_FALSE(fs::equivalent(db, dir.path / kept[0]));            // echo.db is the fresh file
+    CHECK(opened->get_config("process_enabled", "true") == "true");
+}
+
+namespace {
+// An open whose REFUSAL is under test (#7470): the call runs under the standard's hang backstop
+// (docs/testing/echo-test-standard.md, rule 4), which also prints its real elapsed seconds to the
+// test log on every run. A refusal slower than the bound ends the test process naming the call;
+// a slower one under it shows in the log and does not fail.
+std::expected<EchoDatabase, std::string> open_bounded(const char* what, const fs::path& db) {
+    std::optional<std::expected<EchoDatabase, std::string>> result;
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, what,
+                                   [&] { result.emplace(EchoDatabase::open(db)); });
+    return std::move(*result);
+}
+} // namespace
+
+// #7470. A corrupt file another connection holds EXCLUSIVE is not quarantined: the open waits out
+// its busy timeout once and refuses as busy. The corruption is in every page after the first, so
+// the holder can still read the schema and take the lock while the integrity check would fail.
+// Once the holder is gone the next open quarantines the same bytes and recovers. The one wait is
+// SQLite's 5 s busy timeout (kBusyTimeoutMs, echo_db.cpp:67), acceptable for a boot-time call as in
+// the #7286 case above and the only wait in this case; measured 5.213 s on macOS (uid 501, HEAD
+// 4712650928), and the bounded call prints the elapsed time on every run.
+TEST_CASE("EchoDatabase: a corrupt echo.db held exclusively is refused as busy, then quarantined once released (#7470)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_corruptbusy_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    for (const char* sfx : {"-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{db.string() + sfx}, ec);
+    }
+    {
+        auto bytes = slurp_file(db);
+        REQUIRE(bytes.size() > 1024);
+        std::size_t page = (static_cast<unsigned char>(bytes[16]) << 8) |
+                           static_cast<unsigned char>(bytes[17]);
+        if (page == 1)
+            page = 65536;
+        REQUIRE(bytes.size() % page == 0);
+        REQUIRE(bytes.size() / page >= 2);
+        for (std::size_t off = page; off < bytes.size(); off += page)
+            bytes[off] = '\xff'; // an invalid b-tree page type on every page but the first
+        spit_file(db, bytes);
+    }
+    const std::string corrupt_bytes = slurp_file(db);
+
+    auto holder = std::make_unique<SqliteOwner>();
+    REQUIRE(sqlite3_open_v2(db.string().c_str(), &holder->db, SQLITE_OPEN_READWRITE, nullptr) ==
+            SQLITE_OK);
+    exec_sql(holder->db, "PRAGMA locking_mode=EXCLUSIVE");
+    exec_sql(holder->db, "BEGIN EXCLUSIVE");
+
+    auto refused = open_bounded("EchoDatabase::open of a corrupt echo.db held exclusively", db);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("echo.db is busy") != std::string::npos);
+    CHECK(refused.error().find("not quarantined") != std::string::npos);
+    CHECK(slurp_file(db) == corrupt_bytes);
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+
+    exec_sql(holder->db, "ROLLBACK");
+    holder.reset();
+
+    auto recovered = EchoDatabase::open(db);
+    REQUIRE(recovered.has_value());
+    REQUIRE(recovered->quarantined_this_open().has_value()); // the corruption was real
+    const auto kept = names_with_prefix(dir.path, "echo.db.corrupt-");
+    REQUIRE(kept.size() == 1);
+    CHECK(slurp_file(dir.path / kept[0]) == corrupt_bytes); // the evidence is the bytes refused above
+    CHECK(recovered->get_config("process_enabled", "true") == "true");
+}
+
+// #7470. A file the agent's account cannot read at all (mode 000) is neither corrupt nor busy:
+// the open refuses (SQLite cannot open it) and quarantines nothing, and once the mode is back the
+// next open reads it.
+TEST_CASE("EchoDatabase: an echo.db with mode 000 is refused and opens once the mode is restored (#7470)",
+          "[echo][store][lifecycle][corruption]") {
+    if (::geteuid() == 0)
+        SKIP("root reads a mode-000 file; cannot provoke the refusal");
+    yuzu::test::TempDir dir{"yuzu_test_echo_mode000_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    struct ModeGuard {
+        fs::path p;
+        ~ModeGuard() {
+            std::error_code ec;
+            fs::permissions(p, fs::perms::owner_read | fs::perms::owner_write,
+                            fs::perm_options::replace, ec);
+        }
+    } guard{db};
+    std::error_code ec;
+    fs::permissions(db, fs::perms::none, fs::perm_options::replace, ec);
+    REQUIRE_FALSE(ec);
+
+    auto refused = open_bounded("EchoDatabase::open of an echo.db with mode 000", db);
+    REQUIRE_FALSE(refused.has_value());
+    // Observed: the failure is at SQLite's open, so the text is `failed to open echo.db: unable to
+    // open database file` (no path, no "could not be checked").
+    CHECK(refused.error().find("failed to open echo.db: unable to open database file") !=
+          std::string::npos);
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+
+    fs::permissions(db, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace,
+                    ec);
+    REQUIRE_FALSE(ec);
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    CHECK_FALSE(reopened->quarantined_this_open().has_value());
+    CHECK(reopened->get_config("process_enabled", "true") == "false"); // its data, intact
+}
+
+// #7470. A data directory the account cannot write to: SQLite cannot create the WAL, so the open
+// refuses; nothing is quarantined, and restoring the directory lets the next open succeed.
+TEST_CASE("EchoDatabase: a read-only data directory is refused and opens once restored (#7470)",
+          "[echo][store][lifecycle][corruption]") {
+    if (::geteuid() == 0)
+        SKIP("root bypasses directory permissions; cannot make the directory read-only");
+    yuzu::test::TempDir dir{"yuzu_test_echo_rodir_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    struct DirGuard {
+        fs::path d;
+        ~DirGuard() {
+            std::error_code ec;
+            fs::permissions(d, fs::perms::owner_all, fs::perm_options::add, ec);
+        }
+    } guard{dir.path};
+    std::error_code ec;
+    fs::permissions(dir.path,
+                    fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                    fs::perm_options::remove, ec);
+    REQUIRE_FALSE(ec);
+
+    auto refused = open_bounded("EchoDatabase::open in a read-only data directory", db);
+    REQUIRE_FALSE(refused.has_value());
+    INFO("open error: " << refused.error());
+    // Observed (macOS, uid 501): the file opens, the integrity check cannot create the WAL, so the
+    // text is `echo.db could not be checked (sqlite rc 8): not quarantined and not opened; ...`,
+    // the class docs/user-manual/echo.md describes. The prefix and the path are pinned, not the
+    // result code (8 on macOS), which another platform's SQLite may report differently.
+    CHECK(refused.error().find("echo.db could not be checked (sqlite rc ") != std::string::npos);
+    CHECK(refused.error().find(db.string()) != std::string::npos); // the refusal names the path
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+
+    fs::permissions(dir.path, fs::perms::owner_all, fs::perm_options::add, ec);
+    REQUIRE_FALSE(ec);
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    CHECK_FALSE(reopened->quarantined_this_open().has_value());
+    CHECK(reopened->get_config("process_enabled", "true") == "false");
+}
+
+// #6366. The WAL a corrupt echo.db leaves is held open by a second, READ-ONLY connection (a
+// reader that began before the writer closed keeps it from being checkpointed away). The
+// quarantine carries the WAL: present, non-empty, owner-only.
+TEST_CASE("EchoDatabase: a non-empty -wal held open by a read connection is quarantined owner-only (#6366)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_readerwal_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    const fs::path wal{db.string() + "-wal"};
+
+    SqliteOwner reader;
+    REQUIRE(sqlite3_open_v2(db.string().c_str(), &reader.db, SQLITE_OPEN_READONLY, nullptr) ==
+            SQLITE_OK);
+    exec_sql(reader.db, "BEGIN");
+    exec_sql(reader.db, "SELECT count(*) FROM echo_config");
+    {
+        SqliteOwner writer;
+        REQUIRE(sqlite3_open_v2(db.string().c_str(), &writer.db, SQLITE_OPEN_READWRITE, nullptr) ==
+                SQLITE_OK);
+        exec_sql(writer.db, "PRAGMA wal_autocheckpoint=0");
+        exec_sql(writer.db,
+                 "INSERT OR REPLACE INTO echo_config(key, value) VALUES ('wal_row', 'x')");
+    } // the writer closes while the reader still holds the WAL
+    REQUIRE(fs::exists(wal));
+    REQUIRE(fs::file_size(wal) > 0);
+    const std::string wal_bytes = slurp_file(wal);
+    spit_file(db, "this is not a SQLite database -- corrupt main file beside a read-held WAL");
+    // Seed the live -wal group/other-readable so the quarantined copy's 0600 proves the sidecar
+    // was re-secured, not inherited (SQLite creates the -wal with the database's own mode).
+    std::error_code pec;
+    fs::permissions(wal, fs::perms::owner_all | fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace, pec);
+    REQUIRE_FALSE(pec);
+
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->quarantined_this_open().has_value());
+    const std::string qfile = reopened->get_config("db_health_last_quarantine_file", "");
+    REQUIRE_FALSE(qfile.empty());
+    const fs::path qwal = dir.path / (qfile + "-wal");
+    REQUIRE(fs::exists(qwal));
+    CHECK(fs::file_size(qwal) > 0);
+    CHECK(slurp_file(qwal) == wal_bytes);
+    CHECK((fs::status(qwal).permissions() & fs::perms::mask) ==
+          (fs::perms::owner_read | fs::perms::owner_write));
+}
+
+// #6366. A rollback journal with a ZERO header (not hot, so SQLite leaves it) that holds bytes
+// after the header, left group/other-readable: open() re-modes it owner-only and keeps it.
+TEST_CASE("EchoDatabase: a non-empty zero-header rollback journal is owner-only after open (#6366)",
+          "[echo][store][lifecycle][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_zjmode_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    const fs::path journal{db.string() + "-journal"};
+    spit_file(journal, std::string(512, '\0') + "left over after a PERSIST commit");
+    REQUIRE(fs::file_size(journal) > 512);
     std::error_code ec;
     fs::permissions(journal, fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read |
                                  fs::perms::others_read,
@@ -5047,8 +5640,12 @@ TEST_CASE("EchoDatabase (Windows): a hard link squatted at a quarantine sidecar 
     REQUIRE(fs::exists(squatted));
     REQUIRE(fs::exists(d.dir.path / std::format("echo.db.corrupt-{}", *opened->quarantined_this_open())));
 
-    // Nothing was re-secured through the squat: the target keeps its descriptor and every link.
-    CHECK(fs::hard_link_count(decoy) == kSquats + 1);
+    // Nothing was re-secured through the squat: the target keeps its content and its descriptor.
+    // Retention (`prune_old_quarantines`) keeps the newest `kKeepQuarantined` groups (3, in
+    // echo_db.cpp) and unlinks the other squatted names; that drops links only. Every group left
+    // here carries one squatted `-wal` link, so the decoy keeps itself plus those.
+    constexpr std::size_t kKeptGroups = 3;
+    CHECK(fs::hard_link_count(decoy) == 1 + kKeptGroups);
     CHECK(read_file(decoy) == "not a wal");
     CHECK_FALSE(dacl_facts(decoy).dacl_protected);
     CHECK(dacl_facts(decoy).allows(kUsers));
@@ -5552,12 +6149,10 @@ TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
     }
 }
 
-TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not finish and counts it",
-          "[echo][store][purge][dictionary]") {
-    // The rows go either way; the strings of the purged rows are forensic data too, so a sweep
-    // that outran its deadline is reported (dictionary_pending) and counted, never a silent
-    // "purged". A deadline already past is gc_dictionary's own seam for that path.
-    auto t = make_test_db();
+namespace {
+// One "process" event whose name lands in the dictionary and in the hourly, daily and monthly
+// roll-up rows: the data the purge cases below delete.
+void fold_purged_process_row(TestEchoDb& t) {
     ProcessEvent e;
     e.ts = 1000;
     e.snapshot_id = 1;
@@ -5566,6 +6161,16 @@ TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not fi
     e.name = "purged.exe";
     e.user = "u";
     REQUIRE(t.db.fold_process_events({e}));
+}
+} // namespace
+
+TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not finish and counts it",
+          "[echo][store][purge][dictionary]") {
+    // The rows go either way; the strings of the purged rows are forensic data too, so a sweep
+    // that outran its deadline is reported (dictionary_pending) and counted, never a silent
+    // "purged". A deadline already past is gc_dictionary's own seam for that path.
+    auto t = make_test_db();
+    fold_purged_process_row(t);
 
     const auto starved = t.db.purge_source("process", std::chrono::seconds(0));
     REQUIRE(starved.has_value());
@@ -5580,6 +6185,91 @@ TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not fi
     CHECK(!swept->dictionary_pending);
     CHECK(t.db.get_config("dict_gc_starved_total", "0") == "1");
     CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "0");
+}
+
+namespace {
+// One purged-then-starved "process" row: its dictionary string is left behind as an orphan.
+void seed_orphan_string(TestEchoDb& t) {
+    fold_purged_process_row(t);
+    const auto starved = t.db.purge_source("process", std::chrono::seconds(0));
+    REQUIRE(starved.has_value());
+    REQUIRE(starved->dictionary_pending);
+}
+} // namespace
+
+TEST_CASE("EchoDatabase: dictionary sweep: a cancelled pass deletes nothing and reports the deadline as hit",
+          "[echo][store][purge][dictionary]") {
+    auto t = make_test_db();
+    seed_orphan_string(t);
+    const std::string orphan_sql = "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'";
+    const auto far_off = EchoFold::Clock::now() + std::chrono::hours(1);
+
+    const auto at_once = t.db.fold().gc_dictionary(t.db, far_off, [] { return true; });
+    REQUIRE(at_once.has_value());
+    CHECK(at_once->deadline_hit);
+    CHECK(at_once->deleted == 0);
+    CHECK(first_cell(t.db, orphan_sql) == "1");
+
+    // A stop that arrives after the first poll (the check before the scan): the second poll is the
+    // statement progress handler's, which interrupts the live-set scan. Only an interrupted scan
+    // leaves live_set_built false (the between-batch check runs after it). The scan is an EXCEPT
+    // chain over every interned key column, several handler periods of 1000 VM instructions even
+    // here, so no extra rows are needed; reverting the handler to the deadline alone fails the
+    // live_set_built check. Counted in polls, never in elapsed time.
+    int polls = 0;
+    const auto midway = t.db.fold().gc_dictionary(t.db, far_off, [&polls] { return ++polls >= 2; });
+    REQUIRE(midway.has_value());
+    CHECK(midway->deadline_hit);
+    CHECK_FALSE(midway->live_set_built);
+    CHECK(midway->deleted == 0);
+    CHECK(polls >= 2);
+    CHECK(first_cell(t.db, orphan_sql) == "1");
+
+    const auto done = t.db.fold().gc_dictionary(t.db, far_off);
+    REQUIRE(done.has_value());
+    CHECK_FALSE(done->deadline_hit);
+    CHECK(first_cell(t.db, orphan_sql) == "0");
+}
+
+TEST_CASE("EchoDatabase: purge: a stop request during the sweep returns with the dictionary and the WAL reported pending",
+          "[echo][store][purge][dictionary]") {
+    auto t = make_test_db();
+    fold_purged_process_row(t);
+
+    const auto stopped = t.db.purge_source("process", std::chrono::seconds(60), [] { return true; });
+    REQUIRE(stopped.has_value());
+    CHECK(stopped->rows_deleted == 3);
+    CHECK(stopped->dictionary_pending);
+    CHECK(stopped->wal_pending);
+    // Reported pending, not starved: a sweep the stop ended is no signal about the database.
+    CHECK(t.db.get_config("dict_gc_starved_total", "0") == "0");
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "1");
+}
+
+TEST_CASE("EchoDatabase: purge: a checkpoint that finds the WAL pinned is reported as wal pending while the rows are gone",
+          "[echo][store][purge]") {
+    auto t = make_test_db();
+    fold_purged_process_row(t);
+
+    // A read transaction on a second connection pins the WAL at its snapshot, so the purge's
+    // frames sit past the reader's mark and TRUNCATE (busy timeout 0) cannot reset the log. The
+    // owner closes the connection on every path, so a failed assertion cannot leave it locked.
+    SqliteOwner reader;
+    REQUIRE(sqlite3_open_v2(t.path.string().c_str(), &reader.db, SQLITE_OPEN_READONLY, nullptr) ==
+            SQLITE_OK);
+    exec_sql(reader.db, "BEGIN; SELECT COUNT(*) FROM echo_config;");
+
+    const auto pinned = t.db.purge_source("process");
+    REQUIRE(pinned.has_value());
+    CHECK(pinned->rows_deleted == 3);
+    CHECK_FALSE(pinned->dictionary_pending);
+    CHECK(pinned->wal_pending);
+    CHECK(first_cell(t.db, "SELECT COUNT(*) FROM process_hourly_r") == "0");
+
+    exec_sql(reader.db, "COMMIT");
+    const auto clear = t.db.purge_source("process");
+    REQUIRE(clear.has_value());
+    CHECK_FALSE(clear->wal_pending);
 }
 
 // =============================================================================

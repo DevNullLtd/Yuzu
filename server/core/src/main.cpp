@@ -529,6 +529,19 @@ int main(int argc, char* argv[]) {
     // combination may boot) is made in ServerImpl::run() after certificate bootstrap.
     register_gateway_peer_options(app, cfg);
 
+    // WP01: proof of identity when an already-enrolled agent id re-registers
+    // (agent_reregistration_gate.hpp). Default `audit` for one release: decide and count, admit as
+    // before; `enforce` refuses an unproven re-registration; `off` is the pre-WP01 behaviour. An
+    // unknown spelling refuses to start (CLI::IsMember) rather than falling back to a weaker mode.
+    app.add_option("--agent-reregistration-proof", cfg.agent_reregistration_proof,
+                   "Proof required when an already-enrolled agent id re-registers: off | audit "
+                   "(default: count what enforce would refuse, admit as before) | enforce "
+                   "(refuse with a gRPC status unless the agent presents its current client "
+                   "certificate or a fresh single-use enrollment token). Only agents holding a "
+                   "certificate issued by this server's own CA are covered.")
+        ->check(CLI::IsMember({"off", "audit", "enforce"}))
+        ->envname("YUZU_AGENT_REREGISTRATION_PROOF");
+
     // Guardian heartbeat-reconcile admission budget (#5513): per-replica time budget, burst and
     // count ceiling. Registered from server_guardian_reconcile_options.hpp; a non-positive or
     // non-finite value is refused at startup (guardian_reconcile_options_error, below).
@@ -630,6 +643,15 @@ int main(int argc, char* argv[]) {
         // surprise (Hermes cyber-review F5). A lock window must be >= 1 second.
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_AUTH_LOCKOUT_WINDOW_SECS");
+
+    app.add_option("--auth-pbkdf2-per-source-cap", cfg.auth_pbkdf2_per_source_cap,
+                   "Concurrent password-hash (PBKDF2) slots one client address may hold on the "
+                   "unauthenticated login lane (default: 4, range 1-64). The address is the TCP "
+                   "peer: behind a reverse proxy, load balancer or NAT every user shares it, so "
+                   "raise this to the expected concurrent-login burst through that address.")
+        ->default_val(4)
+        ->check(CLI::Range(1, 64))
+        ->envname("YUZU_AUTH_PBKDF2_PER_SOURCE_CAP");
 
     // JIT admin elevation — SOC 2 CC6.3/CC6.6. See docs/auth-architecture.md.
     app.add_option("--jit-max-elevation-secs", cfg.jit_max_elevation_secs,
@@ -743,15 +765,21 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_INVENTORY_EXPORT_CONCURRENCY");
     app.add_option("--inventory-export-max-rows", cfg.inventory_export_max_rows,
                    "Most rows one streamed installed-software export may write "
-                   "(GET /api/v1/inventory/software/export, JSONL and CSV). A stream that would "
-                   "pass it is cut without its terminating chunk, so the client sees an aborted "
-                   "transfer, never a file that looks complete. Default 5000000.")
+                   "(GET /api/v1/inventory/software/export, JSONL, CSV and XLSX). A stream that "
+                   "would pass it is cut without its terminating chunk, so the client sees an "
+                   "aborted transfer, never a file that looks complete. An XLSX export is built "
+                   "whole before anything is sent, so one that would pass it is answered 413 "
+                   "instead; the XLSX sheet's own limit of 1048575 data rows also applies. "
+                   "Default 5000000.")
         ->check(CLI::Range(std::int64_t{1000}, std::int64_t{1'000'000'000}))
         ->envname("YUZU_INVENTORY_EXPORT_MAX_ROWS");
     app.add_option("--inventory-export-max-bytes", cfg.inventory_export_max_bytes,
                    "Most body bytes one streamed installed-software export may write (JSONL and "
-                   "CSV). Cut like --inventory-export-max-rows when passed. Default 1073741824 "
-                   "(1 GiB).")
+                   "CSV). Cut like --inventory-export-max-rows when passed. For XLSX it bounds "
+                   "the UNCOMPRESSED SHEET (cell text plus markup and escaping), not the "
+                   "finished file; an XLSX export holds up to 3 times that on the data volume "
+                   "(under <data dir>/export-tmp) while it is built and sent, and is refused "
+                   "when that would leave under 1 GiB free. Default 1073741824 (1 GiB).")
         ->check(CLI::Range(std::int64_t{1} << 20, std::int64_t{1} << 40))
         ->envname("YUZU_INVENTORY_EXPORT_MAX_BYTES");
     app.add_option("--inventory-sync-cooldown", cfg.inventory_sync_cooldown_s,
@@ -878,7 +906,9 @@ int main(int argc, char* argv[]) {
     bool break_glass_arm = false;
     app.add_flag("--break-glass-arm", break_glass_arm,
                  "Break-glass: arm --break-glass-user for the configured window, then exit "
-                 "(audited; enables local login under --auth-mode=sso-only)");
+                 "(audited; enables local login under --auth-mode=sso-only). Arming also resets "
+                 "the account's second-factor failure lock; the exemption is from the password "
+                 "lockout only, so the MFA failure budget still applies to it afterwards.");
 
     // NVD CVE feed options
     int nvd_sync_hours = 4;
@@ -2219,7 +2249,7 @@ int main(int argc, char* argv[]) {
         ev.target_id = cfg.break_glass_user;
         ev.result = "success";
         ev.detail = std::format("break-glass armed until {} ({}s window) via --break-glass-arm "
-                                "CLI (os_identity={})",
+                                "CLI (os_identity={}); any MFA failure lock on the account was reset",
                                 armed->armed_until, cfg.break_glass_window_secs, os_user);
         if (!audit->log(ev)) {
             // COMPENSATING UN-ARM (review #1735 HIGH-2): the mandatory evidence

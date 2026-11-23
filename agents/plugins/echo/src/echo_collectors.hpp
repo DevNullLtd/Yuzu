@@ -84,6 +84,13 @@ inline constexpr std::string_view kCollectStatusCursorLost = "cursor_lost";
 /// operator actually looks; spdlog is not that place.
 inline constexpr std::string_view kCollectStatusCaptureIncomplete = "capture_incomplete";
 
+/// A cursor source was NOT attempted this tick: its earlier ticks kept failing and it is
+/// backed off (CursorRetry, echo_cursor.hpp). Written to the collect stream so the skip is
+/// visible. It is never recorded in the health ledger -- `last_status`,
+/// `last_status_at` and `consecutive_failures` keep describing the last real attempt, and
+/// `config|<src>_next_retry_at|<epoch>` says when the next one is due.
+inline constexpr std::string_view kCollectStatusRetryBackoff = "retry_backoff";
+
 // ── Collector data types ─────────────────────────────────────────────────────
 
 struct NetConnection {

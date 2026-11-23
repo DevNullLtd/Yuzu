@@ -1,4 +1,5 @@
 #include "policy_store.hpp"
+#include "dispatch_target_shape.hpp" // check_params_key_shape (sg10 / UP-1)
 
 #include "cel_eval.hpp"
 #include "compliance_eval.hpp"
@@ -522,6 +523,12 @@ PolicyStore::create_fragment(const std::string& yaml_source, const std::string& 
     nlohmann::json post_params_json = nlohmann::json::object();
     for (const auto& [k, v] : post_params_map)
         post_params_json[k] = v;
+    // sg10 / UP-1: a parameter key the agent would truncate (control byte, NUL, invalid UTF-8) or a
+    // NUL value is refused at creation, never stored (the same rule every ingress applies).
+    for (const auto* m : {&check_params_json, &fix_params_json, &post_params_json}) {
+        if (const auto bad = yuzu::server::check_params_key_shape(*m))
+            return std::unexpected(std::string(bad->reason) + ": " + bad->message);
+    }
 
     if (!check_compliance.empty()) {
         check_compliance = cel::migrate_expression(check_compliance);
@@ -1285,13 +1292,15 @@ PolicyStore::set_agents_error_status(const std::string& policy_id,
                 continue;
             if (lease_hook_for_test_)
                 lease_hook_for_test_(lease.get(), idx, attempt);
+            // `ORDER BY a` makes every concurrent writer take the row locks in the same order; without it two
+            // overlapping chunks deadlock (40P01), which is statement-class and not retried here.
             pg::PgResult res = pg::exec_params(
                 lease.get(),
                 "INSERT INTO policy_store.policy_status "
                 "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
                 " fix_attempt_count) "
                 "SELECT DISTINCT $1, a, 'error', EXTRACT(EPOCH FROM NOW())::bigint, 0::bigint, $3, 0 "
-                "FROM unnest($2::text[]) AS a "
+                "FROM unnest($2::text[]) AS a ORDER BY a "
                 "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
                 "  status = 'error', last_check_at = EXCLUDED.last_check_at, "
                 "  check_result = EXCLUDED.check_result "

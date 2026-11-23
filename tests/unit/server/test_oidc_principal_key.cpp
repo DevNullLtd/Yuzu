@@ -232,6 +232,23 @@ TEST_CASE("sanitize_detail_value: strips other control bytes incl. DEL, "
     CHECK(yuzu::server::detail::sanitize_detail_value("Alex Kim") == "Alex Kim");
 }
 
+TEST_CASE("sanitize_detail_value: folds UTF-8 C1 controls and Unicode line separators (WP04)",
+         "[auth][oidc][1837][sanitize][log_injection]") {
+    // Every C1 code point U+0080-U+009F (2 bytes: C2 80..C2 9F), NEL included, and U+2028 / U+2029
+    // (E2 80 A8 / E2 80 A9): none may reach an audit detail, each becomes one '_'.
+    for (unsigned cp = 0x80; cp <= 0x9F; ++cp) {
+        std::string in = "a";
+        in.push_back('\xC2');
+        in.push_back(static_cast<char>(cp));
+        in += "b";
+        CHECK(yuzu::server::detail::sanitize_detail_value(in) == "a_b");
+    }
+    CHECK(yuzu::server::detail::sanitize_detail_value("a\xE2\x80\xA8" "b") == "a_b");
+    CHECK(yuzu::server::detail::sanitize_detail_value("a\xE2\x80\xA9" "b") == "a_b");
+    // A forged second row through U+2028 stays one value.
+    CHECK(yuzu::server::detail::sanitize_detail_value("x\xE2\x80\xA8" "action=evil") == "x_action_evil");
+}
+
 TEST_CASE("sanitize_detail_value: caps length at a UTF-8 code-point boundary",
          "[auth][oidc][1837][sanitize]") {
     // An over-long ASCII value is truncated to exactly the cap.

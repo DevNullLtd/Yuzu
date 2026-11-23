@@ -64,6 +64,18 @@ public:
         h.last_status_at = now_epoch;
     }
 
+    /// A source in cursor-driver backoff: when its next attempt is due (epoch seconds). Not a
+    /// status -- the streak and `last_status` are untouched. Cleared by the first tick that returns.
+    void set_next_retry(std::string_view source, int64_t ts) { next_retry_[std::string{source}] = ts; }
+    void clear_next_retry(std::string_view source) { next_retry_.erase(std::string{source}); }
+
+    [[nodiscard]] std::optional<int64_t> next_retry(std::string_view source) const {
+        auto it = next_retry_.find(std::string{source});
+        if (it == next_retry_.end())
+            return std::nullopt;
+        return it->second;
+    }
+
     [[nodiscard]] std::optional<SourceHealth> get(std::string_view source) const {
         auto it = entries_.find(std::string{source});
         if (it == entries_.end())
@@ -73,9 +85,11 @@ public:
 
 private:
     std::unordered_map<std::string, SourceHealth> entries_;
+    std::unordered_map<std::string, int64_t> next_retry_;
 };
 
-/// Three `config|` lines per registry source, in registry order.
+/// Three `config|` lines per registry source, in registry order, plus a fourth
+/// `config|<src>_next_retry_at|<epoch>` after them for a source in cursor-driver backoff.
 [[nodiscard]] inline std::vector<std::string>
 format_source_health_lines(const SourceHealthLedger& ledger,
                            const std::vector<CaptureSourceDef>& sources) {
@@ -90,6 +104,8 @@ format_source_health_lines(const SourceHealthLedger& ledger,
                       std::to_string(h ? h->consecutive_failures : 0));
         out.push_back("config|" + name + "_last_status_at|" +
                       std::to_string(h ? h->last_status_at : int64_t{0}));
+        if (const auto retry = ledger.next_retry(d.name))
+            out.push_back("config|" + name + "_next_retry_at|" + std::to_string(*retry));
     }
     return out;
 }

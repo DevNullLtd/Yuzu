@@ -1490,3 +1490,13 @@ TEST_CASE("KvStore::rename_plugin with rows to move still needs the write lock",
     CHECK(t.store.get("echo", "a") == std::optional<std::string>{"1"});
     CHECK_FALSE(t.store.get("tar", "a").has_value());
 }
+
+// Security floor (docs/build-guide.md, "Security dependency pins"): the agent's SQLite lives in
+// libyuzu_agent_core and must be at least the 3.54.1 that vcpkg.json overrides sqlite3 to (the CVE
+// batch fixed in 3.54.0). Mirrors the server-side case in test_sqlite_raii.cpp. Raise both numbers
+// when the pin moves; never lower them.
+TEST_CASE("KvStore: linked SQLite is at least the security-pinned 3.54.1", "[deps][security]") {
+    STATIC_REQUIRE(SQLITE_VERSION_NUMBER >= 3054001);
+    INFO("sqlite3_libversion() = " << sqlite3_libversion());
+    CHECK(sqlite3_libversion_number() >= 3054001);
+}

@@ -245,8 +245,10 @@ bool LeaderElector::connect_locked() {
 
     conn_ = pg::PgConn{PQconnectdb(cfg_.dsn.c_str())};
     if (conn_.get() == nullptr || PQstatus(conn_.get()) != CONNECTION_OK) {
+        // Fixed cause only: the raw text can quote DSN fragments (F56).
         spdlog::warn("leader_elector: dedicated connection failed: {}",
-                     conn_.get() != nullptr ? PQerrorMessage(conn_.get()) : "null conn");
+                     pg::connect_failure_cause(conn_.get() != nullptr ? PQerrorMessage(conn_.get())
+                                                                      : "out of memory"));
         return false;
     }
     // Bound this dedicated connection server-side so a wedged lock-holder or a

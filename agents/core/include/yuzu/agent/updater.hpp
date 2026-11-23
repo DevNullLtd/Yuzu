@@ -102,6 +102,12 @@ public:
     /// No-op returning false when the updater is disabled.
     [[nodiscard]] bool rollback_if_needed();
 
+    /// Write the `.yuzu-update-verified` marker beside the executable: the running build has
+    /// registered with the server, so rollback_if_needed must keep it. Call once after a
+    /// successful Register and before perform_startup_maintenance. No-op when the updater is
+    /// disabled (the no-write mode below); a failed write is logged, never thrown.
+    void mark_update_verified();
+
     /// Run the startup rollback/cleanup protocol when OTA is enabled.
     ///
     /// A disabled updater is a no-write mode: it must not inspect or alter files

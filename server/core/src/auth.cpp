@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
@@ -35,7 +36,8 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <sys/stat.h> // umask()
-#include <unistd.h>   // geteuid()
+#include <unistd.h>   // geteuid(), isatty()
+#include <termios.h>  // F44: disable echo on the first-run password prompt
 #endif
 
 namespace yuzu::server::auth {
@@ -391,22 +393,36 @@ static std::string prompt(const std::string& msg, const std::string& default_val
     return input;
 }
 
-static std::string prompt_password(const std::string& msg) {
+// F44: returns nullopt (caller refuses) when echo cannot be disabled on POSIX.
+static std::optional<std::string> prompt_password(const std::string& msg) {
     std::cout << msg << ": ";
     std::cout.flush();
 
-    // Disable echo
 #ifdef _WIN32
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD mode;
+    DWORD mode = 0;
     GetConsoleMode(hStdin, &mode);
     SetConsoleMode(hStdin, mode & ~ENABLE_ECHO_INPUT);
 #else
-    // POSIX: use termios to disable echo
-    struct termios_guard {
-        // Simple approach: just read without echo toggle for now.
-        // Full implementation would use tcgetattr/tcsetattr.
-    };
+    // POSIX: refuse unless stdin is a TTY whose echo we can clear. The RAII
+    // guard restores the saved attributes on every exit path (early return,
+    // exception from getline).
+    struct termios saved{};
+    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &saved) != 0) {
+        std::cerr << "\nstdin is not a terminal; refusing to read a password without echo "
+                     "control.\n";
+        return std::nullopt;
+    }
+    struct termios noecho = saved;
+    noecho.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &noecho) != 0) {
+        std::cerr << "\nCould not disable terminal echo; refusing to read a password.\n";
+        return std::nullopt;
+    }
+    struct EchoRestore {
+        struct termios saved;
+        ~EchoRestore() { tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved); }
+    } restore{saved};
 #endif
 
     std::string pw;
@@ -438,7 +454,10 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         std::cerr << "Account name cannot be empty.\n";
         return false;
     }
-    auto admin_pw = prompt_password("Admin password");
+    auto admin_pw_opt = prompt_password("Admin password");
+    if (!admin_pw_opt)
+        return false;
+    auto admin_pw = std::move(*admin_pw_opt);
     if (const auto verdict = check_password_policy(admin_pw);
         verdict != PasswordPolicyVerdict::kOk) {
         if (verdict == PasswordPolicyVerdict::kTooShort)
@@ -449,7 +468,9 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         return false;
     }
     auto admin_pw2 = prompt_password("Confirm admin password");
-    if (admin_pw != admin_pw2) {
+    if (!admin_pw2)
+        return false;
+    if (admin_pw != *admin_pw2) {
         std::cerr << "Passwords do not match.\n";
         return false;
     }
@@ -603,7 +624,7 @@ bool AuthManager::wipe_user_sessions_durable(const std::string& username) {
     if (auto r = session_store_->invalidate_user(username); !r) {
         spdlog::error("durable session wipe for user '{}' failed ({}) - session wipe did not "
                       "persist, retry (invalidate_user is idempotent)",
-                      username, r.error().message);
+                      ::yuzu::log_key_token(username), r.error().message);
         note_session_store_degrade("invalidate_user"); // parity with the other degrade sites
         return false; // fail closed — caller must not report success (authdb-BLOCKING)
     }
@@ -1244,7 +1265,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // one) — reject without the DB read or PBKDF2, which bounds the hash input.
     // Never log the length.
     if (password_exceeds_max(password)) {
-        spdlog::warn("Auth failed: over-length password for '{}'", username);
+        spdlog::warn("Auth failed: over-length password for '{}'", ::yuzu::log_key_token(username));
         return std::nullopt;
     }
 
@@ -1254,7 +1275,10 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
         if (entry.error() == UserLookupMiss::DbError)
             return std::nullopt; // AuthDB unreachable: fail closed, already logged, not a
                                  // bad-username signal (no unknown_user histogram sample)
-        spdlog::warn("Auth failed: unknown user '{}'", username);
+        spdlog::warn("Auth failed: unknown user '{}'", ::yuzu::log_key_token(username));
+        // F38: equalise cost with the known-user path (fixed dummy salt, result
+        // discarded) so latency does not enumerate usernames.
+        (void)pbkdf2_sha256(password, std::vector<uint8_t>(16, 0x5a), kPbkdf2Iterations);
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1270,7 +1294,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
 
     if (!constant_time_compare(hash, entry->hash_hex)) {
-        spdlog::warn("Auth failed: bad password for '{}'", username);
+        spdlog::warn("Auth failed: bad password for '{}'", ::yuzu::log_key_token(username));
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1339,7 +1363,7 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
     // AuthRoutes::verify_password_with_lockout already rejects before calling).
     // An over-max password can never match, so it is a credential verdict.
     if (password_exceeds_max(password)) {
-        spdlog::warn("verify_password failed: over-length password for '{}'", username);
+        spdlog::warn("verify_password failed: over-length password for '{}'", ::yuzu::log_key_token(username));
         return std::unexpected(VerifyFailure::kBadCredential);
     }
     auto entry = find_user_or_hydrate(username); // AuthDB-first (#4020/#5274), a COPY
@@ -1349,7 +1373,10 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
         // as a failed guess. Logged by the helper; no unknown_user sample.
         if (entry.error() == UserLookupMiss::DbError)
             return std::unexpected(VerifyFailure::kStoreUnavailable);
-        spdlog::warn("verify_password failed: unknown user '{}'", username);
+        spdlog::warn("verify_password failed: unknown user '{}'", ::yuzu::log_key_token(username));
+        // F38: equalise cost with the known-user path (fixed dummy salt, result
+        // discarded) so latency does not enumerate usernames.
+        (void)pbkdf2_sha256(password, std::vector<uint8_t>(16, 0x5a), kPbkdf2Iterations);
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1363,7 +1390,7 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
     auto salt = hex_to_bytes(entry->salt_hex);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
     if (!constant_time_compare(hash, entry->hash_hex)) {
-        spdlog::warn("verify_password failed: bad password for '{}'", username);
+        spdlog::warn("verify_password failed: bad password for '{}'", ::yuzu::log_key_token(username));
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -2864,7 +2891,7 @@ std::size_t AuthManager::report_stale_cfg_credentials() {
             } else if (row.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::warn("#5274 boot check: could not read auth.users row for cfg user '{}' "
                              "(store error) - stale-credential check skipped for it",
-                             name);
+                             ::yuzu::log_key_token(name));
             }
             continue; // no row: the cfg entry is not shadowing anything
         }
@@ -2981,7 +3008,7 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         if (lifecycle_guard_unwired(true, rbac_store_ != nullptr)) {
             spdlog::error("AuthManager::update_role_checked('{}'): the last-Administrator guard "
                           "is not wired (no RbacStore) - refusing to change the role without it",
-                          username);
+                          ::yuzu::log_key_token(username));
             note_lifecycle_store_failure("set_role");
             return UpdateRoleOutcome::StoreFailure; // nothing was attempted: no eviction
         }
@@ -2990,16 +3017,16 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         using Kind = LocalRoleChangeResult::Kind;
         switch (res.kind) {
         case Kind::kNotFound:
-            spdlog::warn("update_role: user not found: '{}'", username);
+            spdlog::warn("update_role: user not found: '{}'", ::yuzu::log_key_token(username));
             return UpdateRoleOutcome::NotFound;
         case Kind::kLastAdministratorRefused:
             return UpdateRoleOutcome::LastAdministratorRefused; // nothing changed
         case Kind::kInactivePromotionRefused:
-            spdlog::warn("update_role: refusing to promote inactive account '{}'", username);
+            spdlog::warn("update_role: refusing to promote inactive account '{}'", ::yuzu::log_key_token(username));
             return UpdateRoleOutcome::InactivePromotionRefused;
         case Kind::kStoreFailure:
             spdlog::error("AuthManager::update_role_checked: guarded role write for '{}' failed: {}",
-                          username, res.err);
+                          ::yuzu::log_key_token(username), ::yuzu::log_key_token(res.err));
             note_lifecycle_store_failure("set_role");
             // The write MAY have committed (a lost COMMIT ack): do not keep serving the cached
             // role or a session minted at the old one. Fail toward re-authentication.
@@ -3040,7 +3067,7 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         if (!wipe_user_sessions_then_drop_cache(username)) {
             spdlog::error("AuthManager::update_role_checked: durable session wipe for '{}' failed "
                           "(the role IS changed)",
-                          username);
+                          ::yuzu::log_key_token(username));
             return UpdateRoleOutcome::UpdatedSessionWipeFailed;
         }
         return UpdateRoleOutcome::Updated;
@@ -3223,12 +3250,14 @@ std::string AuthManager::create_saml_session(const std::string& name_id,
     params.session_lifetime_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
     if (!persist_new_session(token, params)) {
-        spdlog::error("create_saml_session: durable persist failed for '{}'", stable_username);
+        spdlog::error("create_saml_session: durable persist failed for '{}'", ::yuzu::log_key_token(stable_username));
         return {}; // fail-safe empty token (ADR-0007)
     }
 
-    spdlog::info("SAML session created for '{}' (display={}, email={}, role={})", stable_username,
-                 resolved_display, saml_email, role_to_string(role));
+    // NameID, display name and email are IdP-controlled: fold the LOG copies only.
+    spdlog::info("SAML session created for '{}' (display={}, email={}, role={})",
+                 ::yuzu::log_key_token(stable_username), ::yuzu::log_key_token(resolved_display),
+                 ::yuzu::log_key_token(saml_email), role_to_string(role));
     return token;
 }
 
@@ -3326,11 +3355,11 @@ std::expected<ConsumeEnrollResult, StoreError>
 AuthManager::consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                                 const std::string& hostname, const std::string& os,
                                 const std::string& arch, const std::string& agent_version,
-                                bool enforce_new_id_charset) {
+                                bool enforce_new_id_charset, bool require_single_use) {
     return enrollment_store_call<ConsumeEnrollResult>(
         "consume", [&](yuzu::server::AuthDB& db) {
             return db.consume_and_enroll(raw_token, agent_id, hostname, os, arch, agent_version,
-                                         enforce_new_id_charset);
+                                         enforce_new_id_charset, require_single_use);
         });
 }
 

@@ -97,7 +97,7 @@ The substrate **requires pgvector 0.8.2** and the two-password first-boot init
 (`deploy/docker/postgres-init/`). A stock Patroni/Spilo image carries neither. So the HA image is a
 thin layer: `FROM ghcr.io/<owner>/yuzu-postgres:<version>` + Patroni (pinned) + a Patroni bootstrap
 that runs our init SQL. This keeps the HA nodes byte-identical to the single-node substrate
-(same PG 18.4, same pgvector commit, same app-role/db creation) — the alternative (re-implementing
+(same PostgreSQL minor, 18.6 since WP15/S9, same pgvector commit, same app-role/db creation) — the alternative (re-implementing
 init inside a Spilo template) would drift the two apart.
 
 ### Conventions that MUST be preserved on every HA node (from discovery)

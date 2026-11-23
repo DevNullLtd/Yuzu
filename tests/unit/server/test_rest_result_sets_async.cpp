@@ -194,7 +194,7 @@ struct AsyncHarness {
     explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true,
                           InventoryStore* inv = nullptr, bool with_exec_visible = true,
                           bool with_fleet_read_fn = true, bool with_all_agent_ids_fn = true,
-                          bool with_forensics_set = false)
+                          bool with_forensics_set = false, bool with_instruction_store = true)
         : inventory(inv), wire_dispatch(with_dispatch), wire_exec_visible(with_exec_visible),
           wire_fleet_read_fn(with_fleet_read_fn), wire_all_agent_ids_fn(with_all_agent_ids_fn) {
         permit_exec = true; // each harness starts permissive
@@ -296,7 +296,8 @@ struct AsyncHarness {
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
-                            /*quarantine_store=*/nullptr, /*response_store=*/nullptr, instr.get(),
+                            /*quarantine_store=*/nullptr, /*response_store=*/nullptr,
+                            with_instruction_store ? instr.get() : nullptr,
                             tracker.get(), /*schedule_engine=*/nullptr,
                             /*approval_manager=*/nullptr,
                             /*tag_store=*/nullptr, /*audit_store=*/nullptr, /*service_group_fn=*/{},
@@ -1166,12 +1167,27 @@ TEST_CASE("from-instruction-result: a column matcher is bound to the declared co
 // #4644: an echo_rows_ge matcher's `n` is stored on the pending row and read by the maintenance
 // tick. A wrong-typed n used to throw out of that tick on every pass; -1 admitted every responder.
 // It is now refused here, before anything is dispatched or stored.
-TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 and dispatches "
-          "nothing (#4644)",
+TEST_CASE("from-instruction-result: a malformed or oversized matcher is refused with 400 and "
+          "dispatches nothing (#4644, #6478)",
           "[pg][result_set][async][instruction][numeric_params]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
+    {
+        // The matcher is refused ahead of the instruction store as well: with none wired a field
+        // over its bound is still the permanent 400, and a well-formed request gets the 503.
+        AsyncHarness unwired(pool, true, nullptr, true, true, true, false,
+                             /*with_instruction_store=*/false);
+        const std::string route = "/api/v1/result-sets/from-instruction-result";
+        int status = 0;
+        unwired.post(route,
+                     R"({"instruction_id":"x","matcher":{"op":")" +
+                         std::string(rs_matcher::kMatcherOpMaxBytes + 1, 'x') + R"("}})",
+                     status);
+        CHECK(status == 400);
+        unwired.post(route, R"({"instruction_id":"x","matcher":{"op":"eq"}})", status);
+        CHECK(status == 503);
+    }
     AsyncHarness h(pool);
     auto iid = make_instruction(*h.instr);
     for (const char* n :
@@ -1197,6 +1213,51 @@ TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 an
         auto j = h.post("/api/v1/result-sets/from-instruction-result", body, status);
         CHECK(status == 400);
         CHECK(j["error"]["message"].get<std::string>().find("matcher") != std::string::npos);
+    }
+    // A matcher over the size bound is refused with the one text the MCP twin also sends: a
+    // permanent input error, answered before the definition is looked up (an unknown id too).
+    for (const std::string& id : {iid, std::string("no-such-instruction")}) {
+        INFO(id);
+        const std::string body = R"({"instruction_id":")" + id +
+                                 R"(","matcher":{"column":"c","op":"in","value_set":[")" +
+                                 std::string(rs_matcher::kMatcherMaxBytes, 'v') + R"("]}})";
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body, status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"] ==
+              "RESULT_SET_BAD_REQUEST: matcher exceeds 65536 bytes as compact JSON");
+        CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+        CHECK(j["error"].at("retry_after_ms").is_null());
+    }
+    // A column, op or value over its byte bound is refused the same way, with the MCP tool's
+    // text behind this route's prefix. Exactly at the bound the matcher is admitted, so the
+    // unknown id is what answers (404).
+    struct Field {
+        const char* key;
+        std::size_t bound;
+    };
+    for (const Field& f : {Field{"column", rs_matcher::kMatcherColumnMaxBytes},
+                           Field{"op", rs_matcher::kMatcherOpMaxBytes},
+                           Field{"value", rs_matcher::kMatcherValueMaxBytes}}) {
+        INFO(f.key);
+        nlohmann::json body{{"instruction_id", "no-such-instruction"},
+                            {"matcher", {{"column", "c"}, {"op", "eq"}, {"value", "v"}}}};
+        body["matcher"][f.key] = std::string(f.bound, 'x');
+        int status = 0;
+        h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        CHECK(status == 404);
+        body["matcher"][f.key] = std::string(f.bound + 1, 'x');
+        for (const std::string& id : {iid, std::string("no-such-instruction")}) {
+            INFO(id);
+            body["instruction_id"] = id;
+            auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+            CHECK(status == 400);
+            CHECK(j["error"]["message"] ==
+                  "RESULT_SET_BAD_REQUEST: a matcher field exceeds its bound "
+                  "(column<=128, op<=32, value<=512 bytes)");
+            CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+            CHECK(j["error"].at("retry_after_ms").is_null());
+        }
     }
     CHECK(h.calls.empty());
     CHECK(h.store->list_pending().empty());
@@ -4686,13 +4747,14 @@ TEST_CASE("from-instruction-result: a definition that reads a raw capture table 
 namespace {
 
 void put_exec_row(ResponseStore& store, const std::string& execution_id, const std::string& agent,
-                  int status, const std::string& output, int64_t ts) {
+                  int status, const std::string& output, int64_t ts, int plugin_status = 0) {
     StoredResponse r;
     r.instruction_id = "echo-1";
     r.execution_id = execution_id;
     r.agent_id = agent;
     r.plugin = yuzu::server::test::kOrdinaryPlugin;
     r.status = status;
+    r.plugin_result_status = plugin_status;
     r.output = output;
     r.timestamp = ts;
     store.store(r);
@@ -4914,6 +4976,58 @@ TEST_CASE("materialise: a success answer whose schema lacks the matcher column i
     CHECK(found->agents_failed == 1);
 }
 
+TEST_CASE("materialise: a CONSTRAINED answer with no matching row is a failed agent only when the "
+          "definition opted in (#6478)",
+          "[pg][result_set][async][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResponseStore responses{pool};
+    REQUIRE(responses.is_open());
+    // search_dir answers as stored. The status number is the agent's own verdict: 4 (CONSTRAINED)
+    // when part of the tree was not examined, 0 from an agent that reports no typed status.
+    const std::string cut = "truncated|deadline|visited=5|hashed=0|skipped_unreadable=0|"
+                            "skipped_symlink=0|skipped_not_regular=0|skipped_oversize=0|"
+                            "skipped_network_mount=0\n";
+    const int constrained = rs_matcher::kPluginResultConstrained;
+    put_exec_row(responses, "exec-sd", "agent-full-miss", 1, "total_matches|0", 100, 1);
+    put_exec_row(responses, "exec-sd", "agent-old-miss", 1, "total_matches|0", 100);
+    put_exec_row(responses, "exec-sd", "agent-cut-miss", 1, cut + "total_matches|0", 100,
+                 constrained);
+    put_exec_row(responses, "exec-sd", "agent-cut-hit", 1,
+                 "result|/tmp/foo|file\n" + cut + "total_matches|1", 100, constrained);
+
+    nlohmann::json matcher{{"column", "path"}, {"op", "eq"}, {"value", "/tmp/foo"}};
+    rs_matcher::bind_declared_columns(
+        matcher,
+        R"({"partialWhenConstrained":true,"columns":[{"name":"row_kind","type":"string",)"
+        R"("discriminator":true},{"name":"path","type":"string"},)"
+        R"({"name":"entry_type","type":"string"}]})",
+        "filesystem");
+    PendingSet pending;
+    pending.id = "rs-sd";
+    pending.source_execution_id = "exec-sd";
+    pending.matcher = matcher.dump();
+    const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+    auto found = result_set_members(responses, plugins, pending);
+    REQUIRE(found.has_value());
+    // The cut-short search that found the path is a member; the one that found nothing is failed,
+    // not a clean non-member. A full search and an older agent's answer stay clean non-members.
+    CHECK(std::vector<std::string>(found->begin(), found->end()) ==
+          std::vector<std::string>{"agent-cut-hit"});
+    CHECK(found->agents_failed == 1);
+
+    // The same rows under a matcher bound without the key (find_by_hash, a stored 0.4.0
+    // definition): the membership is the same and nobody is failed.
+    matcher.erase("partial_when_constrained");
+    pending.matcher = matcher.dump();
+    auto plain = result_set_members(responses, plugins, pending);
+    REQUIRE(plain.has_value());
+    CHECK(std::vector<std::string>(plain->begin(), plain->end()) ==
+          std::vector<std::string>{"agent-cut-hit"});
+    CHECK(plain->agents_failed == 0);
+}
+
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
@@ -4958,6 +5072,33 @@ std::size_t count_in(const std::string& text, const std::string& needle) {
     return n;
 }
 } // namespace
+
+TEST_CASE("materialise: the members read parses the matcher once, before the page loop (#6478)",
+          "[result_set][async][agents_failed]") {
+    // Parsing the matcher again for each row gives the same members, so no result can show it:
+    // this pins the statements. The text is read in one place, ahead of the loop over pages.
+    const auto src = normalised_source("result_set_members.hpp");
+    const auto parsed_at = src.find("const rs_matcher::ParsedMatcher matcher(pending.matcher);");
+    const auto loop_at = src.find("for (int read = 0;;) {");
+    REQUIRE(parsed_at != std::string::npos);
+    REQUIRE(loop_at != std::string::npos);
+    CHECK(parsed_at < loop_at);
+    CHECK(count_in(src, "pending.matcher") == 1);
+    CHECK(count_in(src, "ParsedMatcher") == 1);
+    // The same holds for an `in` matcher's entries: the one loop over `value_set` is the parse's
+    // own, and a cell is looked up in the set it fills.
+    const auto matcher_src = normalised_source("result_set_matcher.cpp");
+    const auto entries_at = matcher_src.find("[\"value_set\"])");
+    CHECK(count_in(matcher_src, "[\"value_set\"])") == 1);
+    CHECK(matcher_src.find("ParsedMatcher::ParsedMatcher(") < entries_at);
+    CHECK(entries_at < matcher_src.find("ParsedMatcher::~ParsedMatcher()"));
+    CHECK(count_in(matcher_src, "in_set.contains(cell)") == 1);
+    // Every helper takes that set by const reference (a copy for each cell gives the same
+    // answers), and it is the ordered set: `in_set_` in the header says why.
+    CHECK(count_in(matcher_src, "const ValueSet& in_set") == 4);
+    CHECK(count_in(matcher_src, "ValueSet in_set") == 0);
+    CHECK(count_in(matcher_src, "using ValueSet = std::set<std::string_view>;") == 1);
+}
 
 TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a truncated read closed",
           "[result_set][async][agents_failed]") {

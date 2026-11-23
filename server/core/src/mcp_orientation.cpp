@@ -94,7 +94,19 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "list_software_collection_settings",
                                            "get_software_collection_settings",
                                            "set_software_collection_settings",
-                                           "get_software_host_collection_settings"};
+                                           "get_software_host_collection_settings",
+                                           // SAM-29: the lifecycle-rule and normalisation
+                                           // curation twins (three reads, five writes).
+                                           "list_software_lifecycle_rules",
+                                           "import_software_lifecycle_rules",
+                                           "delete_software_lifecycle_rules",
+                                           "get_software_normalization_status",
+                                           "list_software_curation_queue",
+                                           "curate_software_alias",
+                                           "reject_software_curation",
+                                           "replace_software_normalization_pack",
+                                           // SAM-21: the components lookup twin.
+                                           "query_software_components"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
@@ -122,7 +134,8 @@ constexpr std::string_view kDexSignals[] = {
     "get_dex_catalogue",      // ADR-0031 WS-A4 PR-1
     "get_dex_catalogue_group", "get_dex_device_history",  "get_dex_observation",
     "get_dex_health",         "get_dex_trends",           "get_dex_overview",
-    "get_dex_score_policy",   "set_dex_score_policy",     "reset_dex_score_policy"};
+    "get_dex_score_policy",   "set_dex_score_policy",     "reset_dex_score_policy",
+    "get_dex_apps_usage"};
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",
                                          "get_dex_perf_cohort_diff", "list_dex_perf_devices",
                                          "list_dex_perf_apps",   "get_dex_app_perf",
@@ -134,7 +147,8 @@ constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devi
                                         "list_discovered_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_instruction_definition",
                                            "execute_bundle", "get_bundle_result",
-                                           "sync_hardware_software"};
+                                           "sync_hardware_software",
+                                           "get_software_sync_status"}; // SAM-21
 constexpr std::string_view kRemediation[] = {"quarantine_device", "list_quarantined_devices"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
@@ -385,7 +399,8 @@ constexpr std::array<ToolFamily, 43> kFamilies{{
     {"DEX signals",
      "digital-employee-experience reliability signals and their scope/detail, plus the customer "
      "score policy (get_dex_score_policy; set_dex_score_policy and reset_dex_score_policy are "
-     "supervised-tier writes, reset also approval-gated)",
+     "supervised-tier writes, reset also approval-gated), and fleet application usage "
+     "(get_dex_apps_usage: Forensics:Read as well, audited before the read)",
      kDexSignals},
     {"DEX performance", "fleet, cohort, device, and per-app performance over time", kDexPerf},
     {"Network quality", "fleet and per-device network-quality posture, and hosts found by "
@@ -457,7 +472,7 @@ constexpr std::array<ToolFamily, 43> kFamilies{{
     {"RBAC role assignments", "fleet-wide listing of every current RBAC role assignment -- "
                               "who currently holds which role, across every principal type",
      kRbacAssignmentsList},
-    {"Account lockout", "clear a local account's failed-login lockout counter (SOC 2 CC6.3)",
+    {"Account lockout", "clear a local account's failed-login lockout and its MFA failure lock (SOC 2 CC6.3)",
      kAccountLockout},
     {"Offload targets", "configure event-forwarding webhook targets and inspect their delivery "
                         "history",

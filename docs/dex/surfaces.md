@@ -71,8 +71,8 @@ per-device app-usage route (see the map below). Conventions:
   `PUT` and `DELETE` on the score policy and `POST` on the live-info route
   (a `POST` only because it waits for the device to answer).
 - **Failed store reads.** Some routes fail loudly and some do not. The device
-  score, the catalogue, the Apps list, per-device application usage and the
-  retained application-performance reads (the picker, the fleet, group and tag
+  score, the catalogue, the Apps list, per-device application usage, fleet
+  application usage and the retained application-performance reads (the picker, the fleet, group and tag
   trends, the version-devices drill, the version comparison and one device's
   retained history) answer `503` with a `retry_after_ms` hint. The Overview,
   Health score, Trends, the signal rollup, scope and signal drill-down, the
@@ -86,7 +86,12 @@ per-device app-usage route (see the map below). Conventions:
 - **Audit.** Routes that name individual devices write an audit row before
   they answer, and refuse to answer (`503` with `Sec-Audit-Failed: true`) if
   that row cannot be stored. Aggregates that carry no device identity are not
-  audited. Each area page lists its verbs.
+  audited, with exceptions: the cohort comparison and fleet application usage
+  are audited aggregates. Fleet usage reads Forensics-tier usage and, at the
+  default floor of 1, a cell can be one device's figures, so every request that
+  passes validation is audited as `dex.apps.usage.view` before it is read, by
+  the REST route and by the Apps tab Usage view (`GET /fragments/dex/apps/usage`)
+  alike. Each area page lists its verbs.
 - **Service-scoped tokens.** A token scoped to one service is refused on
   every DEX route except these:
   - The per-device routes under `/api/v1/dex/devices/{id}` accept it only for a
@@ -95,9 +100,12 @@ per-device app-usage route (see the map below). Conventions:
     can see.
   - Both kinds need RBAC enforcement to be on and the service owner role to hold
     the permission.
-  - Every other route is refused, aggregates included, and so is the per-device
-    app-usage route, because the service owner role does not hold
-    `Forensics:Read`.
+  - Every other route is refused, aggregates included. The per-device app-usage
+    route is refused because the service owner role does not hold
+    `Forensics:Read`. The fleet application usage route is refused at its first
+    gate, `GuaranteedState:Read`, which is a fleet-wide permission that a
+    service-scoped token is refused at, and it would fail its `Forensics:Read`
+    gate as well.
   - Every refusal on REST and MCP is audited. The overview, the signal and
     application drill-downs, the performance and network device lists, the group
     and tag trends and the version comparison record it under their own verb
@@ -127,7 +135,9 @@ and in the server's own `GET /api/v1/openapi.json`.
 
 ## The MCP server
 
-An agentic worker reaches the same data through MCP tools. Conventions:
+An agentic worker reaches the same data through MCP tools. Fleet usage per
+application (`GET /api/v1/dex/apps/usage`) is the `get_dex_apps_usage` tool.
+Conventions:
 
 - **Endpoint and tokens.** `POST /mcp/v1/` with an API token minted with an
   `mcp_tier` (`readonly`, `operator` or `supervised`). A token without a tier
@@ -135,9 +145,12 @@ An agentic worker reaches the same data through MCP tools. Conventions:
 - **Read tools work at every tier.** The DEX read tools need
   `GuaranteedState:Read` and are available to a `readonly` token. The
   per-device app-usage tool needs `Forensics:Read` instead, and is available at
-  every tier too.
+  every tier too. `get_dex_apps_usage` needs both `GuaranteedState:Read` and
+  `Forensics:Read` (Administrator only while RBAC is off), and is available at
+  every tier.
 - **Same model, same numbers.** A tool answers from the same read model as the
-  REST route it mirrors, so the two agree figure for figure. Tool arguments
+  REST route it mirrors (where the route has a tool), so the two agree figure for
+  figure. Tool arguments
   match the route's query parameters. The one difference is the device: the
   per-device tools take it as `agent_id`, where the REST routes carry it in the
   path as `{id}`.
@@ -150,7 +163,10 @@ An agentic worker reaches the same data through MCP tools. Conventions:
   `mcp.compare_app_perf_versions` row on success and uses `dex.app_perf.compare`
   only for a refusal. Most tools set-and-proceed on MCP, flagging
   `audit_persisted: false` if the row was lost; the per-device app-usage tool
-  withholds data instead.
+  withholds data instead. `get_dex_apps_usage` records `dex.apps.usage.view`
+  before it reads, and does not read if that row cannot be stored; its generic
+  `mcp.get_dex_apps_usage` row follows the outcome and, if lost, only sets
+  `audit_persisted: false`.
 - **Service-scoped tokens.** A tool follows the same rule as the REST route
   it mirrors. A token scoped to one service is refused on every DEX tool
   except the per-device tools (`get_dex_device_score`,
@@ -256,6 +272,7 @@ this map; see [network](network.md).
 | Capability | Dashboard | REST | MCP | Fed by | Permission and audit | Page |
 |---|---|---|---|---|---|---|
 | One device's per-executable usage | Device page, Application usage | `GET /api/v1/forensics/agents/{id}/app-usage` | `get_agent_app_usage` | Echo `usage`, `app_usage` plugin, daily sync | `Forensics:Read` scoped to the device; refused to service-scoped tokens, whose role does not hold `Forensics:Read`; audited `app_usage.agent.view`, fails closed | [app usage](app-usage.md) |
+| Fleet usage per application: devices, run time, launches and crashes and hangs per hour of use | Apps tab, Usage view (`GET /fragments/dex/apps/usage`), per hour of use | `GET /api/v1/dex/apps/usage` | `get_dex_apps_usage` | Echo `usage`, `app_usage` plugin, daily sync, DEX observer | `Forensics:Read` and `GuaranteedState:Read`, both required (Administrator only while RBAC is off); refused to service-scoped tokens; audited `dex.apps.usage.view` once parameters validate before the read, fails closed on all three surfaces (REST `503`; the Usage view draws a panel and reads nothing; the MCP tool reads nothing and answers a retryable error) | [app usage](app-usage.md#using-it-in-the-dashboard-the-apps-tab-usage-view) |
 
 ### Alerts
 

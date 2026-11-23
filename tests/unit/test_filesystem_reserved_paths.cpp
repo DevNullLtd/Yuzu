@@ -533,28 +533,32 @@ TEST_CASE("filesystem plugin: a reserved name behind a link chain longer than th
           "[agent][filesystem_plugin][reserved][symlink]") {
     auto handle = load_fs_plugin();
     REQUIRE(handle);
-    // Kernel symlink-follow limits differ: Linux MAXSYMLINKS = 40, macOS (XNU) = 32 (and a macOS temp
-    // root sits under /var -> /private/var, one more hop). 28 resolves on both; 41 refuses on both (the
-    // kernel's ELOOP). Exactly 40 reaches the plugin's own kMaxLinkHops cap branch on Linux (on macOS
-    // the kernel refuses first: the assertion is the same, the branch differs).
+    // Kernel symlink-follow limits differ: Linux MAXSYMLINKS = 40, macOS (XNU) = 32. The links carry
+    // ABSOLUTE targets, so a root that itself passes through a link (a macOS temp root, /var ->
+    // /private/var) would re-pay that link on EVERY hop: the root is canonicalised first so a chain of
+    // N links costs N + 1 follows. 28 resolves on both; 41 refuses on both (the kernel's ELOOP).
+    // Exactly 40 reaches the plugin's own kMaxLinkHops cap branch on Linux (on macOS the kernel
+    // refuses first: the assertion is the same, the branch differs).
     for (const int hops : {41, 40, 28}) {
         yuzu::test::TempDir root{"yuzu_test_fs_reserved_chain_"};
         std::error_code dec;
         fs::create_directories(root.path, dec);
-        const auto ok = root.path / "ok.txt";
+        const fs::path real_root = fs::canonical(root.path, dec);
+        REQUIRE_FALSE(dec);
+        const auto ok = real_root / "ok.txt";
         {
             std::ofstream o(ok);
             o << "fine\n";
         }
-        const auto reserved_name = root.path / "chain-0";
+        const auto reserved_name = real_root / "chain-0";
         yuzu::agent::StandalonePluginContext ctx{
             "filesystem", {{"agent.tls_client_key", reserved_name.string()}}};
         REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
         // chain-0 -> chain-1 -> ... -> chain-<hops> -> nothing (dangling), planted after init
         for (int i = 0; i < hops; ++i) {
             std::error_code lec;
-            fs::create_symlink(root.path / ("chain-" + std::to_string(i + 1)),
-                               root.path / ("chain-" + std::to_string(i)), lec);
+            fs::create_symlink(real_root / ("chain-" + std::to_string(i + 1)),
+                               real_root / ("chain-" + std::to_string(i)), lec);
             REQUIRE_FALSE(lec);
         }
         auto run = make_runner(*handle);

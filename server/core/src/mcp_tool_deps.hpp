@@ -63,6 +63,7 @@
 #include "authz_gates.hpp"        // authz::FleetReadGate
 #include "crypto_api.hpp"         // CryptoApi's query / result types (the abstract seam, no store)
 #include "crypto_widget_catalogue.hpp" // crypto_widgets::Access / WidgetGate
+#include "dex_api.hpp"            // DexApi's usage types (the abstract seam, no store)
 #include "dex_score_policy_writer.hpp"  // DexScorePolicyProvider::ReadFn, the write request / result / audit hook
 #include "hardware_ci_page_model.hpp" // hardware_ci_page::Reader
 #include "hardware_list_model.hpp" // HardwareCiDetail
@@ -108,6 +109,10 @@ struct ToolDeps {
     const std::atomic<pg::CollationGate>* ci_collation_gate{nullptr};
     DexScoreFn dex_score_fn; // page rows only, never the whole roster (one query per call)
     QuarantineListFn quarantine_list_fn;
+    // Records ended by force whose device still owes a release (include=release_owed, #7624);
+    // same shape and scope-in-query contract as quarantine_list_fn. Empty = the include option is
+    // refused as unwired, never read as "nothing owed".
+    QuarantineListFn quarantine_owed_list_fn;
 
     // ── /crypto (mcp_tools_crypto.cpp) ──────────────────────────────────────────────────
     // One closure per CryptoApi method the seven /crypto tools call, each a thin forward to
@@ -176,6 +181,18 @@ struct ToolDeps {
         const std::string& target_id, const std::string& detail)>;
     SessionFn session_fn;
     AuditAsSessionFn audit_as_session_fn;
+
+    // ── DEX fleet application usage (mcp_tools_dex.cpp) ─────────────────────────────────
+    // A pure forward of DexApi::apps_usage on the SAME DexApi instance GET
+    // /api/v1/dex/apps/usage calls (server.cpp), so the tool cannot read a different answer.
+    // It applies no permission or audit rule: the handler gates and audits. `visible` is the
+    // Forensics:Read gate's scope. EMPTY when the deployment has no DexApi, and the handler
+    // then answers an internal error. Like SessionFn it has no alias twin to static_assert
+    // against.
+    using DexAppsUsageFn = std::function<std::expected<DexAppsUsageModel, DexUsageRefusal>(
+        const std::string& window, const std::string& platform_scope, const DexUsageSlice& slice,
+        std::int64_t floor, const authz::VisibleSet& visible)>;
+    DexAppsUsageFn dex_apps_usage_fn;
 };
 
 } // namespace yuzu::server::mcp

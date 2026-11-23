@@ -478,8 +478,8 @@ A failed bump aborts the deactivation (the account stays active, a store failure
 A seventh query owner: `DexAppUsageOwner` (`dex_app_usage_owner.{hpp,cpp}`), the read behind the
 fleet application usage model of the Digital Employee Experience (DEX) Apps list. It is a READ join
 across `app_usage_store.agent_last_used`, `app_usage_store.usage_state` and
-`guaranteed_state_store.guardian_observations` on one lease (`pool.with_txn_for`, `SET LOCAL
-statement_timeout`, one statement). One statement matters for the same reason as the fifth owner:
+`guaranteed_state_store.guardian_observations` on one lease (`try_acquire_for`, then `with_txn_on` on that lease, `SET
+LOCAL statement_timeout`, one statement). One statement matters for the same reason as the fifth owner:
 usage collection can be off per device, so crashes and hangs counted on every online device over
 usage from only the reporting devices would overstate the exposure rate. The usage totals, the
 exposed events and the reporting count therefore come from one population. A device counts only when
@@ -491,6 +491,23 @@ read (no connection in the bounded acquire, a statement error or timeout, an ind
 returns `std::nullopt`, distinct from an engaged empty result. Nothing about the rule changes: the
 owner borrows the pool, issues schema-qualified SQL with bound parameters, and no per-store class
 gained a cross-schema method.
+
+Update (2026-11-17): `read` now returns `std::expected<DexUsageRead, DexReadFault>` and no longer
+returns `std::nullopt`; this supersedes the `std::nullopt` sentence above. The fault is one of
+`pool_acquire_timeout` (no connection within the bounded `try_acquire_for`), `query_error` (an index
+out of range, or a failed statement, `BEGIN` or `COMMIT` on the leased connection),
+`statement_timeout` (SQLSTATE 57014) or `concurrency_budget` (an in-flight budget of 4, never wider
+than the Apps stability read's own, refused at once rather than queued behind the pool). The owner
+takes the lease with `try_acquire_for` and runs the transaction on it with `with_txn_on`, so an
+acquire timeout and a transaction failure are told apart. Each fault counts
+`yuzu_server_guardian_read_degrade_total{reason, source="dex_usage"}`. The owner also keeps a
+sustained-timeout state: three or more consecutive statement timeouts whose unbroken run is at
+least two minutes old (any success resets both) are reported to the surface as `fleet_too_large`
+instead of the retryable `statement_timeout`. A stall shorter than two minutes stays retryable; only a
+success resets the run, so a database-wide stall of two minutes or more can reach `fleet_too_large`
+too. The freshness cut is a width (48 hours) applied to the database's own `now()` inside the one
+statement, never an instant taken from a replica clock, so a replica clock that is out of step with
+the database cannot move the fresh and stale counts.
 
 ## Update (2026-11-16) -- an eighth query owner: MfaDisableOwner
 

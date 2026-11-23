@@ -15,12 +15,15 @@ regressible — nothing fails loudly when one is broken.
 1. **Every claimed command is resolved by EXACTLY ONE** of `record_terminal` (terminal, memoised) or
    `release` (transient — queue-full only). Otherwise its claim leaks.
 
-2. **`record_terminal` is called BEFORE the terminal wire Write.** The durable record is the source
-   of truth; the send is replayable. A new terminal-write site that forgets this degrades that
-   command to RUNNING-forever / outcome-lost.
+2. **For a claimed command, `record_terminal` is called BEFORE the terminal wire Write.** The durable
+   record is the source of truth; the send is replayable. (A command refused before the claim, such as
+   one with a NUL parameter, has no record to write: it claims nothing and is answered `REJECTED` once.)
+   A new terminal-write site that forgets this degrades that command to RUNNING-forever / outcome-lost.
 
-3. **The `__guard__` side channel is the ONLY dispatch that bypasses the claim.** Gate on the
-   literal, so dedup stays the SAFE DEFAULT for any future reserved-name command.
+3. **The `__guard__` side channel is the ONLY dispatch that skips claiming for a reason of its own.**
+   Gate on the literal, so dedup stays the SAFE DEFAULT for any future reserved-name command. (The one
+   other path that never claims is a refusal made BEFORE the claim step, such as a parameter holding a
+   NUL byte: it is answered `REJECTED` and nothing is dispatched, so no claim exists to leak.)
 
 4. **A duplicate NEVER re-executes.** Terminal replays the stored frame; InFlight answers RUNNING
    (indeterminate).
@@ -48,8 +51,9 @@ regressible — nothing fails loudly when one is broken.
    claimed with an atomic hard link; if the hard link fails for any reason other than the name being taken, or
    if every `-n` is taken, it fails closed instead and the file stays where it is), carries any non-empty
    `-wal`/`-shm`/`-journal` with it as `<that name>-wal` etc (empty sidecars are removed; one that cannot be
-   renamed is copied, then removed; one whose quarantine name is already taken, or whose copy fails, is removed and not kept, and the note says so), and opens a fresh store. The filesystem half lives in `agents/core/src/command_dedup_quarantine.hpp`
-   (header-only, unit-tested directly). When the original name is replaced or removed only after the claim landed, the judged main file is kept under its `.corrupt-` name with its `-wal`, `-shm` and `-journal` files left at the live names, and the store degrades (`yuzu.dedup_degraded`, fail-open, observable) rather than open a fresh one; a self-consistent stale `-wal` that a later fresh store replays can only make old command_ids read as duplicates (no re-execution). The claim protects the quarantined EVIDENCE only: two agent daemons on
+   renamed is copied, then removed; one whose quarantine name is already taken (for the copy, by any directory entry at all, a dangling link included), or whose copy fails, is removed and not kept, and the note says so; a copy that fails part-way has its partial file removed from the set where possible, and the note says whether it was; on Linux and macOS the copy is by descriptor: the sidecar is opened without following a link and must be a regular file, the bytes are written owner-only to a temporary beside the quarantine name and linked into place only when complete (a crash mid-copy leaves a stray temporary, never a truncated file at the quarantine name), and a failed flush to disk keeps the complete copy and says so), and opens a fresh store. The filesystem half lives in `agents/shared/sqlite_quarantine.hpp` (the move, the name grammar and the
+   count-based prune, shared with the Echo store and unit-tested directly); `agents/core/src/command_dedup_quarantine.hpp`
+   (header-only) keeps the `kKeepQuarantined` count and the logging wrappers. When the original name is replaced or removed only after the claim landed, the judged main file is kept under its `.corrupt-` name with its `-wal`, `-shm` and `-journal` files left at the live names, and the store degrades (`yuzu.dedup_degraded`, fail-open, observable) rather than open a fresh one; a self-consistent stale `-wal` that a later fresh store replays can only make old command_ids read as duplicates (no re-execution). The claim protects the quarantined EVIDENCE only: two agent daemons on
    one data dir are unsupported (no instance lock covers the dedup store; the Guardian boot-epoch lock guards only the epoch claim), and one can still drop the fresh store the other
    just created. The store passes no verdict-time identity (the connection that failed is already closed), so the move is bound to the regular file at the name at the moment of the claim; a link or directory there is refused, and a regular file swapped in before the claim is not told apart. What counts is deliberately narrow:
    - `SQLITE_CORRUPT` / `SQLITE_NOTADB` from any open step (open, the `journal_mode`/`synchronous` pragmas,
@@ -108,6 +112,17 @@ gates 1's queue-full release are decided by the pure, proto-free `agents/core/sr
 `agent.cpp`'s claim block acts on its answer, and `tests/test_agent_command_dedup_wiring_lexical.py`
 pins that it still calls both functions and acts on every field. A change to which commands are
 claimed, or to replay / RUNNING / proceed, belongs in the header, not inline.
+
+## A command killed mid-execution
+
+A command killed in the middle of its plugin call (SIGKILL, including the 60 s `TimeoutStopSec` of the
+packaged unit) leaves its in-flight row in `command_outcomes`. The ring (`prune_locked`) evicts
+TERMINAL rows only, nothing sweeps an in-flight row at boot, and `release` runs only from a live
+process, so the row answers `RUNNING` for that command id until the agent's dedup database is removed; it is never evicted. To clear it, stop the agent, remove
+`<data-dir>/command_dedup.db` (`/var/lib/yuzu-agent/command_dedup.db` under the packaged unit), then start it;
+this forfeits replay protection for commands issued before the removal. The quarantine reconciler re-dispatches containment under a fresh
+command id, and an operator re-issues any other command under a new id. A boot sweep is not part of
+this build and is tracked as a follow-up issue (#3664).
 
 ## Two further contracts
 

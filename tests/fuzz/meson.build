@@ -21,7 +21,7 @@ endif
 
 fuzz_args = ['-fsanitize=fuzzer,address,undefined', '-fno-sanitize-recover=all']
 
-server_src_inc = include_directories('../../server/core/src')
+server_src_inc = include_directories('../../server/core/src', '../../agents/shared')
 
 fuzz_targets = {
   'fuzz_preflight_parse': {
@@ -30,6 +30,22 @@ fuzz_targets = {
   },
   'fuzz_component_zip': {
     'sources': files('fuzz_component_zip.cpp'),
+    'deps': [],
+  },
+  'fuzz_binary_header_pe': {
+    'sources': files('fuzz_binary_header_pe.cpp'),
+    'deps': [],
+  },
+  'fuzz_binary_header_elf': {
+    'sources': files('fuzz_binary_header_elf.cpp'),
+    'deps': [],
+  },
+  'fuzz_binary_header_macho': {
+    'sources': files('fuzz_binary_header_macho.cpp'),
+    'deps': [],
+  },
+  'fuzz_component_native': {
+    'sources': files('fuzz_component_native.cpp'),
     'deps': [],
   },
   'fuzz_deployment_parse': {
@@ -48,6 +64,18 @@ fuzz_targets = {
       '../../server/core/src/guardian_schema_registry.cpp',
     ),
     'deps': [nlohmann_dep],
+  },
+  'fuzz_file_search_cursor': {
+    'sources': files('fuzz_file_search_cursor.cpp'),
+    'deps': [],
+  },
+  'fuzz_file_search_names': {
+    'sources': files('fuzz_file_search_names.cpp'),
+    'deps': [],
+  },
+  'fuzz_file_search_glob': {
+    'sources': files('fuzz_file_search_glob.cpp'),
+    'deps': [],
   },
 }
 

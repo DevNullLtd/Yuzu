@@ -122,7 +122,8 @@ classify_and_authorize_dispatch(
     const CommandCapabilityRegistry& registry, const DispatchCaller& caller,
     std::string_view plugin, std::string_view action,
     const std::function<bool(std::string_view principal, std::string_view securable,
-                             authz::Operation operation)>& has_permission) {
+                             authz::Operation operation)>& has_permission,
+    const std::unordered_map<std::string, std::string>* parameters = nullptr) {
     auto classified = registry.classify(plugin, action);
     if (!classified) {
         return std::unexpected(DispatchDenial{
@@ -130,7 +131,22 @@ classify_and_authorize_dispatch(
                                                                   : DispatchDenialReason::Unclassified,
             {}, authz::Operation::Read});
     }
-    const CommandCapability cap = *classified;
+    CommandCapability cap = *classified;
+    // sg10 / UP-1: a parameter key with a control byte, a NUL or invalid UTF-8 is a DENIAL, never
+    // a truncation: the agent's C-string key would match a name the server's exact lookup missed.
+    // Judged for system callers too, before their early return.
+    if (parameters != nullptr && !parameters_well_formed(*parameters))
+        return std::unexpected(DispatchDenial{DispatchDenialReason::Forbidden,
+                                              std::string(effective_securable(cap, parameters)),
+                                              cap.operation});
+    // sg10: a row that escalates its securable on a parameter (`CommandCapability::
+    // param_escalation_key`) is judged, and reported, under the escalated securable when the
+    // parameter is supplied and non-empty. `parameters == nullptr` means the caller does not know
+    // them (the MCP/REST pre-dispatch DRY RUN): the escalation is then NOT evaluated here and is
+    // enforced at the send path, `ServerImpl::build_classified_command`, which always passes them, and
+    // at schedule/outbox arming (`schedule_arming_permitted`), which judges the same rule at fire
+    // and at delivery. A `.system = true` caller (below) skips the permission check entirely.
+    cap.securable = effective_securable(cap, parameters);
 
     // #1398 defense in depth: see DispatchDenialReason::Unclassified's doc
     // comment — every fragment's compile-time sweep should make this
@@ -145,8 +161,22 @@ classify_and_authorize_dispatch(
             DispatchDenial{DispatchDenialReason::Unclassified, {}, authz::Operation::Read});
     }
 
-    if (caller.system)
+    if (caller.system) {
+        // sg10 RULE for every `.system = true` dispatch (policy evaluator, preflight, canned
+        // panels): a system caller holds no grant, so
+        // a PARAMETER-ESCALATED securable (`cap.securable` above differs from the row's own) has no one to
+        // prove it and is REFUSED, never admitted by the early return. Operator-authored
+        // parameters therefore cannot ride a system dispatch past an escalation. A system dispatch with
+        // NO escalating parameter (policy evaluator, triggers, pre-flight, canned panels) is
+        // unaffected. Schedule and outbox dispatches are not system dispatches: they re-resolve the
+        // arming principal and are authorised against the escalated securable at arming
+        // (`schedule_arming_permitted`) and again here as that caller.
+        if (cap.securable != classified->securable)
+            return std::unexpected(
+                DispatchDenial{DispatchDenialReason::Forbidden, std::string(cap.securable),
+                               cap.operation});
         return cap;
+    }
 
     // No anonymous operator dispatch (PLAN item 2): an empty principal must
     // never reach `has_permission`, where a legacy-open store would admit it

@@ -94,8 +94,9 @@ namespace {
 // read unchanged.
 bool compose_arming_check(const CommandCapabilityRegistry& registry, const RbacStore* rbac,
                           const std::string& principal, const std::string& plugin,
-                          const std::string& action, bool legacy_admin = true) {
-    return yuzu::server::schedule_arming_permitted(registry, rbac, principal, plugin, action,
+                          const std::string& action, bool legacy_admin = true,
+                          const std::unordered_map<std::string, std::string>& parameters = {}) {
+    return yuzu::server::schedule_arming_permitted(registry, rbac, principal, plugin, action, parameters,
                                                    [legacy_admin]() -> ArmingResult {
                                                        return legacy_admin;
                                                    })
@@ -256,22 +257,22 @@ TEST_CASE("arming_check composition: tri-state - an auth-store fault is UNAVAILA
         return std::unexpected(std::string("auth store error"));
     };
     // Non-Read pair, RBAC off: the lookup runs and its fault is reported as UNAVAILABLE.
-    auto r = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "create_temp", fault);
+    auto r = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "create_temp", {}, fault);
     CHECK_FALSE(r.has_value());
     CHECK(lookups == 1);
     // Read pair: never consults the auth store.
-    auto rd = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "exists", fault);
+    auto rd = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "exists", {}, fault);
     REQUIRE(rd.has_value());
     CHECK(*rd);
     CHECK(lookups == 1);
     // Engine principal: denied without a lookup.
-    auto en = schedule_arming_permitted(registry, &rbac, "engine:x", "filesystem", "create_temp", fault);
+    auto en = schedule_arming_permitted(registry, &rbac, "engine:x", "filesystem", "create_temp", {}, fault);
     REQUIRE(en.has_value());
     CHECK_FALSE(*en);
     CHECK(lookups == 1);
     // RBAC enforced: the legacy lookup is not consulted at all.
     rbac.set_rbac_enabled(true);
-    (void)schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "create_temp", fault);
+    (void)schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "create_temp", {}, fault);
     CHECK(lookups == 1);
 }
 
@@ -284,10 +285,10 @@ TEST_CASE("arming_check composition: enforced RBAC with an unreadable grant stor
     REQUIRE(rbac.assign_role(PrincipalRole{"user", "alice", "Administrator"}).has_value());
     auto never = []() -> ArmingResult { return false; };
     // Healthy: a definitive answer either way.
-    auto granted = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "exists", never);
+    auto granted = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "exists", {}, never);
     REQUIRE(granted.has_value());
     CHECK(*granted);
-    auto denied = schedule_arming_permitted(registry, &rbac, "nobody", "filesystem", "exists", never);
+    auto denied = schedule_arming_permitted(registry, &rbac, "nobody", "filesystem", "exists", {}, never);
     REQUIRE(denied.has_value());
     CHECK_FALSE(*denied);
     // The role table cannot be read: the question has no answer, so it is not a denial.
@@ -297,10 +298,10 @@ TEST_CASE("arming_check composition: enforced RBAC with an unreadable grant stor
         yuzu::server::pg::PgResult dr{PQexec(c.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
         REQUIRE(dr.ok());
     }
-    auto faulted = schedule_arming_permitted(registry, &rbac, "bob", "filesystem", "exists", never);
+    auto faulted = schedule_arming_permitted(registry, &rbac, "bob", "filesystem", "exists", {}, never);
     CHECK_FALSE(faulted.has_value());
     // No store wired: also unavailable (held), not a recorded denial.
-    auto none = schedule_arming_permitted(registry, nullptr, "alice", "filesystem", "exists", never);
+    auto none = schedule_arming_permitted(registry, nullptr, "alice", "filesystem", "exists", {}, never);
     CHECK_FALSE(none.has_value());
 }
 
@@ -399,8 +400,9 @@ struct Harness {
                   },
               .arming_check =
                   [this](const std::string& principal, const std::string& plugin,
-                        const std::string& action) {
-                      return compose_arming_check(registry, &rbac, principal, plugin, action);
+                        const std::string& action, const std::unordered_map<std::string, std::string>& parameters) {
+                      return compose_arming_check(registry, &rbac, principal, plugin, action,
+                                                  /*legacy_admin=*/true, parameters);
                   },
               // #6096: the outbox spent-ticket ledger. This harness's enqueue_fn writes no
               // outbox row, so the ledger is empty and no occurrence has run.

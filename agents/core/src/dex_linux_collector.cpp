@@ -30,6 +30,7 @@
 #include "dex_perf_breach.hpp"    // breach_update, kCpuBreach/kMemoryBreach, *_observation
 #include "dex_win_poll.hpp"       // DiskLevel, latch_should_emit
 
+#include <yuzu/log_token.hpp> // log_key_token: subject/reason come from journal fields (F59)
 #include <yuzu/agent/dex_rate_limiter.hpp> // DexRateLimiter — per-obs_type hourly emit cap
 
 #include <sys/statvfs.h>
@@ -432,6 +433,10 @@ private:
     // dropped and re-baselined — without that, a stale cursor would silently never match
     // again (permanent silence). A quiet poll with no new entries exits 0, so it keeps its
     // cursor.
+    std::uint64_t journal_untrusted_dropped_{0}; // F58: entries failing the sender check
+    std::int64_t journal_last_drop_warn_{-1};   // steady_now() of the last drop warning
+    std::uint64_t journal_gap_events_{0};        // UP6: cursor re-baselines (a possible data gap)
+
     void poll_journald() {
         // Evict debounce entries older than the window FIRST, every cycle (the
         // age-keyed analogue of poll_disks()'s std::erase_if on disk_low_reported_):
@@ -460,8 +465,25 @@ private:
         // drain advances journal_cursor_ to the newest entry it reads; a throw or short
         // read leaves it at the last good line, so the same window is re-polled. The
         // debounce collapses a flapping unit/process to one observation per window.
-        auto observations = lnx::drain_journal_pipe(pipe.get(), journal_cursor_);
-        const int rc = pipe.close(); // exit status AFTER draining stdout to EOF
+        std::size_t untrusted = 0;
+        auto observations = lnx::drain_journal_pipe(pipe.get(), journal_cursor_, &untrusted);
+        const int rc = pipe.close();
+        if (untrusted != 0) {
+            // WP13/F58: entries that matched a reliability id but failed the journald-stamped
+            // sender check. A genuine mismatch (an unexpected coredump identity) would otherwise
+            // be silent. The journalctl match already keeps user-manager entries and other uids
+            // out (`_UID=0`, `_PID=1 _UID=0`), so those are filtered BEFORE this check and are
+            // not counted here.
+            journal_untrusted_dropped_ += untrusted;
+            // Throttled (WP13 N-WARN): a forger could otherwise turn every poll into a log line.
+            // First drop, then at most once per hour with the running total.
+            if (journal_last_drop_warn_ < 0 || now - journal_last_drop_warn_ >= 3600) {
+                journal_last_drop_warn_ = now;
+                spdlog::warn("dex_observer(linux): dropped journal entries failing the trusted-sender "
+                             "check ({} total since start, this poll {}; logged at most hourly)",
+                             journal_untrusted_dropped_, untrusted);
+            }
+        } // exit status AFTER draining stdout to EOF
         // Emit whatever was read FIRST (a timeout mid-read still yields real events),
         // then re-baseline on a non-zero exit so a cursor the journal rotated past does
         // not wedge the source in permanent silence.
@@ -469,9 +491,15 @@ private:
             if (journal_debounce_.should_emit(obs.obs_type, obs.subject, now))
                 emit(std::move(obs));
         if (rc != 0) {
+            // Gap marker (WP13 governance UP6): the re-baseline continues from the journal END,
+            // so every entry between the old cursor and now is never read. Count and log it so a
+            // rotation/vacuum gap is visible; cursor semantics are unchanged.
+            ++journal_gap_events_;
             spdlog::warn(
-                "dex_observer(linux): journalctl exited {} — dropping journald cursor to re-baseline",
-                rc);
+                "dex_observer(linux): journalctl exited {} — dropping journald cursor to re-baseline; "
+                "journald entries between the old cursor and the journal end are NOT observed "
+                "(gap #{} since start)",
+                rc, journal_gap_events_);
             journal_cursor_.clear();
         }
     }
@@ -511,7 +539,7 @@ private:
         if (decision != RateDecision::Emit)
             return; // over cap this hour — drop
         spdlog::info("dex_observer(linux): observed {} subject='{}' reason={}", obs.obs_type,
-                     obs.subject, obs.reason);
+                     ::yuzu::log_key_token(obs.subject), ::yuzu::log_key_token(obs.reason));
         try {
             sink_(obs);
         } catch (...) {

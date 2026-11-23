@@ -10,13 +10,14 @@
 /// CHECKS a CRL against; it is never a trust anchor, an issuer, or a TLS root for any Yuzu
 /// decision path.
 ///
-/// This PR (2b-1a) WRITES only `source`, `source_ca_key` and `source_url`. The schema is created
-/// whole, so the fetcher (2b-1b) adds no migration: `fetch_status`, `crl`, `crl_entry` and
-/// `rollback_high_water` exist, are READ here (a source's fetch status, its held-CRL count) and
-/// are deleted with their source / URL / key, but nothing in this PR inserts into `crl` or
-/// `crl_entry`. The one exception is `rollback_high_water`, which `reset_high_water` upserts:
-/// that mark is keyed by the CA, never by the source, so it survives `remove` (a remove and
-/// re-register cannot accept an older CRL).
+/// This PR (2b-1a) WRITES only `source`, `source_ca_key` and `source_url`. v1 creates the tables
+/// the fetcher (2b-1b) reads and writes; `cert_signature_check` (2b-2) is not created here. The
+/// #6590 rulings (2026-11-18: reset key list, `scope_key` encoding, canonical URLs) land as
+/// migration v2 before 2b-1b. `fetch_status`, `crl`, `crl_entry` and `rollback_high_water` exist,
+/// are READ here (a source's fetch status, its held-CRL count) and are deleted with their source /
+/// URL / key, but nothing in this PR inserts into `crl` or `crl_entry`. The one exception is
+/// `rollback_high_water`, which `reset_high_water` upserts: that mark is keyed by the CA, never by
+/// the source, so it survives `remove` (a remove and re-register cannot accept an older CRL).
 ///
 /// Posture (ADR-0012 §1): construction is fail-CLOSED. A store that cannot migrate/open sets
 /// the server's `startup_failed_`, and the store is in the `/readyz` conjunction: it holds the
@@ -200,9 +201,10 @@ public:
     [[nodiscard]] std::expected<std::int64_t, RevocationSourceStoreError>
     crl_past_next_update_count();
 
-    /// Register a source; returns its id. Errors: kConflict (one source per CA), kLimitReached,
-    /// kInvalidInput, kPoolAcquireTimeout, kQueryError, kOutcomeUnknown.
-    [[nodiscard]] std::expected<std::int64_t, RevocationSourceStoreError>
+    /// Register a source; returns it as stored, read back inside the same transaction (so a
+    /// committed registration is never reported as a failure). Errors: kConflict (one source per
+    /// CA), kLimitReached, kInvalidInput, kPoolAcquireTimeout, kQueryError, kOutcomeUnknown.
+    [[nodiscard]] std::expected<RevocationSourceRecord, RevocationSourceStoreError>
     create(const NewRevocationSource& src, const std::string& created_by);
 
     /// Replace the source's name, keys and URLs (a full replace). A body equal to the stored
@@ -237,6 +239,18 @@ public:
         write_fault_ = std::move(f);
     }
 
+    /// Test seam (empty in production): the read-side twin of `set_write_fault_for_test`, called
+    /// with the operation name (`list`, `get`, `crl_past_next_update_count`) at the start of every
+    /// read, where a returned kind fails the read with it before any lease is taken; and with
+    /// `create.reread` just before `create` reads its new row back inside its open transaction,
+    /// where a returned kind fails the create and the transaction rolls back. Lets a test prove a
+    /// write path does not depend on a separate read after its commit, and that a failed read-back
+    /// leaves nothing committed.
+    void set_read_fault_for_test(std::function<std::optional<RevocationSourceStoreError::Kind>(
+                                     std::string_view op)> f) {
+        read_fault_ = std::move(f);
+    }
+
     /// Test seam: shorten the bounded lease wait so a held-lease test does not sit out the
     /// production timeout. Not for production use.
     void set_acquire_timeout_for_test(std::chrono::milliseconds t) noexcept { timeout_ = t; }
@@ -248,6 +262,7 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     std::function<std::optional<RevocationSourceStoreError::Kind>(std::string_view)> write_fault_;
+    std::function<std::optional<RevocationSourceStoreError::Kind>(std::string_view)> read_fault_;
 };
 
 } // namespace yuzu::server

@@ -5,9 +5,13 @@
  */
 
 #include "echo_software_core.hpp"
+#include "echo_version.hpp"
+#include "echo_wire_scrub.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <tuple>
 #include <utility>
 
 namespace yuzu::echo {
@@ -22,7 +26,7 @@ std::string software_state_to_json(const std::vector<SoftwareInfo>& apps) {
                        {"publisher", a.publisher},
                        {"install_date", a.install_date}});
     }
-    return arr.dump();
+    return arr.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 std::vector<SoftwareInfo> software_state_from_json(const std::string& s) {
@@ -48,10 +52,33 @@ std::vector<SoftwareInfo> software_state_from_json(const std::string& s) {
     return result;
 }
 
+void dedup(std::vector<SoftwareInfo>& apps) {
+    std::sort(apps.begin(), apps.end(), [](const SoftwareInfo& a, const SoftwareInfo& b) {
+        if (a.name != b.name)
+            return a.name < b.name;
+        if (int c = compare_versions(a.version, b.version); c != 0)
+            return c > 0; // descending → unique keeps the highest
+        // Versions that rank equal can still differ as strings ("1.0" and "1"), and the diff
+        // compares the string, so the tie is broken on the bytes of every field: the kept
+        // entry is a function of the set of entries, never of their order.
+        return std::tie(b.version, b.publisher, b.install_date) <
+               std::tie(a.version, a.publisher, a.install_date);
+    });
+    apps.erase(std::unique(apps.begin(), apps.end(),
+                           [](const SoftwareInfo& a, const SoftwareInfo& b) {
+                               return a.name == b.name;
+                           }),
+               apps.end());
+}
+
 SoftwareCollectResult software_collect_core(const std::string& prev_json,
                                             std::vector<SoftwareInfo> enumerated,
                                             int64_t timestamp, int64_t snapshot_id) {
     SoftwareCollectResult r;
+
+    // Well-formed UTF-8 at collection so the dump(replace) baseline round-trips losslessly
+    // (otherwise a name with a bad byte diffs as installed+removed every tick).
+    scrub_wire_strings(enumerated);
 
     // Cold start: no prior state row. Seed the baseline silently — an 'installed'
     // event must mean "installed now", not "already present when the agent began

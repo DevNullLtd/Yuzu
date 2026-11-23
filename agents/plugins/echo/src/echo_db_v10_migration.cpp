@@ -29,11 +29,20 @@
  *        named (never read as "fold everything", which would double count); a mark ahead of the
  *        clock is untrusted and replaced by the end of the converted tier's newest bucket, logged
  *        with the figures (the old pass returned early on such a mark, so nothing after it was
- *        summarised);
+ *        summarised). Under such a floor a finer row goes up only into an upper (bucket, key) the
+ *        upper tier does not already hold: the old pass rolled whole upper buckets, so a bucket
+ *        and key the tier holds were rolled in full, and the floor lies below buckets the old
+ *        pass wrote (during the excursion, or between a stepped-back clock and a sane mark);
  *     4. fold each source's raw rows the aggregator had NOT yet summarised (ts at or above the
- *        mark of the source's first old summary tier; every row when there is none) through the
- *        production `<src>_delta` and EchoFold::fold_in, in id order and chunks of 10,000; the
- *        process rows past `usage_hwm_id` (the usage fold's own cursor, deleted in step 5) are
+ *        stored mark of the source's first old summary tier; every row when there is none)
+ *        through the production `<src>_delta` and EchoFold::fold_in, in id order and chunks of
+ *        10,000, the rows below that mark first: a row below it was usually summarised, but the
+ *        clock-gap clamp and a backfill left some out, so it folds only where the converted first
+ *        tier holds no row for its bucket and keys and the bucket is newer than the tier's oldest
+ *        (retention or the budget removed older ones while raw rows survived);
+ *        a cursor source keeps its
+ *        single pass at the floor. The process rows past `usage_hwm_id` (the usage fold's own
+ *        cursor, deleted in step 5) are
  *        also fed to the usage fold in this transaction when usage is enabled and Active (the
  *        fold's own predicate, whether or not the process source is enabled), so a lagging
  *        usage fold loses nothing it would have credited (one id-ordered walk over every row past
@@ -51,8 +60,8 @@
  * pass retries daily.
  *
  * BOUNDS. Before it starts the migration refuses a volume with less than twice the database file
- * plus its write-ahead log already on disk free (so Echo stays offline until the space is freed and the agent restarts, rather than risking
- * the host's disk). The transaction's WAL (the converted summary bytes plus the zeroed raw pages)
+ * plus its write-ahead log already on disk free (so Echo loads offline and retries rather than
+ * risking the host's disk). The transaction's WAL (the converted summary bytes plus the zeroed raw pages)
  * is NOT bounded by the file's size: it measured 1.35 times the file. The twice-the-file check
  * covers the measured case (WAL 325.7 MB plus the new file about 79 MB is about 404 MB, under the
  * 483 MB demanded for a 241.8 MB file); no general bound is proven. The WAL is checkpointed to
@@ -60,6 +69,20 @@
  * and the second free-space check bounds that phase. The write lock is held for the whole run (tens of seconds on a 250 MiB file): no
  * collector writes meanwhile, and a collector call that finds the database busy retries on its
  * next tick.
+ *
+ * FAILURE (owner ruling 2026-11-16, #7290). A failure of this step other than a crash (the free-space
+ * refusal, a damaged mark or an out-of-range bucket, a lock, a full volume, the deadline below) does
+ * not fail the plugin and does not quarantine the file: Echo loads OFFLINE
+ * (`storage_state|offline|<reason>`), no source collects, and the plugin retries the open at 1, 5 and
+ * 15 minutes and then hourly (echo_open_retry.hpp). Quarantine-and-start-fresh was rejected: it would
+ * discard data a repair could save, break the all-or-nothing rule and re-enable every source an
+ * operator had paused. Each attempt is bounded by a wall-clock deadline of 60 s plus 2 s per MiB of the
+ * file, doubled for every earlier attempt that ended on it and capped at one hour (the one measured
+ * run took 55 s on 242 MB, so a short fixed bound would interrupt every attempt and Echo would never
+ * come online); a hit or a shutdown interrupts the statement and rolls back. The deadline never
+ * covers the post-commit phase. The schema version and the retired-table list are read again
+ * INSIDE the write transaction: a second opener that finished first makes this one a no-op, and a
+ * changed list fails the attempt for the retry to redo.
  *
  * CURSOR SOURCES (power, removable, registry) change their idempotence: the raw store kept every
  * record_key forever and refused a reuse; the replay ring keeps the newest 4096 keys of a source.
@@ -71,9 +94,11 @@
 
 #include "echo_aggregator.hpp" // kAutoVacuumDeferredKey
 #include "echo_db.hpp"
+#include "echo_open_retry.hpp" // v10_migration_deadline
 #include "echo_fold.hpp"
 #include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp" // source_default_enabled: the usage feed decision
+#include "echo_sqlite_progress.hpp" // ScopedProgressHandler: the deadline and cancel guard
 #include "echo_status_format.hpp"   // kFreeSpaceRefusalPrefix
 #include "echo_usage.hpp"           // usage_active_in, usage_fold_in: the lagged rows reach usage
 
@@ -253,8 +278,8 @@ std::optional<Columns> raw_columns(TransactionHandle& h, std::string_view source
     return c;
 }
 
-// Streams `<source>_live` rows with ts >= min_ts in id order, kChunkRows at a time, to `on_chunk`.
-// `after_id` starts the id walk past that id (a cursor).
+// Streams `<source>_live` rows with ts >= min_ts (and ts < before_ts when that is given) in id
+// order, kChunkRows at a time, to `on_chunk`. `after_id` starts the id walk past that id (a cursor).
 // Id order, not (ts, id): every merge the fold applies (sum, max, min, last-by-guard with ties to
 // the later arrival) gives the same result for either order, and the id walk needs no sort.
 // Returns the number of rows read. The SELECT is finalised before this returns, so a later DROP
@@ -262,14 +287,15 @@ std::optional<Columns> raw_columns(TransactionHandle& h, std::string_view source
 std::optional<int64_t> for_each_chunk(
     TransactionHandle& h, std::string_view source, const Columns& c, int64_t min_ts,
     const std::function<bool(const std::vector<RawRow>&)>& on_chunk,
-    int64_t after_id = std::numeric_limits<int64_t>::min()) {
+    int64_t after_id = std::numeric_limits<int64_t>::min(),
+    std::optional<int64_t> before_ts = std::nullopt) {
     std::string select = "SELECT id";
     for (std::size_t i = 0; i < c.cols.size(); ++i)
         select += c.present[i] ? std::format(", {}", c.cols[i].name)
                                : std::format(", {} AS {}", c.cols[i].sql_type == "TEXT" ? "''" : "0",
                                              c.cols[i].name);
-    select += std::format(" FROM {}_live WHERE id > ?1 AND ts >= ?2 ORDER BY id LIMIT {}", source,
-                          kChunkRows);
+    select += std::format(" FROM {}_live WHERE id > ?1 AND ts >= ?2{} ORDER BY id LIMIT {}", source,
+                          before_ts ? " AND ts < ?3" : "", kChunkRows);
     auto st = prep(h, select);
     if (!st)
         return std::nullopt;
@@ -281,6 +307,8 @@ std::optional<int64_t> for_each_chunk(
         sqlite3_clear_bindings(st.get());
         sqlite3_bind_int64(st.get(), 1, last_id);
         sqlite3_bind_int64(st.get(), 2, min_ts);
+        if (before_ts)
+            sqlite3_bind_int64(st.get(), 3, *before_ts);
         std::vector<RawRow> rows;
         int rc = SQLITE_OK;
         while ((rc = sqlite3_step(st.get())) == SQLITE_ROW) {
@@ -560,8 +588,11 @@ RegistryEvent decode_registry(const RawRow& r) {
 
 struct Report {
     int64_t legacy_tier_rows{0};
-    int64_t raw_rows{0};
-    int64_t below_mark{0}; // raw rows older than the old roll-up mark (or floor): not folded into the tiers, counted
+    int64_t raw_rows{0};               // raw rows at or above the stored mark, folded as they are
+    int64_t below_mark_rows{0};        // raw rows read below the stored mark (the held-bucket test)
+    int64_t below_mark_events_folded{0};  // of those, events the converted tier did not hold
+    int64_t below_mark_events_skipped{0}; // ... and events it held, or that lie at or before its oldest bucket
+    int64_t rollup_rows_skipped_as_held{0}; // tier-to-tier rows left out: the upper tier already held them
     int64_t rejected{0};
     int64_t ring_keys{0};
     int64_t untrusted_marks{0};   // marks ahead of the clock, replaced by the converted tier's edge
@@ -744,18 +775,53 @@ private:
         // Only a tier the old aggregator had filled can hold rows its upper tier is missing.
         if (!legacy_tiers_.contains(fold_view_name(def.name, from)))
             return {};
-        const std::string sql = fold_tier_from_tier_sql(def.name, from, to);
-        if (sql.empty())
-            return {};
         const auto floor = floor_for(def, to);
         if (!floor)
             return std::unexpected(floor.error());
-        auto st = prep(h_, sql);
+        // Under a mark ahead of the clock the floor is a substitute, and a finer row at or above it
+        // may sit in an upper bucket the old pass already rolled up (a bucket written during the
+        // excursion, or between a stepped-back clock and a sane mark): it goes up only into a
+        // (bucket, key) the upper tier does not hold. The old pass rolled whole upper buckets, so
+        // a (bucket, key) the tier holds was rolled in full. A sane mark keeps today's statement.
+        const auto mark = marks_.find(std::format("{}/{}", def.name, to));
+        const bool only_absent = mark != marks_.end() && mark->second.untrusted &&
+                                 *floor != std::numeric_limits<int64_t>::min();
+        const std::string sql = fold_tier_from_tier_sql(def.name, from, to, only_absent);
+        if (sql.empty())
+            return {};
+        const auto fail = [&](const std::string& why) {
+            return std::unexpected(std::format("rolling {} {} up into {}: {}", def.name, from, to, why));
+        };
+        int64_t eligible = 0;
+        if (only_absent) {
+            auto count = prep(h_, std::format("SELECT COUNT(*) FROM {} WHERE {} >= ?1",
+                                              physical_table_name(def.name, from),
+                                              ts_column_for_suffix(from)));
+            if (!count)
+                return fail(h_.error());
+            sqlite3_bind_int64(count.get(), 1, *floor);
+            if (sqlite3_step(count.get()) != SQLITE_ROW)
+                return fail(sqlite3_errmsg(h_.raw()));
+            eligible = sqlite3_column_int64(count.get(), 0);
+        }
+        // RETURNING counts the rows that went up (one per finer row, insert or merge); the rest of
+        // the eligible rows were left out.
+        auto st = prep(h_, only_absent ? sql + " RETURNING id" : sql);
         if (!st)
-            return std::unexpected(std::format("rolling {} {} up into {}: {}", def.name, from, to, h_.error()));
+            return fail(h_.error());
         sqlite3_bind_int64(st.get(), 1, *floor);
-        if (!step_done(h_, st.get()))
-            return std::unexpected(std::format("rolling {} {} up into {}: {}", def.name, from, to, h_.error()));
+        if (!only_absent) {
+            if (!step_done(h_, st.get()))
+                return fail(h_.error());
+            return {};
+        }
+        int64_t added = 0;
+        int rc = SQLITE_OK;
+        while ((rc = sqlite3_step(st.get())) == SQLITE_ROW)
+            ++added;
+        if (rc != SQLITE_DONE)
+            return fail(sqlite3_errmsg(h_.raw()));
+        report_.rollup_rows_skipped_as_held += eligible - added;
         return {};
     }
 
@@ -813,23 +879,45 @@ private:
     // a mark ahead of the clock, the end of the newest bucket AT OR BEFORE THE CLOCK that the
     // converted tier holds (what the old pass had provably summarised), clamped to the clock. A
     // bucket the old pass wrote during the excursion sits ahead of the clock too and must not be
-    // the floor: every raw row written since the clock healed is below it and would be dropped as
-    // summarised (g8-2). A converted tier with no such bucket cannot bound the fold: folding
-    // everything would add every raw row on top of the upper tiers that already hold them (g8-1),
-    // so the migration refuses with the figures named instead of guessing. The trust rule is the
-    // old budget pass's own bare `mark > now` (acd22e776 echo_aggregator.cpp, no tolerance), so a
-    // migration clock behind the stored marks makes them untrusted and lands here: a source whose
-    // converted tier holds a bucket is bounded by it, one with no bucket refuses until the clock
-    // or the mark is repaired. Logged once per mark with the figures. A source with nothing to
-    // fold (no raw row, every converted tier empty) is not refused: its mark bounds nothing.
-    // ponytail: two triggers fold rows a second time on top of the converted buckets that hold
-    // them, and neither is closed here. (1) A raw row the excursion itself stamped (ts ahead of
-    // the clock) folds again on top of the converted future bucket; an upper bound on the raw
-    // read would close that. (2) A migration clock set back from a SANE mark (a restored
-    // snapshot, an NTP step) makes the mark untrusted by the same rule, and the clamp to the
-    // clock re-folds every raw row between the clock and the mark on top of the buckets that
-    // hold them. Add the bound if a healed excursion with surviving raw rows, or a migration
-    // under a stepped-back clock, is ever seen in the field.
+    // the floor: every raw row written since the clock healed is above it (g8-2). A converted
+    // tier with no such bucket cannot bound the fold: folding everything would add every raw row
+    // on top of the upper tiers that already hold them (g8-1), so the migration refuses with the
+    // figures named instead of guessing. The trust rule is the old budget pass's own bare
+    // `mark > now` (acd22e776 echo_aggregator.cpp, no tolerance), so a migration clock behind the
+    // stored marks makes them untrusted and lands here: a source whose converted tier holds a
+    // bucket is bounded by it, one with no bucket refuses until the clock or the mark is
+    // repaired. Logged once per mark with the figures. A source with nothing to fold (no raw row,
+    // every converted tier empty) is not refused: its mark bounds nothing.
+    //
+    // A substituted floor is NOT proof that what lies above it is unsummarised: the old pass wrote
+    // buckets above it (a bucket during the excursion, the days between a stepped-back clock and
+    // a sane mark), and a row stamped inside one of them was summarised with it. So a floor only
+    // ever bounds WHERE the held-bucket test applies, never what is dropped:
+    //   - finish_rollup: a finer row at or above the floor goes up only into an upper (bucket,
+    //     key) the upper tier does not hold (fold_tier_from_tier_sql's only_absent);
+    //   - fold_raw: a raw row below the STORED mark of the first old tier folds only where that
+    //     converted tier holds no row for its bucket and keys, and rows at or above it fold as
+    //     they are (cursor sources are outside the held-bucket test and keep the single pass at
+    //     the floor; see the last residual).
+    // Residuals, all erring toward not folding:
+    //   - a raw row at or before the first tier's oldest bucket (the pre-v10 build aged buckets
+    //     out oldest first: an hourly row after 24 hours, 31 days for perf and procperf, a daily
+    //     row after 31 days, its byte budget sooner on a build that had one, while raw rows,
+    //     kept by row count, survived);
+    //   - a raw row whose bucket and keys the converted tier holds although the row itself was
+    //     never summarised (a row a backfill wrote after its bucket was rolled, or an event kind
+    //     the old tier did not count; the old GROUP BY kept no row identity);
+    //   - in finish_rollup, an upper bucket the tier above already holds is never completed (the
+    //     rest of a month whose old range began mid-month after the old clock-gap clamp, boundary
+    //     - max_gap; and a finer row the step below has just added, such as a day the daily tier
+    //     lacked);
+    //   - and cursor sources, which the held-bucket test does not cover and whose migration fold
+    //     never consults the replay ring: a file that gave one a summary tier or a mark would keep
+    //     the old rule with both gaps (no shipped schema gave power, removable or registry either,
+    //     so no file in the field takes that path).
+    // The old tiers carried no unique index, so a
+    // re-rolled range wrote a second row and the conversion merged it: the rule never counts that
+    // range twice and never completes it.
     std::expected<int64_t, std::string> floor_for(const FoldSourceDef& def, std::string_view tier) {
         const auto it = marks_.find(std::format("{}/{}", def.name, tier));
         if (it == marks_.end() || !it->second.value)
@@ -860,8 +948,8 @@ private:
         const int64_t floor = std::min(**edge, now_);
         spdlog::warn("EchoDatabase v10: rollup mark rollup_{}_{}_at = {} is ahead of the clock ({}); "
                      "it proves nothing about what was summarised, so the fold floor is the end of "
-                     "the converted {} tier's newest bucket at or before the clock instead ({}); rows "
-                     "below it are counted as older than the mark",
+                     "the converted {} tier's newest bucket at or before the clock instead ({}); what "
+                     "lies above it is added only where the converted tier holds no row for it",
                      def.name, tier, *it->second.value, now_, tier, floor);
         return floor;
     }
@@ -892,13 +980,143 @@ private:
         return std::optional<int64_t>{sqlite3_column_int64(st.get(), 0)};
     }
 
-    // The ts at or above which a source's raw rows were NOT yet summarised: the floor of its first
-    // old summary tier (the tier that read the raw table), or the beginning of time when it had none.
-    std::expected<int64_t, std::string> unsummarised_from(const FoldSourceDef& def) {
+    // The finest old summary tier `def` held: the tier that read the raw table.
+    [[nodiscard]] std::optional<std::string_view> first_old_tier(const FoldSourceDef& def) const {
         for (const auto tier : kTiers)
             if (legacy_tiers_.contains(fold_view_name(def.name, tier)))
-                return floor_for(def, tier);
+                return tier;
+        return std::nullopt;
+    }
+
+    // The ts at or above which a source's raw rows were NOT yet summarised: the floor of its first
+    // old summary tier, or the beginning of time when it had none.
+    std::expected<int64_t, std::string> unsummarised_from(const FoldSourceDef& def) {
+        if (const auto tier = first_old_tier(def))
+            return floor_for(def, *tier);
         return std::numeric_limits<int64_t>::min();
+    }
+
+    // The mark stored for `tier` of `def`, as written (trusted or not); nullopt when there is none.
+    [[nodiscard]] std::optional<int64_t> stored_mark(const FoldSourceDef& def, std::string_view tier) const {
+        const auto it = marks_.find(std::format("{}/{}", def.name, tier));
+        return it == marks_.end() ? std::nullopt : it->second.value;
+    }
+
+    // The held-bucket test of the raw rows below a stored mark (pass 1 of fold_raw): a row folds
+    // only when its first-tier bucket is NEWER than the converted tier's oldest bucket AND the
+    // converted tier holds no row for its bucket and keys.
+    //   - Newer than the oldest bucket: the pre-v10 build aged first-tier buckets out oldest
+    //     first (retention, or its byte budget) while raw rows survived, so a bucket's absence
+    //     inside the evicted range does not mean "never summarised" and folding there would
+    //     double count the daily and monthly tiers. An empty tier admits nothing.
+    //   - Holds no row: asked of the converted first tier, on the key columns the old GROUP BY
+    //     carried (`keys`) -- the tier's other key columns are enrichment the old pass never
+    //     wrote, '' or 0 in every converted row, which a delta may now name. The tier is read as
+    //     it stood BEFORE the pass: a row above `watermark` (the tier's highest id before any
+    //     fold) is this pass's own write, so the answer for a (bucket, keys) is the same in every
+    //     chunk and a second row of one bucket and key is never told "held" by the first's write.
+    //     That also keeps the cache of answers (`memo`) per chunk: memory stays bounded by the
+    //     chunk, not by the number of buckets and keys the raw table holds. The converted first
+    //     tier is not written by finish_rollup (it only writes a tier above one it converted), so
+    //     its state is the same whether or not step 3 ran.
+    struct BelowMark {
+        std::string_view tier;
+        int64_t oldest{std::numeric_limits<int64_t>::max()}; // max: the converted tier is empty
+        int64_t watermark{0};
+        StmtPtr held;                  // one row for (bucket, keys) at or below the watermark?
+        std::vector<std::size_t> keys; // positions in the event's key vector the old tier grouped by
+        std::map<std::pair<int64_t, std::vector<Value>>, bool> memo; // this chunk's answers
+        int64_t folded{0};                                           // events admitted
+    };
+
+    std::expected<BelowMark, std::string> open_below_mark(const FoldSourceDef& def, std::string_view tier) {
+        BelowMark b;
+        b.tier = tier;
+        const std::string table = physical_table_name(def.name, tier);
+        const std::string bucket{ts_column_for_suffix(tier)};
+        {
+            auto st = prep(h_, std::format("SELECT MIN({}), MAX(id) FROM {}", bucket, table));
+            if (!st)
+                return std::unexpected(h_.error());
+            if (sqlite3_step(st.get()) != SQLITE_ROW)
+                return std::unexpected(std::string("step failed: ") + sqlite3_errmsg(h_.raw()));
+            if (sqlite3_column_type(st.get(), 0) != SQLITE_NULL) {
+                b.oldest = sqlite3_column_int64(st.get(), 0);
+                b.watermark = sqlite3_column_int64(st.get(), 1);
+            }
+        }
+        if (b.oldest == std::numeric_limits<int64_t>::max())
+            return b; // nothing is ever asked of an empty tier
+        const auto have = column_names(h_, fold_view_name(def.name, tier) + "_legacy");
+        if (!have)
+            return std::unexpected(h_.error());
+        std::string where = std::format("r.{} = ?1 AND r.id <= ?2", bucket);
+        int param = 2;
+        std::size_t position = 0;
+        for (const auto& c : def.columns) {
+            if (c.role != ColumnRole::kKey)
+                continue;
+            const std::size_t at = position++;
+            if (!have->contains(std::string{c.name}))
+                continue;
+            where += c.interned ? std::format(" AND r.{} = (SELECT id FROM {} WHERE text = ?{})",
+                                              physical_column_name(c), kDictTable, ++param)
+                                : std::format(" AND r.{} = ?{}", physical_column_name(c), ++param);
+            b.keys.push_back(at);
+        }
+        b.held = prep(h_, std::format("SELECT 1 FROM {} r WHERE {} LIMIT 1", table, where));
+        if (!b.held)
+            return std::unexpected(h_.error());
+        return b;
+    }
+
+    // TierAccumulator's admission predicate for pass 1. A failure to ask poisons the handle and
+    // answers "do not fold"; fold_raw's chunk then stops with the error.
+    bool below_mark_admits(BelowMark& b, int64_t ts, const std::vector<Value>& keys) {
+        if (h_.poisoned())
+            return false;
+        const auto bucket = bucket_start(ts, b.tier);
+        if (!bucket || *bucket <= b.oldest)
+            return false;
+        std::vector<Value> probe;
+        probe.reserve(b.keys.size());
+        for (const auto at : b.keys)
+            probe.push_back(keys[at]);
+        const auto [it, fresh] = b.memo.try_emplace(std::pair{*bucket, std::move(probe)}, false);
+        if (fresh)
+            it->second = !below_mark_holds(b, it->first);
+        if (it->second)
+            ++b.folded;
+        return it->second;
+    }
+
+    // Whether the converted first tier held a row for (bucket, keys) before the pass. An
+    // unreadable answer reads as held (nothing is folded on a guess) after poisoning the handle.
+    bool below_mark_holds(BelowMark& b, const std::pair<int64_t, std::vector<Value>>& slot) {
+        sqlite3_stmt* st = b.held.get();
+        sqlite3_reset(st);
+        sqlite3_clear_bindings(st);
+        sqlite3_bind_int64(st, 1, slot.first);
+        sqlite3_bind_int64(st, 2, b.watermark);
+        int idx = 2;
+        for (const auto& v : slot.second) {
+            ++idx;
+            if (const auto* i = std::get_if<int64_t>(&v))
+                sqlite3_bind_int64(st, idx, *i);
+            else if (const auto* d = std::get_if<double>(&v))
+                sqlite3_bind_double(st, idx, *d);
+            else {
+                const auto& t = std::get<std::string>(v);
+                sqlite3_bind_text(st, idx, t.data(), static_cast<int>(t.size()), SQLITE_STATIC);
+            }
+        }
+        const int rc = sqlite3_step(st);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+            h_.fail(std::string("step failed: ") + sqlite3_errmsg(h_.raw()));
+            return true;
+        }
+        sqlite3_reset(st); // no read cursor stays open across the chunk's writes
+        return rc == SQLITE_ROW;
     }
 
     std::expected<void, std::string> fold_raw(const FoldSourceDef& def) {
@@ -910,19 +1128,24 @@ private:
             return std::unexpected(from.error());
         const int64_t min_ts = *from;
 
-        // Rows older than the mark are not folded: the old roll-up already summarised them, except
-        // those a process-event backfill wrote or the clock-gap clamp skipped, and the old GROUP BY
-        // destroyed the identity that would tell the two apart. They are counted so the drop is
-        // visible. With no mark nothing is below it.
-        if (min_ts != std::numeric_limits<int64_t>::min()) {
-            auto st = prep(h_, std::format("SELECT COUNT(*) FROM {}_live WHERE ts < ?1", def.name));
-            if (!st)
-                return std::unexpected(h_.error());
-            sqlite3_bind_int64(st.get(), 1, min_ts);
-            if (sqlite3_step(st.get()) != SQLITE_ROW)
-                return std::unexpected(std::string("step failed: ") + sqlite3_errmsg(h_.raw()));
-            report_.below_mark += sqlite3_column_int64(st.get(), 0);
+        // The rows below the STORED mark of the source's first old tier (pass 1) are not dropped as
+        // "already summarised": the old pass summarised a row only when its bucket was inside a
+        // range it rolled, and the clock-gap clamp or a backfill left some out, while a mark ahead
+        // of the clock sits above rows that were never summarised and below rows that were. A row
+        // below the mark folds only where the converted first tier holds nothing for its bucket
+        // and keys (BelowMark); the rows at or above it fold as they are (pass 2). The stored
+        // mark is the split, not the floor: under a mark ahead of the clock the floor is a
+        // substitute and the rows between it and the stored mark were summarised in buckets the
+        // old pass wrote. A cursor source keeps its single pass at the floor, its replay ring seeded
+        // from the rows that fold.
+        std::optional<int64_t> split;
+        std::optional<std::string_view> first_tier;
+        if (!def.cursor_source && min_ts != std::numeric_limits<int64_t>::min()) {
+            first_tier = first_old_tier(def);
+            if (first_tier)
+                split = stored_mark(def, *first_tier);
         }
+        const int64_t tier_min_ts = split.value_or(min_ts);
 
         // The usage fold read the raw process rows through its own cursor (`usage_hwm_id`): rows
         // past it never reached usage, and the migration deletes the cursor (hp-2). They are fed to
@@ -994,8 +1217,13 @@ private:
 
         int64_t seq = 0;
         std::optional<std::string> failure;
-        const auto chunk = [&](const std::vector<RawRow>& rows) -> bool {
+        // One chunk of raw rows through the production `<src>_delta` into the tiers: the same
+        // dispatch below and at or above the mark, the former with an admission predicate.
+        const auto fold_chunk = [&](const std::vector<RawRow>& rows,
+                                    const TierAccumulator::AdmitFn* admit) -> bool {
             TierAccumulator acc(def);
+            if (admit)
+                acc.set_admit(*admit);
             try {
                 if (def.name == "process") {
                     process_delta(decode<ProcessEvent>(rows, decode_process), acc);
@@ -1042,7 +1270,13 @@ private:
             }
             if (failure)
                 return false;
+            if (h_.poisoned()) { // the held-bucket test could not be asked
+                failure = h_.error();
+                return false;
+            }
             report_.rejected += static_cast<int64_t>(acc.rejected());
+            if (admit)
+                report_.below_mark_events_skipped += static_cast<int64_t>(acc.filtered());
             const auto n = fold_.fold_in(h_, def.name, acc);
             if (!n) {
                 failure = n.error();
@@ -1050,7 +1284,34 @@ private:
             }
             return true;
         };
-        const auto read = for_each_chunk(h_, def.name, *cols, min_ts, chunk);
+
+        // Pass 1: the rows below the stored mark, through the held-bucket test.
+        if (split) {
+            auto below = open_below_mark(def, *first_tier);
+            if (!below)
+                return std::unexpected(below.error());
+            const TierAccumulator::AdmitFn admit = [&](int64_t ts, const std::vector<Value>& keys) {
+                return below_mark_admits(*below, ts, keys);
+            };
+            const auto read = for_each_chunk(
+                h_, def.name, *cols, std::numeric_limits<int64_t>::min(),
+                [&](const std::vector<RawRow>& rows) {
+                    below->memo.clear();
+                    return fold_chunk(rows, &admit);
+                },
+                std::numeric_limits<int64_t>::min(), *split);
+            if (failure)
+                return std::unexpected(*failure);
+            if (!read)
+                return std::unexpected(h_.error());
+            report_.below_mark_rows += *read;
+            report_.below_mark_events_folded += below->folded;
+        }
+
+        const auto read = for_each_chunk(h_, def.name, *cols, tier_min_ts,
+                                         [&](const std::vector<RawRow>& rows) {
+                                             return fold_chunk(rows, nullptr);
+                                         });
         if (failure)
             return std::unexpected(*failure);
         if (!read)
@@ -1059,8 +1320,8 @@ private:
 
         // Usage is fed here, apart from the tiers, in ONE id-ordered walk over every row past the
         // usage cursor whatever its ts: usage pairs a stop with its start, so a run that
-        // straddles the roll-up mark must arrive start first, and the tier walk above reads only
-        // rows at or past the mark (the old roll-up already summarised the rest into the tiers).
+        // straddles the roll-up mark must arrive start first, and the tier walk above reads rows
+        // below the stored mark only through the held-bucket test, so it cannot serve usage.
         if (def.name == "process" && usage_hwm != std::numeric_limits<int64_t>::max()) {
             const auto fed = for_each_chunk(
                 h_, def.name, *cols, std::numeric_limits<int64_t>::min(),
@@ -1072,7 +1333,9 @@ private:
                         failure = std::format("{}: {}", def.name, e.what());
                         return false;
                     }
-                    if (const auto u = usage::usage_fold_in(h_, now_, lagged); !u) {
+                    if (const auto u =
+                            usage::usage_fold_in(h_, now_, lagged, usage::UsageSweep::kDefer);
+                        !u) {
                         failure = "usage fold of the lagged process rows: " + u.error();
                         return false;
                     }
@@ -1084,6 +1347,17 @@ private:
                 return std::unexpected(*failure);
             if (!fed)
                 return std::unexpected(h_.error());
+            // The chunks above deferred the open-run sweep, so a walk that fed rows is one logical
+            // fold tick: expire and cap once, against the anchor as it stood before the walk.
+            // kClose, not kRun, so a disabled process source (whose lagged rows the walk fed all
+            // the same, see above) is swept too. A walk that fed nothing swept nothing, as before.
+            // A failure here fails the migration and the file stays at v9.
+            if (*fed > 0) {
+                if (const auto u = usage::usage_fold_in(h_, now_, {}, usage::UsageSweep::kClose);
+                    !u)
+                    return std::unexpected("usage sweep after the lagged process rows: " +
+                                           u.error());
+            }
         }
         return {};
     }
@@ -1203,10 +1477,12 @@ private:
     Report report_;
 };
 
-// The names of the old tables a database still holds: `<src>_live` and `<src>_<tier>` for every
-// roll-up source. A lookup failure is an error, never "no tables".
-std::expected<std::pair<std::set<std::string>, std::set<std::string>>, std::string>
-find_retired_tables(EchoDatabase& db) {
+using RetiredTables = std::pair<std::set<std::string>, std::set<std::string>>; // {tiers, raw}
+
+// Sort table names into the old tables a database still holds: `<src>_live` and `<src>_<tier>`
+// for every roll-up source. Pure; shared by the pre-check and the in-transaction re-read so the
+// two cannot disagree about what counts as retired.
+RetiredTables classify_retired(const std::vector<std::string>& names) {
     std::set<std::string> tiers, raw, wanted_tiers, wanted_raw;
     for (const auto& def : fold_sources()) {
         if (def.own_tables)
@@ -1215,16 +1491,25 @@ find_retired_tables(EchoDatabase& db) {
         for (const auto tier : kTiers)
             wanted_tiers.insert(fold_view_name(def.name, tier));
     }
+    for (const auto& name : names) {
+        if (wanted_raw.contains(name))
+            raw.insert(name);
+        else if (wanted_tiers.contains(name))
+            tiers.insert(name);
+    }
+    return {std::move(tiers), std::move(raw)};
+}
+
+// The retired tables a database still holds. A lookup failure is an error, never "no tables".
+std::expected<RetiredTables, std::string> find_retired_tables(EchoDatabase& db) {
     const auto rows = db.execute_query("SELECT name FROM sqlite_master WHERE type = 'table'", 100000);
     if (!rows)
         return std::unexpected("listing tables: " + rows.error());
-    for (const auto& r : rows->rows) {
-        if (wanted_raw.contains(r.at(0)))
-            raw.insert(r.at(0));
-        else if (wanted_tiers.contains(r.at(0)))
-            tiers.insert(r.at(0));
-    }
-    return std::pair{std::move(tiers), std::move(raw)};
+    std::vector<std::string> names;
+    names.reserve(rows->rows.size());
+    for (const auto& r : rows->rows)
+        names.push_back(r.at(0));
+    return classify_retired(names);
 }
 
 std::optional<std::uintmax_t> free_bytes_of(const OpenSeams& seams, const std::filesystem::path& path) {
@@ -1253,8 +1538,8 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
     const std::set<std::string> raw_tables = retired->second;
     const bool has_retired = !legacy_tiers.empty() || !raw_tables.empty();
 
-    // 0. BEFORE any transaction: refuse a volume that cannot hold the migration. Echo stays offline
-    // until the space is freed and the agent restarted -- the alternative is a full disk under
+    // 0. BEFORE any transaction: refuse a volume that cannot hold the migration. Echo loads offline
+    // and the plugin retries the open (echo_open_retry.hpp) -- the alternative is a full disk under
     // the host. A database with nothing to migrate needs no room.
     const StorageBytes before = db.storage_bytes();
     if (has_retired) {
@@ -1282,10 +1567,64 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
         }
     }
 
+    // The attempt's wall-clock bound. It covers the transaction only: a committed migration is
+    // never failed for time, so the post-commit checkpoint and VACUUM run unbounded. A hit rolls
+    // the transaction back (all-or-nothing is unchanged) and the plugin retries with a longer one.
+    const auto deadline_ms =
+        seams.v10_deadline.value_or(std::chrono::duration_cast<std::chrono::milliseconds>(
+            v10_migration_deadline(before.ok ? before.file_bytes() : 0)));
+    const auto deadline = Clock::now() + deadline_ms;
+    const auto cancelled = [&] { return seams.v10_cancel && seams.v10_cancel(); };
+    const auto expired = [&] { return Clock::now() >= deadline || cancelled(); };
+    const auto expiry_text = [&]() -> std::string {
+        if (cancelled())
+            return "the migration was cancelled by shutdown and rolled back";
+        return std::format("the migration {} {} s deadline and was rolled back", kV10DeadlineMarker,
+                           std::chrono::duration_cast<std::chrono::seconds>(deadline_ms).count());
+    };
+
+    // The gap between the pre-checks above and the write lock below is where a second opener, a
+    // lock holder or a full volume can change the picture; the transaction re-reads what it relied on.
+    if (seams.v10_before_begin)
+        seams.v10_before_begin(db.db_);
+
     // 1. ONE transaction.
     Report report;
     std::size_t dropped = 0;
+    bool already_migrated = false;
     const auto result = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+        // The deadline and the cancel poll interrupt the running statement; the guard is gone
+        // before checked_transaction's COMMIT/ROLLBACK. (No other guard is installed on this path:
+        // EchoFold::gc_dictionary's is a separate transaction.)
+        ScopedProgressHandler guard(h.raw(), expired);
+
+        // Re-read, under the write lock, what the pre-checks above read without it. A second
+        // opener may have finished the migration (nothing left to do), or the retired set may have
+        // changed (the plan this attempt built no longer applies: fail, the retry starts afresh).
+        const auto version_rows =
+            read_texts(h, "SELECT value FROM echo_config WHERE key = 'schema_version'");
+        if (!version_rows)
+            return std::unexpected(h.error());
+        const int version = version_rows->empty() ? 0 : parse_schema_version(version_rows->front());
+        if (version >= 10) {
+            already_migrated = true;
+            return {};
+        }
+        if (version != 9)
+            return std::unexpected(std::format("the schema version is {} inside the migration "
+                                               "transaction; expected 9",
+                                               version));
+        const auto names = read_texts(h, "SELECT name FROM sqlite_master WHERE type = 'table'");
+        if (!names)
+            return std::unexpected(h.error());
+        const auto now_retired = classify_retired(*names);
+        if (now_retired.first != legacy_tiers || now_retired.second != raw_tables)
+            return std::unexpected(
+                std::string{"the database changed between the free-space check and the migration; "
+                            "retried"});
+        if (expired())
+            return std::unexpected(expiry_text());
+
         if (has_retired) {
             Migration m(h, *db.fold_, legacy_tiers, raw_tables, now_epoch_seconds());
             if (auto r = m.run(); !r)
@@ -1311,14 +1650,22 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
         return {};
     });
     if (!result) {
-        spdlog::error("EchoDatabase v10: migration rolled back, the retired tables are intact: {}",
-                      result.error());
+        // The caller logs the wrapped text once; this branch only words the cause. An interrupted
+        // statement reads "interrupted"; say whether the deadline or a shutdown did it.
+        if (expired() && result.error().find("interrupt") != std::string::npos)
+            return std::unexpected(expiry_text());
         return std::unexpected(result.error());
     }
 
     // 2. After COMMIT: never carry on from a connection that is still inside a transaction.
     if (sqlite3_get_autocommit(db.db_) == 0)
         return std::unexpected("the connection is still inside a transaction after the v10 commit");
+    if (already_migrated) {
+        // A second opener migrated the file first; its checkpoint and VACUUM are its own.
+        spdlog::info("EchoDatabase: the file was already at schema version 10 when this open took the "
+                     "write lock; nothing to migrate");
+        return {};
+    }
     if (!has_retired) {
         spdlog::info("EchoDatabase: migrated to schema version 10 (roll-up tiers installed)");
         return {};
@@ -1358,20 +1705,20 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
 
     const StorageBytes end = db.storage_bytes();
     spdlog::info("EchoDatabase: migrated to schema version 10 (roll-up tiers) in {} s: {} old summary "
-                 "rows converted, {} raw rows folded, {} raw rows older than the old roll-up mark (or "
-                 "the converted tier's edge that replaced an untrusted one) were not folded into the tiers (under a "
-                 "sane mark the old roll-up had summarised them, except rows written by a "
-                 "process-event backfill or skipped by the clock-gap clamp, and the two cannot be told "
-                 "apart; under a replaced floor they are the rows the converted tier's edge does not "
-                 "reach), {} rejected, {} replay keys seeded, {} marks ahead of the clock replaced by "
-                 "the converted tier's edge, usage lag: {} raw process rows past usage_hwm_id "
-                 "(usage_lag_events was {}), {} of them folded into usage, {} tables dropped; file {} "
-                 "-> {} bytes, WAL {} bytes at commit; VACUUM {}",
+                 "rows converted, {} raw rows folded, {} raw rows older than the old roll-up mark were "
+                 "read ({} events folded because the converted tier held no row for them, {} skipped "
+                 "because it held one or they lie at or before its oldest bucket), {} roll-up rows left "
+                 "out because the upper tier already held them, {} rejected, {} replay keys seeded, {} "
+                 "marks ahead of the clock replaced by the converted tier's edge, usage lag: {} raw "
+                 "process rows past usage_hwm_id (usage_lag_events was {}), {} of them folded into "
+                 "usage, {} tables dropped; file {} -> {} bytes, WAL {} bytes at commit; VACUUM {}",
                  std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started).count(),
-                 report.legacy_tier_rows, report.raw_rows, report.below_mark, report.rejected,
-                 report.ring_keys, report.untrusted_marks, report.usage_lag_rows,
-                 report.usage_lag_events, report.usage_lag_folded, dropped, before.file_bytes(),
-                 end.ok ? end.file_bytes() : 0, after_commit.wal_bytes, vacuum_note);
+                 report.legacy_tier_rows, report.raw_rows, report.below_mark_rows,
+                 report.below_mark_events_folded, report.below_mark_events_skipped,
+                 report.rollup_rows_skipped_as_held, report.rejected, report.ring_keys,
+                 report.untrusted_marks, report.usage_lag_rows, report.usage_lag_events,
+                 report.usage_lag_folded, dropped, before.file_bytes(), end.ok ? end.file_bytes() : 0,
+                 after_commit.wal_bytes, vacuum_note);
     return {};
 }
 

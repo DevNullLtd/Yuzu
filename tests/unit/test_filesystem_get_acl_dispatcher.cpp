@@ -19,7 +19,9 @@
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
+#include <atomic>
 #include <cctype>
+#include <thread>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -299,5 +301,49 @@ TEST_CASE("filesystem get_acl: a file with an extended ACL reports its allow ent
     }
     CHECK(extended);
     CHECK(allow_rows == 1);
+}
+#endif
+
+#ifndef _WIN32
+// F63: owner/group resolve through the reentrant lookups, so concurrent get_acl calls on
+// different pool threads never see each other's (or a torn) name. Two paths with different owners
+// are interleaved; every call must report ITS path's owner. Under TSan the old getpwuid()/getgrgid()
+// statics are reported as a race.
+TEST_CASE("filesystem get_acl: concurrent owner/group lookups stay coherent",
+          "[filesystem][acl][dispatcher][tsan]") {
+    auto plugin = load_or_fail();
+    if (!plugin)
+        return;
+    yuzu::test::TempDir dir{"yuzu_test_acl_conc_"};
+    const auto mine = make_file(dir).string();
+    const std::string root_path = "/etc/passwd"; // owned by uid 0 on every supported Linux/macOS
+    std::error_code ec;
+    if (!fs::exists(root_path, ec))
+        return;
+
+    const auto owner_of = [&](const std::string& path) {
+        for (const auto& r : captured_rows(get_acl(*plugin, path).captured))
+            if (starts_with(r, "owner|"))
+                return r;
+        return std::string{};
+    };
+    const std::string expect_mine = owner_of(mine);
+    const std::string expect_root = owner_of(root_path);
+    REQUIRE_FALSE(expect_mine.empty());
+    REQUIRE_FALSE(expect_root.empty());
+
+    std::atomic<int> wrong{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t)
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < 200; ++i) {
+                const bool use_root = ((t + i) % 2) == 0;
+                if (owner_of(use_root ? root_path : mine) != (use_root ? expect_root : expect_mine))
+                    ++wrong;
+            }
+        });
+    for (auto& th : threads)
+        th.join();
+    CHECK(wrong.load() == 0);
 }
 #endif

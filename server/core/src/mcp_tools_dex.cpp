@@ -3,6 +3,18 @@
 // `set_dex_score_policy` and `reset_dex_score_policy`, over the one customer score policy
 // document (runtime-config key kDexScorePolicyKey).
 //
+// The same file holds the fleet application usage tool `get_dex_apps_usage`, the MCP twin of
+// GET /api/v1/dex/apps/usage. Its posture: the record declares GuaranteedState:Read (the pair
+// the REST route's first gate asks, which the generic tier, approval and service-scope checks
+// act on: a service-scoped token is refused before the handler), and the handler then also
+// requires Forensics:Read through ToolDeps::fleet_read_fn, in REST's order. The two gates name
+// different pairs, so this is not the same-pair stacking the registry forbids. The fleet gate's
+// scope reaches the read. ONE domain row, `dex.apps.usage.view`, is written BEFORE the read and
+// fails closed (no row, no read); the generic `mcp.get_dex_apps_usage` row is written after the
+// outcome and is set-and-proceed (a dropped row serves the data with `audit_persisted:false`).
+// Every admitted call writes its own domain row, a retry included. The pure argument, refusal
+// and body logic is dex_usage_json.hpp, shared with REST.
+//
 // ONE write path. Both writes go through `apply_dex_score_policy` (dex_score_policy_writer.hpp)
 // via the single forwarding closure ToolDeps::dex_score_policy_apply_fn, the same function the
 // REST PUT and DELETE call: no second validator, no second If-Match parser, no second audit-row
@@ -56,8 +68,10 @@
 #include "mcp_tool_registry.hpp"
 
 #include "dex_score_policy_mcp.hpp"  // the pure half: request, code, success payload
+#include "dex_usage_json.hpp"        // the usage body, argument parser, refusal classifier
 #include "mcp_jsonrpc.hpp"           // kInvalidParams, kInternalError, kTierDenied, success_response
 #include "mcp_policy.hpp"            // tier_allows
+#include "mcp_retry.hpp"             // kMcpStoreFaultRetryMs
 #include "mcp_tool_deps.hpp"         // ToolDeps (provider closures)
 #include "mcp_tool_helpers.hpp"      // answer, answer_unwired, dump_replace (shared by the registry files)
 #include "rest_audit.hpp"            // detail::try_persist_audit (the shared audit kernel)
@@ -96,6 +110,34 @@ constexpr const char* kWriteOutputSchema =
     R"j("dry_run":{"type":"boolean","description":"Present and true only on a dry run: nothing was stored"},)j"
     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when an audit row after the change failed to persist; the change stands"})j"
     R"j(},"required":["document","revision","source","previous_revision"]})j";
+
+// Typed output schema, mirroring the OpenAPI DexAppsUsage keys (rest_api_v1.cpp) and every key
+// dex_apps_usage_json writes. A withheld figure is JSON null, never 0.
+constexpr const char* kUsageOutputSchema =
+    R"j({"type":"object","properties":{)j"
+    R"j("window":{"type":"string","enum":["24h","7d","30d","all"]},)j"
+    R"j("platform_scope":{"type":"string","enum":["all","windows","macos","linux"]},)j"
+    R"j("slice":{"type":"object","properties":{"kind":{"type":"string","enum":["fleet","platform","group","tag"]},"key":{"type":["string","null"],"description":"The group id or the tag key; null for fleet and platform"}},"required":["kind","key"]},)j"
+    R"j("as_of":{"type":"string","description":"UTC instant of the model snapshot (taken when the build began); a cached result is reused for 30 seconds after its build completes, so a served answer can be older than 30 seconds"},)j"
+    R"j("basis":{"type":"string","enum":["estimated_from_30_day_usage"]},)j"
+    R"j("freshness_window_hours":{"type":"integer","description":"A device counts only when the server received its usage state this recently (48)"},)j"
+    R"j("floor":{"type":"integer","description":"The floor applied"},)j"
+    R"j("floor_scope":{"type":"string","enum":["per_table"],"description":"The floor protects one table only; slices and windows can be differenced"},)j"
+    R"j("population":{"type":"integer","description":"Devices in the platform scope online now and visible to the caller; 0 is a valid answer"},)j"
+    R"j("reporting_devices":{"type":"integer","description":"Population devices with a fresh usage state. A device that has never reported usage is in neither this count nor stale_devices"},)j"
+    R"j("stale_devices":{"type":"integer","description":"Population devices with an older usage state; they contribute to no figure"},)j"
+    R"j("apps":{"type":"array","description":"One row per application in the list_dex_apps order for the same window and platform (at most 100)","items":{"type":"object","properties":{)j"
+    R"j("subject":{"type":"string"},)j"
+    R"j("state":{"type":"string","enum":["matched","no_usage","ambiguous_name"]},)j"
+    R"j("devices":{"type":["integer","null"],"description":"Devices that ran it and reported usage, also when the figures are withheld below the floor; null for ambiguous_name; 0 for no_usage"},)j"
+    R"j("run_seconds_30d":{"type":["integer","null"],"description":"Null when withheld (below the floor, no usage or an ambiguous name), never 0"},)j"
+    R"j("launches_30d":{"type":["integer","null"],"description":"Null when withheld, never 0"},)j"
+    R"j("cells":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["named","untagged","other"],"description":"The key of a cell; the label is data and may equal a residual's label"},"label":{"type":"string","description":"A tag value or a group id, the slice name, or a platform; not unique"},"devices":{"type":"integer"},"run_seconds_30d":{"type":"integer"},"launches_30d":{"type":"integer"},"small_cohort":{"type":"boolean","description":"True below 30 devices: a reliability flag, not a disclosure rule"}},"required":["kind","label","devices","run_seconds_30d","launches_30d","small_cohort"]}},)j"
+    R"j("exposure_rate":{"type":["object","null"],"description":"Crashes plus hangs per process-hour of use; null when withheld, with rate_withheld naming why","properties":{"per_hour":{"type":"object","properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean","description":"False when too few events back the estimate"}},"required":["estimate","lower","upper","reliable"]},"hours":{"type":"number","description":"The denominator: run seconds scaled to the window, in process-hours"},"crashes":{"type":"integer"},"hangs":{"type":"integer"},"basis":{"type":"string","enum":["estimated_from_30_day_usage"]}},"required":["per_hour","hours","crashes","hangs","basis"]},)j"
+    R"j("rate_withheld":{"type":["string","null"],"description":"Why exposure_rate is null: below_floor, no_usage, ambiguous_name, unbounded_window, window_exceeds_retention, zero_usage or no_statistic"})j"
+    R"j(},"required":["subject","state","devices","run_seconds_30d","launches_30d","cells","exposure_rate","rate_withheld"]}},)j"
+    R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the generic mcp.get_dex_apps_usage row failed to persist; the data is served and the dex.apps.usage.view row was written before the read"})j"
+    R"j(},"required":["window","platform_scope","slice","as_of","basis","freshness_window_hours","floor","floor_scope","population","reporting_devices","stale_devices","apps"]})j";
 
 /// Carried by every reset refusal or failure the handler answers after the ticket is consumed:
 /// the generic gate consumed the approval ticket before the handler ran (mcp_server.cpp), so a
@@ -328,6 +370,92 @@ void handle_reset_dex_score_policy(const ToolCallContext& ctx) {
                              {}, persisted));
 }
 
+// ── get_dex_apps_usage ────────────────────────────────────────────────────────────────────
+// Gate order is REST's: GuaranteedState:Read (the declared pair), then Forensics:Read through
+// the fleet gate, then the arguments, then the audit row, then the read.
+void handle_get_dex_apps_usage(const ToolCallContext& ctx) {
+    if (!tier_admits(ctx, "GuaranteedState", "Read"))
+        return;
+    if (!ctx.perm_fn(ctx.req, ctx.res, "GuaranteedState", "Read"))
+        return; // loud: the gate wrote its own 403
+    const ToolDeps* deps = ctx.deps;
+    // A missing audit sink is UNWIRED here, not audit-off: try_persist_audit treats an empty
+    // sink as persisted, which is wrong for a read that must fail closed.
+    if (deps == nullptr || !deps->fleet_read_fn || !deps->audit_fn) {
+        answer_unwired(ctx, "service unavailable", "dex usage provider unwired", {},
+                       "get_dex_apps_usage: fleet_read_fn or audit_fn unwired - misconfigured "
+                       "call site; failing closed");
+        return;
+    }
+    // The second gate, a different (securable, operation) pair from the first. A refusal has
+    // already written its own A4 body and status; write nothing more.
+    const auto gate = deps->fleet_read_fn(ctx.req, ctx.res, "Forensics", "Read");
+    if (!gate.admitted)
+        return;
+    if (!deps->dex_apps_usage_fn) {
+        answer_unwired(ctx, "service unavailable", "dex usage provider unwired", {},
+                       "get_dex_apps_usage: dex_apps_usage_fn unwired - misconfigured call "
+                       "site; failing closed");
+        return;
+    }
+    const auto rq = dex_usage_mcp_request(ctx.args);
+    if (!rq) {
+        refuse_params(ctx, rq.error(), kBadArgsRemediation);
+        return;
+    }
+    const std::string shape = dex_usage_audit_shape(*rq);
+    // The access row first, fail closed: it records the admitted request, not the outcome, and
+    // no agent id. Every admitted call writes its own row, a retry included.
+    if (!yuzu::server::detail::try_persist_audit(
+            deps->audit_fn, ctx.req, "dex.apps.usage.view", "success", "Forensics", "",
+            "MCP DEX fleet application usage read via get_dex_apps_usage " + shape)) {
+        spdlog::warn("dex.apps.usage.view audit fail-closed (MCP get_dex_apps_usage)");
+        (void)ctx.audit("failure", "access audit row not persisted; read not run");
+        answer(ctx, ctx.a4_error(kInternalError,
+                                 "audit subsystem unavailable; refusing to serve fleet "
+                                 "application usage without durable evidence",
+                                 "retry the request", /*retry_after_ms=*/kMcpStoreFaultRetryMs, {},
+                                 true));
+        return;
+    }
+
+    // The gate's scope reaches the read exactly as given: never widened.
+    const auto r = deps->dex_apps_usage_fn(rq->window, rq->platform_scope, rq->slice, rq->floor,
+                                           gate.scope);
+    if (r) {
+        // set-and-proceed: the access row already stands, so a dropped generic row serves the
+        // data and says so.
+        const bool generic_ok = ctx.audit("success", shape);
+        std::string body = dex_apps_usage_json(*r);
+        if (!generic_ok) {
+            auto j = nlohmann::json::parse(body);
+            j["audit_persisted"] = false;
+            body = dump_replace(j);
+        }
+        answer(ctx, success_response(ctx.id, ctx.tool_result(body, kUsageOutputSchema)));
+        return;
+    }
+
+    // Never a success with zero figures: a refused read is an error answer.
+    const DexUsageRefusalClass c = dex_usage_refusal_class(r.error());
+    const std::string why = r.error().reason + (r.error().detail.empty() ? "" : ": " + r.error().detail);
+    const bool audit_ok =
+        ctx.audit(c.kind == DexUsageRefusalKind::CallerError ? "denied" : "failure", why);
+    if (c.kind == DexUsageRefusalKind::CallerError) {
+        const std::string remediation = r.error().detail == "unknown_group"
+                                            ? "call list_management_groups for valid group ids, then call again"
+                                            : std::string(kBadArgsRemediation);
+        answer(ctx, ctx.a4_error(kInvalidParams, c.message, remediation, -1, {}, audit_ok)); // retry-hint-exempt: caller-input rejection
+        return;
+    }
+    if (c.kind == DexUsageRefusalKind::Terminal) {
+        answer(ctx, ctx.a4_error(kInternalError, c.message, c.remediation, -1, {}, audit_ok)); // retry-hint-exempt: fleet_too_large, no_population and invalid_request fail identically on a retry as sent
+        return;
+    }
+    answer(ctx, ctx.a4_error(kInternalError, c.message, c.remediation,
+                             /*retry_after_ms=*/static_cast<long>(c.retry_after_ms), {}, audit_ok));
+}
+
 // Positional initialisation only (no designated initialisers): the lexical CI gates
 // (check-api-parity.py, check-mcp-retry-hints.py) read this slice.
 constexpr ToolRecord kToolRecords[] = {
@@ -427,6 +555,46 @@ constexpr ToolRecord kToolRecords[] = {
      kWriteOutputSchema,
      "Infrastructure", "Delete", ServiceScopeClass::denied, ToolEffect::Destructive, true,
      "Reset the DEX score policy to defaults", &handle_reset_dex_score_policy},
+
+    {"get_dex_apps_usage",
+     "Get fleet application usage for Digital Employee Experience (DEX): for each application "
+     "in the list_dex_apps list (the same rows in the same order for the same window and "
+     "platform, at most 100), how many devices ran it, its run time and launches over a 30-day "
+     "basis, and its exposure rate (crashes plus hangs per process-hour of use), split into the "
+     "cells of the chosen slice (fleet, platform, group or tag; default fleet). Use "
+     "list_dex_apps for the stability list without usage and get_agent_app_usage for one "
+     "device. Group ids come from list_management_groups; tag_key is a device tag key (default "
+     "model). A figure the model withholds is null, never 0; population 0 (no device online or "
+     "visible) is a valid answer, not an error, and the figures cover only the devices the "
+     "caller may see. THE FLOOR (1 to 10000, default 1) APPLIES PER TABLE: a cell below it "
+     "merges into the residual 'other' cell and an application below it publishes its device "
+     "count only, but two slices or two windows can be compared to isolate a small group, so it "
+     "protects one table, not the set of tables. Every figure is an ESTIMATE from the agent's "
+     "trailing 30-day usage; only devices whose usage state arrived in the last 48 hours count; "
+     "as_of is the build snapshot time and a cached result is reused for 30 seconds after its build completes, so it can be older than 30 seconds. Run time is summed per process run, so it is "
+     "process-hours, not user hours. An invalid argument or an unknown group is a non-retryable "
+     "invalid-params error naming the field. A read that cannot complete is an error, never "
+     "zero figures: fleet_too_large, no_population and invalid_request are terminal (no retry "
+     "hint; only a narrower platform shrinks the fleet_too_large read, and the first successful read clears it), every other reason is "
+     "retryable with retry_after_ms 2000. Every admitted call, a retry included, writes its own "
+     "dex.apps.usage.view audit row BEFORE the read, so wait the hinted retry_after_ms before "
+     "a retry. If that row cannot be stored the read does not run: a retryable error "
+     "(retry_after_ms 5000) with no data. Also audited as mcp.get_dex_apps_usage after the "
+     "outcome; audit_persisted:false means only that this second row was dropped and the data "
+     "is served. Requires GuaranteedState:Read AND Forensics:Read (Administrator-only while "
+     "role-based access control is off); readable at every MCP tier; a service-scoped token is "
+     "refused. Mirrors GET /api/v1/dex/apps/usage. Read-only.",
+     R"j({"type":"object","properties":{)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"description":"Window of the application list the usage rows align with; default 7d"},)j"
+     R"j("platform":{"type":"string","enum":["all","windows","macos","linux"],"description":"Platform scope: the population and every figure are over that scope's online devices; default all"},)j"
+     R"j("slice":{"type":"string","enum":["fleet","platform","group","tag"],"description":"How the devices are split into cells; default fleet"},)j"
+     R"j("group":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id, 1 to 256 bytes, no control characters, valid UTF-8. Required with slice=group and valid only with it"},)j"
+     R"j("tag_key":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_.:-]{1,64}$","description":"Device tag key; valid only with slice=tag; default model"},)j"
+     R"j("floor":{"type":"integer","minimum":1,"maximum":10000,"description":"Least devices a published figure needs; applies per table; default 1"})j"
+     R"j(},"additionalProperties":false})j",
+     kUsageOutputSchema,
+     "GuaranteedState", "Read", ServiceScopeClass::denied, ToolEffect::ReadOnly, true,
+     "Get fleet application usage", &handle_get_dex_apps_usage},
 };
 
 static_assert(records_well_formed(kToolRecords),

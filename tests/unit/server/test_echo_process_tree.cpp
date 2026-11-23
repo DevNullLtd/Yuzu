@@ -267,7 +267,7 @@ TEST_CASE("echo_split_pipe stops splitting at the bound", "[echo][tree][parse][s
     // A 1 MiB line of pipes yields at most width+1 cells, not a million.
     const std::string pipes(1 << 20, '|');
     const auto cells = echo_split_pipe(pipes, 8);
-    CHECK(cells.size() == 8);
+    REQUIRE(cells.size() == 8);
     CHECK(cells.back().size() == pipes.size() - 7);
     // End to end: such a line in a process answer is one unreadable row.
     EchoParseStats st;
@@ -379,7 +379,7 @@ TEST_CASE("echo tree: three hours each build their own name-level tree", "[echo]
     const auto* bash = find_node(t2, "bash");
     const auto* ls = find_node(t2, "ls");
     REQUIRE((sd && bash && ls));
-    CHECK(sd->children.size() == 2);
+    REQUIRE(sd->children.size() == 2);
     CHECK(t2.nodes[bash->parent].name == "systemd");
     CHECK(t2.nodes[ls->parent].name == "bash");
     CHECK(ls->start_count == 9);

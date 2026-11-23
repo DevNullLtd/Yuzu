@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Static lexical gate over the Echo security wiring no unit binary on a Mac can reach.
 
-Three properties of the #7075 / #3864 batch live in files the unit suites do not build or run
-here, so they are pinned by text:
+Four properties of the #7075 / #3864 / #7290 batch live in files the unit suites do not build or
+run here, so they are pinned by text:
 
   1. echo_plugin.cpp (not part of yuzu_echo_tests) writes the `process` baseline only through
      yuzu::echo::encode_process_baseline, never an inline JSON dump that would carry a command
@@ -14,6 +14,14 @@ here, so they are pinned by text:
      which stamps an empty principal once the session is gone.
   3. server.cpp wires that writer: echo_tree_routes_->set_audit_as_session_fn(
      auth_routes_->audit_as_session_fn()).
+  4. (#7290) The dispatch gate publishes in the one safe order, because start_collection runs on the
+     open-retry thread while the plugin takes commands and writes db_ and every collector member
+     without collect_mu_. EchoPlugin has no seam (TU-local), so the order is pinned here:
+     exactly one `online_.store(true, std::memory_order_release);`, directly followed by
+     `return {}; }` (start_collection's last statement); execute_dispatch opens with
+     `if (!online_.load(std::memory_order_acquire))`; fail_internal rolls back only behind
+     `online_.load(std::memory_order_acquire) && db_`; shutdown opens with `open_retry_.stop();
+     online_.store(false, std::memory_order_release);` (join the retry thread, then close the gate).
 
 Lexical only: comments (`//` and `/* */`) are stripped and whitespace is collapsed before matching,
 and a check that a token is PRESENT also ignores string and character literals, so a token kept
@@ -35,7 +43,8 @@ SERVER = ROOT / "server" / "core" / "src" / "server.cpp"
 PUSH_ROUTE = 'sink.Post("/fragments/echo/capture-sources/push"'
 WIRING = "echo_tree_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn())"
 WIRING_STATUS = "echo_tree_routes_->set_denial_status_fn("
-HINT = (" (this gate pins the #7075/#3864 wiring; if the code was legitimately restructured,"
+HINT = (" (this gate pins the #7075/#3864 wiring and the #7290 online_ publish order; if the code was"
+        " legitimately restructured,"
         " update tests/test_echo_security_wiring_lexical.py)")
 
 
@@ -98,6 +107,24 @@ def problems(plugin_src, routes_src, server_src):
         if "audit_as_session_fn_" not in normalise(body, literals=False):
             out.append("the push handler no longer writes through audit_as_session_fn_")
 
+    stores = re.findall(r"online_\.store\(true, std::memory_order_release\);( return \{\}; \})?", p_code)
+    if len(stores) != 1:
+        out.append(f"echo_plugin.cpp stores online_ = true {len(stores)} times; the dispatch gate must be "
+                   "published exactly once (#7290)")
+    elif not stores[0]:
+        out.append("echo_plugin.cpp's online_.store(true, release) is no longer directly followed by "
+                   "`return {}; }`: the gate must be start_collection's last statement (#7290)")
+    if not re.search(r"int execute_dispatch\([^)]*\) \{ if \(!online_\.load\(std::memory_order_acquire\)\)",
+                     p_code):
+        out.append("execute_dispatch no longer opens with `if (!online_.load(std::memory_order_acquire))` "
+                   "(#7290)")
+    if "if (online_.load(std::memory_order_acquire) && db_) db_->rollback_open_transaction();" not in p_code:
+        out.append("fail_internal's rollback is no longer guarded by "
+                   "`online_.load(std::memory_order_acquire) && db_` (#7290)")
+    if not re.search(r"void shutdown\(yuzu::PluginContext& ctx\) noexcept override \{ open_retry_\.stop\(\); "
+                     r"online_\.store\(false, std::memory_order_release\);", p_code):
+        out.append("shutdown no longer opens with open_retry_.stop(); online_.store(false, release) (#7290)")
+
     if WIRING + ";" not in s_code:  # as a statement, outside comments and literals
         out.append("server.cpp no longer wires the push's session-bound audit writer")
     if WIRING_STATUS not in s_code:  # outside comments and literals
@@ -147,6 +174,19 @@ class EchoSecurityWiringLexical(unittest.TestCase):
                 s, WIRING + ";", "/* " + WIRING + "; */")),
             "the wiring survives only in a string literal": dict(s=mutate(
                 s, WIRING + ";", 'spdlog::info("' + WIRING + ';");')),
+            "the gate is published early as well": dict(p=mutate(
+                p, "reconcile_db_health_publish(ctx); // #1567",
+                   "online_.store(true, std::memory_order_release);\n        reconcile_db_health_publish(ctx); // #1567")),
+            "a statement follows the gate's publish": dict(p=mutate(
+                p, "online_.store(true, std::memory_order_release);\n        return {};",
+                   "online_.store(true, std::memory_order_release);\n        spdlog::info(\"online\");\n        return {};")),
+            "execute_dispatch stops loading the gate": dict(p=mutate(
+                p, "if (!online_.load(std::memory_order_acquire)) {\n            OfflineState offline;",
+                   "if (false) {\n            OfflineState offline;")),
+            "fail_internal rolls back without the gate": dict(p=mutate(
+                p, "if (online_.load(std::memory_order_acquire) && db_)", "if (db_)")),
+            "shutdown stops joining the retry thread first": dict(p=mutate(
+                p, "open_retry_.stop();\n        // Close the dispatch gate", "(void)0;\n        // Close the dispatch gate")),
         }
         for name, over in cases.items():
             with self.subTest(mutation=name):
