@@ -6,7 +6,8 @@ readable through agent_logging.get_log.
 Best-effort lexical gate, two checks:
   1. agents/core/src/agent.cpp logs `session_fp={}` via `session_log_fingerprint(` and never
      passes `session_id_` to that spdlog call; dex_linux_collector.cpp wraps subject/reason.
-  2. No text file in the repo parses `session=` out of that agent line. Backslash continuations are
+  2. No scanned text file parses `session=` out of that agent line (scanned: the whole checkout
+     except SKIP_DIRS, top-level build* directories and files over 2 MB). Backslash continuations are
      joined, and a `session=` extractor within WINDOW lines of a "Registered with server" mention
      (a separate-line extractor included) fails. A line that carries the marker
      `tripwire-allow: <reason>` is exempt, so each exemption is visible at its own line (only the
@@ -25,7 +26,10 @@ SKIP_DIRS = {".git", "node_modules", "vcpkg_installed",
 # Every top-level build* directory is skipped, not only the three per-OS names: the self-hosted
 # runners build several CI jobs into sibling dirs of one checkout (build-linux-coverage,
 # build-linux-clang-21-debug, ...), whose test logs and coverage reports quote the agent's
-# Registered line and would fail this gate on a PR that never touched it (#8637).
+# Registered line and would fail this gate on a PR that never touched it (#8637). Top-level FILES
+# named build* are still scanned. The skip rests on one premise: no TRACKED top-level directory
+# starts with the prefix, so only build output is skipped, never source. Nothing checks it yet
+# (#8643); do not add a tracked top-level build* directory without narrowing the prefix.
 SKIP_PREFIX = "build"
 WINDOW = 25  # extractors may sit well after the grep that fetches the line
 MENTION = re.compile(r"Registered\s+with\s+server")
@@ -94,10 +98,8 @@ def skipped(rel_parts):
 
 def iter_files(root=ROOT):
     for p in root.rglob("*"):
-        if not p.is_file() or p.resolve() == SELF:
-            continue
         rel = p.relative_to(root)
-        if skipped(rel.parts):
+        if skipped(rel.parts) or not p.is_file() or p.resolve() == SELF:
             continue
         try:
             if p.stat().st_size > 2_000_000:
@@ -151,11 +153,14 @@ def selftest_walk(bad_line):
             (root / rel).write_text(log_line)
         (root / "scripts").mkdir()
         (root / "scripts" / "x.sh").write_text(bad_line + "\n")
-        # A build* name BELOW the top level is ordinary source and is still scanned.
-        (root / "deploy" / "build-tools").mkdir(parents=True)
-        (root / "deploy" / "build-tools" / "y.sh").write_text(bad_line + "\n")
+        # Still scanned: a build* name BELOW the top level, and top-level dirs the prefix must not
+        # reach (a widened prefix such as "b", or a case-insensitive match, would skip these).
+        for rel in ("deploy/build-tools/y.sh", "bin/z.sh", "Build/z.sh"):
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(bad_line + "\n")
         flagged = sorted(rel for rel, text in iter_files(root) if check_text(rel, text))
-        assert flagged == ["deploy/build-tools/y.sh", "scripts/x.sh"], ("selftest walk", flagged)
+        assert flagged == ["Build/z.sh", "bin/z.sh", "deploy/build-tools/y.sh", "scripts/x.sh"], \
+            ("selftest walk", flagged)
     assert not skipped(("build-tools.sh",)), "selftest: a top-level FILE named build* is still scanned"
 
 
