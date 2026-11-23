@@ -43,6 +43,7 @@
 #include "filesystem_find_by_hash.hpp"
 #include <agent_reserved_path_keys.hpp>
 #include "filesystem_reserved_paths.hpp" // WP06 F55: refuse the agent's own secrets
+#include "filesystem_stdio_identity.hpp"  // POSIX: the agent's own stdout/stderr when a regular file
 #include "filesystem_posix_names.hpp"
 #include "filesystem_search_dir.hpp"
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
@@ -133,6 +134,17 @@ using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 // Windows allows). The shared converter (find_by_hash::path_utf8, from_wide on Windows) does neither:
 // such a unit becomes U+FFFD. Used for comparison only, never to open a file.
 std::string path_bytes(const fs::path& p) { return yuzu::filesystem::find_by_hash::path_utf8(p); }
+
+// The inverse of path_bytes for the reserved Set, which is UTF-8 by construction: the narrow
+// fs::path constructor would decode those bytes as the active code page on MSVC and name a different
+// (mojibake) path, so the identity, hard-link and planted-link legs would compare against nothing.
+fs::path path_from_bytes(const std::string& s) {
+#ifdef _WIN32
+    return fs::path{yuzu::win::to_wide(s)};
+#else
+    return fs::path{s};
+#endif
+}
 
 // WP06 F55: the agent's own data dir, log file and TLS key/cert/CA paths, captured at init and
 // refused by every validate_path* below (best effort, see filesystem_reserved_paths.hpp).
@@ -248,6 +260,10 @@ bool path_is_reserved_unguarded(const fs::path& p) {
     if (yuzu::filesystem::reserved::is_proc_secret_path(cs, own_pid()))
         return true;
 #ifndef _WIN32
+    // launchd's StandardErrorPath and systemd's StandardOutput=file: make fd 1 or 2 a regular file the
+    // log-file rule does not name: the same file (st_dev, st_ino) is the agent's own log.
+    if (yuzu::filesystem::reserved::is_agent_stdio_file(canon))
+        return true;
     // macOS has no /proc: the agent's own descriptors are /dev/fd/N, /dev/stdin|stdout|stderr.
     if (yuzu::filesystem::reserved::is_dev_fd_path(cs) ||
         yuzu::filesystem::reserved::is_dev_fd_path(path_bytes(p.lexically_normal())))
@@ -274,7 +290,7 @@ bool path_is_reserved_unguarded(const fs::path& p) {
                 // weakly_canonical does not follow a DANGLING link at the leaf (the link's target
                 // does not exist, so it treats the name as a plain missing one): follow it by hand,
                 // bounded, so a link planted at a not-yet-existing reserved name reaches its target.
-                fs::path cur{v[i]};
+                fs::path cur = path_from_bytes(v[i]);
                 bool ok = true;
                 bool resolved = false;
                 for (int hop = 0; hop < kMaxLinkHops && ok; ++hop) {
@@ -344,7 +360,7 @@ bool path_is_reserved_unguarded(const fs::path& p) {
     // Identity: the candidate (or an ancestor of it) IS a reserved object. A candidate-side stat
     // failure REFUSES; a reserved-side one refuses only a candidate that could be a hard link to it.
     for (const auto& f : snapshot.files) {
-        const auto id = identity_of(canon, fs::path{f});
+        const auto id = identity_of(canon, path_from_bytes(f));
         if (id == Ident::Same || id == Ident::CandidateUnknown ||
             (id == Ident::ReservedUnknown && may_be_hard_link))
             return true;
@@ -356,14 +372,14 @@ bool path_is_reserved_unguarded(const fs::path& p) {
         std::size_t seen = 0;
         for (const auto& d : snapshot.dirs) {
             std::error_code e4;
-            const bool dir_exists = fs::exists(fs::path{d}, e4);
+            const bool dir_exists = fs::exists(path_from_bytes(d), e4);
             if (e4)
                 return true;
             if (!dir_exists)
                 continue;
             // No skip_permission_denied: a subdirectory this process cannot read may hold the very
             // file this candidate links to, so an unreadable entry REFUSES.
-            fs::recursive_directory_iterator it{fs::path{d}, fs::directory_options::none, e4};
+            fs::recursive_directory_iterator it{path_from_bytes(d), fs::directory_options::none, e4};
             if (e4)
                 return true;
             const fs::recursive_directory_iterator end{};
@@ -390,7 +406,7 @@ bool path_is_reserved_unguarded(const fs::path& p) {
     }
     for (fs::path a = canon; !a.empty(); a = a.parent_path()) {
         for (const auto& d : snapshot.dirs) {
-            const auto id = identity_of(a, fs::path{d});
+            const auto id = identity_of(a, path_from_bytes(d));
             if (id == Ident::Same || id == Ident::CandidateUnknown ||
                 (id == Ident::ReservedUnknown && may_be_hard_link))
                 return true;
@@ -528,9 +544,10 @@ std::string validate_path_or_parent_impl(std::string_view raw_path, std::string_
     std::error_code ec;
     std::string path_str{raw_path};
 
-    // If it exists, do full validation
+    // If it exists, do full validation (the _impl: a throw must reach this function's wrapper, which
+    // tells `exists` a throw apart from "does not exist")
     if (fs::exists(path_str, ec)) {
-        return validate_path(raw_path, base_dir);
+        return validate_path_impl(raw_path, base_dir);
     }
 
     // A symlink leaf that does not resolve is a dangling link: a write through it would create
@@ -592,13 +609,20 @@ std::string validate_path_or_parent_impl(std::string_view raw_path, std::string_
     return path_str;
 }
 
-// Same contract as validate_path: a throw is a clean refusal.
-std::string validate_path_or_parent(std::string_view raw_path, std::string_view base_dir) {
+// Same contract as validate_path: a throw is a clean refusal. `threw` (optional) lets a caller whose
+// empty answer would otherwise read as "does not exist" (`exists`) tell a throw apart from absence.
+std::string validate_path_or_parent_ex(std::string_view raw_path, std::string_view base_dir, bool* threw) {
     try {
         return validate_path_or_parent_impl(raw_path, base_dir);
     } catch (...) {
+        if (threw)
+            *threw = true;
         return {};
     }
+}
+
+std::string validate_path_or_parent(std::string_view raw_path, std::string_view base_dir) {
+    return validate_path_or_parent_ex(raw_path, base_dir, nullptr);
 }
 
 #ifdef _WIN32
@@ -1235,7 +1259,13 @@ private:
         }
 
         // For exists check, use validate_path_or_parent (path may not exist)
-        auto validated = validate_path_or_parent(path, base_dir);
+        bool validate_threw = false;
+        auto validated = validate_path_or_parent_ex(path, base_dir, &validate_threw);
+        if (validate_threw) {
+            // A throw (a canonical name the code page cannot hold) is a refusal, never `exists|false`.
+            ctx.write_output("error|path is not accessible or was refused");
+            return 1;
+        }
         if (validated.empty() && !base_dir.empty()) {
             ctx.write_output("error|path is outside allowed base directory");
             return 1;

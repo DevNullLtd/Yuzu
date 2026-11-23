@@ -10,6 +10,7 @@
 
 #include "filesystem_dispatcher_test_support.hpp"
 #include "filesystem_reserved_paths.hpp"
+#include "filesystem_stdio_identity.hpp"
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
@@ -24,6 +25,7 @@
 #include <utility>
 #include <vector>
 #ifndef _WIN32
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -118,6 +120,41 @@ TEST_CASE("is_agent_reserved_path: the agent's rotated log generations (spdlog n
     CHECK(rsv::is_rotated_sibling_of("/a/b.log", "/a/b.7.log"));
     CHECK_FALSE(rsv::is_rotated_sibling_of("/a/.hidden", "/a/.1hidden"));
 }
+
+#ifndef _WIN32
+TEST_CASE("is_same_file_as_open_fd: a regular file open as a descriptor is matched by identity, a sibling and a non-regular fd are not",
+          "[agent][filesystem_plugin][reserved][stdio]") {
+    yuzu::test::TempDir root{"yuzu_test_fs_stdio_"};
+    std::error_code mkec;
+    fs::create_directories(root.path, mkec);
+    REQUIRE_FALSE(mkec);
+    const auto log = root.path / "yuzu-agent.stderr.log";
+    const auto other = root.path / "other.log";
+    for (const auto& p : {log, other}) {
+        std::ofstream o(p);
+        o << "x";
+    }
+    const int fd = ::open(log.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    CHECK(rsv::is_same_file_as_open_fd(log, fd));
+    CHECK_FALSE(rsv::is_same_file_as_open_fd(other, fd));
+    CHECK_FALSE(rsv::is_same_file_as_open_fd(root.path / "absent.log", fd));
+    // A hard link to the same file is the same file.
+    const auto link = root.path / "link.log";
+    std::error_code lec;
+    fs::create_hard_link(log, link, lec);
+    if (!lec)
+        CHECK(rsv::is_same_file_as_open_fd(link, fd));
+    // A non-regular descriptor (a pipe) is never matched.
+    int p[2];
+    REQUIRE(::pipe(p) == 0);
+    CHECK_FALSE(rsv::is_same_file_as_open_fd(log, p[0]));
+    CHECK_FALSE(rsv::is_same_file_as_open_fd(log, 9999));
+    ::close(p[0]);
+    ::close(p[1]);
+    ::close(fd);
+}
+#endif
 
 TEST_CASE("is_agent_reserved_path: an empty set reserves nothing; windows separators normalise",
           "[agent][filesystem_plugin][reserved]") {
@@ -503,6 +540,40 @@ TEST_CASE("filesystem plugin: /dev/fd and /dev/stdin and friends are refused on 
         auto r = run("read", {{"path", p}});
         CHECK(r.rc != 0);
     }
+    handle->descriptor()->shutdown(ctx.get());
+}
+
+TEST_CASE("filesystem plugin: a file that is the agent's own stderr is refused, an ordinary sibling is read",
+          "[agent][filesystem_plugin][reserved][stdio]") {
+    auto handle = load_fs_plugin();
+    REQUIRE(handle);
+    yuzu::test::TempDir root{"yuzu_test_fs_stderr_"};
+    std::error_code mkec;
+    fs::create_directories(root.path, mkec);
+    REQUIRE_FALSE(mkec);
+    const auto log = root.path / "yuzu-agent.stderr.log";
+    const auto other = root.path / "other.log";
+    for (const auto& p : {log, other}) {
+        std::ofstream o(p);
+        o << "LOGLINE\n";
+    }
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    auto run = make_runner(*handle);
+    const int saved = ::dup(2);
+    REQUIRE(saved >= 0);
+    const int lfd = ::open(log.c_str(), O_WRONLY | O_APPEND);
+    REQUIRE(lfd >= 0);
+    REQUIRE(::dup2(lfd, 2) == 2); // launchd StandardErrorPath / systemd StandardOutput=file:
+    auto refused = run("read", {{"path", log.string()}});
+    auto allowed = run("read", {{"path", other.string()}});
+    ::dup2(saved, 2);
+    ::close(saved);
+    ::close(lfd);
+    CHECK(refused.rc != 0);
+    CHECK(refused.captured.find("LOGLINE") == std::string::npos);
+    CHECK(allowed.rc == 0);
+    CHECK(allowed.captured.find("LOGLINE") != std::string::npos);
     handle->descriptor()->shutdown(ctx.get());
 }
 

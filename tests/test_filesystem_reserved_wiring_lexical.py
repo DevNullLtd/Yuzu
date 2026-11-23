@@ -42,6 +42,11 @@ def main() -> int:
 
     need("contains_nul(path_bytes(p))", "a NUL in the candidate path must refuse (UTF-8 bytes, never p.string())")
     need("contains_nul(cs)", "a NUL in the canonical path must refuse")
+    need("is_agent_stdio_file(canon)", "the agent's own stdout/stderr file (launchd/systemd log redirection)")
+    need("path_from_bytes(f)", "the reserved Set is UTF-8: rebuild paths with path_from_bytes, never fs::path{std::string}")
+    need("path_from_bytes(d)", "the reserved Set is UTF-8: rebuild paths with path_from_bytes, never fs::path{std::string}")
+    if re.search(r"fs::path\{(?:f|d|v\[i\])\}", b):
+        problems.append("the reserved decision rebuilds a reserved path with the narrow fs::path{std::string} (ACP on MSVC)")
     need("is_dev_fd_path(cs)", "canonical /dev/fd spelling")
     need("is_dev_fd_path(path_bytes(p.lexically_normal()))", "literal /dev/fd spelling")
     need("#ifdef __APPLE__", "the /.vol/ refusal is macOS only")
@@ -76,14 +81,17 @@ def main() -> int:
     for name, rx in pins.items():
         if not re.search(rx, flat):
             problems.append(f"whole-statement pin {name!r} not found (condition weakened or removed)")
-    # path_bytes must be the NON-throwing shared converter (u8string() throws on MSVC for an unpaired
-    # surrogate), and validate_path / validate_path_or_parent must turn any throw into a refusal.
-    if "u8string()" in code[code.index("std::string path_bytes("):code.index("std::string path_bytes(") + 400]:
-        problems.append("path_bytes calls u8string(): it throws on MSVC for an unpaired surrogate; use find_by_hash::path_utf8")
-    for fn in ("validate_path", "validate_path_or_parent"):
-        w = re.search(r"std::string " + fn + r"\(std::string_view raw_path, std::string_view base_dir\) \{\s*try \{\s*return " + fn + r"_impl\(raw_path, base_dir\);\s*\} catch \(\.\.\.\) \{\s*return \{\};", code)
-        if not w:
-            problems.append(f"{fn} is not a try/catch(...) wrapper returning an empty refusal over {fn}_impl")
+    # path_bytes must be EXACTLY the non-throwing shared converter, validate_path / validate_path_or_parent
+    # must turn any throw into a refusal, and do_exists must tell a throw apart from "does not exist".
+    flat_code = re.sub(r"\s+", " ", code)
+    if "std::string path_bytes(const fs::path& p) { return yuzu::filesystem::find_by_hash::path_utf8(p); }" not in flat_code:
+        problems.append("path_bytes is not exactly the non-throwing find_by_hash::path_utf8 (u8string()/string() throw on MSVC)")
+    if not re.search(r"std::string validate_path\(std::string_view raw_path, std::string_view base_dir\) \{ try \{ return validate_path_impl\(raw_path, base_dir\); \} catch \(\.\.\.\) \{ return \{\}; \} \}", flat_code):
+        problems.append("validate_path is not exactly a try/catch(...) wrapper returning an empty refusal over validate_path_impl")
+    if not re.search(r"std::string validate_path_or_parent_ex\(std::string_view raw_path, std::string_view base_dir, bool\* threw\) \{ try \{ return validate_path_or_parent_impl\(raw_path, base_dir\); \} catch \(\.\.\.\) \{ if \(threw\) \*threw = true; return \{\}; \} \}", flat_code):
+        problems.append("validate_path_or_parent_ex is not exactly the flagging try/catch(...) wrapper")
+    if "bool validate_threw = false; auto validated = validate_path_or_parent_ex(path, base_dir, &validate_threw); if (validate_threw) {" not in flat_code:
+        problems.append("do_exists does not tell a validate throw apart from a nonexistent path")
     # path::string() throws on MSVC for a name the active code page cannot hold, and the guard turns a throw
     # into a REFUSAL: every non-ACP file name was refused as reserved. The decision converts through
     # path_bytes (UTF-8) only.
