@@ -757,3 +757,33 @@ TEST_CASE("GET /api/v1/bundles/{id}: a Forensics step with no response yet write
     CHECK(a["data"]["steps"][0]["state"] == "pending");
     CHECK(forensics_audit_rows(h.audits).empty()); // nothing was served, so nothing is audited
 }
+
+// sg10 / UP-1: a step whose params key the agent would truncate is a 400, audited and counted, and
+// nothing is dispatched.
+TEST_CASE("POST /api/v1/bundles: a step params key with a NUL or control byte is refused 400, audited "
+          "and counted (sg10)",
+          "[pg][bundle][rest][sg10]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    for (const char* key : {"targets\\u0000x", "a\\u0007b"}) {
+        int status = 0;
+        h.audits.clear();
+        (void)h.post("/api/v1/bundles",
+                     std::string(R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime",)") +
+                         R"("params":{")" + key + R"(":"h"}}]})",
+                     status);
+        CHECK(status == 400);
+        bool saw = false;
+        for (const auto& a : h.audits)
+            if (a.verb == "bundle.dispatch" && a.result == "denied" &&
+                a.detail == "reason=param_key_invalid")
+                saw = true;
+        CHECK(saw);
+    }
+    CHECK(h.calls.empty());
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "bundle"}, {"reason", "param_key_invalid"}})
+              .value() == 2.0);
+}

@@ -14,7 +14,7 @@ cadences.
   `install_location`. The daily sync calls eleven inventory actions in-process,
   one at a time, and reports each as its own section (see "The per-source
   report (blob v3)" below): `installed_apps` `list_inventory` (Windows: `HKLM`
-  plus the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
+  plus the agent service account's own `HKCU`; Linux: the `dpkg` and `rpm` databases read in-process, `pacman`/`apk` run as tools;
   macOS: `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew;
   Chocolatey and winget on Windows) and `store_packages` (Linux snaps and
   flatpaks; the Windows Appx roster), and
@@ -81,8 +81,9 @@ cadences.
   `bundle_id` is `-` for rows the bounded bundle-id pass (30 s, at most 5000
   applications, one pass in flight) did not reach; that run leads with a
   `warning|bundle_id_*` row and reports CONSTRAINED -- never silently.
-  A degraded acquisition on any OS (Linux/macOS: timeout, kill, spawn failure,
-  truncation, or a nonzero exit; Windows: an unreadable Uninstall root or
+  A degraded acquisition on any OS (Linux pacman/apk and macOS: timeout, kill, spawn failure,
+  truncation, or a nonzero exit; Linux dpkg/rpm: an unreadable, locked, damaged
+  or over-limit package database; Windows: an unreadable Uninstall root or
   application subkey) now emits a single `error|installed_apps: acquisition
   degraded (...)` row and a nonzero result instead of an empty or partial
   `app|` list; on macOS a `list` may begin with a `warning|bundle_id_*` row --
@@ -354,6 +355,85 @@ cadences.
   GUI applications and installer receipts, so zero means the tool failed. On
   Linux an empty result is often honest — a host may legitimately have `rpm`
   installed and no rpm packages — so that check is not applied there.
+
+  **Linux dpkg and rpm rows come from an in-process database read.** This plugin
+  no longer runs `dpkg-query` or `rpm` (other plugins still run their own tools):
+  it reads the dpkg status file (and the `/var/lib/dpkg/status.d/` directory
+  minimal images use) and the rpm database (sqlite, ndb or Berkeley DB, whichever
+  the host uses) itself, read-only and without following a symlink at the file,
+  within 20 seconds, 50,000 packages (for dpkg, stanzas) and fixed byte limits
+  (32 MiB of dpkg text in total, 32 MiB per rpm header, 1 GiB of rpm headers and
+  8 MiB of retained text across them). The rows, and therefore the section hash,
+  are byte-for-byte what the tools produced on every host measured, so a fleet
+  upgrade resends nothing, with one exception: a host that carries a tab, pipe or
+  newline inside a maintainer or vendor sends those rows once more, with the full
+  value the tools used to truncate. What else is different from the tools:
+
+  - **`status.d`.** A host whose packages live only there (minimal images with no
+    shell) now reports them, as new install rows; and a host with a healthy status
+    file and one `status.d` control file that does not hold exactly one stanza, and that one in the installed state (a `not-installed` stanza beside it is ignored; unparseable, zero-byte and comment-only files are refused, and so is a second stanza of any other kind, or a single one in another state such as config-files or half-installed) is degraded
+    (`dpkg_status_d:corrupt`, no rows, the server keeps its stored ones) where
+    `dpkg-query` ignored the directory. The token does not name the file: list
+    `/var/lib/dpkg/status.d` and look for a zero-byte, comment-only or hand-edited
+    one, one holding two stanzas, one whose `Status` is not installed, or two files that name the same package. Restore it (reinstall the package
+    that owns it) rather than delete it: a deleted control file drops its package
+    from the roster, which is then read as complete. A name with a leading dot is
+    skipped, which costs the same as deleting it.
+  - **Which manager is read.** It is chosen by its database file, not its binary.
+    A dpkg status with no installed package (empty, or only config-files and
+    half-installed stanzas) falls through to rpm, and an rpm database that holds no
+    package falls through to `pacman` (and, for `list_inventory`, the daily sync,
+    `apk`); a host with such an empty database and no other manager reports an
+    empty collection, not a degraded one.
+  - **dpkg `Status`.** A `Status` is accepted only as dpkg writes it (dpkg's own
+    words, lowercase, one space between them). A status file hand-edited to mixed
+    case or repeated blanks, which `dpkg-query` read, is `dpkg_status:corrupt` (no
+    rows, the server keeps its stored ones) until dpkg next rewrites it.
+  - **Symlinks.** A symlinked status file, `status.d` directory or rpm database
+    file is refused (`symlink_refused`) where the tools followed the link. A
+    symlinked rpm directory is skipped, never followed; when a database file sits
+    behind such a link in a directory this reader did not read, the read is
+    `rpmdb:symlink_refused` rather than an empty list, and so is a populated
+    directory read after such a link that hides a different database (a link on
+    a later candidate is not examined). The current Fedora, RHEL and SUSE layout,
+    where `/var/lib/rpm` links to the directory that is read, is unaffected. A
+    regular file where an rpm database directory belongs is `rpmdb:not_regular`.
+  - **A writer is running.** On a host that keeps an ndb or Berkeley DB rpm
+    database, a running rpm transaction answers `locked` (the reader asks whether
+    rpm's transaction lock is held and never takes it); and on any host with a
+    pending update journal (a file named with digits only in
+    `/var/lib/dpkg/updates`, left by a dpkg run in progress or an interrupted one),
+    including an rpm host that carries a stale dpkg tree, the read answers
+    `dpkg_updates:locked`, where `dpkg-query` printed the merged view. Both
+    keep the server's stored rows. The rpm one clears when the transaction ends;
+    the dpkg one when dpkg next completes a run, and after an interrupted run
+    `dpkg --configure -a` (when no dpkg run is in progress) completes the journal
+    and clears it; on an rpm host there is no dpkg to run, so the leftover record
+    is removed by hand. An rpm lock file moved out of the database directory is not
+    seen.
+  - **Unprivileged read.** An rpm sqlite database without its WAL sidecars is
+    readable by an unprivileged account (measured on one AlmaLinux 9 image, where
+    `rpm -qa` failed as `nobody`); other accounts and images were not measured.
+
+  When the read fails, the collection is degraded exactly as above, with no rows and
+  a named reason in the agent log, the `list`/`query` error row and the result's
+  provenance (`installed_apps:<source>:<cause>`, source one of `dpkg_status`,
+  `dpkg_status_d`, `dpkg_updates`, `rpm_sqlite`, `rpm_ndb`, `rpm_bdb`, `rpmdb` or
+  `pkgdb`): `locked` (a writer holds the database: sqlite write-locked past its
+  timeout, an rpm transaction running on ndb or Berkeley DB, or a pending dpkg
+  update journal), `changed_during_read` (a transaction rewrote the rpm database
+  during the read), `corrupt` or `truncated` (a damaged database or record: one
+  bad rpm header fails the whole read rather than publishing a shorter list),
+  `unsupported_format` (a database layout the reader does not decode, for example
+  an LMDB rpm database or a Berkeley DB hash version other than 9),
+  `oversized`, `row_cap`, `byte_cap`, `timeout` and `busy` (a limit was reached),
+  `symlink_refused` and `not_regular` (the database, its directory or its
+  `.rpm.lock` is a link, or not a regular file or directory), and `unreadable` (a permission or I/O error). The daily sync's own
+  constrained token does not carry the reason yet; read it from the agent log
+  (where that is, `--log-file` or the console and your service manager, is under
+  "Where the lines go" in the Guardian `T_*` log-lines entry of
+  [server-admin.md](server-admin.md)). A degraded Linux host keeps its last-known
+  rows, shown as unconfirmed, until the database is readable again.
 
   **Windows degrades the same way (#4711).** The registry walk is native, so the
   subprocess cases above do not apply, but an Uninstall root that cannot be
@@ -2043,7 +2123,8 @@ The server turns every distinct installed-software title into a stable identity 
 - **Cadence.** A quiet fleet is checked once an hour. A tick covers up to 200,000 titles or 60 seconds of work in total, whichever comes first. When it stops at either limit with more waiting (a new pack version, or the first run on a large fleet), the next tick starts after 60 seconds instead of an hour, so a backlog is worked off in back-to-back ticks rather than one tick an hour. The same 60 seconds applies right after a server start or upgrade when the catalogue rollup has not yet produced the title list: the job finds nothing to do and keeps checking every 60 seconds until the rollup has produced the title list, instead of waiting an hour. A tick that fails or times out is retried at the hourly interval, because an immediate retry would pick the same batch and fail the same way.
 - **The alias pack.** Resolution is driven by a versioned alias pack (`YYYY.MM.N`) stored in Postgres. A seed pack ships inside the server and is loaded on first boot only when no pack exists; a newer server build does not replace a pack that is already loaded (the boot log names both versions). If the pack cannot be loaded for any reason, including a transient database error, the server refuses to start and logs `[PG] Refusing to start`.
 - **Settled titles are re-resolved only when something changes.** A title is resolved when it first appears and again when the pack version changes, its product is deleted, or a registry write marks it stale. A curated alias (`POST /api/v1/inventory/software/normalization/aliases`) or a replaced pack (`POST .../pack`) marks every title stale in the same transaction, so the next hourly passes pick the fleet up again; rejecting a queue entry does not.
-- **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions, architectures and edition words are removed (for example `2019` or `Pro`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
+- **Unnormalized never means guessed.** A title resolves only through a curated or pack alias, or to the product whose key is exactly the title's cleaned-up publisher, product and edition; similar-looking products are never used, so a companion title such as a remote-desktop host does not resolve to the main product. A title that does not resolve this way is labelled `unnormalized`, keeps its cleaned-up publisher, product and edition, and has no product. A name that reduces to nothing once versions and architectures are removed (for example `2019` or `(x64)`) is always `unnormalized`. The title is also added to the curation queue with its device count, so the most widely installed unknowns surface first. The queue follows the fleet: counts are refreshed every hour (only when a count changed, or at least daily) and a title that has left the fleet is dropped and comes back, still open, when the title does. A title a curator has rejected stays rejected, even after the title later resolves.
+- **How a title and a publisher are cleaned up.** The product key is built from the publisher, the title and the edition, each cleaned the same way every time. Case is folded for ASCII letters and runs of spaces collapse. A title loses its standalone version words (`2019`, `16.0.1`, `v2.1`; the first is kept as the title's version), its architecture words (`x64`, `(64-bit)`) and a bare `-` separator. An edition word (`Standard`, `Enterprise`, `Pro`, `Home`, ...) is the edition only after a title word: `Windows 11 Pro` is `windows` with edition `pro`, while a title that is one (`Home`) or starts with one (`Pro Display Calibrator`) keeps it as part of the title. The word `edition` right after an architecture word, or after a word taken as the edition, is dropped (`7-Zip 26.04 (x64 edition)` is `7-zip`); a leading edition word kept as part of the title does not arm it (`Home Edition` is `home edition`). A Homebrew `name@version` keeps the name and supplies the version (`openssl@3` is `openssl`, version `3`). A year range such as `2015-2022` stays in the title because it names a runtime generation; a version glued to a name (`python3.14`, `postgresql-18`) is not stripped, since such package names are legitimate, so the seed pack lists those it knows. A publisher loses only the trailing run of legal-suffix words (`Inc.`, `Corporation`, `GmbH`, `L.L.C.`, `Software`, `Foundation`, ...) and never its last word, so `Python Software Foundation` is `python`, `macOS Software Signing` keeps its name and `Software` stays `software`; compound forms such as `GmbH & Co. KG` are not reduced. These rules decide the keys the pack and the curation queue use; see [Upgrading](upgrading.md) for what a change to them does to a server that already holds a pack.
 - **Origin labels.** A publisher of the form `via:<ecosystem>` (for example `via:brew`) names where a row came from, not a vendor, so it normalises to no vendor. It is the title's raw key: the queue and `GET .../queue` show it as `raw_publisher`, and a title the pack or a curated alias covers resolves through that alias like a title with no publisher.
 - **Editions are distinct products.** An alias binds exactly one edition, and a title is never matched to a different edition of the same product, so SQL Server Standard and SQL Server Enterprise resolve separately and an edition the pack does not list lands in the queue rather than on its neighbour.
 - **Automatic product creation is off.** The job does not create products for unmatched titles; they wait in the queue.
