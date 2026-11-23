@@ -373,4 +373,3 @@ TEST_CASE("bulk read cap: a locked audit table parks at most `cap` audit writers
     CHECK(r.authz_ok);
     CHECK(r.audit_ok == resolved->cap);
 }
-
