@@ -1589,6 +1589,7 @@ if build_server
       'unit/server/test_auth_lockout.cpp',
       'unit/server/test_auth_break_glass.cpp',
       'unit/server/test_auth_db_pg.cpp',
+      'unit/server/test_pbkdf2_budget.cpp',    # WP03 perf-F1: lane/floor arithmetic of the PBKDF2 concurrency budget (no PG)
       'unit/server/test_auth_password.cpp',   # #5342/#5274: AuthManager password change/reset + DB-first credential read
       'unit/server/test_mfa_disable_owner.cpp', # #6079 PR 2c: MfaDisableOwner one-transaction factor clear + session end + outcome audit row
       'unit/server/test_auto_approve.cpp',
@@ -4964,6 +4965,14 @@ test('access audit production wiring lexical gate',
 test('same-site gate production wiring lexical gate',
   _python3_test,
   args: [files('test_same_site_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP03: both second-factor code verifiers are called only from the two budgeted handlers
+# (source-text only, so Python; suite 'docs').
+test('mfa failure budget wiring lexical gate',
+  _python3_test,
+  args: [files('test_mfa_budget_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
