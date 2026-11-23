@@ -3371,8 +3371,8 @@ TEST_CASE("EchoCorruptionAuditGate: agents writing at the cap do not evict each 
     }
 }
 
-TEST_CASE("EchoCorruptionAuditGate: at the cap an agent with a live window is not evicted while "
-          "elapsed or never-windowed entries are examined",
+TEST_CASE("EchoCorruptionAuditGate: at the cap an agent with a live window survives a table of "
+          "elapsed and never-windowed entries",
           "[health_store][echo][corruption][gate]") {
     using yuzu::server::detail::EchoCorruptionAuditGate;
     using yuzu::server::detail::kEchoCorruptionAuditMinRowInterval;
@@ -3419,7 +3419,11 @@ TEST_CASE("EchoCorruptionAuditGate: agents written in the same second at the cap
         gate.mark_logged("fresh-" + std::to_string(i), "1:f");
     // The clock does not move: whole-second stamps tie, and the first examined entry (often a
     // just-inserted node) must not win a tie against an older-or-equal one.
-    for (int r = 0; r < 2; ++r) {
+    // Enough pairs that a strict comparison (first examined wins ties) loses a window on
+    // libstdc++ as well as libc++; two new entries per round stay inside the examined prefix.
+    constexpr int kRounds = 15;
+    static_assert(2 * kRounds < static_cast<int>(EchoCorruptionAuditGate::kVictimScan));
+    for (int r = 0; r < kRounds; ++r) {
         const std::string a = "pa-" + std::to_string(r);
         const std::string b = "pb-" + std::to_string(r);
         REQUIRE(gate.should_log(a, "1:f"));
@@ -3427,7 +3431,7 @@ TEST_CASE("EchoCorruptionAuditGate: agents written in the same second at the cap
         REQUIRE(gate.should_log(b, "1:f"));
         gate.mark_logged(b, "1:f");
     }
-    for (int r = 0; r < 2; ++r) {
+    for (int r = 0; r < kRounds; ++r) {
         CHECK_FALSE(gate.should_log("pa-" + std::to_string(r), "2:g"));
         CHECK_FALSE(gate.should_log("pb-" + std::to_string(r), "2:g"));
     }

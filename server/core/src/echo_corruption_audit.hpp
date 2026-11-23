@@ -25,7 +25,8 @@
  * The identity is agent-asserted and only shape-validated, so the gate also
  * bounds a rotating identity: at most one row per agent per
  * kEchoCorruptionAuditMinRowInterval seconds PER SERVER PROCESS (in-memory; a
- * restart or another HA node opens a fresh window). Intermediate quarantines
+ * restart or another HA node opens a fresh window; best effort once the table
+ * is full). Intermediate quarantines
  * inside one window collapse to the newest identity, which persists in the
  * agent's `last` tag and logs on the first heartbeat after the window. Once a
  * lookup or write has failed, no lookup runs until
@@ -131,7 +132,7 @@ inline constexpr const char* kEchoCorruptionAuditAction = "echo.db.corruption_qu
 inline constexpr const char* kEchoCorruptionAuditTargetType = "Agent";
 
 /// Minimum seconds between two rows for one agent (bounds a rotating,
-/// agent-asserted identity to 144 rows/day/agent).
+/// agent-asserted identity to 144 rows/day/agent; best effort at the cap).
 inline constexpr int64_t kEchoCorruptionAuditMinRowInterval = 600;
 /// While the audit store answers "degraded", skip lookups for this long.
 inline constexpr int64_t kEchoCorruptionAuditDegradedRetry = 60;

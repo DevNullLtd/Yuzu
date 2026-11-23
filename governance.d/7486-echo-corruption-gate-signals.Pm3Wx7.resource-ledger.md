@@ -1,6 +1,6 @@
 # Resource Ledger — echo corruption audit gate signals
 
-Range: `47697d783d54..62dff0a712` (last updated at the round-1 fixes for review 6025655092) (branch `fix/echo-corruption-gate-signals`)
+Range: `47697d783d54..62dff0a712` (last updated at the final delta gates of the round-1 fixes for review 6025655092) (branch `fix/echo-corruption-gate-signals`)
 
 ## Summary
 
