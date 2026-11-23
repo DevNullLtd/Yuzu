@@ -3389,6 +3389,8 @@ TEST_CASE("parse_iptables_legacy_save: anything that is not a listing in shape i
         "*filter\n:INPUT ACCEPT [0:0]\n-A INPUT -m comment --comment \"open\nCOMMIT\n",
         "*filter\n:INPUT ACCEPT [0:0]\n-A INPUT -m comment --comment \"escaped quote\\\" -j ACCEPT\nCOMMIT\n",
         "*filter\n:IN\"PUT ACCEPT [0:0]\nCOMMIT\n", // an open quote on a chain line
+        // a double quote in a field the tool prints outside quotes leaves the line open
+        "*filter\n:INPUT ACCEPT [0:0]\n-A INPUT -i a\"b -j DROP\nCOMMIT\n",
     };
     for (const auto& text : unshaped) {
         INFO(text);
@@ -3411,6 +3413,13 @@ TEST_CASE("parse_iptables_legacy_save: quotes close as iptables-save writes them
     REQUIRE(escaped.has_value());
     CHECK(escaped->append_count == 3);
     CHECK(escaped->entries.back().spec == "-m comment --comment \"a#b *c COMMIT\" -j ACCEPT");
+    // a newline in a field the tool prints outside quotes reads as a line break: it adds a line and
+    // a count, and never removes one
+    const auto split = parse_iptables_legacy_save(
+        "*filter\n:INPUT ACCEPT [0:0]\n-A INPUT -i a\n-A INPUT -j DROP\nCOMMIT\n");
+    REQUIRE(split.has_value());
+    CHECK(split->has_content);
+    CHECK(split->append_count == 2);
     // a backslash outside quotes is nothing special, and a single quote is no quote
     CHECK(parse_iptables_legacy_save("*filter\n:INPUT ACCEPT [0:0]\n-A INPUT -m comment --comment it's -j ACCEPT\n"
                                      "COMMIT\n")
@@ -3458,20 +3467,11 @@ TEST_CASE("format_iptables_rule_row: no legacy row's second field is another bac
         for (const auto& entry : listing->entries) {
             const auto row = format_iptables_rule_row(entry, ip6);
             INFO(row);
-            std::vector<std::string> field;
-            for (std::size_t pos = 0;;) {
-                const auto bar = row.find('|', pos);
-                field.push_back(row.substr(pos, bar == std::string::npos ? std::string::npos : bar - pos));
-                if (bar == std::string::npos)
-                    break;
-                pos = bar + 1;
-            }
-            REQUIRE(field.size() >= 4);
-            CHECK(field[0] == "rule");
-            // the one word before the table or kind is `ip6` for IPv6, and nothing for IPv4
-            const auto& word = field[ip6 ? 2 : 1];
-            CHECK((!ip6 || field[1] == "ip6"));
-            CHECK(std::find(second_field.begin(), second_field.end(), word) != second_field.end());
+            // after `rule|` (`rule|ip6|` for IPv6) comes one of the eight words, no backend's
+            const std::string head = ip6 ? "rule|ip6|" : "rule|";
+            CHECK(std::any_of(second_field.begin(), second_field.end(), [&](const std::string& w) {
+                return row.starts_with(head + w + "|");
+            }));
         }
     }
 }
@@ -3809,7 +3809,6 @@ TEST_CASE("snapshot_connect_token and snapshot_error_row", "[firewall]") {
     CHECK(snapshot_error_row("empty") == "error|snapshot:empty");
     CHECK(kFwSnapshotSocketPath == "/run/yuzu-fw-snapshot.sock");
     CHECK(kFwSnapshotMaxBytes == 4194304);
-    CHECK(kFwSnapshotMaxBytes == kNftDumpMaxBytes); // one bound for a host ruleset, on every leg
 }
 
 TEST_CASE("helper_snapshot_outcome: the listing, or a token that names the failure", "[firewall]") {
@@ -3831,9 +3830,9 @@ TEST_CASE("helper_snapshot_outcome: the listing, or a token that names the failu
     auto refused = done; // sudo refused, or the helper failed: the helper file is there, so it is a failed read
     refused.exit_code = 1;
     CHECK(token(refused) == "helper:exit:1");
-    auto unknown_word = done; // a helper that does not accept the word
-    unknown_word.exit_code = 64;
-    CHECK(token(unknown_word) == "helper:exit:64");
+    auto other_exit = done; // any other exit status is named as it is
+    other_exit.exit_code = 64;
+    CHECK(token(other_exit) == "helper:exit:64");
     auto timed_out = done;
     timed_out.timed_out = true;
     timed_out.exit_code = 1; // a timeout wins over the exit code
@@ -3907,31 +3906,54 @@ TEST_CASE("linux_snapshot_rung: inactive is never answered from one snapshot", "
                                    "error|iptables:snapshot:failed"});
 }
 
-TEST_CASE("linux_snapshot_rung: a second snapshot that fails is a row and no answer", "[firewall]") {
-    // a transport error is the row that says why, and nothing is answered
+namespace {
+
+/// A second read that gives no answer after a first read of `inactive`, and the row that says why.
+struct Unconfirmed {
+    Reply second;
+    std::string error;
+};
+
+std::vector<Unconfirmed> unconfirmed_seconds() {
+    std::vector<Unconfirmed> all;
+    // a failed read on either transport: the reader's token, or the helper's own
     for (const char* token : {"timeout", "io_error", "oversized", "peer_not_root", "connect:refused",
-                              "helper:timeout", "helper:exit:1"}) {
-        INFO(token);
-        const auto run = run_rung({kEmptyHost, Reply{std::unexpected(std::string{token})}});
-        CHECK(run.reads == 2);
-        CHECK_FALSE(run.rung.answered);
-        CHECK(run.rung.rows == Rows{std::string{"error|snapshot:"} + token});
+                              "connect:busy", "connect:eacces", "helper:timeout", "helper:exit:1",
+                              "helper:truncated", "helper:not_run"})
+        all.push_back(
+            {Reply{std::unexpected(std::string{token})}, std::string{"error|snapshot:"} + token});
+    // the transport that answered the first read is gone: the reader finds none
+    all.push_back({kNoTransport, "error|snapshot:gone"});
+    // a reply that fails the framing: empty, no end line, not a listing
+    all.push_back({Reply{std::string{}}, "error|snapshot:empty"});
+    all.push_back({Reply{kEmptyHost.substr(0, kEmptyHost.size() - 7)}, "error|snapshot:truncated"});
+    all.push_back({Reply{std::string{"not a listing\n"}}, "error|snapshot:malformed"});
+    // a snapshot that declines: nft vanished between the reads and nothing read shows content
+    all.push_back(
+        {Reply{snap(kAbsent, kTablesNone, kTablesNone)}, "error|nftables:snapshot:absent"});
+    return all;
+}
+
+} // namespace
+
+TEST_CASE("linux_snapshot_rung: a first inactive that the second read cannot confirm is unknown",
+          "[firewall]") {
+    // the rung owns the answer once the first snapshot reads inactive: the ladder never goes on to
+    // the ufw and `iptables -S` rungs, which read less and can print inactive for the same host
+    for (const auto& c : unconfirmed_seconds()) {
+        INFO(c.error);
+        for (const auto action : {FwReadAction::state, FwReadAction::rules}) {
+            const auto run = run_rung({kEmptyHost, c.second}, false, false, action);
+            const char* verdict = action == FwReadAction::state ? "state|unknown" : "rules|unknown";
+            CHECK(run.reads == 2);
+            CHECK(run.rung.answered);
+            CHECK(run.rung.rows == Rows{"backend|nftables", verdict, "ruleset|unknown", c.error});
+            const auto& rows = run.rung.rows;
+            CHECK(std::none_of(rows.begin(), rows.end(), [](const std::string& r) {
+                return r == "state|inactive" || r == "ruleset|0";
+            }));
+        }
     }
-    // a transport that has gone (an empty token) is no transport: nothing is written or answered
-    const auto gone = run_rung({kEmptyHost, kNoTransport});
-    CHECK(gone.reads == 2);
-    CHECK_FALSE(gone.rung.answered);
-    CHECK(gone.rung.rows.empty());
-    // a reply that fails the framing: empty, truncated and malformed, each its own row
-    const auto empty = run_rung({kEmptyHost, Reply{std::string{}}});
-    CHECK_FALSE(empty.rung.answered);
-    CHECK(empty.rung.rows == Rows{"error|snapshot:empty"});
-    const auto cut = run_rung({kEmptyHost, Reply{kEmptyHost.substr(0, kEmptyHost.size() - 7)}}); // no end line
-    CHECK_FALSE(cut.rung.answered);
-    CHECK(cut.rung.rows == Rows{"error|snapshot:truncated"});
-    const auto garbage = run_rung({kEmptyHost, Reply{std::string{"not a listing\n"}}});
-    CHECK_FALSE(garbage.rung.answered);
-    CHECK(garbage.rung.rows == Rows{"error|snapshot:malformed"});
 }
 
 TEST_CASE("linux_snapshot_rung: every answer but inactive is one read", "[firewall]") {

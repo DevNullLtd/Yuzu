@@ -1331,14 +1331,17 @@ read_fw_snapshot_via_helper(std::chrono::steady_clock::time_point deadline) {
 }
 
 /// true iff the snapshot answered (dispatch stops); false means the next rung runs. A host with no
-/// transport (no socket, no provisioned helper) says nothing; one that has a transport but could not
-/// be read says why in an `error|snapshot:<token>` row. The rows and the decision are the pure
+/// transport (no socket, no provisioned helper) says nothing; one that has a transport but could
+/// not be read says why in an `error|snapshot:<token>` row. The rows and the decision are the pure
 /// linux_snapshot_rung's: it reads one whole snapshot, and a second before it answers `inactive`.
-/// Both reads share one deadline, computed once, so the rung's worst case does not change. A
-/// declined answer (no nft CLI and nothing read shows content) writes just its `error|` rows and the
-/// ladder goes on. While `info.firewalld_running` only an active answer is written and accepted; any
-/// other answer writes just its `error|` rows, so firewalld's held answer stands and the refusals
-/// that explain what was not read are still reported.
+/// The reader below chooses its transport again for each read (the socket, else the helper). Both
+/// reads share one deadline, computed once: it bounds the whole rung. A host whose first read is
+/// `inactive` and whose second cannot be taken answers `unknown` with its row and stops here, so no
+/// narrower rung answers for it. A declined first answer (no nft CLI and nothing read shows
+/// content) writes just its `error|` rows and the ladder goes on. While `info.firewalld_running`
+/// only an active answer is written and accepted; any other answer writes just its `error|` rows,
+/// so firewalld's held answer stands and the refusals that explain what was not read are still
+/// reported.
 bool try_snapshot(yuzu::CommandContext& ctx, const NftFallthroughInfo& info,
                   yuzu::firewall::FwReadAction action) {
     const auto deadline = std::chrono::steady_clock::now() + kAcqDeadline;

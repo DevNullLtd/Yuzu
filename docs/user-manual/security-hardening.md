@@ -124,32 +124,42 @@ bound.
   nothing else; a family with no save tool reads the kernel's own table list instead. The reply is
   cut at 4 MiB. The agent sends nothing, checks that root created the socket and treats the reply as
   untrusted text. The script changes no ruleset and writes no file. For the tables the kernel lists,
-  the legacy reads load no module and take no lock; one effect is measured and stays: an nft read on
-  a host where nf_tables is not loaded makes the kernel load it (an empty ruleset, no table and no
-  rule).
+  the legacy reads load no module and take no lock. Two reads can make the kernel load a module,
+  both measured (ADR-3007 clause 3): an nft read on a host where nf_tables is not loaded makes the
+  kernel load nf_tables (an empty ruleset, no table and no rule), and a legacy save tool that asks
+  for a table whose module is not loaded makes the kernel load that module (an empty table), which
+  the broker's reads reach only when a table is removed while a read is under way.
 - **What the agent account can now read:** the host's full nftables ruleset, rule handles and rule
   comments included, and every instantiated legacy `iptables` and `ip6tables` table. Through the
-  broker it can change no ruleset and write no file, and the agent unit's own sandbox is unchanged. Anyone who can run code
-  as the agent can read those listings; treat the ruleset as readable by that account. A host with
-  no `nft` command cannot have nf_tables read through the broker: the plugin then reports
-  `error|nftables:snapshot:absent` and never `inactive` for it.
+  broker it can change no ruleset and write no file, and the agent unit's own sandbox is unchanged.
+  Anyone who can run code as the agent can read those listings; treat the ruleset as readable by
+  that account. A host with no `nft` command cannot have nf_tables read through the broker: the
+  plugin then reports `error|nftables:snapshot:absent` and never `inactive` for it.
 - The service unit has its own sandbox (its own two capabilities, a system call filter, address
   families, a read-only file system). It does not set `NoNewPrivileges`: with SELinux enforcing
-  (measured on Rocky 9.9, systemd 252) the exec of `nft` was a denied `nnp_transition` under it and
-  `nft` ran outside its own confined domain; the bounding set and the filters, which systemd
-  applies to every process the script starts, are what bound it. On
-  Ubuntu 26.04 the broker's processes ran unconfined by AppArmor (measured). One thing changes
-  without the flag: an exec of a setuid or setgid program that belongs to another user or group
-  changes the process to that identity. That adds no capability beyond the two in the bounding set,
-  the filters still apply, and the script runs only `nft`, the two legacy save tools and `head`, with no
-  input. The service
-  unit's IP egress filter takes effect only on hosts with the unified cgroup hierarchy; its
-  address-family list is what bounds its sockets. The agent unit keeps `NoNewPrivileges=true`.
+  (measured on Rocky 9.9, systemd 252) the exec of `nft` was a denied `nnp_transition` under
+  `NoNewPrivileges` and `nft` ran outside its own confined domain; the bounding set and the
+  filters, which systemd applies to every process the script starts, are what bound it. On Ubuntu
+  26.04 the broker's processes ran unconfined by AppArmor (measured). One thing changes without the
+  flag: an exec of a setuid or setgid program that belongs to another user or group changes the
+  process to that identity. That adds no capability beyond the two in the bounding set, the
+  filters still apply, and the script runs only `nft`, the two legacy save tools and `head`, with
+  no input. The service unit's IP egress filter takes effect only on hosts with the unified cgroup
+  hierarchy; its address-family list is what bounds its sockets. The agent unit keeps
+  `NoNewPrivileges=true`.
 - If a read answers `unknown` with no `error|snapshot:` row on a packaged host, there is no socket
   file: the socket was stopped, masked or has failed. Run `systemctl status
   yuzu-fw-snapshot.socket`; then `systemctl reset-failed yuzu-fw-snapshot.socket` and `systemctl
   start yuzu-fw-snapshot.socket`, or restart `yuzu-agent`. `journalctl -u
   'yuzu-fw-snapshot@*'` shows each instance.
+- If a read answers `error|snapshot:empty` or `error|snapshot:timeout`, the broker was reached and
+  did not reply in full: either four reads were already in flight (`MaxConnections=4`; a connection
+  over the limit is accepted and closed at once, the read is not retried and the next read
+  answers) or the instance could not start or finish. `journalctl -u yuzu-fw-snapshot.socket`
+  shows a connection dropped at the limit (on Ubuntu 26.04, systemd 259: "Too many incoming
+  connections (4), dropping connection."), `systemctl list-units 'yuzu-fw-snapshot@*'` shows the
+  instances that are running, and `journalctl -u 'yuzu-fw-snapshot@*'` shows one that failed. A
+  host that reads `inactive` makes two connections per read.
 - To opt out, run `systemctl stop yuzu-fw-snapshot.socket` and then `systemctl mask
   yuzu-fw-snapshot.socket`; to keep the broker from ever starting, run `systemctl mask
   yuzu-fw-snapshot.socket` before the package is installed, and the agent starts without it. The

@@ -37,16 +37,18 @@ wiring around them, per OS class below:
                      listing, or a `helper:<token>` row), and the run gets what is left of the
                      rung's one deadline. try_snapshot computes that deadline once and hands the
                      transport to the pure linux_snapshot_rung, which takes a second whole
-                     snapshot before it answers `inactive`; the plugin never decides a snapshot
-                     itself. A declined snapshot answer writes its error rows and lets the ladder
-                     go on.
+                     snapshot before it answers `inactive` and answers `unknown` when that second
+                     snapshot cannot be taken; the plugin never decides a snapshot itself. A
+                     declined first snapshot answer writes its error rows and lets the ladder go
+                     on.
 
   BrokerUnits        the shipped socket, template service and snapshot script are exactly the
                      reviewed directive sets, agree with the plugin's socket path and with what the
                      deb and rpm packaging install, the script reads nothing, and the agent unit's
                      NoNewPrivileges and single capability are untouched. The service unit
-                     deliberately has no NoNewPrivileges (SELinux denies the tools' domain
-                     transition under it), and the gate says so by name.
+                     deliberately has no NoNewPrivileges (with SELinux enforcing, the exec of nft
+                     under it was a denied nnp_transition and nft ran in the script's domain), and
+                     the gate says so by name.
 
 Matching runs on tests/cpp_lex_helper.live_text(): comments, backslash-continued comments and
 `#if 0` blocks are removed first (string contents kept), so a pin cannot be satisfied by commented-out
@@ -833,12 +835,13 @@ def broker_problems(sources):
         for section in got:
             if section not in want:
                 out.append(f"the {name} unit has a section the review did not cover: [{section}]")
-    # NoNewPrivileges is deliberately absent from the service: under SELinux enforcing it makes every exec of
-    # nft, iptables and ip6tables a denied nnp_transition (three audit denials per read) and leaves the tools
-    # in the script's domain instead of their own; the agent unit keeps it (checked below)
+    # NoNewPrivileges is deliberately absent from the service: with SELinux enforcing, the exec
+    # of nft under it was a denied nnp_transition and nft ran in the script's domain; the agent
+    # unit keeps it (checked below)
     if "NoNewPrivileges" in parse_unit(sources["service"]).get("Service", {}):
-        out.append("the service unit sets NoNewPrivileges: SELinux denies the domain transition of the tools it "
-                   "runs, three denials per read (ADR-3007 clause 7)")
+        out.append("the service unit sets NoNewPrivileges: with SELinux enforcing, the exec of "
+                   "nft under it was a denied nnp_transition and nft ran in the script's domain "
+                   "(ADR-3007 clause 7)")
     # the socket path is the one the plugin connects to
     m = re.search(r'kFwSnapshotSocketPath = "([^"]+)"', sources["parsers"])
     if not m or m.group(1) != SOCKET_UNIT["Socket"]["ListenStream"]:

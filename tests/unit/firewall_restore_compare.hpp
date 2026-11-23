@@ -566,14 +566,10 @@ inline void compare_linux(const Parsed& a, const Parsed& b, Verdict& v) {
                 // policy of `-` is a user-defined chain, which is a rule like any other) are defaults
                 const bool policy_line =
                     line.starts_with("-P ") || (line.starts_with(':') && line.size() > 2 && !line.ends_with(" -"));
-                const bool opens = !nft && line.starts_with('*');
-                const bool closes = !table.empty() && line == "COMMIT";
-                if (opens)
+                if (!nft && line.starts_with('*'))
                     table = line.substr(1);
                 else if (!table.empty())
                     line = table + " " + line;
-                if (closes)
-                    table.clear();
                 if (policy_line)
                     policies.insert(line);
                 else

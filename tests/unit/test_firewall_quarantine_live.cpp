@@ -129,6 +129,8 @@
 #endif
 #if defined(__linux__)
 #include "firewall_snapshot_reader.hpp" // the production socket client, which the baseline read below runs too
+
+#include <sys/prctl.h>
 #endif
 
 namespace fq = yuzu::firewall::quarantine;
@@ -303,14 +305,18 @@ constexpr fr::Os kThisOs = fr::Os::lin;
     return ::access(std::string{yuzu::firewall::kFwSnapshotSocketPath}.c_str(), F_OK) == 0;
 }
 
+/// The installer's helper is a transport for a non-root agent when the plugin's own test says so
+/// (read_fw_snapshot_via_helper): the helper file is executable and this process is not under
+/// NoNewPrivileges, which sudo cannot elevate. The plugin runs inside this process, so the bit it
+/// reads is this process's own.
+[[nodiscard, maybe_unused]] bool installer_helper_present() {
+    return ::access(std::string{fq::kFwHelperPath}.c_str(), X_OK) == 0 &&
+           !fq::linux_privilege_refusal(false, ::prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
+}
+
 /// A non-root agent has a snapshot transport on this host: the broker socket (the packaged unit's
 /// account) or the installer's helper (an installer-provisioned account, whose baseline was read
 /// through it). With either, `state` and `rules` must answer with a real read.
-[[nodiscard, maybe_unused]] bool installer_helper_present() {
-    std::error_code ec;
-    return fs::exists(std::string{fq::kFwHelperPath}, ec) && !ec;
-}
-
 [[nodiscard, maybe_unused]] bool snapshot_transport_present() {
     return broker_socket_present() || installer_helper_present();
 }
@@ -920,7 +926,10 @@ struct PluginRig {
         raw.reserve(params.size());
         for (const auto& [k, v] : params)
             raw.push_back({k.c_str(), v.c_str()});
-        return dispatcher.run(plugin->descriptor(), action, raw);
+        // A `rules` read prints one row per rule of a listing of up to 4 MiB, and a row is longer
+        // than its line, so the capture takes its own cap, not the dispatcher's 2 MiB default.
+        return dispatcher.run(plugin->descriptor(), action, raw,
+                              4 * yuzu::firewall::kFwSnapshotMaxBytes);
     }
     [[nodiscard]] std::optional<fq::QuarantineState> record() {
         auto v = kv->get("firewall", std::string{fq::kStateKey});
@@ -1817,6 +1826,7 @@ TEST_CASE("live: state reports what the OS tool reports, and the host is left as
     const auto r = rig.run("state");
     INFO(r.captured);
     REQUIRE(r.rc == 0);
+    REQUIRE_FALSE(r.truncated); // a clipped capture is this harness's limit, not a missing row
     const auto ruleset = row_value(r.captured, "ruleset");
     REQUIRE(ruleset.has_value()); // every terminal state carries a count row, `unknown` when it could not be read
 
@@ -1914,6 +1924,7 @@ TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it 
     const auto r = rig.run("rules");
     INFO(r.captured);
     REQUIRE(r.rc == 0);
+    REQUIRE_FALSE(r.truncated); // a clipped capture is this harness's limit, not a missing row
     const auto ruleset = row_value(r.captured, "ruleset");
     REQUIRE(ruleset.has_value());
 

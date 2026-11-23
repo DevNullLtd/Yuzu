@@ -57,10 +57,12 @@ metadata:
     error|nftables:unrecognised_output, error|iptables:snapshot:failed,
     error|iptables:snapshot:absent, error|iptables:unrecognised_output,
     error|ip6tables:snapshot:failed, error|ip6tables:snapshot:absent or
-    error|ip6tables:unrecognised_output). inactive is answered only when all
-    three sections (nftables, legacy iptables, legacy ip6tables) were read and
-    none shows content, in two snapshots taken one after the other; a rule
-    count is written whenever all three were read.
+    error|ip6tables:unrecognised_output). Through the snapshot socket or
+    helper, inactive is answered only when all three sections (nftables,
+    legacy iptables, legacy ip6tables) were read and none shows content, in two
+    snapshots taken one after the other; a rule count is written whenever all
+    three sections of the answering snapshot were read and the netlink read did
+    not turn the state to unknown.
   tags: [security, firewall, compliance, network]
 
 spec:
@@ -116,8 +118,9 @@ spec:
           fd_exhausted for EMFILE/ENFILE on the nftables socket, or ufw:unrecognised_output / iptables:unrecognised_output
           for output that finished but is not in the expected shape; snapshot:<token> when the root snapshot socket
           could not be read (connect:eacces, connect:refused, connect:busy, connect:errno:<n>, peer_not_root, timeout,
-          io_error, oversized, empty, truncated or malformed); snapshot:helper:<token> when the root helper's
-          snapshot word run through sudo timed out, was clipped, was refused or failed (not_run, timeout, truncated, exit:<n>);
+          io_error, oversized, empty, truncated, malformed or gone); snapshot:helper:<token> when the
+          root helper's snapshot word run through sudo timed out, was clipped, was refused or failed
+          (not_run, timeout, truncated, exit:<n>);
           nftables:snapshot:failed, nftables:snapshot:absent, nftables:unrecognised_output, iptables:snapshot:failed,
           iptables:snapshot:absent, iptables:unrecognised_output, ip6tables:snapshot:failed,
           ip6tables:snapshot:absent or ip6tables:unrecognised_output for a snapshot section that was not read.
@@ -254,8 +257,8 @@ spec:
           first HRESULT, written before the ruleset row; Linux:
           snapshot:<token> when the root snapshot socket could not be read
           (connect:eacces, connect:refused, connect:busy, connect:errno:<n>,
-          peer_not_root, timeout, io_error, oversized, empty, truncated or
-          malformed), snapshot:helper:<token> when the root helper's snapshot
+          peer_not_root, timeout, io_error, oversized, empty, truncated,
+          malformed or gone), snapshot:helper:<token> when the root helper's snapshot
           word run through sudo timed out, was clipped, was refused or failed,
           nftables:snapshot:failed, nftables:snapshot:absent,
           nftables:unrecognised_output, iptables:snapshot:failed,

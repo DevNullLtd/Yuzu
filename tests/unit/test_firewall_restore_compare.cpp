@@ -429,7 +429,7 @@ TEST_CASE("Linux: a policy or a rule that changes in one table cannot hide behin
     CHECK_FALSE(moved.restored);
     CHECK(moved.gone == 1);
     CHECK(moved.added == 1);
-    // the `-S` form lists the filter table alone and is compared as before
+    // the `-S` form lists the filter table alone and is compared without table keys
     CHECK_FALSE(compare(Os::lin, lin_snapshot(kNftRuleset, kIpt, kIpt),
                         lin_snapshot(kNftRuleset, "-P INPUT DROP\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n", kIpt))
                     .restored);

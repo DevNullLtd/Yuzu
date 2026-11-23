@@ -5432,9 +5432,9 @@ test('issue lifecycle docs',
 # the host, and the broker script's own cases (argument refusal, standard input, the cap, one whole
 # reply) once under each; the script's functions are the helper's byte for byte, so the shell matrix of
 # their branches runs once, on the helper. That is thousands of short processes, so its budget is wider
-# than the source-text gates around it. Measured under sh, dash and bash: about 40 s on a developer Mac
-# at a load average of 3.7 (2026-11-23), about 60 s on one at a load average of 4.5, and about 9 s on
-# Ubuntu 26.04, where CI runs it. The 120 s budget stays.
+# than the source-text gates around it. Measured under sh, dash and bash on 2026-11-23: about 38 to
+# 46 s on a developer Mac at load averages between 2.7 and 3.8, and 8.4 s on Ubuntu 26.04 (134
+# cases), where CI runs it. The budget is 120 s.
 test('removed containment plugin lexical gate',
   _python3_test,
   args: [files('test_legacy_quarantine_plugin_removed_lexical.py')],

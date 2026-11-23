@@ -55,12 +55,12 @@ breaks any of them is outside this ADR and needs its own threat model.
    when the package is built. The client sends nothing, and bytes it does send are never read.
 3. **Fixed, read-only work.** The program is a root-owned file shipped by the package. It names
    each tool by its literal absolute path with literal arguments, under a reset `PATH` and locale,
-   and changes no ruleset, writes no file and takes no lock, and, for the tables the kernel lists,
-   loads no kernel module. It reads two
-   kernel rulesets, one reader each: the nf_tables ruleset with `/usr/sbin/nft -a list ruleset`,
-   and the legacy xtables tables of each address family with that family's legacy save tool under
-   its own name, `/usr/sbin/iptables-legacy-save` and `/usr/sbin/ip6tables-legacy-save`, run with
-   no argument, which list every instantiated table. The alternatives-selected `iptables` and
+   and changes no ruleset, writes no file and takes no lock. For the tables the kernel lists its
+   legacy reads load no kernel module; the two reads that can make the kernel load one are stated
+   at the end of this clause. It reads two kernel rulesets, one reader each: the nf_tables ruleset
+   with `/usr/sbin/nft -a list ruleset`, and the legacy xtables tables of each address family with
+   that family's legacy save tool under its own name, `/usr/sbin/iptables-legacy-save` and
+   `/usr/sbin/ip6tables-legacy-save`, run with no argument, which list every instantiated table. The alternatives-selected `iptables` and
    `ip6tables` are never run: on an nft-backed host they are the shim, whose listing repeats rules
    the nft section lists and says nothing of the legacy tables. Two decisions are made before a
    tool runs, from host state and never from input. If `/proc/net/dev` cannot be stat'ed, the
@@ -81,20 +81,31 @@ breaks any of them is outside this ADR and needs its own threat model.
    `ip6tables-save.c` at 1.8.2-4; one file serves both families from 1.8.7), and as measured on
    1.8.11 in the broker's sandbox. A release not named here is not covered by that statement. Release
    1.6.0 returns quietly on any failure, but it has no `-legacy-save` name, so the script never runs
-   it. A table that goes away between the kernel listing it and the tool reading it is the one case
-   in which a save tool asks for a module: `do_output` runs `xtables_load_ko`, which runs `modprobe`
-   for the family's core module and asks again, in every release read, and then fails. That
-   `modprobe` can load nothing in the broker's instance under `ProtectKernelModules` and runs as
-   root in the installer's helper, which has no such sandbox; the section is `[failed]`. One side
-   effect is measured and stays: an nft read on a host where nf_tables is not loaded makes the
-   kernel load nf_tables (an empty ruleset: no table, no rule). It cannot be avoided inside this
+   it. Two reads can make the kernel load a module, and both are measured. First, an nft read on a
+   host where nf_tables is not loaded makes the kernel load nf_tables (an empty ruleset: no table,
+   no rule). Second, a save tool that asks for a table whose module is not loaded makes the kernel
+   itself request and load that table's module, and the tool then lists the table the kernel has
+   just made, which is empty: measured on Ubuntu 26.04 ARM64 (kernel 7.0.0-43, iptables 1.8.11,
+   2026-11-23) with `iptables-legacy-save -t raw` while `iptable_raw` was not loaded, unconfined and
+   in an instance of the shipped unit. The request came from the kernel
+   (`xt_request_find_table_lock`), `modprobe` was started by a kernel worker and not by the tool,
+   the tool exited 0, and `ProtectKernelModules` did not stop the load: that directive bounds what a
+   process of the instance loads, not what the kernel loads on demand. The script's tools are run
+   with no argument and ask only for the tables the kernel has just listed (`for_each_table`), so
+   the second case is reached only when a table is removed between the kernel listing it and the
+   tool asking for it, which puts the tool in the measured position: the kernel loads the module
+   again and the section lists the table it then holds. Neither load can be avoided inside this
    contract: skipping nft needs proof that nf_tables is absent, and no existence test gives it on a
-   kernel that builds nf_tables in.
-4. **Bounded.** The output is cut at 4 MiB (4194304 bytes), which is the bound the plugin's netlink
-   leg already has for the same host ruleset (`kNftDumpMaxBytes`), so the plugin has one bound for
-   it; the instance has `RuntimeMaxSec` and `TasksMax`, the socket has `MaxConnections`, and the
-   client has its own deadline and the same size cap (the installer helper's run is capped at twice
-   that). A listing over the cap is cut and read as unknown, never as a shorter ruleset.
+   kernel that builds nf_tables in; and nothing the script can test closes the time between the
+   kernel's list and the tool's request.
+4. **Bounded.** The output is cut at 4 MiB (4194304 bytes), the same number as the cap on the
+   plugin's netlink dumps (`kNftDumpMaxBytes`); the two bound different encodings, this one the text
+   listing and that one the netlink dump, so a ruleset can fit one and not the other. The instance
+   has `RuntimeMaxSec` and `TasksMax`, the socket has `MaxConnections`, and the client has its own
+   deadline and the same size cap (the installer helper's run is capped at twice that). A listing
+   over the cap is cut and read as unknown, never as a shorter ruleset. Both snapshots of a read
+   that reaches `inactive` share the client's one 5 second deadline: a host on which they do not
+   fit reads `error|snapshot:timeout` and `unknown`, never `inactive`.
 5. **Authorisation is the socket.** Who may connect is the socket's owner, group and mode. That
    proves identity and not authenticity, so only data that is acceptable to disclose to the agent
    account may be served. What the firewall snapshot serves is the host's full nftables ruleset
@@ -117,7 +128,9 @@ breaks any of them is outside this ADR and needs its own threat model.
    decision: `active` when any READ section shows content; `unknown` when none does and a section
    is UNREAD; `inactive` when all three sections were READ and none shows content in two snapshots
    taken one after the other (the second is taken only when the first reads `inactive`, and its
-   answer is the answer), and then `unknown` again if the netlink read saw a table. A rule count is
+   answer is the answer; when the second snapshot cannot be taken or framed, or declines, the
+   answer is `unknown` with the row that says why, and no count), and then `unknown` again if the
+   netlink read saw a table. A rule count is
    written whenever all three sections of the answering snapshot were READ and the netlink read did
    not turn the state to `unknown`: the nft rules plus the `-A` rules of both legacy families.
    `inactive` therefore means that, twice in a row, the nf_tables ruleset (every family nft lists,
@@ -161,7 +174,8 @@ breaks any of them is outside this ADR and needs its own threat model.
    reply without it is incomplete.
 10. **A mutating helper is out of scope.** A helper whose work is to change host state (a
     containment, for example) needs its own threat model and its own ADR. The kernel loading
-    nf_tables on demand, which clause 3 records, is a side effect of a read, not work the helper does.
+    a module on demand, in the two cases clause 3 records, is a side effect of a read, not work the
+    helper does.
 
 ## What this discharges
 
@@ -197,10 +211,12 @@ breaks any of them is outside this ADR and needs its own threat model.
 - On a host the installer provisioned (no packaged socket), the plugin reads the same listing from the
   root helper's `snapshot` word through `sudo -n --`, a rung-3 site registered in the manifest
   (`firewall/try_snapshot#1`); a host with no helper file makes no sudo call and says nothing, and a
-  sudo that refuses, or a helper that times out, is clipped, does not accept the word or fails, is
+  sudo that refuses, or a helper that times out, is clipped or fails, is
   `error|snapshot:helper:<token>`. It is not an OS-activated helper
   and is outside this contract; it is recorded here only because it feeds the same parser, and the
-  descriptors' `fallback` field names it.
+  descriptors' `fallback` field names it. The helper has no connection limit: the agent's command
+  pool (4 to 32 workers) bounds how many helper runs are in flight, and the runner caps each run's
+  output at 8 MiB.
 - The agent account can now read the host's full nftables ruleset and the legacy iptables listings.
   That is the cost, and `docs/user-manual/security-hardening.md` says so.
 - The units need systemd 239 or later; the plugin README names the versions the lab measured.

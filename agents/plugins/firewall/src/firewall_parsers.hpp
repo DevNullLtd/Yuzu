@@ -1550,19 +1550,21 @@ struct IptablesSummary {
     int append_count = 0;
 };
 
+/// Sets `has_content` and `append_count` from `sum.entries`: a policy other than ACCEPT and every
+/// entry that is not a policy is content, and each append is one rule. It is the one place that
+/// rule is written, for the `-S` summary and the legacy save parser alike.
+inline void iptables_tally(IptablesSummary& sum) {
+    for (const auto& r : sum.entries) {
+        sum.has_content =
+            sum.has_content || r.type != IptablesEntryType::policy || r.spec != "ACCEPT";
+        sum.append_count += r.type == IptablesEntryType::append;
+    }
+}
+
 [[nodiscard]] inline IptablesSummary iptables_summary(std::string_view output) {
     IptablesSummary sum;
     sum.entries = parse_iptables_save(output);
-    for (const auto& r : sum.entries) {
-        if (r.type == IptablesEntryType::policy) {
-            if (r.spec != "ACCEPT")
-                sum.has_content = true;
-        } else {
-            sum.has_content = true;
-        }
-        if (r.type == IptablesEntryType::append)
-            ++sum.append_count;
-    }
+    iptables_tally(sum);
     sum.shaped = iptables_shape_ok(sum.entries);
     return sum;
 }
@@ -1591,22 +1593,25 @@ struct IptablesSummary {
 // (yuzu-fw-snapshot.sh, the same text as the root helper's `snapshot` word) and writes it to the
 // connection; the agent connects, sends nothing and reads to end of stream. Everything below is
 // pure: the framing, the whole-ruleset text parser, the legacy save-listing parser and the
-// decision. The reply is untrusted text from a socket: strict framing, fail closed, and never a
-// false-safe value. Three sections, three disjoint rulesets, one reader each: the nf_tables ruleset
-// (nft), and the legacy IPv4 and IPv6 xtables tables (the legacy save tools by name, or the kernel's
-// own table list when a family has no such tool). A section is READ when it vouches for its ruleset
-// and UNREAD otherwise. `inactive` is answered only when all three sections were read and none shows
-// content, in two snapshots taken one after the other; a rule count is written whenever all three
-// were read.
+// decision. The reply is untrusted text from a socket: strict framing, fail closed: a reply that
+// failed or was cut is never read as empty. Three sections, three disjoint rulesets, one reader
+// each: the nf_tables ruleset (nft), and the legacy IPv4 and IPv6 xtables tables (the legacy save
+// tools by name, or the kernel's own table list when a family has no such tool). A section is READ
+// when it vouches for its ruleset and UNREAD otherwise. `inactive` is answered only when all three
+// sections were read and none shows content, in two snapshots taken one after the other; a rule
+// count is written whenever all three sections of the answering snapshot were read and the netlink
+// read did not turn the state to unknown.
 
 inline constexpr std::string_view kFwSnapshotSocketPath = "/run/yuzu-fw-snapshot.sock";
 /// The script cuts its whole reply here (`head -c`), so a reply that is longer than this was not
-/// produced by it, and one cut at this size has no end line. It is the bound the netlink leg already
-/// has for the same host ruleset (kNftDumpMaxBytes), so the plugin has one bound for it: a ruleset
-/// whose listing is over this reads `error|snapshot:truncated` and unknown, never a shorter one.
+/// produced by it, and one cut at this size has no end line. It is the same number as the cap on
+/// the plugin's netlink dumps (kNftDumpMaxBytes). The two bound different encodings, this one the
+/// text listing and that one the netlink dump, so a ruleset can fit one and not the other: a
+/// ruleset whose listing is over this reads `error|snapshot:truncated` and unknown, never a shorter
+/// one.
 inline constexpr std::size_t kFwSnapshotMaxBytes = 4194304;
 static_assert(kFwSnapshotMaxBytes == kNftDumpMaxBytes,
-              "the broker reply cap is the netlink dump cap: one bound for a host ruleset");
+              "the broker reply cap is the same number as the netlink dump cap");
 inline constexpr std::string_view kFwSnapshotNftLabel = "nft -a list ruleset";
 inline constexpr std::string_view kFwSnapshotIptablesLabel = "iptables-legacy-save";
 inline constexpr std::string_view kFwSnapshotIp6tablesLabel = "ip6tables-legacy-save";
@@ -2030,19 +2035,18 @@ namespace detail {
 /// quotes a double quote opens, inside a backslash takes the next byte and a double quote closes. The
 /// tool writes a rule comment or log prefix raw between double quotes and escapes only the double
 /// quote, the backslash and the single quote, so a newline inside one leaves the first line open:
-/// the listing is unread, it does not become further lines.
+/// the listing is unread, it does not become further lines. Only what stands between double quotes
+/// is covered. A field outside them (an interface, chain or target name) is taken as it stands: a
+/// double quote there leaves the line open, so the listing is unread on every read until the name
+/// changes, and a newline there reads as a line break, which can add a line (a row and a count) and
+/// never removes one.
 [[nodiscard]] inline bool save_quotes_closed(std::string_view line) noexcept {
     bool quoted = false;
-    for (std::size_t i = 0; i < line.size(); ++i) {
-        if (quoted) {
-            if (line[i] == '\\')
-                ++i;
-            else if (line[i] == '"')
-                quoted = false;
-        } else if (line[i] == '"') {
-            quoted = true;
-        }
-    }
+    for (std::size_t i = 0; i < line.size(); ++i)
+        if (line[i] == '"')
+            quoted = !quoted;
+        else if (quoted && line[i] == '\\')
+            ++i;
     return !quoted;
 }
 
@@ -2065,8 +2069,9 @@ namespace detail {
 /// Parses an `iptables-legacy-save` / `ip6tables-legacy-save` listing into the entries the `-S` reads
 /// use (a `:<chain> <policy> [p:b]` line is a `policy` entry, or a `new_chain` entry when the policy
 /// is `-`, which marks a user-defined chain; an entry outside the filter table carries its table).
-/// It accepts only what `iptables-save` writes, and is nullopt for anything else, so an unshaped
-/// listing is never an empty summary that reads as no content:
+/// It accepts a subset of what `iptables-save` writes (the shape below, with the quote rule of
+/// detail::save_quotes_closed) and is nullopt for anything else, so an unshaped listing is never an
+/// empty summary that reads as no content:
 ///  1. a line that is empty or starts with `#` is skipped (a line of only blanks is not shaped);
 ///  2. `*<name>` opens a table when none is open and `<name>` is one of the five kernel table names
 ///     (filter, nat, mangle, raw, security) not opened before in this listing: a repeated table, or
@@ -2118,11 +2123,9 @@ namespace detail {
             entry.chain = std::string{line.substr(1, sp1 - 1)};
             if (policy == "-") {
                 entry.type = IptablesEntryType::new_chain;
-                out.has_content = true;
             } else {
                 entry.type = IptablesEntryType::policy;
                 entry.spec = std::string{policy};
-                out.has_content = out.has_content || policy != "ACCEPT";
             }
         } else if (line.starts_with("-A ")) {
             const auto rest = line.substr(3);
@@ -2132,8 +2135,6 @@ namespace detail {
             entry.type = IptablesEntryType::append;
             entry.chain = std::string{rest.substr(0, sp)};
             entry.spec = sp == std::string_view::npos ? std::string{} : std::string{rest.substr(sp + 1)};
-            out.has_content = true;
-            ++out.append_count;
         } else {
             return std::nullopt;
         }
@@ -2141,6 +2142,7 @@ namespace detail {
     }
     if (in_table)
         return std::nullopt; // cut inside a table
+    iptables_tally(out);
     return out;
 }
 
@@ -2379,7 +2381,9 @@ struct FirewalldZone {
 /// The row a failed read of the snapshot writes: `error|snapshot:<token>` for a read that failed on
 /// either transport, with the reader's token (a reply that fails the framing is `empty`, `truncated`
 /// or `malformed` whichever transport carried it), and `error|snapshot:helper:<token>` only when the
-/// installer helper's own run did not complete (helper_snapshot_outcome).
+/// installer helper's own run did not complete (helper_snapshot_outcome). `gone` is not a reader's
+/// token: linux_snapshot_rung writes it when the second read of a pair finds no transport after the
+/// first read found one.
 [[nodiscard]] inline std::string snapshot_error_row(std::string_view token) {
     return std::format("error|snapshot:{}", token);
 }
@@ -2388,8 +2392,8 @@ struct FirewalldZone {
 /// completed with exit 0, else `helper:<token>` with the token subprocess_failure_token gives
 /// (`not_run`, `timeout`, `truncated`, `exit:<n>`). The caller makes no sudo call at all on a host the
 /// installer did not provision (no helper file), so a sudo that refuses (exit 1) is a failed read of
-/// a provisioned transport, as is a helper that timed out, was clipped, or does not accept the word
-/// (it exits 64). None of them is read as "not provisioned".
+/// a provisioned transport, as is a helper that timed out, was clipped or exited with any other
+/// status. None of them is read as "not provisioned".
 [[nodiscard]] inline std::expected<std::string, std::string>
 helper_snapshot_outcome(const yuzu::agent::SubprocessResult& res) {
     const auto token = subprocess_failure_token(res);
@@ -2411,23 +2415,30 @@ struct LinuxSnapshotRung {
 /// answer is held: only an `active` answer is then accepted, and any other writes just its `error|`
 /// rows, so the refusals that explain what was not read are still reported.
 ///
-/// `inactive` is never answered from one snapshot. The three sections are read one after another and
-/// are three separate kernel rulesets, so a rule set that moves from one backend to another between
-/// two of the reads would be read as empty by the one snapshot that saw each side at the wrong time.
-/// When a snapshot would be accepted as `inactive` (all three sections READ, no content, not declined,
-/// not clamped to unknown, firewalld not held), the rung takes a second whole snapshot through the same
-/// transport, and the second answer is the answer whatever it is: `inactive` confirmed, `active`,
-/// `unknown` with its error rows, or a transport or framing error row and no answer. The six reads
-/// run in the order nft, IPv4, IPv6, nft, IPv4, IPv6, so for content to move from one ruleset to
-/// another unseen every read of the one must follow the move and every read of the other must
-/// precede it, which no pair of reads allows: every single move is seen. Two or more moves between
-/// rulesets inside one read can still be missed, and the count of an `active` answer is the sum of
-/// one pass, so a rule in motion can be counted twice or not at all (ADR-3007, clause 6). Only a host
-/// that reads `inactive` pays the second read, and the caller gives both reads one deadline.
+/// `inactive` is never answered from one snapshot. The three sections are read one after another
+/// and are three separate kernel rulesets, so a rule set that moves from one backend to another
+/// between two of the reads would be read as empty by the one snapshot that saw each side at the
+/// wrong time. When a snapshot would be accepted as `inactive` (all three sections READ, no
+/// content, not declined, not clamped to unknown, firewalld not held), the rung takes a second
+/// whole snapshot, and the second answer is the answer: `inactive` confirmed, `active`, or
+/// `unknown` with its error rows. The reader is asked again for each read (the socket, else the
+/// helper), so the second read can take the other transport. Once the first snapshot is accepted as
+/// `inactive` the rung owns the answer and the ladder never goes on to a narrower read: a second
+/// read that cannot be taken or framed, that finds no transport (`error|snapshot:gone`) or that
+/// declines is `unknown` with the row that says why, and no count, because the ufw rung and the
+/// `iptables -S` rung behind it read less and can print `inactive` for a host whose netlink read
+/// failed. A first read that fails, finds no transport, declines, is clamped or is not `inactive`,
+/// like a held firewalld, is one read and is answered or declined on its own. The six reads run in
+/// the order nft, IPv4, IPv6, nft, IPv4, IPv6, so for content to move from one ruleset to another
+/// unseen every read of the one must follow the move and every read of the other must precede it,
+/// which no pair of reads allows: every single move is seen. Two or more moves between rulesets
+/// inside one read can still be missed, and the count of an `active` answer is the sum of one pass,
+/// so a rule in motion can be counted twice or not at all (ADR-3007, clause 6). Only a host that
+/// reads `inactive` pays the second read, and the caller gives both reads one deadline.
 template <typename Reader>
 [[nodiscard]] LinuxSnapshotRung linux_snapshot_rung(Reader&& read, bool tables_seen, bool firewalld_held,
                                                     FwReadAction action) {
-    // The answer of one snapshot, or the row that says why there is none (empty: write nothing).
+    // The answer of one snapshot, or the row that says why there is none (empty: no transport).
     const auto one = [&]() -> std::expected<LinuxSnapshotAnswer, std::string> {
         const auto reply = read();
         if (!reply)
@@ -2438,10 +2449,24 @@ template <typename Reader>
         return linux_snapshot_answer(*snapshot, tables_seen, action);
     };
     auto answer = one();
-    if (answer && !answer->declined && !firewalld_held && answer->state == NftVerdict::inactive)
+    const bool confirm =
+        answer && !answer->declined && !firewalld_held && answer->state == NftVerdict::inactive;
+    if (confirm)
         answer = one();
 
     LinuxSnapshotRung rung;
+    if (confirm && (!answer || answer->declined)) {
+        rung.answered = true;
+        rung.rows = {"backend|nftables",
+                     action == FwReadAction::state ? "state|unknown" : "rules|unknown",
+                     "ruleset|unknown"};
+        if (answer) // a declined answer holds only the error rows that say what was not read
+            rung.rows.insert(rung.rows.end(), answer->rows.begin(), answer->rows.end());
+        else
+            rung.rows.push_back(answer.error().empty() ? snapshot_error_row("gone")
+                                                       : answer.error());
+        return rung;
+    }
     if (!answer) {
         if (!answer.error().empty())
             rung.rows.push_back(answer.error());

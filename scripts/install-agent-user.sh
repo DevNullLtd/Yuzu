@@ -603,8 +603,10 @@ EOF
 # provisioned with this build's installer. The helper also takes one read-only word, snapshot,
 # with no other argument: it prints the nft ruleset and the legacy iptables and ip6tables tables of
 # the host (at most 4 MiB), changes no ruleset and writes no file, so the agent account can read the
-# host ruleset through this same line. One side effect is measured: an nft read on a host where
-# nf_tables is not loaded makes the kernel load it.
+# host ruleset through this same line. Two reads can make the kernel load a module, both measured
+# (ADR-3007, clause 3): an nft read on a host where nf_tables is not loaded makes the kernel load
+# nf_tables, and a save tool that asks for a table whose module is not loaded makes the kernel load
+# that module.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 
 # firewall plugin — nftables containment (own table inet yuzu_quarantine). The ruleset is loaded
@@ -887,15 +889,15 @@ snap_one() {
 # its own name, with no argument. That tool lists every instantiated table; for the tables the
 # kernel lists it loads no kernel module, runs no modprobe and takes no lock. Empty output with exit
 # 0 is a family that holds no table, and a non-zero exit is a failure (`[failed]` through snap_one).
-# Two decisions are made here, before any tool runs, from host state and never from input. If /proc/net cannot be stat'ed the process
-# cannot see the kernel's tables at all, and a save tool reads a missing table list as no table, so
-# the section is `[failed]` and no tool is run. If the family has no save tool, nothing here can
-# list its tables; the kernel's own list of them is printed under `[tables]`, which is the names
-# file NAMES, present exactly while the family's core module is loaded. `[tables]` alone says the
-# family holds no table; `[tables]` and a name say tables exist that nothing listed, and the reader
-# treats them as unread. NAMES that cannot be stat'ed is read as no table (behind the /proc/net
-# check above, which rules out every cause at directory level); a name list that cannot be read is
-# `[failed]`. No file is created.
+# Two decisions are made here, before any tool runs, from host state and never from input. If
+# /proc/net cannot be stat'ed the process cannot see the kernel's tables at all, and a save tool
+# reads a missing table list as no table, so the section is `[failed]` and no tool is run. If the
+# family has no save tool, nothing here can list its tables; the kernel's own list of them is
+# printed under `[tables]`, which is the names file NAMES, present exactly while the family's core
+# module is loaded. `[tables]` alone says the family holds no table; `[tables]` and a name say
+# tables exist that nothing listed, and the reader treats them as unread. NAMES that cannot be
+# stat'ed is read as no table (behind the /proc/net check above, which rules out every cause at
+# directory level); a name list that cannot be read is `[failed]`. No file is created.
 snap_xt() {
     if [ ! -e /proc/net/dev ]; then
         printf '== %s\n\n[failed]\n' "$1"

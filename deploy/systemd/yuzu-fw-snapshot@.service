@@ -73,13 +73,12 @@ ProtectHome=true
 PrivateTmp=true
 # A minimal /dev without physical devices.
 PrivateDevices=true
-# Refuses explicit module loading and makes the module files unreachable. No read needs it: for the
-# tables the kernel lists, the legacy save tools load no module and the script runs no tool that
-# would. A table that goes away between the kernel listing it and the tool reading it makes the tool
-# run modprobe for the family's core module, which this directive leaves unable to load anything
-# (the section is then `[failed]`). It does not stop the kernel itself loading a module on demand
-# (an nft read on a host where nf_tables is not loaded makes it load nf_tables, measured; see the
-# plugin README).
+# Refuses explicit module loading by the instance's processes and makes the module files
+# unreachable. No read needs it: for the tables the kernel lists, the save tools load no module. It
+# does not stop the kernel loading a module on demand, which two reads can cause (ADR-3007, clause
+# 3; both measured on Ubuntu 26.04): an nft read on a host where nf_tables is not loaded loads
+# nf_tables, and a save tool that asks for a table whose module is not loaded (a table removed
+# between the kernel listing it and the tool asking for it) loads that module.
 ProtectKernelModules=true
 # Makes /proc/sys, /sys and similar kernel tunables read-only.
 ProtectKernelTunables=true

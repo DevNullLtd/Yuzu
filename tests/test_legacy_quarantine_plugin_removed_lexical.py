@@ -700,6 +700,8 @@ class SnapshotCase:
     PROC_DEV = "/proc/net/dev"
     NAMES = {XT4[1]: "/proc/net/ip_tables_names", XT6[1]: "/proc/net/ip6_tables_names"}
     CAP = 4194304
+    # a stub tool whose output is over the cap
+    BIG = "head -c %d /dev/zero | tr '\\000' 'a'\n" % (CAP + 100000)
     FILE_NAME = "yuzu-fw-helper"
     # the bodies map of a host with neither legacy save tool installed
     NO_SAVE_TOOLS = {XT4[1]: NOT_INSTALLED, XT6[1]: NOT_INSTALLED}
@@ -941,9 +943,8 @@ class SnapshotRuns(SnapshotCase, unittest.TestCase):
                 self.assertIsNone(re.search(shim, body), (name, shim))
 
     def test_a_listing_longer_than_the_cap_is_cut_and_has_no_end_line(self):
-        big = "head -c 4300000 /dev/zero | tr '\\000' 'a'\n"
         for shell in available_shells():
-            r = subprocess.run([shell, self.make_helper({self.NFT[1]: big}), "snapshot"],
+            r = subprocess.run([shell, self.make_helper({self.NFT[1]: self.BIG}), "snapshot"],
                                capture_output=True, timeout=60)
             self.assertEqual(r.returncode, 0, shell)
             self.assertEqual(len(r.stdout), self.CAP, shell)
@@ -1037,9 +1038,9 @@ class BrokerSnapshotScriptRuns(SnapshotCase, unittest.TestCase):
                     "== ip6tables-legacy-save\n[tables]\n== end\n"), shell)
 
     def test_a_listing_longer_than_the_cap_is_cut_and_has_no_end_line(self):
-        big = "head -c 4300000 /dev/zero | tr '\\000' 'a'\n"
         for shell in available_shells():
-            r = subprocess.run([shell, self.make_helper({self.NFT[1]: big})], capture_output=True, timeout=60)
+            r = subprocess.run([shell, self.make_helper({self.NFT[1]: self.BIG})],
+                               capture_output=True, timeout=60)
             self.assertEqual(r.returncode, 0, shell)
             self.assertEqual(len(r.stdout), self.CAP, shell)
             self.assertNotIn(b"== end", r.stdout, shell)
@@ -1089,7 +1090,7 @@ class BrokerSnapshotScriptRuns(SnapshotCase, unittest.TestCase):
             self.assertIn('"%s"' % marker, header, marker)
         self.assertNotIn("[unloaded]", header)
         self.assertIn('kFwSnapshotSocketPath = "/run/yuzu-fw-snapshot.sock"', header)
-        self.assertIn("kFwSnapshotMaxBytes = 4194304", header)
+        self.assertIn("kFwSnapshotMaxBytes = %d" % self.CAP, header)
 
 
 GOLDEN_RE = re.compile(r'kGoldenNftRuleset = R"NFTGOLDEN\((.*?)\)NFTGOLDEN";', re.S)
