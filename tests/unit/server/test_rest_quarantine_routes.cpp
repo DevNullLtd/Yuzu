@@ -64,7 +64,9 @@ yuzu::test::PgTestTemplate responsestore_route_tpl{"responsestore", [](const std
 
 // The DELETE route reads the device's reply for a bounded number of polls: no sleeping between
 // them, and a small budget, so a "no reply" case costs two reads and no wall time. Process-global
-// test seams (detail::live_poll_interval_ms / release_confirm_max_polls), restored on exit.
+// test seams (detail::live_poll_interval_ms / release_confirm_max_polls), restored on exit. The
+// wait itself is admitted by the shared held-open budget (`SseSurface::kLiveRead`), which each
+// harness owns as `live_budget`.
 struct ReleasePollSeams {
     int saved_interval{detail::live_poll_interval_ms().load()};
     int saved_polls{detail::release_confirm_max_polls().load()};
@@ -93,6 +95,9 @@ struct AuditCall {
 // with a real QuarantineStore and injectable auth / scoped-permission
 // behaviour.
 struct QuarantineRouteHarness {
+    // The held-open budget the DELETE route's reply wait leases from. Declared first so it
+    // outlives the route handlers that borrow it. A global cap of 0 refuses every lease.
+    yuzu::server::detail::StreamBudget live_budget;
     yuzu::server::test::TestRouteSink sink;
     RestApiV1 api;
 
@@ -193,8 +198,11 @@ struct QuarantineRouteHarness {
 
     explicit QuarantineRouteHarness(pg::PgPool& pool, bool wire_scope = true, bool wire_fleet = true,
                                     bool wire_authorize = true, ResponseStore* rstore = nullptr,
-                                    bool wire_dispatch = true)
-        : quarantine_store(pool), response_store(rstore) {
+                                    bool wire_dispatch = true,
+                                    std::size_t live_global_cap =
+                                        yuzu::server::detail::kTargetHeldOpenStreamsDefault)
+        : live_budget(yuzu::server::detail::StreamBudget::Config{.global_cap = live_global_cap}),
+          quarantine_store(pool), response_store(rstore) {
         REQUIRE(quarantine_store.is_open());
         api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
 
@@ -345,7 +353,7 @@ struct QuarantineRouteHarness {
                             /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
-                            /*stream_budget=*/nullptr, exec_visible_wired,
+                            &live_budget, exec_visible_wired,
                             /*list_read_fn=*/{}, fleet_fn,
                             /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
                             /*verify_api=*/nullptr, /*device_api=*/nullptr,
@@ -1424,22 +1432,62 @@ TEST_CASE("REST DELETE /api/v1/quarantine: a reply of inactive for a record anot
     CHECK(success->detail.find("ended_by=") == std::string::npos);
 }
 
-TEST_CASE("REST DELETE /api/v1/quarantine: with no in-flight slot the release is dispatched, nothing is "
+TEST_CASE("REST DELETE /api/v1/quarantine: with no held-open slot the release is dispatched, nothing is "
           "waited for, and the answer is 202",
           "[rest][quarantine][release][pg]") {
-    RELEASE_RIG(h, "status|inactive"); // a reply IS stored; it must not be read
-    struct CapGuard {
-        int saved{detail::live_max_inflight().load()};
-        CapGuard() { detail::live_max_inflight().store(0); }
-        ~CapGuard() { detail::live_max_inflight().store(saved); }
-    } cap;
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_route_tpl);
+    pg::PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+    ResponseStore rstore{rpool};
+    REQUIRE(rstore.is_open());
+    // A budget whose global cap is 0 refuses every lease: the wait has no slot.
+    QuarantineRouteHarness h(qpool, true, true, true, &rstore, /*wire_dispatch=*/true,
+                             /*live_global_cap=*/0);
+    h.release_reply = "status|inactive"; // a reply IS stored; it must not be read
+    REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", "10.0.0.1"));
     auto res = h.del("agent-B");
     REQUIRE(res);
-    CHECK(res->status == 202);
+    CHECK(res->status == 202); // never a 429: the record is already releasing
     CHECK(h.dispatch_calls.size() == 1);
     const auto rec = active_record(h.quarantine_store, "agent-B");
     REQUIRE(rec.has_value());
     CHECK(rec->status == "releasing");
+    CHECK(h.live_budget.active() == 0);
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: the reply wait holds a live-read lease keyed by the "
+          "operator, returned on every exit",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, ""); // no reply: the wait polls more than once
+    // Sample the lease from inside the wait: the pause hook runs before every poll after the first.
+    std::size_t during_total = 99;
+    std::size_t during_alice = 99;
+    detail::release_confirm_pause_hook() = [&h, &during_total, &during_alice] {
+        during_total = h.live_budget.active_for_surface(detail::SseSurface::kLiveRead);
+        during_alice = h.live_budget.active_for(detail::SseSurface::kLiveRead, "alice");
+    };
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(during_total == 1);
+    CHECK(during_alice == 1); // keyed by the session's operator
+    CHECK(h.live_budget.active() == 0);
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: an operator over the per-principal live-read cap is not "
+          "made to wait, and the answer is 202",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, "status|inactive");
+    // The operator already holds the per-principal share of live reads: no slot for the wait.
+    std::vector<detail::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < detail::kPerPrincipalLiveRead; ++i)
+        held.push_back(h.live_budget.try_acquire(detail::SseSurface::kLiveRead, "alice", 0).lease);
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls.size() == 1);
+    CHECK(h.live_budget.active_for(detail::SseSurface::kLiveRead, "alice") == held.size());
 }
 
 TEST_CASE("REST DELETE /api/v1/quarantine: with no dispatch or response store wired the answer is 202 "

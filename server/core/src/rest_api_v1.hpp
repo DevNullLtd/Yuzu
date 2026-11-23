@@ -110,12 +110,11 @@ namespace yuzu::server {
 
 namespace detail {
 // --- /api/v1/dex/devices/{id}/live tuning (TEST SEAM, not a request knob) ---
-// The synchronous live-read handler bounds its blast radius with an in-flight cap
-// (UP-1/2/3: keeps httplib workers free for the dashboard, SSE and health probes)
-// and a bounded poll. These default to production values; unit tests lower them to
-// exercise the 429 (cap) and 504 (timeout) branches without real concurrency or a
-// ~20s wall. Process-global by design — the cap is a whole-server budget.
-std::atomic<int>& live_max_inflight();     // default 4 (strictly below the worker pool)
+// The synchronous live-read handler bounds its blast radius with a bounded poll. The poll
+// budget defaults to its production value; unit tests lower it to exercise the 504 (timeout)
+// branch without a ~20s wall. The concurrency cap is not a seam: it is the `kLiveRead` surface of
+// the shared held-open `StreamBudget` (per principal `kPerPrincipalLiveRead`, across principals
+// `kLiveReadSurfaceCap`), so a test exercises it by passing a budget of its own.
 std::atomic<int>& live_poll_max_polls();   // default 40
 std::atomic<int>& live_poll_interval_ms(); // default 500
 // DELETE /api/v1/quarantine/{agent_id}: how many times (one per live_poll_interval_ms) the handler

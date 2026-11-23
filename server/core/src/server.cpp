@@ -1098,7 +1098,8 @@ public:
         metrics_.describe("yuzu_http_held_open_responses",
                           "Responses held open right now across ALL surfaces (MCP GET, "
                           "MCP streamed POST, /api/v1/events, dashboard drawer, legacy /events, "
-                          "synchronous workflow runs) - each pins one HTTP worker thread",
+                          "synchronous workflow runs, per-device live reads) - each pins one HTTP "
+                          "worker thread",
                           "gauge");
         metrics_.describe(yuzu::server::kWorkflowRunsInFlightMetric,
                           "Synchronous workflow runs holding an HTTP worker right now (REST v1 "

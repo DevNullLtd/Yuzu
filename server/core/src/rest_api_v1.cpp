@@ -33,7 +33,11 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_model.hpp" // the ONE live-read kind table + wire-format parsers (pure; #2146)
+#include "live_outcome.hpp" // LiveOutcome / LiveSurface / kind_label: the closed metric label vocabulary
+#include "live_read_poll.hpp" // poll_live_output: the shared response-store poll (REST and MCP)
 #include "live_result_json.hpp" // the ONE live `data` JSON builder shared with the MCP tool
+#include "live_zero_reach_outcome.hpp" // ZeroReachCause -> LiveOutcome (REST and MCP)
+#include "command_v1_routes.hpp" // command_v1::zero_reach_reply: the one zero-reach answer table
 #include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
@@ -712,48 +716,45 @@ static std::string reply_dispatch_denied(httplib::Response& res, const std::stri
     return token;
 }
 
-// Render a live plugin output into the JSON `data` object for the live route. The builder
-// (kind table lookup, row parsing, JSON) is the one shared with the MCP tool, in
-// live_result_json.hpp; the route has already resolved `kind` to a rest_v1 kind, so a
-// nullopt here cannot occur and renders as JSON null rather than a wrong shape.
-std::string live_result_json(const std::string& kind, const std::string& output) {
-    auto r = live::live_result_json(kind, output);
-    return r ? std::move(r->body) : std::string("null");
-}
-
-// Bound concurrent /api/v1/dex/devices/{id}/live polls (UP-1/2/3): each call pins
-// an httplib worker for up to ~20s, so an unbounded burst (or SSE pre-pressure)
-// would starve the dashboard, REST and the health probes. The cap is a whole-server
-// in-flight budget held strictly below the worker pool; over-budget callers get 429
-// + retry_after_ms instead of dispatching a command they can't wait for. RAII so
-// EVERY exit path (429/400/502/503/504/200) releases the slot — a leaked slot would
-// permanently shrink capacity. `acquired` records whether we were within budget.
-class LiveInflightGuard {
+// Mirrors the number of held per-device live reads (`SseSurface::kLiveRead` leases) into the
+// `yuzu_server_live_inflight` gauge. Declare it BEFORE the lease it reports on: locals are destroyed
+// in reverse order, so the lease is returned first and the destructor then publishes the count
+// WITHOUT it (a gauge read after the lease went out of scope, not before). `publish()` is called
+// once after a successful acquire. Both the gauge and the budget are borrowed and may be null.
+class LiveGaugeMirror {
 public:
-    // `gauge` (optional) mirrors the current in-flight depth for observability —
-    // updated to the live atomic value on acquire and release so an operator can see
-    // saturation approaching the cap (sre S1). Borrowed; the registry outlives the
-    // handler.
-    explicit LiveInflightGuard(yuzu::Gauge* gauge = nullptr) : gauge_(gauge) {
-        const int cap = detail::live_max_inflight().load(std::memory_order_relaxed);
-        acquired_ = inflight_.fetch_add(1, std::memory_order_acq_rel) < cap;
-        if (gauge_)
-            gauge_->set(inflight_.load(std::memory_order_relaxed));
+    LiveGaugeMirror(detail::StreamBudget* budget, yuzu::Gauge* gauge) noexcept
+        : budget_(budget), gauge_(gauge) {}
+    ~LiveGaugeMirror() { publish(); }
+    LiveGaugeMirror(const LiveGaugeMirror&) = delete;
+    LiveGaugeMirror& operator=(const LiveGaugeMirror&) = delete;
+
+    void publish() noexcept {
+        if (budget_ == nullptr || gauge_ == nullptr)
+            return;
+        try {
+            gauge_->set(static_cast<double>(budget_->active_for_surface(detail::SseSurface::kLiveRead)));
+        } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a request
+        }
     }
-    ~LiveInflightGuard() {
-        inflight_.fetch_sub(1, std::memory_order_acq_rel);
-        if (gauge_)
-            gauge_->set(inflight_.load(std::memory_order_relaxed));
-    }
-    LiveInflightGuard(const LiveInflightGuard&) = delete;
-    LiveInflightGuard& operator=(const LiveInflightGuard&) = delete;
-    bool acquired() const { return acquired_; }
 
 private:
-    yuzu::Gauge* gauge_{nullptr};
-    static inline std::atomic<int> inflight_{0};
-    bool acquired_{false};
+    detail::StreamBudget* budget_;
+    yuzu::Gauge* gauge_;
 };
+
+// Takes a `kLiveRead` lease: per principal `kPerPrincipalLiveRead`, across principals
+// `kLiveReadSurfaceCap`, both under the budget's one mutex. A null budget is the unmetered seam
+// (tests only); production always wires one.
+static detail::StreamBudget::AcquireResult acquire_live_read_lease(detail::StreamBudget* budget,
+                                                                   const std::string& principal) {
+    if (budget == nullptr)
+        return {};
+    return budget->try_acquire(detail::SseSurface::kLiveRead, principal,
+                               detail::kPerPrincipalLiveRead,
+                               detail::StreamBudget::Admission::kEnforceCaps,
+                               detail::kLiveReadSurfaceCap);
+}
 
 // A4 / event-envelope helpers move to `yuzu::server::detail` below —
 // declared in `rest_a4_envelope.hpp` so unit tests can assert the shape
@@ -2651,7 +2652,7 @@ const std::string& openapi_spec() {
       "get": {"operationId": "getDexDevicesById", "summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist, so the device's behavioural data is never served without durable evidence. A DEGRADED signal-summary read (store closed / pool-acquire timeout / query error) also 503s (retry_after_ms 2000, no Sec-Audit-Failed) rather than rendering a fabricated healthy 100 with no signals. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/DexDeviceScore"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable, the dex.device.view audit row could not persist (Sec-Audit-Failed: true), OR the DEX signal-summary store read degraded (retryable, retry_after_ms 2000).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/devices/{id}/live": {
-      "post": {"operationId": "postDexDevicesByIdLive", "summary": "Live device read (uptime / running processes)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read AND Execution:Execute, scoped to the device's management group. POST (not GET) because it DISPATCHES a read-only plugin instruction to the device NOW (a side effect; not cached heartbeat data) and returns the result as JSON — the machine-readable equivalent of the dashboard 'Get live info' panel. kind=uptime returns {kind, uptime_display, uptime_seconds}; kind=processes returns {kind, processes[].pid/name/sha256/path} (the SHA-256 is of each on-disk executable). SYNCHRONOUS: the call blocks until the device responds or times out (~20s). The request is audited per kind (device.live.uptime / device.live.processes) with result=requested BEFORE the command is dispatched; if the audit row cannot persist the request is rejected with 503 + Sec-Audit-Failed: true and NO command is dispatched (audit-on-open, fail-closed). Once the requested row is stored both scoped gates and the caller are decided again: a permission withdrawn in between answers the gate's own 403, writes a failure audit row with detail permission_revoked (or caller_unresolved when the caller no longer resolves; both are audit-detail tokens, not response fields) and dispatches nothing. A dispatch the chokepoint refuses for the caller answers a 403 whose error message is 'dispatch denied: reason=<token>' (500 when the token is unclassified or ambiguous, a server catalogue fault) with a failure audit row dispatch_denied reason=<token>, never a retryable offline 503. Concurrent live polls are capped server-wide (over-budget → 429); a slow device returns 504, an offline device 503, both with retry_after_ms. This is the INTERACTIVE, single-device probe — NOT the fleet-scale path. To read many devices at once, dispatch to a scope via the async execution surface and collect by execution_id; do NOT fan a synchronous /live call out across the fleet (the cap will reject it by design).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "kind", "in": "query", "required": true, "schema": {"type": "string", "enum": ["uptime", "processes"]}}], "responses": {"200": {"description": "Live result object (data.kind + uptime fields or processes[])", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/DexLiveResult"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "unknown kind"}, "401": {"description": "Not authenticated, or the caller no longer resolves after the requested audit row was written (the resolver's own refusal; audit detail caller_unresolved; nothing dispatched)"}, "403": {"description": "outside the caller's management scope, missing Execute, a scoped gate withdrawn after the requested audit row was written, or the dispatch chokepoint refused the pair (message dispatch denied: reason=<token>)"}, "429": {"description": "too many concurrent live queries; retry after retry_after_ms"}, "500": {"description": "scope gate not configured, or a server catalogue fault: the chokepoint reported the server-named pair as unclassified or ambiguous"}, "502": {"description": "the device reported an error or the query failed"}, "503": {"description": "device offline or live query unavailable"}, "504": {"description": "device did not respond in time"}}}
+      "post": {"operationId": "postDexDevicesByIdLive", "summary": "Live device read (uptime / running processes)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read AND Execution:Execute, scoped to the device's management group. POST (not GET) because it DISPATCHES a read-only plugin instruction to the device NOW (a side effect; not cached heartbeat data) and returns the result as JSON — the machine-readable equivalent of the dashboard 'Get live info' panel. kind=uptime returns {kind, uptime_display, uptime_seconds}; kind=processes returns {kind, processes[].pid/name/sha256/path} (the SHA-256 is of each on-disk executable). SYNCHRONOUS: the call blocks until the device responds or times out (~20s). The request is audited per kind (device.live.uptime / device.live.processes) with result=requested BEFORE the command is dispatched; if the audit row cannot persist the request is rejected with 503 + Sec-Audit-Failed: true and NO command is dispatched (audit-on-open, fail-closed). Once the requested row is stored both scoped gates and the caller are decided again: a permission withdrawn in between answers the gate's own 403, writes a failure audit row with detail permission_revoked (or caller_unresolved when the caller no longer resolves; both are audit-detail tokens, not response fields) and dispatches nothing. A dispatch the chokepoint refuses for the caller answers a 403 whose error message is 'dispatch denied: reason=<token>' (500 when the token is unclassified or ambiguous, a server catalogue fault) with a failure audit row dispatch_denied reason=<token>, never a retryable offline 503. Live reads are admitted against the shared held-open budget: at most 2 in flight per caller and 4 across all callers, and never beyond the server-wide held-open cap. Over budget answers 429 with a Retry-After header and retry_after_ms, writes no audit row and dispatches nothing; the error carries a reason of per_principal_stream_cap, surface_stream_cap or global_stream_cap. When the command reaches no device the error carries a reason that says why, and a failure audit row with detail reason=<token> is written: quarantined (409, the device is withheld by quarantine containment), plugin_not_found (422, the device does not report the plugin), kill_switched_os (403, the action is switched off for the device's OS), or, retryable with retry_after_ms, containment_unreadable, route_unreadable, os_gate_unreadable and no_agents_reached (503; the last is an offline device). A slow device returns 504 with retry_after_ms; a response store that could not be read returns 503 with retry_after_ms. This is the INTERACTIVE, single-device probe — NOT the fleet-scale path. To read many devices at once, dispatch to a scope via the async execution surface and collect by execution_id; do NOT fan a synchronous /live call out across the fleet (the cap will reject it by design).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "kind", "in": "query", "required": true, "schema": {"type": "string", "enum": ["uptime", "processes"]}}], "responses": {"200": {"description": "Live result object (data.kind + uptime fields or processes[])", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/DexLiveResult"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "unknown kind"}, "401": {"description": "Not authenticated, or the caller no longer resolves after the requested audit row was written (the resolver's own refusal; audit detail caller_unresolved; nothing dispatched)"}, "403": {"description": "outside the caller's management scope, missing Execute, a scoped gate withdrawn after the requested audit row was written, the dispatch chokepoint refused the pair (message dispatch denied: reason=<token>), or the action is switched off for the device's OS (reason kill_switched_os)"}, "409": {"description": "the device is withheld by quarantine containment (reason quarantined); nothing was sent and retrying alone will not help"}, "422": {"description": "the device does not report the plugin the read needs (reason plugin_not_found); nothing was sent and retrying alone will not help"}, "429": {"description": "too many concurrent live reads: per caller, across callers, or server-wide (reason per_principal_stream_cap, surface_stream_cap or global_stream_cap); retry after the Retry-After header and retry_after_ms; no audit row is written and nothing was dispatched"}, "500": {"description": "scope gate not configured, or a server catalogue fault: the chokepoint reported the server-named pair as unclassified or ambiguous"}, "502": {"description": "the device reported an error or the query failed"}, "503": {"description": "device offline or live query unavailable; the audit row could not be written (Sec-Audit-Failed: true, nothing dispatched); the response store could not be read; or a retryable zero-reach cause. The error carries a reason (containment_unreadable, route_unreadable, os_gate_unreadable or no_agents_reached) and retry_after_ms when the cause is known"}, "504": {"description": "device did not respond in time"}}}
     },
     "/dex/devices/{id}/app-perf": {
       "get": {"operationId": "getDexDevicesByIdAppPerf", "summary": "Per-device app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group. This device's retained daily per-app-version performance series: the 'over time, on THIS box' companion to the fleet trend GET /dex/perf/app. One row per (app, version, UTC day) over the retention window (up to 31 days): cpu_avg/cpu_max are share-of-capacity %, ws_avg_bytes/ws_max_bytes are working-set bytes, samples is the hourly-bucket count, instances_max the peak concurrent process count. No percentiles — a single device's daily averages ARE the series. Optional app query parameter narrows to one app name. Individual-identifying behavioral data, so every call emits a dex.device.app_perf.view audit event and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that row cannot persist. Covers only resource-significant app-versions (apps that were among the device's top CPU or memory consumers at some sample), NOT every installed app.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "app", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Exact app-name filter (optional)."}], "responses": {"200": {"description": "{data:{agent_id, app, rows[].{app_name, version, day, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes}}}", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/DexDeviceAppPerf"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable, the app-perf store read degraded, OR the dex.device.app_perf.view audit row could not persist (carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
@@ -3286,10 +3287,6 @@ std::string make_event_envelope(std::string_view execution_id,
 // --- /api/v1/dex/devices/{id}/live tuning (test seam; see rest_api_v1.hpp) ---
 // Meyers-singleton atomics: production reads the defaults; unit tests lower them to
 // exercise the 429 (cap) and 504 (timeout) branches deterministically.
-std::atomic<int>& live_max_inflight() {
-    static std::atomic<int> v{4};
-    return v;
-}
 std::atomic<int>& live_poll_max_polls() {
     static std::atomic<int> v{40};
     return v;
@@ -8501,7 +8498,7 @@ void RestApiV1::register_routes(
         R"(/api/v1/quarantine/(.+))",
         [auth_fn, scoped_perm_fn, audit_fn, quarantine_store, authorize_dispatch_fn,
          exec_visible_fn, metrics_registry, command_dispatch_fn, response_store, forensics_plugins,
-         audit_as_session = audit_as_session_fn_](const httplib::Request& req,
+         stream_budget, audit_as_session = audit_as_session_fn_](const httplib::Request& req,
                                                   httplib::Response& res) {
             // CDX-P1-02: authenticate first (401 before any store work). Every row below is
             // stamped from the session resolved here; see the POST route above.
@@ -8641,16 +8638,20 @@ void RestApiV1::register_routes(
             }
             std::optional<ContainmentReply> reply;
             if (sent > 0 && response_store) {
-                yuzu::Gauge* inflight_gauge =
-                    metrics_registry ? &metrics_registry->gauge("yuzu_server_live_inflight")
-                                     : nullptr;
-                // #7588(c), ruled keep: the wait leases a slot from the SAME whole-server budget
-                // as the live reads (LiveInflightGuard), because that budget is what bounds how
-                // many httplib workers any handler may pin, and a second budget for DELETE would
-                // raise that bound. A request over budget skips the wait and answers 202 (never
-                // 429): the record is already releasing and the reconciler finishes it.
-                LiveInflightGuard slot{inflight_gauge};
-                if (slot.acquired()) { // no slot: skip the wait (the cap is a whole-server budget)
+                // #7588(c), ruled keep: the wait leases a slot from the SAME held-open budget as
+                // the live reads (`SseSurface::kLiveRead`, keyed by the operator), because that
+                // budget is what bounds how many httplib workers any handler may pin, and a second
+                // budget for DELETE would raise that bound. A request over budget skips the wait
+                // and answers 202 (never 429): the record is already releasing and the reconciler
+                // finishes it. The mirror is declared before the lease so the gauge is published
+                // after the lease is returned. A null budget is the unmetered seam (tests only).
+                LiveGaugeMirror gauge_mirror{
+                    stream_budget, metrics_registry
+                                       ? &metrics_registry->gauge("yuzu_server_live_inflight")
+                                       : nullptr};
+                const auto admission = acquire_live_read_lease(stream_budget, session->username);
+                gauge_mirror.publish();
+                if (stream_budget == nullptr || admission.lease) { // no slot: skip the wait
                     const int max_polls =
                         detail::release_confirm_max_polls().load(std::memory_order_relaxed);
                     const auto interval = std::chrono::milliseconds(
@@ -19868,12 +19869,14 @@ void RestApiV1::register_routes(
     if (metrics_registry) {
         metrics_registry->describe(
             "yuzu_server_live_requests_total",
-            "Per-device live-read (/api/v1/dex/devices/{id}/live) requests by kind and terminal "
-            "HTTP status",
+            "Per-device live-read requests by surface (rest or mcp), kind (uptime, processes or "
+            "unknown) and outcome (a closed token set: ok, gate_refused, over_budget_principal, "
+            "over_budget_surface, over_budget_global, quarantined, timeout and so on)",
             "counter");
         metrics_registry->describe(
             "yuzu_server_live_inflight",
-            "Current in-flight synchronous live-read polls (bounded by the concurrency cap)",
+            "Current held per-device live reads (the live_read surface of the shared held-open "
+            "budget), across the REST route, the MCP tool and the quarantine release wait",
             "gauge");
     }
     // POST /dex/devices/{id}/live?kind=uptime|processes — live device read. Dispatches
@@ -19882,9 +19885,9 @@ void RestApiV1::register_routes(
     // NO other REST path (raw plugin actions are not dispatchable via /api/v1, and no
     // InstructionDefinition wraps processes/list_hashed). Scoped Read + Execute.
     // SYNCHRONOUS bounded poll: this handler blocks up to ~20s waiting for the agent;
-    // a slow/offline device returns 504/503 with retry_after_ms. POINTER-FREE poll —
-    // each iteration copies the fields it needs out of the freshly queried vector, so
-    // no pointer outlives the loop (the device-routes UAF class, avoided by design).
+    // a slow/offline device returns 504/503 with retry_after_ms. The poll itself (row
+    // reduction, the output cap, store-degrade versus timeout) is the one shared with the MCP
+    // twin, in live_read_poll.hpp, and reads scoped at the store seam.
     // POST (not GET): /live DISPATCHES a real command to the device — a side effect.
     // GET must stay safe/idempotent (prefetchers/proxies/retry libraries fire GETs
     // speculatively), and every other command-dispatch route on /api/v1 is POST
@@ -19892,33 +19895,38 @@ void RestApiV1::register_routes(
     sink.Post(
         R"(/api/v1/dex/devices/([^/]+)/live)",
         [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry,
-         resolve_secondary_caller, forensics_plugins](const httplib::Request& req,
-                                                      httplib::Response& res) {
+         resolve_secondary_caller, forensics_plugins, stream_budget](const httplib::Request& req,
+                                                                     httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             // Echo the correlation id on EVERY response path (A3), parity with the
             // read model above and /api/v1/events.
             res.set_header("X-Correlation-Id", cid);
             const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
-            // Count every live-read by kind + terminal HTTP status at handler exit
-            // (RAII, so all return paths — 200/400/403/429/500/502/503/504 — are
-            // covered without littering each branch). sre S1.
-            // The label is the closed set {uptime, processes, unknown} (docs/user-manual/metrics.md):
-            // `kind` is caller-chosen text, so an unresolved one is recorded as `unknown`, never as
-            // itself (one series per distinct string a caller sends).
             const auto lk = live::resolve_rest_kind(kind);
-            const std::string kind_label = lk ? kind : "unknown";
+            // Count every live read by surface, kind and outcome at handler exit (RAII, so every
+            // return path is covered without littering each branch). Every label value comes from
+            // live_outcome.hpp's closed vocabulary: `kind` is caller-chosen text and a kind this
+            // route does not serve is recorded as `unknown`, never as itself. The default is
+            // `internal` so a path that forgot to set the outcome (an exception) is still counted.
+            live::LiveOutcome outcome = live::LiveOutcome::kInternal;
             struct OutcomeRecorder {
                 yuzu::MetricsRegistry* reg;
-                const std::string& kind;
-                const httplib::Response& res;
+                std::string_view kind;
+                const live::LiveOutcome& outcome;
                 ~OutcomeRecorder() {
-                    if (reg)
+                    if (reg == nullptr)
+                        return;
+                    try {
                         reg->counter("yuzu_server_live_requests_total",
-                                     {{"kind", kind}, {"outcome", std::to_string(res.status)}})
+                                     {{"surface", std::string(live::to_token(live::LiveSurface::kRest))},
+                                      {"kind", std::string(kind)},
+                                      {"outcome", std::string(live::to_token(outcome))}})
                             .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch) observability must not fail a request
+                    }
                 }
-            } outcome{metrics_registry, kind_label, res};
+            } recorder{metrics_registry, live::kind_label(lk ? kind : std::string_view{}), outcome};
             std::string plugin, action, audit_action;
             if (lk) {
                 plugin = lk->plugin;
@@ -19928,19 +19936,22 @@ void RestApiV1::register_routes(
             // Per-device scope is mandatory — fail CLOSED if unwired (never widen to
             // the global gate). Scoped Read floor + Execute, before validate/dispatch.
             if (!scoped_perm_fn) {
+                outcome = live::LiveOutcome::kNotConfigured;
                 res.status = 500;
                 res.set_content(detail::error_json_a4(500, "scope gate not configured", cid),
                                 "application/json");
                 return;
             }
-            const auto gate = [&](const char* sec, const char* op) {
-                return scoped_perm_fn(req, res, sec, op, agent_id);
-            };
-            if (!gate("GuaranteedState", "Read"))
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id)) {
+                outcome = live::LiveOutcome::kGateRefused;
                 return;
-            if (!gate("Execution", "Execute"))
+            }
+            if (!scoped_perm_fn(req, res, "Execution", "Execute", agent_id)) {
+                outcome = live::LiveOutcome::kGateRefused;
                 return;
+            }
             if (plugin.empty()) {
+                outcome = live::LiveOutcome::kBadKind;
                 res.status = 400;
                 res.set_content(
                     detail::error_json_a4(400, "unknown kind (expected uptime|processes)", cid),
@@ -19948,37 +19959,52 @@ void RestApiV1::register_routes(
                 return;
             }
             if (!command_dispatch_fn || !response_store) {
+                outcome = live::LiveOutcome::kNotConfigured;
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "live device query unavailable", cid, 5000, ""),
                     "application/json");
                 return;
             }
-            // #1788 defense-in-depth, behind the per-device `gate(...)` above.
-            // Resolved HERE — after the dependency checks, but BEFORE the
-            // in-flight slot and before the audit "requested" row — so a failure
-            // cannot leave an audited request that never dispatched, and cannot
-            // consume a concurrency slot it will not use. (Doing it after the
-            // audit was the original shape and is the ordering defect this
-            // moves; the scope gate above has already answered 401, so this
-            // still cannot fail in practice and no status ordering shifts.)
-            // (The caller dispatched is re-derived below, after the `requested` row.)
-            if (!resolve_secondary_caller(req, res))
-                return;
-            // Concurrency cap (UP-1/2/3): acquire an in-flight slot BEFORE dispatch so
-            // an over-budget caller gets 429 without orphaning a command. RAII releases
-            // the slot on every return below; the gauge mirrors current depth.
-            yuzu::Gauge* inflight_gauge =
-                metrics_registry ? &metrics_registry->gauge("yuzu_server_live_inflight") : nullptr;
-            LiveInflightGuard slot{inflight_gauge};
-            if (!slot.acquired()) {
+            // #1788 defense-in-depth, behind the per-device scoped gates above. Resolved HERE,
+            // after the dependency checks and BEFORE the held-open lease and the audit
+            // "requested" row, so a failure cannot leave an audited request that never
+            // dispatched and cannot take a slot it will not use. The principal it names keys the
+            // lease. (The caller dispatched is re-derived below, after the `requested` row.)
+            const auto first_caller = resolve_secondary_caller(req, res);
+            if (!first_caller) {
+                outcome = live::LiveOutcome::kCallerUnresolved;
+                return; // the resolver wrote the refusal body
+            }
+            // Admission against the one held-open budget, after every refusal that needs no slot
+            // and BEFORE the `requested` row: an over-budget caller is answered 429 and leaves no
+            // audit row, and no command is dispatched. The mirror is declared before the lease so
+            // the gauge is published after the lease is returned, on every exit path.
+            LiveGaugeMirror gauge_mirror{
+                stream_budget,
+                metrics_registry ? &metrics_registry->gauge("yuzu_server_live_inflight") : nullptr};
+            auto admission = acquire_live_read_lease(stream_budget, first_caller->principal);
+            if (stream_budget != nullptr && !admission.lease) {
+                const std::string_view why = admission.reject_reason != nullptr
+                                                 ? std::string_view(admission.reject_reason)
+                                                 : std::string_view(detail::StreamBudget::kRejectGlobal);
+                outcome = why == detail::StreamBudget::kRejectPerPrincipal
+                              ? live::LiveOutcome::kOverBudgetPrincipal
+                          : why == detail::StreamBudget::kRejectSurface
+                              ? live::LiveOutcome::kOverBudgetSurface
+                              : live::LiveOutcome::kOverBudgetGlobal;
                 res.status = 429;
+                res.set_header("Retry-After", "2");
+                detail::A4ErrorOpts opts;
+                opts.retry_after_ms = 2000;
+                opts.remediation = "retry the request";
+                opts.reason = why;
                 res.set_content(detail::error_json_a4(
-                                    429, "too many concurrent live queries; retry shortly", cid,
-                                    2000, "retry the request"),
+                                    429, "too many concurrent live queries; retry shortly", cid, opts),
                                 "application/json");
                 return;
             }
+            gauge_mirror.publish();
             // Audit the REQUEST BEFORE the side-effect (audit-on-open / UP-8): the
             // works-council-relevant event is "the operator requested live data on this
             // device" — known here, before dispatch. FAIL-CLOSED: when the evidence row
@@ -19989,20 +20015,23 @@ void RestApiV1::register_routes(
             // reported by the response itself (503 below when none) — command_id is
             // minted by dispatch, so it surfaces in metrics / the response store, not
             // the pre-dispatch audit. A null audit_fn is test / audit-off, not a
-            // persistence failure, and dispatches per the AuditFn contract.
+            // persistence failure, and dispatches per the AuditFn contract. The helper
+            // sets `Sec-Audit-Failed` itself, and a sink that THROWS is the same
+            // failure (503), never an unhandled 500.
             // Usage-class read (processes) stays separately auditable from machine-
             // health (uptime) via the per-kind audit_action.
-            if (audit_fn && !audit_fn(req, audit_action, "requested", "Agent", agent_id,
-                                      "REST live " + plugin + "/" + action + " cid=" + cid)) {
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, audit_action, "requested", "Agent",
+                                               agent_id,
+                                               "REST live " + plugin + "/" + action + " cid=" + cid)) {
+                outcome = live::LiveOutcome::kAuditFailed;
                 res.status = 503;
-                res.set_header("Sec-Audit-Failed", "true");
                 res.set_content(
                     detail::error_json_a4(503, "audit subsystem unavailable; refusing to dispatch "
                                                "without durable evidence",
                                           cid, 5000, "retry the request"),
                     "application/json");
                 spdlog::warn("{} audit fail-closed (503, no dispatch) cid={} agent_id={}",
-                             audit_action, cid, agent_id);
+                             log_token(audit_action), cid, log_token(agent_id));
                 return;
             }
             // #7110: the `requested` row is stored, so decide both scoped gates AGAIN and
@@ -20017,13 +20046,16 @@ void RestApiV1::register_routes(
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, audit_action, "failure",
                                                     "Agent", agent_id, why + " cid=" + cid);
             };
-            if (!gate("GuaranteedState", "Read") || !gate("Execution", "Execute")) {
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id) ||
+                !scoped_perm_fn(req, res, "Execution", "Execute", agent_id)) {
+                outcome = live::LiveOutcome::kPermissionRevoked;
                 fail("permission_revoked");
                 return;
             }
             const auto caller = resolve_secondary_caller(req, res);
             if (!caller) {
                 // The resolver wrote the refusal body.
+                outcome = live::LiveOutcome::kCallerUnresolved;
                 fail("caller_unresolved");
                 return;
             }
@@ -20035,95 +20067,95 @@ void RestApiV1::register_routes(
             // route runs no pre-send dry run, so the chokepoint alone decides the pair's
             // `Inventory:Read`; the (plugin, action) pair comes from the server's own kind table,
             // so Unclassified / Ambiguous answers 500, not the caller's 400 (see
-            // reply_dispatch_denied). No metric beyond the per-status outcome count above.
+            // reply_dispatch_denied). It is read BEFORE the zero-reach classifier, which would
+            // otherwise answer the same refusal from its own table.
             if (dispatch_outcome.denied) {
+                outcome = live::LiveOutcome::kDispatchDenied;
                 const auto token =
                     reply_dispatch_denied(res, cid, *dispatch_outcome.denied, plugin, action);
                 fail("dispatch_denied reason=" + token);
                 return;
             }
             if (sent == 0) {
-                res.status = 503;
-                res.set_content(detail::error_json_a4(
-                                    503, "device offline — live info needs a connected agent", cid,
-                                    5000, ""),
+                // Nothing was sent: say WHY, from the one shared classifier (a quarantined device
+                // is not "offline", and a missing plugin is not retryable). The cause token rides
+                // in the A4 body as `reason`; retry_after_ms is present only for a retryable one.
+                const auto cause = classify_zero_reach(
+                    dispatch_outcome, yuzu::protective::is_protective_action(plugin, action));
+                const auto reply = command_v1::zero_reach_reply(
+                    cause, dispatch_outcome.scope_parse_error.value_or(std::string{}));
+                outcome = live::live_outcome_for(cause);
+                fail("reason=" + std::string(reply.reason));
+                res.status = reply.status;
+                detail::A4ErrorOpts opts;
+                opts.retry_after_ms = reply.retry_after_ms;
+                opts.remediation = reply.remediation;
+                opts.reason = reply.reason;
+                res.set_content(detail::error_json_a4(reply.status, reply.message, cid, opts),
                                 "application/json");
                 return;
             }
             // Bounded synchronous poll (~20s default; processes/list_hashed hashes each
-            // on-disk image, so allow generous time before a 504). Budget is a test
-            // seam (defaults in detail::live_poll_*).
-            const int max_polls = detail::live_poll_max_polls().load(std::memory_order_relaxed);
-            const auto interval =
-                std::chrono::milliseconds(detail::live_poll_interval_ms().load(std::memory_order_relaxed));
-            // Cap the device output we parse/return (UP-11) — a runaway/malicious agent
-            // must not make us hold + line-split a multi-MB blob in the worker.
-            constexpr std::size_t kMaxLiveOutputBytes = 4 * 1024 * 1024;
-            for (int i = 0; i < max_polls; ++i) {
-                if (i > 0)
-                    std::this_thread::sleep_for(interval); // query first; back off only on miss
-                std::string output, error_detail;
-                int terminal = -1;
-                bool have_output = false;
-                // Degrade → empty this iteration; the bounded poll loop retries
-                // (deny-or-benign, ADR-0039).
-                // #4990: this poll reads back a command this handler dispatched itself from the
-                // fixed live-snapshot kinds (device info plugins, none Forensics-tier), so the
-                // Forensics tier is excluded outright rather than derived from the caller.
-                const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins);
-                for (const auto& r : response_store->query(command_id, tier).value_or(std::vector<StoredResponse>{})) {
-                    if (r.agent_id != agent_id)
-                        continue; // never render another agent's row
-                    if (!r.output.empty()) {
-                        output = r.output;
-                        have_output = true;
-                    }
-                    if (r.status >= 1) {
-                        terminal = r.status;
-                        error_detail = r.error_detail;
-                    }
-                }
-                // FAILURE WINS (UP-4): a terminal-failure row must 502 even if a
-                // partial-output row is also present — otherwise a failed command with
-                // partial output returns a false 200.
-                if (terminal >= 2) {
-                    res.status = 502;
-                    res.set_content(
-                        detail::error_json_a4(502, "device query failed: " + error_detail.substr(0, 200),
-                                              cid),
-                        "application/json");
+            // on-disk image, so allow generous time before a 504). Budget is a test seam
+            // (defaults in detail::live_poll_*). REST refuses device output over 4 MiB (UP-11):
+            // a runaway or malicious agent must not make this worker hold and split a multi-MB
+            // blob.
+            live::LivePollLimits limits;
+            limits.max_polls = detail::live_poll_max_polls().load(std::memory_order_relaxed);
+            limits.interval = std::chrono::milliseconds(
+                detail::live_poll_interval_ms().load(std::memory_order_relaxed));
+            limits.max_output_bytes = 4u * 1024u * 1024u;
+            limits.over_cap = live::OverCapPolicy::kRefuse;
+            const auto polled = live::poll_live_output(*response_store, command_id, agent_id,
+                                                       forensics_plugins, limits);
+            outcome = polled.outcome;
+            switch (polled.outcome) {
+            case live::LiveOutcome::kOk: {
+                const auto rendered = live::live_result_json(kind, polled.output);
+                if (!rendered) { // unreachable: the kind was resolved to a rest_v1 kind above
+                    outcome = live::LiveOutcome::kInternal;
+                    res.status = 500;
+                    res.set_content(detail::error_json_a4(500, "live result could not be rendered", cid),
+                                    "application/json");
                     return;
                 }
-                if (have_output) {
-                    if (output.rfind("error|", 0) == 0) {
-                        res.status = 502;
-                        res.set_content(detail::error_json_a4(
-                                            502, "device reported an error: " + output.substr(6, 200),
-                                            cid),
-                                        "application/json");
-                        return;
-                    }
-                    if (output.size() > kMaxLiveOutputBytes) {
-                        res.status = 502;
-                        res.set_content(
-                            detail::error_json_a4(502, "device output too large", cid),
-                            "application/json");
-                        return;
-                    }
-                    res.set_content(ok_json(live_result_json(kind, output)), "application/json");
-                    return;
-                }
-                if (terminal == 1) {
-                    // success terminal, no output → empty result (not a false timeout)
-                    res.set_content(ok_json(live_result_json(kind, "")), "application/json");
-                    return;
-                }
+                res.set_content(ok_json(rendered->body), "application/json");
+                return;
             }
-            res.status = 504;
-            res.set_content(
-                detail::error_json_a4(504, "device did not respond in time", cid, 3000,
-                                      "retry the request"),
-                "application/json");
+            case live::LiveOutcome::kDeviceFailed:
+                res.status = 502;
+                res.set_content(
+                    detail::error_json_a4(502, "device query failed: " + polled.detail, cid),
+                    "application/json");
+                return;
+            case live::LiveOutcome::kDeviceError:
+                res.status = 502;
+                res.set_content(
+                    detail::error_json_a4(502, "device reported an error: " + polled.detail, cid),
+                    "application/json");
+                return;
+            case live::LiveOutcome::kOutputTooLarge:
+                res.status = 502;
+                res.set_content(detail::error_json_a4(502, "device output too large", cid),
+                                "application/json");
+                return;
+            case live::LiveOutcome::kStoreDegraded:
+                // Every read of the response store degraded: the device may well have answered,
+                // so this is retryable and is not the device's timeout.
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "response store read degraded", cid, 2000,
+                                                      "retry the request"),
+                                "application/json");
+                return;
+            default: // kTimeout (the only other value the poll returns)
+                outcome = live::LiveOutcome::kTimeout;
+                res.status = 504;
+                res.set_content(
+                    detail::error_json_a4(504, "device did not respond in time", cid, 3000,
+                                          "retry the request"),
+                    "application/json");
+                return;
+            }
         });
 
     // GET /dex/scope — per-OS signal coverage (how many distinct obs_types each

@@ -155,6 +155,10 @@ struct RestGsHarness {
     /// #7114: when set, the dispatch stub answers as the chokepoint does for a refused pair (sent 0,
     /// the denial on the outcome); `live_dispatches` counts the dispatches the route made.
     std::optional<yuzu::server::detail::DispatchDenial> live_denied;
+    /// A zero-reach shape: when set, the stub answers `sent == 0` with this applied to the outcome
+    /// (a quarantined, unknown-plugin or kill-switched target, or an unreadable gate), the way the
+    /// confined dispatch reports why nothing was sent.
+    std::function<void(yuzu::server::ConfinedDispatchOutcome&)> live_zero_reach;
     int live_dispatches{0};
     std::string last_live_plugin, last_live_action;
     /// #1788: the confinement set the /live handler derived and threaded into
@@ -263,6 +267,12 @@ struct RestGsHarness {
     // When false, the live deps (response_store + command_dispatch_fn) are left
     // unwired so a test can prove /live → 503 when the substrate is unavailable.
     bool wire_live_deps{true};
+
+    // The ONE held-open budget the /live route leases from (`SseSurface::kLiveRead`: per principal 2,
+    // across principals 4). Owned here, registered with the routes, so a test can pre-hold leases to
+    // reach each cap and read `active()` to prove a lease was returned. `live_global_cap` (a ctor
+    // argument) of 0 makes every acquire a global-cap rejection.
+    yuzu::server::detail::StreamBudget live_budget;
 
     // Per-device scoped-permission simulation for the baseline-anchored route.
     // scoped_deny_agent (when non-empty) is treated as OUT OF SCOPE → 403; every
@@ -434,8 +444,13 @@ struct RestGsHarness {
                            // handed to RestApiV1::set_csrf_trusted_origins BEFORE the routes
                            // register (a route captures the list by value); empty keeps the
                            // same-host-only behaviour every other test here relies on.
-                           std::vector<std::string> csrf_trusted_origins = {})
-        : wire_live_deps(live_deps), wire_exec_visible(with_exec_visible),
+                           std::vector<std::string> csrf_trusted_origins = {},
+                           // The global cap of `live_budget` (0: every acquire is refused).
+                           std::size_t live_global_cap =
+                               yuzu::server::detail::kTargetHeldOpenStreamsDefault)
+        : wire_live_deps(live_deps),
+          live_budget(yuzu::server::detail::StreamBudget::Config{.global_cap = live_global_cap}),
+          wire_exec_visible(with_exec_visible),
           wire_list_read_fn_(wire_list_read_fn), wire_dex_api_(wire_dex_api) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
@@ -484,6 +499,12 @@ struct RestGsHarness {
             last_live_exec_visible = caller.exec_visible;
             if (live_denied)
                 return {.command_id = plugin + "-live", .denied = live_denied};
+            if (live_zero_reach) {
+                yuzu::server::ConfinedDispatchOutcome o;
+                o.command_id = plugin + "-live";
+                live_zero_reach(o);
+                return o;
+            }
             // Model what the production seam does to the Ids arm rather than
             // ignoring the set the route just derived — otherwise this fake
             // reports a successful dispatch whatever confinement decided, which
@@ -787,7 +808,7 @@ struct RestGsHarness {
                             /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
-                            /*stream_budget=*/nullptr,
+                            &live_budget,
                             // #1788: by default a derivation that ANSWERS
                             // (nullopt = unfiltered), so this file's existing
                             // /live dispatch assertions keep their meaning;
@@ -4053,6 +4074,18 @@ TEST_CASE("REST dex/devices/{id}: out-of-scope device → 403, no data leak, no 
     CHECK(h.audit_log.empty()); // the scope gate runs BEFORE any audit emission
 }
 
+namespace {
+// The REST /live request counter for one {kind, outcome} pair. The surface label is always `rest`
+// here; the MCP tool counts under `mcp`. Reading creates the series at 0, which is fine for an
+// assertion on a count.
+double rest_live_count(RestGsHarness& h, const std::string& kind, const std::string& outcome) {
+    return h.metrics
+        .counter("yuzu_server_live_requests_total",
+                 {{"surface", "rest"}, {"kind", kind}, {"outcome", outcome}})
+        .value();
+}
+} // namespace
+
 // ── #1788 per-device dispatch confinement on /live ───────────────────────
 // The per-device `scoped_perm_fn` gate remains this route's PRIMARY
 // authorization; the derived VisibleSet is a SECOND, independent check at the
@@ -4207,12 +4240,8 @@ TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
     CHECK(h.last_live_plugin.empty()); // never dispatched
     // The metric label is the closed set: an unresolved kind is counted as `unknown`, never as
     // the caller's own text (one series per distinct string a caller sends).
-    CHECK(h.metrics
-              .counter("yuzu_server_live_requests_total", {{"kind", "unknown"}, {"outcome", "400"}})
-              .value() == 1.0);
-    CHECK(h.metrics
-              .counter("yuzu_server_live_requests_total", {{"kind", "bogus"}, {"outcome", "400"}})
-              .value() == 0.0);
+    CHECK(rest_live_count(h, "unknown", "bad_kind") == 1.0);
+    CHECK(rest_live_count(h, "bogus", "bad_kind") == 0.0);
 }
 
 // QE-1: a dashboard-only kind (a REAL row of the live kind table that the REST view does not
@@ -4232,13 +4261,9 @@ TEST_CASE("REST dex/devices/{id}/live: dashboard-only kind → 400, no dispatch,
         CHECK(res->status == 400);
         CHECK(h.last_live_plugin.empty()); // never dispatched
         // Not counted under its own name: the label set is {uptime, processes, unknown}.
-        CHECK(h.metrics
-                  .counter("yuzu_server_live_requests_total", {{"kind", kind}, {"outcome", "400"}})
-                  .value() == 0.0);
+        CHECK(rest_live_count(h, kind, "bad_kind") == 0.0);
     }
-    CHECK(h.metrics
-              .counter("yuzu_server_live_requests_total", {{"kind", "unknown"}, {"outcome", "400"}})
-              .value() == static_cast<double>(dashboard_only.size()));
+    CHECK(rest_live_count(h, "unknown", "bad_kind") == static_cast<double>(dashboard_only.size()));
     // Nothing was audited for a refused kind (no audit row without a dispatchable kind).
     for (const auto& a : h.audit_log)
         CHECK(a.action.rfind("device.live.", 0) != 0);
@@ -4277,6 +4302,7 @@ struct AtomicSave {
     AtomicSave(const AtomicSave&) = delete;
     AtomicSave& operator=(const AtomicSave&) = delete;
 };
+
 } // namespace
 
 
@@ -4369,19 +4395,6 @@ TEST_CASE("REST dex/devices/{id}/live: success terminal, no output → 200 empty
     CHECK(j["data"]["processes"].empty());
 }
 
-TEST_CASE("REST dex/devices/{id}/live: over the concurrency cap → 429, no dispatch",
-          "[pg][rest][dex][device][live]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    RestGsHarness h(true, true, true, true, &pool);
-    AtomicSave cap_save{yuzu::server::detail::live_max_inflight()};
-    yuzu::server::detail::live_max_inflight().store(0); // any call is over budget
-    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
-    REQUIRE(res);
-    CHECK(res->status == 429);
-    CHECK(h.last_live_plugin.empty()); // 429'd before dispatch — no command sent
-}
-
 TEST_CASE("REST dex/devices/{id}/live: agent never responds → 504",
           "[pg][rest][dex][device][live]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -4409,7 +4422,8 @@ TEST_CASE("REST dex/devices/{id}/live: GET is not routed (POST-only side effect)
     CHECK(h.last_live_plugin.empty()); // never dispatched
 }
 
-TEST_CASE("REST dex/devices/{id}/live: emits outcome counter + in-flight gauge",
+TEST_CASE("REST dex/devices/{id}/live: emits the {surface, kind, outcome} counter and the in-flight "
+          "gauge",
           "[pg][rest][dex][device][live][metrics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -4421,24 +4435,26 @@ TEST_CASE("REST dex/devices/{id}/live: emits outcome counter + in-flight gauge",
     r.output = "uptime_display|1d";
     h.resp_store->store(r);
 
+    // The gauge reads the live_read surface of the budget WHILE the request holds its lease: the
+    // `requested` audit write happens inside the lease, so sample it there.
+    double gauge_during = -1.0;
+    std::size_t budget_during = 99;
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested") {
+            gauge_during = h.metrics.gauge("yuzu_server_live_inflight").value();
+            budget_during =
+                h.live_budget.active_for_surface(yuzu::server::detail::SseSurface::kLiveRead);
+        }
+    };
     auto ok = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(ok);
     CHECK(ok->status == 200);
-    // One uptime/200 counted; the in-flight gauge returns to 0 after the call.
-    CHECK(h.metrics
-              .counter("yuzu_server_live_requests_total", {{"kind", "uptime"}, {"outcome", "200"}})
-              .value() == 1.0);
+    // One uptime/ok counted; the in-flight gauge was 1 inside the call and returns to 0 after it.
+    CHECK(rest_live_count(h, "uptime", "ok") == 1.0);
+    CHECK(budget_during == 1);
+    CHECK(gauge_during == 1.0);
     CHECK(h.metrics.gauge("yuzu_server_live_inflight").value() == 0.0);
-
-    // A 429 (cap exhausted) is counted under its own outcome label, no dispatch.
-    AtomicSave cap_save{yuzu::server::detail::live_max_inflight()};
-    yuzu::server::detail::live_max_inflight().store(0);
-    auto rej = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
-    REQUIRE(rej);
-    CHECK(rej->status == 429);
-    CHECK(h.metrics
-              .counter("yuzu_server_live_requests_total", {{"kind", "uptime"}, {"outcome", "429"}})
-              .value() == 1.0);
+    CHECK(h.live_budget.active() == 0);
 }
 
 // ── #1549 review hardening: audit-on-open fail-closed, A4 denials, headers ──
@@ -5184,6 +5200,398 @@ TEST_CASE("REST dex/devices/{id}/live: a chokepoint refusal is a dispatch_denied
             CHECK(h.audit_log[1].target_id == "WS-1");
             CHECK(h.audit_log[1].detail.find(std::string("dispatch_denied reason=") + c.token) == 0);
         }
+    }
+}
+
+// ── PR B: held-open admission, zero-reach causes, audit fail-closed, multi-row poll ───────────
+
+// Each admission cap answers 429 with its own reject reason, and a refusal dispatches nothing and
+// writes no audit row. The per-principal cap is 2 and the surface cap 4 (stream_budget.hpp); the
+// global cap is the budget's own, so a budget built with 0 refuses every acquire.
+TEST_CASE("REST dex/devices/{id}/live: each held-open cap answers 429 with its reject reason, no "
+          "dispatch, no audit row",
+          "[pg][rest][dex][device][live][stream]") {
+    using yuzu::server::detail::SseSurface;
+    using yuzu::server::detail::StreamBudget;
+    struct Case {
+        const char* name;
+        const char* reason;
+        const char* outcome;
+    };
+    const Case cases[] = {
+        {"per principal", "per_principal_stream_cap", "over_budget_principal"},
+        {"across principals (the surface cap)", "surface_stream_cap", "over_budget_surface"},
+        {"server-wide (the global cap)", "global_stream_cap", "over_budget_global"},
+    };
+    for (const auto& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            const bool global = std::string_view(c.reason) == "global_stream_cap";
+            RestGsHarness h(true, true, true, true, &pool, true, nullptr, true, {},
+                            global ? std::size_t{0}
+                                   : yuzu::server::detail::kTargetHeldOpenStreamsDefault);
+            // Pre-hold leases of another request's making (cap 0 here: this test is the one
+            // that sets the shape, the route's own caps are what is under test).
+            std::vector<StreamBudget::Lease> held;
+            if (std::string_view(c.reason) == "per_principal_stream_cap") {
+                for (std::size_t i = 0; i < yuzu::server::detail::kPerPrincipalLiveRead; ++i)
+                    held.push_back(
+                        h.live_budget.try_acquire(SseSurface::kLiveRead, h.session_user, 0).lease);
+            } else if (std::string_view(c.reason) == "surface_stream_cap") {
+                for (std::size_t i = 0; i < yuzu::server::detail::kLiveReadSurfaceCap; ++i)
+                    held.push_back(h.live_budget
+                                       .try_acquire(SseSurface::kLiveRead,
+                                                    "other-" + std::to_string(i), 0)
+                                       .lease);
+            }
+            for (const auto& l : held)
+                REQUIRE(static_cast<bool>(l));
+
+            auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+            REQUIRE(res);
+            CHECK(res->status == 429);
+            CHECK(res->get_header_value("Retry-After") == "2");
+            CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+            const auto j = nlohmann::json::parse(res->body);
+            CHECK(j["error"]["code"].get<int>() == 429);
+            CHECK(j["error"]["retry_after_ms"].get<int>() == 2000);
+            CHECK(j["error"]["reason"].get<std::string>() == c.reason);
+            CHECK(h.live_dispatches == 0); // refused before any command was sent
+            CHECK(h.audit_log.empty());    // and before the `requested` row
+            CHECK(rest_live_count(h, "uptime", c.outcome) == 1.0);
+            // Only the leases this test pre-held are still counted: the refused request holds none.
+            CHECK(h.live_budget.active_for_surface(SseSurface::kLiveRead) == held.size());
+        }
+    }
+}
+
+// A lease is taken for the request and returned on EVERY exit: the success, the device's failure,
+// the timeout, a refusal, an audit failure, a withdrawn grant, a dispatch the chokepoint refused
+// and an exception out of dispatch.
+TEST_CASE("REST dex/devices/{id}/live: the held-open lease is returned on every exit",
+          "[pg][rest][dex][device][live][stream]") {
+    struct Exit {
+        const char* name;
+        std::function<void(RestGsHarness&)> setup;
+        int status; // 0: the handler throws
+    };
+    const Exit exits[] = {
+        {"200 success",
+         [](RestGsHarness& h) {
+             StoredResponse r;
+             r.instruction_id = "os_info-live";
+             r.agent_id = "WS-1";
+             r.status = kStatusSuccess;
+             r.output = "uptime_display|1d";
+             h.resp_store->store(r);
+         },
+         200},
+        {"502 device failure",
+         [](RestGsHarness& h) {
+             StoredResponse r;
+             r.instruction_id = "os_info-live";
+             r.agent_id = "WS-1";
+             r.status = kStatusFailure;
+             r.error_detail = "agent aborted";
+             h.resp_store->store(r);
+         },
+         502},
+        {"504 timeout (no row)", [](RestGsHarness&) {}, 504},
+        {"503 offline", [](RestGsHarness& h) { h.live_sent = 0; }, 503},
+        {"503 audit sink refuses", [](RestGsHarness& h) { h.audit_succeeds = false; }, 503},
+        {"503 audit sink throws", [](RestGsHarness& h) { h.audit_throws = true; }, 503},
+        {"403 grant withdrawn inside the requested write",
+         [](RestGsHarness& h) {
+             h.on_audit = [&h](const std::string& result) {
+                 if (result == "requested")
+                     h.deny_scoped_op = "Execute";
+             };
+         },
+         403},
+        {"403 dispatch refused by the chokepoint",
+         [](RestGsHarness& h) {
+             using R = yuzu::server::detail::DispatchDenialReason;
+             h.live_denied = yuzu::server::detail::DispatchDenial{
+                 R::Forbidden, "Inventory", yuzu::server::authz::Operation::Read};
+         },
+         403},
+        {"exception out of dispatch",
+         [](RestGsHarness& h) {
+             h.live_zero_reach = [](yuzu::server::ConfinedDispatchOutcome&) {
+                 throw std::runtime_error("dispatch failed (test)");
+             };
+         },
+         0},
+    };
+    for (const auto& e : exits) {
+        DYNAMIC_SECTION(e.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
+            AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
+            yuzu::server::detail::live_poll_max_polls().store(2);
+            yuzu::server::detail::live_poll_interval_ms().store(1);
+            RestGsHarness h(true, true, true, true, &pool);
+            e.setup(h);
+            if (e.status == 0) {
+                CHECK_THROWS_AS(h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", ""),
+                                std::runtime_error);
+            } else {
+                auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+                REQUIRE(res);
+                CHECK(res->status == e.status);
+            }
+            CHECK(h.live_budget.active() == 0);
+            CHECK(h.metrics.gauge("yuzu_server_live_inflight").value() == 0.0);
+        }
+    }
+}
+
+// The dispatch classifier names WHY a read reached nobody: a quarantined device is not "offline",
+// a missing plugin is not retryable. Each cause answers its own status with the token as `reason`,
+// a retry hint only where a retry can help, a `failure` audit row after the `requested` row, and
+// its own outcome label.
+TEST_CASE("REST dex/devices/{id}/live: a zero-reach cause is named in the answer, the audit row and "
+          "the metric",
+          "[pg][rest][dex][device][live][7114]") {
+    struct Case {
+        const char* name;
+        std::function<void(yuzu::server::ConfinedDispatchOutcome&)> shape;
+        int status;
+        const char* token;
+        bool retryable;
+    };
+    const Case cases[] = {
+        {"quarantined is a permanent 409",
+         [](auto& o) { o.denied_quarantined_count = 1; }, 409, "quarantined", false},
+        {"plugin_not_found is a permanent 422",
+         [](auto& o) { o.unknown_plugin_count = 1; }, 422, "plugin_not_found", false},
+        {"kill_switched_os is a permanent 403",
+         [](auto& o) { o.kill_switched_os_count = 1; }, 403, "kill_switched_os", false},
+        {"containment_unreadable is a retryable 503",
+         [](auto& o) { o.containment_unreadable = true; }, 503, "containment_unreadable", true},
+        {"route_unreadable is a retryable 503",
+         [](auto& o) { o.route_unreadable = true; }, 503, "route_unreadable", true},
+        {"os_gate_unreadable is a retryable 503",
+         [](auto& o) { o.os_gate_unreadable = true; }, 503, "os_gate_unreadable", true},
+        {"nothing reached and no cause: the device is offline, a retryable 503",
+         [](auto&) {}, 503, "no_agents_reached", true},
+    };
+    for (const auto& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            RestGsHarness h(true, true, true, true, &pool);
+            h.live_zero_reach = c.shape;
+            auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+            REQUIRE(res);
+            CHECK(res->status == c.status);
+            const auto j = nlohmann::json::parse(res->body);
+            CHECK(j["error"]["reason"].get<std::string>() == c.token);
+            if (c.retryable)
+                CHECK(j["error"]["retry_after_ms"].get<int>() == 5000);
+            else
+                CHECK(j["error"]["retry_after_ms"].is_null());
+            CHECK(h.live_dispatches == 1);
+            REQUIRE(h.audit_log.size() == 2);
+            CHECK(h.audit_log[0].result == "requested");
+            CHECK(h.audit_log[1].action == "device.live.uptime");
+            CHECK(h.audit_log[1].result == "failure");
+            CHECK(h.audit_log[1].target_id == "WS-1");
+            CHECK(h.audit_log[1].detail.find(std::string("reason=") + c.token + " cid=") == 0);
+            CHECK(rest_live_count(h, "uptime", c.token == std::string("no_agents_reached")
+                                                   ? "unavailable"
+                                                   : c.token) == 1.0);
+            CHECK(h.live_budget.active() == 0);
+        }
+    }
+}
+
+// The classifier is told whether the dispatched (plugin, action) pair is protective: a protective
+// action is never answered as a missing plugin or a kill-switched OS. The live kinds are not
+// protective, so for them those causes apply. This pins that the route passes the pair it
+// dispatched (processes/list_hashed here), and that the audit verb follows the kind.
+TEST_CASE("REST dex/devices/{id}/live: the classifier reads the dispatched pair, so the live kinds "
+          "report plugin_not_found",
+          "[pg][rest][dex][device][live][7114]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    h.live_zero_reach = [](auto& o) { o.unknown_plugin_count = 1; };
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+    REQUIRE(res);
+    CHECK(res->status == 422);
+    CHECK(h.last_live_plugin == "processes");
+    CHECK(nlohmann::json::parse(res->body)["error"]["reason"].get<std::string>() ==
+          "plugin_not_found");
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].action == "device.live.processes");
+}
+
+// The `requested` row goes through the shared helper: a sink that THROWS is the same failure as one
+// that answers false (503 with Sec-Audit-Failed, nothing dispatched), never an unhandled 500.
+TEST_CASE("REST dex/devices/{id}/live: a throwing audit sink is 503 + Sec-Audit-Failed, not 500",
+          "[pg][rest][dex][device][live][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    h.audit_throws = true;
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.live_dispatches == 0);
+    CHECK(h.audit_log.empty());
+    CHECK(rest_live_count(h, "uptime", "audit_failed") == 1.0);
+    CHECK(h.live_budget.active() == 0);
+    // The header is set once, whatever the number of failed writes.
+    CHECK(res->get_header_value_count("Sec-Audit-Failed") == 1);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: an audit row that cannot persist is counted audit_failed",
+          "[pg][rest][dex][device][live][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    h.audit_succeeds = false;
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(rest_live_count(h, "processes", "audit_failed") == 1.0);
+}
+
+// The poll reads every row of the command for this device. A RUNNING row that carries output and a
+// later terminal failure row is a failure (the partial output must not answer a false 200).
+TEST_CASE("REST dex/devices/{id}/live: a RUNNING output row plus a terminal failure row is a 502",
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    StoredResponse running;
+    running.instruction_id = "os_info-live";
+    running.agent_id = "WS-1";
+    running.status = kStatusPending;
+    running.output = "uptime_display|2d 2h";
+    h.resp_store->store(running);
+    StoredResponse failed;
+    failed.instruction_id = "os_info-live";
+    failed.agent_id = "WS-1";
+    failed.status = kStatusFailure;
+    failed.error_detail = "agent aborted after partial output";
+    h.resp_store->store(failed);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 502);
+    const auto msg = nlohmann::json::parse(res->body)["error"]["message"].get<std::string>();
+    CHECK(msg.find("device query failed") != std::string::npos);
+    CHECK(msg.find("agent aborted after partial output") != std::string::npos);
+    CHECK(res->body.find("2d 2h") == std::string::npos); // the partial output is not served
+    CHECK(rest_live_count(h, "uptime", "device_failed") == 1.0);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: output spread over several rows is read whole, in order",
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    StoredResponse a;
+    a.instruction_id = "processes-live";
+    a.agent_id = "WS-1";
+    a.status = kStatusPending;
+    a.output = "proc|1|init||/sbin/init\n";
+    h.resp_store->store(a);
+    StoredResponse b;
+    b.instruction_id = "processes-live";
+    b.agent_id = "WS-1";
+    b.status = kStatusSuccess;
+    b.output = "proc|2|sh||/bin/sh";
+    h.resp_store->store(b);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["processes"].size() == 2);
+    CHECK(j["data"]["processes"][0]["pid"].get<int64_t>() == 1);
+    CHECK(j["data"]["processes"][1]["pid"].get<int64_t>() == 2);
+    CHECK(rest_live_count(h, "processes", "ok") == 1.0);
+}
+
+// The read is scoped to the target device AT THE STORE: a row of another device under the same
+// command id is never read, whatever it says. Here the other device's row is a failure and the
+// target's own is a success: the answer is the target's, and the other row's text is nowhere.
+TEST_CASE("REST dex/devices/{id}/live: another device's failure row under the same command is "
+          "never read",
+          "[pg][rest][dex][device][live][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    StoredResponse other;
+    other.instruction_id = "os_info-live";
+    other.agent_id = "OTHER";
+    other.status = kStatusFatal;
+    other.error_detail = "OTHER_AGENT_FAILURE_MARKER";
+    other.output = "uptime_display|OTHER_AGENT_OUTPUT_MARKER";
+    h.resp_store->store(other);
+    StoredResponse mine;
+    mine.instruction_id = "os_info-live";
+    mine.agent_id = "WS-1";
+    mine.status = kStatusSuccess;
+    mine.output = "uptime_display|3h";
+    h.resp_store->store(mine);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(nlohmann::json::parse(res->body)["data"]["uptime_display"].get<std::string>() == "3h");
+    CHECK(res->body.find("OTHER_AGENT") == std::string::npos);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a timeout and a device error are counted under their own "
+          "outcome labels",
+          "[pg][rest][dex][device][live][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
+    AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
+    yuzu::server::detail::live_poll_max_polls().store(2);
+    yuzu::server::detail::live_poll_interval_ms().store(1);
+    auto timed_out = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(timed_out);
+    CHECK(timed_out->status == 504);
+    CHECK(nlohmann::json::parse(timed_out->body)["error"]["retry_after_ms"].get<int>() == 3000);
+    CHECK(rest_live_count(h, "uptime", "timeout") == 1.0);
+
+    StoredResponse r;
+    r.instruction_id = "processes-live";
+    r.agent_id = "WS-1";
+    r.status = kStatusPending;
+    r.output = "error|disk subsystem offline";
+    h.resp_store->store(r);
+    auto errored = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+    REQUIRE(errored);
+    CHECK(errored->status == 502);
+    CHECK(rest_live_count(h, "processes", "device_error") == 1.0);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a refused gate and an unwired substrate are counted",
+          "[pg][rest][dex][device][live][metrics]") {
+    {
+        YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        RestGsHarness h(true, true, true, true, &pool);
+        h.deny_scoped_agent = "WS-9";
+        auto res = h.sink.Post("/api/v1/dex/devices/WS-9/live?kind=uptime", "");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(rest_live_count(h, "uptime", "gate_refused") == 1.0);
+    }
+    {
+        RestGsHarness h{/*live_deps=*/false};
+        auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(rest_live_count(h, "uptime", "not_configured") == 1.0);
     }
 }
 
