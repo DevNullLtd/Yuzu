@@ -294,8 +294,8 @@ out through `unrestricted_internal_consumer()` are frozen by
 dispatched itself from a fixed non-Forensics plugin (the pre-flight check collation, the quarantine
 containment poll, the `echo.fleet_snapshot` topology poll and the deployment collect), none of which returns raw rows
 to an operator. The server-side consumers that used to read the store unfiltered now apply the tier
-through a real filter: the policy evaluator excludes the Forensics plugins outright (such a check
-scores `unknown`), the result-set materializer does the same (and the result-set producers refuse
+through a real filter: the policy evaluator refuses a Forensics check at dispatch (every action of these plugins has an
+execute gate; the policy shows `blocked`) and excludes the Forensics plugins from its read outright, the result-set materializer does the same (and the result-set producers refuse
 such a command as a source), and bundle collation applies the caller's own decision
 (approval to dispatch a step does not imply reading its output; a step the caller may not read stays
 `pending` with an empty output; a collation that serves a Forensics-tier step's output writes the
@@ -337,8 +337,8 @@ defense in depth: it covers a row only while the execution's dispatch record (24
 (`ExecutionTracker::get_execution()` applies the same reduction as its siblings), and a failed record lookup reduces the
 text rather than showing it, with one warning per 60 seconds.
 
-**Not covered by this tier.** A separate follow-up (#6065) tracks the dispatch-side authorization of policy
-checks. A user holding only `ForensicsAnalyst` cannot dispatch: the `Execution:Execute` gate of
+**Not covered by this tier.** Policy evaluation refuses a Forensics-tier check at dispatch (see the policy dispatch
+entry in `docs/user-manual/upgrading.md`). A user holding only `ForensicsAnalyst` cannot dispatch: the `Execution:Execute` gate of
 `POST /api/command` refuses, and on the MCP `execute_instruction` tool at the supervised tier the
 approval step runs before the tool's own permission check (an ordering that already applied to any
 caller lacking that permission).

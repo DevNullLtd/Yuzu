@@ -4730,10 +4730,12 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). A collation that serves a Forensics-tier step's output also writes `response.forensics.read` with `surface=bundle` (see `response.forensics.read` in the [Audit log](audit-log.md) guide). |
-| `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
-| `policy.create` | Policy created via `POST /api/policies`. `result` = `success`. Detail (#2123) records the targeting **as stored**: `scope=<scope_expression>` (`-` when empty; cut to 1024 bytes, then `~` appended; the cut can fall inside a multi-byte character) and `groups=<n>` followed by `:<id>,<id>…` (at most 32 ids, then `,~`; each id cut to 64 bytes, then `~`), each value neutralised with `audit_token` (space, `=`, `,` and control bytes become `_`), e.g. `scope=ostype____"windows"_AND_EXISTS_tag:prod groups=1:abc123def456`. `scope=unreadable groups=unreadable` means the read-back after the write failed. A refused create (`400`/`503`) writes no row, and a policy installed from a product pack writes none (#7011). |
-| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
-| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
+| `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. The denied row's `target_id` is the `displayName`, name or id the submitted YAML carries (no policy or fragment exists yet). Denied detail values: `duplicate_name` (409, fragment with the same `name` already exists) and `reason=<token> instruction=<id>` (400, an instruction policy evaluation does not dispatch; see `POST /api/policy-fragments`). |
+| `policy.create` | Policy created via `POST /api/policies`. `result` = `success`. Detail (#2123) records the targeting **as stored**: `scope=<scope_expression>` (`-` when empty; cut to 1024 bytes, then `~` appended; the cut can fall inside a multi-byte character) and `groups=<n>` followed by `:<id>,<id>…` (at most 32 ids, then `,~`; each id cut to 64 bytes, then `~`), each value neutralised with `audit_token` (space, `=`, `,` and control bytes become `_`), e.g. `scope=ostype____"windows"_AND_EXISTS_tag:prod groups=1:abc123def456`. `scope=unreadable groups=unreadable` means the read-back after the write failed. A create refused because its fragment names an instruction policy evaluation does not dispatch (`400`) writes a `result=denied` row with detail `reason=<token> instruction=<id>` and a `target_id` of the `displayName`, name or id the submitted YAML carries (no policy exists yet); any other refused create (`400`/`503`) writes no row, and a policy installed from a product pack writes none (#7011). |
+| `policy.dispatch` | Written by the server (principal `system`) when policy evaluation refuses to dispatch a check, fix or post-fix check; `result=denied`. When it is written and when it can be lost: see the audit log manual. |
+| `policy.enable` | A policy enabled via `POST /api/policies/{id}/enable`. `result` ∈ {`success`, `denied`}. Denied detail is `reason=<token> instruction=<id>` (400, a fragment instruction policy evaluation does not dispatch). |
+| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `denied`, `error`}. Success detail format `execution_id=<id>`. A refused dispatch (the check names an action policy evaluation does not run) answers its own `409` and audits `result=denied` with `detail=reason=<token>`. Note: the other `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
+| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (`reason=<token>` when the fix names an action policy evaluation does not run, which answers `409`; or e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined (`attempt`, `success` or `failure`; `denied` when the dispatch approval check refuses the request, with `reason=<label> securable=<name>` in the detail, or when the request's two session look-ups named different principals, with `authenticated principal changed during the request now=<account>` in the detail) |
 | `quarantine.disable` | Device released from quarantine (`attempt`, `success` or `failure`; `denied` in the same two cases as `quarantine.enable`) |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. Also emitted by `POST /api/v1/ca/issue-code-signing` (gap-matrix #10) / MCP `issue_code_signing_cert`: `target_type=CodeSigningCertificate`, `target_id=<label>` on a rejected request or `<serial_hex>` on success, `detail` carries `purpose=code-signing`; `result=success`, `result=denied` (no CA root, or a bad/unparseable CSR), or `result=failure` (a genuine 5xx — key-load, signing, or `ca_store` write failure). |
@@ -5408,7 +5410,9 @@ Create a new policy fragment from YAML.
 
 **Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
 
-**Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body).
+**Response (400), refused instruction:** a fragment whose `check`, `fix` or `postCheck` instruction names an action policy evaluation will not dispatch (an execute gate, a destructive or reserved action, or one the server cannot classify) or has an approval mode other than `auto` is refused before it is stored. Body is the A4 error envelope, `{"error":{"code":400,"message":"instruction <id> names an action that policy evaluation does not dispatch (<reason>)","correlation_id":"<id>","retry_after_ms":null,"remediation":"policy_dispatch_refused: <reason>. ..."},"meta":{"api_version":"v1"}}`, with the same `X-Correlation-Id` header, where `<reason>` is `unclassified`, `ambiguous`, `gated`, `destructive`, `reserved`, `approval_required` or `dispatch_identifier_invalid` (`unwired` answers `503`, below). For `approval_required` the message reads `instruction <id> has an approval mode that policy evaluation does not dispatch (approval_required)`: the instruction's approval mode is not `auto`. Unlike the other `400`s on these routes, whose `error` is a string, the `error` of this one is an object, and its `remediation` starts `policy_dispatch_refused: ` followed by the reason; that is how a client tells it apart. Audit event `policy_fragment.create / denied`, detail `reason=<reason> instruction=<id>`. The check is advisory: an instruction that does not exist yet is accepted, and the dispatch check is the control.
+
+**Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body). Also `503` when the refused-instruction check cannot be answered, and the fragment is never accepted in that case. The body is the A4 error envelope with a correlation id. When the instruction store failed (a retry may clear it) the message is `instruction lookup unavailable, try again` and `retry_after_ms` is 5000; when the evaluator has no capability registry or instruction store (`unwired`, which no retry clears) the message is `instruction lookup unavailable` and `retry_after_ms` is `null`.
 
 ---
 
@@ -5527,7 +5531,9 @@ Create a new policy from YAML.
 
 **Response (400):** YAML missing required fields, unknown `fragment_id`, invalid scope expression, or an explicit `id` that is longer than 128 characters, holds a character other than letters, digits, `.`, `_` and `-`, or consists only of dots. Also `400` (#2123): a `spec.scope.selector.tags` or `managementGroups` list the server cannot read as written — an inline `[ ]` list that does not close on its own line, a `- item` line out of line with the list's other items (including one indented to `selector:`'s own column), a line missing its `- `, an item continued on the next line, an empty-string item, a single value where a list is expected, list lines written after a value on the key line (`tags: null` or `tags: [a]` followed by `- prod`), or a list followed directly by an outer list's next item — and a `managementGroups` entry that is not a management group id (ids are letters, digits and `_ . : * -`). The reason names the field and, except for a `- item` outside `selector:` (which names `spec.scope`), the entry. Body is `{"error": "<reason>"}`.
 
-**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body.
+**Response (400), refused instruction:** when the policy's fragment names an instruction policy evaluation will not dispatch, the create is refused with the same body as `POST /api/policy-fragments` (the A4 error envelope, `error.code` 400, a `message` of `instruction <id> names an action that policy evaluation does not dispatch (<reason>)` and a `remediation` starting `policy_dispatch_refused: <reason>`) and audited `policy.create / denied`, detail `reason=<reason> instruction=<id>`. A fragment that does not exist yet is left to the store's own check below.
+
+**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body. Also `503` when the refused-instruction check cannot be answered (the A4 error envelope: message `instruction lookup unavailable, try again` with `retry_after_ms` 5000 when the instruction store failed; message `instruction lookup unavailable` with `retry_after_ms` `null` for an unwired evaluator). The check is skipped, and the write goes ahead, when the fragment the policy names cannot be read at that moment (the dispatch check still applies at the policy's first dispatch).
 
 ---
 
@@ -5560,6 +5566,7 @@ Get policy detail including compliance summary.
     "unknown": 5,
     "fixing": 1,
     "error": 0,
+    "blocked": 0,
     "total": 51
   }
 }
@@ -5597,9 +5604,9 @@ Enable a previously disabled policy.
 }
 ```
 
-**Response (400):** `policy not found`. **Response (503):** a genuine internal
+**Response (400):** `policy not found`. **Response (400), refused instruction:** enabling is where a policy starts to run, so the same refused-instruction check runs here (a policy installed by a product pack was never checked at install); same body as `POST /api/policy-fragments`, audited `policy.enable / denied`, detail `reason=<reason> instruction=<id>`. **Response (503):** a genuine internal
 store failure on the write — safe to retry, internal error string never
-included in the body.
+included in the body; also `503` when the refused-instruction check cannot be answered (the A4 error envelope: message `instruction lookup unavailable, try again` with `retry_after_ms` 5000 when the instruction store failed; message `instruction lookup unavailable` with `retry_after_ms` `null` for an unwired evaluator). The check is skipped, and the write goes ahead, when the policy or its fragment cannot be read at that moment (the dispatch check still applies at the policy's first dispatch).
 
 ---
 
@@ -5669,7 +5676,7 @@ Force an immediate compliance evaluation of a policy, ignoring its interval. The
 server dispatches the bound fragment's `check` instruction to the policy's scope
 and, once responses arrive (within a short grace window), evaluates the CEL
 `check_compliance` per agent and writes `compliant` / `non_compliant` /
-`unknown` / `error` to each agent's status — which is what
+`unknown` / `error` (or `blocked`, see below) to each agent's status — which is what
 `GET /api/compliance` and `GET /api/policies/{id}` then report. Evaluation is
 asynchronous: this returns immediately with the dispatch `execution_id`; the
 verdicts appear a few seconds later.
@@ -5687,7 +5694,15 @@ verdicts appear a few seconds later.
 
 **Response (404):** policy not found. **Response (409):** the policy's fragment
 has no `check` instruction, the policy matches no agents, or a check for this
-policy is already in flight. **Response (503):** either the policy evaluator
+policy is already in flight; or the check names an action that policy evaluation
+does not run, or an instruction whose approval mode is not `auto` (a refused dispatch). The refused dispatch has its own error body,
+built like every other A4 error (`error.code` 409, `message` "policy dispatch
+refused", a `correlation_id`, and a `remediation` text that starts
+`policy_dispatch_refused: ` followed by the reason: `gated`, `destructive`,
+`reserved`, `unclassified`, `ambiguous`, `unwired`, `approval_required` or
+`dispatch_identifier_invalid`; the text tells the caller to change the instruction, except for
+`unwired`, where it says to try again later). Nothing was sent; the policy's devices are
+`blocked` and the attempt is audited as `policy.evaluate` `denied`. **Response (503):** either the policy evaluator
 isn't wired, a genuine internal store failure occurred while reading the policy
 or fragment, recording the dispatch claim, or (ADR-0058) resolving the check
 instruction against InstructionStore, **or (#4981 PR-1) the policy's scope
@@ -5749,7 +5764,10 @@ absent) releases its claim without consuming a retry attempt and is excluded
 from the count, so `agents` may be smaller than the number of `agent_ids`
 requested.
 
-**Response (404):** policy not found. **Response (409):** the fragment defines no
+**Response (404):** policy not found. **Response (409):** the fix names an action
+that policy evaluation does not run, or an instruction whose approval mode is not `auto` (a refused dispatch, with the same error body
+as `/evaluate` above; the targets become `blocked` and their claims are released;
+this is decided at dispatch, after the no-fix-instruction, no-agents and claim rejections below, which answer first), the fragment defines no
 `fix` instruction, there are no non-compliant agents to remediate, or a target
 could not be claimed — either it is already claimed for remediation (a durable
 per-`(policy, agent)` claim in `PolicyStore`, safe across replicas, HA WS-3
@@ -5824,6 +5842,7 @@ top-level fields (not nested under a `"policy"` key), A4-enveloped. MCP twin:
       "unknown": 5,
       "fixing": 1,
       "error": 0,
+      "blocked": 0,
       "total": 51
     }
   },
@@ -5855,7 +5874,8 @@ Fleet compliance summary across all active policies.
   "non_compliant": 8,
   "unknown": 5,
   "fixing": 2,
-  "error": 0
+  "error": 0,
+  "blocked": 0
 }
 ```
 
@@ -5881,6 +5901,7 @@ Per-policy compliance detail with per-agent statuses.
     "unknown": 5,
     "fixing": 1,
     "error": 0,
+    "blocked": 0,
     "total": 51
   },
   "agents": [
@@ -5894,6 +5915,8 @@ Per-policy compliance detail with per-agent statuses.
   ]
 }
 ```
+
+`blocked` counts devices whose check or fix policy evaluation refused to dispatch, because the instruction names an action with an execute gate, a destructive or reserved action, or one the server cannot classify, or has an approval mode other than `auto` (see "Action approval and the `blocked` status" in the policy engine manual). It counts as failing, nothing was sent, and the other routes in this section carry the same field. For a `blocked` device `check_result` is not agent output but a JSON string the server wrote: `{"action":"execute_staged","phase":"check","plugin":"content_dist","reason":"gated","result":"blocked"}` (keys in this order; `result` is always `blocked`). `phase` is `check`, `fix` or `verify`; `reason` is one of `unclassified`, `ambiguous`, `gated`, `destructive`, `reserved`, `unwired`, `approval_required` and `dispatch_identifier_invalid`; `plugin` and `action` are `null` when the refused pair was not a well formed identifier (the reason is then `dispatch_identifier_invalid`).
 
 **Response (503):** `policy store degraded`, on either the summary or the
 per-agent-status read.
@@ -5918,7 +5941,8 @@ MCP twin: `get_fleet_compliance`.
     "non_compliant": 8,
     "unknown": 5,
     "fixing": 2,
-    "error": 0
+    "error": 0,
+    "blocked": 0
   },
   "meta": { "api_version": "v1" }
 }
@@ -5953,6 +5977,7 @@ the store's unfiltered fleet-wide aggregate. MCP twin: `get_policy_agent_statuse
       "unknown": 5,
       "fixing": 1,
       "error": 0,
+      "blocked": 0,
       "total": 51
     },
     "agents": [
@@ -5985,11 +6010,12 @@ field rather than a header/status code.
 
 **Forensics-tier checks.** The one case where `check_result` is not the check's output: when
 the check instruction runs a Forensics-tier plugin (`app_usage`, `browser_inventory`,
-`execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), the agent's `status` is
-`unknown` and `check_result` is empty, because the evaluator does not read or store that plugin's
-output. `unknown` there says nothing about the device. Check output of such a policy is never
-stored. See "Forensics-tier rows" in the
-Command/Instruction Responses section.
+`execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), policy evaluation does not dispatch it: every action of these plugins has an execute gate, so the
+check is refused and the agent's `status` is `blocked` with a `check_result` of
+`{"phase":"check","result":"blocked","reason":"gated","plugin":...,"action":...}`. Check output of such a
+policy is never stored, and the evaluator would not read it if it were (a stored Forensics row is
+excluded from the evaluator's read). See "Forensics-tier rows" in the Command/Instruction Responses
+section.
 
 ---
 
@@ -8246,7 +8272,7 @@ browser sign-in does not), so expect denial rows from automation that polls stor
 The filter is per plugin, because only the `plugin` name is stored with a row, and it is a rule
 about these plugins' rows, not about a kind of data: other plugins can return comparable
 information under their own securables, and their stored rows stay under `Response:Read`. The same filter is applied to the
-server's own consumers of these rows: policy check output (such a policy scores `unknown`), result
+server's own consumers of these rows: policy check output (policy evaluation does not dispatch such a check, so the policy shows `blocked`; the filter excludes any stored row), result
 set membership (the set producers refuse such a command as a source, `RESULT_SET_SOURCE_NOT_SUPPORTED`) and the live output stream,
 which publishes no row of a Forensics-tier plugin on `GET /events`, `GET /sse/executions/{id}` or
 `GET /api/v1/events`. (Such a frame publishes nothing to the live output stream, not a row and not a notice, and
