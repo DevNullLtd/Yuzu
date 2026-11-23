@@ -2529,7 +2529,7 @@ AuthRoutes::MfaReserved AuthRoutes::mfa_budget_reserve(const std::string& userna
             m->counter("yuzu_auth_mfa_lockout_blocked_total").increment();
         return {MfaBudget::kLocked, false};
     }
-    return {MfaBudget::kOpen, r->just_locked};
+    return {MfaBudget::kOpen, r->just_locked, r->prev_attempt_at, r->this_attempt_at};
 }
 
 void AuthRoutes::mfa_budget_note_failure(const httplib::Request& req, const std::string& username,
@@ -2548,10 +2548,13 @@ void AuthRoutes::mfa_budget_note_failure(const httplib::Request& req, const std:
         m->counter("yuzu_auth_mfa_lockout_applied_total").increment();
 }
 
-void AuthRoutes::mfa_budget_refund(const std::string& username) {
+void AuthRoutes::mfa_budget_refund(const std::string& username, const MfaReserved& r) {
     if (auto* db = auth_mgr_.auth_db_ptr()) {
         // A failed refund errs toward counting (the reservation stays spent): logged, not fatal.
-        if (auto rf = db->refund_mfa_attempt(username, mfa_budget_threshold()); !rf)
+        AuthDB::MfaReservation given;
+        given.prev_attempt_at = r.prev_attempt_at;
+        given.this_attempt_at = r.this_attempt_at;
+        if (auto rf = db->refund_mfa_attempt(username, mfa_budget_threshold(), given); !rf)
             spdlog::warn("refund_mfa_attempt failed for '{}': error={} (attempt stays counted)",
                          username, static_cast<int>(rf.error()));
     }
@@ -3723,7 +3726,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         if (store_unavailable) {
-            mfa_budget_refund(entry.username); // an outage proved nothing: not a spent guess
+            mfa_budget_refund(entry.username, reservation); // an outage proved nothing: not a spent guess
             res.status = 503;
             res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
                             "application/json");
@@ -3747,7 +3750,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             mfa_budget_note_failure(req, entry.username, auth::role_to_string(entry.role),
                                     reservation);
         else
-            mfa_budget_refund(entry.username);
+            mfa_budget_refund(entry.username, reservation);
 
         if (!matched) {
             // Bump attempts counter and re-insert if still under the cap.
@@ -4439,7 +4442,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         if (store_unavailable) {
-            mfa_budget_refund(session->username); // an outage proved nothing
+            mfa_budget_refund(session->username, reservation); // an outage proved nothing
             res.status = 503;
             res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
                             "application/json");
@@ -4464,7 +4467,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             mfa_budget_note_failure(req, session->username, auth::role_to_string(session->role),
                                     reservation);
         else
-            mfa_budget_refund(session->username);
+            mfa_budget_refund(session->username, reservation);
 
         if (!matched) {
             res.status = 401;

@@ -1728,25 +1728,24 @@ AuthDB::reserve_mfa_attempt(const std::string& username, int threshold, int wind
     out.reserved = to_bool(col(res.get(), 0, 1));
     out.locked = to_bool(col(res.get(), 0, 2));
     out.just_locked = out.reserved && out.locked && out.failed_count == threshold;
+    out.prev_attempt_at = col_str(res.get(), 0, 3);
+    out.this_attempt_at = col_str(res.get(), 0, 4);
     return out;
 }
 
 std::expected<void, AuthDBError> AuthDB::refund_mfa_attempt(const std::string& username,
-                                                             int threshold) {
+                                                             int threshold,
+                                                             const MfaReservation& reservation) {
     if (!is_valid_username(username))
         return std::unexpected(AuthDBError::InvalidUsername);
     auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected(AuthDBError::StoreBusy);
-    // Give back exactly ONE reservation (never a reset: concurrent failures stay counted) and
-    // lift the lock only if the count falls back under the threshold.
+    // kRefundMfaAttemptSql: give back ONE reservation, and its timestamp while it is still ours.
     pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE auth.users SET mfa_failed_count = GREATEST(mfa_failed_count - 1, 0), "
-        "mfa_locked_until = CASE WHEN GREATEST(mfa_failed_count - 1, 0) < $1::int "
-        "    THEN NULL ELSE mfa_locked_until END "
-        "WHERE username = $2 AND is_active = TRUE",
-        std::vector<std::string>{std::to_string(threshold), username});
+        lease.get(), auth_sql::kRefundMfaAttemptSql,
+        std::vector<std::string>{std::to_string(threshold), username, reservation.this_attempt_at,
+                                 reservation.prev_attempt_at});
     if (res.status() != PGRES_COMMAND_OK)
         return std::unexpected(AuthDBError::WriteFailed);
     return {};
