@@ -487,7 +487,8 @@ the metrics reference — and writes a
 deduplicated against the audit store and bounded to one row per agent per 10
 minutes per server process (intermediate quarantines inside that window collapse
 to the newest identity; another HA node can add a second row for the same
-identity) — see the audit-log reference. Devices are not queued behind one
+identity; once the per-process table of 65,536 agents is full, an agent inside
+its window can be forgotten early and get a second row sooner) — see the audit-log reference. Devices are not queued behind one
 another, but at most 4 are admitted at a time: each holds one connection of the
 shared PostgreSQL pool (default 16) for its lookup and write, so a quarantine
 that hits many devices at once writes the rows over successive heartbeats while
