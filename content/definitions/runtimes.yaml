@@ -157,7 +157,7 @@ spec:
         platforms: [windows, darwin, linux]
       - name: flavour
         type: string
-        description: 'Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — Debian and SUSE OpenJDK release files have no IMAGE_TYPE, and a release-less home has no file at all; never guessed from the path). Status rows: the action name.'
+        description: 'Image kind. The IMAGE_TYPE key of the release file decides when it is present. Values: jdk, jre, unmodelled. Where the file has no IMAGE_TYPE, or on Linux there is no release file, the Linux leg reads the home''s bin directory by directory entry (nothing is run or followed): jdk when bin/javac is there, jre when only a java binary is; unmodelled when neither can be established, and on macOS and Windows whenever the file does not say. Never guessed from the path or a package name. Status rows: the action name.'
         values: [jdk, jre, unmodelled]
         example: jdk
         platforms: [windows, darwin, linux]
