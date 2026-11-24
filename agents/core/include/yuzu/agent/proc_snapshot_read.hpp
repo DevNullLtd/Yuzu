@@ -76,33 +76,58 @@ inline constexpr std::chrono::milliseconds kProcSnapshotDeadline{5000};
 
 /// The single-flight slot: free, busy (a healthy read in flight) or abandoned (a read past its
 /// deadline whose worker is still blocked). Pure and thread-free, like DismSlot.
+///
+/// Each acquisition carries a generation, so a late mark_abandoned from a caller whose worker has
+/// already released (and whose slot a NEW dispatch has since acquired) cannot land on that new,
+/// healthy read. The word packs the state in the low 2 bits and a 62-bit generation above it: at
+/// one acquisition per nanosecond the generation would take about 146 years to wrap, so wrap is
+/// not a practical concern and is not handled.
 class ProcSnapshotSlot {
 public:
     enum class Acquire { acquired, busy, abandoned };
+    struct Ticket {
+        Acquire result = Acquire::busy;
+        std::uint64_t generation = 0; ///< meaningful only when result == acquired
+    };
 
-    [[nodiscard]] Acquire try_acquire() noexcept {
-        int expected = kFree;
-        if (state_.compare_exchange_strong(expected, kBusy, std::memory_order_acquire,
-                                           std::memory_order_acquire))
-            return Acquire::acquired;
-        return expected == kAbandoned ? Acquire::abandoned : Acquire::busy;
+    [[nodiscard]] Ticket try_acquire() noexcept {
+        std::uint64_t w = word_.load(std::memory_order_acquire);
+        for (;;) {
+            if (state_of(w) != kFree)
+                return {state_of(w) == kAbandoned ? Acquire::abandoned : Acquire::busy, 0};
+            const std::uint64_t gen = (w >> kStateBits) + 1;
+            if (word_.compare_exchange_weak(w, (gen << kStateBits) | kBusy,
+                                            std::memory_order_acquire,
+                                            std::memory_order_acquire))
+                return {Acquire::acquired, gen};
+        }
     }
-    /// Called by the caller whose deadline fired. A CAS, not a store: a worker that finished at
-    /// the deadline has already released, and that release must not be undone.
-    void mark_abandoned() noexcept {
-        int expected = kBusy;
-        state_.compare_exchange_strong(expected, kAbandoned, std::memory_order_acq_rel,
-                                       std::memory_order_relaxed);
+    /// Called by the caller whose deadline fired, with the generation of ITS acquisition. A CAS on
+    /// (generation, busy): a worker that finished at the deadline has already released, and a
+    /// stale generation (the slot was released and re-acquired since) does nothing.
+    void mark_abandoned(std::uint64_t generation) noexcept {
+        std::uint64_t expected = (generation << kStateBits) | kBusy;
+        word_.compare_exchange_strong(expected, (generation << kStateBits) | kAbandoned,
+                                      std::memory_order_acq_rel, std::memory_order_relaxed);
     }
     /// Called by the worker when its read returns or throws (or by the caller when the worker
-    /// never ran).
-    void release() noexcept { state_.store(kFree, std::memory_order_release); }
+    /// never ran). Only the current owner calls it, so keeping the generation is race-free.
+    void release() noexcept {
+        std::uint64_t w = word_.load(std::memory_order_relaxed);
+        while (!word_.compare_exchange_weak(w, (w & ~kStateMask) | kFree,
+                                            std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+        }
+    }
 
 private:
-    static constexpr int kFree = 0;
-    static constexpr int kBusy = 1;
-    static constexpr int kAbandoned = 2;
-    std::atomic<int> state_{kFree};
+    static constexpr std::uint64_t kFree = 0;
+    static constexpr std::uint64_t kBusy = 1;
+    static constexpr std::uint64_t kAbandoned = 2;
+    static constexpr int kStateBits = 2;
+    static constexpr std::uint64_t kStateMask = 3;
+    static constexpr std::uint64_t state_of(std::uint64_t w) noexcept { return w & kStateMask; }
+    std::atomic<std::uint64_t> word_{0};
 };
 
 namespace detail {
@@ -116,7 +141,8 @@ ProcSnapshotResult bounded_proc_snapshot(ProcSnapshotSlot& slot, int pid,
                   "a throwing Reader move would escape with the slot held");
     ProcSnapshotResult out;
     // Admission first: a call during an in-flight read is Busy/Abandoned even with a spent budget.
-    switch (slot.try_acquire()) {
+    const auto ticket = slot.try_acquire();
+    switch (ticket.result) {
     case ProcSnapshotSlot::Acquire::acquired:
         break;
     case ProcSnapshotSlot::Acquire::busy:
@@ -148,7 +174,7 @@ ProcSnapshotResult bounded_proc_snapshot(ProcSnapshotSlot& slot, int pid,
     case yuzu::shared::BoundedCallStatus::TimedOut:
         // Also a throwing reader, which returns at once with no value. If the worker is still
         // running, mark it abandoned so the next dispatch is told so, not just "busy".
-        slot.mark_abandoned();
+        slot.mark_abandoned(ticket.generation);
         out.status = ProcSnapshotStatus::TimedOut;
         break;
     case yuzu::shared::BoundedCallStatus::Rejected:

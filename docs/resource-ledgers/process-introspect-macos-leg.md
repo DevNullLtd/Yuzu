@@ -30,7 +30,7 @@ early return, `bad_alloc` unwind) releases exactly the resource listed.
   long after the caller gave up. A Rejected admission (the worker never ran) is released by the
   caller.
 - **At the deadline:** the worker is abandoned, not cancelled (a blocked kernel call cannot be);
-  the slot is marked abandoned, so the next dispatch answers `abandoned_call_pending` and starts nothing (a dispatch that meets a healthy read answers `call_in_progress` instead).
+  the slot is marked abandoned (by generation, so a late mark cannot land on a later healthy read), so the next dispatch answers `abandoned_call_pending` and starts nothing (a dispatch that meets a healthy read answers `call_in_progress` instead).
   At most ONE such thread exists at a time. It runs only agent-core text, so unloading the plugin
   cannot unmap code under it.
 - **Transfer:** never.

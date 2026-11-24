@@ -19,6 +19,7 @@
 
 #include <yuzu/agent/proc_snapshot_read.hpp>
 
+#include "test_bounded_return.hpp"
 #include "test_helpers.hpp"
 
 #include <atomic>
@@ -181,9 +182,12 @@ TEST_CASE("a second dispatch during a healthy read is Busy, not Abandoned",
 
 TEST_CASE("a spent deadline starts nothing and leaves the slot free", "[proc_snapshot][agent]") {
     auto started = std::make_shared<std::atomic<int>>(0);
-    const auto r = read_proc_snapshot_bounded_for_test(1, 0ms, [started](int) {
-        ++*started;
-        return ProcSnapshot{};
+    yuzu::agent::ProcSnapshotResult r;
+    yuzu::test::must_return_within(10s, "bounded read, spent deadline", [&] {
+        r = read_proc_snapshot_bounded_for_test(1, 0ms, [started](int) {
+            ++*started;
+            return ProcSnapshot{};
+        });
     });
     CHECK(r.status == ProcSnapshotStatus::TimedOut);
     CHECK(started->load() == 0);
@@ -194,8 +198,12 @@ TEST_CASE("a spent deadline starts nothing and leaves the slot free", "[proc_sna
 
 TEST_CASE("a throwing reader answers TimedOut at once and frees the slot",
           "[proc_snapshot][agent]") {
-    const auto r = read_proc_snapshot_bounded_for_test(
-        1, 30000ms, [](int) -> ProcSnapshot { throw 1; });
+    // A throwing reader must return at once, far inside its 30 s deadline.
+    yuzu::agent::ProcSnapshotResult r;
+    yuzu::test::must_return_within(10s, "bounded read, throwing reader", [&] {
+        r = read_proc_snapshot_bounded_for_test(1, 30000ms,
+                                                [](int) -> ProcSnapshot { throw 1; });
+    });
     CHECK(r.status == ProcSnapshotStatus::TimedOut);
     // The worker's releaser has run or is about to: the slot becomes free, never Abandoned.
     ProcSnapshotStatus st = ProcSnapshotStatus::Busy;
@@ -237,6 +245,62 @@ TEST_CASE("a Rejected admission releases the slot", "[proc_snapshot][agent]") {
         slot, 1, 5000ms, [](int) { return ProcSnapshot{}; });
     CHECK(r.status == ProcSnapshotStatus::Rejected);
     // The worker never ran, so the caller released the slot: it is acquirable again.
-    CHECK(slot.try_acquire() == yuzu::agent::ProcSnapshotSlot::Acquire::acquired);
+    CHECK(slot.try_acquire().result == yuzu::agent::ProcSnapshotSlot::Acquire::acquired);
+    slot.release();
+}
+
+TEST_CASE("a stale mark_abandoned cannot land on a later healthy acquisition (ABA)",
+          "[proc_snapshot][agent]") {
+    using Slot = yuzu::agent::ProcSnapshotSlot;
+    Slot slot;
+    // Dispatch A acquires, its deadline fires, but the worker returns (releases) before the
+    // waiter wakes and calls mark_abandoned.
+    const auto a = slot.try_acquire();
+    REQUIRE(a.result == Slot::Acquire::acquired);
+    slot.release();
+    // Dispatch B acquires a healthy read.
+    const auto b = slot.try_acquire();
+    REQUIRE(b.result == Slot::Acquire::acquired);
+    CHECK(b.generation != a.generation);
+    // A's stale mark must do nothing: B is still a healthy Busy, not Abandoned.
+    slot.mark_abandoned(a.generation);
+    CHECK(slot.try_acquire().result == Slot::Acquire::busy);
+    // B's own deadline mark does land.
+    slot.mark_abandoned(b.generation);
+    CHECK(slot.try_acquire().result == Slot::Acquire::abandoned);
+    // The worker returns: free again, with a fresh generation.
+    slot.release();
+    const auto c = slot.try_acquire();
+    CHECK(c.result == Slot::Acquire::acquired);
+    CHECK(c.generation != b.generation);
+    slot.release();
+}
+
+TEST_CASE("the slot sequences free, busy, abandoned and release", "[proc_snapshot][agent]") {
+    using Slot = yuzu::agent::ProcSnapshotSlot;
+    Slot slot;
+    const auto t = slot.try_acquire();
+    REQUIRE(t.result == Slot::Acquire::acquired);
+    CHECK(slot.try_acquire().result == Slot::Acquire::busy);
+    slot.mark_abandoned(t.generation);
+    CHECK(slot.try_acquire().result == Slot::Acquire::abandoned);
+    // A mark on an already-free slot (the worker finished at the deadline) does nothing.
+    slot.release();
+    slot.mark_abandoned(t.generation);
+    const auto u = slot.try_acquire();
+    CHECK(u.result == Slot::Acquire::acquired);
+    slot.release();
+}
+
+TEST_CASE("a throwing reader unwinds through the releaser: never Abandoned afterwards",
+          "[proc_snapshot][agent]") {
+    static yuzu::agent::ProcSnapshotSlot slot; // outlives any worker
+    const auto r = yuzu::agent::detail::bounded_proc_snapshot(
+        slot, 1, 30000ms, [](int) -> ProcSnapshot { throw 1; });
+    CHECK(r.status == ProcSnapshotStatus::TimedOut);
+    // The releaser ran during the unwind, before the caller was woken, so the slot is free
+    // deterministically (no wait), and the caller's mark_abandoned was a no-op.
+    const auto t = slot.try_acquire();
+    CHECK(t.result == yuzu::agent::ProcSnapshotSlot::Acquire::acquired);
     slot.release();
 }
