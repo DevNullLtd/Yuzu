@@ -216,7 +216,9 @@ def selftest():
     near = "Registered with server (session_fp=ab12cd34)\n"
     assert not check_text("x.log", near + "ProxyRegister succeeded: agent=a, session=b"), \
         "selftest server line near"
-    assert check_text("x.log", near + "ProxyRegister failed: session=b"), "selftest exemption scope"
+    # Split, and off the assert line, so a failing assert's traceback carries no extractor.
+    other_proxy_line = near + "ProxyRegister failed: sess" + "ion=b"
+    assert check_text("x.log", other_proxy_line), "selftest exemption scope"
     # Windows-style path separators must not matter
     assert check_text("scripts\\x.sh".replace("\\", "/"), bad[0]), "selftest path"
     # The gate's own FAIL line, captured in a top-level log, must not trip the gate on the next run.
@@ -321,11 +323,11 @@ def selftest_unreadable(good_call):
             loop = None
             print("selftest: real ELOOP check skipped (cannot create a symlink here)",
                   file=sys.stderr)
-        if hasattr(os, "mkfifo"):
+        try:
             os.mkfifo(fifo)
-        else:
+        except (AttributeError, OSError):
             fifo = None
-            print("selftest: FIFO check skipped (no os.mkfifo here)", file=sys.stderr)
+            print("selftest: FIFO check skipped (cannot create a FIFO here)", file=sys.stderr)
         want = (1, ["loop.sh"]) if loop else (0, [])
         assert unread_paths() == want, ("selftest: real ELOOP / FIFO", unread_paths())
         for made in (loop, fifo):
