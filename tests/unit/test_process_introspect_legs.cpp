@@ -1167,6 +1167,36 @@ TEST_CASE("process_introspect macOS: the start_time guard", "[process_introspect
     }
 }
 
+TEST_CASE("process_introspect macOS: a bounded call that did not answer is never an empty ok",
+          "[process_introspect]") {
+    struct Case {
+        MacBsdInfo::Bound bound;
+        const char* cause;
+    };
+    const Case cases[] = {
+        {MacBsdInfo::Bound::deadline_exceeded, "deadline_exceeded"},
+        {MacBsdInfo::Bound::abandoned_pending, "abandoned_call_pending"},
+    };
+    for (const auto& c : cases) {
+        MacFake fk;
+        fk.info.bound = c.bound;
+        // Numbers a fake might still carry must not leak into an answer.
+        for (const std::string& st : {std::string{}, kMacToken}) {
+            const auto r = run_mac(fk, Facet::sched, st);
+            INFO(c.cause);
+            CHECK(r.status == StatusState::unavailable);
+            CHECK(r.reason == kMacTokPrefix + c.cause);
+            CHECK(r.rows.empty());
+        }
+        CHECK(fk.boot_calls == 0); // no identity was built
+    }
+    // The unsupported facets still answer before any read, so the bound never reaches them.
+    MacFake fk;
+    fk.info.bound = MacBsdInfo::Bound::deadline_exceeded;
+    CHECK(run_mac(fk, Facet::caps).status == StatusState::unsupported);
+    CHECK(fk.bsd_calls == 0);
+}
+
 TEST_CASE("process_introspect macOS: nice value edges", "[process_introspect]") {
     {
         MacFake fk;
@@ -1226,9 +1256,11 @@ TEST_CASE("process_introspect macOS: no fault ever reads as supported or torn", 
 }
 
 TEST_CASE("process_introspect macOS: MacBsdInfo carries numbers only", "[process_introspect]") {
-    // A fifth member (a process-name field, say) breaks this structured binding.
+    // A further member (a process-name field, say) breaks this structured binding. `bound` is an
+    // enum, not data from the target.
     MacBsdInfo b;
-    const auto& [err, start_sec, start_usec, nice] = b;
+    const auto& [err, start_sec, start_usec, nice, bound] = b;
+    static_assert(std::is_enum_v<decltype(MacBsdInfo::bound)>);
     static_assert(std::is_same_v<decltype(MacBsdInfo::err), int>);
     static_assert(std::is_same_v<decltype(MacBsdInfo::start_sec), std::uint64_t>);
     static_assert(std::is_same_v<decltype(MacBsdInfo::start_usec), std::uint64_t>);
@@ -1237,4 +1269,5 @@ TEST_CASE("process_introspect macOS: MacBsdInfo carries numbers only", "[process
     CHECK(start_sec == 0);
     CHECK(start_usec == 0);
     CHECK(nice == 0);
+    CHECK(bound == MacBsdInfo::Bound::answered);
 }

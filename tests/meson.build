@@ -549,6 +549,7 @@ agent_test_exe = executable(
     'unit/test_installed_apps_win_actions.cpp', # #4716: real installed_apps.dll `list` via LocalDispatcher (Windows-only; no-op TU elsewhere via #ifdef _WIN32)
     'unit/test_installed_apps_registry_walk.cpp', # #4711: Uninstall-hive walk against a process-suffixed scratch key: ok/absent/failed/mixed (Windows-only; no-op TU elsewhere)
     'unit/test_bundle_id_read.cpp',            # #4710: agent-core bounded bundle-id pass driver (portable; the CF reader is injected)
+    'unit/test_proc_snapshot_read.cpp',        # SRE-1: agent-core bounded libproc snapshot driver (portable; the reader is injected)
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (macOS and Windows, self-gated)
     'unit/test_msi_packages_inventory.cpp',   # pure list_inventory builder over the committed Kingsley REAL CAPTURE (fixture via YUZU_TEST_FIXTURE_DIR; runs on every OS)

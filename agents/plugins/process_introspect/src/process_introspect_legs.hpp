@@ -424,9 +424,17 @@ struct MacBsdInfo {
     std::uint64_t start_sec = 0;
     std::uint64_t start_usec = 0;
     std::int32_t nice = 0;
+    /// Whether the bounded call produced an answer. Anything but `answered` carries no numbers.
+    enum class Bound {
+        answered,          ///< the call returned within the deadline (err may still be set)
+        deadline_exceeded, ///< no answer arrived: deadline hit, or the call could not be started
+        abandoned_pending, ///< an earlier call is still blocked in the kernel; none was started
+    };
+    Bound bound = Bound::answered;
 };
 
-/// The injected libproc / sysctl boundary. `bsdinfo` is called at most ONCE per decision.
+/// The injected libproc / sysctl boundary. `bsdinfo` is called at most ONCE per decision and is
+/// bounded by a deadline in the shell (an owned worker in agent-core), never here.
 struct MacSource {
     std::function<MacBsdInfo()> bsdinfo;
     std::function<RawRead()> boot_session; ///< kern.bootsessionuuid
@@ -454,6 +462,12 @@ struct MacSource {
                           {}};
 
     const MacBsdInfo b = src.bsdinfo();
+    // A bounded call that did not answer is never an empty success and never `supported`: the
+    // named token says which, and the status is the same `unavailable` as every identity refusal.
+    if (b.bound == MacBsdInfo::Bound::deadline_exceeded)
+        return refuse(StatusState::unavailable, "deadline_exceeded", kMacTok);
+    if (b.bound == MacBsdInfo::Bound::abandoned_pending)
+        return refuse(StatusState::unavailable, "abandoned_call_pending", kMacTok);
     switch (classify_macos_errno(b.err)) {
     case ReadState::ok:
         break;

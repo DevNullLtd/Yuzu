@@ -46,6 +46,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "process of another account answers permission_denied unless the agent runs as root "
          "(root not measured); for sched, a supplied start_time that no longer matches is refused "
          "as pid_reused (the other five facets are answered before any read and never check it); "
+         "the libproc call has a 5 second deadline: no answer reads deadline_exceeded, and while "
+         "that call is still blocked in the kernel the next dispatch reads abandoned_call_pending "
+         "instead of starting another; "
          "the start time survives an exec, so the token does not tell a program from the one it "
          "exec'd into"},
         /* .windows_leg = */
