@@ -1140,8 +1140,8 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   packages the scanner cannot see.
   The one exception to a freshness refusal is a reviewed provider waiver in `.grypeignore.yaml`
   (at most 14 days), which admits one named grype DB provider whose capture is older than 72
-  hours; every image judged with it says `DEGRADED: provider waiver in force` in its grype
-  `.gate.txt` (sample with `grep -H '^DEGRADED:' grype-*.attempt-*.gate.txt`). The push carries no release tag (the agent bundle's carries a
+  hours; every image that passes under it says `DEGRADED: provider waiver in force` in its grype
+  `.gate.txt` (sample with `grep -H -e '^gate:' -e '^provider waiver:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt`; only the highest attempt whose journal ends `publish: tagged` counts). The push carries no release tag (the agent bundle's carries a
   `:candidate-<run>-<N>` tag, never a release tag); the tags move only after the
   pushed digest is verified to be the scanned image, signed and attested, and a write-ahead publish
   journal (`publish-<image>.attempt-<N>.txt`) records each step before it runs. What is kept: every
