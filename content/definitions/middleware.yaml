@@ -12,7 +12,7 @@
 ##   Windows ibm_mq: every subkey of HKLM\SOFTWARE\IBM\WebSphere MQ\Installation, in both registry
 ##                 views, is one installation named by the subkey; `FilePath` is its install path and
 ##                 `VRMF` its version. The key and both value names were confirmed on one real
-##                 IBM MQ 9.4.5.0 install (non-elevated user), so the leg is declared supported.
+##                 IBM MQ 9.4.5.0 install (read in an elevated administrator session), so the leg is declared supported.
 ##
 ## macOS: planned; the action answers a single unsupported status row
 ## (`status|<action>|unsupported|macos:planned`).
@@ -38,7 +38,7 @@ metadata:
     /etc/opt/mqm/mqinst.ini `Installation:` stanzas and takes the version from the
     product tag file name under each installation's FilePath/swidtag. On Windows it
     reads the HKLM Installation subkeys in both registry views (FilePath and VRMF
-    values; confirmed on one real IBM MQ 9.4.5.0 install, non-elevated user). No `dspmqver`
+    values; confirmed on one real IBM MQ 9.4.5.0 install, read in an elevated administrator session). No `dspmqver`
     process is started.
     A `supported` status with no rows means no registered installation was found;
     a `constrained` status means a read failed or was skipped and the list may be
