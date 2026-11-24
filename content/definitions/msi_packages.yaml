@@ -278,7 +278,7 @@ metadata:
     the single package reader busy makes the status row `constrained` with a
     `windows:installer_records:<detail>` token. Install locations and sources
     under the user profiles directory, or under a registered user profile's
-    folder, are reported as `withheld:user_path`. When the user-profile list cannot be read in full, every non-empty one of these paths is `withheld:profile_list_incomplete` and the status is `constrained`, even when no field holds a path (fail closed). A path that cannot be placed on a volume is `withheld:path_unverifiable`.
+    folder, are reported as `withheld:user_path`. When the user-profile list cannot be read in full, every non-empty one of these paths is `withheld:profile_list_incomplete` and the status is `constrained`, even when no field holds a path (fail closed). A path off the allow-list (a plain drive-absolute or UNC path of plain segments; no stream colon, device or namespace form, loopback or administrative share) is `withheld:path_unverifiable`.
     Exactly one status row leads the result.
   tags: [software, msi, inventory, windows]
 
@@ -335,12 +335,12 @@ spec:
         platforms: [windows]
       - name: install_location
         type: string
-        description: 'Record rows only: the InstallLocation value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder, `withheld:profile_list_incomplete` when the user-profile list could not be read in full, `withheld:path_unverifiable` when the path cannot be placed on a volume.'
+        description: 'Record rows only: the InstallLocation value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder, `withheld:profile_list_incomplete` when the user-profile list could not be read in full, `withheld:path_unverifiable` when the path is off the path allow-list.'
         example: "C:\\Program Files\\7-Zip\\"
         platforms: [windows]
       - name: install_source
         type: string
-        description: 'Record rows only: the InstallSource value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder, `withheld:profile_list_incomplete` when the user-profile list could not be read in full, `withheld:path_unverifiable` when the path cannot be placed on a volume; a UNC source is reported as recorded.'
+        description: 'Record rows only: the InstallSource value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder, `withheld:profile_list_incomplete` when the user-profile list could not be read in full, `withheld:path_unverifiable` when the path is off the path allow-list; a UNC source on a plain server and share outside the profile folders is reported as recorded.'
         example: "C:\\ProgramData\\Package Cache\\"
         platforms: [windows]
       - name: local_package
