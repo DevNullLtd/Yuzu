@@ -14,9 +14,10 @@ Best-effort lexical gate, two checks:
      read FAILS the gate (#8646), unless it is absent (ENOENT: it vanished mid-scan, or is a
      dangling link): an unscanned path could hold an extractor.
      Backslash continuations are joined, and a `session=` extractor within WINDOW lines of a
-     "Registered with server" mention (a separate-line extractor included) fails. A line that carries the marker
-     `tripwire-allow: <reason>` is exempt, so each exemption is visible at its own line (only the
-     upgrade note quoting the old line). There is NO other `session=` read of that line.
+     "Registered with server" mention (a separate-line extractor included) fails. A line that
+     carries the marker `tripwire-allow: <reason>` is exempt, so each exemption is visible at its
+     own line (only the upgrade note quoting the old line). There is NO other `session=` read of
+     that line.
 The server-side "ProxyRegister succeeded: ... session=" line is the id's source and is not flagged.
 """
 import errno
@@ -74,7 +75,8 @@ def check_text(path, text):
     lines = join_continuations(text)
     mention_at = [i for i, (_, l) in enumerate(lines) if MENTION.search(l)]
     for i, (n, l) in enumerate(lines):
-        if not EXTRACT.search(l) or ALLOW in l or ("ProxyRegister" in l and not MENTION.search(l)):
+        server_line = "ProxyRegister succeeded" in l and not MENTION.search(l)
+        if not EXTRACT.search(l) or ALLOW in l or server_line:
             continue
         if any(abs(i - m) <= WINDOW for m in mention_at):
             # Worded so the message does not itself match MENTION + EXTRACT: a log at the top of the
@@ -148,7 +150,9 @@ def iter_files(root=ROOT, visited=None, unread=None, walk=os.walk):
     # the selftest inject listing errors without chmod, which root bypasses.
     if unread is None:
         unread = []
-    for dirpath, dirnames, filenames in walk(root, onerror=lambda e: note_unreadable(unread, root, e)):
+    def onerror(err):
+        note_unreadable(unread, root, err)
+    for dirpath, dirnames, filenames in walk(root, onerror=onerror):
         rel_dir = pathlib.Path(dirpath).relative_to(root).parts
         if visited is not None:
             visited.append("/".join(rel_dir))
@@ -207,15 +211,20 @@ def selftest():
     assert not check_text("x.sh", "Registered with server (session_fp=ab12cd34, "), "selftest ok-fp"
     assert not check_text("x.sh", 'grep "Registered with server" x | grep session=  # tripwire-allow: reviewed example'), "selftest allow"
     assert not check_text("x.sh", "ProxyRegister succeeded: agent=a, session=b"), "selftest server line"
-    # ... even next to a Registered mention, which is what the ProxyRegister exemption is for.
-    assert not check_text("x.log", "Registered with server (session_fp=ab12cd34)\n"
-                          "ProxyRegister succeeded: agent=a, session=b"), "selftest server line near"
+    # The server line stays exempt even beside a Registered mention (the case the exemption
+    # exists for); any other ProxyRegister text there is not.
+    near = "Registered with server (session_fp=ab12cd34)\n"
+    assert not check_text("x.log", near + "ProxyRegister succeeded: agent=a, session=b"), \
+        "selftest server line near"
+    assert check_text("x.log", near + "ProxyRegister failed: session=b"), "selftest exemption scope"
     # Windows-style path separators must not matter
     assert check_text("scripts\\x.sh".replace("\\", "/"), bad[0]), "selftest path"
     # The gate's own FAIL line, captured in a top-level log, must not trip the gate on the next run.
     hit = check_text("x.sh", bad[0])
     assert hit and not check_text("x.log", "FAIL: " + hit[0]), "selftest: the FAIL message self-matches"
     selftest_walk(bad[0])
+    selftest_unreadable(good_call)
+    selftest_main()
 
 
 def selftest_walk(bad_line):
@@ -254,72 +263,99 @@ def selftest_walk(bad_line):
         # deleting it mid-scan, and listing it costs time against the meson timeout).
         entered = [v for v in visited if any(v == t or v.startswith(t + "/") for t in skipped_trees)]
         assert not entered, ("selftest: walk entered skipped trees", entered)
-        selftest_unreadable(root)
     assert not skipped(("build-tools.sh",)), "selftest: a top-level FILE named build* is still scanned"
 
 
-def selftest_unreadable(root):
+def selftest_unreadable(good_call):
     """#8646: a path the walk cannot list or read fails the gate; one that is absent (ENOENT)
     does not. Listing errors are injected, so that half holds on every OS and under root; file
     stat/read errors are checked for real (ELOOP, FIFO, chmod) where the platform allows, and a
-    skipped real check is announced on stderr."""
+    skipped real check is announced on stderr. Runs on its own tree that passes both checks, so
+    each exit code below is decided by the unreadable paths alone."""
+    def at(top, name):
+        return str(pathlib.Path(top, name))
+
     def walk_with_errors(top, onerror):
-        onerror(PermissionError(errno.EACCES, "Permission denied", str(pathlib.Path(top, "locked"))))
-        onerror(OSError(errno.EIO, "I/O error", str(pathlib.Path(top, "bad_disk"))))
-        onerror(NotADirectoryError(errno.ENOTDIR, "Not a directory", str(pathlib.Path(top, "swapped"))))
-        onerror(FileNotFoundError(errno.ENOENT, "No such file", str(pathlib.Path(top, "gone"))))
+        onerror(PermissionError(errno.EACCES, "Permission denied", at(top, "locked")))
+        onerror(OSError(errno.EIO, "I/O error", at(top, "bad_disk")))
+        onerror(NotADirectoryError(errno.ENOTDIR, "Not a directory", at(top, "swapped")))
+        onerror(FileNotFoundError(errno.ENOENT, "No such file", at(top, "gone")))
         yield from os.walk(top, onerror=onerror)
 
-    def unread_paths(**kw):
-        # run() end to end, so the result must reach the FAIL listing and the exit code. Its check-1
-        # files are absent from this tree, which fails with different wording, filtered out here.
-        lines = []
-        rc = run(root, out=lines.append, **kw)
-        got = sorted(l[len("FAIL: "):].split(":", 1)[0] for l in lines if "could not be read" in l)
-        return rc, got
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_session_log_unread_") as tmp:
+        root = pathlib.Path(tmp)
+        src = root / "agents" / "core" / "src"
+        src.mkdir(parents=True)
+        (src / "agent.cpp").write_text(good_call + "\n")
+        (src / "dex_linux_collector.cpp").write_text(
+            'spdlog::info("dex_observer(linux): observed {} {}", '
+            "log_key_token(obs.subject), log_key_token(obs.reason));\n")
 
-    rc, got = unread_paths(walk=walk_with_errors)
-    assert rc == 1 and got == ["bad_disk", "locked", "swapped"], ("selftest: listing errors", rc, got)
-    # A file whose stat or read fails is recorded the same way (the real os.stat raises here).
-    unread = []
-    note_unreadable(unread, root, PermissionError(errno.EACCES, "Permission denied", str(root / "s.sh")))
-    note_unreadable(unread, root, FileNotFoundError(errno.ENOENT, "No such file", str(root / "t.sh")))
-    assert [u.split(":", 1)[0] for u in unread] == ["s.sh"], ("selftest: file errors", unread)
-    # The real OS paths too, where the platform allows. A self-referencing symlink fails os.stat
-    # with ELOOP even under root (POSIX; Windows needs a privilege to create one). A FIFO is not a
-    # regular file: it is skipped, never opened (opening it would block until the meson timeout).
-    loop, fifo = root / "loop.sh", root / "pipe.sh"
-    try:
-        os.symlink("loop.sh", loop)
-    except (OSError, NotImplementedError):
-        loop = None
-        print("selftest: real ELOOP check skipped (cannot create a symlink here)", file=sys.stderr)
-    if hasattr(os, "mkfifo"):
-        os.mkfifo(fifo)
-    else:
-        fifo = None
-        print("selftest: FIFO check skipped (no os.mkfifo here)", file=sys.stderr)
-    _, got = unread_paths()
-    assert got == (["loop.sh"] if loop else []), ("selftest: real ELOOP / FIFO", got)
-    for made in (loop, fifo):
-        if made is not None:
-            made.unlink()
-    # Where chmod does deny (POSIX, not root): an unlistable directory and an unreadable file.
-    locked, locked_file = root / "locked_dir", root / "locked_file.sh"
-    locked.mkdir()
-    (locked / "y.sh").write_text("x\n")
-    locked_file.write_text("x\n")
-    try:
-        locked.chmod(0)
-        locked_file.chmod(0)
-        if not os.access(locked, os.R_OK) and not os.access(locked_file, os.R_OK):
-            _, got = unread_paths()
-            assert got == ["locked_dir", "locked_file.sh"], ("selftest: real EACCES", got)
+        def unread_paths(**kw):
+            # run() end to end, so the paths must reach both the FAIL listing and the exit code.
+            lines = []
+            rc = run(root, out=lines.append, **kw)
+            got = sorted(l[len("FAIL: "):].split(":", 1)[0]
+                         for l in lines if "could not be read" in l)
+            return rc, got
+
+        assert unread_paths() == (0, []), ("selftest: clean tree", unread_paths())
+        # Check 1 fails, never passes over, when a pinned source is missing.
+        assert len(check_sources(root / "absent")) == 2, "selftest: missing check-1 sources"
+        rc, got = unread_paths(walk=walk_with_errors)
+        assert (rc, got) == (1, ["bad_disk", "locked", "swapped"]), \
+            ("selftest: listing errors", rc, got)
+        # A file whose stat or read fails is recorded the same way (the real os.stat raises here).
+        unread = []
+        note_unreadable(unread, root, PermissionError(errno.EACCES, "Denied", at(root, "s.sh")))
+        note_unreadable(unread, root, FileNotFoundError(errno.ENOENT, "Absent", at(root, "t.sh")))
+        assert [u.split(":", 1)[0] for u in unread] == ["s.sh"], ("selftest: file errors", unread)
+        # The real OS paths too, where the platform allows. A self-referencing symlink fails
+        # os.stat with ELOOP even under root (POSIX; Windows needs a privilege to create one). A
+        # FIFO is not a regular file: it is skipped, never opened (that would block until the
+        # meson timeout).
+        loop, fifo = root / "loop.sh", root / "pipe.sh"
+        try:
+            os.symlink("loop.sh", loop)
+        except (OSError, NotImplementedError):
+            loop = None
+            print("selftest: real ELOOP check skipped (cannot create a symlink here)",
+                  file=sys.stderr)
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(fifo)
         else:
-            print("selftest: real EACCES check skipped (chmod does not deny here)", file=sys.stderr)
-    finally:
-        locked.chmod(0o700)
-        locked_file.chmod(0o600)
+            fifo = None
+            print("selftest: FIFO check skipped (no os.mkfifo here)", file=sys.stderr)
+        want = (1, ["loop.sh"]) if loop else (0, [])
+        assert unread_paths() == want, ("selftest: real ELOOP / FIFO", unread_paths())
+        for made in (loop, fifo):
+            if made is not None:
+                made.unlink()
+        # Where chmod does deny (POSIX, not root): an unlistable directory and an unreadable file.
+        locked, locked_file = root / "locked_dir", root / "locked_file.sh"
+        locked.mkdir()
+        (locked / "y.sh").write_text("x\n")
+        locked_file.write_text("x\n")
+        try:
+            locked.chmod(0)
+            locked_file.chmod(0)
+            if not os.access(locked, os.R_OK) and not os.access(locked_file, os.R_OK):
+                rc, got = unread_paths()
+                assert (rc, got) == (1, ["locked_dir", "locked_file.sh"]), \
+                    ("selftest: real EACCES", rc, got)
+            else:
+                print("selftest: real EACCES check skipped (chmod does not deny here)",
+                      file=sys.stderr)
+        finally:
+            locked.chmod(0o700)
+            locked_file.chmod(0o600)
+
+
+def selftest_main():
+    """main() runs the selftest, then run(), and returns run()'s exit code."""
+    calls = []
+    assert main(st=lambda: calls.append("selftest"), rn=lambda: calls.append("run") or 7) == 7 \
+        and calls == ["selftest", "run"], ("selftest: main wiring", calls)
 
 
 def check_sources(root=ROOT):
@@ -337,7 +373,8 @@ def check_sources(root=ROOT):
 
 
 def run(root=ROOT, walk=os.walk, out=print):
-    """Both checks over `root`; prints the FAIL lines (or OK) through `out`, returns the exit code."""
+    """Both checks over `root`. Prints the FAIL lines (or OK) through `out`; returns the exit
+    code."""
     errs = check_sources(root) + scan(root, walk=walk)
     for e in errs:
         out(f"FAIL: {e}")
@@ -347,12 +384,13 @@ def run(root=ROOT, walk=os.walk, out=print):
     return 0
 
 
-def main():
-    selftest()
+def main(st=None, rn=None):
+    # st/rn stand in for selftest/run only in selftest_main(), which pins this wiring.
+    (st or selftest)()
     if hasattr(sys.stdout, "reconfigure"):
         # A non-UTF-8 file name must not turn the FAIL listing into a traceback that hides the rest.
         sys.stdout.reconfigure(errors="backslashreplace")
-    return run()
+    return (rn or run)()
 
 
 if __name__ == "__main__":
