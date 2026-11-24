@@ -94,3 +94,49 @@ TEST_CASE("schedule_params_contain_sensitive_key fails closed-to-false on malfor
     CHECK_FALSE(schedule_params_contain_sensitive_key("[1,2,3]"));
     CHECK_FALSE(schedule_params_contain_sensitive_key(""));
 }
+
+// ── Unretained keys: an agent-issued resume token is not a secret, and is never kept ─────────────
+
+TEST_CASE("redact_sensitive_instruction_params drops the resume token and keeps the request itself",
+          "[server][sensitive_params]") {
+    std::unordered_map<std::string, std::string> params{{"root", "/data"},
+                                                         {"pattern", "*.bin"},
+                                                         {"kinds", "file"},
+                                                         {"cursor", "fsv1.sealed-token"}};
+    auto kept = redact_sensitive_instruction_params(params);
+    CHECK(kept.count("cursor") == 0);
+    REQUIRE(kept.count("root") == 1);
+    CHECK(kept.at("root") == "/data");
+    CHECK(kept.at("pattern") == "*.bin");
+    CHECK(kept.at("kinds") == "file");
+    // The live dispatch still uses the raw map: the helper takes a copy and never touches the caller's.
+    CHECK(params.count("cursor") == 1);
+}
+
+TEST_CASE("cursor is an unretained key and NOT a secret key", "[server][sensitive_params]") {
+    CHECK(is_unretained_instruction_param_key("cursor"));
+    CHECK_FALSE(is_unretained_instruction_param_key("Cursor")); // exact keys only
+    CHECK_FALSE(is_unretained_instruction_param_key("root"));
+    CHECK_FALSE(is_unretained_instruction_param_key(""));
+    // The secret classification (read by the Console mask, the definition hint and the hardware form)
+    // must not gain it: a resume token must not make a form mask its field.
+    CHECK_FALSE(is_redacted_instruction_param_key("cursor"));
+    for (const auto key : kRedactedInstructionParamKeys)
+        CHECK_FALSE(is_unretained_instruction_param_key(key));
+    for (const auto key : kUnretainedInstructionParamKeys)
+        CHECK_FALSE(is_redacted_instruction_param_key(key));
+}
+
+TEST_CASE("schedule_params_contain_unretained_key is true for a cursor and false without one",
+          "[server][sensitive_params]") {
+    CHECK(schedule_params_contain_unretained_key(R"({"root":"/data","cursor":"fsv1.x"})"));
+    CHECK(schedule_params_contain_unretained_key(R"({"cursor":""})"));
+    CHECK_FALSE(schedule_params_contain_unretained_key(R"({"root":"/data","pattern":"*.bin"})"));
+    CHECK_FALSE(schedule_params_contain_unretained_key("{}"));
+    CHECK_FALSE(schedule_params_contain_unretained_key("not json"));
+    CHECK_FALSE(schedule_params_contain_unretained_key("[1,2,3]"));
+    CHECK_FALSE(schedule_params_contain_unretained_key(""));
+    // The two refusals are independent: a secret is not an unretained key, and the reverse.
+    CHECK_FALSE(schedule_params_contain_unretained_key(R"({"grant_secret":"x"})"));
+    CHECK_FALSE(schedule_params_contain_sensitive_key(R"({"cursor":"fsv1.x"})"));
+}

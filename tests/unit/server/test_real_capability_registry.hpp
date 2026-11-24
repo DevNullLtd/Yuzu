@@ -52,6 +52,7 @@
 #include "capability_decls/plugin_action_catalogue_virtualization.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "capability_decls/plugin_action_catalogue_process_introspect.hpp"
+#include "capability_decls/plugin_action_catalogue_file_search.hpp"
 #include "command_capability.hpp"
 
 #include <string_view>
@@ -92,6 +93,7 @@ inline const yuzu::server::CommandCapabilityRegistry& real_capability_registry()
         capdecls::plugin_action_catalogue_shares(),
         capdecls::plugin_action_catalogue_remote_access_audit(),
         capdecls::plugin_action_catalogue_process_introspect(),
+        capdecls::plugin_action_catalogue_file_search(),
         capdecls::plugin_action_catalogue_middleware(),
         capdecls::plugin_action_catalogue_virtualization(),
         capdecls::core_dispatch_capabilities(),

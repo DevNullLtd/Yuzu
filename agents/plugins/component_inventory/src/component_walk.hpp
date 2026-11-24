@@ -80,10 +80,15 @@ struct DirEntry {
     std::uint64_t file_id{0}; // inode or file reference number; 0 = unknown
 };
 
+/// Why a directory could not be listed. `error` stays the plain flag the breadth-first walk() reads;
+/// the ordered walk reads the cause to report a refused directory as such.
+enum class ListError { none, unreadable, permission_denied, dataless };
+
 struct ListResult {
     std::vector<DirEntry> entries;
-    bool error{false};     // the directory could not be listed
-    bool truncated{false}; // the listing was cut at the cap the caller passed
+    bool error{false};                // the directory could not be listed
+    ListError cause{ListError::none}; // meaningful only when `error`; none reads as unreadable
+    bool truncated{false};            // the listing was cut at the cap the caller passed
     // Identity of the LISTED directory (0 = unknown): the device and the inode or file reference number.
     std::uint64_t dev{0};
     std::uint64_t file_id{0};
@@ -98,7 +103,27 @@ struct FileView {
     std::function<bool()> unchanged;
 };
 
+// ---- the seam an OS leg fills for the on-demand file search ----
+// Pure vocabulary, so the driver and the leg share one spelling; a leg that cannot answer says `other`.
+
+/// What a root path turned out to be when the leg tried to reach it with no link followed.
+enum class RootState { ok, is_link, not_found, not_a_directory, other };
+
+/// The facts of one matched regular file, taken from the descriptor of the opened leaf (never from the
+/// name), so they describe the object any extent read then sees. The file is opened and never read.
+struct MatchFacts {
+    bool opened{false};
+    std::uint64_t size{0};
+    std::int64_t mtime{0}; // seconds
+};
+
 struct FsOps {
+    /// Lists `dir`, at most `cap` entries. NAMES: every entry is returned with its name exactly as the
+    /// filesystem reports it; a leg never drops or rewrites a name it cannot place. The walker owns the
+    /// rule: an empty name, "." and ".." are ignored; a name over kMaxNameBytes or holding '/' or NUL
+    /// (file_search::valid_component false) is a name_too_long gap, never joined into a path, never
+    /// compared with a pattern and never placed in a Position. A leg that hid such an entry would turn
+    /// an unsearched name into a silent miss.
     std::function<ListResult(const std::string& dir, std::size_t cap)> list;
     // nullopt = not opened: a link, not a regular file, refused or gone.
     std::function<std::optional<FileView>(const std::string& path)> open_file;
@@ -234,9 +259,9 @@ class Walker {
 public:
     Walker(const std::string& root, const fsr::Position& resume, const WalkLimits& limits, const FsOps& fs,
            std::chrono::steady_clock::time_point deadline, const OrderedVisit& visit,
-           std::size_t max_retained)
+           std::size_t max_retained, const std::function<bool()>& rows_full)
         : root_(root), original_(resume), resume_(resume), limits_(limits), fs_(fs), deadline_(deadline),
-          visit_(visit), max_retained_(max_retained),
+          visit_(visit), max_retained_(max_retained), rows_full_(rows_full),
           // A Position cannot name deeper than this, so nothing deeper is entered either.
           max_depth_((std::min)(limits.max_depth, fsr::kMaxPositionDepth)) {
         stack_.reserve(max_depth_ + 1);
@@ -265,6 +290,7 @@ private:
     std::chrono::steady_clock::time_point deadline_;
     const OrderedVisit& visit_;
     std::size_t max_retained_;
+    const std::function<bool()>& rows_full_;
     std::size_t max_depth_;
 
     OrderedResult out_;
@@ -279,6 +305,12 @@ private:
     std::size_t retained_{0};
 
     [[nodiscard]] bool time_up() const { return fs_.now() >= deadline_; }
+
+    // The row cap: max_rows reached, or the caller's own predicate (a byte budget) says no further row
+    // fits. Both end the slice the same way, at the same position.
+    [[nodiscard]] bool rows_capped() const {
+        return out_.rows >= limits_.max_rows || (rows_full_ && rows_full_());
+    }
 
     bool stop(Stop s) {
         out_.stop = s;
@@ -316,7 +348,9 @@ private:
             return stop(Stop::budget_time);
         ListResult lr = fs_.list(path, limits_.max_dir_entries);
         if (lr.error)
-            return skip_dir(path, Cause::dir_unreadable);
+            return skip_dir(path, lr.cause == ListError::permission_denied ? Cause::permission_denied
+                                  : lr.cause == ListError::dataless        ? Cause::dataless
+                                                                           : Cause::dir_unreadable);
         if (lr.truncated || lr.entries.size() > limits_.max_dir_entries)
             return skip_dir(path, Cause::dir_truncated);
         if (depth == 0)
@@ -410,7 +444,7 @@ private:
                 return stop(Stop::budget_time);
             if (out_.stats.entries >= limits_.max_entries)
                 return stop(Stop::budget_entries);
-            if (out_.rows >= limits_.max_rows)
+            if (rows_capped())
                 return stop(Stop::section_rows);
             ++out_.stats.entries;
 
@@ -428,7 +462,7 @@ private:
 
             if (visit_(path, e, lr.dev))
                 ++out_.rows;
-            const bool row_cap = out_.rows >= limits_.max_rows;
+            const bool row_cap = rows_capped();
 
             if (e.type == Type::file) {
                 complete(e.name);
@@ -485,7 +519,8 @@ private:
  * "." or ".." are ignored; every other entry counts one in stats.entries, except a name_too_long entry
  * (a gap, not counted). Links count links_skipped;
  * a network_mount counts mounts_skipped and adds a network_mount gap; any other type is skipped. A
- * listing with error is a dir_unreadable gap. A listing that is truncated or longer than
+ * listing with error is a dir_unreadable gap, or a permission_denied or dataless gap when its cause says
+ * the directory was refused rather than unreadable. A listing that is truncated or longer than
  * max_dir_entries is a dir_truncated gap and NONE of its entries is visited (a partial listing cannot
  * be resumed soundly and must not read as searched). A listing whose dev is non-zero and differs from
  * the root listing's non-zero dev is an other_device gap and none of its entries is visited. A
@@ -497,7 +532,10 @@ private:
  * clock read per entry: a visitor may be slow and a 50,000-entry flat listing must not carry a slice
  * past its deadline): Stop::budget_time. stats.entries >= limits.max_entries is checked before each new
  * entry: Stop::budget_entries. rows reaching limits.max_rows ends the slice immediately after the visit
- * that produced the last row: Stop::section_rows. A zero max_entries or max_rows admits nothing: the slice
+ * that produced the last row: Stop::section_rows. `rows_full`, when set, is a second row cap the caller
+ * owns (a byte budget): it is asked at the same two points as max_rows and, once true, ends the slice
+ * with the same stop at the same position; unset it changes nothing. A zero max_entries or max_rows
+ * admits nothing: the slice
  * returns `resume` itself, advanced false, without listing anything. Stop takes no other value; the other
  * causes are gaps.
  *
@@ -554,8 +592,11 @@ private:
 [[nodiscard]] inline OrderedResult
 walk_ordered(const std::string& root, const yuzu::shared::file_search::Position& resume,
              const WalkLimits& limits, const FsOps& fs, std::chrono::steady_clock::time_point deadline,
-             const OrderedVisit& visit, std::size_t max_retained_bytes = kMaxOrderedRetainedBytes) {
-    return walk_ordered_detail::Walker(root, resume, limits, fs, deadline, visit, max_retained_bytes).run();
+             const OrderedVisit& visit, std::size_t max_retained_bytes = kMaxOrderedRetainedBytes,
+             const std::function<bool()>& rows_full = {}) {
+    return walk_ordered_detail::Walker(root, resume, limits, fs, deadline, visit, max_retained_bytes,
+                                       rows_full)
+        .run();
 }
 
 /**
