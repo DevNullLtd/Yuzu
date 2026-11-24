@@ -37,8 +37,10 @@ When building new features, design data schemas with downstream analytics in min
 
 Server-side stores live on **PostgreSQL** as of 2026-06-09 (ADR-0006); the agent stays on
 SQLite. New server stores default to Postgres, existing ones migrate incrementally behind
-per-store ADRs. ClickHouse (below) remains the **analytics** sink, fed separately — it is not
-the OLTP substrate. Schema designers: read `docs/adr/0006-server-postgresql-substrate.md`
+per-store ADRs. ClickHouse receives the separate analytics feed. The
+[ADR-0006 amendment](adr/0006-server-postgresql-substrate.md#amendment-2026-11-21--retention-bound-cold-records)
+also authorizes protected cold verdicts and a future bulk live response cutover. PostgreSQL
+retains transactional authority. Schema designers: read `docs/adr/0006-server-postgresql-substrate.md`
 (and ADR-0004, its first instance) before adding a server store.
 
 ## Cross-references
