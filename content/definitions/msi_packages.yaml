@@ -340,7 +340,7 @@ spec:
         platforms: [windows]
       - name: install_source
         type: string
-        description: 'Record rows only: the InstallSource value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder, `withheld:profile_list_incomplete` when the user-profile list could not be read in full, `withheld:path_unverifiable` when the path is off the path allow-list; a UNC source on a plain server and share outside the profile folders is reported as recorded.'
+        description: 'Record rows only: the InstallSource value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder, `withheld:profile_list_incomplete` when the user-profile list could not be read in full, `withheld:path_unverifiable` when the path is off the path allow-list; a UNC source is reported as recorded only when its server and share are plain names and its share and path are not under a UNC profile root (a UNC root matches on share and path whatever the server).'
         example: "C:\\ProgramData\\Package Cache\\"
         platforms: [windows]
       - name: local_package

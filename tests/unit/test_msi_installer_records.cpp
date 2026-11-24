@@ -833,7 +833,7 @@ TEST_CASE("installer records: an unresolved redirected root is withheld and cons
         CHECK(line.find("Alice") == std::string::npos);
 }
 
-TEST_CASE("installer records: only a drive-absolute or UNC root keeps the profile list complete",
+TEST_CASE("installer records: only a root on the path allow-list keeps the list complete",
           "[msi_packages][installer_records]") {
     for (const char* bad : {".", "..", "\\", "\\\\", " ", "", "   \t", "Users\\jsmith", "C:Users",
                             "D:Profiles\\Alice", "C:", "\\Users", "\\\\server",
@@ -1014,6 +1014,56 @@ TEST_CASE("installer records: a non-ASCII code point possibly equals any letter 
     CHECK(rec::classify_path("C:\\home\\carol\\x", unc) == V::keep);
 }
 
+TEST_CASE("installer records: code points are counted by the lead byte, and the letter bounds hold",
+          "[msi_packages][installer_records]") {
+    using rec::detail::Cp;
+    using rec::detail::cp_may_equal;
+    // a malformed byte (lone continuation, invalid lead) is ONE code point; a valid sequence is one
+    const std::vector<std::string> ab{"D:\\Profiles\\ab"};
+    CHECK(rec::classify_path("D:\\Profiles\\\x80\x80\\x", ab) == V::user_path);
+    CHECK(rec::classify_path("D:\\Profiles\\\xC3\xA9\xC3\xA9\\x", ab) == V::user_path);
+    CHECK(rec::classify_path("D:\\Profiles\\\xF8\x80\\x", ab) == V::user_path); // 2 points
+    CHECK(rec::classify_path("D:\\Profiles\\\xF8\x80\x80\\x", ab) == V::keep);   // 3 points
+    // one point against a root of two letters
+    CHECK(rec::classify_path("D:\\Profiles\\\xC3\xA9\\x", ab) == V::keep);
+    // a root of a point and a letter against two points
+    const std::vector<std::string> ea{"D:\\Profiles\\\xC3\xA9" "a"};
+    CHECK(rec::classify_path("D:\\Profiles\\\xC3\xA9\xC3\xA9\\x", ea) == V::user_path);
+    CHECK(rec::classify_path("D:\\Profiles\\\xC3\xA9\\x", ea) == V::keep);
+    // a wide point equals a..z in either operand order, and nothing else
+    const Cp wide{0, true};
+    for (const char c : {'a', 'm', 'z'}) {
+        CHECK(cp_may_equal(wide, Cp{c, false}));
+        CHECK(cp_may_equal(Cp{c, false}, wide));
+    }
+    for (const char c : {'`', '{', '@', '[', '0', '9', '-', '.', ' ', '\\', '_', 'A', 'Z'}) {
+        CHECK_FALSE(cp_may_equal(wide, Cp{c, false}));
+        CHECK_FALSE(cp_may_equal(Cp{c, false}, wide));
+    }
+    CHECK(cp_may_equal(wide, wide));
+    CHECK(cp_may_equal(Cp{'q', false}, Cp{'q', false}));
+    CHECK_FALSE(cp_may_equal(Cp{'q', false}, Cp{'r', false}));
+    // through the gate: a wide point never stands for a digit or punctuation of the root
+    CHECK(rec::classify_path("D:\\Profiles\\\xC3\xA9\\x",
+                             std::vector<std::string>{"D:\\Profiles\\1"}) == V::keep);
+    CHECK(rec::classify_path("D:\\Profiles\\\xC3\xA9\\x",
+                             std::vector<std::string>{"D:\\Profiles\\{"}) == V::keep);
+    CHECK(rec::classify_path("D:\\Profiles\\\xC3\xA9\\x",
+                             std::vector<std::string>{"D:\\Profiles\\z"}) == V::user_path);
+    // drive letters just outside a..z and the tilde-digit boundary
+    CHECK(rec::classify_path("`:\\x", ab) == V::unverifiable);
+    CHECK(rec::classify_path("{:\\x", ab) == V::unverifiable);
+    CHECK(rec::classify_path("a:\\x", ab) == V::keep);
+    CHECK(rec::classify_path("z:\\x", ab) == V::keep);
+    CHECK(rec::classify_path("C:\\a\\b~9", ab) == V::unverifiable);
+    CHECK(rec::classify_path("C:\\a\\b~0", ab) == V::unverifiable);
+    CHECK(rec::classify_path("C:\\a\\b~a", ab) == V::keep);
+    CHECK(rec::classify_path("C:\\a\\b~", ab) == V::keep);
+    // the over-withholding of a server-less UNC root, stated
+    CHECK(rec::classify_path("\\\\anyserver\\profiles\\x",
+                             std::vector<std::string>{"\\\\fs\\profiles"}) == V::user_path);
+}
+
 TEST_CASE("installer records: a generated matrix never emits a hostile or profile path",
           "[msi_packages][installer_records]") {
     // Expectation is the simple invariant, built into each case: a path made under a root, or
@@ -1039,8 +1089,7 @@ TEST_CASE("installer records: a generated matrix never emits a hostile or profil
     std::size_t always = 0;
     for (int i = 0; i < 4000; ++i) {
         std::string tail;
-        for (std::size_t n = 1 + next(4); n > 0; --n)
-        {
+        for (std::size_t n = 1 + next(4); n > 0; --n) {
             // sequenced explicitly: the order of two next() calls in one expression is unspecified
             const std::string& sep = cosmetic[next(cosmetic.size())];
             const std::string& seg = benign[next(benign.size())];

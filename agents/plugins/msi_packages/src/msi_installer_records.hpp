@@ -257,8 +257,19 @@ struct Cp {
     const auto b = static_cast<unsigned char>(s[i++]);
     if (b < 0x80)
         return {static_cast<char>(b), false};
-    while (i < s.size() && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80)
+    // only the continuation bytes the lead byte declares: a lone continuation byte or an
+    // invalid lead is one code point by itself
+    std::size_t extra = 0;
+    if (b >= 0xF0 && b < 0xF8)
+        extra = 3;
+    else if (b >= 0xE0 && b < 0xF0)
+        extra = 2;
+    else if (b >= 0xC0 && b < 0xE0)
+        extra = 1;
+    while (extra != 0 && i < s.size() && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80) {
         ++i;
+        --extra;
+    }
     return {0, true};
 }
 
@@ -379,7 +390,8 @@ struct Cp {
 // `withheld:path_unverifiable`. A root must pass (1) and (2) as well, or the profile list is
 // incomplete. Residual, still emitted because nothing here can see them: junctions, symbolic
 // links, mount points, `subst` and mapped drives, a UNC path naming this machine by its own
-// DNS name, and a case variant that needs a multi-character fold (such as `ss` for U+00DF).
+// DNS name or its NetBIOS or short name, and a case variant that needs a multi-character fold
+// (such as `ss` for U+00DF).
 
 /// A path reduced to its comparable form. `comparable` is false when it is not on the
 /// allow-list: it is then neither compared nor emitted.
@@ -472,27 +484,24 @@ enum class PathVerdict { keep, user_path, unverifiable };
 /// The profile roots, normalised once. A root that is not comparable is skipped here (the
 /// profile list is then incomplete: see count_unresolved_roots).
 struct ProfileGate {
-    struct Root {
-        bool unc = false;
-        std::string key; ///< NormalPath::key()
-    };
-    std::vector<Root> roots;
+    std::vector<std::string> roots; ///< NormalPath::key() of each usable root
     explicit ProfileGate(const std::vector<std::string>& raw) {
         for (const auto& r : raw)
             if (const auto n = normalise_path(r); n.comparable)
-                roots.push_back({n.unc, std::string{n.key()}});
+                roots.emplace_back(n.key());
     }
 };
 
 /// The gate's decision for a non-empty path (see THE RULE above). A UNC root matches on its
 /// share and path whatever the server's spelling (fail closed: the same share under a short
-/// name, an FQDN or an alias is the same profile).
+/// name, an FQDN or an alias is the same profile). A drive key starts `x:` and a UNC key
+/// starts with a separator, so the two kinds can never match each other.
 [[nodiscard]] inline PathVerdict classify_path(std::string_view path, const ProfileGate& gate) {
     const NormalPath p = normalise_path(path);
     if (!p.comparable)
         return PathVerdict::unverifiable;
     for (const auto& root : gate.roots)
-        if (root.unc == p.unc && detail::key_under(p.key(), root.key))
+        if (detail::key_under(p.key(), root))
             return PathVerdict::user_path;
     return PathVerdict::keep;
 }
