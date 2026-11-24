@@ -12888,7 +12888,8 @@ TEST_CASE("MCP get_device_live: the poll reads the device's rows only (multi-row
         CHECK(err["data"]["reason"] == "incomplete");
         // The device was working, so its first run may still be hashing. A `processes` run has a
         // 120 s budget, so a retry at the poll's 25 s deadline could start a second hash: the
-        // hint is the plugin's budget. (A quick kind keeps the 25 s deadline, see the unit test.)
+        // hint is the plugin's budget. (A quick kind keeps the 25 s deadline: see the uptime
+        // SECTION below and the unit test.)
         CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kLiveReadProcessesTimeoutRetryMs);
         CHECK(err["data"]["retry_after_ms"] == 120000);
         CHECK(err["data"]["retry_after_ms"] != yuzu::server::mcp::kLiveReadIncompleteRetryMs);
