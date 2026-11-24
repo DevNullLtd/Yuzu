@@ -6,7 +6,7 @@
 #include "device_estate_render.hpp"
 #include "http_route_sink.hpp"
 
-#include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
+#include <yuzu/server/auth.hpp> // auth::agent_id_is_audit_safe
 
 #include <algorithm>
 
@@ -18,12 +18,6 @@ void send_html(httplib::Response& res, std::string body) {
     res.set_content(std::move(body), "text/html; charset=utf-8");
 }
 
-// Same audit-trail floor as hardware_routes.cpp / device_containment_routes.cpp.
-bool id_is_safe(const std::string& id) {
-    return id.size() <= auth::kMaxAgentIdLength &&
-           std::none_of(id.begin(), id.end(), [](unsigned char c) { return c < 0x20; });
-}
-
 } // namespace
 
 void DeviceEstateRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
@@ -31,7 +25,7 @@ void DeviceEstateRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/fragments/hardware/ci/stored-data",
              [this](const httplib::Request& req, httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-        if (id.empty() || !id_is_safe(id)) {
+        if (id.empty() || !auth::agent_id_is_audit_safe(id)) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\">Missing or invalid device id.</div>");
             return;

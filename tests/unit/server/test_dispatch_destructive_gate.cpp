@@ -65,6 +65,7 @@
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "capability_decls/plugin_action_catalogue_process_introspect.hpp"
+#include "capability_decls/plugin_action_catalogue_file_search.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -449,6 +450,29 @@ TEST_CASE("remote_access_audit: the REAL catalogue fragment is Forensics-securab
         CHECK(refused.refusal_reason == kReasonForensicUntargeted);
         CHECK(refused.refusal_message == kForensicUntargetedMessage);
     }
+}
+
+TEST_CASE("file_search: the REAL catalogue fragment is NOT single-target — its stored rows are "
+          "Forensics-tier through the stored-row flag, but its dispatch securable is FileRetrieval, so "
+          "a multi-target, group or fleet dispatch is not refused for targeting",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{
+        yuzu::server::capdecls::plugin_action_catalogue_file_search()};
+    auto classified = registry.classify("file_search", "search");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable != kForensicsSecurable);
+    CHECK(classified->dispatch_class == DispatchClass::ReadOnly);
+    CHECK_FALSE(requires_explicit_targets(*classified));
+
+    // The same decision the dispatch surfaces make: never RefuseUntargeted for this row. The verdict is
+    // decided before any targeting argument is read, so two shapes stand for them all: two ids, and a
+    // scope with no ids.
+    CHECK(evaluate_destructive_targeting(classified, /*valid_nonempty_agent_ids=*/true,
+                                         /*scope_key_present=*/false, /*agent_id_count=*/2)
+              .verdict == DestructiveTargetingVerdict::NotDestructive);
+    CHECK(evaluate_destructive_targeting(classified, /*valid_nonempty_agent_ids=*/false,
+                                         /*scope_key_present=*/true, /*agent_id_count=*/0)
+              .verdict == DestructiveTargetingVerdict::NotDestructive);
 }
 
 TEST_CASE("process_introspect: the REAL catalogue fragment is Forensics-securable and gates "

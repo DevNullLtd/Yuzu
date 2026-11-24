@@ -220,11 +220,15 @@ TEST_CASE("pkg_inventory plugin: status row first, then only well-formed rows of
             } else if (f[0] == "package") {
                 REQUIRE(f.size() >= 2);
                 if (std::string_view{action} == "packages") {
-                    REQUIRE(f.size() == 5);
 #if defined(_WIN32)
+                    REQUIRE(f.size() == 5);
                     CHECK(f[1] == "chocolatey"); // Windows packages = Chocolatey; Homebrew is macOS
 #else
+                    REQUIRE(f.size() == 11); // a Homebrew row: five fields + receipt, scope, owner, prefix
                     CHECK(f[1] == "homebrew");
+                    // No absolute home path ever reaches a row (a user prefix is `~/...`).
+                    for (const auto& field : f)
+                        CHECK_FALSE(field.starts_with("/Users/"));
 #endif
                 } else {
                     CHECK(std::string_view{action} == "store_packages");

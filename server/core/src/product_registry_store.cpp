@@ -819,12 +819,12 @@ derive_curated_alias(std::string_view ecosystem, std::string_view raw_name,
     k.title = prod.title;
     // Same edition rules as the pack parser: an alias binds exactly one edition.
     if (!edition.empty()) {
-        const NormalizedTitle col = normalize_title(edition);
-        if (col.edition.empty() || !col.title.empty())
+        const std::string col = normalize_edition(edition);
+        if (col.empty())
             return std::unexpected("edition is not a recognised edition token");
-        if (!nt.edition.empty() && nt.edition != col.edition)
+        if (!nt.edition.empty() && nt.edition != col)
             return std::unexpected("edition contradicts raw_name");
-        k.edition = col.edition;
+        k.edition = col;
     } else {
         k.edition = nt.edition;
     }

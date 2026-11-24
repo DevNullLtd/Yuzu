@@ -27,6 +27,7 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <sstream>
@@ -39,6 +40,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -542,6 +544,95 @@ TEST_CASE("Echo #538: a failed baseline clear leaves the source ENABLED (UP-1)",
     CHECK_FALSE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600));
     CHECK(db.get_config("process_enabled", "true") == "true"); // still enabled
     CHECK(db.get_config("process_paused_at", "0") == "0");     // never paused
+}
+
+TEST_CASE("Echo #1624: recovering an errored source clears its mapped baseline",
+          "[echo][paused_at][issue1624]") {
+    // The baseline was last written before the flag went bad and nothing has
+    // maintained it since (collection is gated closed on a non-canonical flag).
+    // Resuming against it diffs the whole errored interval into ghost events.
+    const struct {
+        const char* source;
+        const char* state_key;
+    } cases[] = {{"process", "process"}, {"tcp", "network"}, {"service", "service"},
+                 {"user", "user"},       {"software", "software"},
+                 {"arp", "arp"},         {"dns", "dns"},
+                 {"mapdrive", "mapdrive"}};
+
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1624_errored_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    for (const auto& c : cases) {
+        INFO("source: " << c.source);
+        REQUIRE(db.set_state(c.state_key, R"([{"x":1}])"));
+        REQUIRE_FALSE(db.get_state(c.state_key).empty());
+        // The flag clobbered to a value the plugin never writes; a stale pause stamp too.
+        REQUIRE(db.set_config(std::string{c.source} + "_enabled", "maybe"));
+        REQUIRE(db.set_config(std::string{c.source} + "_paused_at", "1735689600"));
+        REQUIRE(canonical_source_enabled(db.get_config(std::string{c.source} + "_enabled", "true")) ==
+                "errored");
+
+        REQUIRE(apply_source_enabled_transition(db, c.source, "true", 1'735'700'000));
+
+        CHECK(db.get_state(c.state_key).empty());
+        CHECK(db.get_config(std::string{c.source} + "_enabled", "") == "true");
+        CHECK(db.get_config(std::string{c.source} + "_paused_at", "") == "0");
+    }
+}
+
+TEST_CASE("Echo #1624: true to true and false to true do not clear a baseline",
+          "[echo][paused_at][issue1624]") {
+    // Negative control: only the errored recovery is new. A re-assert of an
+    // enabled source and a plain un-pause must keep whatever baseline exists.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1624_control_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_state("process", R"([{"pid":1}])"));
+    REQUIRE(apply_source_enabled_transition(db, "process", "true", 1'735'689'600)); // true -> true
+    CHECK_FALSE(db.get_state("process").empty());
+
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'689'700)); // clears
+    REQUIRE(db.get_state("process").empty());
+    REQUIRE(db.set_state("process", R"([{"pid":2}])")); // something re-seeds it
+    REQUIRE(apply_source_enabled_transition(db, "process", "true", 1'735'689'800)); // false -> true
+    CHECK_FALSE(db.get_state("process").empty());
+}
+
+TEST_CASE("Echo #1624: a failed baseline clear on errored recovery leaves the flag unmoved",
+          "[echo][paused_at][issue1624]") {
+    // Mirror of the UP-1 case above for the new edge: the clear and the flag
+    // commit together or not at all, so a failed clear never reports a recovery.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1624_clearfail_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_config("process_enabled", "maybe"));
+    REQUIRE(db.set_config("process_paused_at", "1735689600"));
+    REQUIRE(db.execute_sql("DROP TABLE echo_state"));
+
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "true", 1'735'700'000));
+    CHECK(db.get_config("process_enabled", "true") == "maybe");        // still errored
+    CHECK(db.get_config("process_paused_at", "0") == "1735689600");    // stamp untouched
+}
+
+TEST_CASE("Echo #1624: interval_baseline_reset_due decides the in-memory reset",
+          "[echo][paused_at][issue1624]") {
+    // A disable always resets; an enable resets only when it leaves "errored".
+    for (const char* prev : {"true", "false", "errored"}) {
+        INFO("prev: " << prev);
+        CHECK(interval_baseline_reset_due(prev, "false"));
+    }
+    CHECK(interval_baseline_reset_due("errored", "true"));
+    CHECK_FALSE(interval_baseline_reset_due("true", "true"));
+    CHECK_FALSE(interval_baseline_reset_due("false", "true"));
 }
 
 TEST_CASE("Echo #538: only the enable→disable TRANSITION clears (idempotent)",
@@ -1453,6 +1544,22 @@ TEST_CASE("Echo #2361: a table whose count cannot be read is skipped, not declin
     CHECK(row_count(*f.db, "tcp_hourly") == 20);
 }
 
+TEST_CASE("Echo #6197: a clock that steps backward between passes declines both, single-threaded",
+          "[echo][retention][clock-guard]") {
+    // Deterministic twin of the concurrent case below: the second pass sees a
+    // stored reading ahead of its own `now`, which is a different fact set from
+    // the first pass's, so it declines again instead of reading as already
+    // reported. No expired row goes in either pass.
+    EchoGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 200); // all expired, no survivor
+
+    run_retention(*f.db, kT0 + 10, f.guard);
+    run_retention(*f.db, kT0 + 5, f.guard);
+
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 200);
+}
+
 TEST_CASE("Echo #2361: concurrent rollup passes are race-free when the caller serialises",
           "[echo][retention][clock-guard]") {
     // do_rollup is reachable from two places at once: the 900s `echo.rollup`
@@ -1890,6 +1997,70 @@ TEST_CASE("Echo #2361: an implausible stored reading is an anomaly, not a quiet 
     CHECK(declines_after("99999999999999") == 1);  // far ahead of now
 }
 
+TEST_CASE("Echo #3104: an implausible stored reading is counted once per pass, with no expired rows",
+          "[echo][retention][clock-guard]") {
+    // The per-table decline for a corrupt stored reading fires only when a table
+    // has expired rows to decline, so on an idle device (every row inside its
+    // window) a tampered anchor produced no signal at all. The guard now counts
+    // the corruption itself, once, under a sentinel no table can collide with.
+    auto failures_after = [](const char* stored) {
+        EchoGuardFixture f;
+        seed_process_hourly_at(*f.db, kT0 - 3600, 3); // in-window only: nothing is expired
+        REQUIRE(f.db->set_config("retention_guard_last_pass", stored));
+
+        CHECK(yuzu::echo::retention_clock_events(f.guard) == 0);
+        run_retention(*f.db, kT0, f.guard);
+        CHECK(failures_of(f.guard, "__implausible_stored__") == 1);
+        CHECK(declines_of(f.guard, "process_hourly") == 0); // per-table behaviour unchanged
+        CHECK(row_count(*f.db, "process_hourly") == 3);
+        // The sentinel is a clock event: do_rollup skips the byte-budget pass when this
+        // total rises across run_retention, so a corrupt reading costs one budget pass.
+        CHECK(yuzu::echo::retention_clock_events(f.guard) == 1);
+        // And it reaches `echo status` as its own line, inside the failures total.
+        const auto lines = yuzu::echo::format_retention_guard_lines(f.guard);
+        REQUIRE(lines.size() == 3);
+        CHECK(lines[0] == "retention_guard_failed|__implausible_stored__|1");
+        CHECK(lines[1] == "retention_guard_declines_total|0");
+        CHECK(lines[2] == "retention_guard_failures_total|1");
+        // Re-anchored to now, so the corruption is not counted again.
+        CHECK(f.db->get_config("retention_guard_last_pass", "") == std::to_string(kT0));
+        run_retention(*f.db, kT0 + 1, f.guard);
+        return failures_of(f.guard, "__implausible_stored__");
+    };
+    CHECK(failures_after("not-a-number") == 1);   // unparseable
+    CHECK(failures_after("-1") == 1);             // negative
+    CHECK(failures_after("99999999999999") == 1); // far ahead of now
+
+    // A healthy anchor counts nothing.
+    EchoGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 3600, 3);
+    run_retention(*f.db, kT0, f.guard);
+    CHECK(failures_of(f.guard, "__implausible_stored__") == 0);
+    CHECK(yuzu::echo::retention_clock_events(f.guard) == 0);
+}
+
+TEST_CASE("Echo #3104: a corrupt stored reading that cannot be re-anchored is counted every pass",
+          "[echo][retention][clock-guard]") {
+    // The re-anchor is what makes the sentinel a once-only count. When that write
+    // fails the bad reading stays, so each pass reports it again, beside the
+    // `__clock_state__` failure for the write itself.
+    EchoGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 3600, 3); // in-window only: nothing is expired
+    REQUIRE(f.db->set_config("retention_guard_last_pass", "not-a-number"));
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_cfg BEFORE UPDATE ON echo_config "
+                              "WHEN NEW.key = 'retention_guard_last_pass' "
+                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    for (int pass = 1; pass <= 3; ++pass) {
+        run_retention(*f.db, kT0 + pass, f.guard);
+        CHECK(failures_of(f.guard, "__implausible_stored__") == pass);
+        CHECK(failures_of(f.guard, "__clock_state__") == pass);
+        CHECK(yuzu::echo::retention_clock_events(f.guard) == 2 * pass);
+    }
+    CHECK(f.db->get_config("retention_guard_last_pass", "") == "not-a-number");
+    CHECK(row_count(*f.db, "process_hourly") == 3); // nothing deleted meanwhile
+}
+
 TEST_CASE("Echo #2361: a failed persist of the clock reading is reported",
           "[echo][retention][clock-guard]") {
     // `set_config` used to return void, so a write that never landed left the
@@ -2227,9 +2398,9 @@ TEST_CASE("Echo #2361: a closed store skips the pass instead of reporting clock 
     // The pass must say the true thing once and stop.
     //
     // A moved-from EchoDatabase has `db_ == nullptr`, which is the same state the
-    // wedge path produces via sqlite3_close_v2. The close itself needs a rollback
-    // that fails with the transaction still open -- a disk-level fault, not
-    // inducible here -- so this covers the downstream behaviour, not the close.
+    // wedge path produces via sqlite3_close_v2. This case covers the downstream
+    // behaviour; the close itself is driven through the OpenSeams::rollback seam in
+    // the cases that follow it.
     EchoGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 10);
 
@@ -2253,6 +2424,276 @@ TEST_CASE("Echo #2361: a closed store skips the pass instead of reporting clock 
     CHECK(row_count(live, "process_hourly") == 10);
 }
 
+// A database seeded from the migrated template and opened with `seams` (a current-version open, so
+// no ladder and no extra fsyncs).
+static EchoDatabase open_with_seams(const fs::path& path, const OpenSeams& seams) {
+    (void)yuzu::test::seed_echo_db_from_template(path);
+    auto opened = EchoDatabase::open(path, seams);
+    INFO(std::string{opened.has_value() ? "" : opened.error()});
+    REQUIRE(opened.has_value());
+    return std::move(*opened);
+}
+
+TEST_CASE("Echo #8099: checked_transaction closes the store when ROLLBACK fails inside the transaction",
+          "[echo][store][rollback-wedge]") {
+    // A seam that reports an error WITHOUT rolling back leaves the connection in the transaction,
+    // which is the wedge: the store must close, the write path must fail, and the read-only query
+    // connection (a separate handle) must survive.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_ct_"};
+    int rollbacks = 0;
+    OpenSeams seams;
+    seams.rollback = [&](sqlite3*) {
+        ++rollbacks;
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+    REQUIRE(db.is_open());
+    REQUIRE(db.query_engine_available());
+
+    const auto result = db.checked_transaction(
+        [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == "injected");
+    CHECK(rollbacks == 1);
+    CHECK_FALSE(db.is_open());
+    CHECK_FALSE(db.set_config("k", "v"));
+    CHECK(db.query_engine_available());
+}
+
+TEST_CASE("Echo #8099: execute_atomic_batch closes the store when ROLLBACK fails inside the transaction",
+          "[echo][store][rollback-wedge]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_ab_"};
+    int rollbacks = 0;
+    OpenSeams seams;
+    seams.rollback = [&](sqlite3*) {
+        ++rollbacks;
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+
+    // SQLITE_TOOBIG is neither a plain error nor a constraint, so the batch abandons the pass
+    // while the transaction is still open and goes to ROLLBACK. This holds only while the compiled
+    // SQLITE_MAX_LENGTH is below 2,000,000,000 (the SQLite default is 1,000,000,000); a build that
+    // raised it would let the statement succeed, and the checks below then fail instead of passing
+    // by accident: began is required first, then committed, the rollback count and the close.
+    const auto batch = db.execute_atomic_batch({"SELECT zeroblob(2000000000)"});
+    REQUIRE(batch.began);
+    CHECK_FALSE(batch.committed);
+    CHECK(rollbacks == 1);
+    CHECK_FALSE(db.is_open());
+    CHECK_FALSE(db.set_config("k", "v")); // the write path is closed, not merely flagged
+    CHECK(db.query_engine_available());
+}
+
+TEST_CASE("Echo #8099: a ROLLBACK that rolled back and then reported an error leaves the store open",
+          "[echo][store][rollback-wedge]") {
+    // The benign case the wedge branch must not mistake for a wedge: SQLite already ended the
+    // transaction (autocommit is 1), so closing the store would be a false alarm.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_ok_"};
+    OpenSeams seams;
+    seams.rollback = [](sqlite3* raw) {
+        sqlite3_exec(raw, "ROLLBACK", nullptr, nullptr, nullptr);
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+
+    const auto result = db.checked_transaction(
+        [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+    REQUIRE_FALSE(result.has_value());
+    CHECK(db.is_open());
+    CHECK(db.set_config("k", "v")); // a connection still inside a transaction would refuse this
+    CHECK(db.get_config("k") == "v");
+}
+
+TEST_CASE("Echo #8099: a batch ROLLBACK that rolled back and then reported an error leaves the store open",
+          "[echo][store][rollback-wedge]") {
+    // The same benign shape as the checked_transaction case above, through the batch path's own
+    // discriminator: the two paths are separate code and must each keep the store open.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_abok_"};
+    OpenSeams seams;
+    seams.rollback = [](sqlite3* raw) {
+        sqlite3_exec(raw, "ROLLBACK", nullptr, nullptr, nullptr);
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+
+    const auto batch = db.execute_atomic_batch({"SELECT zeroblob(2000000000)"});
+    CHECK(batch.began);
+    CHECK_FALSE(batch.committed);
+    CHECK(db.is_open());
+    CHECK(db.set_config("k", "v")); // a connection still inside a transaction would refuse this
+    CHECK(db.get_config("k") == "v");
+}
+
+TEST_CASE("Echo #8099: a failed rollback during the v10 step is an open failure, not a runtime wedge",
+          "[echo][store][rollback-wedge]") {
+    // The open-time counterpart, already reported as migration_failed: the step fails (here the
+    // retired daily tier has a row but no roll-up mark, so the step refuses inside its
+    // transaction), its ROLLBACK fails with the transaction open, and open() refuses (the
+    // connection closes with the transaction undone). The file stays v9 with its retired row, and classify_open_failure keeps
+    // the reason it always gave. No `rollback_wedged` tag comes out of an open.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_v10_"};
+    // RAII handles: a failing REQUIRE unwinds through these lambdas, and a raw handle would leak.
+    const auto open_raw = [&] {
+        sqlite3* raw = nullptr;
+        const int rc = sqlite3_open(tmp.path.string().c_str(), &raw);
+        std::unique_ptr<sqlite3, int (*)(sqlite3*)> handle{raw, sqlite3_close}; // owned even on failure
+        REQUIRE(rc == SQLITE_OK);
+        return handle;
+    };
+    const auto exec_raw = [&](const char* sql) {
+        const auto raw = open_raw();
+        REQUIRE(sqlite3_exec(raw.get(), sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    const auto scalar = [&](const char* sql) {
+        const auto raw = open_raw();
+        sqlite3_stmt* stmt_raw = nullptr;
+        const int rc = sqlite3_prepare_v2(raw.get(), sql, -1, &stmt_raw, nullptr);
+        std::unique_ptr<sqlite3_stmt, int (*)(sqlite3_stmt*)> stmt{stmt_raw, sqlite3_finalize};
+        REQUIRE(rc == SQLITE_OK);
+        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_ROW);
+        const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        REQUIRE(text != nullptr);
+        return std::string{text};
+    };
+    exec_raw("CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');"
+             "INSERT INTO echo_config VALUES ('schema_version', '9');"
+             "CREATE TABLE process_daily (id INTEGER PRIMARY KEY AUTOINCREMENT, day_ts INTEGER NOT "
+             "NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '', user TEXT NOT NULL DEFAULT '', "
+             "start_count INTEGER NOT NULL DEFAULT 0, stop_count INTEGER NOT NULL DEFAULT 0);"
+             "INSERT INTO process_daily VALUES (NULL, 1793613600, 'a', 'u', 3, 1);");
+
+    int rollbacks = 0;
+    OpenSeams seams;
+    seams.rollback = [&](sqlite3*) {
+        ++rollbacks;
+        return SQLITE_IOERR;
+    };
+    const auto failed = EchoDatabase::open(tmp.path, seams);
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(rollbacks == 1);
+    CHECK(failed.error().starts_with(kV10MigrationFailedPrefix));
+    CHECK(classify_open_failure(failed.error()) == OfflineReason::migration_failed);
+    CHECK(scalar("SELECT value FROM echo_config WHERE key = 'schema_version'") == "9");
+    CHECK(scalar("SELECT COUNT(*) FROM process_daily") == "1");
+}
+
+// A store a failed ROLLBACK has closed: the seam reports an error without rolling back, so the
+// transaction stays open and checked_transaction takes the real close path.
+static EchoDatabase open_wedged(const fs::path& path) {
+    OpenSeams seams;
+    seams.rollback = [](sqlite3*) { return SQLITE_IOERR; };
+    auto db = open_with_seams(path, seams);
+    REQUIRE(db.is_open());
+    const auto result = db.checked_transaction(
+        [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE_FALSE(db.is_open());
+    return db;
+}
+
+TEST_CASE("Echo #8099: the ROLLBACK seam follows the database through a move assignment",
+          "[echo][store][rollback-wedge]") {
+    // EchoDatabase has two move operations and open_with_seams exercises only the constructor. A
+    // move assignment that dropped the seam would run a real ROLLBACK, which succeeds, and the
+    // store would stay open.
+    yuzu::test::TempDbFile seamed_file{"yuzu_test_echo_8099_mva_"};
+    yuzu::test::TempDbFile plain_file{"yuzu_test_echo_8099_mvb_"};
+    OpenSeams seams;
+    seams.rollback = [](sqlite3*) { return SQLITE_IOERR; };
+    auto seamed = open_with_seams(seamed_file.path, seams);
+    auto target = open_with_seams(plain_file.path, OpenSeams{});
+
+    target = std::move(seamed);
+    REQUIRE(target.is_open());
+    const auto result = target.checked_transaction(
+        [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+    REQUIRE_FALSE(result.has_value());
+    CHECK_FALSE(target.is_open());
+}
+
+TEST_CASE("Echo #8099: each guarded action is refused on a store a failed ROLLBACK closed, and only then",
+          "[echo][store][rollback-wedge]") {
+    // The action gate (EchoPlugin::refuse_on_closed_store) is TU-local, so this drives its decision
+    // with the real liveness probes of a real closed store: the store is wedged through the seam,
+    // not faked, and the probes are the ones the shell reads. The wiring itself is pinned by
+    // tests/test_echo_storage_offline_reconcile_lexical.py.
+    const std::string action = GENERATE(as<std::string>{}, "collect_fast", "collect_slow", "configure",
+                                        "fleet_snapshot", "rollup");
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_gate_"};
+    OpenSeams seams;
+    seams.rollback = [](sqlite3*) { return SQLITE_IOERR; };
+    auto db = open_with_seams(tmp.path, seams);
+
+    // open: runs
+    CHECK_FALSE(format_closed_store_refusal(action, db.is_open(), db.query_engine_available()));
+
+    const auto closed = [&] {
+        const auto result = db.checked_transaction(
+            [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+        REQUIRE_FALSE(result.has_value());
+    };
+    closed();
+    REQUIRE_FALSE(db.is_open());
+    REQUIRE(db.query_engine_available());
+
+    // closed: refused with line 0 of the offline status reply, `error|` first, promising the read path
+    const auto refusal = format_closed_store_refusal(action, db.is_open(), db.query_engine_available());
+    REQUIRE(refusal.has_value());
+    CHECK(refusal->starts_with("error|"));
+    CHECK(*refusal == format_storage_offline_lines(true).front());
+    CHECK(refusal->find("`echo sql`") != std::string::npos);
+}
+
+TEST_CASE("Echo #8099: the actions left unguarded on a closed store answer honestly, as the gate's contract says",
+          "[echo][store][rollback-wedge]") {
+    // refused_on_closed_store leaves these alone because each already tells the truth about a closed
+    // store. Pin the facts that claim rests on, against a real closed store, so a change that makes
+    // one of them report a healthy empty store moves the action into the refused set instead of
+    // slipping through.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_honest_"};
+    auto db = open_wedged(tmp.path);
+
+    // the gate lets all of them run
+    for (const std::string_view action : {"status", "sql", "compatibility", "query", "export", "purge_source",
+                                          "snapshot", "collect_perf", "collect_software"})
+        CHECK_FALSE(format_closed_store_refusal(action, db.is_open(), db.query_engine_available()));
+
+    // query and export read through the write connection: an error, never an empty result set
+    const auto read = db.execute_query("SELECT 1");
+    REQUIRE_FALSE(read.has_value());
+    CHECK(read.error() == "database not open");
+
+    // purge_source, snapshot, collect_perf and collect_software gate on the enable flag: unreadable
+    // (nullopt) on a closed store, which the shell reports as config_unreadable, a partial snapshot
+    // naming every source, and `state_unreadable`
+    for (const auto& src : capture_sources())
+        CHECK_FALSE(source_enabled_state(db, src.name).has_value());
+
+    // sql reads the separate read-only connection, which survives the close: the one action that
+    // keeps answering, and the offline status reply says so
+    const auto user = db.execute_user_query("SELECT 1");
+    CHECK(user.has_value());
+    CHECK(format_storage_offline_lines(db.query_engine_available())[0].find("`echo sql`") !=
+          std::string::npos);
+}
+
+TEST_CASE("Echo #8099: why configure is refused on a closed store: a usage re-assert reads the default and succeeds",
+          "[echo][store][rollback-wedge]") {
+    // The one configure write that reports success on a closed store, and the reason the gate
+    // refuses the whole action. A closed store returns the registry default for every config read
+    // (`usage` defaults to enabled), so re-asserting `usage_enabled=true` sees no change and returns
+    // true with nothing written: an operator resuming a paused source would read `status|ok` for a
+    // store that cannot hold the change. Every other source's toggle is one transaction and fails.
+    // If the usage branch ever fails closed itself, this case documents the original defect and may
+    // be reduced to the second check.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_cfg_"};
+    auto db = open_wedged(tmp.path);
+    CHECK(apply_source_enabled_transition(db, "usage", "true", 1'000'000));
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "false", 1'000'000));
+    CHECK_FALSE(db.set_config("slow_interval_seconds", "60"));
+}
+
 TEST_CASE("Echo #2361: the offline status reply leads with error|, not storage_state",
           "[echo][retention][clock-guard]") {
     // Governance Gate 3 (quality-engineer) BLOCKING: this ordering is the fix
@@ -2269,7 +2710,7 @@ TEST_CASE("Echo #2361: the offline status reply leads with error|, not storage_s
     const auto lines = yuzu::echo::format_storage_offline_lines(/*query_engine_available=*/true);
     REQUIRE(lines.size() == 2);
     CHECK(lines[0].starts_with("error|"));
-    CHECK(lines[1] == "storage_state|offline");
+    CHECK(lines[1] == "storage_state|offline|rollback_wedged");
     CHECK(lines[0].find("echo sql") != std::string::npos);
 
     // And when the read-only connection is gone too, the line must NOT promise
@@ -2277,7 +2718,7 @@ TEST_CASE("Echo #2361: the offline status reply leads with error|, not storage_s
     const auto dark = yuzu::echo::format_storage_offline_lines(/*query_engine_available=*/false);
     REQUIRE(dark.size() == 2);
     CHECK(dark[0].starts_with("error|"));
-    CHECK(dark[1] == "storage_state|offline");
+    CHECK(dark[1] == "storage_state|offline|rollback_wedged");
     CHECK(dark[0].find("cannot read") != std::string::npos);
 }
 

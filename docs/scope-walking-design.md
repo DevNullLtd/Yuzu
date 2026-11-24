@@ -47,6 +47,13 @@ SQLite file is retained read-only for one release as a rollback breadcrumb
 retained as the original design illustration; treat ADR-0036 as authoritative
 for the live schema.
 
+Synchronous creation and asynchronous materialisation deduplicate device IDs and
+insert up to 1,000 members per PostgreSQL statement. The header and all member
+batches share one transaction. A failed insert rolls back the entire write.
+For a pending set, only the transaction that changes its status to materialised
+can publish members and counts. A failed fill leaves the pending set available
+for retry.
+
 ```sql
 CREATE TABLE result_sets (
   id              TEXT PRIMARY KEY,        -- "rs_<ulid>", monotonic, lexically sortable
@@ -170,7 +177,7 @@ Three different functions split a plugin's newline-joined output into lines, and
 | Splitter | CR handling | Used for |
 |---|---|---|
 | `split_output_lines` (`result_parsing.hpp`) | deletes **every** CR | row text on the SSE stream, dashboard fragments, facets |
-| `live::split_lines` (`live_kinds.hpp`) | drops only a **trailing** CR | the device-page live snapshots |
+| `live::split_lines` (`live_model.hpp`) | drops only a **trailing** CR | the device-page live snapshots |
 | `rs_matcher` (`result_set_matcher.cpp`) | keeps **every** CR | the membership matcher |
 
 The matcher keeps CR because its cell text decides which devices are MEMBERS of a result set (`eq`, `in`, `contains` compare the cell text). Making it delete CR like `split_output_lines` would change which devices match: for an answer whose last cell is CRLF-terminated, `eq` against the value without the CR would start matching devices it does not match today. The owner decision is to leave the matcher unchanged. A matcher author whose plugin emits CRLF should match with `contains`, or the plugin should stop emitting CR. The three behaviours are pinned by tests in `tests/unit/server/test_result_set_matcher.cpp`.

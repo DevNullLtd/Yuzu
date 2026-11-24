@@ -302,6 +302,20 @@ PrepareOutcome prepare_impl(Ctx& c) {
                                       "dispatched and no approval ticket was created"));
     }
 
+    // sg10 / UP-1: a params key the agent would truncate (or a NUL value) is refused here, before
+    // any approval, execution row or dispatch, as a 400 `param_key_invalid`.
+    if (rq.body.contains("params")) {
+        if (const auto bad = check_params_key_shape(rq.body["params"])) {
+            bump(ports, "yuzu_server_dispatch_target_rejected_total",
+                 {{"route", route_label(rq.surface)}, {"reason", std::string(kReasonParamKeyInvalid)}});
+            c.audit("denied", std::string("reason=") + std::string(kReasonParamKeyInvalid) +
+                                  " definition=" + def_token);
+            return refuse(c, make_refusal(RefusalKind::kBadRequest, bad->reason, bad->message,
+                                          "remove the control byte, NUL or invalid UTF-8 from the "
+                                          "params key (or the NUL from the value) and re-send"));
+        }
+    }
+
     Plan plan;
     plan.def = def;
     for (const auto& a : rq.body.value("agent_ids", nlohmann::json::array()))

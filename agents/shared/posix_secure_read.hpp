@@ -362,6 +362,15 @@ struct FileOpen {
 #endif
 }
 
+/// The status-change time of a stat result, at nanosecond resolution (the field name differs by OS).
+[[nodiscard]] inline struct timespec ctime_of(const struct stat& st) noexcept {
+#if defined(__APPLE__)
+    return st.st_ctimespec;
+#else
+    return st.st_ctim;
+#endif
+}
+
 /// Open the regular file `name` under `dir_fd` for ranged reads by the caller (pread, fstat), the
 /// leaf not followed. Same single-component contract, flags and by-descriptor regular-file check
 /// as the read forms; unlike them it reads nothing and applies no size cap.

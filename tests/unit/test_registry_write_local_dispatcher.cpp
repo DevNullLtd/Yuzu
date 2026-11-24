@@ -1672,7 +1672,12 @@ TEST_CASE("registry plugin: version 2.1.0 and the 12 descriptors -- Windows supp
         CHECK(d.windows_leg.support == YUZU_SUPPORT_SUPPORTED);
         CHECK(d.windows_leg.rung == 1);
     }
-    CHECK(seen == std::unordered_set<std::string>(std::begin(kExpectedActions), std::end(kExpectedActions)));
+    // An explicit loop, not the range constructor: libstdc++ 14 (gcc-toolset-14) cannot build a
+    // std::string set from a string_view range, because the conversion is explicit.
+    std::unordered_set<std::string> expected;
+    for (const std::string_view action : kExpectedActions)
+        expected.emplace(action);
+    CHECK(seen == expected);
 }
 
 TEST_CASE("registry plugin: off Windows a read answers the sentinel with rc 0 and every mutator with rc 1",

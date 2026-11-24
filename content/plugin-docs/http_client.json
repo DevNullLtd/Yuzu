@@ -81,8 +81,8 @@
   ],
   "caveats": [
     "**`head`'s declared result columns don't match what the code emits.** The definition YAML declares `status|content_length|content_type`; `do_head` actually writes `status|headers`, where `headers` is the full raw header block. A consumer parsing by the declared schema will not find `content_length`/`content_type`.",
-    "**`get`'s size cap doesn't stop the transfer.** `download` streams to disk and aborts mid-transfer past 100 MiB (`content_receiver`, lines 265-273). `get` calls `cli.Get(parsed.path)` with no content receiver, so the full body is already downloaded in memory before the `res->body.size() > kMaxDownloadSize` check (line 350) replaces it with an error string — the cap limits what's returned, not what's fetched.",
-    "**No redirect following.** Neither `set_follow_location` nor any equivalent is called on any `httplib::Client`/`SSLClient` instance, so a 3xx response is returned as-is (status + whatever body/headers the redirect response itself carries), not followed.",
+    "**`get` caps what it buffers; `download` buffers up to its cap.** `get` receives the body through a capped receiver that aborts the transfer past 1 MiB and reports `truncated|1048576`; the exit code stays 0 on a truncated 2xx, so a caller reads the `truncated` row, not the code. `download` holds the whole body in memory (up to 100 MiB, reserved once from `Content-Length` when declared) before writing, and reports an allocation failure as `download aborted: out of memory`.",
+    "**No redirect following.** Neither `set_follow_location` nor any equivalent is called on any `httplib::Client`/`SSLClient` instance, so for `get` and `head` a 3xx response is returned as-is (status + whatever body/headers the redirect response itself carries), not followed; for `download` anything but a 2xx status is a failure (`download failed: HTTP <status>`) and writes nothing.",
     "**HTTPS on Windows depends on a build-time OpenSSL find.** Windows OpenSSL discovery is `required: false` (`meson.build`); when it isn't found, `CPPHTTPLIB_OPENSSL_SUPPORT` is undefined and every `https://` call on that build returns `status|0` with an \"HTTPS not supported\" message instead of connecting (lines 283-287, 334-337, 378-381). Linux/macOS require OpenSSL at configure time and always have it.",
     "**This plugin does not set a typed result status.** Every sample shows `UNDECLARED / UNKNOWN /` regardless of outcome — a caller must parse the `status`/`error` output fields, not the result-status envelope, to detect failure."
   ],
@@ -145,7 +145,7 @@
     }
   ],
   "description": "HTTP client — download files, GET/HEAD requests with hash verification (no shell-out)",
-  "how_it_works": "All three actions parse the operator-supplied URL, reject anything but `http://`/`https://`, and run it through an SSRF filter before opening a connection: `hostname_resolves_to_private` resolves the hostname and rejects any IPv4/IPv6 result in a private, loopback, link-local, CGN, benchmarking, or unique-local range, and fails closed — blocking the request — if resolution itself fails. `get` and `head` then issue a single `httplib::Client`/`SSLClient` GET or HEAD and return the status plus body/headers as-is. `download` additionally canonicalizes the destination's parent directory and rejects any path containing a `..` component before streaming the response to disk, capping the transfer at 100 MiB by aborting mid-stream; it then SHA-256-hashes the file (BCrypt on Windows, OpenSSL EVP elsewhere) and, if `expected_hash` was supplied, deletes the file and fails on a mismatch. Every request goes through cpp-httplib's native in-process socket client — no shell invocation on any platform. The plugin deliberately does not follow HTTP redirects, does not accept custom headers/methods/auth, and does not retry a failed request.",
+  "how_it_works": "All three actions parse the operator-supplied URL, reject anything but `http://`/`https://`, and vet the destination before opening a connection (`agents/shared/outbound_address_policy.hpp`): the host name is resolved **once**, every address the lookup returned must be a public address, and the connection goes to one of those vetted addresses (IPv4 first, then IPv6, each tried in turn) through cpp-httplib's hostname-to-address map, so the `Host` header and TLS name verification stay on the original name and a DNS answer that changes between the check and the connect cannot redirect it. Loopback, private (RFC 1918, carrier-grade NAT, unique-local), link-local and the cloud metadata addresses (`169.254.169.254`, `168.63.129.16`, the Alibaba Cloud metadata address, `fd00:ec2::254`), unspecified, multicast, reserved, documentation and other non-global blocks are refused, IPv4-mapped, NAT64 (`64:ff9b::/96`) and 6to4 forms are judged by the IPv4 address they embed, and a failed lookup blocks the request (fail closed). `get` and `head` then issue a single GET or HEAD under a 120 s total deadline and return the status plus body/headers, except that `get` returns at most the first 1 MiB of the body: a longer body is cut there, at a character boundary, and a final `truncated|1048576` row follows the `body` row (the status is still the peer's and the exit code is unchanged), so one `get` result can never be a frame the server refuses. The `get` body is scrubbed through the shared wire-UTF-8 helper (`agents/shared/wire_utf8.hpp`): a NUL, an LF, a CR, any other control byte below `0x20` except TAB, or an invalid UTF-8 byte is replaced with `?` and a `constrained|body_bytes_replaced:<count>` row follows, never a silently shortened row. The server splits plugin output on newlines, so a body can never start a `status|`, `constrained|` or `truncated|` row of its own: a multi-line body reads as one `body|` row with `?` where each line break was. `head` applies the same rule to the peer's response headers: in a header name, `|` and every control byte, and in a value every control byte except TAB, and in both any invalid UTF-8 byte, is replaced with `?`, and a `constrained|headers_bytes_replaced:<count>` row follows when any byte was replaced, so a header named `status|200` cannot read as a `status` row. Use `download` for a larger body. `download` first refuses a destination on a network or device path (or whose resolved parent is one) and any path containing a `..` component, then fetches the body into memory (capped at 100 MiB, 600 s total deadline) accepting only a **2xx** status, requires the body to be **complete** (it matches `Content-Length`, or the framing is chunked, or an `expected_hash` is given to verify it; a body with none of these is refused because a cut-short close-delimited transfer cannot be told from a finished one), checks `expected_hash` (case-insensitive SHA-256) and only then replaces the destination in one atomic rename. A failed, non-2xx, over-cap, incomplete or unverified transfer writes nothing and leaves an existing destination as it was; the replacement is a new regular file, so a symlink or hard-linked destination is replaced rather than written through. Every request goes through cpp-httplib's native in-process socket client, no shell invocation on any platform. The plugin deliberately does not follow HTTP redirects, does not accept custom headers/methods/auth, and does not retry a failed request. It also never decodes a compressed response: every client turns httplib's response decompression off (`set_decompress(false)`), so `download` hashes and stores exactly the bytes the peer sent, and `get` and `head` ask for `identity` encoding and return whatever arrives undecoded. A host that answers both IPv4 and IPv6 is tried address by address (IPv4 first, at most four addresses, one total deadline for all attempts) and only a failure to connect moves on to the next address. `download` stores exactly the bytes it received (a gzip body is stored compressed and `expected_hash` is compared with those stored bytes), and a destination file name of about 235 characters or more fails because the atomic-replace temporary name needs room in the same directory.",
   "inputs": [
     {
       "constraints": null,
@@ -169,7 +169,7 @@
       "constraints": null,
       "default": null,
       "definition_id": "agent.http_client.download",
-      "description": "Optional SHA256 hash for verification.",
+      "description": "Optional SHA256 hash (hex, case-insensitive) the downloaded body must match before anything is written. Without it the response must declare its length (Content-Length, or chunked framing) so a truncated transfer is refused.",
       "name": "expected_hash",
       "required": false,
       "type": "string"
@@ -198,7 +198,7 @@
     "gathered": false,
     "mutating": true
   },
-  "leg_hash": "6e02e2f89c34",
+  "leg_hash": "60b58499489d",
   "manifest_version": 1,
   "name": "http_client",
   "outputs": [
@@ -229,7 +229,7 @@
           "values": null
         },
         {
-          "description": "Size in bytes of the downloaded file on disk, read back with std::filesystem::file_size after the write completes. Values: non-negative integer, bytes.",
+          "description": "Size in bytes of the downloaded body, which is the size of the file now at the destination (the body is held in memory, verified, then written in one atomic replace). Values: non-negative integer, bytes.",
           "example": 559,
           "name": "size",
           "platforms": [
@@ -241,7 +241,7 @@
           "values": null
         },
         {
-          "description": "Lowercase hex SHA-256 digest of the downloaded file, computed via BCrypt on Windows and OpenSSL EVP on Linux/macOS. Values: 64-character lowercase hex string.",
+          "description": "Lowercase hex SHA-256 digest of the downloaded body (the shared in-memory SHA-256, identical on every OS), the value compared with expected_hash before anything is written. Values: 64-character lowercase hex string.",
           "example": "ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d",
           "name": "hash",
           "platforms": [
@@ -270,7 +270,7 @@
           "values": null
         },
         {
-          "description": "Response body text; a body over the 100 MiB cap is replaced with an error string, though the full response is already received over the wire before that check runs. Values: free text, or an error string on failure.",
+          "description": "Response body text, at most the first 1 MiB (a longer body is cut at a character boundary and a truncated row follows); NUL, LF, CR, any other control byte below 0x20 except TAB, and invalid UTF-8 bytes are replaced with ? and a constrained row reports how many. Values: free text, or an error string on failure.",
           "example": "<!doctype html><html lang=\"en\"><head><title>Example Domain</title>...",
           "name": "body",
           "platforms": [
@@ -279,6 +279,30 @@
             "darwin"
           ],
           "type": "string",
+          "values": null
+        },
+        {
+          "description": "Present only when body bytes were replaced: body_bytes_replaced:<count> of NUL, LF, CR, other control bytes below 0x20 except TAB, or invalid UTF-8 bytes. Values: body_bytes_replaced:<count>.",
+          "example": "body_bytes_replaced:3",
+          "name": "constrained",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Present only when the body was cut at the cap: the cap in bytes (1048576). The status is still the peer status and the exit code is unchanged. Values: 1048576.",
+          "example": 1048576,
+          "name": "truncated",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
           "values": null
         }
       ],
@@ -318,7 +342,7 @@
       "definition_id": "agent.http_client.head"
     }
   ],
-  "outputs_note": "Rows are pipe-delimited `field|value` lines written one at a time via `ctx.write_output()`; there is no multi-row output for any of these three actions, and a validation or transport failure emits a single `error|<message>` line in place of the normal fields rather than a row with an error status. `download`'s four fields (`status|path|size|hash`) and `get`'s two fields (`status|body`) match their declared result columns exactly. `head`'s declared columns do **not** match what the code emits: the leg writes only `status` and a single `headers` field holding the full raw response header block (one `Name: value` pair per line, newline-joined, in the order the server sent them; before the cpp-httplib 0.59 bump the order was unspecified (hash order, differing by platform)) — `content_length` and `content_type` are declared in the definition YAML but never populated by `do_head`; see Caveats.",
+  "outputs_note": "Rows are pipe-delimited `field|value` lines written one at a time via `ctx.write_output()`; there is no multi-row output for any of these three actions, and a validation or transport failure emits a single `error|<message>` line in place of the normal fields rather than a row with an error status. `download`'s four fields (`status|path|size|hash`) match their declared result columns exactly; `get`'s fields (`status|body`, plus `constrained|<token>` only when body bytes were replaced and `truncated|<cap>` only when the body was cut) match its declared columns, the last two being the declared conditional columns. A truncated 2xx `get` still exits 0. `head`'s declared columns do **not** match what the code emits: the leg writes `status` and a single `headers` field (plus `constrained|headers_bytes_replaced:<count>` only when header bytes were replaced) holding the full raw response header block (one `Name: value` pair per line, newline-joined, in the order the server sent them; before the cpp-httplib 0.59 bump the order was unspecified (hash order, differing by platform)) — `content_length` and `content_type` are declared in the definition YAML but never populated by `do_head`; see Caveats.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -412,7 +436,7 @@
       "stamp": {
         "date": "2026-09-06",
         "host_class": "container",
-        "leg_hash": "6e02e2f89c34",
+        "leg_hash": "60b58499489d",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -480,7 +504,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "6e02e2f89c34",
+        "leg_hash": "60b58499489d",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -548,7 +572,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "6e02e2f89c34",
+        "leg_hash": "60b58499489d",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
         "privilege": "SYSTEM"
@@ -593,6 +617,7 @@
       "content/definitions/http_client.yaml"
     ],
     "plugin": [
+      "agents/plugins/http_client/src/http_client_download.hpp",
       "agents/plugins/http_client/src/http_client_plugin.cpp"
     ],
     "privilege_row": false,
@@ -602,7 +627,7 @@
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `response_store.hpp:153`), queryable at `/api/responses/{id}`.",
     "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics — no server-side code references `agent.http_client.*` or `http_client` outside `agent_registry.cpp`'s instruction-catalogue description strings (`agent_registry.cpp:860-863`) and the capability declarations.",
-    "**Sensitivity.** `get`/`download` rows carry the fetched URL's response body verbatim, and `head`'s `headers` field carries the full raw response header block — whatever the remote endpoint returns rides through unfiltered, so a URL pointed at an internal system could surface usernames, credentials, or other personal data in the body/headers; the `path`/`hash` fields otherwise carry nothing beyond the operator-chosen destination.",
+    "**Sensitivity.** `get`/`download` rows carry the fetched URL's response body verbatim, and `head`'s `headers` field carries the full raw response header block — whatever the remote endpoint returns rides through apart from the byte replacements described above, so a URL pointed at an internal system could surface usernames, credentials, or other personal data in the body/headers; the `path`/`hash` fields otherwise carry nothing beyond the operator-chosen destination.",
     "**Siblings:** none — no other plugin performs outbound HTTP.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"agent.http_client.get\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
   ]

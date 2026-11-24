@@ -146,6 +146,9 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                  const auto cid = make_cid();
                  res.set_header("X-Correlation-Id", cid);
                  const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+                 // Before the scope gate and any audit row: the id reaches target_id on both.
+                 if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                     return;
 
                  // Per-device scope is MANDATORY — fail CLOSED if the gate is unwired
                  // rather than silently widening to a global read (mirrors the dex
@@ -249,6 +252,10 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
             const auto cid = make_cid();
             res.set_header("X-Correlation-Id", cid);
             const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+            // Before the scope gate and any audit row: the id reaches target_id on both, and
+            // this is the destructive cascade.
+            if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                return;
             if (!scoped_perm_fn_) {
                 send_json(res, 503, a4_error(503, "scope gate not configured", cid));
                 return;

@@ -6,6 +6,19 @@
 
 ---
 
+## Planned incident-mode dispatch
+
+In a broad threat hunt the device verdict can be small even when the evidence is enormous.
+For example, 1,000 path records averaging 93 bytes across 1.3 million devices produce about
+121 GB of text before storage overhead. The approved design streams bulk live responses through
+core to ClickHouse in both ordinary and incident runs. PostgreSQL holds run control and bounded
+warm verdicts. Incident mode admits a higher rate in waves as ClickHouse acknowledges writes.
+A stalled sink pauses dispatch. The run must show the destination, acknowledged progress and
+devices with incomplete coverage. Operators cannot infer absence from missing evidence.
+
+This is planned for the live-input ladder. Today's response store writes to PostgreSQL.
+See [criteria-run live delivery](adr/0075-criteria-runs.md#r13-live-delivery-from-slice-3-d17-d23-d25-d30).
+
 ## 1. Epistemic Status
 
 ### Verified from implementation
