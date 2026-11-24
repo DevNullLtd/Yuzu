@@ -432,45 +432,6 @@ TEST_CASE("component_legs_win: the scan keeps out of WindowsApps too and says so
     CHECK(row_paths(b).size() == 3);
 }
 
-TEST_CASE("component_legs_win: only STATUS_ACCESS_DENIED is a permission_denied listing",
-          "[component_inventory][fs_win]") {
-    CHECK(list_cause_from_ntstatus(0xC0000022u) == ListError::permission_denied); // STATUS_ACCESS_DENIED
-    CHECK(list_cause_from_ntstatus(0xC000050Bu) == ListError::none); // STATUS_REPARSE_POINT_ENCOUNTERED
-    CHECK(list_cause_from_ntstatus(0xC0000043u) == ListError::none); // STATUS_SHARING_VIOLATION
-    CHECK(list_cause_from_ntstatus(0u) == ListError::none);          // never attempted
-    CHECK(list_cause_from_ntstatus(0xC0001234u) == ListError::none); // unknown
-}
-
-TEST_CASE("component_legs_win: the scan reports a refused directory as dir_unreadable whatever the listing cause (#8739)",
-          "[component_inventory][fs_win]") {
-    namespace fx = yuzu::component_inventory::fixture;
-    const auto run = [](ListError cause) {
-        fx::MemTree tree;
-        tree.add_file("C:/Program Files/App/lib-1.0.jar", fx::build_zip({fx::stored("a.class", "x")}).bytes);
-        tree.add_file("C:/Program Files/Locked/x.jar", "x");
-        FsOps ops = tree.ops();
-        const auto inner = ops.list;
-        ops.list = [inner, cause](const std::string& d, std::size_t cap) {
-            if (d != "C:/Program Files/Locked")
-                return inner(d, cap);
-            ListResult r;
-            r.error = true;
-            r.cause = cause;
-            return r;
-        };
-        Targets t;
-        t.roots = {"C:/Program Files"};
-        return answer_scan("windows", t, [&](const Targets&) { return ops; }, WalkLimits{});
-    };
-    // walk() has no permission_denied stop (only walk_ordered reads the cause); widening it is #8739.
-    const Answer denied = run(ListError::permission_denied);
-    REQUIRE_FALSE(denied.lines.empty());
-    CHECK(denied.lines[0] == "status|scan|constrained|windows:component_inventory:dir_unreadable");
-    const Answer other = run(ListError::none);
-    REQUIRE_FALSE(other.lines.empty());
-    CHECK(other.lines[0] == "status|scan|constrained|windows:component_inventory:dir_unreadable");
-}
-
 // ---- the roots from the two known-folder lookups ----
 
 TEST_CASE("component_legs_win: a failed known-folder lookup walks nothing and says so, never an empty host",

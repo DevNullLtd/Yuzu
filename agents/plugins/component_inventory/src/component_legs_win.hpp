@@ -527,16 +527,6 @@ using ReadOnce = std::function<std::optional<std::size_t>(std::uint64_t offset, 
     return out;
 }
 
-/// NTSTATUS STATUS_ACCESS_DENIED: the DACL excludes the caller (no backup privilege is requested, so
-/// completeness never depends on one).
-inline constexpr std::uint32_t kNtStatusAccessDenied = 0xC0000022u;
-
-/// What a failed directory open says about why: access denied is a permission refusal; every other
-/// status (a reparse point on the way, a sharing violation, anything unknown, 0) stays unreadable.
-[[nodiscard]] constexpr ListError list_cause_from_ntstatus(std::uint32_t status) noexcept {
-    return status == kNtStatusAccessDenied ? ListError::permission_denied : ListError::none;
-}
-
 } // namespace yuzu::component_inventory
 
 // ---- the Windows-only functions component_fs_win.cpp defines ----
