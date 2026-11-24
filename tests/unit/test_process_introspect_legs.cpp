@@ -1173,6 +1173,20 @@ TEST_CASE("process_introspect macOS: the start_time guard", "[process_introspect
     }
 }
 
+TEST_CASE("process_introspect macOS: every bounded-call status maps to its own answer",
+          "[process_introspect]") {
+    using yuzu::agent::ProcSnapshotStatus;
+    using Bound = MacBsdInfo::Bound;
+    // One line per status, so swapping two branches of mac_bound_from fails here.
+    CHECK(mac_bound_from(ProcSnapshotStatus::Completed) == Bound::answered);
+    CHECK(mac_bound_from(ProcSnapshotStatus::TimedOut) == Bound::deadline_exceeded);
+    CHECK(mac_bound_from(ProcSnapshotStatus::Rejected) == Bound::deadline_exceeded);
+    CHECK(mac_bound_from(ProcSnapshotStatus::Busy) == Bound::call_in_progress);
+    CHECK(mac_bound_from(ProcSnapshotStatus::Abandoned) == Bound::abandoned_pending);
+    // An unlisted status fails closed.
+    CHECK(mac_bound_from(static_cast<ProcSnapshotStatus>(99)) == Bound::deadline_exceeded);
+}
+
 TEST_CASE("process_introspect macOS: a bounded call that did not answer is never an empty ok",
           "[process_introspect]") {
     struct Case {

@@ -31,6 +31,7 @@
 
 #include <constraint_accumulator.hpp>
 #include <wire_utf8.hpp>
+#include <yuzu/agent/proc_snapshot_read.hpp> // ProcSnapshotStatus (header-only types)
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
@@ -436,6 +437,25 @@ struct MacBsdInfo {
     };
     Bound bound = Bound::answered;
 };
+
+/// How the bounded libproc call ended, as the decision sees it. Pure, so every branch is unit
+/// tested on every OS: TimedOut, a throwing read and a Rejected admission (the worker never ran)
+/// all read `deadline_exceeded`; a healthy overlap and an abandoned worker are told apart.
+[[nodiscard]] constexpr MacBsdInfo::Bound
+mac_bound_from(yuzu::agent::ProcSnapshotStatus s) noexcept {
+    switch (s) {
+    case yuzu::agent::ProcSnapshotStatus::Completed:
+        return MacBsdInfo::Bound::answered;
+    case yuzu::agent::ProcSnapshotStatus::Abandoned:
+        return MacBsdInfo::Bound::abandoned_pending;
+    case yuzu::agent::ProcSnapshotStatus::Busy:
+        return MacBsdInfo::Bound::call_in_progress;
+    case yuzu::agent::ProcSnapshotStatus::TimedOut:
+    case yuzu::agent::ProcSnapshotStatus::Rejected:
+        return MacBsdInfo::Bound::deadline_exceeded;
+    }
+    return MacBsdInfo::Bound::deadline_exceeded; // an unlisted status fails closed
+}
 
 /// The injected libproc / sysctl boundary. `bsdinfo` is called at most ONCE per decision and is
 /// bounded by a deadline in the shell (an owned worker in agent-core), never here.

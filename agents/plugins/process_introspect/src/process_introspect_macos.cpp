@@ -49,24 +49,14 @@ namespace yuzu::process_introspect {
 int run_macos(yuzu::CommandContext& ctx, const Request& req) {
     MacSource src;
     src.bsdinfo = [pid = static_cast<int>(req.pid)] {
-        using yuzu::agent::ProcSnapshotStatus;
         MacBsdInfo out;
         const auto r =
             yuzu::agent::read_proc_snapshot_bounded(pid, yuzu::agent::kProcSnapshotDeadline);
-        if (r.status == ProcSnapshotStatus::Abandoned) {
-            out.bound = MacBsdInfo::Bound::abandoned_pending;
+        // The mapping is pure (mac_bound_from, unit tested on every OS). TimedOut, a throwing read
+        // and Rejected (the worker never ran, so this answers at once) read deadline_exceeded.
+        out.bound = mac_bound_from(r.status);
+        if (out.bound != MacBsdInfo::Bound::answered)
             return out;
-        }
-        if (r.status == ProcSnapshotStatus::Busy) {
-            out.bound = MacBsdInfo::Bound::call_in_progress;
-            return out;
-        }
-        // TimedOut, a throwing reader, and Rejected (the worker never ran, so this answers at
-        // once, not after the deadline): no answer arrived.
-        if (r.status != ProcSnapshotStatus::Completed) {
-            out.bound = MacBsdInfo::Bound::deadline_exceeded;
-            return out;
-        }
         out.err = r.snap.err;
         out.start_sec = r.snap.start_sec;
         out.start_usec = r.snap.start_usec;
