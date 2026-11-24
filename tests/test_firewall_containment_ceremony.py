@@ -300,7 +300,7 @@ class FlowHarness:
     (or exceptions) it answers with, in order. A mixin: the cases are in Flow and the remote-mode classes below."""
 
     def run_main(self, script, apply=True, extra=(), dashboard="http://127.0.0.1:9", agent=True, client=None,
-                 lock=None, install=None):
+                 lock=None, install=None, cleartext_ok=True):
         # a per-process lock file: concurrent jobs on one CI box must not share the run lock
         if lock is None:
             lock = os.path.join(fc.tempfile.gettempdir(), f"yuzu_test_fwc_run_{os.getpid()}.lock")
@@ -320,7 +320,8 @@ class FlowHarness:
             return r(calls) if callable(r) else r
 
         argv = ["--dashboard", dashboard] + (["--agent-id", "a"] if agent else []) + \
-               (["--apply-containment"] if apply else []) + list(extra)
+               (["--apply-containment"] if apply else []) + list(extra) + \
+               (["--allow-cleartext"] if cleartext_ok else [])  # the cleartext gate has its own tests below
         self.install = install if install is not None else mock.MagicMock(return_value=(0, ""))
         with mock.patch.object(fc, "refusal", return_value=None), \
                 mock.patch.object(fc, "install_check", self.install), \
@@ -443,7 +444,7 @@ class Flow(FlowHarness, unittest.TestCase):
         self.assertEqual(rc, fc.EXIT_PRECONDITION)
         self.assertEqual(calls, [])
         rc, _ = self.run_main({"quarantine_status": [row("inactive")]}, apply=False,
-                              dashboard="http://192.0.2.7:8080")
+                              dashboard="http://192.0.2.7:8080", extra=["--allow-cleartext"])
         self.assertEqual(rc, fc.EXIT_OK)         # a probe-only run changes nothing, so any dashboard is fine
 
     def test_zero_or_several_registered_agents_exit_before_any_dispatch(self):
@@ -901,10 +902,31 @@ class Cleartext(FlowHarness, unittest.TestCase):
             with self.subTest(dashboard=dashboard):
                 self.assertFalse(fc.cleartext_login(dashboard))
 
+    def test_plain_http_off_host_is_refused_without_the_flag_in_every_mode_and_never_logs_in(self):
+        for apply, extra in ((True, REMOTE_FLAGS), (False, ["--remote"]), (False, [])):
+            with self.subTest(apply=apply, extra=extra):
+                client = remote_client()
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc, calls = self.run_main({}, apply=apply, dashboard=OFF_HOST, extra=extra, client=client,
+                                              cleartext_ok=False)
+                self.assertEqual(rc, fc.EXIT_PRECONDITION)
+                self.assertEqual(calls, [])
+                client.login.assert_not_called()
+                self.assertIn("--allow-cleartext", err.getvalue())
+                self.assertIn("192.0.2.7", err.getvalue())
+                self.assertNotIn("8080", err.getvalue())
+
+    def test_the_refusal_is_pure_and_the_flag_and_loopback_and_https_lift_it(self):
+        self.assertIn("--allow-cleartext", fc.cleartext_refusal(args(dashboard=OFF_HOST)) or "")
+        self.assertIsNone(fc.cleartext_refusal(args(dashboard=OFF_HOST, allow_cleartext=True)))
+        for dashboard in ("http://127.0.0.1:9", "http://localhost:8080", "https://192.0.2.7:8080"):
+            self.assertIsNone(fc.cleartext_refusal(args(dashboard=dashboard)))
+
     def test_a_remote_run_and_a_probe_only_run_against_plain_http_are_warned(self):
         for apply, extra in ((True, REMOTE_FLAGS), (False, ["--remote"]), (False, [])):
             with self.subTest(apply=apply, extra=extra):
-                err = self.stderr_of(OFF_HOST, apply, extra, client=remote_client())
+                err = self.stderr_of(OFF_HOST, apply, [*extra, "--allow-cleartext"], client=remote_client())
                 self.assertIn("unencrypted", err)
                 self.assertIn("192.0.2.7", err)
                 self.assertNotIn("8080", err)   # the host only: never a URL that could carry credentials
@@ -919,7 +941,8 @@ class Cleartext(FlowHarness, unittest.TestCase):
         client = remote_client()
         client.login.side_effect = login
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            self.run_main({}, apply=False, dashboard=OFF_HOST, extra=["--remote"], client=client)
+            self.run_main({}, apply=False, dashboard=OFF_HOST, extra=["--remote", "--allow-cleartext"],
+                          client=client)
         self.assertEqual(len(at_login), 1)
         self.assertIn("unencrypted", at_login[0])
 

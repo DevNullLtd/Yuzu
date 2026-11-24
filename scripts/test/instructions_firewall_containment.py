@@ -24,7 +24,11 @@ DO NOT RUN THE CONTAINMENT STEP ON A REMOTE / SSH-ONLY HOST. It briefly blocks a
 the allow set (loopback plus the agent's control channel). It refuses to run when an SSH session
 is detected (SSH_CONNECTION / SSH_CLIENT / SSH_TTY) unless --i-have-console-access is given, and
 never runs without --apply-containment. The SSH check reads environment variables that `sudo` and a
-long-lived tmux/screen session can drop, so --i-have-console-access is the real control. The dashboard
+long-lived tmux/screen session can drop, so --i-have-console-access is the real control. A plain http
+dashboard at a non-loopback address is refused in every mode (exit 2, nothing dispatched, no login) unless
+--allow-cleartext is given: the login would send the admin password and the session cookie unencrypted,
+so the flag is the operator's explicit acceptance of that on a network they trust; a loopback or https
+dashboard needs nothing, and with the flag the run still warns. The dashboard
 URL must be loopback (this host), or the run must be --remote (below); that checks the URL, not the
 network path, so it is also a precondition that the server and its stores are reachable over loopback
 while this host is contained (a server whose Postgres is published from a Docker network is not: the
@@ -68,7 +72,9 @@ something: an `inactive` read after a refused release, or after the time limit o
 already released the host (`no_state_record`, `state_unreadable`), exits 1 ("release unproven"), not 0.
 A login that does not yield an authenticated session exits 2. The host binding trusts the hostname each agent
 reported about itself: it stops a mistyped or remote agent id, it is not an authentication (a remote clone with
-the same default name, while this host's own agent is not registered, would bind). The release is never skipped
+the same default name, while this host's own agent is not registered, would bind). Remote mode is
+therefore clone-tolerant: a clone that reports the typed hostname and the agent id satisfies the binding, so the
+operator's console access to the agent is the real control. The release is never skipped
 by a failing terminal: every message after the apply goes through a print that cannot raise.
 
 An --apply-containment run holds an exclusive lock on yuzu_firewall_containment_ceremony.lock in the temp
@@ -547,11 +553,25 @@ def dashboard_is_local(dashboard: str) -> bool:
         return False
 
 
+def cleartext_refusal(args: argparse.Namespace) -> str | None:
+    """Why the login must not be sent, or None: a plain http dashboard at a non-loopback address without
+    --allow-cleartext (pure). The host only is named, never a URL that could carry credentials."""
+    base = args.dashboard.rstrip("/")
+    if cleartext_login(base) and not getattr(args, "allow_cleartext", False):
+        return CLEARTEXT_REFUSAL.format(host=urllib.parse.urlparse(base).hostname)
+    return None
+
+
 def cleartext_login(dashboard: str) -> bool:
     """Is the dashboard plain http at an address that is not loopback? The login then sends the admin
     password and the session cookie across the network unencrypted (pure)."""
     return urllib.parse.urlparse(dashboard).scheme.lower() == "http" and not dashboard_is_local(dashboard)
 
+
+CLEARTEXT_REFUSAL = ("the dashboard at {host} is plain http at a non-loopback address: the login would send "
+                     "the admin password and the session cookie across the network unencrypted. Use an https "
+                     "dashboard or run this on the server's host (a loopback dashboard); --allow-cleartext "
+                     "accepts the risk on a network you trust")
 
 CLEARTEXT_WARNING = ("warning: the dashboard at {host} is plain http at a non-loopback address: the admin "
                      "password and the session cookie cross the network unencrypted. Run this on the server's host "
@@ -604,9 +624,12 @@ def parse_args(argv):
                    help="this script runs on the server's host (or another one), NOT on the agent: the dashboard may "
                         "be any address and the SSH check does not apply. With --apply-containment it needs "
                         "--agent-id, --agent-hostname and --i-have-console-access-to-the-agent. A plain http "
-                        "dashboard at a non-loopback address sends the admin password and the session cookie "
-                        "across the network unencrypted (the script warns): run on the server's host or use "
-                        "an https dashboard")
+                        "dashboard at a non-loopback address is refused unless --allow-cleartext is given "
+                        "(see below)")
+    p.add_argument("--allow-cleartext", action="store_true",
+                   help="log in to a plain http dashboard at a non-loopback address, sending the admin password and "
+                        "the session cookie across the network unencrypted (refused without this flag; a loopback "
+                        "or https dashboard needs nothing)")
     p.add_argument("--agent-hostname", default="",
                    help="--remote only: the agent's own hostname, typed by you; it must equal the hostname the "
                         "agent reported to the server and not be one of this machine's names")
@@ -666,6 +689,10 @@ def main(argv=None) -> int:
 
 def checked_run(args: argparse.Namespace, rec: dict) -> int:
     why = refusal(args)
+    if why:
+        say(f"refused: {why}", file=sys.stderr)
+        return EXIT_PRECONDITION
+    why = cleartext_refusal(args)
     if why:
         say(f"refused: {why}", file=sys.stderr)
         return EXIT_PRECONDITION
