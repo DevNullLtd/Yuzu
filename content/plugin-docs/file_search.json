@@ -235,14 +235,14 @@
     {
       "grant": "None: no new privilege. Folders protected by the system's privacy controls (TCC, Full Disk Access) are refused to a daemon without that access; how to grant it to the agent is not settled here (`deploy/packaging/macos/README.md`, Privacy permissions, describes a profile that names the agent binary, written for another plugin and not verified for this one)",
       "if_refused": "A directory that cannot be listed is a `permission_denied` gap row; a file that cannot be opened for its facts is a match row with size and time `-` and extents `failed`; the verdict reads `partial`",
-      "measured": "2026-11-21, one macOS 26.6.2 arm64 bare-metal host, as an unprivileged account (euid 501), over a scratch tree only (the sample). Not measured as the root LaunchDaemon; the behaviour of a daemon with no Full Disk Access over protected folders is not measured",
+      "measured": "2026-11-21, one macOS 26.6.2 arm64 bare-metal host, as an unprivileged account (euid 501), over a scratch tree only (the sample was recaptured on 2026-11-23 on the same host). Not measured as the root LaunchDaemon; the behaviour of a daemon with no Full Disk Access over protected folders is not measured",
       "os": "macOS",
       "runs_as": "agent daemon: a root LaunchDaemon today (`docs/agent-privilege-model.md`)"
     },
     {
       "grant": "None added by this plugin. The packaged unit already holds `CAP_DAC_READ_SEARCH` for every plugin; the search worker thread drops it from its effective set and raises it only around the lookups that need it (hygiene, not a boundary: caveat 5)",
       "if_refused": "A directory the account cannot search is a `permission_denied` gap row (`dir_unreadable` for another failure); a file that cannot be opened for its facts is a match row with size and time `-` and extents `failed`; the verdict reads `partial`",
-      "measured": "2026-11-21, one Ubuntu 26.04.1 LTS x86_64 virtual machine, as root (euid 0) over a scratch tree only (the sample); the capability-scope cases ran as root there. Not measured as the packaged unprivileged `yuzu-agent` account holding the ambient capability over another account's directories",
+      "measured": "2026-11-21, one Ubuntu 26.04.1 LTS x86_64 virtual machine, as root (euid 0) over a scratch tree only (the sample was recaptured on 2026-11-24 on the same lane VM, as root); the capability-scope cases ran as root there. Not measured as the packaged unprivileged `yuzu-agent` account holding the ambient capability over another account's directories",
       "os": "Linux",
       "runs_as": "agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`)"
     }
