@@ -35,9 +35,9 @@
  * SHIPPED LEGS. Linux and macOS (machine roots only), and Windows for `scan` and `native` (the two Program
  * Files trees on fixed drives, through a filesystem binding that follows no reparse point;
  * component_fs_win.cpp). The Windows leg is declared SUPPORTED on the measured scope (one
- * host, Windows 11 build 26200, elevated administrator session; docs/samples/windows.txt) and answers
- * constrained when a directory is refused or a bound is reached; the Windows leg of `python` and `node` is a later change and answers through the
- * shared planned-leg reporter. All three descriptor legs are declared unconditionally so
+ * host, Windows 11 build 26200, elevated administrator session; docs/samples/windows.txt) and
+ * answers constrained when a directory is refused or a bound is reached; the Windows leg of
+ * `python` and `node` is a later change and answers through the shared planned-leg reporter. All three descriptor legs are declared unconditionally so
  * the capability-matrix generator sees a complete, stable shape.
  *
  * ZERO SUBPROCESS, READ-ONLY. Nothing here mutates the host; the only write is the plugin's own
@@ -146,8 +146,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); the PE fixed file "
          "version read in-process within fixed bounds; WindowsApps under each root excluded and counted",
          "measured on one host (Windows 11 build 26200, elevated administrator session), where a "
-         "system directory whose access list excludes Administrators was refused and the 5,000-row cap "
-         "was reached, so the action answered constrained; libraries inside applications only; machine "
+         "system directory whose access list excludes Administrators was refused and the walk returned "
+         "exactly 5,000 rows, the row limit, so the action answered constrained; libraries inside applications only; machine "
          "roots only; the server refuses it until an operator switches it on; a reparse point is counted "
          "and never read; any budget, unreadable directory or changed file answers constrained"},
     },

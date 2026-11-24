@@ -1624,6 +1624,10 @@ is declared `supported` on the measured scope (one host, Windows 11 build 26200,
 administrator session, `docs/samples/windows.txt`) and answers `constrained` when a directory is refused
 or a bound is reached; the descriptor says so.
 
+*Capture, 2026-11-24.* The measured scope was captured on 2026-11-24, after this update was first
+written. `scan` answered `constrained` with `dir_unreadable` at a refused system directory; `native`
+returned exactly 5,000 rows, the row limit.
+
 **Roots (Decision 1).** The 64-bit and 32-bit Program Files directories, named by the shell's
 known-folder lookup and never by an environment variable, on fixed local drives only. A root on a UNC
 path, a mapped network drive, removable or optical media or a RAM drive is dropped and counted in
