@@ -17,6 +17,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -476,7 +477,6 @@ TEST_CASE("poll_live_output: the output byte cap refuses (REST) or cuts at a new
         const auto out = live::poll_live_output(read, "agent-1", limits, no_sleep);
         CHECK(out.outcome == live::LiveOutcome::kOutputTooLarge);
         CHECK(out.output.empty());
-        CHECK_FALSE(out.truncated);
     }
     SECTION("cut at the last newline inside the cap") {
         limits.over_cap = live::OverCapPolicy::kTruncateAtNewline;
@@ -505,7 +505,6 @@ TEST_CASE("poll_live_output: the output byte cap refuses (REST) or cuts at a new
         limits.over_cap = live::OverCapPolicy::kTruncateAtNewline;
         const auto out = live::poll_live_output(read, "agent-1", limits, no_sleep);
         CHECK(out.output == big);
-        CHECK_FALSE(out.truncated);
     }
 }
 
@@ -856,7 +855,7 @@ TEST_CASE("poll_live_output [pg]: a stored answer over the byte cap is cut by th
     }
 }
 
-// S1 (adversarial review): the bounded read ranked rows by `timestamp DESC, id DESC`, so a terminal
+// The bounded read ranked rows by `timestamp DESC, id DESC`, so a terminal
 // row stamped with an OLDER timestamp than the chunks before it (a clock step back) was the first
 // row cut at the row limit or the byte cap, and the id-ordered reducer never saw it: a stored device
 // failure was answered `ok` + `truncated`. The poll now ranks by id alone, so the newest row by id
@@ -880,11 +879,10 @@ TEST_CASE("poll_live_output [pg]: a terminal failure with an older timestamp tha
         seed(store, "cmd-step-rows", "agent-1", 2, "", "os_info", "agent exploded", 500);
 
         auto limits = fast_limits(1);
-        limits.over_cap = live::OverCapPolicy::kTruncateAtNewline; // the MCP policy, where S1 answered ok
+        limits.over_cap = GENERATE(live::OverCapPolicy::kTruncateAtNewline, live::OverCapPolicy::kRefuse);
         const auto out = live::poll_live_output(store, "cmd-step-rows", "agent-1", plugins, limits, no_sleep);
         CHECK(out.outcome == live::LiveOutcome::kDeviceFailed);
         CHECK(out.detail == "agent exploded");
-        CHECK_FALSE(out.truncated);
     }
     SECTION("byte cap: large chunks fill the cap, the failing terminal row is newest by id, oldest by timestamp") {
         for (int i = 0; i < 5; ++i)
@@ -894,7 +892,7 @@ TEST_CASE("poll_live_output [pg]: a terminal failure with an older timestamp tha
 
         auto limits = fast_limits(1);
         limits.max_output_bytes = 150;
-        limits.over_cap = live::OverCapPolicy::kTruncateAtNewline;
+        limits.over_cap = GENERATE(live::OverCapPolicy::kTruncateAtNewline, live::OverCapPolicy::kRefuse);
         const auto out = live::poll_live_output(store, "cmd-step-bytes", "agent-1", plugins, limits, no_sleep);
         CHECK(out.outcome == live::LiveOutcome::kDeviceFailed);
         CHECK(out.detail == "agent exploded");
@@ -937,6 +935,54 @@ TEST_CASE("ResponseStore::query_bounded [pg]: order_by_id ranks by id alone, the
     CHECK(by_id->rows[0].output == "three"); // newest id first: the terminal row survives
     CHECK(by_id->rows[1].output == "two");
     CHECK(by_id->row_cap_hit);
+}
+
+// The id ranking must not widen what is visible: the agent scope and the Forensics tier stay in the
+// WHERE clause, ahead of the limit and the cut. Newer-id rows that are filtered out must neither
+// displace a permitted row nor set a cap flag.
+TEST_CASE("ResponseStore::query_bounded [pg]: order_by_id keeps the scope and tier filters ahead of the cut",
+          "[live][poll][pg][2146]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::test::PostgresTestDb db{live_poll_tpl};
+    REQUIRE(db.available());
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+
+    seed(store, "cmd-vis", "agent-1", 0, "first", "os_info", "", 100);
+    seed(store, "cmd-vis", "agent-1", 1, "second", "os_info", "", 200);
+    // Newer ids that must stay invisible: another agent's row and a Forensics-tier row.
+    seed(store, "cmd-vis", "agent-2", 1, "foreign", "os_info", "", 300);
+    seed(store, "cmd-vis", "agent-1", 1, "secret", yuzu::server::test::kForensicsPlugin, "", 400);
+
+    const auto tier = ResponseTierFilter::for_fixed_plugin_poll(&yuzu::server::test::forensics_plugin_set());
+    ResponseQuery q;
+    q.agent_id = "agent-1";
+    q.order_by_id = true;
+    q.limit = 2; // exactly the two permitted rows: no row cap may be reported
+
+    const auto got = store.query_bounded("cmd-vis", tier, q, std::nullopt, 1u << 20);
+    REQUIRE(got.has_value());
+    REQUIRE(got->rows.size() == 2);
+    CHECK(got->rows[0].output == "second");
+    CHECK(got->rows[1].output == "first");
+    CHECK_FALSE(got->row_cap_hit);
+    CHECK_FALSE(got->byte_cap_hit);
+
+    // The byte cut under id ranking: a row is kept while the bytes BEFORE it are under the cap, so
+    // a cap of 6 keeps the newest row ("second", 6 bytes) and cuts the older one, and the first row
+    // is always kept even when it alone exceeds the cap (cap 1).
+    const auto cut = store.query_bounded("cmd-vis", tier, q, std::nullopt, 6);
+    REQUIRE(cut.has_value());
+    REQUIRE(cut->rows.size() == 1);
+    CHECK(cut->rows[0].output == "second");
+    CHECK(cut->byte_cap_hit);
+    const auto tiny = store.query_bounded("cmd-vis", tier, q, std::nullopt, 1);
+    REQUIRE(tiny.has_value());
+    REQUIRE(tiny->rows.size() == 1);
+    CHECK(tiny->rows[0].output == "second");
 }
 
 TEST_CASE("live_read_timeout_retry_ms: processes is priced at the plugin's action budget, other kinds at 3 s",

@@ -689,7 +689,7 @@ does (agentic-first parity):
   foreign event id is a 404).
 - **`POST /api/v1/dex/devices/{id}/live?kind=uptime|processes`**, the "Get live
   info" read: it dispatches a read-only instruction to the device and waits up to
-  about 20 seconds for the result (hence POST, not GET). Needs scoped `Read` and
+  about 20 seconds when the store answers quickly (never longer than the 25 second poll deadline plus one 0.5 second interval and one store read) for the result (hence POST, not GET). Needs scoped `Read` and
   `Execute`, audited before dispatch (`device.live.uptime` or
   `device.live.processes`), and answers 409, 422, 403, 429, 502, 503 or 504
   when the device cannot answer (see the REST reference). It answers only after

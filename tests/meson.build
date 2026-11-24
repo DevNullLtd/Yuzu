@@ -4681,6 +4681,16 @@ test('HKEY_USERS listing callers refuse a failed listing lexical gate (#7035)',
   timeout: 30,
 )
 
+# Pins kLiveReadProcessesTimeoutRetryMs (mcp_retry.hpp) to the processes plugin's kActionBudget,
+# which no static_assert can link (the plugin is a separate DSO). Carries its own in-memory self-test.
+# No build required; one process, well under a second.
+test('live-read processes timeout hint equals the plugin action budget (#2146)',
+  _python3_test,
+  args: [files('test_live_retry_budget_lexical.py')],
+  suite: 'server',
+  timeout: 30,
+)
+
 # #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
 # CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
 # flag-then-cancel_ctx() teardown order. Carries its own in-memory mutation self-test. No build

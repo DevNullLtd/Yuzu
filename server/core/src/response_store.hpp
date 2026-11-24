@@ -208,11 +208,14 @@ struct ResponseQuery {
     /// `offset` walk can do both). The other reads do not honour it.
     std::optional<std::pair<int64_t, int64_t>> continue_after;
     /// `query_bounded` only: rank candidate rows by `id DESC` alone instead of `timestamp DESC,
-    /// id DESC`. The live poll sets it because ids are the one order its reducer trusts (a
-    /// timestamp is the agent-reported or receipt time and can step backwards), so the newest
-    /// ROW, which carries the terminal state, survives the row limit and the byte cut. Only the
-    /// ranking changes: the WHERE clause, the scope clause and the tier clause are untouched.
-    /// The other reads do not honour it.
+    /// id DESC`. The live poll sets it because ids are the one order its reducer trusts (the
+    /// stored timestamp is the server's receipt time in epoch seconds, and it can step backwards
+    /// on a server clock step or across replicas), so the newest ROW, which carries the terminal
+    /// state, survives the row limit and the byte cut. Only the ranking changes: the WHERE
+    /// clause, the scope clause and the tier clause are untouched. For a fresh per-command poll
+    /// only: on a very large, old `instruction_id` the planner can pick a backward primary-key
+    /// scan, which is slow (measured 267 ms warm over 1.9 M rows) though still correct. The
+    /// other reads do not honour it.
     bool order_by_id{false};
 };
 
@@ -431,9 +434,10 @@ public:
     ///   2. only rows whose PRECEDING cumulative size is still below the cap are joined
     ///      back to fetch the full columns (the first row is always kept, so a single row
     ///      larger than the cap still makes progress).
-    /// Export order is `timestamp DESC, id DESC`, or `id DESC` alone when `q.order_by_id` is set (the id tiebreak makes the cut
-    /// deterministic; `query()` orders by timestamp alone, so rows with equal timestamps can come
-    /// back in a different order from the list routes). `q.offset` is ignored. A
+    /// Export order is `timestamp DESC, id DESC` (the id tiebreak makes the cut deterministic),
+    /// or `id DESC` alone when `q.order_by_id` is set. `query()` orders by timestamp alone, so
+    /// rows with equal timestamps can come back in a different order from the list routes.
+    /// `q.offset` is ignored. A
     /// concurrent delete between the two steps is one statement, so the snapshot is
     /// consistent. Returns nullopt on store-degraded, exactly like `query()`.
     [[nodiscard]] std::optional<BoundedResponses>

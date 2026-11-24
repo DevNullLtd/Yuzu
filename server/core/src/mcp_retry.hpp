@@ -128,7 +128,7 @@ inline constexpr std::int64_t kMcpLiveReadDeviceTimeoutRetryMs = 3000;
 /// agents/plugins/processes/src/processes_plugin.cpp), and a retry is a fresh `command_id` that
 /// executes for real, so a retry inside the first run starts a second hash of every image on the
 /// same device. The hint is that budget. The two constants are not linked by a `static_assert`
-/// (the plugin is a separate DSO); the pairing is pinned by a test that names both.
+/// (the plugin is a separate DSO); the pairing is pinned by tests/test_live_retry_budget_lexical.py, which reads both numbers.
 inline constexpr std::int64_t kLiveReadProcessesTimeoutRetryMs = 120000;
 
 /// The `retry_after_ms` a live read answers when it ends `timeout`, by the allowlist-resolved kind
@@ -143,7 +143,9 @@ inline constexpr std::int64_t kLiveReadProcessesTimeoutRetryMs = 120000;
 /// when the caller retries. A retry that lands inside that run only adds device load and starts a
 /// second read of every executable image, so the hint is the poll's own wall deadline (the same
 /// 25 s as `LivePollLimits::deadline`, pinned equal by a `static_assert` in live_read_poll.hpp):
-/// by then the first run has either finished or been given its full budget. Deliberately NOT the
+/// by then a quick kind's first run has finished. For `processes` that is NOT true (its run has a
+/// 120 s budget, see `kLiveReadProcessesTimeoutRetryMs`), so for `processes` this hint is shorter
+/// than its `timeout` hint: a known inversion, left as decided and tracked. Deliberately NOT the
 /// quick-kind timeout hint above, which fits a device that never answered at all.
 inline constexpr std::int64_t kLiveReadIncompleteRetryMs = 25000;
 

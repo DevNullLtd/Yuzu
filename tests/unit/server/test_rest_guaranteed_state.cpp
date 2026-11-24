@@ -462,7 +462,10 @@ struct RestGsHarness {
                            std::vector<std::string> csrf_trusted_origins = {},
                            // The global cap of `live_budget` (0: every acquire is refused).
                            std::size_t live_global_cap =
-                               yuzu::server::detail::kTargetHeldOpenStreamsDefault)
+                               yuzu::server::detail::kTargetHeldOpenStreamsDefault,
+                           // false: the Forensics plugin set is never wired, the state the live
+                           // route must refuse up front (the poll would refuse every row).
+                           bool wire_forensics_set = true)
         : wire_live_deps(live_deps),
           live_budget(yuzu::server::detail::StreamBudget::Config{.global_cap = live_global_cap}),
           wire_exec_visible(with_exec_visible),
@@ -823,7 +826,8 @@ struct RestGsHarness {
         api.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
         // #4990: the live-snapshot polls read back with a fixed-plugin tier filter, and an unwired
         // plugin set refuses every row.
-        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        if (wire_forensics_set)
+            api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac_,
                             /*mgmt_store=*/&mgmt_,
@@ -6039,6 +6043,21 @@ TEST_CASE("REST dex/devices/{id}/live: another device's failure row under the sa
     CHECK(res->status == 200);
     CHECK(nlohmann::json::parse(res->body)["data"]["uptime_display"].get<std::string>() == "3h");
     CHECK(res->body.find("OTHER_AGENT") == std::string::npos);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: an unwired Forensics plugin set is refused up front, nothing sent",
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool, true, nullptr, true, {},
+                    yuzu::server::detail::kTargetHeldOpenStreamsDefault,
+                    /*wire_forensics_set=*/false);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 503); // not the 504 the full poll budget would have ended in
+    CHECK(res->body.find("live device query unavailable") != std::string::npos);
+    CHECK(rest_live_count(h, "uptime", "not_configured") == 1.0);
+    CHECK(h.live_dispatches == 0);
 }
 
 TEST_CASE("REST dex/devices/{id}/live: a timeout and a device error are counted under their own "
