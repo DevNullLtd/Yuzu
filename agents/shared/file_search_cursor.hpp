@@ -76,7 +76,8 @@ inline constexpr std::string_view kCursorPrefix = "fs1:";
 // one instruction parameter.
 inline constexpr std::size_t kMaxCursorTokenBytes = 65'408;
 // The deepest position of the longest names must still fit: the body layout above is 50 fixed bytes, then
-// per directory 2 + name + 16, then 2 + the `after` name, and the token is the prefix plus padded base64.
+// per directory 2 + name + 16, then 2 + the `after` name, and the token is the prefix plus padded base64
+// (the trailing `+ 2` is the round-up of the base64 quantum: body bytes + 2, then / 3).
 static_assert(4 + 4 * ((50 + kMaxPositionDepth * (2 + kMaxNameBytes + 16) + 2 + kMaxNameBytes + 2) / 3) <=
                   kMaxCursorTokenBytes,
               "the deepest position of kMaxNameBytes names must fit the token bound");

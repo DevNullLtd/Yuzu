@@ -718,8 +718,7 @@ TEST_CASE("want_file_ids lists non-zero ids equal to the low half of each handle
     OpenRootResult opened = open_root(tmp.path);
     REQUIRE(opened.root.has_value());
     if (!is_ntfs(opened.root->h_.get())) {
-        WARN("skipped: the temp directory is not on NTFS");
-        return;
+        SKIP("skipped: the temp directory is not on NTFS");
     }
     const HANDLE root_handle = opened.root->h_.get();
     const FileIdentity& root_id = opened.root->identity();
@@ -797,8 +796,10 @@ TEST_CASE("open_file_attributes_at reads size, time and attributes, refuses a di
     // the handle has no data right: a read through it is refused
     char byte = 0;
     DWORD got = 0;
-    CHECK_FALSE(ReadFile(f.h.get(), &byte, 1, &got, nullptr));
-    CHECK(GetLastError() == ERROR_ACCESS_DENIED);
+    const BOOL read_ok = ReadFile(f.h.get(), &byte, 1, &got, nullptr);
+    const DWORD read_error = GetLastError(); // straight after the call: CHECK_FALSE may itself touch the last error
+    CHECK_FALSE(read_ok);
+    CHECK(read_error == ERROR_ACCESS_DENIED);
 
     CHECK_FALSE(open_file_attributes_at(root_handle, "sub", root_id).h.valid()); // the kernel refuses a directory
     const OpenFileResult missing = open_file_attributes_at(root_handle, "nope.txt", root_id);

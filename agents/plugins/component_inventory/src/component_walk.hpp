@@ -123,7 +123,7 @@ enum class RootState { ok, is_link, not_found, not_a_directory, other };
 struct MatchFacts {
     bool opened{false};
     std::uint64_t size{0};
-    std::int64_t mtime{0}; // seconds
+    std::optional<std::int64_t> mtime; // seconds; nullopt: the filesystem keeps no valid time (the row prints `-`)
 };
 
 struct FsOps {
@@ -623,7 +623,7 @@ private:
  * directory. A directory (the root included, and one re-entered on the resume path) whose listing would
  * take the total over `max_retained_bytes` is not entered: a memory_cap gap, none of its entries is
  * visited, and the walk continues with its next sibling. With the default 50,000-entry listing cap and
- * 765-byte names one listing is about 41 MiB, so a single directory always fits and the cap bites only
+ * 765-byte names one listing is about 41 MB (39.5 MiB), so a single directory always fits and the cap bites only
  * on a chain of very large ancestors. retained_bytes_peak reports the high-water mark.
  * The cap bounds what is HELD, not peak live memory: a listing is live before it is charged (one a
  * memory_cap gap then rejects included) and the sort takes scratch, so allow about one more listing.

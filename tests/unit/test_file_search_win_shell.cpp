@@ -259,7 +259,8 @@ TEST_CASE("file_search windows shell: facts read size and time from the handle, 
     const FileFacts big = probe.facts("big.bin");
     CHECK(big.facts.opened);
     CHECK(big.facts.size == 8u * 1024 * 1024);
-    CHECK(big.facts.mtime != 0);
+    REQUIRE(big.facts.mtime.has_value()); // nullopt != 0 would pass
+    CHECK(*big.facts.mtime != 0);
     CHECK(big.extents.state == ExtentsState::ok);
     CHECK(big.extents.note.empty());
     CHECK_FALSE(big.extents.extents.empty());
@@ -293,8 +294,7 @@ TEST_CASE("file_search windows shell: a file with 40 separated allocated ranges 
     Fixture fx{"yuzu_test_fs_win_many_"};
     const Unit u = unit_for(fx.root);
     if (!on_ntfs(u)) {
-        WARN("skipped: sparse granularity is an NTFS property and the temp volume is not NTFS");
-        return;
+        SKIP("skipped: sparse granularity is an NTFS property and the temp volume is not NTFS");
     }
     {
         RawFile sparse(fx.root / "many.bin");
@@ -355,8 +355,7 @@ TEST_CASE("file_search windows shell: an NTFS-compressed file carries the compre
     Fixture fx{"yuzu_test_fs_win_lznt_"};
     const Unit u = unit_for(fx.root);
     if (!on_ntfs(u)) {
-        WARN("skipped: compression is an NTFS property and the temp volume is not NTFS");
-        return;
+        SKIP("skipped: compression is an NTFS property and the temp volume is not NTFS");
     }
     {
         RawFile file(fx.root / "lznt.bin");
@@ -460,6 +459,25 @@ TEST_CASE("file_search windows shell: the volume reader answers one entry for th
     CHECK(e.source == e.root);
     CHECK_FALSE(e.fstype.empty());
 
+    // Asked again for the same healthy volume it answers again: a query that returned is never recorded as blocked.
+    const auto again = os_read_mounts(label);
+    REQUIRE(again.has_value());
+    CHECK(again->entries.size() == 1);
+
+    // The same volume reached by its GUID path is the same volume: equal root, type and serial, so the key
+    // an abandoned worker is recorded under (label, root, type) is one key for both spellings.
+    const auto guid_label = wr::normalise_windows_root(e.root);
+    REQUIRE(guid_label.has_value());
+    const auto by_guid = os_read_mounts(*guid_label);
+    REQUIRE(by_guid.has_value());
+    REQUIRE(by_guid->entries.size() == 1);
+    const auto& g = by_guid->entries[0];
+    CHECK(g.mount_point == *guid_label);
+    CHECK(g.mount_point != e.mount_point);
+    CHECK(g.root == e.root);
+    CHECK(g.fstype == e.fstype);
+    CHECK(g.dev_minor == e.dev_minor);
+
     const DWORD letters = GetLogicalDrives();
     char unused = 0;
     for (char c = 'Z'; c >= 'D'; --c)
@@ -501,10 +519,10 @@ TEST_CASE("file_search windows shell: a profile of the volume is a root in the u
         break;
     }
     if (path.empty()) {
-        WARN("skipped: this host has no non-system profile on a drive-letter volume");
-        return;
+        SKIP("skipped: this host has no non-system profile on a drive-letter volume");
     }
-    const std::string rest = yuzu::win::from_wide(path.c_str() + mount.size());
+    const std::string mount_utf8 = yuzu::win::from_wide(mount.c_str());
+    const std::string path_utf8 = yuzu::win::from_wide(path.c_str());
     const std::string guid_path = yuzu::win::from_wide(guid.c_str());
     const std::string guid_volume = guid_path.substr(4, guid_path.size() - 5); // `Volume{...}`
 
@@ -512,7 +530,7 @@ TEST_CASE("file_search windows shell: a profile of the volume is a root in the u
     by_letter.mount_point = std::string("/") + static_cast<char>(std::toupper(static_cast<unsigned char>(mount[0]))) + ":";
     by_letter.root_field = guid_path;
     const auto letter_roots = os_user_roots(by_letter);
-    const auto want_letter = wr::profile_root_label(by_letter.mount_point, rest);
+    const auto want_letter = wr::profile_root_label(by_letter.mount_point, mount_utf8, path_utf8);
     REQUIRE(want_letter.has_value());
     CHECK(std::ranges::find(letter_roots, *want_letter) != letter_roots.end());
 
@@ -520,7 +538,7 @@ TEST_CASE("file_search windows shell: a profile of the volume is a root in the u
     by_guid.mount_point = "/" + guid_volume;
     by_guid.root_field = guid_path;
     const auto guid_roots = os_user_roots(by_guid);
-    const auto want_guid = wr::profile_root_label(by_guid.mount_point, rest);
+    const auto want_guid = wr::profile_root_label(by_guid.mount_point, mount_utf8, path_utf8);
     REQUIRE(want_guid.has_value());
     CHECK(std::ranges::find(guid_roots, *want_guid) != guid_roots.end());
 
@@ -563,20 +581,27 @@ TEST_CASE("file_search windows shell: the work function runs in background mode"
     CHECK(*probe == ERROR_THREAD_MODE_ALREADY_BACKGROUND);
 }
 
-TEST_CASE("file_search windows shell: the worker environment suppresses hard-error dialogs around the body only",
+TEST_CASE("file_search windows shell: the worker environment suppresses hard-error dialogs and runs in background mode around the body only",
           "[file_search][file_search_win_shell]") {
-    // On a thread of its own, joined: the environment starts background mode and never ends it, so it must not
-    // run on the test's thread. The error mode is cleared first so the restore is observable.
+    // On a thread of its own, joined, so the thread's modes can be read after the call without touching the
+    // test's thread. The error mode is cleared first so the restore is observable.
     DWORD inside = 0;
     DWORD after = ~DWORD{0};
+    BOOL background_ended = FALSE;
     std::thread worker([&] {
         ::SetThreadErrorMode(0, nullptr);
         os_in_worker_environment([&] { inside = ::GetThreadErrorMode(); });
         after = ::GetThreadErrorMode();
+        // Background mode ended with the body: beginning it again succeeds (it fails with
+        // ERROR_THREAD_MODE_ALREADY_BACKGROUND while it is still on), and that second one is ended here.
+        background_ended = ::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+        if (background_ended != FALSE)
+            (void)::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
     });
     worker.join();
     CHECK((inside & SEM_FAILCRITICALERRORS) != 0);
     CHECK(after == 0);
+    CHECK(background_ended != FALSE);
 }
 
 #endif // _WIN32

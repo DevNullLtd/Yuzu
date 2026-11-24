@@ -13,8 +13,8 @@
 ##
 ## ON BY DEFAULT: the server seeds no kill switch for this plugin, so the action dispatches
 ## unless an operator turns it off with the server-side plugin-config kill switch
-## (`PUT /api/v1/plugin-config/file_search/kill-switch {"enabled":false}`). A kill-switch row
-## that already exists is not changed by an upgrade.
+## (`PUT /api/v1/plugin-config/file_search/kill-switch {"enabled":false}`). The server no
+## longer writes that row; a row already present is left as it is.
 ##
 ## ONE action, one slice of the search per call: the caller loops on the cursor row until a
 ## slice answers with none. Every slice ends with exactly one `search` row. Nine row kinds
@@ -47,7 +47,7 @@ metadata:
     non-administrator without Forensics:Read can start a search under an approval and cannot
     continue it. Linux, macOS and Windows are searched; on Windows only fixed local volumes are
     searched, one volume per search, through no-reparse opens, and a cloud placeholder or
-    offline file or folder is never opened or read.
+    offline file or folder is never opened for use, listed or read.
   tags: [filesystem, search, inventory, extents]
 
 spec:
@@ -67,7 +67,7 @@ spec:
         type: string
         displayName: Search Root
         description: >
-          The absolute directory to search from. A root of / is the whole filesystem. A
+          The absolute directory to search from. On Linux and macOS a root of / is the whole filesystem. A
           trailing slash is ignored; empty, . and .. components, a doubled slash and a NUL
           byte are refused. On Windows the root is a drive path (C:\Users or C:/Users) or a
           volume GUID path (\\?\Volume{guid}\dir), and rows name paths in the form
@@ -77,7 +77,7 @@ spec:
           root_not_found, root_not_a_directory).
         validation:
           maxLength: 4096
-          pattern: '^(/|[A-Za-z]:[\\/]|\\\\\?\\[Vv]olume\{)'
+          pattern: '^(/|[A-Za-z]:[\\/]|\\\\\?\\[Vv][Oo][Ll][Uu][Mm][Ee]\{)'
       pattern:
         type: string
         displayName: Name Pattern
@@ -146,7 +146,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_6
         type: string
-        description: 'match: system, or user for a path under a user profile directory (a rule on the path, so a home relocated elsewhere is not tagged). volume: entries=<n>, the entries visited on the volume. search: links_skipped=<n>, links seen and never followed.'
+        description: 'match: system, or user for a path under a user profile directory (a rule on the path, so on Linux and macOS a home relocated elsewhere is not tagged). volume: entries=<n>, the entries visited on the volume. search: links_skipped=<n>, links seen and never followed.'
         example: system
         platforms: [windows, linux, darwin]
     aggregation:

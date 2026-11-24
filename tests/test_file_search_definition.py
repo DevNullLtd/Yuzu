@@ -112,7 +112,10 @@ class FileSearchDefinitionParameters(unittest.TestCase):
         root = re.compile(self._params()["properties"]["root"]["validation"]["pattern"])
         for ok in ("/", "/home", "/srv/data/", "/Users/x", "/x", "C:\\x", "c:\\", "C:/x",
                    "\\\\?\\Volume{0f1e2d3c-1111-2222-3333-44445555aabb}\\",
-                   "\\\\?\\volume{0f1e2d3c-1111-2222-3333-44445555aabb}\\dir"):
+                   "\\\\?\\volume{0f1e2d3c-1111-2222-3333-44445555aabb}\\dir",
+                   # the agent takes the prefix in any case (file_search_win_rules.hpp, starts_icase)
+                   "\\\\?\\VOLUME{0f1e2d3c-1111-2222-3333-44445555aabb}\\",
+                   "\\\\?\\vOlUmE{0f1e2d3c-1111-2222-3333-44445555aabb}\\dir"):
             self.assertTrue(root.search(ok), ok)
         for bad in ("", "home", "./x", "../x", " /x", "C:", "C:x", "\\foo", "relative\\dir"):
             self.assertFalse(root.search(bad), bad)

@@ -124,10 +124,12 @@ struct Unit {
     std::string walk_root;
     std::vector<std::string> prune; // mount points strictly below walk_root, in byte order
 
-    /// The key an abandoned worker is recorded under and a cursor's hash covers.
-    [[nodiscard]] std::string key() const {
-        return mount_point + '\x1f' + label + '\x1f' + root_field + '\x1f' + fstype;
-    }
+    /// The key an abandoned worker is recorded under: the volume's identity, never the spelling of its mount
+    /// point (a Windows volume is reached as `/C:` or as `/Volume{guid}`, and one hung volume must not take a
+    /// stalled slot per spelling). It is the identity build_plan already uses for one subtree mounted twice
+    /// (label and root field), plus the type. units_hash below covers the four fields itself, mount point
+    /// included, and does not go through key().
+    [[nodiscard]] std::string key() const { return label + '\x1f' + root_field + '\x1f' + fstype; }
 };
 
 struct Refused {

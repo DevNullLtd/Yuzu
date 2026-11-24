@@ -416,6 +416,37 @@ TEST_CASE("file_search request: a canonicaliser that writes wildcards is refused
 
 // ---- the in-memory state ----
 
+TEST_CASE("file_search state: a blocked volume query is recorded once per volume spelling and forgotten when it returns",
+          "[file_search][file_search_driver][state]") {
+    BlockedQueries q;
+    CHECK_FALSE(q.blocked("C:"));
+
+    const DoneFlag first = make_done_flag(), second = make_done_flag(), other = make_done_flag();
+    q.add("C:", first);
+    CHECK(q.blocked("C:"));
+    CHECK_FALSE(q.blocked("D:")); // another volume is unaffected
+    q.add("C:", second);          // one per spelling: the second is not recorded
+    q.add("D:", other);
+    CHECK(q.blocked("D:"));
+
+    first->store(true); // the first query returns: with only one recorded for C:, the volume is free
+    CHECK_FALSE(q.blocked("C:"));
+    CHECK(q.blocked("D:"));
+    q.add("C:", second); // a later query that blocks is recorded again
+    CHECK(q.blocked("C:"));
+    second->store(true);
+    other->store(true);
+    CHECK_FALSE(q.blocked("C:"));
+    CHECK_FALSE(q.blocked("D:"));
+
+    // nothing is recorded for a query that has already returned, or without a flag
+    const DoneFlag finished = make_done_flag();
+    finished->store(true);
+    q.add("E:", finished);
+    q.add("E:", nullptr);
+    CHECK_FALSE(q.blocked("E:"));
+}
+
 TEST_CASE("file_search state: abandoned workers and stall counts are bounded and in memory only",
           "[file_search][file_search_driver][state]") {
     SearchState s;
@@ -860,6 +891,43 @@ TEST_CASE("file_search driver: a timeout abandons its worker, the volume reads s
     CHECK(next.cursor.empty());
     CHECK(starts(row_of(next, "coverage|"), "coverage|partial|")); // the stalled volume is in the verdict
     CHECK(row_of(next, "coverage|").find("prior_gaps=1") != std::string::npos);
+}
+
+TEST_CASE("file_search driver: a volume is stalled by its identity, not by the spelling of its mount point",
+          "[file_search][file_search_driver]") {
+    // one Windows volume is reached as `/C:` or as `/Volume{guid}`: same label, root and type, two spellings
+    Unit a;
+    a.mount_point = "/C:";
+    a.fstype = "NTFS";
+    a.label = "0:5";
+    a.root_field = "\\\\?\\Volume{0f1e2d3c-1111-2222-3333-444455556666}\\";
+    Unit b = a;
+    b.mount_point = "/Volume{0f1e2d3c-1111-2222-3333-444455556666}";
+    CHECK(a.key() == b.key());
+    CHECK(units_hash({a}) != units_hash({b})); // a cursor's hash still covers the spelling
+    Unit other_fs = a;
+    other_fs.label = "0:6";
+    CHECK(a.key() != other_fs.key());
+
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.mode = Rig::Mode::timeout;
+    const SliceResult t = checked_slice(make_request(kCtl), rig.b);
+    CHECK(t.reason == "timed_out");
+    REQUIRE(rig.state.abandoned_count() == 1);
+
+    // the same filesystem again, reached through another mount point: it reads stalled and takes no second slot
+    rig.mounts = Mounts{};
+    rig.mounts.add("/r", "ext4", "8:1");
+    const VolumePlan again = rig.plan();
+    REQUIRE(again.units.size() == 1);
+    CHECK(again.units[0].mount_point == "/r");
+    rig.mode = Rig::Mode::run;
+    const int calls = rig.runner_calls;
+    const SliceResult skip = checked_slice(make_request(kCtl), rig.b);
+    CHECK(skip.reason == "stalled");
+    CHECK(rig.runner_calls == calls);
+    CHECK(rig.state.abandoned_count() == 1);
 }
 
 TEST_CASE("file_search driver: with two workers still abandoned every slice answers busy and frees the slot",
@@ -1960,6 +2028,27 @@ TEST_CASE("file_search driver: the leg's extents state and note are printed as t
     CHECK_FALSE(matches[1].ends_with("|-|-|system"));
     CHECK(extents[2].find("|failed|0|-") != std::string::npos);
     CHECK(extents[2].find("failed:") == std::string::npos); // no note: the state alone
+}
+
+TEST_CASE("file_search driver: an opened file whose facts carry no time prints `-` for the time and still prints its size",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-a.bin", "");
+    rig.fs.add_file("/r/yuzu-fs-control-b.bin", "");
+    rig.facts_override = [](const std::string&, const DirEntry& e) {
+        FileFacts f;
+        f.facts.opened = true;
+        f.facts.size = 3;
+        if (e.name == "yuzu-fs-control-b.bin")
+            f.facts.mtime = 0; // a real 1970-01-01 time is a time, and prints as one
+        f.extents.state = ExtentsState::failed;
+        return f;
+    };
+    const Run run = search(rig, kCtl);
+    const auto matches = rows_of_kind(run, "match|");
+    REQUIRE(matches.size() == 2);
+    CHECK(matches[0].ends_with("|3|-|system")); // no time: `-`, not `0`
+    CHECK(matches[1].ends_with("|3|0|system"));
 }
 
 TEST_CASE("file_search driver: a Windows-labelled tree walks, reports label paths, and tags a relocated profile through the unit's roots",

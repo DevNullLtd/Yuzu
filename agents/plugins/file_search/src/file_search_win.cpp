@@ -27,8 +27,10 @@
  * on one handle, a provider can turn a populated folder back into a not-populated one, and no enumeration
  * mode refuses population. Its worst case is that the provider fills in that ONE folder's entries (names and
  * metadata, never file content: no file handle carries a data right), or, with no provider running, that the
- * listing fails with ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING, which reads dataless. A recall-on-open folder
- * named on the ROOT PATH is opened (never listed) because no listing precedes a root hop and a handle does
+ * listing fails with ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING, which reads dataless. A provider that never
+ * answers the population callback blocks that one enumeration: the slice runs to its bound, the worker is
+ * abandoned and the volume reads stalled until the call returns (the driver's abandon path). A recall-on-open
+ * folder named on the ROOT PATH is opened (never listed) because no listing precedes a root hop and a handle does
  * not report that bit; opening was measured harmless for a recall-on-data-access folder, a recall-on-open one
  * was not measured.
  *
@@ -40,8 +42,8 @@
  *
  * NOTHING BEFORE THE WORKER. os_make_leg is allocation only; its handles and the cluster size are opened
  * lazily on first use. The driver builds the leg, and reads the profile roots, on the slice's worker. The
- * bounded volume query below is the only filesystem or registry call made before cursor authentication, the
- * slot and the worker.
+ * bounded volume query below is the only filesystem or registry call made before the worker: it runs on the
+ * pool thread after the cursor is authenticated and the slot is taken.
  */
 #include "file_search_execute.hpp"
 
@@ -104,10 +106,17 @@ bool os_draw_cursor_key(CursorKey& key) noexcept {
 
 /// Runs inside the worker thread for the whole call of `body`: hard-error dialogs suppressed for this thread
 /// (a not-ready volume would otherwise block it), and background priority for the thread's CPU and I/O. Both
-/// die with the thread; the error mode is restored by the guard.
+/// end when `body` returns (the error mode by its guard, background mode by the END call below), so the
+/// environment lasts exactly as long as `body` on any thread, pooled or fresh.
 void os_in_worker_environment(const std::function<void()>& body) {
     const yuzu::win::ThreadErrorModeGuard errors(SEM_FAILCRITICALERRORS);
-    (void)::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    struct BackgroundMode {
+        bool begun;
+        ~BackgroundMode() {
+            if (begun)
+                (void)::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+        }
+    } background{::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) != 0};
     body();
 }
 
@@ -199,17 +208,31 @@ struct VolumeFacts {
     return v;
 }
 
+/// The volume queries that timed out and have not returned, one per volume spelling. Touched only by the pool
+/// thread that holds the slice slot (the driver reads the mount table at its step 4); a blocked query thread
+/// sets only its own done flag.
+BlockedQueries g_blocked_queries;
+
 } // namespace
 
 /// The ONE mount entry of a Windows search: the volume that holds the root. The query runs inside a bounded
 /// call (a dead network or optical drive must not hold the pool thread); a timeout or a refused worker reads
-/// as an unreadable table.
+/// as an unreadable table. A query that timed out is not asked again until it returns: each retry would
+/// leave one more thread, and one more of the module's bounded-call slots, behind. Another volume is
+/// unaffected.
 std::optional<yuzu::shared::MountTable> os_read_mounts(const std::string& root) {
     const auto label = wr::split_label(root);
     if (!label)
         return std::nullopt;
-    auto ran = yuzu::shared::bounded_call_ex(std::chrono::seconds{5},
-                                             [volume = label->volume]() -> VolumeFacts { return query_volume(volume); });
+    if (g_blocked_queries.blocked(label->volume))
+        return std::nullopt;
+    const DoneFlag done = make_done_flag();
+    auto ran = yuzu::shared::bounded_call_ex(std::chrono::seconds{5}, [volume = label->volume, done]() -> VolumeFacts {
+        const driver_detail::DoneOnExit finished{done};
+        return query_volume(volume);
+    });
+    if (ran.status == yuzu::shared::BoundedCallStatus::TimedOut)
+        g_blocked_queries.add(label->volume, done);
     if (ran.status != yuzu::shared::BoundedCallStatus::Completed || !ran.value)
         return std::nullopt;
     const VolumeFacts& v = *ran.value;
@@ -309,16 +332,14 @@ public:
             out.truncated = true;
             listed.entries.resize((std::min)(listed.entries.size(), cap));
         }
-        for (const cfs::DirEntry& de : listed.entries) {
-            const wr::Listed l = wr::classify(de.meta.attributes, de.meta.reparse_tag);
+        for (cfs::DirEntry& de : listed.entries) {
+            // A name that cannot round-trip UTF-8 is a gap (classify): its lossy form may equal a real
+            // sibling's, and the walker never merges the two.
+            const wr::Listed l = wr::classify(de.meta.attributes, de.meta.reparse_tag, de.name_invalid);
             ci::DirEntry e;
-            e.name = de.name;
+            e.name = std::move(de.name); // moved, not copied: at the caps the names are tens of MB
             e.type = l.type;
             e.gap = l.gap;
-            // A name that cannot round-trip UTF-8 is a gap: its lossy form may equal a real sibling's, and
-            // the walker never merges the two.
-            if (de.name_invalid)
-                e.gap = fsr::GapCause::name_too_long;
             e.file_id = wr::stable_id(stable_, de.meta.file_id, 0);
             e.leg_hint = (static_cast<std::uint64_t>(de.meta.attributes) << 32) | de.meta.reparse_tag;
             out.entries.push_back(std::move(e));
@@ -354,7 +375,7 @@ public:
             return f;
         f.facts.opened = true;
         f.facts.size = opened.size;
-        f.facts.mtime = opened.mtime.value_or(0);
+        f.facts.mtime = opened.mtime; // nullopt when the filesystem keeps no valid time: the row prints `-`
         if (!now->ioctl) {
             f.extents.state = ExtentsState::unsupported;
             f.extents.note = now->note;
@@ -369,7 +390,7 @@ public:
         switch (wr::external_backing_of(backing_ok != 0 ? 0 : ::GetLastError())) {
         case wr::Backing::backed:
             f.extents.state = ExtentsState::unsupported;
-            f.extents.note = "wof_external_backing";
+            f.extents.note = wr::kNoteWofBacking;
             return f;
         case wr::Backing::unknown:
             return f; // backing could not be ruled out: an extent list is never reported
@@ -395,10 +416,12 @@ public:
         std::vector<wr::Run> runs;
         std::uint64_t starting_vcn = 0;
         if ((error == 0 || error == wr::kErrorMoreData) && bytes >= kHeader) {
+            // `buffer` is a local alignas(8) BYTE array that the call above filled and that outlives this
+            // read. It is read, const, through the system's own structure type, and only the header and the
+            // runs that lie inside `bytes` are touched (retrieval_runs_to_read holds the count to that).
             const auto* out = reinterpret_cast<const RETRIEVAL_POINTERS_BUFFER*>(buffer);
             starting_vcn = static_cast<std::uint64_t>(out->StartingVcn.QuadPart);
-            const std::size_t fit = (static_cast<std::size_t>(bytes) - kHeader) / kRun;
-            const std::size_t n = (std::min)({static_cast<std::size_t>(out->ExtentCount), fit, kMaxExtents});
+            const std::size_t n = wr::retrieval_runs_to_read(bytes, kHeader, kRun, out->ExtentCount, kMaxExtents);
             for (std::size_t i = 0; i < n; ++i)
                 runs.push_back({static_cast<std::uint64_t>(out->Extents[i].NextVcn.QuadPart), out->Extents[i].Lcn.QuadPart});
         }
@@ -450,8 +473,11 @@ private:
             parent = held.get();
         }
         stack_.push_back({{}, std::move(held)}); // frame 0: the walk root (an empty path gives the volume root)
-        if (!stack_.front().handle.valid())
+        if (!stack_.front().handle.valid()) {
             stack_.front().handle = cfs::WinHandle(duplicate_of(volume_->h_.get()));
+            if (!stack_.front().handle.valid())
+                failure_ = OpenFailure{}; // no handle for the walk root: it cannot be listed
+        }
     }
 
     /// The directory `dir` (a label at or under the walk root): the common prefix of the held frames is kept
@@ -579,9 +605,12 @@ std::vector<std::string> os_user_roots(const Unit& unit) {
         wchar_t guid[64] = {};
         if (mount.empty() || ::GetVolumeNameForVolumeMountPointW(mount.c_str(), guid, 64) == 0)
             continue;
-        if (!ascii_ieq(yuzu::win::from_wide(guid), unit.root_field) || mount.size() > path.size())
+        if (!ascii_ieq(yuzu::win::from_wide(guid), unit.root_field))
             continue;
-        if (const auto label = wr::profile_root_label(unit.mount_point, yuzu::win::from_wide(path.c_str() + mount.size())))
+        // The mount root must be the path's own prefix (profile_root_label): a path that crosses a junction
+        // to another volume is answered with that volume's root and is skipped, tagged by the built-in rule only.
+        if (const auto label = wr::profile_root_label(unit.mount_point, yuzu::win::from_wide(mount.c_str()),
+                                                      rec.profile_image_path))
             roots.push_back(*label);
     }
     return roots;

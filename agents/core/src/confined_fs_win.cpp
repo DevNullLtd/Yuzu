@@ -406,13 +406,14 @@ OpenDirResult open_dir_at(HANDLE parent, const std::string& name, const FileIden
         if (have_tag)
             result.reparse_tag = tag_info.ReparseTag;
         if (!have_tag || !reparse_dir_open_allowed(reparse, info.dwFileAttributes, tag_info.ReparseTag)) {
-            if (have_tag && is_cloud_reparse_tag(tag_info.ReparseTag)) {
-                // steady state (a folder that is not populated, or a caller that did not opt in), not an attack
+            if (reparse == ReparseDirs::allow_populated_cloud && have_tag && is_cloud_reparse_tag(tag_info.ReparseTag)) {
+                // steady state (a caller that opted in met a cloud folder that is not populated), not an attack
                 spdlog::debug("confined_fs::open_dir_at: cloud directory not admitted for '{}'", name);
             } else {
-                // warn, matching the POSIX leg: this branch fires on a mid-walk junction
-                // swap -- the live TOCTOU attack this primitive exists to defeat, not a
-                // steady-state reparse entry (which decide_entry handles, unlogged).
+                // warn, matching the POSIX leg: for a caller that did not opt in (the default policy) and
+                // for any tag or unreadable tag, this branch fires on a mid-walk junction swap -- the live
+                // TOCTOU attack this primitive exists to defeat, not a steady-state reparse entry (which
+                // decide_entry handles, unlogged).
                 spdlog::warn("confined_fs::open_dir_at: reparse point rejected for '{}'", name);
             }
             result.reason = Reason::ReparseRejected;

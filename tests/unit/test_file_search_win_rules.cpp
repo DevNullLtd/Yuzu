@@ -7,9 +7,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 using namespace yuzu::file_search;
@@ -120,14 +122,30 @@ TEST_CASE("windows root: label split, volume root path and profile root labels",
           std::string("\\\\?\\Volume{") + kGuidLower + "}\\");
     CHECK(volume_root_path("nonsense").empty());
 
-    CHECK(profile_root_label("/C:", "Users\\alice") == "/C:/Users/alice");
-    CHECK(profile_root_label("/C:", "\\Users/alice\\") == "/C:/Users/alice");
+    CHECK(profile_root_label("/C:", "C:\\", "C:\\Users\\alice") == "/C:/Users/alice");
+    CHECK(profile_root_label("/C:", "C:\\", "C:\\Users/alice\\") == "/C:/Users/alice");
     const std::string vol = std::string("/Volume{") + kGuidLower + "}";
-    CHECK(profile_root_label(vol, "Users\\alice") == vol + "/Users/alice");
-    CHECK_FALSE(profile_root_label("/C:", "Users\\..\\x").has_value()); // a refused component gives none
-    CHECK_FALSE(profile_root_label("/C:", "Users\\a:b").has_value());
-    CHECK_FALSE(profile_root_label("/C:", "").has_value());             // never the whole volume
-    CHECK_FALSE(profile_root_label("/C:", "\\").has_value());
+    CHECK(profile_root_label(vol, "C:\\", "C:\\Users\\alice") == vol + "/Users/alice");
+    CHECK(profile_root_label("/D:", "D:\\data\\", "D:\\data\\Users\\bob") == "/D:/Users/bob"); // a mounted volume
+    CHECK_FALSE(profile_root_label("/C:", "C:\\", "C:\\Users\\..\\x").has_value()); // a refused component gives none
+    CHECK_FALSE(profile_root_label("/C:", "C:\\", "C:\\Users\\a:b").has_value());
+    CHECK_FALSE(profile_root_label("/C:", "C:\\", "C:\\").has_value()); // never the whole volume
+    CHECK_FALSE(profile_root_label("/C:", "C:\\", "C:").has_value());
+    CHECK_FALSE(profile_root_label("/C:", "C:\\", "").has_value());
+}
+
+TEST_CASE("profile_root_label: the mount root must be the path's own prefix", "[file_search][win_rules]") {
+    // the root is the prefix: the label is built from what follows it
+    CHECK(profile_root_label("/C:", "C:\\", "C:\\Users\\alice") == "/C:/Users/alice");
+    // a different drive (a profile path that crosses a junction is answered with the other volume's root):
+    // skipped, never labelled from the wrong components
+    CHECK_FALSE(profile_root_label("/D:", "D:\\", "C:\\Users\\alice").has_value());
+    CHECK_FALSE(profile_root_label("/C:", "D:\\", "C:\\Users\\alice").has_value());
+    // a root longer than the path
+    CHECK_FALSE(profile_root_label("/C:", "C:\\Users\\alice\\", "C:\\Users").has_value());
+    // a prefix that differs only in letter case still matches (ASCII, as the system treats a drive letter)
+    CHECK(profile_root_label("/C:", "c:\\", "C:\\Users\\alice") == "/C:/Users/alice");
+    CHECK(profile_root_label("/C:", "C:\\USERS\\", "c:\\users\\Alice") == "/C:/Alice");
 }
 
 // ---- the classifier, with the measured values ----
@@ -145,6 +163,31 @@ TEST_CASE("classify: links, special files, plain entries", "[file_search][win_ru
     CHECK(at(0x10, 0).type == Type::dir);
     CHECK_FALSE(at(0x10, 0).gap.has_value());
     CHECK(at(0x20, 0).family == TagFamily::none);
+}
+
+TEST_CASE("classify: a name that cannot round-trip UTF-8 is a name_too_long gap and keeps its type",
+          "[file_search][win_rules]") {
+    // the default is searchable, exactly as before
+    CHECK_FALSE(classify(0x20, 0).gap.has_value());
+    CHECK_FALSE(classify(0x20, 0, false).gap.has_value());
+    for (const auto& [attrs, tag, type] : {std::tuple<std::uint32_t, std::uint32_t, Type>{0x20, 0, Type::file},
+                                           {0x10, 0, Type::dir},
+                                           {0x410, 0x9000601A, Type::dir},
+                                           {0x420, kTagSymlink, Type::link},
+                                           {0x420, kTagAfUnix, Type::other},
+                                           {0x420, 0x80000099, Type::file}}) {
+        const Listed l = classify(attrs, tag, true);
+        CHECK(l.type == type); // the type stays what the attributes say
+        REQUIRE(l.gap.has_value());
+        CHECK(*l.gap == fsr::GapCause::name_too_long);
+    }
+    // it replaces the entry's own gap (an unknown tag, a recall-marked directory): today's behaviour exactly
+    CHECK(classify(0x420, 0x80000099).gap == fsr::GapCause::reparse_unknown);
+    CHECK(classify(0x420, 0x80000099, true).gap == fsr::GapCause::name_too_long);
+    CHECK(classify(0x10 | 0x40000u, 0).gap == fsr::GapCause::dataless);
+    CHECK(classify(0x10 | 0x40000u, 0, true).gap == fsr::GapCause::name_too_long);
+    // the family is untouched
+    CHECK(classify(0x420, 0x9000601A, true).family == TagFamily::cloud);
 }
 
 TEST_CASE("classify: WOF, dedup and app-exec files are files with their family; directories and unknown tags are gaps",
@@ -232,6 +275,7 @@ TEST_CASE("extents_decision: placeholders are never opened, families say why the
     CHECK(wof.open);
     CHECK_FALSE(wof.ioctl);
     CHECK(wof.note == "wof_external_backing");
+    CHECK(wof.note == kNoteWofBacking); // the one spelling the shell also uses when the backing ioctl answers
     CHECK(extents_decision(0x20, TagFamily::dedup).note == "dedup_external_backing");
     const auto alias = extents_decision(0x420, TagFamily::app_exec);
     CHECK(alias.open);
@@ -263,6 +307,29 @@ TEST_CASE("external_backing_of reads the answer of FSCTL_GET_EXTERNAL_BACKING", 
         CHECK(external_backing_of(code) == Backing::not_backed);
     for (const std::uint32_t code : {5u, 122u, 234u, 6u, 999u})
         CHECK(external_backing_of(code) == Backing::unknown);
+}
+
+TEST_CASE("retrieval_runs_to_read: a read of the kernel's buffer never leaves the bytes it returned",
+          "[file_search][win_rules]") {
+    constexpr std::size_t kHeader = 16, kRun = 16, kCap = 32;
+    // the stated count is honoured when the bytes hold it
+    CHECK(retrieval_runs_to_read(kHeader + 3 * kRun, kHeader, kRun, 3, kCap) == 3);
+    CHECK(retrieval_runs_to_read(kHeader + 2 * kRun, kHeader, kRun, 2, kCap) == 2); // an exact fit
+    // a stated count above what the bytes hold (a crafted or torn answer): only what fits
+    CHECK(retrieval_runs_to_read(kHeader + 3 * kRun, kHeader, kRun, 100, kCap) == 3);
+    CHECK(retrieval_runs_to_read(kHeader + 3 * kRun + kRun - 1, kHeader, kRun, 100, kCap) == 3); // a partial run is not one
+    CHECK(retrieval_runs_to_read(kHeader + 3 * kRun, kHeader, kRun, 0xFFFFFFFFull, kCap) == 3);
+    CHECK(retrieval_runs_to_read(kHeader + 3 * kRun, kHeader, kRun, ~std::uint64_t{0}, kCap) == 3);
+    // above the cap with room for more
+    CHECK(retrieval_runs_to_read(kHeader + 100 * kRun, kHeader, kRun, 1000, kCap) == kCap);
+    CHECK(retrieval_runs_to_read(kHeader + 100 * kRun, kHeader, kRun, kCap + 1, kCap) == kCap);
+    // an answer shorter than its header, or none, reads nothing
+    CHECK(retrieval_runs_to_read(kHeader - 1, kHeader, kRun, 5, kCap) == 0);
+    CHECK(retrieval_runs_to_read(0, kHeader, kRun, 5, kCap) == 0);
+    CHECK(retrieval_runs_to_read(kHeader, kHeader, kRun, 5, kCap) == 0); // the header and no run
+    // no count, and a run size of zero (a mis-bound structure), read nothing
+    CHECK(retrieval_runs_to_read(kHeader + 3 * kRun, kHeader, kRun, 0, kCap) == 0);
+    CHECK(retrieval_runs_to_read(kHeader + 3 * kRun, kHeader, 0, 5, kCap) == 0);
 }
 
 namespace {

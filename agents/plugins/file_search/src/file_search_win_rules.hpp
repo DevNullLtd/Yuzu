@@ -271,11 +271,17 @@ struct Label {
 }
 
 /// The label of a profile directory inside the searched volume: the unit's mount point plus the components
-/// of `rest_on_volume` (the profile path after its volume's mount root, separated by either separator).
-/// nullopt when a component is refused or when there is none (a profile "at the volume root" would read the
-/// whole volume as user data).
+/// of `profile_path` after `volume_mount_root` (both as the system answered them, UTF-8, either separator).
+/// nullopt when the mount root is not an ASCII-case-insensitive prefix of the path (a profile path that
+/// crosses a junction to another volume is answered with that volume's root: its components would label the
+/// wrong directory), when a component is refused, or when there is none (a profile "at the volume root"
+/// would read the whole volume as user data). Lexical on purpose: the leg opens nothing by path.
 [[nodiscard]] inline std::optional<std::string> profile_root_label(std::string_view unit_mount_point,
-                                                                    std::string_view rest_on_volume) {
+                                                                    std::string_view volume_mount_root,
+                                                                    std::string_view profile_path) {
+    if (!detail::starts_icase(profile_path, volume_mount_root))
+        return std::nullopt;
+    std::string_view rest_on_volume = profile_path.substr(volume_mount_root.size());
     while (!rest_on_volume.empty() && detail::is_sep(rest_on_volume.front()))
         rest_on_volume.remove_prefix(1);
     std::string rest = "\\" + std::string(rest_on_volume);
@@ -307,8 +313,7 @@ struct Listed {
     return (attributes & cfs::kAttrRecallOrOffline) != 0;
 }
 
-/// The one classification of a listed entry (the same function is applied to the attributes and tag read
-/// from an opened handle).
+/// What the attributes and the reparse tag of an entry say it is:
 ///  - no reparse attribute: a directory with a recall or offline bit is a dir with a `dataless` gap (never
 ///    opened: the listing, not a handle, reports recall-on-open); any other directory is a dir; else a file;
 ///  - reparse: SYMLINK, MOUNT_POINT and LX_SYMLINK are links; AF_UNIX and the WSL special files are other;
@@ -320,7 +325,7 @@ struct Listed {
 ///  - any other tag: a `reparse_unknown` gap.
 /// The WOF tag row stays for a volume that shows the tag, but it is NOT how a CompactOS file is found (that
 /// file lists as a plain file with no tag, measured): see external_backing_of.
-[[nodiscard]] constexpr Listed classify(std::uint32_t attributes, std::uint32_t reparse_tag) noexcept {
+[[nodiscard]] constexpr Listed classify_attributes(std::uint32_t attributes, std::uint32_t reparse_tag) noexcept {
     using Type = ci::DirEntry::Type;
     const bool dir = (attributes & cfs::kAttrDirectory) != 0;
     const bool recall = has_recall(attributes);
@@ -365,7 +370,24 @@ struct Listed {
     return out;
 }
 
+/// The one classification of a listed entry (the same function is applied to the attributes and tag read
+/// from an opened handle). `name_invalid`: the entry's name cannot round-trip UTF-8 (its lossy form may equal
+/// a real sibling's): whatever else it is, it is a `name_too_long` gap, and its type stays what the
+/// attributes say.
+[[nodiscard]] constexpr Listed classify(std::uint32_t attributes, std::uint32_t reparse_tag,
+                                        bool name_invalid = false) noexcept {
+    Listed out = classify_attributes(attributes, reparse_tag);
+    if (name_invalid)
+        out.gap = fsr::GapCause::name_too_long;
+    return out;
+}
+
 // ---- extents: the decision before any open, and the readings of the two ioctls ----
+
+/// The extents note of a file that CompactOS or another WOF provider backs: spelled once, read by the
+/// decision from a listed tag and by the shell when FSCTL_GET_EXTERNAL_BACKING answers (a CompactOS file
+/// lists with no tag at all).
+inline constexpr std::string_view kNoteWofBacking = "wof_external_backing";
 
 /// Whether a matched file is opened at all, whether the two ioctls are then asked, and the closed token the
 /// extents row carries after its state (empty for an ordinary file).
@@ -385,7 +407,7 @@ struct ExtentsDecision {
         return {false, false, "placeholder"};
     switch (family) {
     case TagFamily::wof:
-        return {true, false, "wof_external_backing"};
+        return {true, false, kNoteWofBacking};
     case TagFamily::dedup:
         return {true, false, "dedup_external_backing"};
     case TagFamily::app_exec:
@@ -434,6 +456,21 @@ struct Run {
     std::uint64_t next_vcn{0};
     std::int64_t lcn{0};
 };
+
+/// How many runs of a retrieval-pointer answer may be read: the count the answer states, held to what lies
+/// inside the `bytes` the call returned (after `header` bytes, `run_size` each) and to `cap`. This is the
+/// bound on a read of a kernel-filled buffer: a stated count the bytes cannot hold, an answer shorter than
+/// its header and a zero run size all read none. The shell binds the sizes of the system's own structure and
+/// reads that many runs.
+[[nodiscard]] constexpr std::size_t retrieval_runs_to_read(std::size_t bytes, std::size_t header,
+                                                           std::size_t run_size, std::uint64_t stated,
+                                                           std::size_t cap) noexcept {
+    if (bytes < header || run_size == 0)
+        return 0;
+    const std::size_t fit = (bytes - header) / run_size;
+    const std::uint64_t n = stated < fit ? stated : fit;
+    return n < cap ? static_cast<std::size_t>(n) : cap;
+}
 
 /// What the shell hands over. `win32_error` is GetLastError() verbatim (0 when the call succeeded), `runs`
 /// only the runs that lie inside the bytes returned. The mapper owns EVERY status decision; there is no
