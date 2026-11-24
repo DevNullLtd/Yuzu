@@ -302,8 +302,8 @@ first delivery.
 The 2026-11-09 sentence that `delete_agent` "adds no new lock" is therefore true of the pending-event and
 census steps and no longer of the method as a whole: it now takes the agent's order-row lock, first.
 Nothing else is added: no advisory lock, no rule-mutation hook, no policy-generation bump, no push, and no
-tenth cascade store (the order row is part of the `guaranteed_state` store, so the nine-store count
-and its pins are unchanged).
+tenth cascade store at that time (the order row is part of the `guaranteed_state` store, so the
+nine-store count and its pins were unchanged; a tenth store, `management_group_memberships`, joined later, #6352).
 
 Erasure of this store remains PARTIAL (owner ruling D1, unchanged): the event log and the DEX
 observations stay until retention expiry, and widening that is still tracked in #7531; the event

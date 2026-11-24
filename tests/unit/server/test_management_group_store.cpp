@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -333,6 +334,239 @@ TEST_CASE("ManagementGroupStore: static membership", "[pg][management_group][mem
     store.remove_member(*group_id, "agent-001");
     auto members2 = store.get_members(*group_id);
     CHECK(members2.size() == 1);
+}
+
+// Decommission memberships: the returning-id question, in two phases. Register's only membership
+// write is add_member(root), so an agent that registers again with the same id keeps every group it
+// was in UNLESS a decommission removed its memberships in between (the tenth cascade store), in
+// which case it is back in the ROOT group only. This test models that Register write directly
+// against the store; the Register-side half (an approved id takes the fast path, no token) is
+// driven through the real service in test_agent_service_impl.cpp.
+TEST_CASE("ManagementGroupStore: a re-registered agent id keeps its memberships until decommission, then rejoins root only",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+
+    // The root group is created by ServerImpl at boot (server.cpp: "Ensure root 'All Devices' group
+    // exists"), not by the store migration, so a bare store has none and add_member(root) would
+    // violate the group foreign key. Bootstrap it the way the server does.
+    {
+        ManagementGroup root;
+        root.id = ManagementGroupStore::kRootGroupId;
+        root.name = "All Devices";
+        root.membership_type = "dynamic";
+        root.scope_expression = "*";
+        root.created_by = "system";
+        REQUIRE(store.create_group(root).has_value());
+    }
+    auto make = [&](const char* name, const char* type) {
+        ManagementGroup g;
+        g.name = name;
+        g.membership_type = type;
+        auto id = store.create_group(g);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    const auto s1 = make("Static one", "static");
+    const auto s2 = make("Static two", "static");
+    const auto dyn = make("Dynamic one", "dynamic");
+
+    // a1: root (as Register adds it), two static groups, one dynamic group. a2: bystander.
+    REQUIRE(store.add_member(ManagementGroupStore::kRootGroupId, "a1").has_value());
+    REQUIRE(store.add_member(s1, "a1").has_value());
+    REQUIRE(store.add_member(s2, "a1").has_value());
+    store.refresh_dynamic_membership(dyn, {"a1"});
+    REQUIRE(store.add_member(s1, "a2").has_value());
+    REQUIRE(store.add_member(s2, "a2").has_value());
+
+    auto sorted_groups = [&](const std::string& agent) {
+        auto g = store.get_agent_groups(agent);
+        REQUIRE(g.has_value());
+        std::vector<std::string> v = *g;
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    std::vector<std::string> want_a1{ManagementGroupStore::kRootGroupId, s1, s2, dyn};
+    std::sort(want_a1.begin(), want_a1.end());
+    REQUIRE(sorted_groups("a1") == want_a1);
+
+    // Re-registration, modelled exactly as production does it: the root-group add, result discarded.
+    // Nothing else on that path writes membership.
+    (void)store.add_member(ManagementGroupStore::kRootGroupId, "a1");
+
+    // The agent never left a group, so its old scope is intact: exact set, not "non-empty".
+    CHECK(sorted_groups("a1") == want_a1);
+    std::vector<std::string> want_a2{s1, s2};
+    std::sort(want_a2.begin(), want_a2.end());
+    CHECK(sorted_groups("a2") == want_a2);
+
+    // After decommission the id is in no group; the modelled re-registration puts it back in the
+    // ROOT group only. Non-root scope does not come back by itself.
+    REQUIRE(store.delete_agent("a1"));
+    (void)store.add_member(ManagementGroupStore::kRootGroupId, "a1");
+    CHECK(sorted_groups("a1") == std::vector<std::string>{ManagementGroupStore::kRootGroupId});
+    CHECK(sorted_groups("a2") == want_a2);
+}
+
+// #6352: ManagementGroupStore::delete_agent, the tenth decommission cascade store.
+namespace {
+struct DeleteAgentFixture {
+    std::string root;
+    std::string s1, s2, dyn;
+};
+
+// The root group is created by ServerImpl at boot, not by the store migration; bootstrap it the way
+// server.cpp does. a1 sits in root, two static groups and one dynamic group; a2 (the bystander) in
+// root and s1.
+DeleteAgentFixture seed_delete_agent(ManagementGroupStore& store) {
+    ManagementGroup root;
+    root.id = ManagementGroupStore::kRootGroupId;
+    root.name = "All Devices";
+    root.membership_type = "dynamic";
+    root.scope_expression = "*";
+    root.created_by = "system";
+    REQUIRE(store.create_group(root).has_value());
+    auto make = [&](const char* name, const char* type) {
+        ManagementGroup g;
+        g.name = name;
+        g.membership_type = type;
+        auto id = store.create_group(g);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    DeleteAgentFixture f;
+    f.root = ManagementGroupStore::kRootGroupId;
+    f.s1 = make("S1", "static");
+    f.s2 = make("S2", "static");
+    f.dyn = make("Dyn", "dynamic");
+    REQUIRE(store.add_member(f.root, "a1").has_value());
+    REQUIRE(store.add_member(f.s1, "a1").has_value());
+    REQUIRE(store.add_member(f.s2, "a1").has_value());
+    store.refresh_dynamic_membership(f.dyn, {"a1"});
+    REQUIRE(store.add_member(f.root, "a2").has_value());
+    REQUIRE(store.add_member(f.s1, "a2").has_value());
+    return f;
+}
+
+std::vector<std::string> sorted_ids(std::vector<std::string> v) {
+    std::sort(v.begin(), v.end());
+    return v;
+}
+} // namespace
+
+TEST_CASE("ManagementGroupStore::delete_agent removes the agent from every group and no other",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    const auto f = seed_delete_agent(store);
+    REQUIRE(sorted_ids(store.get_agent_groups("a1").value()) ==
+            sorted_ids({f.root, f.s1, f.s2, f.dyn}));
+
+    std::vector<std::string> removed;
+    std::size_t removed_count = 99;
+    CHECK(store.delete_agent("a1", &removed, &removed_count));
+    // The evidence: exactly the groups the agent was removed from (static, dynamic and root), and
+    // the count the cascade uses to tell a complete id list from a lost one.
+    CHECK(sorted_ids(removed) == sorted_ids({f.root, f.s1, f.s2, f.dyn}));
+    CHECK(removed_count == removed.size());
+
+    // A value, not nullopt (no degrade): the agent is in NO group, static, dynamic and root alike.
+    auto after = store.get_agent_groups("a1");
+    REQUIRE(after.has_value());
+    CHECK(after->empty());
+    for (const auto& gid : {f.root, f.s1, f.s2, f.dyn})
+        for (const auto& m : store.get_members(gid))
+            CHECK(m.agent_id != "a1");
+
+    // The bystander's exact set and each group's remaining member list are intact.
+    CHECK(sorted_ids(store.get_agent_groups("a2").value()) == sorted_ids({f.root, f.s1}));
+    CHECK(store.get_members(f.s1).size() == 1);
+    CHECK(store.get_members(f.root).size() == 1);
+    // The groups themselves are untouched.
+    CHECK(store.get_group(f.s1).has_value());
+    CHECK(store.get_group(f.dyn).has_value());
+}
+
+TEST_CASE("ManagementGroupStore::delete_agent is idempotent and an unknown id is a successful no-op",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    const auto f = seed_delete_agent(store);
+
+    CHECK(store.delete_agent("never-seen")); // true, zero rows
+    CHECK(sorted_ids(store.get_agent_groups("a1").value()) ==
+          sorted_ids({f.root, f.s1, f.s2, f.dyn})); // nothing else touched
+    CHECK(sorted_ids(store.get_agent_groups("a2").value()) == sorted_ids({f.root, f.s1}));
+
+    CHECK(store.delete_agent("a1"));
+    CHECK(store.delete_agent("a1")); // second call on a deleted id: still true
+    CHECK(store.get_agent_groups("a1").value().empty());
+}
+
+TEST_CASE("ManagementGroupStore::delete_agent refuses an empty or NUL-bearing id and deletes nothing",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    const auto f = seed_delete_agent(store);
+
+    std::vector<std::string> removed{"stale"};
+    CHECK_FALSE(store.delete_agent("", &removed));
+    CHECK(removed.empty()); // cleared on a refusal, never left holding stale ids
+    CHECK_FALSE(store.delete_agent(""));
+    // An embedded NUL must not truncate onto another agent's id ("a1\0x" would otherwise read as "a1").
+    CHECK_FALSE(store.delete_agent(std::string_view("a1\0x", 4)));
+    CHECK(sorted_ids(store.get_agent_groups("a1").value()) ==
+          sorted_ids({f.root, f.s1, f.s2, f.dyn}));
+}
+
+// Point-in-time pin : delete_agent is not a tombstone. add_member and
+// refresh_dynamic_membership are INSERT ... ON CONFLICT DO NOTHING with no agent-existence check, so
+// the id can be put back in a group after the delete returned, for example by an operator add or by
+// a dynamic group created later. The deterministic, non-racing form of the documented residual.
+TEST_CASE("ManagementGroupStore::delete_agent is point-in-time: a later add puts the id back",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    const auto f = seed_delete_agent(store);
+
+    REQUIRE(store.delete_agent("a1"));
+    REQUIRE(store.get_agent_groups("a1").value().empty());
+
+    REQUIRE(store.add_member(f.s2, "a1").has_value());
+    store.refresh_dynamic_membership(f.dyn, {"a1"});
+    CHECK(sorted_ids(store.get_agent_groups("a1").value()) == sorted_ids({f.s2, f.dyn}));
+}
+
+// A lease that cannot be had is a refusal, never a false erasure: the only pooled
+// connection is held, so a bounded acquire on the saturated pool gives up (the pool fails a bounded
+// acquire fast, well inside kWriteTimeout) and delete_agent returns false, and the rows survive.
+TEST_CASE("ManagementGroupStore::delete_agent returns false when no connection is available",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    const auto f = seed_delete_agent(store);
+
+    auto held = pool.try_acquire_for(std::chrono::seconds(2));
+    REQUIRE(held);
+    CHECK_FALSE(store.delete_agent("a1"));
+    held = {}; // release the only connection
+    CHECK(sorted_ids(store.get_agent_groups("a1").value()) ==
+          sorted_ids({f.root, f.s1, f.s2, f.dyn}));
+}
+
+TEST_CASE("ManagementGroupStore::delete_agent returns false on a store that is not open",
+          "[management_group][degrade][decommission]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(!store.is_open());
+    CHECK_FALSE(store.delete_agent("a1"));
 }
 
 TEST_CASE("ManagementGroupStore: dynamic membership refresh", "[pg][management_group][members]") {
