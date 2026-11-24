@@ -9,16 +9,19 @@ Best-effort lexical gate, two checks:
   2. No scanned text file parses `session=` out of that agent line (scanned: the whole checkout
      except the top-level SKIP_DIRS (including the `vcpkg` clone) and build* directories,
      rebar3's `gateway/_build*`, `node_modules` and `.git` at any depth, files over 2 MB, binary
-     files (a NUL in the first 4 KiB), unreadable paths, and this file; directory symlinks are not
-     followed). Backslash continuations are joined, and a `session=` extractor within WINDOW lines
+     files (a NUL in the first 4 KiB), and this file; directory symlinks are not followed). A
+     directory it cannot list or a file it cannot read FAILS the gate (#8646), unless it vanished
+     mid-scan (ENOENT): an unscanned path could hold an extractor. Backslash continuations are joined, and a `session=` extractor within WINDOW lines
      of a "Registered with server" mention
      (a separate-line extractor included) fails. A line that carries the marker
      `tripwire-allow: <reason>` is exempt, so each exemption is visible at its own line (only the
      upgrade note quoting the old line). There is NO other `session=` read of that line.
 The server-side "ProxyRegister succeeded: ... session=" line is the id's source and is not flagged.
 """
+import errno
 import os
 import pathlib
+import stat
 import re
 import sys
 import tempfile
@@ -37,9 +40,11 @@ REBAR3_PARENT, REBAR3_PREFIX = "gateway", "_build"
 # runners build several CI jobs into sibling dirs of one checkout (build-linux-coverage,
 # build-linux-clang-21-debug, ...), whose test logs and coverage reports quote the agent's
 # Registered line and would fail this gate on a PR that never touched it (#8637). Top-level FILES
-# named build* are still scanned. Every skip here rests on one premise: no TRACKED file lies in a
-# skipped directory, so only build output and third-party clones are skipped, never source.
-# Nothing checks it yet (#8643); do not add tracked files under any of these names.
+# named build* are still scanned. The #8637 prunes (top-level build*, vcpkg/, gateway/_build*)
+# rest on one premise: no TRACKED file lies under them, so they skip only build output and
+# third-party clones, never source. Nothing checks it yet (#8643); do not add tracked files under
+# these names. The older SKIP_DIRS entries (.claude, changelog.d, governance.d, site, ...) DO hold
+# tracked files and were skipped before #8637; this change leaves their scope as it was.
 SKIP_PREFIX = "build"
 WINDOW = 25  # extractors may sit well after the grep that fetches the line
 MENTION = re.compile(r"Registered\s+with\s+server")
@@ -118,12 +123,30 @@ def skipped(rel_parts):
     return any(skipped_dir(rel_parts[:i]) for i in range(1, len(rel_parts))) or rel_parts[-1] == ".git"
 
 
-def iter_files(root=ROOT, visited=None):
+def note_unreadable(unread, root, err):
+    """Record a path the walk could not list or read (#8646). ENOENT alone is passed over: the
+    path vanished mid-scan, so there is nothing left to hold an extractor. Every other error
+    (EACCES, EIO, ELOOP, ...) leaves the path unscanned, and the gate cannot vouch for it."""
+    if err.errno == errno.ENOENT:
+        return
+    try:
+        rel = pathlib.Path(err.filename).relative_to(root).as_posix()
+    except (TypeError, ValueError):
+        rel = str(err.filename)
+    unread.append(f"{rel}: could not be read ({errno.errorcode.get(err.errno, err.errno)}), "
+                  "so this gate cannot check it")
+
+
+def iter_files(root=ROOT, visited=None, unread=None, walk=os.walk):
     # os.walk with pruning, not rglob: a skipped tree is never listed, so another job deleting or
     # writing its build output mid-scan cannot crash or slow this gate (#8637). Like rglob, it does
-    # not follow directory symlinks, and a directory it cannot list is passed over. `visited`, when
-    # given, collects every directory listed (the selftest uses it to pin the pruning).
-    for dirpath, dirnames, filenames in os.walk(root):
+    # not follow directory symlinks. A directory it cannot list and a file it cannot stat or read
+    # go to `unread` (see note_unreadable), which main() reports as failures. `visited`, when
+    # given, collects every directory listed (the selftest uses it to pin the pruning); `walk` lets
+    # the selftest inject listing errors without chmod, which root bypasses.
+    if unread is None:
+        unread = []
+    for dirpath, dirnames, filenames in walk(root, onerror=lambda e: note_unreadable(unread, root, e)):
         rel_dir = pathlib.Path(dirpath).relative_to(root).parts
         if visited is not None:
             visited.append("/".join(rel_dir))
@@ -131,17 +154,29 @@ def iter_files(root=ROOT, visited=None):
         for name in filenames:
             rel = rel_dir + (name,)
             p = pathlib.Path(dirpath, name)
-            if skipped(rel) or not p.is_file() or p.resolve() == SELF:
+            if skipped(rel):
                 continue
+            # os.stat, not Path.is_file(): is_file() swallows some errors and which ones depends
+            # on the Python version, which would make an unreadable file a silent pass-over again.
             try:
-                if p.stat().st_size > 2_000_000:
+                st = os.stat(p)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > 2_000_000 or p.resolve() == SELF:
                     continue
                 raw = p.read_bytes()
-            except OSError:
+            except OSError as e:
+                note_unreadable(unread, root, e)
                 continue
             if b"\0" in raw[:4096]:
                 continue
             yield "/".join(rel), raw.decode("utf-8", errors="replace")
+
+
+def scan(root=ROOT, walk=os.walk):
+    """Check 2 over the checkout: every extractor hit, then every path it could not check."""
+    errs, unread = [], []
+    for rel, text in iter_files(root, unread=unread, walk=walk):
+        errs += check_text(rel, text)
+    return errs + unread
 
 
 def selftest():
@@ -214,15 +249,59 @@ def selftest_walk(bad_line):
         # deleting it mid-scan, and listing it costs time against the meson timeout).
         entered = [v for v in visited if any(v == t or v.startswith(t + "/") for t in skipped_trees)]
         assert not entered, ("selftest: walk entered skipped trees", entered)
+        selftest_unreadable(root)
     assert not skipped(("build-tools.sh",)), "selftest: a top-level FILE named build* is still scanned"
+
+
+def selftest_unreadable(root):
+    """#8646: a path the walk cannot list or read fails the gate; one that vanished (ENOENT)
+    does not. Errors are injected, so this holds on every OS and under root."""
+    def walk_with_errors(top, onerror):
+        onerror(PermissionError(errno.EACCES, "Permission denied", str(pathlib.Path(top, "locked"))))
+        onerror(OSError(errno.EIO, "I/O error", str(pathlib.Path(top, "bad_disk"))))
+        onerror(FileNotFoundError(errno.ENOENT, "No such file", str(pathlib.Path(top, "gone"))))
+        yield from os.walk(top, onerror=onerror)
+    unread = [e for e in scan(root, walk=walk_with_errors) if "could not be read" in e]
+    got = sorted(u.split(":", 1)[0] for u in unread)
+    assert got == ["bad_disk", "locked"], ("selftest: listing errors", got)
+    # A file whose stat or read fails is recorded the same way (the real os.stat raises here).
+    unread = []
+    note_unreadable(unread, root, PermissionError(errno.EACCES, "Permission denied", str(root / "s.sh")))
+    note_unreadable(unread, root, FileNotFoundError(errno.ENOENT, "No such file", str(root / "t.sh")))
+    assert [u.split(":", 1)[0] for u in unread] == ["s.sh"], ("selftest: file errors", unread)
+    # The real OS paths too, where the platform allows. A self-referencing symlink fails os.stat
+    # with ELOOP even under root (POSIX; Windows needs a privilege to create one).
+    loop = root / "loop.sh"
+    try:
+        os.symlink("loop.sh", loop)
+    except (OSError, NotImplementedError):
+        loop = None
+    if loop is not None:
+        unread = [e for e in scan(root) if "could not be read" in e]
+        assert [u.split(":", 1)[0] for u in unread] == ["loop.sh"], ("selftest: real ELOOP", unread)
+        loop.unlink()
+    # Where chmod does deny (POSIX, not root): an unlistable directory and an unreadable file.
+    locked, locked_file = root / "locked_dir", root / "locked_file.sh"
+    locked.mkdir()
+    (locked / "y.sh").write_text("x\n")
+    locked_file.write_text("x\n")
+    locked.chmod(0)
+    locked_file.chmod(0)
+    try:
+        if not os.access(locked, os.R_OK) and not os.access(locked_file, os.R_OK):
+            unread = [e for e in scan(root) if "could not be read" in e]
+            got = sorted(u.split(":", 1)[0] for u in unread)
+            assert got == ["locked_dir", "locked_file.sh"], ("selftest: real EACCES", got)
+    finally:
+        locked.chmod(0o700)
+        locked_file.chmod(0o600)
 
 
 def main():
     selftest()
     errs = check_agent_cpp((ROOT / "agents/core/src/agent.cpp").read_text(errors="replace"))
     errs += check_dex_emit((ROOT / "agents/core/src/dex_linux_collector.cpp").read_text(errors="replace"))
-    for rel, text in iter_files():
-        errs += check_text(rel, text)
+    errs += scan()
     if hasattr(sys.stdout, "reconfigure"):
         # A non-UTF-8 file name must not turn the FAIL listing into a traceback that hides the rest.
         sys.stdout.reconfigure(errors="backslashreplace")
