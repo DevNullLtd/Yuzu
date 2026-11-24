@@ -1572,7 +1572,7 @@ inline void iptables_tally(IptablesSummary& sum) {
 /// One iptables entry as a row: `rule|[ip6|][<table>|]<kind>|<chain>|<spec>`. `ip6|` marks an
 /// ip6tables entry. `<table>` is written only for an entry outside the filter table, from a legacy
 /// save listing or from a direct `-t <table> -S` read, and is one of `nat`, `mangle`, `raw`,
-/// `security` (the save parser admits no other table name; the direct reads name the first three).
+/// `security` (the save parser admits no other table name; the direct reads name these four).
 /// `<kind>` is one of `policy`, `new_chain`, `append`, `unknown`. Those are two
 /// closed sets of fixed words, so the second field of a row is one of nine words (`ip6`, the four
 /// tables, the four kinds) and never `nftables`, `firewalld` or another backend's word. Chain and
@@ -1632,7 +1632,9 @@ enum class IptablesFlavour { legacy, nf_tables, unknown };
 /// runs only for a tool that is `legacy` (its tables are the ones the names files list). A tool
 /// that is an nf_tables shim or of unknown flavour runs every table: the names files say nothing
 /// about nf_tables rules, and a run that is not ok is unread (never empty, never skipped). A tool
-/// that is not installed cannot be run: the names alone say whether tables exist for it.
+/// that is not installed cannot show its family's nf_tables rules, and nothing else says that
+/// family is empty, so every table of it is unread (a host without `ip6tables` reads `unknown`, never
+/// `inactive`; a missing `iptables` ends the ladder at `none` before any plan is made).
 /// `unseen` is true when tables exist that no run of this plan reads, so the family cannot be
 /// called empty: a legacy list that names a table outside the five, or, for a shim or a tool of
 /// unknown flavour, a legacy list that is non-empty or unreadable (legacy tables are loaded and the
@@ -1664,9 +1666,13 @@ struct IptablesFamilyPlan {
 plan_iptables_family(IptablesFlavour flavour, IptablesNamesOutcome names,
                      std::string_view names_text, bool tool_installed) {
     IptablesFamilyPlan plan;
+    if (!tool_installed) {
+        plan.action.fill(IptablesTableAction::unread);
+        return plan;
+    }
     const auto listed = names == IptablesNamesOutcome::listed ? iptables_listed_names(names_text)
                                                               : std::vector<std::string_view>{};
-    if (tool_installed && flavour != IptablesFlavour::legacy) {
+    if (flavour != IptablesFlavour::legacy) {
         plan.action.fill(IptablesTableAction::run);
         plan.unseen = names == IptablesNamesOutcome::unreadable || !listed.empty();
         return plan;
@@ -1681,7 +1687,7 @@ plan_iptables_family(IptablesFlavour flavour, IptablesNamesOutcome names,
             plan.unseen = true;
         else
             plan.action[static_cast<std::size_t>(it - kIptablesDirectTables.begin())] =
-                tool_installed ? IptablesTableAction::run : IptablesTableAction::unread;
+                IptablesTableAction::run;
     }
     return plan;
 }

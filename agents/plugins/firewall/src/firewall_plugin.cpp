@@ -1493,8 +1493,8 @@ struct XtNamesRead {
 /// unknown flavour a request for an unloaded table can load its module. All the runs share one
 /// deadline, computed once, so the leg stays inside kAcqDeadline; a run that has no time left, or
 /// whose process does not start or fails, is unread, never skipped. nullopt when `iptables` itself
-/// is not installed (the ladder ends at `none`); a missing `ip6tables` leaves its listed tables
-/// unread and its unlisted ones empty.
+/// is not installed (the ladder ends at `none`); a missing `ip6tables` leaves all its tables unread
+/// (nothing shows that family empty), so such a host reads `unknown`.
 [[nodiscard]] std::optional<std::vector<yuzu::firewall::IptablesTableRead>> read_iptables_tables() {
     if (::access("/usr/sbin/iptables", X_OK) != 0)
         return std::nullopt;

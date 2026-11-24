@@ -606,7 +606,7 @@ def linux_problems(plugin_src, reader_src):
             out.append(f"run_nft_probe writes the socket-open diagnostic rows (error|fd_exhausted, "
                        f"error|nftables:socket:eperm) at {opens} sites, expected 2: they are never deferred")
 
-    # the root direct iptables read: both families, the four tables of the pure list, the table list
+    # the root direct iptables read: both families, the five tables of the pure list, the table list
     # gating each run, one deadline, one literal argv per run
     out += direct_iptables_problems(live)
 
@@ -1020,9 +1020,22 @@ class LinuxSnapshotWiring(unittest.TestCase):
                 self.assertTrue(p, "mutation was NOT detected by the gate")
                 self.assertTrue(any(expected in m for m in p), f"expected {expected!r} in {p}")
 
+    def test_a_missing_tool_reads_its_family_unread(self):
+        hpp = PARSERS_HPP.read_text(encoding="utf-8")
+        pat = r"if \(!tool_installed\) \{\s*plan\.action\.fill\(IptablesTableAction::unread\);\s*return plan;"
+        self.assertTrue(re.search(pat, hpp), "firewall_parsers.hpp no longer reads a missing tool's family unread")
+        for what, repl in (("a missing tool read as empty", "IptablesTableAction::empty"),
+                           ("a missing tool run", "IptablesTableAction::run")):
+            mutated = re.sub(r"(if \(!tool_installed\) \{\s*plan\.action\.fill\()IptablesTableAction::unread",
+                             r"\g<1>" + repl, hpp, count=1)
+            self.assertNotEqual(mutated, hpp, "mutation changed nothing (stale pattern)")
+            self.assertFalse(re.search(pat, mutated), f"{what} was not detected")
+        dropped = re.sub(r"if \(!tool_installed\) \{", "if (false) {", hpp, count=1)
+        self.assertFalse(re.search(pat, dropped), "dropping the missing-tool branch was not detected")
+
     def test_the_flavour_gate_is_pinned(self):
         hpp = PARSERS_HPP.read_text(encoding="utf-8")
-        gate = r"if \(tool_installed && flavour != IptablesFlavour::legacy\) \{\s*plan\.action\.fill\(IptablesTableAction::run\);"
+        gate = r"if \(flavour != IptablesFlavour::legacy\) \{\s*plan\.action\.fill\(IptablesTableAction::run\);"
         parse = (r"if \(!tool_ran \|\| !exit_ok \|\| !complete\)\s*return IptablesFlavour::unknown;.*?"
                  r"if \(nft == legacy\)\s*return IptablesFlavour::unknown;")
         for what, pat in (("the shim and unknown flavours running every table", gate),

@@ -4008,7 +4008,7 @@ IptablesTableRead direct_read(bool ip6, std::string_view table, std::string_view
     return classify_iptables_table_read(ip6, table, tool_ran, exit_ok, complete, out);
 }
 
-/// All eight tables clean, except those `over` replaces.
+/// All ten tables (five per family) clean, except those `over` replaces.
 std::vector<IptablesTableRead>
 direct_reads(std::initializer_list<IptablesTableRead> over = {}) {
     std::vector<IptablesTableRead> v;
@@ -4179,7 +4179,7 @@ TEST_CASE("iptables direct: a listed security table is read, never skipped into 
     CHECK(std::ranges::count(rules.rule_rows, "rule|security|append|PREROUTING|-j DROP") == 1);
     CHECK(compose("", false).state == NftVerdict::unknown);              // its run failed
     CHECK(compose(kDirectCleanRaw, true).state == NftVerdict::inactive); // read, empty
-    // the original probe: the four others empty and security listed, but never read
+    // the original probe: the other four empty and security listed, but never read
     std::vector<IptablesTableRead> unread = direct_reads({});
     unread[4] = iptables_unrun_read(false, "security", Act::unread);
     CHECK(iptables_direct_answer(unread, false).state == NftVerdict::unknown);
@@ -4213,12 +4213,27 @@ TEST_CASE("iptables direct: a shim with legacy tables loaded is unknown, or acti
     CHECK(iptables_direct_answer(direct_reads(), false).state == NftVerdict::inactive);
 }
 
-TEST_CASE("iptables plan: tables listed for a family with no tool installed are unread",
-          "[firewall]") {
-    CHECK(plan_iptables_family(kLegacy, kListed, "nat\n", false).action ==
-          Acts{Act::empty, Act::empty, Act::empty, Act::unread, Act::empty});
-    CHECK(plan_iptables_family(kLegacy, kNone, "", false).action ==
-          Acts{Act::empty, Act::empty, Act::empty, Act::empty, Act::empty});
+TEST_CASE("iptables plan: a family whose tool is not installed is entirely unread", "[firewall]") {
+    const Acts unread{Act::unread, Act::unread, Act::unread, Act::unread, Act::unread};
+    for (const auto flavour : {kLegacy, kShim, kUnknownFlavour})
+        for (const auto names : {kNone, kListed, kUnreadable})
+            CHECK(plan_iptables_family(flavour, names, names == kListed ? "nat\n" : "", false)
+                      .action == unread);
+}
+
+TEST_CASE("iptables direct: a host without ip6tables reads unknown, never inactive", "[firewall]") {
+    // iptables is installed (an nf_tables shim) and every IPv4 table is read and empty; ip6tables
+    // is missing, so nothing shows the IPv6 family empty. (A missing iptables ends the ladder at
+    // none before any plan is made.)
+    std::vector<IptablesTableRead> v;
+    for (std::size_t i = 0; i < 5; ++i)
+        v.push_back(direct_read(false, kIptablesDirectTables[i], kIptClean));
+    const auto missing = plan_iptables_family(kUnknownFlavour, kNone, "", false);
+    for (std::size_t i = 0; i < 5; ++i)
+        v.push_back(iptables_unrun_read(true, kIptablesDirectTables[i], missing.action[i]));
+    CHECK(iptables_direct_answer(v, false).state == NftVerdict::unknown);
+    v[3] = direct_read(false, "nat", kDirectRuleRaw); // a rule in IPv4 nat still reads active
+    CHECK(iptables_direct_answer(v, false).state == NftVerdict::active);
 }
 
 TEST_CASE("iptables direct: planned tables compose into the answer", "[firewall]") {
@@ -4264,15 +4279,14 @@ TEST_CASE("iptables flavour: the marker decides, anything else is unknown, never
 
 TEST_CASE("iptables plan: a shim or unknown flavour is never gated by the names files",
           "[firewall]") {
-    const Acts all_run{Act::run, Act::run, Act::run, Act::run};
+    const Acts all_run{Act::run, Act::run, Act::run, Act::run, Act::run};
     for (const auto flavour : {kShim, kUnknownFlavour})
         for (const auto names : {kNone, kListed, kUnreadable})
             CHECK(plan_iptables_family(flavour, names, "", true).action == all_run);
-    // a legacy tool is still gated, an uninstalled tool cannot run whatever its flavour reads
     CHECK(plan_iptables_family(kLegacy, kNone, "", true).action ==
           Acts{Act::empty, Act::empty, Act::empty, Act::empty, Act::empty});
-    CHECK(plan_iptables_family(kUnknownFlavour, kNone, "", false).action ==
-          Acts{Act::empty, Act::empty, Act::empty, Act::empty, Act::empty});
+    CHECK(plan_iptables_family(kUnknownFlavour, kNone, "", true).action ==
+          Acts{Act::run, Act::run, Act::run, Act::run, Act::run});
 }
 
 TEST_CASE("iptables direct: an nft shim with rules only in nat is active, names file aside",
