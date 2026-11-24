@@ -13,7 +13,8 @@
  *   os_make_leg            one filesystem leg for a unit. Called on the slice's worker.
  *   os_draw_cursor_key     fills the 32-byte cursor key from the system's random source; false if it cannot.
  *   os_in_worker_environment  runs `body` inside the worker thread's environment (priority class, error mode,
- *                          dataless or capability scope); the environment lasts exactly as long as `body`.
+ *                          dataless, cloud-files view or capability scope); the environment lasts exactly as
+ *                          long as `body`.
  *   os_name_semantics      the OS's name rule.
  *   os_normalise_root      the OS's root normaliser (the request parser's RootNormaliser).
  *   os_user_roots          profile directories of the unit's volume that the built-in `/home`-style rule does

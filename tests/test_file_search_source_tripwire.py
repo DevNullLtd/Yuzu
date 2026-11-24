@@ -26,7 +26,8 @@ spellings, never a `write*` or `read_file*` prefix, so the plugin's own `write_o
     members of confined_fs (`unlink_at`, `delete_matching`, `read_file_bounded`, `open_no_reparse`), every data
     access right (`GENERIC_*`, `FILE_READ_DATA`, `FILE_LIST_DIRECTORY`, the write rights, `MAXIMUM_ALLOWED`, the bare
     `DELETE`, ...), the backup and restore privileges and `FILE_FLAG_BACKUP_SEMANTICS`, the process-wide
-    `SetErrorMode(` (the thread-scoped `SetThreadErrorMode(` is fine) and the placeholder compatibility switch;
+    `SetErrorMode(` and the process-wide placeholder compatibility switch `RtlSetProcessPlaceholderCompatibilityMode`
+    (the thread-scoped `SetThreadErrorMode(` and `RtlSetThreadPlaceholderCompatibilityMode(` are the allowed forms);
   - every `FSCTL_*` and `IOCTL_*` name except `FSCTL_GET_RETRIEVAL_POINTERS` and `FSCTL_GET_EXTERNAL_BACKING`,
     and a count rule over the one allowed pair: `DeviceIoControl(` occurs nowhere, or exactly twice and only in
     file_search_win.cpp, and then each of the two allowed names occurs exactly once in that file (the plugin's
@@ -150,7 +151,8 @@ SRC_FORBIDDEN: list[tuple[str, str, str]] = [
      r"AdjustTokenPrivileges|FILE_FLAG_BACKUP_SEMANTICS)\b",
      "a search runs with the agent's own token: no backup or restore privilege, no privilege adjustment"),
     ("win-process-state", _ID + r"(?:SetErrorMode\(|RtlSetProcessPlaceholderCompatibilityMode\b)",
-     "process-wide state is never changed by a search (SetThreadErrorMode( is the thread-scoped form)"),
+     "process-wide state is never changed by a search (SetThreadErrorMode( and "
+     "RtlSetThreadPlaceholderCompatibilityMode( are the thread-scoped forms)"),
     ("win-ioctl", _ID + r"(?:FSCTL_(?!(?:GET_RETRIEVAL_POINTERS|GET_EXTERNAL_BACKING)\b)\w+|IOCTL_\w+)",
      "only the extent query and the external-backing query are control codes a search may spell"),
 ]
@@ -473,12 +475,14 @@ def selftest() -> int:
 
     # The Windows spellings that merely contain a pinned one, or that the leg legitimately uses, are not named.
     win_own = canonical("SetThreadErrorMode(SEM_FAILCRITICALERRORS, &old); read_file_extents(p, 4); "
+                        "CHAR m = RtlSetThreadPlaceholderCompatibilityMode(2); "
                         "DWORD s = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE; "
                         "DWORD a = FILE_READ_ATTRIBUTES | SYNCHRONIZE; DWORD f = FILE_ATTRIBUTE_REPARSE_POINT; "
                         "auto c = FILE_DELETE_ON_CLOSE_X; auto d = DELETED; auto e = my_DELETE; "
                         "auto g = ReadFileLike; auto h = WriteFiles;")
     win_ids = {r for r, _ in source_problems(dict(src, **{driver: src[driver] + win_own}))}
-    expect(win_ids == set(), f"win: SetThreadErrorMode(, read_file_extents( and look-alikes must not count: {sorted(win_ids)}")
+    expect(win_ids == set(), f"win: SetThreadErrorMode(, RtlSetThreadPlaceholderCompatibilityMode(, read_file_extents( "
+                             f"and look-alikes must not count: {sorted(win_ids)}")
 
     # The two ioctls: nowhere, or exactly twice and only in file_search_win.cpp, each allowed name once.
     two = canonical("DeviceIoControl(h, FSCTL_GET_EXTERNAL_BACKING, nullptr, 0, b, 4, &n, nullptr); "

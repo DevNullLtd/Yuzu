@@ -104,10 +104,37 @@ bool os_draw_cursor_key(CursorKey& key) noexcept {
 
 // ---- the worker ----
 
+namespace {
+
+/// `RtlSetThreadPlaceholderCompatibilityMode` (ntdll, Windows 10 1709 on): sets the calling thread's cloud-files
+/// view and returns the previous one, or a negative value on failure. Resolved once the way confined_fs_win.cpp
+/// resolves NtCreateFile; null where the export is absent, and then the slice runs in the default view.
+using SetPlaceholderModeFn = CHAR(NTAPI*)(CHAR);
+
+SetPlaceholderModeFn resolve_set_placeholder_mode() {
+    static const SetPlaceholderModeFn resolved = []() -> SetPlaceholderModeFn {
+        const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr)
+            return nullptr;
+        return reinterpret_cast<SetPlaceholderModeFn>(
+            reinterpret_cast<void*>(::GetProcAddress(ntdll, "RtlSetThreadPlaceholderCompatibilityMode")));
+    }();
+    return resolved;
+}
+
+/// PHCM_EXPOSE_PLACEHOLDERS: cloud files are shown as they are. In the default view the system hides the cloud
+/// reparse tag and the sparse and offline bits from every process whose main image is not under %systemroot%,
+/// so a fully local cloud file could never be told apart from an ordinary one.
+constexpr CHAR kExposePlaceholders = 2;
+
+} // namespace
+
 /// Runs inside the worker thread for the whole call of `body`: hard-error dialogs suppressed for this thread
-/// (a not-ready volume would otherwise block it), and background priority for the thread's CPU and I/O. Both
-/// end when `body` returns (the error mode by its guard, background mode by the END call below), so the
-/// environment lasts exactly as long as `body` on any thread, pooled or fresh.
+/// (a not-ready volume would otherwise block it), background priority for the thread's CPU and I/O, and the
+/// thread's cloud-files view set to exposed (never the process-wide switch, which the source tripwire forbids).
+/// All three end when `body` returns (the error mode by its guard, background mode by the END call below, the
+/// view by restoring the mode the first call returned), so the environment lasts exactly as long as `body` on
+/// any thread, pooled or fresh.
 void os_in_worker_environment(const std::function<void()>& body) {
     const yuzu::win::ThreadErrorModeGuard errors(SEM_FAILCRITICALERRORS);
     struct BackgroundMode {
@@ -120,6 +147,26 @@ void os_in_worker_environment(const std::function<void()>& body) {
                 (void)::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
         }
     } background;
+    struct PlaceholderView {
+        SetPlaceholderModeFn set{nullptr}; // non-null only while the exposed view is on
+        CHAR before{0};
+        PlaceholderView() {
+            const SetPlaceholderModeFn fn = resolve_set_placeholder_mode();
+            if (fn == nullptr)
+                return;
+            const CHAR previous = fn(kExposePlaceholders);
+            if (previous >= 0) { // a negative return is a failure and changed nothing
+                set = fn;
+                before = previous;
+            }
+        }
+        PlaceholderView(const PlaceholderView&) = delete; // a copy would restore the mode twice
+        PlaceholderView& operator=(const PlaceholderView&) = delete;
+        ~PlaceholderView() {
+            if (set != nullptr)
+                (void)set(before);
+        }
+    } view;
     body();
 }
 

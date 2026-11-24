@@ -17,17 +17,27 @@
  * handle carries no data right, and what protects a directory is the listing decision plus the recheck of
  * its attributes on the opened handle before anything is enumerated.
  *
- * MEASURED VALUES, from a Windows 11 host (a synthetic cloud sync root with a real provider callback round
- * trip, as the interactive administrator and as SYSTEM): a populated folder is attributes 0x410 with tag
- * 0x9000601A in sync and 0x9000201A not in sync; the sync-root folder is 0x430 with 0x9000701A; a folder that
- * is not populated is 0x401410; an unhydrated file is 0x401620 (pinned variants 0x481620 and 0x501620); a
- * hydrated cloud file is 0x420 with 0x9000601A or 0x9000201A; an app-execution alias is 0x420 with
- * 0x8000001B; a `compact /exe` file is a plain file (0x20, no tag) whose retrieval pointers read as ONE hole;
- * a sparse hole is an lcn -1 run, a wholly sparse file answers success with one lcn -1 run, and a resident
- * or empty file answers ERROR_HANDLE_EOF; a buffer under 32 bytes answers ERROR_INSUFFICIENT_BUFFER, not
- * ERROR_MORE_DATA. NOT MEASURED, stated where each rule uses it: EFS (the `encrypted` flag follows the
- * documented attribute), deduplication (detected by its tag), ReFS, a commercial sync client, and a
- * recall-on-open directory.
+ * CLOUD VIEWS. The Cloud Files documentation says Windows shows the cloud reparse tag and the sparse and
+ * offline bits only to a sync engine and to a process whose main image is under %systemroot%, and shows any
+ * other process an entry with them cleared; RtlSetThreadPlaceholderCompatibilityMode is its thread-scoped
+ * opt-in. The leg sets it on its own worker thread (os_in_worker_environment), never for the process.
+ *
+ * MEASURED VALUES, all from one Windows 11 build 26200 host and its synthetic cloud sync root (a real
+ * provider callback round trip), as the interactive administrator and as SYSTEM. Seen from powershell.exe,
+ * an image under %systemroot%: a populated folder is attributes 0x410 with tag 0x9000601A in sync and
+ * 0x9000201A not in sync; the sync-root folder is 0x430 with 0x9000701A; a folder that is not populated is
+ * 0x401410; an unhydrated file is 0x401620 (pinned variants 0x481620 and 0x501620); a hydrated cloud file is
+ * 0x420 with 0x9000601A or 0x9000201A. Seen through this plugin in its default view (no switch) on the
+ * same host: a hydrated file is 0x20 with no tag, an unhydrated file 0x400020, a populated folder 0x10, a
+ * folder that is not populated 0x400010, and the sync-root folder, listed from its plain parent, 0x430 with
+ * 0x9000701A. The recall-on-data-access bit (0x400000) was present in both views. The switch itself was
+ * not measured. Also measured on that host: an app-execution alias is 0x420 with 0x8000001B; a `compact
+ * /exe` file is a plain file (0x20, no tag) whose retrieval pointers read as ONE hole; a sparse hole is an
+ * lcn -1 run, a wholly sparse file answers success with one lcn -1 run, and a resident or empty file
+ * answers ERROR_HANDLE_EOF; a buffer under 32 bytes answers ERROR_INSUFFICIENT_BUFFER, not
+ * ERROR_MORE_DATA. NOT MEASURED, stated where each rule uses it: the switch, EFS (the `encrypted` flag
+ * follows the documented attribute), deduplication (detected by its tag), ReFS, a commercial sync client,
+ * and a recall-on-open directory.
  */
 #pragma once
 

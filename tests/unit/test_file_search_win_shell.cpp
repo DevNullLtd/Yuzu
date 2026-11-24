@@ -606,17 +606,40 @@ TEST_CASE("file_search windows shell: the work function runs in background mode"
     CHECK(*probe == ERROR_THREAD_MODE_ALREADY_BACKGROUND);
 }
 
-TEST_CASE("file_search windows shell: the worker environment suppresses hard-error dialogs and runs in background mode around the body only",
+TEST_CASE("file_search windows shell: the worker environment suppresses hard-error dialogs, exposes cloud files and runs in background mode around the body only",
           "[file_search][file_search_win_shell]") {
+    // The cloud-files view is a per-thread setting made through two ntdll exports, so the test resolves them
+    // itself and REQUIRES both: a missing export would otherwise let the guard do nothing and pass unseen.
+    using SetModeFn = CHAR(NTAPI*)(CHAR);
+    using QueryModeFn = CHAR(NTAPI*)();
+    const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    REQUIRE(ntdll != nullptr);
+    const auto set_mode = reinterpret_cast<SetModeFn>(
+        reinterpret_cast<void*>(::GetProcAddress(ntdll, "RtlSetThreadPlaceholderCompatibilityMode")));
+    const auto query_mode = reinterpret_cast<QueryModeFn>(
+        reinterpret_cast<void*>(::GetProcAddress(ntdll, "RtlQueryThreadPlaceholderCompatibilityMode")));
+    REQUIRE(set_mode != nullptr);
+    REQUIRE(query_mode != nullptr);
+
     // On a thread of its own, joined, so the thread's modes can be read after the call without touching the
-    // test's thread. The error mode is cleared first so the restore is observable.
+    // test's thread. The error mode is cleared first so the restore is observable, and the cloud-files view is
+    // set to a non-default mode (1, disguised) so that restoring the previous mode differs from resetting it.
     DWORD inside = 0;
     DWORD after = ~DWORD{0};
+    CHAR view_before = 0;
+    CHAR view_inside = 0;
+    CHAR view_after = 0;
     BOOL background_ended = FALSE;
     std::thread worker([&] {
         ::SetThreadErrorMode(0, nullptr);
-        os_in_worker_environment([&] { inside = ::GetThreadErrorMode(); });
+        (void)set_mode(1);
+        view_before = query_mode();
+        os_in_worker_environment([&] {
+            inside = ::GetThreadErrorMode();
+            view_inside = query_mode();
+        });
         after = ::GetThreadErrorMode();
+        view_after = query_mode();
         // Background mode ended with the body: beginning it again succeeds (it fails with
         // ERROR_THREAD_MODE_ALREADY_BACKGROUND while it is still on), and that second one is ended here.
         background_ended = ::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
@@ -627,6 +650,9 @@ TEST_CASE("file_search windows shell: the worker environment suppresses hard-err
     CHECK((inside & SEM_FAILCRITICALERRORS) != 0);
     CHECK(after == 0);
     CHECK(background_ended != FALSE);
+    CHECK(view_before == 1);
+    CHECK(view_inside == 2); // PHCM_EXPOSE_PLACEHOLDERS inside the body
+    CHECK(view_after == view_before); // and the mode the thread had before, once the body returns
 }
 
 #endif // _WIN32
