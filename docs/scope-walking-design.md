@@ -47,6 +47,13 @@ SQLite file is retained read-only for one release as a rollback breadcrumb
 retained as the original design illustration; treat ADR-0036 as authoritative
 for the live schema.
 
+Synchronous creation and asynchronous materialisation deduplicate device IDs and
+insert up to 1,000 members per PostgreSQL statement. The header and all member
+batches share one transaction. A failed insert rolls back the entire write.
+For a pending set, only the transaction that changes its status to materialised
+can publish members and counts. A failed fill leaves the pending set available
+for retry.
+
 ```sql
 CREATE TABLE result_sets (
   id              TEXT PRIMARY KEY,        -- "rs_<ulid>", monotonic, lexically sortable

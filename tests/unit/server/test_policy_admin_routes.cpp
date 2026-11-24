@@ -12,6 +12,9 @@
  */
 
 #include "agent_registry.hpp"
+#include "capability_fragments.hpp"
+#include "instruction_store.hpp"
+#include "management_group_store.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -19,6 +22,7 @@
 #include "policy_admin_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "policy_store.hpp"
+#include "test_mgmt_group_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -32,6 +36,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace yuzu::server;
@@ -487,6 +492,544 @@ TEST_CASE("POST /api/policies/:id/disable|enable: an unknown clean id answers 40
     CHECK(h.emitted_events.empty());
 }
 
+// ---------------------------------------------------------------------------
+// G01: a refused dispatch is its own 409, and the authoring routes refuse early
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const CommandCapabilityRegistry& route_full_registry() {
+    static const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    return registry;
+}
+
+// A real PolicyStore, InstructionStore and ManagementGroupStore with one static group of two
+// agents, an evaluator with the FULL registry (or none), and the policy admin routes on top.
+struct RefusalRoutes {
+    yuzu::server::pg::PgPool pool;
+    PolicyStore ps;
+    InstructionStore is;
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    std::string group_id;
+    std::string empty_group_id;
+    int dispatch_calls{0};
+    std::optional<PolicyEvaluator> evaluator;
+    // Declared before `routes`, which counts refusals into it.
+    yuzu::MetricsRegistry metrics;
+    // Declared before `sink`: the sink captures `routes`'s `this`, so `routes` must outlive it.
+    PolicyAdminRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    std::vector<AuditCall> audit_calls;
+
+    RefusalRoutes(const std::string& dsn, const CommandCapabilityRegistry* registry)
+        : pool({.conninfo = dsn, .size = 4}), ps(pool), is(pool) {
+        REQUIRE(ps.is_open());
+        ManagementGroup g;
+        g.name = "grp";
+        g.membership_type = "static";
+        auto gid = mg.create_group(g);
+        REQUIRE(gid.has_value());
+        group_id = *gid;
+        REQUIRE(mg.add_member(group_id, "agentA").has_value());
+        REQUIRE(mg.add_member(group_id, "agentB").has_value());
+        ManagementGroup e;
+        e.name = "empty";
+        e.membership_type = "static";
+        auto eid = mg.create_group(e);
+        REQUIRE(eid.has_value());
+        empty_group_id = *eid;
+
+        PolicyEvaluator::Deps d;
+        d.policy_store = &ps;
+        d.instruction_store = &is;
+        d.mgmt_group_store = &mg;
+        d.capability_registry = registry;
+        d.dispatch_fn = [this](const std::string&, const std::string&,
+                               const std::vector<std::string>& agents, const std::string&,
+                               const std::unordered_map<std::string, std::string>&,
+                               const std::string& execid) -> yuzu::server::ConfinedDispatchOutcome {
+            ++dispatch_calls;
+            yuzu::server::ConfinedDispatchOutcome o;
+            o.command_id = "cmd-" + execid;
+            o.sent = static_cast<int>(agents.size());
+            return o;
+        };
+        evaluator.emplace(d);
+
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "tester";
+            s.role = auth::Role::admin;
+            return s;
+        };
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> bool { return true; };
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) -> bool {
+            audit_calls.push_back({action, result, target_type, target_id, detail});
+            return true;
+        };
+        auto emit_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
+                          const nlohmann::json&) {};
+        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, &ps, &*evaluator, &metrics);
+    }
+
+    std::string define(const std::string& id, const std::string& plugin, const std::string& action,
+                       const std::string& approval_mode = {}) {
+        InstructionDefinition d;
+        d.id = id;
+        d.approval_mode = approval_mode;
+        d.name = id;
+        d.version = "1.0.0";
+        d.type = "question";
+        d.plugin = plugin;
+        d.action = action;
+        d.enabled = true;
+        REQUIRE(is.create_definition(d).has_value());
+        return id;
+    }
+
+    // A fragment straight into the store (as a pack install would, written straight to the store).
+    std::string fragment(const std::string& name, const std::string& check, const std::string& fix = {},
+                         const std::string& post = {}) {
+        std::string y = "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\ndisplayName: " + name +
+                        "\nspec:\n  check:\n    instruction: " + check +
+                        "\n    compliance: \"result.hostname != ''\"\n";
+        if (!fix.empty())
+            y += "  fix:\n    instruction: " + fix + "\n";
+        if (!post.empty())
+            y += "  postCheck:\n    instruction: " + post + "\n    compliance: \"result.hostname != ''\"\n";
+        auto id = ps.create_fragment(y);
+        REQUIRE(id.has_value());
+        return *id;
+    }
+
+    std::string policy(const std::string& name, const std::string& fragment_id, const std::string& group) {
+        auto id = ps.create_policy("apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: " + name +
+                                   "\nspec:\n  fragment: " + fragment_id +
+                                   "\n  managementGroups:\n    - " + group + "\n");
+        REQUIRE(id.has_value());
+        return *id;
+    }
+};
+
+std::string fragment_yaml(const std::string& name, const std::string& check) {
+    return "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\ndisplayName: " + name +
+           "\nspec:\n  check:\n    instruction: " + check +
+           "\n    compliance: \"result.hostname != ''\"\n";
+}
+
+// The same document with a fix and a post-check section, either of which may be empty.
+std::string fragment_yaml3(const std::string& name, const std::string& check, const std::string& fix,
+                           const std::string& post) {
+    auto y = fragment_yaml(name, check);
+    if (!fix.empty())
+        y += "  fix:\n    instruction: " + fix + "\n";
+    if (!post.empty())
+        y += "  postCheck:\n    instruction: " + post + "\n    compliance: \"result.hostname != ''\"\n";
+    return y;
+}
+
+} // namespace
+
+TEST_CASE("POST /api/policies/:id/evaluate: a refused dispatch is a 409 of its own, audited with "
+          "the reason, and nothing is sent",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto gated = r.define("i.gated", "content_dist", "execute_staged");
+    const auto fid = r.fragment("refused", gated);
+    const auto pid = r.policy("refused policy", fid, r.group_id);
+
+    auto res = r.sink.Post("/api/policies/" + pid + "/evaluate", "");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(r.dispatch_calls == 0);
+
+    const auto body = nlohmann::json::parse(res->body);
+    const auto& err = body.at("error");
+    CHECK(err.at("code") == 409);
+    CHECK(err.at("message") == "policy dispatch refused");
+    CHECK(err.contains("correlation_id"));
+    CHECK(err.contains("retry_after_ms"));
+    CHECK(err.at("retry_after_ms").is_null());
+    CHECK(err.at("remediation").get<std::string>().rfind("policy_dispatch_refused: gated", 0) == 0);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+
+    // Audited as denied, with the token, not as a success and not as an error.
+    bool found = false;
+    for (const auto& c : r.audit_calls)
+        if (c.action == "policy.evaluate") {
+            found = true;
+            CHECK(c.result == "denied");
+            CHECK(c.target_id == pid);
+            CHECK(c.detail == "reason=gated");
+        }
+    CHECK(found);
+}
+
+TEST_CASE("POST /api/policies/:id/evaluate: an unwired refusal does not tell the caller to change "
+          "the instruction",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), nullptr); // no capability registry: every pair reads unwired
+    const auto check = r.define("i.check", "echo", "status");
+    const auto fid = r.fragment("unwired", check);
+    const auto pid = r.policy("unwired policy", fid, r.group_id);
+
+    auto res = r.sink.Post("/api/policies/" + pid + "/evaluate", "");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(r.dispatch_calls == 0);
+
+    const auto body = nlohmann::json::parse(res->body);
+    const auto& err = body.at("error");
+    CHECK(err.at("message") == "policy dispatch refused");
+    const auto remediation = err.at("remediation").get<std::string>();
+    CHECK(remediation.rfind("policy_dispatch_refused: unwired", 0) == 0);
+    // The instruction is not at fault: the server could not check it.
+    CHECK(remediation.find("Change the instruction") == std::string::npos);
+    CHECK(remediation.find("Try again later") != std::string::npos);
+}
+
+TEST_CASE("POST /api/policies/:id/evaluate: the refusal 409 is distinguishable from the "
+          "nothing-to-dispatch 409",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto allowed = r.define("i.status", "echo", "status");
+    const auto fid = r.fragment("allowed", allowed);
+    // An allowed check bound to a group with no members: nothing to dispatch.
+    const auto pid = r.policy("nothing to dispatch", fid, r.empty_group_id);
+
+    auto res = r.sink.Post("/api/policies/" + pid + "/evaluate", "");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    const auto err = nlohmann::json::parse(res->body).at("error");
+    CHECK(err.at("message").get<std::string>().find("matches no agents") != std::string::npos);
+    CHECK_FALSE(err.contains("remediation"));
+    CHECK_FALSE(err.contains("correlation_id"));
+}
+
+TEST_CASE("POST /api/policies/:id/remediate: a refused fix is a 409 with the same shape, not a 400",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto check = r.define("i.status", "echo", "status");
+    const auto fix = r.define("i.gated", "content_dist", "execute_staged");
+    const auto fid = r.fragment("fix refused", check, fix);
+    const auto pid = r.policy("fix refused policy", fid, r.group_id);
+
+    auto res = r.sink.Post("/api/policies/" + pid + "/remediate", R"({"agent_ids":["agentA"]})",
+                           "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(r.dispatch_calls == 0);
+    const auto err = nlohmann::json::parse(res->body).at("error");
+    CHECK(err.at("code") == 409);
+    CHECK(err.at("message") == "policy dispatch refused");
+    CHECK(err.contains("correlation_id"));
+    CHECK(err.at("remediation").get<std::string>().rfind("policy_dispatch_refused: gated", 0) == 0);
+    bool found = false;
+    for (const auto& c : r.audit_calls)
+        if (c.action == "policy.remediate") {
+            found = true;
+            CHECK(c.result == "denied");
+            CHECK(c.detail == "reason=gated");
+        }
+    CHECK(found);
+}
+
+TEST_CASE("authoring routes refuse a fragment, policy or enable that names a gated instruction, "
+          "with a denied audit row",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto gated = r.define("i.gated", "content_dist", "execute_staged");
+    const auto allowed = r.define("i.status", "echo", "status");
+
+    // Fragment create: refused with a 400 naming the reason; nothing is stored.
+    auto bad = r.sink.Post("/api/policy-fragments", fragment_yaml("bad fragment", gated), "text/plain");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    CHECK(nlohmann::json::parse(bad->body).at("error").at("message").get<std::string>().find("(gated)") !=
+          std::string::npos);
+    {
+        // The A4 envelope, like the dispatch 409: a correlation id (body and header), a null
+        // retry, and the reason in the remediation text, which is how a client tells this 400
+        // from the string-error 400s on the same routes.
+        const auto body = nlohmann::json::parse(bad->body);
+        const auto& err = body.at("error");
+        CHECK(err.at("code") == 400);
+        CHECK(err.contains("correlation_id"));
+        CHECK_FALSE(err.at("correlation_id").get<std::string>().empty());
+        CHECK_FALSE(bad->get_header_value("X-Correlation-Id").empty());
+        CHECK(err.contains("retry_after_ms"));
+        CHECK(err.at("retry_after_ms").is_null());
+        CHECK(err.at("remediation").get<std::string>().rfind("policy_dispatch_refused: gated", 0) == 0);
+        CHECK(body.at("meta").at("api_version") == "v1");
+    }
+    REQUIRE_FALSE(r.audit_calls.empty());
+    CHECK(r.audit_calls.back().action == "policy_fragment.create");
+    CHECK(r.audit_calls.back().result == "denied");
+    CHECK(r.audit_calls.back().target_id == "bad fragment");
+    CHECK(r.audit_calls.back().detail == "reason=gated instruction=i.gated");
+    auto frags = r.ps.query_fragments();
+    REQUIRE(frags.has_value());
+    CHECK(frags->empty());
+
+    // An allowed instruction and an id that does not exist yet are both accepted.
+    auto ok = r.sink.Post("/api/policy-fragments", fragment_yaml("ok fragment", allowed), "text/plain");
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+    auto unknown = r.sink.Post("/api/policy-fragments",
+                               fragment_yaml("pack fragment", "defined.later"), "text/plain");
+    REQUIRE(unknown);
+    CHECK(unknown->status == 201);
+
+    // A fragment that reached the store another way (a pack install does not run the check):
+    // policy create and enable both refuse it.
+    const auto stored = r.fragment("stored gated", gated);
+    auto policy_yaml = "apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: p\nspec:\n  fragment: " +
+                       stored + "\n  managementGroups:\n    - " + r.group_id + "\n";
+    auto created = r.sink.Post("/api/policies", policy_yaml, "text/plain");
+    REQUIRE(created);
+    CHECK(created->status == 400);
+    CHECK(r.audit_calls.back().action == "policy.create");
+    CHECK(r.audit_calls.back().result == "denied");
+
+    const auto pid = r.policy("pack policy", stored, r.group_id); // as a pack install would
+    auto enabled = r.sink.Post("/api/policies/" + pid + "/enable", "");
+    REQUIRE(enabled);
+    CHECK(enabled->status == 400);
+    CHECK(r.audit_calls.back().action == "policy.enable");
+    CHECK(r.audit_calls.back().result == "denied");
+    CHECK(r.audit_calls.back().target_id == pid);
+    CHECK(r.dispatch_calls == 0);
+}
+
+TEST_CASE("authoring routes answer 503, never an accept or a 400, when the instruction lookup "
+          "cannot be answered",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    // An evaluator with no registry reads every lookup as degraded.
+    RefusalRoutes r(db.dsn(), nullptr);
+    const auto allowed = r.define("i.status", "echo", "status");
+
+    auto res = r.sink.Post("/api/policy-fragments", fragment_yaml("any", allowed), "text/plain");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    {
+        // The A4 envelope. An evaluator with no registry is a wiring condition no retry
+        // clears, so the body carries a null retry hint (a transient store failure carries
+        // 5000: the next test).
+        const auto body = nlohmann::json::parse(res->body);
+        const auto& err = body.at("error");
+        CHECK(err.at("code") == 503);
+        // No "try again": the null hint and the message agree that a retry will not help.
+        CHECK(err.at("message") == "instruction lookup unavailable");
+        CHECK(err.contains("correlation_id"));
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        REQUIRE(err.contains("retry_after_ms"));
+        CHECK(err.at("retry_after_ms").is_null());
+        CHECK(body.at("meta").at("api_version") == "v1");
+    }
+    auto frags = r.ps.query_fragments();
+    REQUIRE(frags.has_value());
+    CHECK(frags->empty());
+    // A degraded lookup is not an operator denial: no denied row.
+    for (const auto& c : r.audit_calls)
+        CHECK(c.result != "denied");
+}
+
+TEST_CASE("authoring routes carry retry_after_ms on a 503 only when the instruction lookup failed "
+          "transiently",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry()); // wired: the lookup can only fail transiently
+    const auto allowed = r.define("i.status", "echo", "status");
+
+    // The instruction table becomes unreadable: a store failure, not a wiring condition.
+    {
+        auto lease = r.pool.try_acquire_for(std::chrono::milliseconds{2000});
+        REQUIRE(lease);
+        auto q = yuzu::server::pg::exec_params(
+            lease.get(),
+            "ALTER TABLE instruction_store.instruction_definitions RENAME TO "
+            "instruction_definitions_gone",
+            std::vector<std::string>{});
+        REQUIRE(q.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = r.sink.Post("/api/policy-fragments", fragment_yaml("any", allowed), "text/plain");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body);
+    const auto& err = body.at("error");
+    CHECK(err.at("message") == "instruction lookup unavailable, try again");
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    REQUIRE(err.contains("retry_after_ms"));
+    CHECK(err.at("retry_after_ms") == 5000);
+    for (const auto& c : r.audit_calls)
+        CHECK(c.result != "denied");
+}
+
+TEST_CASE("authoring routes refuse a fragment, policy or enable whose FIX or POST-CHECK instruction "
+          "is refused, and accept the same shape when all three are allowed",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto check = r.define("i.status", "echo", "status");
+    const auto fix_ok = r.define("i.status.fix", "echo", "status");
+    const auto post_ok = r.define("i.status.post", "echo", "status");
+    const auto fix_gated = r.define("i.gated.fix", "content_dist", "execute_staged");
+    const auto post_destructive = r.define("i.destructive.post", "echo", "purge_source");
+
+    const auto policy_yaml = [&](const std::string& fragment_id) {
+        return "apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: p-" + fragment_id +
+               "\nspec:\n  fragment: " + fragment_id + "\n  managementGroups:\n    - " + r.group_id + "\n";
+    };
+    const auto last_denied = [&](const char* verb, const std::string& token, const std::string& instr) {
+        REQUIRE_FALSE(r.audit_calls.empty());
+        const auto& c = r.audit_calls.back();
+        CHECK(c.action == verb);
+        CHECK(c.result == "denied");
+        CHECK(c.detail.find("reason=" + token) != std::string::npos);
+        CHECK(c.detail.find("instruction=" + instr) != std::string::npos);
+    };
+    const auto refused_body = [](const std::unique_ptr<httplib::Response>& res, const std::string& token,
+                                 const std::string& instr) {
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto msg = nlohmann::json::parse(res->body).at("error").at("message").get<std::string>();
+        CHECK(msg.find("instruction " + instr + " ") != std::string::npos);
+        CHECK(msg.find("(" + token + ")") != std::string::npos);
+    };
+
+    // Positive control: an allowed check, fix and post-check are accepted on all three routes,
+    // so the refusals below are the id list's doing and not the shape's.
+    {
+        auto frag = r.sink.Post("/api/policy-fragments",
+                                fragment_yaml3("all allowed", check, fix_ok, post_ok), "text/plain");
+        REQUIRE(frag);
+        CHECK(frag->status == 201);
+        const auto stored = r.fragment("all allowed stored", check, fix_ok, post_ok);
+        auto created = r.sink.Post("/api/policies", policy_yaml(stored), "text/plain");
+        REQUIRE(created);
+        CHECK(created->status == 201);
+        const auto pid = r.policy("all allowed policy", stored, r.group_id);
+        auto enabled = r.sink.Post("/api/policies/" + pid + "/enable", "");
+        REQUIRE(enabled);
+        CHECK(enabled->status == 200);
+    }
+
+    // A refused FIX instruction, behind an allowed check.
+    {
+        auto frag = r.sink.Post("/api/policy-fragments",
+                                fragment_yaml3("gated fix", check, fix_gated, ""), "text/plain");
+        refused_body(frag, "gated", fix_gated);
+        last_denied("policy_fragment.create", "gated", fix_gated);
+
+        const auto stored = r.fragment("gated fix stored", check, fix_gated);
+        auto created = r.sink.Post("/api/policies", policy_yaml(stored), "text/plain");
+        refused_body(created, "gated", fix_gated);
+        last_denied("policy.create", "gated", fix_gated);
+
+        const auto pid = r.policy("gated fix policy", stored, r.group_id);
+        auto enabled = r.sink.Post("/api/policies/" + pid + "/enable", "");
+        refused_body(enabled, "gated", fix_gated);
+        last_denied("policy.enable", "gated", fix_gated);
+    }
+
+    // A refused POST-CHECK instruction, behind an allowed check and an allowed fix.
+    {
+        auto frag = r.sink.Post("/api/policy-fragments",
+                                fragment_yaml3("destructive post", check, fix_ok, post_destructive),
+                                "text/plain");
+        refused_body(frag, "destructive", post_destructive);
+        last_denied("policy_fragment.create", "destructive", post_destructive);
+
+        const auto stored = r.fragment("destructive post stored", check, fix_ok, post_destructive);
+        auto created = r.sink.Post("/api/policies", policy_yaml(stored), "text/plain");
+        refused_body(created, "destructive", post_destructive);
+        last_denied("policy.create", "destructive", post_destructive);
+
+        const auto pid = r.policy("destructive post policy", stored, r.group_id);
+        auto enabled = r.sink.Post("/api/policies/" + pid + "/enable", "");
+        refused_body(enabled, "destructive", post_destructive);
+        last_denied("policy.enable", "destructive", post_destructive);
+    }
+    CHECK(r.dispatch_calls == 0);
+}
+
+TEST_CASE("authoring and dispatch routes refuse a definition whose approval_mode is not auto, "
+          "with the approval_required reason",
+          "[pg][policy][admin][dispatch_approval][approval_mode]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    // echo.status is an allowed pair: only the definition's approval_mode refuses it.
+    const auto check = r.define("i.status", "echo", "status");
+    const auto always = r.define("i.status.always", "echo", "status", "always");
+    const auto role_gated = r.define("i.status.rg", "echo", "status", "role-gated");
+
+    // Authoring: fragment create, policy create and policy enable answer 400 naming the reason.
+    for (const auto& [name, def, token] :
+         {std::tuple<std::string, std::string, std::string>{"always fragment", always, "always"},
+          std::tuple<std::string, std::string, std::string>{"role-gated fragment", role_gated, "role-gated"}}) {
+        INFO("definition mode " << token);
+        auto bad = r.sink.Post("/api/policy-fragments", fragment_yaml(name, def), "text/plain");
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+        const auto body = nlohmann::json::parse(bad->body);
+        const auto msg = body.at("error").at("message").get<std::string>();
+        CHECK(msg.find("(approval_required)") != std::string::npos);
+        CHECK(msg.find(def) != std::string::npos);
+        const auto rem = body.at("error").at("remediation").get<std::string>();
+        CHECK(rem.rfind("policy_dispatch_refused: approval_required", 0) == 0);
+        REQUIRE_FALSE(r.audit_calls.empty());
+        CHECK(r.audit_calls.back().action == "policy_fragment.create");
+        CHECK(r.audit_calls.back().result == "denied");
+        CHECK(r.audit_calls.back().detail == "reason=approval_required instruction=" + def);
+    }
+    // The allowed definition is accepted (the control).
+    auto ok = r.sink.Post("/api/policy-fragments", fragment_yaml("ok fragment", check), "text/plain");
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+
+    // A fragment that reached the store another way: policy create and enable refuse it.
+    const auto stored = r.fragment("stored always", always);
+    auto created = r.sink.Post("/api/policies",
+                               "apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: p\nspec:\n  fragment: " +
+                                   stored + "\n  managementGroups:\n    - " + r.group_id + "\n",
+                               "text/plain");
+    REQUIRE(created);
+    CHECK(created->status == 400);
+    CHECK(r.audit_calls.back().action == "policy.create");
+    CHECK(r.audit_calls.back().detail.find("reason=approval_required") != std::string::npos);
+
+    const auto pid = r.policy("always policy", stored, r.group_id);
+    auto enabled = r.sink.Post("/api/policies/" + pid + "/enable", "");
+    REQUIRE(enabled);
+    CHECK(enabled->status == 400);
+    CHECK(r.audit_calls.back().action == "policy.enable");
+    CHECK(r.audit_calls.back().detail.find("reason=approval_required") != std::string::npos);
+
+    // Dispatch: evaluate answers a 409 of its own with the reason, and nothing is sent.
+    auto ev = r.sink.Post("/api/policies/" + pid + "/evaluate", "");
+    REQUIRE(ev);
+    CHECK(ev->status == 409);
+    const auto err = nlohmann::json::parse(ev->body).at("error");
+    CHECK(err.at("message") == "policy dispatch refused");
+    const auto rem = err.at("remediation").get<std::string>();
+    CHECK(rem.rfind("policy_dispatch_refused: approval_required", 0) == 0);
+    // The text names the approval mode, not an action, and says what to do.
+    CHECK(rem.find("approval mode") != std::string::npos);
+    CHECK(r.dispatch_calls == 0);
+}
+
 // sg10 / UP-1: a fragment whose check, fix or postCheck parameter key holds a control byte is a 400,
 // audited and counted; nothing is stored.
 TEST_CASE("POST /api/policy-fragments: a hostile parameter key in check, fix or postCheck is refused 400, "
@@ -529,4 +1072,60 @@ TEST_CASE("POST /api/policy-fragments: a hostile parameter key in check, fix or 
     auto stored = store.query_fragments();
     REQUIRE(stored.has_value());
     CHECK(stored->empty());
+}
+
+// G01 and sg10 together. A fragment that BOTH names an instruction policy evaluation does not
+// dispatch AND holds a parameter key with a control byte is refused by G01's authoring check,
+// which runs before the store parses the fragment (and so before every store-side validation,
+// the parameter-key rule included). The caller gets G01's 400 and exactly one denied audit row,
+// `reason=gated instruction=<id>`; no `param_key_invalid` row is written and the param_key_invalid
+// counter does not move. The same key with an allowed instruction is the sg10 refusal (control).
+TEST_CASE("POST /api/policy-fragments: a fragment that is both refused by G01 and holds a hostile "
+          "parameter key gets the G01 400 and one G01 audit row, not param_key_invalid",
+          "[pg][policy][admin][dispatch_approval][sg10]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto gated = r.define("i.gated", "content_dist", "execute_staged");
+    const auto allowed = r.define("i.status", "echo", "status");
+    const std::string bad_key = std::string("bad\x07key");
+    const auto with_bad_key = [&](const std::string& name, const std::string& check) {
+        return fragment_yaml(name, check) + "    parameters:\n      " + bad_key + ": v\n";
+    };
+    const auto key_counter = [&] {
+        return r.metrics
+            .counter("yuzu_server_dispatch_target_rejected_total",
+                     {{"route", "policy_fragment"}, {"reason", "param_key_invalid"}})
+            .value();
+    };
+
+    auto both = r.sink.Post("/api/policy-fragments", with_bad_key("both", gated), "text/plain");
+    REQUIRE(both);
+    CHECK(both->status == 400);
+    {
+        const auto err = nlohmann::json::parse(both->body).at("error");
+        CHECK(err.at("message").get<std::string>().find("(gated)") != std::string::npos);
+        CHECK(err.at("remediation").get<std::string>().rfind("policy_dispatch_refused: gated", 0) == 0);
+    }
+    REQUIRE(r.audit_calls.size() == 1);
+    CHECK(r.audit_calls[0].action == "policy_fragment.create");
+    CHECK(r.audit_calls[0].result == "denied");
+    CHECK(r.audit_calls[0].target_id == "both");
+    CHECK(r.audit_calls[0].detail == "reason=gated instruction=i.gated");
+    CHECK(key_counter() == 0.0);
+
+    // Control: the same key with an allowed instruction reaches the store and is the sg10 refusal.
+    r.audit_calls.clear();
+    auto key_only = r.sink.Post("/api/policy-fragments", with_bad_key("key only", allowed), "text/plain");
+    REQUIRE(key_only);
+    CHECK(key_only->status == 400);
+    CHECK(key_only->body.find("param_key_invalid") != std::string::npos);
+    REQUIRE(r.audit_calls.size() == 1);
+    CHECK(r.audit_calls[0].action == "policy_fragment.create");
+    CHECK(r.audit_calls[0].result == "denied");
+    CHECK(r.audit_calls[0].detail == "reason=param_key_invalid");
+    CHECK(key_counter() == 1.0);
+
+    auto frags = r.ps.query_fragments();
+    REQUIRE(frags.has_value());
+    CHECK(frags->empty());
 }

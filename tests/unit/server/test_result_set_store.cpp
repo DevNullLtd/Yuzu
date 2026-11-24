@@ -30,8 +30,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <barrier>
 #include <chrono>
 #include <format>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -500,6 +502,116 @@ TEST_CASE("ResultSetStore: async create -> materialize", "[pg][result_set][async
     CHECK(got->device_count == 2);
     CHECK(store.list_pending().empty());
     CHECK(contains_ok(store, rs->id, "dev-1"));
+}
+
+TEST_CASE("ResultSetStore: a failed second insert batch rolls back and can be retried",
+          "[pg][result_set][bulk_insert]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    // A statement trigger observes each actual batch. nextval survives rollback,
+    // so only the second batch fails and the same request can then be retried.
+    exec_sql(db.dsn(), R"SQL(
+        CREATE SEQUENCE batch_number;
+        CREATE FUNCTION check_batch() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF (SELECT count(*) FROM inserted) > 1000 THEN
+                RAISE EXCEPTION 'unbounded member insert';
+            END IF;
+            IF nextval('batch_number') = 2 THEN
+                RAISE EXCEPTION 'second batch failed';
+            END IF;
+            RETURN NULL;
+        END $$;
+        CREATE TRIGGER check_batch AFTER INSERT ON result_set_store.result_set_members
+        REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE FUNCTION check_batch();
+    )SQL");
+
+    std::vector<std::string> ids;
+    for (int i = 0; i < 2001; ++i)
+        ids.push_back(std::format("device-{}", i));
+    ids.emplace_back("device-0");
+    ids.emplace_back("");
+    std::string id;
+    SECTION("ordinary creation rolls back its header and every member") {
+        const auto request = req("alice", "bulk");
+        const auto failed = store.create_materialized(request, ids);
+        REQUIRE_FALSE(failed.has_value());
+        CHECK(failed.error() == ResultSetError::DbError);
+        CHECK_FALSE(resolve_alias_ok(store, "alice", "bulk").has_value());
+        CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM result_set_store.result_set_members") ==
+              "0");
+        CHECK(query_scalar(db.dsn(), "SELECT last_value FROM batch_number") == "2");
+        const auto retried = store.create_materialized(request, ids);
+        REQUIRE(retried.has_value());
+        id = retried->id;
+    }
+    SECTION("asynchronous fill leaves the original set pending and empty") {
+        const auto pending = store.create_pending(req("alice", "bulk"), "exec-bulk");
+        REQUIRE(pending.has_value());
+        id = pending->id;
+        const auto failed = store.materialize(id, ids, 2, 3);
+        REQUIRE_FALSE(failed.has_value());
+        CHECK(failed.error() == ResultSetError::DbError);
+        const auto header = get_ok(store, id);
+        REQUIRE(header.has_value());
+        CHECK(header->status == ResultSetStatus::Pending);
+        CHECK(header->device_count == 0);
+        CHECK(header->agents_failed == 0);
+        CHECK(header->agents_unanswered == 0);
+        CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM result_set_store.result_set_members") ==
+              "0");
+        CHECK(query_scalar(db.dsn(), "SELECT last_value FROM batch_number") == "2");
+        REQUIRE(store.materialize(id, ids, 2, 3).has_value());
+        const auto retried = get_ok(store, id);
+        REQUIRE(retried.has_value());
+        CHECK(retried->agents_failed == 2);
+        CHECK(retried->agents_unanswered == 3);
+    }
+    const auto stored = get_ok(store, id);
+    REQUIRE(stored.has_value());
+    CHECK(stored->status == ResultSetStatus::Materialized);
+    CHECK(stored->device_count == 2001);
+    ids.pop_back(); // Remove the empty ID, keeping the duplicate.
+    CHECK(member_set_owned_ok(store, id, "alice") ==
+          std::unordered_set<std::string>(ids.begin(), ids.end()));
+    CHECK(query_scalar(db.dsn(), "SELECT last_value FROM batch_number") == "5");
+}
+
+TEST_CASE("ResultSetStore: concurrent bulk fills publish just the winning producer's membership",
+          "[pg][result_set][bulk_insert][async]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResultSetStore store(pool);
+    const auto pending = store.create_pending(req("alice", "bulk"), "exec-bulk");
+    REQUIRE(pending.has_value());
+    std::vector<std::string> left, right;
+    for (int i = 0; i < 1001; ++i) {
+        left.push_back(std::format("left-{}", i));
+        right.push_back(std::format("right-{}", i));
+    }
+
+    std::barrier start{2};
+    auto first = std::async(std::launch::async, [&] {
+        start.arrive_and_wait();
+        return store.materialize(pending->id, left, 1, 2);
+    });
+    start.arrive_and_wait();
+    const auto right_result = store.materialize(pending->id, right, 3, 4);
+    const auto left_result = first.get();
+    REQUIRE(left_result.has_value() != right_result.has_value());
+    const auto& loser = left_result ? right_result : left_result;
+    CHECK(loser.error() == ResultSetError::NotFound);
+    const auto& winners = left_result ? left : right;
+    CHECK(member_set_owned_ok(store, pending->id, "alice") ==
+          std::unordered_set<std::string>(winners.begin(), winners.end()));
+    const auto stored = get_ok(store, pending->id);
+    REQUIRE(stored.has_value());
+    CHECK(stored->device_count == 1001);
+    CHECK(stored->agents_failed == (left_result ? 1 : 3));
+    CHECK(stored->agents_unanswered == (left_result ? 2 : 4));
 }
 
 // UP-6 (2026-07-26 hardening round, S2): materialize() must dedup + drop

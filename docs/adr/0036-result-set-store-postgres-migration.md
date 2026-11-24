@@ -240,9 +240,10 @@ library instead of leaning on a Postgres-side cast this store has no other reaso
 - All runtime statements schema-qualify `result_set_store.result_sets` /
   `result_set_store.result_set_members`; mutate-and-return paths use `RETURNING` (#1033-banning
   idiom), never `sqlite3_changes()`.
-- Member-set batch inserts (`insert_row_impl`, `materialize`) use the `unnest($n::text[])` idiom
-  (`pg::to_text_array`) rather than per-row `INSERT`, so a 100,000-member result set (the
-  `kMaxMembersPerSet` cap) costs one round trip, not 100,000.
+- The migration used a single `unnest` insert for all members. Packet 1.4 of ADR-0075
+  bounds each insert to 1,000 distinct IDs in both `insert_row_impl` and `materialize`.
+  A 100,000-member set therefore uses 100 member inserts. All batches share the header
+  transaction, so a failure in any batch rolls back the entire write.
 - `docs/postgres-migration-ladder.md`'s `ResultSetStore` row moves from Wave 1 to Done, citing
   this ADR.
 - **The public C++ API's method NAMES and parameter shapes are unchanged; four return types

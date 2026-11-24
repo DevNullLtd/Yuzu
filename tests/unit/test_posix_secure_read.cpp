@@ -98,6 +98,10 @@ TEST_CASE("posix_secure_read: file opens never block, follow a leaf link or adop
     CHECK((flags & O_NONBLOCK) == O_NONBLOCK);
     CHECK((flags & O_NOCTTY) == O_NOCTTY);
     CHECK((flags & O_CLOEXEC) == O_CLOEXEC);
+    // O_RDONLY is 0, so no bit test above can see a write flag added beside it: read the access mode out.
+    // MUTATION: adding O_RDWR or O_WRONLY to either set fails here.
+    CHECK((flags & O_ACCMODE) == O_RDONLY);
+    CHECK((detail::kDirFlags & O_ACCMODE) == O_RDONLY);
 }
 
 TEST_CASE("posix_secure_read: path forms refuse an embedded NUL and a trailing slash or dot",

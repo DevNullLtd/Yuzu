@@ -2,8 +2,9 @@
 
 `cflite-pr.yml` builds this directory's `Dockerfile` + `build.sh` on any PR
 touching the fuzzed compile closure — the parser families under `server/core/src/`
-and `agents/shared/`, and the component_inventory ZIP reader and native-library (ELF and Mach-O) adapter under
-`agents/plugins/component_inventory/src/`, plus `tests/fuzz/` and `.clusterfuzzlite/` (see the
+and `agents/shared/`, the component_inventory ZIP reader, ordered walker and native-library (ELF and Mach-O) adapter under
+`agents/plugins/component_inventory/src/`, and the file_search sources under
+`agents/plugins/file_search/src/`, plus `tests/fuzz/` and `.clusterfuzzlite/` (see the
 workflow's `paths:`) — and fuzzes **what the PR changed** for a short budget
 (code-change mode, ASan). Findings surface as the workflow's SARIF / crash
 artifacts — file them as issues; don't fix them inside unrelated PRs.
@@ -36,9 +37,10 @@ download-miss warnings in the job logs.
 | Target | Parses | Why it's fuzzed |
 |---|---|---|
 | `fuzz_preflight_parse` | pipe-delimited plugin output → pre-flight verdicts | agent/plugin-controlled bytes decide go/no-go |
-| `fuzz_file_search_cursor` | the file search resume cursor (`fs1:` token) | caller-supplied bytes choose where a walk resumes; a forged cursor must be refused before any filesystem call |
+| `fuzz_file_search_cursor` | the file search resume cursor (`fs1:` token) | caller-supplied bytes choose where a walk resumes; a malformed cursor must be refused before any filesystem call; forgery is refused by the `fsv1` token that wraps it |
 | `fuzz_file_search_names` | the reversible name encoding of result rows | file names are attacker-chosen bytes and must round-trip exactly |
 | `fuzz_file_search_glob` | the leaf-name pattern compiler and matcher | operator patterns meet attacker-chosen file names; matching must stay bounded |
+| `fuzz_file_search_volume_cursor` | the search's volume cursor (`fsv1` token, wrapping the `fs1:` cursor) | caller-supplied bytes choose which mount a search resumes on; a forged token must be refused before any filesystem call |
 | `fuzz_deployment_parse` | deployment config fields + content_dist output | operator strings + agent bytes gate the mutating deploy step |
 | `fuzz_yaml_scan` | the in-tree YAML-subset scanner | only runtime consumer of `yaml_source`; authorization-load-bearing since #1215 |
 | `fuzz_guardian_rule_spec` | Guardian rule bodies + `dangerous_enforce_*` chokepoints | network-supplied specs gate enforce-mode promotion |
@@ -48,7 +50,7 @@ download-miss warnings in the job logs.
 | `fuzz_binary_header_macho` | a Mach-O thin or universal file's headers and load commands | same: a planted file decides what the agent reads |
 | `fuzz_component_native` | an ELF shared object's SONAME and a Mach-O (thin or fat) library's install name | a planted library's bytes decide what the agent reads and lists |
 
-Every target is deliberately **closure-light** (STL + nlohmann only) so this
+Every target is deliberately **closure-light** (in-tree sources, the STL, and nlohmann where a target parses JSON) so this
 container needs no meson/vcpkg. The same sources build two ways:
 
 - `build.sh` (here) — direct `$CXX` compile against `$LIB_FUZZING_ENGINE`.
