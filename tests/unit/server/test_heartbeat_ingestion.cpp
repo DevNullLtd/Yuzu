@@ -12,6 +12,7 @@
 #include "heartbeat_ingestion.hpp"
 
 #include "agent_registry.hpp"
+#include "echo_corruption_audit.hpp"
 #include "event_bus.hpp"
 #include "fleet_topology_store.hpp"
 #include "offline_endpoint_store.hpp"
@@ -326,6 +327,46 @@ TEST_CASE("HeartbeatIngestion: a throwing guardian reconcile fn does not abort i
         CHECK(cap.generation == 8);
         CHECK(quarantine_calls == 2);
     }
+}
+
+// #7475: the health-store upsert runs the corruption sink (an audit-store round-trip) inline. A
+// sink that throws must not escape ingest(): the gateway batch counts an entry whose ingest
+// throws as failed, and the hooks below the upsert would be skipped for the heartbeat.
+TEST_CASE("HeartbeatIngestion: a throwing corruption sink does not abort ingestion (#7475)",
+          "[heartbeat_ingestion][corruption]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::detail::AgentHealthStore store;
+    store.set_corruption_sink([](const std::string&, int64_t, const std::string&) {
+        throw std::runtime_error("audit store failed");
+    });
+    HeartbeatIngestion ingestion{registry, &store, nullptr, &metrics};
+
+    int guardian_calls = 0;
+    int quarantine_calls = 0;
+    ingestion.set_guardian_reconcile_fn(
+        [&](std::string_view, std::uint64_t) { ++guardian_calls; });
+    ingestion.set_quarantine_reconcile_fn([&](std::string_view) { ++quarantine_calls; });
+    const auto upsert_exceptions = [&] {
+        return metrics.counter("yuzu_server_health_upsert_exceptions_total").value();
+    };
+
+    // A valid candidate pair reaches the sink; the heartbeat also carries a guardian generation.
+    auto hb = make_hb("7");
+    (*hb.mutable_status_tags())[yuzu::server::detail::kEchoTagCorruptionTotal] = "1";
+    (*hb.mutable_status_tags())[yuzu::server::detail::kEchoTagQuarantineLast] = "5:f";
+    CHECK_NOTHROW(ingestion.ingest(hb, "agent-x", "direct"));
+    // The rest of ingestion ran for this heartbeat, and the throw is counted.
+    CHECK(guardian_calls == 1);
+    CHECK(quarantine_calls == 1);
+    CHECK(metrics.counter("yuzu_heartbeats_received_total", {{"via", "direct"}}).value() == 1.0);
+    CHECK(upsert_exceptions() == 1.0);
+
+    // A heartbeat without the pair never reaches the sink and is not counted.
+    CHECK_NOTHROW(ingestion.ingest(make_hb("8"), "agent-x", "direct"));
+    CHECK(guardian_calls == 2);
+    CHECK(upsert_exceptions() == 1.0);
 }
 
 // SAM-39: the `yuzu.inv_settings_version` tag -> inventory settings reconcile hook. Only `none`

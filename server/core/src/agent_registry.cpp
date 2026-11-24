@@ -120,8 +120,10 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     // An agent that reports the retired name `tar` and no `echo` is not an Echo agent: Echo
     // commands are refused for it and its `yuzu.plugin.tar.*` heartbeat tags (the corruption
     // signal) are not read. The fleet is meant to be one build, so say so rather than let it pass.
-    if (std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end() &&
-        std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end()) {
+    session->retired_tar_only =
+        std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end() &&
+        std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end();
+    if (session->retired_tar_only) {
         spdlog::warn("AgentRegistry::register_agent({}): inventory reports the retired plugin name "
                      "'tar' and no 'echo' - not an Echo agent; upgrade it to the current build",
                      safe_agent_id);
@@ -224,7 +226,15 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         }
         if (it != agents_.end() && !it->second->session_id.empty())
             session_to_agent_.erase(it->second->session_id);
+        // retired_tar_only_n_ follows agents_ at every insert, replace and erase (O(1) read). The
+        // assignment comes first: a first registration allocates and can throw, and the counter
+        // must not have moved for a session that was never installed.
+        const bool was_tar = it != agents_.end() && it->second->retired_tar_only;
         agents_[info.agent_id()] = session;
+        if (was_tar)
+            --retired_tar_only_n_;
+        if (session->retired_tar_only)
+            ++retired_tar_only_n_;
     }
     metrics_.counter("yuzu_agents_registered_total").increment();
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
@@ -385,6 +395,8 @@ void AgentRegistry::remove_agent(const std::string& agent_id) {
             if (!it->second->session_id.empty()) {
                 session_to_agent_.erase(it->second->session_id);
             }
+            if (it->second->retired_tar_only)
+                --retired_tar_only_n_;
             agents_.erase(it);
         }
     }
@@ -406,6 +418,8 @@ bool AgentRegistry::remove_agent_if_session(const std::string& agent_id,
             return false;
         }
         session_to_agent_.erase(session_id);
+        if (it->second->retired_tar_only)
+            --retired_tar_only_n_;
         agents_.erase(it);
     }
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
@@ -428,6 +442,8 @@ void AgentRegistry::remove_agent_if_same(const std::string& agent_id,
         }
         if (!it->second->session_id.empty())
             session_to_agent_.erase(it->second->session_id);
+        if (it->second->retired_tar_only)
+            --retired_tar_only_n_;
         agents_.erase(it);
     }
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
@@ -1906,6 +1922,11 @@ std::string AgentRegistry::find_agent_by_stream(
 std::size_t AgentRegistry::agent_count() const {
     std::lock_guard lock(mu_);
     return agents_.size();
+}
+
+std::size_t AgentRegistry::retired_tar_only_count() const {
+    std::lock_guard lock(mu_);
+    return retired_tar_only_n_;
 }
 
 void AgentRegistry::map_session(const std::string& session_id, const std::string& agent_id) {

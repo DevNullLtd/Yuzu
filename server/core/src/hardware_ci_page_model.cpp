@@ -228,6 +228,10 @@ std::string_view read_error_message(ReadError e) {
         return "the device CI data cannot be vouched for right now; retry after the hint and "
                "restart the walk from the first page (operators: see PostgreSQL collation "
                "version in server-admin.md)";
+    case ReadError::kBusy:
+        // Generic: it says this replica is at its bulk-read cap, nothing about the pool or the
+        // cap's value.
+        return "hardware CI bulk read capacity in use; retry after the hint";
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
     }
@@ -271,10 +275,22 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
         // persist marks the response Sec-Audit-Failed, hardware_routes.cpp), and no read ran.
         f.unavailable = true;
         f.retry_after_ms = device_ci_read_gate::kOrderingRetryAfterMs;
+        f.retry_after_header = true;
         f.remediation = kOrderingUnverifiedRemediation;
         f.domain_audit_row = true;
         f.audit_outcome = "failure";
         f.audit_detail = std::format("hardware CI records ({}) state=collation ordering unverified", name);
+        return f;
+    case ReadError::kBusy:
+        // The store is fine and nothing was read or served: NO audit row on either transport (the
+        // `yuzu_hardware_ci_read_busy_total` counter is the record). A refusal holds no slot, so a
+        // row here would be an audit writer outside the cap (#7951). `audit_outcome` and
+        // `audit_detail` stay empty: nothing consumes them for this answer.
+        f.unavailable = true;
+        f.retry_after_ms = kBusyRetryAfterMs;
+        f.retry_after_header = true;
+        f.remediation = kBusyRemediation;
+        f.domain_audit_row = false;
         return f;
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
@@ -288,7 +304,8 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
 
 std::expected<Page, ReadError>
 read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
-          const std::atomic<pg::CollationGate>* gate) {
+          const std::atomic<pg::CollationGate>* gate, BulkReadSlots* slots,
+          std::size_t row_budget_bytes) {
     const std::string fp = filter_fingerprint(rq);
     Position incoming; // the head: nothing served yet
     if (!rq.cursor.empty()) {
@@ -336,14 +353,46 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
     // store limit, which the store reads as its whole row ceiling.
     const int want = std::clamp(rq.limit, 1, static_cast<int>(kPageMax));
     q.limit = want + 1;
+
+    // The concurrency cap, taken after every refusal above (they take no slot). It is held across
+    // the store call and then handed to the caller in `Page::hold`, to be kept through the caller's
+    // access-audit writes (#7951); a failed read releases it here. A point read (`agent_id`) takes
+    // none, so confirm-before-retire never gets a busy answer during a walk.
+    std::optional<BulkReadSlots::Slot> slot;
+    if (slots != nullptr && rq.agent_id.empty()) {
+        slot = slots->try_acquire();
+        if (!slot)
+            return std::unexpected(ReadError::kBusy);
+    }
     auto rows = read(q);
     if (!rows)
-        return std::unexpected(ReadError::kDegraded);
+        return std::unexpected(ReadError::kDegraded); // `slot` is released on this return
+    out.hold = std::move(slot);
     const auto limit = static_cast<std::size_t>(want);
+    // Rows left over for a later page: by the count (the extra row was seen) or by the byte budget.
+    bool more = false;
     if (rows->size() > limit) {
         rows->resize(limit);
-        out.next_cursor = encode_cursor({rows->back().agent_id}, fp);
+        more = true;
     }
+    // The byte cut, here and not in `page_json`: the audit `rows=` count is taken from `rows.size()`
+    // and written before anything is serialised, and the cursor is minted below. The first row is
+    // always kept so a walk cannot wedge on one wide row, and a row is never truncated.
+    std::size_t kept = 0;
+    std::size_t used = 0;
+    for (; kept < rows->size(); ++kept) {
+        const std::size_t w = row_wire_bytes((*rows)[kept]);
+        if (kept > 0 && used + w > row_budget_bytes)
+            break;
+        used += w;
+    }
+    if (kept < rows->size()) {
+        rows->resize(kept);
+        out.byte_capped = true;
+        more = true;
+    }
+    if (more)
+        out.next_cursor = encode_cursor({rows->back().agent_id}, fp);
     out.rows = std::move(*rows);
     return out;
 }
@@ -362,6 +411,12 @@ nlohmann::json row_json(const DeviceCiRecord& rec) {
     };
 }
 
+std::size_t row_wire_bytes(const DeviceCiRecord& rec) {
+    // The same dump both surfaces make of the page (compact, error_handler_t::replace), so the
+    // measure cannot drift from what is served; the test pins sum + separators == the array's bytes.
+    return row_json(rec).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace).size();
+}
+
 nlohmann::json page_json(const Page& page) {
     auto devices = nlohmann::json::array();
     for (const auto& r : page.rows)
@@ -371,6 +426,8 @@ nlohmann::json page_json(const Page& page) {
     nlohmann::json out = nlohmann::json::object();
     out["devices"] = std::move(devices);
     out["next_cursor"] = page.next_cursor;
+    if (page.byte_capped)
+        out["page_bytes_capped"] = true;
     return out;
 }
 
@@ -395,6 +452,8 @@ std::string audit_detail(const Page& page, const Request& rq, std::string_view s
     if (!rq.cursor.empty())
         out += " page=continuation";
     out += confined ? " scope=authority_scoped" : " scope=fleet";
+    if (page.byte_capped)
+        out += " byte_capped=1";
     return out;
 }
 

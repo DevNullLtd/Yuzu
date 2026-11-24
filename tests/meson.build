@@ -1892,6 +1892,8 @@ if build_server
       'unit/server/test_device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
       'unit/server/test_bulk_ci_page_model.cpp', # bulk device-CI keyset page: params, cursor, scope walk, JSON
+      'unit/server/test_hardware_ci_read_cap_pg.cpp', # #7949: [pg] the cap keeps pool connections free for authz + audit
+      'unit/server/test_bulk_read_slots.cpp', # #7949/#7951: bulk device-CI read concurrency cap (slots, boot arithmetic, read_page)
       'unit/server/test_quarantine_read_model.cpp', # Seam PR2: shared quarantine list JSON builder (key order, escaping)
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
@@ -5791,6 +5793,16 @@ test('dashboard audit checked lexical',
 test('Echo security wiring lexical gate',
   _python3_test,
   args: [files('test_echo_security_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# Echo corruption-audit gate signals: server.cpp's pre-seeds of the three new counters (the
+# quarantine alert's 0 sample), the wrote-guarded quarantine increment, the degraded-observer
+# counter and the sweep gauge, plus DegradedCause vs its pre-seed list. server.cpp is built by no
+# Mac unit binary; the script self-checks its detector.
+test('Echo corruption-audit gate wiring lexical gate',
+  _python3_test,
+  args: [files('test_corruption_audit_gate_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
