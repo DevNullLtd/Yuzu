@@ -22030,6 +22030,14 @@ private:
                 return std::nullopt;
             return device_inventory_store_->list_device_ci_after(q);
         };
+        // The `changed_since` watermark both bulk-read transports stamp on every served page
+        // (hardware_ci_page::with_watermark). An unwired store reads as a failure (nullopt), never
+        // a guessed value, and the transports answer that as a 503.
+        auto hw_ci_watermark_fn = [this]() -> std::optional<std::int64_t> {
+            if (!device_inventory_store_)
+                return std::nullopt;
+            return device_inventory_store_->device_ci_watermark();
+        };
         // Counts a bulk read refused as busy. The label is chosen here from the closed Surface
         // enum, never from request text.
         auto hw_ci_read_busy_fn = [this](hardware_ci_page::Surface surface) {
@@ -22298,6 +22306,7 @@ private:
                              .ci_collation_gate = &collation_gate_,
                              .ci_read_slots = hardware_ci_read_slots_.get(),
                              .ci_read_busy_fn = hw_ci_read_busy_fn,
+                             .ci_watermark_fn = hw_ci_watermark_fn,
                              // Actions lens (generic action runner): the connected
                              // agent's advertised plugins/actions, copied into the
                              // gRPC-free HwPluginActions shape.
@@ -25283,6 +25292,7 @@ private:
             tool_deps.ci_collation_gate = &collation_gate_;
             tool_deps.ci_read_slots = hardware_ci_read_slots_.get();
             tool_deps.ci_read_busy_fn = hw_ci_read_busy_fn;
+            tool_deps.ci_watermark_fn = hw_ci_watermark_fn;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // #7624: records an operator ended by force whose device still owes a release, for

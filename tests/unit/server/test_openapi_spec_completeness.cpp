@@ -405,6 +405,44 @@ TEST_CASE("openapi_spec_json(): GET /hardware-ci and DELETE /sle/agents state th
     CHECK(r500.find("retry_after_ms is 60000") != std::string::npos);
 }
 
+// The `changed_since` delta pull is in the spec, not only the manual: the query parameter, the
+// per-row `changed_at`, the per-page `next_changed_since` (both required, so a generated client
+// treats them as always present), the terminal 400 for a scope-confined caller and the recipe.
+// Kills a spec edit that drops the parameter, makes a field optional, or loses the refusal.
+TEST_CASE("openapi_spec_json(): GET /hardware-ci documents changed_since, changed_at and next_changed_since",
+          "[openapi][changed_since]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& get = spec["paths"]["/hardware-ci"]["get"];
+    const json* param = nullptr;
+    for (const auto& p : get["parameters"])
+        if (p["name"] == "changed_since")
+            param = &p;
+    REQUIRE(param != nullptr);
+    CHECK((*param)["in"] == "query");
+    CHECK((*param)["required"] == false);
+    CHECK((*param)["schema"]["type"] == "integer");
+    CHECK((*param)["schema"]["minimum"] == 0);
+
+    const std::string d = get["description"].get<std::string>();
+    for (const char* needle : {"changed_since", "next_changed_since", "FIRST page", "at-least-once",
+                               "upsert by agent_id", "removal signal", "full walk"})
+        CHECK(d.find(needle) != std::string::npos);
+    const std::string r400 = get["responses"]["400"]["description"].get<std::string>();
+    CHECK(r400.find("changed_since was sent by a caller whose read is confined to a scope") !=
+          std::string::npos);
+    CHECK(r400.find("terminal") != std::string::npos);
+
+    const auto& schemas = spec["components"]["schemas"];
+    const json& row = schemas["HardwareCiPageRow"];
+    CHECK(row["properties"]["changed_at"]["type"] == "integer");
+    CHECK(std::find(row["required"].begin(), row["required"].end(), "changed_at") != row["required"].end());
+    const json& data = schemas["HardwareCiPageResponse"]["properties"]["data"];
+    CHECK(data["properties"]["next_changed_since"]["type"] == "integer");
+    CHECK(std::find(data["required"].begin(), data["required"].end(), "next_changed_since") !=
+          data["required"].end());
+}
+
 TEST_CASE("openapi_spec_json(): the strict instruction create requests are closed schemas",
           "[openapi]") {
     // The routes refuse an unknown key (build_*_from_*_body), so a schema that omits

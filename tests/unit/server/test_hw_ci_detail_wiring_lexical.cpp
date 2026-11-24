@@ -375,3 +375,43 @@ TEST_CASE("bulk read cap wiring (LEXICAL pin, not behaviour): both bulk-read con
     const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
     CHECK(count_occurrences(mcp, "deps->ci_collation_gate,deps->ci_read_slots,") == 1);
 }
+
+// The `changed_since` watermark (`next_changed_since`). An EMPTY provider fails every page closed
+// (`with_watermark`), so a deps field that silently stayed empty in production would 503 the whole
+// bulk read; a transport that stopped wrapping its `read_page` in `with_watermark` would serve pages
+// WITHOUT the watermark (a delta client would then keep a stale or zero value). This pins the
+// production wiring: both bulk-read consumers are handed the ONE `hw_ci_watermark_fn` closure, which
+// binds `DeviceInventoryStore::device_ci_watermark` and answers nullopt for an unwired store, and
+// each transport's one `read_page` call sits inside `with_watermark` with its deps' provider.
+TEST_CASE("changed_since watermark wiring (LEXICAL pin, not behaviour): both bulk-read consumers are handed the "
+          "one production provider and wrap read_page in with_watermark",
+          "[hardware][wiring][lexical][changed_since]") {
+    const std::string flat = squeeze(comment_free_source("server.cpp"));
+
+    REQUIRE(count_occurrences(flat, "autohw_ci_watermark_fn=") == 1);
+    CHECK(count_occurrences(flat, ".ci_watermark_fn=hw_ci_watermark_fn,") == 1);
+    CHECK(count_occurrences(flat, "tool_deps.ci_watermark_fn=hw_ci_watermark_fn;") == 1);
+    CHECK(count_occurrences(flat, ".ci_watermark_fn=") == 2); // the two assignments; the definition is `auto hw_ci_watermark_fn=`
+    CHECK(count_occurrences(flat, "ci_watermark_fn=nullptr") == 0);
+    CHECK(count_occurrences(flat, "ci_watermark_fn={}") == 0);
+    // The closure reads the store's database-clock watermark and degrades to nullopt, never a value
+    // of its own (no clock call in its body).
+    const std::string body = lambda_body(comment_free_source("server.cpp"), "hw_ci_watermark_fn",
+                                         "std::optional<std::int64_t>");
+    REQUIRE_FALSE(body.empty());
+    const std::string flat_body = squeeze(body);
+    CHECK(count_occurrences(flat_body, "device_inventory_store_->device_ci_watermark()") == 1);
+    CHECK(count_occurrences(flat_body, "returnstd::nullopt;") == 1);
+    CHECK(count_occurrences(flat_body, "chrono") == 0);
+    CHECK(count_occurrences(flat_body, "time(") == 0);
+
+    // Each transport's ONE read_page call is the argument of with_watermark, with its deps' provider.
+    const std::string rest = squeeze(comment_free_source("hardware_routes.cpp"));
+    CHECK(count_occurrences(rest, "hardware_ci_page::with_watermark(") == 1);
+    CHECK(count_occurrences(rest, "hardware_ci_page::with_watermark(hardware_ci_page::read_page(") == 1);
+    CHECK(count_occurrences(rest, "hardware_ci_page::kRestRowBudgetBytes),deps_.ci_watermark_fn)") == 1);
+    const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
+    CHECK(count_occurrences(mcp, "hardware_ci_page::with_watermark(") == 1);
+    CHECK(count_occurrences(mcp, "hardware_ci_page::with_watermark(hardware_ci_page::read_page(") == 1);
+    CHECK(count_occurrences(mcp, "hardware_ci_page::kMcpRowBudgetBytes),deps->ci_watermark_fn)") == 1);
+}

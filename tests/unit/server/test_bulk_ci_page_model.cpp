@@ -18,9 +18,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <set>
 #include <string>
@@ -869,7 +872,7 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
         int retry_after_ms; // -1 = none
         bool retry_after_header = false; // REST also sends Retry-After
     };
-    static constexpr std::array<Expect, 6> table = {{
+    static constexpr std::array<Expect, 7> table = {{
         {hcp::ReadError::kDegraded, true, "hardware CI records unavailable", true, "failure",
          "hardware CI records (REST) state=store unreadable",
          "hardware CI records (MCP) state=store unreadable", "", "", 5000},
@@ -914,6 +917,18 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
          "(one retry usually succeeds; give up after about 5 minutes of continuous refusals); read "
          "one page at a time, never several in parallel",
          2000, true},
+        // A scope-confined caller's delta: TERMINAL (400 / -32602, no retry hint), audited as a
+        // refusal on both transports, naming no device, count or scope.
+        {hcp::ReadError::kDeltaNeedsGlobalRead, false,
+         "changed_since needs a credential with global read; a scope-confined credential cannot use a "
+         "delta pull",
+         true, "denied", "hardware CI records (REST) state=changed_since needs global read",
+         "hardware CI records (MCP) state=changed_since needs global read",
+         "use a credential with global read for a changed_since delta pull, or omit changed_since and "
+         "walk the full set",
+         "use a credential with global read for a changed_since delta pull, or omit changed_since and "
+         "walk the full set",
+         -1},
     }};
     static_assert(table.size() == static_cast<std::size_t>(hcp::ReadError::kCount),
                   "a new ReadError needs a row in this table (and a case in describe_read_error)");
@@ -1014,9 +1029,10 @@ TEST_CASE("hardware ci page: page JSON shape and audit text", "[hardware_ci_page
     page.rows.push_back(make_record("a"));
     page.next_cursor = "tok";
     const json j = hcp::page_json(page);
-    CHECK(j.size() == 2);
+    CHECK(j.size() == 3);
     CHECK(j["devices"].size() == 1);
     CHECK(j["next_cursor"] == "tok");
+    CHECK(j["next_changed_since"] == 0); // a page that never passed through with_watermark
     CHECK_FALSE(j.contains("devices_omitted"));
 
     hcp::Page last;
@@ -1049,7 +1065,7 @@ TEST_CASE("hardware ci page: a confined caller's body carries scope_basis and no
 
     json confined = hcp::page_json(page);
     hcp::apply_scope_disclosure(confined, /*confined=*/true);
-    CHECK(confined.size() == 3);
+    CHECK(confined.size() == 4);
     CHECK(confined["scope_basis"] == "authority_scoped");
     CHECK(confined["devices"].size() == 1);
     CHECK(confined["next_cursor"] == "");
@@ -1058,7 +1074,7 @@ TEST_CASE("hardware ci page: a confined caller's body carries scope_basis and no
     hcp::apply_scope_disclosure(global, /*confined=*/false);
     CHECK(global == hcp::page_json(page)); // untouched
     CHECK_FALSE(global.contains("scope_basis"));
-    CHECK(global.size() == 2);
+    CHECK(global.size() == 3);
 }
 
 // Kills: reading `rec.hostname` verbatim (an empty or "unknown" CI hostname must be null so a
@@ -1295,15 +1311,368 @@ TEST_CASE("hardware ci page: byte_capped reaches the body and the audit text onl
     page.next_cursor = "tok";
     hcp::Request rq;
     // Not capped: byte-identical to the pre-existing shapes.
-    CHECK(hcp::page_json(page).size() == 2);
+    CHECK(hcp::page_json(page).size() == 3); // devices, next_cursor, next_changed_since
     CHECK(hcp::audit_detail(page, rq, "REST", false) == "hardware CI records (REST): rows=1 scope=fleet");
     page.byte_capped = true;
     const json j = hcp::page_json(page);
-    CHECK(j.size() == 3);
+    CHECK(j.size() == 4);
     CHECK(j["page_bytes_capped"] == true);
     CHECK(hcp::audit_detail(page, rq, "REST", false) ==
           "hardware CI records (REST): rows=1 scope=fleet byte_capped=1");
     rq.cursor = "c";
     CHECK(hcp::audit_detail(page, rq, "MCP", true) ==
           "hardware CI records (MCP): rows=1 page=continuation scope=authority_scoped byte_capped=1");
+}
+
+// ── changed_since: the delta filter ──────────────────────────────────────────
+
+namespace {
+
+constexpr std::int64_t kNow = 1'700'000'000; // the injected clock of the parser tests
+
+DeviceCiRecord changed_record(std::string id, std::int64_t changed_at) {
+    auto r = make_record(std::move(id));
+    r.changed_at = changed_at;
+    return r;
+}
+
+} // namespace
+
+// Pins the NO-FILTER fingerprint as LITERALS computed independently (FNV-1a 64 of
+// "agent_id=<id>", by a script, not by this code), so a change that moves it (a cursor already
+// issued stops decoding: the `h1` format is frozen) fails here even if the function and the test
+// helper moved together. The existing cursor test only compares the function against itself.
+TEST_CASE("hardware ci page: the no-filter cursor fingerprint is byte-identical to the one issued before the delta "
+          "filter",
+          "[hardware_ci_page][cursor][changed_since]") {
+    hcp::Request none;
+    CHECK(hcp::filter_fingerprint(none) == "73f89ce57dce020f");
+    hcp::Request named;
+    named.agent_id = "PC-1";
+    CHECK(hcp::filter_fingerprint(named) == "5e7145c8bd9b443c");
+    named.agent_id = "agent-7";
+    CHECK(hcp::filter_fingerprint(named) == "d90e801a323e4a24");
+    // a cursor minted with the pre-change fingerprint of the empty filter still decodes
+    const std::string old_token = hcp::encode_cursor(hcp::Position{"agent-42"}, "73f89ce57dce020f");
+    const auto back = hcp::decode_cursor(old_token, hcp::filter_fingerprint(none));
+    REQUIRE(back.has_value());
+    CHECK(back->after == "agent-42");
+}
+
+TEST_CASE("hardware ci page: changed_since is bound into the cursor fingerprint, value by value",
+          "[hardware_ci_page][cursor][changed_since]") {
+    hcp::Request none;
+    hcp::Request zero;
+    zero.changed_since = 0;
+    hcp::Request five;
+    five.changed_since = 5;
+    hcp::Request six;
+    six.changed_since = 6;
+    const auto fp_none = hcp::filter_fingerprint(none);
+    const auto fp_zero = hcp::filter_fingerprint(zero);
+    const auto fp_five = hcp::filter_fingerprint(five);
+    const auto fp_six = hcp::filter_fingerprint(six);
+    // unset, 0, 5 and 6 are four different filters
+    CHECK(fp_none != fp_zero); // 0 is a value, not "unset"
+    CHECK(fp_zero != fp_five);
+    CHECK(fp_five != fp_six);
+    CHECK(fp_none != fp_five);
+    // and the agent_id still counts
+    hcp::Request five_named = five;
+    five_named.agent_id = "dev";
+    CHECK(hcp::filter_fingerprint(five_named) != fp_five);
+    // a token from one walk is refused (as a filter mismatch, not as malformed) under another
+    const std::string tok = hcp::encode_cursor(hcp::Position{"agent-1"}, fp_five);
+    REQUIRE(hcp::decode_cursor(tok, fp_five).has_value());
+    for (const std::string* other : {&fp_none, &fp_zero, &fp_six}) {
+        const auto r = hcp::decode_cursor(tok, *other);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == hcp::CursorError::kFilterMismatch);
+    }
+    // no agent_id can spell the suffix: a control byte is refused at the parser
+    CHECK_FALSE(hcp::parse_params(params({{"agent_id", "x\nchanged_since=5"}})).has_value());
+}
+
+TEST_CASE("hardware ci page: REST changed_since is digits only, bounded above by now plus the skew",
+          "[hardware_ci_page][params][changed_since]") {
+    const auto parse = [](const char* v) { return hcp::parse_params(params({{"changed_since", v}}), kNow); };
+    SECTION("absent and empty are not given") {
+        CHECK_FALSE(hcp::parse_params({}, kNow)->changed_since.has_value());
+        CHECK_FALSE(parse("")->changed_since.has_value());
+    }
+    SECTION("a plain non-negative integer") {
+        CHECK(*parse("0")->changed_since == 0);
+        CHECK(*parse("1699999700")->changed_since == 1'699'999'700);
+        CHECK(*parse("007")->changed_since == 7); // digits only; leading zeros are digits
+    }
+    SECTION("the future bound is now plus 60 seconds, inclusive") {
+        CHECK(*parse(std::to_string(kNow + hcp::kChangedSinceFutureSkewSecs).c_str())->changed_since ==
+              kNow + 60);
+        const auto over = parse(std::to_string(kNow + hcp::kChangedSinceFutureSkewSecs + 1).c_str());
+        REQUIRE_FALSE(over.has_value());
+        CHECK(over.error() == std::string(hcp::kChangedSinceFutureMessage));
+        static_assert(hcp::kChangedSinceFutureSkewSecs == 60);
+    }
+    SECTION("anything else is refused with the one invalid message, never echoed") {
+        for (const char* bad : {"-1", "-0", "+5", " 5", "5 ", "5\n", "1.5", "1e3", "0x10", "abc", "5abc",
+                                "٥", "9223372036854775808", "99999999999999999999999"}) {
+            INFO(bad);
+            const auto r = parse(bad);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == std::string(hcp::kChangedSinceInvalidMessage));
+            CHECK(r.error().find(bad) == std::string::npos);
+        }
+        // INT64_MAX is well-formed and in the future
+        const auto max = parse("9223372036854775807");
+        REQUIRE_FALSE(max.has_value());
+        CHECK(max.error() == std::string(hcp::kChangedSinceFutureMessage));
+    }
+    SECTION("a repeated key keeps its first value") {
+        const auto r = hcp::parse_params(params({{"changed_since", "5"}, {"changed_since", "x"}}), kNow);
+        REQUIRE(r.has_value());
+        CHECK(*r->changed_since == 5);
+    }
+    SECTION("the one-argument form judges against the real clock") {
+        CHECK(hcp::parse_params(params({{"changed_since", "1"}})).has_value());
+        CHECK_FALSE(hcp::parse_params(params({{"changed_since", "99999999999"}})).has_value()); // year 5138
+        const auto before = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        CHECK(std::abs(hcp::wall_clock_secs() - before) <= 2);
+    }
+}
+
+TEST_CASE("hardware ci page: MCP changed_since is a strict non-negative integer not past now plus the skew",
+          "[hardware_ci_page][params][changed_since]") {
+    const auto args = [](const json& v) { return hcp::request_from_args(json{{"changed_since", v}}, kNow); };
+    CHECK_FALSE(hcp::request_from_args(json::object(), kNow)->changed_since.has_value());
+    CHECK(*args(0)->changed_since == 0);
+    CHECK(*args(kNow)->changed_since == kNow);
+    CHECK(*args(kNow + 60)->changed_since == kNow + 60);
+    const auto future = args(kNow + 61);
+    REQUIRE_FALSE(future.has_value());
+    CHECK(future.error().message == std::string(hcp::kChangedSinceFutureMessage));
+    CHECK(future.error().fault == hcp::ArgFault::kOther);
+    for (const json& bad : {json("5"), json(1.5), json(-1), json(true), json(nullptr), json::array(), json::object(),
+                            json(INT64_MIN), json(static_cast<std::uint64_t>(INT64_MAX) + 1), json(UINT64_MAX)}) {
+        INFO(bad.dump());
+        const auto r = args(bad);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().message == std::string(hcp::kChangedSinceInvalidMessage));
+    }
+    // INT64_MAX is a well-formed integer, in the future
+    CHECK(args(INT64_MAX).error().message == std::string(hcp::kChangedSinceFutureMessage));
+    // the REST and MCP messages are one spelling
+    CHECK(hcp::parse_params(params({{"changed_since", "-1"}}), kNow).error() == args(-1).error().message);
+}
+
+// Kills: a store query without the filter, `>` for `>=`, and a delta walk that skips or doubles a
+// row across pages. The fake applies the SAME rule as the SQL, and the exact set is asserted.
+TEST_CASE("hardware ci page: a delta walk visits exactly the rows at or after changed_since, once each, in order",
+          "[hardware_ci_page][walk][changed_since]") {
+    FakeStore store;
+    store.add(changed_record("a", 90));
+    store.add(changed_record("b", 100)); // exactly at the value: delivered
+    store.add(changed_record("c", 99));
+    store.add(changed_record("d", 101));
+    store.add(changed_record("e", 100));
+    store.add(changed_record("f", 5000));
+    hcp::Request rq;
+    rq.changed_since = 100;
+    rq.limit = 2;
+    int pages = 0;
+    const auto all = walk(store, rq, std::nullopt, &pages);
+    CHECK(all == std::vector<std::string>{"b", "d", "e", "f"});
+    CHECK(pages == 2);
+    for (const auto& q : store.queries) {
+        REQUIRE(q.changed_since.has_value());
+        CHECK(*q.changed_since == 100);
+    }
+    // 0 is a real value: every row has changed_at >= 0
+    hcp::Request zero;
+    zero.changed_since = 0;
+    CHECK(walk(store, zero, std::nullopt).size() == 6);
+    // and no filter leaves the query unfiltered
+    FakeStore plain;
+    plain.add(changed_record("x", 1));
+    (void)hcp::read_page(plain.reader(), {}, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
+    REQUIRE(plain.queries.size() == 1);
+    CHECK_FALSE(plain.queries[0].changed_since.has_value());
+}
+
+// Kills: letting a scope-confined caller take a delta (it would silently omit a device that ENTERED
+// its scope), checking it AFTER the cursor / agent_id scope test (the answer would then vary with a
+// device's existence or membership), and a refusal that reads the store or takes a slot.
+TEST_CASE("hardware ci page: a scope-confined caller's changed_since is refused first, before any read or slot",
+          "[hardware_ci_page][scope][changed_since][security]") {
+    std::set<std::string> real;
+    FakeStore store = forty_devices(real);
+    BulkReadSlots slots(1);
+    const authz::VisibleSet in_scope_set = scope_of_size(real, 3);
+    struct Case {
+        const char* name;
+        authz::VisibleSet scope;
+    };
+    for (const Case& c : {Case{"bounded group scope", in_scope_set},
+                          Case{"engaged-empty", authz::deny_all()},
+                          Case{"over the push-down ceiling", scope_of_size(real, hcp::kMaxPushdownScopeIds + 1)}}) {
+        INFO(c.name);
+        for (const std::string& agent : {std::string(), *real.begin(), std::string("not-a-device")}) {
+            INFO(agent);
+            hcp::Request rq;
+            rq.changed_since = 1;
+            rq.agent_id = agent;
+            // even beside a garbage cursor and a closed gate: the delta refusal comes first
+            rq.cursor = "garbage";
+            std::atomic<pg::CollationGate> closed{pg::CollationGate::Mismatch};
+            const auto page = hcp::read_page(store.reader(), rq, c.scope, &closed, &slots, hcp::kRestRowBudgetBytes);
+            REQUIRE_FALSE(page.has_value());
+            CHECK(page.error() == hcp::ReadError::kDeltaNeedsGlobalRead);
+        }
+    }
+    CHECK(store.reads == 0);
+    CHECK(slots.in_use() == 0);
+    // the message and audit text name no device, count or scope
+    const std::string msg(hcp::read_error_message(hcp::ReadError::kDeltaNeedsGlobalRead));
+    CHECK(msg.find("global read") != std::string::npos);
+    CHECK(msg.find("10000") == std::string::npos);
+    CHECK(hcp::audit_detail_delta_needs_global_read("MCP") ==
+          "hardware CI records (MCP) state=changed_since needs global read");
+    // describe_read_error: terminal (no retry hint, not unavailable), audited as denied on both
+    for (const auto surface : {hcp::Surface::kRest, hcp::Surface::kMcp}) {
+        const auto f = hcp::describe_read_error(hcp::ReadError::kDeltaNeedsGlobalRead, surface);
+        CHECK_FALSE(f.unavailable);
+        CHECK(f.retry_after_ms == -1);
+        CHECK_FALSE(f.retry_after_header);
+        CHECK(f.domain_audit_row);
+        CHECK(f.audit_outcome == "denied");
+    }
+}
+
+// Kills: refusing a global-read caller's delta, and changing what a scoped caller WITHOUT the
+// filter reads.
+TEST_CASE("hardware ci page: a global caller's delta is served and a scoped caller without it reads as before",
+          "[hardware_ci_page][scope][changed_since]") {
+    FakeStore store;
+    store.add(changed_record("in-a", 50));
+    store.add(changed_record("in-b", 200));
+    store.add(changed_record("out-c", 200));
+    hcp::Request delta;
+    delta.changed_since = 100;
+    // TOP (nullopt): global read, with and without an agent_id
+    CHECK(walk(store, delta, std::nullopt) == std::vector<std::string>{"in-b", "out-c"});
+    delta.agent_id = "in-a";
+    CHECK(walk(store, delta, std::nullopt).empty()); // exists, but not changed since 100
+    // a scoped caller without changed_since: the set is applied in SQL as before, no delta clause
+    const authz::VisibleSet scope = std::unordered_set<std::string>{"in-a", "in-b"};
+    store.queries.clear();
+    CHECK(walk(store, hcp::Request{}, scope) == std::vector<std::string>{"in-a", "in-b"});
+    for (const auto& q : store.queries) {
+        CHECK(q.agent_ids.has_value());
+        CHECK_FALSE(q.changed_since.has_value());
+    }
+}
+
+// Kills: serving a page with no watermark or a guessed one, serving the rows of a page whose
+// watermark failed, a watermark taken outside the held slot, and leaking the slot on failure.
+TEST_CASE("hardware ci page: with_watermark stamps every served page while its slot is held, and fails closed",
+          "[hardware_ci_page][watermark][changed_since]") {
+    FakeStore store;
+    store.add("a");
+    store.add("b");
+    BulkReadSlots slots(1);
+    int calls = 0;
+    int in_use_at_call = -1;
+    const hcp::Watermark good = [&]() -> std::optional<std::int64_t> {
+        ++calls;
+        in_use_at_call = slots.in_use();
+        return 1'699'999'700;
+    };
+    auto page = hcp::with_watermark(
+        hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), good);
+    REQUIRE(page.has_value());
+    CHECK(page->next_changed_since == 1'699'999'700);
+    CHECK(calls == 1);
+    CHECK(in_use_at_call == 1);      // read while the bulk-read slot was held
+    CHECK(slots.in_use() == 1);      // and still held for the caller's audit write
+    CHECK(hcp::page_json(*page)["next_changed_since"] == 1'699'999'700);
+    page->release_slot();
+    CHECK(slots.in_use() == 0);
+
+    SECTION("a failed provider replaces the page with kDegraded and frees the slot") {
+        const hcp::Watermark bad = []() -> std::optional<std::int64_t> { return std::nullopt; };
+        const auto r = hcp::with_watermark(
+            hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), bad);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == hcp::ReadError::kDegraded);
+        CHECK(slots.in_use() == 0);
+    }
+    SECTION("an unwired (empty) provider is the same answer") {
+        const auto r = hcp::with_watermark(
+            hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes),
+            hcp::Watermark{});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == hcp::ReadError::kDegraded);
+        CHECK(slots.in_use() == 0);
+    }
+    SECTION("an error from read_page passes through untouched and asks for no watermark") {
+        calls = 0;
+        hcp::Request rq;
+        rq.cursor = "garbage";
+        const auto r = hcp::with_watermark(
+            hcp::read_page(store.reader(), rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), good);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == hcp::ReadError::kCursorMalformed);
+        CHECK(calls == 0);
+    }
+    SECTION("the empty page, the denied named device and a point read all carry it") {
+        calls = 0;
+        FakeStore empty;
+        const auto none = hcp::with_watermark(
+            hcp::read_page(empty.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), good);
+        REQUIRE(none.has_value());
+        CHECK(none->rows.empty());
+        CHECK(none->next_changed_since == 1'699'999'700);
+        hcp::Request named;
+        named.agent_id = "a";
+        const authz::VisibleSet other = std::unordered_set<std::string>{"zzz"};
+        const auto denied = hcp::with_watermark(
+            hcp::read_page(store.reader(), named, other, nullptr, &slots, hcp::kRestRowBudgetBytes), good);
+        REQUIRE(denied.has_value());
+        CHECK(denied->target_denied);
+        CHECK(denied->next_changed_since == 1'699'999'700);
+        const auto point = hcp::with_watermark(
+            hcp::read_page(store.reader(), named, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), good);
+        REQUIRE(point.has_value());
+        CHECK(point->next_changed_since == 1'699'999'700);
+        CHECK(calls == 3);
+    }
+}
+
+TEST_CASE("hardware ci page: row JSON carries changed_at at row level and never inside the ci block",
+          "[hardware_ci_page][json][changed_since]") {
+    const auto rec = changed_record("agent-1", 1'699'999'000);
+    const json row = hcp::row_json(rec);
+    CHECK(row["changed_at"] == 1'699'999'000);
+    CHECK_FALSE(row["ci"].contains("changed_at")); // the per-id route's ci bytes are unchanged
+    CHECK(row.size() == 6);
+    // the byte measure includes the field: a wider value is a wider row
+    const auto narrow = changed_record("agent-1", 1);
+    const auto wide = changed_record("agent-1", INT64_MAX);
+    CHECK(hcp::row_wire_bytes(wide) - hcp::row_wire_bytes(narrow) == 18); // 19 digits against 1
+    // the page cut counts it: a budget that fits narrow rows exactly cuts the wide ones
+    FakeStore a;
+    FakeStore b;
+    for (const char* id : {"r-1", "r-2", "r-3"}) {
+        a.add(changed_record(id, 1));
+        b.add(changed_record(id, INT64_MAX));
+    }
+    const std::size_t budget = 3 * hcp::row_wire_bytes(changed_record("r-1", 1)) + 2 + 2;
+    const auto na = hcp::read_page(a.reader(), {}, std::nullopt, nullptr, nullptr, budget);
+    const auto nb = hcp::read_page(b.reader(), {}, std::nullopt, nullptr, nullptr, budget);
+    REQUIRE(na.has_value());
+    REQUIRE(nb.has_value());
+    CHECK(na->rows.size() == 3);
+    CHECK(nb->rows.size() < 3);
+    CHECK(nb->byte_capped);
 }

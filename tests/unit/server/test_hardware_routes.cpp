@@ -26,6 +26,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <expected>
 #include <functional>
@@ -92,6 +93,13 @@ struct HwHarness {
     // decided once at construction, like the other unwire flags (see below).
     yuzu::server::test::FakeCiKeysetStore ci_store;
     bool ci_page_unwired = false;
+    // The `changed_since` watermark provider (production binds DeviceInventoryStore::
+    // device_ci_watermark): the value it answers (nullopt = the read failed), how often it was
+    // asked, and whether it is wired at all (decided once at construction, like the flags above).
+    static constexpr std::int64_t kWatermark = 1'699'999'700;
+    std::optional<std::int64_t> ci_watermark{kWatermark};
+    int ci_watermark_calls = 0;
+    bool ci_watermark_unwired = false;
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
     std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call, in order
@@ -156,8 +164,9 @@ struct HwHarness {
                        bool quarantine_list_wired_ctor = false,
                        bool containment_ui_ctor = kContainmentUi,
                        ResponseStore* response_store = nullptr, bool unwire_ci_page_ctor = false,
-                       bool unwire_ci_gate_ctor = false) {
+                       bool unwire_ci_gate_ctor = false, bool unwire_ci_watermark_ctor = false) {
         ci_page_unwired = unwire_ci_page_ctor;
+        ci_watermark_unwired = unwire_ci_watermark_ctor;
         quarantine_list_wired = quarantine_list_wired_ctor;
         unwire_sync_dispatch = unwire_sync_dispatch_ctor;
         unwire_agent_version_fn = unwire_agent_version_fn_ctor;
@@ -262,6 +271,11 @@ struct HwHarness {
             deps.ci_page_reader = ci_store.reader();
         if (!unwire_ci_gate_ctor)
             deps.ci_collation_gate = &ci_gate;
+        if (!ci_watermark_unwired)
+            deps.ci_watermark_fn = [this]() {
+                ++ci_watermark_calls;
+                return ci_watermark;
+            };
         deps.scoped_probe_fn = probe;
         deps.dex_score_fn = dex_fn;
         if (quarantine_list_wired) {
@@ -2878,11 +2892,11 @@ TEST_CASE("route: GET /api/v1/hardware-ci never returns a device outside the cal
         REQUIRE(res);
         REQUIRE(res->status == 200);
         const auto body = nlohmann::json::parse(res->body);
-        // the exact key set of the data object: devices, next_cursor, scope_basis
+        // the exact key set of the data object: devices, next_cursor, next_changed_since, scope_basis
         std::set<std::string> keys;
         for (const auto& [k, v] : body["data"].items())
             keys.insert(k);
-        CHECK(keys == std::set<std::string>{"devices", "next_cursor", "scope_basis"});
+        CHECK(keys == std::set<std::string>{"devices", "next_changed_since", "next_cursor", "scope_basis"});
         CHECK(body["data"]["scope_basis"] == "authority_scoped");
         CHECK_FALSE(contains(res->body, "devices_omitted"));
         REQUIRE(h.audit_details.size() == 1);
@@ -2926,7 +2940,7 @@ TEST_CASE("route: GET /api/v1/hardware-ci gives an unconfined caller no scope_ba
     std::set<std::string> keys;
     for (const auto& [k, v] : body["data"].items())
         keys.insert(k);
-    CHECK(keys == std::set<std::string>{"devices", "next_cursor"});
+    CHECK(keys == std::set<std::string>{"devices", "next_changed_since", "next_cursor"});
     REQUIRE(h.audit_details.size() == 1);
     CHECK(h.audit_details[0] == "hardware CI records (REST): rows=2 scope=fleet");
 }
@@ -3466,4 +3480,342 @@ TEST_CASE("route: GET /api/v1/hardware-ci keeps a 400 for a malformed cursor whi
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.ci_store.reads == 0);
+}
+
+// ───────────────────── GET /api/v1/hardware-ci: the changed_since delta pull ─────────────────────
+
+namespace {
+
+// A row whose content last changed at `changed_at` (the fake store filters on it, as the SQL does).
+void seed_ci_changed(HwHarness& h, const char* id, std::int64_t changed_at) {
+    auto r = yuzu::server::test::make_ci_record(id);
+    r.changed_at = changed_at;
+    h.ci_store.add(std::move(r));
+}
+
+// The current server clock, for a value that is valid now (the parser refuses a future one).
+std::int64_t delta_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+} // namespace
+
+// Kills: a delta that returns every row (the filter not plumbed into the store query), one that
+// drops the boundary row (> instead of >=), a row without changed_at, and a page without the
+// watermark the next pull needs.
+TEST_CASE("route: GET /api/v1/hardware-ci changed_since returns exactly the rows at or after it, each with "
+          "changed_at, and every page carries next_changed_since",
+          "[hardware][route][rest][ci_page][changed_since]") {
+    HwHarness h;
+    const std::int64_t t = delta_now() - 1000;
+    seed_ci_changed(h, "d-old", t - 1);
+    seed_ci_changed(h, "d-edge", t); // exactly at the value: delivered again (at-least-once)
+    seed_ci_changed(h, "d-new", t + 500);
+
+    auto full = h.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(full);
+    REQUIRE(full->status == 200);
+    const auto fb = nlohmann::json::parse(full->body);
+    CHECK(ci_page_ids(fb) == std::vector<std::string>{"d-edge", "d-new", "d-old"});
+    CHECK(fb["data"]["next_changed_since"] == HwHarness::kWatermark);
+    CHECK(fb["data"]["devices"][1]["changed_at"] == t + 500); // d-new, row level
+    CHECK(h.ci_store.queries.back().changed_since == std::nullopt); // no filter: nothing narrowed
+
+    auto delta = h.sink.Get("/api/v1/hardware-ci?changed_since=" + std::to_string(t));
+    REQUIRE(delta);
+    REQUIRE(delta->status == 200);
+    const auto db = nlohmann::json::parse(delta->body);
+    CHECK(ci_page_ids(db) == std::vector<std::string>{"d-edge", "d-new"}); // d-old excluded
+    CHECK(db["data"]["next_changed_since"] == HwHarness::kWatermark);
+    REQUIRE(h.ci_store.queries.back().changed_since.has_value());
+    CHECK(*h.ci_store.queries.back().changed_since == t);
+    CHECK(db["data"]["devices"][0]["changed_at"] == t);
+    // the watermark is read on every page, the empty page of a delta included
+    auto none = h.sink.Get("/api/v1/hardware-ci?changed_since=" + std::to_string(delta_now()));
+    REQUIRE(none);
+    REQUIRE(none->status == 200);
+    const auto nb = nlohmann::json::parse(none->body);
+    CHECK(nb["data"]["devices"].empty());
+    CHECK(nb["data"]["next_changed_since"] == HwHarness::kWatermark);
+    CHECK(h.ci_watermark_calls == 3);
+}
+
+// A delta read is audited exactly like a full one: one fail-closed row per page.
+TEST_CASE("route: GET /api/v1/hardware-ci changed_since page is audited like a full page and fails closed",
+          "[hardware][route][rest][ci_page][changed_since][security]") {
+    HwHarness h;
+    const std::int64_t t = delta_now() - 100;
+    seed_ci_changed(h, "d-1", t);
+    auto ok = h.sink.Get("/api/v1/hardware-ci?changed_since=" + std::to_string(t));
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    REQUIRE(h.audit_full.size() == 1);
+    CHECK(h.audit_full[0] == "inventory.devices.ci|success|Inventory|fleet");
+    CHECK(h.audit_details[0] == "hardware CI records (REST): rows=1 scope=fleet");
+
+    h.audit_should_fail = true;
+    auto bad = h.sink.Get("/api/v1/hardware-ci?changed_since=" + std::to_string(t));
+    REQUIRE(bad);
+    CHECK(bad->status == 503);
+    CHECK(bad->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(contains(bad->body, "d-1")); // withheld, not served
+}
+
+// Kills: a malformed delta filter read as "no filter" (a silent full read), and a future-dated one
+// read as "nothing changed".
+TEST_CASE("route: GET /api/v1/hardware-ci refuses a malformed, negative or future changed_since with 400",
+          "[hardware][route][rest][ci_page][changed_since]") {
+    HwHarness h;
+    seed_ci_changed(h, "d-1", delta_now());
+    // (whitespace spellings are pinned on the pure parser: a URL layer may trim them before the route)
+    for (const char* bad : {"abc", "-1", "-0", "1.5", "1e3", "0x10", "5abc", "99999999999999999999999",
+                            "9223372036854775808"}) {
+        INFO(bad);
+        auto res = h.sink.Get(std::string("/api/v1/hardware-ci?changed_since=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK_FALSE(body.contains("data"));
+        CHECK(body["error"]["message"] ==
+              "invalid changed_since (expected epoch seconds as a non-negative integer)");
+        if (std::string_view(bad).size() >= 4)
+            CHECK_FALSE(contains(res->body, bad)); // the value is never echoed
+    }
+    auto future = h.sink.Get("/api/v1/hardware-ci?changed_since=" + std::to_string(delta_now() + 3600));
+    REQUIRE(future);
+    CHECK(future->status == 400);
+    CHECK(nlohmann::json::parse(future->body)["error"]["message"] == "invalid changed_since (it is in the future)");
+    CHECK(h.ci_store.reads == 0);        // refused before any read
+    CHECK(h.audit_full.empty());         // like a malformed limit: no row, nothing was served
+    // an empty value is "not given", like limit and cursor
+    auto empty = h.sink.Get("/api/v1/hardware-ci?changed_since=");
+    REQUIRE(empty);
+    CHECK(empty->status == 200);
+    CHECK(h.ci_store.queries.back().changed_since == std::nullopt);
+    // 0 is a value (the full read, spelled as a delta)
+    auto zero = h.sink.Get("/api/v1/hardware-ci?changed_since=0");
+    REQUIRE(zero);
+    CHECK(zero->status == 200);
+    REQUIRE(h.ci_store.queries.back().changed_since.has_value());
+    CHECK(*h.ci_store.queries.back().changed_since == 0);
+}
+
+// Kills: a cursor from one walk resuming under another filter (rows skipped or doubled), and the
+// no-filter cursor of today stopping to decode.
+TEST_CASE("route: GET /api/v1/hardware-ci binds the cursor to changed_since",
+          "[hardware][route][rest][ci_page][changed_since]") {
+    HwHarness h;
+    const std::int64_t t = delta_now() - 100;
+    for (const char* id : {"a", "b", "c"})
+        seed_ci_changed(h, id, t);
+    auto plain = h.sink.Get("/api/v1/hardware-ci?limit=1");
+    auto delta = h.sink.Get("/api/v1/hardware-ci?limit=1&changed_since=" + std::to_string(t));
+    REQUIRE(plain);
+    REQUIRE(delta);
+    const std::string plain_cursor = nlohmann::json::parse(plain->body)["data"]["next_cursor"];
+    const std::string delta_cursor = nlohmann::json::parse(delta->body)["data"]["next_cursor"];
+    REQUIRE_FALSE(plain_cursor.empty());
+    REQUIRE_FALSE(delta_cursor.empty());
+    CHECK(plain_cursor != delta_cursor);
+    const std::string msg = "invalid cursor; restart from the first page";
+    // each resumes under its own filter
+    CHECK(h.sink.Get("/api/v1/hardware-ci?limit=1&cursor=" + plain_cursor)->status == 200);
+    CHECK(h.sink.Get("/api/v1/hardware-ci?limit=1&changed_since=" + std::to_string(t) + "&cursor=" + delta_cursor)
+              ->status == 200);
+    h.ci_store.reads = 0;
+    for (const std::string& url :
+         {"/api/v1/hardware-ci?cursor=" + delta_cursor,                                   // no filter
+          "/api/v1/hardware-ci?changed_since=" + std::to_string(t) + "&cursor=" + plain_cursor, // added
+          "/api/v1/hardware-ci?changed_since=" + std::to_string(t + 1) + "&cursor=" + delta_cursor}) { // changed
+        INFO(url);
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(nlohmann::json::parse(res->body)["error"]["message"] == msg);
+    }
+    CHECK(h.ci_store.reads == 0);
+}
+
+// Kills: a scope-confined caller getting a delta (the page would look complete and silently omit a
+// device that ENTERED its scope), a refusal that names a device or a count, a refusal that is
+// retryable, one that varies with the cursor or a named device, and a refusal that reads the store.
+TEST_CASE("route: GET /api/v1/hardware-ci changed_since from a scope-confined caller is a terminal 400, no read",
+          "[hardware][route][rest][ci_page][changed_since][security]") {
+    const std::int64_t t = delta_now() - 100;
+    const std::string delta = "?changed_since=" + std::to_string(t);
+    const std::string msg =
+        "changed_since needs a credential with global read; a scope-confined credential cannot use a "
+        "delta pull";
+    struct Case {
+        const char* name;
+        authz::VisibleSet scope;
+    };
+    // A group-scoped caller and a service-scoped token both reach the route as an ENGAGED scope
+    // (`require_fleet_read` resolves a service-scoped session to `meet(mgmt, tag set)`, engaged
+    // even when the management axis is TOP: test_authz_gates.cpp "AdmitAll x service S => scoped to
+    // S"); the route cannot tell them apart and refuses both identically. An empty engaged set (a
+    // scope holding no device) and one over the push-down ceiling are refused the same way.
+    for (const Case& c : {Case{"group-scoped", authz::VisibleSet{std::unordered_set<std::string>{"in-a", "in-d"}}},
+                          Case{"service-scoped", authz::VisibleSet{std::unordered_set<std::string>{"in-a"}}},
+                          Case{"engaged-empty", authz::deny_all()},
+                          Case{"over the ceiling", ci_scope_of_size({"in-a"}, 10001)}}) {
+        INFO(c.name);
+        HwHarness h;
+        seed_ci_changed(h, "in-a", t);
+        seed_ci_changed(h, "out-b", t);
+        seed_ci_changed(h, "in-d", t);
+        h.scope = c.scope;
+        for (const std::string& url : {"/api/v1/hardware-ci" + delta, "/api/v1/hardware-ci" + delta + "&limit=1",
+                                       "/api/v1/hardware-ci" + delta + "&agent_id=in-a",
+                                       "/api/v1/hardware-ci" + delta + "&agent_id=out-b", // outside the scope
+                                       "/api/v1/hardware-ci" + delta + "&agent_id=ghost",
+                                       "/api/v1/hardware-ci" + delta + "&cursor=garbage"}) {
+            INFO(url);
+            auto res = h.sink.Get(url);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->has_header("X-Correlation-Id"));
+            CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+            const auto body = nlohmann::json::parse(res->body, nullptr, false);
+            REQUIRE_FALSE(body.is_discarded());
+            CHECK_FALSE(body.contains("data"));
+            CHECK(body["error"]["message"] == msg);
+            CHECK(body["error"]["retry_after_ms"].is_null()); // terminal: not retryable
+            CHECK(body["error"]["remediation"] ==
+                  "use a credential with global read for a changed_since delta pull, or omit changed_since and "
+                  "walk the full set");
+            // no device, no count, no scope detail
+            for (const char* leak : {"in-a", "out-b", "in-d", "ghost", "pad-", "10000", "authority_scoped"})
+                CHECK_FALSE(contains(res->body, leak));
+        }
+        CHECK(h.ci_store.reads == 0);
+        CHECK(h.ci_watermark_calls == 0);
+        // one `denied` domain row per refusal, no count and no device
+        REQUIRE_FALSE(h.audit_full.empty());
+        for (std::size_t i = 0; i < h.audit_full.size(); ++i) {
+            CHECK(h.audit_full[i].starts_with("inventory.devices.ci|denied|"));
+            CHECK(h.audit_details[i] == "hardware CI records (REST) state=changed_since needs global read");
+        }
+    }
+}
+
+// The refusal is best effort like the scope-too-wide one: a row that does not persist marks the
+// answer Sec-Audit-Failed but the 400 stands.
+TEST_CASE("route: GET /api/v1/hardware-ci changed_since refusal stands, marked Sec-Audit-Failed, when its audit row fails",
+          "[hardware][route][rest][ci_page][changed_since][security]") {
+    HwHarness h;
+    seed_ci_changed(h, "in-a", delta_now());
+    h.scope = std::unordered_set<std::string>{"in-a"};
+    h.audit_should_fail = true;
+    auto res = h.sink.Get("/api/v1/hardware-ci?changed_since=" + std::to_string(delta_now() - 5));
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+// Kills: the refusal reaching a scoped caller who does NOT send the filter, and the full read of a
+// global caller changing (no filter = exactly today's behaviour).
+TEST_CASE("route: GET /api/v1/hardware-ci a scoped caller without changed_since reads as before; a global caller "
+          "with it is served",
+          "[hardware][route][rest][ci_page][changed_since]") {
+    const std::int64_t t = delta_now() - 100;
+    {
+        HwHarness h;
+        seed_ci_changed(h, "in-a", t - 50);
+        seed_ci_changed(h, "out-b", t);
+        h.scope = std::unordered_set<std::string>{"in-a"};
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(ci_page_ids(body) == std::vector<std::string>{"in-a"});
+        CHECK(body["data"]["scope_basis"] == "authority_scoped");
+        CHECK(body["data"]["next_changed_since"] == HwHarness::kWatermark);
+        REQUIRE(h.ci_store.queries.back().agent_ids.has_value());
+        CHECK_FALSE(h.ci_store.queries.back().changed_since.has_value());
+    }
+    {
+        // scope == nullopt: a global-read caller (RBAC global grant, an elevated session, an engine
+        // principal with the grant, and every non-engine caller while RBAC is off all resolve to TOP)
+        HwHarness h;
+        seed_ci_changed(h, "in-a", t - 50);
+        seed_ci_changed(h, "out-b", t);
+        auto res = h.sink.Get("/api/v1/hardware-ci?changed_since=" + std::to_string(t - 10));
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(ci_page_ids(body) == std::vector<std::string>{"out-b"});
+        CHECK_FALSE(body["data"].contains("scope_basis"));
+        // a global caller may also narrow a point read with it
+        auto named = h.sink.Get("/api/v1/hardware-ci?agent_id=in-a&changed_since=" + std::to_string(t - 10));
+        REQUIRE(named);
+        CHECK(named->status == 200);
+        CHECK(nlohmann::json::parse(named->body)["data"]["devices"].empty());
+    }
+}
+
+// Kills: serving a page without the watermark when its source fails or is unwired (the client
+// would keep a stale or missing value and quietly miss changes), and a guessed value.
+TEST_CASE("route: GET /api/v1/hardware-ci answers 503 when the watermark cannot be read, never a page without it",
+          "[hardware][route][rest][ci_page][changed_since][security]") {
+    SECTION("the provider fails") {
+        HwHarness h;
+        seed_ci(h, {"a"});
+        h.ci_watermark = std::nullopt;
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK_FALSE(body.contains("data"));
+        CHECK(body["error"]["retry_after_ms"] == 5000);
+        CHECK_FALSE(contains(res->body, "next_changed_since"));
+        CHECK_FALSE(contains(res->body, "\"a\"")); // no row of the discarded page
+        // the failure is audited as the store-unreadable row, not as a served page
+        REQUIRE(h.audit_full.size() == 1);
+        CHECK(h.audit_full[0] == "inventory.devices.ci|failure|Inventory|fleet");
+        CHECK(h.audit_details[0] == "hardware CI records (REST) state=store unreadable");
+    }
+    SECTION("the provider is unwired") {
+        HwHarness h(false, false, false, kContainmentUi, nullptr, false, false, /*unwire_ci_watermark_ctor=*/true);
+        seed_ci(h, {"a"});
+        auto res = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(contains(res->body, "next_changed_since"));
+        auto named = h.sink.Get("/api/v1/hardware-ci?agent_id=a");
+        REQUIRE(named);
+        CHECK(named->status == 503);
+    }
+}
+
+// The new fields count toward the byte bound: a page of worst-case rows is still cut at 4 MiB of
+// ROW bytes, and the whole body stays within the row budget plus a few KB of framing.
+TEST_CASE("route: GET /api/v1/hardware-ci rows with changed_at and the watermark stay within the byte bound",
+          "[hardware][route][rest][ci_page][changed_since][bytes]") {
+    HwHarness h;
+    for (int i = 0; i < 30; ++i) {
+        auto r = yuzu::server::test::make_worst_case_ci_record("w-" + std::to_string(100 + i));
+        r.changed_at = 9'223'372'036'854'775'807LL; // the widest value: 19 digits
+        h.ci_store.add(std::move(r));
+    }
+    auto res = h.sink.Get("/api/v1/hardware-ci?limit=1000");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["page_bytes_capped"] == true);
+    CHECK_FALSE(body["data"]["next_cursor"].get<std::string>().empty());
+    std::size_t rows_bytes = 0;
+    for (const auto& d : body["data"]["devices"])
+        rows_bytes += d.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace).size();
+    const std::size_t n = body["data"]["devices"].size();
+    REQUIRE(n > 1);
+    // the served rows plus their separators and brackets are within the budget (a page of more than
+    // one row never exceeds it: only the first row is exempt), and the body is that plus framing
+    CHECK(rows_bytes + (n - 1) + 2 <= hardware_ci_page::kRestRowBudgetBytes);
+    CHECK(res->body.size() <= hardware_ci_page::kRestRowBudgetBytes + 4096);
+    CHECK(body["data"]["devices"][0]["changed_at"] == 9'223'372'036'854'775'807LL);
 }
