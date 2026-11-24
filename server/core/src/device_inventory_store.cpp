@@ -74,6 +74,12 @@ std::int64_t now_secs() {
         .count();
 }
 
+// The PostgreSQL clock in epoch seconds. ONE spelling for every authoring and reading site of
+// `changed_at` (the content upsert, `device_ci_watermark`), so the stamp and the watermark that
+// brackets it come from the same clock and the same rounding. clock_timestamp(), not now(): it
+// advances inside a transaction, so a long ingest transaction does not stamp an old instant.
+constexpr const char* kDbClockSecsExpr = "EXTRACT(EPOCH FROM clock_timestamp())::bigint";
+
 // Per-site degrade-WARN state (one static instance per call site).
 struct DegradeSampler {
     std::atomic<std::uint64_t> count{0};
@@ -258,6 +264,28 @@ const std::string kMigrationV4Sql = "SET LOCAL lock_timeout = '30s'; "
                                     "SET LOCAL statement_timeout = 0; " +
                                     agent_id_c_index_ddl("device_ci") + ";";
 
+// v5: `changed_at`, the change marker behind the bulk read's `changed_since` delta filter. Epoch
+// SECONDS (the unit of first_seen/last_seen) of the last CONTENT change, authored by the PostgreSQL
+// clock inside the content upsert (kDbClockSecsExpr there); `last_seen` cannot serve because every
+// hash-skip daily sync bumps it. The DEFAULT is the migration's own `now()`: a STABLE, non-volatile
+// expression, which PostgreSQL 11+ evaluates once and records as the column's "missing value"
+// instead of rewriting the table, so the ADD COLUMN is metadata-only (measured on PostgreSQL 18.4,
+// docs/security-reviews/hardware-ci-changed-since-2026-11.md), and every existing row reads
+// "changed at the migration" - the conservative answer, since nothing says when it really changed.
+// clock_timestamp() (volatile) would force a rewrite, so it is NOT the default. The default stays on
+// the column: the content upsert always supplies the value, and a hand-inserted row still gets one.
+// Idempotent (IF NOT EXISTS on both). The index serves a sparse delta (`changed_at >= $n`); it is
+// built with v4's transaction-local settings for the same reason (a plain build takes a SHARE lock
+// and the pool's 30 s statement_timeout / 10 s lock_timeout would otherwise bound it, and a failed
+// migration refuses to start the server on every restart). Not CONCURRENTLY: the runner's
+// transaction refuses it.
+const std::string kMigrationV5Sql =
+    "SET LOCAL lock_timeout = '30s'; "
+    "SET LOCAL statement_timeout = 0; "
+    "ALTER TABLE device_ci ADD COLUMN IF NOT EXISTS changed_at BIGINT NOT NULL "
+    "DEFAULT (EXTRACT(EPOCH FROM now()))::bigint; "
+    "CREATE INDEX IF NOT EXISTS device_ci_changed_at_idx ON device_ci (changed_at);";
+
 // The index as the runtime check (and an operator by hand) creates it: schema-qualified, because
 // no search_path is set outside the migration runner.
 const std::string kAgentIdCIndexCreateSql = agent_id_c_index_ddl("device_inventory_store.device_ci");
@@ -305,6 +333,7 @@ const std::vector<pg::PgMigration>& migrations() {
         {2, kMigrationV2Sql},
         {3, kMigrationV3Sql},
         {4, kMigrationV4Sql},
+        {5, kMigrationV5Sql},
     };
     return kMigrations;
 }
@@ -316,7 +345,7 @@ constexpr const char* kSelectCols =
     "disks_summary, primary_mac, macs_summary, nic_count, os_name, os_version, os_build, "
     "arch, first_seen, last_seen, blob_version, chassis_type, chassis_serial, "
     "chassis_asset_tag, chassis_source, board_vendor, board_product, board_serial, "
-    "board_source, machine_id_hash, machine_id_algorithm, machine_id_source";
+    "board_source, machine_id_hash, machine_id_algorithm, machine_id_source, changed_at";
 
 /// Returns the index of the first column after the ones it read, so a query that appends columns
 /// to `kSelectCols` can continue from there.
@@ -360,6 +389,7 @@ int fill_record(PGresult* res, int row, DeviceCiRecord& out) {
     out.machine_id_hash = col();
     out.machine_id_algorithm = col();
     out.machine_id_source = col();
+    out.changed_at = to_i64(col());
     return c;
 }
 
@@ -663,16 +693,21 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
         // v2 -> v1 downgrade blanks them.
         pg::PgResult up = pg::exec_params(
             c,
-            "INSERT INTO device_inventory_store.device_ci ("
+            (// The statement is text-built (the DB-clock expression is spliced in, never a bound
+             // parameter, so the stamp is the database's own); the temporary lives to the end of
+             // this full expression.
+             "INSERT INTO device_inventory_store.device_ci ("
             "agent_id, content_hash, manufacturer, model, serial, system_uuid, hostname, domain, "
             "ou, bios_vendor, bios_version, bios_date, cpu_model, cpu_cores, cpu_threads, "
             "ram_bytes, disks_summary, primary_mac, macs_summary, nic_count, os_name, os_version, "
             "os_build, arch, first_seen, last_seen, blob_version, chassis_type, chassis_serial, "
             "chassis_asset_tag, chassis_source, board_vendor, board_product, board_serial, "
-            "board_source, machine_id_hash, machine_id_algorithm, machine_id_source) VALUES ("
+            "board_source, machine_id_hash, machine_id_algorithm, machine_id_source, changed_at) VALUES ("
             "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::bigint, $15::bigint, "
             "$16::bigint, $17, $18, $19, $20::bigint, $21, $22, $23, $24, $25::bigint, "
-            "$26::bigint, $27::smallint, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38) "
+            "$26::bigint, $27::smallint, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, " +
+                std::string(kDbClockSecsExpr) +
+                ") "
             "ON CONFLICT (agent_id) DO UPDATE SET "
             "content_hash = EXCLUDED.content_hash, manufacturer = EXCLUDED.manufacturer, "
             "model = EXCLUDED.model, serial = EXCLUDED.serial, system_uuid = EXCLUDED.system_uuid, "
@@ -691,8 +726,14 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             "board_product = EXCLUDED.board_product, board_serial = EXCLUDED.board_serial, "
             "board_source = EXCLUDED.board_source, machine_id_hash = EXCLUDED.machine_id_hash, "
             "machine_id_algorithm = EXCLUDED.machine_id_algorithm, "
-            "machine_id_source = EXCLUDED.machine_id_source "
-            "RETURNING agent_id",
+            "machine_id_source = EXCLUDED.machine_id_source, "
+            // changed_at moves only when the stored content hash differs from the incoming one. The
+            // right-hand sides of a DO UPDATE read the OLD row, so `device_ci.content_hash` is the
+            // stored hash even though `content_hash = EXCLUDED.content_hash` sits earlier in the
+            // list. A full re-send of unchanged content therefore keeps it.
+            "changed_at = CASE WHEN device_ci.content_hash IS DISTINCT FROM EXCLUDED.content_hash "
+            "THEN " + std::string(kDbClockSecsExpr) + " ELSE device_ci.changed_at END "
+            "RETURNING agent_id").c_str(),
             std::vector<std::string>{
                 agent_id_s, server_hash, r.manufacturer, r.model, r.serial, r.system_uuid,
                 r.hostname, r.domain, r.ou, r.bios_vendor, r.bios_version, r.bios_date,
@@ -972,6 +1013,13 @@ DeviceCiKeysetStatement device_ci_keyset_statement(const DeviceCiKeysetQuery& q)
         params.push_back(pg::to_text_array(ids));
         sql += " AND agent_id COLLATE \"C\" = ANY($" + std::to_string(params.size()) + "::text[])";
     }
+    if (q.changed_since) {
+        // `>=`, never `>`: a row stamped in the same second as the client's watermark must still be
+        // delivered (at-least-once). The comparison is on the plain column, so the v5 btree index
+        // can serve it; no filter adds no text and no parameter.
+        params.push_back(std::to_string(*q.changed_since));
+        sql += " AND changed_at >= $" + std::to_string(params.size()) + "::bigint";
+    }
     params.push_back(std::to_string(eff));
     sql += " ORDER BY agent_id COLLATE \"C\" ASC LIMIT $" + std::to_string(params.size()) + "::bigint";
     return st;
@@ -1043,6 +1091,35 @@ DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
         spdlog::warn("DeviceInventoryStore: keyset list degraded: {}", cause);
     }
     return std::nullopt;
+}
+
+std::optional<std::int64_t> DeviceInventoryStore::device_ci_watermark() {
+    if (!open_) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: watermark read on a closed store");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: watermark skipped, no connection in time ({})",
+                         pool_.last_error());
+        return std::nullopt;
+    }
+    // The database's clock, minus the margin, in one statement: the same expression that authors
+    // `changed_at`, so the watermark and the stamps it brackets cannot disagree about the clock.
+    const std::string sql = std::string("SELECT (") + kDbClockSecsExpr + ") - $1::bigint";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(kChangedSinceMarginSecs)});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1 || PQgetisnull(res.get(), 0, 0)) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+            spdlog::warn("DeviceInventoryStore: watermark read failed: {}", PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    return to_i64(PQgetvalue(res.get(), 0, 0));
 }
 
 namespace {

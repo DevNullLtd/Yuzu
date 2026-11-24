@@ -1105,11 +1105,13 @@ TEST_CASE("device_ci schema created by the frozen migrations matches the section
                                    "content_digest:text:YES"});
 
     // The 11 scalars appended to device_ci at wire positions 22-32, after the 26 v1 columns
-    // (v1 ends at last_seen) and blob_version.
+    // (v1 ends at last_seen) and blob_version; v5's changed_at is the last column.
     const auto dev = live_columns(pool, "device_ci");
-    // 26 v1 columns, blob_version, then the appended scalars: tied to the wire constant, so a new
-    // scalar (kDeviceCiScalarFields grows) fails here until a migration adds its column.
-    REQUIRE(dev.size() == 26 + 1 + (yuzu::server::kDeviceCiScalarFields - 22));
+    // 26 v1 columns, blob_version, then the appended scalars, then changed_at (v5): tied to the wire
+    // constant, so a new scalar (kDeviceCiScalarFields grows) fails here until a migration adds its
+    // column.
+    REQUIRE(dev.size() == 26 + 1 + (yuzu::server::kDeviceCiScalarFields - 22) + 1);
+    CHECK(dev.back() == "changed_at:bigint:NO");
     CHECK(dev[26] == "blob_version:smallint:NO");
     const std::vector<std::string> scalars{
         "chassis_type",    "chassis_serial",      "chassis_asset_tag", "chassis_source",
@@ -1169,6 +1171,10 @@ TEST_CASE("DeviceInventoryStore refuses at construction when the schema lacks a 
          "ALTER TABLE device_inventory_store.device_ci DROP COLUMN content_hash", "device_ci",
          "ALTER TABLE device_inventory_store.device_ci ADD COLUMN content_hash TEXT NOT NULL "
          "DEFAULT ''"},
+        {"the v5 changed_at column absent (a v4 schema under a binary that reads it)",
+         "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at", "device_ci",
+         "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at BIGINT NOT NULL "
+         "DEFAULT 0"},
         {"a missing appended scalar on device_ci",
          "ALTER TABLE device_inventory_store.device_ci DROP COLUMN machine_id_source",
          "device_ci",
@@ -3663,9 +3669,9 @@ TEST_CASE("list_device_ci_after's single-device read is byte-exact and plans on 
 TEST_CASE("migration v4 lifts the statement timeout and allows a longer lock wait for its index build",
           "[device_ci][migration][v4]") {
     const auto& all = yuzu::server::device_inventory_migrations();
-    REQUIRE(all.size() == 4);
-    REQUIRE(all.back().version == 4);
-    const std::string& sql = all.back().sql;
+    REQUIRE(all.size() == 5);
+    REQUIRE(all[3].version == 4);
+    const std::string& sql = all[3].sql;
     const auto at = [&](const char* needle) { return sql.find(needle); };
     REQUIRE(at("SET LOCAL lock_timeout = '30s'") != std::string::npos);
     REQUIRE(at("SET LOCAL statement_timeout = 0") != std::string::npos);
@@ -4049,5 +4055,396 @@ TEST_CASE("list_device_ci_after counts a saturated pool as pool_acquire_timeout 
         CHECK(ci_read_degrades(metrics, "query_error") == 1.0);
         CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 0.0);
         CHECK(ci_read_degrades(metrics, "store_not_open") == 0.0);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// changed_at / the `changed_since` delta filter (migration v5)
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// The PostgreSQL clock in epoch seconds, spelled as the store spells it.
+long long db_now_secs(PgPool& pool) {
+    return count_rows(pool, "SELECT EXTRACT(EPOCH FROM clock_timestamp())::bigint");
+}
+
+// One bigint column of one row; -1 when the row is absent or the read fails.
+long long ci_column(PgPool& pool, const std::string& id, const std::string& column) {
+    return count_rows(pool, "SELECT " + column + " FROM device_inventory_store.device_ci WHERE agent_id = '" +
+                                id + "'");
+}
+
+// Stores one v2 record under `id` whose pinned content hash is `hash`.
+InventoryIngestOutcome put_ci(DeviceInventoryStore& store, const std::string& id, const std::string& hash) {
+    DeviceCiRecord r = distinct_v2_record("A");
+    r.content_hash = hash;
+    return store.apply_device_ci(id, DeviceInventoryStore::canonical_hash(r), std::optional<DeviceCiRecord>{r}, 1);
+}
+
+// The ids of a changed_since page, in served order.
+std::vector<std::string> since_ids(DeviceInventoryStore& store, yuzu::server::DeviceCiKeysetQuery q) {
+    return keyset_ids(store.list_device_ci_after(q));
+}
+
+} // namespace
+
+// Kills: changed_at stamped from the replica clock, stamped on every upsert, not stamped on insert,
+// or moved by a hash-skip touch (the defect that makes last_seen useless as a change marker).
+// Backdating both columns to 1000 makes "left alone" and "moved to now" unmistakable on a fast box.
+TEST_CASE("changed_at is stamped from the database clock on insert and moves only when the content hash changes",
+          "[pg][device_ci][changed_since]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const long long before = db_now_secs(pool);
+    REQUIRE(put_ci(store, "agent-1", "hash-1") == InventoryIngestOutcome::kStored);
+    const long long after = db_now_secs(pool);
+    REQUIRE(before > 0);
+
+    SECTION("a first store is stamped inside the database clock's window and the record carries it") {
+        const long long at = ci_column(pool, "agent-1", "changed_at");
+        CHECK(at >= before);
+        CHECK(at <= after);
+        auto got = store.get_device_ci("agent-1");
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        CHECK((**got).changed_at == at);
+    }
+
+    // From here every section starts with both timestamps in the past.
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = 1000, last_seen = 1000");
+
+    SECTION("a full re-send of unchanged content leaves changed_at alone and still moves last_seen") {
+        REQUIRE(put_ci(store, "agent-1", "hash-1") == InventoryIngestOutcome::kStored);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+        CHECK(ci_column(pool, "agent-1", "last_seen") > 1000);
+    }
+    SECTION("a full replace with a different content hash moves changed_at forward to the database clock") {
+        const long long b = db_now_secs(pool);
+        REQUIRE(put_ci(store, "agent-1", "hash-2") == InventoryIngestOutcome::kStored);
+        const long long a = db_now_secs(pool);
+        const long long at = ci_column(pool, "agent-1", "changed_at");
+        CHECK(at >= b);
+        CHECK(at <= a);
+        // and the new hash is the baseline: re-sending it does not move the marker again
+        exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = 1000");
+        REQUIRE(put_ci(store, "agent-1", "hash-2") == InventoryIngestOutcome::kStored);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+    }
+    SECTION("a hash-skip touch moves last_seen and leaves changed_at alone") {
+        REQUIRE(store.apply_device_ci("agent-1", "hash-1", std::nullopt, 1) == InventoryIngestOutcome::kTouched);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+        CHECK(ci_column(pool, "agent-1", "last_seen") > 1000);
+    }
+    SECTION("changed_at is not part of the content hash") {
+        DeviceCiRecord r = distinct_v2_record("A");
+        r.changed_at = 12345; // a record field a caller might set must not reach the stored marker
+        r.content_hash = "hash-1";
+        REQUIRE(store.apply_device_ci("agent-1", DeviceInventoryStore::canonical_hash(r),
+                                      std::optional<DeviceCiRecord>{r}, 1) == InventoryIngestOutcome::kStored);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+        DeviceCiRecord v1 = parse_device_ci_blob(sample_blob());
+        DeviceCiRecord v1b = v1;
+        v1b.changed_at = 99;
+        CHECK(DeviceInventoryStore::canonical_hash(v1) == DeviceInventoryStore::canonical_hash(v1b));
+    }
+}
+
+// Kills: a filter that is `>`, that is ignored when combined with another narrowing, or that does
+// not compose with the cursor. The seeded stamps are 100, 200, 300, 400 on ids a..d in byte order.
+TEST_CASE("changed_since returns exactly the rows with changed_at >= since, alone and combined",
+          "[pg][device_ci][changed_since][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* id : {"a", "b", "c", "d"})
+        REQUIRE(put_ci(store, id, std::string("hash-") + id) == InventoryIngestOutcome::kStored);
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = "
+                    "CASE agent_id WHEN 'a' THEN 100 WHEN 'b' THEN 200 WHEN 'c' THEN 300 ELSE 400 END");
+    using Ids = std::vector<std::string>;
+    yuzu::server::DeviceCiKeysetQuery q;
+
+    q.changed_since = 300;
+    CHECK(since_ids(store, q) == Ids{"c", "d"}); // inclusive at the boundary
+    q.changed_since = 301;
+    CHECK(since_ids(store, q) == Ids{"d"});
+    q.changed_since = 401;
+    auto none = store.list_device_ci_after(q);
+    REQUIRE(none.has_value()); // an answered empty page, not a degrade
+    CHECK(none->empty());
+    q.changed_since = 0;
+    CHECK(since_ids(store, q) == Ids{"a", "b", "c", "d"});
+    q.changed_since = std::numeric_limits<std::int64_t>::min() + 1;
+    CHECK(since_ids(store, q).size() == 4);
+
+    SECTION("with the cursor, the limit and the byte order") {
+        q.changed_since = 200;
+        q.after = "b";
+        CHECK(since_ids(store, q) == Ids{"c", "d"});
+        q.after = "";
+        q.limit = 2;
+        CHECK(since_ids(store, q) == Ids{"b", "c"});
+        q.after = "c";
+        CHECK(since_ids(store, q) == Ids{"d"});
+    }
+    SECTION("with a single-device read") {
+        q.changed_since = 300;
+        q.agent_id = "d";
+        CHECK(since_ids(store, q) == Ids{"d"});
+        q.agent_id = "a"; // exists but is older than the filter: absent, and answered
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+    SECTION("with a scope-membership list") {
+        q.changed_since = 200;
+        q.agent_ids = Ids{"a", "c", "zzz"};
+        CHECK(since_ids(store, q) == Ids{"c"});
+        q.agent_ids = Ids{}; // deny-all stays deny-all: no SQL, an empty answered page
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+    SECTION("every served row carries its own changed_at") {
+        q.changed_since = 300;
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->size() == 2);
+        CHECK((*page)[0].changed_at == 300);
+        CHECK((*page)[1].changed_at == 400);
+    }
+    SECTION("the keyed read carries it too") {
+        auto keyed = store.list_device_ci_for({"b"});
+        REQUIRE(keyed.has_value());
+        REQUIRE(keyed->size() == 1);
+        CHECK((*keyed)[0].changed_at == 200);
+    }
+}
+
+// Kills: a no-filter statement that changed (text or parameters), a filter bound by interpolation
+// instead of a parameter, or a placeholder renumbering that shifts the LIMIT. The unfiltered tail is
+// pinned literally; the select list differs from before ONLY by the appended `changed_at` column.
+TEST_CASE("the keyset statement without changed_since is the unfiltered statement, and with it adds one bound clause",
+          "[device_ci][changed_since][keyset]") {
+    using yuzu::server::device_ci_keyset_statement;
+    yuzu::server::DeviceCiKeysetQuery plain;
+    const auto base = device_ci_keyset_statement(plain);
+    // The unfiltered text from FROM onward and its parameters, exactly as before this change.
+    constexpr const char* kTail =
+        " FROM device_inventory_store.device_ci WHERE true ORDER BY agent_id COLLATE \"C\" ASC LIMIT $1::bigint";
+    CHECK(base.sql.ends_with(std::string(", content_hash") + kTail));
+    CHECK(base.sql.find("machine_id_source, changed_at, content_hash FROM") != std::string::npos);
+    CHECK(base.sql.find("changed_since") == std::string::npos);
+    CHECK(base.sql.find("changed_at >=") == std::string::npos);
+    CHECK(base.params == std::vector<std::string>{"100"});
+
+    SECTION("alone: one clause, one bound parameter, before the LIMIT") {
+        auto q = plain;
+        q.changed_since = 1234567890123LL;
+        const auto st = device_ci_keyset_statement(q);
+        std::string expected = base.sql;
+        const auto at = expected.find(" ORDER BY");
+        REQUIRE(at != std::string::npos);
+        expected.insert(at, " AND changed_at >= $1::bigint");
+        expected.replace(expected.find("LIMIT $1::bigint"), 16, "LIMIT $2::bigint");
+        CHECK(st.sql == expected);
+        CHECK(st.params == std::vector<std::string>{"1234567890123", "100"});
+        CHECK(st.sql.find("1234567890123") == std::string::npos); // never interpolated
+    }
+    SECTION("with the cursor and both narrowings the placeholders stay in order") {
+        auto q = plain;
+        q.after = "m";
+        q.agent_id = "x";
+        q.agent_ids = std::vector<std::string>{"y"};
+        const auto without = device_ci_keyset_statement(q);
+        q.changed_since = 7;
+        const auto with = device_ci_keyset_statement(q);
+        REQUIRE(without.params.size() == 4); // after, agent_id, agent_ids, limit
+        REQUIRE(with.params.size() == 5);
+        CHECK(with.params[3] == "7");
+        CHECK(with.params[4] == "100");
+        CHECK(with.params[0] == without.params[0]);
+        CHECK(with.params[1] == without.params[1]);
+        CHECK(with.params[2] == without.params[2]);
+        CHECK(with.sql.find(" AND changed_at >= $4::bigint ORDER BY") != std::string::npos);
+        CHECK(with.sql.find("LIMIT $5::bigint") != std::string::npos);
+    }
+    SECTION("a negative or zero filter is still a bound parameter") {
+        auto q = plain;
+        q.changed_since = -5;
+        CHECK(device_ci_keyset_statement(q).params == std::vector<std::string>{"-5", "100"});
+    }
+}
+
+// Kills: a v5 that rewrites the table (a volatile default), builds its index without v4's
+// transaction-local settings, is not idempotent, or uses CONCURRENTLY (the runner's transaction
+// refuses it). The default must be the STABLE `now()`, never `clock_timestamp()` (volatile).
+TEST_CASE("migration v5 adds changed_at with a stable default and builds its index under transaction-local timeouts",
+          "[device_ci][migration][v5][changed_since]") {
+    const auto& all = yuzu::server::device_inventory_migrations();
+    REQUIRE(all.size() == 5);
+    REQUIRE(all.back().version == 5);
+    const std::string& sql = all.back().sql;
+    const auto at = [&](const char* needle) { return sql.find(needle); };
+    REQUIRE(at("SET LOCAL lock_timeout = '30s'") != std::string::npos);
+    REQUIRE(at("SET LOCAL statement_timeout = 0") != std::string::npos);
+    REQUIRE(at("ALTER TABLE device_ci ADD COLUMN IF NOT EXISTS changed_at BIGINT NOT NULL "
+               "DEFAULT (EXTRACT(EPOCH FROM now()))::bigint") != std::string::npos);
+    REQUIRE(at("CREATE INDEX IF NOT EXISTS device_ci_changed_at_idx ON device_ci (changed_at)") !=
+            std::string::npos);
+    CHECK(at("SET LOCAL lock_timeout") < at("ALTER TABLE"));
+    CHECK(at("SET LOCAL statement_timeout") < at("ALTER TABLE"));
+    CHECK(at("ALTER TABLE") < at("CREATE INDEX"));
+    CHECK(sql.find("CONCURRENTLY") == std::string::npos);
+    CHECK(sql.find("clock_timestamp") == std::string::npos);
+    CHECK(sql.find("DROP") == std::string::npos);
+    CHECK(yuzu::server::kChangedSinceMarginSecs == 300);
+}
+
+// Kills: a v5 that fails on a populated v4 database, rewrites the table (the relfilenode changes
+// when it does), loses the rows' content, or leaves the index out. The existing rows read
+// "changed at the migration" (the stable default's evaluation time), not 0 and not their last_seen.
+TEST_CASE("a v4 database upgrades to v5 in place without a table rewrite and backfills the migration time",
+          "[pg][device_ci][migration][v5][changed_since]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        REQUIRE(put_ci(seed, "agent-v4-1", "h1") == InventoryIngestOutcome::kStored);
+        REQUIRE(put_ci(seed, "agent-v4-2", "h2") == InventoryIngestOutcome::kStored);
+    }
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, first_seen, last_seen) "
+                    "SELECT 'bulk-' || i, 5, 5 FROM generate_series(1, 20000) AS i");
+    // a database as v4 left it: no column, no index, recorded version 4
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 4 WHERE store = 'device_inventory_store'");
+    const long long rows = count_rows(pool, "SELECT count(*) FROM device_inventory_store.device_ci");
+    REQUIRE(rows == 20002);
+    const long long file_before =
+        count_rows(pool, "SELECT pg_relation_filenode('device_inventory_store.device_ci')::bigint");
+    REQUIRE(file_before > 0);
+
+    const long long t0 = db_now_secs(pool);
+    DeviceInventoryStore store{pool}; // runs v5 over the populated table
+    const long long t1 = db_now_secs(pool);
+    REQUIRE(store.is_open());
+
+    CHECK(count_rows(pool, "SELECT pg_relation_filenode('device_inventory_store.device_ci')::bigint") ==
+          file_before); // metadata-only: the heap file was not rewritten
+    CHECK(count_rows(pool, "SELECT count(*) FROM device_inventory_store.device_ci") == rows);
+    CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                           "AND indexname = 'device_ci_changed_at_idx'") == 1);
+    // every row reads the migration time (statement-start now(), inside the window around the open)
+    CHECK(count_rows(pool, "SELECT count(*) FROM device_inventory_store.device_ci WHERE changed_at < " +
+                               std::to_string(t0 - 1) + " OR changed_at > " + std::to_string(t1 + 1)) == 0);
+    auto got = store.get_device_ci("agent-v4-1");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((**got).changed_at >= t0 - 1);
+    // and a delta pull from before the upgrade sees every pre-existing row (nothing is silently old)
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.changed_since = t0 - 5;
+    q.agent_id = "agent-v4-2";
+    CHECK(since_ids(store, q) == std::vector<std::string>{"agent-v4-2"});
+}
+
+// Kills: a watermark from the replica clock, one that omits the margin, or a nullopt that is
+// really a guess. The window is the database clock read before and after the call.
+TEST_CASE("device_ci_watermark is the database clock minus the margin, and absent when it cannot be read",
+          "[pg][device_ci][changed_since]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const long long lo = db_now_secs(pool) - yuzu::server::kChangedSinceMarginSecs;
+    const auto w = store.device_ci_watermark();
+    const long long hi = db_now_secs(pool) - yuzu::server::kChangedSinceMarginSecs;
+    REQUIRE(w.has_value());
+    CHECK(*w >= lo);
+    CHECK(*w <= hi);
+
+    SECTION("a saturated pool is nullopt, not a stale or guessed value") {
+        PgPool one{{.conninfo = db.dsn(), .size = 1}};
+        REQUIRE(one.valid());
+        DeviceInventoryStore s2{one};
+        REQUIRE(s2.is_open());
+        auto held = one.acquire();
+        REQUIRE(held);
+        CHECK_FALSE(s2.device_ci_watermark().has_value());
+    }
+}
+
+TEST_CASE("device_ci_watermark on a closed store is nullopt", "[device_ci][changed_since]") {
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=x user=x", .size = 1}};
+    DeviceInventoryStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+    CHECK_FALSE(store.device_ci_watermark().has_value());
+}
+
+// Kills: a v5 whose changed_at index the planner cannot use for a sparse delta (a delta pull would
+// then walk the whole agent_id index per page and, on a large fleet, run into the 5 s statement
+// cap), and a filter spelling that defeats the agent_id index for a dense delta. The REAL statement
+// is explained. Measured on PostgreSQL 18.4 at 1,000,000 rows: a 0.1% delta plans on the
+// changed_at index (about 6 ms) and a 90% delta on the agent_id index (about 6 ms a page); the
+// planner's one known bad case (a mid-density delta whose rows cluster at the END of agent_id order)
+// is documented in the security review, not asserted here.
+TEST_CASE("changed_since plans a sparse delta on the changed_at index and a dense one on the agent_id index",
+          "[pg][device_ci][changed_since][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // 50,000 rows; every 1000th (0.1%) changed after the cutoff, the rest long ago. Ids are
+    // zero-padded so byte order is numeric order.
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, hostname, first_seen, last_seen, "
+                    "changed_at) SELECT 'g-' || lpad(i::text, 6, '0'), 'h' || i, 1, 1, "
+                    "CASE WHEN i % 1000 = 0 THEN 2000000000 ELSE 1000 END FROM generate_series(1, 50000) AS i");
+    exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
+
+    SECTION("a sparse delta, first page and mid-walk page, plans on the changed_at index") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.changed_since = 1500000000;
+        q.limit = 1001;
+        const std::string first = keyset_plan(pool, q);
+        INFO(first);
+        CHECK(first.find("device_ci_changed_at_idx") != std::string::npos);
+        q.after = "g-025000";
+        const std::string mid = keyset_plan(pool, q);
+        INFO(mid);
+        CHECK(mid.find("device_ci_changed_at_idx") != std::string::npos);
+        // and it returns exactly the 50 changed rows, in byte order
+        q.after.clear();
+        const auto ids = keyset_ids(store.list_device_ci_after(q));
+        REQUIRE(ids.size() == 50);
+        CHECK(ids.front() == "g-001000");
+        CHECK(ids.back() == "g-050000");
+        CHECK(std::is_sorted(ids.begin(), ids.end()));
+    }
+    SECTION("a dense delta plans on the agent_id index and still pages in byte order") {
+        exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = CASE WHEN i_ok THEN "
+                        "2000000000 ELSE 1000 END FROM (SELECT agent_id AS a, (random() < 0.9) AS i_ok "
+                        "FROM device_inventory_store.device_ci) s WHERE agent_id = s.a");
+        exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.changed_since = 1500000000;
+        q.limit = 101;
+        const std::string plan = keyset_plan(pool, q);
+        INFO(plan);
+        CHECK(plan.find("device_ci_agent_id_c_idx") != std::string::npos);
+        const auto ids = keyset_ids(store.list_device_ci_after(q));
+        REQUIRE(ids.size() == 101);
+        CHECK(std::is_sorted(ids.begin(), ids.end()));
     }
 }
