@@ -5,6 +5,7 @@
 #include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
 #include "checked_pending_count.hpp" // approval mint: throw-folding pending-count wrapper
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
+#include "approval_continuation.hpp" // one approval for a whole multi-slice read (continuation_param)
 #include "dispatch_denial_text.hpp" // shared describe_dispatch_denial (#6065 PR-Q; was an anonymous-namespace local here)
 #include "engine_no_admin_audit.hpp"      // the shared no-admin auditor (REST + MCP)
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
@@ -1036,7 +1037,7 @@ static const ToolDef kTools[] = {
     {"get_compliance_summary",
      "Get per-policy compliance breakdown (compliant/non-compliant/unknown counts).",
      R"({"type":"object","properties":{"policy_id":{"type":"string","description":"Policy ID"}},"required":["policy_id"]})",
-     R"j({"type":"object","properties":{"policy_id":{"type":"string"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}},"required":["policy_id","compliant","non_compliant","unknown","fixing","error","total"]})j"},
+     R"j({"type":"object","properties":{"policy_id":{"type":"string"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"blocked":{"type":"integer"},"total":{"type":"integer"}},"required":["policy_id","compliant","non_compliant","unknown","fixing","error","blocked","total"]})j"},
 
     // #4034: output widened to carry `fixing`/`error` (previously silently
     // dropped — a real shape mismatch against this tool's REST siblings,
@@ -1046,12 +1047,12 @@ static const ToolDef kTools[] = {
     // only the five pre-existing fields is unaffected.
     {"get_fleet_compliance", "Get fleet-wide compliance percentages across all policies.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"total_checks":{"type":"integer"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"compliance_pct":{"type":"number"}},"required":["total_checks","compliant","non_compliant","unknown","fixing","error","compliance_pct"]})j"},
+     R"j({"type":"object","properties":{"total_checks":{"type":"integer"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"blocked":{"type":"integer"},"compliance_pct":{"type":"number"}},"required":["total_checks","compliant","non_compliant","unknown","fixing","error","blocked","compliance_pct"]})j"},
 
     {"get_policy", "Get a single policy's full detail, including its compliance summary. "
      "REST v1 twin: GET /api/v1/policies/{id}.",
      R"({"type":"object","properties":{"policy_id":{"type":"string","minLength":1,"description":"Policy ID"}},"required":["policy_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"yaml_source":{"type":"string"},"fragment_id":{"type":"string"},"scope_expression":{"type":"string"},"enabled":{"type":"boolean"},"remediation_available":{"type":"boolean"},"inputs":{"type":"object"},"triggers":{"type":"array"},"management_groups":{"type":"array","items":{"type":"string"}},"created_at":{"type":"integer"},"updated_at":{"type":"integer"},"compliance":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}}}},"required":["id","name","enabled","scope_expression"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"yaml_source":{"type":"string"},"fragment_id":{"type":"string"},"scope_expression":{"type":"string"},"enabled":{"type":"boolean"},"remediation_available":{"type":"boolean"},"inputs":{"type":"object"},"triggers":{"type":"array"},"management_groups":{"type":"array","items":{"type":"string"}},"created_at":{"type":"integer"},"updated_at":{"type":"integer"},"compliance":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"blocked":{"type":"integer"},"total":{"type":"integer"}}}},"required":["id","name","enabled","scope_expression"]})j"},
 
     {"list_policy_fragments", "List reusable check/fix/postCheck policy fragments. "
      "REST v1 twin: GET /api/v1/policy-fragments.",
@@ -1074,12 +1075,14 @@ static const ToolDef kTools[] = {
      "Get one policy's per-agent compliance statuses (fan-out list) plus a summary tallied "
      "from exactly the agents returned. Confined by management group / service scope: a "
      "confined caller's summary counts only its own visible agents, never the fleet-wide "
-     "total. A policy whose check instruction runs a Forensics-tier plugin (an action on the "
-     "Forensics securable) is scored unknown for every agent with an empty check_result: the "
-     "evaluator never reads Forensics-tier output, so unknown there is by design and says "
-     "nothing about the device. REST v1 twin: GET /api/v1/compliance/{id} (same shape).",
+     "total. Policy evaluation does not dispatch a check that runs a Forensics-tier plugin (an "
+     "action on the Forensics securable carries an execute gate): once the policy has been "
+     "evaluated every agent shows blocked, its check_result records the refusal (phase, "
+     "reason, plugin, action) and holds no check output, and the evaluator never reads "
+     "Forensics-tier output. "
+     "REST v1 twin: GET /api/v1/compliance/{id} (same shape).",
      R"({"type":"object","properties":{"policy_id":{"type":"string","minLength":1,"description":"Policy ID"}},"required":["policy_id"]})",
-     R"j({"type":"object","properties":{"policy_id":{"type":"string"},"summary":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}}},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"last_check_at":{"type":"integer"},"last_fix_at":{"type":"integer"},"check_result":{"type":"string"}},"required":["agent_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["policy_id","summary","agents"]})j"},
+     R"j({"type":"object","properties":{"policy_id":{"type":"string"},"summary":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"blocked":{"type":"integer"},"total":{"type":"integer"}}},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"last_check_at":{"type":"integer"},"last_fix_at":{"type":"integer"},"check_result":{"type":"string"}},"required":["agent_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["policy_id","summary","agents"]})j"},
 
     {"list_management_groups", "List management groups (hierarchical device grouping).",
      R"({"type":"object","properties":{}})",
@@ -3780,6 +3783,29 @@ static const ToolDef kTools[] = {
      "principal is never counted as a surviving Administrator, so a refusal can happen even "
      "when other Administrator grants nominally exist. "
      "Idempotent: unassigning a role the principal did not hold still returns success. "
+     "Removing a user's Administrator grant also ends that user's JIT elevation window "
+     "in the same transaction: the removal and the clear commit together, and if the clear "
+     "fails the removal is rolled back (an internal error with a retry hint; after a lost "
+     "commit acknowledgement the removal may have committed, so read the grant list before "
+     "assuming nothing changed). The clear runs only when a grant was actually removed: "
+     "unassigning an Administrator grant the user does not hold still succeeds but ends no "
+     "elevation. After the commit the replica that handled the call drops its cached sessions "
+     "of the user, so the elevation ends at once there; other replicas converge on their next "
+     "session-generation poll (about 1 s, up to about 30 s while that read is failing or "
+     "slow; neither bound holds after a database restore or a failover to a lagging "
+     "standby). It does not change the user's elevation eligibility, so an eligible user "
+     "can elevate again, and an elevate request that had already passed its eligibility "
+     "check can complete just after the unassign commits. To end elevated access for good, "
+     "revoke the user's elevation eligibility first with the REST route "
+     "POST /api/v1/users/{name}/elevation-eligibility (it ends live elevations at once on the "
+     "replica that handled it and on other replicas on their next session-generation poll, "
+     "with the same bounds); "
+     "there is no MCP equivalent yet, so an MCP-only caller cannot take that step. If the "
+     "error says the audit record could not be persisted, the removal is already committed: "
+     "verify with a read and do not repeat the call. "
+     "At the supervised tier the approval ticket is consumed before this tool runs and is not "
+     "restored when the call then fails, so a retry after an internal error needs a new "
+     "approval ticket. "
      "Destructive — verify the target doesn't need this role before calling. Requires "
      "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -3906,7 +3932,7 @@ static const ToolDef kTools[] = {
     // lockout lifecycle; this is the first. New "Account lockout" family in
     // mcp_orientation.cpp.
     {"unlock_account",
-     "Clear a local account's failed-login lockout counter (SOC 2 CC6.3 operability path — the "
+     "Clear a local account's failed-login lockout counter AND its second-factor (MFA) failure lock (SOC 2 CC6.3 operability path — the "
      "lockout also auto-expires on its own after the lockout window). Self-target is permitted: "
      "clearing your own lockout is recoverable. Requires the Postgres auth store (AuthDB) — "
      "answers 'lockout subsystem unavailable' if it is not wired, same as the REST route. "
@@ -4578,10 +4604,14 @@ static const ToolDef kTools[] = {
      "never echoed back by any tool — only has_credential (bool) is ever readable afterward "
      "(ADR-0010). url must be http:// or https://; batch_size 1 delivers each event "
      "immediately, >1 accumulates up to that many events per POST. Additive (mints a new "
-     "target, overwrites nothing) but a duplicate name is rejected. url is NOT restricted "
-     "to external hosts - a caller with Infrastructure:Write can point deliveries at any "
-     "reachable address, including the server's own loopback/internal network (no SSRF "
-     "guard on this field today, same posture as REST's twin). Requires "
+     "target, overwrites nothing) but a duplicate name is rejected. Open-world: the server "
+     "POSTs to url. A url whose host is a link-local/cloud-metadata, unspecified, multicast or "
+     "reserved address (or a numeric spelling of one, e.g. 2852039166) is refused with -32602 "
+     "(audited as destination_refused); at delivery a host name is resolved once, every answer "
+     "is vetted and the connect is pinned to a vetted address, and a declined delivery is "
+     "logged destination_refused or destination_unresolved. Loopback and private ranges are NOT "
+     "refused: a caller with Infrastructure:Write can still point deliveries at the server's "
+     "own loopback or internal network (opt-in policy: #4816). Requires "
      "Infrastructure:Write.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique target name; a duplicate is rejected"},)j"
@@ -7191,7 +7221,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // mint_upload_grant above). A duplicate name/license_key is REJECTED,
     // never silently reused -> each successful call mints a distinct id ->
     // not idempotent.
-    {"create_offload_target", {ToolEffect::Additive, false, "Create offload target"}},
+    // openWorldHint is true: the server POSTs fleet events to the administrator-supplied url (an
+    // outbound reach beyond Yuzu's own stores, like the CRL-source registration tools below).
+    {"create_offload_target",
+     {ToolEffect::Additive, false, "Create offload target", /*open_world=*/true}},
     {"activate_platform_license", {ToolEffect::Additive, false, "Activate platform license"}},
     // create_software_deployment is ALSO a pure INSERT (same shape as the two
     // above), but its kToolSecurityRows operation is Execute (matching the
@@ -8782,6 +8815,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                    .add("compliant", fc.compliant)
                                    .add("non_compliant", fc.non_compliant)
                                    .add("unknown", fc.unknown)
+                                   .add("blocked", fc.blocked)
                                    .add("compliance_pct", fc.compliance_pct)
                                    .str();
                 JArr contents;
@@ -9094,6 +9128,14 @@ McpServer::HandlerFn McpServer::build_handler(
             // by the BurnGuard below (NOT by mcp_audit — see its comment for why
             // hooking mcp_audit directly under-counts).
             bool approval_ticket_just_consumed = false;
+            // Set true ONLY by the C8 cover arm below, when an already-SPENT ticket was accepted as
+            // the approval for one continuation slice of a read (approval_continuation.hpp). It is
+            // DELIBERATELY not `approval_ticket_just_consumed`: nothing was consumed on this call,
+            // so the BurnGuard above (which counts a spent human approval that the handler then
+            // failed) must not see it. Read by exactly one stamping site: the execute_instruction
+            // handler, which stamps `ApprovalProvenance::Ticket` when either flag is set, and by
+            // that handler's own audit rows, which append the approval id.
+            bool approval_covers_continuation = false;
             // L1 (#2146, ADR-0033 section 10): the effect a supervised-tier C8 ticket was
             // bound to, for the three tools whose (plugin, action) is read from a STORED
             // definition at dispatch time (execute_instruction_definition and the two
@@ -9623,6 +9665,44 @@ McpServer::HandlerFn McpServer::build_handler(
                     a4_error(kPermissionDenied,
                             authz::kServiceTagMutationDeniedMessage),
                     "application/json");
+                return true;
+            };
+
+            // The device-id audit floor (auth::agent_id_is_audit_safe) for a raw `agent_id`
+            // argument: an id over 256 bytes or with a byte below 0x20 reaches the permission
+            // denial's target_id, an approval ticket's pending row or a domain audit row, and
+            // the audit store keeps CR, LF and TAB. Every tool that takes one calls this BEFORE
+            // the scoped permission check, the approval mint and any audit write. Writes the
+            // -32602 refusal (fixed text, no request data, no audit row) into `res` and returns
+            // true; the caller then returns. An empty id passes: each tool answers its own
+            // "agent_id is required".
+            const auto refuse_unsafe_agent_id = [&](const std::string& agent_id) -> bool {
+                if (auth::agent_id_is_audit_safe(agent_id))
+                    return false;
+                // retry-hint-exempt: caller-input rejection
+                res.set_content(a4_error(kInvalidParams,
+                                         "agent_id must be at most 256 bytes with no byte below "
+                                         "0x20",
+                                         "fix the argument and re-call"),
+                                "application/json");
+                return true;
+            };
+
+            // The tag-key twin of `refuse_unsafe_agent_id` (auth::tag_key_is_audit_safe): a key
+            // over 64 bytes or with a byte below 0x20 reaches the `agent_id:key` text of the
+            // tag rows. `set_tag` and `delete_tag` call it BEFORE the service-tag guard, the
+            // scoped permission check and any audit write. A size and control-byte check only,
+            // never the key charset: `delete_tag` must still reach a stored key that
+            // `TagStore::validate_key` would refuse. An empty key passes (each tool answers its
+            // own "agent_id and key are required").
+            const auto refuse_unsafe_tag_key = [&](const std::string& key) -> bool {
+                if (auth::tag_key_is_audit_safe(key))
+                    return false;
+                // retry-hint-exempt: caller-input rejection
+                res.set_content(a4_error(kInvalidParams,
+                                         "key must be at most 64 bytes with no byte below 0x20",
+                                         "fix the argument and re-call"),
+                                "application/json");
                 return true;
             };
 
@@ -10274,12 +10354,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     // three an `effect_binding()` line is PREPENDED once the effect is resolved.
                     const std::string args_canon = canonical_args(args);
                     std::string canon = args_canon;
+                    // The continuation parameter of a covered read (approval_continuation.hpp),
+                    // else empty. Set below, for execute_instruction only, once the row is
+                    // classified; read again at the recall's cover arm.
+                    std::string continuation_param;
                     const std::string supplied_id = param_str(args, "approval_id");
                     // M2 (PR #1796): device-targeted tools prefix the pending
                     // audit detail with the endpoint so SIEM can filter
                     // mcp.<tool>|pending by agent_id (the success audit already
                     // carries it; the mint audit did not).
                     const std::string audit_agent = param_str(args, "agent_id");
+                    // Before any ticket is minted or recalled and before the pending audit
+                    // row (`mint_detail_prefix` below carries the id): the mint covers every
+                    // approval-gated tool at once, so the floor is applied here once for all.
+                    if (refuse_unsafe_agent_id(audit_agent))
+                        return;
                     const std::string mint_detail_prefix =
                         audit_agent.empty() ? std::string{} : "agent_id=" + audit_agent + " ";
 
@@ -10832,6 +10921,23 @@ McpServer::HandlerFn McpServer::build_handler(
                             }
                             }
                         }
+                        // One approval for a whole multi-slice read (approval_continuation.hpp).
+                        // A row that declares a continuation parameter binds the ticket to the call
+                        // WITHOUT it, so every slice of one search carries the same subject and the
+                        // token is never part of the stored ticket text. The mint, the dedup, the
+                        // match below and the request_moved precondition all use `canon`, so they
+                        // need no change. The row was classified (and a miss refused) above, and
+                        // `covered_param` is empty for anything but a read gated None or
+                        // AdminOrApproval, so every other call keeps its canonical arguments
+                        // byte-for-byte.
+                        if (const auto cap = classify_fn_(param_str(args, "plugin"),
+                                                          param_str(args, "action"))) {
+                            continuation_param = std::string(
+                                yuzu::server::approval_continuation::covered_param(*cap));
+                            if (!continuation_param.empty())
+                                canon = yuzu::server::approval_continuation::ticket_subject(
+                                    args, continuation_param);
+                        }
                     }
 
                     // #2146 batch C: the instruction authoring tools that carry a ticket. Three
@@ -11340,6 +11446,57 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
+                    // CONTINUATION COVER (approval_continuation.hpp). A row that declares a
+                    // continuation parameter lets ONE approval cover every slice of a read: the
+                    // first call spends the ticket as always, and a later call that carries a token
+                    // rides the already-spent ticket for a bounded window, provided the same
+                    // principal holds it and its subject still equals this call's. Only a call that
+                    // carries a token can reach this arm (a call without one needs an unspent
+                    // ticket), and only for a ticket already spent (`consumed_at != 0`); an
+                    // unspent ticket takes the ordinary consume below. The decision is one
+                    // read-only lookup (`covers_continuation`), made against the store, so it is
+                    // the store's answer and never this handler's earlier read.
+                    bool covered = false;
+                    if (!continuation_param.empty() && appr->consumed_at != 0 &&
+                        yuzu::server::approval_continuation::carries_token(args,
+                                                                           continuation_param)) {
+                        const auto cover = approval_manager->covers_continuation(
+                            supplied_id, session->username, ApprovalOrigin::kMcp, definition_id,
+                            canon);
+                        if (!cover) {
+                            // A store fault is the lookup rung's answer (above): fail closed, no
+                            // claim about the ticket, a retry may clear it.
+                            count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                            count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
+                            mcp_audit("denied",
+                                      "approval_id=" + supplied_id + " refused: " +
+                                          consume_denial_reason(ConsumeFailure::kStoreError) +
+                                          " (continuation)");
+                            res.set_content(approval_store_error_body(
+                                                *approval_manager, a4_error,
+                                                cover.error().sqlstate),
+                                            "application/json");
+                            return;
+                        }
+                        if (!*cover) {
+                            // ONE uniform refusal for every way a ticket can fail to cover (another
+                            // principal, another surface, the window passed, a bound ticket): the
+                            // same answer a replayed one-time ticket gets, so the recall is no
+                            // probe for who holds a ticket or how old it is. The audit row names
+                            // the cause class; the client text never does.
+                            count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                            mcp_audit("denied",
+                                      "continuation_not_covered approval_id=" + supplied_id);
+                            res.set_content(
+                                a4_error(kPermissionDenied,
+                                         "approval already used (one-time ticket)",
+                                         "submit a new request without approval_id to obtain a "
+                                         "fresh approval ticket"),
+                                "application/json");
+                            return;
+                        }
+                        covered = true;
+                    }
                     // status == approved → atomically consume (one-time; the CAS
                     // rejects a replay of an already-consumed ticket and wins the
                     // race against a concurrent recall, so a mutating tool runs at
@@ -11544,7 +11701,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
-                    if (auto consumed = approval_manager->consume_ticket(
+                    if (auto consumed = covered ? std::expected<void, ConsumeError>{}
+                                                : approval_manager->consume_ticket(
                             supplied_id, session->username, ApprovalOrigin::kMcp, precondition);
                         !consumed) {
                         const ConsumeFailure kind = consumed.error().kind;
@@ -11756,12 +11914,21 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    mcp_audit("approved", "consumed approval_id=" + supplied_id);
-                    // #2444 item 3: from here on, any mcp_audit("failure", ...) the
-                    // tool handler below emits for THIS request is a burned ticket —
-                    // set AFTER the "approved" row above so that row itself (result
-                    // "approved", not "failure") never counts.
-                    approval_ticket_just_consumed = true;
+                    if (covered) {
+                        // Nothing was consumed: the ticket was spent by this search's first call.
+                        // The flag is its own (never `approval_ticket_just_consumed`, which counts
+                        // a burned human approval), and the row says "continuation" so one
+                        // approve row joins every slice's execution by approval id.
+                        mcp_audit("approved", "continuation approval_id=" + supplied_id);
+                        approval_covers_continuation = true;
+                    } else {
+                        mcp_audit("approved", "consumed approval_id=" + supplied_id);
+                        // #2444 item 3: from here on, any mcp_audit("failure", ...) the
+                        // tool handler below emits for THIS request is a burned ticket —
+                        // set AFTER the "approved" row above so that row itself (result
+                        // "approved", not "failure") never counts.
+                        approval_ticket_just_consumed = true;
+                    }
                     // Ticket consumed → fall through to the tool handler below.
                     // NOTE: the per-handler perm_fn (real RBAC op) has not run
                     // yet; a tier-allows-but-RBAC-denies token can mint→approve→
@@ -13481,6 +13648,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             invalid("agent_id is required (1 to 128 characters)");
                             return;
                         }
+                        if (refuse_unsafe_agent_id(agent_id))
+                            return;
                         // The per-device SCOPED gate, as the REST route: fail closed if unwired.
                         if (!scoped_perm_fn) {
                             res.set_content(a4_error(kInternalError, "scope gate not configured"),
@@ -14631,6 +14800,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id)) // the success row below carries the id
+                    return;
                 bool inventory_truncated = false;
                 auto records = inventory_store->get_agent_inventory(agent_id, &inventory_truncated);
                 if (!records) {
@@ -14683,6 +14854,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The id floor precedes the fail-closed guard (the REST drills also floor before
+                // their scoped gate): an unsafe id is input validation and must reach no audit
+                // row.
+                auto agent_id = param_str(args, "agent_id");
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 // #1717 fail-closed (parity with the REST SLE gate's sle_gate_usable):
                 // a loaded-but-corrupt / unopened rbac.db must refuse, not serve a
                 // legacy-open Read of per-agent licence facts.
@@ -14700,7 +14877,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "agent_id is required"),
                                     "application/json");
@@ -14791,6 +14967,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The id floor precedes the fail-closed guard (the REST drills also floor
+                // before their scoped gate).
+                auto agent_id = param_str(args, "agent_id");
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 if (rbac_enforcement_in_effect(rbac_store) && !(rbac_store && rbac_store->is_open())) {
                     mcp_audit("failure", "authorization subsystem unavailable (#1717 fail-closed)");
                     res.set_content(a4_error(kInternalError, "authorization subsystem unavailable",
@@ -14798,7 +14979,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "agent_id is required"),
                                     "application/json");
@@ -14901,6 +15081,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto agent_id = param_str(args, "agent_id");
+                if (refuse_unsafe_agent_id(agent_id)) // the degrade row below carries the id
+                    return;
                 auto tags = tag_store->get_all_tags(agent_id);
                 if (!tags) {
                     // Degrade → tool error, never an empty tag list
@@ -17379,14 +17561,24 @@ McpServer::HandlerFn McpServer::build_handler(
                             return true;
                     return false;
                 };
+            // Denied `result_set.create` row for a refused request. Returns the error.data to
+            // attach: empty when the row persisted (or audit is off), `audit_persisted:false`
+            // when it was lost or the sink threw (the MCP counterpart of REST's
+            // Sec-Audit-Failed). The SQL text never enters the row.
+            const auto rs_audit_refusal = [&](std::string_view rs_reason, std::string_view rs_kind,
+                                              const std::string& rs_target) -> std::string {
+                const bool rs_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "result_set.create", "denied", "ResultSet", rs_target,
+                    "reason=" + std::string(rs_reason) + " source_kind=" + audit_token(rs_kind));
+                return rs_ok ? std::string{} : std::string{R"({"audit_persisted":false})"};
+            };
             auto rs_refuse_nul = [&](std::string_view rs_what, std::string_view rs_kind) {
-                (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                               "reason=field_contains_nul source_kind=" + audit_token(rs_kind));
                 // retry-hint-exempt: caller-input rejection (a NUL byte), not a transient fault.
                 res.set_content(
                     error_response(id, kInvalidParams,
                                    "RESULT_SET_BAD_REQUEST: " + std::string(rs_what) +
-                                       " must not contain a NUL byte"),
+                                       " must not contain a NUL byte",
+                                   rs_audit_refusal("field_contains_nul", rs_kind, "")),
                     "application/json");
             };
 
@@ -18604,14 +18796,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string sql = param_str(args, "sql");
                 if (sql.empty()) {
                     res.set_content(
-                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required"),
+                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required",
+                                       rs_audit_refusal("sql_missing", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
                 if (sql.size() > 100000) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB",
+                                       rs_audit_refusal("sql_too_large", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
@@ -18626,7 +18820,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                       rs_audit_refusal("stale_source", source_kind::kEchoQuery, "")),
                         "application/json");
                     return;
                 }
@@ -18845,7 +19040,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         args.value("params", nlohmann::json::object()), def.parameter_schema)) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                       rs_audit_refusal("stale_source", source_kind::kInstructionResult, "")),
                         "application/json");
                     return;
                 }
@@ -19035,7 +19231,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (sql.empty()) {
                         res.set_content(
                             error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: original carries no SQL"),
+                                           "RESULT_SET_BAD_REQUEST: original carries no SQL",
+                                           rs_audit_refusal("sql_missing", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19050,7 +19247,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (sql.size() > 100000) {
                         res.set_content(
                             error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB",
+                                           rs_audit_refusal("sql_too_large", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19060,7 +19258,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(
                                 id, kInvalidParams,
-                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                rs_audit_refusal("stale_source", source_kind::kEchoQuery, orig->id)),
                             "application/json");
                         return;
                     }
@@ -19165,7 +19364,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(
                                 id, kInvalidParams,
-                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage),
+                                rs_audit_refusal("stale_source", source_kind::kInstructionResult, orig->id)),
                             "application/json");
                         return;
                     }
@@ -20135,6 +20335,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id)) // the control-byte half; size held above
+                    return;
                 if (!scoped_perm_fn) {
                     res.set_content(error_response(id, kInternalError, "scope gate not configured"),
                                     "application/json");
@@ -21297,6 +21499,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id)) // the control-byte half; size held above
+                    return;
                 if (!scoped_perm_fn) {
                     res.set_content(error_response(id, kInternalError, "scope gate not configured"),
                                     "application/json");
@@ -21749,6 +21953,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 // Per-device SCOPED gate (GuaranteedState:Read + management group) —
                 // mirrors REST's GET /api/v1/dex/devices/{id} (scoped_perm_fn
                 // mandatory there too), NOT the global perm_fn.
@@ -21822,6 +22028,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 // Per-device SCOPED gate — mirrors REST's GET
                 // /api/v1/dex/devices/{id}/app-perf (scoped_perm_fn mandatory there too).
                 if (!scoped_perm_fn) {
@@ -22086,6 +22294,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 // Per-device SCOPED gate -- mirrors REST's GET
                 // /api/v1/dex/devices/{id}/history (scoped_perm_fn mandatory there too).
                 if (!scoped_perm_fn) {
@@ -22137,6 +22347,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 if (!scoped_perm_fn) {
                     res.set_content(a4_error(kInternalError, "scope gate not configured"),
                                     "application/json");
@@ -23620,6 +23832,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             too_large("param_count", std::format("params must have at most {} keys", kExecInstrParamCountMax));
                             return;
                         }
+                        if (auto bad = yuzu::server::check_params_key_shape(p)) {
+                            too_large(bad->reason, bad->message);
+                            return;
+                        }
                         for (const auto& [k, v] : p.items()) {
                             // Key length is NOT expressible in the served schema
                             // (the subset has no propertyNames/maxProperties), so
@@ -23841,7 +24057,13 @@ McpServer::HandlerFn McpServer::build_handler(
                               : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
                 // #1398: a supervised-tier call reaches here only after C8
                 // consumed a real ticket for THIS request
-                // (approval_ticket_just_consumed); an operator-tier call
+                // (approval_ticket_just_consumed), or accepted an already-spent
+                // ticket as the approval of one continuation slice of a read
+                // (approval_covers_continuation: the row declared a continuation
+                // parameter, the ticket's subject equals this call's, the same
+                // principal holds it, and it is inside its window; the pair
+                // dispatched is therefore the one the human approved);
+                // an operator-tier call
                 // (auto-approved, no ticket ever minted) relies solely on
                 // caller.principal_is_admin (already stamped by
                 // caller_fn/derive_dispatch_caller above) at the chokepoint's
@@ -23849,9 +24071,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 // used to rely on it too (refused at /mcp/v1/ admission since
                 // #4309, mcp_admission.hpp; the arm is retained as defence in
                 // depth).
-                caller.approval_provenance = approval_ticket_just_consumed
+                caller.approval_provenance = (approval_ticket_just_consumed ||
+                                              approval_covers_continuation)
                                                  ? yuzu::server::ApprovalProvenance::Ticket
                                                  : yuzu::server::ApprovalProvenance::None;
+                // The approval this call rode, appended to this handler's own audit rows so one
+                // approve row joins every execution that used it (the first slice spends it, the
+                // continuation slices cover themselves with it). `approval_id` was matched against
+                // the store row by exact id above, so it is a server-minted value. Empty when no
+                // ticket was in play (an operator-tier call).
+                const std::string approval_audit_join =
+                    (approval_ticket_just_consumed || approval_covers_continuation)
+                        ? " approval_id=" + param_str(args, "approval_id")
+                        : std::string{};
 
                 if (!authorize_dispatch_fn_) {
                     // #3687: FAIL CLOSED, same posture as the classify_fn_
@@ -24326,8 +24558,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                           {{"op", "mark_cancelled"}, {"surface", "mcp"}})
                                 .increment();
                     }
-                    mcp_audit("failure",
-                              std::string("dispatch_exception execution_id=") + execution_id);
+                    mcp_audit("failure", std::string("dispatch_exception execution_id=") +
+                                             execution_id + approval_audit_join);
                     res.set_content(error_response(id, kInternalError, "dispatch failed"),
                                     "application/json");
                     return;
@@ -24546,7 +24778,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             .add("agents_kill_switched_os",
                                  static_cast<int64_t>(dispatch_outcome.kill_switched_os_count))
                             .str();
-                    mcp_audit("failure", zero_status + " execution_id=" + execution_id);
+                    mcp_audit("failure",
+                              zero_status + " execution_id=" + execution_id + approval_audit_join);
                     res.set_content(
                         success_response(id, tool_result(zero_payload, kObjectOutputSchema)),
                         "application/json");
@@ -24732,7 +24965,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // allocate.
                                 const std::string success_detail =
                                     std::string("command_id=") + command_id +
-                                    " execution_id=" + execution_id + " surface=post";
+                                    " execution_id=" + execution_id + " surface=post" +
+                                    approval_audit_join;
                                 const std::string audit_sid =
                                     yuzu::server::detail::sanitize_detail_value(
                                         bridge_sid.substr(0, 8));
@@ -24988,7 +25222,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 mcp_audit("failure",
                                           std::string("stream_install_failed cid=") + cid +
                                               " execution_id=" + execution_id +
-                                              " command_id=" + command_id);
+                                              " command_id=" + command_id + approval_audit_join);
                                 res.status = 500;
                                 // The remediation names execution_id, so the body must
                                 // CARRY it - a 500 on a MUTATING fleet command that is
@@ -25068,7 +25302,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // can join the audit row to the execution tracker row
                 // without a separate lookup.
                 mcp_audit("success", std::string("command_id=") + command_id +
-                                         " execution_id=" + execution_id);
+                                         " execution_id=" + execution_id + approval_audit_join);
                 res.set_content(success_response(id, result), "application/json");
                 return;
                 } catch (...) {
@@ -25129,6 +25363,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Before the service-tag guard (its denial row carries agent_id:key), the
+                // scoped gate and every other audit row.
+                if (refuse_unsafe_agent_id(agent_id) || refuse_unsafe_tag_key(key))
+                    return;
                 // #3289: value-blind TOCTOU guard, before the scoped gate.
                 if (deny_service_scoped_service_tag_mutation("mcp.set_tag", agent_id, key))
                     return;
@@ -25195,6 +25433,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Before the service-tag guard (its denial row carries agent_id:key), the
+                // scoped gate and every other audit row.
+                if (refuse_unsafe_agent_id(agent_id) || refuse_unsafe_tag_key(key))
+                    return;
                 // #3289: value-blind TOCTOU guard, before the scoped gate.
                 if (deny_service_scoped_service_tag_mutation("mcp.delete_tag", agent_id, key))
                     return;
@@ -25296,6 +25538,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto agent_id = param_str(args, "agent_id");
                 auto reason = param_str(args, "reason");
                 auto whitelist = param_str(args, "whitelist");
+                // Before the store-outage row below (it carries the id) and every other row.
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 if (!quarantine_store || !quarantine_store->is_open()) {
                     // gov-fix(consistency-auditor, Gate 8.2): "agent_id=<id>,
                     // <message>" — same shape as the other two mcp_audit
@@ -25952,14 +26197,22 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 if (!args.contains("steps")) {
                     res.set_content(error_response(id, kInvalidParams, "steps is required"),
                                     "application/json");
                     return;
                 }
-                auto specs = validate_bundle_steps(args["steps"].dump());
+                auto specs = validate_bundle_steps_typed(args["steps"].dump());
                 if (!specs) {
-                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error()),
+                    if (specs.error().kind == BundleStepsError::Kind::kParamKeyInvalid) {
+                        // sg10 / UP-1: counted and audited like every other ingress refusal.
+                        count_param_key_invalid(metrics, "bundle");
+                        (void)audit_fn(req, "bundle.dispatch", "denied", "Execution", "",
+                                       std::string("reason=") + std::string(kReasonParamKeyInvalid));
+                    }
+                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error().message),
                                     "application/json");
                     return;
                 }
@@ -26256,6 +26509,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         .add("compliant", fc.compliant)
                         .add("non_compliant", fc.non_compliant)
                         .add("unknown", fc.unknown)
+                        .add("blocked", fc.blocked)
                         .add("compliance_pct", fc.compliance_pct);
                 } else {
                     // No store wired, or ADR-0056 degrade — either way this is a
@@ -27978,6 +28232,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 params.expected_sha256 = param_str(args, "expected_sha256");
                 params.retention_class = param_str(args, "retention_class");
                 params.minted_by = session->username;
+                // Before the mint: its failure row carries the id as target_id.
+                if (refuse_unsafe_agent_id(params.agent_id))
+                    return;
                 // Strict: a wrong-typed or above-INT64_MAX value is rejected here. The
                 // lenient reader saturated an unsigned overflow to INT64_MAX, which the
                 // store accepts (it only rejects <= 0), minting a grant with no real
@@ -29206,7 +29463,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // store_unavailable/db_error are store/infra degradation
                     // (kInternalError + retry_after_ms) — distinct in the
                     // audit record even where the outcome collapses.
-                    if (result.error() == OffloadWriteError::invalid_input) {
+                    if (result.error() == OffloadWriteError::destination_refused) {
+                        (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
+                                 "destination_refused");
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "target rejected: url host is a link-local, cloud-metadata, "
+                                     "unspecified, multicast or reserved address (or a numeric "
+                                     "spelling of one); offload destinations may not be in those "
+                                     "address classes"),
+                            "application/json");
+                    } else if (result.error() == OffloadWriteError::invalid_input) {
                         (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
                                  "validation_failed");
                         res.set_content(
@@ -30449,6 +30716,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // failure, not a client error → kInternalError, not kInvalidParams.
                 auto result = rbac_store->unassign_role("engine", principal_id, role_name);
                 if (!result) {
+                    // audit_token, as on the user arm: the text can carry control bytes and spaces.
+                    const auto tok = [](std::string_view v) { return audit_token(v.substr(0, 256)); };
+                    spdlog::warn("engine_principal.role.unassigned store fault: principal={} "
+                                 "role={} error={}",
+                                 tok(principal_id), tok(role_name), tok(result.error()));
                     res.set_content(a4_error(kInternalError, result.error(), {},
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
@@ -30945,10 +31217,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // zero administrators (a business-rule conflict, not a store
                 // fault) — is_rbac_last_admin_refusal distinguishes them so
                 // only the genuine fault carries a retry hint.
-                auto result = rbac_store->unassign_role("user", principal_id, role_id);
+                auto result = rbac_store->unassign_role_detailed("user", principal_id, role_id);
                 if (!result) {
+                    // flatten_audit_text: a libpq error carries a trailing newline and a
+                    // CONTEXT line, which would otherwise reach the audit row as extra lines.
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
-                                   result.error());
+                                   flatten_audit_text(result.error()));
                     if (is_rbac_last_admin_refusal(result.error())) {
                         // retry-hint-exempt: business-rule outcome (last
                         // remaining Administrator), not a store fault.
@@ -30961,8 +31235,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
+                    // audit_token, not log_key_token: it maps space, '=' and ',' as well as
+                    // control bytes to '_', so a value cannot forge a `role=x error=y` field
+                    // on this unquoted line. Each value is capped at 256 bytes.
+                    const auto tok = [](std::string_view v) { return audit_token(v.substr(0, 256)); };
+                    spdlog::warn("rbac.role.unassigned store fault: user={} role={} error={}",
+                                 tok(principal_id), tok(role_id), tok(result.error()));
                     // A store fault returns a constant client message; the raw text
-                    // goes only to the audit row above.
+                    // reaches only the audit row above and the server log line, never
+                    // the client.
                     res.set_content(
                         a4_error(kInternalError,
                                  "role unassignment store fault; retry, and if this persists "
@@ -30975,9 +31256,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 // removed=<bool> (governance SHOULD #10) lets an auditor
                 // tell an actual revoke apart from an idempotent no-op from
                 // the log alone.
+                //
+                // An Administrator unassign that ended elevations says so on this
+                // row (suffix) and on one dedicated `role.elevation.revoked` row, both only when
+                // N > 0 and both attempted even if the first fails. Either failing takes the same
+                // 503 as the success row alone always did: the removal and the clear are already
+                // committed, so it reports the audit gap, never a failed removal. The response
+                // payload is unchanged. A no-op (`removed=false`: the user held no such grant)
+                // clears nothing, so it carries neither addition; nor does a retry after a lost
+                // COMMIT acknowledgement, which finds the grant already gone.
+                const int cleared = result->elevations_cleared;
                 bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "rbac.role.unassigned", "success", "User", audit_target_id,
-                    audit_role + "; removed=" + (*result ? "true" : "false"));
+                    audit_role + "; removed=" + (result->removed ? "true" : "false") +
+                        unassign_elevations_cleared_suffix(cleared));
+                if (cleared > 0) {
+                    const bool revoked_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, std::string(kElevationRevokedAuditAction), "ok", "User",
+                        audit_target_id, unassign_elevation_revoked_detail(cleared, audit_role));
+                    audit_ok = audit_ok && revoked_ok;
+                }
                 if (!audit_ok) {
                     mcp_audit("error", "audit_persist_failed");
                     res.set_content(

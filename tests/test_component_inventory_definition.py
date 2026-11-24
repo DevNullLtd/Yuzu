@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """test_component_inventory_definition.py -- ties the C++ row grammar of the component_inventory
 plugin (component_scan.hpp format_component_row:
-`comp|<java|native>|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>`) to the
-definitions YAML that ships it (one per action, scan and native), so a reordered or renamed result column fails here rather than only in a
+`comp|<java|native|python|node>|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>`) to the
+definitions YAML that ships it (one per action: scan, native, python and node), so a reordered or renamed result column fails here rather than only in a
 dashboard.
 
 Runnable standalone: `python3 tests/test_component_inventory_definition.py` (how meson runs it).
@@ -17,6 +17,7 @@ DEFINITION = REPO_ROOT / "content" / "definitions" / "component_inventory.yaml"
 
 # The status row (`status|scan|<level>|<tokens>`) reuses the first four columns. The server decoder
 # keeps field 0 as the row's discriminator (row_kind), so it must lead.
+ACTIONS = ("scan", "native", "python", "node")
 EXPECTED_COLUMNS = [
     "row_kind", "kind", "name", "version", "version_source", "path", "size", "mtime", "anchor_app",
 ]
@@ -34,8 +35,8 @@ def _definition(action: str) -> dict:
 class ComponentInventoryDefinitionColumns(unittest.TestCase):
     def test_one_definition_per_action(self):
         defs = _definitions()
-        self.assertEqual(len(defs), 2)
-        for action in ("scan", "native"):
+        self.assertEqual(len(defs), len(ACTIONS))
+        for action in ACTIONS:
             d = _definition(action)
             self.assertEqual(d["metadata"]["id"], f"crossplatform.components.{action}")
             self.assertEqual(d["spec"]["execution"]["plugin"], "component_inventory")
@@ -43,12 +44,12 @@ class ComponentInventoryDefinitionColumns(unittest.TestCase):
             self.assertEqual(d["spec"]["platforms"], ["darwin", "linux", "windows"])
 
     def test_row_kind_leads_and_the_columns_match_the_wire_row(self):
-        for action in ("scan", "native"):
+        for action in ACTIONS:
             names = [c["name"] for c in _definition(action)["spec"]["result"]["columns"]]
             self.assertEqual(names, EXPECTED_COLUMNS, action)
 
     def test_row_kind_values_are_the_status_row_and_comp(self):
-        for action in ("scan", "native"):
+        for action in ACTIONS:
             self.assertEqual(_definition(action)["spec"]["result"]["columns"][0]["values"], ["status", "comp"])
 
     def test_native_row_grammar_and_closed_version_sources(self):
@@ -59,6 +60,25 @@ class ComponentInventoryDefinitionColumns(unittest.TestCase):
         self.assertEqual(cols["version_source"]["example"], "filename")
         self.assertEqual(_definition("scan")["spec"]["result"]["columns"][4]["values"],
                          ["filename", "pom", "manifest", "unreadable"])
+
+    def test_python_and_node_closed_version_sources(self):
+        # Both sets sit inside the server's closed comp vocabulary (inventory_blob_v3.hpp
+        # kV3VersionSources), which already holds metadata and package_json.
+        server = {"filename", "pom", "manifest", "metadata", "package_json", "pe", "elf", "macho", "unreadable"}
+        want = {"python": ["metadata", "filename", "unreadable"], "node": ["package_json", "unreadable"]}
+        for action, values in want.items():
+            cols = {c["name"]: c for c in _definition(action)["spec"]["result"]["columns"]}
+            self.assertEqual(cols["version_source"]["values"], values, action)
+            self.assertLessEqual(set(values), server, action)
+            self.assertEqual(cols["kind"]["example"], action)
+            self.assertIn(cols["version_source"]["example"], values)
+
+    def test_python_and_node_ship_enabled(self):
+        for action in ("python", "node"):
+            text = " ".join(_definition(action)["metadata"]["description"].split())
+            self.assertNotIn("kill-switch", text, action)
+            self.assertNotIn("switched off", text, action)
+            self.assertIn("ships enabled", text, action)
 
     def test_native_definition_states_the_default_off_contract_and_the_bounds(self):
         d = _definition("native")

@@ -3,6 +3,7 @@
 #include <yuzu/server/auth_db.hpp>
 
 #include "audit_store.hpp"
+#include "bulk_read_slots.hpp" // kMaxBulkReadSlots (--hardware-ci-read-concurrency bound)
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
@@ -351,6 +352,16 @@ int main(int argc, char* argv[]) {
         ->default_val(16)
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_POSTGRES_POOL_SIZE");
+    app.add_option("--hardware-ci-read-concurrency", cfg.hardware_ci_read_concurrency,
+                   "Max bulk device-CI reads (GET /api/v1/hardware-ci and the MCP "
+                   "list_hardware_ci_records tool) that may hold a PostgreSQL connection at once on "
+                   "this server (1-8). Default: min(2, max(1, pool/4)) for the effective "
+                   "--postgres-pool-size, logged at boot. Capped at half the pool "
+                   "(rounded down, minimum 1; a higher explicit value refuses boot). A read "
+                   "over the cap waits 500 ms, then gets a retryable 503. "
+                   "Fleet-wide capacity is this value x the number of server replicas.")
+        ->check(CLI::Range(1, yuzu::server::kMaxBulkReadSlots))
+        ->envname("YUZU_HARDWARE_CI_READ_CONCURRENCY");
     app.add_option("--shutdown-drain-seconds", cfg.shutdown_drain_seconds,
                    "On shutdown, keep serving for at least this many seconds after /readyz "
                    "starts answering 503, so a load balancer stops routing here before the "
@@ -644,6 +655,15 @@ int main(int argc, char* argv[]) {
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_AUTH_LOCKOUT_WINDOW_SECS");
 
+    app.add_option("--auth-pbkdf2-per-source-cap", cfg.auth_pbkdf2_per_source_cap,
+                   "Concurrent password-hash (PBKDF2) slots one client address may hold on the "
+                   "unauthenticated login lane (default: 4, range 1-64). The address is the TCP "
+                   "peer: behind a reverse proxy, load balancer or NAT every user shares it, so "
+                   "raise this to the expected concurrent-login burst through that address.")
+        ->default_val(4)
+        ->check(CLI::Range(1, 64))
+        ->envname("YUZU_AUTH_PBKDF2_PER_SOURCE_CAP");
+
     // JIT admin elevation — SOC 2 CC6.3/CC6.6. See docs/auth-architecture.md.
     app.add_option("--jit-max-elevation-secs", cfg.jit_max_elevation_secs,
                    "Maximum lifetime (seconds) of a time-boxed admin elevation granted via "
@@ -890,7 +910,9 @@ int main(int argc, char* argv[]) {
     bool break_glass_arm = false;
     app.add_flag("--break-glass-arm", break_glass_arm,
                  "Break-glass: arm --break-glass-user for the configured window, then exit "
-                 "(audited; enables local login under --auth-mode=sso-only)");
+                 "(audited; enables local login under --auth-mode=sso-only). Arming also resets "
+                 "the account's second-factor failure lock; the exemption is from the password "
+                 "lockout only, so the MFA failure budget still applies to it afterwards.");
 
     // NVD CVE feed options
     int nvd_sync_hours = 4;
@@ -2231,7 +2253,7 @@ int main(int argc, char* argv[]) {
         ev.target_id = cfg.break_glass_user;
         ev.result = "success";
         ev.detail = std::format("break-glass armed until {} ({}s window) via --break-glass-arm "
-                                "CLI (os_identity={})",
+                                "CLI (os_identity={}); any MFA failure lock on the account was reset",
                                 armed->armed_until, cfg.break_glass_window_secs, os_user);
         if (!audit->log(ev)) {
             // COMPENSATING UN-ARM (review #1735 HIGH-2): the mandatory evidence

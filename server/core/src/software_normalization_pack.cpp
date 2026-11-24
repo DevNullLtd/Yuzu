@@ -122,12 +122,12 @@ std::expected<ParsedPack, std::string> parse_normalization_pack(std::string_view
         row.title = prod.title;
 
         if (!f[5].empty()) {
-            const NormalizedTitle col = normalize_title(f[5]);
-            if (col.edition.empty() || !col.title.empty())
+            const std::string col = normalize_edition(f[5]);
+            if (col.empty())
                 return std::unexpected(line_error(line_no, "edition is not a recognised edition token"));
-            if (!nt.edition.empty() && nt.edition != col.edition)
+            if (!nt.edition.empty() && nt.edition != col)
                 return std::unexpected(line_error(line_no, "edition contradicts raw_name"));
-            row.edition = col.edition;
+            row.edition = col;
         } else {
             row.edition = nt.edition;
         }

@@ -514,3 +514,139 @@ TEST_CASE("WebhookStore[pg]: deliveries past a full queue count reason=queue_ful
     CHECK(store->delivery_pool_pending() == 0);
 }
 #endif // !YUZU_TSAN_BUILD
+
+// ── (#4816): destination-address guard ────────────────────────────────
+
+TEST_CASE("WebhookStore[pg]: a literal link-local or metadata URL is refused at create",
+          "[webhook_store][pg][security]") {
+    WebhookStorePg store;
+    for (const char* u : {"http://169.254.169.254/latest/meta-data/", "http://0.0.0.0:22/x",
+                          "http://[fe80::1]/x", "http://224.0.0.1/x"}) {
+        INFO(u);
+        auto r = store->create_webhook(u, "agent.registered", "secret");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == WebhookWriteError::destination_refused); // distinct from a typo
+    }
+    // Numeric spellings the OS resolver reads as such an address are refused too.
+    for (const char* u : {"http://2852039166/", "http://0xa9fea9fe/", "http://0/"}) {
+        INFO(u);
+        auto r = store->create_webhook(u, "agent.registered", "secret");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == WebhookWriteError::destination_refused);
+    }
+    // A typo is still invalid_url, not destination_refused.
+    {
+        auto r = store->create_webhook("ftp://example.com/x", "agent.registered", "secret");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == WebhookWriteError::invalid_url);
+    }
+    // Loopback and private receivers are still accepted (owner ruling: not part of this slice).
+    CHECK(store->create_webhook("http://127.0.0.1:1/h", "agent.registered", "").has_value());
+    CHECK(store->create_webhook("http://10.1.2.3/h", "agent.registered", "").has_value());
+}
+
+TEST_CASE("WebhookStore[pg]: a stored row aimed at a metadata address is never connected to",
+          "[webhook_store][pg][security]") {
+    WebhookStorePg store;
+    yuzu::MetricsRegistry metrics;
+    store->set_metrics(&metrics);
+    int sink_calls = 0;
+    std::string sink_cause;
+    store->set_delivery_refused_sink([&](std::int64_t, std::string_view cause, std::string_view,
+                                         const std::string&) {
+        ++sink_calls;
+        sink_cause = std::string{cause};
+    });
+    auto id = store->create_webhook("http://127.0.0.1:1/h", "agent.registered", "");
+    REQUIRE(id.has_value());
+    // A row written without going through create (direct SQL): delivery-time vetting must still refuse.
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(), "UPDATE webhook_store.webhooks SET url = $2 WHERE id = $1::bigint",
+            std::vector<std::string>{std::to_string(*id), "http://169.254.169.254/latest/meta-data/"});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+    store->fire_event("agent.registered", R"({"k":"v"})");
+    auto deliveries = wait_for_deliveries(*store, *id, 1);
+    REQUIRE(deliveries.size() == 1);
+    CHECK(deliveries[0].error == "destination_refused"); // never "connection_failed": no connect
+    CHECK(deliveries[0].status_code == 0);
+    // Counted as a refusal, NOT as a failed delivery, and the audit sink saw it.
+    CHECK(metrics.counter("yuzu_server_webhook_delivery_refused_total",
+                          {{"cause", "destination_refused"}}).value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_webhook_delivery_failed_total").value() == 0.0);
+    CHECK(sink_calls == 1);
+    CHECK(sink_cause == "destination_refused");
+}
+
+// ── no second POST once a request may have reached the receiver ─────────────
+
+#include "test_raw_listener.hpp"
+
+namespace {
+// Fire one event at `host:port` through a store whose lookup answers `addrs` (in that order) and
+// return the delivery count seen. The listener(s) accept and drop the request.
+void fire_with_lookup(WebhookStorePg& store, std::vector<std::string> addrs, int port,
+                      std::vector<WebhookDelivery>& out) {
+    store->set_lookup_for_test([addrs](const std::string&) {
+        net::ResolveResult r;
+        r.status = net::ResolveStatus::kOk;
+        r.addresses = addrs;
+        return r;
+    });
+    auto id = store->create_webhook("http://multi.test:" + std::to_string(port) + "/h",
+                                    "agent.registered", /*secret=*/"");
+    REQUIRE(id.has_value());
+    store->fire_event("agent.registered", R"({"k":"v"})");
+    out = wait_for_deliveries(*store, *id, 1, std::chrono::seconds(30));
+}
+} // namespace
+
+TEST_CASE("WebhookStore[pg]: a name with two addresses is not POSTed to twice once the first connected",
+          "[webhook_store][pg][security]") {
+    WebhookStorePg store;
+    auto pair = yuzu::test::open_dual_stack_pair();
+    if (!pair) {
+        SKIP("no IPv4+IPv6 loopback listener pair could be bound on one port in this environment");
+    }
+    // IPv4 is tried first whatever the order. The IPv4 listener accepts the connection and drops it
+    // without answering: a READ error after connecting, so the request may have reached the
+    // receiver. A delivery that moved on to ::1 after this error would POST the same event twice.
+    std::vector<WebhookDelivery> deliveries;
+    fire_with_lookup(store, {"::1", "127.0.0.1"}, pair->v4->port, deliveries);
+    REQUIRE(deliveries.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(pair->v4->accepted.load() == 1);
+    CHECK(pair->v6->accepted.load() == 0); // no second POST
+}
+
+TEST_CASE("WebhookStore[pg]: a connect that FAILS moves on to the next address and the POST arrives once",
+          "[webhook_store][pg][security]") {
+    WebhookStorePg store;
+    yuzu::test::RawListener v4;
+    REQUIRE(v4.open(AF_INET, 0));
+    // 127.0.0.2 has no listener on this port: ECONNREFUSED (a failed connect, nothing sent), so the
+    // loop moves on to 127.0.0.1, where the request arrives exactly once.
+    std::vector<WebhookDelivery> deliveries;
+    fire_with_lookup(store, {"127.0.0.2", "127.0.0.1"}, v4.port, deliveries);
+    REQUIRE(deliveries.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(v4.accepted.load() == 1);
+}
+
+TEST_CASE("WebhookStore[pg]: a connect that TIMES OUT also moves on, and still delivers once",
+          "[webhook_store][pg][security]") {
+    WebhookStorePg store;
+    yuzu::test::RawListener v4;
+    REQUIRE(v4.open(AF_INET, 0));
+    // 10.255.255.1 is a non-routable private address: the connect either times out or is refused
+    // depending on the network (a sandbox may refuse at once). Both are "no connection was made", so
+    // both fall through to the listener at 127.0.0.1, exactly once. Nothing was sent to the first.
+    std::vector<WebhookDelivery> deliveries;
+    fire_with_lookup(store, {"10.255.255.1", "127.0.0.1"}, v4.port, deliveries);
+    REQUIRE(deliveries.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(v4.accepted.load() == 1);
+}

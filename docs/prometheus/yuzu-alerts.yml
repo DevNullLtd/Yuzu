@@ -3356,7 +3356,7 @@ groups:
       - alert: YuzuDispatchTargetRejected
         expr: |
           sum by (route, reason) (
-            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os"}[15m])
+            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os|param_key_invalid"}[15m])
           ) > 3
         labels:
           severity: warning
@@ -3401,7 +3401,12 @@ groups:
             reason="kill_switched_os" (#5294) are excluded for the same reason:
             a withheld dispatch to a plugin absent from the target, or to an OS
             whose switch is off, is the control working, audited as
-            command.dispatch_withheld. reason values
+            command.dispatch_withheld. reason="param_key_invalid" (a params key with a control
+            byte, NUL or invalid UTF-8, or a NUL value, refused at the ingress) is excluded
+            for a different reason: it is a refused malformed request, never a request that
+            named no device, and one client looping on it must not page as a targeting
+            near-miss (the audit row `reason=param_key_invalid` and the counter are the
+            evidence). reason values
             "query_truncated"/"poison_excluded"/"parse_error_excluded" (#4496 + follow-up,
             route="result_set_inventory_query") are NOT excluded from the
             expression, unlike quarantined above: a well-formed, correctly-targeted
@@ -5640,8 +5645,9 @@ groups:
       # per-device unrepresented-pending read and the per-device order read:
       # their degrade is a REST 503 / MCP error, never an empty result, and
       # does not touch either gauge; dex_usage covers the fleet application usage
-      # read behind GET /api/v1/dex/apps/usage: its degrade is a 503, never zero
-      # figures), each
+      # read behind GET /api/v1/dex/apps/usage and the dashboard Apps tab Usage
+      # view (GET /fragments/dex/apps/usage): its degrade is a 503 on REST and a
+      # 200 panel on the dashboard, never zero figures), each
       # keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
       # on guardian_state for the Apps list's in-flight budget, and
@@ -5725,8 +5731,12 @@ groups:
             retryable 503 because four were already running; look for a
             caller polling it in parallel.
             source="dex_usage" means the fleet application usage read behind
-            GET /api/v1/dex/apps/usage is degrading. It fails closed: the
-            request is a 503 naming the reason, never a 200 with zero figures.
+            GET /api/v1/dex/apps/usage and the dashboard Apps tab Usage view
+            (GET /fragments/dex/apps/usage), which share one read, is degrading.
+            It fails closed and never shows zero figures: the REST request is a
+            503 naming the reason, and the dashboard answers a 200 panel that
+            says the usage could not be read, so yuzu_http_requests_total does
+            not show a dashboard degrade.
             reason="concurrency_budget" is the same in-flight budget refusal
             (four at once, retryable). reason="statement_timeout" is the read
             running past its 10 s bound; three in a row spanning two minutes with
@@ -8902,50 +8912,51 @@ groups:
     # No alert on the echo.status registry_* keys yet (no fleet gauge); decision and follow-up in
     # docs/observability-conventions.md (#6521).
     rules:
-      # The gauge counts agents once per sweep, so a rise is a net rise in the agents reporting a
-      # quarantine history, not an event count (limits spelled out in the description). It is a gauge, so `delta`, not `increase`: an
-      # agent that leaves and returns takes the count down and back up, and `increase` would
-      # read the return as a rise. `for: 0m`: a rise is an event, a sustained condition would
-      # never clear. Warning, not critical: the value is agent-self-reported inside the
-      # heartbeat trust boundary, so one forged or buggy agent can raise it.
+      # NEW quarantines, counted at the source (#7486, alert half of #5033). The server counts
+      # one per echo.db corruption audit row it writes (yuzu_server_echo_db_quarantines_total):
+      # the audit gate writes a row only for a (agent, quarantine identity) it has not recorded
+      # and the audit store does not already hold, so an agent returning from offline, a failover
+      # and a reconnect wave add nothing. The alert used to watch yuzu_fleet_echo_db_corruption_agents,
+      # a population gauge that rises whenever agents with an old quarantine reconnect; that
+      # gauge stays published but no rule reads it.
       #
-      # THE RESTART GUARD. The server publishes the gauge every sweep, 0 included, over agents
-      # with a live heartbeat, so a restarted replica starts at 0 and ramps back to N as agents
-      # reconnect. About an hour later the 1h window start slides into that ramp and
-      # `delta(...[1h]) > 0` fires with no new corruption (the same happens on a series younger
-      # than 1h). `unless ... (yuzu_server_uptime_seconds < 3900)` suppresses the rule for the
-      # first 65 minutes of a replica's life: the 1h window plus a 5 minute reconnect ramp. A
-      # real rise stays visible to `delta[1h]` for an hour, so the guard loses a rise inside the
-      # first ~5 minutes of a boot and delays one later in the first 65. If agents take longer than 5 minutes to
-      # reconnect, the tail of the ramp can still leak. An absent uptime series suppresses
-      # nothing. The join is `on (job, instance)` because the guard is about one replica's own
-      # uptime (both series must come from the same scrape job and target, as the shipped scrape
-      # config does; otherwise the guard silently never matches): any label a scrape attaches to only one of the two series would otherwise
-      # defeat the join and silence the guard, and `on (job)` alone would let a young sibling
-      # replica silence an old one (pinned by the two-replica case). The 1h any-rise threshold
-      # is the #5065 starting default, not sized from fleet data.
+      # `increase`, not `delta`: it is a counter, and increase() handles the reset a restart
+      # causes. The server pre-seeds the counter to 0 at boot, so the first quarantine reads as
+      # an increase from 0; a series whose first sample is already 1 shows no increase (pinned by
+      # CORRUPTION CASE 5), so the pre-seed is load-bearing. A replica that goes stale and returns at 0
+      # (a rolling restart) adds nothing, so no uptime guard is needed. `sum by (job)` makes one
+      # alert per job however many replicas recorded one. `for: 0m`: a quarantine is an event; a
+      # sustained condition would never clear. Warning, not critical: the value is
+      # agent-self-reported inside the heartbeat trust boundary, so one forged or buggy agent can
+      # raise it, and it is a count of audit rows written: a row pruned by audit retention and
+      # reported again, or two HA replicas racing on one identity, counts twice, and a crash
+      # between the write and the scrape loses a count. Any increase in 1h is a starting default
+      # (the #5065 one, now over a counter), not sized from fleet data.
       - alert: YuzuEchoDbCorruptionDetected
         expr: |
-          delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0
-            unless on (job, instance) (yuzu_server_uptime_seconds < 3900)
+          sum by (job) (increase(yuzu_server_echo_db_quarantines_total[1h])) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "The count of agents with a quarantined Echo database rose in the last hour"
+          summary: "An agent quarantined its Echo database in the last hour"
           description: >-
-            At least one more agent than an hour ago reports that its Echo database failed its
-            integrity check and was quarantined. This is a net rise in the agents reporting a
-            quarantine history, not an event count: the gauge counts agents once per sweep, so an
-            agent returning from offline with an old quarantine raises it, a repeat quarantine on
-            an agent already counted does not, and an agent leaving in the same window can mask
-            one arriving. A rise seen while the reporting replica has been up under 65 minutes is
-            held until the guard lifts. A failover, a rolling upgrade, agents returning after a
-            site or gateway outage, or ordinary endpoint churn can all raise it with no new
-            corruption, once per replica that gains agents; treat it as a ticket, not a page. The
-            signal is agent-self-reported, so one agent can raise or mask it; the
-            echo.db.corruption_quarantined audit rows name the affected agents but corroborate
-            rather than prove it.
+            The server recorded at least one new Echo database quarantine in the last hour: an
+            agent's echo.db failed its integrity check and was moved aside. Open the
+            echo.db.corruption_quarantined audit rows to see which agents, then check each
+            agent's log for the cause (disk fault, full disk, unclean shutdown). Each row is a
+            new quarantine identity, so an agent returning from offline, a failover and a
+            reconnect wave add none. Any increase in an hour fires: that is a starting default,
+            not sized from fleet data. The count is the server's own audit-row writes, so a row
+            pruned by audit retention and reported again, or two HA replicas racing on one
+            identity, counts twice, and a crash between a write and the next scrape loses that
+            count; the audit rows stay the record. No alert does not mean no quarantine: a
+            quarantine a replica records before Prometheus has scraped it once can be missed (the
+            first sample is already above 0), and no row is written, so none is counted, while the
+            audit store is closed or the gate is waiting out a failed audit lookup or write (every
+            agent after an agent's first failure; only that agent when it fails again, for up to
+            16 failing agents the gate remembers). The signal is agent-self-reported, so one agent
+            can raise it; treat it as a ticket, not a page.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
 
       # DECISION (#6696): one generic rule keyed on the plugin label, not an Echo-only twin; the
@@ -8990,20 +9001,23 @@ groups:
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
 
       # Echo loaded OFFLINE because its database could not be opened (a failed v10 roll-up
-      # migration, or too little free disk for it) and is retrying in the background (#7290). Such
+      # migration, or too little free disk for it) and is retrying in the background (#7290), or
+      # because the database opened and was then closed at run time after a transaction could not
+      # be rolled back (rollback_wedged, #8099: not retried, only an agent restart recovers). Such
       # an agent no longer fails the plugin's init, so it is NOT in yuzu_fleet_plugin_init_failed:
       # this rule is what replaces that signal. The family has a fixed label set (free_space,
-      # migration_failed, open_failed, unknown) published every sweep, 0 included, so `> 0`
-      # selects only the reasons with agents. Same expression shape as YuzuPluginInitFailed
+      # migration_failed, open_failed, rollback_wedged, unknown) published every sweep, 0 included,
+      # so `> 0` selects only the reasons with agents. Same expression shape as YuzuPluginInitFailed
       # (max_over_time[5m] rides over a replica restart's one absent sample, `sum by` drops
       # `instance` so an agent moving replicas does not reset the clock).
       #
       # `for: 30m` is a DESIGN value derived from the agent's retry schedule (1, 5 and 15 minutes,
       # then hourly; the three quick retries finish about 21 minutes after the start), so a
       # transient condition such as a briefly full disk or a held lock has had its quick retries
-      # before anyone is told. It is not fitted to fleet data. Warning, not critical: the agent
-      # keeps retrying on its own (bar a collection-start failure, which needs an agent restart)
-      # and the value is agent-self-reported.
+      # before anyone is told. It is not fitted to fleet data (a rollback_wedged store is not
+      # retried, so the hold only delays that alert). Warning, not critical: the agent keeps
+      # retrying on its own (bar a collection-start failure and a rollback_wedged store, which
+      # need an agent restart) and the value is agent-self-reported.
       - alert: YuzuEchoStorageOffline
         expr: |
           sum by (job, reason) (max_over_time(yuzu_fleet_echo_storage_offline[5m])) > 0
@@ -9015,16 +9029,18 @@ groups:
           description: >-
             For more than 25 minutes, about {{ $value }} agent(s) (summed across core replicas,
             so a failover can count one twice for a few minutes) have reported that their Echo
-            database could not be opened and Echo is offline (heartbeat tag
-            yuzu.plugin.echo.storage_offline), reason {{ $labels.reason }}: free_space is too
-            little free disk for the v10 roll-up migration, migration_failed is a migration that
-            failed or ran past its deadline and was rolled back with the old data intact,
-            open_failed is any other failure on a retry. reason="unknown" sums values the server
-            does not recognise. Nothing is collected on an affected endpoint, but the agent keeps
-            retrying (1, 5 and 15 minutes, then hourly) and recovers by itself once the cause is
-            gone, except an open_failed where the database opened but collection failed to start:
-            that is not retried and needs an agent restart. The agent log and `echo status` on
-            the device name the cause. The value and the reason are agent-self-reported, so the
+            database could not be opened, or was closed at run time after a failed rollback, and
+            Echo is offline (heartbeat tag yuzu.plugin.echo.storage_offline), reason
+            {{ $labels.reason }}: free_space is too little free disk for the v10 roll-up
+            migration, migration_failed is a migration that failed or ran past its deadline and
+            was rolled back with the old data intact, open_failed is any other failure on a retry,
+            rollback_wedged is a database that opened and was then closed because a transaction
+            could not be rolled back. reason="unknown" sums values the server does not recognise.
+            Nothing is collected on an affected endpoint, but the agent keeps retrying (1, 5 and
+            15 minutes, then hourly) and recovers by itself once the cause is gone, except an
+            open_failed where the database opened but collection failed to start and every
+            rollback_wedged: neither is retried and both need an agent restart. The agent log and
+            `echo status` on the device name the cause. The value and the reason are agent-self-reported, so the
             signal is not authoritative.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/echo-storage-offline.md"
 

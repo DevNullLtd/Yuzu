@@ -52,7 +52,7 @@ namespace yuzu::server::mcp {
 namespace {
 
 // The record schemas below spell the agent_id bound as a literal; this keeps it tied to the
-// bound id_is_audit_safe actually enforces.
+// bound auth::agent_id_is_audit_safe actually enforces.
 static_assert(auth::kMaxAgentIdLength == 256,
               "get_hardware_ci's agent_id maxLength literal must match auth::kMaxAgentIdLength");
 
@@ -63,7 +63,7 @@ constexpr const char* kGetOutputSchema =
     R"j({"type":"object","properties":{"agent_id":{"type":["string","null"]},"hostname":{"type":["string","null"]},"os":{"type":["string","null"]},"online":{"type":"boolean"},"last_seen":{"type":["string","null"]},"identity_state":{"type":"string","enum":["found","absent","degraded"]},"ci":{"type":["object","null"],"properties":{"manufacturer":{"type":["string","null"]},"model":{"type":["string","null"]},"serial":{"type":["string","null"]},"system_uuid":{"type":["string","null"]},"domain":{"type":["string","null"]},"ou":{"type":["string","null"]},"bios_vendor":{"type":["string","null"]},"bios_version":{"type":["string","null"]},"bios_date":{"type":["string","null"]},"cpu_model":{"type":["string","null"]},"cpu_cores":{"type":["integer","null"]},"cpu_threads":{"type":["integer","null"]},"ram_bytes":{"type":["integer","null"]},"disks_summary":{"type":["string","null"]},"primary_mac":{"type":["string","null"]},"macs_summary":{"type":["string","null"]},"nic_count":{"type":["integer","null"]},"os_name":{"type":["string","null"]},"os_version":{"type":["string","null"]},"os_build":{"type":["string","null"]},"arch":{"type":["string","null"]},"first_seen":{"type":"integer"},"last_seen":{"type":"integer"},"chassis_type":{"type":["string","null"]},"chassis_serial":{"type":["string","null"]},"chassis_asset_tag":{"type":["string","null"]},"chassis_source":{"type":["string","null"]},"board_vendor":{"type":["string","null"]},"board_product":{"type":["string","null"]},"board_serial":{"type":["string","null"]},"board_source":{"type":["string","null"]},"machine_id_hash":{"type":["string","null"]},"machine_id_algorithm":{"type":["string","null"]},"machine_id_source":{"type":["string","null"]},"sections":{"type":["array","null"],"description":"Per-section status and rows in registry order. Not emitted as null today: a failed sections read is the retryable error, and an unreadable record makes ci itself null. An empty array means none stored, not that the device has none.","items":{"type":"object","properties":{"kind":{"type":"string"},"status":{"type":["string","null"]},"reason":{"type":["string","null"]},"source":{"type":["string","null"]},"complete":{"type":"boolean"},"rows":{"type":"array","items":{"type":"object","description":"Cells are strings; parse numerics using the unit in the column name. Unread values are null.","additionalProperties":{"type":["string","null"]}}}},"required":["kind","status","reason","source","complete","rows"]}}},"required":["manufacturer","model","serial","system_uuid","domain","ou","bios_vendor","bios_version","bios_date","cpu_model","cpu_cores","cpu_threads","ram_bytes","disks_summary","primary_mac","macs_summary","nic_count","os_name","os_version","os_build","arch","first_seen","last_seen","chassis_type","chassis_serial","chassis_asset_tag","chassis_source","board_vendor","board_product","board_serial","board_source","machine_id_hash","machine_id_algorithm","machine_id_source","sections"]},"ci_state":{"type":"string","enum":["found","absent","degraded"]},"sections_state":{"type":"string","enum":["found","absent","degraded"],"description":"found: sections are stored. absent: none stored (an older agent or none reported), not that the device has none. degraded: ci itself could not be read (ci is null). A failed sections read is a retryable error instead, never this value."},"software":{"type":["array","null"],"items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"}},"required":["name","version","publisher","install_date"]}},"software_truncated":{"type":"boolean"},"tags":{"type":["array","null"],"items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"},"updated_at":{"type":"integer"}},"required":["key","value","source","updated_at"]}},"agent_version":{"type":["string","null"]},"sync_supported":{"type":"boolean"},"software_last_seen":{"type":["integer","null"]}},"required":["agent_id","hostname","os","online","last_seen","identity_state","ci","ci_state","sections_state","software","software_truncated","tags","agent_version","sync_supported","software_last_seen"]})j";
 
 constexpr const char* kRecordsOutputSchema =
-    R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"],"description":"The hostname in the stored CI record (the last daily sync); null when empty or the literal unknown."},"ci":{"type":"object","properties":{"manufacturer":{"type":["string","null"]},"model":{"type":["string","null"]},"serial":{"type":["string","null"]},"system_uuid":{"type":["string","null"]},"domain":{"type":["string","null"]},"ou":{"type":["string","null"]},"bios_vendor":{"type":["string","null"]},"bios_version":{"type":["string","null"]},"bios_date":{"type":["string","null"]},"cpu_model":{"type":["string","null"]},"cpu_cores":{"type":["integer","null"]},"cpu_threads":{"type":["integer","null"]},"ram_bytes":{"type":["integer","null"]},"disks_summary":{"type":["string","null"]},"primary_mac":{"type":["string","null"]},"macs_summary":{"type":["string","null"]},"nic_count":{"type":["integer","null"]},"os_name":{"type":["string","null"]},"os_version":{"type":["string","null"]},"os_build":{"type":["string","null"]},"arch":{"type":["string","null"]},"first_seen":{"type":"integer"},"last_seen":{"type":"integer"},"chassis_type":{"type":["string","null"]},"chassis_serial":{"type":["string","null"]},"chassis_asset_tag":{"type":["string","null"]},"chassis_source":{"type":["string","null"]},"board_vendor":{"type":["string","null"]},"board_product":{"type":["string","null"]},"board_serial":{"type":["string","null"]},"board_source":{"type":["string","null"]},"machine_id_hash":{"type":["string","null"]},"machine_id_algorithm":{"type":["string","null"]},"machine_id_source":{"type":["string","null"]}},"required":["manufacturer","model","serial","system_uuid","domain","ou","bios_vendor","bios_version","bios_date","cpu_model","cpu_cores","cpu_threads","ram_bytes","disks_summary","primary_mac","macs_summary","nic_count","os_name","os_version","os_build","arch","first_seen","last_seen","chassis_type","chassis_serial","chassis_asset_tag","chassis_source","board_vendor","board_product","board_serial","board_source","machine_id_hash","machine_id_algorithm","machine_id_source"]},"content_hash":{"type":["string","null"],"description":"The stored hash of the device's CI record. Equal to your copy means the stored record is unchanged apart from first_seen and last_seen, which can move without a hash change (always take last_seen from the row); unequal means re-read it (it also covers section rows this tool does not return)."},"blob_version":{"type":"integer","description":"1 = the older 22-field record (chassis, board and machine-id values are null), 2 = the versioned record."}},"required":["agent_id","hostname","ci","content_hash","blob_version"]}},"next_cursor":{"type":"string","description":"Pass it back as cursor for the next page. Empty means there is nothing further to read."},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the pages describe only devices within that scope. A status, set whether or not any device was hidden."}},"required":["devices","next_cursor"]})j";
+    R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"],"description":"The hostname in the stored CI record (the last daily sync); null when empty or the literal unknown."},"ci":{"type":"object","properties":{"manufacturer":{"type":["string","null"]},"model":{"type":["string","null"]},"serial":{"type":["string","null"]},"system_uuid":{"type":["string","null"]},"domain":{"type":["string","null"]},"ou":{"type":["string","null"]},"bios_vendor":{"type":["string","null"]},"bios_version":{"type":["string","null"]},"bios_date":{"type":["string","null"]},"cpu_model":{"type":["string","null"]},"cpu_cores":{"type":["integer","null"]},"cpu_threads":{"type":["integer","null"]},"ram_bytes":{"type":["integer","null"]},"disks_summary":{"type":["string","null"]},"primary_mac":{"type":["string","null"]},"macs_summary":{"type":["string","null"]},"nic_count":{"type":["integer","null"]},"os_name":{"type":["string","null"]},"os_version":{"type":["string","null"]},"os_build":{"type":["string","null"]},"arch":{"type":["string","null"]},"first_seen":{"type":"integer"},"last_seen":{"type":"integer"},"chassis_type":{"type":["string","null"]},"chassis_serial":{"type":["string","null"]},"chassis_asset_tag":{"type":["string","null"]},"chassis_source":{"type":["string","null"]},"board_vendor":{"type":["string","null"]},"board_product":{"type":["string","null"]},"board_serial":{"type":["string","null"]},"board_source":{"type":["string","null"]},"machine_id_hash":{"type":["string","null"]},"machine_id_algorithm":{"type":["string","null"]},"machine_id_source":{"type":["string","null"]}},"required":["manufacturer","model","serial","system_uuid","domain","ou","bios_vendor","bios_version","bios_date","cpu_model","cpu_cores","cpu_threads","ram_bytes","disks_summary","primary_mac","macs_summary","nic_count","os_name","os_version","os_build","arch","first_seen","last_seen","chassis_type","chassis_serial","chassis_asset_tag","chassis_source","board_vendor","board_product","board_serial","board_source","machine_id_hash","machine_id_algorithm","machine_id_source"]},"content_hash":{"type":["string","null"],"description":"The stored hash of the device's CI record. Equal to your copy means the stored record is unchanged apart from first_seen and last_seen, which can move without a hash change (always take last_seen from the row); unequal means re-read it (it also covers section rows this tool does not return)."},"blob_version":{"type":"integer","description":"1 = the older 22-field record (chassis, board and machine-id values are null), 2 = the versioned record."}},"required":["agent_id","hostname","ci","content_hash","blob_version"]}},"next_cursor":{"type":"string","description":"Pass it back as cursor for the next page. Empty means there is nothing further to read; non-empty means more remain, even when the page is shorter than limit."},"page_bytes_capped":{"type":"boolean","enum":[true],"description":"Present (true) only when the page ended early at the response byte budget (1 MiB of device rows on MCP) rather than at limit: the page is shorter than limit and next_cursor is non-empty. Keep following next_cursor. A page always holds at least one device."},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the pages describe only devices within that scope. A status, set whether or not any device was hidden."}},"required":["devices","next_cursor"]})j";
 
 // ── shared answers ─────────────────────────────────────────────────────────
 
@@ -94,6 +94,17 @@ void answer_roster_unreadable(const ToolCallContext& ctx, const char* verb, cons
                               const std::string& target_id, const std::string& domain_detail) {
     answer_store_unreadable(ctx, "hardware roster unavailable", verb, target_type, target_id,
                             domain_detail);
+}
+
+// The bulk read was refused as busy (hardware_ci_page::ReadError::kBusy): this replica is at its
+// bulk-read cap and nothing was read or served. It writes NO audit row, exactly like REST: a refusal
+// holds no bulk-read slot, so an audit INSERT here would be a writer outside the cap that a locked
+// audit table could park on a pooled connection (#7951). `yuzu_hardware_ci_read_busy_total` is the
+// record of a refusal. The envelope omits audit_persisted (nothing was meant to persist), like
+// answer_audit_withheld. The error is retryable with the failure table's hint.
+void answer_read_busy(const ToolCallContext& ctx, const hardware_ci_page::ReadFailure& f) {
+    answer(ctx, ctx.a4_error(kInternalError, std::string(f.message), std::string(f.remediation),
+                             f.retry_after_ms, {}, /*audit_ok=*/true));
 }
 
 // Either access row was dropped: the personal data is NOT served. The message already says
@@ -219,11 +230,22 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     }
     // deps->ci_collation_gate: the collation gate (device_ci_read_gate.hpp); not Trusted refuses
     // the page before the store is asked. Null means no gate was wired (tests only).
-    const auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope,
-                                                  deps->ci_collation_gate);
+    // deps->ci_read_slots: the bulk-read concurrency cap (bulk_read_slots.hpp), the same instance
+    // REST uses, held across the store call and this page's two audit rows (Page::hold); a point
+    // read (agent_id) takes none. Null means no cap (tests only).
+    auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope,
+                                            deps->ci_collation_gate, deps->ci_read_slots,
+                                            hardware_ci_page::kMcpRowBudgetBytes);
     if (!read) {
         // ONE answer per failure, shared with REST (hardware_ci_page::describe_read_error).
         const auto f = hardware_ci_page::describe_read_error(read.error(), hardware_ci_page::Surface::kMcp);
+        if (read.error() == hardware_ci_page::ReadError::kBusy) {
+            // Busy: nothing was read or served, so no audit row at all (see answer_read_busy).
+            if (deps->ci_read_busy_fn)
+                deps->ci_read_busy_fn(hardware_ci_page::Surface::kMcp);
+            answer_read_busy(ctx, f);
+            return;
+        }
         if (f.unavailable) {
             // A failed store read is never an empty page (ADR-0016 section 7).
             answer_store_unreadable(ctx, std::string(f.message).c_str(), "inventory.devices.ci",
@@ -247,7 +269,7 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
                                  {}, domain_ok && generic_ok));
         return;
     }
-    const hardware_ci_page::Page& page = *read;
+    hardware_ci_page::Page& page = *read;
 
     // Both rows are attempted (no short-circuit) so a drop of one never hides the other. A
     // confined caller never receives an out-of-scope row, id or count: the scope is applied in SQL,
@@ -265,6 +287,8 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
         deps->audit_fn, ctx.req, "inventory.devices.ci", outcome,
         hardware_ci_page::audit_target_type(*rq), hardware_ci_page::audit_target_id(*rq), detail_text);
     const bool generic_ok = ctx.audit(outcome, detail_text);
+    // The bulk-read slot was held through both audit writes above (#7951); free it now.
+    page.release_slot();
     if (!domain_ok || !generic_ok) {
         answer_audit_withheld(ctx);
         return;
@@ -292,7 +316,7 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
     // target_id on every row below. A wrongly typed value is refused, never stringified.
     const auto it = ctx.args.find("agent_id");
     if (it == ctx.args.end() || !it->is_string() || it->get_ref<const std::string&>().empty() ||
-        !id_is_audit_safe(it->get_ref<const std::string&>())) {
+        !auth::agent_id_is_audit_safe(it->get_ref<const std::string&>())) {
         const bool audit_ok = ctx.audit("denied", "invalid arguments: agent_id");
         // retry-hint-exempt: caller-input rejection
         answer(ctx, ctx.a4_error(kInvalidParams,
@@ -303,7 +327,7 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
     }
     const std::string agent_id = it->get<std::string>();
 
-    // id_is_audit_safe held above; audit_token also neutralises the structured-detail
+    // auth::agent_id_is_audit_safe held above; audit_token also neutralises the structured-detail
     // delimiters (space, '=', ',') so the id cannot forge an adjacent field (CWE-117).
     const std::string id_suffix = " id=" + audit_token(agent_id);
 
@@ -429,7 +453,10 @@ constexpr ToolRecord kToolRecords[] = {
      "device's last daily-sync snapshot: normally refreshed daily while the agent reports, but a "
      "record can be arbitrarily old until the device is decommissioned, and last_seen is the "
      "staleness signal. "
-     "Rows are in byte order of agent_id (not locale order); limit is 1..1000 (default 20); "
+     "Rows are in byte order of agent_id (not locale order); limit is 1..1000 (default 20); a page "
+     "also ends early when its device rows reach 1 MiB (the page then carries page_bytes_capped "
+     "true and holds at least one device), so a page can be shorter than limit: a non-empty "
+     "next_cursor means more remain, and a short page never means the walk is done; "
      "agent_id restricts the read to one "
      "device (take agent_id values from list_hardware_ci) and an empty devices array with an "
      "agent_id means no record or outside your scope, which are indistinguishable by design. An "
@@ -453,7 +480,13 @@ constexpr ToolRecord kToolRecords[] = {
      "-32602 (a credential with global read has no such limit; otherwise pass agent_id or narrow "
      "the scope); that is terminal, do not retry it. A failed "
      "store read is a retryable error (wait retry_after_ms, 5000, then call once more; do not "
-     "loop), never an empty page. While the database collation version is changed under the stored "
+     "loop), never an empty page. Read one page at a time: the server allows only a few bulk reads "
+     "at once per replica (a limit on the database connections they hold; it does not limit how "
+     "many rows a read fetches), and when every slot is taken the call is refused with a "
+     "retryable error (retry_after_ms 2000: retry the same cursor after the hint with some jitter "
+     "and back off on repeats; one retry usually succeeds, give up after about 5 minutes of "
+     "continuous refusals) and nothing is read; a call with agent_id never waits for or is "
+     "refused on that limit. While the database collation version is changed under the stored "
      "keys, or the check that confirms it has not yet concluded, the read is refused with a "
      "retryable error (retry_after_ms 60000, one more call, not a loop) until the check concludes, "
      "which after a mismatch needs an administrator to repair the database first (see the server "

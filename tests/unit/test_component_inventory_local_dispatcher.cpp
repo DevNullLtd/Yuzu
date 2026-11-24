@@ -20,7 +20,7 @@
  * materialised one, the Windows leg's own behaviour in test_component_fs_win.cpp, and the real
  * end-to-end run is the sample capture taken against a host.
  *
- * MUTATION: adding a third action, changing a declared leg, or loading the wrong plugin fails the
+ * MUTATION: adding a fifth action, changing a declared leg, or loading the wrong plugin fails the
  * descriptor case; putting the planned-leg reporter back on the Windows path, or letting `native`
  * reach the unknown-action guard, fails the Windows case (an `unsupported` row); an exception out of
  * the Windows leg fails it through the internal_error token and the return code; pairing the Windows
@@ -29,6 +29,10 @@
  * the token and path checks where the test account can list it or the walk completes. A constrained
  * status row names its stop cause alone, so those two checks bite only there, and no wire observable
  * separates the two builds otherwise.
+ *
+ * `python` and `node` have no Windows leg yet (#8440): on Windows a dispatch answers the shared planned row at
+ * once, so it is cheap and stays in the shards; removing the report_planned call on that path, or letting
+ * either reach the unknown-action guard or a walk, fails the planned-row case.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -134,7 +138,7 @@ std::optional<LoadedPlugin> load_plugin() {
 
 } // namespace
 
-TEST_CASE("component_inventory plugin: exactly two actions, `scan` and `native`, with the declared legs",
+TEST_CASE("component_inventory plugin: exactly four actions, `scan`, `native`, `python` and `node`, with the declared legs",
           "[runtime][component_inventory][descriptors]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -142,29 +146,37 @@ TEST_CASE("component_inventory plugin: exactly two actions, `scan` and `native`,
         return;
     }
     CHECK(std::string_view{plugin->descriptor->name} == "component_inventory");
-    CHECK(std::string_view{plugin->descriptor->version} == "1.1.0");
+    CHECK(std::string_view{plugin->descriptor->version} == "1.2.0");
 
     std::vector<std::string> actions;
     for (const char* const* a = plugin->descriptor->actions; a && *a; ++a)
         actions.emplace_back(*a);
-    REQUIRE(actions.size() == 2);
+    REQUIRE(actions.size() == 4);
     CHECK(actions[0] == "scan");
     CHECK(actions[1] == "native");
+    CHECK(actions[2] == "python");
+    CHECK(actions[3] == "node");
 
     REQUIRE(plugin->descriptor->action_descriptors != nullptr);
-    REQUIRE(plugin->descriptor->action_descriptor_count == 2);
-    for (std::size_t i = 0; i < 2; ++i) {
+    REQUIRE(plugin->descriptor->action_descriptor_count == 4);
+    for (std::size_t i = 0; i < 4; ++i) {
         const auto& d = plugin->descriptor->action_descriptors[i];
         CHECK(std::string_view{d.action} == actions[i]);
         CHECK(d.linux_leg.support == YUZU_SUPPORT_SUPPORTED);
         CHECK(d.linux_leg.rung == 1);
         CHECK(d.macos_leg.support == YUZU_SUPPORT_SUPPORTED);
         CHECK(d.macos_leg.rung == 1);
-        // Windows is CONSTRAINED until a real capture from a Windows host is committed, and says so.
-        CHECK(d.windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
-        CHECK(d.windows_leg.rung == 1);
-        REQUIRE(d.windows_leg.fallback != nullptr);
-        CHECK(std::string_view{d.windows_leg.fallback}.contains("not yet verified against a real capture"));
+        if (i < 2) {
+            // scan and native: Windows is CONSTRAINED until a real capture from a Windows host is
+            // committed, and says so.
+            CHECK(d.windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+            CHECK(d.windows_leg.rung == 1);
+            REQUIRE(d.windows_leg.fallback != nullptr);
+            CHECK(std::string_view{d.windows_leg.fallback}.contains("not yet verified against a real capture"));
+        } else {
+            // python and node: no Windows leg yet (#8440).
+            CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);
+        }
     }
 }
 
@@ -276,6 +288,25 @@ TEST_CASE("component_inventory plugin: on Windows scan and native answer a real 
                 return r.starts_with("comp|native|") && r.find("|pe|") != std::string::npos;
             }));
         }
+    }
+}
+
+TEST_CASE("component_inventory plugin: on Windows python and node answer the planned row at once",
+          "[component_inventory][actions]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    for (const char* action : {"python", "node"}) {
+        const auto result = dispatcher.run(plugin->descriptor, action);
+        CHECK(result.rc == 0); // a planned leg is not a failed command
+        const auto rows = captured_rows(result.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == std::string{"status|"} + action + "|unsupported|windows:planned");
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
     }
 }
 #endif

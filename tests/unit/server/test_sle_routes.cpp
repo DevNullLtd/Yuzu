@@ -27,18 +27,33 @@
 #include "test_route_sink.hpp"
 
 #include "agent_decommission.hpp" // DecommissionResult (the DELETE route)
+#include "audit_store.hpp"
+#include "auth_routes.hpp" // the REAL scoped gate (S1 route pin)
+#include "oidc_provider.hpp"
+#include "tag_store.hpp"
 #include "device_ci_read_gate.hpp" // kOrderingRetryAfterMs
+#include "management_group_store.hpp"
 #include "rbac_store.hpp"
 #include "software_licensing_store.hpp"
 
 #include "pg/pg_pool.hpp"
 #include "../test_helpers.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg
+#include "test_mgmt_group_pg_helper.hpp" // PG-backed ManagementGroupStore
+
+#include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp> // Config (AuthRoutes ctor)
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -98,9 +113,12 @@ struct SleHarness {
 
     std::vector<AgentLicenseRow> agent_rows;
     DecommissionResult decommission_result{}; // returned by the injected cascade
+    // When set, the route runs THIS instead of returning `decommission_result` (a real cascade).
+    std::function<DecommissionResult(const std::string&)> decommission_override;
 
     std::vector<std::string> audits;     // "action|result"
     std::vector<std::string> audit_full; // "action|result|target_type|target_id"
+    std::vector<std::string> audit_detail; // the detail text of each audit row, same order
     // The (securable_type, operation, agent_id) each SCOPED gate check was ASKED —
     // recorded so a wrong-securable / wrong-op / wrong-scope regression is caught.
     std::vector<std::string> scoped_calls; // "type|op|agent_id"
@@ -133,11 +151,15 @@ struct SleHarness {
                 return std::nullopt;
             return agent_rows;
         };
-        auto decommission = [this](const std::string&) -> DecommissionResult {
+        auto decommission = [this](const std::string& id) -> DecommissionResult {
+            if (decommission_override)
+                return decommission_override(id);
             return decommission_result;
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                            const std::string& tt, const std::string& tid, const std::string&) {
+                            const std::string& tt, const std::string& tid,
+                            const std::string& detail) {
+            audit_detail.push_back(detail);
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             if (!audit_fail_result.empty() && r == audit_fail_result)
@@ -184,6 +206,58 @@ yuzu::test::PgTestTemplate sle_route_tpl{
             throw std::runtime_error("sle_routes template: store failed to migrate");
     }};
 
+// Full-stack rig for the S1 ROUTE pin: a real RbacStore (enforcement on, seeded ITServiceOwner
+// ceiling), a real TagStore, a real ManagementGroupStore, a real ApiTokenStore and a real
+// AuthRoutes wired as ServerImpl wires it, so `require_scoped_permission` is the production gate
+// and not a stub.
+struct ServiceScopeRig {
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    yuzu::server::pg::PgPool pool;
+    RbacStore rbac;
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    TagStore tags;
+    yuzu::server::pg::PgPool audit_pool;
+    AuditStore audit_store;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    std::unique_ptr<AuthRoutes> ar;
+
+    explicit ServiceScopeRig(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool}, tags{pool},
+          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool} {
+        REQUIRE(pool.valid());
+        REQUIRE(rbac.is_open());
+        REQUIRE(tags.is_open());
+        REQUIRE(audit_store.is_open());
+        rbac.set_rbac_enabled(true); // enforcement in effect: a service token is not legacy-open
+        REQUIRE(auth_mgr.upsert_user("minter", "correct-horse-battery-staple", auth::Role::admin));
+        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(), &audit_store,
+                                          &mgmt, &tags, /*analytics_store=*/nullptr, oidc_mu,
+                                          oidc_provider);
+    }
+
+    std::string group(const std::string& name) {
+        ManagementGroup g;
+        g.name = name;
+        g.membership_type = "static";
+        const auto id = mgmt.create_group(g);
+        REQUIRE(id.has_value());
+        return *id;
+    }
+
+    std::string mint_service_token(const std::string& service) {
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+        const auto raw = api_tokens->create_token("s1-route-pin", "minter", now + 3600, service);
+        REQUIRE(raw.has_value());
+        return *raw;
+    }
+};
+
 } // namespace
 
 // ───────────────────── /sle/agents/{id} drill — D-4 scoped gate + G-2 audit ──────
@@ -205,6 +279,37 @@ TEST_CASE("sle drill: demands exactly SoftwareLicensing:Read via the scoped gate
     h.sink.Get("/api/v1/sle/agents/agent-77");
     REQUIRE(h.scoped_calls.size() == 1);
     CHECK(h.scoped_calls[0] == "SoftwareLicensing|Read|agent-77");
+}
+
+// #7811: the id reaches the scoped gate's denial audit and `target_id` on the per-open and the
+// decommission rows, so an over-long or control-byte id is refused with a 400 before the gate, any
+// audit row and the erasure cascade. The gate here admits every device, so a 400 with no gate call
+// proves the id check runs first, where an empty audit log is also true of a route that refuses late.
+TEST_CASE("sle/agents/{id}: an unsafe agent id answers 400 before the scoped gate or any audit row",
+          "[sle_routes][audit]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.agent_rows = {lic("Office", "licensed")};
+    h.decommission_result = ok_result();
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        for (const auto* verb : {"GET", "DELETE"}) {
+            auto res = h.sink.dispatch(verb, "/api/v1/sle/agents/" + id);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(json::parse(res->body)["error"]["message"] == "Invalid device id.");
+        }
+    }
+    CHECK(h.scoped_calls.empty());
+    CHECK(h.audits.empty());
+
+    // A 256-byte printable id is safe and does reach the gate, on both verbs.
+    const std::string edge(256, 'a');
+    CHECK(h.sink.Get("/api/v1/sle/agents/" + edge)->status == 200);
+    CHECK(h.sink.Delete("/api/v1/sle/agents/" + edge)->status == 200);
+    CHECK(h.scoped_calls.size() == 2);
 }
 
 TEST_CASE("sle/agents/{id}: scoped gate — in-scope 200, out-of-scope 403 (D-4)", "[sle][adr0017]") {
@@ -307,9 +412,10 @@ TEST_CASE("sle erase: scoped Decommission:Delete gate — out-of-scope 403, no e
     CHECK(h.audits.empty()); // denied before the attempt audit / cascade
 }
 
-// The route is NAMED for licences but the cascade erases FIVE per-agent stores spanning
-// THREE securables' READ (SoftwareLicensing/software_licensing, Inventory/inventory+
-// software_inventory+device_inventory, GuaranteedState/app_perf_daily). Rather than a
+// The route is NAMED for licences but the cascade erases TEN per-agent stores (when this was written
+// it was FIVE, spanning THREE securables' READ: SoftwareLicensing/software_licensing, Inventory/
+// inventory+software_inventory+device_inventory, GuaranteedState/app_perf_daily; the later stores
+// and ManagementGroup/management_group_memberships joined it). Rather than a
 // hand-maintained conjunction over all three — the shape ADR-0024 Decision 9 REVERSED
 // once a fourth securable was set to join (PLAN-01 ruling (b)) — the gate is now ONE
 // scoped securable, `Decommission:Delete`, that authorizes for the whole blast radius
@@ -398,12 +504,12 @@ TEST_CASE("sle erase: all-Deleted → 200 decommissioned, attempt+success audite
     CHECK(h.audited("sle.agent.decommission|success"));
 }
 
-// #5675: route passthrough only. The handler reports whatever stores the injected cascade result
-// names, so this pins the nine-entry JSON shape and that a Failed Guardian line is not rolled up
+// #5675 / #6352: route passthrough only. The handler reports whatever stores the injected cascade
+// result names, so this pins the ten-entry JSON shape and that a Failed Guardian line is not rolled up
 // into a success. It does not prove the cascade registers or wires the Guardian store: that is
 // the real-store fan-out in test_agent_decommission.cpp and
 // tests/test_decommission_wiring_lexical.py.
-TEST_CASE("sle erase: a nine-entry stores result is passed through per store (route shape)",
+TEST_CASE("sle erase: a ten-entry stores result is passed through per store (route shape)",
           "[sle_routes]") {
     SleHarness h;
     h.allow_scoped_all = true;
@@ -411,7 +517,8 @@ TEST_CASE("sle erase: a nine-entry stores result is passed through per store (ro
     r.agent_id = "agent-1";
     for (const char* name : {"inventory", "software_inventory", "app_perf_daily",
                              "device_inventory", "software_licensing", "app_usage",
-                             "offline_endpoint", "certificate_inventory", "guaranteed_state"}) {
+                             "offline_endpoint", "certificate_inventory", "guaranteed_state",
+                             "management_group_memberships"}) {
         r.stores.push_back({name, DecommissionOutcome::Deleted, ""});
         ++r.deleted;
     }
@@ -421,12 +528,18 @@ TEST_CASE("sle erase: a nine-entry stores result is passed through per store (ro
         REQUIRE(res);
         REQUIRE(res->status == 200);
         const auto j = json::parse(res->body)["data"];
-        CHECK(j["deleted"] == 9);
-        REQUIRE(j["stores"].size() == 9);
+        CHECK(j["deleted"] == 10);
+        REQUIRE(j["stores"].size() == 10);
         CHECK(j["stores"]["guaranteed_state"] == "deleted");
+        CHECK(j["stores"]["management_group_memberships"] == "deleted");
     }
-    h.decommission_result.stores.back().outcome = DecommissionOutcome::Failed;
-    h.decommission_result.stores.back().error = "txn rolled back";
+    // Fail the Guardian line by NAME: it is no longer the last entry.
+    for (auto& st : h.decommission_result.stores) {
+        if (st.store == "guaranteed_state") {
+            st.outcome = DecommissionOutcome::Failed;
+            st.error = "txn rolled back";
+        }
+    }
     --h.decommission_result.deleted;
     ++h.decommission_result.failed;
     {
@@ -435,6 +548,244 @@ TEST_CASE("sle erase: a nine-entry stores result is passed through per store (ro
         CHECK(res->status == 500);
         CHECK(res->body.find("\"guaranteed_state\":\"failed\"") != std::string::npos);
         CHECK(res->body.find("\"inventory\":\"deleted\"") != std::string::npos);
+    }
+}
+
+// #6352: the outcome audit row names WHICH groups the device left, as its own
+// `<store>.groups=<n>:<ids>` token beside the unchanged `<store>=<outcome>` token, and only for a
+// store that reported evidence. The scope change is otherwise unreconstructable from the audit log.
+TEST_CASE("sle erase: the outcome audit row carries the groups the device left",
+          "[sle_routes]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    DecommissionResult r;
+    r.agent_id = "agent-1";
+    r.stores.push_back({"inventory", DecommissionOutcome::Deleted, "", false, ""});
+    r.stores.push_back({"management_group_memberships", DecommissionOutcome::Deleted, "", false,
+                        "2:000000000000,a1b2c3d4e5f6"});
+    r.deleted = 2;
+    h.decommission_result = r;
+
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    // The attempt row, then the outcome row; the detail of the outcome row is the last one.
+    REQUIRE(h.audit_detail.size() == 2);
+    const auto& outcome = h.audit_detail.back();
+    CHECK(contains(outcome, "management_group_memberships=deleted "));
+    CHECK(contains(outcome, "management_group_memberships.groups=2:000000000000,a1b2c3d4e5f6 "));
+    // A store that reported no evidence adds no extra token.
+    CHECK(contains(outcome, "inventory=deleted "));
+    CHECK_FALSE(contains(outcome, "inventory.groups="));
+    // The response body is unchanged: the evidence is audit-only.
+    CHECK_FALSE(contains(res->body, ".groups="));
+}
+
+// The merge of the device-CI write pause (`write_paused=`) with the group evidence (`.groups=`)
+// made one outcome row able to carry both token families. Pin the exact order: every
+// `<store>=<outcome>` token (each followed by its own `.groups=` token), then `write_paused=`
+// ONCE after the loop, then the counts. Both orderings of the two stores are covered so a regression
+// that rewrites the breakdown, drops `.groups=` beside a pause, or emits `write_paused=` inside
+// the loop fails here.
+TEST_CASE("sle erase: the outcome row carries both .groups= and write_paused= in a fixed order",
+          "[sle_routes]") {
+    for (const bool paused_first : {true, false}) {
+        SECTION(paused_first ? "paused store listed first" : "paused store listed last") {
+            SleHarness h;
+            h.allow_scoped_all = true;
+            DecommissionResult r;
+            r.agent_id = "agent-1";
+            const DecommissionStoreResult paused{"device_inventory", DecommissionOutcome::Failed,
+                                                 "paused", /*write_paused=*/true};
+            const DecommissionStoreResult groups{"management_group_memberships",
+                                                 DecommissionOutcome::Deleted, "",
+                                                 /*write_paused=*/false,
+                                                 "2:000000000000,a1b2c3d4e5f6"};
+            if (paused_first) {
+                r.stores.push_back(paused);
+                r.stores.push_back(groups);
+            } else {
+                r.stores.push_back(groups);
+                r.stores.push_back(paused);
+            }
+            r.deleted = 1;
+            r.failed = 1;
+            h.decommission_result = r;
+
+            auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+            REQUIRE(res);
+            CHECK(res->status == 500);
+            REQUIRE(h.audit_detail.size() == 2);
+            const auto& outcome = h.audit_detail.back();
+            CHECK(h.audited("sle.agent.decommission|partial"));
+
+            const auto p_tok = outcome.find("device_inventory=failed ");
+            const auto g_out = outcome.find("management_group_memberships=deleted ");
+            const auto g_tok =
+                outcome.find("management_group_memberships.groups=2:000000000000,a1b2c3d4e5f6 ");
+            const auto w_tok = outcome.find("write_paused=device_inventory, ");
+            const auto counts = outcome.find("deleted=1 skipped=0 failed=1 ");
+            REQUIRE(p_tok != std::string::npos);
+            REQUIRE(g_out != std::string::npos);
+            REQUIRE(g_tok != std::string::npos);
+            REQUIRE(w_tok != std::string::npos);
+            REQUIRE(counts != std::string::npos);
+            // The groups token comes after its own outcome token.
+            CHECK(g_tok > g_out);
+            // write_paused= comes once, after every per-store token, before the counts.
+            CHECK(w_tok > p_tok);
+            CHECK(w_tok > g_tok);
+            CHECK(counts > w_tok);
+            CHECK(outcome.find("write_paused=", w_tok + 1) == std::string::npos);
+            // The paused store never carries a groups token, and the evidence stays audit-only.
+            CHECK_FALSE(contains(outcome, "device_inventory.groups="));
+            CHECK_FALSE(contains(res->body, ".groups="));
+            const auto j = json::parse(res->body);
+            CHECK(j["error"]["details"]["write_paused"] == json::array({"device_inventory"}));
+        }
+    }
+}
+
+// End to end with the REAL cascade and a real Postgres store behind the route: the audit evidence is
+// produced by `ManagementGroupStore::delete_agent` -> `AgentDecommission` -> the route, not by an
+// injected result, so a break in any of the three links shows here.
+TEST_CASE("sle erase: a real cascade writes the groups the device left into the outcome audit row",
+          "[pg][sle_routes][decommission]") {
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    yuzu::server::ManagementGroupStore& mg = *mg_bundle;
+
+    yuzu::server::ManagementGroup root;
+    root.id = yuzu::server::ManagementGroupStore::kRootGroupId;
+    root.name = "All Devices";
+    root.membership_type = "dynamic";
+    root.scope_expression = "*";
+    root.created_by = "system";
+    REQUIRE(mg.create_group(root).has_value());
+    yuzu::server::ManagementGroup g;
+    g.name = "Edge";
+    g.membership_type = "static";
+    const auto edge = mg.create_group(g);
+    REQUIRE(edge.has_value());
+    REQUIRE(mg.add_member(yuzu::server::ManagementGroupStore::kRootGroupId, "agent-1").has_value());
+    REQUIRE(mg.add_member(*edge, "agent-1").has_value());
+    REQUIRE(mg.add_member(*edge, "agent-2").has_value()); // a bystander
+
+    AgentDecommission cascade{AgentDecommissionStores{.management_group_memberships = &mg}};
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.decommission_override = [&](const std::string& id) { return cascade.decommission(id); };
+
+    auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    std::vector<std::string> ids{yuzu::server::ManagementGroupStore::kRootGroupId, *edge};
+    std::sort(ids.begin(), ids.end());
+    REQUIRE(h.audit_detail.size() == 2);
+    CHECK(contains(h.audit_detail.back(),
+                   "management_group_memberships.groups=2:" + ids[0] + "," + ids[1] + " "));
+    CHECK_FALSE(contains(res->body, ".groups="));
+    // The effect: agent-1 left both groups, the bystander kept its own.
+    CHECK(mg.get_agent_groups("agent-1").value().empty());
+    CHECK(mg.get_agent_groups("agent-2").value() == std::vector<std::string>{*edge});
+}
+
+// Governance S1 ROUTE pin (ADR-0024 Decision 9, owner ruling 2026-11-17). A service-scoped API
+// token passes `DELETE /api/v1/sle/agents/{id}` for a device carrying its service tag (the seeded
+// ITServiceOwner ceiling admits Decommission:Delete), and the cascade then removes that device's
+// memberships in EVERY group, including groups the token holds no authority over. The test drives
+// the REAL `AuthRoutes::require_scoped_permission` and the REAL cascade, so a change to the gate,
+// the ceiling, the tag check or the cascade shows here.
+TEST_CASE("sle erase: a service-scoped token through the real gate drops the device's memberships "
+          "in every group (S1 route pin)",
+          "[pg][sle_routes][authz][decommission][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    ServiceScopeRig r{rbac_db_.dsn()};
+
+    const auto edge = r.group("Edge");
+    const auto core = r.group("Core");
+    REQUIRE(r.tags.set_tag("svc-dev", "service", "printers").has_value());
+    REQUIRE(r.tags.set_tag("other-dev", "service", "billing").has_value());
+    for (const auto& g : {edge, core})
+        REQUIRE(r.mgmt.add_member(g, "svc-dev").has_value());
+    REQUIRE(r.mgmt.add_member(edge, "other-dev").has_value());
+    REQUIRE(r.mgmt.add_member(edge, "untagged-dev").has_value());
+
+    const auto token = r.mint_service_token("printers");
+
+    int cascade_calls = 0;
+    AgentDecommission cascade{AgentDecommissionStores{.management_group_memberships = &r.mgmt}};
+    yuzu::server::test::TestRouteSink sink;
+    SleRoutes routes;
+    routes.register_routes(
+        sink,
+        // Exactly the production wrapper in ServerImpl (sle_scoped_perm_fn) minus the store-usable
+        // probe: the gate under test is the real AuthRoutes::require_scoped_permission.
+        [&](const httplib::Request& req, httplib::Response& res, const std::string& type,
+            const std::string& op, const std::string& agent_id) {
+            return r.ar->require_scoped_permission(req, res, type, op, agent_id);
+        },
+        [](const std::string&) -> std::optional<std::vector<AgentLicenseRow>> {
+            return std::vector<AgentLicenseRow>{};
+        },
+        [&](const std::string& id) {
+            ++cascade_calls;
+            return cascade.decommission(id);
+        },
+        [](const httplib::Request&, const std::string&, const std::string&, const std::string&,
+           const std::string&, const std::string&) { return true; });
+    sink.default_headers["Authorization"] = "Bearer " + token;
+
+    // The asymmetry the ruling accepts: the same token cannot remove a member through the global
+    // ManagementGroup:Write gate (empty kServiceScopeGlobalSafe), yet the decommission below does.
+    {
+        httplib::Request req;
+        req.headers.emplace("Authorization", "Bearer " + token);
+        httplib::Response res;
+        CHECK_FALSE(r.ar->require_permission(req, res, "ManagementGroup", "Write"));
+        CHECK(res.status == 403);
+    }
+
+    SECTION("a device outside the token's service is refused and nothing is removed") {
+        const auto res = sink.Delete("/api/v1/sle/agents/other-dev");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(cascade_calls == 0);
+        CHECK(r.mgmt.get_agent_groups("other-dev").value() == std::vector<std::string>{edge});
+        CHECK(r.mgmt.get_agent_groups("svc-dev").value().size() == 2);
+    }
+    SECTION("an untagged device is refused and nothing is removed") {
+        const auto res = sink.Delete("/api/v1/sle/agents/untagged-dev");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(cascade_calls == 0);
+        CHECK(r.mgmt.get_agent_groups("untagged-dev").value() == std::vector<std::string>{edge});
+    }
+    SECTION("revoking the ITServiceOwner ceiling refuses the same request") {
+        REQUIRE(r.rbac.remove_permission("ITServiceOwner", "Decommission", "Delete").has_value());
+        const auto res = sink.Delete("/api/v1/sle/agents/svc-dev");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(cascade_calls == 0);
+        CHECK(r.mgmt.get_agent_groups("svc-dev").value().size() == 2);
+    }
+    SECTION("a request with no credential is refused and nothing is removed") {
+        sink.default_headers.erase("Authorization");
+        const auto res = sink.Delete("/api/v1/sle/agents/svc-dev");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(cascade_calls == 0);
+        CHECK(r.mgmt.get_agent_groups("svc-dev").value().size() == 2);
+    }
+    SECTION("a device in the token's service leaves every group; bystanders keep theirs") {
+        const auto res = sink.Delete("/api/v1/sle/agents/svc-dev");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(cascade_calls == 1);
+        CHECK(r.mgmt.get_agent_groups("svc-dev").value().empty());
+        CHECK(r.mgmt.get_agent_groups("other-dev").value() == std::vector<std::string>{edge});
+        CHECK(r.mgmt.get_agent_groups("untagged-dev").value() == std::vector<std::string>{edge});
     }
 }
 
@@ -464,6 +815,10 @@ TEST_CASE("sle erase: a paused device_inventory removal gets a distinct 500 reas
         CHECK(j["error"]["retry_after_ms"] ==
               yuzu::server::device_ci_read_gate::kOrderingRetryAfterMs);
         CHECK(contains(j["error"]["message"].get<std::string>(), "AFTER the repair"));
+        // A group-scoped holder cannot re-issue (the first call already removed the device from
+        // its groups, D4): the text names the grant that can.
+        CHECK(contains(j["error"]["message"].get<std::string>(),
+                       "Administrator or a global grant"));
         CHECK(contains(j["error"]["remediation"].get<std::string>(), "after the PostgreSQL "
                                                                      "collation repair"));
         CHECK_FALSE(contains(res->body, "retry the request"));

@@ -342,7 +342,7 @@ TEST_CASE("POST aliases validates every field before auditing or writing",
         alias_body({{"cpe_product", "-"}}),
         alias_body({{"edition", "notanedition"}}),
         alias_body({{"raw_name", "Contoso Studio Standard"}, {"edition", "enterprise"}}),
-        alias_body({{"vendor", "inc"}}), // normalises to nothing
+        alias_body({{"vendor", "via:brew"}}), // an origin label normalises to nothing
     };
     for (const auto& b : bad) {
         INFO(b.substr(0, 60));

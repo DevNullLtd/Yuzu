@@ -184,6 +184,15 @@ struct Config {
     // --postgres-pool-size / YUZU_POSTGRES_POOL_SIZE.
     int postgres_pool_size{16};
 
+    // Concurrency cap on the bulk device-CI read (GET /api/v1/hardware-ci and MCP
+    // list_hardware_ci_records), shared by both: how many may hold a pooled Postgres connection at
+    // once on this replica (#7949, #7951). -1 (the default) = not given: the effective cap is
+    // derived from the pool size and logged at boot. An explicit value outside 1..8, or above half
+    // the effective pool, refuses boot. Wired via --hardware-ci-read-concurrency /
+    // YUZU_HARDWARE_CI_READ_CONCURRENCY; the arithmetic is bulk_read_slots.hpp's
+    // resolve_bulk_read_cap (kBulkReadCapUnset is -1).
+    int hardware_ci_read_concurrency{-1};
+
     // HA WS-8 (ADR-2002 §12): minimum seconds stop() keeps the listener open
     // after /readyz starts answering 503 `draining`, so a load balancer stops
     // routing here before the socket closes. 0 = no minimum (the single-node
@@ -434,10 +443,14 @@ struct Config {
     // counter resets on a successful login or an admin unlock. Threshold 0
     // disables the feature. The lock is temporary/auto-expiring so it cannot
     // be weaponised to permanently DoS a legitimate principal; OIDC and the
-    // MFA code-verification path (which has its own rate-limit) are out of
+    // MFA code-verification path (own per-account budget, see below) are out of
     // scope. See docs/auth-architecture.md.
     int auth_lockout_threshold{5};     // consecutive failures before lock; 0 disables
     int auth_lockout_window_secs{900}; // lock duration, default 15 min
+    // WP03 perf-F1: concurrent PBKDF2 slots one source address may hold on the unauthenticated
+    // login lane (/login, recovery code behind a pending token). Keyed on the TCP peer address:
+    // behind a proxy/LB/NAT every user shares it, so raise it there. See server-admin.md.
+    int auth_pbkdf2_per_source_cap{4};
 
     // MFA / TOTP — `/auth-and-authz` skill gap matrix P0 #1, SOC 2 CC6.6.
     // See docs/auth-mfa-design.md. PR1 ships enforcement="optional" (self-

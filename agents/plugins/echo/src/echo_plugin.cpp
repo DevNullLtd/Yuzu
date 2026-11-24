@@ -1226,6 +1226,22 @@ public:
         return 1;
     }
 
+    // The database closed at run time (a failed rollback, #8099) while the plugin stays online:
+    // answer the actions that would otherwise report a healthy empty store with the offline error
+    // and tell the caller not to run them. Which actions, and why the others are left alone, is
+    // refused_on_closed_store's contract. Only reads the lock-free liveness probes, so a long
+    // `echo sql` or a rollup holding the database mutex cannot stall a tick here.
+    bool refuse_on_closed_store(yuzu::CommandContext& ctx, std::string_view action) {
+        if (!db_)
+            return false;
+        const auto line = yuzu::echo::format_closed_store_refusal(action, db_->is_open(),
+                                                                 db_->query_engine_available());
+        if (!line)
+            return false;
+        ctx.write_output(*line);
+        return true;
+    }
+
     int execute_dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
         if (!online_.load(std::memory_order_acquire)) {
             OfflineState offline;
@@ -1256,10 +1272,14 @@ public:
             return 1;
         }
 
-        if (action == "collect_fast")
-            return do_collect_fast(ctx);
+        // collect_slow first: it reconciles the storage-offline tag, which a closed store still
+        // needs published, and then applies the same closed-store refusal itself.
         if (action == "collect_slow")
             return do_collect_slow(ctx);
+        if (refuse_on_closed_store(ctx, action))
+            return 1;
+        if (action == "collect_fast")
+            return do_collect_fast(ctx);
         if (action == "collect_perf")
             return do_collect_perf(ctx);
         if (action == "collect_software")
@@ -3178,17 +3198,51 @@ private:
     }
 
     int do_collect_slow(yuzu::CommandContext& ctx) {
+        // Return, never fall through to a reconcile that would read a missing store as closed: a
+        // null db_ (the plugin's EchoDatabase, which a wedge leaves in place) would publish
+        // rollback_wedged. The online_ gate makes this unreachable in a running agent (teardown
+        // stops the triggers before it resets db_); the check is parity with
+        // reconcile_db_health_publish.
+        if (!db_) {
+            ctx.write_output("error|Echo database not initialized");
+            return 1;
+        }
         {
             yuzu::PluginContext pctx{plugin_ctx_};
             reconcile_db_health_publish(pctx);
-            // Replay a storage-offline tag delete that failed when the open recovered. Stateless
-            // and safe: this tick runs only past the online_ gate, where nothing legitimately
-            // sets the key (go_offline runs only while offline).
-            if (pctx.storage_exists(yuzu::echo::kStorageOfflineKey) &&
-                !pctx.storage_delete(yuzu::echo::kStorageOfflineKey))
-                spdlog::warn("ECHO: the storage-offline heartbeat tag is still set after "
-                             "recovery and could not be cleared; retried on the next slow collect");
+            // Reconcile the storage-offline tag with the store, stateless. This tick runs only
+            // past the online_ gate, where go_offline never runs, so the only legitimate value
+            // here is rollback_wedged: the store was closed at run time by a failed rollback and
+            // nothing collects until the agent restarts. Anything else is stale (a previous
+            // run's tag, or a delete that failed when the open recovered) and is cleared.
+            const bool key_present = pctx.storage_exists(yuzu::echo::kStorageOfflineKey);
+            const bool store_open = db_->is_open();
+            switch (yuzu::echo::online_offline_tag_action(
+                store_open, key_present,
+                key_present ? pctx.storage_get(yuzu::echo::kStorageOfflineKey) : std::string{})) {
+            case yuzu::echo::OfflineTagAction::publish_wedged:
+                if (pctx.storage_set(yuzu::echo::kStorageOfflineKey, yuzu::echo::kRollbackWedgedToken))
+                    spdlog::error("ECHO: storage offline (rollback_wedged): the database was closed "
+                                  "after a transaction could not be rolled back; collection and "
+                                  "retention are stopped until the agent restarts");
+                else
+                    spdlog::warn("ECHO: failed to publish the storage-offline heartbeat tag; "
+                                 "retried on the next slow collect");
+                break;
+            case yuzu::echo::OfflineTagAction::clear:
+                if (!pctx.storage_delete(yuzu::echo::kStorageOfflineKey))
+                    spdlog::warn("ECHO: the storage-offline heartbeat tag is still set after "
+                                 "recovery and could not be cleared; retried on the next slow "
+                                 "collect");
+                break;
+            case yuzu::echo::OfflineTagAction::leave:
+                break;
+            }
         }
+        // After the reconcile, so a closed store still publishes its tag; nothing below may run on
+        // it (the mapdrive retry and the collect read every source as unreadable).
+        if (refuse_on_closed_store(ctx, "collect_slow"))
+            return 1;
         // §3.8 bounded mapdrive-backfill retry (related issue #5291): above collect_mu_, same as
         // init()'s call site, so hive I/O never runs under the shared lock. Cheap when nothing is
         // due (phase A's own short lock-and-check) — see retry_pending_mapdrive_backfill's banner.
@@ -3341,6 +3395,9 @@ private:
             const auto q = db_->quarantined_this_open();
             ctx.write_output(yuzu::echo::format_db_health_line(q.has_value(), q ? *q : last_q));
         }
+        for (const auto& line : yuzu::echo::format_schema_status_lines(
+                 db_->schema_version(), db_->warehouse_tables_ok()))
+            ctx.write_output(line);
         auto s = db_->stats();
         ctx.write_output(std::format("record_count|{}", s.record_count));
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));
@@ -4604,7 +4661,7 @@ private:
                 const bool tcp_prev_enabled = (src_name == "tcp") && cursor_prev_canon == "true";
                 transition_ok = yuzu::echo::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
-                if (transition_ok && v == "false") {
+                if (transition_ok && yuzu::echo::interval_baseline_reset_due(cursor_prev_canon, v)) {
                     // The interval samplers (perf / procperf) keep their previous
                     // reading in memory, not in a diff-state row, so the
                     // diff_state_key clear inside apply_source_enabled_transition
@@ -4617,7 +4674,11 @@ private:
                     // "re-enabling starts from a clean baseline" promise in
                     // docs/user-manual/echo.md). default-constructed → valid=false,
                     // which derive_sample/derive_proc_samples treat as "no baseline"
-                    // (records nothing on the next tick).
+                    // (records nothing on the next tick). The same reset covers
+                    // recovery from a corrupt ("errored") flag (#1624): a skipped
+                    // tick leaves the reading untouched, so the first tick after
+                    // the recovery would otherwise diff against the pre-error
+                    // reading and record the errored interval's activity.
                     if (src_name == "perf")
                         prev_perf_ = yuzu::echo::PerfCounters{};
                     else if (src_name == "procperf")

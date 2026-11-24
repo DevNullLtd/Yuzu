@@ -94,6 +94,10 @@ spec:
 
 ---
 
+### Parameters that need an extra grant
+
+A policy check or remediation is dispatched by the server itself, with no operator behind the dispatch. A parameter that makes an action need a different permission (today only `windows_updates.patch_connectivity` with a non-empty `targets`, which needs `Infrastructure:Read`) is therefore refused for a policy fragment: the dispatch is denied, no agent runs the check, and after the grace window every target reads `unknown` on each interval (the denial is visible as `yuzu_server_dispatch_denied_total{reason="forbidden"}` and a server warning, not as a per-target error). Use the action's default targets in a policy fragment, or run the probe as an operator-initiated command.
+
 ## Policies
 
 A Policy binds a fragment to devices, defining when and where compliance
@@ -273,9 +277,115 @@ The policy engine tracks compliance status per agent per policy. Each
 |---|---|
 | `compliant` | Check passed -- the endpoint is in the desired state |
 | `non_compliant` | Check failed -- the endpoint is not in the desired state |
-| `unknown` | Not yet evaluated, status invalidated, the agent did not respond to a check within the grace window, or the check instruction runs a Forensics-tier plugin (see below) |
+| `unknown` | Not yet evaluated, status invalidated, or the agent did not respond to a check within the grace window |
 | `fixing` | Fix instruction is currently running |
 | `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`), **or the agent's response could not be evaluated** (output nested past the depth guard, an evaluation that threw, or a compliance expression that fails to evaluate, such as a division by zero; all three are counted in `yuzu_server_policy_unevaluable_responses_total{reason}`; a numeric JSON value is compared as text and is not an error; `reason="expression"` covers an expression that evaluates to no value: a division by zero, a type error, a timeout, or an expression that does not parse or is over-long. A `result.<field>` the response lacks reads as an empty string, which is false: the verdict is `non_compliant`, not `error`, and nothing is counted; only that device is affected) |
+| `blocked` | Policy evaluation did not dispatch the check or fix, because its instruction names an action that policy evaluation does not run, or has an approval mode other than `auto` (see [Action approval and the `blocked` status](#action-approval-and-the-blocked-status)). Nothing was sent to the device. A check that runs a Forensics-tier plugin shows `blocked` for this reason (`gated`). It counts as failing and clears when a later dispatch records a real result. |
+
+### Action approval and the `blocked` status
+
+Policy evaluation applies the action approval requirement before it dispatches. A
+policy's check, fix and post-fix check each name an instruction, and an instruction
+names a plugin and an action. Before the pair is sent to a device, the server classifies
+it against the same capability catalogue the interactive dispatch path uses, and
+dispatches it only when all of these hold:
+
+- the pair is classified, with exactly one catalogue row;
+- the row is not reserved for the server's own use;
+- the row has no execute gate (no approval requirement);
+- the row is not Destructive;
+- the instruction's own approval mode is `auto`. Policy evaluation has no approval step, so an
+  instruction whose approval mode is `role-gated` or `always` is refused, and so is an empty or
+  unrecognised mode (the interactive path reads such a value as needing approval too).
+
+Otherwise nothing is sent, and the policy shows `blocked` for its devices. The device's
+`check_result` records the `phase` (`check`, `fix` or `verify`), the `reason`, and the
+`plugin` and `action` as two fields:
+
+| Reason | Meaning |
+|---|---|
+| `gated` | The action has an execute gate: running it interactively needs an administrator or an approval. |
+| `destructive` | The action is Destructive. |
+| `reserved` | The action is reserved for the server's own dispatch. |
+| `unclassified` | No catalogue row names the pair, or its row has no execute gate recorded. |
+| `ambiguous` | More than one catalogue row names the pair. |
+| `unwired` | The server holds no capability catalogue for policy evaluation, so every dispatch is refused. |
+| `approval_required` | The instruction's approval mode is not `auto` (`role-gated`, `always`, or a value that is not one of the modes). The action itself is one policy evaluation would dispatch; only the instruction's own approval requirement refuses it. It is reported after every other reason, so an action that is also gated, destructive or reserved shows that reason. |
+| `dispatch_identifier_invalid` | The plugin or action is over 128 bytes or uses a character other than letters, digits, `_`, `.` and `-`. The row stores no plugin or action text. |
+
+What this means in use:
+
+- A **refused fix** (`POST /api/policies/{id}/remediate`) answers `409` and the devices
+  become `blocked` with phase `fix`; the claim on them is released. A **refused post-fix
+  check** leaves the fix in place and moves the devices from `fixing` to `blocked` with
+  phase `verify`; it is not counted as a failed evaluation (`error`).
+  A `blocked` status from a refused fix is not kept: the next check of an allowed
+  instruction records the device's own result in its place. The lasting record of a
+  refused fix is the `policy.remediate` `denied` row the route writes and the `policy.dispatch`
+  audit row (each attempted every time, and each lost if the audit store fails to persist it;
+  see the [audit log](audit-log.md)), and the `yuzu_server_policy_dispatch_denied_total`
+  counter. A
+  retry that names `agent_ids` answers the refusal `409` again; a retry with no `agent_ids`
+  selects `non_compliant` devices only, so it answers "no non_compliant agents" until the
+  next check scores the devices.
+- `blocked` counts as **failing** in the "N failing" pill, the Failing checks readout and
+  the home page tile. A later dispatch that records a real result replaces it. A
+  refusal that repeats on every interval changes no status and writes no audit row, but it
+  refreshes the time of the device's last check, so a refusal that still applies stays in
+  the failing figure. The fleet figure applies its 24 hour freshness rule to `blocked` like
+  every other status: a `blocked` row that nothing refreshes (the policy is disabled, the
+  device left its scope or was removed) counts as `unknown` after 24 hours.
+  The first refusal after a row went stale refreshes it at once, but the fleet figure is
+  cached for 60 seconds, so that device can still show as `unknown` for up to 60 seconds,
+  once.
+- **To clear a policy's `blocked` rows at once, delete the policy**: its results are removed
+  with it. Disabling it does not clear them: a disabled policy's `blocked` rows stay in the
+  failing figure until the 24 hour rule above ages them out.
+- Creating a fragment or a policy, and enabling a policy, checks each instruction the
+  fragment names and answers `400` for a refused pair (and `503` when the lookup cannot be
+  answered, with `retry_after_ms` 5000 if the instruction store failed and `null` if the
+  evaluator is unwired). Both bodies are the A4 error envelope. The check is advisory: the dispatch check above is the control, and an
+  instruction that does not exist yet is accepted, because product packs create their
+  instructions and fragments in any order, and so is a write whose policy or fragment cannot
+  be read at that moment (the lookup of the instruction is answered `503` as above, but a
+  failed read of the policy or its fragment skips the check). **Pack install does not refuse** a policy
+  whose instruction is refused: it installs, and shows `blocked` at its first dispatch.
+  Enabling such a policy through the route answers `400`.
+- On fragment create this check runs before the fragment is parsed and stored, so before every
+  other check on the fragment (its kind, size, compliance expressions, parameter keys and name).
+  A fragment that names a refused instruction and also holds a parameter key with a control byte
+  gets this `400` and one `policy_fragment.create` row with detail `reason=<reason> instruction=<id>`,
+  not the `param_key_invalid` refusal.
+- **No policy can run an action that has an execute gate, and nothing approves one.** There
+  is no approval step for a policy and no setting that allows one, so a remediation attempt on a
+  policy whose fix runs such an action is refused (`409`) and its devices show `blocked` until the
+  policy's next check. This covers almost every
+  action that changes an endpoint: file writes, registry changes, firewall and quarantine
+  actions, content distribution, scripts, service start mode, certificate deletion, the power
+  plan and others. The mutating actions that remain usable as a policy fix are exactly four:
+  `tags.set`, `tags.delete`, `agent_actions.set_log_level` and `chargen.chargen_stop`. Every
+  read-only action that has no execute gate and is not reserved for the server is usable as a
+  check; a read-only action that carries a gate or is reserved (including every action of the
+  Forensics-tier plugins) is refused. A remediation policy that
+  needs any other action has to be run another way, for example by an operator running the
+  action interactively, where the approval requirement applies. The Remediate button is still
+  shown for a fix that will be refused: it is shown whenever the fragment has a fix.
+- **An instruction that needs approval is not run by a policy either.** A check, fix or post-fix
+  check whose instruction has approval mode `role-gated` or `always` is refused as
+  `approval_required` and the devices show `blocked`, whatever its action (unless another
+  reason applies first, see the table above). To use such an
+  instruction in a policy, set its approval mode to `auto` (an instruction's approval mode is
+  edited through `PUT /api/instructions/{id}` or `PUT /api/v1/instructions/{id}`); to keep it
+  approval-gated, run it interactively or on a schedule, where the approval requirement
+  applies. Of the shipped definitions, the 79 that set `role-gated` or `always` already name an action
+  that has an execute gate or one policy evaluation cannot classify, so a policy dispatches
+  none of them for that reason alone; this rule is the one that applies to a definition that
+  is authored or edited.
+- A refusal is counted in `yuzu_server_policy_dispatch_denied_total{reason}` and a
+  `policy.dispatch` audit row is attempted (see the [audit log](audit-log.md) for when one is
+  written and when one can be lost).
+- `POST /api/policies/{id}/invalidate` resets `blocked` devices to `unknown`; the next
+  dispatch records the refusal again if it still applies.
 
 ---
 
@@ -305,20 +415,18 @@ Verdict semantics: a plugin failure / timeout / rejection / unevaluable response
 non-responder after the grace window → `unknown`; a successful response that
 fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
 
-**A check that runs a Forensics-tier plugin scores `unknown`.** The evaluator
-reads each check's stored response with every Forensics-tier plugin
-(`app_usage`, `browser_inventory`, `execution_artifacts`,
-`privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is derived from the
-capability catalogue) excluded, because the verdict and the first bytes of the
-check output are shown to readers who do not hold `Forensics:Read`. Such a
-policy therefore shows `unknown` for every agent with an empty `check_result`,
-and never a verdict from, or a stored copy of, Forensics output. `unknown`
-there says nothing about the device. A Forensics-tier plugin is not a suitable
-policy check. The check instruction is still dispatched to the endpoints and the
-plugin's response row is still stored (it is readable only through the
-`Forensics:Read` tier and kept for the response retention window, 90 days by
-default); only the verdict and `check_result` are withheld. A separate
-follow-up (#6065) tracks the dispatch-side authorization of policy checks.
+**A check that runs a Forensics-tier plugin is not dispatched.** Every action of the
+Forensics-tier plugins (`app_usage`, `browser_inventory`, `execution_artifacts`,
+`file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is derived from the
+capability catalogue) carries an execute gate, so policy evaluation refuses such a check
+before anything is sent (see [Action approval and the `blocked`
+status](#action-approval-and-the-blocked-status)). The policy shows `blocked` for every
+agent, with reason `gated` and no check output; it does not show `unknown`. The evaluator
+also reads each check's stored response with every Forensics-tier plugin excluded, because the
+verdict and the first bytes of the check output are shown to readers who do not hold
+`Forensics:Read`; so the verdict and a stored copy of Forensics output are never produced for
+a policy, whichever way a row got there. A Forensics-tier plugin is not a suitable policy
+check.
 
 This release stores no check output for such a policy, so there is nothing to
 clean up for it; deleting a policy (`DELETE /api/policies/{id}`, `Policy:Delete`)
@@ -370,7 +478,12 @@ use-after-free guard any shutdown refactor must preserve.
 
 `POST /api/policies/{id}/evaluate` dispatches a check immediately, ignoring the
 interval. It returns `202` with an `execution_id`; verdicts land within roughly
-15–30 seconds (next collection cycle).
+15–30 seconds (next collection cycle). If the check names an action that policy
+evaluation does not run, nothing is dispatched and the route answers `409` with a
+remediation text that starts `policy_dispatch_refused` and names the reason; the
+devices become `blocked` (see above). For every reason except `unwired` the text says to
+change the instruction the policy uses. For `unwired` (the server's capability registry is
+not available) the instruction is not at fault, and the text says to try again later.
 
 ---
 
@@ -380,7 +493,7 @@ The `FleetCompliance` aggregate provides a fleet-wide view:
 
 - **compliance_pct** -- percentage of (policy, agent) pairs that are compliant
 - **total_checks** -- total number of tracked (policy, agent) pairs
-- Breakdown by status: compliant, non_compliant, unknown, fixing, error
+- Breakdown by status: compliant, non_compliant, unknown, fixing, error, blocked
 
 Per-policy summaries (`ComplianceSummary`) provide the same breakdown scoped
 to a single policy.
@@ -404,7 +517,7 @@ when the signed-in role holds the permission (the server re-checks every call).
 | **Evaluate** | `Policy:Execute` | Dispatches a read-only check now. The toast shows the execution id, not a device count. |
 | **Invalidate all** | `Policy:Execute` | Resets every result to unknown; fleet compliance reads 0% until devices check in. Confirmation required. |
 | **New policy** / **New fragment** | `Policy:Write` | Paste YAML (up to 1 MiB); a refused document shows the server's message. Not available in this build: the controls appear only once the shared dialog script (`/static/yuzu-dialog.js`) is shipped, so create policies and fragments with `POST /api/policies` and `POST /api/policy-fragments` until then. |
-| **Remediate** | `Policy:Execute` | Shown only when the policy's fragment has a fix. Runs the fix on whichever devices are non-compliant when you confirm; there is no approval step. |
+| **Remediate** | `Policy:Execute` | Shown only when the policy's fragment has a fix. Runs the fix on whichever devices are non-compliant when you confirm. A fix whose action has an execute gate, is destructive or is reserved for the server, or whose instruction needs approval, is refused, not dispatched, and the devices show `blocked`; the toast names the reason. |
 | **Invalidate cache** | `Policy:Execute` | Resets one policy's results and its fix attempt counts. Confirmation required. |
 | **Delete** (policy, fragment) | `Policy:Delete` | Confirmation required. A fragment still used by a policy cannot be deleted. |
 
@@ -457,7 +570,7 @@ below are the authority, not a blanket Read/Write pair. The REST reference
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/policy-fragments` | List all fragments. Query params: `name`, `limit`. Permission: `Policy:Read`. |
-| `POST` | `/api/policy-fragments` | Create a fragment from YAML. Permission: `Policy:Write`. Body must be a complete YAML document or a JSON envelope `{"yaml_source": "<full YAML>"}` — see worked example below. |
+| `POST` | `/api/policy-fragments` | Create a fragment from YAML. Permission: `Policy:Write`. Body must be a complete YAML document or a JSON envelope `{"yaml_source": "<full YAML>"}` — see worked example below. `400` when an instruction it names is one policy evaluation does not run; `503` when that cannot be checked. |
 | `DELETE` | `/api/policy-fragments/{id}` | Delete a fragment by ID. Permission: `Policy:Delete`. |
 
 #### Worked example — `POST /api/policy-fragments`
@@ -507,13 +620,13 @@ Both forms produce a 201 with `{"id": "<fragment-id>", "status": "created"}`.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/policies` | List all policies. Query params: `name`, `fragment_id`, `enabled_only`, `limit`. Permission: `Policy:Read`. |
-| `POST` | `/api/policies` | Create a policy from YAML. Permission: `Policy:Write`. Body: same shape as `POST /api/policy-fragments` — full YAML in `yaml_source`, with `kind: Policy`. |
+| `POST` | `/api/policies` | Create a policy from YAML. Permission: `Policy:Write`. Body: same shape as `POST /api/policy-fragments` — full YAML in `yaml_source`, with `kind: Policy`. `400` or `503` in the same cases, through the policy's fragment. |
 | `GET` | `/api/policies/{id}` | Get policy detail including compliance summary and `remediation_available` (true when the bound fragment defines a `fix` instruction). Permission: `Policy:Read`. |
 | `DELETE` | `/api/policies/{id}` | Delete a policy and its compliance data. Permission: `Policy:Delete`. |
-| `POST` | `/api/policies/{id}/enable` | Enable a disabled policy. Permission: `Policy:Write`. |
+| `POST` | `/api/policies/{id}/enable` | Enable a disabled policy. Permission: `Policy:Write`. `400` or `503` in the same cases, through the policy's fragment. |
 | `POST` | `/api/policies/{id}/disable` | Disable an active policy. Permission: `Policy:Write`. |
-| `POST` | `/api/policies/{id}/evaluate` | Force an immediate compliance check, ignoring the interval. Permission: `Policy:Execute`. Returns `202` with `execution_id`; `409` if the policy has no check instruction or matches no agents; `503` on a genuine store/InstructionStore degrade or (#4981 PR-1) if the policy's scope expression itself could not be evaluated — never reported as the `409` "matches no agents" case. |
-| `POST` | `/api/policies/{id}/remediate` | Manually remediate non-compliant agents. Permission: `Policy:Execute`. Only valid when `remediation_available` is true (else `409`). Optional body `{"agent_ids":[...]}` scopes the fix to a subset (intersected with the policy's own scope); absent ⇒ all currently `non_compliant` agents. Never automatic. `503` on a genuine store degrade or, when `agent_ids` is supplied, a scope-evaluation abort (#4981 PR-1) — never reported as the `409` "no in-scope agents" case. |
+| `POST` | `/api/policies/{id}/evaluate` | Force an immediate compliance check, ignoring the interval. Permission: `Policy:Execute`. Returns `202` with `execution_id`; `409` if the policy has no check instruction or matches no agents; `503` on a genuine store/InstructionStore degrade or (#4981 PR-1) if the policy's scope expression itself could not be evaluated — never reported as the `409` "matches no agents" case. `409` with a remediation text starting `policy_dispatch_refused` when the check names an action policy evaluation does not run (distinct from the `409` for nothing to dispatch). |
+| `POST` | `/api/policies/{id}/remediate` | Manually remediate non-compliant agents. Permission: `Policy:Execute`. Only valid when `remediation_available` is true (else `409`). Optional body `{"agent_ids":[...]}` scopes the fix to a subset (intersected with the policy's own scope); absent ⇒ all currently `non_compliant` agents. Never automatic. `503` on a genuine store degrade or, when `agent_ids` is supplied, a scope-evaluation abort (#4981 PR-1) — never reported as the `409` "no in-scope agents" case. `409` with a remediation text starting `policy_dispatch_refused` when the fix names an action policy evaluation does not run; it is decided at dispatch, after the policy, fix-instruction, target and claim checks, which answer first. |
 | `POST` | `/api/policies/{id}/invalidate` | Invalidate agent-side cache for this policy. Permission: `Policy:Execute`. |
 | `POST` | `/api/policies/invalidate-all` | Invalidate cache for all policies (fleet-wide). Permission: `Policy:Execute`. |
 
@@ -631,3 +744,5 @@ spec:
 Moved verbatim from the `Compliance evaluation pipeline` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
 
 Compliance evaluation pipeline — `PolicyEvaluator` background thread (10s tick, 15s grace, ≥60s floor, 3600s default) drives check→verdict→status; `policy_eval_thread_` joins before stores in `~ServerImpl`/`stop()`. Mints `polchk-*` ids `notify_exec_tracker` skips (no tracker row, no SSE — NOT in the executions drawer). Remediation is operator-gated only. Dispatch due-ness is a durable, fleet-wide single-sweeper claim on Postgres (`PolicyStore::claim_due_policies`, `policy_dispatch_state`, ADR-0056) — NOT the evaluator's own in-memory state; never fork a second claim path or reintroduce an in-memory throttle.
+
+Dispatch approval (G01) — `PolicyEvaluator::dispatch_instruction` is the ONLY place the evaluator reaches `dispatch_fn`, and it applies `authorize_policy_dispatch` (`policy_dispatch.hpp`) before anything is minted or sent, so one refusal covers the check, the fix and the post-fix check from every entry point (the scheduler tick, `evaluate_now`, `remediate` and the verify in `collect_ready`). The seam is deny-only: it refuses a pair that is unclassified, ambiguous, system-reserved, carries any execute gate or is Destructive, one whose plugin or action is not a well formed identifier, and (decided last, so every other reason keeps its precedence) an instruction whose `approval_mode` is anything but exactly `auto`; it never admits a pair on the strength of a caller. The evaluator dispatches as the system caller, so this seam is the only approval enforcement on this surface. An unset `Deps::capability_registry` REFUSES every dispatch (`unwired`): the evaluator fails closed, never open. A refusal sends nothing, mints no `polchk-*` id, and is recorded by `PolicyStore::mark_blocked`, the only writer of `blocked` (`update_agent_status` rejects it), fenced on the claim generation for a refused fix or post-fix check when one exists (a post-fix check dispatched without a claim generation writes unfenced). `tests/test_policy_dispatch_wiring_lexical.py` and its self-test (docs-lint) pin the single dispatch site and the `server.cpp` wiring lexically; they are best effort and cannot see control-flow relocation. The authoring-time refusal (`authorize_instruction`, the `400` on create and enable) is advisory and the dispatch seam is the control; product pack install is not refused. The behaviour an operator sees is in "Action approval and the `blocked` status" above.

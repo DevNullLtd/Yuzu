@@ -7,7 +7,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "collection_settings_agent.hpp" // the golden settings documents feed the collector switches
-#include "installed_apps_inventory.hpp" // the plugin's own row parsers/builder feed the publisher cases
+#include "installed_apps_inventory.hpp" // the plugin's own row builder feeds the publisher cases
+#include "installed_apps_old_path_oracle.hpp" // parse_dpkg_inv_line / parse_rpm_inv_line (test-only since SAM-45)
 #include "installed_software_v3.hpp"
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
@@ -1387,6 +1388,7 @@ std::vector<SwEntry> entries_of(const V3Sec& sec) {
         e.distro_id = f[10];
         e.distro_version = f[11];
         e.install_location = f[12];
+        e.attributes = f[13];
         e.package_id = f[14];
         e.source = f[15];
         out.push_back(std::move(e));
@@ -1625,7 +1627,7 @@ TEST_CASE("pkg_inventory packages adapter: real macOS capture", "[sync][parse][a
     const auto r = parse_pkg_inventory_packages_output(
         capture_section("pkg_inventory", "macos.txt", "packages"));
     REQUIRE(r.status == Status::ok);
-    REQUIRE(r.entries.size() == 70);
+    REQUIRE(r.entries.size() == 69);
     CHECK(r.entries[0].name == "actionlint");
     CHECK(r.entries[0].version == "1.7.12");
     CHECK(r.entries[0].kind == "pkg");
@@ -1634,6 +1636,9 @@ TEST_CASE("pkg_inventory packages adapter: real macOS capture", "[sync][parse][a
         CHECK((e.kind == "pkg" || e.kind == "app"));
         CHECK(e.ecosystem == "brew");
         CHECK(e.source.empty()); // the collector stamps source
+        // the capture is of the machine prefix, so every row fills install_location from it
+        CHECK(e.install_location == "/opt/homebrew");
+        CHECK(e.install_date.size() == 10); // the receipt's install time, epoch seconds
     }
 }
 
@@ -1646,6 +1651,94 @@ TEST_CASE("pkg_inventory packages adapter maps casks to kind app", "[sync][parse
     REQUIRE(r.entries.size() == 2);
     CHECK(r.entries[0].kind == "pkg");
     CHECK(r.entries[1].kind == "app");
+}
+
+TEST_CASE("pkg_inventory packages adapter: an eleven-field machine row fills install_date and "
+          "install_location only",
+          "[sync][parse][adapter]") {
+    const pkg::BrewReceipt receipt{"1767225600", "homebrew/core", "true"};
+    const auto r = parse_pkg_inventory_packages_output(nl(
+        {supported_status("packages"),
+         pkg::format_homebrew_package_row("wget", "1.24", pkg::PackageKind::formula, receipt,
+                                          pkg::BrewScope::machine, "", "/opt/homebrew"),
+         pkg::format_homebrew_package_row("firefox", "130.0", pkg::PackageKind::cask, {},
+                                          pkg::BrewScope::machine, "", "/usr/local")}));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 2);
+    CHECK(r.entries[0].name == "wget");
+    CHECK(r.entries[0].kind == "pkg");
+    CHECK(r.entries[0].ecosystem == "brew");
+    CHECK(r.entries[0].install_date == "1767225600");
+    CHECK(r.entries[0].install_location == "/opt/homebrew");
+    // tap and installed_on_request have no column: nothing else carries them
+    CHECK(r.entries[0].publisher.empty());
+    CHECK(r.entries[0].source.empty());
+    CHECK(r.entries[1].kind == "app");
+    CHECK(r.entries[1].install_date.empty()); // `-` in the row: no receipt for a cask
+    CHECK(r.entries[1].install_location == "/usr/local");
+}
+
+TEST_CASE("pkg_inventory packages adapter: a user-scope row is seen and never mapped",
+          "[sync][parse][adapter]") {
+    const pkg::BrewReceipt receipt{"1767225600", "homebrew/core", "true"};
+    const auto r = parse_pkg_inventory_packages_output(nl(
+        {supported_status("packages"),
+         pkg::format_homebrew_package_row("mine", "1.0", pkg::PackageKind::formula, receipt,
+                                          pkg::BrewScope::user, "jsmith", "~/homebrew"),
+         "package|homebrew|odd|1.0|formula|-|-|-|team|-|/opt/homebrew", // an unknown scope token
+         pkg::format_homebrew_package_row("shared", "2.0", pkg::PackageKind::formula, {},
+                                          pkg::BrewScope::machine, "", "/opt/homebrew")}));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 1);
+    CHECK(r.entries[0].name == "shared");
+}
+
+TEST_CASE("pkg_inventory packages adapter: the writer blanks a user-looking prefix on a machine row",
+          "[sync][parse][adapter]") {
+    for (const char* prefix : {"~/homebrew", "/Users/x/homebrew"}) {
+        INFO("prefix: " << prefix);
+        const auto r = parse_pkg_inventory_packages_output(nl(
+            {supported_status("packages"),
+             pkg::format_homebrew_package_row("a", "1", pkg::PackageKind::formula, {},
+                                              pkg::BrewScope::machine, "", prefix)}));
+        REQUIRE(r.entries.size() == 1);
+        CHECK(yuzu::agent::v3_normal_form(r.entries[0]).install_location.empty());
+    }
+}
+
+TEST_CASE("pkg_inventory packages adapter: a non-digit install time and a `-` prefix stay empty",
+          "[sync][parse][adapter]") {
+    const auto r = parse_pkg_inventory_packages_output(nl(
+        {supported_status("packages"),
+         "package|homebrew|a|1|formula|17x7225600|-|-|machine|-|-",
+         "package|homebrew|b|1|formula|-|-|-|machine|-|-"}));
+    REQUIRE(r.entries.size() == 2);
+    for (const auto& e : r.entries) {
+        CHECK(e.install_date.empty());
+        CHECK(e.install_location.empty());
+    }
+}
+
+TEST_CASE("pkg_inventory packages adapter: the old five-field shape maps as before and any other "
+          "width is dropped, never truncated",
+          "[sync][parse][adapter]") {
+    const auto r = parse_pkg_inventory_packages_output(nl(
+        {supported_status("packages"), "package|homebrew|old|1|formula",
+         "package|chocolatey|choc|2|pkg",
+         "package|homebrew|w6|1|formula|-",
+         "package|homebrew|w7|1|formula|-|-",
+         "package|homebrew|w8|1|formula|-|-|-",
+         "package|homebrew|w9|1|formula|-|-|-|machine",
+         "package|homebrew|w10|1|formula|-|-|-|machine|-",
+         "package|homebrew|w12|1|formula|-|-|-|machine|-|/opt/homebrew|extra",
+         "package|homebrew|w13|1|formula|-|-|-|machine|-|/opt/homebrew|extra|more"}));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 2);
+    CHECK(r.entries[0].name == "old");
+    CHECK(r.entries[0].install_date.empty());
+    CHECK(r.entries[0].install_location.empty());
+    CHECK(r.entries[1].name == "choc");
+    CHECK(r.entries[1].ecosystem == "chocolatey");
 }
 
 TEST_CASE("pkg_inventory managers adapter: one Homebrew presence row", "[sync][parse][adapter]") {
@@ -1898,6 +1991,33 @@ TEST_CASE("pkg_inventory managers adapter: a constrained answer contributes no r
     }
 }
 
+TEST_CASE("collector: a formula under both Homebrew machine prefixes is two records, one per "
+          "install_location",
+          "[sync][collector]") {
+    fake_mac();
+    // Same id, version, kind and receipt under both prefixes: install_location is the only field
+    // that differs, and the writer de-duplicates on the whole record, so both must survive.
+    const pkg::BrewReceipt receipt{"1767225600", "homebrew/core", "true"};
+    g_fake[1].out["packages"] = nl(
+        {supported_status("packages"),
+         pkg::format_homebrew_package_row("wget", "1.24", pkg::PackageKind::formula, receipt,
+                                          pkg::BrewScope::machine, "", "/opt/homebrew"),
+         pkg::format_homebrew_package_row("wget", "1.24", pkg::PackageKind::formula, receipt,
+                                          pkg::BrewScope::machine, "", "/usr/local")});
+    const auto sec = section_of(all_plugins(), "pkg_inventory.packages");
+    REQUIRE(sec.has_value());
+    const auto entries = entries_of(*sec);
+    REQUIRE(entries.size() == 2);
+    std::vector<std::string> locations;
+    for (const auto& e : entries) {
+        CHECK(e.name == "wget");
+        CHECK(e.source == "pkg_inventory.packages");
+        locations.push_back(e.install_location);
+    }
+    std::sort(locations.begin(), locations.end());
+    CHECK(locations == std::vector<std::string>{"/opt/homebrew", "/usr/local"});
+}
+
 TEST_CASE("collector: Linux store_packages rows are collected, and a degraded row does not constrain the facet",
           "[sync][collector]") {
     fake_mac();
@@ -1912,7 +2032,7 @@ TEST_CASE("collector: Linux store_packages rows are collected, and a degraded ro
     const auto got = collect_with(all_plugins());
     REQUIRE(got.has_value());
     const auto recs = plus_records(got->first);
-    CHECK(recs.size() == 393 + 70 + 1 + 3);
+    CHECK(recs.size() == 393 + 69 + 1 + 3);
     std::map<std::string, std::string> eco_by_name;
     std::size_t store = 0;
     for (const auto& rec : recs) {
@@ -2196,13 +2316,45 @@ TEST_CASE("msi_packages adapter: status grammar", "[sync][parse][adapter][msi_pa
 TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_packages]") {
     const std::string ok_status = "status|list_inventory|supported|-";
     const std::string good = "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub";
-    SECTION("a 4-token and a 6-token inv row are dropped, never truncated or padded") {
-        // MUTATION: split_tokens truncation to 5 would map the 6-token row.
+    SECTION("a 4-token and a 7-token inv row are dropped, never truncated or padded") {
+        // MUTATION: split_tokens truncation to 6 would map the 7-token row.
         const auto r = parse_msi_packages_list_inventory_output(
-            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0", good + "|extra",
-                good + "|extra|more"}));
+            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0",
+                good + "|{BBBBBBBB-0000-0000-0000-000000000002}|more",
+                good + "|a|b|c|d|e"}));
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
+    }
+    SECTION("a 5-token row maps with no attributes") {
+        const auto r = parse_msi_packages_list_inventory_output(nl({ok_status, good}));
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].attributes.empty());
+    }
+    SECTION("a 6-token row with a braced GUID sets upgrade_code, upper-cased") {
+        const auto r = parse_msi_packages_list_inventory_output(
+            nl({ok_status, good + "|{12345678-90ab-cdef-1234-567890abcdef}",
+                "inv|{AAAAAAAA-0000-0000-0000-000000000002}|App2|1.0|Pub|"
+                "{12345678-90AB-CDEF-1234-567890ABCDEF}"}));
+        REQUIRE(r.entries.size() == 2);
+        CHECK(r.entries[0].attributes == "upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}");
+        CHECK(r.entries[1].attributes == "upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}");
+        // The attribute is part of the row the writer hashes.
+        SwEntry bare = r.entries[0];
+        bare.attributes.clear();
+        CHECK(yuzu::agent::v3_row_hash(r.entries[0]) != yuzu::agent::v3_row_hash(bare));
+    }
+    SECTION("a 6th token that is empty or not a braced GUID keeps the row without attributes") {
+        for (const char* tail : {"", "extra", "12345678-90AB-CDEF-1234-567890ABCDEF",
+                                 "{12345678-90AB-CDEF-1234-567890ABCDE}",
+                                 "{12345678-90AB-CDEF-1234-567890ABCDEG}",
+                                 "{12345678-90AB-CDEF-1234-567890ABCDEF};x=1"}) {
+            CAPTURE(tail);
+            const auto r =
+                parse_msi_packages_list_inventory_output(nl({ok_status, good + "|" + tail}));
+            REQUIRE(r.entries.size() == 1);
+            CHECK(r.entries[0].name == "App");
+            CHECK(r.entries[0].attributes.empty());
+        }
     }
     SECTION("an empty code is mapped with an empty package_id (the adapter invents no key)") {
         const auto r = parse_msi_packages_list_inventory_output(nl({ok_status, "inv||name|1|pub"}));
@@ -2226,7 +2378,7 @@ TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_package
 
 TEST_CASE("collector: msi_packages rows carry package_id and source, and a constrained answer is status-only",
           "[sync][collector][msi_packages]") {
-    SECTION("Windows-shaped run: msi records carry package_id and source, slots 13-14 stay empty") {
+    SECTION("Windows-shaped run: msi records carry package_id and source; slot 13 stays empty and slot 14 is none until the producer sends an upgrade code") {
         fake_windows();
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
@@ -2240,7 +2392,7 @@ TEST_CASE("collector: msi_packages rows carry package_id and source, and a const
             CHECK(f[4] == "pkg");
             CHECK(f[5] == "msi");
             CHECK(f[12].empty()); // install_location (reserved, #5186)
-            CHECK(f[13].empty()); // uninstall_string (reserved, #5186)
+            CHECK(f[13].empty()); // attributes (the captured rows have no 6th token)
             CHECK(f[14].size() == 38); // {GUID}
         }
         CHECK(msi_records == msi_sample_mapped_rows());
@@ -2299,7 +2451,7 @@ TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence
     const auto got = collect_with(all_plugins());
     REQUIRE(got.has_value());
     const auto recs = plus_records(got->first);
-    CHECK(recs.size() == 393 + 70 + 1);
+    CHECK(recs.size() == 393 + 69 + 1);
     const std::set<std::string> sources = {"installed_apps.list_inventory",
                                            "pkg_inventory.packages", "pkg_inventory.managers"};
     std::map<std::string, std::size_t> per_source;
@@ -2311,7 +2463,7 @@ TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence
         ++per_source[f[15]];
     }
     CHECK(per_source["installed_apps.list_inventory"] == 393);
-    CHECK(per_source["pkg_inventory.packages"] == 70);
+    CHECK(per_source["pkg_inventory.packages"] == 69);
     CHECK(per_source["pkg_inventory.managers"] == 1);
     // The claimed report hash is the v3 hash over the facets the call holds: one full section each
     // (the unsupported ones are status-only and not held).
@@ -2603,7 +2755,7 @@ TEST_CASE("collector: a constrained managers answer is status-only, even beside 
     CHECK(m->status == "constrained");
     CHECK(m->token == "macos:homebrew_taps:permission_denied");
     CHECK(m->adds.empty());
-    CHECK(plus_records(got->first).size() == 393 + 70); // no managers row
+    CHECK(plus_records(got->first).size() == 393 + 69); // no managers row
     // The facet is not held: it is absent from the claimed report hash.
     std::vector<std::pair<std::string, std::string>> held;
     for (const auto& sec : secs) {
@@ -2720,7 +2872,7 @@ TEST_CASE("collector: installed_software carries the 01:00-05:00 local nightly w
 // --- Adapter characterisation: the whole observable result of each status-row adapter ---
 //
 // Every cell asserts the whole observable result of an adapter: status, reason, entry count and
-// ALL fifteen fields of every entry. The cells reach the adapters only through the four binders
+// ALL sixteen fields of every entry. The cells reach the adapters only through the four binders
 // below, so how an adapter is bound is the binders' concern alone and the expectations stay put. Status rows are written as raw text (not through a formatter) so
 // they are independent of the producer.
 
@@ -2730,8 +2882,8 @@ std::string show_entry(const SwEntry& e) {
     std::string s;
     for (const std::string* f : {&e.name, &e.version, &e.publisher, &e.install_date, &e.kind,
                                  &e.ecosystem, &e.epoch, &e.release, &e.arch, &e.signature_status,
-                                 &e.distro_id, &e.distro_version, &e.install_location, &e.package_id,
-                                 &e.source}) {
+                                 &e.distro_id, &e.distro_version, &e.install_location,
+                                 &e.attributes, &e.package_id, &e.source}) {
         s += *f;
         s += ',';
     }
@@ -3047,8 +3199,18 @@ TEST_CASE("characterisation: msi list_inventory",
               res("ok", "",
                   {entry_of("n", "", "", "pkg", "msi", "{aaaaaaaa-0000-0000-0000-000000000001}")}));
     }
+    SECTION("an optional sixth token is the upgrade code: a row of that width is mapped, never "
+            "dropped") {
+        // `show` renders the attributes field, so a sixth token that is not a braced GUID is
+        // pinned here to leave it empty; a valid upgrade code is pinned in "msi_packages adapter:
+        // row shape".
+        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|extra"}) ==
+              res("ok", "", {entry_of("App", "1.0", "Pub", "pkg", "msi", code)}));
+        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|"}) ==
+              res("ok", "", {entry_of("App", "1.0", "Pub", "pkg", "msi", code)}));
+    }
     SECTION("rows that are not mapped") {
-        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|extra"}) == res("ok", ""));
+        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|extra|more"}) == res("ok", ""));
         CHECK(run({sup, "msi|" + code + "|App|1.0|-"}) == res("ok", ""));
         CHECK(run({sup, "package|homebrew|a|1|formula"}) == res("ok", ""));
         CHECK(run({sup, "INV|" + code + "|App|1.0|Pub"}) == res("ok", ""));
@@ -3100,10 +3262,10 @@ TEST_CASE("characterisation: collector section digests are byte-pinned",
         const auto [hashes, report] = digests("mac");
         REQUIRE(hashes.size() == 6);
         CHECK(hashes.at("installed_apps.list_inventory") == "0fd2f99dae065cffe3253f3e555bb97a2e826bfc530e8421854bd08bd32ca4a5");
-        CHECK(hashes.at("pkg_inventory.packages") == "7c8fbeeb6502b712034ab6ae188287e60a3d33d919d41265ca698b0277fbb685");
+        CHECK(hashes.at("pkg_inventory.packages") == "b53f22af3e3f5021587000b03bcb68d79ce64676f8d943fb398c0fb33d8b6ec3");
         CHECK(hashes.at("pkg_inventory.managers") == "e3131d004316be18633e1e86d3d625fe525ccbe1b8a78b221f0aae3f700adcae");
         check_empty_runtimes(hashes);
-        CHECK(report == "v3:4a0432236dee712f773bd400c1334d8bbe6fb4407276d084709da4e7c24c6484");
+        CHECK(report == "v3:a508a38f2c9263f72443d55556194a7130a7a47de7f6dd11d4e9c2231e04c1cb");
     }
 #if defined(_WIN32)
     SECTION("Windows-shaped run") {
@@ -3265,7 +3427,7 @@ TEST_CASE("collector: runtimes.python contributes sourced rows; a constrained or
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 1);
-        CHECK(plus_records(got->first).size() == 393 + 70 + 1 + 1);
+        CHECK(plus_records(got->first).size() == 393 + 69 + 1 + 1);
     }
     SECTION("escaped pipes in the free-text fields do not cost the sourced row") {
         // Built by the real producer: vendor and install_path go through safe_output_field, so a
@@ -3282,14 +3444,14 @@ TEST_CASE("collector: runtimes.python contributes sourced rows; a constrained or
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 1);
-        CHECK(plus_records(got->first).size() == 393 + 70 + 1 + 1);
+        CHECK(plus_records(got->first).size() == 393 + 69 + 1 + 1);
     }
     SECTION("a clean empty read contributes nothing and does not skip the cycle") {
         fake_mac();
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 0);
-        CHECK(plus_records(got->first).size() == 393 + 70 + 1);
+        CHECK(plus_records(got->first).size() == 393 + 69 + 1);
     }
     SECTION("a constrained status reports the python facet status-only, even one that carries a row") {
         fake_mac();
@@ -3302,7 +3464,7 @@ TEST_CASE("collector: runtimes.python contributes sourced rows; a constrained or
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 0);
-        CHECK(plus_records(got->first).size() == 393 + 70 + 1); // every other source's rows survive
+        CHECK(plus_records(got->first).size() == 393 + 69 + 1); // every other source's rows survive
         const auto secs = sections_of(got->first);
         const V3Sec* py = find_sec(secs, "runtimes.python");
         REQUIRE(py != nullptr);
@@ -4719,7 +4881,7 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
                                   "Microsoft.NETCore.App/8.0.31|-"});
     g_fake[4].out["jvm"] = nl({supported_status("jvm"),
                                "jvm|jdk|17.0.20|/opt/java/openjdk|Eclipse Adoptium",
-                               "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-amd64|-"});
+                               "jvm|jre|-|/usr/lib/jvm/java-8-openjdk-amd64|-"});
     g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
     // hardware.drivers_inventory: the WMI provider (else the signer) is the publisher on Windows;
     // the fixed Linux provider `kernel` is not a vendor, so a module is labelled by origin.
