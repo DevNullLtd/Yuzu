@@ -307,6 +307,14 @@ A non-zero rate of `row_count_mismatch` or `content_digest_mismatch` means rows 
 
 The related `yuzu_inventory_read_degrade_total{source="device_ci",reason="sections_query_error"}` (see [Inventory](inventory.md)) counts a hardware record read whose record answered but whose sections did not, which the REST route answers `503` and the MCP tool with a retryable error; `query_error` counts the record read itself failing. `reason="keyed_read_budget"` counts a Hardware list CI read abandoned between chunks because its 20-second budget ran out: the list then shows the "CI columns unavailable" banner and `ci_degraded` is `true`, never partial CI. It appears on its first occurrence.
 
+## Bulk device-CI read capacity metric (#7949)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_hardware_ci_read_busy_total{surface}` | counter | One increment per bulk device-CI read refused with a retryable `503` (REST) or retryable error (MCP) because every bulk-read slot on this replica was taken for the 500 ms wait. `surface` is `rest` (`GET /api/v1/hardware-ci`) or `mcp` (`list_hardware_ci_records`), a closed pair, both seeded at 0 at boot. Nothing was read or served and no audit row is written on either transport, so this counter is the only record of the refusal. A read that names an `agent_id` takes no slot and is never counted. Per replica: the cap is `--hardware-ci-read-concurrency` (see [server-admin.md](server-admin.md#bulk-device-ci-read-concurrency)). No alert rule and no in-use gauge ship for it. When it rises: serialise the pull to one walker, check `yuzu_pg_pool_in_use` against the pool size, and check `yuzu_pg_pool_waiters`, the rate of `yuzu_pg_acquire_timeout_total`, `yuzu_server_audit_emit_failed_total` and `yuzu_inventory_read_degrade_total{source="device_ci"}` for a slow, hung or locked database before raising the cap (triage in the same section; `yuzu_server_audit_read_degrade_total` counts failed audit-log reads and is not a signal for this). |
+
+A sustained non-zero rate means callers are walking in parallel or the cap is too low for the workload; raise the cap only within the pool arithmetic in server-admin.md, because the cap exists to keep pool connections free for authorization and audit writes.
+
 ## Installed-software sectioned-report metrics
 
 | Metric | Type | Description |
