@@ -962,6 +962,48 @@ TEST_CASE("settings pending: an empty-looking dot-only agent id gets no row acti
     }
 }
 
+// #7811: the agent id is the `target_id` of every row these routes write (the denial rows too), and
+// the audit store keeps CR, LF and TAB, so an id over 256 bytes or with a byte below 0x20 is a 400
+// that writes no row and never reaches the store. CR and LF are not driven here: the routes'
+// `(.+)` capture does not match them, so they never reach the handler through the sink.
+TEST_CASE("settings pending: an over-long or control-byte agent id is a 400 with no audit row and "
+          "no store hit",
+          "[pg][settings_routes][enrollment][audit]") {
+    EnrollRoutesHarness h;
+    h.queue("normal");
+    h.audit_calls.clear();
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\tA"};
+    for (const auto& seg : bad) {
+        INFO(seg.substr(0, 16));
+        auto a = h.sink.Post("/api/settings/pending-agents/" + seg + "/approve", "", kForm);
+        REQUIRE(a);
+        CHECK(a->status == 400);
+        auto d = h.sink.Post("/api/settings/pending-agents/" + seg + "/deny", "", kForm);
+        REQUIRE(d);
+        CHECK(d->status == 400);
+        auto r = h.sink.Delete("/api/settings/pending-agents/" + seg);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
+    CHECK(h.audit_calls.empty());
+    CHECK(h.attempt_calls.empty());
+    CHECK(h.status_of("normal") == auth::PendingStatus::pending);
+
+    // A 256-byte printable id is safe: it reaches the store, and is approved there.
+    const std::string edge(256, 'a');
+    // (queued directly: `h.queue` derives a hostname from the id, which would be over its bound)
+    REQUIRE(h.auth_mgr.add_pending_agent(edge, "edge-host", "linux", "x86_64", "1.0").value());
+    h.audit_calls.clear();
+    auto ok = h.sink.Post("/api/settings/pending-agents/" + edge + "/approve", "", kForm);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto row = h.only("enrollment.approve");
+    CHECK(row.result == "success");
+    CHECK(row.target_id == edge);
+    CHECK(h.status_of(edge) == auth::PendingStatus::approved);
+}
+
 // An Active token is mild information, never the green OK colour: a credential that may be
 // lapsed or spent must not look healthy. The Expired state itself is pinned against an injected
 // clock in test_groups_enrolment_render.cpp (a lapsed token cannot be minted here without a wait).

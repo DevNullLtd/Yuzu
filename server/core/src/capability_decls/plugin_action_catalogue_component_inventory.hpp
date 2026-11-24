@@ -7,7 +7,7 @@
 #include "../command_capability.hpp"
 
 /// @file plugin_action_catalogue_component_inventory.hpp
-/// One fragment of the command capability catalogue: `component_inventory`'s two
+/// One fragment of the command capability catalogue: `component_inventory`'s four
 /// read-only actions (`agents/plugins/component_inventory/src/component_inventory_plugin.cpp`).
 /// Classified by READING the implementation.
 ///
@@ -23,6 +23,11 @@
 /// dispatch gate already honours and an operator lifts with PUT
 /// /api/v1/plugin-config/component_inventory/kill-switch.
 ///
+/// `python` and `node` are the same shape again, for interpreter installs and package trees
+/// (header and package.json reads, bounded and link-free, fixed machine roots, no subprocess, no
+/// parameter, nothing written). Both are ReadOnly/None and `ExecuteGate::None` and ship ENABLED: there
+/// is no kill-switch seed for either.
+///
 /// The `Inventory` securable is deliberate: the Java archives and libraries found are a
 /// software-inventory fact, not a security-posture fact (Security:Read is for posture
 /// plugins). Same precedent as `runtimes`.
@@ -30,7 +35,7 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueComponentInventory{{
+inline constexpr std::array<CommandCapability, 4> kPluginActionCatalogueComponentInventory{{
     {
         .plugin = "component_inventory",
         .action = "scan",
@@ -45,6 +50,28 @@ inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueComponen
     {
         .plugin = "component_inventory",
         .action = "native",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "component_inventory",
+        .action = "python",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "component_inventory",
+        .action = "node",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Inventory",

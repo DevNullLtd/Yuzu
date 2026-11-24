@@ -496,6 +496,47 @@ TEST_CASE("REST POST /api/v1/quarantine is denied per-target by the scoped gate 
     CHECK_FALSE(h.is_quarantined("agent-B"));
 }
 
+// #7811: the device id reaches the store-outage and scope-gate-failure rows and every attempt and
+// outcome row as `target_id`, so an over-long or control-byte id is refused with a 400 before the
+// scoped gate, the dispatch pre-check and any audit row. The gate here refuses every device, so a
+// 400 with the gate never asked proves the id check runs first.
+TEST_CASE("REST POST/DELETE /api/v1/quarantine: an unsafe agent id is a 400 before the scoped "
+          "gate, the dispatch pre-check or any audit row",
+          "[rest][quarantine][authz][audit][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    h.scope_allow = false;
+    // CR and LF cannot reach the DELETE handler: its `(.+)` capture does not match them.
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        auto post = h.post(nlohmann::json{{"agent_id", id}, {"reason", "test"}}.dump());
+        REQUIRE(post);
+        CHECK(post->status == 400);
+        CHECK(nlohmann::json::parse(post->body)["error"]["message"] == "Invalid device id.");
+        auto del = h.del(id);
+        REQUIRE(del);
+        CHECK(del->status == 400);
+        CHECK(nlohmann::json::parse(del->body)["error"]["message"] == "Invalid device id.");
+    }
+    for (const char* id : {"dev\r\nA", "dev\nA"}) {
+        auto post = h.post(nlohmann::json{{"agent_id", id}, {"reason", "test"}}.dump());
+        REQUIRE(post);
+        CHECK(post->status == 400);
+    }
+    CHECK_FALSE(h.scope_fn_called);
+    CHECK(h.authorize_calls == 0);
+    CHECK(h.audit_calls.empty());
+
+    // A 256-byte printable id is safe and reaches the scoped gate.
+    auto edge = h.post(nlohmann::json{{"agent_id", std::string(256, 'a')}, {"reason", "test"}}.dump());
+    REQUIRE(edge);
+    CHECK(edge->status == 403);
+    CHECK(h.scoped_target.size() == 256);
+}
+
 TEST_CASE("REST POST /api/v1/quarantine passes an OMITTED agent_id through to the scope gate "
           "unmodified — no route-level default/early-return that could diverge from "
           "require_scoped_permission's own empty-agent_id 400 (#2298 PR 3 §3b)",
