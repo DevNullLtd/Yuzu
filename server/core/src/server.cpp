@@ -2932,12 +2932,50 @@ public:
                           "/auto VERIFY cohort reads that hit the row cap and were TRUNCATED (the "
                           "comparison is incomplete and may mis-pair machines)",
                           "counter");
+        // Echo corruption audit gate signals (#7486, #5066, #7475, #7429). The counters are
+        // pre-seeded to 0 so the first quarantine / degrade reads as an increase from 0 (the
+        // alert on the quarantine counter depends on that sample).
+        metrics_.describe("yuzu_server_echo_db_quarantines_total",
+                          "New Echo database quarantines recorded: one per echo.db corruption "
+                          "audit row this server wrote (a duplicate or a durable lookup hit does "
+                          "not count). Alerts watch the increase, not a population",
+                          "counter");
+        metrics_.counter("yuzu_server_echo_db_quarantines_total");
+        metrics_.describe("yuzu_server_echo_corruption_audit_degraded_total",
+                          "Failed echo.db corruption audit lookups and writes, by reason "
+                          "(lookup_degraded, lookup_threw, write_failed). Each opens a 60 s window "
+                          "in which no agent is audited, except a repeat failure by the same "
+                          "agent, which only that agent waits out; quarantines not audited are "
+                          "retried afterwards",
+                          "counter");
+        for (const char* reason : {"lookup_degraded", "lookup_threw", "write_failed"})
+            metrics_.counter("yuzu_server_echo_corruption_audit_degraded_total",
+                             {{"reason", reason}});
+        metrics_.describe("yuzu_server_echo_corruption_audit_store_closed_total",
+                          "Heartbeats that carried an echo.db quarantine candidate while the audit "
+                          "store was closed: nothing can be audited or counted as a quarantine "
+                          "then, so a rise here means the quarantine counter is blind, not that "
+                          "no agent is corrupt",
+                          "counter");
+        metrics_.counter("yuzu_server_echo_corruption_audit_store_closed_total");
+        metrics_.describe("yuzu_server_health_upsert_exceptions_total",
+                          "Heartbeat health-store upserts that threw out of the store (caught in "
+                          "the heartbeat handler, logged and counted; the rest of ingestion "
+                          "continues)",
+                          "counter");
+        metrics_.counter("yuzu_server_health_upsert_exceptions_total");
+        metrics_.describe("yuzu_fleet_retired_tar_plugin_agents",
+                          "Agents connected to this server that report the retired plugin name "
+                          "tar and no echo (not Echo agents; upgrade them). Published every sweep, "
+                          "0 included",
+                          "gauge");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
         metrics_.describe("yuzu_fleet_echo_db_corruption_agents",
                           "Agents whose Echo database has ever been quarantined as corrupt "
-                          "(cumulative per agent since install; a rising value is the signal)",
+                          "(cumulative per agent since install: a population that only falls when "
+                          "agents leave, not a rate; see yuzu_server_echo_db_quarantines_total)",
                           "gauge");
         metrics_.describe("yuzu_fleet_echo_storage_offline",
                           "Agents whose Echo database is offline, by reason (free_space, "
@@ -7055,32 +7093,55 @@ public:
                         return std::optional<std::string>{};
                     return detail::decode_echo_quarantine_from_detail(rows->front().detail);
                 };
-                auto gate = std::make_shared<detail::EchoCorruptionAuditGate>(std::move(latest));
+                // #5066: every lookup or write failure is counted by reason and logged once (the
+                // reason token is a closed set, safe to log verbatim). A repeat failure by the
+                // same agent opens no gate-wide window; the observer still hears it.
+                auto on_degraded = [this](detail::DegradedCause cause) {
+                    const char* reason = detail::echo_corruption_degraded_cause_token(cause);
+                    metrics_.counter("yuzu_server_echo_corruption_audit_degraded_total",
+                                     {{"reason", reason}})
+                        .increment();
+                    spdlog::warn("echo.db corruption audit failed ({}): new quarantines are not "
+                                 "audited until the retry wait ends (every agent, or only the "
+                                 "failing one when it fails again)",
+                                 reason);
+                };
+                auto gate = std::make_shared<detail::EchoCorruptionAuditGate>(
+                    std::move(latest), &detail::EchoCorruptionAuditGate::steady_seconds,
+                    std::move(on_degraded));
                 health_store_.set_corruption_sink([this, gate](const std::string& agent_id,
                                                                int64_t total,
                                                                const std::string& quarantine) {
-                    if (!audit_store_ || !audit_store_->is_open())
+                    if (!audit_store_ || !audit_store_->is_open()) {
+                        // No row can be written, so the quarantine counter cannot move: say so, or
+                        // the corruption signal would be silent exactly when the store is down.
+                        metrics_
+                            .counter("yuzu_server_echo_corruption_audit_store_closed_total")
+                            .increment();
                         return;
-                    if (!gate->should_log(agent_id, quarantine))
-                        return;
-                    // Reservation completes that agent's slot even if AuditEvent construction
-                    // or audit_store_->log() throws (log() is not noexcept).
-                    detail::EchoCorruptionAuditGate::Reservation res(*gate, agent_id);
-                    AuditEvent ev;
-                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                                       std::chrono::system_clock::now().time_since_epoch())
-                                       .count();
-                    ev.principal = "system";
-                    ev.principal_role = "system";
-                    ev.action = detail::kEchoCorruptionAuditAction;
-                    ev.target_type = detail::kEchoCorruptionAuditTargetType;
-                    ev.target_id = agent_id;
-                    ev.detail = detail::encode_echo_corruption_detail(total, quarantine);
-                    ev.result = "success";
-                    if (audit_store_->log(ev))
-                        res.logged(quarantine);
-                    else
-                        res.failed();
+                    }
+                    // log_echo_corruption_once admits via the gate and completes the reservation
+                    // even if AuditEvent construction or audit_store_->log() throws (log() is
+                    // not noexcept). It returns true only for a row this call wrote, so the
+                    // counter moves once per new quarantine and not for a durable lookup hit
+                    // (an agent back from offline, a failover) or a refused or failed write.
+                    const bool wrote = detail::log_echo_corruption_once(
+                        *gate, agent_id, quarantine, [&] {
+                            AuditEvent ev;
+                            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
+                            ev.principal = "system";
+                            ev.principal_role = "system";
+                            ev.action = detail::kEchoCorruptionAuditAction;
+                            ev.target_type = detail::kEchoCorruptionAuditTargetType;
+                            ev.target_id = agent_id;
+                            ev.detail = detail::encode_echo_corruption_detail(total, quarantine);
+                            ev.result = "success";
+                            return audit_store_->log(ev);
+                        });
+                    if (wrote)
+                        metrics_.counter("yuzu_server_echo_db_quarantines_total").increment();
                 });
             }
 
@@ -10847,6 +10908,11 @@ public:
                 // visible.
                 const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, detail::kAgentHealthStaleness);
+                // #7429: agents on the retired `tar` plugin name. The flag lives on the sessions
+                // this replica holds (AgentRegistry, not the health store), so it is read here
+                // and set per replica; a count over server-held sessions has a true zero.
+                metrics_.gauge("yuzu_fleet_retired_tar_plugin_agents")
+                    .set(static_cast<double>(registry_.retired_tar_only_count()));
                 // PostgreSQL pool gauges (#1368): sampled on the same cadence as
                 // the fleet families. Counters/histogram are fed live by the
                 // pool's observer hooks, so only the level gauges are polled here.
