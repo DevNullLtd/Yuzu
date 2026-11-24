@@ -23,8 +23,8 @@
 ##   seccomp          /proc/<pid>/status (Seccomp, Seccomp_filters, NoNewPrivs)
 ##   oom              /proc/<pid>/oom_score and oom_score_adj
 ##   sched            /proc/<pid>/stat (policy, nice, rt priority) and status (Cpus_allowed_list)
-##   macOS:           libproc only (one proc_pidinfo(PROC_PIDTBSDINFO) call and the
-##                    kern.bootsessionuuid sysctl), never a task port. sched answers the nice
+##   macOS:           libproc only (one proc_pidinfo(PROC_PIDTBSDINFO) call, one
+##                    proc_pid_rusage(RUSAGE_INFO_V0) call and the kern.bootsessionuuid sysctl), never a task port. sched answers the nice
 ##                    value only (CONSTRAINED, macos:process_introspect:sched:nice_only, or
 ##                    sched:malformed for a nice value outside -20 to 20);
 ##                    resource_limits, sigmasks and oom answer `unsupported`

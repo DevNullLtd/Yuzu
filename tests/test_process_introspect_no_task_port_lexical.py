@@ -3,7 +3,8 @@
 
 A Mach task port is a write-capable handle on the target process. The macOS leg reads another
 process through libproc only (one proc_pidinfo(PROC_PIDTBSDINFO) call, made in agent-core's bounded
-snapshot unit, which this gate scans too) and the boot identity through one sysctlbyname name. Nothing in the plugin may widen that without a new design note
+snapshot unit, which this gate scans too, plus one proc_pid_rusage(RUSAGE_INFO_V0) call there for
+the monotonic start stamp) and the boot identity through one sysctlbyname name. Nothing in the plugin may widen that without a new design note
 (.claude/routed-concerns-software-estate.md, process_introspect row, clause 6).
 
 Best-effort text pins over the plugin's C/C++ sources and agent-core's proc_snapshot_read.cpp
@@ -18,21 +19,25 @@ extension list: any list is a bypass list):
      proc_bsdinfo is never stored), no string literal ending /mem. Raw spawns (popen, system,
      fork, exec*, posix_spawn) are gated over every plugin by
      scripts/ci/check-plugin-spawn-lexical.sh, not here;
-  3. libproc allow-list: every proc_* identifier is one of proc_pidinfo, proc_bsdinfo, proc_info
+  3. libproc allow-list: every proc_* identifier is one of proc_pidinfo, proc_pid_rusage,
+     proc_bsdinfo, proc_info
      (the include path), proc_snapshot_read (the agent-core header) or proc_visibility (the
      Linux helper), and the only PROC_PID* tokens are PROC_PIDTBSDINFO and
-     PROC_PIDTBSDINFO_SIZE; every proc_pidinfo is a call of the form
-     proc_pidinfo(<pid>, PROC_PIDTBSDINFO, ...) (a numeric or variable flavour, or the bare name,
-     fails; the pid argument holds no comma or parenthesis);
+     PROC_PIDTBSDINFO_SIZE, and the only RUSAGE_INFO_* token is RUSAGE_INFO_V0; every
+     proc_pidinfo is a call of the form proc_pidinfo(<pid>, PROC_PIDTBSDINFO, ...) and every
+     proc_pid_rusage a call of the form proc_pid_rusage(<pid>, RUSAGE_INFO_V0, ...) (a numeric or
+     variable flavour, or the bare name, fails; the pid argument holds no comma or
+     parenthesis);
   4. sysctl allow-list: the only sysctlbyname name is kern.bootsessionuuid, no bare
      (uncalled) sysctlbyname, no MIB-form sysctl( call, no sysctlnametomib, no KERN_PROC* /
      KERN_ARGMAX token (the argv and environment read);
-  5. non-vacuity: proc_snapshot_read.cpp exists and contains proc_pidinfo and PROC_PIDTBSDINFO,
+  5. non-vacuity: proc_snapshot_read.cpp exists and contains proc_pidinfo, PROC_PIDTBSDINFO,
+     proc_pid_rusage and RUSAGE_INFO_V0,
      and process_introspect_macos.cpp exists and calls read_proc_snapshot_bounded, so a rename
      cannot make the gate pass on nothing;
   6. in the libproc TU (proc_snapshot_read.cpp) only: the include set stays within
-     LIBPROC_INCLUDES and proc_pidinfo is called exactly once; in the plugin's macOS shell:
-     no libproc call at all (it goes through agent-core) and its include set stays within
+     LIBPROC_INCLUDES and proc_pidinfo and proc_pid_rusage are each called exactly once; in the
+     plugin's macOS shell: no libproc call at all (it goes through agent-core) and its include set stays within
      MACOS_INCLUDES.
 """
 import pathlib
@@ -59,9 +64,13 @@ PROC_PID_TOKEN = re.compile(r"\bPROC_PID\w*")
 PROC_PID_ALLOWED = {"PROC_PIDTBSDINFO", "PROC_PIDTBSDINFO_SIZE"}
 PROC_PIDINFO = re.compile(r"\bproc_pidinfo\b")
 PROC_PIDINFO_CALL = re.compile(r"proc_pidinfo\s*\(\s*[^,()]*,\s*PROC_PIDTBSDINFO\s*,")
+RUSAGE_TOKEN = re.compile(r"\bRUSAGE_INFO_\w+")
+RUSAGE_ALLOWED = {"RUSAGE_INFO_V0"}
+PROC_PID_RUSAGE = re.compile(r"\bproc_pid_rusage\b")
+PROC_PID_RUSAGE_CALL = re.compile(r"proc_pid_rusage\s*\(\s*[^,()]*,\s*RUSAGE_INFO_V0\s*,")
 PROC_IDENT = re.compile(r"\bproc_\w+")
 # proc_snapshot_read is the agent-core header name in the include path.
-PROC_ALLOWED = {"proc_pidinfo", "proc_bsdinfo", "proc_info", "proc_visibility",
+PROC_ALLOWED = {"proc_pidinfo", "proc_pid_rusage", "proc_bsdinfo", "proc_info", "proc_visibility",
                 "proc_snapshot_read"}
 SYSCTLBYNAME = re.compile(r"\bsysctlbyname\s*\(\s*(\"[^\"\n]*\"|[^,)]*)")
 SYSCTLBYNAME_BARE = re.compile(r"\bsysctlbyname\b(?!\s*\()")
@@ -71,7 +80,7 @@ INCLUDE = re.compile(r"#\s*(?:include|import)\s*([<\"][^>\"\n]+[>\"])")
 MACOS_INCLUDES = {'"process_introspect_legs.hpp"', "<sys/sysctl.h>",
                   "<yuzu/agent/proc_snapshot_read.hpp>", "<cerrno>", "<cstring>"}
 LIBPROC_INCLUDES = {"<yuzu/agent/proc_snapshot_read.hpp>", "<cerrno>", "<libproc.h>",
-                    "<sys/proc_info.h>", "<cstring>"}
+                    "<sys/proc_info.h>", "<sys/resource.h>", "<cstring>"}
 
 
 def findings(name: str, src: str) -> list[str]:
@@ -94,6 +103,13 @@ def findings(name: str, src: str) -> list[str]:
         if not PROC_PIDINFO_CALL.match(ident, m.start()):
             out.append(f"{name}: proc_pidinfo is not called as "
                        "proc_pidinfo(pid, PROC_PIDTBSDINFO, ...)")
+    for m in RUSAGE_TOKEN.finditer(ident):
+        if m.group(0) not in RUSAGE_ALLOWED:
+            out.append(f"{name}: rusage flavour {m.group(0)} is not on the allow-list")
+    for m in PROC_PID_RUSAGE.finditer(ident):
+        if not PROC_PID_RUSAGE_CALL.match(ident, m.start()):
+            out.append(f"{name}: proc_pid_rusage is not called as "
+                       "proc_pid_rusage(pid, RUSAGE_INFO_V0, ...)")
     for m in PROC_IDENT.finditer(ident):
         if m.group(0) not in PROC_ALLOWED:
             out.append(f"{name}: names {m.group(0)} (not on the libproc allow-list)")
@@ -112,6 +128,8 @@ def findings(name: str, src: str) -> list[str]:
         want = 0 if name == MACOS_TU else 1
         if len(PROC_PIDINFO.findall(ident)) != want:
             out.append(f"{name}: proc_pidinfo must be called exactly {want} time(s)")
+        if len(PROC_PID_RUSAGE.findall(ident)) != want:
+            out.append(f"{name}: proc_pid_rusage must be called exactly {want} time(s)")
     return out
 
 
@@ -126,6 +144,11 @@ def self_check() -> list[str]:
         'proc_pidinfo(pid, 4, 0, &x, n);',
         'proc_pidinfo(pid, flavor, 0, &x, n);',
         'proc_pidinfo(pid, PROC_PIDTBSDINFO_SIZE, 0, &x, n);',
+        'proc_pid_rusage(pid, RUSAGE_INFO_V4, &r);',
+        'proc_pid_rusage(pid, 4, &r);',
+        'proc_pid_rusage(pid, flavor, &r);',
+        'auto f = proc_pid_rusage;',
+        'int f = RUSAGE_INFO_CURRENT;',
         'auto f = proc_pidinfo;',
         'proc_pidfdinfo(pid, fd, PROC_PIDFDVNODEINFO, &x, n);',
         'sysctlbyname("kern.procargs2", b, &n, nullptr, 0);',
@@ -149,13 +172,16 @@ def self_check() -> list[str]:
             errs.append(f"self-check: did not flag {bad!r}")
     # Rules that apply to the libproc TU only: an extra include, and a second proc_pidinfo call.
     macos_call = "proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &pbi, PROC_PIDTBSDINFO_SIZE);\n"
-    for bad in ('#include <unistd.h>\n' + macos_call,
-                '#include "macos_socket_walk.hpp"\n' + macos_call,
-                macos_call + macos_call):
+    rusage_call = "proc_pid_rusage(pid, RUSAGE_INFO_V0, &r);\n"
+    for bad in ('#include <unistd.h>\n' + macos_call + rusage_call,
+                '#include "macos_socket_walk.hpp"\n' + macos_call + rusage_call,
+                macos_call + macos_call + rusage_call,
+                macos_call + rusage_call + rusage_call,
+                macos_call, rusage_call):
         if not findings(LIBPROC_TU, bad):
             errs.append(f"self-check: did not flag {bad!r} as the libproc TU")
     # The plugin's macOS shell makes no libproc call of its own, and keeps its include set.
-    for bad in (macos_call, '#include <libproc.h>\n', '#include <unistd.h>\n'):
+    for bad in (macos_call, rusage_call, '#include <libproc.h>\n', '#include <unistd.h>\n'):
         if not findings(MACOS_TU, bad):
             errs.append(f"self-check: did not flag {bad!r} as the macOS shell")
     # Every banned name, spelled out here and not read back from the regexes above, so a typo in
@@ -169,7 +195,7 @@ def self_check() -> list[str]:
         "vm_write", "vm_protect", "dlsym", "dlopen", "ptrace", "ReadProcessMemory",
         "run_bounded_subprocess", "subprocess_runner", "kill", "syscall", "__proc_info",
         "pbi_comm", "pbi_name", "proc_pidpath", "proc_name", "proc_regionfilename",
-        "proc_pidfdinfo", "proc_listpids", "proc_listallpids", "proc_terminate", "proc_pid_rusage",
+        "proc_pidfdinfo", "proc_listpids", "proc_listallpids", "proc_terminate",
         "sysctlnametomib",
     )
     for name in banned_names:
@@ -177,6 +203,7 @@ def self_check() -> list[str]:
             errs.append(f"self-check: did not flag the banned name {name!r}")
     good_shapes = (
         'proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &pbi, PROC_PIDTBSDINFO_SIZE);',
+        'proc_pid_rusage(pid, RUSAGE_INFO_V0, &r);',
         'struct proc_bsdinfo pbi;',
         'sysctlbyname("kern.bootsessionuuid", buf, &len, nullptr, 0);',
         '// task_for_pid is banned\nint x;',
@@ -192,8 +219,8 @@ def self_check() -> list[str]:
         if got:
             errs.append(f"self-check: flagged {good!r}: {got}")
     libproc_good = ('#include <yuzu/agent/proc_snapshot_read.hpp>\n#include <cerrno>\n'
-                    '#include <libproc.h>\n#include <sys/proc_info.h>\n#include <cstring>\n'
-                    + macos_call)
+                    '#include <libproc.h>\n#include <sys/proc_info.h>\n'
+                    '#include <sys/resource.h>\n#include <cstring>\n' + macos_call + rusage_call)
     got = findings(LIBPROC_TU, libproc_good)
     if got:
         errs.append(f"self-check: flagged the libproc TU's own shape: {got}")
@@ -225,7 +252,7 @@ def main() -> int:
         errs.append(f"{MACOS_TU}: no longer calls read_proc_snapshot_bounded: the gate would "
                     "pass vacuously")
     libproc_code = lexh.lex(LIBPROC_TU_PATH.read_text(encoding="utf-8", errors="replace"))
-    for needed in ("proc_pidinfo", "PROC_PIDTBSDINFO"):
+    for needed in ("proc_pidinfo", "PROC_PIDTBSDINFO", "proc_pid_rusage", "RUSAGE_INFO_V0"):
         if needed not in libproc_code:
             errs.append(f"{LIBPROC_TU}: no longer contains {needed}: the gate would pass vacuously")
     for f in [*files, LIBPROC_TU_PATH]:

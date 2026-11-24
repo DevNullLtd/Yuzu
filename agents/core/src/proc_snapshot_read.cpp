@@ -8,6 +8,7 @@
 #if defined(__APPLE__)
 #include <libproc.h>
 #include <sys/proc_info.h>
+#include <sys/resource.h>
 
 #include <cstring>
 #endif
@@ -32,9 +33,19 @@ ProcSnapshot read_snapshot(int pid) {
         out.err = errno != 0 ? errno : EIO;
         return out;
     }
+    // Second call, same worker: the monotonic start stamp. If the pid were recycled between the
+    // two calls the pair is mixed, which can only fail a supplied token (never match one).
+    struct rusage_info_v0 ru;
+    std::memset(&ru, 0, sizeof(ru));
+    errno = 0;
+    if (proc_pid_rusage(pid, RUSAGE_INFO_V0, reinterpret_cast<rusage_info_t*>(&ru)) != 0) {
+        out.err = errno != 0 ? errno : EIO;
+        return out;
+    }
     out.start_sec = pbi.pbi_start_tvsec;
     out.start_usec = pbi.pbi_start_tvusec;
     out.nice = pbi.pbi_nice;
+    out.start_abstime = ru.ri_proc_start_abstime;
     return out;
 }
 

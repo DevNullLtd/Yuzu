@@ -49,6 +49,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "the libproc call has a 5 second deadline: no answer reads deadline_exceeded, and while "
          "that call is still blocked in the kernel the next dispatch reads abandoned_call_pending "
          "instead of starting another; "
+         "the token folds the wall-clock start with the monotonic start stamp (one more libproc "
+         "call, proc_pid_rusage(RUSAGE_INFO_V0)), so a pid recycled after a wall-clock step still "
+         "reads pid_reused; "
          "the start time survives an exec, so the token does not tell a program from the one it "
          "exec'd into"},
         /* .windows_leg = */

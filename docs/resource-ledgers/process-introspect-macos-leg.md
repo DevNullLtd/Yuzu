@@ -1,4 +1,4 @@
-# Resource Ledger: process_introspect plugin macOS leg (libproc `proc_pidinfo` and `kern.bootsessionuuid`)
+# Resource Ledger: process_introspect plugin macOS leg (libproc `proc_pidinfo`, `proc_pid_rusage` and `kern.bootsessionuuid`)
 
 New owned resources introduced by `agents/plugins/process_introspect/src/process_introspect_macos.cpp`
 and the OS-free `inspect_macos` in `process_introspect_legs.hpp`. Every path (normal return,
@@ -12,8 +12,10 @@ early return, `bad_alloc` unwind) releases exactly the resource listed.
   (`process_introspect_macos.cpp`); called at most once per dispatch by `inspect_macos` (once for
   `sched`; the five unsupported facets answer before any read).
 - **Allocated by:** the stack frame of `read_snapshot` (a zero-initialised `struct proc_bsdinfo`),
-  filled by `proc_pidinfo(pid, PROC_PIDTBSDINFO, ...)`.
-- **Owner type:** the stack frame. Only numbers (start seconds, start microseconds, nice) are
+  filled by `proc_pidinfo(pid, PROC_PIDTBSDINFO, ...)`, and a zero-initialised
+  `struct rusage_info_v0` filled by `proc_pid_rusage(pid, RUSAGE_INFO_V0, ...)` in the same worker
+  (UP-3: only `ri_proc_start_abstime`, the monotonic start stamp, is copied out).
+- **Owner type:** the stack frame. Only numbers (start seconds, start microseconds, nice, the monotonic start stamp) are
   copied out into `ProcSnapshot` and then `MacBsdInfo`; the process name bytes in the struct are
   never copied and die with the frame.
 - **Release point:** `read_snapshot`'s return.

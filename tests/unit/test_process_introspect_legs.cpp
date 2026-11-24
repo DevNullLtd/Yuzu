@@ -984,11 +984,14 @@ TEST_CASE("process_introspect report pairs each state with its result status", "
 namespace {
 
 const std::string kMacBoot = "0123ABCD-4567-89AB-CDEF-0123456789AB";
-const std::string kMacToken = "0123abcd.1700000000123456";
+// The number is mac_identity_number(1700000000, 123456, kMacAbstime), a 64-bit fold computed by an
+// independent implementation (not read back from the code under test).
+constexpr std::uint64_t kMacAbstime = 10088783211851ULL;
+const std::string kMacToken = "0123abcd.5209951589045475912";
 
 /// The fake kernel: records every call so the one-snapshot rule is asserted, not assumed.
 struct MacFake {
-    MacBsdInfo info{0, 1700000000, 123456, 7};
+    MacBsdInfo info{0, 1700000000, 123456, 7, kMacAbstime};
     RawRead boot = ok(kMacBoot);
     mutable int bsd_calls = 0;
     mutable int boot_calls = 0;
@@ -1136,7 +1139,8 @@ TEST_CASE("process_introspect macOS: identity that cannot be built is identity_u
         fk.boot = ok("ABCDEF01-4567");
         const auto r = run_mac(fk, Facet::sched);
         REQUIRE(r.rows.size() == 2);
-        CHECK(r.rows[0] == "target|4242|abcdef01.1700000000123456|sched"); // folded to lower case
+        // folded to lower case
+        CHECK(r.rows[0] == "target|4242|abcdef01.5209951589045475912|sched");
     }
 }
 
@@ -1160,7 +1164,7 @@ TEST_CASE("process_introspect macOS: the start_time guard", "[process_introspect
     {
         // The same start number under another boot session is another process.
         const MacFake fk;
-        const auto r = run_mac(fk, Facet::sched, "ffffffff.1700000000123456");
+        const auto r = run_mac(fk, Facet::sched, "ffffffff.5209951589045475912");
         CHECK(r.status == StatusState::unavailable);
         CHECK(r.reason == kMacTokPrefix + "pid_reused");
         CHECK(r.rows.empty());
@@ -1195,6 +1199,44 @@ TEST_CASE("process_introspect macOS: a bounded call that did not answer is never
     fk.info.bound = MacBsdInfo::Bound::deadline_exceeded;
     CHECK(run_mac(fk, Facet::caps).status == StatusState::unsupported);
     CHECK(fk.bsd_calls == 0);
+}
+
+TEST_CASE("process_introspect macOS: the monotonic start stamp is part of the identity (UP-3)",
+          "[process_introspect]") {
+    // The residual this closes: pid recycled, wall clock stepped back, new wall start equal to
+    // the old one to the microsecond. The wall stamps match; only the monotonic stamp differs.
+    // Expected token computed by an independent implementation.
+    MacFake recycled;
+    recycled.info.start_abstime = kMacAbstime + 1;
+    const auto r = run_mac(recycled, Facet::sched, kMacToken);
+    CHECK(r.status == StatusState::unavailable);
+    CHECK(r.reason == kMacTokPrefix + "pid_reused");
+    CHECK(r.rows.empty());
+    // Unguarded, the same process answers its own (different) token.
+    const auto u = run_mac(recycled, Facet::sched);
+    REQUIRE(u.rows.size() == 2);
+    CHECK(u.rows[0] == "target|4242|0123abcd.14632038698758070891|sched");
+    // A zero monotonic stamp is an unset or failed read, never an identity.
+    MacFake unset;
+    unset.info.start_abstime = 0;
+    const auto z = run_mac(unset, Facet::sched);
+    CHECK(z.status == StatusState::unavailable);
+    CHECK(z.reason == kMacTokPrefix + "identity_unreadable");
+    CHECK(z.rows.empty());
+    CHECK(unset.boot_calls == 0);
+    // The token keeps its contract: the shape the request validator accepts, 29 bytes at most.
+    for (const std::uint64_t ab : {1ULL, 10088783211851ULL, UINT64_MAX}) {
+        MacFake fk;
+        fk.info.start_abstime = ab;
+        const auto t = run_mac(fk, Facet::sched);
+        REQUIRE(t.rows.size() == 2);
+        const std::string head = "target|4242|";
+        const std::string tail = "|sched";
+        const std::string token =
+            t.rows[0].substr(head.size(), t.rows[0].size() - head.size() - tail.size());
+        CHECK(valid_start_time_token(token));
+        CHECK(token.size() <= 29);
+    }
 }
 
 TEST_CASE("process_introspect macOS: nice value edges", "[process_introspect]") {
@@ -1259,7 +1301,7 @@ TEST_CASE("process_introspect macOS: MacBsdInfo carries numbers only", "[process
     // A further member (a process-name field, say) breaks this structured binding. `bound` is an
     // enum, not data from the target.
     MacBsdInfo b;
-    const auto& [err, start_sec, start_usec, nice, bound] = b;
+    const auto& [err, start_sec, start_usec, nice, start_abstime, bound] = b;
     static_assert(std::is_enum_v<decltype(MacBsdInfo::bound)>);
     static_assert(std::is_same_v<decltype(MacBsdInfo::err), int>);
     static_assert(std::is_same_v<decltype(MacBsdInfo::start_sec), std::uint64_t>);
@@ -1269,5 +1311,6 @@ TEST_CASE("process_introspect macOS: MacBsdInfo carries numbers only", "[process
     CHECK(start_sec == 0);
     CHECK(start_usec == 0);
     CHECK(nice == 0);
+    CHECK(start_abstime == 0);
     CHECK(bound == MacBsdInfo::Bound::answered);
 }

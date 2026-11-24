@@ -9,10 +9,12 @@
  * write. Every decision, including every errno comparison and every deadline answer, is in
  * process_introspect_legs.hpp (inspect_macos), unit-tested on every OS.
  *
- * One libproc call per dispatch: the start time and the nice value are fields of the same
- * kernel snapshot of one process, so there is nothing a second read could protect (the Linux
- * re-read exists because facet files are read after identity). Only numbers leave agent-core;
- * the process name bytes in proc_bsdinfo die with its stack frame, never copied.
+ * One bounded read per dispatch: the wall-clock start stamp and the nice value are fields of ONE
+ * proc_pidinfo snapshot, so there is nothing a second read of them could protect (the Linux
+ * re-read exists because facet files are read after identity). The monotonic start stamp (UP-3)
+ * is the one extra number, from proc_pid_rusage in the same worker, so a wall-clock step cannot
+ * make two processes share an identity. Only numbers leave agent-core; the process name bytes in
+ * proc_bsdinfo die with its stack frame, never copied.
  *
  * Bounded (SRE-1). Neither call takes the target's VM map lock, but proc_pidinfo does take a
  * reference on the target through proc_find, which waits uninterruptibly while the target is
@@ -62,6 +64,7 @@ int run_macos(yuzu::CommandContext& ctx, const Request& req) {
         out.start_sec = r.snap.start_sec;
         out.start_usec = r.snap.start_usec;
         out.nice = r.snap.nice;
+        out.start_abstime = r.snap.start_abstime;
         return out;
     };
     src.boot_session = [] {

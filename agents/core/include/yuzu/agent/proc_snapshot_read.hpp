@@ -29,9 +29,10 @@
  * WHAT IS READ
  * ------------
  * Public libproc only, numbers only, never the process name: one
- * proc_pidinfo(PROC_PIDTBSDINFO) for the wall-clock start stamp and the nice value. No task
- * port. The plugin's lexical gate (tests/test_process_introspect_no_task_port_lexical.py) scans
- * this unit's source too.
+ * proc_pidinfo(PROC_PIDTBSDINFO) for the wall-clock start stamp and the nice value, then one
+ * proc_pid_rusage(RUSAGE_INFO_V0) for ri_proc_start_abstime, the monotonic (mach absolute time)
+ * start stamp that a wall-clock step cannot move (UP-3). No task port. The plugin's lexical
+ * gate (tests/test_process_introspect_no_task_port_lexical.py) scans this unit's source too.
  */
 
 #include <atomic>
@@ -53,6 +54,7 @@ struct ProcSnapshot {
     std::uint64_t start_sec = 0;
     std::uint64_t start_usec = 0;
     std::int32_t nice = 0;
+    std::uint64_t start_abstime = 0; ///< mach absolute time at process start (monotonic)
 };
 
 enum class ProcSnapshotStatus {

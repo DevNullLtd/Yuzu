@@ -681,6 +681,28 @@ TEST_CASE("process_introspect: boot_session_prefix folds an upper-case UUID", "[
     CHECK_FALSE(boot_session_prefix("0123-BCD-4567").has_value());
 }
 
+TEST_CASE("process_introspect: mac_identity_number folds both start stamps",
+          "[process_introspect]") {
+    // Golden values from an independent FNV-1a implementation over the little-endian bytes of
+    // (sec * 1e6 + usec) and the monotonic stamp.
+    CHECK(mac_identity_number(1700000000, 123456, 10088783211851ULL) ==
+          std::optional<std::uint64_t>{5209951589045475912ULL});
+    CHECK(mac_identity_number(1700000000, 123456, 10088783211852ULL) ==
+          std::optional<std::uint64_t>{14632038698758070891ULL});
+    CHECK(mac_identity_number(1700000000, 123456, 1) ==
+          std::optional<std::uint64_t>{7205747533825640742ULL});
+    // Same wall stamp, different monotonic stamp: different numbers (the UP-3 case).
+    CHECK(mac_identity_number(5, 5, 100) != mac_identity_number(5, 5, 101));
+    // Same monotonic stamp, different wall stamp: different numbers.
+    CHECK(mac_identity_number(5, 5, 100) != mac_identity_number(5, 6, 100));
+    // An unusable wall stamp or a zero monotonic stamp is refused, never folded.
+    CHECK_FALSE(mac_identity_number(0, 5, 100).has_value());
+    CHECK_FALSE(mac_identity_number(1, 1000000, 100).has_value());
+    CHECK_FALSE(mac_identity_number(1, 0, 0).has_value());
+    // Always fits the token's 1-20 digit field.
+    CHECK(std::to_string(*mac_identity_number(1, 0, UINT64_MAX)).size() <= 20);
+}
+
 TEST_CASE("process_introspect: mac_start_number joins sec and usec", "[process_introspect]") {
     CHECK(mac_start_number(1700000000, 123456) == std::optional<std::uint64_t>{1700000000123456ULL});
     CHECK(mac_start_number(1, 0) == std::optional<std::uint64_t>{1000000ULL});

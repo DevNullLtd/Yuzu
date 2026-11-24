@@ -18,8 +18,9 @@
  * change discards every row (torn_read).
  *
  * macOS (inspect_macos): libproc only, never a task port. ONE proc_pidinfo(PROC_PIDTBSDINFO)
- * snapshot carries both the start time and the nice value, so there is no re-read and no
- * torn_read; the boot identity is the kern.bootsessionuuid sysctl; of the six facets only sched
+ * snapshot carries both the start time and the nice value, and proc_pid_rusage adds the
+ * monotonic start stamp, so there is no re-read and no torn_read; the token folds both stamps;
+ * the boot identity is the kern.bootsessionuuid sysctl; of the six facets only sched
  * (nice value only) is read, the rest answer one permanent `unsupported` row and read nothing.
  *
  * Invalid parameters return 1; every process-state outcome returns 0 with a typed status.
@@ -417,13 +418,15 @@ inline constexpr std::size_t kOomCap = 64;
 // The macOS decision (OS-free)
 // ---------------------------------------------------------------------------
 
-/// The numbers one proc_pidinfo(PROC_PIDTBSDINFO) call yields. Numbers only: the process name in
+/// The numbers one bounded libproc read yields (proc_pidinfo(PROC_PIDTBSDINFO) and the monotonic
+/// start stamp from proc_pid_rusage). Numbers only: the process name in
 /// the kernel's struct is never copied, so a text member must not be added.
 struct MacBsdInfo {
     int err = 0; ///< errno of the call; 0 when it succeeded
     std::uint64_t start_sec = 0;
     std::uint64_t start_usec = 0;
     std::int32_t nice = 0;
+    std::uint64_t start_abstime = 0; ///< monotonic start stamp (mach absolute time)
     /// Whether the bounded call produced an answer. Anything but `answered` carries no numbers.
     enum class Bound {
         answered,          ///< the call returned within the deadline (err may still be set)
@@ -443,7 +446,7 @@ struct MacSource {
 /// Order: the facet's answer (an unsupported facet reads nothing, so it is no existence oracle),
 /// ONE identity-and-value read, the boot identity, the caller's start_time guard, state.
 ///
-/// Identity and the facet value come from ONE kernel snapshot of one process, so the Linux
+/// Identity and the facet value come from ONE bounded libproc read of one process, so the Linux
 /// re-read (which exists because facet files are read after identity) is deliberately not
 /// mirrored: this leg never answers `supported` and never answers `torn_read`.
 [[nodiscard]] inline Inspection inspect_macos(const Request& req, const MacSource& src) {
@@ -479,7 +482,7 @@ struct MacSource {
     case ReadState::io:
         return refuse(StatusState::unavailable, "identity_unreadable", kMacTok);
     }
-    const auto start = mac_start_number(b.start_sec, b.start_usec);
+    const auto start = mac_identity_number(b.start_sec, b.start_usec, b.start_abstime);
     if (!start)
         return refuse(StatusState::unavailable, "identity_unreadable", kMacTok);
 

@@ -147,6 +147,26 @@ static_assert(kFacetNames.size() == 6, "rule every new facet for macOS in mac_fa
     return sec * kMicro + usec;
 }
 
+/// The macOS identity number: one 64-bit FNV-1a fold of the wall-clock start stamp AND the
+/// monotonic start stamp (mach absolute time, which a wall-clock step cannot move), written in
+/// decimal so the token keeps its `<8 hex>.<1-20 digits>` shape. Both stamps are fixed at fork and
+/// survive an exec, so the number is stable for a process's whole life; a recycled pid collides
+/// only if BOTH stamps are equal, and the monotonic one strictly increases within a boot session.
+/// Refuses an unusable wall stamp and a zero monotonic stamp (a failed or unset read).
+[[nodiscard]] inline std::optional<std::uint64_t>
+mac_identity_number(std::uint64_t sec, std::uint64_t usec, std::uint64_t abstime) noexcept {
+    const auto wall = mac_start_number(sec, usec);
+    if (!wall || abstime == 0)
+        return std::nullopt;
+    std::uint64_t h = 14695981039346656037ULL;
+    for (const std::uint64_t v : {*wall, abstime})
+        for (int i = 0; i < 8; ++i) {
+            h ^= (v >> (8 * i)) & 0xffU;
+            h *= 1099511628211ULL;
+        }
+    return h;
+}
+
 /// pbi_nice is an int32_t (sys/proc_info.h); the valid range is -20..20.
 [[nodiscard]] inline std::optional<int> mac_nice(std::int32_t nice) noexcept {
     if (nice < -20 || nice > 20)
