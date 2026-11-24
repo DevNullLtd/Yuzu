@@ -1586,21 +1586,20 @@ inline void iptables_tally(IptablesSummary& sum) {
                        sanitize_field(r.chain), sanitize_field(r.spec));
 }
 
-// ── Linux: the root direct iptables legs read every table the kernel lists of the four below ───
+// ── Linux: the root direct iptables legs read every table the kernel lists of the five below ───
 //
 // A bare `iptables -S` lists the filter table only, so a root agent that read nothing else answered
-// `inactive` for a host whose rules sit in raw, mangle or nat (#8614). The root direct legs
-// (try_iptables_state, try_iptables_rules) now read `-t <table> -S` for the filter, raw, mangle and
-// nat tables of iptables and of ip6tables, and the two decisions below are the one place that says
-// what those reads mean. The kernel's own list of a family's tables (/proc/net/ip_tables_names and
-// /proc/net/ip6_tables_names, the seam the snapshot broker uses) gates the runs: a table the
-// kernel does not list does not exist and reads empty with no process spawned, so a request for it
-// can neither autoload a table module nor take /run/xtables.lock. The `security` table is not
-// read: the broker lists it, the root legs have no read for it, and a listed one is neither content
-// nor hidden (IptablesFamilyPlan::unread_listed).
+// `inactive` for a host whose rules sit in raw, mangle, nat or security (#8614). The root direct
+// legs (try_iptables_state, try_iptables_rules) now read `-t <table> -S` for the filter, raw,
+// mangle, nat and security tables of iptables and of ip6tables (the five tables xtables has), and
+// the decisions below are the one place that says what those reads mean. For a legacy tool the
+// kernel's own list of a family's tables (/proc/net/ip_tables_names and /proc/net/ip6_tables_names,
+// the seam the snapshot broker uses) gates the runs: a table the kernel does not list does not
+// exist and reads empty with no process spawned, so a request for it can neither autoload a table
+// module nor take /run/xtables.lock.
 
-inline constexpr std::array<std::string_view, 4> kIptablesDirectTables{"filter", "raw", "mangle",
-                                                                       "nat"};
+inline constexpr std::array<std::string_view, 5> kIptablesDirectTables{
+    "filter", "raw", "mangle", "nat", "security"};
 
 /// What reading a family's names file came to: `listed` (read; its text is the list, empty text is
 /// a family with no table), `none` (the file does not exist, ENOENT: the family's core module is
@@ -1634,40 +1633,52 @@ enum class IptablesFlavour { legacy, nf_tables, unknown };
 /// that is an nf_tables shim or of unknown flavour runs every table: the names files say nothing
 /// about nf_tables rules, and a run that is not ok is unread (never empty, never skipped). A tool
 /// that is not installed cannot be run: the names alone say whether tables exist for it.
-/// `unread_listed` holds a legacy-listed table that is not one of the four.
+/// `unseen` is true when tables exist that no run of this plan reads, so the family cannot be
+/// called empty: a legacy list that names a table outside the five, or, for a shim or a tool of
+/// unknown flavour, a legacy list that is non-empty or unreadable (legacy tables are loaded and the
+/// tool cannot see them). The caller records it as one unread read.
 struct IptablesFamilyPlan {
-    std::array<IptablesTableAction, 4> action{};
-    std::vector<std::string> unread_listed;
+    std::array<IptablesTableAction, 5> action{};
+    bool unseen = false;
 };
+
+/// The names a names file lists, one per line, trimmed, blanks dropped.
+[[nodiscard]] inline std::vector<std::string_view> iptables_listed_names(std::string_view text) {
+    std::vector<std::string_view> out;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        auto end = text.find('\n', pos);
+        if (end == std::string_view::npos)
+            end = text.size();
+        std::string_view name = text.substr(pos, end - pos);
+        pos = end + 1;
+        while (!name.empty() && (name.back() == '\r' || name.back() == ' '))
+            name.remove_suffix(1);
+        if (!name.empty())
+            out.push_back(name);
+    }
+    return out;
+}
 
 [[nodiscard]] inline IptablesFamilyPlan
 plan_iptables_family(IptablesFlavour flavour, IptablesNamesOutcome names,
                      std::string_view names_text, bool tool_installed) {
     IptablesFamilyPlan plan;
+    const auto listed = names == IptablesNamesOutcome::listed ? iptables_listed_names(names_text)
+                                                              : std::vector<std::string_view>{};
     if (tool_installed && flavour != IptablesFlavour::legacy) {
         plan.action.fill(IptablesTableAction::run);
+        plan.unseen = names == IptablesNamesOutcome::unreadable || !listed.empty();
         return plan;
     }
     plan.action.fill(IptablesTableAction::unread); // an unreadable names file: nothing is known
     if (names == IptablesNamesOutcome::unreadable)
         return plan;
     plan.action.fill(IptablesTableAction::empty); // a table the kernel does not list does not exist
-    if (names == IptablesNamesOutcome::none)
-        return plan;
-    std::size_t pos = 0;
-    while (pos < names_text.size()) {
-        auto end = names_text.find('\n', pos);
-        if (end == std::string_view::npos)
-            end = names_text.size();
-        std::string_view name = names_text.substr(pos, end - pos);
-        pos = end + 1;
-        while (!name.empty() && (name.back() == '\r' || name.back() == ' '))
-            name.remove_suffix(1);
-        if (name.empty())
-            continue;
+    for (const auto name : listed) {
         const auto it = std::ranges::find(kIptablesDirectTables, name);
         if (it == kIptablesDirectTables.end())
-            plan.unread_listed.emplace_back(name);
+            plan.unseen = true;
         else
             plan.action[static_cast<std::size_t>(it - kIptablesDirectTables.begin())] =
                 tool_installed ? IptablesTableAction::run : IptablesTableAction::unread;

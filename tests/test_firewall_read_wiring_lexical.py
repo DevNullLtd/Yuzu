@@ -456,7 +456,11 @@ DIRECT_IPTABLES_PINS = (
      r"i < yuzu::firewall::kIptablesDirectTables\.size\(\)"),
     ("a table that is not to run, or has no time left, pushed as a read (never skipped)",
      r"if \( ?plan\.action\[i\] != Action::run \|\| left\.count\(\) <= 0 ?\) \{ "
-     r"(?://[^;{}]*?)?reads\.push_back\( ?yuzu::firewall::iptables_unrun_read\("),
+     r"(?://[^;{}]*?)?reads\.push_back\( ?yuzu::firewall::iptables_unrun_read\( ?ip6, table, "
+     r"plan\.action\[i\] ?\) ?\);"),
+    ("tables that no run reads (loaded legacy tables a shim cannot see) recorded as one unread entry",
+     r'if \( ?plan\.unseen ?\) (?://[^;{}]*?)?reads\.push_back\( ?yuzu::firewall::iptables_unrun_read\( ?ip6, "legacy", '
+     r"Action::unread ?\) ?\);"),
     ("the literal argv `{tool, \"-t\", table, \"-S\"}` on the remaining deadline",
      r'run_bounded_subprocess\( ?\{tool, "-t", std::string\{table\}, "-S"\}, '
      r"SubprocessOptions\{\.deadline = left\} ?\)"),
@@ -772,6 +776,10 @@ LINUX_MUTATIONS = [
      "read_iptables_tables no longer has the literal argv"),
     (_lmut(r"res\.tool_ran, res\.exit_code == 0", "true, res.exit_code == 0"),
      "read_iptables_tables no longer has the run classified"),
+    (_lmut(r"iptables_unrun_read\(ip6, table, plan\.action\[i\]\)",
+           "iptables_unrun_read(ip6, table, Action::empty)"),
+     "read_iptables_tables no longer has a table that is not to run"),
+    (_lmut(r"if \(plan\.unseen\)", "if (false)"), "read_iptables_tables no longer has tables that no run reads"),
     (_lmut(r"plan\.action\[i\] != Action::run \|\| left\.count\(\) <= 0", "plan.action[i] != Action::run"),
      "read_iptables_tables no longer has a table that is not to run"),
     (_lmut(r"if \(::access\(\"/usr/sbin/iptables\", X_OK\) != 0\)\s*return std::nullopt;", ""),
@@ -1032,10 +1040,10 @@ class LinuxSnapshotWiring(unittest.TestCase):
 
     def test_the_direct_table_list_is_pinned(self):
         hpp = PARSERS_HPP.read_text(encoding="utf-8")
-        pat = r'kIptablesDirectTables\{"filter", "raw", "mangle",\s*"nat"\};'
+        pat = r'kIptablesDirectTables\{\s*"filter", "raw", "mangle", "nat", "security"\};'
         self.assertTrue(re.search(pat, hpp), "kIptablesDirectTables is no longer filter, raw, mangle, nat")
         decl = re.search(pat, hpp).group(0)
-        for dropped in ('"filter", ', '"raw", ', '"mangle",', '"nat"'):
+        for dropped in ('"filter", ', '"raw", ', '"mangle", ', '"nat", ', '"security"'):
             mutated = hpp.replace(decl, decl.replace(dropped, "", 1), 1)
             self.assertNotEqual(mutated, hpp, "mutation changed nothing (stale pattern)")
             self.assertFalse(re.search(pat, mutated), f"dropping {dropped} was not detected")

@@ -1483,11 +1483,13 @@ struct XtNamesRead {
     return r;
 }
 
-/// Reads the filter, raw, mangle and nat tables of iptables and of ip6tables (`-t <table> -S`), one
-/// bounded run each. Each tool is first asked its flavour once (`--version`). Only a legacy tool
-/// is gated by the kernel's table list (the pure plan_iptables_family decides which tables run;
-/// one the kernel does not list reads empty and spawns nothing, so no table module is autoloaded).
-/// An nf_tables shim, or a tool whose flavour could not be read, runs all four tables; for an
+/// Reads the filter, raw, mangle, nat and security tables of iptables and of ip6tables
+/// (`-t <table> -S`), one bounded run each. Each tool is first asked its flavour once
+/// (`--version`). Only a legacy tool is gated by the kernel's table list (the pure
+/// plan_iptables_family decides which tables run; one the kernel does not list reads empty and
+/// spawns nothing, so no table module is autoloaded). An nf_tables shim, or a tool whose flavour
+/// could not be read, runs all five tables, and when the legacy table list is non-empty or
+/// unreadable the family also reads one unread entry (legacy tables the tool cannot see); for an
 /// unknown flavour a request for an unloaded table can load its module. All the runs share one
 /// deadline, computed once, so the leg stays inside kAcqDeadline; a run that has no time left, or
 /// whose process does not start or fails, is unread, never skipped. nullopt when `iptables` itself
@@ -1518,14 +1520,13 @@ struct XtNamesRead {
             read_xt_names(ip6 ? "/proc/net/ip6_tables_names" : "/proc/net/ip_tables_names");
         const auto plan =
             yuzu::firewall::plan_iptables_family(flavour, names.outcome, names.text, installed);
+        using Action = yuzu::firewall::IptablesTableAction;
         for (std::size_t i = 0; i < yuzu::firewall::kIptablesDirectTables.size(); ++i) {
             const auto table = yuzu::firewall::kIptablesDirectTables[i];
             const auto left = yuzu::firewall::remaining_ms(deadline);
-            using Action = yuzu::firewall::IptablesTableAction;
             if (plan.action[i] != Action::run || left.count() <= 0) {
-                // a table to run with no time left is unread, never skipped
-                reads.push_back(yuzu::firewall::iptables_unrun_read(
-                    ip6, table, plan.action[i] == Action::empty ? Action::empty : Action::unread));
+                // iptables_unrun_read maps a table to run that has no time left to unread
+                reads.push_back(yuzu::firewall::iptables_unrun_read(ip6, table, plan.action[i]));
                 continue;
             }
             auto res = run_bounded_subprocess({tool, "-t", std::string{table}, "-S"},
@@ -1534,6 +1535,9 @@ struct XtNamesRead {
                 ip6, table, res.tool_ran, res.exit_code == 0, subprocess_complete(res),
                 res.output));
         }
+        // tables exist that no run above reads (loaded legacy tables a shim cannot see): unread
+        if (plan.unseen)
+            reads.push_back(yuzu::firewall::iptables_unrun_read(ip6, "legacy", Action::unread));
     }
     return reads;
 }
