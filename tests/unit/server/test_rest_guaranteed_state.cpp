@@ -4013,6 +4013,39 @@ TEST_CASE("REST dex/devices/{id}/history: per-device signal history, audited dex
     CHECK(denied->status == 403);
 }
 
+// #7811: the device id reaches the scoped gate's denial audit and `target_id` on every per-device
+// DEX row, so an over-long or control-byte id is refused with a 400 before the gate and any audit
+// row, on all five routes. The gate admits every device, so a 400 with the gate never asked proves
+// the id check runs first. The live route is covered too: nothing is dispatched.
+TEST_CASE("REST dex/devices/{id}: an unsafe device id is a 400 before the scoped gate or any "
+          "audit row, on every per-device route",
+          "[pg][rest][dex][device][audit]") {
+    RestGsHarness h;
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        const std::string base = "/api/v1/dex/devices/" + id;
+        auto score = h.sink.Get(base);
+        auto perf = h.sink.Get(base + "/app-perf");
+        auto history = h.sink.Get(base + "/history");
+        auto obs = h.sink.Get(base + "/observations/o1");
+        auto live = h.sink.Post(base + "/live?kind=uptime", "");
+        for (const auto* res : {&score, &perf, &history, &obs, &live}) {
+            REQUIRE(*res);
+            CHECK((*res)->status == 400);
+            CHECK(nlohmann::json::parse((*res)->body)["error"]["message"] == "Invalid device id.");
+        }
+    }
+    CHECK(h.last_scoped_agent_id.empty());
+    CHECK(h.audit_log.empty());
+    CHECK(h.last_live_plugin.empty());
+
+    // A 256-byte printable id is safe and reaches the scoped gate.
+    h.sink.Get("/api/v1/dex/devices/" + std::string(256, 'a') + "?window=all");
+    CHECK(h.last_scoped_agent_id.size() == 256);
+}
+
 TEST_CASE("REST dex/devices/{id}/observations/{event_id}: single-observation detail, audited, "
           "foreign event_id -> 404 (same as genuinely-absent, no oracle)",
           "[pg][rest][dex][device][observation]") {

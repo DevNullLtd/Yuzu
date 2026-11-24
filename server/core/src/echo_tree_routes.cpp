@@ -11,6 +11,8 @@
 #include "secure_random.hpp" // random_hex (CSPRNG cache token, #801)
 #include "web_utils.hpp"      // html_escape, audit_token, now_epoch_seconds
 
+#include <yuzu/server/auth.hpp> // auth::agent_id_is_audit_safe (#7811)
+
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -63,8 +65,10 @@ void note(httplib::Response& res, const std::string& text) {
 }
 
 // The DNS / ARP panels live outside `#echo-tree`, so a tree swap does not clear them. This
-// empty out-of-band replacement clears them; every answer that is not a finished tree for the
-// device carries it, so one host's tables never sit under another host's view.
+// empty out-of-band replacement clears them; the tree frame's notes (`tree_note`) and its
+// loading placeholder carry it, so one host's tables never sit under another host's view. The
+// 4xx refusals (the scoped 403 and the unsafe-device 400) do not: the dashboard's htmx drops a
+// 4xx body, so nothing is swapped and no panel changes.
 const char* const kDevnetReset = "<div id=\"echo-devnet\" hx-swap-oob=\"true\"></div>";
 
 // The capture-sources page pushes with htmx.ajax(swap:'none'), so a response body is never
@@ -96,6 +100,17 @@ void tree_note(httplib::Response& res, const std::string& text) {
 
 std::string get_param(const httplib::Request& req, const char* k) {
     return req.has_param(k) ? req.get_param_value(k) : std::string{};
+}
+
+// A device id reaches `target_id` on every audit row and on the permission-denial audit, so an
+// over-long or control-byte id is refused with a 400 before any scoped check or audit write
+// (#7811). Returns true when refused; the same shape as hardware_routes.cpp's id floor.
+bool refuse_unsafe_device(httplib::Response& res, const std::string& device) {
+    if (auth::agent_id_is_audit_safe(device))
+        return false;
+    res.status = 400;
+    note(res, "Invalid device id.");
+    return true;
 }
 // parse_ts_param lives in echo_process_tree.{hpp,cpp} (pure + unit-tested).
 
@@ -697,6 +712,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             tree_note(res, "Select a host to see its process tree.");
             return;
         }
+        if (refuse_unsafe_device(res, device))
+            return;
         // Per-device scoped Read floor (tier + management group).
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
             return;
@@ -787,6 +804,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         const std::string pcmd = get_param(req, "pcmd");
         const std::string tcmd = get_param(req, "tcmd");
         const std::string hcmd = get_param(req, "hcmd");
+        if (refuse_unsafe_device(res, device))
+            return;
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
             return;
         if (!can_execute(req, device)) {
@@ -984,6 +1003,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             res.set_content("", "text/html; charset=utf-8"); // no host picked yet
             return;
         }
+        if (refuse_unsafe_device(res, device))
+            return;
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
             return;
         if (!can_execute(req, device)) {
@@ -1188,6 +1209,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                             "text/html; charset=utf-8");
             return;
         }
+        if (refuse_unsafe_device(res, device))
+            return;
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device))
             return;
         if (!can_execute(req, device)) {
@@ -1293,6 +1316,11 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         const std::string device = get_param(req, "device");
         if (device.empty()) {
             push_refusal(res, "No device selected.", "No device selected.");
+            return;
+        }
+        if (!auth::agent_id_is_audit_safe(device)) {
+            push_refusal(res, "Invalid device id.", "Invalid device id.");
+            res.status = 400;
             return;
         }
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", device)) {

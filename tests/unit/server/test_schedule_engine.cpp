@@ -106,6 +106,22 @@ TEST_CASE("ScheduleEngine: create is refused when parameters carry a classified 
     CHECK(refused.error().find("secret value") != std::string::npos);
 }
 
+// A resume token (`cursor`) is not a secret but the server erases it from the execution record, and
+// a schedule's stored blob is what fires, so creation is refused with its own wording. Deleting the
+// call in create_schedule must fail this case (the predicate itself is tested in
+// test_sensitive_instruction_params.cpp).
+TEST_CASE("ScheduleEngine: create is refused when parameters carry a resume token",
+          "[schedule_engine][pg]") {
+    ScheduleEnginePg fx;
+
+    auto sched = make_schedule("def-001", "interval", "Resume Token Schedule");
+    sched.interval_minutes = 60;
+    sched.parameter_values = R"({"root":"/data","cursor":"tok"})";
+    auto result = fx->create_schedule(sched);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("resume token") != std::string::npos);
+}
+
 TEST_CASE("ScheduleEngine: create is refused when parameters carry a bare grant_id",
          "[schedule_engine][pg]") {
     ScheduleEnginePg fx;
