@@ -846,7 +846,7 @@
       },
       "default": "yuzu-",
       "definition_id": "device.filesystem.create_temp",
-      "description": "Prefix for the temp file name.",
+      "description": "Prefix for the temp file name. Must be a single file name component (no slash or backslash, and no colon on Windows).",
       "name": "prefix",
       "required": false,
       "type": "string"
@@ -857,7 +857,7 @@
       },
       "default": ".tmp",
       "definition_id": "device.filesystem.create_temp",
-      "description": "Suffix/extension for the temp file name.",
+      "description": "Suffix/extension for the temp file name. Must be a single file name component (no slash or backslash, and no colon on Windows).",
       "name": "suffix",
       "required": false,
       "type": "string"
@@ -893,7 +893,7 @@
       },
       "default": "yuzu-",
       "definition_id": "device.filesystem.create_temp_dir",
-      "description": "Prefix for the temp directory name.",
+      "description": "Prefix for the temp directory name. Must be a single file name component (no slash or backslash, and no colon on Windows).",
       "name": "prefix",
       "required": false,
       "type": "string"

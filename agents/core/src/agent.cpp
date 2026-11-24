@@ -1062,13 +1062,13 @@ public:
         }
 
         // HIGH-1 (#1314): resolve the effective CA path BEFORE the provisioning gate.
-        // The install-CA auto-discovery used to live only inside build_channel and
-        // never wrote back cfg_.tls_ca_cert, so a no-`--ca-cert` agent connected over
-        // server-authenticated TLS but `provisioning_eligible` stayed false → it sent
-        // no CSR and never got its per-agent client leaf, with no error. Promoting the
-        // discovered path into cfg_.tls_ca_cert here makes both the provisioning gate
-        // and build_channel see the same effective CA (an explicit --ca-cert is left
-        // untouched, so this is a no-op when one was given).
+        // Install-CA auto-discovery inside build_channel does not write back
+        // cfg_.tls_ca_cert, so a no-`--ca-cert` agent would connect over
+        // server-authenticated TLS while `provisioning_eligible` stayed false: no CSR,
+        // no per-agent client leaf, no error. Promoting the discovered path into
+        // cfg_.tls_ca_cert here makes both the provisioning gate and build_channel see
+        // the same effective CA (an explicit --ca-cert is left untouched, so this is a
+        // no-op when one was given).
         if (cfg_.tls_enabled && cfg_.tls_ca_cert.empty()) {
             if (auto ca = discover_install_ca_path()) {
                 cfg_.tls_ca_cert = *ca;

@@ -652,8 +652,9 @@ TEST_CASE("filesystem plugin: create_temp and create_temp_dir refuse a prefix or
     const auto before = count_entries(data_dir);
     auto f1 = run("create_temp", {{"directory", other.string()}, {"prefix", climb}});
     CHECK(f1.rc != 0);
-    auto f2 = run("create_temp", {{"directory", other.string()}, {"suffix", "/../../data/y"}});
+    auto f2 = run("create_temp", {{"directory", other.string()}, {"suffix", "/y"}});
     CHECK(f2.rc != 0);
+    CHECK(f2.captured.find("single file name component") != std::string::npos);
     auto d1 = run("create_temp_dir", {{"directory", other.string()}, {"prefix", climb}});
     CHECK(d1.rc != 0);
     CHECK(count_entries(data_dir) == before);

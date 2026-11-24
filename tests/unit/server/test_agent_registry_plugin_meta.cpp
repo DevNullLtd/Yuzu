@@ -274,3 +274,30 @@ TEST_CASE("the per-agent plugin cap exceeds the number of shipped plugins",
     REQUIRE(shipped >= 50); // a wrong path scans zero entries: never pass vacuously
     CHECK(pmr::kMaxPluginsPerAgent >= shipped);
 }
+
+TEST_CASE("an agent's plugin name list holds each valid name once, bounded, and counts a repeat "
+          "(review M3)",
+          "[agent_registry][plugin_meta][31]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+
+    auto info = make_info("dupes");
+    add_plugin(info, "status", "1.0.0", "", {"switch"});
+    add_plugin(info, "status", "2.0.0", "", {"switch"});
+    add_plugin(info, std::string(65, 'x'), "1", "", {"a"});
+    add_plugin(info, "", "1", "", {"a"});
+    auto session = registry.register_agent(info);
+    REQUIRE(session.has_value());
+    REQUIRE((*session)->plugin_names.size() == 1);
+    CHECK((*session)->plugin_names[0] == "status");
+    CHECK(metrics.serialize().find("plugin_meta_dropped_total{field=\"duplicate\"} 1") !=
+          std::string::npos);
+
+    auto flood = make_info("flood-names");
+    for (int i = 0; i < 300; ++i)
+        add_plugin(flood, "p" + std::to_string(i), "1", "", {"a"});
+    auto fs = registry.register_agent(flood);
+    REQUIRE(fs.has_value());
+    CHECK((*fs)->plugin_names.size() == pmr::kMaxPluginsPerAgent);
+}

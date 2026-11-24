@@ -183,11 +183,11 @@ Who may run what is decided by the compiled capability row, not by the header's 
 | `device.filesystem.append` | `content` | string | no | - | - | The text content to append to the file. |
 | `device.filesystem.append` | `newline` | string | no | true | enum: true, false | If "true" (default), adds a newline before appended content when the file does not end with a newline character. Prevents content from being joined to the last existing line. |
 | `device.filesystem.append` | `base_dir` | string | no | - | maxLength 4096 | Optional. Restricts access to files within this directory. |
-| `device.filesystem.create_temp` | `prefix` | string | no | yuzu- | maxLength 64 | Prefix for the temp file name. |
-| `device.filesystem.create_temp` | `suffix` | string | no | .tmp | maxLength 32 | Suffix/extension for the temp file name. |
+| `device.filesystem.create_temp` | `prefix` | string | no | yuzu- | maxLength 64 | Prefix for the temp file name. Must be a single file name component (no slash or backslash, and no colon on Windows). |
+| `device.filesystem.create_temp` | `suffix` | string | no | .tmp | maxLength 32 | Suffix/extension for the temp file name. Must be a single file name component (no slash or backslash, and no colon on Windows). |
 | `device.filesystem.create_temp` | `directory` | string | no | - | maxLength 4096 | Optional. Create the temp file in this directory instead of the system default temp directory. |
 | `device.filesystem.create_temp` | `persist` | string | no | true | enum: true, false | If "true" (default), the file is kept. If "false", the file is deleted after creation (useful for generating unique paths). |
-| `device.filesystem.create_temp_dir` | `prefix` | string | no | yuzu- | maxLength 64 | Prefix for the temp directory name. |
+| `device.filesystem.create_temp_dir` | `prefix` | string | no | yuzu- | maxLength 64 | Prefix for the temp directory name. Must be a single file name component (no slash or backslash, and no colon on Windows). |
 | `device.filesystem.create_temp_dir` | `directory` | string | no | - | maxLength 4096 | Optional. Create the temp directory inside this parent instead of the system default temp directory. |
 | `device.filesystem.create_temp_dir` | `persist` | string | no | true | enum: true, false | If "true" (default), the directory is kept. If "false", deleted after creation. |
 | `device.filesystem.delete_lines` | `path` | string | yes | - | maxLength 4096 | The text file to delete lines from. |

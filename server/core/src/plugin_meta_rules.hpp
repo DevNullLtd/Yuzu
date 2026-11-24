@@ -8,8 +8,9 @@
 ///
 /// Rules (pure, no I/O): a field outside its bound is DROPPED (a name, version, description or
 /// action is never cut short into something misleading; an entry beyond the per-agent cap is
-/// dropped whole) and counted by the caller. Applies ONLY to the `PluginMeta` copy used for the
-/// served catalogue; `AgentSession::plugin_names` (Echo gating, heartbeat logic) is untouched.
+/// dropped whole) and counted by the caller. Applies to the `PluginMeta` copy used for the
+/// served catalogue and to `AgentSession::plugin_names` (Echo gating, heartbeat logic), which holds
+/// each valid name once and at most `kMaxPluginsPerAgent` names.
 /// The agent-reported `description` is bounded here but is deliberately NOT served by
 /// `help_json`/`help_html`; plugins and actions the server's capability catalogue does not recognise are
 /// omitted at serving time (`AgentRegistry::set_catalogue_filter`) (owner decision: endpoint free text is not catalogue documentation).

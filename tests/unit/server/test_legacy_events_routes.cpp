@@ -196,6 +196,7 @@ TEST_CASE("legacy_events_routes: F11 a scoped (non-empty or deny-all) admit is r
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(res->body.find("Response:Read") != std::string::npos);
+    CHECK(res->has_header("X-Correlation-Id"));
     CHECK(bus.listener_count() == 0);
     // The refusal is audited like its siblings (the 403 never depends on the write).
     REQUIRE(h.audit_rows.size() == 1);
@@ -212,6 +213,7 @@ TEST_CASE("legacy_events_routes: F11 an unwired fleet_read_fn fails CLOSED (503)
     auto res = h.sink.Get("/events");
     REQUIRE(res);
     CHECK(res->status == 503);
+    CHECK(res->has_header("X-Correlation-Id"));
     CHECK(bus.listener_count() == 0);
 }
 

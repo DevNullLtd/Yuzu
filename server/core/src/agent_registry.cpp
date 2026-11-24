@@ -107,12 +107,11 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         }
         session->scopable_tags[k] = v;
     }
-    std::size_t plugin_meta_entries = 0;
     for (const auto& p : info.plugins()) {
         // One entry per plugin name, bounded in count and length: a repeated entry would
         // otherwise be one catalogue vote per copy, and an unbounded name list would grow
         // the session (review M3). The first entry for a name is the one kept.
-        if (p.name().size() <= plugin_meta_rules::kMaxNameLen &&
+        if (plugin_meta_rules::plugin_name_ok(p.name()) &&
             session->plugin_names.size() < plugin_meta_rules::kMaxPluginsPerAgent &&
             std::ranges::find(session->plugin_names, p.name()) == session->plugin_names.end())
             session->plugin_names.push_back(p.name());
@@ -127,12 +126,12 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
             drop("name");
             continue;
         }
-        if (std::ranges::any_of(session->plugin_meta, [&](const PluginMeta& m) { return m.name == p.name(); })) {
-            drop("duplicate");
+        if (session->plugin_meta.size() >= plugin_meta_rules::kMaxPluginsPerAgent) {
+            drop("plugins");
             continue;
         }
-        if (++plugin_meta_entries > plugin_meta_rules::kMaxPluginsPerAgent) {
-            drop("plugins");
+        if (std::ranges::any_of(session->plugin_meta, [&](const PluginMeta& m) { return m.name == p.name(); })) {
+            drop("duplicate");
             continue;
         }
         PluginMeta pm;
@@ -273,8 +272,14 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     // The hostname is agent-supplied and sits between two genuine `key=value` tokens, so it takes
     // the closed-set id fold (space, '=', ',' and every non-ASCII byte become '_'): a hostname such
     // as `x' plugins=0 id=victim '` cannot close the quote and add a same-line token.
-    spdlog::info("Agent registered: id={}, hostname='{}', plugins={}", safe_agent_id,
-                 ::yuzu::log_id_token(info.hostname()), info.plugins_size());
+    if (info.plugins_size() > 0 && session->plugin_names.empty()) {
+        spdlog::warn("AgentRegistry::register_agent({}): reported {} plugin entries and none had a "
+                     "valid name; its plugin inventory is treated as unknown",
+                     safe_agent_id, info.plugins_size());
+    }
+    spdlog::info("Agent registered: id={}, hostname='{}', plugins={} (kept {})", safe_agent_id,
+                 ::yuzu::log_id_token(info.hostname()), info.plugins_size(),
+                 session->plugin_names.size());
     return session;
 }
 

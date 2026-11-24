@@ -9399,7 +9399,8 @@ groups:
           description: >-
             yuzu_server_agent_registry_plugin_meta_dropped_total{field="{{ $labels.field }}"}
             increased in the last hour on {{ $labels.instance }} (job {{ $labels.job }}): an agent's registration carried a plugin name, version,
-            description, action, plugin entry or action list beyond its bound and it was dropped.
+            description, action, plugin entry or action list beyond its bound, or repeated a plugin name it had
+            already reported (field="duplicate"), and it was dropped. The counter is per server replica.
             A single name, version, description or action is dropped whole, never cut short; the
             plugin and action LISTS are capped (128 plugins per agent, 64 actions per plugin), so
             field="plugins" or field="actions" means entries past the cap are missing from the served plugin catalogue for that agent. Find the
