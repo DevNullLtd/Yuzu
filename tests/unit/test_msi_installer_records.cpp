@@ -2,11 +2,13 @@
  * test_msi_installer_records.cpp -- the pure core of msi_packages.installer_records (SAM-46).
  *
  * Runs on every OS: msi_installer_records.hpp has no Windows headers and the OS boundary is
- * injected. The registry shapes come from a committed SYNTHETIC fixture
+ * injected. The registry shapes come from a committed REAL capture
  * (tests/unit/fixtures/software-estate/msi_packages/windows/installer-records-system.txt, see
- * provenance.txt beside it: it is hand-written and format-true, NOT a Windows capture). The
- * shapes a registry does not hold (a missing package, a corrupt one, a timeout, a busy slot,
- * a ceiling rejection, row breakers) are built in the test.
+ * provenance.txt beside it: a read-only SYSTEM registry capture, redacted of user profile
+ * paths). The shapes that capture does not hold (a package outside the Installer directory, a
+ * product with no cached package, an install location under a profile, a product under two
+ * upgrade codes, a missing package, a corrupt one, a timeout, a busy slot, a ceiling
+ * rejection, row breakers) are built in the test from its rows.
  *
  * No registry key, package or process is opened: the OS boundary is a fake that records what
  * it was asked, and the handle a package open holds is a counter, so the test can prove the
@@ -116,11 +118,11 @@ Fixture load_fixture() {
 constexpr const char* kPythonLauncher = "{0B1B5000-3C0E-41C0-83C4-4C914420AE93}";
 constexpr const char* kCMake = "{B7526150-1C45-45B5-932D-A4CF5A23403C}";
 constexpr const char* kSevenZip = "{23170F69-40C1-2702-2604-000001000000}";
-constexpr const char* kRuntime = "{43B0D101-A022-48F4-9D04-BA404CEB1D53}";
+constexpr const char* kRuntime = "{FED10190-CF54-E72D-7A92-E3F9CA9B7950}";
 constexpr const char* kUserProfileProduct = "{80F76A51-EAF7-DA8E-C732-B26C591BCC23}";
 constexpr const char* kOutsideInstaller = "{AF4ED0C1-A3D7-450B-A163-62CD3C7BBB27}";
 constexpr const char* kNoLocalPackage = "{F9DDDEF1-BCF0-275F-DE29-9332F1149B79}";
-constexpr const char* kNoProperties = "{6C7D0172-7367-4F0C-95DB-6021765B58EA}";
+constexpr const char* kNoProperties = "{5A6D1C2E-7B3F-4E58-9A10-5A3C0F6D7E21}"; // the one Products key with no InstallProperties
 
 std::string lower(std::string s) {
     for (char& c : s)
@@ -246,6 +248,19 @@ Host fixture_host() {
     return h;
 }
 
+FxProduct& fx_product(Host& h, std::string_view braced) {
+    for (auto& p : h.products)
+        if (p.braced == braced)
+            return p;
+    FAIL("no fixture product " << braced);
+    return h.products.front();
+}
+
+// The lower-case cached-package path the fixture records for a product (the key the fakes use).
+std::string package_key(Host& h, std::string_view braced) {
+    return lower(fx_product(h, braced).props->local_package);
+}
+
 // A distinct, well-formed packed name (as the registry holds it) for the i-th synthetic
 // product, with the braced code it unpacks to.
 FxProduct synthetic_product(std::size_t i, rec::InstallProps props) {
@@ -279,7 +294,8 @@ std::string slurp(const fs::path& p) {
 TEST_CASE("installer records: the packed GUID codec matches an independent implementation",
           "[msi_packages][installer_records]") {
     const auto fx = load_fixture();
-    REQUIRE(fx.products.size() == 8);
+    REQUIRE(fx.products.size() == 137); // 136 with InstallProperties, 1 without
+    CHECK(fx.upgrades.size() == 136);
     for (const auto& p : fx.products) {
         INFO(p.packed);
         const auto un = rec::unpack_guid(p.packed);
@@ -392,18 +408,18 @@ TEST_CASE("installer records: the fixture products come out as the expected rows
     const auto set = run(h);
     const auto lines = rec::render(set);
 
-    REQUIRE(set.records.size() == 8);
+    REQUIRE(set.records.size() == 137);
     CHECK_FALSE(set.constraints.any_failure());
     CHECK(set.non_guid_subkeys == 0);
-    REQUIRE(lines.size() == 9);
+    REQUIRE(lines.size() == 138);
     CHECK(lines[0] == "status|installer_records|supported|-");
 
     // The first product, in full: registry values, then the database's Property rows (its
     // UpgradeCode was spelled in lower case by the fake and comes out upper case).
     CHECK(lines[1] ==
           "rec|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|Python Launcher|3.14.6150.0|Python Software "
-          "Foundation|20261017||C:\\ProgramData\\Package Cache\\{0B1B5000-3C0E-41C0-83C4-"
-          "4C914420AE93}v3.14.6150.0\\|C:\\WINDOWS\\Installer\\1d2e3f40.msi|{7E1A4B20-5C3D-4F68-9A01-"
+          "Foundation|20261012||C:\\ProgramData\\Package Cache\\{0B1B5000-3C0E-41C0-83C4-"
+          "4C914420AE93}v3.14.6150.0\\|C:\\Windows\\Installer\\db826.msi|{7E1A4B20-5C3D-4F68-9A01-"
           "2B3C4D5E6F70}|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|3.14.6150.0|Python Software "
           "Foundation|Python Launcher|-");
     for (std::size_t i = 1; i < lines.size(); ++i)
@@ -418,17 +434,16 @@ TEST_CASE("installer records: the fixture products come out as the expected rows
 TEST_CASE("installer records: an orphaned package is a row reason and the status stays supported",
           "[msi_packages][installer_records]") {
     Host h = fixture_host();
-    h.absent.insert("c:\\windows\\installer\\3f405162.msi"); // 7-Zip's cached package is gone
+    h.absent.insert(package_key(h, kSevenZip)); // 7-Zip's cached package is gone
     const auto set = run(h);
 
     const auto& r = record_of(set, kSevenZip);
     CHECK(r.reason == "package_missing");
     CHECK(r.db.product_code.empty());
-    CHECK(std::find(h.read.begin(), h.read.end(), "c:\\windows\\installer\\3f405162.MSI") ==
-          h.read.end());
+    CHECK(h.read.size() + 1 == h.opened.size()); // the absent package was opened, never read
     CHECK_FALSE(set.constraints.any_failure());
     CHECK(rec::render(set)[0] == "status|installer_records|supported|-");
-    CHECK(rec::render(set).size() == 9);
+    CHECK(rec::render(set).size() == 138);
 }
 
 TEST_CASE("installer records: a corrupt package keeps its row, names the code and spares its siblings",
@@ -438,7 +453,7 @@ TEST_CASE("installer records: a corrupt package keeps its row, names the code an
     bad.status = msi::ReadStatus::Completed;
     bad.outcome.kind = msi::Outcome::Kind::OpenFailed;
     bad.outcome.rc = 1620; // ERROR_INSTALL_PACKAGE_INVALID
-    h.answers["c:\\windows\\installer\\40516273.msi"] = bad;
+    h.answers[package_key(h, kRuntime)] = bad;
     const auto set = run(h);
 
     const auto& r = record_of(set, kRuntime);
@@ -472,7 +487,11 @@ TEST_CASE("installer records: every non-ok outcome names its reason", "[msi_pack
 TEST_CASE("installer records: row-level reasons for a path that is not, or cannot be, opened",
           "[msi_packages][installer_records]") {
     Host h = fixture_host();
-    h.refused.insert("c:\\windows\\installer\\2e3f4051.msi"); // a reparse point, a device, a dead drive
+    h.refused.insert(package_key(h, kCMake)); // a reparse point, a device, a dead drive
+    // shapes the capture does not hold, built from its rows: a package outside <windir>\Installer
+    // and a product that records no package
+    fx_product(h, kOutsideInstaller).props->local_package = "C:\\Temp\\relocated.msi";
+    fx_product(h, kNoLocalPackage).props->local_package.clear();
     const auto set = run(h);
 
     // refused by the opener
@@ -509,7 +528,7 @@ TEST_CASE("installer records: an enumeration failure keeps the rows read and say
     Host h = fixture_host();
     h.enum_failure = rec::enum_token(1450);
     const auto set = run(h);
-    CHECK(set.records.size() == 8);
+    CHECK(set.records.size() == 137);
     CHECK(rec::render(set)[0] == "status|installer_records|constrained|windows:installer_records:enum:1450");
 }
 
@@ -664,11 +683,11 @@ TEST_CASE("installer records: a database ProductCode that differs is flagged and
     other.outcome.kind = msi::Outcome::Kind::Ok;
     other.outcome.props.product_code = "{FFFFFFFF-0000-4000-8000-000000000000}";
     other.outcome.props.product_name = "Some Other Product";
-    h.answers["c:\\windows\\installer\\1d2e3f40.msi"] = other;
+    h.answers[package_key(h, kPythonLauncher)] = other;
     // a case-only difference is not a mismatch (a machine registers some codes in lower case)
     msi::ReadResult lowered = other;
     lowered.outcome.props.product_code = lower(kCMake);
-    h.answers["c:\\windows\\installer\\2e3f4051.msi"] = lowered;
+    h.answers[package_key(h, kCMake)] = lowered;
     const auto set = run(h);
 
     const auto& r = record_of(set, kPythonLauncher);
@@ -690,10 +709,13 @@ TEST_CASE("installer records: a database ProductCode that differs is flagged and
 TEST_CASE("installer records: an install path under the user profiles is withheld",
           "[msi_packages][installer_records]") {
     Host h = fixture_host();
+    // the capture holds profile paths only as install sources (the CMake one); an install
+    // location under a profile, spelled in lower case, is built from another row
+    fx_product(h, kUserProfileProduct).props->install_location = "c:\\users\\jsmith\\AppData\\Local\\X\\";
     const auto set = run(h);
     const auto& r = record_of(set, kUserProfileProduct);
     CHECK(r.props.install_location == "withheld:user_path");
-    CHECK(r.props.install_source == "withheld:user_path"); // spelled in lower case
+    CHECK(record_of(set, kCMake).props.install_source == "withheld:user_path");
     // a machine path is left alone
     CHECK(record_of(set, kCMake).props.install_location == "C:\\Program Files\\CMake\\");
     for (const auto& line : rec::render(set))
@@ -788,30 +810,35 @@ TEST_CASE("installer records: the upgrade map gives every product the code recor
             const auto product = *rec::unpack_guid(packed);
             const auto got = map.resolve(product);
             REQUIRE(got.has_value());
-            // the one product named under two upgrade codes has no single answer (below)
-            if (product == kOutsideInstaller)
-                continue;
             CHECK(*got == u.braced);
         }
     }
-    CHECK(*map.resolve(kPythonLauncher) == "{7E1A4B20-5C3D-4F68-9A01-2B3C4D5E6F70}");
-    CHECK(*map.resolve(kUserProfileProduct) == "{7E1A4B22-5C3D-4F68-9A01-2B3C4D5E6F72}");
+    // every product of the capture is named under exactly one upgrade code
+    CHECK(*map.resolve(kPythonLauncher) == "{1B68A0EC-4DD3-5134-840E-73854B0863F1}");
+    CHECK(*map.resolve(kUserProfileProduct) == "{1EF02066-8B0C-AE04-CAD0-93F7E4164DC8}");
     // the Installer registers a code in whichever case; the join is case-insensitive
-    CHECK(*map.resolve(lower(kPythonLauncher)) == "{7E1A4B20-5C3D-4F68-9A01-2B3C4D5E6F70}");
+    CHECK(*map.resolve(lower(kPythonLauncher)) == "{1B68A0EC-4DD3-5134-840E-73854B0863F1}");
 }
 
 TEST_CASE("installer records: a product under no upgrade code, or under two, gets an empty token",
           "[msi_packages][installer_records]") {
-    const auto fx = load_fixture();
+    auto fx = load_fixture();
+    // The capture names every product under one code; a second code naming the same product is
+    // built here.
+    const auto outside = std::find_if(fx.products.begin(), fx.products.end(),
+                                      [](const auto& p) { return p.braced == kOutsideInstaller; });
+    REQUIRE(outside != fx.products.end());
+    fx.upgrades.push_back({std::format("{:032X}", 1), *rec::unpack_guid(std::format("{:032X}", 1)),
+                           {outside->packed}});
     const auto map = build_map(fx.upgrades);
 
-    // under two upgrade codes in the fixture
+    // under two upgrade codes
     CHECK(*map.resolve(kOutsideInstaller) == "");
-    // named under none
-    for (const auto* none : {kSevenZip, kRuntime, kNoLocalPackage, kNoProperties})
+    // named under none: the Products key with no InstallProperties, and a code never registered
+    for (const auto* none : {kNoProperties, "{FFFFFFFF-0000-4000-8000-000000000000}"})
         CHECK(*map.resolve(none) == "");
     // never an error: an empty token is not a fault
-    CHECK(map.resolve(kSevenZip).has_value());
+    CHECK(map.resolve(kNoProperties).has_value());
 }
 
 TEST_CASE("installer records: a name that is not a packed GUID is skipped and counted",

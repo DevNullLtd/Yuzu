@@ -552,7 +552,7 @@ agent_test_exe = executable(
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (macOS and Windows, self-gated)
     'unit/test_msi_packages_inventory.cpp',   # pure list_inventory builder over the committed Kingsley REAL CAPTURE (fixture via YUZU_TEST_FIXTURE_DIR; runs on every OS)
-    'unit/test_msi_installer_records.cpp',   # SAM-46: pure Installer-records builder over a SYNTHETIC fixture (packed GUID codec, path gate, caps, row-level reasons), runs on every OS
+    'unit/test_msi_installer_records.cpp',   # SAM-46: pure Installer-records builder over a real SYSTEM capture fixture (packed GUID codec, path gate, caps, row-level reasons), runs on every OS
     'unit/test_msi_database_read.cpp',   # SAM-46: agent-core bounded MSI Property-table read (single-flight slot on every OS; real-API cases Windows-only)
     'unit/test_install_row_attributes.cpp',   # SAM-46: shared install-row attribute field (canonical form, closed key table), portable
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
