@@ -283,7 +283,8 @@ answer a retryable `503` (`retry_after_ms`), MCP a retryable `kInternalError`, a
 notice, and
 `yuzu_server_forensics_tier_withheld_total{reason}` counts it (see `docs/observability-conventions.md`).
 The plugin set comes from the capability catalogue
-(`forensics_plugin_set.hpp`), never a hand-kept list, and boot refuses an empty set; it also carries the
+(`forensics_plugin_set.hpp`: every plugin with a row on the `Forensics` securable, plus every plugin whose row carries the
+stored-row flag, today `file_search`), never a hand-kept list, and boot refuses an empty set; it also carries the
 `~unverified` provenance sentinel (below). Only a global `Forensics:Read` admits a row: there is no scoped
 (management-group) read tier on the stored-response reads, and a hand-authored scoped grant reads nothing from
 them (the per-device application-usage read is a separate data set with its own scoped gate). Only `plugin` is

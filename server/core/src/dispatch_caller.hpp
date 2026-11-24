@@ -101,6 +101,13 @@ struct DispatchCaller {
     ///      handlers and the echo-query arm of the result-set producers'
     ///      shared `rs_run_async` (`mcp_server.cpp`): `Ticket`, stamped only
     ///      after `approval_ticket_just_consumed` is true (supervised tier).
+    ///      The `execute_instruction` handler ALONE also stamps it when
+    ///      `approval_covers_continuation` is true: an already-spent ticket accepted for one
+    ///      continuation slice of a READ whose catalogue row declares a continuation parameter
+    ///      (`approval_continuation.hpp`). Nothing is consumed on that call; the cover holds only
+    ///      for the same principal, the same canonical arguments minus the continuation
+    ///      parameter, and a bounded window after the ticket's first use, so the pair dispatched
+    ///      is still the one the human approved. No other stamping site reads that flag.
     ///      Each is safe because the (plugin, action) pair(s) it dispatches are
     ///      bound by the ticket: `execute_instruction` takes them from its own
     ///      arguments, `execute_bundle` from its `steps` argument (the C8 canon
