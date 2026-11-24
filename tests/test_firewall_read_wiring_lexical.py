@@ -137,6 +137,17 @@ MACOS_READS = {
 }
 
 
+# the pure row builder each macOS read hands its results to, and the variable each pf argv must
+# land in: the builders take the results positionally, so two swapped results (all one type) keep
+# every compile and pure test green while the rows describe the wrong reads
+MACOS_BUILDERS = {
+    "do_state_macos": r"macos_state_rows\( ?alf_res, pf_res, anchors_res, rules_res ?\)",
+    "do_rules_macos": r"macos_rules_rows\( ?listapps_res, rules_res, anchors_res ?\)",
+}
+MACOS_RESULT_VAR = {"pfctl_info_argv": "pf_res", "pfctl_anchors_argv": "anchors_res",
+                    "pfctl_rules_argv": "rules_res"}
+
+
 def macos_problems(plugin_src):
     out = []
     live = lexh.live_text(plugin_src)
@@ -158,6 +169,15 @@ def macos_problems(plugin_src):
                            "results positionally)")
             else:
                 pos = m.start()
+        if not re.search(MACOS_BUILDERS[fn], text):
+            out.append(f"{fn} no longer calls {MACOS_BUILDERS[fn]} with its results in that order "
+                       "(the builder takes them positionally)")
+        for builder in argvs:
+            m = re.search(r"const auto (\w+) = run_bounded_subprocess\( ?yuzu::shared::sudo_wrap\( ?fq::"
+                          + builder + r"\(\) ?\)", text)
+            if m and m.group(1) != MACOS_RESULT_VAR[builder]:
+                out.append(f"{fn} stores the fq::{builder}() read in {m.group(1)}, expected "
+                           f"{MACOS_RESULT_VAR[builder]} (the builder takes the results positionally)")
         if "/sbin/pfctl" in text:
             out.append(f"{fn} names a /sbin/pfctl literal (a bare pfctl exits 1 for the agent account; "
                        "the read argv comes from fq::pfctl_*_argv() through sudo_wrap)")
@@ -193,6 +213,14 @@ MACOS_MUTATIONS = [
           r"\1SubprocessOptions{.deadline = kAcqDeadline, .merge_stderr = true});\2"), "merges stderr"),
     (_mut(r"(void do_rules_macos.*?)const auto anchors_res = run_bounded_subprocess\(",
           r"\1const auto anchors_res = sudo_runner("), "do_rules_macos"),
+    # two results swapped in the builder call (positional, one type), in each function
+    (_mut(r"macos_state_rows\(alf_res, pf_res, anchors_res, rules_res\)",
+          "macos_state_rows(alf_res, pf_res, rules_res, anchors_res)"), "no longer calls macos_state_rows"),
+    (_mut(r"macos_rules_rows\(listapps_res, rules_res, anchors_res\)",
+          "macos_rules_rows(listapps_res, anchors_res, rules_res)"), "no longer calls macos_rules_rows"),
+    # a read stored in the other read's variable
+    (_mut(r"const auto pf_res = (run_bounded_subprocess\(yuzu::shared::sudo_wrap\(fq::pfctl_info_argv)",
+          r"const auto anchors_res = \1"), "stores the fq::pfctl_info_argv() read in anchors_res"),
     # the deadline dropped from one pf read (an unbounded wait on a hung sudo or pfctl)
     (_mut(r"(void do_state_macos.*?fq::pfctl_rules_argv\(\)\),\s*)SubprocessOptions\{\.deadline = kAcqDeadline\}",
           r"\1SubprocessOptions{}"), "no longer runs run_bounded_subprocess(sudo_wrap(fq::pfctl_rules_argv())"),
@@ -239,6 +267,16 @@ WIN_PROPERTIES = {
 }
 
 
+# WinRuleRead field -> the expression (a regex) its own read feeds
+WIN_VALUES = {
+    "name": r"name_utf8",
+    "enabled": r"enabled != VARIANT_FALSE",
+    "dir": r"static_cast<int>\(dir\)",
+    "action": r"static_cast<int>\(action\)",
+    "profiles": r"profiles_mask",
+}
+
+
 def windows_problems(plugin_src, parsers_src):
     out = []
     live = lexh.live_text(plugin_src)
@@ -260,6 +298,13 @@ def windows_problems(plugin_src, parsers_src):
         if not re.search(r"\.%s = static_cast<std::uint32_t>\(%s\)" % (field, m.group(1)), text):
             out.append(f"the HRESULT of rule->{getter}( no longer reaches WinRuleRead::{field} "
                        "(the builder would trust the value of a read it was never told failed)")
+
+    # each value reaches the field of its own name (the HRESULT assignments above pin the statuses;
+    # these pin the values, which are all ints or longs and swap without a compile error)
+    for field, expr in WIN_VALUES.items():
+        if not re.search(r"\.%s = %s[,}]" % (field, expr), text):
+            out.append(f"WinRuleRead::{field} is no longer assigned from its own property read "
+                       f"({expr.replace(chr(92), '')})")
 
     first_read = text.find("rule->get_")
     emit = re.search(r"emit_rule\( ?yuzu::firewall::WinRuleRead\{", text)
@@ -330,6 +375,12 @@ WINDOWS_MUTATIONS = [
      "skip site"),
     (_mut(r"(if \(FAILED\(qhr\) \|\| !rule\) \{)\s*emit_rule\(.*?\);(\s*continue;)", r"\1\2"),
      "skip site"),
+    (_mut(r"\.dir = static_cast<int>\(dir\),\s*\.action = static_cast<int>\(action\)",
+          ".dir = static_cast<int>(action), .action = static_cast<int>(dir)"),
+     "WinRuleRead::dir is no longer assigned"),
+    (_mut(r"\.enabled = enabled != VARIANT_FALSE", ".enabled = true"), "WinRuleRead::enabled is no longer"),
+    (_mut(r"\.profiles = profiles_mask", ".profiles = 0"), "WinRuleRead::profiles is no longer"),
+    (_mut(r"\.name = name_utf8", '.name = ""'), "WinRuleRead::name is no longer"),
     (_mut(r"property_failures,\s*first_property_hr\)\)", "0, 0))"), "property_failures and first_property_hr"),
     (_mut(r"static_assert\(NET_FW_ACTION_BLOCK == 0 && NET_FW_ACTION_ALLOW == 1,", "static_assert(true,"),
      "static_asserts"),
