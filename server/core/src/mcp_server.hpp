@@ -957,6 +957,17 @@ public:
     /// is never draining: a harness that does not wire it. server.cpp wires `draining_`.
     void set_draining_fn(std::function<bool()> fn) { draining_fn_ = std::move(fn); }
 
+    /// The typed per-device scoped gate: the SAME body as `ScopedPermFn` (server.cpp wires the one
+    /// `scoped_gate_fn` lambda it hands the REST routes), returning the refusal class instead of a
+    /// bool. `get_device_live` uses it at its #7110 re-decision only, to tell a withdrawn
+    /// permission from a gate that could not read its authority (a store degrade, which is
+    /// retryable and is not a revocation). Unset (a harness that does not wire it) = the re-decision
+    /// falls back to `ScopedPermFn` and every refusal is read as a denial.
+    using ScopedGateFn = std::function<ScopedGateOutcome(
+        const httplib::Request&, httplib::Response&, const std::string& securable_type,
+        const std::string& operation, const std::string& agent_id)>;
+    void set_scoped_gate_fn(ScopedGateFn fn) { scoped_gate_fn_ = std::move(fn); }
+
     /// The wait before the single retry of an indeterminate per-step credential check in an
     /// `execute_workflow` run. Unset (the production default) is `kReauthorizeRetryDelay`; set
     /// only by a test that drives the indeterminate path.
@@ -1544,6 +1555,7 @@ private:
     WorkflowRunFn workflow_run_fn_;                          // see set_workflow_run_fn
     WorkflowIdempotencyLookupFn workflow_idempotency_lookup_fn_; // see set_workflow_idempotency_lookup_fn
     std::function<bool()> draining_fn_;                      // see set_draining_fn
+    ScopedGateFn scoped_gate_fn_;                            // see set_scoped_gate_fn
     std::function<std::optional<std::string>(std::string_view)> workflow_digest_fn_; // see set_workflow_digest_fn
     std::optional<std::chrono::milliseconds> workflow_reauthorize_retry_delay_; // see set_workflow_reauthorize_retry_delay
     StreamRevalidateFn workflow_revalidate_fn_;              // see set_workflow_revalidate_fn

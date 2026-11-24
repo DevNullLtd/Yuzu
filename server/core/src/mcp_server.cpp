@@ -109,7 +109,9 @@
 #include "workflow_execute.hpp" // #2146 batch B: execute_workflow shares this sequence with POST /api/v1/workflows/{id}/execute
 #include "command_v1_routes.hpp" // command_v1::zero_reach_reply: the one zero-reach answer table (get_device_live)
 #include "dispatch_zero_reach.hpp" // classify_zero_reach / zero_reach_token / zero_reach_retryable
-#include "live_gauge_mirror.hpp" // LiveGaugeMirror: yuzu_server_live_inflight (shared with REST)
+#include "live_admission.hpp" // admit_live_read + outcome_for_reject_reason: the ONE kLiveRead admission step
+#include "live_gauge_mirror.hpp" // LiveGaugeMirror: yuzu_server_live_in_flight (shared with REST)
+#include "utf8_clamp.hpp" // utf8_clean_clamp: untrusted text on an error envelope
 #include "live_model.hpp" // resolve_rest_kind: the ONE live kind table (get_device_live)
 #include "live_outcome.hpp" // LiveOutcome / LiveSurface / kind_label: the closed metric label vocabulary
 #include "live_read_poll.hpp" // poll_live_output: the shared device-output poll
@@ -2764,20 +2766,40 @@ static const ToolDef kTools[] = {
     {"get_device_live",
      "Read ONE device's live state from the agent right now: kind 'uptime' (the uptime as "
      "display text and seconds) or 'processes' (running processes with pid, name, executable "
-     "path and SHA-256). "
+     "path and SHA-256). Take agent_id from list_agents; for many devices use "
+     "execute_instruction, never a loop of this tool. "
+     "THIS IS NOT A PASSIVE READ. Every call DISPATCHES a command to the device ('processes' "
+     "hashes every running executable on the endpoint and COSTS DEVICE CPU, so do not poll it), "
+     "writes audit rows, and the result is stored in the server's response store for the "
+     "retention period (90 days by default). Treat each call as an action: never retry one "
+     "that returned no retry_after_ms. "
      "SYNCHRONOUS: the call blocks for up to about 20 seconds waiting for the device and "
      "holds one server request slot meanwhile (at most 2 per principal, 4 server-wide; over "
-     "that it answers a retryable cap error and sends nothing). It COSTS DEVICE CPU: "
-     "'processes' hashes every running executable on the endpoint, so do not poll it; call it "
-     "for one device you are investigating, not across a fleet. Needs BOTH "
+     "that it answers a retryable cap error and sends nothing). The answer is given only after "
+     "the device has finished; partial output is never returned. Needs BOTH "
      "GuaranteedState:Read and Execution:Execute, each scoped to this device; a 'readonly' "
      "token and a 'supervised' token are refused (a live probe has no approval ticket), and "
-     "so is every call while the server runs in read-only mode. Behavioural data: every call "
-     "writes a fail-closed audit row first (device.live.uptime or device.live.processes) and "
-     "dispatches nothing if that row cannot be stored. Output is bounded: at most 1000 "
-     "process rows and 1 MiB of device output, with 'truncated' set when either cut applies. "
-     "An offline, quarantined or unreachable device answers an error whose 'reason' names the "
-     "cause; only the reasons marked retryable carry retry_after_ms. Mirrors POST "
+     "so is every call while the server runs in read-only mode. "
+     "Behavioural data: process paths can contain user names, so the output is personal data "
+     "and the caller is responsible for handling it as such. On Linux an unprivileged agent "
+     "returns an empty sha256 and path for other users' processes; macOS and Windows hash "
+     "every row. "
+     "Audit: the 'requested' row (device.live.uptime or device.live.processes) is written "
+     "before anything is sent and is FAIL CLOSED while the audit store is on: if it cannot be "
+     "stored nothing is sent. With audit switched off the call proceeds. A success row "
+     "that is lost afterwards is flagged on the answer as audit_persisted false. A refusal "
+     "for argument shape, tier, permission, a cap or shutdown writes no such row. "
+     "Output is bounded: at most 1000 process rows and 1 MiB of device output, with "
+     "'truncated' set when either cut applies. "
+     "Errors: an error carries 'reason', and ONLY an error that carries retry_after_ms is "
+     "worth retrying (a device timeout, a device that began to answer but did not finish "
+     "(incomplete), a response store read fault, a cap, an audit store fault, an offline "
+     "device (no_agents_reached), or a store that could not be read: gate_unreadable, "
+     "containment_unreadable, route_unreadable, os_gate_unreadable). Never retry quarantined, "
+     "plugin_not_found, "
+     "kill_switched_os, device_failed, device_error (which includes a device that returned "
+     "nothing usable), dispatch_denied or permission_revoked. shutting_down means the server "
+     "is stopping: retry later or against another replica. Mirrors POST "
      "/api/v1/dex/devices/{id}/live.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact agent/device id (never __all__)"},)j"
@@ -22002,7 +22024,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         try {
                             reg->counter(
-                                   "yuzu_server_live_requests_total",
+                                   live::kLiveRequestsMetric,
                                    {{"surface", std::string(live::to_token(live::LiveSurface::kMcp))},
                                     {"kind", std::string(live::kind_label(kind))},
                                     {"outcome", std::string(live::to_token(*outcome))}})
@@ -22014,6 +22036,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 // One correlation id for the whole call: the response header, every error body and
                 // every audit row's `cid=`.
                 const std::string cid = yuzu::server::detail::ensure_correlation_id(res);
+
+                // The metric label `kind` is read ahead of every refusal, as the REST route labels
+                // it at entry: a refused call is still counted under the kind it asked for. The
+                // value is never trusted (`kind_label` collapses anything but the two served kinds
+                // to `unknown`) and it is validated again, strictly, below.
+                if (args.is_object()) {
+                    if (const auto early = args.find("kind"); early != args.end() && early->is_string())
+                        kind = early->get<std::string>();
+                }
 
                 if (!tier_allows(tier, "GuaranteedState", "Read") ||
                     !tier_allows(tier, "Execution", "Execute")) {
@@ -22037,7 +22068,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 for (auto it = args.begin(); it != args.end(); ++it) {
                     if (it.key() != "agent_id" && it.key() != "kind") {
-                        refuse_input("unknown argument '" + it.key().substr(0, 64) +
+                        refuse_input("unknown argument '" + yuzu::server::utf8_clean_clamp(it.key(), 64) +
                                      "'; get_device_live takes agent_id and kind only");
                         return;
                     }
@@ -22132,52 +22163,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
 
                 // Admission against the ONE held-open budget (SseSurface::kLiveRead): after every
-                // refusal that needs no slot and BEFORE the `requested` row, so an over-budget call
-                // is answered with no audit row and nothing is sent. The lease is branch-local, so
-                // any return or throw below gives the slot back.
+                // refusal that needs no slot and BEFORE the `requested` row, so an over-budget or
+                // draining call is answered with no audit row and nothing is sent. The lease is
+                // branch-local, so any return or throw below gives the slot back. A draining (or
+                // stopping) server refuses here, and the shutdown drain counts the kLiveRead leases
+                // that were admitted before it set its flag, so it waits for exactly those.
                 // The gauge mirror is declared BEFORE the lease so the lease is returned first and
                 // the destructor publishes the count without it, on every exit path.
                 yuzu::server::detail::LiveGaugeMirror gauge_mirror{
                     stream_budget,
-                    metrics != nullptr ? &metrics->gauge("yuzu_server_live_inflight") : nullptr};
-                std::optional<yuzu::server::detail::StreamBudget::Lease> live_lease;
-                std::string_view admission_refusal; // empty == admitted
-                if (draining_fn_ && draining_fn_()) {
-                    admission_refusal = "draining";
-                } else if (stream_budget != nullptr) {
-                    auto acquired = stream_budget->try_acquire(
-                        yuzu::server::detail::SseSurface::kLiveRead, session->username,
-                        yuzu::server::detail::kPerPrincipalLiveRead,
-                        yuzu::server::detail::StreamBudget::Admission::kEnforceCaps,
-                        yuzu::server::detail::kLiveReadSurfaceCap);
-                    if (acquired.lease) {
-                        // Asked again now the lease is held: the shutdown drain counts leases
-                        // after it sets the flag, so a lease it did not count was taken after this.
-                        if (draining_fn_ && draining_fn_())
-                            admission_refusal = "draining"; // `acquired` releases on scope exit
-                        else
-                            live_lease.emplace(std::move(acquired.lease));
-                    } else {
-                        admission_refusal =
-                            acquired.reject_reason != nullptr
-                                ? std::string_view(acquired.reject_reason)
-                                : std::string_view(yuzu::server::detail::StreamBudget::kRejectGlobal);
-                    }
-                }
+                    metrics != nullptr ? &metrics->gauge(live::kLiveInFlightMetric) : nullptr};
+                auto live_admission = live::admit_live_read(stream_budget, draining_fn_, session->username);
                 gauge_mirror.publish();
-                if (!admission_refusal.empty()) {
-                    using SB = yuzu::server::detail::StreamBudget;
-                    const bool draining = admission_refusal == "draining";
-                    outcome = admission_refusal == SB::kRejectPerPrincipal
-                                  ? live::LiveOutcome::kOverBudgetPrincipal
-                              : admission_refusal == SB::kRejectSurface
-                                  ? live::LiveOutcome::kOverBudgetSurface
-                                  : live::LiveOutcome::kOverBudgetGlobal;
-                    res.status = draining ? 503 : 429;
-                    if (!draining)
-                        res.set_header("Retry-After",
-                                       std::to_string((mcp::kMcpLiveReadCapRetryMs + 999) / 1000));
-                    if (draining) {
+                if (live_admission.refused) {
+                    outcome = *live_admission.refused;
+                    if (outcome == live::LiveOutcome::kShuttingDown) {
+                        res.status = 503;
                         // No retry hint: this process cannot know when the server is back.
                         res.set_content(
                             a4_error(kMcpShuttingDown,
@@ -22185,30 +22186,50 @@ McpServer::HandlerFn McpServer::build_handler(
                                      "reads",
                                      "retry after the server restarts, or against another "
                                      "replica; nothing was sent",
-                                     -1, cid, true, admission_refusal),
+                                     -1, cid, true, live::to_token(live::LiveOutcome::kShuttingDown)),
                             "application/json");
-                    } else {
-                        res.set_content(
-                            a4_error(kMcpStreamCap,
-                                     admission_refusal == SB::kRejectPerPrincipal
-                                         ? "this principal already has as many live reads in "
-                                           "progress as it may"
-                                         : "the server is running as many live reads or held-open "
-                                           "requests as it is sized for",
-                                     "wait for a live read to finish, then retry; nothing was sent",
-                                     static_cast<long>(mcp::kMcpLiveReadCapRetryMs), cid, true,
-                                     admission_refusal),
-                            "application/json");
+                        return;
                     }
+                    using SB = yuzu::server::detail::StreamBudget;
+                    const std::string_view refusal = live_admission.reject_reason;
+                    res.status = 429;
+                    res.set_header("Retry-After",
+                                   std::to_string((mcp::kMcpLiveReadCapRetryMs + 999) / 1000));
+                    res.set_content(
+                        a4_error(kMcpStreamCap,
+                                 refusal == SB::kRejectPerPrincipal
+                                     ? "this principal already has as many live reads in "
+                                       "progress as it may"
+                                     : "the server is running as many live reads or held-open "
+                                       "requests as it is sized for",
+                                 "wait for a live read to finish, then retry; nothing was sent",
+                                 static_cast<long>(mcp::kMcpLiveReadCapRetryMs), cid, true,
+                                 refusal),
+                        "application/json");
                     return;
                 }
 
                 // One domain row of the call's own verb, target the device. `why` is a closed
                 // token (or a closed token plus one), never caller text.
-                const auto domain_row = [&](const char* result, const std::string& why) -> bool {
-                    return yuzu::server::detail::try_persist_audit(
-                        audit_fn, req, lk->audit_action, result, "Agent", agent_id,
-                        why + " cid=" + cid);
+                // Every domain row of the call is written AS the session this call resolved at the
+                // top of the handler (the role taken from it once), so a credential revoked
+                // mid-call still leaves rows that name the principal who made the request; the
+                // re-resolving `audit_fn` would stamp a blank one. With no session writer wired
+                // (a deployment without the runtime-config store, tests) the rows fall back to it.
+                const auto domain_row = [&, role = auth::role_to_string(auth::effective_role(*session))](
+                                            const char* result, const std::string& why) -> bool {
+                    const std::string row_detail = why + " cid=" + cid;
+                    if (!tool_deps_.audit_as_session_fn)
+                        return yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, lk->audit_action, result, "Agent", agent_id, row_detail);
+                    try {
+                        return tool_deps_.audit_as_session_fn(req, *session, role, lk->audit_action,
+                                                              result, "Agent", agent_id, row_detail);
+                    } catch (...) {
+                        spdlog::warn("audit_as_session_fn threw on a live-read row verb={} target={}",
+                                     lk->audit_action, audit_token(agent_id));
+                        return false;
+                    }
                 };
                 // Audit-on-open, FAIL CLOSED: the call is usage-class behavioural data, so a
                 // `requested` row that is known to have been lost sends nothing. An unwired
@@ -22236,19 +22257,34 @@ McpServer::HandlerFn McpServer::build_handler(
                 // are repeated. The refusal rendered here replaces whatever the gate or the
                 // authenticator wrote (and its status: a handler-rendered envelope rides 200).
                 const auto fresh = auth_fn(req, res);
-                std::string withdrawn; // empty == still authorised
+                // The typed gate (when wired) tells a withdrawn permission from a gate that could
+                // not read its authority: a store degrade is `gate_unreadable`, retryable, and is
+                // never reported as a revocation (and never writes a revocation row).
+                ScopedGateOutcome regate = ScopedGateOutcome::Admitted;
                 if (!fresh || fresh->username != session->username) {
-                    withdrawn = "caller_unresolved";
+                    regate = ScopedGateOutcome::Unauthenticated;
+                } else if (scoped_gate_fn_) {
+                    regate = scoped_gate_fn_(req, res, "GuaranteedState", "Read", agent_id);
+                    if (regate == ScopedGateOutcome::Admitted)
+                        regate = scoped_gate_fn_(req, res, "Execution", "Execute", agent_id);
                 } else if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id) ||
                            !scoped_perm_fn(req, res, "Execution", "Execute", agent_id)) {
-                    withdrawn = "permission_revoked";
+                    regate = ScopedGateOutcome::Denied; // the bool gate cannot say more
                 }
-                if (!withdrawn.empty()) {
-                    outcome = withdrawn == "permission_revoked"
-                                  ? live::LiveOutcome::kPermissionRevoked
-                                  : live::LiveOutcome::kCallerUnresolved;
+                if (regate != ScopedGateOutcome::Admitted) {
+                    outcome = live::live_outcome_for(regate);
+                    const std::string withdrawn(live::to_token(*outcome));
                     const bool row_ok = domain_row("failure", withdrawn);
                     res.status = 200;
+                    if (*outcome == live::LiveOutcome::kGateUnreadable) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "the authorization store could not be read; nothing was sent",
+                                     "retry the request", mcp::kMcpStoreFaultRetryMs, cid, row_ok,
+                                     withdrawn),
+                            "application/json");
+                        return;
+                    }
                     res.set_content(
                         a4_error(kPermissionDenied,
                                  "the permission or session this call was authorised under was "
@@ -22342,9 +22378,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
 
                     // The shared poll: scoped to the device at the store seam, multi-row output
-                    // joined, a failure row wins, output over the cap cut at the last newline. The
-                    // budget (40 polls of 500 ms by default) is the same test seam the REST route
-                    // reads.
+                    // joined, an answer decided only once the device sent a terminal row, a failure
+                    // row wins, output over the cap cut at the last newline (the newest rows when
+                    // the store itself held some back). The budget (40 polls of 500 ms by default,
+                    // 25 s overall) is the same test seam the REST route reads. The poll gives up
+                    // when the server begins closing (`StreamBudget::closing()`, which flips when
+                    // the shutdown drain ENDS): never on `draining_fn_`, which flips at drain start
+                    // and would abort the very reads the drain is waiting for.
                     live::LivePollLimits limits;
                     limits.max_polls = yuzu::server::detail::live_poll_max_polls().load(
                         std::memory_order_relaxed);
@@ -22353,8 +22393,12 @@ McpServer::HandlerFn McpServer::build_handler(
                             std::memory_order_relaxed));
                     limits.max_output_bytes = 1024u * 1024u;
                     limits.over_cap = live::OverCapPolicy::kTruncateAtNewline;
+                    const live::LiveStopFn should_stop = [stream_budget] {
+                        return stream_budget != nullptr && stream_budget->closing();
+                    };
                     const auto polled = live::poll_live_output(*response_store, dispatched.command_id,
-                                                               agent_id, forensics_plugins_, limits);
+                                                               agent_id, forensics_plugins_, limits,
+                                                               {}, should_stop);
                     outcome = polled.outcome;
                     switch (polled.outcome) {
                     case live::LiveOutcome::kOk: {
@@ -22365,6 +22409,19 @@ McpServer::HandlerFn McpServer::build_handler(
                             res.set_content(a4_error(kInternalError, "live result could not be rendered",
                                                      {}, -1, cid, row_ok),
                                             "application/json");
+                            return;
+                        }
+                        if (rendered->empty) {
+                            // The device finished without error but returned nothing usable: it did
+                            // not answer the question, so this is not a success.
+                            outcome = live::LiveOutcome::kDeviceError;
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         std::string(live::kLiveNoUsableDataDetail),
+                                         "the device answered with nothing usable; retrying the "
+                                         "same call is unlikely to change that",
+                                         -1, cid, true, live::to_token(live::LiveOutcome::kDeviceError)),
+                                "application/json");
                             return;
                         }
                         const bool truncated = rendered->truncated || polled.truncated;
@@ -22401,7 +22458,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                      (polled.outcome == live::LiveOutcome::kDeviceFailed
                                           ? "device query failed (device text): "
                                           : "device reported an error (device text): ") +
-                                         polled.detail,
+                                         yuzu::server::utf8_clean_clamp(polled.detail,
+                                                                        live::kLiveDetailMaxBytes),
                                      "the device answered with a failure; retrying the same call "
                                      "is unlikely to change that",
                                      -1, cid, true, live::to_token(polled.outcome)),
@@ -22419,6 +22477,27 @@ McpServer::HandlerFn McpServer::build_handler(
                             a4_error(kInternalError, "response store read degraded", "retry shortly",
                                      mcp::kMcpStoreFaultShortRetryMs, cid, true,
                                      live::to_token(polled.outcome)),
+                            "application/json");
+                        return;
+                    case live::LiveOutcome::kShuttingDown:
+                        // The server began closing while the device was answering: the command may
+                        // have been sent, so this is not the "nothing was sent" refusal above.
+                        res.set_content(
+                            a4_error(kMcpShuttingDown,
+                                     "the server began shutting down before the device answered",
+                                     "retry after the server restarts, or against another "
+                                     "replica; the command may have been sent",
+                                     -1, cid, true, live::to_token(polled.outcome)),
+                            "application/json");
+                        return;
+                    case live::LiveOutcome::kIncomplete:
+                        // Output arrived and no terminal row followed (the partial output was
+                        // discarded): retryable like a timeout, but named apart so a caller knows
+                        // the device was working on it.
+                        res.set_content(
+                            a4_error(kInternalError, std::string(polled.detail),
+                                     "retry the request", mcp::kMcpLiveReadDeviceTimeoutRetryMs,
+                                     cid, true, live::to_token(polled.outcome)),
                             "application/json");
                         return;
                     default: // kTimeout: the only other outcome the poll returns

@@ -891,6 +891,14 @@ public:
         const std::string& target_type, const std::string& target_id, const std::string& detail)>;
     void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
 
+    /// True while the server is draining or stopping (`ServerImpl::draining_` or
+    /// `stop_requested_`, the same predicate MCP's `set_draining_fn` reads). The per-device live
+    /// read and the quarantine release-confirm wait refuse a NEW wait while it holds: a live read
+    /// holds an HTTP worker for up to the poll budget, and the shutdown drain waits only for the
+    /// reads it counted. Unset (tests, a deployment with no drain) = never draining. MUST be
+    /// called BEFORE `register_routes()` (captured by value).
+    void set_draining_fn(std::function<bool()> fn) { draining_fn_ = std::move(fn); }
+
     /// The score policy writer behind GET/PUT/DELETE /api/v1/dex/score-policy: the observed
     /// store read, the store conditional writes and the provider (`audit` is bound per request
     /// by the handler). Unset = the three routes answer 503 "runtime config store
@@ -903,6 +911,7 @@ public:
 private:
     std::optional<DexScorePolicyWriteDeps> dex_score_policy_writer_;
     AuditAsSessionFn audit_as_session_fn_;
+    std::function<bool()> draining_fn_; // see set_draining_fn
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
     const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set

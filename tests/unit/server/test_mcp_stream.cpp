@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <type_traits>
 
+#include "../../../server/core/src/live_admission.hpp"
+#include "../../../server/core/src/live_gauge_mirror.hpp"
 #include "../../../server/core/src/mcp_session.hpp"
 #include "../../../server/core/src/mcp_stream.hpp"
 #include "../../../server/core/src/stream_budget.hpp"
@@ -34,6 +36,7 @@
 
 namespace mcp = yuzu::server::mcp;
 namespace detail = yuzu::server::detail;
+namespace live = yuzu::server::live;
 
 namespace {
 
@@ -162,6 +165,135 @@ TEST_CASE("StreamBudget: kMcpPost is an independent surface — its per-principa
     CHECK(get.lease);
     CHECK(budget.active_for(detail::SseSurface::kMcpPost, "alice") == detail::kPerPrincipalMcpPost);
     CHECK(budget.active_for(detail::SseSurface::kMcpGet, "alice") == 1);
+}
+
+namespace {
+
+// Runs `principals.size()` threads that each make ONE live-read admission through the shared
+// admission step, all released together by an atomic start flag (no sleeps), and each holding what
+// it got until every thread has made its attempt, so the caps are contended for real. Returns how
+// many were admitted. `budget` is left with nothing held.
+std::size_t contend_for_live_reads(detail::StreamBudget& budget, yuzu::Gauge& gauge,
+                                   const std::vector<std::string>& principals) {
+    const std::size_t n = principals.size();
+    std::atomic<bool> go{false};
+    std::atomic<std::size_t> attempted{0};
+    std::atomic<std::size_t> admitted{0};
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        threads.emplace_back([&, i] {
+            // The mirror is declared before the lease, as the handlers do, so the lease is
+            // returned first and the count is published without it.
+            detail::LiveGaugeMirror mirror{&budget, &gauge};
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            auto admission = live::admit_live_read(&budget, {}, principals[i]);
+            if (!admission.refused)
+                admitted.fetch_add(1, std::memory_order_relaxed);
+            attempted.fetch_add(1, std::memory_order_release);
+            // Hold the lease until every thread has attempted: no thread frees a slot another is
+            // still trying to take.
+            while (attempted.load(std::memory_order_acquire) < n)
+                std::this_thread::yield();
+        });
+    }
+    go.store(true, std::memory_order_release);
+    for (auto& t : threads)
+        t.join();
+    return admitted.load();
+}
+
+} // namespace
+
+// QE-6: the caps hold under real contention. A bound that is checked and then taken in two steps
+// would let more than the cap through; the budget takes both under its one mutex, so exactly the
+// cap is admitted, whatever the interleaving.
+TEST_CASE("StreamBudget: exactly kLiveReadSurfaceCap concurrent live reads across principals are "
+          "admitted, the rest refused, and the slots and the gauge return to zero",
+          "[mcp][stream][live][twin]") {
+    detail::StreamBudget budget{{.global_cap = 64}};
+    yuzu::MetricsRegistry metrics;
+    auto& gauge = metrics.gauge("yuzu_server_live_in_flight");
+    // Twice the cap, one thread per distinct principal, so only the SURFACE cap can bind.
+    std::vector<std::string> principals;
+    for (std::size_t i = 0; i < detail::kLiveReadSurfaceCap * 4; ++i)
+        principals.push_back("user-" + std::to_string(i));
+    for (int round = 0; round < 20; ++round) {
+        INFO("round " << round);
+        const auto admitted = contend_for_live_reads(budget, gauge, principals);
+        CHECK(admitted == detail::kLiveReadSurfaceCap);
+        CHECK(budget.active_for_surface(detail::SseSurface::kLiveRead) == 0);
+        CHECK(budget.active() == 0);
+        // A mirror publishes outside the budget's lock, so the last writer can leave a stale
+        // count; the maintenance tick (and the next handler) republish. The republish is zero.
+        detail::LiveGaugeMirror{&budget, &gauge}.publish();
+        CHECK(gauge.value() == 0.0);
+    }
+}
+
+TEST_CASE("StreamBudget: exactly kPerPrincipalLiveRead concurrent live reads for ONE principal are "
+          "admitted, the rest refused, and the slots return to zero",
+          "[mcp][stream][live][twin]") {
+    detail::StreamBudget budget{{.global_cap = 64}};
+    yuzu::MetricsRegistry metrics;
+    auto& gauge = metrics.gauge("yuzu_server_live_in_flight");
+    // Fewer threads than the surface cap, so only the PER-PRINCIPAL cap can bind.
+    const std::vector<std::string> principals(detail::kLiveReadSurfaceCap, "alice");
+    for (int round = 0; round < 20; ++round) {
+        INFO("round " << round);
+        const auto admitted = contend_for_live_reads(budget, gauge, principals);
+        CHECK(admitted == detail::kPerPrincipalLiveRead);
+        CHECK(budget.active() == 0);
+        detail::LiveGaugeMirror{&budget, &gauge}.publish();
+        CHECK(gauge.value() == 0.0);
+    }
+}
+
+TEST_CASE("live::admit_live_read: a draining server refuses first (no lease), and a drain that begins "
+          "after the lease is taken gives the lease back",
+          "[mcp][stream][live][twin][shutdown]") {
+    detail::StreamBudget budget{{.global_cap = 8}};
+    SECTION("draining at the front door: refused shutting_down, nothing leased, budget untouched") {
+        const auto a = live::admit_live_read(&budget, [] { return true; }, "alice");
+        REQUIRE(a.refused);
+        CHECK(*a.refused == live::LiveOutcome::kShuttingDown);
+        CHECK(a.reject_reason.empty());
+        CHECK_FALSE(a.lease);
+        CHECK(budget.active() == 0);
+    }
+    SECTION("draining begins between the two looks: the lease is returned, still shutting_down") {
+        int asked = 0;
+        const auto a = live::admit_live_read(&budget, [&] { return ++asked > 1; }, "alice");
+        REQUIRE(a.refused);
+        CHECK(*a.refused == live::LiveOutcome::kShuttingDown);
+        CHECK(asked == 2);
+        CHECK_FALSE(a.lease);
+        CHECK(budget.active() == 0);
+    }
+    SECTION("not draining: admitted with a lease; each refusal token maps onto its own outcome") {
+        auto a = live::admit_live_read(&budget, [] { return false; }, "alice");
+        CHECK_FALSE(a.refused);
+        CHECK(a.lease);
+        auto b = live::admit_live_read(&budget, {}, "alice");
+        CHECK_FALSE(b.refused);
+        auto c = live::admit_live_read(&budget, {}, "alice"); // the third for one principal
+        REQUIRE(c.refused);
+        CHECK(*c.refused == live::LiveOutcome::kOverBudgetPrincipal);
+        CHECK(c.reject_reason == detail::StreamBudget::kRejectPerPrincipal);
+        CHECK(live::outcome_for_reject_reason(detail::StreamBudget::kRejectSurface) ==
+              live::LiveOutcome::kOverBudgetSurface);
+        CHECK(live::outcome_for_reject_reason(detail::StreamBudget::kRejectGlobal) ==
+              live::LiveOutcome::kOverBudgetGlobal);
+        CHECK(live::outcome_for_reject_reason("anything else") == live::LiveOutcome::kOverBudgetGlobal);
+    }
+    SECTION("a null budget is the unmetered seam: admitted unless draining") {
+        const auto a = live::admit_live_read(nullptr, {}, "alice");
+        CHECK_FALSE(a.refused);
+        const auto b = live::admit_live_read(nullptr, [] { return true; }, "alice");
+        REQUIRE(b.refused);
+        CHECK(*b.refused == live::LiveOutcome::kShuttingDown);
+    }
 }
 
 TEST_CASE("StreamBudget: kLiveRead is a surface of the ONE budget: 2 per principal, a surface cap of 4 "

@@ -36,6 +36,18 @@ enum class LiveSurface {
     return "rest"; // unreachable for a valid enumerator; keeps the function total
 }
 
+/// The two metric names of the live read, in ONE place so the REST route, the MCP tool, the
+/// quarantine release wait and the boot-time pre-seeding cannot spell them differently.
+/// `kLiveRequestsMetric` is the counter `{surface, kind, outcome}`; `kLiveInFlightMetric` is the
+/// gauge mirroring the `kLiveRead` lease count of the shared held-open budget.
+inline constexpr char kLiveRequestsMetric[] = "yuzu_server_live_requests_total";
+inline constexpr char kLiveInFlightMetric[] = "yuzu_server_live_in_flight";
+
+/// Every value `kind_label` can return, so the boot-time pre-seeding walks the closed set.
+inline constexpr std::array<std::string_view, 3> kAllKindLabels = {"uptime", "processes", "unknown"};
+/// Every `LiveSurface`, for the same walk.
+inline constexpr std::array<LiveSurface, 2> kAllLiveSurfaces = {LiveSurface::kRest, LiveSurface::kMcp};
+
 /// The metric label `kind`: the two kinds the surfaces serve, else `unknown` (a caller-supplied
 /// kind is never used as a label value).
 [[nodiscard]] constexpr std::string_view kind_label(std::string_view kind) noexcept {
@@ -55,7 +67,7 @@ enum class LiveOutcome {
     kUnavailable,          ///< nothing was sent and no more specific cause applies (device offline)
     kOverBudgetPrincipal,  ///< StreamBudget per-principal cap
     kOverBudgetSurface,    ///< StreamBudget surface cap
-    kOverBudgetGlobal,     ///< StreamBudget global cap, or draining
+    kOverBudgetGlobal,     ///< StreamBudget global cap
     kAuditFailed,          ///< the `requested` audit row could not be written (fail closed)
     kPermissionRevoked,    ///< a grant was withdrawn between the first check and the re-decision
     kCallerUnresolved,     ///< the caller could not be re-derived at the re-decision

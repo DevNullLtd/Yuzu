@@ -103,6 +103,9 @@ struct QuarantineRouteHarness {
 
     QuarantineStore quarantine_store;
 
+    // True = the server is draining or stopping, as the route set reads it (`set_draining_fn`).
+    bool draining{false};
+
     // auth: empty session_user => require_auth writes 401 and returns nullopt.
     std::string session_user{"alice"};
     // scope decision the stub returns; when `wire_scope` is false the route is
@@ -205,6 +208,7 @@ struct QuarantineRouteHarness {
           quarantine_store(pool), response_store(rstore) {
         REQUIRE(quarantine_store.is_open());
         api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        api.set_draining_fn([this] { return draining; });
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
@@ -1488,6 +1492,25 @@ TEST_CASE("REST DELETE /api/v1/quarantine: an operator over the per-principal li
     CHECK(res->status == 202);
     CHECK(h.dispatch_calls.size() == 1);
     CHECK(h.live_budget.active_for(detail::SseSurface::kLiveRead, "alice") == held.size());
+}
+
+// CS-1 (a), the third kLiveRead holder: a draining server refuses the confirm wait exactly as a
+// full budget does. The release is still dispatched (the operator asked for it and the reconciler
+// finishes it), nothing is read back, no lease is taken, and the answer is 202. A scripted reply of
+// inactive proves no read happened: had the wait run, the record would have ended (200).
+TEST_CASE("REST DELETE /api/v1/quarantine: a draining server skips the reply wait, takes no lease and "
+          "answers 202 (CS-1)",
+          "[rest][quarantine][release][pg][shutdown]") {
+    RELEASE_RIG(h, "status|inactive");
+    h.draining = true;
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls.size() == 1);
+    const auto rec = active_record(h.quarantine_store, "agent-B");
+    REQUIRE(rec.has_value());
+    CHECK(rec->status == "releasing"); // the reply was never read
+    CHECK(h.live_budget.active() == 0);
 }
 
 TEST_CASE("REST DELETE /api/v1/quarantine: with no dispatch or response store wired the answer is 202 "

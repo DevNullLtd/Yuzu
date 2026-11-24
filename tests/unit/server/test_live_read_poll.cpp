@@ -855,3 +855,28 @@ TEST_CASE("poll_live_output [pg]: a stored answer over the byte cap is cut by th
         CHECK(out.output == std::string(100, 'c') + "\n" + std::string(100, 'd'));
     }
 }
+
+// S3: the helper the REST and MCP error text goes through. Invalid bytes cannot reach those sites
+// through the response store (it scrubs at ingest), so this pins the helper itself: repair first,
+// THEN cut, so the bound holds after U+FFFD (3 bytes) replaces a 1-byte fault.
+TEST_CASE("utf8_clean_clamp: invalid bytes become U+FFFD, then the text is cut within the bound at a "
+          "character boundary",
+          "[live][utf8][2146]") {
+    using yuzu::server::utf8_clean_clamp;
+    // Valid text that fits is returned unchanged.
+    CHECK(utf8_clean_clamp("plain", 200) == "plain");
+    CHECK(utf8_clean_clamp("caf\xc3\xa9", 200) == "caf\xc3\xa9");
+    // A lone invalid byte is replaced by U+FFFD (EF BF BD).
+    CHECK(utf8_clean_clamp("a\xff" "b", 200) == "a\xef\xbf\xbd" "b");
+    // An orphan lead byte at the end is repaired too.
+    CHECK(utf8_clean_clamp("ok\xc3", 200) == "ok\xef\xbf\xbd");
+    // Sanitise BEFORE clamp: ten faults become 30 bytes, and the bound still holds, on a boundary.
+    const std::string faults(10, '\xff');
+    const auto cut = utf8_clean_clamp(faults, 7);
+    CHECK(cut.size() <= 7);
+    CHECK(cut == "\xef\xbf\xbd\xef\xbf\xbd"); // two whole replacement characters, never a third partial one
+    // A valid multi-byte character straddling the bound is dropped whole.
+    CHECK(utf8_clean_clamp(std::string(199, 'a') + "\xc3\xa9\xc3\xa9", 200) == std::string(199, 'a'));
+    // A zero bound is empty.
+    CHECK(utf8_clean_clamp("abc", 0).empty());
+}

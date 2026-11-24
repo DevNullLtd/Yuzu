@@ -13,6 +13,7 @@
 
 #include "dispatch_zero_reach.hpp"
 #include "live_outcome.hpp"
+#include "scoped_gate_outcome.hpp"
 
 namespace yuzu::server::live {
 
@@ -41,6 +42,29 @@ namespace yuzu::server::live {
         return LiveOutcome::kUnavailable;
     }
     return LiveOutcome::kUnavailable; // unreachable for a valid enumerator; keeps the function total
+}
+
+/// The outcome label of a REFUSED re-decision of the per-device scoped gate (#7110: both gates are
+/// decided again after the `requested` row). A definitive denial is a withdrawn permission; a
+/// gate that could not read its authority (the gate answered 503, or an RBAC or management-group
+/// read failed) is `gate_unreadable`, which is NOT a revocation and is retryable; a session that no
+/// longer resolves is `caller_unresolved`. `Admitted` is not a refusal and is never passed here;
+/// it maps to `kInternal` so the function stays total. No `default:`: a new enumerator is a
+/// build failure until it is given an outcome.
+[[nodiscard]] constexpr LiveOutcome live_outcome_for(ScopedGateOutcome outcome) noexcept {
+    switch (outcome) {
+    case ScopedGateOutcome::Denied:
+        return LiveOutcome::kPermissionRevoked;
+    case ScopedGateOutcome::Unauthenticated:
+        return LiveOutcome::kCallerUnresolved;
+    case ScopedGateOutcome::Unavailable:
+    case ScopedGateOutcome::MgmtGroupReadDegraded:
+    case ScopedGateOutcome::RbacReadDegraded:
+        return LiveOutcome::kGateUnreadable;
+    case ScopedGateOutcome::Admitted:
+        return LiveOutcome::kInternal;
+    }
+    return LiveOutcome::kInternal; // out-of-range value: refuse to name it a revocation
 }
 
 } // namespace yuzu::server::live

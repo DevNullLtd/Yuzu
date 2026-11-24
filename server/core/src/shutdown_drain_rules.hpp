@@ -23,8 +23,10 @@
 ///      `workflow_runs_to_drain`: the `StreamBudget` `kWorkflowRun` leases (taken at admission,
 ///      so a run still in PREPARE counts, and held until the adapter returns, so the final audit
 ///      write counts) and `WorkflowEngine::in_flight_runs()` (runs inside `execute()`, kept as
-///      the count for a caller that holds no lease). `keep_draining_for_work` is the one
-///      decision over both kinds of work, and the same cap bounds it: a workflow run still going
+///      the count for a caller that holds no lease). The per-device live reads this process
+///      holds count too (the `StreamBudget` `kLiveRead` leases), because each pins a worker for
+///      up to its poll budget. `keep_draining_for_work` is the one
+///      decision over every kind of work, and the same cap bounds it: a workflow run still going
 ///      at the cap is stopped (`WorkflowStopLevel::kStop`) when `stop_requested_` is set, not
 ///      waited for.
 ///
@@ -78,13 +80,20 @@ constexpr int workflow_runs_to_drain(int engine_runs, std::size_t leased_runs) n
     return leased > engine ? leased : engine;
 }
 
-/// `keep_draining` over BOTH kinds of in-flight work: `tracker_running` executions the tracker
-/// reports as running, and `workflow_runs` runs the workflow engine holds in-process. Either
-/// being non-zero extends the wait, up to the same `kExecutionDrainCap`.
+/// `keep_draining` over every kind of in-flight work: `tracker_running` executions the tracker
+/// reports as running, `workflow_runs` runs the workflow engine holds in-process, and `live_reads`
+/// per-device live reads this process holds (the `kLiveRead` leases: the REST route, the MCP tool
+/// and the quarantine release wait). Any being non-zero extends the wait, up to the same
+/// `kExecutionDrainCap`. A live read holds an HTTP worker for up to its poll budget and is
+/// otherwise neither tracked nor signalled, so without this count `stop()` would close the
+/// listener under it and, past the web-thread wait, hard-exit. New live reads are refused from the
+/// moment `draining_` is set, so the count only falls; a lease that never fell would cost at most
+/// the cap, never an unbounded wait.
 constexpr bool keep_draining_for_work(std::chrono::steady_clock::duration elapsed,
                                       std::chrono::seconds min_grace, std::size_t tracker_running,
-                                      int workflow_runs) noexcept {
-    return keep_draining(elapsed, min_grace, tracker_running > 0 || workflow_runs > 0);
+                                      int workflow_runs, std::size_t live_reads = 0) noexcept {
+    return keep_draining(elapsed, min_grace,
+                         tracker_running > 0 || workflow_runs > 0 || live_reads > 0);
 }
 
 } // namespace yuzu::server::shutdown_drain

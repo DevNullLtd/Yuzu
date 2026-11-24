@@ -2,7 +2,7 @@
 
 /// @file live_gauge_mirror.hpp
 /// Header-only RAII mirror of the held per-device live reads (the `SseSurface::kLiveRead`
-/// leases of the shared held-open budget) into the `yuzu_server_live_inflight` gauge.
+/// leases of the shared held-open budget) into the `yuzu_server_live_in_flight` gauge.
 ///
 /// Both surfaces that take a `kLiveRead` lease use it (the REST live route and the quarantine
 /// release wait, and the MCP `get_device_live` tool), so the one gauge reports the lease count

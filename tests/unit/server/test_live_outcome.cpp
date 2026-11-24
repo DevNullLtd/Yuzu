@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <set>
 #include <string>
@@ -108,4 +109,39 @@ TEST_CASE("LiveSurface and kind_label: bounded label values", "[live][outcome]")
     CHECK(live::kind_label("UPTIME") == "unknown");
     CHECK(live::kind_label("uptime\n") == "unknown");
     CHECK(live::kind_label(std::string(10000, 'x')) == "unknown");
+}
+
+// UP-8: the outcome of a REFUSED re-decision of the per-device scoped gate. A store degrade is
+// never a revocation: only a definitive denial is `permission_revoked`.
+TEST_CASE("live_outcome_for(ScopedGateOutcome): a denial is permission_revoked, every unreadable class "
+          "is gate_unreadable, a lapsed session is caller_unresolved",
+          "[live][outcome][2146]") {
+    using yuzu::server::ScopedGateOutcome;
+    CHECK(live::live_outcome_for(ScopedGateOutcome::Denied) == live::LiveOutcome::kPermissionRevoked);
+    CHECK(live::live_outcome_for(ScopedGateOutcome::Unauthenticated) ==
+          live::LiveOutcome::kCallerUnresolved);
+    CHECK(live::live_outcome_for(ScopedGateOutcome::Unavailable) == live::LiveOutcome::kGateUnreadable);
+    CHECK(live::live_outcome_for(ScopedGateOutcome::RbacReadDegraded) ==
+          live::LiveOutcome::kGateUnreadable);
+    CHECK(live::live_outcome_for(ScopedGateOutcome::MgmtGroupReadDegraded) ==
+          live::LiveOutcome::kGateUnreadable);
+    // The tokens the audit rows and the metric carry.
+    CHECK(live::to_token(live::live_outcome_for(ScopedGateOutcome::Denied)) == "permission_revoked");
+    CHECK(live::to_token(live::live_outcome_for(ScopedGateOutcome::RbacReadDegraded)) ==
+          "gate_unreadable");
+    // Not a refusal: never named a revocation.
+    CHECK(live::live_outcome_for(ScopedGateOutcome::Admitted) == live::LiveOutcome::kInternal);
+}
+
+TEST_CASE("live metric names and the closed label walks", "[live][outcome][2146]") {
+    CHECK(std::string_view(live::kLiveRequestsMetric) == "yuzu_server_live_requests_total");
+    CHECK(std::string_view(live::kLiveInFlightMetric) == "yuzu_server_live_in_flight");
+    CHECK(live::kAllLiveSurfaces.size() == 2);
+    // Every value kind_label can return is in the walk, and nothing else is.
+    for (const auto k : {"uptime", "processes", "anything-else", ""}) {
+        const auto label = live::kind_label(k);
+        CHECK(std::find(live::kAllKindLabels.begin(), live::kAllKindLabels.end(), label) !=
+              live::kAllKindLabels.end());
+    }
+    CHECK(live::kAllKindLabels.size() == 3);
 }
