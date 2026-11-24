@@ -1572,7 +1572,8 @@ inline void iptables_tally(IptablesSummary& sum) {
 /// One iptables entry as a row: `rule|[ip6|][<table>|]<kind>|<chain>|<spec>`. `ip6|` marks an
 /// ip6tables entry. `<table>` is written only for an entry outside the filter table, from a legacy
 /// save listing or from a direct `-t <table> -S` read, and is one of `nat`, `mangle`, `raw`,
-/// `security` (the save parser admits no other table name; the direct reads name the first three). `<kind>` is one of `policy`, `new_chain`, `append`, `unknown`. Those are two
+/// `security` (the save parser admits no other table name; the direct reads name the first three).
+/// `<kind>` is one of `policy`, `new_chain`, `append`, `unknown`. Those are two
 /// closed sets of fixed words, so the second field of a row is one of nine words (`ip6`, the four
 /// tables, the four kinds) and never `nftables`, `firewalld` or another backend's word. Chain and
 /// spec are echoed, so they are sanitised.

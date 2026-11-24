@@ -264,9 +264,23 @@ as_root chmod 0755 "$run_dir/ctl.sh"
 # copies whose Wants= and After= name the salted broker socket, never the real one.
 as_root install -m 0644 "$UNIT_FILE" "$run_dir/shipped-yuzu-agent.service"
 for u in "$id" "$ctl"; do
-    sed -E "s/^(Wants|After)=yuzu-fw-snapshot\.socket\$/\1=$snap.socket/" "$UNIT_FILE" |
+    own_socket=$snap.socket
+    [[ $u == "$ctl" ]] && own_socket=$snapctl.socket
+    sed -E "s/^(Wants|After)=yuzu-fw-snapshot\.socket\$/\1=$own_socket/" "$UNIT_FILE" |
         as_root tee "$sysd/$u.service" >/dev/null
     as_root chmod 0644 "$sysd/$u.service"
+    # The running unit differs from the shipped file in its Wants= and After= lines and nothing else.
+    # This is fatal and runs before any unit starts: a production-socket dependency that the rewrite
+    # missed (a changed line form, a new Requires=) would pull the real broker socket in.
+    unit_diff=$(diff "$UNIT_FILE" <(as_root cat "$sysd/$u.service") | grep -E '^[<>]' | sort || true)
+    want_diff=$(printf '%s\n' "< Wants=yuzu-fw-snapshot.socket" "< After=yuzu-fw-snapshot.socket" \
+                    "> Wants=$own_socket" "> After=$own_socket" | sort)
+    [[ $unit_diff == "$want_diff" ]] ||
+        die "running unit $u differs from the shipped unit beyond Wants= and After= ($unit_diff)"
+    if as_root grep -Eq '^[A-Za-z]+=.*yuzu-fw-snapshot\.socket' "$sysd/$u.service"; then
+        die "running unit $u still names the real yuzu-fw-snapshot.socket in a directive"
+    fi
+    pass "running unit $u differs from the shipped unit in Wants= and After= only ($own_socket)"
 done
 as_root install -d -m 0755 "$sysd/$id.service.d" "$sysd/$ctl.service.d"
 
@@ -320,17 +334,6 @@ if as_root cmp -s "$UNIT_FILE" "$run_dir/shipped-yuzu-agent.service"; then
 else
     fail "shipped unit copy is verbatim"
 fi
-# the running units differ from the shipped file in the Wants= and After= lines and nothing else
-for u in "$id" "$ctl"; do
-    unit_diff=$(diff "$UNIT_FILE" <(as_root cat "$sysd/$u.service") | grep -E '^[<>]' || true)
-    want_diff=$(printf '%s\n' "< Wants=yuzu-fw-snapshot.socket" "< After=yuzu-fw-snapshot.socket" \
-                    "> Wants=$snap.socket" "> After=$snap.socket")
-    if [[ $(printf '%s\n' "$unit_diff" | sort) == $(printf '%s\n' "$want_diff" | sort) ]]; then
-        pass "running unit $u differs from the shipped unit in Wants= and After= only (salted broker socket)"
-    else
-        fail "running unit $u differs from the shipped unit beyond Wants= and After= ($unit_diff)"
-    fi
-done
 
 # --- helpers -----------------------------------------------------------------------------
 ctl_state=/var/lib/$ctl
