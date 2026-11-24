@@ -2,8 +2,11 @@
 
 /// #4990: the Forensics tier on stored-response reads.
 ///
-/// A Forensics-tier plugin (see `kForensicsSecurable`) is gated at DISPATCH, but its stored
-/// response rows land in `ResponseStore` where the read tier is `Response:Read`. This header is the
+/// A Forensics-tier plugin is one whose stored rows are Forensics-tier: by its dispatch securable
+/// (`kForensicsSecurable`, which also gates it at DISPATCH) or by the catalogue's stored-row flag
+/// (`StoredRowTier::ForensicsRead`, `forensics_plugin_set.hpp`, which leaves its dispatch on its
+/// own securable). Its stored response rows land in `ResponseStore`, where the read tier is
+/// `Response:Read`. This header is the
 /// seam that makes the Forensics tier a property of every read: `ResponseStore`'s public read
 /// methods take a `const ResponseTierFilter&` with NO default value, so a read cannot be written
 /// without deciding what the caller may see, and the filter is pushed into the SQL (beside
