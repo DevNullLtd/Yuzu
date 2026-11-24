@@ -10,8 +10,10 @@
 # ExecStartPre helper copies the DMI tables into the agent's state directory. None of that
 # can be seen from a unit test: a typo in a directive name, a missing NoNewPrivileges, or a
 # removed clear_child_capabilities() call all leave every compile and unit suite green. This
-# script installs the shipped unit file VERBATIM under unique runtime names and reads the
-# kernel's view (/proc/<pid>/status) of what a process really holds.
+# script installs the shipped unit file under unique runtime names and reads the kernel's view
+# (/proc/<pid>/status) of what a process really holds. The shipped file is compared byte for byte
+# to a verbatim copy; the unit that runs differs from it in its Wants= and After= lines only,
+# which name the salted broker socket instead of the real yuzu-fw-snapshot.socket.
 #
 # WHAT IS ASSERTED
 # ----------------
@@ -57,9 +59,10 @@
 #       call filter is installed without it)
 #     * an account outside the socket's group cannot connect (EACCES), and the socket file is
 #       root:yuzu-agent 0660
-#     * the real yuzu-fw-snapshot.socket is left in the state it was found in: the salted agent
-#       unit is the shipped file and carries Wants=yuzu-fw-snapshot.socket, which a drop-in cannot
-#       reset, so a host that has the package installed starts the real socket with it
+#     * the units that run name the salted broker socket in Wants= and After= (a rewrite of those
+#       two lines of a copy), so the real yuzu-fw-snapshot.socket is never pulled in and a host
+#       that has the package installed, or a concurrent run, is not disturbed; its state is
+#       checked unchanged at the end
 #
 # NOT RUN, AND WHY. No child process is exec'd by the agent here: the check is server-less, so
 # no instruction can be dispatched to make it spawn one. A child's capabilities follow from the
@@ -140,9 +143,9 @@ if [[ -z $LIB_DIR ]]; then
 fi
 [[ -n $LIB_DIR ]] || { echo "FAIL: libyuzu_agent_core.so not found; set YUZU_AGENT_LIB_DIR" >&2; exit 1; }
 
-# The real broker socket, if the package is installed, is pulled in by the salted agent unit's
-# Wants= (the shipped file is installed verbatim, and a drop-in cannot reset a Wants=). Record
-# whether it was active before this run so cleanup stops it only when this run started it.
+# The real broker socket, if the package is installed, is never pulled in: the units that run name
+# the salted socket in Wants= and After=. Its state is recorded here and checked unchanged at the end
+# (and cleanup stops it only if this run somehow started it).
 if as_root systemctl is-active --quiet "$REAL_SNAP_SOCKET" 2>/dev/null; then
     real_snap_was_active=1
 else
@@ -257,9 +260,14 @@ fi
 EOF
 as_root chmod 0755 "$run_dir/ctl.sh"
 
-# Install the shipped unit byte-for-byte, twice.
-as_root install -m 0644 "$UNIT_FILE" "$sysd/$id.service"
-as_root install -m 0644 "$UNIT_FILE" "$sysd/$ctl.service"
+# The shipped unit, byte for byte, is kept for the comparison only. The two units that run are
+# copies whose Wants= and After= name the salted broker socket, never the real one.
+as_root install -m 0644 "$UNIT_FILE" "$run_dir/shipped-yuzu-agent.service"
+for u in "$id" "$ctl"; do
+    sed -E "s/^(Wants|After)=yuzu-fw-snapshot\.socket\$/\1=$snap.socket/" "$UNIT_FILE" |
+        as_root tee "$sysd/$u.service" >/dev/null
+    as_root chmod 0644 "$sysd/$u.service"
+done
 as_root install -d -m 0755 "$sysd/$id.service.d" "$sysd/$ctl.service.d"
 
 # Path-only drop-ins. The agent's snapshot source is the real /sys (helper SRC omitted); the
@@ -307,11 +315,22 @@ for u in "$id" "$ctl"; do
         pass "drop-in guard: $u path drop-in overrides paths only"
     fi
 done
-if as_root cmp -s "$UNIT_FILE" "$sysd/$id.service"; then
-    pass "shipped unit installed verbatim"
+if as_root cmp -s "$UNIT_FILE" "$run_dir/shipped-yuzu-agent.service"; then
+    pass "shipped unit copy is verbatim"
 else
-    fail "shipped unit installed verbatim"
+    fail "shipped unit copy is verbatim"
 fi
+# the running units differ from the shipped file in the Wants= and After= lines and nothing else
+for u in "$id" "$ctl"; do
+    unit_diff=$(diff "$UNIT_FILE" <(as_root cat "$sysd/$u.service") | grep -E '^[<>]' || true)
+    want_diff=$(printf '%s\n' "< Wants=yuzu-fw-snapshot.socket" "< After=yuzu-fw-snapshot.socket" \
+                    "> Wants=$snap.socket" "> After=$snap.socket")
+    if [[ $(printf '%s\n' "$unit_diff" | sort) == $(printf '%s\n' "$want_diff" | sort) ]]; then
+        pass "running unit $u differs from the shipped unit in Wants= and After= only (salted broker socket)"
+    else
+        fail "running unit $u differs from the shipped unit beyond Wants= and After= ($unit_diff)"
+    fi
+done
 
 # --- helpers -----------------------------------------------------------------------------
 ctl_state=/var/lib/$ctl
@@ -757,6 +776,14 @@ else
     echo "NOTE: no account outside the $SVC_USER group to test the group gate with"
 fi
 as_root systemctl stop "$snap.socket" "$snapctl.socket" >/dev/null 2>&1 || true
+
+# the real broker socket was not touched by this run
+if as_root systemctl is-active --quiet "$REAL_SNAP_SOCKET" >/dev/null 2>&1; then
+    real_snap_now=1
+else
+    real_snap_now=0
+fi
+eq "the real $REAL_SNAP_SOCKET is in the state it was found in (1 = active)" "$real_snap_now" "$real_snap_was_active"
 
 if [[ $FAILS -ne 0 ]]; then
     echo "agent-unit-capcheck: $FAILS check(s) FAILED" >&2
