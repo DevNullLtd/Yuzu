@@ -38,6 +38,14 @@
  *  - unplaceable names: moving the valid_component check after the budget checks fails the bounded-
  *    continuation case, and checking only the length fails the slash and NUL case; placing the name in
  *    the position instead of reporting it fails the name_too_long case.
+ *  - listing cause: reading every failed listing as dir_unreadable fails the permission_denied and dataless
+ *    gaps; a cause that is not none on a SUCCESSFUL listing must never matter (the first case).
+ *  - rows_full: not asking the predicate at both row-cap points, or ending the slice at another stop or
+ *    position than the row cap does, fails the rows_full cases; a predicate that is unset changing
+ *    anything fails the unset half.
+ *  - resume-path faults: restarting on a listing fault, charging the fault to the cursor twice, or
+ *    visiting the entries of a faulted listing fails the resume-path fault case; a root fault on a resumed
+ *    slice not completing the walk with one gap fails the root case.
  *  - resumed other_device, repeated name, depth cap, row count, unmarked oversized listing: skipping
  *    the device check on the resume path, keeping both entries of a repeated name, not capping
  *    max_depth at kMaxPositionDepth, counting a row for a visit that returned false, or trusting
@@ -70,8 +78,9 @@ namespace fsr = yuzu::shared::file_search;
 using T = DirEntry::Type;
 using Cause = OrderedGap::Cause;
 
-// One default-cap listing of 255-byte names fits the default retained-bytes cap.
-static_assert(50000 * (255 + sizeof(DirEntry)) <= kMaxOrderedRetainedBytes);
+// One default-cap listing of 255-byte names fits the default retained-bytes cap (the default cap itself
+// is pinned at 50,000 in test_component_walk.cpp and in the file_search driver's limits mapping).
+static_assert(WalkLimits{}.max_dir_entries * (255 + sizeof(DirEntry)) <= kMaxOrderedRetainedBytes);
 
 namespace {
 
@@ -84,6 +93,7 @@ struct Ident {
 struct Rig {
     MemTree fs;
     std::map<std::string, Ident> ids;          // directory or entry path -> identity stamped on listings
+    std::map<std::string, ListError> causes;   // directory path -> the cause stamped on its failed listing
     std::vector<std::string> visits;           // dir_path/name of every visit, in order
     std::map<std::string, std::uint64_t> dev_at;   // visit path -> the dir_dev the visitor was given
     std::map<std::string, std::uint64_t> id_at;    // visit path -> the entry's file_id
@@ -96,6 +106,9 @@ struct Rig {
         const auto inner = o.list;
         o.list = [this, inner](const std::string& d, std::size_t cap) {
             ListResult r = inner(d, cap);
+            if (r.error)
+                if (const auto c = causes.find(d); c != causes.end())
+                    r.cause = c->second;
             if (const auto it = ids.find(d); it != ids.end()) {
                 r.dev = it->second.dev;
                 r.file_id = it->second.id;
@@ -1013,4 +1026,175 @@ TEST_CASE("walk_ordered: gaps past kMaxOrderedGaps are counted and no file is ev
     CHECK(res.gaps_dropped == 5);
     CHECK(res.stats.mounts_skipped == kMaxOrderedGaps + 5);
     CHECK(r.fs.total_opens == 0);
+}
+
+// ---- listing cause, the second row cap, and faults on the resume path ----
+
+TEST_CASE("walk_ordered: a refused listing reports its cause, any other failure stays dir_unreadable",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    r.dir("/r", {D("a"), D("b"), D("c"), D("d")}); // none of a..d has a listing: each one fails
+    r.causes["/r/a"] = ListError::permission_denied;
+    r.causes["/r/b"] = ListError::dataless;
+    r.causes["/r/c"] = ListError::unreadable;
+    // /r/d keeps ListError::none
+    const auto res = slice(r, {}, {});
+    CHECK(res.stop == Stop::complete);
+    CHECK(tokens(res) == Strs{"permission_denied /r/a", "dataless /r/b", "dir_unreadable /r/c", "dir_unreadable /r/d"});
+    CHECK(res.position.dirs.empty());
+
+    // the cause of a listing that succeeded is never read
+    Rig ok;
+    ok.dir("/r", {F("x")});
+    ok.causes["/r"] = ListError::permission_denied;
+    CHECK(slice(ok, {}, {}).gaps.empty());
+}
+
+TEST_CASE("walk_ordered: rows_full ends the slice with the same stop at the same position the row cap gives",
+          "[walk_ordered][file_search][component_walk]") {
+    const auto build = [](Rig& r) {
+        r.dir("/r", {D("a"), F("b"), F("c")});
+        r.dir("/r/a", {F("x"), F("y")});
+        r.ids["/r/a"] = {1, 10};
+    };
+    const auto walk = [](Rig& r, const fsr::Position& resume, const WalkLimits& lim, const std::function<bool()>& full) {
+        auto ops = r.ops();
+        return walk_ordered("/r", resume, lim, ops, r.fs.clock + 1h, r.visitor(), kMaxOrderedRetainedBytes, full);
+    };
+
+    for (const std::size_t after : {std::size_t{1}, std::size_t{2}, std::size_t{3}}) {
+        INFO("rows_full true after visit " << after);
+        Rig capped;
+        build(capped);
+        WalkLimits by_cap;
+        by_cap.max_rows = after;
+        const auto want = walk(capped, {}, by_cap, {});
+
+        Rig full;
+        build(full);
+        const auto got = walk(full, {}, {}, [&full, after] { return full.visits.size() >= after; });
+        CHECK(want.stop == Stop::section_rows);
+        CHECK(got.stop == want.stop);
+        CHECK(got.position == want.position);
+        CHECK(got.rows == want.rows);
+        CHECK(got.advanced == want.advanced);
+        CHECK(full.visits == capped.visits);
+        // and the resume from there finds everything the capped walk left
+        full.visits.clear();
+        const auto rest = walk(full, got.position, {}, {});
+        CHECK(rest.stop == Stop::complete);
+    }
+
+    // unset, or false throughout, changes nothing
+    Rig plain;
+    build(plain);
+    const auto unset = walk(plain, {}, {}, {});
+    Rig never;
+    build(never);
+    const auto no = walk(never, {}, {}, [] { return false; });
+    CHECK(unset.stop == Stop::complete);
+    CHECK(no.stop == Stop::complete);
+    CHECK(plain.visits == never.visits);
+    CHECK(plain.visits == Strs{"/r/a", "/r/a/x", "/r/a/y", "/r/b", "/r/c"});
+
+    // true before the first entry ends the slice at the resume position itself: nothing was visited
+    Rig early;
+    build(early);
+    const auto none = walk(early, {}, {}, [] { return true; });
+    CHECK(none.stop == Stop::section_rows);
+    CHECK(early.visits.empty());
+    CHECK_FALSE(none.advanced);
+}
+
+TEST_CASE("walk_ordered: a name with a slash or a NUL is a gap and is never joined into a listed path",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    // directories, so a path joined from the name would be listed: it must not be
+    r.dir("/r", {D("a"), D("b/x"), D(std::string("b\0x", 3)), D(std::string(300, 'n'))});
+    r.dir("/r/a", {F("f")});
+    r.dir("/r/b/x", {F("must-not-be-listed")});
+    r.dir("/r/b", {F("nor-this")});
+    const auto res = slice(r, {}, {});
+    CHECK(res.stop == Stop::complete);
+    CHECK(r.fs.listed == Strs{"/r", "/r/a"});
+    CHECK(res.gaps.size() == 3);
+    for (const auto& g : res.gaps)
+        CHECK(g.cause == Cause::name_too_long);
+    CHECK(fsr::valid_position(res.position));
+}
+
+TEST_CASE("walk_ordered: a fault on a resume-path directory is one gap, no restart, and a replay is the same",
+          "[walk_ordered][file_search][component_walk]") {
+    enum class Fault { unreadable, truncated, over_cap, other_device };
+    const auto fault = GENERATE(Fault::unreadable, Fault::truncated, Fault::over_cap, Fault::other_device);
+    INFO("fault " << static_cast<int>(fault));
+
+    Rig r;
+    r.dir("/r", {D("a"), F("b"), F("c")});
+    r.ids["/r"] = {1, 5};
+    r.ids["/r/a"] = {1, 10};
+    WalkLimits lim;
+    switch (fault) {
+    case Fault::unreadable:
+        break; // /r/a has no listing
+    case Fault::truncated:
+    case Fault::over_cap: // the root holds 3 entries and fits the cap, /r/a holds 4 and does not
+        r.dir("/r/a", {F("w"), F("x"), F("y"), F("z")});
+        lim.max_dir_entries = 3;
+        break;
+    case Fault::other_device:
+        r.dir("/r/a", {F("x"), F("y")});
+        r.ids["/r/a"] = {2, 10};
+        break;
+    }
+    // The previous slice stopped inside /r/a after "x"; this one resumes there.
+    fsr::Cursor in;
+    in.sequence = 4;
+    in.prior_gaps = 2;
+    in.position = fsr::Position{1, 5, {{"a", 1, 10}}, "x"};
+
+    const auto run = [&] {
+        auto ops = r.ops();
+        if (fault == Fault::over_cap) // a leg that ignores the cap and returns the whole listing unmarked
+            ops.list = [inner = ops.list](const std::string& d, std::size_t) { return inner(d, 1000); };
+        r.visits.clear();
+        return walk_ordered("/r", in.position, lim, ops, r.fs.clock + 1h, r.visitor());
+    };
+    const auto first = run();
+    CHECK(first.stop == Stop::complete);
+    CHECK_FALSE(first.restarted);
+    REQUIRE(first.gaps.size() == 1);
+    CHECK(first.gaps[0].path == "/r/a");
+    const char* want = fault == Fault::unreadable ? "dir_unreadable"
+                       : fault == Fault::other_device ? "other_device"
+                                                      : "dir_truncated";
+    CHECK(std::string(to_token(first.gaps[0].cause)) == want);
+    CHECK(r.visits == Strs{"/r/b", "/r/c"}); // nothing of the faulted listing was visited
+
+    // A replay of the same slice from the same cursor is the same answer: nothing is double counted.
+    const auto next_of = [&](const OrderedResult& res) {
+        return fsr::next_cursor(in, res.position, res.restarted, res.gaps.size() + res.gaps_dropped);
+    };
+    const auto second = run();
+    CHECK(second.position == first.position);
+    CHECK(second.gaps.size() == first.gaps.size());
+    CHECK(next_of(second) == next_of(first));
+    CHECK(next_of(first).prior_gaps == 3); // the inbound 2 plus this slice's one, however often it is replayed
+    CHECK(next_of(first).generation == in.generation);
+}
+
+TEST_CASE("walk_ordered: a root that fails on a resumed slice completes with one gap",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r; // /r has no listing at all: it was replaced by something unreadable between slices
+    fsr::Cursor in;
+    in.sequence = 7;
+    in.position = fsr::Position{1, 5, {{"a", 1, 10}}, "x"};
+    const auto res = slice(r, in.position, {});
+    CHECK(res.stop == Stop::complete);
+    CHECK_FALSE(res.restarted);
+    CHECK(res.advanced);
+    REQUIRE(res.gaps.size() == 1);
+    CHECK(res.gaps[0].path == "/r");
+    CHECK(res.gaps[0].cause == Cause::dir_unreadable);
+    CHECK(r.visits.empty());
 }

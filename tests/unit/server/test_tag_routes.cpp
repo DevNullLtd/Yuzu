@@ -467,6 +467,88 @@ TEST_CASE("POST /api/tags/set: missing agent_id/key is a 400 before any gate",
     CHECK(h.deny_calls.empty());
 }
 
+// #7811: the id reaches `target_id` (agent_id:key) on every audit row of these routes, and the
+// service-tag guard and the scoped gate write denial rows from it, so an over-long or control-byte
+// id is refused with a 400 before either and before any audit row. The gates here admit every
+// caller, so a 400 with no gate call proves the id check runs first.
+TEST_CASE("POST /api/tags/set and /delete: an unsafe agent id is a 400 before the service-tag "
+          "guard, the scoped gate or any audit row",
+          "[server][routes][tag_routes][rest][pg][audit]") {
+    PgHarness h;
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        for (const char* route : {"/api/tags/set", "/api/tags/delete"}) {
+            auto r = h.sink.Post(
+                route, json{{"agent_id", id}, {"key", "role"}, {"value", "eng"}}.dump());
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(json::parse(r->body)["error"]["message"] == "Invalid device id.");
+        }
+    }
+    CHECK(h.deny_calls.empty());
+    CHECK(h.scoped_perm_fn_calls == 0);
+    CHECK(h.audits.empty());
+
+    // A 256-byte printable id is safe and reaches the gates.
+    h.sink.Post("/api/tags/set",
+                json{{"agent_id", std::string(256, 'a')}, {"key", "role"}, {"value", "eng"}}.dump());
+    CHECK(h.deny_calls.size() == 1);
+    CHECK(h.scoped_perm_fn_calls == 1);
+}
+
+// #7811: the tag KEY reaches `target_id` (agent_id:key) on the `not_found` row of a delete and on
+// every other tag row, so a key over 64 bytes or with a byte below 0x20 is a 400 before the
+// service-tag guard, the scoped gate and any audit row. `/api/tags/set` already runs the tag
+// store's key rules there (its own `invalid tag key` text); `/api/tags/delete` takes the size and
+// control-byte floor only, so a stored key with other characters can still be deleted. The gates
+// admit every caller, so a 400 with no gate call proves the key check runs first.
+TEST_CASE("POST /api/tags/set and /delete: an unsafe tag key is a 400 before the service-tag "
+          "guard, the scoped gate or any audit row",
+          "[server][routes][tag_routes][rest][pg][audit]") {
+    PgHarness h;
+    const std::vector<std::string> bad = {std::string(65, 'k'), std::string("k\0y", 3), "k\r\ny",
+                                          "k\ny", "k\ty"};
+    for (const auto& key : bad) {
+        INFO(key.substr(0, 16));
+        for (const char* route : {"/api/tags/set", "/api/tags/delete"}) {
+            auto r = h.sink.Post(
+                route, json{{"agent_id", "agent-A"}, {"key", key}, {"value", "eng"}}.dump());
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(json::parse(r->body)["error"]["message"] ==
+                  (std::string(route) == "/api/tags/set" ? "invalid tag key"
+                                                         : "Invalid tag key."));
+        }
+    }
+    CHECK(h.deny_calls.empty());
+    CHECK(h.scoped_perm_fn_calls == 0);
+    CHECK(h.audits.empty());
+
+    // A 64-byte printable key is safe on both routes and reaches the gates.
+    const std::string edge(64, 'k');
+    for (const char* route : {"/api/tags/set", "/api/tags/delete"})
+        h.sink.Post(route, json{{"agent_id", "agent-A"}, {"key", edge}, {"value", "eng"}}.dump());
+    CHECK(h.deny_calls.size() == 2);
+    CHECK(h.scoped_perm_fn_calls == 2);
+
+    // A key outside the tag store's charset, within the floor, is refused by `/set`'s own rules
+    // but passes `/delete`'s floor: a stored key like that must stay deletable.
+    h.deny_calls.clear();
+    h.scoped_perm_fn_calls = 0;
+    auto set_bad = h.sink.Post(
+        "/api/tags/set", json{{"agent_id", "agent-A"}, {"key", "two words"}, {"value", "eng"}}.dump());
+    REQUIRE(set_bad);
+    CHECK(set_bad->status == 400);
+    CHECK(h.deny_calls.empty());
+    auto del_odd = h.sink.Post("/api/tags/delete",
+                               json{{"agent_id", "agent-A"}, {"key", "two words"}}.dump());
+    REQUIRE(del_odd);
+    CHECK(h.deny_calls.size() == 1);
+    CHECK(h.scoped_perm_fn_calls == 1);
+}
+
 // ── POST /api/tags/delete: gate ordering + audit ────────────────────────────
 
 TEST_CASE("POST /api/tags/delete: deny_service_scoped_tag_mutation_fn is called BEFORE "

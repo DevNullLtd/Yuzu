@@ -17,6 +17,7 @@
 #include "test_tag_store_pg_helper.hpp" // PG-backed TagStore (ADR-0050)
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include "pg/pg_raii.hpp"
 
@@ -410,4 +411,83 @@ TEST_CASE("REST v1 tag routes classify caller errors as 400 (the 503/400 mutant 
     REQUIRE(del);
     CHECK(del->status == 404);
     CHECK(has_audit(h.audit_events, "tag.delete/not_found/agent-B:missing-key"));
+}
+
+// #7811: the id reaches `target_id` (agent_id:key) on every audit row of these routes, and the
+// service-tag guard writes a denial row from it before the scoped gate, so an over-long or
+// control-byte id is refused with a 400 before either and before any audit row. A service-scoped
+// session is used so the service-tag guard would deny and audit `service` writes if it ran first.
+TEST_CASE("REST PUT and DELETE /api/v1/tags: an unsafe agent id is a 400 before the service-tag "
+          "guard, the scoped gate or any audit row",
+          "[pg][rest][tag][authz][audit]") {
+    TagRouteHarness h;
+    h.token_scope_service = "ServiceA";
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        auto put =
+            h.put(nlohmann::json{{"agent_id", id}, {"key", "service"}, {"value", "ServiceA"}}.dump());
+        REQUIRE(put);
+        CHECK(put->status == 400);
+        CHECK(nlohmann::json::parse(put->body)["error"]["message"] == "Invalid device id.");
+        auto del = h.del(id, "service");
+        REQUIRE(del);
+        CHECK(del->status == 400);
+        CHECK(nlohmann::json::parse(del->body)["error"]["message"] == "Invalid device id.");
+    }
+    CHECK_FALSE(h.scope_fn_called);
+    CHECK(h.audit_events.empty());
+
+    // A 256-byte printable id is safe: it reaches the service-tag guard, which denies the
+    // service-scoped session's `service` write (403) and audits it.
+    auto edge = h.put(nlohmann::json{{"agent_id", std::string(256, 'a')},
+                                     {"key", "service"},
+                                     {"value", "ServiceB"}}
+                          .dump());
+    REQUIRE(edge);
+    CHECK(edge->status == 403);
+    CHECK(h.audit_events.size() == 1);
+}
+
+// #7811: the tag KEY reaches `target_id` (agent_id:key) on the failure row `set_tag_checked` leaves
+// and on a delete's `not_found` row, and the audit store keeps CR, LF and TAB, so a key over 64
+// bytes or with a byte below 0x20 is refused with a 400 before the service-tag guard, the scoped
+// gate and any audit row. The gate here admits every caller, so a 400 with the gate never asked
+// proves the key check runs first; a revert leaves a row carrying the key.
+TEST_CASE("REST PUT and DELETE /api/v1/tags: an unsafe tag key is a 400 before the service-tag "
+          "guard, the scoped gate or any audit row",
+          "[pg][rest][tag][authz][audit]") {
+    TagRouteHarness h;
+    h.token_scope_service = "ServiceA";
+    const std::vector<std::string> bad = {std::string(65, 'k'), std::string("k\0y", 3), "k\r\ny",
+                                          "k\ny", "k\ty"};
+    for (const auto& key : bad) {
+        INFO(key.substr(0, 16));
+        auto put =
+            h.put(nlohmann::json{{"agent_id", "agent-A"}, {"key", key}, {"value", "v"}}.dump());
+        REQUIRE(put);
+        CHECK(put->status == 400);
+        CHECK(nlohmann::json::parse(put->body)["error"]["message"] == "Invalid tag key.");
+        auto del = h.del("agent-A", key);
+        REQUIRE(del);
+        CHECK(del->status == 400);
+        CHECK(nlohmann::json::parse(del->body)["error"]["message"] == "Invalid tag key.");
+    }
+    CHECK_FALSE(h.scope_fn_called);
+    CHECK(h.audit_events.empty());
+
+    // A 64-byte printable key is safe: the write reaches the scoped gate and is stored, and the
+    // delete reaches the store.
+    const std::string edge(64, 'k');
+    auto put =
+        h.put(nlohmann::json{{"agent_id", "agent-A"}, {"key", edge}, {"value", "v"}}.dump());
+    REQUIRE(put);
+    CHECK(put->status == 200);
+    CHECK(h.scope_fn_called);
+    CHECK(tag_value(h.tag_store, "agent-A", edge) == "v");
+    auto del = h.del("agent-A", edge);
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(tag_value(h.tag_store, "agent-A", edge).empty());
 }

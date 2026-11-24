@@ -8,6 +8,19 @@
 - **Parents:** ADR-0006/0007/0008(+Correction), ADR-0009, ADR-0012; conventions from
   ADR-0036 (ResultSetStore), ADR-0037 (InventoryStore), ADR-0038 (GuaranteedStateStore).
 
+## Successor boundary approved on 2026-11-22
+
+This migration describes the deployed PostgreSQL response and facet tables. The bulk live instruction response path will write through core to ClickHouse in ordinary and incident dispatch.
+The [substrate amendment](0006-server-postgresql-substrate.md) assigns storage ownership.
+The response-store design must specify cutover and rollback, historical reads, retention and disposal,
+stable batch identity, durable acknowledgement and deduplication,
+per-device and Forensics-tier filtering in every detail and aggregate query before counting
+or pagination, fail-closed reads when authorization is unavailable, and incomplete coverage
+after loss. Specify the fail-closed access audit and the pause, redelivery and deadline
+behavior after a sink failure in either dispatch profile. Test distinct scopes and tier grants before cutover.
+Reuse the protected-store outage notice required by the substrate amendment.
+Until that cutover ships the existing PostgreSQL path remains operational.
+
 ## Context
 
 `ResponseStore` (`responses.db` today) persists agentic command/instruction **responses** —

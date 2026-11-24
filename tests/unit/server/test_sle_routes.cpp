@@ -207,6 +207,37 @@ TEST_CASE("sle drill: demands exactly SoftwareLicensing:Read via the scoped gate
     CHECK(h.scoped_calls[0] == "SoftwareLicensing|Read|agent-77");
 }
 
+// #7811: the id reaches the scoped gate's denial audit and `target_id` on the per-open and the
+// decommission rows, so an over-long or control-byte id is refused with a 400 before the gate, any
+// audit row and the erasure cascade. The gate here admits every device, so a 400 with no gate call
+// proves the id check runs first, where an empty audit log is also true of a route that refuses late.
+TEST_CASE("sle/agents/{id}: an unsafe agent id answers 400 before the scoped gate or any audit row",
+          "[sle_routes][audit]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    h.agent_rows = {lic("Office", "licensed")};
+    h.decommission_result = ok_result();
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        for (const auto* verb : {"GET", "DELETE"}) {
+            auto res = h.sink.dispatch(verb, "/api/v1/sle/agents/" + id);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(json::parse(res->body)["error"]["message"] == "Invalid device id.");
+        }
+    }
+    CHECK(h.scoped_calls.empty());
+    CHECK(h.audits.empty());
+
+    // A 256-byte printable id is safe and does reach the gate, on both verbs.
+    const std::string edge(256, 'a');
+    CHECK(h.sink.Get("/api/v1/sle/agents/" + edge)->status == 200);
+    CHECK(h.sink.Delete("/api/v1/sle/agents/" + edge)->status == 200);
+    CHECK(h.scoped_calls.size() == 2);
+}
+
 TEST_CASE("sle/agents/{id}: scoped gate — in-scope 200, out-of-scope 403 (D-4)", "[sle][adr0017]") {
     SleHarness h;
     h.scoped_agents = {"agent-in"}; // only this agent is in the operator's scope

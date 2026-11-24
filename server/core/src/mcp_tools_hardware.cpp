@@ -52,7 +52,7 @@ namespace yuzu::server::mcp {
 namespace {
 
 // The record schemas below spell the agent_id bound as a literal; this keeps it tied to the
-// bound id_is_audit_safe actually enforces.
+// bound auth::agent_id_is_audit_safe actually enforces.
 static_assert(auth::kMaxAgentIdLength == 256,
               "get_hardware_ci's agent_id maxLength literal must match auth::kMaxAgentIdLength");
 
@@ -292,7 +292,7 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
     // target_id on every row below. A wrongly typed value is refused, never stringified.
     const auto it = ctx.args.find("agent_id");
     if (it == ctx.args.end() || !it->is_string() || it->get_ref<const std::string&>().empty() ||
-        !id_is_audit_safe(it->get_ref<const std::string&>())) {
+        !auth::agent_id_is_audit_safe(it->get_ref<const std::string&>())) {
         const bool audit_ok = ctx.audit("denied", "invalid arguments: agent_id");
         // retry-hint-exempt: caller-input rejection
         answer(ctx, ctx.a4_error(kInvalidParams,
@@ -303,7 +303,7 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
     }
     const std::string agent_id = it->get<std::string>();
 
-    // id_is_audit_safe held above; audit_token also neutralises the structured-detail
+    // auth::agent_id_is_audit_safe held above; audit_token also neutralises the structured-detail
     // delimiters (space, '=', ',') so the id cannot forge an adjacent field (CWE-117).
     const std::string id_suffix = " id=" + audit_token(agent_id);
 
