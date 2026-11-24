@@ -1492,6 +1492,25 @@ TEST_CASE("result_set_routes: [pg] members applies the owner's CURRENT scope in 
         CHECK(p2->body.find("Show more") == std::string::npos);
     }
 
+    SECTION("a failed second page reports incomplete membership after a successful first page") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto first = h.sink.Get(base);
+        REQUIRE(first);
+        REQUIRE(first->body.find("cursor=dev-100") != std::string::npos);
+
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult rename{
+            PQexec(conn.get(), "ALTER TABLE result_set_store.result_set_members RENAME TO hidden_members")};
+        REQUIRE(rename.ok());
+        auto next = h.sink.Get(base + "?cursor=dev-100");
+        REQUIRE(next);
+        CHECK(next->body.find("data-degraded=\"1\"") != std::string::npos);
+        CHECK(next->body.find("<code>") == std::string::npos);
+    }
+
     SECTION("an owner who now sees none of them is told so, not that the set is empty") {
         Harness h;
         h.store = &w.store;

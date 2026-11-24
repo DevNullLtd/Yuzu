@@ -43642,6 +43642,53 @@ TEST_CASE("MCP create_result_set_from_echo_query: a post-dispatch DbError from c
             PGRES_COMMAND_OK);
 }
 
+TEST_CASE("MCP create_result_set_from_inventory_query: a failed continuation leaves no child",
+          "[pg][mcp][integration][result-sets][pagination]") {
+    yuzu::test::ResultSetStorePg store;
+    yuzu::server::InventoryStore inventory{store.pool()};
+    REQUIRE(inventory.is_open());
+    CreateRequest cr;
+    cr.owner_principal = "test-user";
+    cr.name = "paged-parent";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto parent = store->create_materialized(cr, yuzu::test::seed_paged_inventory(store.dsn()));
+    REQUIRE(parent.has_value());
+    const bool stale_ordering = GENERATE(false, true);
+    if (stale_ordering)
+        yuzu::test::seed_stale_result_set_collation(store.dsn());
+    else
+        yuzu::test::fail_on_second_result_page(store.dsn());
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = store.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+    auto request = nlohmann::json::parse(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query","arguments":{"name":"child","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
+    request["params"]["arguments"]["parent_id"] = parent->id;
+    auto res = ts.call(request.dump());
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == kInternalError);
+    if (stale_ordering) {
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_ORDERING_UNAVAILABLE") !=
+              std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"] == 60000);
+        CHECK(mcp_audit_details(ts, "result_set.create|failure") ==
+              std::vector<std::string>{"reason=ordering_unavailable source_kind=inventory_query"});
+    } else {
+        CHECK(body["error"]["message"].get<std::string>().find("parent set's members") !=
+              std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+        CHECK(mcp_audit_details(ts, "result_set.create|failure") ==
+              std::vector<std::string>{"reason=store_degraded source_kind=inventory_query"});
+    }
+    auto count = store->count_for_owner_checked("test-user");
+    REQUIRE(count.has_value());
+    CHECK(*count == 1);
+}
+
 TEST_CASE("MCP create_result_set_from_inventory_query: a degraded members-table read on the "
           "parent-narrowing loop refuses rather than materialising an unnarrowed result set "
           "(#4306 finding 3)",

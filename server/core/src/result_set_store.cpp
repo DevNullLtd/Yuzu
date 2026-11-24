@@ -4,6 +4,7 @@
 
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "pg/pg_array.hpp"
+#include "pg/pg_collation_check.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -20,6 +21,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <format>
+#include <iterator>
 #include <limits>
 #include <random>
 #include <string_view>
@@ -80,6 +82,8 @@ const char* to_string(ResultSetError e) {
         return "RESULT_SET_PINNED";
     case ResultSetError::TooManyMembers:
         return "RESULT_SET_TOO_MANY_MEMBERS";
+    case ResultSetError::OrderingUnavailable:
+        return "RESULT_SET_ORDERING_UNAVAILABLE";
     case ResultSetError::DbError:
         return "RESULT_SET_DB_ERROR";
     case ResultSetError::NotReady:
@@ -542,6 +546,28 @@ MembersPageSql build_members_page_sql(const std::string& id, const std::string& 
     return out;
 }
 
+static std::expected<ResultSetStore::MembersPage, ResultSetError> read_members_page(
+    PGconn* conn, const std::string& id, const std::string& cursor, int limit,
+    const authz::VisibleSet& visible) {
+    const auto built = build_members_page_sql(id, cursor, limit, visible);
+    pg::PgResult res = pg::exec_params(conn, built.sql.c_str(), built.params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore: member page query failed: {}", PQerrorMessage(conn));
+        return std::unexpected(ResultSetError::DbError);
+    }
+    ResultSetStore::MembersPage page;
+    const int rows = PQntuples(res.get());
+    page.device_ids.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        page.device_ids.emplace_back(PQgetvalue(res.get(), i, 0));
+
+    if (static_cast<int>(page.device_ids.size()) > limit) {
+        page.device_ids.resize(limit);
+        page.next_cursor = page.device_ids.back();
+    }
+    return page;
+}
+
 std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::members_checked(
     const std::string& id, const std::string& cursor, int limit,
     const authz::VisibleSet& visible) {
@@ -556,25 +582,64 @@ std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::membe
         spdlog::error("ResultSetStore::members_checked: no connection ({})", pool_.last_error());
         return std::unexpected(ResultSetError::DbError);
     }
+    return read_members_page(lease.get(), id, cursor, limit, visible);
+}
 
-    const auto built = build_members_page_sql(id, cursor, limit, visible);
-    pg::PgResult res = pg::exec_params(lease.get(), built.sql.c_str(), built.params);
-    if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::members_checked: query failed: {}",
-                      PQerrorMessage(lease.get()));
+std::expected<std::vector<std::string>, ResultSetError>
+ResultSetStore::matching_parent_members(const std::string& id,
+                                        std::unordered_set<std::string> candidates) {
+    if (!open_)
+        return std::unexpected(ResultSetError::DbError);
+    const authz::VisibleSet filter{std::move(candidates)};
+    std::vector<std::string> matches;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::matching_parent_members: no connection ({})",
+                      pool_.last_error());
         return std::unexpected(ResultSetError::DbError);
     }
-    MembersPage page;
-    const int rows = PQntuples(res.get());
-    page.device_ids.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i)
-        page.device_ids.emplace_back(PQgetvalue(res.get(), i, 0));
-
-    if (static_cast<int>(page.device_ids.size()) > limit) {
-        page.device_ids.resize(limit);
-        page.next_cursor = page.device_ids.back();
-    }
-    return page;
+    auto failure = ResultSetError::DbError;
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* conn) {
+        pg::PgResult iso{PQexec(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")};
+        if (iso.status() != PGRES_COMMAND_OK) {
+            spdlog::error(
+                "ResultSetStore::matching_parent_members: could not establish read snapshot: {}",
+                PQerrorMessage(conn));
+            return false;
+        }
+        // Check the same database and B-tree schema that will produce these durable members.
+        // A separate lease could check another host after failover.
+        const auto facts = pg::read_collation_facts(conn, "result_set_store");
+        if (!facts) {
+            spdlog::error("ResultSetStore: parent intersection collation query failed: {}",
+                          facts.error());
+            return false;
+        }
+        const auto ordering = pg::decide_collation_verdict(*facts);
+        if (ordering == pg::CollationVerdict::Mismatch ||
+            ordering == pg::CollationVerdict::Unreadable) {
+            const char* reason = facts->invalid_index ? "invalid result-set index"
+                                 : !facts->actual     ? "actual version unavailable"
+                                                      : "version mismatch";
+            spdlog::warn("ResultSetStore: parent intersection refused: {}", reason);
+            failure = ResultSetError::OrderingUnavailable;
+            return false;
+        }
+        std::string cursor;
+        do {
+            // Even with zero matches, verify the membership table is readable (#4306).
+            auto page = read_members_page(conn, id, cursor, 1000, filter);
+            if (!page)
+                return false;
+            matches.insert(matches.end(), std::make_move_iterator(page->device_ids.begin()),
+                           std::make_move_iterator(page->device_ids.end()));
+            cursor = std::move(page->next_cursor);
+        } while (!cursor.empty());
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(failure);
+    return matches;
 }
 
 std::vector<std::string> ResultSetStore::members(const std::string& id, const std::string& cursor,

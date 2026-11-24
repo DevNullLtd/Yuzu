@@ -1,5 +1,6 @@
 #include "mcp_server.hpp"
 
+#include "device_ci_read_gate.hpp"
 #include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
@@ -1659,7 +1660,9 @@ static const ToolDef kTools[] = {
      "follow-up for the parse-error cause; each cause is its own distinctly-named refusal "
      "reason - query_truncated/poison_excluded/parse_error_excluded). A parent_id that is "
      "pending or failed is refused -32602 RESULT_SET_NOT_READY; the new set inherits the "
-     "parent's agents_failed and agents_unanswered. REST v1 twin: "
+     "parent's agents_failed and agents_unanswered. A refused parent collation check returns "
+     "RESULT_SET_ORDERING_UNAVAILABLE (60000 ms retry hint); a failed catalog or page read "
+     "returns RESULT_SET_STORE_UNAVAILABLE (5000 ms). REST v1 twin: "
      "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. JSON integers are exact; every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is -32602: send an integer, or send the decimal as a string under > >= < <= (at most 15 significant digits, a magnitude below 2^53, not subnormal, within the range of a double), where == and != stay a text compare; write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as 1e16 (read exactly). Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
@@ -18515,7 +18518,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                std::optional<std::unordered_set<std::string>> parent_members;
                 CreateRequest cr;
                 cr.owner_principal = session->username;
                 cr.name = param_str(args, "name");
@@ -18546,40 +18548,6 @@ McpServer::HandlerFn McpServer::build_handler(
                     inherit_completeness(cr, *parent);
                     cr.parent_id = pid;
                     args["scope_input_id"] = pid;
-                    std::unordered_set<std::string> ms;
-                    std::string cur;
-                    while (true) {
-                        // #4306 finding 3: the plain members() silently
-                        // truncated the loop on a degraded page,
-                        // indistinguishable from a genuine last page — this
-                        // tool MATERIALISES the narrowed match set into a
-                        // durable result set, so a truncated read here
-                        // silently narrows who future dispatches against it
-                        // reach. Fail CLOSED: refuse the whole operation
-                        // rather than materialise a partial parent_members
-                        // set. Mirrors REST's identical fix.
-                        auto page_result = result_set_store_->members_checked(pid, cur, 5000);
-                        if (!page_result) {
-                            const bool audit_ok = audit_fn(
-                                req, "result_set.create", "failure", "ResultSet", "",
-                                "reason=store_degraded source_kind=inventory_query");
-                            res.set_content(
-                                a4_error(kInternalError,
-                                         "RESULT_SET_STORE_UNAVAILABLE: could not read the "
-                                         "parent set's members; refusing to materialise a "
-                                         "partial result set",
-                                         "retry once the server reports ready",
-                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {},
-                                         audit_ok),
-                                "application/json");
-                            return;
-                        }
-                        ms.insert(page_result->device_ids.begin(), page_result->device_ids.end());
-                        if (page_result->next_cursor.empty())
-                            break;
-                        cur = std::move(page_result->next_cursor);
-                    }
-                    parent_members = std::move(ms);
                 }
                 // `args` is not read anywhere below this point in this handler.
                 cr.source_payload = args.dump();
@@ -18685,15 +18653,44 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                std::unordered_set<std::string> seen;
-                std::vector<std::string> members;
+                std::unordered_set<std::string> candidates;
                 for (const auto& r : results) {
-                    if (!r.match)
-                        continue;
-                    if (parent_members && !parent_members->count(r.agent_id))
-                        continue;
-                    if (seen.insert(r.agent_id).second)
-                        members.push_back(r.agent_id);
+                    if (r.match)
+                        candidates.insert(r.agent_id);
+                }
+                std::vector<std::string> members;
+                if (cr.parent_id) {
+                    auto matched = result_set_store_->matching_parent_members(
+                        *cr.parent_id, std::move(candidates));
+                    if (!matched) {
+                        if (matched.error() == ResultSetError::OrderingUnavailable) {
+                            const bool audited =
+                                audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                         "reason=ordering_unavailable source_kind=inventory_query");
+                            res.set_content(
+                                a4_error(kInternalError, to_string(matched.error()),
+                                         "check database collation health and retry after repair",
+                                         device_ci_read_gate::kOrderingRetryAfterMs, {}, audited),
+                                "application/json");
+                            return;
+                        }
+                        const bool audit_ok = audit_fn(
+                            req, "result_set.create", "failure", "ResultSet", "",
+                            "reason=store_degraded source_kind=inventory_query");
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: could not read the "
+                                     "parent set's members; refusing to materialise a "
+                                     "partial result set",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {},
+                                     audit_ok),
+                            "application/json");
+                        return;
+                    }
+                    members = std::move(*matched);
+                } else {
+                    members.assign(candidates.begin(), candidates.end());
                 }
                 auto created = result_set_store_->create_materialized(cr, members);
                 if (!created) {

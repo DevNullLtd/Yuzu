@@ -1,4 +1,5 @@
 #include "rest_api_v1.hpp"
+#include "device_ci_read_gate.hpp"
 #include "model_param_helpers.hpp"
 
 #include "content_etag.hpp" // content_etag: strong ETag of the OpenAPI document forms
@@ -3002,7 +3003,7 @@ const std::string& openapi_spec() {
         // idiom as the #3992 F2 / #4540 splits elsewhere in this file.
         R"json(
     "/result-sets/from-inventory-query": {
-      "post": {"operationId": "postResultSetsFromInventoryQuery", "summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Requires Inventory:Read (a synchronous read of the inventory store, not a dispatch; same securable as GET /api/v1/inventory/software). Service-scoped API tokens are denied outright (403), for the same cross-service-reach reason as the other result-set routes that do not dispatch: management-group confinement, which this route also applies, does not by itself close that gap, since the created set is owned by the minting principal's identity, not the token's own service tag. Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}], "description": "A string, or a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically and exactly, and a stored numeric string counts as a number; JSON integers are exact and every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is refused, so send an integer, or the decimal as a string under >, >=, <, <= (at most 15 significant digits, below 2^53, not subnormal); write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as \"1e16\" (read exactly)), or a boolean for == and != only. Null, an array, an object, or a number/boolean under any other op is refused (400)."}}}}, "parent_id": {"type": "string", "maxLength": 64}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, agents_unanswered, partial}>", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "400": {"description": "Invalid JSON, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), parent_id exceeds 64 bytes, or a condition that is not an object, has a non-string plugin/field/op, or has a value of a refused type"}, "403": {"description": "Result-set create denied to a service-scoped token (checked before any other gate); unlike the other result-set routes that do not dispatch, this route also has a real Inventory:Read RBAC gate underneath that check, so a caller past the service-scope check can still be denied here by that gate: no management-group grant for Inventory:Read, an MCP-tier restriction, or, for an engine principal, RBAC disabled or no grant for Inventory:Read"}, "404": {"description": "parent_id not owned by the caller"}, "409": {"description": "RESULT_SET_NOT_READY: parent_id names a set that is still pending (retry_after_ms 5000; remediation: wait until it is materialized) or has failed (retry_after_ms null; remediation: re-create it). A materialized but incomplete parent is accepted"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set); or, when parent_id is supplied, RESULT_SET_STORE_UNAVAILABLE reading the parent set's own members page mid-pagination (a distinct cause from the inventory store read degrading)"}}}
+      "post": {"operationId": "postResultSetsFromInventoryQuery", "summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Requires Inventory:Read (a synchronous read of the inventory store, not a dispatch; same securable as GET /api/v1/inventory/software). Service-scoped API tokens are denied outright (403), for the same cross-service-reach reason as the other result-set routes that do not dispatch: management-group confinement, which this route also applies, does not by itself close that gap, since the created set is owned by the minting principal's identity, not the token's own service tag. Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}], "description": "A string, or a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically and exactly, and a stored numeric string counts as a number; JSON integers are exact and every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is refused, so send an integer, or the decimal as a string under >, >=, <, <= (at most 15 significant digits, below 2^53, not subnormal); write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as \"1e16\" (read exactly)), or a boolean for == and != only. Null, an array, an object, or a number/boolean under any other op is refused (400)."}}}}, "parent_id": {"type": "string", "maxLength": 64}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, agents_unanswered, partial}>", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "400": {"description": "Invalid JSON, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), parent_id exceeds 64 bytes, or a condition that is not an object, has a non-string plugin/field/op, or has a value of a refused type"}, "403": {"description": "Result-set create denied to a service-scoped token (checked before any other gate); unlike the other result-set routes that do not dispatch, this route also has a real Inventory:Read RBAC gate underneath that check, so a caller past the service-scope check can still be denied here by that gate: no management-group grant for Inventory:Read, an MCP-tier restriction, or, for an engine principal, RBAC disabled or no grant for Inventory:Read"}, "404": {"description": "parent_id not owned by the caller"}, "409": {"description": "RESULT_SET_NOT_READY: parent_id names a set that is still pending (retry_after_ms 5000; remediation: wait until it is materialized) or has failed (retry_after_ms null; remediation: re-create it). A materialized but incomplete parent is accepted"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set); or, when parent_id is supplied, RESULT_SET_STORE_UNAVAILABLE reading the parent set's members or catalog facts (5000 ms retry hint), or RESULT_SET_ORDERING_UNAVAILABLE when the collation check refuses ordering (60000 ms retry hint; check index maintenance)"}}}
     },
     "/result-sets/from-echo-query": {
       "post": {"operationId": "postResultSetsFromEchoQuery", "summary": "Create a result set from an async dispatched Echo SQL query", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the echo plugin in parent_id's scope (or __all__ when parent_id is omitted); the SQL runs agent-side in a read-only sandbox, and the server only length-checks it (max 100 KiB). Membership is every agent that returned >= 1 row, or every responder when include_empty=true. Async: lands a pending row that the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution. An agent whose query failed is not a member: the filled set reports how many in agents_failed and sets partial.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string", "maxLength": 64}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, agents_unanswered, partial}> with status=pending", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, sql reads a raw capture table - a $<Source>_Live name or a <source>_live table, which Echo no longer keeps (RESULT_SET_REEVAL_STALE_SOURCE; query the hourly roll-up instead, for example $Process_Hourly), parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), parent_id exceeds 64 bytes, or name, sql or parent_id contains a NUL byte (RESULT_SET_BAD_REQUEST; nothing is dispatched and a result_set.create denied row is written)"}, "404": {"description": "parent_id not owned by the caller"}, "409": {"description": "RESULT_SET_NOT_READY: parent_id names a set that is still pending (retry_after_ms 5000; remediation: wait until it is materialized) or has failed (retry_after_ms null; remediation: re-create it). A materialized but incomplete parent is accepted"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED: the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH: a command was already dispatched but the store fault occurred persisting the pending row afterward; do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch): the per-owner quota could not be verified before dispatch; nothing sent, safe to retry"}}}
@@ -16319,7 +16320,7 @@ void RestApiV1::register_routes(
                       // #2500, FOURTH instance — the one the original fix missed.
                       // A supplied `parent_id` that is numeric, empty or null used
                       // to fail the `is_string() && !empty()` test below and leave
-                      // `parent_members` unset, so the query evaluated over the
+                      // the parent filter unset, so the query evaluated over the
                       // UNSCOPED inventory: a caller who believed it was narrowing
                       // to one result set searched every device instead. This is a
                       // synchronous producer, so the consequence is a read wider
@@ -16398,7 +16399,6 @@ void RestApiV1::register_routes(
                           rs_err(res, 503, "inventory store not available");
                           return;
                       }
-                      std::optional<std::unordered_set<std::string>> parent_members;
                       CreateRequest cr;
                       cr.owner_principal = session->username;
                       cr.name = body.value("name", "");
@@ -16435,39 +16435,6 @@ void RestApiV1::register_routes(
                           inherit_completeness(cr, *parent);
                           cr.parent_id = pid;
                           body["scope_input_id"] = pid;
-                          std::unordered_set<std::string> ms;
-                          std::string cur;
-                          while (true) {
-                              // Separate in/out cursor: members() clears its
-                              // out-cursor first, so aliasing one variable as
-                              // both rereads page 1 forever once the parent
-                              // exceeds the page size (review finding B3).
-                              auto page_result = result_set_store->members_checked(pid, cur, 5000);
-                              // #4306 finding 3: the plain members() silently
-                              // truncated the loop on a degraded page,
-                              // indistinguishable from a genuine last page —
-                              // this route MATERIALISES the narrowed match set
-                              // into a durable result set, so a truncated read
-                              // here silently narrows who future dispatches
-                              // against it reach. Fail CLOSED: refuse the
-                              // whole operation rather than materialise a
-                              // partial parent_members set.
-                              if (!page_result) {
-                                  audit_failure("store_degraded");
-                                  rs_err(res, 503,
-                                         "RESULT_SET_STORE_UNAVAILABLE: could not read the "
-                                         "parent set's members; refusing to materialise a "
-                                         "partial result set",
-                                         {.retry_after_ms = 5000});
-                                  return;
-                              }
-                              ms.insert(page_result->device_ids.begin(),
-                                       page_result->device_ids.end());
-                              if (page_result->next_cursor.empty())
-                                  break;
-                              cur = std::move(page_result->next_cursor);
-                          }
-                          parent_members = std::move(ms);
                       }
                       cr.source_payload = body.dump();
 
@@ -16557,17 +16524,35 @@ void RestApiV1::register_routes(
                                  "match set");
                           return;
                       }
-                      std::unordered_set<std::string> seen;
-                      std::vector<std::string> members;
+                      std::unordered_set<std::string> candidates;
                       for (const auto& r : results) {
-                          if (!r.match)
-                              continue;
-                          if (parent_members && !parent_members->count(r.agent_id))
-                              continue;
-                          if (seen.insert(r.agent_id).second)
-                              members.push_back(r.agent_id);
+                          if (r.match)
+                              candidates.insert(r.agent_id);
                       }
-
+                      std::vector<std::string> members;
+                      if (cr.parent_id) {
+                          auto matched = result_set_store->matching_parent_members(
+                              *cr.parent_id, std::move(candidates));
+                          if (!matched) {
+                              if (matched.error() == ResultSetError::OrderingUnavailable) {
+                                  audit_failure("ordering_unavailable");
+                                  rs_err(res, 503, to_string(matched.error()),
+                                         {.retry_after_ms =
+                                              device_ci_read_gate::kOrderingRetryAfterMs});
+                                  return;
+                              }
+                              audit_failure("store_degraded");
+                              rs_err(res, 503,
+                                     "RESULT_SET_STORE_UNAVAILABLE: could not read the "
+                                     "parent set's members; refusing to materialise a "
+                                     "partial result set",
+                                     {.retry_after_ms = 5000});
+                              return;
+                          }
+                          members = std::move(*matched);
+                      } else {
+                          members.assign(candidates.begin(), candidates.end());
+                      }
                       auto created = result_set_store->create_materialized(cr, members);
                       if (!created) {
                           if (metrics_registry &&

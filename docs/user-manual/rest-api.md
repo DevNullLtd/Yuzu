@@ -8844,6 +8844,12 @@ producer; see `docs/scope-walking-design.md` for the full result-set surface).
 A `parent_id` must name a `materialized` set the caller owns: a `pending` or `failed`
 parent is refused with **409** `RESULT_SET_NOT_READY`, and the new set inherits an
 incomplete parent's `agents_failed` and `agents_unanswered`.
+The parent intersection uses one PostgreSQL snapshot and checks its database collation
+before paging. Different versions, a missing actual version for a recorded version, or an invalid result-set index with equal versions return **503**
+`RESULT_SET_ORDERING_UNAVAILABLE` with a 60-second retry hint. A failed continuation
+returns `RESULT_SET_STORE_UNAVAILABLE` with a 5-second retry hint. Neither case creates a
+partial child. See [PostgreSQL collation maintenance](server-admin.md#postgresql-collation-version)
+for the check's limits and operator repair steps.
 One behavior worth calling out here: when the underlying inventory read hits
 the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 ("inventory query truncated ... refusing to materialise a partial result set") rather than

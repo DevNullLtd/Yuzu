@@ -68,6 +68,16 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **A one-time remove and install in the software change feed.** A row's change identity includes its cleaned-up key. A device row whose key changed under these rules (for example a title that carried a trailing `-`) shows, at the next time that row changes version, as one removal of the old row and one install of the new row, not as an upgrade. Rows that do not change are not rewritten. Curated aliases are keyed the same way, so a curated alias for an affected title stops matching until it is curated again; the queue lists such a title.
 
+## Parent membership in inventory-query result sets
+
+The REST and MCP inventory-query producers now read a materialized parent in pages. Existing
+member cursors and stored data require no migration. If a parented query starts returning
+`RESULT_SET_ORDERING_UNAVAILABLE`, follow the [PostgreSQL collation repair procedure](server-admin.md#postgresql-collation-version)
+before retrying. A five-second `RESULT_SET_STORE_UNAVAILABLE` retry hint can also indicate a
+persistent catalog permission problem. Check the server’s parent-intersection error log and
+restore catalog read access when the same refusal persists.
+
+
 ## ⚠️ Breaking: second-factor failure budget (auth schema v4), first-run password prompt needs a terminal on Linux and macOS
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

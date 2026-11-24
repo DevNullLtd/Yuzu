@@ -29,11 +29,10 @@
 /// per-owner quota check on the three async result-set producers (#4306
 /// finding 1): a silently-empty/zero count there would let an over-quota
 /// dispatch fire for real before the authoritative in-txn recheck ever runs.
-/// `members_checked`/`list_by_owner_checked`/`lineage_checked` back every
-/// REST/MCP consumer that materialises or reports membership (#4306 finding 3
-/// / #4307 finding 2): a silently-truncated page there is indistinguishable
-/// from a genuine last page or an empty fleet. Every caller of these eight
-/// methods MUST apply the reviewer test: "if this value were silently
+/// `matching_parent_members`, `members_checked`, `list_by_owner_checked` and `lineage_checked` back
+/// every REST/MCP consumer that materialises or reports membership (#4306 finding 3 / #4307 finding
+/// 2): a silently-truncated page there is indistinguishable from a genuine last page or an empty
+/// fleet. Every caller of these methods MUST apply the reviewer test: "if this value were silently
 /// empty/false, could any downstream branch grant/target/enforce/skip/
 /// invert(NOT)/report success? If yes, fail closed (abort/503) on `DbError`
 /// — never treat it as empty-container."
@@ -219,6 +218,8 @@ enum class ResultSetError {
     Pinned,
     TooManyMembers,
     DbError,
+    /// A parent intersection refused a collation mismatch, unknown actual version or invalid index.
+    OrderingUnavailable,
     /// The set exists and is owned, but is still `pending`: it has no membership yet, and may
     /// fill. Returned by `member_set_owned` only.
     NotReady,
@@ -362,13 +363,17 @@ public:
     /// but empty = none (an empty page without a round trip). It is applied in the SQL before
     /// `ORDER BY`/`LIMIT` (ADR-0017 INV-3), so ids the caller can no longer see neither appear
     /// nor use up page slots, and the cursor walks only visible ids. EVERY read that DISPLAYS
-    /// membership to a person must pass the caller's scope. The default (unrestricted) is for
-    /// the two producer routes that materialise a parent set's members as the input of a
-    /// separately scoped query: narrowing the parent there would silently shrink a set that
-    /// targets the fleet (the #4306 target-erasure shape).
+    /// membership to a person must pass the caller's scope.
     std::expected<MembersPage, ResultSetError>
     members_checked(const std::string& id, const std::string& cursor, int limit,
                     const authz::VisibleSet& visible = std::nullopt);
+    /// Intersect an already authorized, materialized parent with scoped inventory matches.
+    /// The transaction checks the database collation before paging. OrderingUnavailable
+    /// reports a refused ordering check. A catalog SQL error or failed page returns DbError;
+    /// either error discards the entire result, including when the candidate set is empty.
+    std::expected<std::vector<std::string>, ResultSetError>
+    matching_parent_members(const std::string& id, std::unordered_set<std::string> candidates);
+
     /// Deny-or-benign plain wrapper over `members_checked` — see the
     /// file-header posture note. `out_next_cursor` is cleared on a `DbError`
     /// (same shape as a genuine last page), matching this method's pre-#4306

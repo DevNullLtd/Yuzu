@@ -1,0 +1,1 @@
+- Inventory queries now page matching parent membership in a single snapshot. REST and MCP refuse to create a partial result set if a page fails, database collation versions differ, or an index check cannot establish ordering (`RESULT_SET_ORDERING_UNAVAILABLE`).

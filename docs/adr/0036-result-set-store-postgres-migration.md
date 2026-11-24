@@ -93,6 +93,37 @@ a single global `shared_mutex` serializing every writer.
   longer for a lease, but still bound the wait"). Construction and the one-time backfill use
   unbounded `acquire()`/`with_txn` per ADR-0012 §2(a) (boot is serial).
 
+### Member reads and keyset consistency (2026-11-22)
+
+The dashboard detail fragment and the REST and MCP member lists resolve ownership and current
+device visibility on each request. PostgreSQL applies the visibility predicate before sorting by
+`device_id ASC` and takes one extra row to detect another page. The continuation is the last
+returned device ID, exclusive on the next request, using the same database ordering. Each request
+reads its own snapshot. A cursor confers no authority and does not freeze visibility across
+requests. A failed continuation is a degraded read. As with other text indexes, a database
+collation change requires [index maintenance](../user-manual/server-admin.md#postgresql-collation-version)
+before relying on the index.
+
+The REST and MCP inventory-query producers check parent ownership and readiness and reject
+truncated inventory reads. They evaluate the scoped inventory and intersect its distinct matching
+IDs with the parent in PostgreSQL, reading up to 1,000 matches per page in one read-only,
+repeatable-read transaction. Before reading the first page, check the database collation
+and the result-set schema indexes in that same transaction using the shared PostgreSQL
+collation check. Version mismatch, a recorded version without an actual version, and an
+invalid index with equal versions refuse the operation and audit `ordering_unavailable`.
+On 2026-11-23 Nathan approved the existing PostgreSQL maintenance precondition for these
+inventory-query producer reads (D71). Rebuild affected indexes after a locale change
+before refreshing the recorded version. The indexed keyset relies on this procedure.
+A premature refresh or a change in sort rules with the same version can leave a stale
+index undetected and a stored child incomplete. Revisit the decision if the keyset or
+supported maintenance procedure changes.
+A catalog SQL error or failed page audits `store_degraded`. Both producers discard accumulated
+matches before returning the error. Server memory covers the bounded candidates, their
+matches and one page, independently of the parent size. Materialized membership is immutable. The
+child insert references the parent through a foreign key, so a parent removed before insertion
+cannot yield a parentless child. The general scope-expression evaluator still loads a complete
+owned membership for repeated lookups while evaluating devices.
+
 ### 2026-07-26 hardening round (post-review)
 
 A consolidated governance review of this migration surfaced four further findings, all
@@ -289,7 +320,8 @@ finding 2; full analysis and fix: `changelog.d/`, PR history for #4306).
 added (`std::expected<T, ResultSetError>`, `DbError` on a runtime failure, never
 empty/zero/truncated) and adopted at every call site where a degraded read could
 grant/target/dispatch/materialise: the REST/MCP async-producer quota pre-checks, the
-from-inventory-query parent-narrowing loop and its MCP twin, and the REST/MCP
+original from-inventory-query parent-narrowing loop and its MCP twin (superseded by
+`matching_parent_members` in the 2026-11-22 amendment), and the REST/MCP
 list/members/lineage read routes. The plain `list_by_owner`/`members`/`lineage`/
 `count_for_owner` wrappers remain for API continuity, but only two of the four still have a
 real production caller: `list_by_owner` and `lineage` back the render-only dashboard
