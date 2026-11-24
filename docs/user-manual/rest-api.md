@@ -6010,7 +6010,7 @@ field rather than a header/status code.
 
 **Forensics-tier checks.** The one case where `check_result` is not the check's output: when
 the check instruction runs a Forensics-tier plugin (`app_usage`, `browser_inventory`,
-`execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), policy evaluation does not dispatch it: every action of these plugins has an execute gate, so the
+`execution_artifacts`, `file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), policy evaluation does not dispatch it: every action of these plugins has an execute gate, so the
 check is refused and the agent's `status` is `blocked` with a `check_result` of
 `{"phase":"check","result":"blocked","reason":"gated","plugin":...,"action":...}`. Check output of such a
 policy is never stored, and the evaluator would not read it if it were (a stored Forensics row is
@@ -8236,7 +8236,7 @@ and is marked itself only if frames are refused after it, so a capped pair can c
 rows). See [Response Store](response-store.md).
 
 **Forensics-tier rows (#4990).** Rows written by Forensics-tier plugins (`app_usage`,
-`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is
+`browser_inventory`, `execution_artifacts`, `file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is
 derived from the capability catalogue) are served only to callers who hold `Forensics:Read` in
 addition to `Response:Read`. This applies to every route that reads stored responses: the legacy
 `GET /api/responses/{id}[/aggregate|/export]`, the v1 twins above, `GET
@@ -11788,6 +11788,11 @@ Its audit detail is marked `protective_exempt=true` (`protective_exempt=partial`
 rule delivery, disable or remove the rules instead. The response returns the row that was **written**,
 not the effective state, in the same shape as the `GET` above.
 
+**Plugins that start off.** `execution_artifacts`, `browser_inventory`, `privacy_permissions`,
+`remote_access_audit`, `process_introspect` and `file_search` are seeded as switched off when the server
+starts, and a restart does not overwrite a choice an operator has made. Turn one on with this `PUT` and
+`enabled` set to `true`.
+
 **Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
 plugin/action/os/reason, or `?os=` present but empty), `413`, `500` (the store write failed and may or
 may not have been applied: see "After a `500`" below), `503` (store unavailable, or the audit row could not be saved).
@@ -14207,6 +14212,10 @@ transaction did not report success) answers `503` with `error.outcome` set to `u
 `retry_after_ms`, audited `result=failure`, `detail=outcome_unknown`: the schedule may or may not
 exist, so list schedules before creating it again.
 
+A `parameters` object that carries a resume token (`cursor`) or a classified secret key (a grant
+secret or id, or a client secret) is `400` with the refusal text in `error`, and nothing is created;
+no audit row is written for this refusal.
+
 #### `DELETE /api/schedules/{id}`
 
 Delete a schedule you created. Requires `Schedule:Delete`; a schedule created by another
@@ -14842,7 +14851,7 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 - **Content-Type:** `text/event-stream`
 - **Headers:** `Cache-Control: no-cache`, `X-Accel-Buffering: no` (so reverse proxies don't buffer the stream into chunks).
 
-**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
+**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check - a management-group-confined operator is admitted and then sees only their in-scope agents' events. The caller who **dispatched** the execution is always admitted to the stream (visibility only - avoids a false 404 on a just-dispatched execution with zero responses yet), but that ownership never bypasses the per-event redaction below. A service-scoped token has no dispatcher admission (#5557): it is admitted only once an agent in its service scope has a status row for the execution, and before that the stream answers `404` as for a nonexistent execution. RBAC-off → unrestricted (legacy-open). **This gate is evaluated once, at subscribe time** - it is not re-checked for the life of the connection. If your scope is narrowed, or your session is revoked, mid-stream, an already-open subscription is not automatically disconnected (tracked: #3788); a full server restart is the only thing that currently drops every live stream. A stream's scope is fixed when it attaches: revoking a service-scoped token, retagging an agent out of its service scope or switching RBAC enforcement off does not close an open stream either; this is tracked as #7815. **Residual: the number of withheld events is inferable.** Event ids are per-execution counters, one per published event (every `agent-transition`, every `execution-progress` tick and the `execution-completed`, for all agents), and both this route and `GET /api/v1/events` put the raw id on the wire. A confined or service-scoped subscriber of an execution it is admitted to can therefore infer how many events were withheld from it, namely every dropped `execution-progress` tick and every out-of-scope `agent-transition`, so roughly two per status update of an agent outside its scope, from gaps between the ids it receives and from the id on the sanitized `execution-completed` frame. No event content and no per-agent attribution is disclosed, but the fleet-count withholding protects values, not counts. A dense per-connection id cannot be substituted without breaking `Last-Event-ID` resume; an opaque resumable cursor is tracked as #7816.
 
@@ -14934,7 +14943,7 @@ The browser-oriented `/sse/executions/{id}` route is preserved for the dashboard
 **Permission:** `Execution:Read`.
 **Auth:** Bearer token, `X-Yuzu-Token` header, or session cookie. Same auth surface as every other `/api/v1/*` endpoint.
 
-**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
+**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check - a management-group-confined operator is admitted and then sees only their in-scope agents' events. The execution's dispatcher is always admitted to the stream (visibility only - avoids a false 404 on a just-dispatched execution with zero responses yet), never a bypass of the per-event redaction below. A service-scoped token has no dispatcher admission (#5557): it is admitted only once an agent in its service scope has a status row for the execution, and before that the route answers `404` as for a nonexistent execution. RBAC-off → unrestricted (legacy-open). This route shares one event projector (`execution_event_scope.hpp`) with the dashboard's `/sse/executions/{id}` sibling - see that section for the drop/sanitize table (`agent-transition` filtered by `agent_id`, `execution-progress` dropped, `execution-completed` sanitized to `status` only), and for the same subscribe-time-only gate staleness caveat (tracked: #3788) - this route shares that gap. The same applies to a service-scoped token: a stream's scope is fixed when it attaches, and revoking the token, retagging an agent out of its service scope or switching RBAC enforcement off does not close an open stream (tracked as #7815). **Residual: the number of withheld events is inferable.** Event ids are per-execution counters, one per published event (every `agent-transition`, every `execution-progress` tick and the `execution-completed`, for all agents), and this route puts the raw id on the wire (the `id:` line and the JSON `event_id`). A confined or service-scoped subscriber of an execution it is admitted to can therefore infer how many events were withheld from it, namely every dropped `execution-progress` tick and every out-of-scope `agent-transition`, so roughly two per status update of an agent outside its scope, from gaps between the ids it receives and from the id on the sanitized `execution-completed` frame. On this route the `replay-gap` frame is a further signal: its `missing_to` is computed from the raw ring front, so it is present only once the ring has evicted (about 1000 events), and probing `since=` reads it at will. No event content and no per-agent attribution is disclosed, but the fleet-count withholding protects values, not counts. A dense per-connection id cannot be substituted without breaking `Last-Event-ID` resume; an opaque resumable cursor is tracked as #7816.
 
