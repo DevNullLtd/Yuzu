@@ -11964,8 +11964,8 @@ TEST_CASE("MCP get_device_live: the served description states the lease limits t
     CHECK(description.find("they are the newest ones") == std::string::npos); // the ambiguous wording
     CHECK(description.size() < 4096);
     // F2: the reason and retry statements are the ones the handler makes. MCP stamps the denial
-    // TOKEN, never `dispatch_denied`, and says which refusals carry no reason; `incomplete` waits
-    // the poll deadline (25 s) rather than the timeout's 3 s.
+    // TOKEN, never `dispatch_denied`, and says which refusals carry no reason; a quick kind's
+    // `incomplete` waits the poll deadline (25 s) rather than the timeout's 3 s (processes: 120 s).
     CHECK(description.find("dispatch_denied") == std::string::npos);
     CHECK(description.find("a dispatch denial token") != std::string::npos);
     CHECK(description.find("audit_failed") != std::string::npos);
@@ -12895,6 +12895,16 @@ TEST_CASE("MCP get_device_live: the poll reads the device's rows only (multi-row
         CHECK(res->body.find("PARTIAL_MARKER") == std::string::npos);
         CHECK(mcp_live_count(f.metrics, "processes", "incomplete") == 1.0);
         CHECK(mcp_live_count(f.metrics, "processes", "timeout") == 0.0);
+    }
+    SECTION("a quick kind's incomplete keeps the poll deadline (25 s), not the processes budget") {
+        f.put_row("live-cmd-1", "WS-1", 0, "uptime_display|PARTIAL_MARKER");
+        const auto res = f.call("WS-1", "uptime");
+        const auto err = live_error(res);
+        CHECK(err["data"]["reason"] == "incomplete");
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kLiveReadIncompleteRetryMs);
+        CHECK(err["data"]["retry_after_ms"] == 25000);
+        CHECK(res->body.find("PARTIAL_MARKER") == std::string::npos);
+        CHECK(mcp_live_count(f.metrics, "uptime", "incomplete") == 1.0);
     }
     SECTION("the budget closing abandons the read with shutting_down, the row stays requested-only") {
         f.budget.begin_closing();

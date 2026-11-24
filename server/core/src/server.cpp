@@ -12127,9 +12127,9 @@ public:
                                          yuzu::server::detail::SseSurface::kWorkflowRun)
                                    : 0);
                 // Per-device live reads (REST, MCP, the quarantine release wait) hold a worker
-                // for about 20 s typical, never past the 25 s poll deadline plus one interval and one read, and the
-                // same cap bounds the wait: a lease that
-                // leaked would cost at most kExecutionDrainCap, never wedge the shutdown. New
+                // for about 20 s typical, never past the 25 s poll deadline plus one interval
+                // and one read, and the same cap bounds the wait: a lease that leaked would
+                // cost at most kExecutionDrainCap, never wedge the shutdown. New
                 // reads are refused once draining_ is set, so this count only falls.
                 const std::size_t live_reads =
                     stream_budget_ ? stream_budget_->active_for_surface(

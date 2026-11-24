@@ -6046,6 +6046,32 @@ TEST_CASE("REST dex/devices/{id}/live: another device's failure row under the sa
     CHECK(res->body.find("OTHER_AGENT") == std::string::npos);
 }
 
+TEST_CASE("REST dex/devices/{id}/live: a quick kind's incomplete keeps the poll deadline hint (25 s)",
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
+    AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
+    yuzu::server::detail::live_poll_max_polls().store(2);
+    yuzu::server::detail::live_poll_interval_ms().store(1);
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = 0; // RUNNING: a chunk, never a terminal row
+    r.output = "uptime_display|PARTIAL_MARKER";
+    h.resp_store->store(r);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 504);
+    const auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["reason"].get<std::string>() == "incomplete");
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == yuzu::server::mcp::kLiveReadIncompleteRetryMs);
+    CHECK(j["error"]["retry_after_ms"].get<int>() == 25000);
+    CHECK(res->body.find("PARTIAL_MARKER") == std::string::npos);
+    CHECK(rest_live_count(h, "uptime", "incomplete") == 1.0);
+}
+
 TEST_CASE("REST dex/devices/{id}/live: an unwired Forensics plugin set is refused up front, nothing sent",
           "[pg][rest][dex][device][live]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

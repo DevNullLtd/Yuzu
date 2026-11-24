@@ -143,7 +143,8 @@ inline constexpr std::size_t kPerPrincipalWorkflowRun = 2;
 
 /// Max concurrent per-device live reads one principal may hold (`POST
 /// /api/v1/dex/devices/{id}/live`, MCP `get_device_live`, and the quarantine release-confirm
-/// wait). A live read holds its worker for up to the poll budget (about 20 s, never past the 25 s poll deadline plus one interval and one read) while the
+/// wait). A live read holds its worker for up to the poll budget (about 20 s, never past the
+/// 25 s poll deadline plus one interval and one read) while the device
 /// does real work, so the per-principal share is small: two lets a client overlap one read
 /// behind another while one principal cannot take a meaningful share of the pool.
 inline constexpr std::size_t kPerPrincipalLiveRead = 2;
