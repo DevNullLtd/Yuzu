@@ -9,11 +9,12 @@ Best-effort lexical gate, two checks:
   2. No scanned text file parses `session=` out of that agent line (scanned: the whole checkout
      except the top-level SKIP_DIRS (including the `vcpkg` clone) and build* directories,
      rebar3's `gateway/_build*`, `node_modules` and `.git` at any depth, files over 2 MB, binary
-     files (a NUL in the first 4 KiB), and this file; directory symlinks are not followed). A
-     directory it cannot list or a file it cannot read FAILS the gate (#8646), unless it vanished
-     mid-scan (ENOENT): an unscanned path could hold an extractor. Backslash continuations are joined, and a `session=` extractor within WINDOW lines
-     of a "Registered with server" mention
-     (a separate-line extractor included) fails. A line that carries the marker
+     files (a NUL in the first 4 KiB), non-regular files (FIFOs, sockets, devices), and this
+     file; directory symlinks are not followed). A directory it cannot list or a file it cannot
+     read FAILS the gate (#8646), unless it is absent (ENOENT: it vanished mid-scan, or is a
+     dangling link): an unscanned path could hold an extractor.
+     Backslash continuations are joined, and a `session=` extractor within WINDOW lines of a
+     "Registered with server" mention (a separate-line extractor included) fails. A line that carries the marker
      `tripwire-allow: <reason>` is exempt, so each exemption is visible at its own line (only the
      upgrade note quoting the old line). There is NO other `session=` read of that line.
 The server-side "ProxyRegister succeeded: ... session=" line is the id's source and is not flagged.
@@ -125,23 +126,24 @@ def skipped(rel_parts):
 
 def note_unreadable(unread, root, err):
     """Record a path the walk could not list or read (#8646). ENOENT alone is passed over: the
-    path vanished mid-scan, so there is nothing left to hold an extractor. Every other error
-    (EACCES, EIO, ELOOP, ...) leaves the path unscanned, and the gate cannot vouch for it."""
+    path vanished mid-scan or is a dangling link, so there is nothing to hold an extractor. Every
+    other error (EACCES, EIO, ELOOP, ENOTDIR, ...) leaves the path unscanned, and the gate cannot
+    vouch for it."""
     if err.errno == errno.ENOENT:
         return
     try:
         rel = pathlib.Path(err.filename).relative_to(root).as_posix()
     except (TypeError, ValueError):
         rel = str(err.filename)
-    unread.append(f"{rel}: could not be read ({errno.errorcode.get(err.errno, err.errno)}), "
-                  "so this gate cannot check it")
+    unread.append(f"{rel}: could not be read ({errno.errorcode.get(err.errno, err.errno)}); "
+                  "fix its permissions or remove it so this gate can check it")
 
 
 def iter_files(root=ROOT, visited=None, unread=None, walk=os.walk):
     # os.walk with pruning, not rglob: a skipped tree is never listed, so another job deleting or
     # writing its build output mid-scan cannot crash or slow this gate (#8637). Like rglob, it does
     # not follow directory symlinks. A directory it cannot list and a file it cannot stat or read
-    # go to `unread` (see note_unreadable), which main() reports as failures. `visited`, when
+    # go to `unread` (see note_unreadable), which run() reports as failures. `visited`, when
     # given, collects every directory listed (the selftest uses it to pin the pruning); `walk` lets
     # the selftest inject listing errors without chmod, which root bypasses.
     if unread is None:
@@ -196,7 +198,7 @@ def selftest():
     ]
     # Assert messages name the case by index and never quote it, and no assert line carries a
     # matching literal: a failing selftest's traceback, teed to a top-level log, must not re-trip
-    # this gate the way the old FAIL message did.
+    # this gate the way the pre-#8637 FAIL message did.
     for i, b in enumerate(bad):
         assert check_text("x.sh", b), f"selftest: must fire on bad[{i}]"
     # re-adding a session= read of the Registered line (a fallback) must be RED
@@ -205,6 +207,9 @@ def selftest():
     assert not check_text("x.sh", "Registered with server (session_fp=ab12cd34, "), "selftest ok-fp"
     assert not check_text("x.sh", 'grep "Registered with server" x | grep session=  # tripwire-allow: reviewed example'), "selftest allow"
     assert not check_text("x.sh", "ProxyRegister succeeded: agent=a, session=b"), "selftest server line"
+    # ... even next to a Registered mention, which is what the ProxyRegister exemption is for.
+    assert not check_text("x.log", "Registered with server (session_fp=ab12cd34)\n"
+                          "ProxyRegister succeeded: agent=a, session=b"), "selftest server line near"
     # Windows-style path separators must not matter
     assert check_text("scripts\\x.sh".replace("\\", "/"), bad[0]), "selftest path"
     # The gate's own FAIL line, captured in a top-level log, must not trip the gate on the next run.
@@ -254,63 +259,100 @@ def selftest_walk(bad_line):
 
 
 def selftest_unreadable(root):
-    """#8646: a path the walk cannot list or read fails the gate; one that vanished (ENOENT)
-    does not. Errors are injected, so this holds on every OS and under root."""
+    """#8646: a path the walk cannot list or read fails the gate; one that is absent (ENOENT)
+    does not. Listing errors are injected, so that half holds on every OS and under root; file
+    stat/read errors are checked for real (ELOOP, FIFO, chmod) where the platform allows, and a
+    skipped real check is announced on stderr."""
     def walk_with_errors(top, onerror):
         onerror(PermissionError(errno.EACCES, "Permission denied", str(pathlib.Path(top, "locked"))))
         onerror(OSError(errno.EIO, "I/O error", str(pathlib.Path(top, "bad_disk"))))
+        onerror(NotADirectoryError(errno.ENOTDIR, "Not a directory", str(pathlib.Path(top, "swapped"))))
         onerror(FileNotFoundError(errno.ENOENT, "No such file", str(pathlib.Path(top, "gone"))))
         yield from os.walk(top, onerror=onerror)
-    unread = [e for e in scan(root, walk=walk_with_errors) if "could not be read" in e]
-    got = sorted(u.split(":", 1)[0] for u in unread)
-    assert got == ["bad_disk", "locked"], ("selftest: listing errors", got)
+
+    def unread_paths(**kw):
+        # run() end to end, so the result must reach the FAIL listing and the exit code. Its check-1
+        # files are absent from this tree, which fails with different wording, filtered out here.
+        lines = []
+        rc = run(root, out=lines.append, **kw)
+        got = sorted(l[len("FAIL: "):].split(":", 1)[0] for l in lines if "could not be read" in l)
+        return rc, got
+
+    rc, got = unread_paths(walk=walk_with_errors)
+    assert rc == 1 and got == ["bad_disk", "locked", "swapped"], ("selftest: listing errors", rc, got)
     # A file whose stat or read fails is recorded the same way (the real os.stat raises here).
     unread = []
     note_unreadable(unread, root, PermissionError(errno.EACCES, "Permission denied", str(root / "s.sh")))
     note_unreadable(unread, root, FileNotFoundError(errno.ENOENT, "No such file", str(root / "t.sh")))
     assert [u.split(":", 1)[0] for u in unread] == ["s.sh"], ("selftest: file errors", unread)
     # The real OS paths too, where the platform allows. A self-referencing symlink fails os.stat
-    # with ELOOP even under root (POSIX; Windows needs a privilege to create one).
-    loop = root / "loop.sh"
+    # with ELOOP even under root (POSIX; Windows needs a privilege to create one). A FIFO is not a
+    # regular file: it is skipped, never opened (opening it would block until the meson timeout).
+    loop, fifo = root / "loop.sh", root / "pipe.sh"
     try:
         os.symlink("loop.sh", loop)
     except (OSError, NotImplementedError):
         loop = None
-    if loop is not None:
-        unread = [e for e in scan(root) if "could not be read" in e]
-        assert [u.split(":", 1)[0] for u in unread] == ["loop.sh"], ("selftest: real ELOOP", unread)
-        loop.unlink()
+        print("selftest: real ELOOP check skipped (cannot create a symlink here)", file=sys.stderr)
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(fifo)
+    else:
+        fifo = None
+        print("selftest: FIFO check skipped (no os.mkfifo here)", file=sys.stderr)
+    _, got = unread_paths()
+    assert got == (["loop.sh"] if loop else []), ("selftest: real ELOOP / FIFO", got)
+    for made in (loop, fifo):
+        if made is not None:
+            made.unlink()
     # Where chmod does deny (POSIX, not root): an unlistable directory and an unreadable file.
     locked, locked_file = root / "locked_dir", root / "locked_file.sh"
     locked.mkdir()
     (locked / "y.sh").write_text("x\n")
     locked_file.write_text("x\n")
-    locked.chmod(0)
-    locked_file.chmod(0)
     try:
+        locked.chmod(0)
+        locked_file.chmod(0)
         if not os.access(locked, os.R_OK) and not os.access(locked_file, os.R_OK):
-            unread = [e for e in scan(root) if "could not be read" in e]
-            got = sorted(u.split(":", 1)[0] for u in unread)
+            _, got = unread_paths()
             assert got == ["locked_dir", "locked_file.sh"], ("selftest: real EACCES", got)
+        else:
+            print("selftest: real EACCES check skipped (chmod does not deny here)", file=sys.stderr)
     finally:
         locked.chmod(0o700)
         locked_file.chmod(0o600)
 
 
+def check_sources(root=ROOT):
+    """Check 1: the two pinned spdlog calls."""
+    errs = []
+    for rel, check in (("agents/core/src/agent.cpp", check_agent_cpp),
+                       ("agents/core/src/dex_linux_collector.cpp", check_dex_emit)):
+        try:
+            text = (root / rel).read_text(errors="replace")
+        except OSError as e:
+            errs.append(f"{rel}: missing or unreadable ({errno.errorcode.get(e.errno, e.errno)})")
+            continue
+        errs += check(text)
+    return errs
+
+
+def run(root=ROOT, walk=os.walk, out=print):
+    """Both checks over `root`; prints the FAIL lines (or OK) through `out`, returns the exit code."""
+    errs = check_sources(root) + scan(root, walk=walk)
+    for e in errs:
+        out(f"FAIL: {e}")
+    if errs:
+        return 1
+    out("OK: agent session id is not logged or parsed from the Registered line")
+    return 0
+
+
 def main():
     selftest()
-    errs = check_agent_cpp((ROOT / "agents/core/src/agent.cpp").read_text(errors="replace"))
-    errs += check_dex_emit((ROOT / "agents/core/src/dex_linux_collector.cpp").read_text(errors="replace"))
-    errs += scan()
     if hasattr(sys.stdout, "reconfigure"):
         # A non-UTF-8 file name must not turn the FAIL listing into a traceback that hides the rest.
         sys.stdout.reconfigure(errors="backslashreplace")
-    for e in errs:
-        print("FAIL:", e)
-    if errs:
-        return 1
-    print("OK: agent session id is not logged or parsed from the Registered line")
-    return 0
+    return run()
 
 
 if __name__ == "__main__":
