@@ -646,9 +646,10 @@ one occurrence of `clock_timestamp`. An approval ticket is "live" while it is `a
 unconsumed and `reviewed_at` lies within `[db_now - 7 days, db_now + 300 s]`. That test is ONE SQL
 predicate (`ticket_live_sql()` in `approval_manager.cpp`, constants `kApprovalTicketTtlSeconds` and
 `kApprovalReviewedAtSlackSeconds` in `approval_manager.hpp`) with one definition of the window,
-used by four sites that must not drift apart about its bounds: the `consume_ticket` CAS, its
-diagnostic read, `submit()`'s approved-ticket sweep, and
-`ticket_is_live()`, which `ScheduleRunner` calls before it fires an approved schedule ticket.
+used by five sites that must not drift apart about its bounds: the `consume_ticket` CAS, its
+diagnostic read, `submit()`'s approved-ticket sweep,
+`ticket_is_live()`, which `ScheduleRunner` calls before it fires an approved schedule ticket, and
+`covers_continuation`, which caps a continuation cover at the approval's lifetime.
 
 - **Anti-fork rule.** `ticket_is_live()` answers liveness ONLY. It carries none of the #2442 origin and
   submitter binding, and `consume_ticket` stays the sole redemption chokepoint for the MCP recall:

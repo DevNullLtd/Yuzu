@@ -1343,13 +1343,14 @@ TierPolicyFn AuthRoutes::gateless_tier_policy_fn() {
     };
 }
 
-bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib::Response& res,
-                                           const std::string& securable_type,
-                                           const std::string& operation,
-                                           const std::string& agent_id) {
+ScopedGateOutcome AuthRoutes::require_scoped_permission_outcome(const httplib::Request& req,
+                                                                httplib::Response& res,
+                                                                const std::string& securable_type,
+                                                                const std::string& operation,
+                                                                const std::string& agent_id) {
     auto session = require_auth(req, res);
     if (!session)
-        return false;
+        return ScopedGateOutcome::Unauthenticated;
 
     // JIT admin elevation grants full admin (across all management groups) for
     // its window — cookie-session-only, so unreachable by MCP/service tokens.
@@ -1362,7 +1363,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // that invariant ever changes. Do NOT read its presence as evidence
     // elevation is reachable for service tokens today; it is not.
     if (auth::is_elevated(*session) && session->token_scope_service.empty())
-        return true;
+        return ScopedGateOutcome::Admitted;
 
     // Engine principals have NO legacy or service-scoped authority — their only
     // authority is an explicit RBAC assignment (design §4.2 default-deny). The
@@ -1379,7 +1380,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                               detail::A4ErrorOpts{.permission = securable_type + ":" +
                                                                         operation}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         if (!rbac_store_->is_rbac_enabled() ||
             !rbac_store_->check_scoped_permission(session->username, securable_type, operation,
@@ -1391,7 +1392,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // Belt-and-braces (#2298 PR 3, mirrors require_permission's identical
         // guard): engine-token mint already rejects a non-empty
@@ -1413,9 +1414,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             // "MUST NOT name a permission that wouldn't actually admit").
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
-        return true;
+        return ScopedGateOutcome::Admitted;
     }
 
     // MCP-tier tokens: enforce the tier policy then fall through to the standard
@@ -1433,7 +1434,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // On the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate in
         // mcp_server.cpp is the authoritative approval gate (ticket-then-recall,
@@ -1460,7 +1461,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                     "operation requires approval for this MCP tier on this transport",
                     detail::A4ErrorOpts{.remediation = remediation, .permission = perm}),
                 "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
     }
 
@@ -1480,7 +1481,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403,
                                               "service-scoped tokens require RBAC to be enabled"),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // Check that the ITServiceOwner role grants this permission type
         // Shared ceiling helper (authz::service_ceiling_check). A Degraded verdict (a failed
@@ -1493,7 +1494,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                      "service-scoped token blocked: RBAC read degraded "
                                      "resolving the ITServiceOwner ceiling",
                                      ceiling);
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         // Everything that is not an explicit Admit is refused: a Deny verdict, and any
         // out-of-range value, which must never fall through to the admit.
@@ -1509,7 +1510,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                               " (requires ITServiceOwner AND the target agent's service tag "
                               "to match the token's scope)";
             res.set_content(detail::a4_denial(res, 403, msg), "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // Verify the target agent's service tag matches the token's scope
         if (!tag_store_) {
@@ -1520,7 +1521,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 503, "tag store unavailable, cannot verify scope",
                                               detail::A4ErrorOpts{.retry_after_ms = 5000}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         // #2298 PR 3 (§3b): an empty agent_id used to skip the ONLY
         // comparison that could deny and fall through to an unconditional
@@ -1541,7 +1542,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 400, "agent_id is required",
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // ADR-0050 typed read: a degraded store is a 503 (retryable),
         // never conflated with "agent has no service tag" — the
@@ -1557,7 +1558,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                               "tag store unavailable, cannot verify scope",
                                               detail::A4ErrorOpts{.retry_after_ms = 5000}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         const std::string agent_service = service_tag->value_or(std::string{});
         if (agent_service != session->token_scope_service) {
@@ -1572,9 +1573,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                                   session->token_scope_service + "'",
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
-        return true;
+        return ScopedGateOutcome::Admitted;
     }
 
     // #1717 (ADR-0017 ship-now HIGH): gate on `rbac_enforcement_in_effect`, NOT
@@ -1588,16 +1589,19 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         // a degraded scoped check is still a fail-closed 403 (ADR-0041 deny-on-degrade), not a 503.
         // The detail keeps the `RBAC denied` prefix (a denial either way) and adds a greppable
         // `read degraded:` token that does NOT reuse the 503 forms' "RBAC read degraded resolving
-        // the ITServiceOwner ceiling" phrase (upgrading.md's runbook keys on that phrase).
+        // the ITServiceOwner ceiling" phrase (upgrading.md's runbook keys on that phrase). The
+        // same store label is returned as the outcome class (MgmtGroupReadDegraded or
+        // RbacReadDegraded), so a typed caller learns what the audit row says.
         const auto scoped = rbac_store_->check_scoped_permission_checked(
             session->username, securable_type, operation, agent_id, mgmt_group_store_);
         if (!scoped.has_value() || !*scoped) {
             std::string denial_detail = "RBAC denied " + securable_type + ":" + operation;
+            ScopedGateOutcome refused = ScopedGateOutcome::Denied;
             if (!scoped.has_value()) {
-                const char* source =
-                    scoped.error() == kRbacErrMgmtGroupReadDegraded ? "mgmt_group_store"
-                                                                    : "rbac_store";
-                denial_detail += std::string(" (read degraded: ") + source + ")";
+                refused = scoped.error() == kRbacErrMgmtGroupReadDegraded
+                              ? ScopedGateOutcome::MgmtGroupReadDegraded
+                              : ScopedGateOutcome::RbacReadDegraded;
+                denial_detail += " (read degraded: " + std::string(degraded_store(refused)) + ")";
             }
             // target_type/target_id/detail spelled out: passing the id and the message
             // positionally lands the id in `target_type` and the message in `target_id` (#3219).
@@ -1608,9 +1612,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return refused;
         }
-        return true;
+        return ScopedGateOutcome::Admitted;
     }
 
     // Legacy fallback: write/delete/execute/approve require admin (effective_role
@@ -1653,9 +1657,17 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                           detail::A4ErrorOpts{.permission = securable_type + ":" +
                                                                     operation}),
                         "application/json");
-        return false;
+        return ScopedGateOutcome::Denied;
     }
-    return true;
+    return ScopedGateOutcome::Admitted;
+}
+
+bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib::Response& res,
+                                           const std::string& securable_type,
+                                           const std::string& operation,
+                                           const std::string& agent_id) {
+    return require_scoped_permission_outcome(req, res, securable_type, operation, agent_id) ==
+           ScopedGateOutcome::Admitted;
 }
 
 ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib::Response& res,
@@ -2689,8 +2701,8 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
     //    answer is never cached and is never recorded as "not armed".
     // The refresh itself is bounded in time (break_glass_status caps the pool acquire, the lock
     // wait and the statement). Two facts are kept across failed reads for the MFA step's second
-    // re-check: the id of the last definitive armed read and when the last definitive not-armed
-    // read started.
+    // re-check: the id of the last definitive armed read and the newest "not armed" time (an
+    // own read's end, a shared refresh's start; it never moves back).
     auto* metrics = auth_mgr_.metrics_registry();
     const auto count = [metrics](const char* result) {
         if (metrics)
@@ -2819,8 +2831,11 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
         out.read_wall_at = started_wall;
         return out;
     }
-    // A definitive "not armed". The last armed id is left in place on purpose.
-    bg_last_not_armed_at_ = started;
+    // A definitive "not armed". The last armed id is left in place on purpose. The time is this
+    // read's START, and it only ever moves forward: an own read that ended later may already have
+    // recorded a newer time, which a slow shared read must not lower (SG-1).
+    if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < started)
+        bg_last_not_armed_at_ = started;
     out.last_not_armed_at = bg_last_not_armed_at_;
     out.state = SsoOnlyLocalGate::kRefused;
     out.why = read.armed_until.empty() ? SsoOnlyRefusedWhy::kDisarmed
@@ -3826,7 +3841,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             mfa_verify_barrier_for_test_("/login/mfa", proof);
         // Re-check the arm state once more at the mint (the code verification took time). A code
         // may already be spent here, so the three answers are kept apart:
-        //  - armed: mint;
+        //  - armed: mint, unless the "not armed" time this server holds is at or after this
+        //    read started (then it is a disarm, refused);
         //  - a definitive "not armed": refuse (the refusal is honest about a spent code);
         // This check reads the arm state ITSELF (no shared cache, no single flight), so a refresh
         // held by another request, or an old cache, cannot refuse a login whose code is spent.
@@ -3852,9 +3868,16 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 wall2 - arm1->wall_at <= kArmSnapshotMaxAge &&
                 !arm1->arm_id.empty() && gate2.arm_id == arm1->arm_id &&
                 !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at);
-            const bool admit =
-                arm1.has_value() &&
-                (gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);
+            // An armed own read is honoured only if the "not armed" time this server holds is
+            // before it STARTED; a time at or after that is the newer fact (C-01, PR #8626
+            // review). An own read records that time at its END, a shared refresh at its START,
+            // so a shared "not armed" read that started before this read but finished during it
+            // does not refuse it (a documented residual, auth-architecture.md arm-gate
+            // invariant (2)).
+            const bool armed_ok =
+                gate2.state == SsoOnlyLocalGate::kBreakGlassArmed &&
+                !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= gate2.read_at);
+            const bool admit = arm1.has_value() && (armed_ok || transient_ok);
             if (!admit) {
                 const char* reason = "transient";
                 const char* detail = "reason=break_glass_arm_state_unreadable_before_mint";
@@ -6091,11 +6114,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         }
-        // Revoking eligibility must terminate any in-flight elevation
-        // immediately (governance UP-1) — symmetric with the session
-        // wipe on demote/delete, so an incident-response "revoke now"
-        // actually drops the operator's admin access rather than
-        // leaving it standing for up to the window.
+        // Revoking eligibility must terminate any in-flight elevation (governance UP-1):
+        // at once on this replica, and on the others at their next session-generation poll
+        // (about 1 s, up to about 30 s while that read is failing or slow; neither bound holds
+        // after a database restore or a failover to a lagging standby, which can bring a cleared
+        // elevation back: restart every replica, see docs/ops-runbooks/auth-db-recovery.md,
+        // "Sessions are durable"). Symmetric with the
+        // session wipe on demote/delete, so an incident-response "revoke now" actually drops
+        // the operator's admin access rather than leaving it standing for up to the window.
         int cleared = 0;
         if (!eligible) {
             auto rv = auth_mgr_.revoke_user_elevations(target);
@@ -6426,6 +6452,61 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
+        // Re-read eligibility AFTER the elevation has committed, fail CLOSED. The eligibility revoke flips the flag BEFORE it clears the user's durable
+        // elevations, so either this re-read sees the flipped flag (and this branch rolls the
+        // elevation back), or the flip comes after this re-read, which means the revoke's clear
+        // runs after the elevation committed and ends it. The check before elevate_session
+        // alone leaves a window in which the clear matches no row and the elevation then
+        // commits. No `role.elevation.granted` row is written in any of the three outcomes (403,
+        // 503, 500). In the first two the elevation was rolled back; in the third (the
+        // compensating revoke failed) it may still be live.
+        if (auto post = db->is_elevation_eligible(session->username); !post || !*post) {
+            auto undo = auth_mgr_.revoke_elevation(token); // same compensation as the audit arm
+            if (!undo) {
+                // The compensating revoke itself failed durably: the elevation is LIVE for an
+                // account that is no longer eligible (or whose eligibility is unreadable).
+                spdlog::critical("elevation for '{}' committed but eligibility {} AND the "
+                                 "compensating revoke FAILED ({}) - elevation is LIVE; manual "
+                                 "revocation required",
+                                 ::yuzu::log_key_token(session->username),
+                                 post ? "was revoked" : "could not be re-read", undo.error());
+                audit_log_for_principal(req, "role.elevation.denied", "error", session->username,
+                                        auth::role_to_string(session->role), "User",
+                                        session->username,
+                                        "eligibility recheck after grant failed; "
+                                        "rollback_failed=true");
+                res.status = 500;
+                res.set_content(
+                    detail::error_json_a4(
+                        500, "elevation could not be rolled back; it may be active", cid,
+                        "end it with POST /api/v1/elevate/revoke from this session, or have an "
+                        "administrator send POST /api/v1/users/{name}/elevation-eligibility with "
+                        "{\"eligible\": false}; then check the auth + session stores"),
+                    "application/json");
+                return;
+            }
+            audit_log_for_principal(req, "role.elevation.denied", post ? "denied" : "error",
+                                    session->username, auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    post ? "eligibility revoked during elevation"
+                                         : "eligibility read failed after elevation");
+            if (!post) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "eligibility could not be confirmed "
+                                                           "after the elevation; the elevation "
+                                                           "was rolled back",
+                                                      cid, "retry shortly or contact an "
+                                                           "administrator"),
+                                "application/json");
+                return;
+            }
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid,
+                                                  "ask an administrator to grant you elevation "
+                                                  "eligibility"),
+                            "application/json");
+            return;
+        }
         // `until` may be CLAMPED to the session's own absolute expiry
         // (follow-up B, security review 2026-06-30) — report the TRUE
         // remaining time, not the requested/capped `duration`. A live window
@@ -6530,7 +6611,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
-                  auto rev = auth_mgr_.revoke_elevation(token);
+                  bool lookup_degraded = false;
+                  auto rev = auth_mgr_.revoke_elevation(token, &lookup_degraded);
                   if (!rev) {
                       // Durable clear failed — the elevation may still be LIVE.
                       // Fail CLOSED (503 + error audit) rather than auditing a
@@ -6549,10 +6631,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       return;
                   }
                   const bool was_elevated = *rev;
+                  // A degraded pre-clear lookup means the clear succeeded but whether the
+                  // session WAS elevated is unknown (`*rev` is then only "a row existed"):
+                  // never claim an elevation was ended.
                   audit_log_for_principal(req, "role.elevation.revoked", "ok", session->username,
                                           auth::role_to_string(session->role), "User",
                                           session->username,
-                                          was_elevated ? "was_elevated=true" : "was_elevated=false");
+                                          lookup_degraded ? "was_elevated=unknown"
+                                          : was_elevated  ? "was_elevated=true"
+                                                          : "was_elevated=false");
                   res.set_content(R"({"status":"ok"})", "application/json");
               });
 }

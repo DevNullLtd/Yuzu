@@ -14,6 +14,7 @@
 #include "oidc_provider.hpp"
 #include "saml_provider.hpp"
 #include "rbac_store.hpp"
+#include "scoped_gate_outcome.hpp"
 #include "service_scope_policy.hpp" // authz::PermPair — the test-override seam's element type
 #include "tag_store.hpp"
 
@@ -236,7 +237,9 @@ struct SsoOnlyGateResult {
     /// STARTED. The MFA step's second check measures wall time from it, so a host suspend between
     /// the read and the first check is seen too. Not set by the second check's own read.
     std::chrono::system_clock::time_point read_wall_at{};
-    /// When the last successful read that said NOT armed started (unset when there was none).
+    /// The newest "not armed" time this server holds (unset when there was none): an own read
+    /// records when it ENDED, a shared refresh when it STARTED, and the time never moves back
+    /// (only the test seam `reset_break_glass_arm_cache_for_test` clears it).
     std::optional<std::chrono::steady_clock::time_point> last_not_armed_at;
 
     /// The ONE admit set for "evaluate a local password": open mode or an armed break-glass
@@ -341,7 +344,9 @@ public:
     }
     /// Test seam: freeze the clock the arm gate and the MFA step's re-checks read, at `ms` after
     /// the steady-clock epoch, and move it by hand. Atomic, so a test may advance it while request
-    /// threads run. Never set in production (a negative value means the real clock).
+    /// threads run. Never set in production (a negative value means the real clock). Move it
+    /// FORWARD only, or call `reset_break_glass_arm_cache_for_test()` first: the "not armed" time
+    /// never moves back, so a clock set behind it refuses every armed read.
     void set_arm_clock_for_test(std::int64_t ms) { arm_clock_test_ms_.store(ms); }
     void advance_arm_clock_for_test(std::int64_t ms) { arm_clock_test_ms_.fetch_add(ms); }
     /// Test seam: freeze the WALL clock the MFA step's second re-check reads (see
@@ -572,9 +577,24 @@ public:
     TierPolicyFn gateless_tier_policy_fn();
 
     /// Scoped RBAC-aware permission check for device-specific operations.
+    ///
+    /// This is the `== ScopedGateOutcome::Admitted` wrapper over
+    /// `require_scoped_permission_outcome`, which holds the ONE body of the gate. A caller that
+    /// only needs admit-or-refuse keeps this Boolean path.
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
                                    const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id);
+
+    /// The ONE body of the per-device scoped gate: the same checks, statuses, bodies, audit rows
+    /// and metrics as always, returning the refusal class instead of a bool. Never add a second
+    /// body or a second admitting value; `require_scoped_permission` is this function compared
+    /// with `ScopedGateOutcome::Admitted`. A caller that must tell "denied" from "an
+    /// authorization read failed" (the Echo purge surfaces) uses this accessor and admits only on
+    /// `== Admitted`.
+    [[nodiscard]] ScopedGateOutcome
+    require_scoped_permission_outcome(const httplib::Request& req, httplib::Response& res,
+                                      const std::string& securable_type,
+                                      const std::string& operation, const std::string& agent_id);
 
     /// The transport-layer ADR-0017 admit-then-filter list-read gate — the
     /// SOLE authorization gate for a list/fan-out route reading per-agent
@@ -1449,7 +1469,8 @@ private:
     std::chrono::system_clock::time_point bg_arm_started_wall_{}; ///< the same instant on the wall clock
     std::string bg_arm_id_;                                    ///< `armed_until` of the cached read
     /// Kept across failed reads and across not-armed reads: the id of the last definitive armed
-    /// read, and when the last definitive not-armed read started.
+    /// read, and the newest "not armed" time (an own read's end, a shared refresh's start; it
+    /// never moves back).
     std::string bg_last_armed_id_;
     std::optional<std::chrono::steady_clock::time_point> bg_last_not_armed_at_;
     std::atomic<bool> bg_arm_refreshing_{false};

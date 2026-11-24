@@ -8,9 +8,11 @@
  * it needs) the agent's echo plugin loads OFFLINE and retries; it publishes the reason as the KV key
  * `heartbeat.storage_offline`, which the plugin heartbeat bridge turns into the status tag below.
  * Without this gauge such an agent drops out of yuzu_fleet_plugin_init_failed (the plugin no longer
- * fails init) with nothing replacing it.
+ * fails init) with nothing replacing it. The same tag carries `rollback_wedged` for a database that
+ * opened and then was closed at run time after a failed rollback (not retried: only an agent
+ * restart recovers).
  *
- * The tag value is agent-controlled, so the label set is CLOSED: the three tokens the plugin
+ * The tag value is agent-controlled, so the label set is CLOSED: the four tokens the plugin
  * writes, and `unknown` for anything else (a renamed token, an over-long or newline-bearing value).
  * The tokens are duplicated literals of agents/plugins/echo/src/echo_status_format.hpp's
  * offline_reason_token(): there is no shared header between a plugin and the server, so a test on
@@ -32,8 +34,8 @@ namespace yuzu::server::detail {
 inline constexpr const char* kEchoTagStorageOffline = "yuzu.plugin.echo.storage_offline";
 
 /// The closed gauge label set, in index order; the last entry catches every unrecognised value.
-inline constexpr std::array<std::string_view, 4> kEchoStorageOfflineReasons{
-    "free_space", "migration_failed", "open_failed", "unknown"};
+inline constexpr std::array<std::string_view, 5> kEchoStorageOfflineReasons{
+    "free_space", "migration_failed", "open_failed", "rollback_wedged", "unknown"};
 
 /// Map a tag value to its label index: nullopt for an empty value (not offline), the token's
 /// index for an exact match, the `unknown` index for anything else.

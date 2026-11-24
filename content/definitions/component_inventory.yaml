@@ -1,7 +1,8 @@
 ## Component Inventory Definitions
-## Reports Java archives and the libraries nested inside them (action scan), and versioned shared
-## libraries (action native), found by reading application trees. Read-only, zero subprocess.
-## Plugin: component_inventory | Actions: scan, native (the native definition follows the scan one)
+## Reports Java archives and the libraries nested inside them (action scan), versioned shared
+## libraries (action native), installed Python distributions (action python) and Node packages
+## (action node), found by reading application trees. Read-only, zero subprocess.
+## Plugin: component_inventory | Actions: scan, native, python, node (one definition each, in that order)
 ##
 ## ---- scan ----
 ##
@@ -284,6 +285,237 @@ spec:
         platforms: [darwin, linux]
 
   readablePayload: "Scan application trees for native libraries"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [component_inventory]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.components.python
+  displayName: Python Distribution Inventory
+  version: 1.0.0
+  description: >
+    Reports installed Python distributions found under the machine-wide interpreter and application
+    roots: one row per distribution (name, version and where the version came from, path of its
+    metadata file, size, modification time and the application folder it sits under). Linux reads
+    the python3 and python3.N directories of /usr/local/lib, and /opt in full; macOS reads
+    /Library/Frameworks/Python.framework/Versions and the python3.N directories of /opt/homebrew/lib
+    and /usr/local/lib. The system interpreter trees under /usr/lib are not read on Linux: the
+    package manager owns them and their distributions are already package rows. Only the first
+    16 KiB of a METADATA, PKG-INFO or single-file .egg-info is read, and nothing inside a
+    distribution's own source tree is listed. Per-user locations are not read; Windows is not read
+    yet. No process is started and no Python code is run. This action ships enabled and is dispatched
+    by an operator; it is not part of the daily report.
+    A `supported` status means the scan finished with no bound reached; a `constrained` status
+    means a bound was hit or something could not be read in full, so the list may be incomplete,
+    and it names its one cause. A metadata file that cannot be read gets a row anyway, with
+    version_source `unreadable`; that does not make the scan incomplete. The directories the walk
+    skips by design are not named on the status row; their count is logged by the plugin at info level. `supported`
+    with no rows means none was found at those roots, not that none is installed. The result is a
+    live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds
+    and 400,000 directory entries, and it cannot be cancelled once started. Terminal causes (a
+    repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated.
+    Retryable causes: budget_time, dir_unreadable, archive_changed (a file's size or modification
+    time changed while it was read), mount_table_unreadable, internal_error.
+  tags: [components, python, inventory]
+
+spec:
+  type: question
+  platforms: [darwin, linux]
+
+  execution:
+    plugin: component_inventory
+    action: python
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|python|<level>|<tokens or ->   (always first)
+    # comp|python|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), comp (one per distribution found).'
+        values: [status, comp]
+        example: comp
+        platforms: [darwin, linux]
+      - name: kind
+        type: string
+        description: 'Component kind. Values: python. Status rows: the action name (python).'
+        example: python
+        platforms: [darwin, linux]
+      - name: name
+        type: string
+        description: 'Distribution name from its metadata (Name: of a METADATA or PKG-INFO), else the name in the .dist-info or .egg-info directory name, else that directory or file name itself. A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported).'
+        example: requests
+        platforms: [darwin, linux]
+      - name: version
+        type: string
+        description: 'The Version: of its metadata, else the version in the .dist-info or .egg-info directory name (requests-2.31.0.dist-info reads 2.31.0). Empty when none gives one. Status rows: the comma-joined cause tokens, or -.'
+        example: 2.31.0
+        platforms: [darwin, linux]
+      - name: version_source
+        type: string
+        description: 'Where the version came from. Values: metadata (the Version: header), filename (the directory name carried it), unreadable (neither gave a version; the row is still listed and the scan is not made incomplete by it).'
+        values: [metadata, filename, unreadable]
+        example: metadata
+        platforms: [darwin, linux]
+      - name: path
+        type: string
+        description: 'Absolute path of the distribution metadata file. A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?.'
+        example: /usr/local/lib/python3.12/site-packages/requests-2.31.0.dist-info/METADATA
+        platforms: [darwin, linux]
+      - name: size
+        type: int64
+        description: 'Size of the distribution metadata file in bytes.'
+        example: "6300"
+        platforms: [darwin, linux]
+      - name: mtime
+        type: int64
+        description: 'Modification time of the distribution metadata file as Unix seconds.'
+        example: "1700000000"
+        platforms: [darwin, linux]
+      - name: anchor_app
+        type: string
+        description: 'First path component below the scanned root: the application folder the distribution metadata file sits under (the folder name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?.'
+        example: site-packages
+        platforms: [darwin, linux]
+
+  readablePayload: "Scan interpreter trees for Python distributions"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [component_inventory]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.components.node
+  displayName: Node Package Inventory
+  version: 1.0.0
+  description: >
+    Reports installed Node packages found under the machine-wide module roots: one row per package
+    (name, version and where the version came from, path of its package.json, size, modification
+    time and the application folder it sits under). Linux reads /usr/lib/node_modules,
+    /usr/local/lib/node_modules and /opt; macOS reads /opt/homebrew/lib/node_modules,
+    /usr/local/lib/node_modules and /Applications. Packages nested inside other packages'
+    node_modules are listed down to 8 levels of node_modules; a package's own source tree and .bin
+    are not read. At most 64 KiB of a package.json is read. Packages packed into an asar archive and
+    per-user installs are not read; Windows is not read yet. No process is started and no script is
+    run. This action ships enabled and is dispatched by an operator; it is not part of the daily
+    report.
+    A `supported` status means the scan finished with no bound reached; a `constrained` status
+    means a bound was hit or something could not be read in full, so the list may be incomplete,
+    and it names its one cause. A metadata file that cannot be read gets a row anyway, with
+    version_source `unreadable`; that does not make the scan incomplete. The directories the walk
+    skips by design are not named on the status row; their count is logged by the plugin at info level. `supported`
+    with no rows means none was found at those roots, not that none is installed. The result is a
+    live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds
+    and 400,000 directory entries, and it cannot be cancelled once started. Terminal causes (a
+    repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated.
+    Retryable causes: budget_time, dir_unreadable, archive_changed (a file's size or modification
+    time changed while it was read), mount_table_unreadable, internal_error.
+  tags: [components, node, inventory]
+
+spec:
+  type: question
+  platforms: [darwin, linux]
+
+  execution:
+    plugin: component_inventory
+    action: node
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|node|<level>|<tokens or ->   (always first)
+    # comp|node|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), comp (one per package found).'
+        values: [status, comp]
+        example: comp
+        platforms: [darwin, linux]
+      - name: kind
+        type: string
+        description: 'Component kind. Values: node. Status rows: the action name (node).'
+        example: node
+        platforms: [darwin, linux]
+      - name: name
+        type: string
+        description: 'Package name from its package.json, else the directory name (scoped packages keep their @scope/). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported).'
+        example: express
+        platforms: [darwin, linux]
+      - name: version
+        type: string
+        description: 'The version field of its package.json. Empty when none gives one. Status rows: the comma-joined cause tokens, or -.'
+        example: 4.19.2
+        platforms: [darwin, linux]
+      - name: version_source
+        type: string
+        description: 'Where the version came from. Values: package_json (the file was read and parsed; the version may still be empty when it declares none), unreadable (the file could not be read in full, is not a JSON object or nests too deep; the row is still listed, named from the directory, and the scan is not made incomplete by it).'
+        values: [package_json, unreadable]
+        example: package_json
+        platforms: [darwin, linux]
+      - name: path
+        type: string
+        description: 'Absolute path of the package.json. A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?.'
+        example: /usr/local/lib/node_modules/express/package.json
+        platforms: [darwin, linux]
+      - name: size
+        type: int64
+        description: 'Size of the package.json in bytes.'
+        example: "1800"
+        platforms: [darwin, linux]
+      - name: mtime
+        type: int64
+        description: 'Modification time of the package.json as Unix seconds.'
+        example: "1700000000"
+        platforms: [darwin, linux]
+      - name: anchor_app
+        type: string
+        description: 'First path component below the scanned root: the application folder the package.json sits under (the folder name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?.'
+        example: express
+        platforms: [darwin, linux]
+
+  readablePayload: "Scan module roots for Node packages"
 
   gather:
     ttlSeconds: 300

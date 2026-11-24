@@ -127,6 +127,7 @@ struct EchoHarness {
     bool dispatch_throws_other = false; ///< the dispatch throws something that is no std::exception
     bool caller_throws = false; ///< deriving the dispatch caller throws
     int write_probes = 0; ///< scoped-gate calls for Write, which this stub always refuses
+    int scoped_calls = 0; ///< scoped-gate calls of any operation: the permission check, and in production its denial audit
     /// "audit:<action>/<result>" and "dispatch", in call order: proves the `attempted` row
     /// precedes every dispatch it covers.
     std::vector<std::string> order;
@@ -134,6 +135,7 @@ struct EchoHarness {
     struct AuditRow {
         std::string action, result, target_id, detail;
         std::string principal; ///< stamped by the session-bound writer (the push); empty otherwise
+        std::string session;   ///< the live session_user when the plain writer recorded the row; else empty
     };
     std::vector<AuditRow> audit_log;
     /// Whether the audit store persists a given row (read live per row), applied after
@@ -205,6 +207,7 @@ struct EchoHarness {
         // counted and refused: no route here may probe it (the dispatch chokepoint decides Write).
         auto scoped = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                              const std::string& op, const std::string& dev) {
+            ++scoped_calls;
             if (op == "Write")
                 ++write_probes;
             bool ok = (op == "Execute") ? allow_execute : (op != "Write" && allow_read);
@@ -297,7 +300,7 @@ struct EchoHarness {
             // DexRoutes::AuditFn (aliased by EchoTreeRoutes) is bool-returning (#1549); #1647:
             // record_audit records the row before the throw, so the shared helper's catch-arm
             // is exercised.
-            return record_audit({a, r, tid, d, {}});
+            return record_audit({a, r, tid, d, {}, session_user});
         };
         routes.register_routes(sink, auth, perm, scoped, devices, lookup,
                                wire_dispatch ? EchoTreeRoutes::DispatchFn{dispatch}
@@ -821,7 +824,7 @@ TEST_CASE("Echo capture-sources: an offline device shows the agent's reason, not
         "error|Echo storage is offline on this endpoint; the database was closed after a "
         "transaction could not be rolled back. Collection and retention are both stopped. The "
         "read-only query connection is unavailable too, so `echo sql` cannot read the historical "
-        "data either. Restart the agent to recover.\nstorage_state|offline";
+        "data either. Restart the agent to recover.\nstorage_state|offline|rollback_wedged";
 
     auto res = h.run_capture_sources();
     REQUIRE(res != nullptr);
@@ -1029,15 +1032,14 @@ TEST_CASE("echo routes: /result shows the resolved hour and an Hour selector for
     }
 }
 
-TEST_CASE("echo routes: an agent without the roll-up store gets the upgrade note for the tree",
+TEST_CASE("echo routes: an agent without the roll-up store gets the plain error for the tree",
           "[echo][routes][skew]") {
     EchoHarness h;
     h.proc_output = "error|no such column: parent_name";
     auto r = h.run_result();
     REQUIRE(r);
-    CHECK(r->body.find("This device runs an agent without the roll-up store: upgrade the agent") !=
-          std::string::npos);
-    CHECK(r->body.find("parent_name") == std::string::npos); // the raw SQLite text is not the message
+    CHECK(r->body.find("The device reported an error: no such column: parent_name") != std::string::npos);
+    CHECK(r->body.find("upgrade the agent") == std::string::npos);
     CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
 
     SECTION("any other agent error keeps its reason") {
@@ -1054,7 +1056,9 @@ TEST_CASE("echo routes: an agent without the roll-up store gets the upgrade note
         h.frames_override[kProcCmd] = {f};
         auto failed = h.run_result();
         REQUIRE(failed);
-        CHECK(failed->body.find("upgrade the agent") != std::string::npos);
+        CHECK(failed->body.find("The device reported an error: no such table: process_hourly") !=
+              std::string::npos);
+        CHECK(failed->body.find("upgrade the agent") == std::string::npos);
     }
     SECTION("an answer with no schema is unreadable and never an empty tree") {
         h.proc_output = "7200|bash|systemd|alice|3|3|1\n";
@@ -1074,7 +1078,9 @@ TEST_CASE("echo routes: the tree names why connections are missing", "[echo][rou
         REQUIRE(r);
         CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos); // tree kept
         CHECK(r->body.find("Connection data was unavailable for this host") != std::string::npos);
-        CHECK(r->body.find("upgrade the agent") != std::string::npos);
+        CHECK(r->body.find("The device reported an error: no such column: failed_count") !=
+              std::string::npos);
+        CHECK(r->body.find("upgrade the agent") == std::string::npos);
     }
     SECTION("an answer with no schema") {
         h.tcp_output = "";
@@ -1424,18 +1430,60 @@ TEST_CASE("echo routes: /device-net audits the DNS and ARP rows it renders", "[e
     }
 }
 
+// #1578: the poll is bound to the session's device scope, not to the principal that dispatched, so a
+// second principal polling the first one's command ids reads under its own session and the rows say so.
+TEST_CASE("echo routes: /device-net polled by a second principal audits its DNS and ARP reads under it",
+          "[echo][routes][audit]") {
+    EchoHarness h;
+    h.dns_output = std::string(kDnsSchema) + "7200|a.test|A|1.1.1.1|1|0\n__total__|1\n";
+    h.arp_output = std::string(kArpSchema) + "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n";
+    const std::string base = "/fragments/echo/process-tree/device-net?device=dev-A&hour=7200";
+
+    // The first principal dispatches (no command ids yet) and holds the ids the page then polls with.
+    auto first = h.sink.Get(base);
+    REQUIRE(first);
+    CHECK(h.last_dispatch_caller.principal == "alice");
+    const auto* dns_sent = h.find_audit("echo.dns.read", "dispatched");
+    REQUIRE(dns_sent != nullptr);
+    CHECK(dns_sent->session == "alice");
+    const auto* arp_sent = h.find_audit("echo.arp.read", "dispatched");
+    REQUIRE(arp_sent != nullptr);
+    CHECK(arp_sent->session == "alice");
+    CHECK(h.find_audit("echo.dns.read", "success") == nullptr);
+    CHECK(h.find_audit("echo.arp.read", "success") == nullptr);
+
+    // A second principal, same scope and Execute, replays those ids (as the /detail replay case does).
+    h.session_user = "bob";
+    auto polled = h.sink.Get(base + "&dcmd=" + kDnsCmd + "&acmd=" + kArpCmd + "&n=1");
+    REQUIRE(polled);
+    CHECK(polled->status == 200);
+    CHECK(polled->body.find("a.test") != std::string::npos);
+    CHECK(h.dispatch_calls == 2); // the poll dispatched nothing
+
+    const auto* dns = h.find_audit("echo.dns.read", "success");
+    REQUIRE(dns != nullptr);
+    CHECK(dns->target_id == "dev-A");
+    CHECK(dns->session == "bob");
+    const auto* arp = h.find_audit("echo.arp.read", "success");
+    REQUIRE(arp != nullptr);
+    CHECK(arp->target_id == "dev-A");
+    CHECK(arp->session == "bob");
+}
+
 TEST_CASE("echo routes: a DNS or ARP failure is an error in the panel and never an empty note",
           "[echo][routes][skew]") {
     const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
                              "&acmd=" + kArpCmd + "&n=1&hour=7200";
-    const std::string upgrade = "This device runs an agent without the roll-up store: upgrade the agent";
     SECTION("an old agent, both panels") {
         EchoHarness h;
         h.dns_output = "error|query failed: no such column: negative_count";
         h.arp_output = "error|unknown table: $ARP_Hourly";
         auto r = h.sink.Get(poll);
         REQUIRE(r);
-        CHECK(count_occurrences(r->body, upgrade) == 2);
+        CHECK(r->body.find("The device reported an error: query failed: no such column: negative_count") !=
+              std::string::npos);
+        CHECK(r->body.find("The device reported an error: unknown table: $ARP_Hourly") != std::string::npos);
+        CHECK(r->body.find("upgrade the agent") == std::string::npos);
         CHECK(r->body.find("recorded for this hour") == std::string::npos);
         CHECK(r->body.find("may be disabled") == std::string::npos);
     }
@@ -2423,4 +2471,57 @@ TEST_CASE("capture-sources push: every result series exists before the first pus
                                "dispatch_denied", "dispatch_exception"})
         CHECK(text.find(std::string("yuzu_echo_sources_push_total{result=") + '"' + result + '"' +
                         "}") != std::string::npos);
+}
+
+// #7811: a device id reaches target_id on every audit row and the permission-denial audit, so
+// the fragment routes refuse an over-long or control-byte id before any check, audit or dispatch.
+// Every harness below holds `scope_device = "dev-A"`, so the scoped gate would answer 403 for any
+// id used here: a 400 with `scoped_calls == 0` proves the id check runs first (the permission
+// check, and in production the denial audit that carries the id, never ran), where the empty
+// audit log and the zero dispatches alone are also true of a route that never audits or sends.
+TEST_CASE("echo routes: a fragment route refuses an unsafe device id before any audit or dispatch",
+          "[echo][routes][audit]") {
+    const std::string kLong(257, 'a');
+    const std::vector<std::string> bad = {kLong, "dev%00A", "dev%0D%0AA", "dev%0AA", "dev%09A"};
+    const std::string tail = "&dcmd=" + kDnsCmd + "&acmd=" + kArpCmd + "&scmd=" + kStatusCmd +
+                             "&ccmd=" + kCompatCmd + "&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd +
+                             "&hcmd=" + kHoursCmd + "&n=1&hour=7200&preset=24h";
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        for (const char* route :
+             {"/fragments/echo/process-tree/run", "/fragments/echo/process-tree/result",
+              "/fragments/echo/process-tree/device-net", "/fragments/echo/capture-sources/load"}) {
+            INFO(route);
+            EchoHarness h;
+            h.scope_device = "dev-A";
+            auto r = h.sink.Get(std::string(route) + "?device=" + id + tail);
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(r->body.find("Invalid device id.") != std::string::npos);
+            CHECK(h.scoped_calls == 0);
+            CHECK(h.audit_log.empty());
+            CHECK(h.dispatch_calls == 0);
+        }
+        EchoHarness h;
+        h.scope_device = "dev-A";
+        auto p = h.sink.Post("/fragments/echo/capture-sources/push?device=" + id + "&changes=process%3Don", "");
+        REQUIRE(p);
+        CHECK(p->status == 400);
+        CHECK(h.scoped_calls == 0);
+        CHECK(h.audit_log.empty());
+        CHECK(h.dispatch_calls == 0);
+    }
+}
+
+TEST_CASE("echo routes: a 256-byte printable device id passes the validator and reaches the scoped check",
+          "[echo][routes][authz]") {
+    EchoHarness h;
+    h.scope_device = "dev-A"; // the scoped gate denies any other device with a 403
+    const std::string id(256, 'a');
+    auto r = h.sink.Get("/fragments/echo/process-tree/device-net?device=" + id + "&dcmd=" + kDnsCmd +
+                        "&acmd=" + kArpCmd + "&n=1&hour=7200");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+    CHECK(r->body.find("Invalid device id.") == std::string::npos);
+    CHECK(h.scoped_calls >= 1); // the same harness does reach the permission check for a safe id
 }

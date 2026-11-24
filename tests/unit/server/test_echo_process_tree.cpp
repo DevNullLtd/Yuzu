@@ -907,9 +907,10 @@ TEST_CASE("render_echo_arp_panel: appeared and removed counts for the selected h
 TEST_CASE("render_echo_dns_panel and arp: a failed read is an error and never an empty note",
           "[echo][dns][arp][panel]") {
     EchoReadNotes failed;
-    failed.error = "This device runs an agent without the roll-up store: upgrade the agent";
+    failed.error = "The device reported an error: no such table: process_hourly";
     for (const auto& html : {render_echo_dns_panel({}, 7200, failed), render_echo_arp_panel({}, 7200, failed)}) {
-        CHECK(html.find("upgrade the agent") != std::string::npos);
+        CHECK(html.find("The device reported an error") != std::string::npos);
+        CHECK(html.find("upgrade the agent") == std::string::npos);
         CHECK(html.find("devnet-empty") == std::string::npos);
         CHECK(html.find("recorded for this hour") == std::string::npos);
         CHECK(html.find("devnet-count\">&mdash;<") != std::string::npos);
@@ -957,18 +958,18 @@ TEST_CASE("render_echo_read_notes: says nothing when there is nothing to say", "
 }
 
 // B4: one pure mapping from an agent failure to the sentence the operator reads.
-TEST_CASE("echo_agent_error_note: a missing roll-up table or column says to upgrade the agent",
+TEST_CASE("echo_agent_error_note: a missing roll-up table or column is a plain error",
           "[echo][routes][skew]") {
-    const std::string upgrade = "This device runs an agent without the roll-up store: upgrade the agent";
-    // Every shape an agent without the roll-up tables answers with, for every table we read.
-    for (const char* skew : {"error|no such column: parent_name", "error|query failed: no such column: failed_count",
-                             "error|query failed: no such table: process_hourly",
-                             "error|unknown table: $Process_Hourly", "error|unknown table: $DNS_Hourly",
-                             "error|QUERY FAILED: NO SUCH COLUMN: is_router",
-                             "no such column: parent_name"}) { // a command's error detail has no prefix
+    // Every shape a device without the roll-up tables answers with: the reason is kept, no upgrade step.
+    for (const char* skew : {"error|no such column: parent_name", "error|query failed: no such table: process_hourly",
+                             "error|unknown table: $Process_Hourly", "no such column: parent_name"}) {
         INFO(skew);
-        CHECK(echo_agent_error_note(skew) == upgrade);
+        const auto note = echo_agent_error_note(skew);
+        CHECK(note.rfind("The device reported an error: ", 0) == 0);
+        CHECK(note.find("upgrade") == std::string::npos);
     }
+    CHECK(echo_agent_error_note("error|unknown table: $DNS_Hourly") ==
+          "The device reported an error: unknown table: $DNS_Hourly");
 }
 
 TEST_CASE("echo_agent_error_note: any other failure keeps its reason and only its first record",
@@ -976,7 +977,7 @@ TEST_CASE("echo_agent_error_note: any other failure keeps its reason and only it
     CHECK(echo_agent_error_note("error|database is locked") == "The device reported an error: database is locked");
     CHECK(echo_agent_error_note("database is locked") == "The device reported an error: database is locked");
     // Only the first record of a multi-record reply; the next record never leaks in.
-    const auto note = echo_agent_error_note("error|Echo storage is offline.\nstorage_state|offline");
+    const auto note = echo_agent_error_note("error|Echo storage is offline.\nstorage_state|offline|rollback_wedged");
     CHECK(note == "The device reported an error: Echo storage is offline.");
     CHECK(note.find("storage_state") == std::string::npos);
     // A reply with no reason still says it failed.
