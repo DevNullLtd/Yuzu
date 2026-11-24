@@ -112,9 +112,10 @@ struct ToolDeps {
     // (tests) means no cap. `ci_read_busy_fn` counts one refusal as busy (empty = not counted).
     BulkReadSlots* ci_read_slots{nullptr};
     std::function<void(hardware_ci_page::Surface)> ci_read_busy_fn;
-    // The `changed_since` watermark every served page carries (next_changed_since): production
-    // binds DeviceInventoryStore::device_ci_watermark, the SAME closure as REST's
-    // `Deps::ci_watermark_fn`. Empty (unwired) fails the page closed (hardware_ci_page::with_watermark).
+    // The `changed_since` watermark the FIRST response of a walk carries (next_changed_since; a
+    // cursor page or an agent_id point read neither calls it nor carries the key): production binds
+    // DeviceInventoryStore::device_ci_watermark, the SAME closure as REST's `Deps::ci_watermark_fn`.
+    // Empty (unwired) fails a first page closed (hardware_ci_page::with_watermark).
     hardware_ci_page::Watermark ci_watermark_fn;
     DexScoreFn dex_score_fn; // page rows only, never the whole roster (one query per call)
     QuarantineListFn quarantine_list_fn;

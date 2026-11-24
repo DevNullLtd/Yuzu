@@ -261,10 +261,12 @@ enum class ReadError {
 
 /// The REST `retry_after_ms` (and, rounded to seconds, `Retry-After`) and the MCP hint of `kBusy`.
 /// Derivation: the 500 ms slot wait plus one typical page read. A slot can be held for the store
-/// call plus the audit write(s) (about 62 s on REST in the worst case) and, on a FIRST page only,
-/// the one watermark read (one more pool lease, waiting up to 3 s, for a single-row
-/// query; a cursor page and a point read take none), so 2 s is a typical-contention hint, not a
-/// guarantee.
+/// call plus the audit write(s) (about 62 s on REST in the worst case, before the watermark read)
+/// and, on a FIRST page only, the one watermark read (a second pool lease: up to 3 s to acquire,
+/// up to 10 s to connect, then its single-row statement capped at 5 s by `SET LOCAL
+/// statement_timeout`, so up to 18 s more on a first page, the same bound the page read's own
+/// lease and statement have; a cursor page and a point read take none), so 2 s is a
+/// typical-contention hint, not a guarantee.
 inline constexpr std::int64_t kBusyRetryAfterMs = 2000;
 
 /// Wire message for a refused request: the cursor messages above, and for `kScopeTooWide` the

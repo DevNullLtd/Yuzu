@@ -432,7 +432,10 @@ TEST_CASE("openapi_spec_json(): GET /hardware-ci documents changed_since, change
                                "never derive it from max(changed_at), a later page or your own clock",
                                "never resume a saved cursor across days",
                                "do NOT send changed_since on a confirm read",
-                               "persistent 503 on a delta means drop changed_since and do a full walk",
+                               "If the SAME delta page keeps returning a 503 while unfiltered pages succeed, drop changed_since and run ONE full walk",
+                               "if the full walk's first page also fails (it reads the watermark too) the cause is not the delta plan: back off, do not loop",
+                               "Run the first full walk under the SAME global credential that will run the deltas",
+                               "first-page next_changed_since is NOT valid for a later global delta",
                                "a replica whose clock is behind the database clock can refuse a value the server issued",
                                "fleet-wide Inventory:Read grant"}) {
         INFO(needle);

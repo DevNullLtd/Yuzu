@@ -4394,6 +4394,29 @@ TEST_CASE("device_ci_watermark is the database clock minus the margin, and absen
     }
 }
 
+// Kills: a watermark that set its statement timeout with a plain SET (it would leak onto the pooled
+// connection for every later user) or not at all. The pool's one connection runs the read, then
+// its own `SHOW statement_timeout` is what it was before.
+TEST_CASE("device_ci_watermark's statement timeout is transaction-local",
+          "[pg][device_ci][changed_since][watermark]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    const auto show_timeout = [&]() -> std::string {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(lease.get(), "SHOW statement_timeout", std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        return PQgetvalue(res.get(), 0, 0);
+    };
+    const std::string before = show_timeout();
+    REQUIRE(before != std::string(yuzu::server::kDeviceCiWatermarkStatementTimeout)); // the check must be able to fail
+    REQUIRE(store.device_ci_watermark().has_value());
+    CHECK(show_timeout() == before);
+}
+
 TEST_CASE("device_ci_watermark on a closed store is nullopt", "[device_ci][changed_since]") {
     PgPool pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=x user=x", .size = 1}};
     DeviceInventoryStore store{pool};
@@ -4482,10 +4505,19 @@ TEST_CASE("migration v5 refuses a pre-existing changed_at that is not bigint NOT
     exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
     exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at");
     exec_stmt(pool, "UPDATE public.schema_meta SET version = 4 WHERE store = 'device_inventory_store'");
+    // ... whose runner table (public.yuzu_schema_migrations: one row per applied version, written in
+    // the same transaction as the version stamp) has no v5 row either; the seed above recorded one
+    exec_stmt(pool, "DELETE FROM public.yuzu_schema_migrations WHERE store = 'device_inventory_store' "
+                    "AND version = 5");
 
     const auto stored_version = [&] {
         return count_rows(pool, "SELECT version FROM public.schema_meta WHERE store = 'device_inventory_store'");
     };
+    const auto v5_hash_rows = [&] {
+        return count_rows(pool, "SELECT count(*) FROM public.yuzu_schema_migrations "
+                                "WHERE store = 'device_inventory_store' AND version = 5");
+    };
+    REQUIRE(v5_hash_rows() == 0); // the fixture is a v4 database
     const auto try_open = [&](std::string& log_text) {
         yuzu::test::LogCapture cap(spdlog::level::err);
         DeviceInventoryStore store{pool};
@@ -4503,12 +4535,14 @@ TEST_CASE("migration v5 refuses a pre-existing changed_at that is not bigint NOT
         CHECK(log.find("device_inventory_store.device_ci.changed_at must be bigint NOT NULL") != std::string::npos);
         CHECK(log.find("found type text, not null true") != std::string::npos);
         CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0); // the refused v5 recorded no hash either
         // nothing was built behind the refusal (the transaction rolled back as a whole)
         CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
                                "AND indexname = 'device_ci_changed_at_idx'") == 0);
         // and a restart repeats the refusal rather than stamping it
         CHECK_FALSE(try_open(log));
         CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0);
     }
     SECTION("a nullable BIGINT column") {
         exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at BIGINT");
@@ -4516,6 +4550,7 @@ TEST_CASE("migration v5 refuses a pre-existing changed_at that is not bigint NOT
         CHECK(log.find("changed_at must be bigint NOT NULL") != std::string::npos);
         CHECK(log.find("found type bigint, not null false") != std::string::npos);
         CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0);
     }
     SECTION("an INTEGER column") {
         exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at INTEGER NOT NULL "
@@ -4523,6 +4558,7 @@ TEST_CASE("migration v5 refuses a pre-existing changed_at that is not bigint NOT
         CHECK_FALSE(try_open(log));
         CHECK(log.find("found type integer, not null true") != std::string::npos);
         CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0);
     }
     SECTION("control: a hand-made bigint NOT NULL column is accepted and v5 is stamped") {
         exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at BIGINT NOT NULL "
@@ -4530,6 +4566,7 @@ TEST_CASE("migration v5 refuses a pre-existing changed_at that is not bigint NOT
         CHECK(try_open(log));
         CHECK(log.find("migration v5 failed") == std::string::npos);
         CHECK(stored_version() == 5);
+        CHECK(v5_hash_rows() == 1); // the control: an accepted v5 DOES record its hash
         CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
                                "AND indexname = 'device_ci_changed_at_idx'") == 1);
     }
@@ -4561,11 +4598,14 @@ TEST_CASE("device_ci_watermark is nullopt and counted as query_error when its st
     } // the lease goes back to the pool, idle
     REQUIRE(pid > 0);
     REQUIRE(count_rows(admin, "SELECT pg_terminate_backend(" + std::to_string(pid) + ")::int") == 1);
-    // wait until the backend is really gone (the terminate is asynchronous)
-    for (int i = 0; i < 100 && count_rows(admin, "SELECT count(*) FROM pg_stat_activity WHERE pid = " +
-                                                      std::to_string(pid)) != 0;
-         ++i)
+    // wait until the backend is really gone (the terminate is asynchronous), and REQUIRE it: a
+    // loop that fell through silently would run the statement on a live backend and flake red
+    const auto backend_gone = [&] {
+        return count_rows(admin, "SELECT count(*) FROM pg_stat_activity WHERE pid = " + std::to_string(pid)) == 0;
+    };
+    for (int i = 0; i < 250 && !backend_gone(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    REQUIRE(backend_gone());
 
     CHECK_FALSE(store.device_ci_watermark().has_value());
     CHECK(ci_read_degrades(metrics, "query_error") == 1.0);

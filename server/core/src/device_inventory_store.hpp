@@ -69,6 +69,11 @@ inline constexpr const char* kDeviceInventoryStoreSchema = "device_inventory_sto
 /// pull, and the periodic full walk is the backstop.
 inline constexpr std::int64_t kChangedSinceMarginSecs = 300;
 
+/// Execution cap of the watermark statement (`SET LOCAL statement_timeout` inside its transaction,
+/// like the keyset read's), so a stalled backend frees the pooled connection at this bound rather
+/// than at the pool's 30 s default. A first bulk page takes this lease after its keyset read.
+inline constexpr const char* kDeviceCiWatermarkStatementTimeout = "5s";
+
 /// The statement `DeviceInventoryStore::list_device_ci_after` runs for `q` and its bound
 /// parameters, in placeholder order. Exposed so a test can EXPLAIN the REAL statement (a copy of
 /// the text in a test would stay green with the store's spelling changed). Does not check the

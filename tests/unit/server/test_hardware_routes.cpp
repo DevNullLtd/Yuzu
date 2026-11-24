@@ -3506,7 +3506,7 @@ std::int64_t delta_now() {
 // drops the boundary row (> instead of >=), a row without changed_at, and a page without the
 // watermark the next pull needs.
 TEST_CASE("route: GET /api/v1/hardware-ci changed_since returns exactly the rows at or after it, each with "
-          "changed_at, and every page carries next_changed_since",
+          "changed_at, and the first response carries next_changed_since",
           "[hardware][route][rest][ci_page][changed_since]") {
     HwHarness h;
     const std::int64_t t = delta_now() - 1000;
@@ -3532,7 +3532,7 @@ TEST_CASE("route: GET /api/v1/hardware-ci changed_since returns exactly the rows
     REQUIRE(h.ci_store.queries.back().changed_since.has_value());
     CHECK(*h.ci_store.queries.back().changed_since == t);
     CHECK(db["data"]["devices"][0]["changed_at"] == t);
-    // the watermark is read on every page, the empty page of a delta included
+    // the watermark is read on every first response (no cursor), the empty page of a delta included
     auto none = h.sink.Get("/api/v1/hardware-ci?changed_since=" + std::to_string(delta_now()));
     REQUIRE(none);
     REQUIRE(none->status == 200);

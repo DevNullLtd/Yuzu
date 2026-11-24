@@ -22030,9 +22030,10 @@ private:
                 return std::nullopt;
             return device_inventory_store_->list_device_ci_after(q);
         };
-        // The `changed_since` watermark both bulk-read transports stamp on every served page
-        // (hardware_ci_page::with_watermark). An unwired store reads as a failure (nullopt), never
-        // a guessed value, and the transports answer that as a 503.
+        // The `changed_since` watermark both bulk-read transports stamp on the FIRST response of a
+        // walk only (no cursor, no agent_id; hardware_ci_page::with_watermark). An unwired store
+        // reads as a failure (nullopt), never a guessed value, and the transports answer that as a
+        // 503 / internal error.
         auto hw_ci_watermark_fn = [this]() -> std::optional<std::int64_t> {
             if (!device_inventory_store_)
                 return std::nullopt;

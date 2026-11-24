@@ -1119,6 +1119,16 @@ std::optional<std::int64_t> DeviceInventoryStore::device_ci_watermark() {
             spdlog::warn("DeviceInventoryStore: watermark read on a closed store");
         return std::nullopt;
     }
+    // The database's clock, minus the margin, in one statement: the same expression that authors
+    // `changed_at`, so on ONE primary the watermark and the stamps it brackets read the same clock
+    // and rounding (across a failover or a clock step they can disagree: the margin's residual).
+    // Run in a transaction whose SELECT is capped by SET LOCAL statement_timeout (the keyset read's
+    // idiom): the statement touches no table, but a stalled backend must not hold one of the shared
+    // pool's connections for the pool's 30 s default on every first page. A timeout is a nullopt
+    // (a degrade) like any other query error, never a guessed value.
+    const std::string sql = std::string("SELECT (") + kDbClockSecsExpr + ") - $1::bigint";
+    // Acquire first (bounded) so a lease timeout and a failure on a held connection (a failed
+    // BEGIN, a statement error, a timeout) keep their two distinct degrade reasons.
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
         static DegradeSampler s;
@@ -1127,19 +1137,34 @@ std::optional<std::int64_t> DeviceInventoryStore::device_ci_watermark() {
                          pool_.last_error());
         return std::nullopt;
     }
-    // The database's clock, minus the margin, in one statement: the same expression that authors
-    // `changed_at`, so on ONE primary the watermark and the stamps it brackets read the same clock
-    // and rounding (across a failover or a clock step they can disagree: the margin's residual).
-    const std::string sql = std::string("SELECT (") + kDbClockSecsExpr + ") - $1::bigint";
-    pg::PgResult res = pg::exec_params(
-        lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(kChangedSinceMarginSecs)});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1 || PQgetisnull(res.get(), 0, 0)) {
-        static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
-            spdlog::warn("DeviceInventoryStore: watermark read failed: {}", PQerrorMessage(lease.get()));
-        return std::nullopt;
+    std::optional<std::int64_t> out;
+    std::string err;
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
+        pg::PgResult t = pg::exec_params(
+            c, (std::string("SET LOCAL statement_timeout = '") + kDeviceCiWatermarkStatementTimeout + "'").c_str(),
+            std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(c, sql.c_str(),
+                                           std::vector<std::string>{std::to_string(kChangedSinceMarginSecs)});
+        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1 || PQgetisnull(res.get(), 0, 0)) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        out = to_i64(PQgetvalue(res.get(), 0, 0));
+        return true;
+    });
+    if (ok)
+        return out;
+    static DegradeSampler s;
+    if (note_read_degrade(metrics_, kReasonQueryError, s).should_log) {
+        // `err` is empty when BEGIN failed (the helper logs that itself) or the COMMIT did not take.
+        spdlog::warn("DeviceInventoryStore: watermark read failed: {}",
+                     err.empty() ? std::string("begin or commit failed") : ::yuzu::log_key_token(err));
     }
-    return to_i64(PQgetvalue(res.get(), 0, 0));
+    return std::nullopt;
 }
 
 namespace {

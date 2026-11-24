@@ -3341,6 +3341,9 @@ TEST_CASE("mcp list_hardware_ci_records: the changed_since input, the per-row ch
     CHECK(cs["type"] == "integer");
     CHECK(cs["minimum"] == 0);
     CHECK(cs["maximum"].is_number_integer()); // bounded, not open-ended
+    // the cursor is bound to BOTH the agent_id and the changed_since it was issued with
+    CHECK(tool["inputSchema"]["properties"]["cursor"]["description"].get<std::string>().find(
+              "Valid only with the same agent_id and changed_since it was issued with") != std::string::npos);
     CHECK(tool["annotations"]["readOnlyHint"] == true);
     const auto& out = tool["outputSchema"];
     CHECK(out["properties"]["next_changed_since"]["type"] == "integer");
@@ -3356,7 +3359,12 @@ TEST_CASE("mcp list_hardware_ci_records: the changed_since input, the per-row ch
                                "Only the FIRST response of a walk", "keep ONLY that value", "max(changed_at)",
                                "your own clock", "restart a failed walk from page 1",
                                "never resume a saved cursor across days", "Do NOT send changed_since on an agent_id confirm read",
-                               "does NOT mean no records exist", "persistent 503 on a delta means drop changed_since",
+                               "does NOT mean no records exist",
+                               // the conditional, capped fallback (round 2): never an unconditional loop
+                               "If the SAME delta page keeps returning an internal error (-32603) while unfiltered pages succeed, drop changed_since and run ONE full walk",
+                               "if the full walk's first page also fails (it reads the watermark too) the cause is not the delta plan: back off, do not loop",
+                               "Run the first full walk under the SAME global credential that will run the deltas",
+                               "first-page next_changed_since is NOT valid for a later global delta",
                                "a replica whose clock is behind the database", "fleet-wide Inventory:Read grant",
                                "agent_id and changed_since it was issued with"})
     {

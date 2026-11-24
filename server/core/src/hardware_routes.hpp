@@ -353,10 +353,12 @@ public:
         /// Counts one bulk read refused as busy (`yuzu_hardware_ci_read_busy_total{surface}`).
         /// Empty = not counted (tests that do not look).
         std::function<void(hardware_ci_page::Surface)> ci_read_busy_fn;
-        /// The `changed_since` watermark every served page carries (`data.next_changed_since`):
-        /// production binds `DeviceInventoryStore::device_ci_watermark` (the database clock minus
-        /// the margin, `nullopt` on any failure). Empty is an UNWIRED provider and the route answers
-        /// 503, never a page without the field (`hardware_ci_page::with_watermark`).
+        /// The `changed_since` watermark the FIRST response of a walk carries
+        /// (`data.next_changed_since`; no cursor, no agent_id; a cursor page or a point read omits
+        /// the key and never calls this): production binds
+        /// `DeviceInventoryStore::device_ci_watermark` (the database clock minus the margin,
+        /// `nullopt` on any failure). Empty is an UNWIRED provider and a first page answers 503,
+        /// never a first response without the field (`hardware_ci_page::with_watermark`).
         hardware_ci_page::Watermark ci_watermark_fn;
         ActionsFn actions_fn;
         ClassifyFn classify_fn;
