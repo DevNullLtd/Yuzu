@@ -338,8 +338,9 @@ std::string system_windows_directory() {
 // path. `%SystemDrive%\Users` is only an extra root when ProfilesDirectory is absent; it is not
 // a substitute for the list, because a profile redirected elsewhere is not under it. Any
 // failure to read the list in full (rec::profile_list_complete: an open or enumeration fault,
-// the 512-profile cap with more behind it, one unreadable profile key or path, or an unreadable
-// ProfilesDirectory) is reported as incomplete, and the gate then withholds every path.
+// the 512-profile cap with more behind it, one unreadable or absent profile key or path, a root
+// that is not a drive-absolute or UNC path, or an unreadable ProfilesDirectory) is reported as
+// incomplete, and the gate then withholds every path.
 struct ProfileRoots {
     std::vector<std::string> roots;
     bool complete = false;
@@ -364,9 +365,12 @@ ProfileRoots read_profile_roots() {
     out.roots.push_back(yuzu::win::from_wide(expanded.c_str(), static_cast<int>(expanded.size())));
     // The shared builder owns the system-profile filter (and drops a duplicated SID).
     const auto profiles = yuzu::win::enumerate_profile_list();
-    for (const auto& p : yuzu::profiles::build_profile_list(profiles.records, {}))
-        if (!p.profile_path.empty())
+    for (const auto& p : yuzu::profiles::build_profile_list(profiles.records, {})) {
+        if (p.profile_path.empty())
+            ++facts.profiles_without_path; // a profile with no folder: the list cannot be trusted
+        else
             out.roots.push_back(p.profile_path);
+    }
     facts.root_rc = profiles.root_rc;
     facts.last_rc = profiles.last_rc;
     facts.probe_rc = profiles.probe_rc;

@@ -25,6 +25,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -581,7 +582,9 @@ TEST_CASE("installer records: the records' text is capped in aggregate, not only
     const std::string full(rec::kMaxValueChars, 'a');
     rec::InstallProps heavy;
     heavy.display_name = heavy.display_version = heavy.publisher = full;
-    heavy.install_date = heavy.install_location = heavy.install_source = full;
+    heavy.install_date = full;
+    // the two paths must be comparable (an unplaceable path is withheld and would shrink the row)
+    heavy.install_location = heavy.install_source = "C:\\" + full.substr(3);
     // six values, the 38-character product code, and the reason a row with no LocalPackage gets
     const std::size_t per_row = 6 * rec::kMaxValueChars + 38 + std::string_view{"no_local_package"}.size();
     const std::size_t fit = rec::kMaxRecordBytes / per_row;
@@ -802,14 +805,17 @@ TEST_CASE("installer records: an incomplete profile list withholds every path an
     CHECK_FALSE(listed.constraints.any_failure());
 }
 
-TEST_CASE("installer records: the profile-root comparison folds ASCII only and keeps UTF-8 exact",
+TEST_CASE("installer records: the root comparison folds ASCII; non-ASCII is a possible match",
           "[msi_packages][installer_records]") {
-    // U+00C9 (E acute) is the two bytes C3 89; its lower-case form U+00E9 is C3 A9. Neither
-    // is folded: a non-ASCII profile folder matches only when recorded byte for byte.
+    // U+00C9 (E acute) is the two bytes C3 89; its lower-case form U+00E9 is C3 A9. The NTFS
+    // case table is not reproduced, so any two non-ASCII bytes compare equal: a possible case
+    // variant is withheld (over-withholding), never emitted.
     const std::vector<std::string> roots{"C:\\Users\\jsmith\xC3\x89"};
     CHECK(rec::path_under_any("c:\\USERS\\jsmith\xC3\x89\\x", roots));        // ASCII folds
     CHECK(rec::path_under_any("C:\\Users\\jsmith\xC3\x89", roots));            // byte-exact
-    CHECK_FALSE(rec::path_under_any("C:\\Users\\jsmith\xC3\xA9\\x", roots));  // case variant
+    CHECK(rec::path_under_any("C:\\Users\\jsmith\xC3\xA9\\x", roots));        // case variant
+    CHECK_FALSE(rec::path_under_any("C:\\Users\\jsmitx\xC3\xA9\\x", roots));  // ASCII differs
+    CHECK_FALSE(rec::path_under_any("C:\\Users\\jsmith\\x", roots));
     // high bytes never alias an ASCII letter (no sign-extended std::tolower surprises)
     CHECK(rec::ascii_fold(static_cast<char>(0xC3)) == static_cast<char>(0xC3));
     CHECK(rec::ascii_fold('Z') == 'z');
@@ -881,12 +887,261 @@ TEST_CASE("installer records: paths are normalised before the profile-root compa
     // dot-dot never climbs above the root and never leaves a profile by a sibling name
     CHECK_FALSE(rec::path_under_any("C:\\Users\\..\\Program Files", roots));
     CHECK_FALSE(rec::path_under_any("C:\\UsersX\\x", roots));
-    // NOT handled, so they stay emitted (documented in the README): 8.3 names, junctions
-    CHECK_FALSE(rec::path_under_any("C:\\USERS~1\\x", roots));
-    CHECK_FALSE(rec::path_under_any("C:\\Documents and Settings\\x", roots));
-    CHECK_FALSE(rec::path_under_any("\\\\localhost\\C$\\Users\\x", roots));
+    // an excess `..` clamps at the drive or the UNC share, as Win32 does, and is still under
+    CHECK(rec::path_under_any("C:\\..\\Users\\bob\\a", roots));
+    CHECK(rec::path_under_any("C:\\..\\..\\..\\Users\\bob\\a", roots));
+    CHECK(rec::path_under_any("C:\\Users\\Alice\\..\\..\\..\\Users\\Alice\\setup", roots));
+    CHECK(rec::path_under_any("c:\\users\\..\\..\\users\\x", roots));
+    const std::vector<std::string> unc_root{"\\\\fs\\profiles$\\bob"};
+    CHECK(rec::path_under_any("\\\\fs\\profiles$\\bob\\a\\..\\..\\..\\bob\\x", unc_root));
+    // the same clamping applies to a ROOT
+    const std::vector<std::string> odd_roots{"C:\\..\\..\\Users", "\\\\fs\\profiles$\\..\\bob"};
+    CHECK(rec::path_under_any("C:\\Users\\bob", odd_roots));
+    CHECK(rec::path_under_any("\\\\fs\\profiles$\\bob\\x", odd_roots));
+    CHECK(rec::normalise_path("C:\\..\\..\\Users").text == "c:\\users");
+    CHECK(rec::normalise_path("\\\\fs\\profiles$\\..\\bob").text == "\\\\fs\\profiles$\\bob");
+    // the loopback admin share is read as the drive
+    CHECK(rec::path_under_any("\\\\localhost\\C$\\Users\\x", roots));
+    CHECK(rec::path_under_any("\\\\127.0.0.1\\c$\\users\\x", roots));
     // a root that normalises to nothing never matches everything
     CHECK_FALSE(rec::path_under_any("C:\\x", std::vector<std::string>{"\\", "\\\\", ".", ""}));
+}
+
+TEST_CASE("installer records: a path that cannot be placed on a volume is withheld",
+          "[msi_packages][installer_records]") {
+    const std::vector<std::string> roots{"C:\\Users"};
+    using V = rec::PathVerdict;
+    for (const char* odd :
+         {"\\Users\\x", "Users\\x", "C:Users\\x", "C:", "C:x", "\\\\?\\Volume{1}\\x",
+          "\\\\.\\GLOBALROOT\\Device\\x", "\\\\?\\GLOBALROOT\\x", "\\\\server", "\\\\",
+          "C:\\USERS~1\\x", "C:\\Progra~2\\x", "C:\\Documents and Settings\\x",
+          "\\\\?\\C:\\a\\..\\Users\\x", "\\??\\C:\\.\\x", " C:\\x", "x"}) {
+        INFO(odd);
+        CHECK_FALSE(rec::normalise_path(odd).comparable);
+        CHECK(rec::classify_path(odd, roots) == V::unverifiable);
+    }
+    CHECK(rec::classify_path("C:\\Program Files\\x", roots) == V::keep);
+    CHECK(rec::classify_path("C:\\Users\\x", roots) == V::user_path);
+    CHECK(rec::classify_path("D:\\Tools~\\x", roots) == V::keep); // a tilde without a digit
+
+    Host g;
+    rec::InstallProps p;
+    p.install_location = "\\Users\\bob\\App";
+    p.install_source = "\\\\?\\Volume{0}\\x";
+    g.products.push_back(synthetic_product(1, p));
+    const auto set = run(g);
+    CHECK(set.records[0].props.install_location == "withheld:path_unverifiable");
+    CHECK(set.records[0].props.install_source == "withheld:path_unverifiable");
+    CHECK_FALSE(set.constraints.any_failure()); // a row-level anomaly, not a status token
+}
+
+TEST_CASE("installer records: only a drive-absolute or UNC root keeps the profile list complete",
+          "[msi_packages][installer_records]") {
+    for (const char* bad : {".", "..", "\\", "\\\\", " ", "", "   \t", "Users\\bob", "C:Users",
+                            "D:Profiles\\Alice", "C:", "\\Users", "\\\\server",
+                            "\\\\?\\Volume{1}\\u", "C:\\PROGRA~1\\x", "%HOMESHARE%\\bob",
+                            "C:\\%X%\\u"}) {
+        INFO(bad);
+        CHECK(rec::count_unresolved_roots({"C:\\Users", bad}) == 1);
+        CHECK_FALSE(rec::profile_roots_complete({"C:\\Users", bad}, {}));
+    }
+    for (const char* good : {"C:\\Users", "c:\\users\\", "D:\\Profiles\\Alice", "\\\\fs\\p$\\bob",
+                             "\\\\?\\C:\\Users", "C:\\..\\Users", "E:\\Redirected\\Bob\\"}) {
+        INFO(good);
+        CHECK(rec::count_unresolved_roots({good}) == 0);
+        CHECK(rec::profile_roots_complete({good}, {}));
+    }
+    // a profile with no ProfileImagePath makes the list incomplete
+    rec::ProfileListFacts f;
+    f.profiles_without_path = 1;
+    CHECK_FALSE(rec::profile_roots_complete({"C:\\Users"}, f));
+    // the probe: a redirected profile root the list holds only in an unusable spelling
+    Host g;
+    rec::InstallProps p;
+    p.install_source = "D:\\Profiles\\Alice\\setup";
+    g.products.push_back(synthetic_product(1, p));
+    auto ctx = default_context();
+    ctx.profile_roots = {"C:\\Users", "D:Profiles\\Alice"};
+    ctx.profile_roots_complete = rec::profile_roots_complete(ctx.profile_roots, {});
+    const auto set = run(g, ctx);
+    CHECK(set.records[0].props.install_source == "withheld:profile_list_incomplete");
+    CHECK(rec::render(set)[0] ==
+          "status|installer_records|constrained|windows:installer_records:profile_list_incomplete");
+}
+
+TEST_CASE("installer records: an incomplete profile list constrains even with no path field",
+          "[msi_packages][installer_records]") {
+    Host g;
+    rec::InstallProps p;
+    p.display_name = "Tool"; // no install location, source or package
+    g.products.push_back(synthetic_product(1, p));
+    auto ctx = default_context();
+    ctx.profile_roots_complete = false;
+    const auto set = run(g, ctx);
+    CHECK(rec::render(set)[0] ==
+          "status|installer_records|constrained|windows:installer_records:profile_list_incomplete");
+}
+
+namespace {
+// An independent reference for where Win32 places a path, written separately from
+// normalise_path: nullopt = not a drive-absolute or UNC path it can place (the gate must
+// withhold those). Segments are lower-cased; the first one or two (drive / server+share) are
+// the root of the walk and are never popped.
+std::optional<std::vector<std::string>> win32_place(std::string s) {
+    for (char& c : s)
+        c = c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    bool literal = false;
+    bool unc = false;
+    auto drop = [&s](std::size_t n) { s.erase(0, n); };
+    if (s.rfind("\\\\?\\unc\\", 0) == 0) { drop(8); unc = true; literal = true; }
+    else if (s.rfind("\\\\?\\", 0) == 0 || s.rfind("\\??\\", 0) == 0) { drop(4); literal = true; }
+    else if (s.rfind("\\\\.\\", 0) == 0) { drop(4); }
+    else if (s.rfind("\\\\", 0) == 0) { drop(2); unc = true; }
+    if (!unc && (s.empty() || s[0] == '\\'))
+        return std::nullopt;
+    std::vector<std::string> in;
+    std::size_t at = 0;
+    while (at <= s.size()) {
+        const auto e = s.find('\\', at);
+        const auto seg = s.substr(at, e == std::string::npos ? std::string::npos : e - at);
+        if (!seg.empty())
+            in.push_back(seg);
+        if (e == std::string::npos)
+            break;
+        at = e + 1;
+    }
+    const std::size_t keep = unc ? 2 : 1;
+    if (in.size() < keep)
+        return std::nullopt;
+    if (!unc && !(in[0].size() == 2 && in[0][1] == ':' && s.size() >= 3 && s[2] == '\\'))
+        return std::nullopt;
+    std::vector<std::string> out;
+    if (unc)
+        out.push_back("\\\\"); // a UNC `\\c:\x` is not the drive `c:\x`
+    out.insert(out.end(), in.begin(), in.begin() + static_cast<long>(keep));
+    const std::size_t base = out.size();
+    for (std::size_t i = keep; i < in.size(); ++i) {
+        std::string seg = in[i];
+        if (seg == "." || seg == "..") {
+            if (literal)
+                return std::nullopt;
+            if (seg == ".." && out.size() > base)
+                out.pop_back();
+            continue;
+        }
+        while (!seg.empty() && (seg.back() == '.' || seg.back() == ' '))
+            seg.pop_back();
+        if (!seg.empty())
+            out.push_back(seg);
+    }
+    return out;
+}
+
+bool placed_under(const std::vector<std::string>& p, const std::vector<std::string>& root) {
+    return p.size() >= root.size() && std::equal(root.begin(), root.end(), p.begin());
+}
+
+// Index of the separator that ends the drive (`C:`) or the UNC `\\\\server\\share` of a path.
+std::size_t after_prefix(const std::string& s) {
+    if (s.rfind("\\\\", 0) == 0)
+        return s.find('\\', s.find('\\', 2) + 1);
+    return s.find('\\');
+}
+
+std::string with_separators(std::string s, const std::string& sep) {
+    std::string out;
+    for (char c : s) {
+        if (c == '\\')
+            out += sep;
+        else
+            out += c;
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("installer records: every spelling Win32 places under a profile root is withheld",
+          "[msi_packages][installer_records]") {
+    // roots as the registry would hold them, one redirected, one UNC
+    const std::vector<std::string> roots{"C:\\Users", "D:\\Profiles\\Alice", "\\\\fs\\p$\\bob"};
+    const std::vector<std::string> bases{
+        "C:\\Users\\bob\\setup.msi",          "c:\\USERS\\Bob\\a\\b",
+        "D:\\Profiles\\Alice\\x",             "d:\\profiles\\alice",
+        "\\\\fs\\p$\\bob\\docs\\x",           "\\\\FS\\P$\\BOB",
+        "C:\\Program Files\\Vendor\\a",       "E:\\Data\\x",
+        "C:\\UsersX\\y",                      "D:\\Profiles\\Alice2\\z"};
+    // structural spellings: each rewrites the path (S) as a function of its text
+    const std::vector<std::function<std::string(const std::string&)>> structural{
+        [](const std::string& s) { return s; },
+        [](const std::string& s) { return "\\\\?\\" + s; },
+        [](const std::string& s) { return "\\\\.\\" + s; },
+        [](const std::string& s) { return "\\??\\" + s; },
+        [](const std::string& s) {
+            return s.rfind("\\\\", 0) == 0 ? "\\\\?\\UNC\\" + s.substr(2) : "\\\\?\\" + s;
+        },
+        [](const std::string& s) { // excess parents right after the prefix
+            const auto cut = after_prefix(s);
+            return cut == std::string::npos ? s : s.substr(0, cut) + "\\..\\..\\.." + s.substr(cut);
+        },
+        [](const std::string& s) { // dot segments and a parent step that cancels
+            const auto cut = s.find_last_of('\\');
+            return cut == std::string::npos ? s : s.substr(0, cut) + "\\.\\sub\\.." + s.substr(cut);
+        },
+        [](const std::string& s) { // a dot-dot walk back to the same place from far below
+            const auto cut = after_prefix(s);
+            return cut == std::string::npos ? s
+                                            : s.substr(0, cut) + "\\a\\b\\..\\..\\.." + s.substr(cut);
+        },
+        [](const std::string& s) { // trailing dots and spaces on every segment
+            std::string o;
+            for (char c : s)
+                o += c == '\\' ? std::string{". \\"} : std::string(1, c);
+            return o + ". ";
+        },
+    };
+    const std::vector<std::function<std::string(const std::string&)>> cosmetic{
+        [](const std::string& s) { return s; },
+        [](const std::string& s) { return with_separators(s, "\\\\"); },
+        [](const std::string& s) { return with_separators(s, "/"); },
+        [](const std::string& s) { return with_separators(s, "\\\\\\"); },
+        [](const std::string& s) {
+            std::string o = s;
+            for (char& c : o)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return o;
+        },
+    };
+    std::vector<std::vector<std::string>> placed_roots;
+    for (const auto& r : roots)
+        placed_roots.push_back(*win32_place(r));
+    std::size_t under = 0;
+    std::size_t kept = 0;
+    std::size_t total = 0;
+    for (const auto& base : bases)
+        for (const auto& st : structural)
+            for (const auto& co : cosmetic) {
+                const std::string path = co(st(base));
+                ++total;
+                INFO(path);
+                const auto where = win32_place(path);
+                const bool must_withhold =
+                    !where || std::any_of(placed_roots.begin(), placed_roots.end(),
+                                          [&](const auto& r) { return placed_under(*where, r); });
+                const bool withheld = rec::classify_path(path, roots) != rec::PathVerdict::keep;
+                if (must_withhold) {
+                    CHECK(withheld);
+                    ++under;
+                } else {
+                    ++kept;
+                }
+            }
+    CHECK(total == bases.size() * structural.size() * cosmetic.size());
+    CHECK(under > 100); // the matrix really exercises the match
+    CHECK(kept > 20);   // and really includes paths outside every profile
+    // outside paths are not over-withheld in their plain spellings
+    CHECK(rec::classify_path("C:\\Program Files\\Vendor\\a", roots) == rec::PathVerdict::keep);
+    CHECK(rec::classify_path("E:\\Data\\x", roots) == rec::PathVerdict::keep);
+    CHECK(rec::classify_path("C:\\UsersX\\y", roots) == rec::PathVerdict::keep);
 }
 
 TEST_CASE("installer records: row breakers cannot break a row", "[msi_packages][installer_records]") {

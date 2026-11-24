@@ -132,6 +132,9 @@ inline constexpr std::string_view kWithheldUserPath = "withheld:user_path";
 /// The user-profile list could not be read in full, so no path can be shown to be outside a
 /// profile: every path-bearing field is withheld under this value (fail closed).
 inline constexpr std::string_view kWithheldProfileList = "withheld:profile_list_incomplete";
+/// A path that cannot be placed on a volume (rooted, drive-relative, a namespace or device
+/// path, a possible 8.3 name) is withheld: it cannot be compared with a profile root.
+inline constexpr std::string_view kWithheldPathUnverifiable = "withheld:path_unverifiable";
 
 // ── Packed GUID codec ───────────────────────────────────────────────────────────
 //
@@ -260,79 +263,181 @@ namespace detail {
 
 // ── Privacy ─────────────────────────────────────────────────────────────────────
 
-/// ASCII-only case fold (A-Z); every other byte, so every byte of a UTF-8 multibyte
-/// sequence, is compared exactly. Locale independent. A non-ASCII profile folder recorded
-/// with different letter case therefore does NOT match (the Windows NTFS case table is not
-/// reproduced here), and the path is then EMITTED in clear: the gate withholds whole
-/// fields, never substrings, and a field that matches no root is not withheld. Nothing in
-/// the repo shows that a ProfileImagePath and an installer-supplied path agree in case.
+/// ASCII-only case fold (A-Z); every other byte is returned unchanged. Locale independent.
 [[nodiscard]] constexpr char ascii_fold(char c) noexcept {
     return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
 }
 
-/// The comparable form of a path: `/` read as `\`, ASCII-folded, a `\\?\`, `\\.\` or `\??\`
-/// prefix dropped (`\\?\UNC\` is the `\\` of a UNC path), repeated separators collapsed
-/// (a leading `\\` of a UNC path is kept), `.` segments dropped, `..` segments resolved
-/// lexically (never above the root), and trailing dots and spaces removed from every
-/// segment as Win32 does. Not handled, so they fail OPEN: 8.3 short names, junctions and
-/// symbolic links (such as `Documents and Settings`), the loopback UNC admin-share form
-/// (`\\localhost\C$\...`), and a non-ASCII case difference (see ascii_fold).
-[[nodiscard]] inline std::string normalise_path(std::string_view s) {
+/// A path reduced to a drive-absolute (`c:\a\b`) or UNC (`\\server\share\a`) comparable form.
+/// `comparable` is false for every spelling this code cannot place on a volume with
+/// confidence; such a path (or root) is never compared. A path fails closed (it is withheld),
+/// and a root makes the profile list incomplete.
+struct NormalPath {
+    std::string text; ///< folded, no `.`/`..`, no trailing dots or spaces; meaningful if comparable
+    bool comparable = false;
+};
+
+namespace detail {
+/// A segment that may be an 8.3 short name (`PROGRA~1`, `USERS~1.X`): one `~` then a digit.
+[[nodiscard]] inline bool looks_like_short_name(std::string_view seg) {
+    for (std::size_t i = 0; i + 1 < seg.size(); ++i)
+        if (seg[i] == '~' && seg[i + 1] >= '0' && seg[i + 1] <= '9')
+            return true;
+    return false;
+}
+} // namespace detail
+
+/// Normalises like Win32 for the forms it can place: `/` read as `\`, ASCII fold, a `\\?\`,
+/// `\\.\` or `\??\` prefix dropped (`\\?\UNC\` is a UNC path), repeated separators collapsed,
+/// `.` segments dropped, `..` segments resolved with the drive (`c:`) or the UNC
+/// `\\server\share` kept OUTSIDE the segment stack, so an excess `..` clamps at the root as
+/// Win32 does, and trailing dots and spaces trimmed from every segment. `\\localhost\X$\...`
+/// (and 127.0.0.1) is read as `X:\...`.
+///
+/// NOT comparable (fail closed): a rooted path with no drive (`\Users\x`), a drive-relative
+/// one (`C:x`, `C:`), `\\?\Volume{GUID}\`, `\\.\GLOBALROOT\`, any other device or namespace
+/// path, a UNC path without a server and share, a `\\?\` or `\??\` path holding a `.` or `..`
+/// segment (those prefixes switch Win32's own normalisation off), anything under the
+/// `Documents and Settings` junction, and any segment that may be an 8.3 short name.
+/// Not detected, so it can still be emitted: other junctions, symbolic links, mount points,
+/// `subst` and mapped drives, and a UNC path naming this machine by its own host name.
+[[nodiscard]] inline NormalPath normalise_path(std::string_view s) {
     std::string in(s);
     for (char& c : in)
         c = c == '/' ? '\\' : ascii_fold(c);
     std::string_view v = in;
     bool unc = false;
+    bool literal = false; // \\?\ and \??\: Win32 does not normalise dots there
     if (v.starts_with("\\\\?\\unc\\")) {
         v.remove_prefix(8);
         unc = true;
-    } else if (v.starts_with("\\\\?\\") || v.starts_with("\\\\.\\") || v.starts_with("\\??\\")) {
+        literal = true;
+    } else if (v.starts_with("\\\\?\\") || v.starts_with("\\??\\")) {
+        v.remove_prefix(4);
+        literal = true;
+    } else if (v.starts_with("\\\\.\\")) {
         v.remove_prefix(4);
     } else if (v.starts_with("\\\\")) {
+        v.remove_prefix(2);
         unc = true;
     }
-    const bool rooted = !unc && v.starts_with("\\");
-    std::vector<std::string> parts;
-    while (!v.empty()) {
-        const auto sep = v.find('\\');
-        std::string seg(v.substr(0, sep));
-        v = sep == std::string_view::npos ? std::string_view{} : v.substr(sep + 1);
-        if (seg.empty() || seg == ".")
+    std::vector<std::string> segs;
+    for (std::string_view rest = v; !rest.empty();) {
+        const auto sep = rest.find('\\');
+        std::string seg(rest.substr(0, sep));
+        rest = sep == std::string_view::npos ? std::string_view{} : rest.substr(sep + 1);
+        if (!seg.empty())
+            segs.push_back(std::move(seg));
+    }
+    // The drive, or the UNC server and share, are the prefix; everything after is the stack.
+    std::string prefix;
+    std::size_t first = 0;
+    if (unc) {
+        if (segs.size() < 2)
+            return {};
+        prefix = "\\\\" + segs[0] + "\\" + segs[1];
+        first = 2;
+        const bool loopback = segs[0] == "localhost" || segs[0] == "127.0.0.1";
+        if (loopback && segs[1].size() == 2 && segs[1][1] == '$' && segs[1][0] >= 'a' &&
+            segs[1][0] <= 'z') {
+            prefix = std::string(1, segs[1][0]) + ":";
+        }
+    } else {
+        // after the prefix, a drive-absolute path starts `x:` as its own segment AND was
+        // followed by a separator (so `c:x` is one segment `c:x`, and a rooted path starts
+        // with a separator, not a drive)
+        if (v.starts_with("\\") || segs.empty())
+            return {};
+        const std::string& d = segs[0];
+        if (d.size() != 2 || d[1] != ':' || d[0] < 'a' || d[0] > 'z')
+            return {};
+        if (v.size() < 3 || v[2] != '\\') // `c:` alone and `c:x` are drive-relative
+            return {};
+        prefix = d;
+        first = 1;
+    }
+    std::vector<std::string> stack;
+    for (std::size_t i = first; i < segs.size(); ++i) {
+        std::string seg = segs[i];
+        if (seg == ".") {
+            if (literal)
+                return {};
             continue;
+        }
         if (seg == "..") {
-            if (!parts.empty())
-                parts.pop_back();
+            if (literal)
+                return {};
+            if (!stack.empty())
+                stack.pop_back(); // never pops the prefix: an excess `..` clamps at the root
             continue;
         }
         while (!seg.empty() && (seg.back() == '.' || seg.back() == ' '))
             seg.pop_back();
-        if (!seg.empty())
-            parts.push_back(std::move(seg));
+        if (seg.empty())
+            continue;
+        if (detail::looks_like_short_name(seg))
+            return {};
+        stack.push_back(std::move(seg));
     }
-    std::string out = unc ? "\\\\" : (rooted ? "\\" : "");
-    for (std::size_t i = 0; i < parts.size(); ++i) {
-        if (i != 0)
-            out += '\\';
-        out += parts[i];
-    }
+    if (prefix.size() == 2 && prefix[1] == ':' && !stack.empty() &&
+        stack.front() == "documents and settings")
+        return {};
+    NormalPath out;
+    out.text = std::move(prefix);
+    for (const auto& seg : stack)
+        out.text += "\\" + seg;
+    out.comparable = true;
     return out;
 }
 
-/// True when `path` is, or is under, one of `roots` (the user profiles directory and each
-/// profile's folder), after normalise_path on both, and a root only matches on a segment
-/// boundary (`C:\UsersX` is not under `C:\Users`).
+namespace detail {
+/// ASCII-fold equality, except that two non-ASCII bytes always compare equal: the NTFS case
+/// table is not reproduced, so a non-ASCII difference is treated as a possible case variant
+/// and matches (over-withholds), never the reverse. A variant whose UTF-8 form has a
+/// different length is not seen.
+[[nodiscard]] inline bool fold_equal_prefix(const std::string& p, const std::string& root) {
+    if (p.size() < root.size())
+        return false;
+    for (std::size_t i = 0; i < root.size(); ++i) {
+        const auto a = static_cast<unsigned char>(p[i]);
+        const auto b = static_cast<unsigned char>(root[i]);
+        if (a >= 0x80 && b >= 0x80)
+            continue;
+        if (a != b)
+            return false;
+    }
+    return true;
+}
+} // namespace detail
+
+/// True when `path` is, or is under, one of `roots`, after normalise_path on both, on a
+/// segment boundary (`C:\UsersX` is not under `C:\Users`). A path or root that is not
+/// comparable never matches here: see classify_path for the decision the gate makes.
 [[nodiscard]] inline bool path_under_any(std::string_view path,
                                          const std::vector<std::string>& roots) {
-    const std::string p = normalise_path(path);
+    const NormalPath p = normalise_path(path);
+    if (!p.comparable)
+        return false;
     for (const auto& r : roots) {
-        const std::string root = normalise_path(r);
-        if (root.empty() || root == "\\" || root == "\\\\")
+        const NormalPath root = normalise_path(r);
+        if (!root.comparable)
             continue;
-        if (p.size() >= root.size() && p.compare(0, root.size(), root) == 0 &&
-            (p.size() == root.size() || p[root.size()] == '\\'))
+        if (detail::fold_equal_prefix(p.text, root.text) &&
+            (p.text.size() == root.text.size() || p.text[root.text.size()] == '\\'))
             return true;
     }
     return false;
+}
+
+enum class PathVerdict { keep, user_path, unverifiable };
+
+/// The gate's decision for a non-empty path: under a profile root, or (fail closed) not
+/// comparable with one.
+[[nodiscard]] inline PathVerdict classify_path(std::string_view path,
+                                               const std::vector<std::string>& roots) {
+    if (!normalise_path(path).comparable)
+        return PathVerdict::unverifiable;
+    return path_under_any(path, roots) ? PathVerdict::user_path : PathVerdict::keep;
 }
 
 inline constexpr long kErrorNoMoreItems = 259; ///< ERROR_NO_MORE_ITEMS (bound in the plugin)
@@ -346,27 +451,29 @@ struct ProfileListFacts {
     bool truncated = false;                ///< the cap was reached and more subkeys exist
     std::size_t record_failures = 0;       ///< SID keys / ProfileImagePath values that failed
     std::size_t unreadable_paths = 0;      ///< ProfileImagePath exists but is unusable
-    std::size_t unresolved_roots = 0;      ///< roots still holding `%` after expansion
+    std::size_t unresolved_roots = 0;      ///< roots that are not a drive-absolute or UNC path
+    std::size_t profiles_without_path = 0; ///< non-system profiles with no ProfileImagePath
     bool profiles_dir_failed = false;      ///< ProfilesDirectory could not be read
 };
 
-/// A root that still holds `%` after environment expansion (an undefined variable is left
-/// in place by Windows, and the expansion helper returns its input when the API fails) or is
-/// empty is not a comparable literal path: it can never match, so it must not be trusted.
+/// A root is usable only when it normalises to a drive-absolute or UNC path with no `%`
+/// left in it (an undefined variable stays in place after expansion, and the expansion helper
+/// returns its input when the API fails). Anything else (empty, `.`, `\`, `\\`, whitespace,
+/// relative, drive-relative, a namespace or short-name spelling) can never match a path, so
+/// the list cannot be trusted to cover that profile.
 [[nodiscard]] inline std::size_t count_unresolved_roots(const std::vector<std::string>& roots) {
     return static_cast<std::size_t>(std::count_if(roots.begin(), roots.end(), [](const auto& r) {
-        return r.empty() || r.find('%') != std::string::npos;
+        return r.find('%') != std::string::npos || !normalise_path(r).comparable;
     }));
 }
 
 /// True only when every profile subkey was enumerated and read: the list is then a complete
 /// set of profile folders. Any open or enumeration fault, the 512-profile cap with more behind
-/// it, one profile whose key or path could not be read, or a root that is not a literal path
-/// makes it incomplete, and the privacy gate then withholds every path (a profile that is
-/// missing from the list is not a profile the gate can protect).
+/// it, one profile whose key or path could not be read or is absent, or a root that is not a
+/// usable path makes it incomplete, and the privacy gate then withholds every path.
 [[nodiscard]] constexpr bool profile_list_complete(const ProfileListFacts& f) noexcept {
     if (f.root_rc != 0 || f.truncated || f.record_failures != 0 || f.unreadable_paths != 0 ||
-        f.unresolved_roots != 0 || f.profiles_dir_failed)
+        f.unresolved_roots != 0 || f.profiles_without_path != 0 || f.profiles_dir_failed)
         return false;
     if (f.last_rc == kErrorNoMoreItems)
         return true;
@@ -374,8 +481,8 @@ struct ProfileListFacts {
 }
 
 /// The one decision the plugin shell makes: `roots` (the profiles directory and each profile
-/// folder, as expanded) and the walk's facts. The shell passes the facts it read; the
-/// unresolved-root count is derived here from the roots themselves.
+/// folder, as expanded, none dropped) and the walk's facts. The unresolved-root count is
+/// derived here from the roots themselves.
 [[nodiscard]] inline bool profile_roots_complete(const std::vector<std::string>& roots,
                                                  ProfileListFacts facts) {
     facts.unresolved_roots = count_unresolved_roots(roots);
@@ -476,14 +583,24 @@ RecordSet collect_records(const Context& ctx, Enumerate&& enumerate, ReadPropert
     std::size_t visited = 0;
     std::size_t text_bytes = 0; // record_bytes() summed over the records kept
 
+    // An incomplete profile list constrains the answer on its own, whether or not any field
+    // turns out to carry a path: the gate then has no root list to compare against.
+    if (!ctx.profile_roots_complete)
+        set.constraints.add_failure(kTokenProfileListIncomplete);
     const auto privacy = [&](std::string v) {
         if (v.empty())
             return v;
-        if (!ctx.profile_roots_complete) { // fail closed: no root list to match against
-            set.constraints.add_failure(kTokenProfileListIncomplete);
+        if (!ctx.profile_roots_complete) // fail closed: no usable root list
             return std::string{kWithheldProfileList};
+        switch (classify_path(v, ctx.profile_roots)) {
+        case PathVerdict::unverifiable:
+            return std::string{kWithheldPathUnverifiable};
+        case PathVerdict::user_path:
+            return std::string{kWithheldUserPath};
+        case PathVerdict::keep:
+            break;
         }
-        return path_under_any(v, ctx.profile_roots) ? std::string{kWithheldUserPath} : v;
+        return v;
     };
 
     const auto fill_package = [&](InstallerRecord& r) {
