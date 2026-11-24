@@ -950,7 +950,10 @@ need(body_files == listed,
      ("" if body_files == listed else f" (body-only {sorted(body_files - listed)}, list-only {sorted(listed - body_files)})"))
 
 baseline = json.loads((root / "vcpkg.json").read_text(encoding="utf-8"))["builtin-baseline"]
-EXEMPT = ("docs/reviews/", "governance.d/", "changelog.d/", "CHANGELOG.md")
+# docs/rhel9-toolchain-manifest.json records the baseline a host was provisioned at (setup-rhel9.sh
+# --manifest), so a bump must not rewrite it: like docs/reviews/, it is a measurement, not a pin.
+EXEMPT = ("docs/reviews/", "governance.d/", "changelog.d/", "CHANGELOG.md",
+          "docs/rhel9-toolchain-manifest.json")
 # A bump record ("moved from `<old>` to `<new>`") is history, like docs/reviews/.
 BUMP_RECORD = re.compile(r"moved from `[0-9a-f]{7,40}` to `[0-9a-f]{7,40}`")
 SHORT = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{7,39}(?![0-9A-Za-z])")

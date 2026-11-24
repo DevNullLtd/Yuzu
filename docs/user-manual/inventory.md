@@ -223,8 +223,9 @@ cadences.
   row from `installed_apps`' registry walk, so a Windows host normally carries
   two rows per MSI product. The `msi` row adds the product code (stored as
   `package_id`, which the REST and MCP software routes return on each row)
-  and the machine-context guarantee. Install location and uninstall string are
-  not collected (wire slots 13-14 stay reserved and empty, #5186). If the
+  and the machine-context guarantee. An `msi` row's `install_location` (wire slot
+  13) is empty, no uninstall string is read, sent or stored, and slot 14 is the
+  `attributes` field described below. If the
   enumeration itself fails the source is reported `constrained` (see Troubleshooting).
 
   **Python interpreters** are collected through `runtimes` `python` (all three OSes;
@@ -267,7 +268,8 @@ cadences.
 
   **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
   `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
-  or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
+  or `Java` (when the build does not say; on Linux the `release` file's `IMAGE_TYPE` decides and,
+  where it has none, the home's `bin/javac` and java entries do), `version` from the home's `release` file (when the home has
   none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
   Windows) and `publisher` the file's `IMPLEMENTOR` (on macOS, a bundle with an openable `Contents` and no `release` file
   under `Contents/Home` reports its `Info.plist` `JVMVendor`), else `via:jvm` (the home reports no vendor, or it is a
@@ -465,13 +467,14 @@ cadences.
   `--inventory-disable`. The same holds for `list_inventory` dispatched directly
   as a command (it has no instruction definition, but the catalogue admits it at
   `Inventory:Read`): its fourteenth token is the raw location, minimised only by
-  the daily-sync writer, and the Response store keeps it as sent. The sync blob also has `install_location` and
-  `uninstall_string` slots. In the v2 blob they are reserved: the server ignores
-  them and stores neither, and an agent that fills them gets a full-resend request
-  every cycle. The sectioned v3 blob stores `install_location` and keeps
-  `uninstall_string` reserved (see "Install type, scope and location, and the
-  sectioned report" below). This build's agent sends `install_location` (the Windows
-  `InstallLocation`, the macOS `.app` path, a Homebrew machine prefix) and never `uninstall_string`; since a path under a
+  the daily-sync writer, and the Response store keeps it as sent. The sync blob also has two
+  trailing slots, 13 and 14: `install_location` and the `attributes` field (slot 14 was
+  reserved for an uninstall string until 2026-11-21 and never carried one). In the v2 blob the server stores neither,
+  and an agent that fills them gets a full-resend request every cycle. The sectioned v3 blob
+  stores both (see "Install type, scope and location, and the sectioned report" below, where
+  the `attributes` bullet lives). This build's agent sends `install_location` (the Windows
+  `InstallLocation`, the macOS `.app` path, a Homebrew machine prefix) and, in slot 14, only a
+  validated attribute field, never an uninstall string; since a path under a
   user's profile names an account, the location is an allowlist: the agent canonicalises the
   value (quotes, padding, doubled separators, `.` and `..` segments, the `\\?\` prefix and the
   macOS `/System/Volumes/Data` spelling) and keeps it, in one spelling (case is kept), only when it sits under a
@@ -513,8 +516,8 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   `/opt`. macOS: `/Library/Java`, `/usr/local`, `/opt/homebrew` and `/Applications`. The root list
   holds no per-user location, so an archive under a home directory is not looked for (a property of
   the list: an archive found under a root is read wherever it sits). Windows is not read yet: it
-  answers one `unsupported` status row (`windows:planned`). Python and Node components are not
-  collected.
+  answers one `unsupported` status row (`windows:planned`). Python distributions and Node packages
+  are listed by the `python` and `node` actions, described below.
 - **What a row holds.** Kind (`java`), name, version, where the version came from (`filename`,
   `pom`, `manifest`, or `unreadable` when no source gives one), path (a nested library is
   `<archive path>!<entry>`), size, modification time and the application folder it sits under.
@@ -623,9 +626,63 @@ Mach-O `.dylib` files on macOS. It reads each library's header in-process; no pr
 - **When it runs.** On demand only, as an instruction, once enabled. The daily report does not
   carry these rows yet.
 
+### Python distributions and Node packages (`component_inventory`, `python` and `node`)
+
+The `component_inventory` plugin's `python` action (instruction `crossplatform.components.python`)
+lists installed Python distributions, and its `node` action (instruction
+`crossplatform.components.node`) lists installed Node packages. Both read each package's metadata
+file in-process; no process is started, no `python` or `node` is run and no script is run. Unlike
+`native`, **both are switched on from the start**: there is no kill-switch row to lift.
+
+- **Switching it off.** Either action can be turned off with the kill switch:
+  `PUT /api/v1/plugin-config/component_inventory/kill-switch?action=python` (or `?action=node`)
+  with the JSON body `{"enabled": false}` and an optional `reason`. The row is separate for each
+  action and from `scan` and `native`.
+- **Where.** Linux and macOS only, in machine-wide locations only, walked in this order. `python`
+  on Linux: each `python3` or `python3.<digits>` directory in `/usr/local/lib`, then `/opt`; on
+  macOS: `/Library/Frameworks/Python.framework/Versions`, then each `python3.<digits>` directory in
+  `/opt/homebrew/lib` and `/usr/local/lib`. `/usr/lib` is not a root on Linux: the package manager
+  owns the interpreters under it and their distributions are already package rows. `node` on Linux:
+  `/usr/lib/node_modules`, `/usr/local/lib/node_modules` and `/opt`; on macOS:
+  `/opt/homebrew/lib/node_modules`, `/usr/local/lib/node_modules` and `/Applications`. Per-user
+  installs (home directories, `~/.local`, `~/.nvm`), custom prefixes and packages packed into an
+  Electron `asar` archive are not looked for. Windows is not read yet: each action answers one
+  `unsupported` status row (`windows:planned`).
+- **What a row holds.** Kind (`python` or `node`), name, version, where the version came from
+  (`version_source`), path of the metadata file, size, modification time and the application folder
+  it sits under. For `python` the value is `metadata`, `filename` or `unreadable`; for `node` it is
+  `package_json` or `unreadable`.
+- **How the version is read.** For `python`, from the first 16 KiB of a `METADATA` file (in a
+  `.dist-info` directory), a `PKG-INFO` file (in an `.egg-info` directory) or a single-file
+  `.egg-info`. A row with `version_source` `filename` means the metadata file could not be read or
+  parsed and the version came from the directory name; such a row is not counted by the
+  informational `version_unreadable` token. For `node`, from the first 64 KiB of the `package.json`
+  of a package directly under `node_modules` (or `node_modules/@scope`); a file larger than that, or
+  one that is not a JSON object or nests too deeply, is still listed from its directory name with
+  `version_source` `unreadable`. An unreadable metadata file is a gap in one row and does not make
+  the scan incomplete.
+- **Bounds.** The scan's (400,000 directory entries, 45 seconds, 3,000 rows per application folder)
+  with 20,000 rows in all. `python` walks to a depth of 8; `node` nests at most 8 levels of
+  `node_modules`. Inside `site-packages` and `dist-packages` only the `.dist-info` and `.egg-info`
+  directories are listed, and for `node` nothing below a package other than its own `node_modules`
+  is listed, so an installed package's source tree is never walked; that is by design, not a gap,
+  and the count of directories passed over is logged by the plugin at info level, not put on the
+  status row.
+- **When the list may be incomplete.** The status row reads `constrained` and names one cause: a
+  bound that was reached (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`,
+  `dir_truncated`), a directory or the mount table that could not be read (`dir_unreadable`,
+  `mount_table_unreadable`), `archive_changed` when a metadata file's size or modification time
+  changed while it was read, or `internal_error`. `supported` with no rows means none was found at
+  those roots, not that none is installed.
+- **What it costs, and who can run it.** The same roles and `Inventory` read grant as `scan`; a live
+  read of up to 45 seconds on one device that cannot be cancelled once started. `python` and `node`
+  publish no heartbeat cost counters.
+- **When it runs.** On demand only, as an instruction. The daily report does not carry these rows,
+  so they do not appear in the software inventory views.
+
 ### Install type, scope and location, and the sectioned report
 
-Each stored software row carries four more attributes. They are read-side facts today: the
+Each stored software row carries five more attributes. They are read-side facts today: the
 fleet query, catalogue and device pages do not return them yet, so they are visible only in the
 database.
 
@@ -658,6 +715,16 @@ database.
   v3 blob: a row from a v2 report has an empty `purl` until its device's first v3 report. The
   value is indexed, and the store can look up the devices carrying exactly one `purl`; the REST
   installs lookup returns it and filters on it, and the dashboard and the MCP tool do not yet.
+- **`attributes`** is a validated `key=value` field a collector can attach to a row (wire slot 14),
+  empty for a row that has none: pairs joined by `;`, keys in ascending order, each at most once.
+  One key exists today, `upgrade_code`: the MSI UpgradeCode of a Windows product, which is the same
+  for every version of that product, written as a braced GUID in upper-case hex, for example
+  `upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}`. The server stores it only from the v3 blob
+  (the v2 blob's slot is ignored), keeps it in the row's section hash, and does not return it from
+  any read route, dashboard page or MCP tool yet. No collector reports an `upgrade_code` yet. A
+  value the server cannot read as a valid attribute field refuses that one section (reason
+  `bad_attributes`, below). Two rows that differ only in `attributes` are two rows, and an
+  attribute-only change at the same version writes no change-feed entry.
 
 **The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
 each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
@@ -736,9 +803,9 @@ whatever the source: the older per-source behaviours that removed a constrained 
 section that broke the blob v3 grammar, and the warn-level server log line "v3 section(s) ...
 refused" names the agent and the reason. The reason is one of `unknown_facet`, `duplicate_facet`,
 `unknown_status`, `rows_in_status_only`, `delete_in_full`, `wrong_record_for_facet`,
-`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`, `row_cap`,
-`nul_byte` or `unterminated`. The agent resends the same bytes, so a refusal never clears on its
-own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
+`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`,
+`bad_attributes`, `row_cap`, `nul_byte` or `unterminated`. The agent resends the same bytes, so a
+refusal never clears on its own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
 deleted) until the agent is fixed. The one exception is a device's first v3 call that applies a section: its v2 rows were
 already replaced, so a facet refused then has no rows to keep. `facet="unknown"` on the counter means the server does not
 recognise the name: that is a version-skew incident (an agent and a server of different builds),

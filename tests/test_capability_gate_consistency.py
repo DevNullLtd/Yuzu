@@ -162,6 +162,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_shares.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_remote_access_audit.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_process_introspect.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_file_search.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_middleware.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_virtualization.hpp",
 ]
@@ -257,7 +258,10 @@ FRAGMENT_FILES = [
 # = 253, re-derived by running this test (parse_fragment_gate_rows over FRAGMENT_FILES), not by adding to a
 # baseline. It ships off through an action-level kill-switch seed, not through its gate.
 # process_introspect (inspect, +1, ReadOnly, Forensics:Read, gate AdminOrApproval) on top of SAM-39's 252 = 253 on dev, then SAM-22 native = 254; re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
-EXPECTED_TOTAL_ROWS = 254
+# file_search (search, +1, ReadOnly, FileRetrieval:Read, gate AdminOrApproval) on top of dev's 254 (process_introspect + SAM-22 native) = 255, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
+# SAM-49 component_inventory python and node: +2 (ReadOnly/None, Inventory:Read, Low, gate None) on top of 255
+# = 257, re-derived by running this test. Both ship enabled: no kill-switch seed.
+EXPECTED_TOTAL_ROWS = 257
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

@@ -18443,8 +18443,11 @@ TEST_CASE("MCP Integration: execute_instruction populates execution_id and threa
     };
     ts.start_with_dispatch(dispatch, "operator");
 
+    // A resume token rides in `params`: the agent must still receive it, but the stored execution
+    // record must not keep it (`kUnretainedInstructionParamKeys`); the redactor is keyed on the
+    // parameter name for every plugin, so this case's own plugin pair serves.
     auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":231,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+        R"({"jsonrpc":"2.0","method":"tools/call","id":231,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{"root":"/data","cursor":"tok-1"}}}})");
     REQUIRE(res);
     REQUIRE(res->status == 200);
 
@@ -18472,6 +18475,15 @@ TEST_CASE("MCP Integration: execute_instruction populates execution_id and threa
     CHECK(exec->status == "running");
     CHECK(exec->dispatched_by == "test-user"); // McpTestServer auth_fn sets username="test-user"
     CHECK(exec->agents_targeted == 3);         // set_agents_targeted called with sent=3
+
+    // The agent got the cursor unchanged; the stored copy of the request does not hold it, and
+    // still records what was searched.
+    REQUIRE(ts.last_dispatch_params.count("cursor") == 1);
+    CHECK(ts.last_dispatch_params.at("cursor") == "tok-1");
+    auto stored = nlohmann::json::parse(exec->parameter_values);
+    REQUIRE(stored.is_object());
+    CHECK(stored.contains("root"));
+    CHECK_FALSE(stored.contains("cursor"));
 }
 
 // ── 24. Null dispatch_fn ──────────────────────────────────────────────────
@@ -18683,6 +18695,231 @@ TEST_CASE("MCP execute_instruction: a caller holding only ForensicsAnalyst is re
     CHECK(ana.recall_body == R"({"error":"forbidden"})");
     CHECK_FALSE(ana.dispatched);
     CHECK(ana.consumed_at != 0);
+}
+
+// ── One approval covers a whole multi-slice read (approval_continuation.hpp) ──────────────────────
+//
+// A supervised-tier caller who is not an administrator gets ONE human approval for a search that is
+// answered in slices, each slice a dispatch carrying the agent's cursor. The first slice spends the
+// ticket as for any other call; the later slices (a non-empty cursor, the same principal, the same
+// arguments, inside the window) ride the already-spent ticket and are stamped as ticketed. Every
+// variation that changes the search, the caller or the shape of the call is refused. Drives the real
+// McpServer C8 gate and handler, the real catalogue (the search row declares the continuation
+// parameter) and the real dispatch chokepoint over a real ApprovalManager.
+TEST_CASE("MCP C8 continuation: one approval covers every slice of a multi-slice read, and nothing "
+          "else",
+          "[mcp][pg][integration][execute][security][approval][continuation]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    static const yuzu::server::CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    REQUIRE(registry.classify("file_search", "search").has_value());
+    const auto has_permission = [](std::string_view, std::string_view,
+                                   yuzu::server::authz::Operation) { return true; };
+
+    struct Seen {
+        std::string root;
+        std::string cursor;
+        yuzu::server::ApprovalProvenance provenance{yuzu::server::ApprovalProvenance::None};
+    };
+    std::vector<Seen> dispatched;
+
+    McpTestServer ts;
+    ts.mock_username = "alice";
+    ts.mock_role = yuzu::server::auth::Role::user; // not an effective admin: the cover is the only route
+    ts.classify_fn_for_test = [](std::string_view p, std::string_view a) {
+        return registry.classify(p, a);
+    };
+    ts.authorize_dispatch_fn_for_test = [&](const yuzu::server::DispatchCaller& c, std::string_view p,
+                                            std::string_view a) {
+        return yuzu::server::detail::classify_and_authorize_dispatch(registry, c, p, a,
+                                                                      has_permission);
+    };
+    ts.caller_fn_for_test = [](const yuzu::server::auth::Session& sess) {
+        return yuzu::server::DispatchCaller{.principal = sess.username,
+                                            .principal_role = "user",
+                                            .exec_visible = std::nullopt,
+                                            .principal_is_admin = false};
+    };
+    ts.approval_manager_for_test = &appr;
+    ts.start_with_dispatch(
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>& params,
+            const std::string&, const yuzu::server::DispatchCaller& caller)
+            -> yuzu::server::ConfinedDispatchOutcome {
+            Seen seen;
+            if (auto it = params.find("root"); it != params.end())
+                seen.root = it->second;
+            if (auto it = params.find("cursor"); it != params.end())
+                seen.cursor = it->second;
+            seen.provenance = caller.approval_provenance;
+            dispatched.push_back(std::move(seen));
+            return {.sent = 1, .command_id = "cmd-search"};
+        },
+        "supervised");
+
+    int next_id = 1;
+    const auto arguments = [](const std::string& root, const std::string& cursor,
+                              const std::string& approval_id,
+                              const std::string& agent = "dev-1") {
+        nlohmann::json a = {{"plugin", "file_search"},
+                            {"action", "search"},
+                            {"agent_ids", nlohmann::json::array({agent})},
+                            {"params", {{"root", root}, {"pattern", "*.bin"}}}};
+        if (!cursor.empty())
+            a["params"]["cursor"] = cursor;
+        if (!approval_id.empty())
+            a["approval_id"] = approval_id;
+        return a;
+    };
+    const auto call = [&](const nlohmann::json& args) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                           std::to_string(next_id++) +
+                           R"(,"params":{"name":"execute_instruction","arguments":)" + args.dump() +
+                           "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto refused_with = [](const nlohmann::json& body, int code) {
+        return body.contains("error") && body["error"]["code"] == code;
+    };
+
+    // 1. Mint. The ticket's subject leaves the cursor out, so every slice matches it.
+    const auto minted = call(arguments("/data", "", ""));
+    REQUIRE(refused_with(minted, yuzu::server::mcp::kApprovalRequired));
+    const std::string approval_id = minted["error"]["data"]["approval_id"].get<std::string>();
+    {
+        const auto row = appr.get(approval_id);
+        REQUIRE(row.has_value());
+        const auto newline = row->scope_expression.find('\n');
+        REQUIRE(newline != std::string::npos);
+        CHECK(row->scope_expression.substr(0, newline) == "continuation=cursor window_s=86400");
+        const auto stored_arguments = row->scope_expression.substr(newline + 1);
+        CHECK(stored_arguments.find("cursor") == std::string::npos);
+        CHECK(stored_arguments.find("\"root\":\"/data\"") != std::string::npos);
+    }
+    // A call that already carries a cursor mints the SAME ticket (the dedup key is the subject).
+    const auto reminted = call(arguments("/data", "tok-pre", ""));
+    REQUIRE(refused_with(reminted, yuzu::server::mcp::kApprovalRequired));
+    CHECK(reminted["error"]["data"]["approval_id"] == approval_id);
+    CHECK(appr.pending_count() == 1);
+
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "").has_value());
+
+    // 2. The first slice (no cursor) SPENDS the ticket, as for any other call.
+    const auto first = call(arguments("/data", "", approval_id));
+    INFO("first slice: " << first.dump());
+    REQUIRE_FALSE(first.contains("error"));
+    REQUIRE(dispatched.size() == 1);
+    CHECK(dispatched[0].provenance == yuzu::server::ApprovalProvenance::Ticket);
+    CHECK(dispatched[0].cursor.empty());
+    int64_t first_use = 0;
+    {
+        const auto row = appr.get(approval_id);
+        REQUIRE(row.has_value());
+        CHECK(row->consumed_by == "alice");
+        first_use = row->consumed_at;
+        CHECK(first_use > 0);
+    }
+
+    // 3. Two continuation slices ride the spent ticket: stamped as ticketed, the cursor still reaches
+    // the agent, and the ticket is not consumed again.
+    for (const std::string cursor : {"tok-1", "tok-2"}) {
+        const auto slice = call(arguments("/data", cursor, approval_id));
+        INFO("slice " << cursor << ": " << slice.dump());
+        REQUIRE_FALSE(slice.contains("error"));
+        REQUIRE_FALSE(dispatched.empty());
+        CHECK(dispatched.back().provenance == yuzu::server::ApprovalProvenance::Ticket);
+        CHECK(dispatched.back().cursor == cursor);
+        CHECK(dispatched.back().root == "/data");
+    }
+    REQUIRE(dispatched.size() == 3);
+    {
+        const auto row = appr.get(approval_id);
+        REQUIRE(row.has_value());
+        CHECK(row->consumed_at == first_use); // the cover never moves the row
+    }
+
+    // 4. Every variation is refused, nothing is dispatched, the ticket is untouched.
+    SECTION("a changed root, pattern or target is a different subject") {
+        const auto root = call(arguments("/elsewhere", "tok-3", approval_id));
+        CHECK(refused_with(root, yuzu::server::mcp::kPermissionDenied));
+        auto other_pattern = arguments("/data", "tok-3", approval_id);
+        other_pattern["params"]["pattern"] = "*.txt";
+        CHECK(refused_with(call(other_pattern), yuzu::server::mcp::kPermissionDenied));
+        // One device widened to the fleet.
+        auto fleet = arguments("/data", "tok-3", approval_id);
+        fleet.erase("agent_ids");
+        CHECK(refused_with(call(fleet), yuzu::server::mcp::kPermissionDenied));
+        CHECK(refused_with(call(arguments("/data", "tok-3", approval_id, "dev-2")),
+                           yuzu::server::mcp::kPermissionDenied));
+    }
+    SECTION("another principal cannot ride the ticket") {
+        ts.mock_username = "mallory";
+        const auto other = call(arguments("/data", "tok-3", approval_id));
+        CHECK(refused_with(other, yuzu::server::mcp::kPermissionDenied));
+        CHECK(other["error"]["message"] == "approval already used (one-time ticket)");
+    }
+    SECTION("a call without a cursor needs an unspent approval") {
+        const auto none = call(arguments("/data", "", approval_id));
+        CHECK(refused_with(none, yuzu::server::mcp::kPermissionDenied));
+        CHECK(none["error"]["message"] == "approval already used (one-time ticket)");
+    }
+    SECTION("a value that is not a token never rides it: empty, a space, a control byte, a NUL start") {
+        // An empty value is a call WITHOUT a token (it needs an unspent approval); a space or a
+        // control byte is not part of a token an agent issues; a value starting with NUL reads as
+        // EMPTY on the agent (C-string ABI) and would start a new search under the cover.
+        for (const std::string& bad : {std::string(""), std::string(" x"), std::string("x y"),
+                                       std::string("\x01x"), std::string("\0x", 2)}) {
+            auto args = arguments("/data", "", approval_id);
+            args["params"]["cursor"] = bad;
+            INFO("cursor of " << bad.size() << " bytes");
+            CHECK(call(args).contains("error"));
+        }
+        // Not a string at all: refused by the tool's input schema before any approval logic.
+        auto number = arguments("/data", "", approval_id);
+        number["params"]["cursor"] = 7;
+        CHECK(call(number).contains("error"));
+    }
+    SECTION("past the window the ticket no longer covers anything") {
+        {
+            auto lease = appr_bundle.pool().acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                "UPDATE approval_manager.approvals SET consumed_at = consumed_at - $1::bigint "
+                "WHERE id = $2",
+                std::vector<std::string>{std::to_string(2 * 24 * 3600), approval_id});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        CHECK(refused_with(call(arguments("/data", "tok-3", approval_id)),
+                           yuzu::server::mcp::kPermissionDenied));
+    }
+    CHECK(dispatched.size() == 3);
+    {
+        const auto row = appr.get(approval_id);
+        REQUIRE(row.has_value());
+        CHECK(row->status == "approved");
+    }
+
+    // 5. One approve row joins every slice: the first use says consumed, the others continuation,
+    // and each of the handler's own success rows names the approval it rode.
+    std::size_t consumed_rows = 0, continuation_rows = 0, success_rows = 0;
+    for (std::size_t i = 0; i < ts.audit_log.size(); ++i) {
+        const auto& detail = ts.audit_details[i];
+        if (ts.audit_log[i] == "mcp.execute_instruction|approved") {
+            if (detail == "consumed approval_id=" + approval_id)
+                ++consumed_rows;
+            if (detail == "continuation approval_id=" + approval_id)
+                ++continuation_rows;
+        }
+        if (ts.audit_log[i] == "mcp.execute_instruction|success" &&
+            detail.ends_with(" approval_id=" + approval_id))
+            ++success_rows;
+    }
+    CHECK(consumed_rows == 1);
+    CHECK(continuation_rows == 2);
+    CHECK(success_rows == 3);
 }
 
 // ── 25. Missing plugin ───────────────────────────────────────────────────
@@ -34884,6 +35121,286 @@ TEST_CASE("MCP 2405: wrong-typed argument is rejected before the gate",
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(body["error"]["message"].get<std::string>().find("'/agent_id'") != std::string::npos);
     CHECK(h.appr->pending_count() == 0);
+}
+
+// #7811: an `agent_id` argument over 256 bytes or with a byte below 0x20 reaches the permission
+// denial's target_id, an approval ticket's pending row or a domain audit row, and the audit store
+// keeps CR, LF and TAB. Every tool that takes one refuses it with -32602 before the scoped gate, the
+// approval mint and any audit write. The scoped gate here admits every device, so -32602 with the
+// gate never asked proves the floor runs first (a tool that refused late would reach the gate).
+TEST_CASE("MCP: an unsafe agent_id is refused with -32602 before the scoped gate or any audit row, "
+          "on every ungated tool that takes one",
+          "[mcp][audit]") {
+    int scoped_calls = 0;
+    McpTestServer ts;
+    ts.scoped_perm_fn_for_test = [&scoped_calls](const httplib::Request&, httplib::Response&,
+                                                 const std::string&, const std::string&,
+                                                 const std::string&) -> bool {
+        ++scoped_calls;
+        return true;
+    };
+    ts.start("operator");
+
+    const auto call_tool = [&ts](const std::string& tool, const std::string& agent_id) {
+        nlohmann::json args = {{"agent_id", agent_id}};
+        if (tool == "get_dex_observation")
+            args["event_id"] = "o1";
+        const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                    {"method", "tools/call"},
+                                    {"id", 1},
+                                    {"params", {{"name", tool}, {"arguments", args}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    const std::string floor_message = "agent_id must be at most 256 bytes with no byte below 0x20";
+    for (const char* tool :
+         {"get_dex_device_score", "get_dex_device_app_perf", "get_dex_device_history",
+          "get_dex_observation", "get_guardian_device_guards", "get_guardian_agent_status",
+          "get_agent_app_usage", "query_software_licenses",
+          "get_software_host_collection_settings"}) {
+        const std::string name = tool;
+        for (const auto& id : bad) {
+            INFO(name + " " + id.substr(0, 16));
+            const auto body = call_tool(tool, id);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            const auto message = body["error"]["message"].get<std::string>();
+            // Three tools answer an over-long id with their own earlier bound, so that row never
+            // reaches the shared floor (the settings tool's strict() arg check refuses above 128
+            // bytes). Every other row does, and carries the floor's message: reverting the guard
+            // at any of these tools turns its rows into a different answer.
+            if ((name == "get_software_host_collection_settings" && id.size() > 128) ||
+                ((name == "get_guardian_device_guards" || name == "get_guardian_agent_status") &&
+                 id.size() > 256))
+                CHECK(message == "agent_id is too long");
+            else
+                CHECK(message == floor_message);
+        }
+    }
+    CHECK(scoped_calls == 0);
+    CHECK(ts.audit_log.empty());
+
+    // A 256-byte printable id is safe: the same tool reaches the scoped gate.
+    call_tool("get_dex_device_score", std::string(256, 'a'));
+    CHECK(scoped_calls == 1);
+}
+
+// The approval-gated tools: on a gated tier the generic mint covers every one of them, so an unsafe
+// id mints no ticket and writes no pending row. set_tag, delete_tag and quarantine_device stand for
+// the class (the mint is one block for all of them).
+TEST_CASE("MCP: an unsafe agent_id mints no approval ticket and writes no audit row (#7811)",
+          "[pg][mcp][integration][approval][audit]") {
+    SchemaGateHarness h("supervised");
+
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const char* tool : {"set_tag", "delete_tag", "quarantine_device"}) {
+        for (const auto& id : bad) {
+            INFO(std::string(tool) + " " + id.substr(0, 16));
+            nlohmann::json args = {{"agent_id", id}, {"key", "role"}, {"value", "web"}};
+            const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                        {"method", "tools/call"},
+                                        {"id", 1},
+                                        {"params", {{"name", tool}, {"arguments", args}}}};
+            const auto body = h.call(req.dump());
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(body["error"]["message"] ==
+                  "agent_id must be at most 256 bytes with no byte below 0x20");
+        }
+    }
+    CHECK(h.appr->pending_count() == 0);
+    CHECK(h.ts.audit_log.empty());
+}
+
+// #7811: the tools the table above does not reach, driven WITHOUT a database. A store bound to a
+// pool that cannot connect is non-null but closed, which is enough for set_tag, delete_tag,
+// get_tags and execute_bundle to reach their id check; quarantine_device checks the id before it
+// looks at its store. The empty tier carries no tier or approval gate, so delete_tag and
+// quarantine_device run their own handlers (on a gated tier the generic mint refuses the id first,
+// which the [pg] case above covers). The scoped gate admits every device, so -32602 with the gate
+// never asked proves the check runs first.
+TEST_CASE("MCP: an unsafe agent_id or tag key is refused with -32602 on set_tag, delete_tag, "
+          "get_tags, quarantine_device and execute_bundle before the gate or any audit row (#7811)",
+          "[mcp][audit]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid());
+    yuzu::server::TagStore tags(unreachable);
+    yuzu::server::ResponseStore responses(unreachable);
+
+    int scoped_calls = 0;
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.response_store_for_test = &responses; // with the dispatch below, wires the bundle path
+    ts.scoped_perm_fn_for_test = [&scoped_calls](const httplib::Request&, httplib::Response&,
+                                                 const std::string&, const std::string&,
+                                                 const std::string&) -> bool {
+        ++scoped_calls;
+        return true;
+    };
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    const auto call_tool = [&ts](const std::string& tool, const std::string& agent_id,
+                                 const std::string& key) {
+        const nlohmann::json args = {{"agent_id", agent_id}, {"key", key}, {"value", "x"}};
+        const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                    {"method", "tools/call"},
+                                    {"id", 1},
+                                    {"params", {{"name", tool}, {"arguments", args}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto message_of = [](const nlohmann::json& body) {
+        REQUIRE(body.contains("error"));
+        return body["error"]["message"].get<std::string>();
+    };
+
+    const std::string id_message = "agent_id must be at most 256 bytes with no byte below 0x20";
+    const std::string key_message = "key must be at most 64 bytes with no byte below 0x20";
+    const std::vector<std::string> bad_ids = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                              "dev\r\nA", "dev\nA", "dev\tA"};
+    const std::vector<std::string> bad_keys = {std::string(65, 'k'), std::string("k\0y", 3),
+                                               "k\r\ny", "k\ny", "k\ty"};
+
+    for (const char* tool :
+         {"set_tag", "delete_tag", "get_tags", "quarantine_device", "execute_bundle"}) {
+        for (const auto& id : bad_ids) {
+            INFO(std::string(tool) + " " + id.substr(0, 16));
+            const auto body = call_tool(tool, id, "team");
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(message_of(body) == id_message);
+        }
+    }
+    // The tag key: a safe device id, an unsafe key. The key reaches the `agent_id:key` text of
+    // every tag audit row, so it is refused before the service-tag guard, the gate and any row.
+    for (const char* tool : {"set_tag", "delete_tag"}) {
+        for (const auto& key : bad_keys) {
+            INFO(std::string(tool) + " key " + key.substr(0, 16));
+            const auto body = call_tool(tool, "agent-1", key);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(message_of(body) == key_message);
+        }
+    }
+    CHECK(scoped_calls == 0);
+    CHECK(ts.audit_log.empty());
+
+    // A 256-byte printable id is safe: every tool gets past the id check (the tag tools reach the
+    // scoped gate and then stop at the closed store; execute_bundle stops at its missing steps).
+    for (const char* tool :
+         {"set_tag", "delete_tag", "get_tags", "quarantine_device", "execute_bundle"}) {
+        INFO(tool);
+        const auto body = call_tool(tool, std::string(256, 'a'), "team");
+        CHECK(message_of(body) != id_message);
+    }
+    CHECK(message_of(call_tool("execute_bundle", std::string(256, 'a'), "team")) ==
+          "steps is required");
+    CHECK(scoped_calls == 2);
+
+    // A 64-byte key is safe: set_tag and delete_tag reach the scoped gate with it.
+    for (const char* tool : {"set_tag", "delete_tag"}) {
+        INFO(tool);
+        const auto body = call_tool(tool, "agent-1", std::string(64, 'k'));
+        CHECK(message_of(body) != key_message);
+    }
+    CHECK(scoped_calls == 4);
+}
+
+// The two tools that need an OPEN store (get_agent_inventory, mint_upload_grant), so [pg]. The
+// empty tier carries no tier gate. Same assertions as the table above: -32602 with the floor's
+// message and no audit row, then a 256-byte id that is served.
+TEST_CASE("MCP: an unsafe agent_id is refused with -32602 on get_agent_inventory before any "
+          "audit row (#7811)",
+          "[pg][mcp][integration][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+
+    McpTestServer ts;
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+
+    const auto call = [&ts](const std::string& agent_id) {
+        const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                    {"method", "tools/call"},
+                                    {"id", 1},
+                                    {"params",
+                                     {{"name", "get_agent_inventory"},
+                                      {"arguments", {{"agent_id", agent_id}}}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const auto& id : std::vector<std::string>{std::string(257, 'a'), std::string("dev\0A", 5),
+                                                   "dev\r\nA", "dev\nA", "dev\tA"}) {
+        INFO(id.substr(0, 16));
+        const auto body = call(id);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] ==
+              "agent_id must be at most 256 bytes with no byte below 0x20");
+    }
+    CHECK(ts.audit_log.empty());
+
+    const auto ok = call(std::string(256, 'a'));
+    CHECK_FALSE(ok.contains("error"));
+    CHECK(ts.audit_log == std::vector<std::string>{"mcp.get_agent_inventory|success"});
+}
+
+TEST_CASE("MCP: an unsafe agent_id is refused with -32602 on mint_upload_grant before the mint "
+          "or any audit row (#7811)",
+          "[pg][mcp][integration][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    const auto call = [&ts](const std::string& agent_id) {
+        const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                    {"method", "tools/call"},
+                                    {"id", 1},
+                                    {"params",
+                                     {{"name", "mint_upload_grant"},
+                                      {"arguments",
+                                       {{"agent_id", agent_id}, {"declared_max_size", 4096}}}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const auto& id : std::vector<std::string>{std::string(257, 'a'), std::string("dev\0A", 5),
+                                                   "dev\r\nA", "dev\nA", "dev\tA"}) {
+        INFO(id.substr(0, 16));
+        const auto body = call(id);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] ==
+              "agent_id must be at most 256 bytes with no byte below 0x20");
+    }
+    CHECK(ts.audit_log.empty());
+    auto none = store.list_for_agent(); // every agent: nothing was minted for any refused id
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+
+    // A 256-byte printable id is safe: the grant is minted.
+    const auto ok = call(std::string(256, 'a'));
+    CHECK_FALSE(ok.contains("error"));
+    CHECK(ts.audit_log ==
+          std::vector<std::string>{"upload_grant.mint|success", "mcp.mint_upload_grant|success"});
 }
 
 TEST_CASE("MCP 2405: non-string approval_id is rejected on declaring and non-declaring tools",
@@ -58270,6 +58787,141 @@ TEST_CASE("MCP set_software_collection_settings: the supervised tier mints an ap
     CHECK(minted["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
     CHECK_FALSE(rig.stored(rig.group_a));
     CHECK(mcp_audits(rig.ts, "software_estate.collection_settings.update|requested") == 0);
+}
+
+// G01: `blocked` (policy evaluation refused to dispatch the check or fix) is a status of its own in
+// the compliance reads, counted as failing.
+// The two TOOL outputs build their JSON with the shared compliance_model builders
+// (fleet_compliance_json, compliance_summary_json); this fails if either stops carrying the count.
+// The resource read and the posture tool below have their own serialisers.
+TEST_CASE("MCP Integration: get_fleet_compliance and get_compliance_summary carry the blocked count",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 10;
+        fc.compliant = 5;
+        fc.blocked = 3;
+        fc.compliance_pct = 50.0;
+        return fc;
+    };
+    capi->compliance_summary_fn =
+        [](const std::string& policy_id)
+        -> std::expected<yuzu::server::ComplianceSummary, yuzu::server::PolicyReadError> {
+        yuzu::server::ComplianceSummary cs;
+        cs.policy_id = policy_id;
+        cs.compliant = 1;
+        cs.blocked = 2;
+        cs.total = 3;
+        return cs;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto fleet = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9301,)"
+                         R"("params":{"name":"get_fleet_compliance","arguments":{}}})");
+    REQUIRE(fleet);
+    auto fleet_text = nlohmann::json::parse(
+        nlohmann::json::parse(fleet->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fleet_text["blocked"] == 3);
+
+    auto summary = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9302,)"
+                           R"("params":{"name":"get_compliance_summary","arguments":{"policy_id":"pol-1"}}})");
+    REQUIRE(summary);
+    auto summary_text = nlohmann::json::parse(
+        nlohmann::json::parse(summary->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(summary_text["blocked"] == 2);
+}
+
+TEST_CASE("MCP Integration: the compliance read output schemas declare blocked",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":9303})");
+    REQUIRE(res);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int seen = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (name != "get_compliance_summary" && name != "get_fleet_compliance" &&
+            name != "get_policy" && name != "get_policy_agent_statuses")
+            continue;
+        ++seen;
+        INFO(name);
+        const auto schema_text = t["outputSchema"].dump();
+        CHECK(schema_text.find("\"blocked\":{\"type\":\"integer\"}") != std::string::npos);
+        // The two flat count schemas list every status as required, blocked included.
+        if (name == "get_compliance_summary" || name == "get_fleet_compliance") {
+            const auto& req = t["outputSchema"]["required"];
+            bool has_blocked = false;
+            for (const auto& r : req)
+                has_blocked = has_blocked || r == "blocked";
+            CHECK(has_blocked);
+        }
+    }
+    CHECK(seen == 4);
+}
+
+// The resources/read branch and the get_fleet_posture_fast handler each assemble the fleet
+// figures themselves (not through compliance_model), so each needs its own case: a blocked
+// count dropped from either serialiser must fail here, not be masked by the tool cases above.
+TEST_CASE("MCP Integration: resources/read yuzu://compliance/fleet carries the blocked count",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 10;
+        fc.compliant = 5;
+        fc.non_compliant = 2;
+        fc.blocked = 3;
+        fc.compliance_pct = 50.0;
+        return fc;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"resources/read","id":9311,)"
+                       R"("params":{"uri":"yuzu://compliance/fleet"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto fc = nlohmann::json::parse(body["result"]["contents"][0]["text"].get<std::string>());
+    CHECK(fc["total_checks"] == 10);
+    CHECK(fc["non_compliant"] == 2);
+    CHECK(fc["blocked"] == 3);
+}
+
+TEST_CASE("MCP Integration: get_fleet_posture_fast carries the blocked count in its compliance "
+          "projection",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 10;
+        fc.compliant = 5;
+        fc.non_compliant = 2;
+        fc.blocked = 3;
+        fc.compliance_pct = 50.0;
+        return fc;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9312,)"
+                       R"("params":{"name":"get_fleet_posture_fast","arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& compliance = body["result"]["structuredContent"]["compliance"];
+    CHECK_FALSE(compliance.contains("available"));
+    CHECK(compliance["non_compliant"] == 2);
+    CHECK(compliance["blocked"] == 3);
 }
 
 // ═════════════════════════════════════════════════════════════════════════

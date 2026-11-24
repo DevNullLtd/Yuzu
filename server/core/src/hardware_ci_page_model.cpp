@@ -1,6 +1,6 @@
 #include "hardware_ci_page_model.hpp"
 
-#include "hardware_list_model.hpp"       // hardware_ci_scalars_json, id_is_audit_safe
+#include "hardware_list_model.hpp"       // hardware_ci_scalars_json
 #include "list_keyset.hpp"               // the strict base64url codec shared by every cursor
 #include "model_param_helpers.hpp"       // shared param/cursor helpers (one copy across models)
 
@@ -75,7 +75,7 @@ std::optional<TextFault> text_error(const std::string& agent_id, const std::stri
                          ArgFault::kCursorRefused};
     if (!valid_text(agent_id))
         return TextFault{"invalid parameter encoding"};
-    if (!agent_id.empty() && !id_is_audit_safe(agent_id))
+    if (!agent_id.empty() && !auth::agent_id_is_audit_safe(agent_id))
         return TextFault{"invalid agent_id"};
     return std::nullopt;
 }

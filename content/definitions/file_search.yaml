@@ -1,0 +1,170 @@
+## File Search Definitions
+## An on-demand search of the local disks of one device by file or directory name, with the
+## extents of every matched file. Names, types, sizes, times and extents only: a matched file
+## is opened and never read, and no file content is read or hashed. Nothing is changed.
+## Plugin: file_search | Actions: search
+##
+## Dispatched under the FileRetrieval securable with AdminOrApproval, NOT the single-target
+## Forensics securable, so a search can be sent to a group or the fleet. What it stores is
+## withheld from every reader without a global Forensics:Read (Administrator and
+## ForensicsAnalyst by default; Administrator only while RBAC is off). See this plugin's README
+## (agents/plugins/file_search/README.md) and
+## server/core/src/capability_decls/plugin_action_catalogue_file_search.hpp.
+##
+## DEFAULT-OFF: gated behind the server-side plugin-config kill switch
+## (`PluginConfigStore::seed_kill_switch_default_off`) -- an operator must explicitly
+## `PUT /api/v1/plugin-config/file_search/kill-switch {"enabled":true}` before this action
+## will dispatch.
+##
+## ONE action, one slice of the search per call: the caller loops on the cursor row until a
+## slice answers with none. Every slice ends with exactly one `search` row. Nine row kinds
+## (match, extents, volume, gap, gaps_dropped, volumes_dropped, coverage, cursor, search),
+## plus one `status` row on a leg that is planned and not read yet (Windows).
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.file_search.search
+  displayName: File Search
+  version: 1.0.0
+  description: >
+    Searches the local disks of a device, under one absolute root, for files or directories
+    whose name matches a leaf-name pattern, and reports each match with its type, size,
+    modification time and the extents of the file. Names, types, sizes, times and extents are
+    all that is returned: matched files are opened and never read, and no file content is read
+    or hashed. One call is one slice of the search; repeat the call with the cursor row of the
+    previous answer until a slice answers without one. Every answer ends with a search row
+    stating whether the slice ran, and a coverage row stating whether everything under the
+    root was searched, so an empty result is never confusable with a failed or partial one.
+    Only local filesystem types on the allow-list are searched; every other mount in the mount
+    table the slice read is named by its own volume row with the reason. A search of more than
+    one slice is not a snapshot. Off until enabled; a non-administrator needs an approval, and
+    over the MCP execute_instruction tool one approval covers the whole search (the first slice
+    spends it, and each later slice that carries the cursor rides it for 24 hours, or until the
+    approval's 7-day lifetime ends, whichever comes first); a bundle step, a workflow step and
+    a schedule need one approval per call or occurrence. What is stored is readable only with
+    Forensics:Read, and the next cursor reaches a caller only as a stored row, so a
+    non-administrator without Forensics:Read can start a search under an approval and cannot
+    continue it. The Windows leg is planned and answers one unsupported status row.
+  tags: [filesystem, search, inventory, extents]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: file_search
+    action: search
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [root, pattern]
+    properties:
+      root:
+        type: string
+        displayName: Search Root
+        description: >
+          The absolute directory to search from. A root of / is the whole filesystem. A
+          trailing slash is ignored; empty, . and .. components, a doubled slash and a NUL
+          byte are refused. A root that is a link, does not exist or is not a directory is
+          refused with its own token (root_is_link, root_not_found, root_not_a_directory).
+        validation:
+          maxLength: 4096
+          pattern: "^/"
+      pattern:
+        type: string
+        displayName: Name Pattern
+        description: >
+          A leaf-name glob matched against each entry name, never the whole path: * matches
+          any run of characters and ? any one character; there is no regex. A pattern with too
+          few literal characters, too many * or a forbidden byte is refused with its own token,
+          so it cannot be made to match everything. Names compare by the rule of the agent's
+          OS: byte for byte on Linux; on macOS normalised to NFC and case-folded whatever the
+          volume's own rule.
+        validation:
+          maxLength: 128
+      kinds:
+        type: string
+        displayName: Entry Kinds
+        description: >
+          What to match: "files" (default), "directories" or "both". A directory match carries
+          no size or time, because the search never opens a directory for its facts.
+        default: "files"
+        validation:
+          enum: ["files", "directories", "both"]
+      cursor:
+        type: string
+        displayName: Resume Cursor
+        description: >
+          The token of the cursor row of the previous slice of this same search; leave empty
+          for the first slice. A cursor is valid only in the agent process that issued it, for
+          this root, pattern and kinds: a token the agent did not issue, and any token from
+          before an agent restart, is refused with bad_cursor before anything is read, and the
+          search starts again without one.
+        validation:
+          maxLength: 32896
+
+  result:
+    columns:
+      - name: row_kind
+        type: string
+        values: [match, extents, volume, gap, gaps_dropped, volumes_dropped, coverage, cursor, search, status]
+        description: 'Row shape discriminator (field 0). Values: match, extents, volume, gap, gaps_dropped, volumes_dropped, coverage, cursor, search (the last row of every slice), and status (one row on a leg that is planned and not read yet).'
+        example: match
+        platforms: [windows, linux, darwin]
+      - name: field_1
+        type: string
+        description: 'match: the path, with each byte outside well-formed printable UTF-8 and each % | \ written as %XX. extents: the file identity, device:file id in 16 hex digits each, equal to field 3 of the match row of the same file. volume: the mount point, escaped like a path. gap: the path of the directory or entry that was not searched. gaps_dropped and volumes_dropped: how many were left out of the answer. coverage: complete or partial. cursor: the token to pass back as the cursor parameter. search: ok, invalid, busy or failed. status: the literal "search".'
+        example: /srv/data/report-2026.pdf
+        platforms: [windows, linux, darwin]
+      - name: field_2
+        type: string
+        description: 'match: file or directory. extents: ok, compressed (the filesystem keeps the file encoded and reports no extents), unsupported or failed. volume: the filesystem type. gap: the cause (depth, dir_unreadable, dir_truncated, other_device, memory_cap, permission_denied, dataless, name_too_long, match_cap; network_mount and private_namespace are reserved and never written by this version). coverage: slices=<n>, the slices of this search so far. search: the reason, a closed token (none, a coverage reason, a fault such as busy or timed_out, or a request error such as bad_kinds). status: unsupported.'
+        example: file
+        platforms: [windows, linux, darwin]
+      - name: field_3
+        type: string
+        description: 'match: the file identity, device:file id in 16 hex digits each, or "-" when unknown; the key of the extents row. extents: the extent count, or >=<n> when the system cannot count without listing. volume: complete, partial or not_searched. coverage: prior_gaps=<n>, gaps carried from earlier slices. search: the name rule that ran (bytes on Linux, macos_nfc_casefold_v1 on macOS), or "-" when no pattern was compiled. status: the planned token such as windows:planned.'
+        example: 00000000000000fd:0000000000a1b2c3
+        platforms: [windows, linux, darwin]
+      - name: field_4
+        type: string
+        description: 'match: the size in bytes, or "-" for a directory or a file that could not be opened. extents: the extents, each logical:physical:length:flags joined by commas, or "-" for none; flags are resident, delalloc, shared, compressed, encrypted, unwritten, unallocated and btrfs_logical joined by +, or "-". volume: the reason the volume was not fully searched (none, budget_entries, budget_time, budget_rows, cancelled, fstype_not_allowed, network_mount, private_namespace, stalled, unstable, duplicate_mount, behind_network_mount, max_slices, firmlinks_only; permission_denied, other_device and unsupported are reserved and never written by this version, and mount_table_unreadable and mount_table_changed appear only as the reason of the search row). coverage: consistency=single_pass or not_a_snapshot. search: seq=<n>, the slice number.'
+        example: '48213'
+        platforms: [windows, linux, darwin]
+      - name: field_5
+        type: string
+        description: 'match: the modification time in seconds since the epoch, or "-" when unknown. volume: extents=collected on the row of a unit of the plan (the slice asks for the extents of each matched file there; the answer for each file is its extents row), not_collected on a mount that is refused or not reached; unsupported is reserved and never written by this version. search: q=<8 hex>, a short name for this query that reveals neither the pattern nor the root.'
+        example: '1763251200'
+        platforms: [linux, darwin]
+      - name: field_6
+        type: string
+        description: 'match: system, or user for a path under a user profile directory (a rule on the path, so a home relocated elsewhere is not tagged). volume: entries=<n>, the entries visited on the volume. search: links_skipped=<n>, links seen and never followed.'
+        example: system
+        platforms: [linux, darwin]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "Search {{root}} for names matching {{pattern}}"
+
+  gather:
+    # Stored and served with the definition. Nothing in dispatch reads it today, so it does not time a slice out (issue #8352); the plugin bounds each slice itself.
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [file_search]
+
+status:
+  phase: active
