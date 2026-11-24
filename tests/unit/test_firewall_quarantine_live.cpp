@@ -21,6 +21,10 @@
  * rc == 0 must set the variable first (rc 4 means the environment is unset, or an
  * OS filter matched nothing).
  *
+ * A cleanup that cannot confirm a clean host writes a FIREWALL LIVE HARNESS line to stderr, which
+ * is the primary signal; the last case of the file also fails the run, but only when it runs, and a
+ * test-name filter or --order rand can run the other cases without it.
+ *
  * Who runs it: root / Administrator, OR the agent account after
  * `scripts/install-agent-user.sh --check` is clean on the host. The agent account reaches the
  * host firewall the way the agent does, through the sudo grants the installer wrote (`sudo -n --`
@@ -2429,9 +2433,18 @@ TEST_CASE("live (macOS pf): a failed update keeps the previous generation in for
 #endif
 
 // Last in the file, so it runs last when the live cases are selected together: a cleanup that could
-// not confirm a clean host (reported on stderr by report_unsettled) fails the run.
+// not confirm a clean host (reported on stderr by report_unsettled) fails the run. A backstop only:
+// a name filter or --order rand can run the cases without it, so the stderr line is the primary
+// signal.
 TEST_CASE("live: every cleanup confirmed the host is back to inactive",
           "[.][firewall_quarantine_live]") {
-    INFO("see the FIREWALL LIVE HARNESS lines on stderr; last status seen: " << g_last_status);
+    if (!live_enabled())
+        SKIP("set YUZU_FIREWALL_QUARANTINE_LIVE=1 to run against this host's firewall");
+    std::string last;
+    {
+        std::lock_guard lk(g_status_m);
+        last = g_last_status;
+    }
+    INFO("see the FIREWALL LIVE HARNESS lines on stderr; last status seen: " << last);
     CHECK_FALSE(g_unsettled.load());
 }
