@@ -100,6 +100,18 @@ enum class ReadState { ok, not_found, denied, oversized, io };
     return ReadState::io;
 }
 
+/// macOS: only ESRCH means the pid does not exist. ENOENT is not an answer proc_pidinfo documents, so
+/// it must never read as "the process is gone": it is an unreadable identity like any other errno.
+[[nodiscard]] constexpr ReadState classify_macos_errno(int err) noexcept {
+    if (err == 0)
+        return ReadState::ok;
+    if (err == ESRCH)
+        return ReadState::not_found;
+    if (err == EACCES || err == EPERM)
+        return ReadState::denied;
+    return ReadState::io;
+}
+
 [[nodiscard]] constexpr ReadState classify_read(RawErr e, int err) noexcept {
     switch (e) {
     case RawErr::none:
@@ -442,7 +454,7 @@ struct MacSource {
                           {}};
 
     const MacBsdInfo b = src.bsdinfo();
-    switch (classify_open_errno(b.err)) {
+    switch (classify_macos_errno(b.err)) {
     case ReadState::ok:
         break;
     case ReadState::not_found:

@@ -321,6 +321,16 @@ void sweep_case(Facet f, const std::vector<Fault>& faults) {
 
 } // namespace
 
+TEST_CASE("process_introspect classify_macos_errno maps only ESRCH to not found", "[process_introspect]") {
+    static_assert(classify_macos_errno(ESRCH) == ReadState::not_found);
+    CHECK(classify_macos_errno(0) == ReadState::ok);
+    CHECK(classify_macos_errno(ESRCH) == ReadState::not_found);
+    CHECK(classify_macos_errno(ENOENT) == ReadState::io); // never "the process is gone"
+    CHECK(classify_macos_errno(EACCES) == ReadState::denied);
+    CHECK(classify_macos_errno(EPERM) == ReadState::denied);
+    CHECK(classify_macos_errno(EIO) == ReadState::io);
+}
+
 TEST_CASE("process_introspect classify_open_errno covers every arm", "[process_introspect]") {
     static_assert(classify_open_errno(0) == ReadState::ok);
     CHECK(classify_open_errno(0) == ReadState::ok);
@@ -1060,6 +1070,8 @@ TEST_CASE("process_introspect macOS: a read errno is classified once", "[process
         {EACCES, StatusState::permission_denied, "permission_denied"},
         {EIO, StatusState::unavailable, "identity_unreadable"},
         {EINVAL, StatusState::unavailable, "identity_unreadable"},
+        // ENOENT is not an answer proc_pidinfo documents; it must never read as "the process is gone".
+        {ENOENT, StatusState::unavailable, "identity_unreadable"},
     };
     for (const auto& c : cases) {
         MacFake fk;

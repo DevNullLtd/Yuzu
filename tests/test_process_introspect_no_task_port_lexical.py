@@ -44,7 +44,7 @@ MACOS_TU = "process_introspect_macos.cpp"
 TASK_CALLS = re.compile(
     r"\b(task_for_pid|task_read_for_pid|task_inspect_for_pid|task_name_for_pid|"
     r"processor_set_tasks\w*|(?:mach_)?vm_\w+|task_threads|task_info)\b")
-MACH_INCLUDE = re.compile(r"#\s*include\s*[<\"]mach/")
+MACH_INCLUDE = re.compile(r"#\s*(?:include|import)\s*[<\"]mach/")
 OTHER_BANS = re.compile(r"\b(dlsym|dlopen|ptrace|ReadProcessMemory|run_bounded_subprocess|"
                         r"subprocess_runner|kill|syscall|__proc_info|pbi_comm|pbi_name)\b")
 MEM_LITERAL = re.compile(r'"[^"\n]*/mem"')
@@ -58,7 +58,7 @@ SYSCTLBYNAME = re.compile(r"\bsysctlbyname\s*\(\s*(\"[^\"\n]*\"|[^,)]*)")
 SYSCTLBYNAME_BARE = re.compile(r"\bsysctlbyname\b(?!\s*\()")
 SYSCTL_ALLOWED = '"kern.bootsessionuuid"'
 SYSCTL_BANS = re.compile(r"\bsysctl\s*\(|\bsysctlnametomib\b|\bKERN_PROC\w*|\bKERN_ARGMAX\b")
-INCLUDE = re.compile(r"#\s*include\s*([<\"][^>\"\n]+[>\"])")
+INCLUDE = re.compile(r"#\s*(?:include|import)\s*([<\"][^>\"\n]+[>\"])")
 MACOS_INCLUDES = {'"process_introspect_legs.hpp"', "<libproc.h>", "<sys/proc_info.h>",
                   "<sys/sysctl.h>", "<cerrno>", "<cstring>"}
 
@@ -107,6 +107,7 @@ def self_check() -> list[str]:
     errs = []
     bad_shapes = (
         '#include <mach/mach.h>',
+        '#import <mach/mach.h>',
         'auto p = "/proc/1/mem";',
         'proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, 0, &x, n);',
         'proc_pidinfo(pid, 4, 0, &x, n);',

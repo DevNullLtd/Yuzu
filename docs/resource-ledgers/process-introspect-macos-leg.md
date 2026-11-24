@@ -7,8 +7,8 @@ early return, `bad_alloc` unwind) releases exactly the resource listed.
 ## Resources
 
 ### `proc_bsdinfo` stack buffer
-- **Site:** the `bsdinfo` callable in `run_macos` (`process_introspect_macos.cpp`), called exactly
-  once per dispatch by `inspect_macos`.
+- **Site:** the `bsdinfo` callable in `run_macos` (`process_introspect_macos.cpp`), called at most
+  once per dispatch by `inspect_macos` (once for `sched`; the five unsupported facets answer before any read).
 - **Allocated by:** the stack frame of the callable (a zero-initialised `struct proc_bsdinfo`),
   filled by `proc_pidinfo(pid, PROC_PIDTBSDINFO, ...)`.
 - **Owner type:** the stack frame. Only three numbers (start seconds, start microseconds, nice)
