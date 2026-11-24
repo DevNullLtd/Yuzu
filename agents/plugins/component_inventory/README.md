@@ -6,7 +6,7 @@
 | **What it does** | Installed software components found in application trees (Java archives, native libraries, Python distributions, Node packages) |
 | **Version** | 1.2.0 |
 | **Kind** | Collector · read-only · gathered (crossplatform.components.scan, crossplatform.components.native, crossplatform.components.python, crossplatform.components.node) |
-| **Platforms** | Windows 🟡 constrained · macOS ✅ · Linux ✅ |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
 | **Actions** | `native` (definition `crossplatform.components.native`) · `node` (definition `crossplatform.components.node`) · `python` (definition `crossplatform.components.python`) · `scan` (definition `crossplatform.components.scan`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
@@ -87,14 +87,14 @@ What a result proves. `supported` means the scan finished: no bound was reached 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `native` | 🟡 constrained · rung 1 · bounded read-only walk of the Program Files and Program Files (x86) directories for .dll files, at most 5,000 rows; every directory and file opened relative to its volume root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); the PE fixed file version read in-process within fixed bounds; WindowsApps under each root excluded and counted | ✅ supported · rung 1 · bounded read-only walk of /Applications, /usr/local and /opt/homebrew for .dylib files, at most 5,000 rows; no link followed at any path component; the Mach-O header, load commands and LC_ID_DYLIB (thin, fat or fat64) read in-process within fixed bounds; /usr/local/Cellar and /opt/homebrew/Cellar excluded and counted; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of /opt and /usr/local/lib for .so and .so.<version> files, at most 5,000 rows; no link followed at any path component; the ELF program headers, dynamic section and SONAME read in-process within fixed bounds; network mounts skipped via /proc/<pid>/mountinfo |
+| `native` | ✅ supported · rung 1 · bounded read-only walk of the Program Files and Program Files (x86) directories for .dll files, at most 5,000 rows; every directory and file opened relative to its volume root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); the PE fixed file version read in-process within fixed bounds; WindowsApps under each root excluded and counted | ✅ supported · rung 1 · bounded read-only walk of /Applications, /usr/local and /opt/homebrew for .dylib files, at most 5,000 rows; no link followed at any path component; the Mach-O header, load commands and LC_ID_DYLIB (thin, fat or fat64) read in-process within fixed bounds; /usr/local/Cellar and /opt/homebrew/Cellar excluded and counted; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of /opt and /usr/local/lib for .so and .so.<version> files, at most 5,000 rows; no link followed at any path component; the ELF program headers, dynamic section and SONAME read in-process within fixed bounds; network mounts skipped via /proc/<pid>/mountinfo |
 | `node` | 🟡 planned · rung 1 · bounded walk of the Node install roots with the same package.json reads | ✅ supported · rung 1 · bounded read-only walk of /opt/homebrew/lib/node_modules, /usr/local/lib/node_modules and /Applications for the package.json of each package under node_modules, at most 64 KiB read in-process; a package's own source tree is not listed; no link followed at any path component; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of /usr/lib/node_modules, /usr/local/lib/node_modules and /opt for the package.json of each package under node_modules, at most 64 KiB read in-process; a package's own source tree is not listed; no link followed at any path component; network mounts skipped via /proc/<pid>/mountinfo |
 | `python` | 🟡 planned · rung 1 · bounded walk of the Python install roots with the same metadata reads | ✅ supported · rung 1 · bounded read-only walk of /Library/Frameworks/Python.framework/Versions and of the python3.<digits> directories under /opt/homebrew/lib and /usr/local/lib for METADATA, PKG-INFO and .egg-info files, the first 16 KiB of each read in-process; package source trees inside site-packages are not listed; no link followed at any path component; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of the python3 and python3.<digits> directories under /usr/local/lib and of /opt for METADATA, PKG-INFO and .egg-info files, the first 16 KiB of each read in-process; package source trees inside site-packages are not listed; no link followed at any path component; network mounts skipped via /proc/<pid>/mountinfo |
-| `scan` | 🟡 constrained · rung 1 · bounded read-only walk of the Program Files and Program Files (x86) directories (the shell's known-folder paths, fixed drives only); every directory and file opened relative to its volume root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); archive central directory, pom.properties and MANIFEST.MF read in-process; WindowsApps under each root excluded and counted | ✅ supported · rung 1 · bounded read-only walk of /Applications, /Library/Java, /usr/local and /opt/homebrew; no link followed at any path component; archive central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of /opt, /usr/share/java, /usr/lib/jvm, /usr/local/lib, /usr/local/share and /usr/share/maven; no link followed at any path component; archive central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped via /proc/<pid>/mountinfo |
+| `scan` | ✅ supported · rung 1 · bounded read-only walk of the Program Files and Program Files (x86) directories (the shell's known-folder paths, fixed drives only); every directory and file opened relative to its volume root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); archive central directory, pom.properties and MANIFEST.MF read in-process; WindowsApps under each root excluded and counted | ✅ supported · rung 1 · bounded read-only walk of /Applications, /Library/Java, /usr/local and /opt/homebrew; no link followed at any path component; archive central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of /opt, /usr/share/java, /usr/lib/jvm, /usr/local/lib, /usr/local/share and /usr/share/maven; no link followed at any path component; archive central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped via /proc/<pid>/mountinfo |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`native` / Windows** — not yet verified against a real capture; libraries inside applications only; machine roots only; the server refuses it until an operator switches it on; a reparse point is counted and never read; any budget, unreadable directory or changed file answers constrained
+- **`native` / Windows** — measured on one host (Windows 11 build 26200, elevated administrator session), where a system directory whose access list excludes Administrators was refused and the 5,000-row cap was reached, so the action answered constrained; libraries inside applications only; machine roots only; the server refuses it until an operator switches it on; a reparse point is counted and never read; any budget, unreadable directory or changed file answers constrained
 - **`native` / macOS** — versioned dynamic libraries inside applications only: extension-less framework binaries are not read; machine roots only; the server refuses it until an operator switches it on; any budget, unreadable directory or changed file answers constrained
 - **`native` / Linux** — versioned shared libraries inside applications only: package-owned trees (/usr/lib and friends) are not walked; machine roots only; the server refuses it until an operator switches it on; any budget, unreadable directory or changed file answers constrained
 - **`node` / Windows** — not read yet: one unsupported status row, windows:planned
@@ -103,7 +103,7 @@ What a result proves. `supported` means the scan finished: no bound was reached 
 - **`python` / Windows** — not read yet: one unsupported status row, windows:planned
 - **`python` / macOS** — Python distributions in those library directories only; machine roots only (per-user installs are not read); any budget, unreadable directory or changed file answers constrained
 - **`python` / Linux** — Python distributions installed outside the package manager only (/usr/lib is not walked); machine roots only (per-user installs are not read); any budget, unreadable directory or changed file answers constrained
-- **`scan` / Windows** — not yet verified against a real capture; Java archives only; machine roots only (per-user installs are not read); a reparse point is counted and never read; any budget, unreadable directory or unenumerable archive answers constrained
+- **`scan` / Windows** — measured on one host (Windows 11 build 26200, elevated administrator session), where a system directory whose access list excludes Administrators was refused and the action answered constrained (dir_unreadable); Java archives only; machine roots only (per-user installs are not read); a reparse point is counted and never read; any budget, unreadable directory or unenumerable archive answers constrained
 - **`scan` / macOS** — Java archives only; machine roots only (per-user installs are not read); any budget, unreadable directory or unenumerable archive answers constrained
 - **`scan` / Linux** — Java archives only; machine roots only (per-user installs are not read); any budget, unreadable directory or unenumerable archive answers constrained
 <!-- END GENERATED -->
@@ -227,7 +227,43 @@ For `native`, `archive_changed` means a library changed or vanished between bein
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-22 · euid 501 (application and library names in the native rows and application, scope and package names in the node rows outside npm redacted) · leg-hash f0b0b7eb29ce
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-24 · interactive user (elevated) (application, vendor and library names in paths, names and anchor columns redacted) · leg-hash 5af5fa87538c
+
+```
+== action=scan
+status|scan|constrained|windows:component_inventory:dir_unreadable
+comp|java|jarredacted1|21.0.13|manifest|C:/Program Files/App1/lib/jarredacted1.jar|110123|1792603614|App1
+comp|java|jarredacted1|21.0.12.1|manifest|C:/Program Files/App2/dir1/lib/jarredacted1.jar|110116|1786486512|App2
+comp|java|jarredacted2||unreadable|C:/Program Files/App3/dir2/java/lib/jarredacted2.ear|19101|1768953600|App3
+comp|java|jarredacted3||unreadable|C:/Program Files/App3/dir2/java/lib/jarredacted3.jar|1161454|1768953600|App3
+comp|java|jarredacted4||unreadable|C:/Program Files/App3/dir2/java/lib/jarredacted4.jar|8492458|1768953600|App3
+comp|java|jarredacted5||unreadable|C:/Program Files/App3/dir2/java/lib/jarredacted5.jar|707261|1768953600|App3
+comp|java|jarredacted6|9.4.5.0 - p945-L260121.DE|manifest|C:/Program Files/App3/dir2/java/lib/jarredacted6.jar|8489689|1768953600|App3
+comp|java|jarredacted7|p945-L260121.DE|manifest|C:/Program Files/App3/dir2/java/lib/jarredacted7.jar|783129|1768953600|App3
+comp|java|jarredacted8|9.4.5.0 - p945-L260121.DE|manifest|C:/Program Files/App3/dir2/java/lib/jarredacted8.jar|371744|1768953600|App3
+comp|java|jarredacted9|9.4.5.0 - p945-L260121.DE|manifest|C:/Program Files/App3/dir2/java/lib/jarredacted9.jar|8506775|1768953600|App3
+comp|java|jarredacted10|9.4.5.0 - p945-L260121.DE|manifest|C:/Program Files/App3/dir2/java/lib/jarredacted10.jar|401960|1768953600|App3
+… 12 of 531 rows shown
+[result_status] CONSTRAINED / PARTIAL / windows:component_inventory:dir_unreadable
+
+== action=native
+status|native|constrained|windows:component_inventory:dir_unreadable
+comp|native|libredacted1|26.5.0.0|pe|C:/Program Files/App4/libredacted1.dll|101888|1792584000|App4
+comp|native|libredacted2|26.5.0.0|pe|C:/Program Files/App4/libredacted2.dll|67584|1792584000|App4
+comp|native|libredacted3|26.5.0.0|pe|C:/Program Files/App4/libredacted3.dll|1908736|1792584000|App4
+comp|native|libredacted4||unreadable|C:/Program Files/App5/libredacted4.dll|237960|1769491130|App5
+comp|native|libredacted5||unreadable|C:/Program Files/App6/libredacted5.dll|434176|1794373721|App6
+comp|native|libredacted6|11.0.26100.1150|pe|C:/Program Files/App6/libredacted6.dll|73728|1725595366|App6
+comp|native|libredacted7|0.14.1.0|pe|C:/Program Files/App7/libredacted7.dll|427552|1791402980|App7
+comp|native|libredacted8|1.2.7391.0|pe|C:/Program Files/App8/libredacted8.dll|250168|1788398156|App8
+comp|native|libredacted9|1.0.79.0|pe|C:/Program Files/App8/libredacted9.dll|225648|1793313018|App8
+comp|native|libredacted10||unreadable|C:/Program Files/App8/libredacted10.dll|5364040|1793313042|App8
+comp|native|libredacted11||unreadable|C:/Program Files/App8/libredacted11.dll|13846880|1788398156|App8
+… 12 of 5001 rows shown
+[result_status] CONSTRAINED / PARTIAL / windows:component_inventory:dir_unreadable
+```
+
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-22 · euid 501 (application and library names in the native rows and application, scope and package names in the node rows outside npm redacted) · leg-hash 5af5fa87538c
 
 ```
 == action=scan
@@ -274,7 +310,7 @@ comp|node|binary-extensions|3.1.0|package_json|/opt/homebrew/lib/node_modules/np
 [result_status] CONSTRAINED / PARTIAL / macos:component_inventory:budget_entries
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-22 · euid 0 · leg-hash f0b0b7eb29ce
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-22 · euid 0 · leg-hash 5af5fa87538c
 
 ```
 == action=scan

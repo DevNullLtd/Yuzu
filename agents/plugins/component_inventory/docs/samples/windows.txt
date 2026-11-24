@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-24 · interactive user (elevated) (application, vendor and library names in paths, names and anchor columns redacted) · leg-hash pending
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-24 · interactive user (elevated) (application, vendor and library names in paths, names and anchor columns redacted) · leg-hash 5af5fa87538c
 == action=scan
 status|scan|constrained|windows:component_inventory:dir_unreadable
 comp|java|jarredacted1|21.0.13|manifest|C:/Program Files/App1/lib/jarredacted1.jar|110123|1792603614|App1

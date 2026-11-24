@@ -19,10 +19,10 @@
           "support": "supported"
         },
         "windows": {
-          "fallback": "not yet verified against a real capture; libraries inside applications only; machine roots only; the server refuses it until an operator switches it on; a reparse point is counted and never read; any budget, unreadable directory or changed file answers constrained",
+          "fallback": "measured on one host (Windows 11 build 26200, elevated administrator session), where a system directory whose access list excludes Administrators was refused and the 5,000-row cap was reached, so the action answered constrained; libraries inside applications only; machine roots only; the server refuses it until an operator switches it on; a reparse point is counted and never read; any budget, unreadable directory or changed file answers constrained",
           "mechanism": "bounded read-only walk of the Program Files and Program Files (x86) directories for .dll files, at most 5,000 rows; every directory and file opened relative to its volume root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); the PE fixed file version read in-process within fixed bounds; WindowsApps under each root excluded and counted",
           "rung": "1",
-          "support": "constrained"
+          "support": "supported"
         }
       }
     },
@@ -97,17 +97,17 @@
           "support": "supported"
         },
         "windows": {
-          "fallback": "not yet verified against a real capture; Java archives only; machine roots only (per-user installs are not read); a reparse point is counted and never read; any budget, unreadable directory or unenumerable archive answers constrained",
+          "fallback": "measured on one host (Windows 11 build 26200, elevated administrator session), where a system directory whose access list excludes Administrators was refused and the action answered constrained (dir_unreadable); Java archives only; machine roots only (per-user installs are not read); a reparse point is counted and never read; any budget, unreadable directory or unenumerable archive answers constrained",
           "mechanism": "bounded read-only walk of the Program Files and Program Files (x86) directories (the shell's known-folder paths, fixed drives only); every directory and file opened relative to its volume root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); archive central directory, pom.properties and MANIFEST.MF read in-process; WindowsApps under each root excluded and counted",
           "rung": "1",
-          "support": "constrained"
+          "support": "supported"
         }
       }
     }
   ],
   "caveats": [
     "**Machine roots only.** The roots are fixed (`scan`: six on Linux, four on macOS and two on Windows; `native`: two on Linux, three on macOS and two on Windows; `python` and `node`: see the table above, and no Windows roots): a file in a per-user location, a home directory or a custom prefix is not looked for. `native` also leaves out what the package manager owns: on Linux `/usr/lib` and the other system trees are not roots, so a distribution package's libraries are never listed (use `crossplatform.software.inventory`), and on macOS the Homebrew Cellar trees are counted and named by `package_tree_skipped`, not entered; a library copied under `/opt` or `/usr/local/lib` by hand is read. macOS frameworks ship an extension-less binary (`Foo.framework/Versions/A/Foo`) that the `.dylib` rule does not see, so frameworks are not listed.",
-    "**The Windows leg of `scan` and `native` is declared constrained: it has not yet been verified against a real capture, and `python` and `node` have no Windows leg yet (they answer `windows:planned`, tracked in #8440).** It was written and unit tested without a Windows host to run it on (the pure decisions are tested on every OS over synthetic, format-true inputs; the filesystem binding is tested over a real temporary tree on a Windows runner), and no sample from a Windows host is committed, so the descriptor says `constrained` and the Samples section has no Windows block. It becomes `supported` with a green Windows leg and a committed real capture. Known limits: `WindowsApps` under each root is not entered by either action, so the Store packages are not listed (use the package inventory for them); a file the OS stores behind a reparse point is counted as a link and not read; only fixed local drives are walked; a directory or file name that a Win32 path cannot spell (a segment ending in `.` or a space) reads as unreadable or changed, never as absent; and the open, listing and read calls carry no deadline of their own, so the 45 second budget is checked between directories and files and a dead fixed volume can park one call, as it can for the `runtimes` plugin's read of the same primitive. The Windows leg shares `agents/shared/win_no_reparse_open.hpp` with the `runtimes` plugin; it duplicates part of the filesystem layer the on-demand file search plans for Windows, by owner ruling, and is written as a thin binding so that layer can adopt or replace it.",
+    "**The Windows leg of `scan` and `native` is declared supported on the measured scope only, and `python` and `node` have no Windows leg yet (they answer `windows:planned`, tracked in #8440).** The scope measured is one host, Windows 11 build 26200, in an elevated administrator session (`docs/samples/windows.txt`, 5,539 lines, application and library names redacted); nothing was measured as a standard user or as the intended service account. On that host `scan` answered `constrained` with `windows:component_inventory:dir_unreadable`, because one system directory whose access list excludes Administrators (`Windows Defender Advanced Threat Protection/Classification/Configuration` under Program Files) was refused with `STATUS_ACCESS_DENIED`, and `native` reached its 5,000-row cap. Both are the documented behaviour, not defects: either action may answer `constrained` on a host with a refused directory or at the row cap, and the rows read are still reported. How that refusal is classified is tracked in #8739. Known limits: `WindowsApps` under each root is not entered by either action, so the Store packages are not listed (use the package inventory for them); a file the OS stores behind a reparse point is counted as a link and not read; only fixed local drives are walked; a directory or file name that a Win32 path cannot spell (a segment ending in `.` or a space) reads as unreadable or changed, never as absent; and the open, listing and read calls carry no deadline of their own, so the 45 second budget is checked between directories and files and a dead fixed volume can park one call, as it can for the `runtimes` plugin's read of the same primitive. The Windows leg shares `agents/shared/win_no_reparse_open.hpp` with the `runtimes` plugin; it duplicates part of the filesystem layer the on-demand file search plans for Windows, by owner ruling, and is written as a thin binding so that layer can adopt or replace it.",
     "**Completeness is bounded, not guaranteed.** A scan that reaches a bound answers `constrained` and returns what it reached; one blocked read inside a directory listing or file read is not interrupted by the 45 second budget. The 400,000-entry budget is shared by every root, so the roots are walked cheapest first (on macOS `/Applications`, whose app bundles hold many entries, is last): a host whose first roots exhaust it answers `constrained` with `budget_entries` and the later roots are not walked. `native` has the same budget, so on a macOS host whose `/Applications` holds very large bundles it can answer `constrained` with `budget_entries` before `/usr/local` and `/opt/homebrew` are reached (seen on a development Mac, and it returned the libraries reached first). On Windows `native` can reach the 5,000-row cap (`section_rows`) or the 3,000-row cap for one first-level folder under a root (`anchor_rows`; a Visual Studio or .NET tree can hold thousands of `.dll` files): the rows returned are the ones the name-sorted walk reached first, so the list is partial, and no Windows host has been measured for how often this happens. The network-mount guard is a snapshot of a deny-list: a mount that appears after the table was read, a stacked filesystem over a dead mount or a network filesystem type not on the list is not seen.",
     "**Names are parsed, not proven; nested libraries are listed, not read.** Only `BOOT-INF/lib/`, `WEB-INF/lib/` and `lib/` entries ending `.jar` are listed, from the central directory; their version comes from the entry name alone, so a nested library with an unversioned name reads `unreadable`, and a qualifier word the parser does not know reads as a classifier (nested `guava-31.1-jre.jar` reads `31.1`). An outer archive with no `pom.properties` or manifest takes the file name's word too. A pre-release or build qualifier (`alpha`, `beta`, `rc`, `m`, `ea`, `preview`, `snapshot`, digits and dots) stays in the version. An OSGi-style name (`name_1.2.3...`) keeps everything after the `_` as its version, a classifier word included (`bundle_1.2.3-sources.jar` reads `1.2.3-sources`). Separately, a sole `pom.properties` is trusted: an archive that has no pom of its own but bundles exactly one dependency's reads that dependency's version, marked `pom`, when its file name has no version (`app.jar`, `ROOT.war`); a name that carries a version keeps it (`myapp-2.0.jar` is not affected) unless the archive's value sits in the name; with two or more poms the name rule applies. For `native` the name and version are header and file-name facts, not proof of what the code is: a SONAME or install name is only as honest as whoever built the library; a file named like a library but of another format (a script, a linker script, a thin object) gives no row, while a position-independent executable named `.so` is listed; and in a universal Mach-O file only the first readable dynamic-library slice is used, the other slices are not compared. `native` depends on the shared binary header readers and cannot ship before the change that adds them.",
     "**Not collected yet; `native` ships off; no customer opt-out.** The daily report does not carry these rows, for any of the four actions. `python` and `node` ship enabled and are operator-dispatched only. The server seeds `component_inventory.native` switched off at boot and refuses it until an operator enables it (`PUT /api/v1/plugin-config/component_inventory/kill-switch` with `action`); `scan` is unaffected and a restart never overwrites an operator's own setting. `native` publishes no cost counters, so the fleet-wide cost evidence wanted before it is ever on by default is not collected by this plugin. The permanent customer opt-out of ADR-0028 Decisions 2 and 8 is still open (#7737)."
@@ -118,7 +118,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports versioned shared libraries (ELF .so on Linux, Mach-O .dylib on macOS, PE .dll on Windows) shipped inside applications under the machine-wide application roots: one row per library (name, version and where the version came from, path, size, modification time and the application folder it sits under), at most 5,000 rows. This action is switched off until an operator enables it with PUT /api/v1/plugin-config/component_inventory/kill-switch and action=native; until then the server refuses it. Linux reads /opt and /usr/local/lib and never the package manager's own trees; macOS reads /Applications, /usr/local and /opt/homebrew and does not enter the Homebrew Cellar trees, naming that in the package_tree_skipped token; Windows reads Program Files and Program Files (x86) on fixed drives, takes the version from the file's fixed file version, does not enter WindowsApps (also named in package_tree_skipped) and has not yet been verified against a real capture. Extension-less macOS framework binaries are not read; per-user locations are not read. No process is started and no reparse point is followed. A `supported` status means the scan finished with no bound reached; a `constrained` status means a bound was hit or something could not be read in full, so the list may be incomplete, and it names its one cause. A library whose header cannot be read inside the fixed bounds still gets a row from its file name. `supported` with no rows means none was found at those roots, not that none is installed. The result is a live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds and 400,000 directory entries, and it cannot be cancelled once started. For Java archives use crossplatform.components.scan, and for packaged applications crossplatform.software.inventory. Terminal causes (a repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated. Retryable causes: budget_time, dir_unreadable, archive_changed (a library changed or vanished while read), mount_table_unreadable, internal_error.",
+      "description": "Reports versioned shared libraries (ELF .so on Linux, Mach-O .dylib on macOS, PE .dll on Windows) shipped inside applications under the machine-wide application roots: one row per library (name, version and where the version came from, path, size, modification time and the application folder it sits under), at most 5,000 rows. This action is switched off until an operator enables it with PUT /api/v1/plugin-config/component_inventory/kill-switch and action=native; until then the server refuses it. Linux reads /opt and /usr/local/lib and never the package manager's own trees; macOS reads /Applications, /usr/local and /opt/homebrew and does not enter the Homebrew Cellar trees, naming that in the package_tree_skipped token; Windows reads Program Files and Program Files (x86) on fixed drives, takes the version from the file's fixed file version, does not enter WindowsApps (also named in package_tree_skipped) and was measured on one host, Windows 11 build 26200, in an elevated administrator session. Extension-less macOS framework binaries are not read; per-user locations are not read. No process is started and no reparse point is followed. A `supported` status means the scan finished with no bound reached; a `constrained` status means a bound was hit or something could not be read in full, so the list may be incomplete, and it names its one cause. A library whose header cannot be read inside the fixed bounds still gets a row from its file name. `supported` with no rows means none was found at those roots, not that none is installed. The result is a live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds and 400,000 directory entries, and it cannot be cancelled once started. For Java archives use crossplatform.components.scan, and for packaged applications crossplatform.software.inventory. Terminal causes (a repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated. Retryable causes: budget_time, dir_unreadable, archive_changed (a library changed or vanished while read), mount_table_unreadable, internal_error.",
       "display_name": "Native Library Inventory",
       "execute_roles": [
         "endpoint-admin",
@@ -179,7 +179,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports Java archives (.jar, .war, .ear) and the libraries nested one level inside them, found under the machine-wide application roots: one row per archive and per nested library (name, version and where the version came from, path, size, modification time and the application folder it sits under). Linux, macOS and Windows (Program Files and Program Files (x86) on fixed drives, WindowsApps not entered; the Windows leg has not yet been verified against a real capture); per-user locations are not read. No process is started, no reparse point is followed on Windows and no nested archive is unpacked. A `supported` status means the scan finished and read everything it opened in full, naming in a token any link, network mount or package tree it passed over; a `constrained` status means a bound was hit or something could not be read in full, so the list may be incomplete, and it names its one cause. When time runs out, archives not yet read give no rows, and a walk that used the whole budget returns none. Use it for software no package manager owns; for packaged applications use crossplatform.software.inventory and for installed Java runtimes crossplatform.runtimes.jvm. `supported` with no component rows means none was found at the roots, not that none is installed. The result is a live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds and 400,000 directory entries, and it cannot be cancelled once started. Terminal causes (a repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated, archive_unenumerated. Retryable causes: budget_time, dir_unreadable, archive_changed, mount_table_unreadable, internal_error. The version comes from the file name; the archive corrects it only when the name carries the archive's version.",
+      "description": "Reports Java archives (.jar, .war, .ear) and the libraries nested one level inside them, found under the machine-wide application roots: one row per archive and per nested library (name, version and where the version came from, path, size, modification time and the application folder it sits under). Linux, macOS and Windows (Program Files and Program Files (x86) on fixed drives, WindowsApps not entered; the Windows leg was measured on one host, Windows 11 build 26200, in an elevated administrator session); per-user locations are not read. No process is started, no reparse point is followed on Windows and no nested archive is unpacked. A `supported` status means the scan finished and read everything it opened in full, naming in a token any link, network mount or package tree it passed over; a `constrained` status means a bound was hit or something could not be read in full, so the list may be incomplete, and it names its one cause. When time runs out, archives not yet read give no rows, and a walk that used the whole budget returns none. Use it for software no package manager owns; for packaged applications use crossplatform.software.inventory and for installed Java runtimes crossplatform.runtimes.jvm. `supported` with no component rows means none was found at the roots, not that none is installed. The result is a live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds and 400,000 directory entries, and it cannot be cancelled once started. Terminal causes (a repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated, archive_unenumerated. Retryable causes: budget_time, dir_unreadable, archive_changed, mount_table_unreadable, internal_error. The version comes from the file name; the archive corrects it only when the name carries the archive's version.",
       "display_name": "Component Inventory",
       "execute_roles": [
         "endpoint-admin",
@@ -204,7 +204,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "5cc8d9563d18",
+  "leg_hash": "5af5fa87538c",
   "manifest_version": 1,
   "name": "component_inventory",
   "outputs": [
@@ -677,13 +677,13 @@
   "platforms": {
     "linux": "supported",
     "macos": "supported",
-    "windows": "constrained"
+    "windows": "supported"
   },
   "privileges": [
     {
       "grant": "None: the walker runs as LocalSystem, a far wider reach than `Users`, which is why no reparse point is ever followed (a junction planted by a non-administrator would otherwise be read with that reach). Under the intended `NT SERVICE\\YuzuAgent` account, `Program Files` and `Program Files (x86)` are readable by `Users` by default (inferred, not measured as either account) and an application directory with a tighter ACL may not be (`WindowsApps` is never entered)",
       "if_refused": "A directory that cannot be listed records `windows:component_inventory:dir_unreadable` and the answer is `constrained`; a Program Files location the shell cannot name, a path that is not a walkable directory, or a drive whose type cannot be told walks nothing and records `windows:component_inventory:mount_table_unreadable`; `python` and `node` have no Windows leg yet and answer `status|<action>|unsupported|windows:planned`, result `UNAVAILABLE`",
-      "measured": "Not measured: no capture from a Windows host is committed yet, so the leg is declared constrained",
+      "measured": "Measured once: one host, Windows 11 build 26200, an elevated administrator session (`docs/samples/windows.txt`); nothing was measured as `NT SERVICE\\YuzuAgent` or as a standard user",
       "os": "Windows",
       "runs_as": "agent service, LocalSystem today (`#1442`; the intended identity is `NT SERVICE\\YuzuAgent`, `docs/agent-privilege-model.md`)"
     },
@@ -708,7 +708,7 @@
       "completeness": "full",
       "provenance": "(empty)",
       "status": "`OK`",
-      "when": "The scan finished with no bound reached and every directory and archive it opened read in full, populated or empty. Informational tokens may still ride the status row without changing the level: `<os>:component_inventory:root_link_skipped` (a root was dropped for a link), `<os>:component_inventory:link_skipped` (a link inside a tree was not entered or listed; no link is followed; on Windows, a reparse point of any kind), `<os>:component_inventory:network_fs_skipped` (a root or a directory inside the tree sat on a network mount and was passed over; on Windows, a root on a UNC path or on a drive that is not a fixed local disk was dropped) `<os>:component_inventory:version_unreadable` (at least one row has `version_source` `unreadable`; a `python` row whose version came from its directory name (`filename`), and a `node` package.json that declares no version, which gives an empty version with source `package_json`, are not counted) and, for `native` only, `<os>:component_inventory:package_tree_skipped` (a package-owned tree was not entered: `WindowsApps` on Windows for both actions, the Homebrew Cellar on macOS for `native` only)"
+      "when": "The scan finished with no bound reached and every directory and archive it opened read in full, populated or empty. Informational tokens may still ride the status row without changing the level: `<os>:component_inventory:root_link_skipped` (a root was dropped for a link), `<os>:component_inventory:link_skipped` (a link inside a tree was not entered or listed; no link is followed; on Windows, a reparse point of any kind), `<os>:component_inventory:network_fs_skipped` (a root or a directory inside the tree sat on a network mount and was passed over; on Windows, a root on a UNC path or on a drive that is not a fixed local disk was dropped) `<os>:component_inventory:version_unreadable` (at least one row has `version_source` `unreadable`; a `python` row whose version came from its directory name (`filename`), and a `node` package.json that declares no version, which gives an empty version with source `package_json`, are not counted) and `<os>:component_inventory:package_tree_skipped` (a package-owned tree was not entered: `WindowsApps` on Windows for both actions, the Homebrew Cellar on macOS for `native` only)"
     },
     {
       "completeness": "partial",
@@ -810,7 +810,7 @@
       "stamp": {
         "date": "2026-11-22",
         "host_class": "vm",
-        "leg_hash": "f0b0b7eb29ce",
+        "leg_hash": "5af5fa87538c",
         "os": "linux",
         "os_version": "Ubuntu 26.04.1 LTS x86_64",
         "privilege": "euid 0"
@@ -897,10 +897,62 @@
       "stamp": {
         "date": "2026-11-22",
         "host_class": "bare-metal",
-        "leg_hash": "f0b0b7eb29ce",
+        "leg_hash": "5af5fa87538c",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (application and library names in the native rows and application, scope and package names in the node rows outside npm redacted)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "scan",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "windows:component_inventory:dir_unreadable",
+            "status": "CONSTRAINED"
+          },
+          "row_count": 531,
+          "rows": [
+            "status|scan|constrained|windows:component_inventory:dir_unreadable",
+            "comp|java|jarredacted1|21.0.13|manifest|C:/Program Files/App1/lib/jarredacted1.jar|110123|1792603614|App1",
+            "comp|java|jarredacted1|21.0.12.1|manifest|C:/Program Files/App2/dir1/lib/jarredacted1.jar|110116|1786486512|App2",
+            "comp|java|jarredacted2||unreadable|C:/Program Files/App3/dir2/java/lib/jarredacted2.ear|19101|1768953600|App3",
+            "comp|java|jarredacted3||unreadable|C:/Program Files/App3/dir2/java/lib/jarredacted3.jar|1161454|1768953600|App3"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "native",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "windows:component_inventory:dir_unreadable",
+            "status": "CONSTRAINED"
+          },
+          "row_count": 5001,
+          "rows": [
+            "status|native|constrained|windows:component_inventory:dir_unreadable",
+            "comp|native|libredacted1|26.5.0.0|pe|C:/Program Files/App4/libredacted1.dll|101888|1792584000|App4",
+            "comp|native|libredacted2|26.5.0.0|pe|C:/Program Files/App4/libredacted2.dll|67584|1792584000|App4",
+            "comp|native|libredacted3|26.5.0.0|pe|C:/Program Files/App4/libredacted3.dll|1908736|1792584000|App4",
+            "comp|native|libredacted4||unreadable|C:/Program Files/App5/libredacted4.dll|237960|1769491130|App5"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-11-24",
+        "host_class": "bare-metal",
+        "leg_hash": "5af5fa87538c",
+        "os": "windows",
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "interactive user (elevated) (application, vendor and library names in paths, names and anchor columns redacted)"
       }
     }
   },
