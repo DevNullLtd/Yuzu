@@ -332,10 +332,10 @@ a scrape-configuration problem, not a rule problem: target a stable identity.
   `yuzu_server_uptime_seconds`** can leave this alert **permanently** silent,
   not just delayed — the gauge is written at most once per boot, so
   `resets()` never sees more than a handful of transitions no matter how long
-  the loop runs. There is no dead-man's-switch (`up == 0`) rule for the
-  server process in this file today (tracked: #2956); if the process is
-  unreachable outright, rely on `up{job="yuzu"}` / your scrape-health
-  dashboard, not this alert.
+  the loop runs. The shipped `YuzuServerMetricsScrapeDown` rule
+  (`up{job="yuzu-server"} == 0`) is the dead-man's-switch for the server
+  process; if the process is unreachable outright, that alert and your
+  scrape-health dashboard tell you, not this one.
 
 **This alert and `YuzuAuditRetentionNotRunning` can legitimately disagree.**
 They key on different facts: this one on restart frequency (`> 3` in the
@@ -589,7 +589,7 @@ apart.**
 - **`up` is 1.** The metric itself is missing. Either the server predates it (the
   rules file is a copy you apply yourself, so it routinely runs ahead of the
   servers it points at), or a scrape config is dropping it. Confirm with
-  `curl -s <server>/metrics | grep audit_retention_passes`, then check
+  `curl -sS -H "Authorization: Bearer $YUZU_METRICS_TOKEN" <server>/metrics | grep audit_retention_passes` (`/metrics` needs a bearer token; a bare `curl -s` prints a `401` body that matches nothing, which reads as "the metric is missing". Token recipe: `docs/user-manual/metrics.md`), then check
   `metric_relabel_configs`.
 
 It is **fleet-wide by construction**: `absent()` fires only when NO series exists

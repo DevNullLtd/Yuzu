@@ -2606,14 +2606,13 @@ groups:
             is down, but this rule only fires once Prometheus manages to scrape
             /metrics. Do not rely on it to page DURING a full database outage:
             a remote scrape of the authenticated /metrics resolves its session
-            or API token against Postgres (it can fail, except for a localhost
-            scrape, --metrics-no-auth, or a still-cached token) and the
+            or API token against Postgres (it can fail, except under --metrics-no-auth, a direct
+            loopback scrape with --metrics-trust-loopback, or a still-cached token) and the
             handler itself reads Postgres. YuzuServerPostgresUnreachable and
             YuzuPgConnectFailing need a working scrape too, so they are not an
             honest backstop for a TOTAL outage either; the backstops for that
-            case are the /readyz readiness probe and an operator-defined
-            `up == 0` (scrape target down) alert on the server job (none
-            ships in this file). This rule then fires after recovery from the
+            case are the /readyz readiness probe and an `up == 0` (scrape target down)
+            alert on the server job (YuzuServerMetricsScrapeDown, group yuzu-metrics-scrape). This rule then fires after recovery from the
             increase over the gap, or at once when the fault is partial. If
             the audit store is down as well, the audit row of a mutating
             request's 503 (scim.user.provisioned, scim.user.updated,
@@ -3931,7 +3930,7 @@ groups:
       # The series is ABSENT while no CRL exists, the CA store is closed (an
       # install with its own certificates has no internal CA), or the scrape
       # fails; these rules need a successful scrape, so they share the
-      # `up == 0` caveat of the yuzu-ha-leader group. Nothing here alerts on a
+      # scrape caveat (YuzuServerMetricsScrapeDown covers a down server) of the yuzu-ha-leader group. Nothing here alerts on a
       # never-published CRL (that state is only visible as a 503 on
       # GET /api/v1/ca/crl, YuzuLeaderNoLeader, or YuzuCaCrlPublishFailing).
       - alert: YuzuCaCrlNearExpiry
@@ -3961,7 +3960,7 @@ groups:
             relying parties that check freshness (a reverse proxy reading
             GET /api/v1/ca/crl) refuse certificates from this CA. This rule
             needs a successful scrape: a server that is down or an unreachable
-            /metrics silences it, so keep your own `up == 0` alert.
+            /metrics silences it; the YuzuServerMetricsScrapeDown alert covers that.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-near-expiry-or-expired"
 
       - alert: YuzuCaCrlExpired
@@ -4009,7 +4008,7 @@ groups:
       # reverse holds too, and is the price of `max`: after the fix, a replica whose
       # reads keep failing keeps the OLD future-dated value, `max` selects it, and
       # the alert stays firing until that replica's reads recover or it restarts.
-      # Same `up == 0` caveat as the two rules above. Nothing else detects this
+      # Same scrape caveat as the two rules above. Nothing else detects this
       # today: #6916 (still open) covers only the opposite direction, a clock
       # stepped back.
       - alert: YuzuCaCrlFutureDated
@@ -4037,7 +4036,7 @@ groups:
             correct clock (never all of them, and not while Postgres is
             unreachable) so its boot publish replaces the CRL; see "CRL dated
             in the future" in docs/pki-architecture.md. This rule needs a successful
-            scrape, so keep your own `up == 0` alert.
+            scrape; the YuzuServerMetricsScrapeDown alert covers a missing one.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-dated-in-the-future"
 
       - alert: YuzuCaRevocationSweepReadFailing
@@ -5111,7 +5110,7 @@ groups:
         # series means the check could not run or does not apply, NOT that the database is
         # healthy, and this rule is silent on it: the alert YuzuPgCollationCheckBlind covers
         # this, and the server log's "[PG] could not check" WARN line names the cause. A
-        # missing scrape is likewise silent here, so keep your own `up == 0` alert on the
+        # missing scrape is likewise silent here; YuzuServerMetricsScrapeDown covers the
         # server job. The check repeats every minute while it is 1, so after the database is
         # fixed the next check sets the gauge to 0 and this clears without a restart.
         # The mismatch is ONE shared pg_database fact, so the alert collapses replicas with
@@ -5163,8 +5162,8 @@ groups:
             created with the C collation has no collation version and is not affected. This
             rule needs a successful scrape and a check that can run: a server that is down or
             an unreachable /metrics silences it, and an absent series means the check could not
-            run or does not apply, not that the database is healthy, so keep your own
-            `up == 0` alert; the alert YuzuPgCollationCheckBlind covers a check that cannot
+            run or does not apply, not that the database is healthy, so
+            YuzuServerMetricsScrapeDown covers that; the alert YuzuPgCollationCheckBlind covers a check that cannot
             run. Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation version".
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
 
@@ -5261,8 +5260,8 @@ groups:
             the start-time check itself is counted but cannot be seen by increase()).
             Known limits: a check stuck mid-query is covered by YuzuPgCollationCheckStale, not
             by this alert; a replica restarting more often than once a minute while the check
-            keeps failing is not seen by this alert (see YuzuServerRestartLoop and your own
-            `up == 0` rule). Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation
+            keeps failing is not seen by this alert (see YuzuServerRestartLoop and
+            YuzuServerMetricsScrapeDown). Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation
             version".
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
 
@@ -5277,7 +5276,7 @@ groups:
         # covers what neither of the other two can: a stuck check adds no counter increments,
         # leaves the mismatch gauge as it was and logs nothing.
         # An absent series (a process that never finished its boot check, or a scrape gap) is
-        # silent here: keep your own `up == 0` rule. The value is a replica wall-clock time
+        # silent here: YuzuServerMetricsScrapeDown covers a missing scrape. The value is a replica wall-clock time
         # compared with Prometheus's time(), so a replica clock that is more than about an hour
         # off moves the threshold, and the hourly wait uses a clock that does not advance while
         # the host is suspended, so a suspend can also fire it (both reasoned): check the
@@ -5304,7 +5303,7 @@ groups:
             does not advance while suspended) or when the replica's clock is more than about an
             hour off the Prometheus server's, so check the replica's uptime and clock before
             treating it as a hang. An absent series (a process that never finished its boot
-            check, or a scrape gap) does not fire this alert: keep your own `up == 0` rule.
+            check, or a scrape gap) does not fire this alert: `YuzuServerMetricsScrapeDown` covers a missing scrape.
             Each replica exports its own series, so one database problem raises one alert per
             replica: group the notifications by alertname and job. Runbook:
             docs/user-manual/server-admin.md, "PostgreSQL collation version".
@@ -5413,10 +5412,8 @@ groups:
   #    primary freezes while its kernel keeps ACKing) the /metrics handler's own
   #    pool queries hang too, the scrape fails, and every yuzu_server_leader_*
   #    series goes stale at once, so every rule below evaluates EMPTY. The
-  #    backstop is an `up == 0` alert on the server job (substitute YOUR scrape
-  #    job name) plus /readyz: NO such rule ships (no rule in this file is a
-  #    dead-man's-switch for the server process; #2956 tracked it and was closed
-  #    without building it), so configure one.
+  #    backstop is YuzuServerMetricsScrapeDown (`up == 0` on a job named
+  #    `yuzu-server`; group yuzu-metrics-scrape) plus /readyz.
   - name: yuzu-ha-leader
     rules:
       - alert: YuzuLeaderSplitBrain
@@ -5569,7 +5566,7 @@ groups:
         # freeze never alerts. last_ok_age is computed at SCRAPE time, so it keeps
         # growing even when the election loop is wedged. BLIND SPOT: in a
         # WHOLE-PRIMARY stall the scrape itself fails (see the group header), so
-        # this rule cannot evaluate; the `up == 0` backstop must catch that. Both
+        # this rule cannot evaluate; YuzuServerMetricsScrapeDown must catch that. Both
         # series carry the same job/instance labels, so default all-label matching
         # applies (no on()).
         expr: |
@@ -6155,10 +6152,8 @@ groups:
       # `Restart=always` with no `RestartSec` crashing before the first tick fires,
       # every time -- writes the gauge AT MOST once per boot no matter how long the
       # loop runs, so `resets()` can never observe more than a handful of
-      # transitions and this rule stays PERMANENTLY silent, not just delayed. No
-      # rule in this file is a dead-man's-switch for the server process itself (an
-      # `up == 0` / `absent_over_time()` companion would be); tracked as #2956, not
-      # closed here.
+      # transitions and this rule stays PERMANENTLY silent, not just delayed. The
+      # dead-man's-switch for the server process itself is YuzuServerMetricsScrapeDown.
       #
       # `resets()` FALSE-NEGATIVES ON A PARTIAL RANGE, the mirror of
       # YuzuAuditRetentionNotRunning's documented `increase()` false-POSITIVE below.
@@ -9408,3 +9403,111 @@ groups:
             yuzu_server_revocation_source_resolver_in_flight: a value of 16 means every slot is
             in use.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#registering-a-crl-source"
+  - name: yuzu-metrics-scrape
+    # /metrics requires authentication from every peer unless the server runs with
+    # --metrics-no-auth or the opt-in --metrics-trust-loopback. A scrape job that sends no
+    # credential is then answered 401, so `up` reads 0 and every other yuzu_* alert in this file
+    # reads ABSENT, which is silence, not health. This rule is the one that says so.
+    rules:
+      - alert: YuzuServerMetricsScrapeDown
+        # `up == 0` for the server job: the scrape failed (401 for a missing or rejected token, a
+        # refused connection, a timeout). A scrape target that vanished from service discovery
+        # does not produce `up == 0` at all; pair it with an absent() alert in a deployment that
+        # uses dynamic discovery.
+        expr: |
+          up{job="yuzu-server"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus cannot scrape the Yuzu server /metrics on {{ $labels.instance }}"
+          description: >-
+            up{job="yuzu-server"} has been 0 on {{ $labels.instance }} for 5 minutes. Every other
+            yuzu_* alert reads absent while this fires. Check the scrape job's credential first:
+            /metrics answers 401 unless the request carries a valid bearer token (an API token of
+            any principal), or the server runs with --metrics-no-auth or --metrics-trust-loopback.
+            deploy/prometheus/prometheus.yml shows the `authorization` block.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md#get-metrics"
+      - alert: YuzuAgentPluginMetaDropped
+        # Registration dropped an agent-reported plugin name, version, description or action (or
+        # a plugin entry beyond the per-agent cap, or an action beyond the per-plugin cap) because
+        # it fell outside its bound. A healthy
+        # fleet reports nothing out of bounds, so any increase means an agent build or an endpoint
+        # is reporting malformed plugin metadata.
+        expr: |
+          sum by (job, instance, field) (increase(yuzu_server_agent_registry_plugin_meta_dropped_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agents reported plugin metadata outside its bounds (field {{ $labels.field }})"
+          description: >-
+            yuzu_server_agent_registry_plugin_meta_dropped_total{field="{{ $labels.field }}"}
+            increased in the last hour on {{ $labels.instance }} (job {{ $labels.job }}): an agent's registration carried a plugin name, version,
+            description, action, plugin entry or action list beyond its bound, or repeated a plugin name it had
+            already reported (field="duplicate"), and it was dropped. The counter is per server replica.
+            A single name, version, description or action is dropped whole, never cut short; the
+            plugin and action LISTS are capped (128 plugins per agent, 64 actions per plugin), so
+            field="plugins" or field="actions" means entries past the cap are missing from the served plugin catalogue for that agent. Find the
+            agent in the "dropping" lines of that server's log.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"
+  - name: yuzu-authz-signals
+    # Counters that report a server-side refusal or a held decision that no other rule watches.
+    # Each is pre-seeded at 0 at boot (yuzu_schedule_arming_unavailable_total), so an increase is
+    # measurable from the first event.
+    rules:
+      - alert: YuzuScheduleArmingUnavailable
+        # A due schedule was HELD (not advanced) because its creator's authority could not be
+        # determined: an auth-store fault. A single tick during a short blip is normal. The 5m
+        # window asks "is it increasing NOW" and `for: 15m` holds that condition for 15 minutes, so
+        # a fault that clears inside the hold stays quiet and a continuing one fires about 16
+        # minutes in. (A 15m window with a 15m hold fires after a short fault that already ended.)
+        expr: |
+          sum by (instance) (increase(yuzu_schedule_arming_unavailable_total[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scheduled work is held on {{ $labels.instance }}: the auth store cannot answer"
+          description: >-
+            yuzu_schedule_arming_unavailable_total has been increasing on {{ $labels.instance }}
+            continuously for 15 minutes: due schedules are held, not advanced, because the creator's authority
+            cannot be read from the auth store. Nothing is denied and nothing is lost; the
+            schedules run when the store answers. Check Postgres reachability and the auth store
+            (YuzuServerPostgresUnreachable, the server ERROR log).
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"
+      - alert: YuzuScheduleDueHeld
+        # How much scheduled work is parked on the arming hold: the gauge is the number of due
+        # schedules the scheduler is skipping because their creator's authority could not be read.
+        # min_over_time over 5m is above zero only when EVERY sample in the window was, and the 5m
+        # hold adds to that, so a hold must last about 10 minutes unbroken; a blip that clears
+        # earlier never fires. A hold that persists means scheduled work is not running.
+        expr: |
+          min by (instance) (min_over_time(yuzu_schedule_due_held[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} scheduled occurrence(s) held on {{ $labels.instance }} for 10 minutes: the auth store cannot answer"
+          description: >-
+            yuzu_schedule_due_held has stayed above zero on {{ $labels.instance }} for about 10 minutes:
+            due schedules are skipped (held, not advanced, not denied) because their creator's
+            authority cannot be read from the auth store. They run when the store answers.
+            yuzu_schedule_arming_deferred_total counts the skipped asks. Check Postgres
+            reachability and the auth store.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"
+      - alert: YuzuCommandOutboxArmingUnavailable
+        # The same fault at the command outbox's send-time re-authorization: the occurrence is
+        # rescheduled with back-off, not denied.
+        expr: |
+          sum by (instance) (increase(yuzu_server_command_outbox_deliver_arming_unavailable_total[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Command-outbox delivery is held on {{ $labels.instance }}: the auth store cannot answer"
+          description: >-
+            yuzu_server_command_outbox_deliver_arming_unavailable_total has been increasing on
+            {{ $labels.instance }} continuously for 15 minutes: scheduled command occurrences are rescheduled
+            with back-off because the send-time re-authorization cannot read the auth store. They
+            are not denied. Check Postgres reachability and the auth store.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"

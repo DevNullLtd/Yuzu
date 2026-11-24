@@ -14,8 +14,10 @@ import sys
 
 SERVER = pathlib.Path(__file__).resolve().parent.parent / "server/core/src/server.cpp"
 
-LAMBDA = re.compile(r"\.arming_check\s*=\s*\[this\]\s*\(([^)]*)\)\s*->\s*bool\s*\{(.*?)\n\s*\}[,;]", re.S)
-CALL = re.compile(r"schedule_arming_permitted\s*\(([^;]*?)\)\s*;", re.S)
+LAMBDA = re.compile(r"\.arming_check\s*=\s*\[this\]\s*\(([^)]*)\)\s*->\s*(?:yuzu::server::)?ArmingResult\s*\{(.*?)\n\s*\}[,;]", re.S)
+CALL = re.compile(r"\bschedule_arming\s*\(([^;]*?)\)\s*;", re.S)
+# The ONE production call of the shared rule, inside ServerImpl::schedule_arming (both lambdas go through it).
+PERMITTED = re.compile(r"schedule_arming_permitted\(\s*capability_registry_,\s*rbac_store_\.get\(\),\s*principal,\s*plugin,\s*action,\s*parameters,")
 
 
 def strip_comments(text):
@@ -29,21 +31,29 @@ def check(source):
     defects = []
     lambdas = LAMBDA.findall(src)
     if len(lambdas) != 2:
-        defects.append(f"expected exactly 2 `.arming_check = [this](...) -> bool` lambdas, found {len(lambdas)}")
+        defects.append(f"expected exactly 2 `.arming_check = [this](...) -> ArmingResult` lambdas, found {len(lambdas)}")
     for sig, body in lambdas:
         sig_n = " ".join(sig.split())
         if "const std::unordered_map<std::string, std::string>& parameters" not in sig_n:
             defects.append("an arming_check lambda does not take `parameters`")
         m = CALL.search(body)
         if not m:
-            defects.append("an arming_check lambda does not call schedule_arming_permitted")
+            defects.append("an arming_check lambda does not call schedule_arming")
             continue
         args = [a.strip() for a in " ".join(m.group(1).split()).split(",")]
-        if args[-1] != "parameters" or len(args) != 6:
-            defects.append(f"schedule_arming_permitted is not called with the lambda's `parameters` last: {args}")
-    n_calls = len(re.findall(r"schedule_arming_permitted\s*\(", src))
-    if n_calls != 2:
-        defects.append(f"expected exactly 2 production calls of schedule_arming_permitted, found {n_calls}")
+        if args[-1] != "parameters" or len(args) != 4:
+            defects.append(f"schedule_arming is not called with the lambda's `parameters` last: {args}")
+    # The lazy legacy-admin closure fails closed: no auth store or no creator is a DENIAL, and only the
+    # administrator role admits (a later edit to `return true;` would arm every non-Read pair under RBAC off).
+    for needle in ("if (!auth_db_ || principal.empty())\n                    return false;",
+                   "return user->role == auth::Role::admin;",
+                   "return yuzu::server::legacy_admin_lookup_failure(user.error());"):
+        if needle not in source:
+            defects.append(f"the legacy-admin closure in schedule_arming lost `{needle.splitlines()[0]}`")
+    # Raw text: the one-pass comment stripper is not trustworthy across the whole file (see below).
+    n_calls = len(PERMITTED.findall(source))
+    if n_calls != 1:
+        defects.append(f"expected exactly 1 production call of schedule_arming_permitted, forwarding `parameters` before the legacy-admin closure, found {n_calls}")
     return defects
 
 
@@ -79,8 +89,10 @@ def check_param_key_wiring(source):
 def selftest(source):
     mutants = {
         "drops the forwarded argument": source.replace("plugin, action, parameters)", "plugin, action, {})", 1),
+        "the shared call drops parameters": source.replace("principal, plugin, action, parameters,\n            [this", "principal, plugin, action, {},\n            [this", 1),
         "passes the argument from a first lambda only": source.replace("plugin, action, parameters);", "plugin, action);", 1),
     }
+    mutants["legacy-admin closure admits"] = source.replace("return user->role == auth::Role::admin;", "return true;", 1)
     mutants["schedule Deps without metrics"] = source.replace("                             .metrics = &metrics_,\n                         });\n\n        // #2542 PR-11: the 3-route legacy pre-v1 Responses API","                         });\n\n        // #2542 PR-11: the 3-route legacy pre-v1 Responses API",1)
     mutants["pre-seed drops a route"] = source.replace('"mcp", "schedule", "bundle",\n                                  "policy_fragment"}','"mcp", "bundle",\n                                  "policy_fragment"}',1)
     mutants["pre-seed drops mcp"] = source.replace('"instruction_execute", "mcp", "schedule"','"instruction_execute", "schedule"',1)
