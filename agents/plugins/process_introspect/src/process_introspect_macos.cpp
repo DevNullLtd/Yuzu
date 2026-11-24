@@ -29,8 +29,9 @@
  * thread, until the worker returns and releases the slot. A dispatch that meets a healthy
  * read of another dispatch answers `call_in_progress` (retry shortly). The worker's code is
  * agent-core's, so an unloaded plugin cannot pull it out from under it (the dlclose hazard
- * documented in agents/core/include/yuzu/agent/passwd_lookup.hpp). A blocked worker still pins one thread of
- * the agent until the kernel releases it; that thread is not a command-pool worker.
+ * documented in agents/core/include/yuzu/agent/passwd_lookup.hpp). A blocked worker still pins
+ * one thread of the agent until the kernel releases it; that thread is not a command-pool
+ * worker.
  */
 #if defined(__APPLE__)
 
