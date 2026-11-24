@@ -88,6 +88,16 @@
 ///     written by earlier builds on the lens carry a constant `"success"`
 ///     written BEFORE the read, so a historical lens row can say `success`
 ///     for a read that rendered the degraded placeholder.
+///   * `device.live.uptime` / `device.live.processes` (the per-device live
+///     read: REST `POST /api/v1/dex/devices/{id}/live` and MCP
+///     `get_device_live`) audit BEFORE the dispatch with `result="requested"`
+///     and fail closed: the row says only that the probe was authorised and
+///     is about to be sent. Nothing is sent when it cannot be stored (while
+///     audit is on). What happened afterwards is a later `failure` row on the
+///     same verb (nothing sent, a permission withdrawn or unreadable) or the
+///     answer itself; the MCP tool adds a generic `mcp.get_device_live` row
+///     after a successful answer. The device-page "Get live info" panel
+///     audits AFTER the dispatch (`dispatched`/`no_agents`, set-and-proceed).
 /// These postures are a known, accepted split across surfaces, not a bug in
 /// any one of them — an auditor reading raw rows must not assume one meaning
 /// fleet-wide, and must key off (verb, surface), not verb alone. Converging

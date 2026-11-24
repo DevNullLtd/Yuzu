@@ -135,7 +135,7 @@ running processes. The device page offers more, each with its own
 | `get_dex_observation` | One observation in detail. |
 | `get_device_live` | One device's live uptime or process list (`kind` `uptime` or `processes`), up to about 20 seconds, at most 1000 process rows. |
 
-`get_device_live` is the MCP tool for live info; it takes `agent_id` and `kind`, and refuses a `readonly` or `supervised` token and `--mcp-read-only`, because it sends a probe to the device. Arguments match the REST parameters above,
+`get_device_live` is the MCP tool for live info; it takes `agent_id` and `kind`, and refuses a `readonly` or `supervised` token, `--mcp-read-only` and a draining server, because it sends a probe to the device. It is labelled as an action, not a passive read: it is served not read-only and not idempotent, each call writes audit rows and stores the result in the response store for the retention period, and a client must not retry it blindly or loop over it. It answers only after the device has finished. On Linux an unprivileged agent returns an empty SHA-256 and path for other users' processes; macOS and Windows hash every row. Arguments match the REST parameters above,
 except that the per-device tools take the device as `agent_id` where the REST
 routes carry it in the path as `{id}`.
 

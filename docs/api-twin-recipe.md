@@ -552,8 +552,8 @@ if a dashboard fragment already exists for the same data, its `(void)`-discard m
 rule for every tool. A twin whose data is behavioural PII (ADR-0016: serial, system UUID and MAC)
 and whose REST route already fails closed may do the same: it withholds the data when either audit
 row drops and answers a retryable `kInternalError`, with no `audit_persisted` key.
-`get_agent_app_usage`, the hardware CI twins (`list_hardware_ci`, `get_hardware_ci`, `list_hardware_ci_records`) and `get_device_live` (whose `requested` row is the fail-closed one; its generic row stays set-and-proceed) take this
-posture. State the choice explicitly in the PR, and do not copy it onto a tool whose data is not
+`get_agent_app_usage`, the hardware CI twins (`list_hardware_ci`, `get_hardware_ci`, `list_hardware_ci_records`) and `get_device_live` take this
+posture; `get_device_live` takes a narrower form of it (only its `requested` row is fail-closed, so no probe is sent without durable evidence, while its generic row stays set-and-proceed and no audit row withholds an answer), and a twin that dispatches a command to a device and stores the result is labelled not read-only and not idempotent (through the closed `kDispatchProbeTools` override) even when its security row is a read. State the choice explicitly in the PR, and do not copy it onto a tool whose data is not
 behavioural PII.
 
 ### The two functions involved

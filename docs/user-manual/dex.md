@@ -692,9 +692,14 @@ does (agentic-first parity):
   about 20 seconds for the result (hence POST, not GET). Needs scoped `Read` and
   `Execute`, audited before dispatch (`device.live.uptime` or
   `device.live.processes`), and answers 409, 422, 403, 429, 502, 503 or 504
-  when the device cannot answer (see the REST reference). The MCP tool
+  when the device cannot answer (see the REST reference). It answers only after
+  the device has finished, never with a partial list. The reply is stored in the
+  response store for `response_retention_days` (90 by default), and process paths
+  can contain user names, so treat it as personal data. The MCP tool
   `get_device_live` is its twin and shares its limit of 2 reads per caller and
-  4 in all.
+  4 in all; the tool is labelled as an action, not a passive read (not read-only,
+  not idempotent), because every call dispatches a command to the device, writes
+  audit rows and stores the result.
 
 The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all` (and the
 catalogue rollup + per-signal drill-down additionally take the optional `os`

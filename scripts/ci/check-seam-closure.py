@@ -458,7 +458,7 @@ FAMILIES = {
             # (#2146); shared with the REST v1 live route.
             "server/core/src/live_model.cpp",
             "server/core/src/live_model.hpp",
-            # live_result_json.{hpp,cpp} + live_outcome.hpp — the shared REST+MCP `data` JSON
+            # live_result_json.{hpp,cpp} + live_outcome.hpp: the shared REST+MCP `data` JSON
             # builder and the closed live-read outcome vocabulary (both pure). live_read_poll is
             # deliberately NOT enrolled: it reads the response store.
             "server/core/src/live_result_json.cpp",

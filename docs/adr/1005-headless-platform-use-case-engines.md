@@ -2129,9 +2129,16 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        data, so the tool does not run without durable evidence. This is a
        deliberate choice, recorded here, and is not a default for the next
        behavioural MCP tool. The generic `mcp.get_device_live` row is
-       set-and-proceed. The REST `requested` row moves to the shared
-       `emit_behavioral_audit` helper, so a sink that throws answers `503` with
-       `Sec-Audit-Failed` instead of a `500`.
+       set-and-proceed, and is written only after a successful answer and for a
+       tier, approval or read-only refusal; the other refusals leave one domain
+       `failure` row (after the `requested` row) or none. Every domain row of a
+       call is written as the original session, even when the credential is
+       revoked mid-call. With audit switched off the call proceeds. The REST
+       `requested` row moves to the shared `emit_behavioral_audit` helper, so a
+       sink that throws answers `503` with `Sec-Audit-Failed` instead of a
+       `500`. The live answer is stored in the response store for
+       `response_retention_days` (a live read changes what the server stores,
+       which is why the tool is not labelled read-only).
      - **REST behaviour change.** A send that reaches no agent is classified by
        `classify_zero_reach`: `409` quarantined, `422` plugin not found, `403`
        per-OS kill switch, and a retryable `503` for the other causes, each
@@ -2141,16 +2148,27 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        shared stream budget by the REST route, the MCP tool and the
        containment-release confirmation wait, which skips the wait and answers
        `202` when no slot is free. The metric `yuzu_server_live_requests_total`
-       is relabelled `{surface, kind, outcome}` with a closed outcome word set;
-       the HTTP status label is removed. The upgrade note is in
-       `docs/user-manual/upgrading.md`.
+       is relabelled `{surface, kind, outcome}` with a closed outcome word set
+       of 31 words, every series pre-seeded at boot; the HTTP status label is
+       removed, and the gauge is renamed `yuzu_server_live_in_flight`. The
+       upgrade note is in `docs/user-manual/upgrading.md`.
      - **Poll.** One shared reader scopes the stored rows to the device at the
-       store, joins multi-row output in time order, lets a failure row win, and
-       is bounded; the MCP answer is capped at 1000 rows and 1 MiB with a
-       `truncated` flag. The shutdown drain does not wait for `kLiveRead`
-       leases, as the earlier guard was not drained either; the MCP tool
-       refuses a new call while draining (`-32015`), the REST route does not
-       consult the drain flag.
+       store, answers only after the device has finished (a stored row with a
+       terminal status; partial output without one is discarded and answered
+       `incomplete`), joins the output chunks with a newline in stored order,
+       lets a failure row win, and is bounded by a 25 second wall-clock
+       deadline and a bounded store read; the MCP answer is capped at 1000
+       rows and 1 MiB with a `truncated` flag, the REST answer refuses over
+       4 MiB or 20000 rows (`output_too_large`). A response-store ingest
+       property remains and is not fixed here: if one middle chunk of a
+       multi-chunk device answer is not stored, the read cannot detect the hole
+       and may return the surviving rows as complete.
+     - **Shutdown.** All three `kLiveRead` holders refuse (the REST route and
+       the MCP tool, `shutting_down`; the MCP code is `-32015`) or skip (the
+       quarantine release confirmation) a new wait once the server is draining;
+       the shutdown drain counts the `kLiveRead` leases, within its existing
+       30 second cap; a poll already running abandons its read when the
+       held-open budget closes.
      - **Check order and denial mapping.** The MCP handler runs the tier
        checks, argument validation and the two scoped gates before the
        supervised and read-only refusals, so an out-of-scope device answers

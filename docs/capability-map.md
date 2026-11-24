@@ -1550,7 +1550,7 @@ Deferred — `yuzu.net_degraded` is retired per the routed-concerns table (gauge
 
 ### 34.2 Live Snapshot ("Get live info") :white_check_mark: `T2` *(verified 2026-09-07)*
 
-Dispatch-and-poll card grid with 20+ live kinds — process tree, services, users, netconfig, ARP/DNS on Windows, listening/connections, capture sources, hardware disks/memory/processors/drivers, battery, thermal, SMART, volumes, adapters, WiFi, disk free and uptime — each with its own `device.live.<kind>` audit verb, gated on `Execution:Execute` (`server/core/src/device_routes.cpp`). Uptime and processes are also served over REST (`POST /api/v1/dex/devices/{id}/live`) and MCP (`get_device_live`), sharing one limit of 2 reads per principal and 4 in all.
+Dispatch-and-poll card grid with 20+ live kinds — process tree, services, users, netconfig, ARP/DNS on Windows, listening/connections, capture sources, hardware disks/memory/processors/drivers, battery, thermal, SMART, volumes, adapters, WiFi, disk free and uptime — each with its own `device.live.<kind>` audit verb, gated on `Execution:Execute` (`server/core/src/device_routes.cpp`). Uptime and processes are also served over REST (`POST /api/v1/dex/devices/{id}/live`) and MCP (`get_device_live`), sharing one limit of 2 reads per principal and 4 in all (the dashboard path is not covered by that limit and keeps its own poll semantics until it moves onto the shared read).
 
 ### 34.3 Agentic REST Parity for Device Surfaces :white_check_mark: `T2` *(verified 2026-09-07)*
 
