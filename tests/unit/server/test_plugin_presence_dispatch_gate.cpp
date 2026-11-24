@@ -14,6 +14,7 @@
 #include "../test_log_capture.hpp"
 
 #include <algorithm>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -560,6 +561,72 @@ TEST_CASE("an agent reporting only the retired `tar` plugin does not count as ha
     REQUIRE(session);
     CHECK(std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end());
     CHECK(std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end());
+}
+
+// #7429: the count behind yuzu_fleet_retired_tar_plugin_agents covers sessions this replica holds
+// that report `tar` and no `echo`; a session that leaves or re-registers with `echo` drops out.
+TEST_CASE("retired_tar_only_count counts only tar-without-echo sessions",
+          "[server][registry][echo_rename]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    const auto register_with = [&](const std::string& id, std::initializer_list<const char*> names) {
+        auto info = make_presence_test_info(id);
+        for (const char* n : names)
+            info.add_plugins()->set_name(n);
+        (void)registry.register_agent(info);
+    };
+    CHECK(registry.retired_tar_only_count() == 0);
+
+    register_with("dev-echo", {"os_info", "echo"});
+    register_with("dev-both", {"echo", "tar"}); // mid-upgrade inventories carry both
+    register_with("dev-none", {"os_info"});
+    CHECK(registry.retired_tar_only_count() == 0);
+
+    register_with("dev-tar", {"os_info", "tar"});
+    CHECK(registry.retired_tar_only_count() == 1);
+
+    register_with("dev-tar-2", {"tar"});
+    CHECK(registry.retired_tar_only_count() == 2);
+
+    // Re-registering with echo clears the flag (the new session replaces the old one) ...
+    register_with("dev-tar", {"os_info", "echo"});
+    CHECK(registry.retired_tar_only_count() == 1);
+    // ... and a removed session no longer counts.
+    registry.remove_agent("dev-tar-2");
+    CHECK(registry.retired_tar_only_count() == 0);
+
+    // The count is a counter kept at every insert, replace and erase (the health sweep reads it in
+    // O(1)), so each removal path and a same-flag replace must leave it equal to a scan.
+    const auto register_ret = [&](const std::string& id, const std::string& session) {
+        auto info = make_presence_test_info(id);
+        info.add_plugins()->set_name("tar");
+        auto s = registry.register_agent(info);
+        REQUIRE(s);
+        registry.map_session(session, id);
+        return *s;
+    };
+    (void)register_ret("dev-a", "sess-a");
+    const auto installed_b = register_ret("dev-b", "sess-b");
+    (void)register_ret("dev-c", "sess-c");
+    CHECK(registry.retired_tar_only_count() == 3);
+    (void)register_ret("dev-a", "sess-a2"); // tar replaced by tar: still one entry
+    CHECK(registry.retired_tar_only_count() == 3);
+    CHECK(registry.remove_agent_if_session("dev-a", "sess-a2"));
+    CHECK(registry.retired_tar_only_count() == 2);
+    CHECK_FALSE(registry.remove_agent_if_session("dev-b", "not-the-session")); // refused: no change
+    CHECK(registry.retired_tar_only_count() == 2);
+    registry.remove_agent_if_same("dev-b", installed_b);
+    CHECK(registry.retired_tar_only_count() == 1);
+    registry.remove_agent("dev-c");
+    CHECK(registry.retired_tar_only_count() == 0);
+    // The other replace direction: an echo session replaced by a tar-only one starts counting.
+    register_with("dev-flip", {"echo"});
+    CHECK(registry.retired_tar_only_count() == 0);
+    register_with("dev-flip", {"tar"});
+    CHECK(registry.retired_tar_only_count() == 1);
+    registry.remove_agent("dev-flip");
+    CHECK(registry.retired_tar_only_count() == 0);
 }
 
 TEST_CASE("an agent reporting `echo` has it and send_to / send_to_all write `echo` to the wire",
