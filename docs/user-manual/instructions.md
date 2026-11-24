@@ -599,6 +599,7 @@ Yuzu supports three approval modes that control whether an execution requires hu
 - **Submitter cannot approve.** The account that submits an execution request cannot be the one to approve it. A different account with the appropriate role must review it (the check compares account names; see the known limitation under [Who can approve](#who-can-approve)).
 - **Comments are supported.** Both approve and reject actions accept an optional comment for the audit trail.
 - **Pending count.** The API provides a pending approval count for dashboard badges and automation polling.
+- **A policy does not run an instruction whose approval mode is not `auto`.** Policy evaluation has no approval step, so a policy check, fix or post-fix check that names such an instruction is refused and its devices show `blocked` with reason `approval_required`; creating a fragment or a policy, or enabling a policy, with such an instruction answers `400`. See [Action approval and the `blocked` status](policy-engine.md#action-approval-and-the-blocked-status).
 
 ### YAML Configuration
 
