@@ -4687,7 +4687,7 @@ test('HKEY_USERS listing callers refuse a failed listing lexical gate (#7035)',
 test('live-read processes timeout hint equals the plugin action budget (#2146)',
   _python3_test,
   args: [files('test_live_retry_budget_lexical.py')],
-  suite: 'server',
+  suite: 'docs',
   timeout: 30,
 )
 

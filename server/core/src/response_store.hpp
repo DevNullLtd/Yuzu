@@ -210,8 +210,9 @@ struct ResponseQuery {
     /// `query_bounded` only: rank candidate rows by `id DESC` alone instead of `timestamp DESC,
     /// id DESC`. The live poll sets it because ids are the one order its reducer trusts (the
     /// stored timestamp is the server's receipt time in epoch seconds, and it can step backwards
-    /// on a server clock step or across replicas), so the newest ROW, which carries the terminal
-    /// state, survives the row limit and the byte cut. Only the ranking changes: the WHERE
+    /// on a server clock step or across replicas), so the newest ROW (a separately inserted
+    /// terminal row, when the chunks were not finalized in place) survives the row limit and the
+    /// byte cut. Only the ranking changes: the WHERE
     /// clause, the scope clause and the tier clause are untouched. For a fresh per-command poll
     /// only: on a very large, old `instruction_id` the planner can pick a backward primary-key
     /// scan, which is slow (measured 267 ms warm over 1.9 M rows) though still correct. The

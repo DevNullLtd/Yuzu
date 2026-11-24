@@ -12886,11 +12886,12 @@ TEST_CASE("MCP get_device_live: the poll reads the device's rows only (multi-row
         CHECK(err["code"] == yuzu::server::mcp::kInternalError);
         CHECK(err["message"].get<std::string>() == "the device began to answer but did not finish");
         CHECK(err["data"]["reason"] == "incomplete");
-        // UP-17: the device was working, so its first run may still be hashing. The hint is the
-        // poll's own wall deadline (25 s), not the 3 s a timeout carries.
-        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kLiveReadIncompleteRetryMs);
-        CHECK(err["data"]["retry_after_ms"] == 25000);
-        CHECK(err["data"]["retry_after_ms"] != yuzu::server::mcp::kMcpLiveReadDeviceTimeoutRetryMs);
+        // The device was working, so its first run may still be hashing. A `processes` run has a
+        // 120 s budget, so a retry at the poll's 25 s deadline could start a second hash: the
+        // hint is the plugin's budget. (A quick kind keeps the 25 s deadline, see the unit test.)
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kLiveReadProcessesTimeoutRetryMs);
+        CHECK(err["data"]["retry_after_ms"] == 120000);
+        CHECK(err["data"]["retry_after_ms"] != yuzu::server::mcp::kLiveReadIncompleteRetryMs);
         CHECK(res->body.find("PARTIAL_MARKER") == std::string::npos);
         CHECK(mcp_live_count(f.metrics, "processes", "incomplete") == 1.0);
         CHECK(mcp_live_count(f.metrics, "processes", "timeout") == 0.0);

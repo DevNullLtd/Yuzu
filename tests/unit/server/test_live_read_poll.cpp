@@ -899,6 +899,33 @@ TEST_CASE("poll_live_output [pg]: a terminal failure with an older timestamp tha
     }
 }
 
+// The dominant failure shape: the terminal frame has no output, so the gateway/proxy ingest path
+// finalizes the existing RUNNING chunk rows IN PLACE (every chunk row then carries the failure).
+// Over the row limit the poll must still report the failure under the id ranking.
+TEST_CASE("poll_live_output [pg]: chunks finalized in place as a failure answer device_failed over the row limit",
+          "[live][poll][pg][2146]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::test::PostgresTestDb db{live_poll_tpl};
+    REQUIRE(db.available());
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+
+    for (int i = 0; i < live::kLivePollRowLimit + 6; ++i)
+        seed(store, "cmd-final", "agent-1", 0, "proc|" + std::to_string(i) + "|x\n", "os_info", "", 1000 + i);
+    REQUIRE(store.finalize_terminal_status("cmd-final", "agent-1", 2, "agent exploded", "", 0) ==
+            ResponseStore::FinalizeResult::Updated);
+
+    auto limits = fast_limits(1);
+    limits.over_cap = GENERATE(live::OverCapPolicy::kTruncateAtNewline, live::OverCapPolicy::kRefuse);
+    const auto out = live::poll_live_output(store, "cmd-final", "agent-1",
+                                            &yuzu::server::test::forensics_plugin_set(), limits, no_sleep);
+    CHECK(out.outcome == live::LiveOutcome::kDeviceFailed);
+    CHECK(out.detail == "agent exploded");
+}
+
 TEST_CASE("ResponseStore::query_bounded [pg]: order_by_id ranks by id alone, the default still ranks by timestamp",
           "[live][poll][pg][2146]") {
     if (yuzu::test::pg_admin_dsn_env() == nullptr)
@@ -996,6 +1023,18 @@ TEST_CASE("live_read_timeout_retry_ms: processes is priced at the plugin's actio
     CHECK(mcp::kLiveReadProcessesTimeoutRetryMs == 120000);
     // An unresolved token never reaches the hint, but the default must be the short quick-kind price.
     CHECK(mcp::live_read_timeout_retry_ms("") == mcp::kMcpLiveReadDeviceTimeoutRetryMs);
+}
+
+TEST_CASE("live_read_incomplete_retry_ms: processes is priced at its run budget, other kinds at the poll deadline",
+          "[live][retry][2146]") {
+    namespace mcp = yuzu::server::mcp;
+    CHECK(mcp::live_read_incomplete_retry_ms("uptime") == mcp::kLiveReadIncompleteRetryMs);
+    CHECK(mcp::live_read_incomplete_retry_ms("uptime") == 25000);
+    CHECK(mcp::live_read_incomplete_retry_ms("processes") == mcp::kLiveReadProcessesTimeoutRetryMs);
+    CHECK(mcp::live_read_incomplete_retry_ms("") == mcp::kLiveReadIncompleteRetryMs);
+    // A processes read that finished its first run is never told to retry sooner than a read that
+    // sent nothing at all: the two hints agree for it.
+    CHECK(mcp::live_read_incomplete_retry_ms("processes") == mcp::live_read_timeout_retry_ms("processes"));
 }
 
 // S3: the helper the REST and MCP error text goes through. Invalid bytes cannot reach those sites

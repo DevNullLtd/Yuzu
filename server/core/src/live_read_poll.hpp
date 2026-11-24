@@ -107,8 +107,9 @@ struct LivePollLimits {
     OverCapPolicy over_cap = OverCapPolicy::kRefuse;
 };
 
-// The `incomplete` retry hint is the poll's own wall deadline (see mcp_retry.hpp): a caller told
-// to retry sooner could land inside a first run that is still hashing.
+// The quick-kind `incomplete` retry hint is the poll's own wall deadline (see mcp_retry.hpp): a
+// caller told to retry sooner could land inside a first run that is still hashing. `processes` has
+// its own, longer price (`live_read_incomplete_retry_ms`).
 static_assert(std::chrono::milliseconds{yuzu::server::mcp::kLiveReadIncompleteRetryMs} ==
                   LivePollLimits{}.deadline,
               "the incomplete retry hint must equal the poll's wall deadline");

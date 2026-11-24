@@ -5563,11 +5563,12 @@ TEST_CASE("REST dex/devices/{id}/live: output with no terminal row is 504 incomp
     const auto j = nlohmann::json::parse(res->body);
     CHECK(j["error"]["message"].get<std::string>() == "the device began to answer but did not finish");
     CHECK(j["error"]["reason"].get<std::string>() == "incomplete");
-    // UP-17: the device was working, so its first run may still be hashing; the hint is the poll's
-    // own wall deadline (25 s), NOT the 3 s a timeout carries, so a retry cannot land inside it.
-    CHECK(j["error"]["retry_after_ms"].get<int>() == 25000);
+    // The device was working, so its first run may still be hashing; a `processes` run has a 120 s
+    // budget, so the hint is that budget (a quick kind keeps the poll's 25 s deadline), and a retry
+    // cannot land inside the first run.
+    CHECK(j["error"]["retry_after_ms"].get<int>() == 120000);
     CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() ==
-          yuzu::server::mcp::kLiveReadIncompleteRetryMs);
+          yuzu::server::mcp::kLiveReadProcessesTimeoutRetryMs);
     CHECK(res->body.find("PARTIAL_MARKER") == std::string::npos);
     CHECK(rest_live_count(h, "processes", "incomplete") == 1.0);
     CHECK(rest_live_count(h, "processes", "timeout") == 0.0);
@@ -6052,6 +6053,11 @@ TEST_CASE("REST dex/devices/{id}/live: an unwired Forensics plugin set is refuse
     RestGsHarness h(true, true, true, true, &pool, true, nullptr, true, {},
                     yuzu::server::detail::kTargetHeldOpenStreamsDefault,
                     /*wire_forensics_set=*/false);
+    // A regression (no guard) would run the whole poll and answer 504: keep that fast to observe.
+    AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
+    AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
+    yuzu::server::detail::live_poll_max_polls().store(2);
+    yuzu::server::detail::live_poll_interval_ms().store(1);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
     CHECK(res->status == 503); // not the 504 the full poll budget would have ended in

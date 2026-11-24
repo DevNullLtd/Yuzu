@@ -2773,8 +2773,8 @@ static const ToolDef kTools[] = {
      "writes audit rows, and the result is stored in the server's response store for the "
      "retention period (90 days by default). Treat each call as an action: never retry one "
      "that returned no retry_after_ms. "
-     "SYNCHRONOUS: the call blocks for about 20 seconds when the store answers quickly, never "
-     "longer than the 25 second poll deadline plus one 0.5 second interval and one store read, "
+     "SYNCHRONOUS: the call blocks until the device answers (about 20 seconds at most when the "
+     "store is quick, never past the 25 second deadline plus one interval and one read) "
      "and holds one server request slot meanwhile (at most 2 per principal, 4 server-wide; over "
      "that it answers a retryable cap error and sends nothing). The answer is given only after "
      "the device has finished: partial output without a final row is never returned, except "
@@ -2811,8 +2811,8 @@ static const ToolDef kTools[] = {
      "worth retrying (a device timeout, a response store read fault, a cap, an audit store "
      "fault, an offline device (no_agents_reached), or a store that could not be read: "
      "gate_unreadable, containment_unreadable, route_unreadable, os_gate_unreadable). A device "
-     "that began to answer but did not finish (incomplete) is retryable with a longer wait, the "
-     "poll's own 25 second deadline, because its first run may still be hashing. Never retry "
+     "that began to answer but did not finish (incomplete) is retryable with a longer wait (25 seconds, "
+     "120 for processes), because its first run may still be hashing. Never retry "
      "quarantined, plugin_not_found, kill_switched_os, device_failed, device_error (which "
      "includes a device that returned nothing usable), a dispatch denial token or "
      "permission_revoked. shutting_down means the server is stopping: retry later or against "
@@ -22547,12 +22547,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     case live::LiveOutcome::kIncomplete:
                         // Output arrived and no terminal row followed (the partial output was
-                        // discarded): retryable, but NOT as soon as a timeout. The device was working,
-                        // so its first run may still be hashing; the hint is the poll's own wall
-                        // deadline, so a retry does not land inside it.
+                        // discarded): retryable, but NOT as soon as a quick kind's timeout. The
+                        // device was working, so its first run may still be hashing; the hint is the
+                        // poll's own wall deadline (the plugin's 120 s budget for processes), so a
+                        // retry does not land inside it.
                         res.set_content(
                             a4_error(kInternalError, std::string(polled.detail),
-                                     "retry the request", mcp::kLiveReadIncompleteRetryMs,
+                                     "retry the request", mcp::live_read_incomplete_retry_ms(kind),
                                      cid, true, live::to_token(polled.outcome)),
                             "application/json");
                         return;

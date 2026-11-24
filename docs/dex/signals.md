@@ -108,8 +108,9 @@ running processes. The device page offers more, each with its own
   observation. An unknown event id, or one that belongs to another device, is
   a `404`.
 - `POST /api/v1/dex/devices/{id}/live` takes `kind=uptime` or `kind=processes`,
-  dispatches a read-only instruction to the device and waits up to about 20
-  seconds for the answer. It answers `429` when the caller already has 2 live
+  dispatches a read-only instruction to the device and waits for the answer, up
+  to about 20 seconds when the store answers quickly and never longer than the
+  25 second poll deadline plus one 0.5 second interval and one store read. It answers `429` when the caller already has 2 live
   queries running, or the server already has 4 (the MCP tool and the
   quarantine release wait draw on the same limit). It answers `502` when the
   instruction failed on the device, the device reported an error or its output
@@ -133,7 +134,7 @@ running processes. The device page offers more, each with its own
 | `get_dex_device_score` | One device's score and signal summary. |
 | `get_dex_device_history` | One device's signal history. |
 | `get_dex_observation` | One observation in detail. |
-| `get_device_live` | One device's live uptime or process list (`kind` `uptime` or `processes`), up to about 20 seconds, at most 1000 process rows. |
+| `get_device_live` | One device's live uptime or process list (`kind` `uptime` or `processes`), up to about 20 seconds when the store answers quickly (never longer than the 25 second poll deadline plus one 0.5 second interval and one store read), at most 1000 process rows. |
 
 `get_device_live` is the MCP tool for live info; it takes `agent_id` and `kind`, and refuses a `readonly` or `supervised` token, `--mcp-read-only` and a draining server, because it sends a probe to the device. It is labelled as an action, not a passive read: it is served not read-only and not idempotent, each call writes audit rows and stores the result in the response store for the retention period, and a client must not retry it blindly or loop over it. It answers only after the device has finished (partial output without a final row is never returned, except an answer already over the size cap, which MCP cuts and flags `truncated` at once and REST refuses; a chunk the server failed to store cannot be detected). On every OS a process row can carry an empty SHA-256 and path (protected or kernel processes, network, device or non-fixed images) or a `hash_unavailable:<cause>` marker in the SHA-256 field; an unprivileged Linux agent additionally cannot read other users' images, and Linux kernel threads have no executable link even for a privileged agent. Arguments match the REST parameters above,
 except that the per-device tools take the device as `agent_id` where the REST

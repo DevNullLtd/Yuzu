@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pins the `processes` live-read `timeout` retry hint to the processes plugin's action budget.
+"""#2146 static lexical gate pinning the `processes` live-read retry hint to the processes plugin's action budget.
 
 `kLiveReadProcessesTimeoutRetryMs` (server/core/src/mcp_retry.hpp) is the `retry_after_ms` a live
 read of kind `processes` answers when it times out. It must equal the plugin's own action budget
