@@ -1,5 +1,6 @@
 # component_inventory -- installed software components found in application trees (Java archives
-# and the libraries nested in them, and native shared libraries: ELF and Mach-O). Read-only, zero
+# and the libraries nested in them, native shared libraries: ELF and Mach-O, Python distributions and
+# Node packages; nlohmann reads package.json). Read-only, zero
 # subprocess. Multi-TU shape follows
 # agents/plugins/runtimes/meson.build: one portable plugin TU plus the POSIX filesystem leg, which
 # is #if-gated internally so it is listed unconditionally. The Windows leg is a later change.
@@ -13,7 +14,7 @@ if not component_inventory_zlib_dep.found()
   component_inventory_zlib_dep = dependency('zlib', required: true, include_type: 'system')
 endif
 
-component_inventory_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep, component_inventory_zlib_dep]
+component_inventory_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep, nlohmann_dep, component_inventory_zlib_dep]
 
 # Assigned (not anonymous) so tests/meson.build's link_depends can name this build output,
 # matching runtimes_plugin_lib.

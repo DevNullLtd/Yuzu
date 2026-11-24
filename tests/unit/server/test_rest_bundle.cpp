@@ -546,6 +546,45 @@ TEST_CASE("REST POST rejects empty agent_id", "[pg][bundle][rest][unhappy]") {
     CHECK(status == 400);
 }
 
+// #7811: the bundle's agent id reaches the scoped gate's denial audit and `target_id` on the
+// per-step and `bundle.dispatch` rows, so an over-long or control-byte id is refused with a 400
+// before the gate, any audit row and any dispatch. The gate admits every device, so a 400 with no
+// gate call proves the id check runs first.
+TEST_CASE("POST /api/v1/bundles: an unsafe agent id is a 400 before the scoped gate, any audit "
+          "row or dispatch",
+          "[pg][bundle][rest][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        int status = 0;
+        auto j = h.post("/api/v1/bundles",
+                        nlohmann::json{{"agent_id", id},
+                                       {"steps", nlohmann::json::array(
+                                                     {{{"plugin", "os_info"}, {"action", "uptime"}}})}}
+                            .dump(),
+                        status);
+        CHECK(status == 400);
+        REQUIRE(j.is_object());
+        CHECK(j["error"]["message"] == "Invalid device id.");
+    }
+    CHECK(h.last_scoped_agent.empty()); // the scoped gate was never asked
+    CHECK(h.calls.empty());
+    CHECK(h.audits.empty());
+
+    // A 256-byte printable id is safe and reaches the scoped gate.
+    int status = 0;
+    h.post("/api/v1/bundles",
+           nlohmann::json{{"agent_id", std::string(256, 'a')},
+                          {"steps", nlohmann::json::array({{{"plugin", "os_info"}, {"action", "uptime"}}})}}
+               .dump(),
+           status);
+    CHECK(h.last_scoped_agent.size() == 256);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // json-dump-depth-guard fix (#2437-class): nlohmann::json::dump() is
 // unboundedly recursive. The REST handler's OWN guard checks the RAW body
