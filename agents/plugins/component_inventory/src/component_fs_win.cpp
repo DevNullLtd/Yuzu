@@ -139,9 +139,11 @@ struct Stamp {
 
 [[nodiscard]] ListResult list_directory(const std::string& dir, std::size_t cap, const DriveClassTest& drive_class) {
     const auto wide = native_path_from_walk(dir);
+    std::uint32_t open_status = 0; // the refused open's NTSTATUS; 0 when it was never attempted
     // The volume is re-checked at every open, not only at planning (volume_is_fixed): not fixed is a refusal.
     if (wide && volume_is_fixed(dir, drive_class)) {
         const auto opened = yuzu::win::open_dir_no_reparse(to_wstring(*wide));
+        open_status = opened.ntstatus;
         if (opened.status == yuzu::win::NoReparseOpen::ok) {
             const HANDLE h = opened.file.get();
             std::vector<std::uint64_t> buffer(kBatchBytes / sizeof(std::uint64_t)); // 8-byte aligned records
@@ -161,6 +163,7 @@ struct Stamp {
         }
     }
     ListResult out;
+    out.cause = list_cause_from_ntstatus(open_status);
     // Not opened: missing, a reparse point on the way, refused, a volume that is not fixed, or a name it
     // cannot spell.
     out.error = true;

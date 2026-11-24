@@ -47,6 +47,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -135,6 +136,9 @@ enum class NoReparseOpen { ok, absent, refused, unsupported };
 struct NoReparseOpenResult {
     NoReparseOpen status{NoReparseOpen::refused};
     NoReparseHandle file; ///< valid only when status == ok
+    /// The NTSTATUS NtCreateFile answered (0 when it was never called: a refused name or a missing
+    /// module). Lets a caller tell an access-denied refusal from the other refusals.
+    std::uint32_t ntstatus{0};
 };
 
 namespace no_reparse_detail {
@@ -242,6 +246,7 @@ inline NoReparseHandle open_volume_root(wchar_t drive_letter) {
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, kFileOpen,
         kFileNonDirectoryFile | kFileSynchronousIoNonalert | kFileOpenReparsePoint,
         /*EaBuffer=*/nullptr, /*EaLength=*/0);
+    result.ntstatus = static_cast<std::uint32_t>(status);
     if (status >= 0) {
         result.file = NoReparseHandle(raw); // owned at the statement it is produced
         result.status = NoReparseOpen::ok;
@@ -304,6 +309,7 @@ inline NoReparseHandle open_volume_root(wchar_t drive_letter) {
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, kFileOpen,
         kFileDirectoryFile | kFileSynchronousIoNonalert | kFileOpenReparsePoint,
         /*EaBuffer=*/nullptr, /*EaLength=*/0);
+    result.ntstatus = static_cast<std::uint32_t>(status);
     if (status >= 0) {
         NoReparseHandle owned(raw); // owned at the statement it is produced
         BY_HANDLE_FILE_INFORMATION info{};
