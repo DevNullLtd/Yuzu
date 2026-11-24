@@ -14,12 +14,12 @@
  *     resolution, so it can only be shown against a real junction; every race is staged in explicit
  *     steps (list, then replace, then the second call), never by timing.
  *
- * PROVENANCE. SYNTHETIC: no Windows capture is committed with this change. Every directory batch below
- * is built in the test to the documented FILE_ID_BOTH_DIR_INFO layout (the offsets are the ones
- * component_legs_win.hpp names; component_fs_win.cpp static_asserts them against the SDK struct on the
- * host that compiles it, so a wrong offset is a build failure there, not a silent misread here). The
- * attribute values are the documented FILE_ATTRIBUTE_* constants. The real-tree cases on Windows are
- * the first contact with a live volume.
+ * PROVENANCE. SYNTHETIC: the fixtures in this file are built here, and no test loads a capture. Every
+ * directory batch below is built in the test to the documented FILE_ID_BOTH_DIR_INFO layout (the offsets
+ * are the ones component_legs_win.hpp names; component_fs_win.cpp static_asserts them against the SDK
+ * struct on the host that compiles it, so a wrong offset is a build failure there, not a silent misread
+ * here). The attribute values are the documented FILE_ATTRIBUTE_* constants. The plugin's real capture
+ * is agents/plugins/component_inventory/docs/samples/windows.txt.
  *
  * MUTATION NOTES (each assertion below FAILS if the named wiring is removed):
  *  - typing a reparse point from FILE_ATTRIBUTE_DIRECTORY before FILE_ATTRIBUTE_REPARSE_POINT (a junction
