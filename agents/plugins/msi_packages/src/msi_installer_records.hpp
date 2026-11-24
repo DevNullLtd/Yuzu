@@ -182,6 +182,85 @@ namespace detail {
            (iequals_ascii(base.substr(0, 3), "COM") || iequals_ascii(base.substr(0, 3), "LPT"));
 }
 
+// ── Path allow-list helpers (the privacy gate below) ──────────────────────────
+
+/// ASCII-only case fold (A-Z); every other byte is returned unchanged. Locale independent.
+[[nodiscard]] constexpr char ascii_fold(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+[[nodiscard]] constexpr bool is_alnum(char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+}
+
+/// One path segment (already folded, never `.` or `..`) is on the allow-list when it is
+/// non-empty, does not start or end with a space or a dot (Win32 trims those, so such a
+/// name is not the name it looks like), is not an 8.3 short name (`~` then a digit), and
+/// holds only: letters, digits, a space inside the name, any non-ASCII byte (UTF-8 text),
+/// and the punctuation  - _ . ( ) [ ] { } & + , ; = @ # ! ' $ ^ ~ . Everything else is out,
+/// notably `:` (an NTFS stream or a drive), `%`, `*`, `?`, `"`, `<`, `>`, `|`, `\`, `/`,
+/// a control character, NUL and DEL.
+[[nodiscard]] inline bool segment_allowed(std::string_view seg) noexcept {
+    if (seg.empty() || seg.front() == ' ' || seg.front() == '.' || seg.back() == ' ' ||
+        seg.back() == '.')
+        return false;
+    for (std::size_t i = 0; i < seg.size(); ++i) {
+        const char c = seg[i];
+        const bool ok = is_alnum(c) || c == ' ' || static_cast<unsigned char>(c) >= 0x80 ||
+                        std::string_view{"-_.()[]{}&+,;=@#!'$^~"}.find(c) != std::string_view::npos;
+        if (!ok)
+            return false;
+        if (c == '~' && i + 1 < seg.size() && seg[i + 1] >= '0' && seg[i + 1] <= '9')
+            return false;
+    }
+    return true;
+}
+
+/// A UNC server is kept only as a plain DNS-style name: dot-separated labels of letters,
+/// digits and inner hyphens; no label purely numeric or starting `0x` (any IPv4 spelling,
+/// `0`, `127.1`); no label `localhost` or a name starting `localhost`; no `ipv6-literal.net`
+/// suffix. Anything else (`.`, `?`, an IPv6 literal, a trailing dot, `[::1]`) is out.
+[[nodiscard]] inline bool unc_server_allowed(std::string_view server) noexcept {
+    constexpr std::string_view kV6 = "ipv6-literal.net";
+    if (server.empty() || server.back() == '.' || server.starts_with("localhost") ||
+        (server.size() >= kV6.size() && server.substr(server.size() - kV6.size()) == kV6))
+        return false;
+    while (!server.empty()) {
+        const auto dot = server.find('.');
+        const std::string_view label = server.substr(0, dot);
+        server = dot == std::string_view::npos ? std::string_view{} : server.substr(dot + 1);
+        if (label.empty() || label == "localhost" || label.front() == '-' || label.back() == '-' ||
+            label.starts_with("0x") ||
+            std::all_of(label.begin(), label.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            return false;
+        if (!std::all_of(label.begin(), label.end(),
+                         [](char c) { return is_alnum(c) || c == '-'; }))
+            return false;
+    }
+    return true;
+}
+
+/// A UNC share is kept only as a plain name: no `$` (so no `C$`, `ADMIN$`, `IPC$`, `print$`)
+/// and the segment allow-list.
+[[nodiscard]] inline bool unc_share_allowed(std::string_view share) noexcept {
+    return share.find('$') == std::string_view::npos && segment_allowed(share);
+}
+
+/// ASCII-fold equality, except that two non-ASCII bytes always compare equal: the NTFS case
+/// table is not reproduced, so a non-ASCII difference is treated as a possible case variant
+/// and matches (over-withholds), never the reverse. A variant whose UTF-8 form has a
+/// different length is not seen.
+[[nodiscard]] inline bool fold_equal_prefix(const std::string& p, const std::string& root) {
+    if (p.size() < root.size())
+        return false;
+    for (std::size_t i = 0; i < root.size(); ++i) {
+        const auto a = static_cast<unsigned char>(p[i]);
+        const auto b = static_cast<unsigned char>(root[i]);
+        if ((a < 0x80 || b < 0x80) && a != b)
+            return false;
+    }
+    return true;
+}
 } // namespace detail
 
 /// Packed 32-digit form -> upper-case braced GUID. nullopt for a wrong length or a non-hex digit.
@@ -262,125 +341,84 @@ namespace detail {
 }
 
 // ── Privacy ─────────────────────────────────────────────────────────────────────
+//
+// THE RULE (an allow-list; everything else is withheld). A non-empty path is EMITTED only
+// when, after normalisation, it is (1) a plain drive-absolute path (`X:\...`, X one ASCII
+// letter) or a plain UNC path (`\\server\share\...`), (2) every segment is on the segment
+// allow-list and the UNC server and share on theirs (detail::segment_allowed,
+// unc_server_allowed, unc_share_allowed), and (3) it is not under a profile root. A path under
+// a root is withheld as `withheld:user_path`; a path that fails (1) or (2) as
+// `withheld:path_unverifiable`. A root must pass (1) and (2) as well, or the profile list is
+// incomplete. Residual, still emitted because nothing here can see them: junctions, symbolic
+// links, mount points, `subst` and mapped drives, a UNC path naming this machine by its own
+// DNS name, and a non-ASCII case variant whose UTF-8 form has a different length.
 
-/// ASCII-only case fold (A-Z); every other byte is returned unchanged. Locale independent.
-[[nodiscard]] constexpr char ascii_fold(char c) noexcept {
-    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-}
-
-/// A path reduced to a drive-absolute (`c:\a\b`) or UNC (`\\server\share\a`) comparable form.
-/// `comparable` is false for every spelling this code cannot place on a volume with
-/// confidence; such a path (or root) is never compared. A path fails closed (it is withheld),
-/// and a root makes the profile list incomplete.
+/// A path reduced to its comparable form. `comparable` is false when it is not on the
+/// allow-list: it is then neither compared nor emitted.
 struct NormalPath {
-    std::string text; ///< folded, no `.`/`..`, no trailing dots or spaces; meaningful if comparable
+    std::string text; ///< folded, no `.`/`..`; meaningful only if comparable
     bool comparable = false;
 };
 
-namespace detail {
-/// A segment that may be an 8.3 short name (`PROGRA~1`, `USERS~1.X`): one `~` then a digit.
-[[nodiscard]] inline bool looks_like_short_name(std::string_view seg) {
-    for (std::size_t i = 0; i + 1 < seg.size(); ++i)
-        if (seg[i] == '~' && seg[i + 1] >= '0' && seg[i + 1] <= '9')
-            return true;
-    return false;
-}
-} // namespace detail
-
-/// Normalises like Win32 for the forms it can place: `/` read as `\`, ASCII fold, a `\\?\`,
-/// `\\.\` or `\??\` prefix dropped (`\\?\UNC\` is a UNC path), repeated separators collapsed,
-/// `.` segments dropped, `..` segments resolved with the drive (`c:`) or the UNC
-/// `\\server\share` kept OUTSIDE the segment stack, so an excess `..` clamps at the root as
-/// Win32 does, and trailing dots and spaces trimmed from every segment. `\\localhost\X$\...`
-/// (and 127.0.0.1) is read as `X:\...`.
-///
-/// NOT comparable (fail closed): a rooted path with no drive (`\Users\x`), a drive-relative
-/// one (`C:x`, `C:`), `\\?\Volume{GUID}\`, `\\.\GLOBALROOT\`, any other device or namespace
-/// path, a UNC path without a server and share, a `\\?\` or `\??\` path holding a `.` or `..`
-/// segment (those prefixes switch Win32's own normalisation off), anything under the
-/// `Documents and Settings` junction, and any segment that may be an 8.3 short name.
-/// Not detected, so it can still be emitted: other junctions, symbolic links, mount points,
-/// `subst` and mapped drives, and a UNC path naming this machine by its own host name.
+/// Normalises a path as Win32 reads a plain path, and gives up (not comparable) on anything
+/// the allow-list does not cover: `/` is read as `\`, ASCII is folded, repeated separators
+/// collapse, `.` segments drop, `..` segments pop, and the drive (`c:`) or the UNC
+/// `\\server\share` stays OUTSIDE the segment stack, so an excess `..` clamps at the root as
+/// Win32 does. A `\\?\`, `\\.\` or `\??\` prefix, a rooted path with no drive, a
+/// drive-relative one, a control character, a segment that is only dots or spaces (other than
+/// exactly `.` and `..`) and every segment, server or share the allow-list rejects make it
+/// not comparable. The first segment `Documents and Settings` (a junction) does too.
 [[nodiscard]] inline NormalPath normalise_path(std::string_view s) {
     std::string in(s);
     for (char& c : in)
-        c = c == '/' ? '\\' : ascii_fold(c);
-    std::string_view v = in;
-    bool unc = false;
-    bool literal = false; // \\?\ and \??\: Win32 does not normalise dots there
-    if (v.starts_with("\\\\?\\unc\\")) {
-        v.remove_prefix(8);
-        unc = true;
-        literal = true;
-    } else if (v.starts_with("\\\\?\\") || v.starts_with("\\??\\")) {
-        v.remove_prefix(4);
-        literal = true;
-    } else if (v.starts_with("\\\\.\\")) {
-        v.remove_prefix(4);
-    } else if (v.starts_with("\\\\")) {
-        v.remove_prefix(2);
-        unc = true;
-    }
+        c = c == '/' ? '\\' : detail::ascii_fold(c);
+    if (std::any_of(in.begin(), in.end(),
+                    [](char c) { return static_cast<unsigned char>(c) < 0x20 || c == 0x7f; }))
+        return {};
+    const bool unc = in.starts_with("\\\\");
+    if (unc && (in.starts_with("\\\\?\\") || in.starts_with("\\\\.\\") ||
+                in.starts_with("\\\\\\")))
+        return {};
+    if (in.starts_with("\\??\\") || (!unc && in.starts_with("\\")))
+        return {};
     std::vector<std::string> segs;
-    for (std::string_view rest = v; !rest.empty();) {
+    for (std::string_view rest = in; !rest.empty();) {
         const auto sep = rest.find('\\');
-        std::string seg(rest.substr(0, sep));
+        if (sep != 0)
+            segs.emplace_back(rest.substr(0, sep));
         rest = sep == std::string_view::npos ? std::string_view{} : rest.substr(sep + 1);
-        if (!seg.empty())
-            segs.push_back(std::move(seg));
     }
-    // The drive, or the UNC server and share, are the prefix; everything after is the stack.
     std::string prefix;
     std::size_t first = 0;
     if (unc) {
-        if (segs.size() < 2)
+        if (segs.size() < 2 || !detail::unc_server_allowed(segs[0]) ||
+            !detail::unc_share_allowed(segs[1]))
             return {};
         prefix = "\\\\" + segs[0] + "\\" + segs[1];
         first = 2;
-        const bool loopback = segs[0] == "localhost" || segs[0] == "127.0.0.1";
-        if (loopback && segs[1].size() == 2 && segs[1][1] == '$' && segs[1][0] >= 'a' &&
-            segs[1][0] <= 'z') {
-            prefix = std::string(1, segs[1][0]) + ":";
-        }
     } else {
-        // after the prefix, a drive-absolute path starts `x:` as its own segment AND was
-        // followed by a separator (so `c:x` is one segment `c:x`, and a rooted path starts
-        // with a separator, not a drive)
-        if (v.starts_with("\\") || segs.empty())
+        // `x:` as its own first segment, followed by a separator: `c:` and `c:x` are
+        // drive-relative
+        if (segs.empty() || segs[0].size() != 2 || segs[0][1] != ':' || segs[0][0] < 'a' ||
+            segs[0][0] > 'z' || in.size() < 3 || in[2] != '\\')
             return {};
-        const std::string& d = segs[0];
-        if (d.size() != 2 || d[1] != ':' || d[0] < 'a' || d[0] > 'z')
-            return {};
-        if (v.size() < 3 || v[2] != '\\') // `c:` alone and `c:x` are drive-relative
-            return {};
-        prefix = d;
+        prefix = segs[0];
         first = 1;
     }
     std::vector<std::string> stack;
     for (std::size_t i = first; i < segs.size(); ++i) {
-        std::string seg = segs[i];
-        if (seg == ".") {
-            if (literal)
-                return {};
+        if (segs[i] == ".")
             continue;
-        }
-        if (seg == "..") {
-            if (literal)
-                return {};
+        if (segs[i] == "..") {
             if (!stack.empty())
                 stack.pop_back(); // never pops the prefix: an excess `..` clamps at the root
             continue;
         }
-        while (!seg.empty() && (seg.back() == '.' || seg.back() == ' '))
-            seg.pop_back();
-        if (seg.empty())
-            continue;
-        if (detail::looks_like_short_name(seg))
+        if (!detail::segment_allowed(segs[i]))
             return {};
-        stack.push_back(std::move(seg));
+        stack.push_back(segs[i]);
     }
-    if (prefix.size() == 2 && prefix[1] == ':' && !stack.empty() &&
-        stack.front() == "documents and settings")
+    if (!unc && !stack.empty() && stack.front() == "documents and settings")
         return {};
     NormalPath out;
     out.text = std::move(prefix);
@@ -390,54 +428,34 @@ namespace detail {
     return out;
 }
 
-namespace detail {
-/// ASCII-fold equality, except that two non-ASCII bytes always compare equal: the NTFS case
-/// table is not reproduced, so a non-ASCII difference is treated as a possible case variant
-/// and matches (over-withholds), never the reverse. A variant whose UTF-8 form has a
-/// different length is not seen.
-[[nodiscard]] inline bool fold_equal_prefix(const std::string& p, const std::string& root) {
-    if (p.size() < root.size())
-        return false;
-    for (std::size_t i = 0; i < root.size(); ++i) {
-        const auto a = static_cast<unsigned char>(p[i]);
-        const auto b = static_cast<unsigned char>(root[i]);
-        if (a >= 0x80 && b >= 0x80)
-            continue;
-        if (a != b)
-            return false;
-    }
-    return true;
-}
-} // namespace detail
-
-/// True when `path` is, or is under, one of `roots`, after normalise_path on both, on a
-/// segment boundary (`C:\UsersX` is not under `C:\Users`). A path or root that is not
-/// comparable never matches here: see classify_path for the decision the gate makes.
-[[nodiscard]] inline bool path_under_any(std::string_view path,
-                                         const std::vector<std::string>& roots) {
-    const NormalPath p = normalise_path(path);
-    if (!p.comparable)
-        return false;
-    for (const auto& r : roots) {
-        const NormalPath root = normalise_path(r);
-        if (!root.comparable)
-            continue;
-        if (detail::fold_equal_prefix(p.text, root.text) &&
-            (p.text.size() == root.text.size() || p.text[root.text.size()] == '\\'))
-            return true;
-    }
-    return false;
-}
-
 enum class PathVerdict { keep, user_path, unverifiable };
 
-/// The gate's decision for a non-empty path: under a profile root, or (fail closed) not
-/// comparable with one.
+/// The profile roots, normalised once. A root that is not comparable is skipped here (the
+/// profile list is then incomplete: see count_unresolved_roots).
+struct ProfileGate {
+    std::vector<std::string> roots;
+    explicit ProfileGate(const std::vector<std::string>& raw) {
+        for (const auto& r : raw)
+            if (auto n = normalise_path(r); n.comparable)
+                roots.push_back(std::move(n.text));
+    }
+};
+
+/// The gate's decision for a non-empty path (see THE RULE above).
+[[nodiscard]] inline PathVerdict classify_path(std::string_view path, const ProfileGate& gate) {
+    const NormalPath p = normalise_path(path);
+    if (!p.comparable)
+        return PathVerdict::unverifiable;
+    for (const auto& root : gate.roots)
+        if (detail::fold_equal_prefix(p.text, root) &&
+            (p.text.size() == root.size() || p.text[root.size()] == '\\'))
+            return PathVerdict::user_path;
+    return PathVerdict::keep;
+}
+
 [[nodiscard]] inline PathVerdict classify_path(std::string_view path,
                                                const std::vector<std::string>& roots) {
-    if (!normalise_path(path).comparable)
-        return PathVerdict::unverifiable;
-    return path_under_any(path, roots) ? PathVerdict::user_path : PathVerdict::keep;
+    return classify_path(path, ProfileGate{roots});
 }
 
 inline constexpr long kErrorNoMoreItems = 259; ///< ERROR_NO_MORE_ITEMS (bound in the plugin)
@@ -456,11 +474,10 @@ struct ProfileListFacts {
     bool profiles_dir_failed = false;      ///< ProfilesDirectory could not be read
 };
 
-/// A root is usable only when it normalises to a drive-absolute or UNC path with no `%`
-/// left in it (an undefined variable stays in place after expansion, and the expansion helper
-/// returns its input when the API fails). Anything else (empty, `.`, `\`, `\\`, whitespace,
-/// relative, drive-relative, a namespace or short-name spelling) can never match a path, so
-/// the list cannot be trusted to cover that profile.
+/// A root is usable only when it is on the path allow-list (a plain drive-absolute or UNC path
+/// of plain segments, see normalise_path) and holds no `%` (an undefined variable stays in
+/// place after expansion, and the expansion helper returns its input when the API fails).
+/// Anything else can never match a path, so the list cannot be trusted to cover that profile.
 [[nodiscard]] inline std::size_t count_unresolved_roots(const std::vector<std::string>& roots) {
     return static_cast<std::size_t>(std::count_if(roots.begin(), roots.end(), [](const auto& r) {
         return r.find('%') != std::string::npos || !normalise_path(r).comparable;
@@ -587,12 +604,13 @@ RecordSet collect_records(const Context& ctx, Enumerate&& enumerate, ReadPropert
     // turns out to carry a path: the gate then has no root list to compare against.
     if (!ctx.profile_roots_complete)
         set.constraints.add_failure(kTokenProfileListIncomplete);
+    const ProfileGate gate{ctx.profile_roots};
     const auto privacy = [&](std::string v) {
         if (v.empty())
             return v;
         if (!ctx.profile_roots_complete) // fail closed: no usable root list
             return std::string{kWithheldProfileList};
-        switch (classify_path(v, ctx.profile_roots)) {
+        switch (classify_path(v, gate)) {
         case PathVerdict::unverifiable:
             return std::string{kWithheldPathUnverifiable};
         case PathVerdict::user_path:
