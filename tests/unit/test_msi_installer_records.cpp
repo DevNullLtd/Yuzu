@@ -1064,6 +1064,95 @@ TEST_CASE("installer records: code points are counted by the lead byte, and the 
                              std::vector<std::string>{"\\\\fs\\profiles"}) == V::user_path);
 }
 
+namespace {
+// Code points take_cp sees in `bytes`, walking the whole string (the last step must end exactly
+// at the end, so a step can never skip or overrun).
+std::size_t cp_count(const std::string& bytes) {
+    // an exact-size heap buffer with no terminator: a read past the end is an ASAN report
+    const auto buf = std::make_unique<char[]>(bytes.size());
+    std::copy(bytes.begin(), bytes.end(), buf.get());
+    const std::string_view view{buf.get(), bytes.size()};
+    std::size_t i = 0;
+    std::size_t n = 0;
+    while (i < view.size()) {
+        const auto before = i;
+        (void)rec::detail::take_cp(view, i);
+        REQUIRE(i > before);
+        REQUIRE(i <= view.size());
+        ++n;
+    }
+    return n;
+}
+
+// The same count seen through the gate: a root of N letters is matched by exactly N code points
+// followed by a separator, so exactly one N withholds the path.
+std::size_t cp_count_via_gate(const std::string& bytes) {
+    const std::string path = "D:\\Profiles\\" + bytes + "\\x";
+    std::size_t found = 0;
+    for (std::size_t n = 1; n <= 8; ++n) {
+        const std::vector<std::string> root{"D:\\Profiles\\" + std::string(n, 'a')};
+        if (rec::classify_path(path, root) == V::user_path) {
+            REQUIRE(found == 0);
+            found = n;
+        }
+    }
+    return found;
+}
+} // namespace
+
+TEST_CASE("installer records: take_cp counts a code point by the lead byte's declared length",
+          "[msi_packages][installer_records]") {
+    const std::vector<std::pair<std::string, std::size_t>> rows{
+        // valid 2-, 3- and 4-byte sequences: one code point each
+        {"\xC3\xA9", 1}, {"\xE2\x82\xAC", 1}, {"\xF0\x9F\x98\x80", 1},
+        // a valid sequence followed by stray continuation bytes: each stray is its own point
+        {"\xC3\xA9\x80", 2}, {"\xC3\xA9\x80\x80", 3}, {"\xE2\x82\xAC\x80", 2},
+        {"\xE2\x82\xAC\x80\x80", 3}, {"\xF0\x9F\x98\x80\x80", 2},
+        {"\xF0\x9F\x98\x80\x80\x80", 3},
+        // lone continuation bytes, the whole continuation range
+        {"\x80", 1}, {"\xBF", 1}, {"\x80\x80", 2}, {"\xBF\x80\xBF", 3},
+        // the edges of each lead range, with their full declared continuation count
+        {"\xC0\x80", 1}, {"\xC1\xBF", 1}, {"\xC2\x80", 1}, {"\xDF\xBF", 1},
+        {"\xE0\xA0\x80", 1}, {"\xEF\xBF\xBD", 1}, {"\xF0\x90\x80\x80", 1},
+        {"\xF7\xBF\xBF\xBF", 1},
+        // leads that declare no continuation: invalid bytes, one point each
+        {"\xF8\x80", 2}, {"\xF8\x80\x80", 3}, {"\xFF\x80", 2}, {"\xFE", 1}, {"\xF8", 1},
+        // truncated sequences: a lead at the end of the string, or before a non-continuation
+        {"\xC3", 1}, {"\xE2", 1}, {"\xE2\x82", 1}, {"\xF0", 1}, {"\xF0\x9F\x98", 1},
+        {"\xC3" "a", 2}, {"\xE2\x82" "a", 2}, {"\xE2" "a" "\x80", 3}, {"\xC3" "@", 2},
+        // a continuation is exactly 10xxxxxx: a lead or an ASCII byte right after a lead is not
+        {"\xC3\xC3\xA9", 2}, {"\xE2\xC0", 2}, {"\xC3\xFF", 2}, {"\xE2\x82\xC3\xA9", 2},
+        {"\xC3\x7F", 2}, {"\xC3\x40", 2}};
+    for (const auto& [bytes, expected] : rows) {
+        INFO(expected);
+        std::string hex;
+        for (const unsigned char c : bytes)
+            hex += std::format("{:02X} ", static_cast<unsigned>(c));
+        INFO(hex);
+        CHECK(cp_count(bytes) == expected);
+        // through the gate too, when every ASCII byte is a letter (a letter root can match it)
+        const bool letters_only = std::all_of(bytes.begin(), bytes.end(), [](char c) {
+            return static_cast<unsigned char>(c) >= 0x80 || (c >= 'a' && c <= 'z');
+        });
+        if (letters_only)
+            CHECK(cp_count_via_gate(bytes) == expected);
+    }
+    // the named examples, against a root of letters
+    const std::vector<std::string> two{"D:\\Profiles\\ab"};
+    const std::vector<std::string> one{"D:\\Profiles\\a"};
+    CHECK(rec::classify_path("D:\\Profiles\\\xE2\x82\xAC\\x", two) == V::keep);
+    CHECK(rec::classify_path("D:\\Profiles\\\xF0\x9F\x98\x80\\x", one) == V::user_path);
+    CHECK(rec::classify_path("D:\\Profiles\\\xC3\xA9\x80\\x", two) == V::user_path);
+    CHECK(rec::classify_path("D:\\Profiles\\\xC3\xA9\x80\\x", one) == V::keep);
+    // the lead at the very end of the string does not read past it
+    const auto lead_end = std::make_unique<char[]>(1);
+    lead_end[0] = static_cast<char>(0xC3);
+    std::size_t i = 0;
+    const auto cp = rec::detail::take_cp(std::string_view{lead_end.get(), 1}, i);
+    CHECK(cp.wide);
+    CHECK(i == 1);
+}
+
 TEST_CASE("installer records: a generated matrix never emits a hostile or profile path",
           "[msi_packages][installer_records]") {
     // Expectation is the simple invariant, built into each case: a path made under a root, or
