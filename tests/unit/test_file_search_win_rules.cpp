@@ -129,7 +129,7 @@ TEST_CASE("windows root: label split, volume root path and profile root labels",
     CHECK(profile_root_label(vol, "C:\\", "C:\\Users\\alice") == vol + "/Users/alice");
     CHECK(profile_root_label("/D:", "D:\\data\\", "D:\\data\\Users\\bob") == "/D:/Users/bob"); // a mounted volume
     CHECK_FALSE(profile_root_label("/C:", "C:\\", "C:\\Users\\..\\x").has_value()); // a refused component gives none
-    CHECK_FALSE(profile_root_label("/C:", "C:\\", "C:\\Users\\a:b").has_value());
+    CHECK_FALSE(profile_root_label("/C:", "C:\\", "C:\\Users\\alice:b").has_value());
     CHECK_FALSE(profile_root_label("/C:", "C:\\", "C:\\").has_value()); // never the whole volume
     CHECK_FALSE(profile_root_label("/C:", "C:\\", "C:").has_value());
     CHECK_FALSE(profile_root_label("/C:", "C:\\", "").has_value());
