@@ -86,6 +86,7 @@ flowchart LR
 How to read the answers:
 
 - `unknown` and `ruleset|unknown` mean the read did not complete (refused, timed out, truncated or unrecognised). They never mean "off" or "empty"; a cleanly read empty ruleset reports `ruleset|0`.
+- When `ip6tables` is not installed on a host that has `iptables`, the IPv6 family is unread: `state` reads `unknown`, and `rules` answers the rows it did read followed by `rules|unknown` and `ruleset|unknown`, never an empty ruleset. The root snapshot read can differ: it answers a family that has no legacy save tool and whose kernel table list names no table as read and empty, so it can say `inactive` where this direct read says `unknown`.
 - `active` from nftables or iptables means there is at least one rule or a base-chain policy other than accept (for iptables, a user-defined chain also counts). A container runtime's own rules make a host `active`, so it is not evidence of a restrictive policy; `inactive` is reported only on a complete read.
 - On Windows `enabled` says a profile's firewall switch is on, not what its default inbound action is, and on macOS an Application Firewall `enabled` does not imply pf is filtering.
 - A fleet roll-up that counts `state` values should count `unknown` separately, since it hides both permission failures and absent tools.
