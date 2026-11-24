@@ -814,7 +814,7 @@ TEST_CASE("installer records: the root comparison folds ASCII; non-ASCII is a po
     CHECK(rec::path_under_any("c:\\USERS\\jsmith\xC3\x89\\x", roots));        // ASCII folds
     CHECK(rec::path_under_any("C:\\Users\\jsmith\xC3\x89", roots));            // byte-exact
     CHECK(rec::path_under_any("C:\\Users\\jsmith\xC3\xA9\\x", roots));        // case variant
-    CHECK_FALSE(rec::path_under_any("C:\\Users\\jsmitx\xC3\xA9\\x", roots));  // ASCII differs
+    CHECK_FALSE(rec::path_under_any("C:\\Other\\jsmith\xC3\xA9\\x", roots)); // ASCII differs
     CHECK_FALSE(rec::path_under_any("C:\\Users\\jsmith\\x", roots));
     // high bytes never alias an ASCII letter (no sign-extended std::tolower surprises)
     CHECK(rec::ascii_fold(static_cast<char>(0xC3)) == static_cast<char>(0xC3));
