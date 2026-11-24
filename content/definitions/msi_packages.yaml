@@ -278,7 +278,7 @@ metadata:
     the single package reader busy makes the status row `constrained` with a
     `windows:installer_records:<detail>` token. Install locations and sources
     under the user profiles directory, or under a registered user profile's
-    folder, are reported as `withheld:user_path`.
+    folder, are reported as `withheld:user_path`. When the user-profile list cannot be read in full, every non-empty one of these paths is `withheld:profile_list_incomplete` and the status is `constrained` (fail closed).
     Exactly one status row leads the result.
   tags: [software, msi, inventory, windows]
 

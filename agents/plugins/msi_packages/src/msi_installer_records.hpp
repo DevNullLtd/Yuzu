@@ -100,6 +100,9 @@ inline constexpr std::string_view kTokenDbDeadline = "windows:installer_records:
 inline constexpr std::string_view kTokenDbBusy = "windows:installer_records:msi_db:busy";
 inline constexpr std::string_view kTokenAccessDenied = "windows:installer_records:access_denied";
 /// The UpgradeCodes walk was cut short by a bound: constrained like a failed read.
+/// The privacy gate withheld paths because the ProfileList read was incomplete.
+inline constexpr std::string_view kTokenProfileListIncomplete =
+    "windows:installer_records:profile_list_incomplete";
 inline constexpr std::string_view kTokenUpgradeMapOverCap = "windows:msi_upgrade_map:over_cap";
 
 [[nodiscard]] inline std::string enum_token(unsigned rc) {
@@ -126,6 +129,9 @@ inline constexpr std::string_view kReasonPropertiesUnreadable = "install_propert
 inline constexpr std::string_view kReasonNoLocalPackage = "no_local_package";
 inline constexpr std::string_view kReasonCodeMismatch = "product_code_mismatch";
 inline constexpr std::string_view kWithheldUserPath = "withheld:user_path";
+/// The user-profile list could not be read in full, so no path can be shown to be outside a
+/// profile: every path-bearing field is withheld under this value (fail closed).
+inline constexpr std::string_view kWithheldProfileList = "withheld:profile_list_incomplete";
 
 // ── Packed GUID codec ───────────────────────────────────────────────────────────
 //
@@ -254,9 +260,20 @@ namespace detail {
 
 // ── Privacy ─────────────────────────────────────────────────────────────────────
 
+/// ASCII-only case fold (A-Z); every other byte, so every byte of a UTF-8 multibyte
+/// sequence, is compared exactly. Locale independent. A non-ASCII profile folder recorded
+/// with different letter case therefore does NOT match (the Windows NTFS case table is not
+/// reproduced here): the ProfileList paths and the Installer values come from the same
+/// registry writers, so they normally agree in case, and the gate withholds whole fields,
+/// never substrings.
+[[nodiscard]] constexpr char ascii_fold(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
 /// True when `path` is, or is under, one of `roots` (the user profiles directory and each
-/// profile's folder). ASCII case-insensitive, either separator, a `\\?\` prefix ignored, and
-/// a root only matches on a component boundary (`C:\UsersX` is not under `C:\Users`).
+/// profile's folder). ASCII case-insensitive (see ascii_fold), either separator, a `\\?\`
+/// prefix ignored, and a root only matches on a component boundary (`C:\UsersX` is not
+/// under `C:\Users`).
 [[nodiscard]] inline bool path_under_any(std::string_view path,
                                          const std::vector<std::string>& roots) {
     const auto normal = [](std::string_view s) {
@@ -264,7 +281,7 @@ namespace detail {
             s.remove_prefix(4);
         std::string out(s);
         for (char& c : out)
-            c = c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            c = c == '/' ? '\\' : ascii_fold(c);
         return out;
     };
     const std::string p = normal(path);
@@ -279,6 +296,39 @@ namespace detail {
             return true;
     }
     return false;
+}
+
+/// How one ProfileList walk ended, as plain numbers (no Windows header): the codes and
+/// counts of yuzu::win::ProfileListEnumeration. Defaults describe a clean, complete walk.
+struct ProfileListFacts {
+    long root_rc = 0;             ///< opening ProfileList itself
+    long last_rc = 259;           ///< the RegEnumKeyExW code that ended the walk (0 = the cap)
+    long probe_rc = 259;          ///< the extra enumeration run only at the cap
+    bool truncated = false;       ///< the cap was reached and more subkeys exist
+    std::size_t record_failures = 0; ///< SID keys / ProfileImagePath values that failed to read
+    std::size_t unreadable_paths = 0; ///< records whose ProfileImagePath exists but is unusable
+};
+
+inline constexpr long kErrorNoMoreItems = 259;
+
+/// True only when every profile subkey was enumerated and read: the list is then a complete
+/// set of profile folders. Any open or enumeration fault, the 512-profile cap with more behind
+/// it, or one profile whose key or path could not be read makes it incomplete, and the privacy
+/// gate then withholds every path (a profile that is missing from the list is not a profile
+/// the gate can protect).
+[[nodiscard]] constexpr bool profile_list_complete(const ProfileListFacts& f) noexcept {
+    if (f.root_rc != 0 || f.truncated || f.record_failures != 0 || f.unreadable_paths != 0)
+        return false;
+    if (f.last_rc == kErrorNoMoreItems)
+        return true;
+    return f.last_rc == 0 && f.probe_rc == kErrorNoMoreItems; // exactly the cap, nothing behind
+}
+
+/// Registry value types the string reads accept: REG_SZ always; REG_EXPAND_SZ only for a
+/// caller that expands it (a value that was not expanded would not match a literal path).
+[[nodiscard]] constexpr bool string_value_type_accepted(unsigned long type,
+                                                        bool expands) noexcept {
+    return type == 1 /*REG_SZ*/ || (type == 2 /*REG_EXPAND_SZ*/ && expands);
 }
 
 // ── Model ───────────────────────────────────────────────────────────────────────
@@ -318,6 +368,9 @@ enum class OpenStatus { ok, absent, refused };
 struct Context {
     std::string windows_dir;                 ///< GetSystemWindowsDirectoryW, e.g. `C:\WINDOWS`
     std::vector<std::string> profile_roots;  ///< the profiles directory and each profile folder
+    /// False when the ProfileList read was incomplete (profile_list_complete): the privacy
+    /// gate then withholds every path-bearing field instead of matching against the roots.
+    bool profile_roots_complete = true;
 };
 
 struct RecordSet {
@@ -373,6 +426,12 @@ RecordSet collect_records(const Context& ctx, Enumerate&& enumerate, ReadPropert
     std::size_t text_bytes = 0; // record_bytes() summed over the records kept
 
     const auto privacy = [&](std::string v) {
+        if (v.empty())
+            return v;
+        if (!ctx.profile_roots_complete) { // fail closed: no root list to match against
+            set.constraints.add_failure(kTokenProfileListIncomplete);
+            return std::string{kWithheldProfileList};
+        }
         return path_under_any(v, ctx.profile_roots) ? std::string{kWithheldUserPath} : v;
     };
 

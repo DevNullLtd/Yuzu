@@ -231,8 +231,11 @@ bool key_absent(LSTATUS rc) { return rc == ERROR_FILE_NOT_FOUND || rc == ERROR_P
 
 // Reads one string value. An absent value is an empty string; any failure is the code. A value
 // that is not a string (ERROR_INVALID_DATA) or is longer than kMaxValueChars (ERROR_MORE_DATA)
-// is a failure, never a silent empty.
-std::expected<std::string, unsigned> read_string_value(HKEY key, const wchar_t* name) {
+// is a failure, never a silent empty. REG_EXPAND_SZ is accepted only when `expands` (the
+// caller expands it); otherwise it is ERROR_INVALID_DATA, so an unexpanded `%VAR%` path is
+// never compared against a literal one.
+std::expected<std::string, unsigned> read_string_value(HKEY key, const wchar_t* name,
+                                                       bool expands = false) {
     DWORD type = 0;
     DWORD bytes = 0;
     LSTATUS rc = RegQueryValueExW(key, name, nullptr, &type, nullptr, &bytes);
@@ -240,7 +243,7 @@ std::expected<std::string, unsigned> read_string_value(HKEY key, const wchar_t* 
         return std::string{};
     if (rc != ERROR_SUCCESS)
         return std::unexpected(static_cast<unsigned>(rc));
-    if (type != REG_SZ && type != REG_EXPAND_SZ)
+    if (!rec::string_value_type_accepted(type, expands))
         return std::unexpected(static_cast<unsigned>(ERROR_INVALID_DATA));
     if (bytes > rec::kMaxValueChars * sizeof(wchar_t))
         return std::unexpected(static_cast<unsigned>(ERROR_MORE_DATA));
@@ -325,30 +328,51 @@ std::string system_windows_directory() {
     return yuzu::win::from_wide(buf, static_cast<int>(n));
 }
 
-// The user profiles directory and each user profile's folder, for the privacy rule. The
-// LocalSystem, LocalService and NetworkService profiles are skipped: their folders sit under the
-// Windows directory, where a machine install source is not a user path. A failed read of either
-// falls back to the default `%SystemDrive%\Users`: this only widens what is withheld, so it
-// never needs to fail the answer.
-std::vector<std::string> read_profile_roots() {
+// The user profiles directory and each user profile's folder, for the privacy rule, and whether
+// that list is COMPLETE. The LocalSystem, LocalService and NetworkService profiles are skipped:
+// their folders sit under the Windows directory, where a machine install source is not a user
+// path. `%SystemDrive%\Users` is only an extra root when ProfilesDirectory is absent; it is not
+// a substitute for the list, because a profile redirected elsewhere is not under it. Any
+// failure to read the list in full (rec::profile_list_complete: an open or enumeration fault,
+// the 512-profile cap with more behind it, one unreadable profile key or path, or an unreadable
+// ProfilesDirectory) is reported as incomplete, and the gate then withholds every path.
+struct ProfileRoots {
     std::vector<std::string> roots;
+    bool complete = false;
+};
+
+ProfileRoots read_profile_roots() {
+    ProfileRoots out;
     std::string profiles_dir;
+    bool dir_ok = true;
     yuzu::win::RegKey list;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kProfileListKey, 0, kRead64, list.put()) ==
         ERROR_SUCCESS) {
-        if (auto dir = read_string_value(list.get(), L"ProfilesDirectory"))
+        if (auto dir = read_string_value(list.get(), L"ProfilesDirectory", true))
             profiles_dir = std::move(*dir);
+        else
+            dir_ok = false;
     }
     if (profiles_dir.empty())
         profiles_dir = "%SystemDrive%\\Users";
     const std::wstring expanded = yuzu::win::expand_env_strings(yuzu::win::to_wide(profiles_dir));
-    roots.push_back(yuzu::win::from_wide(expanded.c_str(), static_cast<int>(expanded.size())));
+    out.roots.push_back(yuzu::win::from_wide(expanded.c_str(), static_cast<int>(expanded.size())));
     // The shared builder owns the system-profile filter (and drops a duplicated SID).
     const auto profiles = yuzu::win::enumerate_profile_list();
     for (const auto& p : yuzu::profiles::build_profile_list(profiles.records, {}))
         if (!p.profile_path.empty())
-            roots.push_back(p.profile_path);
-    return roots;
+            out.roots.push_back(p.profile_path);
+    rec::ProfileListFacts facts;
+    facts.root_rc = profiles.root_rc;
+    facts.last_rc = profiles.last_rc;
+    facts.probe_rc = profiles.probe_rc;
+    facts.truncated = profiles.truncated;
+    facts.record_failures = profiles.record_failures.size();
+    for (const auto& r : profiles.records)
+        if (r.profile_image_path_unreadable)
+            ++facts.unreadable_paths;
+    out.complete = dir_ok && rec::profile_list_complete(facts);
+    return out;
 }
 
 // A package opened with no reparse point followed below the drive root; the handle is held
@@ -704,7 +728,9 @@ int do_installer_records(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
     rec::Context rctx;
     rctx.windows_dir = system_windows_directory();
-    rctx.profile_roots = read_profile_roots();
+    auto profile_roots = read_profile_roots();
+    rctx.profile_roots = std::move(profile_roots.roots);
+    rctx.profile_roots_complete = profile_roots.complete;
     const auto set = rec::collect_records(
         rctx, [](auto&& on_key) { return enumerate_product_keys(on_key); }, read_install_properties,
         open_package, [](const std::string& path, std::chrono::milliseconds deadline) {

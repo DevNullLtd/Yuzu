@@ -736,6 +736,96 @@ TEST_CASE("installer records: an install path under the user profiles is withhel
     CHECK(set2.records[0].props.install_source == "withheld:user_path");
 }
 
+TEST_CASE("installer records: ProfileList completeness is decided from every failure signal",
+          "[msi_packages][installer_records]") {
+    rec::ProfileListFacts f; // a clean walk: ended with ERROR_NO_MORE_ITEMS
+    CHECK(rec::profile_list_complete(f));
+    // exactly the 512-profile cap with nothing behind it (probe finds no more) is complete
+    f.last_rc = 0;
+    f.probe_rc = rec::kErrorNoMoreItems;
+    CHECK(rec::profile_list_complete(f));
+    // truncated at the cap: more subkeys exist
+    f.probe_rc = 0;
+    f.truncated = true;
+    CHECK_FALSE(rec::profile_list_complete(f));
+    // the cap probe itself failed
+    f.truncated = false;
+    f.probe_rc = 5;
+    CHECK_FALSE(rec::profile_list_complete(f));
+    // each other signal alone
+    rec::ProfileListFacts g;
+    g.root_rc = 5;
+    CHECK_FALSE(rec::profile_list_complete(g)); // ProfileList itself could not be opened
+    g = {};
+    g.last_rc = 5;
+    CHECK_FALSE(rec::profile_list_complete(g)); // the walk ended on an error
+    g = {};
+    g.record_failures = 1;
+    CHECK_FALSE(rec::profile_list_complete(g)); // one SID key or path value failed to read
+    g = {};
+    g.unreadable_paths = 1;
+    CHECK_FALSE(rec::profile_list_complete(g)); // ProfileImagePath exists but is unusable
+}
+
+TEST_CASE("installer records: an incomplete profile list withholds every path and constrains",
+          "[msi_packages][installer_records]") {
+    Host g;
+    rec::InstallProps p;
+    p.install_location = "E:\\Redirected\\jsmith\\App"; // a redirected profile the list missed
+    p.install_source = "C:\\Program Files\\Vendor\\";
+    p.local_package = "C:\\WINDOWS\\Installer\\1a2b3c.msi";
+    g.products.push_back(synthetic_product(1, p));
+    auto ctx = default_context();
+    ctx.profile_roots_complete = false;
+    const auto set = run(g, ctx);
+    const auto& r = set.records[0].props;
+    CHECK(r.install_location == "withheld:profile_list_incomplete");
+    CHECK(r.install_source == "withheld:profile_list_incomplete"); // machine path too: unknowable
+    CHECK(r.local_package == "withheld:profile_list_incomplete");
+    CHECK(set.constraints.any_failure());
+    CHECK(rec::render(set)[0] ==
+          "status|installer_records|constrained|windows:installer_records:profile_list_incomplete");
+    for (const auto& line : rec::render(set))
+        CHECK(line.find("jsmith") == std::string::npos);
+
+    // an empty field has nothing to withhold, and a complete list leaves the redirected path
+    // alone only when its folder is a listed root (a redirected profile that IS listed)
+    Host h;
+    rec::InstallProps q;
+    q.install_location = "E:\\Redirected\\jsmith\\App";
+    h.products.push_back(synthetic_product(2, q));
+    auto done = default_context();
+    done.profile_roots.push_back("E:\\Redirected\\jsmith");
+    const auto listed = run(h, done);
+    CHECK(listed.records[0].props.install_location == "withheld:user_path");
+    CHECK(listed.records[0].props.install_source.empty());
+    CHECK_FALSE(listed.constraints.any_failure());
+}
+
+TEST_CASE("installer records: the profile-root comparison folds ASCII only and keeps UTF-8 exact",
+          "[msi_packages][installer_records]") {
+    // U+00C9 (E acute) is the two bytes C3 89; its lower-case form U+00E9 is C3 A9. Neither
+    // is folded: a non-ASCII profile folder matches only when recorded byte for byte.
+    const std::vector<std::string> roots{"C:\\Users\\jsmith\xC3\x89"};
+    CHECK(rec::path_under_any("c:\\USERS\\jsmith\xC3\x89\\x", roots));        // ASCII folds
+    CHECK(rec::path_under_any("C:\\Users\\jsmith\xC3\x89", roots));            // byte-exact
+    CHECK_FALSE(rec::path_under_any("C:\\Users\\jsmith\xC3\xA9\\x", roots));  // case variant
+    // high bytes never alias an ASCII letter (no sign-extended std::tolower surprises)
+    CHECK(rec::ascii_fold(static_cast<char>(0xC3)) == static_cast<char>(0xC3));
+    CHECK(rec::ascii_fold('Z') == 'z');
+    CHECK(rec::ascii_fold('[') == '[');
+}
+
+TEST_CASE("installer records: only REG_SZ, and REG_EXPAND_SZ for a caller that expands it",
+          "[msi_packages][installer_records]") {
+    CHECK(rec::string_value_type_accepted(1, false));
+    CHECK(rec::string_value_type_accepted(1, true));
+    CHECK_FALSE(rec::string_value_type_accepted(2, false));
+    CHECK(rec::string_value_type_accepted(2, true));
+    CHECK_FALSE(rec::string_value_type_accepted(4, true)); // REG_DWORD
+    CHECK_FALSE(rec::string_value_type_accepted(7, true)); // REG_MULTI_SZ
+}
+
 TEST_CASE("installer records: row breakers cannot break a row", "[msi_packages][installer_records]") {
     // SYNTHETIC strings: no captured name carries these.
     Host h;
