@@ -21,11 +21,11 @@
  * upgrade_code is the braced upper-case UpgradeCode the Installer registry map
  * (HKLM\SOFTWARE\Classes\Installer\UpgradeCodes) records for the product, EMPTY
  * when the map names the product under no upgrade code or under more than one, or
- * is absent or over its cap (msi_installer_records.hpp build_upgrade_map). It is a
+ * is absent (msi_installer_records.hpp build_upgrade_map). It is a
  * registry read only, so it is the same every day for the same installed set. A
- * FAILED read of the map is a failure token that constrains the roster, exactly as a
- * failed property read does, so no row is sent with a token a fault emptied. The
- * collector tolerates a fifth or a sixth token.
+ * FAILED read of the map, or one cut short by a bound (over its cap), is a failure token
+ * that constrains the roster, exactly as a failed property read does, so no row is sent
+ * with a token a fault emptied. The collector tolerates a fifth or a sixth token.
  */
 #pragma once
 
@@ -107,7 +107,8 @@ struct Inventory {
 /// unless the enumeration itself failed, whose token takes priority.
 /// `upgrade_code_of(code)` returns the product's upgrade code (empty when there is none)
 /// or, when the map read FAILED, a failure token that is handled exactly like a failed
-/// property read.
+/// property read. `upgrade_map_failure` is the map's own failure token (nullopt: none), used
+/// when no product asked for it; it ranks after the enumeration and property failures.
 ///
 /// An advertised-but-not-installed product is enumerated by the OS, but
 /// InstalledProductName, VersionString and Publisher are installed-only
@@ -116,7 +117,8 @@ struct Inventory {
 /// renders `inv|{code}|||` and the collector drops the empty name. That is
 /// deliberate, not an oversight.
 template <class Enumerate, class Property, class UpgradeCodeOf>
-Inventory collect(Enumerate&& enumerate, Property&& property, UpgradeCodeOf&& upgrade_code_of) {
+Inventory collect(Enumerate&& enumerate, Property&& property, UpgradeCodeOf&& upgrade_code_of,
+                  std::optional<std::string> upgrade_map_failure = std::nullopt) {
     Inventory inv;
     std::optional<std::string> property_failure;
     auto read = [&](const std::string& code, std::string_view prop) {
@@ -143,6 +145,10 @@ Inventory collect(Enumerate&& enumerate, Property&& property, UpgradeCodeOf&& up
     inv.constraint = enumerate(kMachineContext, on_code);
     if (!inv.constraint)
         inv.constraint = std::move(property_failure);
+    // The map's own failure (a failed read, or a bound that cut it short) constrains the
+    // roster whatever the product count: with no product `upgrade_code_of` is never asked.
+    if (!inv.constraint)
+        inv.constraint = std::move(upgrade_map_failure);
     return inv;
 }
 

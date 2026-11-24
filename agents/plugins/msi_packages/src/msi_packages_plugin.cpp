@@ -677,7 +677,8 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     const auto roster = inv::collect(
         [](unsigned c, auto&& on_code) { return enumerate_machine_products(c, on_code); },
         read_product_property,
-        [&upgrades](const std::string& code) { return upgrades.resolve(code); });
+        [&upgrades](const std::string& code) { return upgrades.resolve(code); },
+        upgrades.failure);
     if (upgrades.over_cap) {
         spdlog::warn("msi_packages: the UpgradeCodes map is over its cap; the roster is "
                      "constrained (windows:msi_upgrade_map:over_cap)");

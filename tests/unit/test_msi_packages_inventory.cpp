@@ -149,7 +149,8 @@ inv::Inventory run(FakeSource& src, const rec::UpgradeMap* map = nullptr) {
             if (map == nullptr)
                 return std::string{};
             return map->resolve(code);
-        });
+        },
+        map == nullptr ? std::nullopt : map->failure);
 }
 
 constexpr const char* kUpgradeA = "{7E1A4B20-5C3D-4F68-9A01-2B3C4D5E6F70}";
@@ -463,6 +464,38 @@ TEST_CASE("msi inventory: an UpgradeCodes map cut short by a bound constrains th
     const auto ok = make_map();
     CHECK_FALSE(ok.over_cap);
     CHECK(inv::render(run(clean_src, &ok))[0] == "status|list_inventory|supported|-");
+}
+
+TEST_CASE("msi inventory: the map's failure constrains the roster even with no product",
+          "[msi_packages][msi_inventory]") {
+    FakeSource none; // a successful enumeration of zero machine products
+    // over its cap
+    const auto capped = rec::build_upgrade_map([](auto&& on_upgrade) -> std::optional<std::string> {
+        on_upgrade(kPackedUpgradeA, std::vector<std::string>(rec::kMaxUpgradeValueNames + 1,
+                                                             std::string{kPackedCMake}));
+        return std::nullopt;
+    });
+    REQUIRE(capped.over_cap);
+    auto lines = inv::render(run(none, &capped));
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] == "status|list_inventory|constrained|windows:msi_upgrade_map:over_cap");
+    // a failed read
+    const auto faulty = make_map(rec::upgrade_map_failure_token(5));
+    lines = inv::render(run(none, &faulty));
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] == "status|list_inventory|constrained|windows:msi_upgrade_map:5");
+    // a clean map stays supported
+    const auto clean = make_map();
+    lines = inv::render(run(none, &clean));
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] == "status|list_inventory|supported|-");
+    // an enumeration failure keeps its priority over the map's
+    FakeSource broken;
+    broken.rows = load_fixture();
+    broken.fail_token = "windows:msi_enum:1610";
+    broken.fail_after = 2;
+    CHECK(inv::render(run(broken, &faulty))[0] ==
+          "status|list_inventory|constrained|windows:msi_enum:1610");
 }
 
 TEST_CASE("msi inventory: a map read fault constrains the roster; an absent map leaves the sixth token empty",
