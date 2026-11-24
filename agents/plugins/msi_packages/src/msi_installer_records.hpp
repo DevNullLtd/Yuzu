@@ -76,8 +76,8 @@ inline constexpr std::size_t kMaxValueChars = 4096;
 /// 5.1 million names, and each becomes a map entry, from a planted tree; this holds the total
 /// to one name per visited subkey on average. A real machine registers each of its products
 /// under one upgrade code, so the total is about its product count: hundreds, and 5,000
-/// products (kMaxRecords) is a quarter of the cap. Over it the map is over_cap: every token
-/// is empty for the dispatch.
+/// products (kMaxRecords) is a quarter of the cap. Over it the map is over_cap, which is a
+/// failure token (kTokenUpgradeMapOverCap): the roster is constrained.
 inline constexpr std::size_t kMaxUpgradeNames = kMaxSubkeysVisited;
 /// Text bytes the records may hold in all (every string field of every record, as read). The
 /// per-field bounds alone allow 5,000 rows x 12 fields x 4,096 characters = about 246 million
@@ -99,10 +99,10 @@ inline constexpr std::string_view kTokenRowCap = "windows:installer_records:row_
 inline constexpr std::string_view kTokenDbDeadline = "windows:installer_records:msi_db:deadline";
 inline constexpr std::string_view kTokenDbBusy = "windows:installer_records:msi_db:busy";
 inline constexpr std::string_view kTokenAccessDenied = "windows:installer_records:access_denied";
-/// The UpgradeCodes walk was cut short by a bound: constrained like a failed read.
 /// The privacy gate withheld paths because the ProfileList read was incomplete.
 inline constexpr std::string_view kTokenProfileListIncomplete =
     "windows:installer_records:profile_list_incomplete";
+/// The UpgradeCodes walk was cut short by a bound: constrained like a failed read.
 inline constexpr std::string_view kTokenUpgradeMapOverCap = "windows:msi_upgrade_map:over_cap";
 
 [[nodiscard]] inline std::string enum_token(unsigned rc) {
@@ -263,33 +263,70 @@ namespace detail {
 /// ASCII-only case fold (A-Z); every other byte, so every byte of a UTF-8 multibyte
 /// sequence, is compared exactly. Locale independent. A non-ASCII profile folder recorded
 /// with different letter case therefore does NOT match (the Windows NTFS case table is not
-/// reproduced here): the ProfileList paths and the Installer values come from the same
-/// registry writers, so they normally agree in case, and the gate withholds whole fields,
-/// never substrings.
+/// reproduced here), and the path is then EMITTED in clear: the gate withholds whole
+/// fields, never substrings, and a field that matches no root is not withheld. Nothing in
+/// the repo shows that a ProfileImagePath and an installer-supplied path agree in case.
 [[nodiscard]] constexpr char ascii_fold(char c) noexcept {
     return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
 }
 
+/// The comparable form of a path: `/` read as `\`, ASCII-folded, a `\\?\`, `\\.\` or `\??\`
+/// prefix dropped (`\\?\UNC\` is the `\\` of a UNC path), repeated separators collapsed
+/// (a leading `\\` of a UNC path is kept), `.` segments dropped, `..` segments resolved
+/// lexically (never above the root), and trailing dots and spaces removed from every
+/// segment as Win32 does. Not handled, so they fail OPEN: 8.3 short names, junctions and
+/// symbolic links (such as `Documents and Settings`), the loopback UNC admin-share form
+/// (`\\localhost\C$\...`), and a non-ASCII case difference (see ascii_fold).
+[[nodiscard]] inline std::string normalise_path(std::string_view s) {
+    std::string in(s);
+    for (char& c : in)
+        c = c == '/' ? '\\' : ascii_fold(c);
+    std::string_view v = in;
+    bool unc = false;
+    if (v.starts_with("\\\\?\\unc\\")) {
+        v.remove_prefix(8);
+        unc = true;
+    } else if (v.starts_with("\\\\?\\") || v.starts_with("\\\\.\\") || v.starts_with("\\??\\")) {
+        v.remove_prefix(4);
+    } else if (v.starts_with("\\\\")) {
+        unc = true;
+    }
+    const bool rooted = !unc && v.starts_with("\\");
+    std::vector<std::string> parts;
+    while (!v.empty()) {
+        const auto sep = v.find('\\');
+        std::string seg(v.substr(0, sep));
+        v = sep == std::string_view::npos ? std::string_view{} : v.substr(sep + 1);
+        if (seg.empty() || seg == ".")
+            continue;
+        if (seg == "..") {
+            if (!parts.empty())
+                parts.pop_back();
+            continue;
+        }
+        while (!seg.empty() && (seg.back() == '.' || seg.back() == ' '))
+            seg.pop_back();
+        if (!seg.empty())
+            parts.push_back(std::move(seg));
+    }
+    std::string out = unc ? "\\\\" : (rooted ? "\\" : "");
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        if (i != 0)
+            out += '\\';
+        out += parts[i];
+    }
+    return out;
+}
+
 /// True when `path` is, or is under, one of `roots` (the user profiles directory and each
-/// profile's folder). ASCII case-insensitive (see ascii_fold), either separator, a `\\?\`
-/// prefix ignored, and a root only matches on a component boundary (`C:\UsersX` is not
-/// under `C:\Users`).
+/// profile's folder), after normalise_path on both, and a root only matches on a segment
+/// boundary (`C:\UsersX` is not under `C:\Users`).
 [[nodiscard]] inline bool path_under_any(std::string_view path,
                                          const std::vector<std::string>& roots) {
-    const auto normal = [](std::string_view s) {
-        if (s.starts_with("\\\\?\\"))
-            s.remove_prefix(4);
-        std::string out(s);
-        for (char& c : out)
-            c = c == '/' ? '\\' : ascii_fold(c);
-        return out;
-    };
-    const std::string p = normal(path);
+    const std::string p = normalise_path(path);
     for (const auto& r : roots) {
-        std::string root = normal(r);
-        while (!root.empty() && root.back() == '\\')
-            root.pop_back();
-        if (root.empty())
+        const std::string root = normalise_path(r);
+        if (root.empty() || root == "\\" || root == "\\\\")
             continue;
         if (p.size() >= root.size() && p.compare(0, root.size(), root) == 0 &&
             (p.size() == root.size() || p[root.size()] == '\\'))
@@ -298,37 +335,51 @@ namespace detail {
     return false;
 }
 
+inline constexpr long kErrorNoMoreItems = 259; ///< ERROR_NO_MORE_ITEMS (bound in the plugin)
+
 /// How one ProfileList walk ended, as plain numbers (no Windows header): the codes and
 /// counts of yuzu::win::ProfileListEnumeration. Defaults describe a clean, complete walk.
 struct ProfileListFacts {
-    long root_rc = 0;             ///< opening ProfileList itself
-    long last_rc = 259;           ///< the RegEnumKeyExW code that ended the walk (0 = the cap)
-    long probe_rc = 259;          ///< the extra enumeration run only at the cap
-    bool truncated = false;       ///< the cap was reached and more subkeys exist
-    std::size_t record_failures = 0; ///< SID keys / ProfileImagePath values that failed to read
-    std::size_t unreadable_paths = 0; ///< records whose ProfileImagePath exists but is unusable
+    long root_rc = 0;                      ///< opening ProfileList itself
+    long last_rc = kErrorNoMoreItems;      ///< the RegEnumKeyExW code that ended the walk (0 = cap)
+    long probe_rc = kErrorNoMoreItems;     ///< the extra enumeration run only at the cap
+    bool truncated = false;                ///< the cap was reached and more subkeys exist
+    std::size_t record_failures = 0;       ///< SID keys / ProfileImagePath values that failed
+    std::size_t unreadable_paths = 0;      ///< ProfileImagePath exists but is unusable
+    std::size_t unresolved_roots = 0;      ///< roots still holding `%` after expansion
+    bool profiles_dir_failed = false;      ///< ProfilesDirectory could not be read
 };
 
-inline constexpr long kErrorNoMoreItems = 259;
+/// A root that still holds `%` after environment expansion (an undefined variable is left
+/// in place by Windows, and the expansion helper returns its input when the API fails) or is
+/// empty is not a comparable literal path: it can never match, so it must not be trusted.
+[[nodiscard]] inline std::size_t count_unresolved_roots(const std::vector<std::string>& roots) {
+    return static_cast<std::size_t>(std::count_if(roots.begin(), roots.end(), [](const auto& r) {
+        return r.empty() || r.find('%') != std::string::npos;
+    }));
+}
 
 /// True only when every profile subkey was enumerated and read: the list is then a complete
 /// set of profile folders. Any open or enumeration fault, the 512-profile cap with more behind
-/// it, or one profile whose key or path could not be read makes it incomplete, and the privacy
-/// gate then withholds every path (a profile that is missing from the list is not a profile
-/// the gate can protect).
+/// it, one profile whose key or path could not be read, or a root that is not a literal path
+/// makes it incomplete, and the privacy gate then withholds every path (a profile that is
+/// missing from the list is not a profile the gate can protect).
 [[nodiscard]] constexpr bool profile_list_complete(const ProfileListFacts& f) noexcept {
-    if (f.root_rc != 0 || f.truncated || f.record_failures != 0 || f.unreadable_paths != 0)
+    if (f.root_rc != 0 || f.truncated || f.record_failures != 0 || f.unreadable_paths != 0 ||
+        f.unresolved_roots != 0 || f.profiles_dir_failed)
         return false;
     if (f.last_rc == kErrorNoMoreItems)
         return true;
     return f.last_rc == 0 && f.probe_rc == kErrorNoMoreItems; // exactly the cap, nothing behind
 }
 
-/// Registry value types the string reads accept: REG_SZ always; REG_EXPAND_SZ only for a
-/// caller that expands it (a value that was not expanded would not match a literal path).
-[[nodiscard]] constexpr bool string_value_type_accepted(unsigned long type,
-                                                        bool expands) noexcept {
-    return type == 1 /*REG_SZ*/ || (type == 2 /*REG_EXPAND_SZ*/ && expands);
+/// The one decision the plugin shell makes: `roots` (the profiles directory and each profile
+/// folder, as expanded) and the walk's facts. The shell passes the facts it read; the
+/// unresolved-root count is derived here from the roots themselves.
+[[nodiscard]] inline bool profile_roots_complete(const std::vector<std::string>& roots,
+                                                 ProfileListFacts facts) {
+    facts.unresolved_roots = count_unresolved_roots(roots);
+    return profile_list_complete(facts);
 }
 
 // ── Model ───────────────────────────────────────────────────────────────────────

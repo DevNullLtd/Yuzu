@@ -227,6 +227,10 @@ constexpr const wchar_t* kProfileListKey =
     L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
 constexpr REGSAM kRead64 = KEY_READ | KEY_WOW64_64KEY;
 
+// The pure header carries these codes as plain numbers (it includes no Windows header).
+static_assert(rec::kErrorNoMoreItems == ERROR_NO_MORE_ITEMS);
+static_assert(rec::kErrorAccessDenied == ERROR_ACCESS_DENIED);
+
 bool key_absent(LSTATUS rc) { return rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND; }
 
 // Reads one string value. An absent value is an empty string; any failure is the code. A value
@@ -243,7 +247,7 @@ std::expected<std::string, unsigned> read_string_value(HKEY key, const wchar_t* 
         return std::string{};
     if (rc != ERROR_SUCCESS)
         return std::unexpected(static_cast<unsigned>(rc));
-    if (!rec::string_value_type_accepted(type, expands))
+    if (type != REG_SZ && !(type == REG_EXPAND_SZ && expands))
         return std::unexpected(static_cast<unsigned>(ERROR_INVALID_DATA));
     if (bytes > rec::kMaxValueChars * sizeof(wchar_t))
         return std::unexpected(static_cast<unsigned>(ERROR_MORE_DATA));
@@ -343,15 +347,16 @@ struct ProfileRoots {
 
 ProfileRoots read_profile_roots() {
     ProfileRoots out;
+    rec::ProfileListFacts facts;
     std::string profiles_dir;
-    bool dir_ok = true;
     yuzu::win::RegKey list;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kProfileListKey, 0, kRead64, list.put()) ==
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kProfileListKey, 0, kRead64, list.put()) !=
         ERROR_SUCCESS) {
-        if (auto dir = read_string_value(list.get(), L"ProfilesDirectory", true))
-            profiles_dir = std::move(*dir);
-        else
-            dir_ok = false;
+        facts.profiles_dir_failed = true; // the walk below reports its own open separately
+    } else if (auto dir = read_string_value(list.get(), L"ProfilesDirectory", true)) {
+        profiles_dir = std::move(*dir);
+    } else {
+        facts.profiles_dir_failed = true;
     }
     if (profiles_dir.empty())
         profiles_dir = "%SystemDrive%\\Users";
@@ -362,7 +367,6 @@ ProfileRoots read_profile_roots() {
     for (const auto& p : yuzu::profiles::build_profile_list(profiles.records, {}))
         if (!p.profile_path.empty())
             out.roots.push_back(p.profile_path);
-    rec::ProfileListFacts facts;
     facts.root_rc = profiles.root_rc;
     facts.last_rc = profiles.last_rc;
     facts.probe_rc = profiles.probe_rc;
@@ -371,7 +375,9 @@ ProfileRoots read_profile_roots() {
     for (const auto& r : profiles.records)
         if (r.profile_image_path_unreadable)
             ++facts.unreadable_paths;
-    out.complete = dir_ok && rec::profile_list_complete(facts);
+    // A root still holding `%` (expand_env_strings returns its input when the API fails and
+    // Windows leaves an undefined variable in place) is counted as unresolved by the decision.
+    out.complete = rec::profile_roots_complete(out.roots, facts);
     return out;
 }
 

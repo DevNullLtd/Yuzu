@@ -816,14 +816,77 @@ TEST_CASE("installer records: the profile-root comparison folds ASCII only and k
     CHECK(rec::ascii_fold('[') == '[');
 }
 
-TEST_CASE("installer records: only REG_SZ, and REG_EXPAND_SZ for a caller that expands it",
+TEST_CASE("installer records: a root that is not a literal path makes the list incomplete",
           "[msi_packages][installer_records]") {
-    CHECK(rec::string_value_type_accepted(1, false));
-    CHECK(rec::string_value_type_accepted(1, true));
-    CHECK_FALSE(rec::string_value_type_accepted(2, false));
-    CHECK(rec::string_value_type_accepted(2, true));
-    CHECK_FALSE(rec::string_value_type_accepted(4, true)); // REG_DWORD
-    CHECK_FALSE(rec::string_value_type_accepted(7, true)); // REG_MULTI_SZ
+    CHECK(rec::count_unresolved_roots({"C:\\Users", "D:\\Profiles\\bob"}) == 0);
+    CHECK(rec::count_unresolved_roots({"C:\\Users", "%PROFILE_DRIVE%\\Redirected\\Alice"}) == 1);
+    CHECK(rec::count_unresolved_roots({"%HOMESHARE%\\bob", ""}) == 2); // empty: not usable either
+
+    // clean registry facts, every root literal
+    CHECK(rec::profile_roots_complete({"C:\\Users", "D:\\p\\bob"}, {}));
+    // clean registry facts but an expansion that left a variable in place (the probe)
+    CHECK_FALSE(
+        rec::profile_roots_complete({"C:\\Users", "%PROFILE_DRIVE%\\Redirected\\Alice"}, {}));
+    // ProfilesDirectory unreadable (or ProfileList unopenable) is incomplete on its own
+    rec::ProfileListFacts f;
+    f.profiles_dir_failed = true;
+    CHECK_FALSE(rec::profile_roots_complete({"C:\\Users"}, f));
+    // a registry fault is still incomplete with literal roots
+    f = {};
+    f.root_rc = 5;
+    CHECK_FALSE(rec::profile_roots_complete({"C:\\Users"}, f));
+}
+
+TEST_CASE("installer records: an unresolved redirected root is withheld and constrained",
+          "[msi_packages][installer_records]") {
+    Host g;
+    rec::InstallProps p;
+    p.install_location = "C:\\Program Files\\Vendor\\";
+    p.install_source = "E:\\Redirected\\Alice\\setup";
+    g.products.push_back(synthetic_product(1, p));
+    auto ctx = default_context();
+    ctx.profile_roots = {"C:\\Users", "%PROFILE_DRIVE%\\Redirected\\Alice"};
+    // the shell's decision, from clean registry facts
+    ctx.profile_roots_complete = rec::profile_roots_complete(ctx.profile_roots, {});
+    REQUIRE_FALSE(ctx.profile_roots_complete);
+    const auto set = run(g, ctx);
+    CHECK(set.records[0].props.install_source == "withheld:profile_list_incomplete");
+    CHECK(set.records[0].props.install_location == "withheld:profile_list_incomplete");
+    CHECK(rec::render(set)[0] ==
+          "status|installer_records|constrained|windows:installer_records:profile_list_incomplete");
+    for (const auto& line : rec::render(set))
+        CHECK(line.find("Alice") == std::string::npos);
+}
+
+TEST_CASE("installer records: paths are normalised before the profile-root comparison",
+          "[msi_packages][installer_records]") {
+    const std::vector<std::string> roots{"C:\\Users", "E:\\Redirected\\alice"};
+    // each non-canonical spelling of a profile path is still under the root
+    CHECK(rec::path_under_any("C:\\\\Users\\\\x", roots));                  // doubled separators
+    CHECK(rec::path_under_any("C:\\Users\\\\\\x\\y\\", roots));             // trailing separator
+    CHECK(rec::path_under_any("C:\\Users\\.\\x", roots));                   // dot segment
+    CHECK(rec::path_under_any("C:\\Windows\\..\\Users\\x", roots));         // dot-dot segment
+    CHECK(rec::path_under_any("C:\\Users.\\x", roots));                     // trailing dot
+    CHECK(rec::path_under_any("C:\\Users \\x", roots));                     // trailing space
+    CHECK(rec::path_under_any("c:/USERS/x", roots));                        // either separator
+    CHECK(rec::path_under_any("\\\\?\\C:\\Users\\x", roots));               // \\?\ prefix
+    CHECK(rec::path_under_any("\\??\\C:\\Users\\x", roots));                // NT prefix
+    CHECK(rec::path_under_any("\\\\.\\E:\\Redirected\\Alice\\x", roots));   // device prefix
+    CHECK(rec::path_under_any("E:\\Redirected\\Alice...\\x", roots));       // trailing dots
+    // a UNC profile root, in the long form too
+    const std::vector<std::string> unc{"\\\\fs\\profiles$\\bob"};
+    CHECK(rec::path_under_any("\\\\fs\\profiles$\\bob\\Documents", unc));
+    CHECK(rec::path_under_any("\\\\?\\UNC\\fs\\profiles$\\bob\\Documents", unc));
+    CHECK_FALSE(rec::path_under_any("\\\\fs\\profiles$\\bobby", unc));
+    // dot-dot never climbs above the root and never leaves a profile by a sibling name
+    CHECK_FALSE(rec::path_under_any("C:\\Users\\..\\Program Files", roots));
+    CHECK_FALSE(rec::path_under_any("C:\\UsersX\\x", roots));
+    // NOT handled, so they stay emitted (documented in the README): 8.3 names, junctions
+    CHECK_FALSE(rec::path_under_any("C:\\USERS~1\\x", roots));
+    CHECK_FALSE(rec::path_under_any("C:\\Documents and Settings\\x", roots));
+    CHECK_FALSE(rec::path_under_any("\\\\localhost\\C$\\Users\\x", roots));
+    // a root that normalises to nothing never matches everything
+    CHECK_FALSE(rec::path_under_any("C:\\x", std::vector<std::string>{"\\", "\\\\", ".", ""}));
 }
 
 TEST_CASE("installer records: row breakers cannot break a row", "[msi_packages][installer_records]") {
@@ -943,7 +1006,7 @@ TEST_CASE("installer records: a name that is not a packed GUID is skipped and co
     CHECK_FALSE(map.over_cap);
 }
 
-TEST_CASE("installer records: over its cap the upgrade map is a failure, so the roster is constrained",
+TEST_CASE("installer records: an over-cap upgrade map is a failure: the roster is constrained",
           "[msi_packages][installer_records]") {
     // 257 value names under one subkey
     {
