@@ -539,6 +539,9 @@ agent_test_exe = executable(
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
     'unit/test_installed_apps_parsers.cpp',   # Wave 4 PR4.3a: pure dpkg/rpm/pacman/system_profiler/
                                                 # brew/pkgutil parsers (installed_apps_parsers.hpp)
+    'unit/test_dpkg_status_parsers.cpp',      # SAM-45: dpkg status text parser (agents/shared/dpkg_status_parsers.hpp) over real captures, [dpkg][pkgdb], portable
+    'unit/test_rpmdb_parsers.cpp',            # SAM-45: rpm header blob + ndb + Berkeley DB hash readers (agents/shared/rpmdb_parsers.hpp) over real captures, [rpmdb][pkgdb], portable
+    'unit/test_installed_apps_pkgdb.cpp',     # SAM-45: installed_apps package-database shell, detection, limits, status.d, row-set parity with the old path, [installed_apps][pkgdb] (POSIX; no-op TU on Windows)
     'unit/test_installed_apps_actions.cpp',   # Wave 4 PR4.3a remediation: real installed_apps.dylib/.so
                                                 # driven end to end via LocalDispatcher (POSIX-only; a
                                                 # no-op TU on Windows via the file's own #ifndef _WIN32 guard)
@@ -549,6 +552,7 @@ agent_test_exe = executable(
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (macOS and Windows, self-gated)
     'unit/test_msi_packages_inventory.cpp',   # pure list_inventory builder over the committed Kingsley REAL CAPTURE (fixture via YUZU_TEST_FIXTURE_DIR; runs on every OS)
+    'unit/test_install_row_attributes.cpp',   # SAM-46: shared install-row attribute field (canonical form, closed key table), portable
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
     'unit/test_installed_apps_macos_receipts.cpp', # round-3 sync-speed fix: pure receipt-plist byte
@@ -1852,6 +1856,8 @@ if build_server
       'unit/server/test_yaml_scan.cpp',
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
+      # G01: the refusal seam policy evaluation applies before it dispatches a pair (pure, no store, no [pg])
+      'unit/server/test_policy_dispatch_seam.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
       'unit/server/test_census_ordering_store.cpp', # #5690 PR2a-1: census ordering key, durable pending evidence, schema v4
       'unit/server/test_census_pair_order.cpp', # #5690 UP-14 PR B: census order decision on the agent's (boot_epoch, emit_seq) pair
@@ -2348,6 +2354,12 @@ if build_server
                # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
                '-DYUZU_API_PARITY_LEDGER_DIR="' +
                (meson.project_source_root() / 'scripts' / 'ci' / 'api-parity').replace('\\', '/') +
+               '"',
+               # test_product_normalize.cpp reads the committed normaliser fixture
+               # (tests/unit/fixtures/software-estate/normaliser/normaliser_cases.tsv) at run time; same
+               # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
+               '-DYUZU_TEST_FIXTURE_DIR="' +
+               (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
                '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # MSVC's default 1 MiB thread stack reserve is marginal for this binary's
@@ -4601,6 +4613,18 @@ test('Echo scrub-wiring lexical gate (WP07)',
   timeout: 30,
 )
 
+# #8099: lexical pin over echo_plugin.cpp's do_collect_slow -- the slow-tick reconcile that
+# publishes the rollback_wedged storage-offline tag or clears a stale one. The decision and the
+# store seam have unit tests; EchoPlugin is TU-local, so the shell that calls the decision and does
+# the storage_set / storage_delete is reachable by none. Carries its own in-memory mutation
+# self-test. Source text only, so Python, no build needed.
+test('Echo storage-offline reconcile wiring lexical gate (#8099)',
+  _python3_test,
+  args: [files('test_echo_storage_offline_reconcile_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # WP07: lexical pins for the agent's output-dropped counter increment and the server's boot call to
 # pg::report_server_encoding (neither is reachable from a unit test). Source text only.
 test('WP07 metrics wiring lexical gate',
@@ -4797,6 +4821,19 @@ test('agent installed-software drain wiring lexical gate',
 test('installed_apps windows roots lexical gate',
   _python3_test,
   args: [files('test_windows_uninstall_roots_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Installed-apps package-database wiring (SAM-45): the Linux actions read the dpkg and rpm databases
+# in-process, never through dpkg-query or rpm. Parity is the design, so no output assertion can tell
+# the two acquisitions apart and the Linux block is `#ifdef __linux__`; this pins that no literal
+# names those executables, that each Linux collector calls the bounded read once and keeps only the
+# pacman and apk legs, and the guard / stop flag / shutdown quiesce / init re-arm of the bounded
+# read. Carries its own in-memory mutation self-test. No build required.
+test('installed_apps package-database wiring lexical gate',
+  _python3_test,
+  args: [files('test_installed_apps_pkgdb_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
@@ -5586,6 +5623,23 @@ test('software read wiring lexical',
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# G01: policy evaluation keeps applying the execute gate before it dispatches. server.cpp must hand
+# the PolicyEvaluator its capability registry (an evaluator without one refuses every dispatch, so a
+# dropped line stops every policy and no unit test notices), and policy_evaluator.cpp must reach
+# dispatch_fn from one place only, after the seam. Lexical gate + a selftest that mutates each
+# required statement in memory; both also run in .github/workflows/docs-lint.yml.
+test('policy dispatch wiring lexical',
+  _python3_test,
+  args: [files('test_policy_dispatch_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('policy dispatch wiring lexical selftest',
+  _python3_test,
+  args: [files('test_policy_dispatch_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 30,
 )

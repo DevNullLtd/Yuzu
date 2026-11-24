@@ -767,7 +767,8 @@ EchoDatabase::EchoDatabase(EchoDatabase&& other) noexcept
       query_db_{other.query_db_},
       quarantined_at_{other.quarantined_at_},
       warehouse_tables_ok_{other.warehouse_tables_ok_},
-      fold_{std::move(other.fold_)} {
+      fold_{std::move(other.fold_)},
+      rollback_{std::move(other.rollback_)} {
     other.quarantined_at_.reset();
     other.db_ = nullptr;
     other.query_db_ = nullptr;
@@ -784,11 +785,16 @@ EchoDatabase& EchoDatabase::operator=(EchoDatabase&& other) noexcept {
         quarantined_at_ = other.quarantined_at_;
         warehouse_tables_ok_ = other.warehouse_tables_ok_;
         fold_ = std::move(other.fold_);
+        rollback_ = std::move(other.rollback_);
         other.quarantined_at_.reset();
         other.db_ = nullptr;
         other.query_db_ = nullptr;
     }
     return *this;
+}
+
+int EchoDatabase::rollback_locked(char** errmsg) {
+    return rollback_ ? rollback_(db_) : sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, errmsg);
 }
 
 namespace {
@@ -1147,6 +1153,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     }
 
     auto db = EchoDatabase{guard.release()};
+    db.rollback_ = seams.rollback; // before the schema steps: the v10 step runs checked_transaction
     db.fold_ = std::make_unique<EchoFold>();
 
     // Ensure every registry-declared warehouse table exists on EVERY open —
@@ -2674,7 +2681,7 @@ EchoDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
     }
 
     // Rolled back as a whole, so every statement is reported failed.
-    const int rb = sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, err.addr());
+    const int rb = rollback_locked(err.addr());
     if (rb != SQLITE_OK) {
         // A ROLLBACK error USUALLY means SQLite already rolled back on its own,
         // which is the state we wanted. But it can also mean the rollback itself
@@ -2786,7 +2793,7 @@ std::expected<void, std::string> EchoDatabase::checked_transaction(
     // transaction that will never commit. See that method's doc comment for
     // the full reasoning; this is the identical pattern, reused rather than
     // reinvented.
-    const int rb = sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, err.addr());
+    const int rb = rollback_locked(err.addr());
     if (rb != SQLITE_OK && sqlite3_get_autocommit(db_) == 0) {
         spdlog::error("EchoDatabase: checked_transaction ROLLBACK failed and the connection is "
                       "STILL in a transaction ({}). Closing the Echo database: further writes "
