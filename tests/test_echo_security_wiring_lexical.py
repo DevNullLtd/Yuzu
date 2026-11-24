@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Static lexical gate over the Echo security wiring no unit binary on a Mac can reach.
 
-Four properties of the #7075 / #3864 / #7290 batch live in files the unit suites do not build or
-run here, so they are pinned by text:
+Five properties of the #7075 / #3864 / #7290 / #2532 batch live in files the unit suites do not
+build or run here, so they are pinned by text:
 
   1. echo_plugin.cpp (not part of yuzu_echo_tests) writes the `process` baseline only through
      yuzu::echo::encode_process_baseline, never an inline JSON dump that would carry a command
@@ -22,6 +22,15 @@ run here, so they are pinned by text:
      `if (!online_.load(std::memory_order_acquire))`; fail_internal rolls back only behind
      `online_.load(std::memory_order_acquire) && db_`; shutdown opens with `open_retry_.stop();
      online_.store(false, std::memory_order_release);` (join the retry thread, then close the gate).
+  5. (#2532) The per-device scoped gate has ONE body and two typed consumers wired in order.
+     auth_routes.cpp's Boolean `require_scoped_permission` is exactly the `== Admitted` wrapper over
+     `require_scoped_permission_outcome`, so it admits only on the single admitting class and a
+     second body cannot appear unseen. server.cpp builds one `scoped_gate_fn` that returns that
+     typed outcome and wires it into BOTH Echo purge surfaces (`dashboard_routes_->set_scoped_perm_fn`
+     and `rest_api_v1_->set_scoped_gate_fn`). REST copies the function by value when its routes
+     register, so the REST setter must come BEFORE `rest_api_v1_->register_routes(`: a setter after it
+     leaves the purge route on its fail-closed 500 for good and no unit binary notices (the harnesses
+     wire their own fake). The dashboard reads its member per request, so only its presence is pinned.
 
 Lexical only: comments (`//` and `/* */`) are stripped and whitespace is collapsed before matching,
 and a check that a token is PRESENT also ignores string and character literals, so a token kept
@@ -40,10 +49,23 @@ ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "agents" / "plugins" / "echo" / "src" / "echo_plugin.cpp"
 ROUTES = ROOT / "server" / "core" / "src" / "echo_tree_routes.cpp"
 SERVER = ROOT / "server" / "core" / "src" / "server.cpp"
+AUTH = ROOT / "server" / "core" / "src" / "auth_routes.cpp"
 PUSH_ROUTE = 'sink.Post("/fragments/echo/capture-sources/push"'
 WIRING = "echo_tree_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn())"
 WIRING_STATUS = "echo_tree_routes_->set_denial_status_fn("
-HINT = (" (this gate pins the #7075/#3864 wiring and the #7290 online_ publish order; if the code was"
+GATE_LAMBDA = "return auth_routes_->require_scoped_permission_outcome(req, res, type, op, agent_id);"
+DASHBOARD_GATE = "dashboard_routes_->set_scoped_perm_fn(scoped_gate_fn);"
+REST_GATE = "rest_api_v1_->set_scoped_gate_fn(scoped_gate_fn);"
+# The Boolean gate: exactly the `== Admitted` wrapper over the one body.
+GATE_WRAPPER = re.compile(
+    r"bool AuthRoutes::require_scoped_permission\([^)]*\) \{ return "
+    r"require_scoped_permission_outcome\(req, res, securable_type, operation, agent_id\) == "
+    r"ScopedGateOutcome::Admitted; \}")
+# The REST setter statement, followed LATER by the registration that copies it by value.
+REST_GATE_BEFORE_REGISTER = re.compile(
+    r"rest_api_v1_->set_scoped_gate_fn\(scoped_gate_fn\);.*?rest_api_v1_->register_routes\(")
+HINT = (" (this gate pins the #7075/#3864 wiring, the #7290 online_ publish order and the #2532 scoped"
+        " gate's one body and wiring order; if the code was"
         " legitimately restructured,"
         " update tests/test_echo_security_wiring_lexical.py)")
 
@@ -73,7 +95,7 @@ def push_body(routes):
     return routes[start:min(ends)] if ends else routes[start:]
 
 
-def problems(plugin_src, routes_src, server_src):
+def problems(plugin_src, routes_src, server_src, auth_src=""):
     out = []
     p = normalise(plugin_src)
     p_code = normalise(plugin_src, literals=False)
@@ -130,6 +152,25 @@ def problems(plugin_src, routes_src, server_src):
     if WIRING_STATUS not in s_code:  # outside comments and literals
         out.append("server.cpp no longer injects the push's denial status mapping (set_denial_status_fn): "
                    "a refused dispatch would answer 500 instead of 403")
+
+    # Property 5 (#2532): the scoped gate's one body, and the typed gate wired into both surfaces.
+    if not GATE_WRAPPER.search(normalise(auth_src, literals=False)):
+        out.append("auth_routes.cpp's require_scoped_permission is no longer exactly "
+                   "`return require_scoped_permission_outcome(...) == ScopedGateOutcome::Admitted;`: the "
+                   "Boolean gate must admit only on the one admitting class (#2532)")
+    if GATE_LAMBDA not in s_code:
+        out.append("server.cpp's scoped_gate_fn no longer returns "
+                   "auth_routes_->require_scoped_permission_outcome(...) (#2532)")
+    if DASHBOARD_GATE not in s_code:
+        out.append("server.cpp no longer wires the typed scoped gate into the dashboard's Echo purge "
+                   "and re-enable (dashboard_routes_->set_scoped_perm_fn(scoped_gate_fn)) (#2532)")
+    if REST_GATE not in s_code:
+        out.append("server.cpp no longer wires the typed scoped gate into the REST Echo purge "
+                   "(rest_api_v1_->set_scoped_gate_fn(scoped_gate_fn)) (#2532)")
+    elif not REST_GATE_BEFORE_REGISTER.search(s_code):
+        out.append("server.cpp calls rest_api_v1_->set_scoped_gate_fn AFTER "
+                   "rest_api_v1_->register_routes: the purge route copies the function at "
+                   "registration, so it would answer its fail-closed 500 for good (#2532)")
     return out
 
 
@@ -138,21 +179,30 @@ def mutate(src, old, new):
     return src.replace(old, new, 1)
 
 
+def mutate_re(src, pattern, new):
+    """Like mutate, for a statement whose line breaks and indentation the formatter may move."""
+    assert re.search(pattern, src), f"stale mutation pattern: {pattern!r}"
+    return re.sub(pattern, lambda _m: new, src, count=1)
+
+
 class EchoSecurityWiringLexical(unittest.TestCase):
     def setUp(self):
         self.plugin = PLUGIN.read_text(encoding="utf-8")
         self.routes = ROUTES.read_text(encoding="utf-8")
         self.server = SERVER.read_text(encoding="utf-8")
+        self.auth = AUTH.read_text(encoding="utf-8")
 
     def probe(self, **over):
         return problems(over.get("p", self.plugin), over.get("r", self.routes),
-                        over.get("s", self.server))
+                        over.get("s", self.server), over.get("a", self.auth))
 
     def test_source_is_clean(self):
         self.assertEqual(self.probe(), [], HINT)
 
     def test_mutations_are_caught(self):
-        p, r, s = self.plugin, self.routes, self.server
+        p, r, s, a = self.plugin, self.routes, self.server, self.auth
+        wrapper = (r"return require_scoped_permission_outcome\(req, res, securable_type, operation, "
+                   r"agent_id\)\s*==\s*ScopedGateOutcome::Admitted;")
         cases = {
             "a poll write reverts to an inline dump": dict(p=mutate(
                 p, "db_->set_state(proc_key, yuzu::echo::encode_process_baseline(current))",
@@ -187,6 +237,19 @@ class EchoSecurityWiringLexical(unittest.TestCase):
                 p, "if (online_.load(std::memory_order_acquire) && db_)", "if (db_)")),
             "shutdown stops joining the retry thread first": dict(p=mutate(
                 p, "open_retry_.stop();\n        // Close the dispatch gate", "(void)0;\n        // Close the dispatch gate")),
+            "the Boolean gate admits everything": dict(a=mutate_re(a, wrapper, "return true;")),
+            "the Boolean gate admits anything but a plain denial": dict(a=mutate_re(
+                a, wrapper,
+                "return require_scoped_permission_outcome(req, res, securable_type, operation, "
+                "agent_id) != ScopedGateOutcome::Denied;")),
+            "the typed lambda stops returning the gate's class": dict(s=mutate(
+                s, GATE_LAMBDA, "return yuzu::server::ScopedGateOutcome::Admitted;")),
+            "the dashboard setter is removed": dict(s=mutate(s, DASHBOARD_GATE, "")),
+            "the dashboard setter is rebound to the Boolean gate": dict(s=mutate(
+                s, DASHBOARD_GATE, "dashboard_routes_->set_scoped_perm_fn(scoped_perm_fn);")),
+            "the REST setter is removed": dict(s=mutate(s, REST_GATE, "")),
+            # Still present, but after the registration that copies it: only the ORDER check sees it.
+            "the REST setter moves after register_routes": dict(s=mutate(s, REST_GATE, "") + "\n" + REST_GATE + "\n"),
         }
         for name, over in cases.items():
             with self.subTest(mutation=name):

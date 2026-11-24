@@ -407,7 +407,7 @@ constrained via the `NET_RT_FLAGS` sysctl route dump — `entry_type` always
 `unknown` there), so `arp_enabled|true` reports real rows there — run the
 `compatibility` action to distinguish a supported-but-empty source from a
 planned-but-unimplemented one.
-`<source>_rows` counts the rows of the source's finest tier (its hourly tier; `usage_daily` for `usage`), and `<source>_oldest_ts` is the start of that tier's oldest bucket, not an event's own time. For `usage`, `usage_rows` is the `usage_daily` row count and `usage_oldest_ts` the oldest day, not the number of open runs in `usage_live`. `netqual_boot_rows` counts the per-boot baseline table. When the storage is offline the reply leads with `error|` and then `storage_state|offline`. When Echo loaded offline at open, that line carries the reason as a third field: `storage_state|offline|free_space` (the migration was refused for lack of free space), `storage_state|offline|migration_failed` (the v10 roll-up step, or an earlier step, failed or ran out of time) or `storage_state|offline|open_failed` (any other failure met on a later retry). The `error|` line says the open is retried automatically, 1, 5 and 15 minutes after the first failure and then hourly, so no restart is needed once the cause is cleared (the exception is a collection start that fails after a late open: nothing more is retried and the line asks for an agent restart); see [Upgrading an existing database](#upgrading-an-existing-database).
+`<source>_rows` counts the rows of the source's finest tier (its hourly tier; `usage_daily` for `usage`), and `<source>_oldest_ts` is the start of that tier's oldest bucket, not an event's own time. For `usage`, `usage_rows` is the `usage_daily` row count and `usage_oldest_ts` the oldest day, not the number of open runs in `usage_live`. `netqual_boot_rows` counts the per-boot baseline table. When the storage is offline the reply leads with `error|` and then `storage_state|offline`. The line always carries the reason as a third field: `storage_state|offline|free_space` (the migration was refused for lack of free space), `storage_state|offline|migration_failed` (the v10 roll-up step, or an earlier step, failed or ran out of time), `storage_state|offline|open_failed` (any other failure met on a later retry) or `storage_state|offline|rollback_wedged` (the database opened, then was closed at run time after a rollback failed). The first three are an open that failed: the `error|` line says the open is retried automatically, 1, 5 and 15 minutes after the first failure and then hourly, so no restart is needed once the cause is cleared (the exception is a collection start that fails after a late open: nothing more is retried and the line asks for an agent restart). `rollback_wedged` is never retried: the line asks for an agent restart; see [Upgrading an existing database](#upgrading-an-existing-database).
 `software_last_run_ts` is the wall-clock of the last `collect_software` tick (`0`
 if it has not run yet); it is the heartbeat that distinguishes "healthy but no
 software changed" (where `software_rows` stays low) from "the hourly trigger
@@ -477,17 +477,41 @@ common case) and `heartbeat.db_quarantine_last` (`<epoch>:<file>`) in its plugin
 storage, which the
 agent forwards on every heartbeat as `yuzu.plugin.echo.db_corruption_total` /
 `yuzu.plugin.echo.db_quarantine_last`. The server exposes
-`yuzu_fleet_echo_db_corruption_agents` (see the metrics reference) and writes a
+`yuzu_fleet_echo_db_corruption_agents` (agents that have ever quarantined: a
+population, which rises when an agent with an old quarantine reconnects) and
+`yuzu_server_echo_db_quarantines_total` (new quarantines: one per audit row
+written; the `YuzuEchoDbCorruptionDetected` alert watches its increase over an
+hour, and any increase fires, a starting default not sized from fleet data) — see
+the metrics reference — and writes a
 `echo.db.corruption_quarantined` audit row per (agent, quarantine identity),
 deduplicated against the audit store and bounded to one row per agent per 10
 minutes per server process (intermediate quarantines inside that window collapse
 to the newest identity; another HA node can add a second row for the same
-identity) — see the audit-log reference. Devices are not queued behind one
-another, so a quarantine that hits many devices at once writes each device's
-audit row on the heartbeat that reports it while the audit store is healthy. A
-report is deferred to a later heartbeat if the same device's lookup is already
-in flight, if it arrives inside the server-wide 60 s back-off that follows any
-failed lookup or write, or if the in-flight set is at capacity. A plugin that
+identity; once the per-process table of 65,536 agents is full the limit is best
+effort, and an agent inside its window can be forgotten early and get a second
+row sooner) — see the audit-log reference. Devices are not queued behind one
+another, but at most 4 are admitted at a time: each holds one connection of the
+shared PostgreSQL pool (default 16) for its lookup and write, so a quarantine
+that hits many devices at once writes the rows over successive heartbeats while
+the audit store is healthy, not all on the first. A report is deferred to a later
+heartbeat if the same device's lookup is already in flight, if 4 devices are
+already in flight, or if it arrives inside the server-wide 60 s back-off that
+follows a failed lookup (including one that throws) or failed write. The one
+exception is a device the server already remembers as failing: the first failure
+by a device it does not remember opens the back-off for every device and the
+server remembers that device, and a later failure by a remembered device makes
+only that device wait 60 s from its failure. So a device whose own lookup or
+write fails every time pauses the others once, not on every retry. The server
+remembers up to 16 failing devices, each until its own lookup finds the row or its
+write succeeds, with no time limit. With more than 16 devices failing and none
+succeeding it forgets the one whose wait ends earliest, and a forgotten device's
+next failure opens the back-off again, so other devices' rows are delayed, not
+lost. While the audit store itself is failing, each remembered device tries at
+most once per 60 s. The back-off is dated from the failure and a later failure never
+shortens it; there is no separate probe, so when it ends, up to 4 devices look up
+at once and the first failure by a device that is not remembered re-opens it. Each
+failure is counted in `yuzu_server_echo_corruption_audit_degraded_total{reason}`
+and logged. A plugin that
 failed to initialise (including Echo when the corrupt file cannot be moved
 aside) is reported in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
 which distinguishes "failed to load" from "not installed". An Echo that loads
@@ -496,7 +520,9 @@ which distinguishes "failed to load" from "not installed". An Echo that loads
 is not counted there: it retries by itself, and it is visible as the
 `yuzu.plugin.echo.storage_offline` heartbeat tag, the
 `yuzu_fleet_echo_storage_offline{reason}` gauge and the `YuzuEchoStorageOffline`
-alert. The plugin keeps its
+alert. A database closed at run time after a rollback failed is reported the same
+way with reason `rollback_wedged`; it is not retried, and only an agent restart
+recovers it. The plugin keeps its
 count in a private storage record; if that record is present but unreadable the
 plugin logs `ECHO: db_health.ledger unreadable; not overwriting` and stops updating
 the two heartbeat keys rather than resetting the count — `status` still reports
@@ -581,7 +607,7 @@ The first frame surfaces every device × source pair where the collector has bee
 
 **State persistence:** Scan results are held in the server's memory keyed by your username. Restarting the server clears the last-scan reference; click **Scan fleet** again after a restart. Persistence across restarts and multi-server coordination are planned for Phase 15.G operational hardening.
 
-**Audit trail:** Every Scan emits an `echo.status.scan` audit event. Every Re-enable emits `echo.source.reenable` (with `result=success` and `detail` carrying `device_id` and `source` on success, or `result=failure` with `detail` carrying the real reason — `scope_violation`, `agent_not_connected`, `permission_revoked` (the grant lapsed after the `attempted` row: `Execution:Execute` for a re-enable, `Infrastructure:Delete` for a purge) or `dispatch_denied reason=<token>` (the dispatch chokepoint refused the command for the operator, answered `403`, or `500` for a server catalogue fault; #7114) — on rejected attempts). Every **Purge data** emits `echo.source.purge` (same detail shape; `result=denied` if the `Infrastructure:Delete` permission is missing). Because purge dispatch is fire-and-forget, the number of rows deleted is recorded in the command's **response record**, not the dispatch audit row. See `docs/user-manual/audit-log.md` for the full schema.
+**Audit trail:** Every Scan emits an `echo.status.scan` audit event. Every Re-enable emits `echo.source.reenable` (with `result=success` and `detail` carrying `device_id` and `source` on success, or `result=failure` with `detail` carrying the real reason — `scope_violation`, `agent_not_connected`, `permission_revoked` (the grant lapsed, or the session ended, after the `attempted` row: `Execution:Execute` for a re-enable, `Infrastructure:Delete` for a purge), `store_unavailable store=<mgmt_group_store|rbac_store>` (an authorization read failed after the `attempted` row, answered `503`) or `dispatch_denied reason=<token>` (the dispatch chokepoint refused the command for the operator, answered `403`, or `500` for a server catalogue fault; #7114) — on rejected attempts). A refusal before the `attempted` row is `result=denied` when authorization could not be evaluated, the session ended or the request repeats a recent one: `store_unavailable store=<mgmt_group_store|rbac_store>` (an authorization read failed, answered `503` instead of the `404`), `scoped_gate_unavailable` (`503`; after the `attempted` row the same token is `result=failure`), `session_revoked` (`404`) and `rate_limited cooldown=<N>s` (the same device and source was dispatched less than 30 seconds ago, answered `429`; always `denied`). Every row from the `attempted` row on ends in the same `cid=<id>`, so an outcome pairs with its attempt. Every **Purge data** emits `echo.source.purge` (same detail shape; a caller without `Infrastructure:Delete` on the device is `result=failure` with `scope_violation`, answered `404`). Because purge dispatch is fire-and-forget, the number of rows deleted is recorded in the command's **response record**, not the dispatch audit row. See `docs/user-manual/audit-log.md` for the full schema.
 
 ### Process tree viewer
 
@@ -603,7 +629,7 @@ The third frame on the `/echo` page shows a **per-host process tree for one hour
 - **Names only.** The hourly roll-up keeps counts per name, not individual processes: **process ids, command lines and file paths are not kept**, on any platform, and processes that share a name share one position in the tree. Loaded modules (DLLs) are not part of the tree: on Windows the separate `module` source captures them into `$Module_Hourly` (shown on the capture-source cards), and on Linux and macOS that source returns no rows until an OS collector ships.
 - **One hour at a time, whole hours.** A process that started before the chosen hour appears only through its stops; a window covers hourly buckets that exist. If the host has no rows for the hour the tree says so. A newly enrolled host, or one whose agent has only just been upgraded, has no earlier hours to show.
 - **Never shown as complete when it may not be.** The device answers at most 10,000 rows per query, so an hour with more process names (or more connections) than that is shown with a "Results were cut at 10,000 rows for this hour" note, and a row the server could not read is counted ("N rows unreadable"). Pick a quieter hour or ask the device with `echo.sql` for the rest.
-- **A failed read is said, not hidden.** A device whose agent has no roll-up store shows "upgrade the agent" in the tree and in the DNS and ARP panels; the panels are never left reading "nothing recorded" for a read that failed. See "Behaviour change: the Echo page reads the roll-up tables" in the upgrade guide.
+- **A failed read is said, not hidden.** A device that answers a read with an error, a missing roll-up table included, shows "The device reported an error: ..." with the device's own text in the tree and in the DNS and ARP panels; the panels are never left reading "nothing recorded" for a read that failed. See "Behaviour change: the Echo page reads the roll-up tables" in the upgrade guide.
 - **Spawn flags survive placement.** The suspicious-spawn check looks at every parent a name was started under in the hour, including a parent that was already running and has no row of its own, so it does not depend on which parent the name is shown under (the one that started it most).
 - **No boot or agent-install anchors.** They need process ids and raw capture rows, which the roll-up does not keep.
 - **Not measured yet.** The DNS panel has no "no such name" count and the ARP panel has no router role or MAC-rebind column: the agent does not write those values yet, so the page does not show them (they return when it does).
@@ -751,7 +777,7 @@ If that rollback ITSELF fails and the database is left inside the transaction,
 the agent **closes the Echo database**. Every later write on a connection stuck in
 an uncommittable transaction would be reported durable and then lost at restart,
 so it fails all of them closed instead. `echo status` then returns non-zero and
-emits an `error|` line followed by `storage_state|offline`, and nothing else --
+emits an `error|` line followed by `storage_state|offline|rollback_wedged`, and nothing else --
 every `config|` line is withheld. Collection and retention are both stopped on
 that endpoint until the agent restarts. **Historical data normally stays
 readable**: the close affects only the read-write connection, so `echo sql` can
@@ -759,8 +785,13 @@ still query what was already collected. The error line says which of those two
 cases you are in -- the read-only connection is itself optional at open time, and
 on the rare endpoint where it never opened, `echo sql` cannot read the history
 either, so the line says that instead of promising a read path that is not there.
-This needs a disk-level fault to reach, but read `storage_state` before trusting
-any other line in that output.
+While the database is closed, `collect_fast`, `collect_slow`, `rollup`, `configure` and
+`fleet_snapshot` fail with that same `error|` line, because each would otherwise answer as
+if nothing were wrong (an empty success, a snapshot that shows the process and tcp sources
+paused by an operator, or a `configure` that reports `status|ok` with nothing written).
+`query` and `export` fail with `error|database not open`; `echo sql` is the one action that
+keeps answering. This needs a disk-level fault to reach, but read `storage_state` before
+trusting any other line in that output.
 
 In the dashboard, the capture-sources frame surfaces that error line verbatim
 rather than a generic failure, so the reason and the recovery advice reach the

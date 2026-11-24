@@ -33,6 +33,7 @@
 /// nothing else, and is bound to the `agent_id` filter, never to the scope or the limit.
 
 #include "authz_model.hpp"
+#include "bulk_read_slots.hpp"
 #include "device_ci_read_gate.hpp"
 #include "device_inventory_types.hpp"
 
@@ -64,6 +65,18 @@ static_assert(kMaxPushdownScopeIds == 10000,
 /// The MCP default page size, smaller than the REST default: each page lands in an agentic
 /// worker's context. The input schema's `default` and `request_from_args` both read this.
 inline constexpr std::int64_t kMcpDefaultLimit = 20;
+
+/// The byte budget of one page's ROWS, per surface (compile-time constants, not flags). The sum of
+/// `row_wire_bytes` over the rows a page serves stays within it, except that a page ALWAYS serves its
+/// first row (one row is at most about 180 KB with worst-case JSON control-byte escaping, so the
+/// first row of a page cannot wedge a walk, and a row is never truncated). REST serves the rows
+/// once; the MCP `tool_result` emits the payload twice (as `content[0].text`, escaped, and as
+/// `structuredContent`), so its budget is smaller. The whole response body is the budget plus the
+/// array separators and the envelope, and on MCP the escaping of the text copy; the documented
+/// per-surface maximum is in the user manual. This bounds the RESPONSE only: the store still reads
+/// `limit + 1` rows, and only `BulkReadSlots` bounds that read.
+inline constexpr std::size_t kRestRowBudgetBytes = std::size_t{4} * 1024 * 1024;
+inline constexpr std::size_t kMcpRowBudgetBytes = std::size_t{1} * 1024 * 1024;
 
 using Params = std::multimap<std::string, std::string>;
 
@@ -145,6 +158,19 @@ struct Page {
     std::string next_cursor;
     /// The request named an `agent_id` outside the caller's scope. Nothing is read then.
     bool target_denied{false};
+    /// The byte budget (not the row count) ended the page: rows that fit the count were left for the
+    /// next page, so `next_cursor` is non-empty and a page can be shorter than `limit`. Served as
+    /// `page_bytes_capped: true` and `byte_capped=1` in the audit detail, only when set.
+    bool byte_capped{false};
+    /// The bulk-read slot (`bulk_read_slots.hpp`), still HELD when `read_page` returns a served
+    /// bulk page. Empty for a point read, a refused page, a failed read and a null cap. The
+    /// transport keeps it through the access-audit writes of this page and calls `release_slot()`
+    /// right after them, so the cap bounds the pool connections the read AND the audit write of a
+    /// served bulk page hold (#7951), not the read alone. Dropping the `Page` releases it too, on
+    /// every exit path. Move-only for that reason. The slot borrows its `BulkReadSlots`: a `Page`
+    /// must not outlive `ServerImpl::hardware_ci_read_slots_` and is request-local by design.
+    std::optional<BulkReadSlots::Slot> hold;
+    void release_slot() noexcept { hold.reset(); }
 };
 
 /// Why a page could not be produced.
@@ -158,6 +184,12 @@ struct Page {
 ///    concluded). A 503 with `retry_after_ms` `device_ci_read_gate::kOrderingRetryAfterMs`, never
 ///    an empty page and not `kDegraded` (that one says the store is unavailable). Decided after
 ///    every refusal that needs no read and BEFORE the store is asked, so no read is made.
+///  - `kBusy`: every bulk-read slot (`bulk_read_slots.hpp`) was taken for the whole bounded wait.
+///    A 503 with `retry_after_ms` `kBusyRetryAfterMs` and a `Retry-After` header, never an empty
+///    page and not `kDegraded` (the store is fine, this replica is at its read cap). Nothing was
+///    read or served, so it writes NO audit row on either transport (a refusal holds no slot, so a
+///    row would be an audit writer outside the cap, #7951). The
+///    `yuzu_hardware_ci_read_busy_total` counter is the record of every refusal.
 ///  - `kCount`: NOT an error. A sentinel one past the last real enumerator, so a test can walk
 ///    every value and a `static_assert` can tie a table to the enumerator count; it is answered
 ///    like any out-of-range value. A new enumerator MUST be inserted BEFORE it: the
@@ -168,8 +200,15 @@ enum class ReadError {
     kCursorFilterMismatch,
     kScopeTooWide,
     kOrderingUnverified,
+    kBusy,
     kCount
 };
+
+/// The REST `retry_after_ms` (and, rounded to seconds, `Retry-After`) and the MCP hint of `kBusy`.
+/// Derivation: the 500 ms slot wait plus one typical page read. A slot can be held for the store
+/// call plus the audit write(s) (about 62 s on REST in the worst case), so 2 s is a
+/// typical-contention hint, not a guarantee.
+inline constexpr std::int64_t kBusyRetryAfterMs = 2000;
 
 /// Wire message for a refused request: the cursor messages above, and for `kScopeTooWide` the
 /// same text on REST and MCP (it names the global-read way out and carries no count).
@@ -182,6 +221,12 @@ enum class ReadError {
 inline constexpr std::string_view kScopeTooWideRemediation =
     "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
     "caller's scope";
+
+/// The A4 `remediation` hint for a `kBusy` refusal, the same text on REST and MCP.
+inline constexpr std::string_view kBusyRemediation =
+    "wait retry_after_ms, then retry the same cursor with some jitter and back off on repeats "
+    "(one retry usually succeeds; give up after about 5 minutes of continuous refusals); read one "
+    "page at a time, never several in parallel";
 
 /// The A4 `remediation` hint for a `kOrderingUnverified` refusal, the same text on REST and MCP.
 inline constexpr std::string_view kOrderingUnverifiedRemediation =
@@ -204,7 +249,11 @@ enum class Surface { kRest, kMcp };
 ///  - `domain_audit_row`: the transport writes an `inventory.devices.ci` row (`audit_outcome`,
 ///    `audit_detail`). A refused cursor writes none. MCP also writes its generic row
 ///    (`audit_outcome`, `audit_detail`) on EVERY failure it answers, whatever `audit_detail`
-///    holds; REST writes only the domain row, and none when `domain_audit_row` is false.
+///    holds, except `kBusy`; REST writes only the domain row, and none when `domain_audit_row` is false.
+///    `kBusy` is the one answer that is `unavailable` with `domain_audit_row` false and it writes
+///    NO row on either transport (its `audit_outcome` and `audit_detail` are empty).
+///  - `retry_after_header`: REST also sends `Retry-After` (whole seconds, `retry_after_ms`
+///    rounded up), so the header agrees with the body hint.
 ///  The `string_view` members (`message`, `remediation`, `audit_outcome`) point at string
 ///  literals or `inline constexpr` views, so they stay valid for the life of the program; only
 ///  `audit_detail` owns its text.
@@ -213,6 +262,7 @@ struct ReadFailure {
     std::string_view message;
     std::string_view remediation;
     std::int64_t retry_after_ms{-1}; ///< REST 503 hint; -1 = none
+    bool retry_after_header{false};
     bool domain_audit_row{false};
     std::string_view audit_outcome;
     std::string audit_detail;
@@ -221,16 +271,43 @@ struct ReadFailure {
 /// The answer to a failed read. One `switch` over `ReadError` with no `default`.
 [[nodiscard]] ReadFailure describe_read_error(ReadError e, Surface surface);
 
+/// The byte length of `row_json(rec)` exactly as both surfaces serve it (compact dump with
+/// `error_handler_t::replace`). The ONE measure the byte budget is applied in: the sum over a page's
+/// rows plus one comma between neighbours plus the two array brackets is the byte length of the
+/// served `devices` array.
+[[nodiscard]] std::size_t row_wire_bytes(const DeviceCiRecord& rec);
+
 /// One page: decode the cursor, apply the scope as described in the file comment, check the
-/// collation gate, read. A `rq.limit` outside [1, kPageMax] is clamped into it (the parsers never
+/// collation gate, take a read slot, read, then cut to the count and to `row_budget_bytes`. A `rq.limit` outside [1, kPageMax] is clamped into it (the parsers never
 /// produce one). `gate` is `device_ci_read_gate`'s input and has NO default: every caller states
 /// it. Null means "no gate" and the read is served (a unit test that deliberately models no gate
 /// passes an explicit `nullptr`; production passes `&collation_gate_`, pinned by a lexical test).
 /// The gate is checked after the cursor and scope refusals, which need no read and keep
 /// their own answers, and before the one store call.
+/// `slots` is the bulk-read concurrency cap (`bulk_read_slots.hpp`) and, like `gate`, has NO
+/// default: every caller states it. A slot is taken after every refusal above (they take none)
+/// and held across the one `read(rq)` call. On a served bulk page it is handed to the caller in
+/// `Page::hold` and must stay held through the caller's access-audit writes (`release_slot()`
+/// afterwards): a pool connection is then held by a served bulk page either for the read or for
+/// its audit write, never more than `cap` at once, so an audit write that stalls on a locked audit
+/// table cannot pile up (#7951). That bound covers the audit write of a served bulk page ONLY: a
+/// point read, the failure row of a failed read and the refusal rows hold no slot. On every
+/// refusal and on a failed read the slot is released before this returns. A request that names
+/// an `agent_id` (a point read) takes none. When no slot frees within `kBulkReadSlotWait` the answer is
+/// `ReadError::kBusy` and nothing is read. Null means "no cap" and the read is served (a unit test
+/// that deliberately models no cap passes an explicit `nullptr`; production passes the one
+/// `hardware_ci_read_slots_` through `Deps::ci_read_slots` / `ToolDeps::ci_read_slots`, pinned by
+/// a lexical test).
+/// `row_budget_bytes` is the surface's byte budget (`kRestRowBudgetBytes` / `kMcpRowBudgetBytes`) and
+/// has NO default. Rows are kept while the running sum of `row_wire_bytes` stays within it; the first
+/// row is always kept and a row is never truncated. When the budget (not the count) left rows over,
+/// `Page::byte_capped` is set. `next_cursor` is minted from the last KEPT row whenever any row was
+/// left over, by the count or by the budget, including when fewer than `limit + 1` rows were read
+/// (the `agent_id > last` resume and the `h1` cursor are unchanged).
 [[nodiscard]] std::expected<Page, ReadError>
 read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
-          const std::atomic<pg::CollationGate>* gate);
+          const std::atomic<pg::CollationGate>* gate, BulkReadSlots* slots,
+          std::size_t row_budget_bytes);
 
 /// The production binding of `Reader` is a one-line lambda in server.cpp over
 /// `DeviceInventoryStore::list_device_ci_after`; there is no binder here so this header stays
@@ -244,7 +321,8 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
 /// hash, null when empty, so a caller can diff client-side); `blob_version`.
 [[nodiscard]] nlohmann::json row_json(const DeviceCiRecord& rec);
 
-/// `{"devices": [...], "next_cursor": "<cursor or empty>"}`.
+/// `{"devices": [...], "next_cursor": "<cursor or empty>"}`, plus `"page_bytes_capped": true` only
+/// when the byte budget ended the page (an absent key means it did not).
 [[nodiscard]] nlohmann::json page_json(const Page& page);
 
 /// The status for a CONFINED caller (the gate's VisibleSet was a present set), applied to a
@@ -260,7 +338,7 @@ void apply_scope_disclosure(nlohmann::json& body, bool confined);
 [[nodiscard]] std::string audit_target_type(const Request& rq);
 [[nodiscard]] std::string audit_target_id(const Request& rq);
 
-/// `hardware CI records (<surface>): rows=<n>[ page=continuation] scope=<fleet|authority_scoped>`
+/// `hardware CI records (<surface>): rows=<n>[ page=continuation] scope=<fleet|authority_scoped>[ byte_capped=1]`
 /// (the requested device, when there is one, is the row's target, not repeated here). `surface` is
 /// "REST" or "MCP". `confined` is whether the gate's VisibleSet was a present set. The detail
 /// never lists device ids and never carries a count of devices outside the caller's scope.

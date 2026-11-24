@@ -6628,14 +6628,18 @@ void SettingsRoutes::register_routes(
 
     // A pending-agent id that is empty, `.` or `..` can never be addressed by a
     // browser-built URL (dot segments collapse), so an API call carrying one is
-    // refused outright rather than matched against the store.
+    // refused outright rather than matched against the store. An id over 256 bytes or with
+    // a byte below 0x20 (the shared audit floor) is refused the same way, and leaves no row:
+    // the denial row below would carry it as target_id.
     auto refuse_unaddressable_agent_id = [this](const httplib::Request& req,
                                                 httplib::Response& res, const char* verb,
                                                 const std::string& agent_id,
                                                 const std::string& by) -> bool {
-        if (path_segment_ok(agent_id))
+        const bool audit_safe = auth::agent_id_is_audit_safe(agent_id);
+        if (audit_safe && path_segment_ok(agent_id))
             return false;
-        audit_fn_(req, verb, "denied", "Agent", agent_id, "invalid_agent_id by=" + by);
+        if (audit_safe)
+            audit_fn_(req, verb, "denied", "Agent", agent_id, "invalid_agent_id by=" + by);
         res.status = 400;
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Invalid agent id","level":"error"}})");

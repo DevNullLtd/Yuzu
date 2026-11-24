@@ -31,6 +31,7 @@
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
+#include "capability_decls/plugin_action_catalogue_file_search.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
@@ -84,6 +85,7 @@
     ::yuzu::server::capdecls::plugin_action_catalogue_virtualization(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_remote_access_audit(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_process_introspect(),\
+    ::yuzu::server::capdecls::plugin_action_catalogue_file_search(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_middleware()
 
 // An overflow of CommandCapabilityRegistry::kMaxSources is otherwise only a boot-time throw, and

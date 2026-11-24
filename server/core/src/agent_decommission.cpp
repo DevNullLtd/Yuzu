@@ -1,5 +1,6 @@
 #include "agent_decommission.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <utility>
 
@@ -9,6 +10,7 @@
 #include "app_perf_daily_store.hpp"
 #include "device_inventory_store.hpp"
 #include "inventory_store.hpp"
+#include "management_group_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
@@ -120,10 +122,71 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                                        return p->delete_agent(id);
                                    })
                                  : nullptr});
+    // The tenth store (#6352): the agent's management-group memberships. Registered LAST.
+    // `deleted` means every membership row for the id was removed; the enrolment row is NOT touched,
+    // so decommission still does not un-enrol the agent.
+    // It reports WHICH groups the agent left (the audit evidence of a scope change).
+    if (stores.management_group_memberships) {
+        add_store_with_detail(
+            "management_group_memberships",
+            [p = stores.management_group_memberships](std::string_view id, std::string& detail) {
+                std::vector<std::string> removed;
+                std::size_t count = 0;
+                if (!p->delete_agent(id, &removed, &count))
+                    return false;
+                // The DELETE has committed: building the evidence must never turn this into a
+                // `Failed` (the contract says Failed means the delete did not commit). An
+                // exception here (out of memory) degrades the evidence, never the outcome.
+                try {
+                    detail = format_group_evidence(std::move(removed), count);
+                    // Also in the server log, so the group set survives a lost outcome audit row.
+                    // Its own guard: a failure while logging must not discard the evidence above.
+                    try {
+                        spdlog::info("AgentDecommission: agent={} left management groups {}",
+                                     ::yuzu::log_id_token(id), detail);
+                    } catch (...) {
+                    }
+                } catch (...) {
+                    try {
+                        detail = std::to_string(count) + ":unrecorded";
+                    } catch (...) {
+                        detail.clear();
+                    }
+                }
+                return true;
+            });
+    } else {
+        targets_.push_back({"management_group_memberships", nullptr, nullptr});
+    }
 }
 
 void AgentDecommission::add_store(std::string name, std::function<bool(std::string_view)> deleter) {
-    targets_.push_back({std::move(name), std::move(deleter)});
+    targets_.push_back({std::move(name), std::move(deleter), nullptr, nullptr});
+}
+
+void AgentDecommission::add_store_with_detail(
+    std::string name, std::function<bool(std::string_view, std::string&)> deleter) {
+    targets_.push_back({std::move(name), nullptr, nullptr, std::move(deleter)});
+}
+
+std::string format_group_evidence(std::vector<std::string> group_ids) {
+    std::sort(group_ids.begin(), group_ids.end());
+    std::string out = std::to_string(group_ids.size()) + ":";
+    const std::size_t shown = std::min(group_ids.size(), kMaxGroupEvidenceIds);
+    for (std::size_t i = 0; i < shown; ++i) {
+        if (i)
+            out += ',';
+        out += group_ids[i];
+    }
+    if (group_ids.size() > shown)
+        out += ",+" + std::to_string(group_ids.size() - shown);
+    return out;
+}
+
+std::string format_group_evidence(std::vector<std::string> group_ids, std::size_t group_count) {
+    if (group_ids.size() != group_count)
+        return std::to_string(group_count) + ":unrecorded";
+    return format_group_evidence(std::move(group_ids));
 }
 
 DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
@@ -137,7 +200,7 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
         // target is reported Skipped so the audit trail is complete.
         spdlog::warn("AgentDecommission: empty agent_id — nothing to decommission");
         for (const auto& t : targets_) {
-            result.stores.push_back({t.name, DecommissionOutcome::Skipped, {}});
+            result.stores.push_back({t.name, DecommissionOutcome::Skipped, {}, {}});
             ++result.skipped;
         }
         return result;
@@ -146,7 +209,7 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
     for (const auto& t : targets_) {
         DecommissionStoreResult r;
         r.store = t.name;
-        if (!t.deleter) {
+        if (!t.deleter && !t.detail_deleter) {
             r.outcome = DecommissionOutcome::Skipped;
             ++result.skipped;
             result.stores.push_back(std::move(r));
@@ -159,7 +222,11 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
         // never claims an erasure that did not happen. A throw is the additional
         // exceptional case (an unexpected bug/bad_alloc), likewise Failed.
         try {
-            if (t.deleter(agent_id)) {
+            const bool committed = t.detail_deleter ? t.detail_deleter(agent_id, r.detail)
+                                                    : t.deleter(agent_id);
+            if (!committed)
+                r.detail.clear(); // evidence is kept only for a delete that committed
+            if (committed) {
                 r.outcome = DecommissionOutcome::Deleted;
                 ++result.deleted;
             } else if (t.write_paused && t.write_paused()) {
@@ -180,12 +247,14 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
                               t.name, ::yuzu::log_id_token(agent_id));
             }
         } catch (const std::exception& e) {
+            r.detail.clear();
             r.outcome = DecommissionOutcome::Failed;
             r.error = e.what();
             ++result.failed;
             spdlog::error("AgentDecommission: store '{}' delete_agent threw for agent={}: {}",
                           t.name, ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(e.what()));
         } catch (...) {
+            r.detail.clear();
             r.outcome = DecommissionOutcome::Failed;
             r.error = "unknown exception";
             ++result.failed;

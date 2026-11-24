@@ -4,6 +4,7 @@
 #include "sync_scheduler.hpp" // sanitize_skip_reason
 
 #include <user_profile_model.hpp> // iequals_ascii
+#include <yuzu/install_row_attributes.hpp>
 
 #include <algorithm>
 #include <array>
@@ -36,15 +37,15 @@ bool is_sep(char c) {
     return c == '\\' || c == '/';
 }
 
-// Comparator walks the stored fields in wire order, install_location before package_id and
-// source: byte for byte the server's entry_less (software_inventory_store.cpp).
+// Comparator walks the stored fields in wire order, install_location and attributes before
+// package_id and source: byte for byte the server's entry_less (software_inventory_store.cpp).
 bool entry_less(const SwEntry& a, const SwEntry& b) {
     return std::tie(a.name, a.version, a.publisher, a.install_date, a.kind, a.ecosystem, a.epoch,
                     a.release, a.arch, a.signature_status, a.distro_id, a.distro_version,
-                    a.install_location, a.package_id, a.source) <
+                    a.install_location, a.attributes, a.package_id, a.source) <
            std::tie(b.name, b.version, b.publisher, b.install_date, b.kind, b.ecosystem, b.epoch,
                     b.release, b.arch, b.signature_status, b.distro_id, b.distro_version,
-                    b.install_location, b.package_id, b.source);
+                    b.install_location, b.attributes, b.package_id, b.source);
 }
 
 bool entry_equal(const SwEntry& a, const SwEntry& b) {
@@ -57,7 +58,7 @@ std::string record_of(const SwEntry& e) {
                                         e.install_date, e.kind,           e.ecosystem,
                                         e.epoch,      e.release,          e.arch,
                                         e.signature_status, e.distro_id,  e.distro_version,
-                                        e.install_location, std::string_view{}, e.package_id,
+                                        e.install_location, e.attributes,       e.package_id,
                                         e.source};
     std::string out;
     out.reserve(112);
@@ -393,6 +394,10 @@ SwEntry v3_normal_form(const SwEntry& in) {
     e.distro_id = clamp(in.distro_id);
     e.distro_version = clamp(in.distro_version);
     e.install_location = machine_install_location(clamp(in.install_location));
+    // Slot 14: the writer sends only what the shared validator accepts; a value it cannot
+    // validate is dropped and the row hashes as if the slot were empty (never a refused section).
+    e.attributes =
+        yuzu::install_attrs::canonical_attributes(clamp(in.attributes)).value_or(std::string{});
     e.package_id = clamp(in.package_id);
     e.source = clamp(in.source);
     return e;

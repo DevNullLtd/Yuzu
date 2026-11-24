@@ -3,6 +3,8 @@
 #include "http_route_sink.hpp"
 #include "rest_audit.hpp" // emit_behavioral_audit, try_persist_audit
 
+#include <yuzu/server/auth.hpp> // auth::agent_id_is_audit_safe
+
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -13,13 +15,6 @@ namespace {
 
 void send_html(httplib::Response& res, std::string body) {
     res.set_content(std::move(body), "text/html; charset=utf-8");
-}
-
-// Same audit-trail floor the Hardware record fragment applies to an id taken raw
-// from a URL: bounded length, no control bytes.
-bool id_is_audit_safe(const std::string& id) {
-    return id.size() <= auth::kMaxAgentIdLength &&
-           std::none_of(id.begin(), id.end(), [](unsigned char c) { return c < 0x20; });
 }
 
 } // namespace
@@ -34,7 +29,7 @@ void register_device_data_routes(HttpRouteSink& sink, Deps deps) {
         if (!deps.auth_fn(req, res))
             return; // 401 already written
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-        if (id.empty() || !id_is_audit_safe(id)) {
+        if (id.empty() || !auth::agent_id_is_audit_safe(id)) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
             return;
@@ -79,7 +74,7 @@ void usage_fragment(const UsageDeps& deps, const httplib::Request& req, httplib:
     if (!deps.auth_fn(req, res))
         return;
     const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-    if (id.empty() || !id_is_audit_safe(id)) {
+    if (id.empty() || !auth::agent_id_is_audit_safe(id)) {
         res.status = 400;
         send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
         return;

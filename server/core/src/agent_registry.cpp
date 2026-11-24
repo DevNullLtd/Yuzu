@@ -120,8 +120,10 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     // An agent that reports the retired name `tar` and no `echo` is not an Echo agent: Echo
     // commands are refused for it and its `yuzu.plugin.tar.*` heartbeat tags (the corruption
     // signal) are not read. The fleet is meant to be one build, so say so rather than let it pass.
-    if (std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end() &&
-        std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end()) {
+    session->retired_tar_only =
+        std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end() &&
+        std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end();
+    if (session->retired_tar_only) {
         spdlog::warn("AgentRegistry::register_agent({}): inventory reports the retired plugin name "
                      "'tar' and no 'echo' - not an Echo agent; upgrade it to the current build",
                      safe_agent_id);
@@ -224,7 +226,15 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         }
         if (it != agents_.end() && !it->second->session_id.empty())
             session_to_agent_.erase(it->second->session_id);
+        // retired_tar_only_n_ follows agents_ at every insert, replace and erase (O(1) read). The
+        // assignment comes first: a first registration allocates and can throw, and the counter
+        // must not have moved for a session that was never installed.
+        const bool was_tar = it != agents_.end() && it->second->retired_tar_only;
         agents_[info.agent_id()] = session;
+        if (was_tar)
+            --retired_tar_only_n_;
+        if (session->retired_tar_only)
+            ++retired_tar_only_n_;
     }
     metrics_.counter("yuzu_agents_registered_total").increment();
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
@@ -385,6 +395,8 @@ void AgentRegistry::remove_agent(const std::string& agent_id) {
             if (!it->second->session_id.empty()) {
                 session_to_agent_.erase(it->second->session_id);
             }
+            if (it->second->retired_tar_only)
+                --retired_tar_only_n_;
             agents_.erase(it);
         }
     }
@@ -406,6 +418,8 @@ bool AgentRegistry::remove_agent_if_session(const std::string& agent_id,
             return false;
         }
         session_to_agent_.erase(session_id);
+        if (it->second->retired_tar_only)
+            --retired_tar_only_n_;
         agents_.erase(it);
     }
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
@@ -428,6 +442,8 @@ void AgentRegistry::remove_agent_if_same(const std::string& agent_id,
         }
         if (!it->second->session_id.empty())
             session_to_agent_.erase(it->second->session_id);
+        if (it->second->retired_tar_only)
+            --retired_tar_only_n_;
         agents_.erase(it);
     }
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
@@ -1004,6 +1020,19 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "non-admin also needs approval); pid from crossplatform.process.list; a degraded read is "
          "CONSTRAINED, never an empty OK; no_such_process* and pid_reused terminal, torn_read "
          "retryable"},
+        {"file_search.search",
+         "On-demand, resumable search of the local disks of one device under an absolute root, by "
+         "leaf-name pattern: names, types, sizes, times and the extents of every matched file; "
+         "matched files are opened and never read and no file content is read or hashed. One call is one slice: "
+         "repeat with the cursor row until a slice answers without one, and read the coverage row "
+         "(an empty result is never confusable with a partial or failed one). Linux and macOS, "
+         "Windows is planned; read-only, default-off, AdminOrApproval; stored results are "
+         "readable only with Forensics:Read; busy, timed_out, rejected, no_progress retryable "
+         "on the same cursor; bad_cursor, max_slices, mount_table_changed terminal; each slice "
+         "is its own dispatch, and a non-admin on the supervised MCP tier needs ONE approval "
+         "for the whole search (the first slice spends it, later slices that carry the cursor "
+         "ride it for 24 hours, or until the approval's 7-day lifetime ends, whichever comes "
+         "first)"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -1231,6 +1260,18 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "version source, path, size and anchor application, at most 5,000 rows (Linux and "
          "macOS; Windows planned; read-only, no subprocess; package-owned trees are not read; "
          "switched off until an operator enables it)"},
+        {"component_inventory.python",
+         "List installed Python distributions (the METADATA, PKG-INFO or .egg-info file of each) "
+         "under the machine-wide Python roots, with name, version, version source, path, size "
+         "and anchor application, at most 20,000 rows (Linux and macOS; Windows planned; "
+         "read-only, no subprocess, nothing is run; per-user installs are not read; enabled "
+         "by default)"},
+        {"component_inventory.node",
+         "List installed Node packages (the package.json of each package under a node_modules "
+         "directory) under the machine-wide Node roots, with name, version, version source, "
+         "path, size and anchor application, at most 20,000 rows (Linux and macOS; Windows "
+         "planned; read-only, no subprocess, nothing is run; per-user installs are not read; "
+         "enabled by default)"},
         // runtimes
         {"runtimes.dotnet",
          "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "
@@ -1876,6 +1917,11 @@ std::string AgentRegistry::find_agent_by_stream(
 std::size_t AgentRegistry::agent_count() const {
     std::lock_guard lock(mu_);
     return agents_.size();
+}
+
+std::size_t AgentRegistry::retired_tar_only_count() const {
+    std::lock_guard lock(mu_);
+    return retired_tar_only_n_;
 }
 
 void AgentRegistry::map_session(const std::string& session_id, const std::string& agent_id) {

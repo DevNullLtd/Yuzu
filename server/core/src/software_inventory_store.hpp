@@ -743,9 +743,10 @@ public:
     static constexpr int kChangesPruneCapPerPass = 50'000;
 
     /// Hash of one section's rows: SHA-256 hex over the sorted, de-duplicated rows, each written
-    /// as ALL 16 wire slots (slot 14 empty; no conditional tail), 0x1F-joined and
-    /// 0x1E-terminated. Pure; the agent's builder mirrors it byte for byte. NOT the v2
-    /// `canonical_hash` (whose tail is conditional and whose slot 13 is always empty).
+    /// as ALL 16 wire slots (slot 14 is the attribute field, empty when a row has none; no
+    /// conditional tail), 0x1F-joined and 0x1E-terminated. Pure; the agent's builder mirrors it
+    /// byte for byte. NOT the v2 `canonical_hash` (whose tail is conditional and whose slots 13
+    /// and 14 are always empty).
     [[nodiscard]] static std::string canonical_section_hash(std::vector<SoftwareEntry> rows);
 
     /// The v3 report hash stored in `inventory_state.content_hash`: `v3:` + SHA-256 hex over

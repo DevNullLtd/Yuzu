@@ -2048,6 +2048,17 @@ public:
              {"store_not_open", "pool_acquire_timeout", "query_error", "read_concurrency_cap"})
             metrics_.counter("yuzu_server_quarantine_read_degrade_total", {{"reason", reason}});
 
+        // #7949: bulk device-CI reads refused because every read slot was taken. The surface
+        // label is the closed pair below, set only by hw_ci_read_busy_fn (never caller text).
+        // Seeded so the first refusal reads as an increase from 0.
+        metrics_.describe("yuzu_hardware_ci_read_busy_total",
+                          "Bulk device-CI reads (GET /api/v1/hardware-ci and MCP "
+                          "list_hardware_ci_records) refused with a retryable 503 because every "
+                          "read slot on this replica was taken, by surface (rest/mcp)",
+                          "counter");
+        for (const char* surface : {"rest", "mcp"})
+            metrics_.counter("yuzu_hardware_ci_read_busy_total", {{"surface", surface}});
+
         // #3402: the internal pushes that deliberately BYPASS that gate, seeded
         // across the full capability x result product. Every combination is
         // reachable — each of the five pushes can fail at the registry seam —
@@ -2478,24 +2489,29 @@ public:
         // #4966: a store fault inside the account-lifecycle guard (a lock wait that expired, a
         // lost connection, an unwired guard), by the guarded operation. NOT a refusal: the
         // request was neither allowed nor judged. Counted in AuthManager, so the dashboard, SCIM
-        // and every other caller through it share one series. No alert rule ships with it yet
-        // (a later change owns the alerts).
+        // and every other caller through it share one series, except op=unassign, which
+        // RbacStore counts for a failed role unassignment of any role or principal type. No
+        // alert rule ships with it yet (a later change owns the alerts).
         metrics_.describe("yuzu_server_rbac_lifecycle_store_failure_total",
-                          "Store faults inside the account-lifecycle last-Administrator guard, "
-                          "by operation (deactivate: account removal; set_role: role write; "
-                          "would_strand: the advisory pre-check, after which the request still "
-                          "proceeds to the guarded write; grant_read: the SCIM "
-                          "pre-provisioning Administrator-grant read). The unwired fail-closed "
+                          "Store faults in the account-lifecycle last-Administrator guard and in "
+                          "role unassignment, by operation (deactivate: account removal; "
+                          "set_role: role write; would_strand: the advisory pre-check, after "
+                          "which the request still proceeds to the guarded write; grant_read: "
+                          "the SCIM pre-provisioning Administrator-grant read; unassign: a "
+                          "role unassignment, of any role or principal type, whose transaction "
+                          "failed with a store fault; a last-Administrator refusal is not "
+                          "counted). The unwired fail-closed "
                           "arm also counts, for deactivate and set_role only. A sustained "
-                          "non-zero rate means deprovisioning or role changes are being "
-                          "answered with a store-unavailable error rather than judged, except "
-                          "for would_strand, which never stops the request (SCIM answers 503 "
-                          "with Retry-After; the dashboard role route gives no retry hint): "
-                          "look at yuzu_pg_pool_waiters and "
-                          "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
-                          "holder.",
+                          "non-zero rate means deprovisioning, role changes or unassignments "
+                          "are being answered with a store-unavailable error rather than "
+                          "judged, except for would_strand, which never stops the request "
+                          "(SCIM answers 503 with Retry-After; the dashboard role route gives "
+                          "no retry hint): look at yuzu_pg_pool_waiters and "
+                          "yuzu_pg_acquire_wait_seconds, and for a stuck lock holder (the "
+                          "rbac_enabled row for deactivate and set_role; an unassign takes no "
+                          "rbac_enabled lock).",
                           "counter");
-        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read"})
+        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read", "unassign"})
             metrics_.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}});
         // #4966: a SCIM same-request compensation (the guarded undo of a just-created or
         // just-revived account) that did NOT complete. Written beside the
@@ -2916,17 +2932,56 @@ public:
                           "/auto VERIFY cohort reads that hit the row cap and were TRUNCATED (the "
                           "comparison is incomplete and may mis-pair machines)",
                           "counter");
+        // Echo corruption audit gate signals (#7486, #5066, #7475, #7429). The counters are
+        // pre-seeded to 0 so the first quarantine / degrade reads as an increase from 0 (the
+        // alert on the quarantine counter depends on that sample).
+        metrics_.describe("yuzu_server_echo_db_quarantines_total",
+                          "New Echo database quarantines recorded: one per echo.db corruption "
+                          "audit row this server wrote (a duplicate or a durable lookup hit does "
+                          "not count). Alerts watch the increase, not a population",
+                          "counter");
+        metrics_.counter("yuzu_server_echo_db_quarantines_total");
+        metrics_.describe("yuzu_server_echo_corruption_audit_degraded_total",
+                          "Failed echo.db corruption audit lookups and writes, by reason "
+                          "(lookup_degraded, lookup_threw, write_failed). Each opens a 60 s window "
+                          "in which no agent is audited, except a repeat failure by the same "
+                          "agent, which only that agent waits out; quarantines not audited are "
+                          "retried afterwards",
+                          "counter");
+        for (const char* reason : {"lookup_degraded", "lookup_threw", "write_failed"})
+            metrics_.counter("yuzu_server_echo_corruption_audit_degraded_total",
+                             {{"reason", reason}});
+        metrics_.describe("yuzu_server_echo_corruption_audit_store_closed_total",
+                          "Heartbeats that carried an echo.db quarantine candidate while the audit "
+                          "store was closed: nothing can be audited or counted as a quarantine "
+                          "then, so a rise here means the quarantine counter is blind, not that "
+                          "no agent is corrupt",
+                          "counter");
+        metrics_.counter("yuzu_server_echo_corruption_audit_store_closed_total");
+        metrics_.describe("yuzu_server_health_upsert_exceptions_total",
+                          "Heartbeat health-store upserts that threw out of the store (caught in "
+                          "the heartbeat handler, logged and counted; the rest of ingestion "
+                          "continues)",
+                          "counter");
+        metrics_.counter("yuzu_server_health_upsert_exceptions_total");
+        metrics_.describe("yuzu_fleet_retired_tar_plugin_agents",
+                          "Agents connected to this server that report the retired plugin name "
+                          "tar and no echo (not Echo agents; upgrade them). Published every sweep, "
+                          "0 included",
+                          "gauge");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
         metrics_.describe("yuzu_fleet_echo_db_corruption_agents",
                           "Agents whose Echo database has ever been quarantined as corrupt "
-                          "(cumulative per agent since install; a rising value is the signal)",
+                          "(cumulative per agent since install: a population that only falls when "
+                          "agents leave, not a rate; see yuzu_server_echo_db_quarantines_total)",
                           "gauge");
         metrics_.describe("yuzu_fleet_echo_storage_offline",
-                          "Agents whose Echo database is offline and being retried, by reason "
-                          "(free_space, migration_failed, open_failed; anything else sums under "
-                          "unknown). Published for every reason each sweep, 0 included",
+                          "Agents whose Echo database is offline, by reason (free_space, "
+                          "migration_failed, open_failed are retried; rollback_wedged is not and "
+                          "needs an agent restart; anything else sums under unknown). Published "
+                          "for every reason each sweep, 0 included",
                           "gauge");
         metrics_.describe("yuzu_fleet_plugin_init_failed",
                           "Agents reporting a plugin that failed init, by plugin name (absent "
@@ -5860,6 +5915,30 @@ public:
         // before the health recompute thread's first sweep (started in run()).
         health_store_.set_known_plugins(yuzu::server::catalogue_plugin_names(capability_registry_));
 
+        // The bulk device-CI read's concurrency cap (#7949/#7951, bulk_read_slots.hpp), resolved
+        // against the EFFECTIVE pool size (the same fallback the pool construction below uses).
+        // Always constructed, so the routes and the MCP tools are never handed a null: an invalid
+        // explicit value refuses boot and, defensively, leaves the tightest cap (1).
+        {
+            // Config::hardware_ci_read_concurrency's default and kBulkReadCapUnset are two
+            // spellings of one value (Config is not a literal type, so a unit test pins it:
+            // test_bulk_read_slots.cpp).
+            const int effective_pool =
+                cfg_.postgres_pool_size > 0 ? cfg_.postgres_pool_size : 16;
+            const auto cap =
+                yuzu::server::resolve_bulk_read_cap(cfg_.hardware_ci_read_concurrency, effective_pool);
+            if (!cap) {
+                spdlog::error("[HardwareCI] Refusing to start: {}", cap.error());
+                startup_failed_ = true;
+                hardware_ci_read_slots_ = std::make_unique<yuzu::server::BulkReadSlots>(1);
+            } else {
+                spdlog::info("[HardwareCI] bulk read concurrency cap {} (postgres pool size {}, {})",
+                             cap->cap, effective_pool,
+                             cap->defaulted ? "defaulted" : "set by --hardware-ci-read-concurrency");
+                hardware_ci_read_slots_ = std::make_unique<yuzu::server::BulkReadSlots>(cap->cap);
+            }
+        }
+
         // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
         // BEFORE any Postgres-backed store and validated by a probe checkout so
         // the server FAILS CLOSED — no SQLite fallback — when the DSN is empty
@@ -6531,6 +6610,21 @@ public:
             }
         }
 
+        // file_search ships default-off (it lists file names under every user's directories;
+        // its stored rows are Forensics-tier). Enable via PUT
+        // /api/v1/plugin-config/file_search/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "file_search",
+                    "default-off: lists file names under every user's directories; enable per PUT "
+                    "/api/v1/plugin-config/file_search/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: file_search default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
         // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
         // and session credentials are stored as SHA-256 digests, never a
         // sealed SecretCodec blob (upload_grant_store.hpp file header).
@@ -6999,32 +7093,55 @@ public:
                         return std::optional<std::string>{};
                     return detail::decode_echo_quarantine_from_detail(rows->front().detail);
                 };
-                auto gate = std::make_shared<detail::EchoCorruptionAuditGate>(std::move(latest));
+                // #5066: every lookup or write failure is counted by reason and logged once (the
+                // reason token is a closed set, safe to log verbatim). A repeat failure by the
+                // same agent opens no gate-wide window; the observer still hears it.
+                auto on_degraded = [this](detail::DegradedCause cause) {
+                    const char* reason = detail::echo_corruption_degraded_cause_token(cause);
+                    metrics_.counter("yuzu_server_echo_corruption_audit_degraded_total",
+                                     {{"reason", reason}})
+                        .increment();
+                    spdlog::warn("echo.db corruption audit failed ({}): new quarantines are not "
+                                 "audited until the retry wait ends (every agent, or only the "
+                                 "failing one when it fails again)",
+                                 reason);
+                };
+                auto gate = std::make_shared<detail::EchoCorruptionAuditGate>(
+                    std::move(latest), &detail::EchoCorruptionAuditGate::steady_seconds,
+                    std::move(on_degraded));
                 health_store_.set_corruption_sink([this, gate](const std::string& agent_id,
                                                                int64_t total,
                                                                const std::string& quarantine) {
-                    if (!audit_store_ || !audit_store_->is_open())
+                    if (!audit_store_ || !audit_store_->is_open()) {
+                        // No row can be written, so the quarantine counter cannot move: say so, or
+                        // the corruption signal would be silent exactly when the store is down.
+                        metrics_
+                            .counter("yuzu_server_echo_corruption_audit_store_closed_total")
+                            .increment();
                         return;
-                    if (!gate->should_log(agent_id, quarantine))
-                        return;
-                    // Reservation completes that agent's slot even if AuditEvent construction
-                    // or audit_store_->log() throws (log() is not noexcept).
-                    detail::EchoCorruptionAuditGate::Reservation res(*gate, agent_id);
-                    AuditEvent ev;
-                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                                       std::chrono::system_clock::now().time_since_epoch())
-                                       .count();
-                    ev.principal = "system";
-                    ev.principal_role = "system";
-                    ev.action = detail::kEchoCorruptionAuditAction;
-                    ev.target_type = detail::kEchoCorruptionAuditTargetType;
-                    ev.target_id = agent_id;
-                    ev.detail = detail::encode_echo_corruption_detail(total, quarantine);
-                    ev.result = "success";
-                    if (audit_store_->log(ev))
-                        res.logged(quarantine);
-                    else
-                        res.failed();
+                    }
+                    // log_echo_corruption_once admits via the gate and completes the reservation
+                    // even if AuditEvent construction or audit_store_->log() throws (log() is
+                    // not noexcept). It returns true only for a row this call wrote, so the
+                    // counter moves once per new quarantine and not for a durable lookup hit
+                    // (an agent back from offline, a failover) or a refused or failed write.
+                    const bool wrote = detail::log_echo_corruption_once(
+                        *gate, agent_id, quarantine, [&] {
+                            AuditEvent ev;
+                            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
+                            ev.principal = "system";
+                            ev.principal_role = "system";
+                            ev.action = detail::kEchoCorruptionAuditAction;
+                            ev.target_type = detail::kEchoCorruptionAuditTargetType;
+                            ev.target_id = agent_id;
+                            ev.detail = detail::encode_echo_corruption_detail(total, quarantine);
+                            ev.result = "success";
+                            return audit_store_->log(ev);
+                        });
+                    if (wrote)
+                        metrics_.counter("yuzu_server_echo_db_quarantines_total").increment();
                 });
             }
 
@@ -7940,6 +8057,33 @@ public:
                 // does not exist until this block. Nulled at teardown beside
                 // set_credential_change_owner(nullptr).
                 auth_mgr_.set_rbac_store(rbac_store_.get());
+                // An Administrator unassign clears the target's durable elevations in
+                // its own transaction (the RbacStore default mode; this file never opts out).
+                // That clear needs the session_store schema, which only an OPEN SessionStore
+                // guarantees. The SessionStore construction block earlier in this startup path
+                // already sets `startup_failed_` when the store fails to open, and this block
+                // runs only while `startup_failed_` is false, so the check below is a backstop
+                // against a future reordering, not a new boot refusal in a healthy configuration;
+                // it exists so a console where every user Administrator unassign would fail is
+                // never served. The callback then drops THIS
+                // replica's cached sessions of the user (other replicas converge on their next
+                // generation poll). `auth_mgr_` is a reference to main.cpp's AuthManager, which
+                // outlives ServerImpl; the callback is never cleared at teardown (it is
+                // read lock-free by serving threads) and only takes AuthManager's own lock.
+                if (!session_store_ || !session_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: the RbacStore Administrator unassign "
+                                  "ends the target's JIT elevation in its own transaction, which "
+                                  "needs an open SessionStore (session_store schema), and none is "
+                                  "available");
+                    startup_failed_ = true;
+                } else if (!rbac_store_->set_local_session_drop(
+                               [&auth_mgr = auth_mgr_](const std::string& username) {
+                                   auth_mgr.drop_local_sessions_of_user(username);
+                               })) {
+                    spdlog::error("[PG] Refusing to start: the RbacStore local session-drop "
+                                  "callback was already set; it must be wired exactly once");
+                    startup_failed_ = true;
+                }
             }
         }
         // #4966 boot self-check: an AuthDB without the guard would leave
@@ -10764,6 +10908,11 @@ public:
                 // visible.
                 const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, detail::kAgentHealthStaleness);
+                // #7429: agents on the retired `tar` plugin name. The flag lives on the sessions
+                // this replica holds (AgentRegistry, not the health store), so it is read here
+                // and set per replica; a count over server-held sessions has a true zero.
+                metrics_.gauge("yuzu_fleet_retired_tar_plugin_agents")
+                    .set(static_cast<double>(registry_.retired_tar_only_count()));
                 // PostgreSQL pool gauges (#1368): sampled on the same cadence as
                 // the fleet families. Counters/histogram are fed live by the
                 // pool's observer hooks, so only the level gauges are polled here.
@@ -11989,6 +12138,7 @@ public:
             .offline_endpoint = offline_endpoint_store_.get(),
             .certificate_inventory = certificate_inventory_store_.get(),
             .guaranteed_state = guaranteed_state_store_.get(),
+            .management_group_memberships = mgmt_group_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
@@ -18276,6 +18426,17 @@ private:
                                      const std::string& agent_id) -> bool {
             return require_scoped_permission(req, res, type, op, agent_id);
         };
+        // The SAME per-device scoped gate, returning its refusal class (admit, deny, "could not
+        // evaluate", or a degraded authorization read) instead of a bool. It is the one body the
+        // Boolean gate above compares with Admitted, so the response, audit row and metric are the
+        // gate's own either way. Wired into the two Echo purge surfaces that must tell a denial
+        // from an outage (the dashboard fragments and the REST purge); every other consumer keeps
+        // scoped_perm_fn.
+        auto scoped_gate_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& type, const std::string& op,
+                                     const std::string& agent_id) -> yuzu::server::ScopedGateOutcome {
+            return auth_routes_->require_scoped_permission_outcome(req, res, type, op, agent_id);
+        };
         // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
         // The fleet guaranteed-state status route's SOLE authorization gate, and the MCP
         // get_guardian_status / list_plugin_config tools' — never stacked with perm_fn (see
@@ -19699,6 +19860,15 @@ private:
             // flips — same field and wiring as the other three background
             // engines' Deps.
             .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
+            // G01: the capability registry policy evaluation classifies a pair against before it
+            // dispatches (execute gate, Destructive class, reserved rows). Without it the
+            // evaluator refuses every dispatch (`unwired`), so this wiring is what lets a policy
+            // run at all. `capability_registry_` is declared before `policy_evaluator_`, so it
+            // outlives the evaluator.
+            .capability_registry = &capability_registry_,
+            // The `policy.dispatch` / `denied` audit rows; same store the other background
+            // engines write to.
+            .audit_store = audit_store_.get(),
         });
         policy_eval_thread_ = std::thread([this]() {
             spdlog::info("Policy evaluation thread started (cadence=10s, grace=15s)");
@@ -21860,6 +22030,14 @@ private:
                 return std::nullopt;
             return device_inventory_store_->list_device_ci_after(q);
         };
+        // Counts a bulk read refused as busy. The label is chosen here from the closed Surface
+        // enum, never from request text.
+        auto hw_ci_read_busy_fn = [this](hardware_ci_page::Surface surface) {
+            metrics_
+                .counter("yuzu_hardware_ci_read_busy_total",
+                         {{"surface", surface == hardware_ci_page::Surface::kMcp ? "mcp" : "rest"}})
+                .increment();
+        };
         // agent_id -> hostname, one bulk read of the 30-day roster. Shared by the Software
         // devices tables and the Quarantined devices panel.
         auto hw_hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
@@ -22118,6 +22296,8 @@ private:
                              .ci_detail_fn = hw_ci_detail_fn,
                              .ci_page_reader = hw_ci_page_reader,
                              .ci_collation_gate = &collation_gate_,
+                             .ci_read_slots = hardware_ci_read_slots_.get(),
+                             .ci_read_busy_fn = hw_ci_read_busy_fn,
                              // Actions lens (generic action runner): the connected
                              // agent's advertised plugins/actions, copied into the
                              // gRPC-free HwPluginActions shape.
@@ -22424,8 +22604,11 @@ private:
                     auto fc = compliance_api->fleet_compliance();
                     if (!fc)
                         return std::nullopt;
-                    return home::ComplianceFigure{fc->total_checks, fc->compliant, fc->non_compliant,
-                                                  fc->unknown, fc->compliance_pct};
+                    // `error` and `blocked` count as failing, like `non_compliant`: the tile,
+                    // the compliance page's readout and its row pills are defined to agree.
+                    return home::ComplianceFigure{fc->total_checks, fc->compliant,
+                                                  fc->non_compliant, fc->unknown,
+                                                  fc->compliance_pct, fc->error, fc->blocked};
                 },
                 .failed_fn = [this]() -> std::optional<std::vector<home::FailedRow>> {
                     if (!execution_tracker_)
@@ -22980,7 +23163,8 @@ private:
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
         // #2540: the Echo purge/re-enable POSTs authorize through the SAME per-device scoped
         // gate as the REST purge twin (set before register_routes, per the ordering note above).
-        dashboard_routes_->set_scoped_perm_fn(scoped_perm_fn);
+        // The typed lambda: a degraded authorization read is answered 503, not collapsed into the 404.
+        dashboard_routes_->set_scoped_perm_fn(scoped_gate_fn);
         dashboard_routes_->set_forensics_plugin_set(forensics_plugins()); // #4990
         dashboard_routes_->set_forensics_visibility_fn(forensics_visibility_fn);
         // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
@@ -24236,6 +24420,11 @@ private:
         // register_routes() (captured by value at registration), same timing as the setters above.
         rest_api_v1_->set_forensics_plugin_set(forensics_plugins());
         rest_api_v1_->set_forensics_visibility_fn(forensics_visibility_fn);
+        // The Echo retention-paused purge route's typed scoped gate. The route copies the function
+        // by value when routes register, so this MUST stay above register_routes() (a call after
+        // it leaves the purge on its fail-closed 500 for good); tests/test_echo_security_wiring_lexical.py
+        // pins the order.
+        rest_api_v1_->set_scoped_gate_fn(scoped_gate_fn);
         // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
         // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
         // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT
@@ -25092,6 +25281,8 @@ private:
             tool_deps.ci_detail_fn = hw_ci_detail_fn;
             tool_deps.ci_page_reader = hw_ci_page_reader;
             tool_deps.ci_collation_gate = &collation_gate_;
+            tool_deps.ci_read_slots = hardware_ci_read_slots_.get();
+            tool_deps.ci_read_busy_fn = hw_ci_read_busy_fn;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // #7624: records an operator ended by force whose device still owes a release, for
@@ -26041,6 +26232,14 @@ private:
     /// plus the same closures). The initialiser is `kInitialCollationGate` (Unproven), never
     /// Trusted. tests/test_pg_collation_check_wiring_lexical.py pins the order and the initialiser.
     std::atomic<pg::CollationGate> collation_gate_{pg::kInitialCollationGate};
+    /// The bulk device-CI read's concurrency cap (#7949/#7951, bulk_read_slots.hpp): ONE instance
+    /// shared by `hardware_routes_` (`Deps::ci_read_slots`) and `mcp_server_`
+    /// (`ToolDeps::ci_read_slots`), so REST and MCP draw on the same slots. It holds no store
+    /// pointer; it is declared BEFORE both borrowers so it is destroyed after them. Built in the
+    /// constructor (always, never null) once the effective pool size is known, because the
+    /// semaphore's capacity is fixed at construction.
+    /// tests/test_pg_collation_check_wiring_lexical.py pins the order and both wiring sites.
+    std::unique_ptr<yuzu::server::BulkReadSlots> hardware_ci_read_slots_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     /// Fleet health aggregation (heartbeat status_tags -> yuzu_fleet_* gauges, and the per-device
