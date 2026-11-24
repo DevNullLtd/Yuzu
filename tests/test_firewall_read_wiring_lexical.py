@@ -428,6 +428,46 @@ WRITE_CALLS = (r"::write\(", r"::send\(", r"::sendto\(", r"::sendmsg\(", r"::wri
 WRITE_ROWS = r"for \( ?const auto& row : firewalld\.rows ?\) ctx\.write_output\(row\);"
 
 
+DIRECT_IPTABLES_PINS = (
+    ("the iptables-installed guard that ends the ladder at `none`",
+     r'if \( ?::access\("/usr/sbin/iptables", X_OK\) != 0 ?\) return std::nullopt;'),
+    ("one shared deadline, computed once, from kAcqDeadline",
+     r"const auto deadline = std::chrono::steady_clock::now\(\) \+ kAcqDeadline;"),
+    ("the IPv4 pass then the IPv6 pass (`for (const bool ip6 : {false, true})`)",
+     r"for \( ?const bool ip6 : \{false, true\} ?\)"),
+    ("both absolute tool paths, IPv4 first",
+     r'const char\* tool = ip6 \? "/usr/sbin/ip6tables" : "/usr/sbin/iptables";'),
+    ("each family's own names file",
+     r'read_xt_names\( ?ip6 \? "/proc/net/ip6_tables_names" : "/proc/net/ip_tables_names" ?\)'),
+    ("the plan decided by plan_iptables_family from the names read and the tool's presence",
+     r"plan_iptables_family\( ?names\.outcome, names\.text, ::access\(tool, X_OK\) == 0 ?\)"),
+    ("every table of kIptablesDirectTables, by index",
+     r"i < yuzu::firewall::kIptablesDirectTables\.size\(\)"),
+    ("a table that is not to run, or has no time left, pushed as a read (never skipped)",
+     r"if \( ?plan\.action\[i\] != Action::run \|\| left\.count\(\) <= 0 ?\) \{ "
+     r"(?://[^;{}]*?)?reads\.push_back\( ?yuzu::firewall::iptables_unrun_read\("),
+    ("the literal argv `{tool, \"-t\", table, \"-S\"}` on the remaining deadline",
+     r'run_bounded_subprocess\( ?\{tool, "-t", std::string\{table\}, "-S"\}, '
+     r"SubprocessOptions\{\.deadline = left\} ?\)"),
+    ("the run classified with its own tool_ran, exit and completeness",
+     r"classify_iptables_table_read\( ?ip6, table, res\.tool_ran, res\.exit_code == 0, "
+     r"subprocess_complete\(res\), res\.output ?\)"),
+)
+
+
+def direct_iptables_problems(live):
+    body = function_body(live, r"std::optional<std::vector<yuzu::firewall::IptablesTableRead>> "
+                               r"read_iptables_tables\(\) ?(?=\{)")
+    if body is None:
+        return ["firewall_plugin.cpp no longer defines read_iptables_tables() (the root direct iptables read)"]
+    text = squash(body)
+    out = [f"read_iptables_tables no longer has {what}" for what, pat in DIRECT_IPTABLES_PINS
+           if not re.search(pat, text)]
+    if len(re.findall(r"run_bounded_subprocess\(", text)) != 1:
+        out.append("read_iptables_tables spawns other than its one `-t <table> -S` run")
+    return out
+
+
 def linux_problems(plugin_src, reader_src):
     out = []
     live = lexh.live_text(plugin_src)
@@ -550,6 +590,10 @@ def linux_problems(plugin_src, reader_src):
         if opens != 2:
             out.append(f"run_nft_probe writes the socket-open diagnostic rows (error|fd_exhausted, "
                        f"error|nftables:socket:eperm) at {opens} sites, expected 2: they are never deferred")
+
+    # the root direct iptables read: both families, the four tables of the pure list, the table list
+    # gating each run, one deadline, one literal argv per run
+    out += direct_iptables_problems(live)
 
     # each of the two clamped rungs hands its parameter to the pure function that applies the clamp
     for name, hand_over in (
@@ -691,6 +735,26 @@ def _lmut(pattern, repl, count=1):
 _HELD_ROWS = r"\{\s*for \(const auto& row : firewalld\.rows\)\s*ctx\.write_output\(row\);\s*return;\s*\}"
 
 LINUX_MUTATIONS = [
+    # the root direct iptables read: nat dropped by an off-by-one, the IPv6 pass dropped, a swapped tool
+    (_lmut(r"i < yuzu::firewall::kIptablesDirectTables\.size\(\)",
+           "i + 1 < yuzu::firewall::kIptablesDirectTables.size()"), "read_iptables_tables no longer has every table"),
+    (_lmut(r"for \(const bool ip6 : \{false, true\}\)", "for (const bool ip6 : {false})"),
+     "read_iptables_tables no longer has the IPv4 pass then the IPv6 pass"),
+    (_lmut(r'ip6 \? "/usr/sbin/ip6tables" : "/usr/sbin/iptables"', 'ip6 ? "/usr/sbin/iptables" : "/usr/sbin/ip6tables"'),
+     "read_iptables_tables no longer has both absolute tool paths"),
+    (_lmut(r'"/proc/net/ip6_tables_names" : "/proc/net/ip_tables_names"',
+           '"/proc/net/ip_tables_names" : "/proc/net/ip6_tables_names"'),
+     "read_iptables_tables no longer has each family's own names file"),
+    (_lmut(r'\{tool, "-t", std::string\{table\}, "-S"\}', '{tool, "-S", std::string{table}, "-t"}'),
+     "read_iptables_tables no longer has the literal argv"),
+    (_lmut(r"SubprocessOptions\{\.deadline = left\}\);\s*reads", "SubprocessOptions{.deadline = kAcqDeadline});\n reads"),
+     "read_iptables_tables no longer has the literal argv"),
+    (_lmut(r"res\.tool_ran, res\.exit_code == 0", "true, res.exit_code == 0"),
+     "read_iptables_tables no longer has the run classified"),
+    (_lmut(r"plan\.action\[i\] != Action::run \|\| left\.count\(\) <= 0", "plan.action[i] != Action::run"),
+     "read_iptables_tables no longer has a table that is not to run"),
+    (_lmut(r"if \(::access\(\"/usr/sbin/iptables\", X_OK\) != 0\)\s*return std::nullopt;", ""),
+     "read_iptables_tables no longer has the iptables-installed guard"),
     # the snapshot rung dropped from the state ladder
     (_lmut(r"\s*if \(try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::state\)\)\s*return;", ""), "do_state_linux"),
     # ... and from the rules ladder
@@ -926,6 +990,16 @@ class LinuxSnapshotWiring(unittest.TestCase):
                 p = linux_problems(mutated, self.reader)
                 self.assertTrue(p, "mutation was NOT detected by the gate")
                 self.assertTrue(any(expected in m for m in p), f"expected {expected!r} in {p}")
+
+    def test_the_direct_table_list_is_pinned(self):
+        hpp = PARSERS_HPP.read_text(encoding="utf-8")
+        pat = r'kIptablesDirectTables\{"filter", "raw", "mangle",\s*"nat"\};'
+        self.assertTrue(re.search(pat, hpp), "kIptablesDirectTables is no longer filter, raw, mangle, nat")
+        decl = re.search(pat, hpp).group(0)
+        for dropped in ('"filter", ', '"raw", ', '"mangle",', '"nat"'):
+            mutated = hpp.replace(decl, decl.replace(dropped, "", 1), 1)
+            self.assertNotEqual(mutated, hpp, "mutation changed nothing (stale pattern)")
+            self.assertFalse(re.search(pat, mutated), f"dropping {dropped} was not detected")
 
     def test_reader_mutations_are_caught(self):
         for i, (mutate, expected) in enumerate(READER_MUTATIONS, 1):
