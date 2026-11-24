@@ -42,7 +42,7 @@ before the page is cut.
 Recorded 2026-11-18. Each is a fact about the code as committed.
 
 1. One caller can hold every slot, and the semaphore wait is not first-in-first-out, so a low-privilege
-   `Inventory:Read` caller can starve the CMDB sync's bulk read. A per-principal limit is a follow-up.
+   `Inventory:Read` caller can starve the CMDB sync's bulk read. A per-principal limit is a follow-up (#8716).
 2. Point reads (`agent_id`) are uncapped.
 3. There is no audit-liveness breaker. The slot is held through the audit write of a served bulk page, so a
    locked audit table (migration DDL, `VACUUM FULL`) parks at most `cap` such writers (proved on a real pool in
@@ -53,30 +53,30 @@ Recorded 2026-11-18. Each is a fact about the code as committed.
    whole pool) one stalled audit write can leave authorization without a connection (at pool 2 it takes two: the one capped
    bulk writer plus one writer that holds no slot). A busy refusal writes no row on either
    transport. Owner adjudication: recorded as pre-existing and out of scope for this change (2026-11-18); the
-   class-wide follow-up is the audit-write-path issue (to be filed; its number will be recorded here and in the ledger).
+   class-wide follow-up is #8714.
 4. A slot is held for the whole store call and then the access-audit write(s). The store call: a pool acquire of up to 3 s
    (500 ms when the pool is saturated), up to 10 s to open a connection and the 5 s statement limit. Each audit
    write: a pool acquire of up to 4 s, up to 10 s to connect, the pool's 30 s statement limit and a 10 s lock
    wait. A DSN with its own `options=` (or `PGOPTIONS`) loses the injected statement and lock timeouts (connect
    timeout and keepalives are injected independently, and the store read keeps its own `SET LOCAL` 5 s limit), so
    a write parked on a lock holds its slot until the lock ends. Against a database whose process is frozen but whose host still acknowledges packets (verified with a paused
-   container) no client-side limit fires at all, so a hold can exceed those sums. Recovery is passive.
-5. A read waiting for a slot occupies an HTTP worker for up to 500 ms; the cap bounds connections, not workers.
+   container) no client-side limit fires at all, so a hold can exceed those sums. Recovery is passive. A bound on the hold is tracked in #8715.
+5. A read waiting for a slot occupies an HTTP worker for up to 500 ms; the cap bounds connections, not workers (#8716).
 6. The byte bound does not bound memory: a cap of 8 can transiently hold several hundred MB on one replica.
 7. Busy refusals are counter-only on both transports (`yuzu_hardware_ci_read_busy_total{surface}`): no principal is
-   attributed to a refusal flood.
-8. No alert rule and no in-use gauge ship for the cap yet.
-9. Retries are not rate limited, and the server adds no jitter to its `retry_after_ms` hint.
+   attributed to a refusal flood (#8716).
+8. No alert rule and no in-use gauge ship for the cap yet (#8717).
+9. Retries are not rate limited, and the server adds no jitter to its `retry_after_ms` hint (#8716).
 10. The cap is per replica; fleet capacity is replicas times the cap, and a balancer retry can land on a
     replica with free slots.
 11. Chaos was run once against the real `yuzu-server` binary (see "Chaos run, 2026-11-24" below): an audit-table lock,
     a frozen database, a backend kill and a SIGTERM. It was one replica on Linux with the default pool of 16 and nothing
     else. A live multi-replica run, a database reached through a proxy that drops packets, and a degraded (slow, not
     frozen) database were not run.
-12. ThreadSanitizer was not run on the new concurrency tests; the timing-based tests give lower bounds only.
+12. ThreadSanitizer was not run on the new concurrency tests; the timing-based tests give lower bounds only (#8718).
 13. A restart (SIGTERM) while a bulk read is parked in its audit write on a locked audit table can outlast the
     server's 15 s listener grace and end in a forced exit; any audited handler has the same exposure, so it
-    predates this change and the slot hold does not lengthen the handler.
+    predates this change and the slot hold does not lengthen the handler (#8715).
 14. The real REST and MCP handlers are now run against a really locked audit table, at pool 4 (cap 2), pool 2
     (derived cap 1) and pool 1 (cap 1), in `test_mcp_tools_hardware.cpp` (tag `[pg][hardware][ci_page]`).
     Pool 4 and pool 2 keep a connection for authorization; pool 1 does not, and the test pins that as the
