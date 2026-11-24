@@ -99,6 +99,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -857,18 +858,30 @@ private:
 };
 
 /// Releases a quarantine the test left behind if a case hangs or throws: the
-/// standalone harness has no trigger engine, so the plugin's TTL cannot do it.
+/// standalone harness has no trigger engine, so the plugin's TTL cannot do it. `settle` is the
+/// whole cleanup (it retries the release and confirms the host is `inactive`). It runs when the
+/// case ends, normally or by unwinding, BEFORE the watchdog disarms and is joined, so a failed
+/// REQUIRE can never leave the host contained with nothing watching.
 class Watchdog {
 public:
-    template <class Fn> explicit Watchdog(std::chrono::seconds after, Fn&& release)
-        : thread_([this, after, release = std::forward<Fn>(release)] {
+    template <class Fn>
+    explicit Watchdog(std::chrono::seconds after, Fn&& settle)
+        : settle_(std::forward<Fn>(settle)), thread_([this, after] {
               std::unique_lock lk(m_);
-              if (!cv_.wait_for(lk, after, [this] { return done_; }))
-                  release();
+              if (!cv_.wait_for(lk, after, [this] { return done_; })) {
+                  settle_();
+                  done_ = true;
+              }
           }) {}
     ~Watchdog() {
         {
-            std::lock_guard lk(m_);
+            std::lock_guard lk(m_); // the timeout thread holds m_ while it settles
+            if (!done_) {
+                try {
+                    settle_();
+                } catch (...) { // the host is what matters; a throwing cleanup must not skip the join
+                }
+            }
             done_ = true;
         }
         cv_.notify_all();
@@ -881,6 +894,7 @@ private:
     std::mutex m_;
     std::condition_variable cv_;
     bool done_ = false;
+    std::function<void()> settle_;
     std::thread thread_;
 };
 
@@ -962,12 +976,40 @@ struct PluginRig {
     }
 };
 
-/// The live rig: releases whatever a case left applied, then shuts the plugin down.
+/// Releases whatever is applied until the plugin itself answers `status|inactive`: up to five
+/// attempts, one second apart. `repair_first` is for a case that tampered with the host: the
+/// stored set is re-applied through the plugin (a no-op when nothing is contained) so the release
+/// finds the state it recorded, not the tampered one. True once the host reads inactive.
+bool settle_release(PluginRig& rig, bool repair_first = false) {
+    if (repair_first)
+        (void)rig.run("quarantine", {{"repair", "1"}});
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        (void)rig.run("release");
+        if (has_row(rig.run("quarantine_status").captured, "status|inactive"))
+            return true;
+        std::this_thread::sleep_for(1s);
+    }
+    return false;
+}
+
+/// The same for a case that drives the legs directly through fq::release.
+template <class FqEnv> bool settle_fq_release(FqEnv& fenv) {
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        fq::Deadline dl;
+        if (fq::release(fenv, fq::ReleaseRequest{}, dl).status == "inactive")
+            return true;
+        std::this_thread::sleep_for(1s);
+    }
+    return false;
+}
+
+/// The live rig: releases whatever a case left applied (confirmed inactive), then shuts the
+/// plugin down. A case's Watchdog settles first; this is the last backstop.
 struct LiveRig : PluginRig {
     using PluginRig::PluginRig;
     ~LiveRig() {
         if (plugin && ctx)
-            (void)run("release");
+            (void)settle_release(*this);
     }
 };
 
@@ -1431,7 +1473,7 @@ TEST_CASE("live: apply, verify the block, release restores the host byte-identic
     LIVE_OR_SKIP(env);
     const auto before = baseline_snapshot();
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig); });
 
     REQUIRE(probe(env.probe_target) != fq::ProbeOutcome::timeout); // reachable before
     const auto q = rig.run("quarantine", env.quarantine_params());
@@ -1457,7 +1499,7 @@ TEST_CASE("live: a pre-established prohibited stream stops carrying data on appl
     LIVE_OR_SKIP(env);
     const auto target = env.stream_target.empty() ? env.probe_target : env.stream_target;
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig); });
 
     KeptStream stream;
     if (!stream.open(target))
@@ -1509,7 +1551,7 @@ TEST_CASE("live: an unrelated enabled allow rule is disabled for the duration an
     } cleanup{netsh, rule};
 
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig); });
     REQUIRE(probe(env.probe_target) != fq::ProbeOutcome::timeout);
     const auto q = rig.run("quarantine", env.quarantine_params());
     INFO(q.captured);
@@ -1530,7 +1572,7 @@ TEST_CASE("live: a control-channel stream open before the apply keeps carrying d
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig); });
 
     KeptStream stream;
     if (!stream.open(env.server))
@@ -1575,7 +1617,7 @@ TEST_CASE("live: quarantine_allow adds and removes an exception through the plug
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig); });
 
     REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
     REQUIRE(rig.record().has_value());
@@ -1610,7 +1652,7 @@ TEST_CASE("live: quarantine_allow adds and removes an exception through the plug
 TEST_CASE("live: quarantine_status shapes", "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig, /*repair_first=*/true); });
 
     CHECK(has_row(rig.run("quarantine_status").captured, "status|inactive"));
 
@@ -1648,7 +1690,7 @@ TEST_CASE("live: init completes an interrupted release and re-applies a lost con
     LIVE_OR_SKIP(env);
     const auto before = baseline_snapshot();
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig, /*repair_first=*/true); });
 
     REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
     auto rec = rig.record();
@@ -1721,7 +1763,7 @@ TEST_CASE("live: the repair self-check re-applies a containment the host lost, f
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig, /*repair_first=*/true); });
 
     REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
     const auto stored = rig.record();
@@ -1775,7 +1817,7 @@ TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig); });
 
     // The time limit is written onto the record directly: the standalone harness has no
     // trigger engine, so a real `ttl_seconds` could never be enforced here, but its
@@ -2143,10 +2185,7 @@ TEST_CASE("live (linux nft): a failed update keeps the previous generation in fo
     auto allow = fq::build_allow_set(env.server_ip(), env.server, {}, exceptions);
     REQUIRE(allow.has_value());
 
-    Watchdog dog(120s, [&] {
-        fq::Deadline dl;
-        (void)fq::release(fenv, fq::ReleaseRequest{}, dl);
-    });
+    Watchdog dog(120s, [&] { (void)settle_fq_release(fenv); });
     fq::Deadline dl;
     fq::ApplyRequest req;
     req.allow = *allow;
@@ -2204,7 +2243,7 @@ TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release resto
     LIVE_OR_SKIP(env);
     const auto before = baseline_snapshot();
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig); });
 
     const auto q = rig.run("quarantine", env.quarantine_params());
     INFO(q.captured);
@@ -2248,7 +2287,7 @@ TEST_CASE("live (macOS pf): pf switched off behind the plugin's back is reported
     if (!running_as_root())
         SKIP("pfctl -d is not granted to the agent account, so only a root run can switch pf off");
     LiveRig rig(env.server, env.server_ip());
-    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+    Watchdog dog(120s, [&] { (void)settle_release(rig, /*repair_first=*/true); });
 
     REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
     const auto old_token = rig.record() ? rig.record()->os.pf_token : std::string{};
@@ -2290,10 +2329,7 @@ TEST_CASE("live (macOS pf): a failed update keeps the previous generation in for
     auto allow = fq::build_allow_set(env.server_ip(), env.server, {}, exceptions);
     REQUIRE(allow.has_value());
 
-    Watchdog dog(120s, [&] {
-        fq::Deadline dl;
-        (void)fq::release(fenv, fq::ReleaseRequest{}, dl);
-    });
+    Watchdog dog(120s, [&] { (void)settle_fq_release(fenv); });
     fq::Deadline dl;
     fq::ApplyRequest req;
     req.allow = *allow;
