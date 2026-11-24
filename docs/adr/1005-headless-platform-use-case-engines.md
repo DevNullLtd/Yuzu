@@ -2129,9 +2129,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        data, so the tool does not run without durable evidence. This is a
        deliberate choice, recorded here, and is not a default for the next
        behavioural MCP tool. The generic `mcp.get_device_live` row is
-       set-and-proceed, and is written only after a successful answer and for a
-       tier, approval or read-only refusal; the other refusals leave one domain
-       `failure` row (after the `requested` row) or none. Every domain row of a
+       set-and-proceed, and is written after a successful answer, for a
+       tier, approval or read-only refusal, and as a `failure` row when the
+       `requested` row could not be stored (`audit_failed`, the refusal's own
+       record); the other refusals leave one domain `failure` row (after the
+       `requested` row) or none. Every domain row of a
        call is written as the original session, even when the credential is
        revoked mid-call. With audit switched off the call proceeds. The REST
        `requested` row moves to the shared `emit_behavioral_audit` helper, so a
@@ -2155,14 +2157,16 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **Poll.** One shared reader scopes the stored rows to the device at the
        store, answers only after the device has finished (a stored row with a
        terminal status; partial output without one is discarded and answered
-       `incomplete`), joins the output chunks with a newline in stored order,
+       `incomplete`, retryable after the poll's 25 second deadline), joins the output chunks with a newline in stored order,
        lets a failure row win, and is bounded by a 25 second wall-clock
        deadline and a bounded store read; the MCP answer is capped at 1000
-       rows and 1 MiB with a `truncated` flag, the REST answer refuses over
-       4 MiB or 20000 rows (`output_too_large`). A response-store ingest
-       property remains and is not fixed here: if one middle chunk of a
-       multi-chunk device answer is not stored, the read cannot detect the hole
-       and may return the surviving rows as complete.
+       rows and 1 MiB with a `truncated` flag (an answer already over the cap is
+       cut and flagged at once, and the surviving rows are not a stable
+       prefix), the REST answer refuses over 4 MiB, 20000 rows or 64 stored
+       rows (`output_too_large`). A response-store ingest property remains and
+       is not fixed here: if one middle chunk of a multi-chunk device answer
+       is not stored, the read cannot detect the hole and may return the
+       surviving rows as complete.
      - **Shutdown.** All three `kLiveRead` holders refuse (the REST route and
        the MCP tool, `shutting_down`; the MCP code is `-32015`) or skip (the
        quarantine release confirmation) a new wait once the server is draining;

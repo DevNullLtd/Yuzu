@@ -693,7 +693,9 @@ does (agentic-first parity):
   `Execute`, audited before dispatch (`device.live.uptime` or
   `device.live.processes`), and answers 409, 422, 403, 429, 502, 503 or 504
   when the device cannot answer (see the REST reference). It answers only after
-  the device has finished, never with a partial list. The reply is stored in the
+  the device has finished: partial output without a final row is never
+  returned (a chunk the server failed to store cannot be detected, so a
+  complete-looking list can have a hole). The reply is stored in the
   response store for `response_retention_days` (90 by default), and process paths
   can contain user names, so treat it as personal data. The MCP tool
   `get_device_live` is its twin and shares its limit of 2 reads per caller and

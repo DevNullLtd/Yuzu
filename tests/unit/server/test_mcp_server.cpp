@@ -11963,6 +11963,10 @@ TEST_CASE("MCP get_device_live: the served description states the lease limits t
     CHECK(description.find("carry none") != std::string::npos);
     CHECK(description.find("25 second deadline") != std::string::npos);
     CHECK(yuzu::server::mcp::kLiveReadIncompleteRetryMs == 25000);
+    // PX-1: the per-OS claim is exact. No OS hashes every row, so the description must not say so.
+    CHECK(description.find("hash every row") == std::string::npos);
+    CHECK(description.find("hash_unavailable:<cause>") != std::string::npos);
+    CHECK(description.find("threads have no executable link even for a privileged agent") != std::string::npos);
 }
 
 TEST_CASE("MCP get_device_live: a kind outside the REST pair (a dashboard-only kind, an unknown name, "

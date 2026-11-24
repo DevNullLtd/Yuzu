@@ -3523,17 +3523,20 @@ groups:
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#server-cli-flags"
           description: >-
             yuzu_http_held_open_responses is above 80% of yuzu_http_held_open_capacity
-            on {{ $labels.instance }} for 5 minutes. Every streaming surface and every
-            synchronous workflow run leases from this ONE budget (MCP GET and streamed
-            POST, /api/v1/events, the dashboard executions drawer, the legacy /events
-            stream, and POST /api/v1/workflows/{id}/execute, MCP execute_workflow and the
-            legacy POST /api/workflows/{id}/execute), and each lease pins one HTTP worker
-            thread. At 100% the next stream or workflow run is refused with a 429
+            on {{ $labels.instance }} for 5 minutes. Every streaming surface, every
+            synchronous workflow run and every synchronous live device read leases from
+            this ONE budget (MCP GET and streamed POST, /api/v1/events, the dashboard
+            executions drawer, the legacy /events stream, POST /api/v1/workflows/{id}/execute,
+            MCP execute_workflow and the legacy POST /api/workflows/{id}/execute, and for
+            live reads POST /api/v1/dex/devices/{id}/live, MCP get_device_live and the
+            confirmation wait of DELETE /api/v1/quarantine/{agent_id}), and each lease pins
+            one HTTP worker thread. At 100% the next stream or workflow run is refused with a 429
             (yuzu_server_workflow_run_refused_total{reason="global_stream_cap"} for a
             workflow run). Read yuzu_server_workflow_runs_in_flight for the workflow
-            share (a run holds its slot for up to 60 seconds, at most 2 per caller), and
-            yuzu_mcp_streams_active / yuzu_mcp_post_streams_active for the MCP share.
-            Both gauges are sampled on the server's maintenance tick (about every 15
+            share (a run holds its slot for up to 60 seconds, at most 2 per caller),
+            yuzu_server_live_in_flight for the live read share (at most 4 per server
+            process, 2 per caller), and yuzu_mcp_streams_active /
+            yuzu_mcp_post_streams_active for the MCP share. These gauges are sampled on the server's maintenance tick (about every 15
             seconds), so a burst shorter than that can be missed; the 5 minute window is
             a level, not a count. The remedy is a higher --max-sse-streams (the worker
             pool follows it; see docs/adr/0034) or fewer concurrent clients, not a
