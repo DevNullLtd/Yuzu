@@ -910,6 +910,16 @@ A route or tool that already refused such an id through its own route pattern (a
 
 **Rollback.** The agent keeps the new counts in memory only and the server recomputes the gauges at every sweep, so nothing needs to be undone: a return to an earlier build removes the tags, the gauges and the alert's input.
 
+## Behaviour change: the Echo corruption alert counts new quarantines (`YuzuEchoDbCorruptionDetected`, #7486)
+
+**What changed.** `YuzuEchoDbCorruptionDetected` (warning, group `yuzu-echo`) no longer reads the population gauge `yuzu_fleet_echo_db_corruption_agents`. It fires on `sum by (job) (increase(yuzu_server_echo_db_quarantines_total[1h])) > 0`: any new quarantine the server recorded in the last hour, one per `echo.db.corruption_quarantined` audit row it writes, so an agent returning from offline, a failover and a reconnect wave no longer fire it. The gauge stays published and no rule reads it. The same server change adds `yuzu_server_echo_corruption_audit_degraded_total{reason}`, `yuzu_server_echo_corruption_audit_store_closed_total` (heartbeats with a quarantine candidate while the audit store is closed, when the quarantine counter cannot move), `yuzu_server_health_upsert_exceptions_total` and `yuzu_fleet_retired_tar_plugin_agents` (reference: [metrics.md](metrics.md)). **To get the new rule, load `docs/prometheus/yuzu-alerts.yml` into your Prometheus; no compose or Helm file the project ships does.**
+
+**Upgrade order.** Upgrade every server replica first, then load the new rule file. Only this build's server publishes `yuzu_server_echo_db_quarantines_total`, so against a replica still on an earlier build the new rule reads no series and that replica's quarantines raise no alert. The new rule replaces the old one rather than sitting beside it, so a replica that has not been upgraded is covered by neither.
+
+**What it does not cover.** The threshold is any increase in an hour, a starting default not sized from fleet data. The counter is pre-seeded to 0 at boot, but a quarantine a replica records before Prometheus has scraped it once can still be missed. The count is of audit rows written, so the alert is blind while the audit store is closed or the gate is waiting out a failed audit lookup or write: no alert then does not mean no quarantine. See [Echo](echo.md#corrupt-database-quarantine).
+
+**Rollback.** No migration and no schema change, and this change writes no new durable state. An earlier server does not publish the counter, so the new rule is silent against it and a quarantine raises no alert. A return to an earlier build is not a supported path (see "Deployment contract (hard cutover)" in the Forensics section of this page).
+
 ## Behaviour change: the webhook and offload drop counters carry a `reason` label, and delivery backlog is published
 
 `yuzu_server_webhook_delivery_dropped_total` and `yuzu_server_offload_delivery_dropped_total` now carry a `reason` label with two values, `queue_full` (the store's delivery queue was full) and `quiescing` (the store was shutting down). Both values of both counters are present at `0` from boot. The earlier unlabelled series no longer exists.
