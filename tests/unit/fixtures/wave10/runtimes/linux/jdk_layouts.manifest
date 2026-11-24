@@ -1,12 +1,12 @@
-# jdk_layouts.manifest -- JVM home layouts of four distro packages, each under its own root
-# directory (roots/<distro>/...), for the release-less-home and extra-root walk tests in
+# jdk_layouts.manifest -- JVM home layouts of distro packages, each under its own root
+# directory (roots/<distro>/...), for the release-less-home, extra-root and bin/javac flavour walk tests in
 # tests/unit/test_runtimes_linux_parsers.cpp. Same line grammar as tree.manifest; provenance.txt
 # holds the images, package versions and capture commands.
 #
 # REAL CAPTURE structure, trimmed to the paths the walk reads (home directories, `release`, the
-# bin/java and jre/bin/java probes, the alias entries next to the homes). RECONSTRUCTION: every
-# regular file other than the SUSE `release` is an EMPTY placeholder (the capture recorded names,
-# not contents), and the Ubuntu .jinfo file is empty.
+# bin/java, jre/bin/java and bin/javac probes, the alias entries next to the homes).
+# RECONSTRUCTION: every regular file other than a `release` file is an EMPTY placeholder (the
+# capture recorded names, not contents), and the Ubuntu .jinfo file is empty.
 #
 # -- ubuntu:22.04 + openjdk-8-jre-headless: NO `release` file anywhere in the home ---------------
 roots/ubuntu2204-openjdk8/usr/lib/jvm/.java-1.8.0-openjdk-arm64.jinfo	T:
@@ -36,3 +36,126 @@ roots/opensuse156-openjdk17/usr/lib64/jvm/jre	L:/etc/alternatives/jre
 roots/opensuse156-openjdk17/usr/lib64/jvm/jre-17	L:/etc/alternatives/jre_17
 roots/opensuse156-openjdk17/usr/lib64/jvm/jre-17-openjdk	L:java-17-openjdk-17
 roots/opensuse156-openjdk17/usr/lib64/jvm/jre-openjdk	L:/etc/alternatives/jre_openjdk
+#
+#
+# -- SAM-48 captures, flavour from bin/javac when the release file has no IMAGE_TYPE: a JDK package
+# and a JRE package of Debian 12, Ubuntu 24.04 and openSUSE Leap 15.6 (the headless SUSE package is
+# the opensuse156-openjdk17 root above). Real names, symlink targets and release payloads; every
+# regular file other than `release` is an EMPTY placeholder; the JDK-only directories (include,
+# jmods, lib, legal, ...) are trimmed because the walk does not read them. ----------------------
+roots/debian12-openjdk17-jdk/usr/lib/jvm/.java-1.17.0-openjdk-arm64.jinfo	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-1.17.0-openjdk-arm64	L:java-17-openjdk-arm64
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jar	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jarsigner	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/java	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/javac	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/javadoc	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/javap	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jcmd	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jdb	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jdeprscan	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jdeps	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jfr	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jhsdb	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jimage	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jinfo	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jlink	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jmap	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jmod	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jpackage	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jps	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jrunscript	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jshell	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jstack	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jstat	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/jstatd	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/keytool	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/rmiregistry	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/bin/serialver	T:
+roots/debian12-openjdk17-jdk/usr/lib/jvm/java-17-openjdk-arm64/release	T:IMPLEMENTOR="Debian"\nJAVA_RUNTIME_VERSION="17.0.21.1+2-1-deb12u1-Debian"\nJAVA_VERSION="17.0.21.1"\nJAVA_VERSION_DATE="2026-11-17"\nLIBC="gnu"\nMODULES="java.base java.compiler java.datatransfer java.xml java.prefs java.desktop java.instrument java.logging java.management java.security.sasl java.naming java.rmi java.management.rmi java.net.http java.scripting java.security.jgss java.transaction.xa java.sql java.sql.rowset java.xml.crypto java.se java.smartcardio jdk.accessibility jdk.internal.jvmstat jdk.attach jdk.charsets jdk.compiler jdk.crypto.ec jdk.crypto.cryptoki jdk.dynalink jdk.internal.ed jdk.editpad jdk.hotspot.agent jdk.httpserver jdk.incubator.foreign jdk.incubator.vector jdk.internal.le jdk.internal.opt jdk.internal.vm.ci jdk.internal.vm.compiler jdk.internal.vm.compiler.management jdk.jartool jdk.javadoc jdk.jcmd jdk.management jdk.management.agent jdk.jconsole jdk.jdeps jdk.jdwp.agent jdk.jdi jdk.jfr jdk.jlink jdk.jpackage jdk.jshell jdk.jsobject jdk.jstatd jdk.localedata jdk.management.jfr jdk.naming.dns jdk.naming.rmi jdk.net jdk.nio.mapmode jdk.random jdk.sctp jdk.security.auth jdk.security.jgss jdk.unsupported jdk.unsupported.desktop jdk.xml.dom jdk.zipfs"\nOS_ARCH="aarch64"\nOS_NAME="Linux"\nSOURCE=""\n
+#
+roots/debian12-openjdk17-jre/usr/lib/jvm/.java-1.17.0-openjdk-arm64.jinfo	T:
+roots/debian12-openjdk17-jre/usr/lib/jvm/java-1.17.0-openjdk-arm64	L:java-17-openjdk-arm64
+roots/debian12-openjdk17-jre/usr/lib/jvm/java-17-openjdk-arm64/bin/java	T:
+roots/debian12-openjdk17-jre/usr/lib/jvm/java-17-openjdk-arm64/bin/jpackage	T:
+roots/debian12-openjdk17-jre/usr/lib/jvm/java-17-openjdk-arm64/bin/keytool	T:
+roots/debian12-openjdk17-jre/usr/lib/jvm/java-17-openjdk-arm64/bin/rmiregistry	T:
+roots/debian12-openjdk17-jre/usr/lib/jvm/java-17-openjdk-arm64/release	T:IMPLEMENTOR="Debian"\nJAVA_RUNTIME_VERSION="17.0.21.1+2-1-deb12u1-Debian"\nJAVA_VERSION="17.0.21.1"\nJAVA_VERSION_DATE="2026-11-17"\nLIBC="gnu"\nMODULES="java.base java.compiler java.datatransfer java.xml java.prefs java.desktop java.instrument java.logging java.management java.security.sasl java.naming java.rmi java.management.rmi java.net.http java.scripting java.security.jgss java.transaction.xa java.sql java.sql.rowset java.xml.crypto java.se java.smartcardio jdk.accessibility jdk.internal.jvmstat jdk.attach jdk.charsets jdk.compiler jdk.crypto.ec jdk.crypto.cryptoki jdk.dynalink jdk.internal.ed jdk.editpad jdk.hotspot.agent jdk.httpserver jdk.incubator.foreign jdk.incubator.vector jdk.internal.le jdk.internal.opt jdk.internal.vm.ci jdk.internal.vm.compiler jdk.internal.vm.compiler.management jdk.jartool jdk.javadoc jdk.jcmd jdk.management jdk.management.agent jdk.jconsole jdk.jdeps jdk.jdwp.agent jdk.jdi jdk.jfr jdk.jlink jdk.jpackage jdk.jshell jdk.jsobject jdk.jstatd jdk.localedata jdk.management.jfr jdk.naming.dns jdk.naming.rmi jdk.net jdk.nio.mapmode jdk.random jdk.sctp jdk.security.auth jdk.security.jgss jdk.unsupported jdk.unsupported.desktop jdk.xml.dom jdk.zipfs"\nOS_ARCH="aarch64"\nOS_NAME="Linux"\nSOURCE=""\n
+#
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/.java-1.21.0-openjdk-arm64.jinfo	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-1.21.0-openjdk-arm64	L:java-21-openjdk-arm64
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jar	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jarsigner	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/java	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/javac	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/javadoc	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/javap	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jcmd	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jdb	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jdeprscan	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jdeps	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jfr	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jhsdb	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jimage	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jinfo	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jlink	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jmap	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jmod	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jpackage	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jps	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jrunscript	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jshell	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jstack	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jstat	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jstatd	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/jwebserver	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/keytool	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/rmiregistry	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/bin/serialver	T:
+roots/ubuntu2404-openjdk21-jdk/usr/lib/jvm/java-21-openjdk-arm64/release	T:IMPLEMENTOR="Ubuntu"\nJAVA_RUNTIME_VERSION="21.0.13.1+2-1-24.04.1-Ubuntu"\nJAVA_VERSION="21.0.13.1"\nJAVA_VERSION_DATE="2026-11-17"\nLIBC="gnu"\nMODULES="java.base java.compiler java.datatransfer java.xml java.prefs java.desktop java.instrument java.logging java.management java.security.sasl java.naming java.rmi java.management.rmi java.net.http java.scripting java.security.jgss java.transaction.xa java.sql java.sql.rowset java.xml.crypto java.se java.smartcardio jdk.accessibility jdk.internal.jvmstat jdk.attach jdk.charsets jdk.internal.opt jdk.zipfs jdk.compiler jdk.crypto.ec jdk.crypto.cryptoki jdk.dynalink jdk.internal.ed jdk.editpad jdk.hotspot.agent jdk.httpserver jdk.incubator.vector jdk.internal.le jdk.internal.vm.ci jdk.internal.vm.compiler jdk.internal.vm.compiler.management jdk.jartool jdk.javadoc jdk.jcmd jdk.management jdk.management.agent jdk.jconsole jdk.jdeps jdk.jdwp.agent jdk.jdi jdk.jfr jdk.jlink jdk.jpackage jdk.jshell jdk.jsobject jdk.jstatd jdk.localedata jdk.management.jfr jdk.naming.dns jdk.naming.rmi jdk.net jdk.nio.mapmode jdk.random jdk.sctp jdk.security.auth jdk.security.jgss jdk.unsupported jdk.unsupported.desktop jdk.xml.dom"\nOS_ARCH="aarch64"\nOS_NAME="Linux"\nSOURCE=""\n
+#
+roots/ubuntu2404-openjdk21-jre/usr/lib/jvm/.java-1.21.0-openjdk-arm64.jinfo	T:
+roots/ubuntu2404-openjdk21-jre/usr/lib/jvm/java-1.21.0-openjdk-arm64	L:java-21-openjdk-arm64
+roots/ubuntu2404-openjdk21-jre/usr/lib/jvm/java-21-openjdk-arm64/bin/java	T:
+roots/ubuntu2404-openjdk21-jre/usr/lib/jvm/java-21-openjdk-arm64/bin/jpackage	T:
+roots/ubuntu2404-openjdk21-jre/usr/lib/jvm/java-21-openjdk-arm64/bin/keytool	T:
+roots/ubuntu2404-openjdk21-jre/usr/lib/jvm/java-21-openjdk-arm64/bin/rmiregistry	T:
+roots/ubuntu2404-openjdk21-jre/usr/lib/jvm/java-21-openjdk-arm64/release	T:IMPLEMENTOR="Ubuntu"\nJAVA_RUNTIME_VERSION="21.0.13.1+2-1-24.04.1-Ubuntu"\nJAVA_VERSION="21.0.13.1"\nJAVA_VERSION_DATE="2026-11-17"\nLIBC="gnu"\nMODULES="java.base java.compiler java.datatransfer java.xml java.prefs java.desktop java.instrument java.logging java.management java.security.sasl java.naming java.rmi java.management.rmi java.net.http java.scripting java.security.jgss java.transaction.xa java.sql java.sql.rowset java.xml.crypto java.se java.smartcardio jdk.accessibility jdk.internal.jvmstat jdk.attach jdk.charsets jdk.internal.opt jdk.zipfs jdk.compiler jdk.crypto.ec jdk.crypto.cryptoki jdk.dynalink jdk.internal.ed jdk.editpad jdk.hotspot.agent jdk.httpserver jdk.incubator.vector jdk.internal.le jdk.internal.vm.ci jdk.internal.vm.compiler jdk.internal.vm.compiler.management jdk.jartool jdk.javadoc jdk.jcmd jdk.management jdk.management.agent jdk.jconsole jdk.jdeps jdk.jdwp.agent jdk.jdi jdk.jfr jdk.jlink jdk.jpackage jdk.jshell jdk.jsobject jdk.jstatd jdk.localedata jdk.management.jfr jdk.naming.dns jdk.naming.rmi jdk.net jdk.nio.mapmode jdk.random jdk.sctp jdk.security.auth jdk.security.jgss jdk.unsupported jdk.unsupported.desktop jdk.xml.dom"\nOS_ARCH="aarch64"\nOS_NAME="Linux"\nSOURCE=""\n
+#
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java	L:/etc/alternatives/java_sdk
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17	L:/etc/alternatives/java_sdk_17
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk	L:java-17-openjdk-17
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-openjdk	L:/etc/alternatives/java_sdk_openjdk
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/jre	L:/etc/alternatives/jre
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/jre-17	L:/etc/alternatives/jre_17
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/jre-17-openjdk	L:java-17-openjdk-17
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/jre-openjdk	L:/etc/alternatives/jre_openjdk
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jar	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jarsigner	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/java	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/javac	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/javadoc	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/javap	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jcmd	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jconsole	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jdb	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jdeprscan	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jdeps	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jfr	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jhsdb	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jimage	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jinfo	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jlink	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jmap	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jmod	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jpackage	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jps	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jrunscript	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jshell	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jstack	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jstat	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/jstatd	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/keytool	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/rmiregistry	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/bin/serialver	T:
+roots/opensuse156-openjdk17-devel/usr/lib64/jvm/java-17-openjdk-17/release	T:IMPLEMENTOR="N/A"\nJAVA_RUNTIME_VERSION="17.0.18+8-suse-1500-aarch64"\nJAVA_VERSION="17.0.18"\nJAVA_VERSION_DATE="2026-01-20"\nLIBC="gnu"\nMODULES="java.base java.compiler java.datatransfer java.xml java.prefs java.desktop java.instrument java.logging java.management java.security.sasl java.naming java.rmi java.management.rmi java.net.http java.scripting java.security.jgss java.transaction.xa java.sql java.sql.rowset java.xml.crypto java.se java.smartcardio jdk.accessibility jdk.internal.jvmstat jdk.attach jdk.charsets jdk.compiler jdk.crypto.ec jdk.crypto.cryptoki jdk.dynalink jdk.internal.ed jdk.editpad jdk.hotspot.agent jdk.httpserver jdk.incubator.foreign jdk.incubator.vector jdk.internal.le jdk.internal.opt jdk.internal.vm.ci jdk.internal.vm.compiler jdk.internal.vm.compiler.management jdk.jartool jdk.javadoc jdk.jcmd jdk.management jdk.management.agent jdk.jconsole jdk.jdeps jdk.jdwp.agent jdk.jdi jdk.jfr jdk.jlink jdk.jpackage jdk.jshell jdk.jsobject jdk.jstatd jdk.localedata jdk.management.jfr jdk.naming.dns jdk.naming.rmi jdk.net jdk.nio.mapmode jdk.random jdk.sctp jdk.security.auth jdk.security.jgss jdk.unsupported jdk.unsupported.desktop jdk.xml.dom jdk.zipfs"\nOS_ARCH="aarch64"\nOS_NAME="Linux"\nSOURCE=""\n

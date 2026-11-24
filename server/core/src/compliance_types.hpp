@@ -81,7 +81,7 @@ struct Policy {
 struct PolicyAgentStatus {
     std::string policy_id;
     std::string agent_id;
-    std::string status;        // "compliant", "non_compliant", "unknown", "fixing", "error"
+    std::string status;        // "compliant", "non_compliant", "unknown", "fixing", "error", "blocked"
     int64_t last_check_at{0};
     int64_t last_fix_at{0};
     std::string check_result;  // JSON of last check output
@@ -94,6 +94,7 @@ struct ComplianceSummary {
     int64_t unknown{0};
     int64_t fixing{0};
     int64_t error{0};
+    int64_t blocked{0};  // policy evaluation refused to dispatch the check or fix (policy_dispatch.hpp)
     int64_t total{0};
 };
 
@@ -104,6 +105,7 @@ struct FleetCompliance {
     int64_t unknown{0};
     int64_t fixing{0};
     int64_t error{0};
+    int64_t blocked{0};          // see ComplianceSummary::blocked; counted as failing
     double compliance_pct{0.0};  // compliant / total * 100
 };
 

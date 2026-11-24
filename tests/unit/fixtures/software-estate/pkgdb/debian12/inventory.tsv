@@ -1,0 +1,10 @@
+debconf	ii 	1.5.82	all	Debconf Developers <debconf-devel@lists.alioth.debian.org>
+hostname	ii 	3.23+nmu1	arm64	Michael Meskes <meskes@debian.org>
+libacl1	ii 	2.3.1-3	arm64	Guillem Jover <guillem@debian.org>
+libattr1	ii 	1:2.5.1-4	arm64	Guillem Jover <guillem@debian.org>
+libaudit-common	ii 	1:3.0.9-1	all	Laurent Bigonville <bigon@debian.org>
+libgmp10	ii 	2:6.2.1+dfsg1-1.1	arm64	Debian Science Team <debian-science-maintainers@lists.alioth.debian.org>
+libtinfo6	ii 	6.4-4	arm64	Craig Small <csmall@debian.org>
+login	ii 	1:4.13+dfsg1-1+deb12u2	arm64	Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>
+sed	ii 	4.9-1+deb12u1	arm64	Clint Adams <clint@debian.org>
+tzdata	ii 	2026f-0+deb12u1	all	GNU Libc Maintainers <debian-glibc@lists.debian.org>

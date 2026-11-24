@@ -93,7 +93,7 @@ PolicyFragment make_fragment() {
 
 } // namespace
 
-TEST_CASE("fleet_compliance_json: all seven fields, matching legacy /api/compliance shape",
+TEST_CASE("fleet_compliance_json: all eight fields, matching legacy /api/compliance shape",
           "[compliance][model]") {
     auto j = fleet_compliance_json(make_fleet_compliance());
     CHECK(j.at("compliance_pct").get<double>() == 92.5);
@@ -103,10 +103,21 @@ TEST_CASE("fleet_compliance_json: all seven fields, matching legacy /api/complia
     CHECK(j.at("unknown").get<int64_t>() == 5);
     CHECK(j.at("fixing").get<int64_t>() == 2);
     CHECK(j.at("error").get<int64_t>() == 0);
-    CHECK(j.size() == 7);
+    CHECK(j.at("blocked").get<int64_t>() == 0);
+    CHECK(j.size() == 8);
 }
 
-TEST_CASE("compliance_summary_json: all six fields, matching legacy summary shape",
+TEST_CASE("fleet_compliance_json and compliance_summary_json carry the blocked count",
+          "[compliance][model]") {
+    FleetCompliance fc = make_fleet_compliance();
+    fc.blocked = 4;
+    CHECK(fleet_compliance_json(fc).at("blocked").get<int64_t>() == 4);
+    ComplianceSummary cs = make_summary();
+    cs.blocked = 3;
+    CHECK(compliance_summary_json(cs).at("blocked").get<int64_t>() == 3);
+}
+
+TEST_CASE("compliance_summary_json: all seven fields, matching legacy summary shape",
           "[compliance][model]") {
     auto j = compliance_summary_json(make_summary());
     CHECK(j.at("compliant").get<int64_t>() == 42);
@@ -114,11 +125,12 @@ TEST_CASE("compliance_summary_json: all six fields, matching legacy summary shap
     CHECK(j.at("unknown").get<int64_t>() == 5);
     CHECK(j.at("fixing").get<int64_t>() == 1);
     CHECK(j.at("error").get<int64_t>() == 0);
+    CHECK(j.at("blocked").get<int64_t>() == 0);
     CHECK(j.at("total").get<int64_t>() == 51);
     // Deliberately no "policy_id" — matches the legacy nested "summary"
     // sub-object shape, not the top-level get_compliance_summary MCP tool
     // (which adds policy_id as a sibling field, not through this builder).
-    CHECK(j.size() == 6);
+    CHECK(j.size() == 7);
 }
 
 TEST_CASE("policy_agent_status_json: five fields, matching legacy agents[] row",
@@ -191,23 +203,25 @@ TEST_CASE("single_policy_detail_json: remediation_available is exactly what the 
     CHECK(j.at("remediation_available").get<bool>() == false);
 }
 
-TEST_CASE("confined_policy_compliance: nullopt scope (TOP) keeps every row and tallies all five "
+TEST_CASE("confined_policy_compliance: nullopt scope (TOP) keeps every row and tallies all six "
           "statuses",
           "[compliance][model][security]") {
     std::vector<PolicyAgentStatus> statuses = {
         make_status("a1", "compliant"),   make_status("a2", "compliant"),
         make_status("a3", "non_compliant"), make_status("a4", "unknown"),
         make_status("a5", "fixing"),      make_status("a6", "error"),
+        make_status("a7", "blocked"),
     };
     auto out = confined_policy_compliance(statuses, /*scope=*/std::nullopt, "pol_1");
-    CHECK(out.visible.size() == 6);
+    CHECK(out.visible.size() == 7);
     CHECK(out.summary.policy_id == "pol_1");
     CHECK(out.summary.compliant == 2);
     CHECK(out.summary.non_compliant == 1);
     CHECK(out.summary.unknown == 1);
     CHECK(out.summary.fixing == 1);
     CHECK(out.summary.error == 1);
-    CHECK(out.summary.total == 6);
+    CHECK(out.summary.blocked == 1);
+    CHECK(out.summary.total == 7);
 }
 
 TEST_CASE("confined_policy_compliance: engaged-empty scope (deny-all) admits nothing",

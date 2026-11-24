@@ -188,9 +188,9 @@ SoftwareEntry full_v2_entry() {
     return e;
 }
 
-// full_v2_entry() plus the stored extended-tail fields. Wire slot 14 (uninstall_string) is
-// reserved and has no member; slot 13 (install_location) is a member only the v3 `+` record
-// fills, so the v2 path neither stores nor hashes either.
+// full_v2_entry() plus the stored extended-tail fields. Wire slots 13 (install_location) and 14
+// (attributes) are members only the v3 `+` record fills, so the v2 path neither stores nor hashes
+// either.
 SoftwareEntry full_extended_entry() {
     SoftwareEntry e = full_v2_entry();
     e.package_id = "bash-5.2.21-3.fc40.x86_64";
@@ -4423,6 +4423,19 @@ constexpr const char* kV3Comp = "component_inventory";
 constexpr const char* kEmptySectionHash =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+// SAM-46 golden: the row of the canonical_section_hash pin below carrying `upgrade_code`. The record
+// bytes and the digest are pinned identically in tests/unit/test_installed_software_v3.cpp
+// (kUpgradeCodeRecord, kUpgradeCodeRowHash): the cross-side contract for wire slot 14. Recipe (one
+// row, so the row hash, instance_key and section hash are the same digest):
+//   printf 'Alpha\0371.0\037Pub\0372026-01-01\037app\037windows\037\037\037x64\037\037\037\037C:\\Program Files\\Alpha\037upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}\037pkg-a\037installed_apps.list_inventory\036' | shasum -a 256
+constexpr const char* kUpgradeCode = "upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}";
+constexpr const char* kUpgradeCodeRowHash =
+    "0aa32899b7f2568e9a7a1163032565effb71f319771abdeb47986368174a5ae5";
+const std::string kUpgradeCodeRecord =
+    std::string("Alpha\x1f" "1.0\x1f" "Pub\x1f" "2026-01-01\x1f" "app\x1f" "windows\x1f\x1f\x1f"
+                "x64\x1f\x1f\x1f\x1f" "C:\\Program Files\\Alpha\x1f") +
+    kUpgradeCode + "\x1f" "pkg-a\x1f" "installed_apps.list_inventory\x1e";
+
 SqlTable sql_rows(PgPool& pool, const std::string& sql,
                   const std::vector<std::string>& params = {}) {
     auto lease = pool.try_acquire_for(std::chrono::seconds{5});
@@ -4546,11 +4559,12 @@ std::string w_sec(const std::string& facet, const std::string& status, const std
                   const std::string& bytes = "0") {
     return w_rec({"S", facet, status, base, token, dur, bytes});
 }
-// A `+` record matching v3_entry(name, source, "1.0", loc) slot for slot (slot 14 empty).
+// A `+` record matching v3_entry(name, source, "1.0", loc) slot for slot (slot 14, the attribute
+// field, empty unless given).
 std::string w_plus(const std::string& name, const std::string& source,
-                   const std::string& loc = "") {
+                   const std::string& loc = "", const std::string& slot14 = "") {
     return w_rec({"+", name, "1.0", "Pub", "2026-01-01", "app", "windows", "", "", "x64", "", "",
-                  "", loc, "", "pkg-" + name, source});
+                  "", loc, slot14, "pkg-" + name, source});
 }
 
 } // namespace
@@ -4640,12 +4654,13 @@ TEST_CASE("canonical_section_hash is order and duplicate independent, 16 slots a
           "4f5f399d1a8f2cb7e94eee0487cf6dbb86b2bcdbb7b266fbc2869bd92b338fdd");
     CHECK(SoftwareInventoryStore::canonical_section_hash({}) == kEmptySectionHash);
 
-    // Every stored field, install_location included, moves the hash; no conditional tail: a
-    // row with an empty package_id and source still writes all 16 slots, so it differs from
-    // the same row with only the tail changed.
+    // Every stored field, install_location and attributes included, moves the hash; no
+    // conditional tail: a row with an empty package_id and source still writes all 16 slots, so
+    // it differs from the same row with only the tail changed.
     const auto base = SoftwareInventoryStore::canonical_section_hash({a});
-    for (auto field : {&SoftwareEntry::install_location, &SoftwareEntry::package_id,
-                       &SoftwareEntry::source, &SoftwareEntry::distro_version}) {
+    for (auto field : {&SoftwareEntry::install_location, &SoftwareEntry::attributes,
+                       &SoftwareEntry::package_id, &SoftwareEntry::source,
+                       &SoftwareEntry::distro_version}) {
         SoftwareEntry other = a;
         other.*field = "zz";
         CHECK(SoftwareInventoryStore::canonical_section_hash({other}) != base);
@@ -4658,6 +4673,85 @@ TEST_CASE("canonical_section_hash is order and duplicate independent, 16 slots a
     SoftwareEntry derived = a;
     SoftwareInventoryStore::derive_install_keys(derived);
     CHECK(SoftwareInventoryStore::canonical_section_hash({derived}) == base);
+}
+
+TEST_CASE("canonical_section_hash pins a row carrying an install-row attribute (SAM-46 golden)",
+          "[software_inventory][v3][hash][attributes]") {
+    SoftwareEntry a;
+    a.name = "Alpha";
+    a.version = "1.0";
+    a.publisher = "Pub";
+    a.install_date = "2026-01-01";
+    a.kind = "app";
+    a.ecosystem = "windows";
+    a.arch = "x64";
+    a.install_location = "C:\\Program Files\\Alpha";
+    a.attributes = kUpgradeCode;
+    a.package_id = "pkg-a";
+    a.source = kV3Apps;
+    // The pin, the row's instance_key (what a `-` names) and the one-row section hash agree...
+    CHECK(SoftwareInventoryStore::canonical_section_hash({a}) == kUpgradeCodeRowHash);
+    SoftwareEntry keyed_row = a;
+    SoftwareInventoryStore::derive_install_keys(keyed_row);
+    CHECK(keyed_row.instance_key == kUpgradeCodeRowHash);
+    // ...and the pinned literal bytes, read back through the real v3 parser (slot 14 is wire field
+    // 14 after the `+`), land on the same row and the same hash: the literal, the parser and the
+    // hash are one contract with the agent writer's identical pin.
+    const std::string blob = std::string("\037v3\036") +
+                             std::string("S\x1f" "installed_apps.list_inventory\x1f" "full\x1f\x1f\x1f"
+                                         "0\x1f" "0\x1e") +
+                             "+\x1f" + kUpgradeCodeRecord;
+    const auto parsed = yuzu::server::parse_v3_blob(blob);
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->sections.size() == 1);
+    REQUIRE(parsed->sections[0].refusal == yuzu::server::V3Refusal::kNone);
+    REQUIRE(parsed->sections[0].rows.size() == 1);
+    CHECK(parsed->sections[0].rows[0].attributes == kUpgradeCode);
+    CHECK(SoftwareInventoryStore::canonical_section_hash(parsed->sections[0].rows) ==
+          kUpgradeCodeRowHash);
+
+    // An empty slot is the pre-SAM-46 pin: the same row with no attributes hashes as it always did.
+    SoftwareEntry plain = a;
+    plain.attributes.clear();
+    CHECK(SoftwareInventoryStore::canonical_section_hash({plain}) ==
+          "c573935d6af97c9deaef2b526cb01a3dabc2d3958b7e69b289968a6e80dbf229");
+    // The attribute is a stored field: it moves the hash and keeps two rows apart.
+    CHECK(SoftwareInventoryStore::canonical_section_hash({a}) !=
+          SoftwareInventoryStore::canonical_section_hash({plain}));
+    CHECK(SoftwareInventoryStore::canonical_section_hash({a, plain, a}) ==
+          SoftwareInventoryStore::canonical_section_hash({plain, a}));
+    // The v2 report hash never carries slot 14.
+    CHECK(SoftwareInventoryStore::canonical_hash({a}) ==
+          SoftwareInventoryStore::canonical_hash({plain}));
+}
+
+TEST_CASE("canonical_section_hash sorts attributes after install_location and before package_id "
+          "(SAM-46 order pin)",
+          "[software_inventory][v3][hash][attributes]") {
+    // canonical_section_hash sorts the rows with the server's entry_less, so the section hash is
+    // taken over the rows in that order. Two rows whose attributes and package_id disagree about which sorts
+    // first pin the position: attributes decide, so the row with the smaller attributes (and the
+    // larger package_id) is written first. Moving attributes after package_id in entry_less or in
+    // the record form changes these bytes, and so this digest. Recipe (the agent's slot order):
+    //   printf 'Alpha\0371.0\037Pub\0372026-01-01\037app\037windows\037\037\037x64\037\037\037\037C:\\Program Files\\Alpha\037upgrade_code={00000000-0000-0000-0000-000000000000}\037zzz\037installed_apps.list_inventory\036Alpha\0371.0\037Pub\0372026-01-01\037app\037windows\037\037\037x64\037\037\037\037C:\\Program Files\\Alpha\037upgrade_code={FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}\037aaa\037installed_apps.list_inventory\036' | shasum -a 256
+    SoftwareEntry lo;
+    lo.name = "Alpha";
+    lo.version = "1.0";
+    lo.publisher = "Pub";
+    lo.install_date = "2026-01-01";
+    lo.kind = "app";
+    lo.ecosystem = "windows";
+    lo.arch = "x64";
+    lo.install_location = "C:\\Program Files\\Alpha";
+    lo.attributes = "upgrade_code={00000000-0000-0000-0000-000000000000}";
+    lo.package_id = "zzz";
+    lo.source = kV3Apps;
+    SoftwareEntry hi = lo;
+    hi.attributes = "upgrade_code={FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}";
+    hi.package_id = "aaa";
+    const char* kPinned = "f61a695310eff3d26ea732c700a9e30a12df2bd1e417ea6f5e543404d19c13a3";
+    CHECK(SoftwareInventoryStore::canonical_section_hash({lo, hi}) == kPinned);
+    CHECK(SoftwareInventoryStore::canonical_section_hash({hi, lo}) == kPinned);
 }
 
 TEST_CASE("canonical_section_hash pins a row whose publisher is an origin label (via:brew)",
@@ -5822,6 +5916,181 @@ TEST_CASE("v3: same title and version with a different instance_key writes no le
                          "WHERE agent_id = 'agent-ch'")[0][0] == "2026-06-01");
 }
 
+// ── SAM-46: slot 14, the install-row attribute field ─────────────────────────────────────────
+
+namespace {
+
+std::string attributes_of(PgPool& pool, const std::string& agent, const std::string& name) {
+    return sql_rows(pool,
+                    "SELECT attributes FROM software_inventory_store.installed_software "
+                    "WHERE agent_id = $1 AND name = $2",
+                    {agent, name})[0][0];
+}
+
+SoftwareEntry with_attributes(SoftwareEntry e, const std::string& attributes) {
+    e.attributes = attributes;
+    return e;
+}
+
+constexpr const char* kOtherUpgradeCode = "upgrade_code={FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}";
+
+} // namespace
+
+TEST_CASE("v3: a row with attributes round-trips, and the stored section hash is the agent golden",
+          "[pg][software_inventory][v3][attributes]") {
+    SWINV_SHARED(store, pool);
+    SoftwareEntry golden = v3_entry("Alpha", kV3Apps, "1.0", "C:\\Program Files\\Alpha");
+    golden.package_id = "pkg-a"; // the pinned row's package_id
+    golden.attributes = kUpgradeCode;
+    REQUIRE(section_hash_of({golden}) == kUpgradeCodeRowHash);
+
+    const auto res =
+        store.apply_installed_software_v3("agent-at", v3_report({v3_full(kV3Apps, {golden})}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    // The column holds the value as sent, and the section hash the store recorded for the facet is
+    // the digest the agent writer pins for the same bytes.
+    CHECK(attributes_of(pool, "agent-at", "Alpha") == kUpgradeCode);
+    CHECK(facet_status(pool, "agent-at", kV3Apps) == std::string("full/") + kUpgradeCodeRowHash);
+    CHECK(instance_key_of(pool, "agent-at", "Alpha") == kUpgradeCodeRowHash);
+    CHECK(stored_hash(pool, "agent-at") ==
+          SoftwareInventoryStore::v3_report_hash({{kV3Apps, kUpgradeCodeRowHash}}));
+
+    // Two rows identical but for their attributes are two rows, and a row without any stays ''.
+    const auto plain = v3_entry("Beta", kV3Apps);
+    const auto one = with_attributes(v3_entry("Gamma", kV3Apps), kUpgradeCode);
+    const auto two = with_attributes(v3_entry("Gamma", kV3Apps), kOtherUpgradeCode);
+    REQUIRE(store.apply_installed_software_v3("agent-at2",
+                                              v3_report({v3_full(kV3Apps, {plain, one, two})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    CHECK(row_count(pool, "agent-at2") == "3");
+    CHECK(attributes_of(pool, "agent-at2", "Beta").empty());
+}
+
+TEST_CASE("v3: an attribute-only change at the same version writes no ledger event",
+          "[pg][software_inventory][v3][ledger][attributes]") {
+    SWINV_SHARED(store, pool);
+    const auto a1 = v3_entry("Alpha", kV3Apps, "1.0");
+    const auto with_attr = with_attributes(a1, kUpgradeCode);
+    REQUIRE(keyed(a1).instance_key != keyed(with_attr).instance_key);
+    REQUIRE(store.apply_installed_software_v3("agent-al", v3_report({v3_full(kV3Apps, {a1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+
+    SECTION("by a full section") {
+        REQUIRE(store.apply_installed_software_v3("agent-al",
+                                                  v3_report({v3_full(kV3Apps, {with_attr})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+    }
+    SECTION("by a delta") {
+        REQUIRE(store.apply_installed_software_v3(
+                    "agent-al",
+                    v3_report({v3_delta(kV3Apps, section_hash_of({a1}), {with_attr}, {a1},
+                                        {with_attr})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+    }
+    CHECK(ledger_count(pool, "agent-al") == "0");
+    CHECK(attributes_of(pool, "agent-al", "Alpha") == kUpgradeCode);
+    CHECK(facet_status(pool, "agent-al", kV3Apps).ends_with("/" + section_hash_of({with_attr})));
+}
+
+TEST_CASE("v3: a delta section carrying an attribute change applies and matches expect",
+          "[pg][software_inventory][v3][ledger][attributes]") {
+    SWINV_SHARED(store, pool);
+    const auto a1 = with_attributes(v3_entry("Alpha", kV3Apps, "1.0"), kUpgradeCode);
+    const auto a1b = with_attributes(v3_entry("Alpha", kV3Apps, "1.0"), kOtherUpgradeCode);
+    const auto b1 = v3_entry("Beta", kV3Apps);
+    const auto c1 = with_attributes(v3_entry("Gamma", kV3Apps), kUpgradeCode);
+    REQUIRE(store.apply_installed_software_v3("agent-ad", v3_report({v3_full(kV3Apps, {a1, b1})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    const std::string base = section_hash_of({a1, b1});
+
+    // One row's attribute value changes (-old +new) and a new row arrives carrying one. The
+    // server verifies by hashing the rows the table now holds, so the row load carries the column.
+    const std::string after = section_hash_of({a1b, b1, c1});
+    const auto res = store.apply_installed_software_v3(
+        "agent-ad", v3_report({v3_delta(kV3Apps, base, {a1b, b1, c1}, {a1}, {a1b, c1})}));
+    REQUIRE(res.size() == 1);
+    CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    CHECK(facet_status(pool, "agent-ad", kV3Apps) == "delta/" + after);
+    CHECK(attributes_of(pool, "agent-ad", "Alpha") == kOtherUpgradeCode);
+    CHECK(attributes_of(pool, "agent-ad", "Gamma") == kUpgradeCode);
+    CHECK(attributes_of(pool, "agent-ad", "Beta").empty());
+    // The only ledger row is the new install; the attribute change on Alpha is not an event.
+    const auto led = ledger(pool, "agent-ad");
+    REQUIRE(led.size() == 1);
+    CHECK(led[0][0] == "install");
+    CHECK(led[0][1] == "Gamma");
+
+    // A delta on the held base that names the row by the OLD attribute's key no longer finds it:
+    // the `-` set returns fewer rows than it names, so the section is a mismatch (the base is
+    // held, so it is not need-full), rolled back, nothing is written.
+    const auto stale = store.apply_installed_software_v3(
+        "agent-ad", v3_report({v3_delta(kV3Apps, after, {b1, c1}, {a1}, {})}));
+    REQUIRE(stale.size() == 1);
+    CHECK(stale[0].outcome == V3SectionOutcome::kMismatch);
+    CHECK(attributes_of(pool, "agent-ad", "Alpha") == kOtherUpgradeCode);
+}
+
+TEST_CASE("migration v13 adds the attributes column over live rows, keeps their section hash and re-runs idempotently",
+          "[pg][software_inventory][v3][attributes]") {
+    // Reproduce a v12-era schema: drop the v13 column, rewind schema_meta to 12, reconstruct so
+    // v13 runs over live rows; then rewind and reconstruct again to prove the migration text is
+    // idempotent.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    const auto a1 = v3_entry("Alpha", kV3Apps, "1.0", "C:\\Program Files\\Alpha");
+    const auto b1 = v3_entry("Beta", kV3Apps);
+    const std::string held = section_hash_of({a1, b1});
+    {
+        SoftwareInventoryStore s1{pool};
+        REQUIRE(s1.is_open());
+        REQUIRE(s1.apply_installed_software_v3("agent-mg", v3_report({v3_full(kV3Apps, {a1, b1})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+    }
+    const auto rewind = [&] {
+        REQUIRE(sql_ok(pool, "UPDATE public.schema_meta SET version = 12 "
+                             "WHERE store = 'software_inventory_store'"));
+    };
+    REQUIRE(sql_ok(pool, "ALTER TABLE software_inventory_store.installed_software "
+                         "DROP COLUMN attributes"));
+    rewind();
+    const auto shape = [&] {
+        const auto col = sql_rows(pool, "SELECT data_type, is_nullable, column_default FROM "
+                                        "information_schema.columns WHERE table_schema = "
+                                        "'software_inventory_store' AND table_name = "
+                                        "'installed_software' AND column_name = 'attributes'");
+        REQUIRE(col.size() == 1);
+        CHECK(col[0][0] == "text");
+        CHECK(col[0][1] == "NO");
+        CHECK(col[0][2] == "''::text");
+    };
+    {
+        SoftwareInventoryStore store{pool}; // v13 over the v12 shape, rows already stored
+        REQUIRE(store.is_open());
+        shape();
+        // Every pre-existing row reads '' (what its slot 14 hashed as), so no stored hash moves.
+        const auto held_rows = sql_rows(pool, "SELECT attributes FROM "
+                                              "software_inventory_store.installed_software "
+                                              "WHERE agent_id = 'agent-mg'");
+        REQUIRE(held_rows.size() == 2); // Alpha and Beta: an empty result must not pass the loop
+        for (const auto& row : held_rows)
+            CHECK(row[0].empty());
+        CHECK(facet_status(pool, "agent-mg", kV3Apps) == "full/" + held);
+        // The held rows still hash to the held section hash: a delta on that base verifies against
+        // the rows read back from the table.
+        const auto c1 = with_attributes(v3_entry("Gamma", kV3Apps), kUpgradeCode);
+        const auto res = store.apply_installed_software_v3(
+            "agent-mg", v3_report({v3_delta(kV3Apps, held, {a1, b1, c1}, {}, {c1})}));
+        REQUIRE(res.size() == 1);
+        CHECK(res[0].outcome == V3SectionOutcome::kStored);
+    }
+    rewind();
+    SoftwareInventoryStore again{pool}; // second run over an already-migrated table
+    CHECK(again.is_open());
+    shape();
+}
+
 namespace {
 // A distro-package-shaped row: the version column is upstream, release/epoch their own columns.
 SoftwareEntry rpm_row(const std::string& name, const std::string& version,
@@ -6766,6 +7035,37 @@ TEST_CASE("ingest_inventory_report v3: a refused section nacks only its facet; t
                          {{"source", "installed_software"}, {"phase", "v3"}})
               .snapshot()
               .count == 1);
+}
+
+TEST_CASE("ingest_inventory_report v3: slot 14 rides the wire as the attribute field; a non-canonical value refuses only its section",
+          "[pg][software_inventory][seam][v3][attributes]") {
+    SWINV_SHARED(store, pool);
+    yuzu::MetricsRegistry metrics;
+
+    const std::string blob =
+        w_hdr() + w_sec(kV3Apps, "full") + w_plus("Alpha", kV3Apps, "", kUpgradeCode) +
+        w_sec(kV3Pkgs, "full") + w_plus("Bad", kV3Pkgs, "", "uninstall.exe /x");
+    agentpb::InventoryReport rep;
+    // content_hashes names which sources came due; without it the report ingests nothing.
+    (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
+    (*rep.mutable_plugin_data())["installed_software"] = blob;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-wa", rep, ack, &metrics);
+
+    // Only the section whose slot 14 is not canonical is asked for again.
+    CHECK(std::set<std::string>(ack.need_full().begin(), ack.need_full().end()) ==
+          std::set<std::string>{"installed_software:pkg_inventory.packages"});
+    CHECK(ack.need_full_size() == 1);
+    CHECK(names_of(pool, "agent-wa", kV3Apps) == std::vector<std::string>{"Alpha"});
+    CHECK(names_of(pool, "agent-wa", kV3Pkgs).empty());
+    CHECK(attributes_of(pool, "agent-wa", "Alpha") == kUpgradeCode);
+    // The stored section hash is the hash of the row w_plus describes, attributes included.
+    CHECK(facet_status(pool, "agent-wa", kV3Apps) ==
+          "full/" + section_hash_of({with_attributes(v3_entry("Alpha", kV3Apps), kUpgradeCode)}));
+    CHECK(metrics
+              .counter("yuzu_inventory_section_ingest_total",
+                       {{"facet", kV3Pkgs}, {"outcome", "rejected"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("ingest_inventory_report v3: a full component_inventory section with no records is "
