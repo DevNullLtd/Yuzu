@@ -3,8 +3,8 @@
  * WinRegFs (middleware_win_parsers.hpp), the registry Fs behind run_reg_leg. It runs on EVERY OS,
  * unguarded, over a FakeOps: nothing here opens a registry key.
  *
- * SYNTHETIC. No Windows capture exists yet: the value names `FilePath` and `VRMF` come from the
- * vendor's documentation, not a capture, so
+ * SYNTHETIC cases. The value names `FilePath` and `VRMF` were confirmed on one real IBM MQ 9.4.5.0
+ * install (docs/samples/windows.txt), but
  * every installation below is an inline, labelled-synthetic one.
  *
  * MUTATION NOTES (each assertion fails if the named wiring is removed):

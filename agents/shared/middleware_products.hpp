@@ -119,9 +119,9 @@ inline constexpr std::array<Probe, 3> kIbmMqLinuxProbes{{
 
 /// IBM MQ on Windows: every subkey of `Installation` is one installation, named by the subkey; its
 /// `FilePath` value is the install path and its `VRMF` value the version, read in both registry views.
-/// The key and the two value names come from IBM's documentation, NOT from a capture of a real
-/// install, so the leg is CONSTRAINED and the runner keeps a wrong spelling loud on a host that has
-/// the product: no subkey with a usable FilePath is `installation_key:malformed`, and no row built
+/// The key and both value names were confirmed on one real IBM MQ 9.4.5.0 install (see
+/// docs/samples/windows.txt), so the leg is SUPPORTED; the runner still keeps a version that spells
+/// them differently loud on a host that has the product: no subkey with a usable FilePath is `installation_key:malformed`, and no row built
 /// with a VRMF value is `vrmf:malformed` (the rows are kept, version `-`). A FilePath the host
 /// refuses to read is `installation_key:permission_denied`, one that failed to read in any other
 /// way `installation_key:unreadable`. A key that is present and holds no subkey is `supported`
@@ -143,10 +143,10 @@ inline constexpr std::array<Product, 1> kProducts{{
                "/etc/opt/mqm/mqinst.ini Installation: stanzas; version from the swidtag file name "
                "under each installation's FilePath; no dspmqver",
                nullptr, kIbmMqLinuxProbes},
-     .windows = {YUZU_SUPPORT_CONSTRAINED,
+     .windows = {YUZU_SUPPORT_SUPPORTED,
                  "HKLM\\SOFTWARE\\IBM\\WebSphere MQ\\Installation\\<name> FilePath/VRMF in both "
                  "registry views",
-                 "not yet verified against a real capture", kIbmMqWindowsProbes}},
+                 nullptr, kIbmMqWindowsProbes}},
 }};
 
 [[nodiscard]] constexpr const Product* find_product(std::string_view id) noexcept {

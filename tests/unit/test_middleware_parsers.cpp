@@ -10,8 +10,8 @@
  * mqinst.ini is the REAL byte-exact file of that registered install (one stanza, 64 trailing spaces
  * in Description, no Primary key; provenance.txt has the sha256 and cites IBM's documentation).
  * The only synthetic input is kTwoInstallationsInline below, a clearly labelled inline string, and
- * every registry case: no Windows capture exists yet, so
- * FakeRegFs scripts SYNTHETIC installations.
+ * every registry case: FakeRegFs scripts SYNTHETIC installations
+ * (the cases are synthetic; the key and value names in them are the ones captured on a real 9.4.5.0 install).
  * Fixtures are read via YUZU_TEST_FIXTURE_DIR and REQUIREd to exist -- a missing fixture fails,
  * never skips.
  *
@@ -274,7 +274,7 @@ struct FakeFs {
 };
 static_assert(mw::MiddlewareFs<FakeFs>);
 
-// -- FakeRegFs (SYNTHETIC: no Windows capture exists) ------------------------------------------------
+// -- FakeRegFs (SYNTHETIC cases; the names are the captured ones) ------------------------------------------------
 
 constexpr const char* kRegKey = "SOFTWARE\\IBM\\WebSphere MQ\\Installation";
 
@@ -599,10 +599,9 @@ TEST_CASE("middleware products: the table is well-formed and find_product reads 
     CHECK(std::string_view{p->kind} == "app");
     CHECK(p->linux.support == YUZU_SUPPORT_SUPPORTED);
     CHECK(p->linux.probes.size() == 3);
-    CHECK(p->windows.support == YUZU_SUPPORT_CONSTRAINED); // value names unverified against a capture
+    CHECK(p->windows.support == YUZU_SUPPORT_SUPPORTED); // names confirmed on a real 9.4.5.0 install
     CHECK(p->windows.probes.size() == 2);
-    REQUIRE(p->windows.note != nullptr);
-    CHECK(std::string_view{p->windows.note} == "not yet verified against a real capture");
+    CHECK(p->windows.note == nullptr);
     CHECK(mw::find_product("nope") == nullptr);
     CHECK(mw::find_product("") == nullptr);
 

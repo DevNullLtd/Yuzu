@@ -425,14 +425,14 @@ TEST_CASE("middleware plugin: the actions and the ABI4 descriptors are generated
     }
 }
 
-TEST_CASE("middleware plugin: ibm_mq is linux supported, windows constrained and macos planned",
+TEST_CASE("middleware plugin: ibm_mq is linux supported, windows supported and macos planned",
           "[middleware][descriptors]") {
-    // The table, not only the plugin, says so: the Windows value names are unverified against a
-    // capture, so the leg stays CONSTRAINED until one confirms them.
+    // The table, not only the plugin, says so: the Windows value names were confirmed on a real
+    // 9.4.5.0 capture, so the leg is SUPPORTED.
     const mw::Product* p = mw::find_product("ibm_mq");
     REQUIRE(p != nullptr);
     CHECK(p->linux.support == YUZU_SUPPORT_SUPPORTED);
-    CHECK(p->windows.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(p->windows.support == YUZU_SUPPORT_SUPPORTED);
 
     auto plugin = load_middleware_plugin();
     if (!plugin) {
@@ -445,7 +445,7 @@ TEST_CASE("middleware plugin: ibm_mq is linux supported, windows constrained and
         const YuzuActionDescriptor& a = d.action_descriptors[i];
         if (std::string_view{a.action} != "ibm_mq") continue;
         CHECK(a.linux_leg.support == YUZU_SUPPORT_SUPPORTED);
-        CHECK(a.windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(a.windows_leg.support == YUZU_SUPPORT_SUPPORTED);
         CHECK(a.macos_leg.support == YUZU_SUPPORT_PLANNED);
     }
 }

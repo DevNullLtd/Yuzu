@@ -12,8 +12,8 @@
  * ZERO SUBPROCESS. Every fact is an installer-metadata read (rung 1): a file name or content on
  * Linux, a registry value under HKLM on Windows; no product binary (`dspmqver`, `dspmqinst`) is ever started.
  *
- * SHIPPED LEGS. Linux and Windows (the Windows leg is declared CONSTRAINED in the table until its
- * registry value names are confirmed against a real capture). The macOS leg is declared PLANNED
+ * SHIPPED LEGS. Linux and Windows (the Windows leg is declared SUPPORTED: its registry value names were
+ * confirmed on one real IBM MQ 9.4.5.0 install). The macOS leg is declared PLANNED
  * through one shared constant and reports `status|<action>|unsupported|macos:planned`.
  *
  * This TU is portable except for its single dispatch #if, which selects the one host leg to call --
