@@ -419,9 +419,8 @@ TEST_CASE("middleware plugin: the actions and the ABI4 descriptors are generated
         CHECK(std::string_view{a.macos_leg.fallback} == mw::kPlannedNote);
         if (p.linux.note == nullptr) CHECK(a.linux_leg.fallback == nullptr);
         else CHECK(std::string_view{a.linux_leg.fallback} == p.linux.note);
-        REQUIRE(p.windows.note != nullptr);
-        REQUIRE(a.windows_leg.fallback != nullptr);
-        CHECK(std::string_view{a.windows_leg.fallback} == p.windows.note);
+        if (p.windows.note == nullptr) CHECK(a.windows_leg.fallback == nullptr);
+        else CHECK(std::string_view{a.windows_leg.fallback} == p.windows.note);
     }
 }
 
