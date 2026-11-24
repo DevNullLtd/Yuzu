@@ -167,12 +167,12 @@ TEST_CASE("component_inventory plugin: exactly four actions, `scan`, `native`, `
         CHECK(d.macos_leg.support == YUZU_SUPPORT_SUPPORTED);
         CHECK(d.macos_leg.rung == 1);
         if (i < 2) {
-            // scan and native: Windows is CONSTRAINED until a real capture from a Windows host is
-            // committed, and says so.
-            CHECK(d.windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+            // scan and native: Windows is SUPPORTED on the measured scope (one elevated host with a
+            // refused directory, which answered constrained), and says so.
+            CHECK(d.windows_leg.support == YUZU_SUPPORT_SUPPORTED);
             CHECK(d.windows_leg.rung == 1);
             REQUIRE(d.windows_leg.fallback != nullptr);
-            CHECK(std::string_view{d.windows_leg.fallback}.contains("not yet verified against a real capture"));
+            CHECK(std::string_view{d.windows_leg.fallback}.contains("measured on one host"));
         } else {
             // python and node: no Windows leg yet (#8440).
             CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);

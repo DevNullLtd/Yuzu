@@ -1620,8 +1620,9 @@ the 2026-11-21 update below.)
 **What shipped.** Both actions now run on Windows; neither answers `windows:planned` any more. The leg
 is a Windows binding of the existing filesystem seam and nothing else: the walk, the limits, the
 archive reads and the answer assembly are the portable code the Linux and macOS legs already use. It
-is declared `constrained`, not `supported`, until a real capture from a Windows host is committed; the
-descriptor says so.
+is declared `supported` on the measured scope (one host, Windows 11 build 26200, an elevated
+administrator session, `docs/samples/windows.txt`) and answers `constrained` when a directory is refused
+or a bound is reached; the descriptor says so.
 
 **Roots (Decision 1).** The 64-bit and 32-bit Program Files directories, named by the shell's
 known-folder lookup and never by an environment variable, on fixed local drives only. A root on a UNC

@@ -7,8 +7,8 @@
 ## ---- scan ----
 ##
 ## SHIPPED LEGS: Linux, macOS and Windows, machine-wide roots only (the root list holds no per-user
-## location). The Windows leg is declared constrained: it has not yet been verified against a real
-## capture from a Windows host.
+## location). The Windows leg is declared supported on the measured scope (one host, Windows 11 build 26200,
+## elevated administrator session) and may answer constrained when a directory is refused or a bound is reached.
 ##   Linux:   /opt, /usr/share/java, /usr/lib/jvm, /usr/local/lib, /usr/local/share and
 ##            /usr/share/maven.
 ##   macOS:   /Applications, /Library/Java, /usr/local and /opt/homebrew.
@@ -66,8 +66,8 @@ metadata:
     found under the machine-wide application roots: one row per archive and per nested library
     (name, version and where the version came from, path, size, modification time and the
     application folder it sits under). Linux, macOS and Windows (Program Files and Program Files
-    (x86) on fixed drives, WindowsApps not entered; the Windows leg has not yet been verified
-    against a real capture); per-user locations are not read. No process is started, no reparse
+    (x86) on fixed drives, WindowsApps not entered; the Windows leg was measured on one host,
+    Windows 11 build 26200, in an elevated administrator session); per-user locations are not read. No process is started, no reparse
     point is followed on Windows and no nested archive is unpacked. A
     `supported` status means the scan finished and read everything it opened in full, naming in a
     token any link, network mount or package tree it passed over; a `constrained` status means a bound was hit
@@ -175,7 +175,8 @@ status:
 ## and action=native (an action-level row; component_inventory.scan is unaffected).
 ##
 ## SHIPPED LEGS: Linux, macOS and Windows, machine-wide roots only. The Windows leg is declared
-## constrained: it has not yet been verified against a real capture from a Windows host.
+## supported on the measured scope (one host, Windows 11 build 26200, elevated administrator session)
+## and may answer constrained when a directory is refused or the row cap is reached.
 ##   Linux:   /opt and /usr/local/lib. The package manager's own trees (/usr/lib and the other
 ##            system library directories) are not walked at all.
 ##   macOS:   /Applications, /usr/local and /opt/homebrew. The Homebrew package trees
@@ -235,8 +236,8 @@ metadata:
     macOS reads /Applications, /usr/local and /opt/homebrew and does not enter the Homebrew Cellar
     trees, naming that in the package_tree_skipped token; Windows reads Program Files and Program
     Files (x86) on fixed drives, takes the version from the file's fixed file version, does not
-    enter WindowsApps (also named in package_tree_skipped) and has not yet been verified against a
-    real capture. Extension-less macOS framework binaries are not read; per-user locations are not
+    enter WindowsApps (also named in package_tree_skipped) and was measured on one host, Windows 11
+    build 26200, in an elevated administrator session. Extension-less macOS framework binaries are not read; per-user locations are not
     read. No process is started and no reparse point is followed.
     A `supported` status means the scan finished with no bound reached; a `constrained` status
     means a bound was hit or something could not be read in full, so the list may be incomplete,

@@ -34,8 +34,9 @@
  *
  * SHIPPED LEGS. Linux and macOS (machine roots only), and Windows for `scan` and `native` (the two Program
  * Files trees on fixed drives, through a filesystem binding that follows no reparse point;
- * component_fs_win.cpp). The Windows leg is declared CONSTRAINED, not supported, until a real capture from a
- * Windows host is committed; the Windows leg of `python` and `node` is a later change and answers through the
+ * component_fs_win.cpp). The Windows leg is declared SUPPORTED on the measured scope (one
+ * host, Windows 11 build 26200, elevated administrator session; docs/samples/windows.txt) and answers
+ * constrained when a directory is refused or a bound is reached; the Windows leg of `python` and `node` is a later change and answers through the
  * shared planned-leg reporter. All three descriptor legs are declared unconditionally so
  * the capability-matrix generator sees a complete, stable shape.
  *
@@ -106,13 +107,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "Java archives only; machine roots only (per-user installs are not read); any budget, "
          "unreadable directory or unenumerable archive answers constrained"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 1,
+        {YUZU_SUPPORT_SUPPORTED, 1,
          "bounded read-only walk of the Program Files and Program Files (x86) directories (the shell's "
          "known-folder paths, fixed drives only); every directory and file opened relative to its volume "
          "root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); "
          "archive central directory, pom.properties and MANIFEST.MF read in-process; WindowsApps under "
          "each root excluded and counted",
-         "not yet verified against a real capture; Java archives only; machine roots only (per-user "
+         "measured on one host (Windows 11 build 26200, elevated administrator session), where a "
+         "system directory whose access list excludes Administrators was refused and the action "
+         "answered constrained (dir_unreadable); Java archives only; machine roots only (per-user "
          "installs are not read); a reparse point is counted and never read; any budget, unreadable "
          "directory or unenumerable archive answers constrained"},
     },
@@ -137,14 +140,16 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "are not read; machine roots only; the server refuses it until an operator switches it on; "
          "any budget, unreadable directory or changed file answers constrained"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 1,
+        {YUZU_SUPPORT_SUPPORTED, 1,
          "bounded read-only walk of the Program Files and Program Files (x86) directories for .dll files, "
          "at most 5,000 rows; every directory and file opened relative to its volume root with no reparse "
          "point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); the PE fixed file "
          "version read in-process within fixed bounds; WindowsApps under each root excluded and counted",
-         "not yet verified against a real capture; libraries inside applications only; machine roots only; "
-         "the server refuses it until an operator switches it on; a reparse point is counted and never "
-         "read; any budget, unreadable directory or changed file answers constrained"},
+         "measured on one host (Windows 11 build 26200, elevated administrator session), where a "
+         "system directory whose access list excludes Administrators was refused and the 5,000-row cap "
+         "was reached, so the action answered constrained; libraries inside applications only; machine "
+         "roots only; the server refuses it until an operator switches it on; a reparse point is counted "
+         "and never read; any budget, unreadable directory or changed file answers constrained"},
     },
     {
         /* .action      = */ "python",

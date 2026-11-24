@@ -517,8 +517,8 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   `Program Files` directory, then `Program Files (x86)`, named by the shell's known-folder lookup
   (never an environment variable), on fixed local drives only; the `WindowsApps` directory directly
   under each is not entered, and no reparse point (a junction, a symbolic link, a mount point) is ever
-  followed. The Windows leg is declared `constrained` in the capability matrix: it has not yet been
-  verified against a real capture from a Windows host. The root list holds no per-user location, so
+  followed. The Windows leg is declared `supported` in the capability matrix on the measured scope: one
+  host, Windows 11 build 26200, an elevated administrator session; it answers `constrained` when a directory is refused or a bound is reached. The root list holds no per-user location, so
   an archive under a home directory is not looked for (a property of the list: an archive found under
   a root is read wherever it sits). Python distributions and Node packages are listed by the
   `python` and `node` actions, described below; neither has a Windows leg yet and each answers one
@@ -604,7 +604,7 @@ no process is started.
   an operator's own setting.
 - **Where.** Linux: `/opt` and `/usr/local/lib`. macOS: `/Applications`, `/usr/local` and
   `/opt/homebrew`. Windows: `Program Files` and `Program Files (x86)` on fixed local drives, the same
-  roots as `scan` (declared `constrained` until a real capture from a Windows host is committed). The
+  roots as `scan` (declared `supported` on the measured scope, one host, Windows 11 build 26200, an elevated administrator session; it answers `constrained` at the 5,000-row cap or when a directory is refused). The
   package manager's own trees are not read: on Linux `/usr/lib` and the other system library
   directories are not roots, on macOS the Homebrew Cellar trees (`/usr/local/Cellar`,
   `/opt/homebrew/Cellar`) are not entered, and on Windows `WindowsApps` under each root is not
