@@ -447,6 +447,67 @@ TEST_CASE("file_search state: a blocked volume query is recorded once per volume
     CHECK_FALSE(q.blocked("E:"));
 }
 
+TEST_CASE("file_search state: a volume query that timed out is not asked again until its work returns",
+          "[file_search][file_search_driver][state]") {
+    // The rule the Windows volume reader makes of every query, over a fake runner: no thread, no clock.
+    enum class Run { hold, run_then_time_out, complete, reject };
+    Run mode = Run::hold;
+    int runner_calls = 0;
+    std::function<int()> held; // the work the runner kept when it timed out
+    const BoundedRunner<int> runner = [&](std::chrono::milliseconds, std::function<int()> work) -> RunOutcome<int> {
+        ++runner_calls;
+        switch (mode) {
+        case Run::hold:
+            held = std::move(work);
+            return {RunStatus::timed_out, std::nullopt};
+        case Run::run_then_time_out: // the thrown-query path: the work ran and the status is still timed_out
+            (void)work();
+            return {RunStatus::timed_out, std::nullopt};
+        case Run::complete:
+            return {RunStatus::completed, work()};
+        case Run::reject:
+            return {RunStatus::rejected, std::nullopt};
+        }
+        return {RunStatus::rejected, std::nullopt};
+    };
+    BlockedQueries q;
+    const auto ask = [&](const std::string& volume) {
+        return driver_detail::bounded_blockable_query<int>(q, volume, std::chrono::seconds{5}, runner, [] { return 7; });
+    };
+
+    // timed out with the work held: no answer, and the next ask for that spelling never reaches the runner
+    CHECK_FALSE(ask("C:").has_value());
+    CHECK(runner_calls == 1);
+    CHECK(q.blocked("C:"));
+    mode = Run::complete;
+    CHECK_FALSE(ask("C:").has_value());
+    CHECK(runner_calls == 1);
+
+    // another spelling is unaffected, and a completed run answers its value and records nothing
+    CHECK(ask("Volume{x}") == 7);
+    CHECK(runner_calls == 2);
+    CHECK_FALSE(q.blocked("Volume{x}"));
+
+    // the held work finally runs: its done flag sets, and the spelling is asked again
+    REQUIRE(held);
+    CHECK(held() == 7);
+    CHECK_FALSE(q.blocked("C:"));
+    CHECK(ask("C:") == 7);
+    CHECK(runner_calls == 3);
+
+    // a runner that ran the work and still says timed_out leaves nothing blocked; neither does a refusal
+    mode = Run::run_then_time_out;
+    CHECK_FALSE(ask("D:").has_value());
+    CHECK_FALSE(q.blocked("D:"));
+    mode = Run::reject;
+    CHECK_FALSE(ask("E:").has_value());
+    CHECK_FALSE(q.blocked("E:"));
+    mode = Run::complete;
+    CHECK(ask("D:") == 7);
+    CHECK(ask("E:") == 7);
+    CHECK(runner_calls == 7);
+}
+
 TEST_CASE("file_search state: abandoned workers and stall counts are bounded and in memory only",
           "[file_search][file_search_driver][state]") {
     SearchState s;

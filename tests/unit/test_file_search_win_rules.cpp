@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -299,6 +300,23 @@ TEST_CASE("handle_decision: the entry is judged again from its opened handle", "
     CHECK_FALSE(handle_decision(0x410, kTagSymlink).has_value());
     CHECK_FALSE(handle_decision(0x10, 0).has_value());               // became a directory
     CHECK_FALSE(handle_decision(0x420, 0x80000099).has_value());     // an unknown tag
+}
+
+TEST_CASE("opened_facts: an unknown write time stays unknown and is never defaulted to the epoch",
+          "[file_search][win_rules]") {
+    struct Opened { // what the shell's open result carries: a size and a time that may be unknown
+        std::uint64_t size;
+        std::optional<std::int64_t> mtime;
+    };
+    const auto unknown = opened_facts(Opened{3, std::nullopt});
+    CHECK(unknown.opened);
+    CHECK(unknown.size == 3);
+    CHECK_FALSE(unknown.mtime.has_value()); // the row prints `-`
+    const auto epoch = opened_facts(Opened{3, 0});
+    CHECK(epoch.opened);
+    REQUIRE(epoch.mtime.has_value()); // 0 is a real time and prints `0`
+    CHECK(*epoch.mtime == 0);
+    CHECK(*opened_facts(Opened{0, 1700000000}).mtime == 1700000000);
 }
 
 TEST_CASE("external_backing_of reads the answer of FSCTL_GET_EXTERNAL_BACKING", "[file_search][win_rules]") {

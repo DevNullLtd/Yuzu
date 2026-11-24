@@ -209,6 +209,31 @@ TEST_CASE("file_search windows shell: a listing names its entries and types, has
     CHECK(sub.dev == top.dev);
 }
 
+TEST_CASE("file_search windows shell: a name that cannot round-trip UTF-8 lists as a name_too_long gap, beside an ordinary one",
+          "[file_search][file_search_win_shell]") {
+    Fixture fx{"yuzu_test_fs_win_badname_"};
+    write_file(fx.root / "ordinary.txt", "x");
+    // A lone high surrogate cannot round-trip through UTF-8, and NTFS does not validate UTF-16, so a file with
+    // this name is creatable without admin. Composed as a std::filesystem::path (its native form on Windows
+    // is std::wstring) so the code unit survives untouched, as test_confined_fs_win.cpp builds it.
+    const std::wstring bad_name = L"x" + std::wstring(1, static_cast<wchar_t>(0xD800));
+    const RawFile bad(fx.root / fs::path(bad_name));
+    if (!bad.h.ok())
+        SKIP("a lone-surrogate file name cannot be created on this volume");
+    const Unit u = unit_for(fx.root);
+    UnitLeg leg = os_make_leg(u);
+    const ci::ListResult top = leg.ops.list(label_of(fx.root), 100);
+    REQUIRE_FALSE(top.error);
+    REQUIRE(top.entries.size() == 2);
+    const ci::DirEntry* ordinary = entry_named(top, "ordinary.txt");
+    REQUIRE(ordinary != nullptr);
+    CHECK_FALSE(ordinary->gap.has_value());
+    const auto lossy = std::ranges::find_if(top.entries, [](const ci::DirEntry& e) { return e.gap.has_value(); });
+    REQUIRE(lossy != top.entries.end());
+    CHECK(*lossy->gap == fsr::GapCause::name_too_long); // never searched: its lossy name may equal a real sibling
+    CHECK(lossy->type == ci::DirEntry::Type::file);
+}
+
 TEST_CASE("file_search windows shell: a junction lists as a link and is never entered, and a root through it is a link",
           "[file_search][file_search_win_shell]") {
     Fixture fx{"yuzu_test_fs_win_junc_"};

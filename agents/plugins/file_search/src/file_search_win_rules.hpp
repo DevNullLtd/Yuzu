@@ -431,6 +431,15 @@ struct ExtentsDecision {
     return extents_decision(attributes, now.family);
 }
 
+/// The facts of a file opened for its attributes: the size and the write time the open read. A time the
+/// filesystem keeps no valid value for stays UNKNOWN (absent: the row prints `-`) and is never defaulted: 0
+/// is a real time (the epoch) and prints `0`. A template only because this header names no OS type: `Opened`
+/// is the shell's confined_fs::OpenFileResult, or anything with a `size` and a `mtime`.
+template <typename Opened>
+[[nodiscard]] constexpr ci::MatchFacts opened_facts(const Opened& o) {
+    return {true, o.size, o.mtime};
+}
+
 /// The reading of FSCTL_GET_EXTERNAL_BACKING's answer, asked on every file whose decision says `ioctl`,
 /// BEFORE retrieval pointers (a CompactOS/WOF file lists as a plain file and its retrieval pointers read as
 /// one hole, so backing is ruled out before any extent is trusted). 0: backed. ERROR_OBJECT_NOT_EXTERNALLY_BACKED

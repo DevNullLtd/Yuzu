@@ -112,11 +112,14 @@ void os_in_worker_environment(const std::function<void()>& body) {
     const yuzu::win::ThreadErrorModeGuard errors(SEM_FAILCRITICALERRORS);
     struct BackgroundMode {
         bool begun;
+        BackgroundMode() : begun(::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) != 0) {}
+        BackgroundMode(const BackgroundMode&) = delete; // a copy would end the mode twice
+        BackgroundMode& operator=(const BackgroundMode&) = delete;
         ~BackgroundMode() {
             if (begun)
                 (void)::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
         }
-    } background{::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) != 0};
+    } background;
     body();
 }
 
@@ -213,29 +216,43 @@ struct VolumeFacts {
 /// sets only its own done flag.
 BlockedQueries g_blocked_queries;
 
+/// The module's bounded call as the driver's runner: the same three outcomes, spelled in the driver's terms.
+[[nodiscard]] RunOutcome<VolumeFacts> run_bounded_volume_query(std::chrono::milliseconds timeout,
+                                                               std::function<VolumeFacts()> work) {
+    auto ran = yuzu::shared::bounded_call_ex(timeout, std::move(work));
+    RunOutcome<VolumeFacts> out;
+    switch (ran.status) {
+    case yuzu::shared::BoundedCallStatus::Completed:
+        out.status = RunStatus::completed;
+        out.value = std::move(ran.value);
+        break;
+    case yuzu::shared::BoundedCallStatus::TimedOut:
+        out.status = RunStatus::timed_out;
+        break;
+    case yuzu::shared::BoundedCallStatus::Rejected:
+        out.status = RunStatus::rejected;
+        break;
+    }
+    return out;
+}
+
 } // namespace
 
 /// The ONE mount entry of a Windows search: the volume that holds the root. The query runs inside a bounded
 /// call (a dead network or optical drive must not hold the pool thread); a timeout or a refused worker reads
 /// as an unreadable table. A query that timed out is not asked again until it returns: each retry would
 /// leave one more thread, and one more of the module's bounded-call slots, behind. Another volume is
-/// unaffected.
+/// unaffected. The rule is driver_detail::bounded_blockable_query, pinned by a portable test.
 std::optional<yuzu::shared::MountTable> os_read_mounts(const std::string& root) {
     const auto label = wr::split_label(root);
     if (!label)
         return std::nullopt;
-    if (g_blocked_queries.blocked(label->volume))
+    const auto ran = driver_detail::bounded_blockable_query<VolumeFacts>(
+        g_blocked_queries, label->volume, std::chrono::seconds{5}, &run_bounded_volume_query,
+        [volume = label->volume] { return query_volume(volume); });
+    if (!ran)
         return std::nullopt;
-    const DoneFlag done = make_done_flag();
-    auto ran = yuzu::shared::bounded_call_ex(std::chrono::seconds{5}, [volume = label->volume, done]() -> VolumeFacts {
-        const driver_detail::DoneOnExit finished{done};
-        return query_volume(volume);
-    });
-    if (ran.status == yuzu::shared::BoundedCallStatus::TimedOut)
-        g_blocked_queries.add(label->volume, done);
-    if (ran.status != yuzu::shared::BoundedCallStatus::Completed || !ran.value)
-        return std::nullopt;
-    const VolumeFacts& v = *ran.value;
+    const VolumeFacts& v = *ran;
     yuzu::shared::MountEntry e;
     e.mount_point = "/" + label->volume;
     e.root = v.has_guid ? v.guid_path : "-";
@@ -373,9 +390,7 @@ public:
         const auto now = wr::handle_decision(opened.attributes, opened.reparse_tag);
         if (!now || !now->open)
             return f;
-        f.facts.opened = true;
-        f.facts.size = opened.size;
-        f.facts.mtime = opened.mtime; // nullopt when the filesystem keeps no valid time: the row prints `-`
+        f.facts = wr::opened_facts(opened);
         if (!now->ioctl) {
             f.extents.state = ExtentsState::unsupported;
             f.extents.note = now->note;

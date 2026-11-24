@@ -177,6 +177,31 @@ struct DoneOnExit {
     }
 };
 
+/// The ONE rule of a query that can block in the system (the Windows volume reader), over an injected bounded
+/// runner so a portable test drives it. While a query for `volume` (the spelling the caller asked under) is
+/// recorded as blocked in `blocked`, nothing is asked and the answer is nullopt: each retry would leave one
+/// more thread behind. Otherwise `query` runs through `run` wrapped so its done flag is set when it returns,
+/// even by exception; a timeout records that flag (a flag already set records nothing: the query finished,
+/// or threw, before the record), and only a completed run yields the value.
+template <typename Result>
+[[nodiscard]] std::optional<Result> bounded_blockable_query(BlockedQueries& blocked, const std::string& volume,
+                                                            std::chrono::milliseconds timeout,
+                                                            const BoundedRunner<Result>& run,
+                                                            std::function<Result()> query) {
+    if (blocked.blocked(volume))
+        return std::nullopt;
+    const DoneFlag done = make_done_flag();
+    RunOutcome<Result> ran = run(timeout, [done, query = std::move(query)]() -> Result {
+        const DoneOnExit finished{done};
+        return query();
+    });
+    if (ran.status == RunStatus::timed_out)
+        blocked.add(volume, done);
+    if (ran.status != RunStatus::completed)
+        return std::nullopt;
+    return std::move(ran.value);
+}
+
 struct DirTally {
     std::size_t matches{0};
     bool capped{false};
