@@ -2107,8 +2107,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `GATE_PARITY_NO_GATE_MAX` (16) do not move.
      - **Legacy-branch tool, Read pair, literal gates.** The tool is a branch of
        `mcp_server.cpp`, not a registry tool. It declares `GuaranteedState:Read`,
-       the route's first gate, with service-scope class `confined`, annotated
-       read-only and idempotent. The handler adds what the declaration cannot:
+       the route's first gate, with service-scope class `confined`. Its
+       served annotations are overridden through a closed table
+       (`kDispatchProbeTools`): `readOnlyHint:false`, `idempotentHint:false`,
+       `destructiveHint:false`, `openWorldHint:false`, because the call
+       dispatches a command to the device and stores the result (owner ruling,
+       2026-11-24; the earlier "read-only and idempotent" labels are withdrawn).
+       The handler adds what the declaration cannot:
        `tier_allows(Execution, Execute)`, the approval rule (a supervised token
        is refused, as REST refuses it), and the `--mcp-read-only` refusal. The
        REST route's local gate lambda is deleted: both surfaces now carry

@@ -2552,6 +2552,14 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
     for (const auto& r : mcp::tool_security_rows_for_test())
         op[std::string(r.name)] = std::string(r.operation);
 
+    // The closed set of Read-class dispatch probes (a Read securable operation, but the call
+    // dispatches a command to a device and stores the result): the ONLY tools allowed to
+    // disagree with "readOnlyHint is the Read operation". Pinned by exact content below.
+    std::set<std::string> probes;
+    for (const auto sv : mcp::dispatch_probe_tool_names_for_test())
+        probes.insert(std::string(sv));
+    CHECK(probes == std::set<std::string>{"get_device_live"});
+
     std::set<std::string> listed;
     for (const auto& t : tools) {
         const auto name = t["name"].get<std::string>();
@@ -2588,8 +2596,18 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         CHECK(open_world == (name == "register_revocation_source" ||
                              name == "update_revocation_source" ||
                              name == "create_offload_target"));
-        // readOnlyHint is mechanically the Read operation.
-        CHECK(read_only == (operation == "Read"));
+        // readOnlyHint is mechanically the Read operation, EXCEPT for the closed dispatch-probe
+        // set: a Read-class tool whose call dispatches to a device and stores the result is NOT
+        // read-only and NOT idempotent. Any other tool whose hint disagrees still fails here.
+        const bool probe = probes.count(name) == 1;
+        CHECK(read_only == (operation == "Read" && !probe));
+        if (probe) {
+            CHECK(operation == "Read");
+            CHECK(read_only == false);
+            CHECK(idempotent == false);
+            CHECK(destructive == false);
+            CHECK(open_world == false);
+        }
         // Coherence: a read-only tool is neither destructive, and reads are idempotent.
         if (read_only) {
             CHECK(destructive == false);
@@ -2641,6 +2659,15 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         if (operation != "Read")
             non_read.insert(name);
     CHECK(write_tools == non_read);
+    // A dispatch probe keeps its Read classification (who may call it and the order of its checks
+    // are unchanged): every member is served, is a Read-class tool, and is absent from kWriteTools.
+    for (const auto& p : probes) {
+        INFO("dispatch probe = " << p);
+        CHECK(listed.count(p) == 1);
+        REQUIRE(op.count(p) == 1);
+        CHECK(op[p] == "Read");
+        CHECK(write_tools.count(p) == 0);
+    }
 
     auto ann = [&](const std::string& n) -> nlohmann::json {
         for (const auto& t : tools)
@@ -11955,10 +11982,15 @@ TEST_CASE("MCP get_device_live: the served schemas pin the kind enum to the REST
     CHECK(out["properties"]["processes"]["maxItems"] == 1000);
     CHECK(out["properties"]["truncated"]["type"] == "boolean");
     CHECK(out["required"] == nlohmann::json::array({"agent_id", "kind", "count", "truncated"}));
-    // Annotations: read-only, idempotent.
+    // Annotations: honest labels. The call dispatches a command to the device and stores the
+    // result, so it is neither read-only nor idempotent; it only adds rows (not destructive); the
+    // target is a managed device (not open-world, like execute_instruction).
     const auto& ann = (*tool)["annotations"];
-    CHECK(ann["readOnlyHint"] == true);
-    CHECK(ann["idempotentHint"] == true);
+    REQUIRE(ann.is_object());
+    CHECK(ann["readOnlyHint"] == false);
+    CHECK(ann["idempotentHint"] == false);
+    CHECK(ann["destructiveHint"] == false);
+    CHECK(ann["openWorldHint"] == false);
 }
 
 TEST_CASE("MCP get_device_live: a supervised token is refused (no approval ticket for a live probe) "

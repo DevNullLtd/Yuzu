@@ -6859,6 +6859,23 @@ void validate_tool_security_registration(
 // every change (governance).
 // ToolEffect lives in mcp_tool_registry.hpp (a registry ToolRecord carries it).
 
+// The CLOSED set of dispatch probes: tools whose securable operation is Read but whose call
+// dispatches a command to a device and stores the result. RULE: a tool whose securable operation
+// is Read but whose call dispatches a command to a device and stores the result is NOT read-only
+// and NOT idempotent, so its served hints are readOnlyHint=false, idempotentHint=false,
+// destructiveHint=false (it adds audit rows and stored response rows and replaces nothing).
+// This is the ONLY sanctioned exception to "readOnlyHint is mechanically the Read operation" in
+// the cross-check test (test_mcp_server.cpp). The tool stays in the Read class for everything
+// else (its security row, its absence from kWriteToolsRaw, who may call it, and the order of its
+// checks are unchanged: the handler itself refuses the readonly and supervised tiers and
+// --mcp-read-only). The test pins this set by exact content, and requires every member to be a
+// Read-class tool absent from kWriteToolsRaw whose kToolAnnotation entry is Additive and not
+// idempotent; any other tool whose hints disagree with its operation still fails that test.
+// Adding a name is a security decision (it labels a Read-class tool as acting on a device).
+static constexpr std::string_view kDispatchProbeTools[] = {
+    "get_device_live",
+};
+
 struct ToolAnnotation {
     ToolEffect effect;
     bool idempotent;
@@ -7044,7 +7061,13 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_dex_signal_detail", {ToolEffect::ReadOnly, true, "Get DEX signal detail"}},
     {"get_dex_device_score", {ToolEffect::ReadOnly, true, "Get per-device DEX score"}},
     {"get_dex_device_app_perf", {ToolEffect::ReadOnly, true, "Get per-device DEX app performance"}},
-    {"get_device_live", {ToolEffect::ReadOnly, true, "Read one device's live uptime or processes"}},
+    // get_device_live: a member of kDispatchProbeTools above. Its security row is the Read pair
+    // GuaranteedState:Read, yet the call dispatches a command to the device and stores the result,
+    // so the served labels are overridden: Additive (readOnlyHint=false, destructiveHint=false)
+    // and NOT idempotent (each call is another device command and another stored result).
+    // openWorldHint stays false like execute_instruction: the target is a managed device, not an
+    // administrator-registered outside host.
+    {"get_device_live", {ToolEffect::Additive, false, "Probe one device's live uptime or processes"}},
     {"get_dex_app", {ToolEffect::ReadOnly, true, "Get DEX app blast radius"}},
     {"list_dex_apps", {ToolEffect::ReadOnly, true, "List DEX app stability"}},
     {"get_dex_catalogue", {ToolEffect::ReadOnly, true, "Get DEX signal catalogue"}},
@@ -35358,6 +35381,10 @@ std::vector<std::string_view> tool_annotation_names_for_test() {
     for (const auto& [name, _ann] : catalogue().annotations)
         names.push_back(name);
     return names;
+}
+
+std::vector<std::string_view> dispatch_probe_tool_names_for_test() {
+    return {std::begin(kDispatchProbeTools), std::end(kDispatchProbeTools)};
 }
 
 std::vector<std::string_view> write_tool_names_for_test() {
