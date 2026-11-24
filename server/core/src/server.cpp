@@ -20570,51 +20570,12 @@ private:
                             const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(
                                 targeted, responded, execution_tracker_ != nullptr, dropped);
 
-                            // Membership: every responder whose (status,
-                            // output) satisfies the pending row's matcher.
-                            // rs_matcher centralises the per-producer rule —
-                            // empty matcher = SUCCESS responders; echo_rows_ge
-                            // = SUCCESS with ≥N rows; column/op/value = a
-                            // matching output row (PR-D, design §3.3).
-                            // #4990: the read excludes the Forensics plugins (see
-                            // result_set_members.hpp); a degraded read skips this set for this
-                            // tick rather than risk a false-empty membership (ADR-0039) - it
-                            // retries on the next 2s tick.
-                            std::vector<std::string> members;
-                            int64_t agents_failed = 0;
-                            if (response_store_) {
-                                auto found =
-                                    result_set_members(*response_store_, forensics_plugins(), p);
-                                if (!found)
-                                    continue;
-                                if (found->truncated) {
-                                    // The read hit its row bound before the stored rows ran
-                                    // out: a membership that is incomplete in a way
-                                    // agents_failed cannot express. Fail the set closed rather
-                                    // than publish it as partial.
-                                    spdlog::warn("result set {} not materialized: more than {} "
-                                                 "response rows for execution {}",
-                                                 p.id, ResultSetStore::kMaxMembersPerSet,
-                                                 p.source_execution_id);
-                                    result_set_store_->mark_failed(
-                                        p.id, "response rows exceed the members read bound");
-                                    metrics_
-                                        .counter("yuzu_result_sets_total",
-                                                 {{"source_kind", p.source_kind},
-                                                  {"result", "materialize_failed"}})
-                                        .increment();
-                                    continue;
-                                }
-                                agents_failed = found->agents_failed;
-                                members = std::move(*found);
-                            }
-                            if (agents_failed > 0)
-                                spdlog::warn("result set {} materialized partial: {} agent(s) "
-                                             "answered execution {} with a failure or a partly "
-                                             "completed answer and never matched",
-                                             p.id, agents_failed, p.source_execution_id);
-                            if (result_set_store_->materialize(p.id, members, agents_failed,
-                                                              agents_unanswered)) {
+                            const auto fill =
+                                fill_pending_result_set(*result_set_store_, response_store_.get(),
+                                                        forensics_plugins(), p, agents_unanswered);
+                            if (fill == ResultSetFill::ReadUnavailable)
+                                continue;
+                            if (fill == ResultSetFill::Materialized) {
                                 metrics_
                                     .counter("yuzu_result_sets_total",
                                              {{"source_kind", p.source_kind},
@@ -20628,9 +20589,7 @@ private:
                                                   {"result", "count_unreadable"}})
                                         .increment();
                             } else {
-                                // Don't count a materialization that didn't happen
-                                // (review finding bug_008); surface the failure so
-                                // SRE can alert on a stuck pending row.
+                                // Counts both a terminal refusal and a failed write that can retry.
                                 metrics_
                                     .counter("yuzu_result_sets_total",
                                              {{"source_kind", p.source_kind},

@@ -1,0 +1,1 @@
+- The result-set store now rejects a fill above 100,000 distinct devices and records the failed set with no members. Asynchronous query producers continue to stop earlier when the response read exceeds 100,000 rows.

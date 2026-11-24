@@ -13,11 +13,14 @@
 /// tracker (which reads no rows) still says every agent answered: a complete-empty set. The async
 /// producers refuse such a source before they dispatch (`plugin_may_seed_result_set`).
 
+#include <spdlog/spdlog.h>
+
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "response_store.hpp"
@@ -115,6 +118,44 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
         if (!seen.contains(id))
             ++members.agents_failed;
     return members;
+}
+
+enum class ResultSetFill { ReadUnavailable, Failed, Materialized };
+
+/// Run the maintenance tick's read and write for one eligible pending execution.
+/// A read-bound refusal describes incomplete evidence, even when every response
+/// seen so far matches the same device. The store independently caps distinct IDs.
+[[nodiscard]] inline ResultSetFill fill_pending_result_set(ResultSetStore& sets,
+                                                           ResponseStore* responses,
+                                                           const ForensicsPluginSet* plugins,
+                                                           const PendingSet& pending,
+                                                           int64_t agents_unanswered) {
+    ResultSetMembers members;
+    if (responses) {
+        auto found = result_set_members(*responses, plugins, pending);
+        if (!found)
+            return ResultSetFill::ReadUnavailable;
+        if (found->truncated) {
+            spdlog::warn(
+                "result set {} not materialized: more than {} response rows for execution {}",
+                pending.id, ResultSetStore::kMaxMembersPerSet, pending.source_execution_id);
+            sets.mark_failed(pending.id, "response rows exceed the members read bound");
+            return ResultSetFill::Failed;
+        }
+        members = std::move(*found);
+    }
+    const auto fill =
+        sets.materialize(pending.id, members, members.agents_failed, agents_unanswered);
+    if (!fill) {
+        if (fill.error() == ResultSetError::TooManyMembers)
+            spdlog::warn("result set {} failed: {}", pending.id, to_string(fill.error()));
+        return ResultSetFill::Failed;
+    }
+    if (members.agents_failed > 0)
+        spdlog::warn("result set {} materialized partial: {} agent(s) answered execution {} "
+                     "with a failure or a partly completed answer and never matched",
+                     pending.id, members.agents_failed, pending.source_execution_id);
+    return ResultSetFill::Materialized;
 }
 
 } // namespace yuzu::server

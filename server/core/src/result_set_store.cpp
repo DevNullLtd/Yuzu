@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -262,13 +263,32 @@ ResultSet read_row(PGresult* res, int i) {
     return r;
 }
 
-std::vector<std::string_view> as_views(const std::vector<std::string>& v) {
-    std::vector<std::string_view> out;
-    out.reserve(v.size());
-    for (const auto& s : v)
-        out.emplace_back(s);
-    return out;
+// Every existing kind, including unknown legacy labels, has the operator cap.
+// A future fleet-sized kind needs its own server-only producer at creation.
+std::size_t member_limit_for(std::string_view /*source_kind*/) {
+    return ResultSetStore::kMaxMembersPerSet;
 }
+
+// The views borrow from members for the duration of the synchronous write.
+std::expected<std::vector<std::string_view>, ResultSetError>
+distinct_members(const std::vector<std::string>& members, std::size_t limit) {
+    std::vector<std::string_view> ids;
+    std::unordered_set<std::string_view> seen;
+    const auto capacity = std::min(limit, members.size());
+    ids.reserve(capacity);
+    seen.reserve(capacity);
+    for (const auto& member : members) {
+        if (member.empty() || !seen.insert(member).second)
+            continue;
+        if (ids.size() == limit)
+            return std::unexpected(ResultSetError::TooManyMembers);
+        ids.push_back(member);
+    }
+    return ids;
+}
+
+// A missing or terminal row needs no update. A materializer already owns the pending row lock.
+bool mark_failed_on(PGconn* conn, const std::string& id, const std::string& reason);
 
 // Shared by pin() (same connection, no extra round trip) and the public
 // count_pinned_for_owner(). Returns -1 on query error so callers can
@@ -312,22 +332,11 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
     if (!open_)
         return std::unexpected(ResultSetError::DbError);
 
-    // Deduplicate members up front: device_count must reflect the rows
-    // actually stored (ON CONFLICT DO NOTHING silently drops duplicates —
-    // review finding L, preserved from the SQLite implementation), and the
-    // per-set cap is a DoS guard that must bound the *distinct* membership,
-    // not the raw request size (review finding C).
-    std::vector<std::string> uniq;
-    uniq.reserve(members.size());
-    {
-        std::unordered_set<std::string> seen;
-        seen.reserve(members.size() * 2);
-        for (const auto& dev : members)
-            if (!dev.empty() && seen.insert(dev).second)
-                uniq.push_back(dev);
-    }
-    if (uniq.size() > static_cast<size_t>(kMaxMembersPerSet))
-        return std::unexpected(ResultSetError::TooManyMembers);
+    // Generic create accepts a caller-supplied source label. Its write budget
+    // is the operator-list budget regardless of that label.
+    auto uniq = distinct_members(members, member_limit_for(source_kind::kManualCurate));
+    if (!uniq)
+        return std::unexpected(uniq.error());
 
     ResultSet row;
     row.id = generate_id();
@@ -343,11 +352,10 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
     row.status = status;
     row.source_execution_id = execution_id;
     row.matcher = req.matcher;
-    row.device_count = static_cast<int64_t>(uniq.size());
+    row.device_count = static_cast<int64_t>(uniq->size());
     row.agents_failed = req.agents_failed;
     row.agents_unanswered = req.agents_unanswered;
 
-    const std::vector<std::string_view> member_views = as_views(uniq);
     bool quota_exceeded = false;
 
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
@@ -394,12 +402,12 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
             return false;
         }
 
-        if (!uniq.empty()) {
+        if (!uniq->empty()) {
             pg::PgResult r2 = pg::exec_params(
                 conn,
                 "INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
                 "SELECT $1, d FROM unnest($2::text[]) AS d ON CONFLICT DO NOTHING",
-                std::vector<std::string>{row.id, pg::to_text_array(member_views)});
+                std::vector<std::string>{row.id, pg::to_text_array(*uniq)});
             if (r2.status() != PGRES_COMMAND_OK && r2.status() != PGRES_TUPLES_OK) {
                 spdlog::error("ResultSetStore::insert_row_impl: member insert failed: {}",
                               PQerrorMessage(conn));
@@ -1048,30 +1056,34 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
     if (!open_)
         return std::unexpected(ResultSetError::DbError);
 
-    // Dedup + drop empties (UP-6): matches insert_row_impl's contract exactly
-    // — device_count must reflect the rows actually stored (ON CONFLICT DO
-    // NOTHING silently drops duplicates), not the raw request size. Before
-    // this fix materialize() skipped this step, so a caller passing
-    // `["a","a"]` over-reported device_count=2 for one stored row.
-    std::vector<std::string> uniq;
-    uniq.reserve(members.size());
-    {
-        std::unordered_set<std::string> seen;
-        seen.reserve(members.size() * 2);
-        for (const auto& dev : members)
-            if (!dev.empty() && seen.insert(dev).second)
-                uniq.push_back(dev);
-    }
-    const std::vector<std::string_view> member_views = as_views(uniq);
-    bool not_found = false;
-
+    std::optional<ResultSetError> refusal;
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        if (!uniq.empty()) {
+        // Read and lock the authoritative pending row before allocating for the
+        // fill. Concurrent fillers cannot select a kind or install stale members.
+        auto pending = pg::exec_params(conn,
+                                       "SELECT source_kind FROM result_set_store.result_sets "
+                                       "WHERE id = $1 AND status = 'pending' FOR NO KEY UPDATE",
+                                       std::vector<std::string>{id});
+        if (pending.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::materialize: could not lock pending row: {}",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        if (PQntuples(pending.get()) == 0) {
+            refusal = ResultSetError::NotFound;
+            return true;
+        }
+        auto uniq = distinct_members(members, member_limit_for(PQgetvalue(pending.get(), 0, 0)));
+        if (!uniq) {
+            refusal = uniq.error();
+            return mark_failed_on(conn, id, to_string(*refusal));
+        }
+        if (!uniq->empty()) {
             pg::PgResult r = pg::exec_params(
                 conn,
                 "INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
                 "SELECT $1, d FROM unnest($2::text[]) AS d ON CONFLICT DO NOTHING",
-                std::vector<std::string>{id, pg::to_text_array(member_views)});
+                std::vector<std::string>{id, pg::to_text_array(*uniq)});
             if (r.status() != PGRES_COMMAND_OK && r.status() != PGRES_TUPLES_OK) {
                 spdlog::error("ResultSetStore::materialize: member insert failed: {}",
                               PQerrorMessage(conn));
@@ -1086,7 +1098,7 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
             "device_count = $1::bigint, agents_failed = agents_failed + $2::bigint, "
             "agents_unanswered = agents_unanswered + $3::bigint "
             "WHERE id = $4 AND status = 'pending' RETURNING id",
-            std::vector<std::string>{std::to_string(static_cast<int64_t>(uniq.size())),
+            std::vector<std::string>{std::to_string(static_cast<int64_t>(uniq->size())),
                                      std::to_string(agents_failed),
                                      std::to_string(agents_unanswered), id});
         if (upd.status() != PGRES_TUPLES_OK) {
@@ -1094,53 +1106,35 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
             return false;
         }
         if (PQntuples(upd.get()) == 0) {
-            not_found = true;
-            return false;
+            return false; // the pending row is locked by this transaction
         }
         return true;
     });
     if (!ok)
-        return std::unexpected(not_found ? ResultSetError::NotFound : ResultSetError::DbError);
+        return std::unexpected(ResultSetError::DbError);
+    if (refusal)
+        return std::unexpected(*refusal);
     return {};
 }
 
-void ResultSetStore::mark_failed(const std::string& id, const std::string& reason) {
-    if (!open_)
-        return;
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease) {
-        spdlog::error("ResultSetStore::mark_failed: no connection ({})", pool_.last_error());
-        return;
-    }
+namespace {
+bool mark_failed_on(PGconn* conn, const std::string& id, const std::string& reason) {
     pg::PgResult sel = pg::exec_params(
-        lease.get(),
+        conn,
         "SELECT source_payload FROM result_set_store.result_sets WHERE id = $1 AND status = "
         "'pending'",
         std::vector<std::string>{id});
     if (sel.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::mark_failed: read failed: {}", PQerrorMessage(lease.get()));
-        return;
+        spdlog::error("ResultSetStore::mark_failed: read failed: {}", PQerrorMessage(conn));
+        return false;
     }
     if (PQntuples(sel.get()) == 0)
-        return; // not pending (or gone) — nothing to mark
+        return true; // not pending (or gone) — nothing to mark
 
     const std::string raw_payload(PQgetvalue(sel.get(), 0, 0));
 
-    // #2437-class guard: this function's whole job is to write an updated
-    // source_payload back, and nlohmann::json::dump() is unboundedly
-    // recursive. This has no HTTP request/response of its own to answer with
-    // a 400 (its one production caller is the maintenance tick in server.cpp,
-    // which fails a pending set closed when the members read passes its row
-    // bound; the rest are unit tests), so a poisoned row reaching here
-    // (written before this guard existed, or via any other path, past or
-    // future) would otherwise SIGSEGV the whole process on the
-    // `payload.dump()` below.
-    // Check the RAW fetched text before it is ever parsed: if it nests too
-    // deeply, DISCARD the poisoned original rather than try to preserve it.
-    // The row still must transition to 'failed' (callers depend on that
-    // contract), so the replacement is a small, fixed, trivially-shallow
-    // object that is always safe to dump: the row is "healed", no longer a
-    // live grenade for a future read.
+    // A deeply nested stored payload can exhaust the stack during dump().
+    // Heal it with a shallow object that still records the failure.
     nlohmann::json payload;
     if (mcp::json_exceeds_depth(raw_payload, mcp::kMcpMaxJsonDepth)) {
         payload = nlohmann::json{{"failure", reason}, {"note", kPoisonedPayloadNote}};
@@ -1161,15 +1155,31 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
     }
 
     pg::PgResult upd = pg::exec_params(
-        lease.get(),
+        conn,
         // A failed set reads agents_failed 0 / agents_unanswered 0 (it is refused everywhere as
         // not ready), so the counters a child inherited at create time are cleared here.
         "UPDATE result_set_store.result_sets SET status = 'failed', source_payload = $1, "
         "agents_failed = 0, agents_unanswered = 0 "
         "WHERE id = $2 AND status = 'pending'",
         std::vector<std::string>{payload.dump(), id});
-    if (upd.status() != PGRES_COMMAND_OK)
-        spdlog::error("ResultSetStore::mark_failed: update failed: {}", PQerrorMessage(lease.get()));
+    if (upd.status() != PGRES_COMMAND_OK) {
+        spdlog::error("ResultSetStore::mark_failed: update failed: {}", PQerrorMessage(conn));
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+void ResultSetStore::mark_failed(const std::string& id, const std::string& reason) {
+    if (!open_)
+        return;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::mark_failed: no connection ({})", pool_.last_error());
+        return;
+    }
+    mark_failed_on(lease.get(), id, reason);
 }
 
 bool ResultSetStore::heal_poisoned_payload(const std::string& id) {
