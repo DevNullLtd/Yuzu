@@ -1,4 +1,4 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-24 · euid 0 · leg-hash 1aaf3cf67f95
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-24 · euid 0 · leg-hash 61524db6b2fc
 == action=list
 error|platform not supported
 [result_status] UNDECLARED / UNKNOWN / 

@@ -654,12 +654,30 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
         [](unsigned c, auto&& on_code) { return enumerate_machine_products(c, on_code); },
         read_product_property,
         [&upgrades](const std::string& code) { return upgrades.resolve(code); });
-    if (upgrades.over_cap)
+    if (upgrades.over_cap) {
         spdlog::warn("msi_packages: the UpgradeCodes map is over its cap; every upgrade_code "
                      "token is empty for this dispatch");
-    else if (upgrades.bad_names != 0)
-        spdlog::warn("msi_packages: {} UpgradeCodes name(s) are not a packed GUID and were skipped",
-                     upgrades.bad_names);
+    } else {
+        if (upgrades.bad_names != 0)
+            spdlog::warn(
+                "msi_packages: {} UpgradeCodes name(s) are not a packed GUID and were skipped",
+                upgrades.bad_names);
+        if (!upgrades.failure) {
+            // One line per dispatch: a sixth token left empty because no upgrade code, or more
+            // than one, names the product would otherwise leave no trace.
+            std::size_t no_code = 0;
+            for (const auto& p : roster.products)
+                if (p.upgrade_code.empty())
+                    ++no_code;
+            std::size_t ambiguous = 0;
+            for (const auto& [code, entry] : upgrades.by_product)
+                if (entry.ambiguous)
+                    ++ambiguous;
+            spdlog::info("msi_packages: {} of {} products have an empty upgrade_code token; "
+                         "{} product(s) are named by more than one upgrade code",
+                         no_code, roster.products.size(), ambiguous);
+        }
+    }
     for (auto& row : inv::render(roster))
         ctx.write_output(std::move(row));
     if (roster.constraint)
@@ -748,11 +766,12 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      /* macos   = */
      {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "Windows Installer records exist only on Windows"},
      /* windows = */
-     {YUZU_SUPPORT_CONSTRAINED, 1,
+     {YUZU_SUPPORT_SUPPORTED, 1,
       "registry (Installer UserData, Reg*W) + bounded read-only MsiOpenDatabaseW of the cached "
       "package",
-      "not yet verified against a real capture; machine context only; nothing is executed; "
-      "5000 records, 5 s per package, 45 s of package reads per dispatch"}},
+      "machine context only; nothing is executed; 5000 records, 5 s per package, 45 s of "
+      "package reads per dispatch; measured as SYSTEM and as an admin user on one host, other "
+      "identities unmeasured"}},
 };
 
 } // namespace

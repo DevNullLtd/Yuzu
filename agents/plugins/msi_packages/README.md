@@ -98,14 +98,14 @@ Nothing is written to the result until the whole walk has been judged, because t
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `installer_records` | 🟡 constrained · rung 1 · registry (Installer UserData, Reg*W) + bounded read-only MsiOpenDatabaseW of the cached package | ⛔ unsupported | ⛔ unsupported |
+| `installer_records` | ✅ supported · rung 1 · registry (Installer UserData, Reg*W) + bounded read-only MsiOpenDatabaseW of the cached package | ⛔ unsupported | ⛔ unsupported |
 | `list` | ✅ supported · rung 1 · msi_api | ✅ supported · rung 2 · pkgutil via bounded argv runner | ⛔ unsupported |
 | `list_inventory` | ✅ supported · rung 1 · msi_api (MsiEnumProductsExW machine context) | ⛔ unsupported | ⛔ unsupported |
 | `product_codes` | ✅ supported · rung 1 · msi_api | ✅ supported · rung 2 · pkgutil via bounded argv runner | ⛔ unsupported |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`installer_records` / Windows** — not yet verified against a real capture; machine context only; nothing is executed; 5000 records, 5 s per package, 45 s of package reads per dispatch
+- **`installer_records` / Windows** — machine context only; nothing is executed; 5000 records, 5 s per package, 45 s of package reads per dispatch; measured as SYSTEM and as an admin user on one host, other identities unmeasured
 - **`installer_records` / macOS** — Windows Installer records exist only on Windows
 - **`installer_records` / Linux** — no Windows Installer on Linux
 - **`list_inventory` / Windows** — machine context only: per-user MSI products are never listed; measured as SYSTEM and as an admin user, non-elevated unmeasured
@@ -219,7 +219,7 @@ Two additional macOS-only sentinel rows exist outside the schema above: `msi|__t
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-24 · LocalSystem (elevated) · leg-hash 1aaf3cf67f95
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-24 · LocalSystem (elevated) · leg-hash 61524db6b2fc
 
 ```
 == action=list
@@ -287,7 +287,7 @@ rec|{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|Windows App Certification Kit Native 
 [result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-24 · euid 501 (interactive user) · leg-hash 1aaf3cf67f95
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-24 · euid 501 (interactive user) · leg-hash 61524db6b2fc
 
 ```
 == action=list
@@ -331,7 +331,7 @@ status|installer_records|unsupported|macos:no_windows_installer
 [result_status] UNAVAILABLE / PARTIAL / macos:no_windows_installer
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-24 · euid 0 · leg-hash 1aaf3cf67f95
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-24 · euid 0 · leg-hash 61524db6b2fc
 
 ```
 == action=list
@@ -360,7 +360,7 @@ status|installer_records|unsupported|linux:no_msi
 2. **macOS lists receipts, not applications, and `list` stops at 500.** A killed, timed-out, truncated or nonzero-exit `pkgutil` run, checked across every call, yields one `error|msi_packages: acquisition degraded (...)` row and rc 1 rather than a partial list. A receipt store above 500 entries ends with `msi|__truncated__|<total_seen>|-|-`, and a receipt id that starts with a dash is skipped without a row.
 3. **Linux has no leg, and Windows install locations are mostly empty.** `list` and `product_codes` return `error|platform not supported` with rc 1, and `list_inventory` and `installer_records` answer `unsupported` with `linux:no_msi` and rc 0 (`installer_records` on macOS: `macos:no_windows_installer`). MSI's `InstallLocation` is often left unset by installers (111 of 118 products in the Windows capture), so `-` there reflects the source data.
 4. **`list_inventory` overlaps `installed_apps`, drops nameless products, and one bad read costs only its section.** An advertised-but-not-installed product is listed with an empty name and the daily-sync collector discards it, and per-user products are never listed. The same MSI product normally also appears in `installed_apps` from its registry walk, so a host carries two rows per product. If `MsiEnumProductsExW` returns anything but success or `ERROR_NO_MORE_ITEMS` (for example `1610`), or a property read or the UpgradeCodes map read fails, the answer is `constrained` and the daily sync reports a status-only section for `msi_packages.list_inventory`, carrying the status row's tokens and no rows. Every other source, `installed_apps` included, is still sent, and nothing is deleted: the server keeps the stored MSI rows and shows them as unconfirmed until the host's Windows Installer registration is repaired.
-5. **`installer_records` has stated limits.** Its Windows leg is declared `constrained` pending the status decision tracked in #8704: the committed fixture is a real SYSTEM capture of the Installer UserData tree (`provenance.txt` beside it), and the two live cases in the Windows test files read the cached packages on that host. The cached package is opened by the Installer API itself from the path that was checked, so a writer who could change `<windows directory>\Installer` (on a default Windows install SYSTEM and administrators only; not measured here) could swap the file between the check and the open; the held no-reparse handle (share read only, so the file cannot be renamed, deleted or rewritten while it is open) and the fixed parent directory bound that window and do not close it. A package that hangs the Installer API pins one detached worker (never more than one in the process) until it returns, and a dispatch made meanwhile gets `msi_db:busy`. If that worker never returns, every later `installer_records` dispatch answers `msi_db:busy` until the agent is restarted, and restarting the agent is the recovery. The read runs inside the agent process under a C++ `try/catch` only, so a fault inside `msi.dll` while it parses a hostile package (an access violation, which is not a C++ exception) takes the agent process down: beyond the path gate and the bounds there is no isolation. The registry map behind `upgrade_code` and the cached packages' own UpgradeCode can disagree; the live cross-check case in `test_msi_packages_actions.cpp` is where that would show, and no fallback from one to the other exists.
+5. **`installer_records` has stated limits.** Its Windows leg is `supported`: the committed fixture is a real SYSTEM capture of the Installer UserData tree (`provenance.txt` beside it), the two live cases in the Windows test files read the cached packages on that host, and the read was measured as SYSTEM and as an admin user on one host. One item is unmeasured: the effect of the share-read hold on a concurrent Installer operation on the same package (#8712). The cached package is opened by the Installer API itself from the path that was checked, so a writer who could change `<windows directory>\Installer` (on a default Windows install SYSTEM and administrators only; not measured here) could swap the file between the check and the open; the held no-reparse handle (share read only, so the file cannot be renamed, deleted or rewritten while it is open) and the fixed parent directory bound that window and do not close it. A package that hangs the Installer API pins one detached worker (never more than one in the process) until it returns, and a dispatch made meanwhile gets `msi_db:busy`. If that worker never returns, every later `installer_records` dispatch answers `msi_db:busy` until the agent is restarted, and restarting the agent is the recovery. The read runs inside the agent process under a C++ `try/catch` only, so a fault inside `msi.dll` while it parses a hostile package (an access violation, which is not a C++ exception) takes the agent process down: beyond the path gate and the bounds there is no isolation. The registry map behind `upgrade_code` and the cached packages' own UpgradeCode can disagree; the live cross-check case in `test_msi_packages_actions.cpp` is where that would show, and no fallback from one to the other exists.
 
 ## Source and tests
 

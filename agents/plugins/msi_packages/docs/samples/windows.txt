@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-24 · LocalSystem (elevated) · leg-hash 1aaf3cf67f95
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-24 · LocalSystem (elevated) · leg-hash 61524db6b2fc
 == action=list
 msi|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|Python Launcher|3.14.6150.0|-
 msi|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|-
