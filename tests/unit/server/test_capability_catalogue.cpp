@@ -50,8 +50,11 @@
 #include "capability_decls/plugin_action_catalogue_virtualization.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "capability_decls/plugin_action_catalogue_process_introspect.hpp"
+#include "capability_decls/plugin_action_catalogue_file_search.hpp"
+#include "approval_continuation.hpp"
 #include "command_capability.hpp"
 #include "forensics_plugin_set.hpp"
+#include "sensitive_instruction_params.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -176,6 +179,7 @@ struct LabeledSpan {
         {"shares", capdecls::plugin_action_catalogue_shares(), false},
         {"remote_access_audit", capdecls::plugin_action_catalogue_remote_access_audit(), false},
         {"process_introspect", capdecls::plugin_action_catalogue_process_introspect(), false},
+        {"file_search", capdecls::plugin_action_catalogue_file_search(), false},
         {"middleware", capdecls::plugin_action_catalogue_middleware(), false},
         {"virtualization", capdecls::plugin_action_catalogue_virtualization(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
@@ -186,7 +190,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, thirty-three sources exactly as a live composition site would use.
+    // literally, thirty-four sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -218,6 +222,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_shares(),
         capdecls::plugin_action_catalogue_remote_access_audit(),
         capdecls::plugin_action_catalogue_process_introspect(),
+        capdecls::plugin_action_catalogue_file_search(),
         capdecls::plugin_action_catalogue_middleware(),
         capdecls::plugin_action_catalogue_virtualization(),
         capdecls::core_dispatch_capabilities(),
@@ -628,6 +633,69 @@ TEST_CASE("capability catalogue: process_introspect.inspect pins its exact class
     check_row(*classified);
 }
 
+/// Exact-row pin for `file_search.search`: dispatched under the existing `FileRetrieval` securable
+/// with AdminOrApproval (NOT the single-target Forensics securable, so a search stays launchable at
+/// a group or the fleet), High risk, and its stored rows in the Forensics read tier through the
+/// catalogue flag. The generic invariants accept ANY seeded securable and ANY stored-row tier, so
+/// without this pin a silent re-typing, or a dropped flag that would make the stored file names
+/// readable at Response:Read, ships green. Checked on the fragment AND as the composed registry
+/// classifies it. One row covers the action at the top tier; contents or a hash would be a new action.
+TEST_CASE("capability catalogue: file_search.search pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_file_search();
+    REQUIRE(rows.size() == 1);
+    const auto check_row = [](const CommandCapability& r) {
+        CHECK(r.plugin == "file_search");
+        CHECK(r.action == "search");
+        CHECK(r.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(r.mutability == Mutability::None);
+        CHECK(r.securable == "FileRetrieval");
+        CHECK(r.securable != kForensicsSecurable);
+        CHECK(r.operation == authz::Operation::Read);
+        CHECK(r.risk_tier == authz::RiskTier::High);
+        CHECK(r.execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK(r.stored_rows == StoredRowTier::ForensicsRead);
+        // The resume parameter that lets ONE approval cover every slice of a search.
+        CHECK(r.continuation_param == "cursor");
+        CHECK(approval_continuation::covered_param(r) == "cursor");
+        CHECK_FALSE(r.system_reserved);
+    };
+    check_row(rows.front());
+    auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("file_search", "search");
+    REQUIRE(classified.has_value());
+    check_row(*classified);
+}
+
+/// The continuation declaration is an authority: a row that declares one lets a single approval
+/// admit more than one dispatch. It is therefore pinned to exactly the one row that needs it (a new
+/// declaring row must be acknowledged HERE), every declaring row must be one `covered_param`
+/// actually honours (a read gated None or AdminOrApproval: a declaration on a mutating or
+/// AlwaysApproval row would be dead text that reads as a promise), and every declared parameter
+/// must be one the server never retains (`kUnretainedInstructionParamKeys`), so a request copy
+/// never holds a resume token.
+TEST_CASE("capability catalogue: only file_search.search declares a continuation parameter, and every "
+          "declaring row is one the cover honours and the server never retains",
+          "[server][dispatch][capability]") {
+    std::size_t declaring = 0;
+    for (const auto& source : all_labeled_sources()) {
+        for (const auto& row : source.rows) {
+            if (row.continuation_param.empty())
+                continue;
+            ++declaring;
+            INFO("source=" << source.label << " plugin=" << row.plugin << " action=" << row.action
+                           << " continuation_param=" << row.continuation_param);
+            CHECK(row.plugin == "file_search");
+            CHECK(row.action == "search");
+            CHECK(approval_continuation::covered_param(row) == row.continuation_param);
+            CHECK(is_unretained_instruction_param_key(row.continuation_param));
+            // Never a secret key: a resume token must not make a form mask its field.
+            CHECK_FALSE(is_redacted_instruction_param_key(row.continuation_param));
+        }
+    }
+    CHECK(declaring == 1);
+}
+
 TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across every "
           "source",
           "[server][dispatch][capability]") {
@@ -955,11 +1023,31 @@ TEST_CASE("capability catalogue: every Forensics-securable plugin is in the resp
     // change for anyone who holds Response:Read but not Forensics:Read.
     // Plus the unresolved-provenance sentinel (#4990): a response whose command id has no server
     // dispatch record is stored under it and is Forensics-tier everywhere.
+    // `file_search` is Forensics-tier through the stored-row flag on its row (its dispatch securable
+    // is FileRetrieval, so it is not one of the `forensics_rows` counted above).
     CHECK(set->names() == std::vector<std::string>{"app_usage", "browser_inventory",
-                                                   "execution_artifacts", "privacy_permissions",
-                                                   "process_introspect", "remote_access_audit",
-                                                   "~unverified"});
+                                                   "execution_artifacts", "file_search",
+                                                   "privacy_permissions", "process_introspect",
+                                                   "remote_access_audit", "~unverified"});
     CHECK(set->contains(kUnverifiedProvenanceLabel));
+
+    // Every plugin whose row asks for the Forensics read tier is in the set too, and its dispatch
+    // securable is not the single-target one (that is what the flag is for).
+    std::size_t flagged_rows = 0;
+    for (const auto& source : all_labeled_sources()) {
+        for (const auto& row : source.rows) {
+            if (row.stored_rows != StoredRowTier::ForensicsRead)
+                continue;
+            ++flagged_rows;
+            INFO("source=" << source.label << " plugin=" << row.plugin << " action=" << row.action);
+            CHECK(row.securable != kForensicsSecurable);
+            std::string lower(row.plugin);
+            for (auto& c : lower)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            CHECK(std::ranges::binary_search(set->names(), lower));
+        }
+    }
+    CHECK(flagged_rows == 1);
 }
 
 // #4990: the unresolved-provenance sentinel "~unverified" is safe as a stored plugin label only

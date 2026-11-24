@@ -19,6 +19,10 @@
  */
 
 #include "agent_registry.hpp"
+#include "audit_store.hpp"
+#include "capability_fragments.hpp"
+#include "command_capability.hpp"
+#include "dispatch_caller.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
 #include "offline_endpoint_store.hpp"
@@ -27,17 +31,22 @@
 #include "pg/pg_raii.hpp"
 #include "test_forensics_tier_fixture.hpp" // #4990
 #include "test_mgmt_group_pg_helper.hpp"
+#include "test_policy_capability_fixture.hpp"
 #include "policy_evaluator.hpp"
 #include "policy_store.hpp"
 #include "response_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 
+#include <cstdio>
+#include <ctime>
 #include <map>
 #include <new>
 #include <set>
@@ -99,6 +108,12 @@ std::string out_json_deep(const std::string& col, int depth) {
            std::string(static_cast<size_t>(depth), ']') + R"(}]})";
 }
 
+// The execution id a kickoff dispatched, or "" when it dispatched nothing (a missing policy, no
+// check, no targets, a check already in flight, a refusal) or degraded.
+std::string exec_id_of(const std::expected<PolicyEvaluator::KickoffOutcome, std::string>& r) {
+    return r ? r->execution_id : std::string{};
+}
+
 struct Harness {
     // PolicyStore (ADR-0056) and InstructionStore (ADR-0058) are both migrated
     // Postgres stores now — share the same pool/database as ResponseStore
@@ -112,6 +127,9 @@ struct Harness {
     int64_t fake_now{1000};
     int dispatch_calls{0};
     std::vector<std::string> dispatched_plugins;
+    // "<plugin>.<action>" of every dispatch_fn call, in order (G01 R1: two pairs on the
+    // same plugin, e.g. echo.status and echo.purge_source, are told apart by this).
+    std::vector<std::string> dispatched_pairs;
     // canned[agent + "|" + plugin] -> (status, output)
     std::map<std::string, std::pair<int, std::string>> canned;
     // HA WS-3 3.4 review B1 regression harness: agent ids the fake
@@ -144,6 +162,14 @@ struct Harness {
     std::set<std::string> route_degraded_agents;
 
     std::string group_id;
+
+    // G01: the capability registry the evaluator classifies a pair against. The default is the
+    // fragment-only fixture (the fake plugins these tests dispatch, all ungated); a test of the
+    // refusal itself sets the FULL production registry (or nullptr for an unwired evaluator)
+    // before it calls deps(). The full registry is 32 of 32 sources, so a fixture cannot be
+    // composed beside it.
+    const CommandCapabilityRegistry* capability_registry{
+        &yuzu::server::test::policy_fixture_registry()};
 
     explicit Harness(pg::PgPool& pool) : ps(pool), is(pool), rs(pool) {
         auto def = [&](const std::string& id, const std::string& plugin) {
@@ -182,16 +208,18 @@ struct Harness {
         d.custom_properties_store = nullptr;
         d.mgmt_group_store = &mg;
         d.forensics_plugins = &yuzu::server::test::forensics_plugin_set(); // #4990
+        d.capability_registry = capability_registry;
         d.grace_seconds = 15;
         d.default_interval_seconds = 3600;
         d.fixing_stale_seconds = 1800;
         d.now_fn = [this] { return fake_now; };
-        d.dispatch_fn = [this](const std::string& plugin, const std::string&,
+        d.dispatch_fn = [this](const std::string& plugin, const std::string& action,
                                const std::vector<std::string>& agents, const std::string&,
                                const std::unordered_map<std::string, std::string>&,
                                const std::string& execid) -> yuzu::server::ConfinedDispatchOutcome {
             ++dispatch_calls;
             dispatched_plugins.push_back(plugin);
+            dispatched_pairs.push_back(plugin + "." + action);
             yuzu::server::ConfinedDispatchOutcome outcome;
             outcome.command_id = "cmd-" + execid;
             if (os_gate_unreadable_outcome) {
@@ -311,7 +339,7 @@ TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20; // past grace
     ev.tick(true);
 
@@ -342,7 +370,7 @@ TEST_CASE("policy evaluator: wrong-typed JSON members take their defaults; a num
     auto deps = h.deps();
     deps.metrics = &metrics;
     PolicyEvaluator ev(deps);
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20; // past grace
     REQUIRE_NOTHROW(ev.tick(true));
 
@@ -385,7 +413,7 @@ TEST_CASE("policy evaluator: a throwing evaluation is its own failure domain - l
             throw std::bad_alloc();
     };
     PolicyEvaluator ev(deps);
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     REQUIRE_NOTHROW(ev.tick(true));
 
@@ -427,8 +455,8 @@ TEST_CASE("policy evaluator: an exception in one item's response-store prelude d
             throw std::runtime_error("store prelude failed");
     };
     PolicyEvaluator ev(deps);
-    REQUIRE_FALSE(ev.evaluate_now(p1).value_or("").empty());
-    REQUIRE_FALSE(ev.evaluate_now(p2).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(p1)).empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(p2)).empty());
     h.fake_now += 20;
     REQUIRE_NOTHROW(ev.tick(true));
     CHECK(items[p1] == 1);
@@ -462,8 +490,8 @@ TEST_CASE("policy evaluator: a non-std exception in a target or an item is conta
             throw 7; // item-level catch (...)
     };
     PolicyEvaluator ev(deps);
-    REQUIRE_FALSE(ev.evaluate_now(p1).value_or("").empty());
-    REQUIRE_FALSE(ev.evaluate_now(p2).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(p1)).empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(p2)).empty());
     h.fake_now += 20;
     REQUIRE_NOTHROW(ev.tick(true));
 
@@ -491,7 +519,7 @@ TEST_CASE("policy evaluator: output nested past the depth guard scores error and
     auto deps = h.deps();
     deps.metrics = &metrics;
     PolicyEvaluator ev(deps);
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
     CHECK(h.status_of(pid, "agentA") == "error");
@@ -513,7 +541,7 @@ TEST_CASE("policy evaluator: an operator evaluate_now completes even when the du
     PolicyEvaluator ev(h.deps());
     // An operator evaluate_now() is accepted on this replica (both operator paths are
     // ungated and run on whichever replica received the call).
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20; // past grace
 
     // Tick with the fenced-leader gate FALSE (this replica is not the leader), exactly
@@ -541,7 +569,7 @@ TEST_CASE("policy evaluator: the due-policy dispatch is SUPPRESSED under tick(fa
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty()); // dispatch #1 (seeds the interval)
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty()); // dispatch #1 (seeds the interval)
     CHECK(h.dispatch_calls == 1);
     h.fake_now += 4000; // default interval (3600s) elapsed -> the policy is now DUE
 
@@ -619,7 +647,7 @@ TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
 
@@ -673,7 +701,7 @@ TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
 
@@ -696,7 +724,7 @@ TEST_CASE("policy evaluator: CEL evaluation error -> error", "[pg][policy][evalu
     auto deps = h.deps();
     deps.metrics = &metrics;
     PolicyEvaluator ev(deps);
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
 
@@ -724,7 +752,7 @@ TEST_CASE("policy evaluator: depth-exceeded r.output -> error, never compliant "
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20; // past grace
     ev.tick(true);
 
@@ -764,7 +792,7 @@ TEST_CASE("policy evaluator: a depth-poisoned response cannot ride along with a 
     h.canned["agentB|fixp"] = {1, "ok"}; // wired up, but must never be dispatched to
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
 
@@ -798,7 +826,7 @@ TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][eval
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty()); // dispatch #1
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty()); // dispatch #1
     CHECK(h.dispatch_calls == 1);
 
     h.fake_now += 20;
@@ -822,7 +850,7 @@ TEST_CASE("policy evaluator: empty compliance CEL -> error (no false compliant)"
     auto pid = h.author(/*check_cel=*/"");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
 
@@ -840,7 +868,7 @@ TEST_CASE("policy evaluator: remediate refuses a 4th call once the fix retry cap
     h.canned["agentA|fixp"] = {1, "ok"};
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -895,7 +923,7 @@ TEST_CASE("policy evaluator: remediate refuses a second call while a FixWait is 
     h.canned["agentA|fixp"] = {1, "ok"};
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -944,7 +972,7 @@ TEST_CASE("policy evaluator: two PolicyEvaluator instances sharing one store rem
 
     PolicyEvaluator evA(h.deps());
     PolicyEvaluator evB(h.deps());
-    REQUIRE_FALSE(evA.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(evA.evaluate_now(pid)).empty());
     h.fake_now += 20;
     evA.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -997,7 +1025,7 @@ TEST_CASE("policy evaluator: remediate releases the claim without burning a retr
     // offline/unreachable device at delivery time.
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -1163,7 +1191,7 @@ TEST_CASE("policy evaluator: a route_unreadable outcome leaves the WHOLE remedia
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -1247,7 +1275,7 @@ TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][ev
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -1274,7 +1302,7 @@ TEST_CASE("policy evaluator: manual remediation fix -> verify -> compliant",
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -1304,7 +1332,7 @@ TEST_CASE("policy evaluator: remediation rejected when no fix_instruction",
     auto pid = h.author("result.hostname != ''", /*with_fix=*/false);
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
     REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
@@ -1486,8 +1514,8 @@ TEST_CASE("policy evaluator: collect_ready() defers every ready item when "
     deps.should_stop = [&stop] { return stop; };
     PolicyEvaluator ev(deps);
 
-    REQUIRE_FALSE(ev.evaluate_now(pid_a).value_or("").empty());
-    REQUIRE_FALSE(ev.evaluate_now(pid_b).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid_a)).empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid_b)).empty());
     h.fake_now += 20; // past grace_seconds (15) — both now "ready" for collect_ready()
 
     stop = true;
@@ -1652,7 +1680,7 @@ TEST_CASE("policy evaluator: a Forensics-plugin check scores unknown and stores 
                         "test.check_forensic");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20; // past grace
     ev.tick(true);
 
@@ -1679,7 +1707,7 @@ TEST_CASE("policy evaluator: an ordinary check still gets its verdict and stored
     auto pid = h.author("result.hostname != ''");
 
     PolicyEvaluator ev(h.deps());
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
 
@@ -1703,8 +1731,1246 @@ TEST_CASE("policy evaluator: an unwired Forensics plugin set scores every check 
     auto deps = h.deps();
     deps.forensics_plugins = nullptr;
     PolicyEvaluator ev(deps);
-    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
     h.fake_now += 20;
     ev.tick(true);
     CHECK(h.status_of(pid, "agentA") == "unknown");
+}
+
+// ---------------------------------------------------------------------------
+// G01: policy evaluation must not dispatch a pair whose execute gate (or destructive
+// class) an interactive caller could not clear, and a refused dispatch is recorded as
+// `blocked` with the reason. The dispatch-count cases use the harness's own spy
+// dispatch_fn, so the assertion is the authorization effect itself (did the pair reach
+// dispatch?), not a mirror of any decision. The pairs are real capability rows from the
+// full production registry (`YUZU_ALL_CAPABILITY_FRAGMENTS`):
+//   content_dist.execute_staged : Destructive, ExecuteGate::AdminOrApproval
+//   echo.purge_source           : Destructive, ExecuteGate::None
+//   echo.status                 : ReadOnly,    ExecuteGate::None   (control)
+//   tags.set                    : Mutating,    ExecuteGate::None   (an allowed fix)
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr const char* kGatedPair = "content_dist.execute_staged";
+constexpr const char* kDestructivePair = "echo.purge_source";
+constexpr const char* kReadControlPair = "echo.status";
+
+const CommandCapabilityRegistry& full_registry() {
+    static const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    return registry;
+}
+
+// Define an instruction on a <plugin>.<action> pair (id = "pair.<plugin>.<action>" unless one is
+// given; a definition id is limited to 128 bytes, so a pair with a very long part needs one).
+std::string define_real_pair(Harness& h, const std::string& plugin, const std::string& action,
+                             const std::string& id = {}, const std::string& approval_mode = {}) {
+    InstructionDefinition d;
+    d.id = id.empty() ? "pair." + plugin + "." + action : id;
+    d.approval_mode = approval_mode;
+    d.name = d.id;
+    d.version = "1.0.0";
+    d.type = "question";
+    d.plugin = plugin;
+    d.action = action;
+    d.enabled = true;
+    REQUIRE(h.is.create_definition(d).has_value());
+    return d.id;
+}
+
+// Fragment + policy bound to the harness's static group: check = check_instruction, and
+// (when fix_instruction is non-empty) fix = fix_instruction with a post-check on
+// `verify_instruction`.
+std::string author_real_pairs(Harness& h, const std::string& check_instruction,
+                              const std::string& fix_instruction = {},
+                              const std::string& verify_instruction = "test.verify") {
+    std::string frag = std::string("apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n") +
+                       "spec:\n  check:\n    instruction: " + check_instruction +
+                       "\n    compliance: \"result.hostname != ''\"\n";
+    if (!fix_instruction.empty()) {
+        frag += "  fix:\n    instruction: " + fix_instruction + "\n";
+        frag += "  postCheck:\n    instruction: " + verify_instruction +
+                "\n    compliance: \"result.hostname != ''\"\n";
+    }
+    auto fid = h.ps.create_fragment(frag);
+    REQUIRE(fid.has_value());
+    const std::string pol = std::string("apiVersion: yuzu.io/v1alpha1\nkind: Policy\n") +
+                            "spec:\n  fragment: " + *fid + "\n  managementGroups:\n    - " +
+                            h.group_id + "\n";
+    auto pid = h.ps.create_policy(pol);
+    REQUIRE(pid.has_value());
+    return *pid;
+}
+
+bool pair_was_dispatched(const Harness& h, const std::string& pair) {
+    for (const auto& p : h.dispatched_pairs)
+        if (p == pair)
+            return true;
+    return false;
+}
+
+// A plugin response the check CEL ("result.hostname != ''") scores non_compliant.
+void can_non_compliant(Harness& h, const std::string& plugin) {
+    h.canned["agentA|" + plugin] = {1, out_json("hostname", "")};
+    h.canned["agentB|" + plugin] = {1, out_json("hostname", "")};
+}
+
+// The parsed check_result of an agent's status row.
+nlohmann::json row_json(Harness& h, const std::string& pid, const std::string& agent) {
+    auto s = h.ps.get_agent_status(pid, agent);
+    REQUIRE(s.has_value());
+    REQUIRE(s->has_value());
+    return nlohmann::json::parse((*s)->check_result);
+}
+
+// Every target is `blocked` with this phase, reason, plugin and action.
+void check_blocked(Harness& h, const std::string& pid, const std::string& phase,
+                   const std::string& reason, const std::string& plugin,
+                   const std::string& action) {
+    for (const char* agent : {"agentA", "agentB"}) {
+        INFO("agent " << agent);
+        REQUIRE(h.status_of(pid, agent) == "blocked");
+        const auto j = row_json(h, pid, agent);
+        CHECK(j["phase"] == phase);
+        CHECK(j["result"] == "blocked");
+        CHECK(j["reason"] == reason);
+        CHECK(j["plugin"] == plugin);
+        CHECK(j["action"] == action);
+    }
+}
+
+std::vector<AuditEvent> audit_rows(AuditStore& audit, const std::string& action) {
+    AuditQuery q;
+    q.action = action;
+    q.limit = 100;
+    auto rows = audit.query(q);
+    REQUIRE(rows.has_value());
+    return *rows;
+}
+
+// Metrics reads that do not create a series by reading it.
+double denied(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter("yuzu_server_policy_dispatch_denied_total", {{"reason", reason}}).value();
+}
+
+} // namespace
+
+TEST_CASE("policy dispatch approval: a pair with an execute gate is not dispatched when a "
+          "policy check is evaluated on operator request",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+
+    PolicyEvaluator ev(h.deps());
+    auto kicked = ev.evaluate_now(pid);
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK_FALSE(pair_was_dispatched(h, kGatedPair));
+    CHECK(h.dispatch_calls == 0);
+    // The refusal is reported as a value, with no execution id, and is not an error.
+    REQUIRE(kicked.has_value());
+    CHECK(kicked->execution_id.empty());
+    REQUIRE(kicked->denial.has_value());
+    CHECK(kicked->denial->reason == PolicyDispatchDenialReason::Gated);
+    // Recorded for every target, with the phase and reason.
+    check_blocked(h, pid, "check", "gated", "content_dist", "execute_staged");
+}
+
+TEST_CASE("policy dispatch approval: a pair with an execute gate is not dispatched when a "
+          "policy check comes due on a scheduler tick with no operator action",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+
+    PolicyEvaluator ev(h.deps());
+    ev.tick(true); // a fresh policy is claimed due on its first tick
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK_FALSE(pair_was_dispatched(h, kGatedPair));
+    CHECK(h.dispatch_calls == 0);
+    check_blocked(h, pid, "check", "gated", "content_dist", "execute_staged");
+
+    // The same refusal on the next due tick changes no verdict or detail. last_check_at is
+    // not compared: a refusal refreshes it from the database clock, so it can differ at a
+    // second boundary.
+    auto before = h.ps.get_agent_status(pid, "agentA");
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value());
+    h.fake_now += 4000;
+    ev.tick(true);
+    CHECK(h.dispatch_calls == 0);
+    auto after = h.ps.get_agent_status(pid, "agentA");
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->check_result == (*before)->check_result);
+}
+
+TEST_CASE("policy dispatch approval: a pair with an execute gate is not dispatched as a policy "
+          "fix on operator remediate",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    can_non_compliant(h, "echo"); // the read-only control check scores non_compliant
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check, fix);
+
+    PolicyEvaluator ev(h.deps());
+    auto kicked = ev.evaluate_now(pid);
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant"); // precondition: the check ran
+    REQUIRE(pair_was_dispatched(h, kReadControlPair));
+
+    auto rr = ev.remediate(pid, {"agentA"});
+
+    CHECK_FALSE(pair_was_dispatched(h, kGatedPair));
+    CHECK_FALSE(rr.ok);
+    CHECK_FALSE(rr.degraded); // a refusal is not a store failure
+    REQUIRE(rr.denial.has_value());
+    CHECK(rr.denial->reason == PolicyDispatchDenialReason::Gated);
+    REQUIRE(h.status_of(pid, "agentA") == "blocked");
+    const auto j = row_json(h, pid, "agentA");
+    CHECK(j["phase"] == "fix");
+    CHECK(j["reason"] == "gated");
+    CHECK(j["plugin"] == "content_dist");
+    CHECK(j["action"] == "execute_staged");
+    // The other agent was not asked about and keeps its verdict.
+    CHECK(h.status_of(pid, "agentB") == "non_compliant");
+    // The claim was released after the fenced write, so the target can be claimed again.
+    auto reclaim = h.ps.claim_remediation(pid, {"agentA"}, 1800);
+    REQUIRE(reclaim.has_value());
+    CHECK(reclaim->ids.size() == 1);
+}
+
+TEST_CASE("policy dispatch approval: a destructive pair is not dispatched when a policy check "
+          "is evaluated on operator request",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "purge_source");
+    const auto pid = author_real_pairs(h, check);
+
+    PolicyEvaluator ev(h.deps());
+    auto kicked = ev.evaluate_now(pid);
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK_FALSE(pair_was_dispatched(h, kDestructivePair));
+    CHECK(h.dispatch_calls == 0);
+    REQUIRE(kicked.has_value());
+    REQUIRE(kicked->denial.has_value());
+    CHECK(kicked->denial->reason == PolicyDispatchDenialReason::Destructive);
+    check_blocked(h, pid, "check", "destructive", "echo", "purge_source");
+}
+
+TEST_CASE("policy dispatch approval: a destructive pair is not dispatched when a policy check "
+          "comes due on a scheduler tick with no operator action",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "purge_source");
+    const auto pid = author_real_pairs(h, check);
+
+    PolicyEvaluator ev(h.deps());
+    ev.tick(true);
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK_FALSE(pair_was_dispatched(h, kDestructivePair));
+    CHECK(h.dispatch_calls == 0);
+    check_blocked(h, pid, "check", "destructive", "echo", "purge_source");
+}
+
+TEST_CASE("policy dispatch approval: a destructive pair is not dispatched as a policy fix on "
+          "operator remediate",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "echo", "purge_source");
+    const auto pid = author_real_pairs(h, check, fix);
+
+    PolicyEvaluator ev(h.deps());
+    auto kicked = ev.evaluate_now(pid);
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+    REQUIRE(pair_was_dispatched(h, kReadControlPair));
+
+    auto rr = ev.remediate(pid, {"agentA"});
+
+    CHECK_FALSE(pair_was_dispatched(h, kDestructivePair));
+    CHECK_FALSE(rr.ok);
+    CHECK_FALSE(rr.degraded);
+    REQUIRE(rr.denial.has_value());
+    CHECK(rr.denial->reason == PolicyDispatchDenialReason::Destructive);
+    REQUIRE(h.status_of(pid, "agentA") == "blocked");
+    const auto j = row_json(h, pid, "agentA");
+    CHECK(j["phase"] == "fix");
+    CHECK(j["reason"] == "destructive");
+    auto reclaim = h.ps.claim_remediation(pid, {"agentA"}, 1800);
+    REQUIRE(reclaim.has_value());
+    CHECK(reclaim->ids.size() == 1);
+}
+
+TEST_CASE("policy dispatch approval: control, a read-only pair with no gate is still "
+          "dispatched by operator evaluate and by a scheduler tick",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    h.canned["agentA|echo"] = {1, out_json("hostname", "yuzu-a")};
+    h.canned["agentB|echo"] = {1, out_json("hostname", "")};
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto pid = author_real_pairs(h, check);
+
+    PolicyEvaluator ev(h.deps());
+    auto kicked = ev.evaluate_now(pid);
+    REQUIRE_FALSE(exec_id_of(kicked).empty());
+    CHECK_FALSE(kicked->denial.has_value());
+    CHECK(pair_was_dispatched(h, kReadControlPair));
+    h.fake_now += 20;
+    ev.tick(true);
+    CHECK(h.status_of(pid, "agentA") == "compliant");
+    CHECK(h.status_of(pid, "agentB") == "non_compliant");
+
+    // A later tick, once the interval has elapsed, dispatches it again with no operator action.
+    const int before = h.dispatch_calls;
+    h.fake_now += 4000;
+    ev.tick(true);
+    CHECK(h.dispatch_calls == before + 1);
+}
+
+TEST_CASE("policy dispatch approval: control, the interactive dispatch chokepoint refuses a "
+          "non-admin caller for the same pairs",
+          "[policy][evaluator][dispatch_approval]") {
+    // The full production registry (no fixture fragment).
+    const CommandCapabilityRegistry& registry = full_registry();
+
+    // Gated pair: RBAC grants everything, so only the execute gate can refuse.
+    DispatchCaller operator_caller{.principal = "op", .principal_role = "Operator"};
+    const auto allow_all = [](std::string_view, std::string_view, authz::Operation) {
+        return true;
+    };
+    auto gated = detail::classify_and_authorize_dispatch(registry, operator_caller, "content_dist",
+                                                         "execute_staged", allow_all);
+    REQUIRE_FALSE(gated.has_value());
+    CHECK(gated.error().reason == detail::DispatchDenialReason::ApprovalRequired);
+
+    // Destructive pair with no gate: the interactive refusal is the Operator's missing
+    // Infrastructure:Delete grant.
+    const auto deny_infrastructure_delete = [](std::string_view, std::string_view securable,
+                                               authz::Operation op) {
+        return !(securable == "Infrastructure" && op == authz::Operation::Delete);
+    };
+    auto destructive = detail::classify_and_authorize_dispatch(
+        registry, operator_caller, "echo", "purge_source", deny_infrastructure_delete);
+    REQUIRE_FALSE(destructive.has_value());
+    CHECK(destructive.error().reason == detail::DispatchDenialReason::Forbidden);
+}
+
+// ---------------------------------------------------------------------------
+// G01: what the refusal records and counts
+// ---------------------------------------------------------------------------
+
+TEST_CASE("policy dispatch approval: an evaluator with no capability registry refuses every "
+          "dispatch (unwired)",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = nullptr;
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "status"); // a pair that is otherwise allowed
+    const auto pid = author_real_pairs(h, check);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    auto kicked = ev.evaluate_now(pid);
+
+    CHECK(h.dispatch_calls == 0);
+    REQUIRE(kicked.has_value());
+    REQUIRE(kicked->denial.has_value());
+    CHECK(kicked->denial->reason == PolicyDispatchDenialReason::Unwired);
+    check_blocked(h, pid, "check", "unwired", "echo", "status");
+    CHECK(denied(metrics, "unwired") == 1);
+}
+
+TEST_CASE("policy dispatch approval: a refusal is counted once per call, a blocked verdict once "
+          "per changed row, and a tick refusal is not an evaluation error",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+
+    // Every reason has a series from construction, at zero (read from the exposition text, so
+    // reading it cannot create it).
+    const auto exposition = metrics.serialize();
+    for (const char* reason : {"unclassified", "ambiguous", "gated", "destructive", "reserved",
+                               "unwired", "dispatch_identifier_invalid", "approval_required"}) {
+        INFO("reason " << reason);
+        CHECK(exposition.find(std::string("yuzu_server_policy_dispatch_denied_total{reason=\"") +
+                              reason + "\"} 0") != std::string::npos);
+    }
+
+    // A due tick: refused, once, and NOT an evaluation error of phase dispatch.
+    ev.tick(true);
+    CHECK(denied(metrics, "gated") == 1);
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "dispatch"}}).value() == 0);
+    // Two targets changed from "no row" to blocked.
+    CHECK(metrics.counter("yuzu_server_policy_verdicts_total", {{"status", "blocked"}}).value() == 2);
+
+    // The same refusal on the next due tick: counted again as a refusal, but no row changed,
+    // so no further blocked verdict.
+    h.fake_now += 4000;
+    ev.tick(true);
+    CHECK(denied(metrics, "gated") == 2);
+    CHECK(metrics.counter("yuzu_server_policy_verdicts_total", {{"status", "blocked"}}).value() == 2);
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "dispatch"}}).value() == 0);
+    CHECK(h.dispatch_calls == 0);
+}
+
+TEST_CASE("policy dispatch approval: an operator refusal always writes an audit row, a tick "
+          "refusal only when something changed",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    PolicyEvaluator ev(deps);
+
+    // Operator evaluate: a row, every time.
+    auto first = ev.evaluate_now(pid);
+    REQUIRE(first.has_value());
+    auto rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "denied");
+    CHECK(rows[0].target_type == "policy");
+    CHECK(rows[0].target_id == pid);
+    CHECK(rows[0].detail.find("phase=check") != std::string::npos);
+    CHECK(rows[0].detail.find("plugin=content_dist") != std::string::npos);
+    CHECK(rows[0].detail.find("action=execute_staged") != std::string::npos);
+    CHECK(rows[0].detail.find("reason=gated") != std::string::npos);
+    CHECK(rows[0].detail.find("origin=operator") != std::string::npos);
+    auto second = ev.evaluate_now(pid);
+    REQUIRE(second.has_value());
+    CHECK(audit_rows(audit, "policy.dispatch").size() == 2);
+
+    // A due tick that records the same refusal changes nothing, so it writes no row.
+    h.fake_now += 4000;
+    ev.tick(true);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(audit_rows(audit, "policy.dispatch").size() == 2);
+}
+
+TEST_CASE("policy dispatch approval: a tick refusal writes an audit row when it is the first, "
+          "and again after invalidate and re-mark",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    PolicyEvaluator ev(deps);
+
+    ev.tick(true); // first refusal: the rows are new
+    auto rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("origin=tick") != std::string::npos);
+    CHECK(rows[0].detail.find("status_write=error") == std::string::npos);
+
+    h.fake_now += 4000;
+    ev.tick(true); // unchanged: no row
+    CHECK(audit_rows(audit, "policy.dispatch").size() == 1);
+
+    // Invalidate resets every row to unknown; the next dispatch of the still-refused policy
+    // finds a changed row, marks it again and writes one more row.
+    auto inv = h.ps.invalidate_policy(pid);
+    REQUIRE(inv.has_value());
+    CHECK(*inv == 2);
+    CHECK(h.status_of(pid, "agentA") == "unknown");
+    h.fake_now += 4000;
+    ev.tick(true);
+    CHECK(h.status_of(pid, "agentA") == "blocked");
+    CHECK(h.status_of(pid, "agentB") == "blocked");
+    CHECK(audit_rows(audit, "policy.dispatch").size() == 2);
+    CHECK(h.dispatch_calls == 0);
+}
+
+TEST_CASE("policy dispatch approval: a refusal whose status write fails still audits, tagged",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+
+    // Break only the column the blocked write sets, so the claim and the sweep still work: the
+    // blocked write fails, the refusal still stands.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(), "ALTER TABLE policy_store.policy_status "
+                                      "RENAME COLUMN check_result TO check_result_gone")};
+        REQUIRE(r.ok());
+    }
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    ev.tick(true);
+
+    CHECK(h.dispatch_calls == 0);
+    CHECK(denied(metrics, "gated") == 1);
+    auto rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("status_write=error") != std::string::npos);
+    CHECK(rows[0].detail.find("origin=tick") != std::string::npos);
+}
+
+TEST_CASE("policy dispatch approval: an over-length or off-charset identifier is refused, "
+          "recorded without its text, and counted under its own reason",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    yuzu::MetricsRegistry metrics;
+    const std::string long_plugin(129, 'a');
+    const auto check = define_real_pair(h, long_plugin, "run", "pair.long-plugin");
+    const auto pid = author_real_pairs(h, check);
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    auto kicked = ev.evaluate_now(pid);
+
+    CHECK(h.dispatch_calls == 0);
+    REQUIRE(kicked.has_value());
+    REQUIRE(kicked->denial.has_value());
+    CHECK(kicked->denial->reason == PolicyDispatchDenialReason::DispatchIdentifierInvalid);
+    for (const char* agent : {"agentA", "agentB"}) {
+        REQUIRE(h.status_of(pid, agent) == "blocked");
+        const auto j = row_json(h, pid, agent);
+        CHECK(j["reason"] == "dispatch_identifier_invalid");
+        CHECK(j["plugin"].is_null());
+        CHECK(j["action"].is_null());
+    }
+    CHECK(denied(metrics, "dispatch_identifier_invalid") == 1);
+    // The audit row names only the byte lengths, never the text.
+    auto rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("reason=dispatch_identifier_invalid") != std::string::npos);
+    CHECK(rows[0].detail.find("plugin_len=129") != std::string::npos);
+    CHECK(rows[0].detail.find(long_plugin) == std::string::npos);
+}
+
+TEST_CASE("policy dispatch approval: a definition repointed to a gated pair after the policy was "
+          "saved is refused at the next tick",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    h.canned["agentA|echo"] = {1, out_json("hostname", "yuzu-a")};
+    h.canned["agentB|echo"] = {1, out_json("hostname", "yuzu-b")};
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto pid = author_real_pairs(h, check);
+
+    PolicyEvaluator ev(h.deps());
+    ev.tick(true);
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.dispatch_calls == 1);
+    REQUIRE(h.status_of(pid, "agentA") == "compliant");
+
+    // The author repoints the same definition id to a gated pair.
+    auto def = h.is.get_definition(check);
+    REQUIRE(def.has_value());
+    REQUIRE(def->has_value());
+    InstructionDefinition d = **def;
+    d.plugin = "content_dist";
+    d.action = "execute_staged";
+    REQUIRE(h.is.update_definition(d).has_value());
+
+    h.fake_now += 4000;
+    ev.tick(true);
+    CHECK(h.dispatch_calls == 1); // nothing more was sent
+    check_blocked(h, pid, "check", "gated", "content_dist", "execute_staged");
+}
+
+TEST_CASE("policy dispatch approval: a refused verify leaves the fix in place and the targets "
+          "blocked, not in error",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");             // the check: allowed, scores non_compliant
+    h.canned["agentA|tags"] = {1, "ok"};      // the fix: an allowed Mutating pair with no gate
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "tags", "set");
+    const auto verify = define_real_pair(h, "content_dist", "execute_staged"); // refused
+    const auto pid = author_real_pairs(h, check, fix, verify);
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    auto rr = ev.remediate(pid, {"agentA"});
+    REQUIRE(rr.ok);
+    REQUIRE(pair_was_dispatched(h, "tags.set"));
+    REQUIRE(h.status_of(pid, "agentA") == "fixing");
+
+    // The fix matures; its verify dispatch is refused.
+    h.fake_now += 20;
+    ev.tick(false);
+    CHECK_FALSE(pair_was_dispatched(h, kGatedPair));
+    CHECK(h.status_of(pid, "agentA") == "blocked");
+    const auto j = row_json(h, pid, "agentA");
+    CHECK(j["phase"] == "verify");
+    CHECK(j["reason"] == "gated");
+    // Not the error arm, and not counted as a failed verify.
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "verify"}}).value() == 0);
+    CHECK(denied(metrics, "gated") == 1);
+    // The tick path audits it because the row changed.
+    auto rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("phase=verify") != std::string::npos);
+    CHECK(rows[0].detail.find("origin=tick") != std::string::npos);
+    // The claim was released with its generation unchanged, so the target can be claimed again.
+    auto reclaim = h.ps.claim_remediation(pid, {"agentA"}, 1800);
+    REQUIRE(reclaim.has_value());
+    CHECK(reclaim->ids.size() == 1);
+}
+
+// ---------------------------------------------------------------------------
+// G01: the `blocked` write of a refused fix or post-fix check is fenced on the claim generation,
+// and a fix refusal writes it BEFORE it releases the claim. These three tests make a sibling
+// replica's reclaim happen at the instant that matters, so removing the fence argument at either
+// call site, or swapping write and release, changes the outcome a test sees.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Runs one statement on its own connection (a trigger definition, or a sibling's reclaim).
+void exec_sql(const std::string& dsn, const char* sql, std::vector<std::string> params = {}) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r = yuzu::server::pg::exec_params(conn.get(), sql, params);
+    INFO(PQerrorMessage(conn.get()));
+    REQUIRE((r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK));
+}
+
+// An AFTER UPDATE trigger on policy_status that bumps the row's claim generation, as a sibling
+// replica's reclaim does, when `when_clause` holds. The nested UPDATE changes neither watched
+// column in a way that satisfies the clause again, so it cannot recurse.
+void install_sibling_reclaim_trigger(const std::string& dsn, const char* when_clause) {
+    exec_sql(dsn,
+             "CREATE FUNCTION policy_store.g01_sibling_reclaim() RETURNS trigger LANGUAGE plpgsql AS "
+             "$$ BEGIN "
+             "  UPDATE policy_store.policy_status SET remediation_claim_gen = "
+             "    remediation_claim_gen + 1 "
+             "  WHERE policy_id = NEW.policy_id AND agent_id = NEW.agent_id; "
+             "  RETURN NULL; END $$");
+    const std::string trig =
+        std::string("CREATE TRIGGER g01_sibling_reclaim AFTER UPDATE ON "
+                    "policy_store.policy_status FOR EACH ROW WHEN (") +
+        when_clause + ") EXECUTE FUNCTION policy_store.g01_sibling_reclaim()";
+    exec_sql(dsn, trig.c_str());
+}
+
+double fence_skips(yuzu::MetricsRegistry& m) {
+    return m.counter("yuzu_server_policy_remediation_fence_skip_total").value();
+}
+
+} // namespace
+
+TEST_CASE("policy dispatch approval: a refused fix is written fenced, so a sibling's reclaim "
+          "is not overwritten by blocked",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "echo", "purge_source"); // Destructive: refused
+    const auto pid = author_real_pairs(h, check, fix);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    // A sibling reclaims the row the instant this call's claim lands.
+    install_sibling_reclaim_trigger(db.dsn(),
+                                    "OLD.remediation_claim_at = 0 AND NEW.remediation_claim_at <> 0");
+    auto rr = ev.remediate(pid, {"agentA"});
+
+    REQUIRE(rr.denial.has_value());
+    CHECK(rr.denial->reason == PolicyDispatchDenialReason::Destructive);
+    CHECK_FALSE(pair_was_dispatched(h, kDestructivePair));
+    // The fenced write matched no row: the sibling's row is untouched and the skip is counted.
+    // An unfenced write would have overwritten it with blocked.
+    CHECK(h.status_of(pid, "agentA") == "non_compliant");
+    CHECK(fence_skips(metrics) == 1);
+    CHECK(denied(metrics, "destructive") == 1);
+}
+
+TEST_CASE("policy dispatch approval: a refused fix writes blocked before it releases the claim",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "echo", "purge_source");
+    const auto pid = author_real_pairs(h, check, fix);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    // A sibling reclaims the row the instant the claim is RELEASED. Written first, blocked
+    // lands under this call's generation; released first, the write would find the sibling's.
+    install_sibling_reclaim_trigger(db.dsn(),
+                                    "OLD.remediation_claim_at <> 0 AND NEW.remediation_claim_at = 0");
+    auto rr = ev.remediate(pid, {"agentA"});
+
+    REQUIRE(rr.denial.has_value());
+    CHECK(h.status_of(pid, "agentA") == "blocked");
+    CHECK(fence_skips(metrics) == 0);
+}
+
+TEST_CASE("policy dispatch approval: a refused verify is written fenced on the claim "
+          "generation, so a sibling's reclaim is not overwritten by blocked",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    h.canned["agentA|tags"] = {1, "ok"}; // the fix: an allowed Mutating pair with no gate
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "tags", "set");
+    const auto verify = define_real_pair(h, "content_dist", "execute_staged"); // refused
+    const auto pid = author_real_pairs(h, check, fix, verify);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+    REQUIRE(ev.remediate(pid, {"agentA"}).ok);
+    REQUIRE(h.status_of(pid, "agentA") == "fixing");
+
+    // A sibling reclaims the row after the fix ran and before its verify matures.
+    exec_sql(db.dsn(),
+             "UPDATE policy_store.policy_status SET remediation_claim_gen = "
+             "remediation_claim_gen + 1 WHERE policy_id = $1 AND agent_id = 'agentA'",
+             {pid});
+    h.fake_now += 20;
+    ev.tick(false);
+
+    CHECK_FALSE(pair_was_dispatched(h, kGatedPair));
+    // The refusal is counted, but its fenced write matched no row: the sibling's row stands.
+    CHECK(denied(metrics, "gated") == 1);
+    CHECK(h.status_of(pid, "agentA") == "fixing");
+    CHECK(fence_skips(metrics) == 1);
+}
+
+// ---------------------------------------------------------------------------
+// G01: the authoring-time check (advisory: the dispatch seam is the control)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("policy dispatch approval: authorize_instruction answers allowed, refused or degraded",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    const auto allowed_id = define_real_pair(h, "echo", "status");
+    const auto gated_id = define_real_pair(h, "content_dist", "execute_staged");
+    const auto destructive_id = define_real_pair(h, "echo", "purge_source");
+    const auto reserved_id = define_real_pair(h, "__guard__", "push_rules");
+    using Kind = PolicyEvaluator::InstructionCheck::Kind;
+
+    PolicyEvaluator ev(h.deps());
+    CHECK(ev.authorize_instruction(allowed_id).kind == Kind::Allowed);
+
+    const auto gated = ev.authorize_instruction(gated_id);
+    CHECK(gated.kind == Kind::Refused);
+    REQUIRE(gated.denial.has_value());
+    CHECK(gated.denial->reason == PolicyDispatchDenialReason::Gated);
+    const auto destructive = ev.authorize_instruction(destructive_id);
+    REQUIRE(destructive.denial.has_value());
+    CHECK(destructive.denial->reason == PolicyDispatchDenialReason::Destructive);
+    const auto reserved = ev.authorize_instruction(reserved_id);
+    REQUIRE(reserved.denial.has_value());
+    CHECK(reserved.denial->reason == PolicyDispatchDenialReason::Reserved);
+
+    // An instruction that does not exist yet is allowed (packs create definitions and
+    // fragments in any order); the dispatch seam still refuses it later if it is bad.
+    CHECK(ev.authorize_instruction("no.such.instruction").kind == Kind::Allowed);
+}
+
+TEST_CASE("policy dispatch approval: authorize_instruction is degraded, never an accept, when "
+          "it cannot answer",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    const auto gated_id = define_real_pair(h, "content_dist", "execute_staged");
+    using Kind = PolicyEvaluator::InstructionCheck::Kind;
+
+    // No registry: unwired reads as degraded (a 503), not as an accept and not as a 400.
+    {
+        auto deps = h.deps();
+        deps.capability_registry = nullptr;
+        PolicyEvaluator ev(deps);
+        CHECK(ev.authorize_instruction(gated_id).kind == Kind::Degraded);
+    }
+    // No instruction store.
+    {
+        auto deps = h.deps();
+        deps.instruction_store = nullptr;
+        PolicyEvaluator ev(deps);
+        CHECK(ev.authorize_instruction(gated_id).kind == Kind::Degraded);
+    }
+    // An instruction store that cannot be read.
+    {
+        PgPool broken_pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+        REQUIRE_FALSE(broken_pool.valid());
+        InstructionStore broken_is{broken_pool};
+        auto deps = h.deps();
+        deps.instruction_store = &broken_is;
+        PolicyEvaluator ev(deps);
+        CHECK(ev.authorize_instruction(gated_id).kind == Kind::Degraded);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G01 fold-in (Q1 option b, -14): record_denial observes AuditStore::log and warns once when the
+// row is not written, and a refused fix writes its audit row after the claim is released.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+size_t count_of(const std::string& hay, const std::string& needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
+        ++n;
+    return n;
+}
+
+// A BEFORE INSERT trigger on the audit table for the policy.dispatch row. `body` is the plpgsql
+// that runs first; it may RAISE to make the INSERT fail, which makes AuditStore::log return false.
+void install_audit_insert_trigger(const std::string& dsn, const char* body) {
+    const std::string fn =
+        std::string("CREATE FUNCTION audit_store.g01_audit_probe() RETURNS trigger LANGUAGE "
+                    "plpgsql AS $$ BEGIN IF NEW.action = 'policy.dispatch' THEN ") +
+        body + " END IF; RETURN NEW; END $$";
+    exec_sql(dsn, fn.c_str());
+    exec_sql(dsn, "CREATE TRIGGER g01_audit_probe BEFORE INSERT ON audit_store.audit_events "
+                  "FOR EACH ROW EXECUTE FUNCTION audit_store.g01_audit_probe()");
+}
+
+} // namespace
+
+TEST_CASE("policy dispatch approval: a refusal whose audit row is not written logs one warning "
+          "naming the policy, phase and reason",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    PolicyEvaluator ev(deps);
+    const std::string phrase = "policy.dispatch audit row not written";
+
+    // A row that is written logs nothing of the kind.
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        REQUIRE(ev.evaluate_now(pid).has_value());
+        cap.stop();
+        CHECK(count_of(cap.text(), phrase) == 0);
+        CHECK(audit_rows(audit, "policy.dispatch").size() == 1);
+        CHECK(audit.emit_failed_count() == 0);
+    }
+
+    // The audit INSERT now fails. The refusal still stands; one warning says the row is missing.
+    install_audit_insert_trigger(db.dsn(), "RAISE EXCEPTION 'audit insert refused';");
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        auto r = ev.evaluate_now(pid);
+        REQUIRE(r.has_value());
+        cap.stop();
+        const auto text = cap.text();
+        CHECK(count_of(text, phrase) == 1);
+        const auto first = text.find(phrase);
+        REQUIRE(first != std::string::npos);
+        const auto warn_line = text.substr(first, text.find('\n', first) - first);
+        CHECK(warn_line.find("policy=" + pid) != std::string::npos);
+        CHECK(warn_line.find("phase=check") != std::string::npos);
+        CHECK(warn_line.find("reason=gated") != std::string::npos);
+        // The store's own error text is not copied into the evaluator's line (the store logs
+        // its own error separately).
+        CHECK(warn_line.find("audit insert refused") == std::string::npos);
+    }
+    CHECK(audit.emit_failed_count() == 1);
+    CHECK(audit_rows(audit, "policy.dispatch").size() == 1);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.status_of(pid, "agentA") == "blocked");
+}
+
+TEST_CASE("policy dispatch approval: a refused fix writes its audit row after the claim is "
+          "released",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "echo", "purge_source"); // Destructive: refused
+    const auto pid = author_real_pairs(h, check, fix);
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    // The audit INSERT fails while any claim is still held, so a row exists only if it is
+    // written after the release.
+    install_audit_insert_trigger(
+        db.dsn(), "IF EXISTS (SELECT 1 FROM policy_store.policy_status WHERE "
+                  "remediation_claim_at <> 0) THEN RAISE EXCEPTION 'claim still held'; END IF;");
+    auto rr = ev.remediate(pid, {"agentA"});
+
+    REQUIRE(rr.denial.has_value());
+    CHECK(h.status_of(pid, "agentA") == "blocked");
+    CHECK(audit.emit_failed_count() == 0);
+    auto rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("phase=fix") != std::string::npos);
+}
+
+// G01: a chunk that fails part-way through a large refused run. The refusal still stands and
+// nothing is sent; the first tick audits it as status_write=error; the next tick repairs the
+// rest and writes one row for what changed; a third, identical refusal writes none (B6).
+TEST_CASE("policy dispatch approval: a chunk failure part-way through a large refused run is "
+          "audited as status_write=error, and the next refusal repairs it once",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+    // 1201 more targets: ids sort as agent-0000..agent-1200, then agentA and agentB. Chunks of
+    // 500 are 0000..0499, 0500..0999 and the remaining 203.
+    for (int i = 0; i <= 1200; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "agent-%04d", i);
+        REQUIRE(h.mg.add_member(h.group_id, buf).has_value());
+    }
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+
+    exec_sql(db.dsn(),
+             "CREATE FUNCTION policy_store.g01_chunk_fail() RETURNS trigger LANGUAGE plpgsql AS "
+             "$$ BEGIN IF NEW.agent_id = 'agent-0700' THEN RAISE EXCEPTION 'chunk refused'; END IF; "
+             "RETURN NEW; END $$");
+    exec_sql(db.dsn(),
+             "CREATE TRIGGER g01_chunk_fail BEFORE INSERT OR UPDATE ON policy_store.policy_status "
+             "FOR EACH ROW EXECUTE FUNCTION policy_store.g01_chunk_fail()");
+
+    ev.tick(true); // the first refusal; chunk 2 of 3 fails
+    CHECK(h.dispatch_calls == 0);
+    CHECK(denied(metrics, "gated") == 1);
+    auto summary = h.ps.get_compliance_summary(pid);
+    REQUIRE(summary.has_value());
+    CHECK(summary->blocked == 500); // chunk 1 only
+    // The partial count is not reported: the blocked verdict counter does not move.
+    CHECK(metrics.counter("yuzu_server_policy_verdicts_total", {{"status", "blocked"}}).value() == 0);
+    auto rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("status_write=error") != std::string::npos);
+    CHECK(rows[0].detail.find("origin=tick") != std::string::npos);
+
+    exec_sql(db.dsn(), "DROP TRIGGER g01_chunk_fail ON policy_store.policy_status");
+    h.fake_now += 4000;
+    ev.tick(true); // the repair: 703 targets were not blocked yet
+    summary = h.ps.get_compliance_summary(pid);
+    REQUIRE(summary.has_value());
+    CHECK(summary->blocked == 1203);
+    CHECK(metrics.counter("yuzu_server_policy_verdicts_total", {{"status", "blocked"}}).value() == 703);
+    rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 2);
+    // Newest first or oldest first, exactly one of the two rows carries the error marker.
+    int errors = 0;
+    for (const auto& r : rows)
+        errors += r.detail.find("status_write=error") != std::string::npos ? 1 : 0;
+    CHECK(errors == 1);
+
+    // B6: the same refusal again changes nothing, writes no new row, and still refreshes.
+    exec_sql(db.dsn(),
+             "UPDATE policy_store.policy_status SET last_check_at = "
+             "EXTRACT(EPOCH FROM NOW())::bigint - 82800 WHERE policy_id = $1 AND agent_id = "
+             "'agent-0000'",
+             {pid});
+    h.fake_now += 4000;
+    ev.tick(true);
+    CHECK(audit_rows(audit, "policy.dispatch").size() == 2);
+    CHECK(metrics.counter("yuzu_server_policy_verdicts_total", {{"status", "blocked"}}).value() == 703);
+    auto st = h.ps.get_agent_status(pid, "agent-0000");
+    REQUIRE(st.has_value());
+    REQUIRE(st->has_value());
+    CHECK(static_cast<int64_t>(std::time(nullptr)) - (*st)->last_check_at < 60);
+    CHECK(h.dispatch_calls == 0);
+}
+
+// ---------------------------------------------------------------------------
+// A definition whose own approval_mode is not `auto` is not dispatched by policy evaluation,
+// whatever its pair: policy evaluation has no approval step. The pair used below is an allowed
+// one (echo.status, tags.set), so the refusal is the approval_mode's doing alone.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("policy dispatch approval: a check whose definition needs approval is not dispatched, "
+          "on operator request and on a tick",
+          "[pg][policy][evaluator][dispatch_approval][approval_mode]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    // The same allowed pair as the control tests, but the definition says `always`.
+    const auto check = define_real_pair(h, "echo", "status", "pair.echo.status.always", "always");
+    const auto pid = author_real_pairs(h, check);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    auto kicked = ev.evaluate_now(pid);
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK_FALSE(pair_was_dispatched(h, kReadControlPair));
+    CHECK(h.dispatch_calls == 0);
+    REQUIRE(kicked.has_value());
+    CHECK(kicked->execution_id.empty());
+    REQUIRE(kicked->denial.has_value());
+    CHECK(kicked->denial->reason == PolicyDispatchDenialReason::ApprovalRequired);
+    check_blocked(h, pid, "check", "approval_required", "echo", "status");
+    CHECK(denied(metrics, "approval_required") >= 1);
+    CHECK(denied(metrics, "gated") == 0);
+}
+
+TEST_CASE("policy dispatch approval: a role-gated definition is refused as well, and an auto "
+          "definition over the same pair still dispatches",
+          "[pg][policy][evaluator][dispatch_approval][approval_mode]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    can_non_compliant(h, "echo");
+    const auto gated_def = define_real_pair(h, "echo", "status", "pair.echo.status.rg", "role-gated");
+    const auto auto_def = define_real_pair(h, "echo", "status", "pair.echo.status.auto", "auto");
+    const auto refused_pid = author_real_pairs(h, gated_def);
+    const auto control_pid = author_real_pairs(h, auto_def);
+
+    PolicyEvaluator ev(h.deps());
+    auto refused = ev.evaluate_now(refused_pid);
+    REQUIRE(refused.has_value());
+    REQUIRE(refused->denial.has_value());
+    CHECK(refused->denial->reason == PolicyDispatchDenialReason::ApprovalRequired);
+    CHECK(h.dispatch_calls == 0);
+
+    auto control = ev.evaluate_now(control_pid);
+    REQUIRE_FALSE(exec_id_of(control).empty());
+    CHECK_FALSE(control->denial.has_value());
+    CHECK(h.dispatch_calls == 1);
+    CHECK(pair_was_dispatched(h, kReadControlPair));
+}
+
+TEST_CASE("policy dispatch approval: a fix whose definition needs approval is not dispatched on "
+          "operator remediate",
+          "[pg][policy][evaluator][dispatch_approval][approval_mode]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    h.canned["agentA|tags"] = {1, "ok"};
+    const auto check = define_real_pair(h, "echo", "status");
+    // tags.set has no execute gate and is Mutating, so only the approval_mode refuses it.
+    const auto fix = define_real_pair(h, "tags", "set", "pair.tags.set.always", "always");
+    const auto pid = author_real_pairs(h, check, fix);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    auto rr = ev.remediate(pid, {"agentA"});
+
+    CHECK_FALSE(pair_was_dispatched(h, "tags.set"));
+    CHECK_FALSE(rr.ok);
+    CHECK_FALSE(rr.degraded);
+    REQUIRE(rr.denial.has_value());
+    CHECK(rr.denial->reason == PolicyDispatchDenialReason::ApprovalRequired);
+    REQUIRE(h.status_of(pid, "agentA") == "blocked");
+    const auto j = row_json(h, pid, "agentA");
+    CHECK(j["phase"] == "fix");
+    CHECK(j["reason"] == "approval_required");
+    CHECK(denied(metrics, "approval_required") == 1);
+    // The claim was released, so the target can be claimed again.
+    auto reclaim = h.ps.claim_remediation(pid, {"agentA"}, 1800);
+    REQUIRE(reclaim.has_value());
+    CHECK(reclaim->ids.size() == 1);
+}
+
+TEST_CASE("policy dispatch approval: a post-fix check whose definition needs approval is not "
+          "dispatched, and the targets are blocked, not in error",
+          "[pg][policy][evaluator][dispatch_approval][approval_mode]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    h.canned["agentA|tags"] = {1, "ok"};
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "tags", "set"); // allowed: auto
+    const auto verify = define_real_pair(h, "echo", "status", "pair.echo.status.verify.always", "always");
+    const auto pid = author_real_pairs(h, check, fix, verify);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    auto rr = ev.remediate(pid, {"agentA"});
+    REQUIRE(rr.ok);
+    REQUIRE(pair_was_dispatched(h, "tags.set"));
+    const int before = h.dispatch_calls;
+
+    h.fake_now += 20;
+    ev.tick(false); // the fix matures; its verify dispatch is refused
+    CHECK(h.dispatch_calls == before);
+    CHECK(h.status_of(pid, "agentA") == "blocked");
+    const auto j = row_json(h, pid, "agentA");
+    CHECK(j["phase"] == "verify");
+    CHECK(j["reason"] == "approval_required");
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "verify"}}).value() == 0);
+    CHECK(denied(metrics, "approval_required") == 1);
 }

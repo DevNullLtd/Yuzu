@@ -9,7 +9,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dylib`); there is no alias, and the agent rejects a leftover `tar` plugin file. See the Echo section of [Upgrading](upgrading.md).
 
 <!-- BEGIN GENERATED: plugin-doc-gen index -->
-74 of 74 plugins document themselves this way; the rest are described in the prose below until their README lands.
+75 of 75 plugins document themselves this way; the rest are described in the prose below until their README lands.
 
 | Plugin | Platforms | What it does | Docs |
 |---|---|---|---|
@@ -36,6 +36,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `event_logs` | ✅ ✅ ✅ | Queries system event logs for errors and filtered events | [README](../../agents/plugins/event_logs/README.md) |
 | `example` | ✅ ✅ ✅ | Reference example plugin — responds to 'ping' | [README](../../agents/plugins/example/README.md) |
 | `execution_artifacts` | ✅ ⛔ ⛔ | Windows execution-evidence sources: ShimCache, Amcache InventoryApplicationFile, and Prefetch. Forensics-gated, single-target, default-off | [README](../../agents/plugins/execution_artifacts/README.md) |
+| `file_search` | 🟡 🟡 🟡 | On-demand, resumable search of the local disks by file or directory name, with the extents of every matched file; names, types, sizes, times and extents only | [README](../../agents/plugins/file_search/README.md) |
 | `filesystem` | ✅ ✅ ✅ | Filesystem operations — exists, list_dir, file_hash, search_dir, text ops (admin-only) | [README](../../agents/plugins/filesystem/README.md) |
 | `filesystem_posture` | 🟡 ✅ 🟡 | Reports mounted filesystems, per-mount quota-subsystem state, and snapshot-capable volumes | [README](../../agents/plugins/filesystem_posture/README.md) |
 | `firewall` | ✅ ✅ ✅ | Firewall status, rule listing and device containment | [README](../../agents/plugins/firewall/README.md) |
