@@ -12911,6 +12911,14 @@ TEST_CASE("MCP get_device_live: the poll reads the device's rows only (multi-row
         CHECK(mcp_live_count(f.metrics, "uptime", "shutting_down") == 1.0);
         CHECK(mcp_live_count(f.metrics, "uptime", "ok") == 0.0);
     }
+    SECTION("a processes timeout is priced at the plugin's action budget, not the quick-kind 3 s (S2)") {
+        const auto res = f.call("WS-1", "processes");
+        const auto err = live_error(res);
+        CHECK(err["data"]["reason"] == "timeout");
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kLiveReadProcessesTimeoutRetryMs);
+        CHECK(err["data"]["retry_after_ms"] != yuzu::server::mcp::kMcpLiveReadDeviceTimeoutRetryMs);
+        CHECK(mcp_live_count(f.metrics, "processes", "timeout") == 1.0);
+    }
     SECTION("a foreign agent's row under the same command id is never read") {
         f.put_row("live-cmd-1", "WS-2", 1, "uptime_display|SECRET-OF-WS-2");
         const auto res = f.call("WS-1", "uptime");

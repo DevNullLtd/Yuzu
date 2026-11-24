@@ -1109,14 +1109,19 @@ ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTi
             // `meta`: the candidate count and how many in-limit rows the cap dropped.
             // Only `kept` rows are joined back for the full columns, so a cut-off row's
             // output/error_detail is never sent over the wire or parsed.
+            // The ranking is one of two fixed literals, never caller text.
+            const char* const rank = q.order_by_id ? "id DESC" : "timestamp DESC, id DESC";
+            const char* const out_rank = q.order_by_id ? "r.id DESC" : "r.timestamp DESC, r.id DESC";
             std::string sql =
                 "WITH lim AS (SELECT id, timestamp, "
                 "COALESCE(octet_length(output), 0) + COALESCE(octet_length(error_detail), 0) "
                 "AS sz FROM response_store.responses" +
-                where + " ORDER BY timestamp DESC, id DESC LIMIT (" + limit_ph +
+                where + " ORDER BY " + rank + " LIMIT (" + limit_ph +
                 " + 1)), "
                 "ranked AS (SELECT id, sz, ROW_NUMBER() OVER w AS rn, SUM(sz) OVER w AS running "
-                "FROM lim WINDOW w AS (ORDER BY timestamp DESC, id DESC)), "
+                "FROM lim WINDOW w AS (ORDER BY " +
+                rank +
+                ")), "
                 "meta AS (SELECT COUNT(*) AS total, "
                 "COUNT(*) FILTER (WHERE rn <= " +
                 limit_ph + " AND rn > 1 AND running - sz >= " + cap_ph +
@@ -1128,7 +1133,8 @@ ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTi
                 "r.error_detail, r.ttl_expires_at, r.plugin, r.execution_id, r.received_at_ms, "
                 "COALESCE(r.plugin_result_status, 0), meta.total, meta.cut_bytes "
                 "FROM kept JOIN response_store.responses r ON r.id = kept.id CROSS JOIN meta "
-                "ORDER BY r.timestamp DESC, r.id DESC";
+                "ORDER BY " +
+                std::string(out_rank);
             pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;

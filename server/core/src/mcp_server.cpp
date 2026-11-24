@@ -2773,7 +2773,8 @@ static const ToolDef kTools[] = {
      "writes audit rows, and the result is stored in the server's response store for the "
      "retention period (90 days by default). Treat each call as an action: never retry one "
      "that returned no retry_after_ms. "
-     "SYNCHRONOUS: the call blocks for up to about 20 seconds waiting for the device and "
+     "SYNCHRONOUS: the call blocks until the device answers or the 25 second poll deadline "
+     "passes (plus at most one 0.5 second poll interval and one store read), waiting for the device and "
      "holds one server request slot meanwhile (at most 2 per principal, 4 server-wide; over "
      "that it answers a retryable cap error and sends nothing). The answer is given only after "
      "the device has finished: partial output without a final row is never returned, except "
@@ -22559,7 +22560,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         outcome = live::LiveOutcome::kTimeout;
                         res.set_content(
                             a4_error(kInternalError, "device did not respond in time",
-                                     "retry the request", mcp::kMcpLiveReadDeviceTimeoutRetryMs,
+                                     "retry the request", mcp::live_read_timeout_retry_ms(kind),
                                      cid, true, "timeout"),
                             "application/json");
                         return;

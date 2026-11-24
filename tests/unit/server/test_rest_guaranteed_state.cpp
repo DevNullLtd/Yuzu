@@ -6057,6 +6057,15 @@ TEST_CASE("REST dex/devices/{id}/live: a timeout and a device error are counted 
     CHECK(nlohmann::json::parse(timed_out->body)["error"]["retry_after_ms"].get<int>() == 3000);
     CHECK(rest_live_count(h, "uptime", "timeout") == 1.0);
 
+    // S2: a `processes` run hashes for up to 120 s and a retry executes for real, so its timeout
+    // hint is the plugin's action budget, not the quick-kind 3 s.
+    auto proc_timed_out = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+    REQUIRE(proc_timed_out);
+    CHECK(proc_timed_out->status == 504);
+    CHECK(nlohmann::json::parse(proc_timed_out->body)["error"]["retry_after_ms"].get<int>() ==
+          yuzu::server::mcp::kLiveReadProcessesTimeoutRetryMs);
+    CHECK(rest_live_count(h, "processes", "timeout") == 1.0);
+
     StoredResponse r;
     r.instruction_id = "processes-live";
     r.agent_id = "WS-1";

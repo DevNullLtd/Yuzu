@@ -204,9 +204,13 @@ LivePollOutcome poll_live_output(const ResponseStore& store, const std::string& 
     ResponseQuery q;
     q.agent_id = std::string(agent_id); // scoped in SQL, before the LIMIT
     q.limit = kLivePollRowLimit;
-    // query_bounded keeps the newest rows first and always keeps the newest one (the terminal
-    // row), cuts the rest at the byte cap, and orders ties by id, so the LIMIT edge is
-    // deterministic. A cut or a row-limit hit means the head of the answer is missing: `capped`.
+    // Rank by id alone: ids are the order the reducer trusts, a stored timestamp can step
+    // backwards, and a timestamp ranking could then cut the terminal row (the newest by id) at
+    // the row limit or the byte cap before the reducer sees it. With `order_by_id`, query_bounded
+    // keeps the newest row by id (the terminal row) and cuts the older rows at the byte cap, so
+    // the LIMIT edge is deterministic. A cut or a row-limit hit means the head of the answer is
+    // missing: `capped`.
+    q.order_by_id = true;
     return poll_live_output(
         [&]() -> std::optional<LiveRowsRead> {
             auto bounded = store.query_bounded(command_id, tier, q, std::nullopt, limits.max_output_bytes);

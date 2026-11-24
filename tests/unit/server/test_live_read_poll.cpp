@@ -856,6 +856,102 @@ TEST_CASE("poll_live_output [pg]: a stored answer over the byte cap is cut by th
     }
 }
 
+// S1 (adversarial review): the bounded read ranked rows by `timestamp DESC, id DESC`, so a terminal
+// row stamped with an OLDER timestamp than the chunks before it (a clock step back) was the first
+// row cut at the row limit or the byte cap, and the id-ordered reducer never saw it: a stored device
+// failure was answered `ok` + `truncated`. The poll now ranks by id alone, so the newest row by id
+// (the terminal row) is always kept.
+TEST_CASE("poll_live_output [pg]: a terminal failure with an older timestamp than its chunks survives the cut",
+          "[live][poll][pg][2146]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::test::PostgresTestDb db{live_poll_tpl};
+    REQUIRE(db.available());
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+    const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+
+    SECTION("row limit: more than 64 chunk rows, the failing terminal row newest by id, oldest by timestamp") {
+        for (int i = 0; i < live::kLivePollRowLimit + 6; ++i)
+            seed(store, "cmd-step-rows", "agent-1", 0, "proc|" + std::to_string(i) + "|x\n", "os_info", "",
+                 1000 + i);
+        seed(store, "cmd-step-rows", "agent-1", 2, "", "os_info", "agent exploded", 500);
+
+        auto limits = fast_limits(1);
+        limits.over_cap = live::OverCapPolicy::kTruncateAtNewline; // the MCP policy, where S1 answered ok
+        const auto out = live::poll_live_output(store, "cmd-step-rows", "agent-1", plugins, limits, no_sleep);
+        CHECK(out.outcome == live::LiveOutcome::kDeviceFailed);
+        CHECK(out.detail == "agent exploded");
+        CHECK_FALSE(out.truncated);
+    }
+    SECTION("byte cap: large chunks fill the cap, the failing terminal row is newest by id, oldest by timestamp") {
+        for (int i = 0; i < 5; ++i)
+            seed(store, "cmd-step-bytes", "agent-1", 0, std::string(100, 'a' + i) + "\n", "os_info", "",
+                 1000 + i);
+        seed(store, "cmd-step-bytes", "agent-1", 2, "", "os_info", "agent exploded", 500);
+
+        auto limits = fast_limits(1);
+        limits.max_output_bytes = 150;
+        limits.over_cap = live::OverCapPolicy::kTruncateAtNewline;
+        const auto out = live::poll_live_output(store, "cmd-step-bytes", "agent-1", plugins, limits, no_sleep);
+        CHECK(out.outcome == live::LiveOutcome::kDeviceFailed);
+        CHECK(out.detail == "agent exploded");
+    }
+}
+
+TEST_CASE("ResponseStore::query_bounded [pg]: order_by_id ranks by id alone, the default still ranks by timestamp",
+          "[live][poll][pg][2146]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::test::PostgresTestDb db{live_poll_tpl};
+    REQUIRE(db.available());
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Row 1 has the NEWEST timestamp, row 3 the newest id and the oldest timestamp.
+    seed(store, "cmd-rank", "agent-1", 0, "one", "os_info", "", 3000);
+    seed(store, "cmd-rank", "agent-1", 0, "two", "os_info", "", 2000);
+    seed(store, "cmd-rank", "agent-1", 1, "three", "os_info", "", 1000);
+
+    const auto tier = ResponseTierFilter::for_fixed_plugin_poll(&yuzu::server::test::forensics_plugin_set());
+    ResponseQuery q;
+    q.agent_id = "agent-1";
+    q.limit = 2; // one row short of the three, so the cut decides which survive
+
+    q.order_by_id = false;
+    const auto by_ts = store.query_bounded("cmd-rank", tier, q, std::nullopt, 1u << 20);
+    REQUIRE(by_ts.has_value());
+    REQUIRE(by_ts->rows.size() == 2);
+    CHECK(by_ts->rows[0].output == "one"); // newest timestamp first: the terminal row is the one cut
+    CHECK(by_ts->rows[1].output == "two");
+    CHECK(by_ts->row_cap_hit);
+
+    q.order_by_id = true;
+    const auto by_id = store.query_bounded("cmd-rank", tier, q, std::nullopt, 1u << 20);
+    REQUIRE(by_id.has_value());
+    REQUIRE(by_id->rows.size() == 2);
+    CHECK(by_id->rows[0].output == "three"); // newest id first: the terminal row survives
+    CHECK(by_id->rows[1].output == "two");
+    CHECK(by_id->row_cap_hit);
+}
+
+TEST_CASE("live_read_timeout_retry_ms: processes is priced at the plugin's action budget, other kinds at 3 s",
+          "[live][retry][2146]") {
+    namespace mcp = yuzu::server::mcp;
+    CHECK(mcp::live_read_timeout_retry_ms("uptime") == mcp::kMcpLiveReadDeviceTimeoutRetryMs);
+    CHECK(mcp::live_read_timeout_retry_ms("uptime") == 3000);
+    CHECK(mcp::live_read_timeout_retry_ms("processes") == mcp::kLiveReadProcessesTimeoutRetryMs);
+    // The processes plugin's own action budget (`kActionBudget`, processes_plugin.cpp) is 120 s; a
+    // retry sooner than that can land inside the first run's hashing.
+    CHECK(mcp::kLiveReadProcessesTimeoutRetryMs == 120000);
+    // An unresolved token never reaches the hint, but the default must be the short quick-kind price.
+    CHECK(mcp::live_read_timeout_retry_ms("") == mcp::kMcpLiveReadDeviceTimeoutRetryMs);
+}
+
 // S3: the helper the REST and MCP error text goes through. Invalid bytes cannot reach those sites
 // through the response store (it scrubs at ingest), so this pins the helper itself: repair first,
 // THEN cut, so the bound holds after U+FFFD (3 bytes) replaces a 1-byte fault.

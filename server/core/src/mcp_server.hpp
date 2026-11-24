@@ -962,7 +962,7 @@ public:
     /// bool. `get_device_live` uses it at its #7110 re-decision only, to tell a withdrawn
     /// permission from a gate that could not read its authority (a store degrade, which is
     /// retryable and is not a revocation). Unset (a harness that does not wire it) = the re-decision
-    /// falls back to `ScopedPermFn` and every refusal is read as a denial.
+    /// fails closed: `get_device_live` answers a retryable `gate_unreadable` and sends nothing.
     using ScopedGateFn = std::function<ScopedGateOutcome(
         const httplib::Request&, httplib::Response&, const std::string& securable_type,
         const std::string& operation, const std::string& agent_id)>;
