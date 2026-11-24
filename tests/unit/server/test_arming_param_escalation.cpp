@@ -59,7 +59,8 @@ TEST_CASE("arming: patch_connectivity targets need Infrastructure:Read at arming
         blank{{"targets", "  "}};
     const auto arm = [&](const char* who, const P& p) {
         return yuzu::server::schedule_arming_permitted(registry, &rbac, who, "windows_updates",
-                                                       "patch_connectivity", p);
+                                                       "patch_connectivity", p)
+            .value_or(false);
     };
     // Default targets: SoftwareDeployment:Read is enough (an empty value is the default branch).
     CHECK(arm("sd", none));

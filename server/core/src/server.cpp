@@ -460,6 +460,18 @@ extern const char* const kYuzuIconsSvg;
 extern const std::string kHtmxJs;
 extern const std::string kSseJs;
 namespace yuzu::server {
+
+namespace {
+/// WP06 F57: true when `req` carries any proxy-evidence header (web_utils.hpp's
+/// `kForwardingEvidenceHeaders`; kept here because web_utils.hpp is httplib-free by design).
+[[nodiscard]] bool request_has_forwarding_evidence(const httplib::Request& req) {
+    for (auto h : kForwardingEvidenceHeaders)
+        if (req.has_header(std::string(h)))
+            return true;
+    return false;
+}
+} // namespace
+
 extern const std::string kYuzuCss; // server/core/static/yuzu.css (build-time embed)
 extern const std::string kYuzuChartsJs;
 extern const std::string kEChartsJs; // server/core/vendor/echarts.min.js (Apache-2.0)
@@ -2048,6 +2060,17 @@ public:
              {"store_not_open", "pool_acquire_timeout", "query_error", "read_concurrency_cap"})
             metrics_.counter("yuzu_server_quarantine_read_degrade_total", {{"reason", reason}});
 
+        // #7949: bulk device-CI reads refused because every read slot was taken. The surface
+        // label is the closed pair below, set only by hw_ci_read_busy_fn (never caller text).
+        // Seeded so the first refusal reads as an increase from 0.
+        metrics_.describe("yuzu_hardware_ci_read_busy_total",
+                          "Bulk device-CI reads (GET /api/v1/hardware-ci and MCP "
+                          "list_hardware_ci_records) refused with a retryable 503 because every "
+                          "read slot on this replica was taken, by surface (rest/mcp)",
+                          "counter");
+        for (const char* surface : {"rest", "mcp"})
+            metrics_.counter("yuzu_hardware_ci_read_busy_total", {{"surface", surface}});
+
         // #3402: the internal pushes that deliberately BYPASS that gate, seeded
         // across the full capability x result product. Every combination is
         // reachable — each of the five pushes can fail at the registry seam —
@@ -2921,12 +2944,50 @@ public:
                           "/auto VERIFY cohort reads that hit the row cap and were TRUNCATED (the "
                           "comparison is incomplete and may mis-pair machines)",
                           "counter");
+        // Echo corruption audit gate signals (#7486, #5066, #7475, #7429). The counters are
+        // pre-seeded to 0 so the first quarantine / degrade reads as an increase from 0 (the
+        // alert on the quarantine counter depends on that sample).
+        metrics_.describe("yuzu_server_echo_db_quarantines_total",
+                          "New Echo database quarantines recorded: one per echo.db corruption "
+                          "audit row this server wrote (a duplicate or a durable lookup hit does "
+                          "not count). Alerts watch the increase, not a population",
+                          "counter");
+        metrics_.counter("yuzu_server_echo_db_quarantines_total");
+        metrics_.describe("yuzu_server_echo_corruption_audit_degraded_total",
+                          "Failed echo.db corruption audit lookups and writes, by reason "
+                          "(lookup_degraded, lookup_threw, write_failed). Each opens a 60 s window "
+                          "in which no agent is audited, except a repeat failure by the same "
+                          "agent, which only that agent waits out; quarantines not audited are "
+                          "retried afterwards",
+                          "counter");
+        for (const char* reason : {"lookup_degraded", "lookup_threw", "write_failed"})
+            metrics_.counter("yuzu_server_echo_corruption_audit_degraded_total",
+                             {{"reason", reason}});
+        metrics_.describe("yuzu_server_echo_corruption_audit_store_closed_total",
+                          "Heartbeats that carried an echo.db quarantine candidate while the audit "
+                          "store was closed: nothing can be audited or counted as a quarantine "
+                          "then, so a rise here means the quarantine counter is blind, not that "
+                          "no agent is corrupt",
+                          "counter");
+        metrics_.counter("yuzu_server_echo_corruption_audit_store_closed_total");
+        metrics_.describe("yuzu_server_health_upsert_exceptions_total",
+                          "Heartbeat health-store upserts that threw out of the store (caught in "
+                          "the heartbeat handler, logged and counted; the rest of ingestion "
+                          "continues)",
+                          "counter");
+        metrics_.counter("yuzu_server_health_upsert_exceptions_total");
+        metrics_.describe("yuzu_fleet_retired_tar_plugin_agents",
+                          "Agents connected to this server that report the retired plugin name "
+                          "tar and no echo (not Echo agents; upgrade them). Published every sweep, "
+                          "0 included",
+                          "gauge");
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
         metrics_.describe("yuzu_fleet_echo_db_corruption_agents",
                           "Agents whose Echo database has ever been quarantined as corrupt "
-                          "(cumulative per agent since install; a rising value is the signal)",
+                          "(cumulative per agent since install: a population that only falls when "
+                          "agents leave, not a rate; see yuzu_server_echo_db_quarantines_total)",
                           "gauge");
         metrics_.describe("yuzu_fleet_echo_storage_offline",
                           "Agents whose Echo database is offline, by reason (free_space, "
@@ -5865,6 +5926,44 @@ public:
         // plugin="unknown" and can neither displace a real plugin nor collide with one. Set once,
         // before the health recompute thread's first sweep (started in run()).
         health_store_.set_known_plugins(yuzu::server::catalogue_plugin_names(capability_registry_));
+        // WP06 F31: the served plugin catalogue (discover_plugins, dashboard help) is bounded to
+        // what the same capability catalogue recognises. `classify` is const and the registry is
+        // fixed after construction, so the filter is safe to run under the registry's lock.
+        registry_.set_catalogue_filter([this](std::string_view plugin, std::string_view action) {
+            return capability_registry_.classify(std::string(plugin), std::string(action)).has_value();
+        });
+        for (const char* field : {"name", "version", "description", "actions", "action", "plugins", "duplicate"})
+            metrics_.counter("yuzu_server_agent_registry_plugin_meta_dropped_total",
+                             {{"field", field}});
+        metrics_.describe("yuzu_server_agent_registry_plugin_meta_dropped_total",
+                          "Agent-reported plugin metadata fields dropped at registration because "
+                          "they fell outside their bound (a plugin entry beyond the per-agent "
+                          "cap counts under field=plugins). Zero means every report was within bounds.",
+                          "counter");
+
+        // The bulk device-CI read's concurrency cap (#7949/#7951, bulk_read_slots.hpp), resolved
+        // against the EFFECTIVE pool size (the same fallback the pool construction below uses).
+        // Always constructed, so the routes and the MCP tools are never handed a null: an invalid
+        // explicit value refuses boot and, defensively, leaves the tightest cap (1).
+        {
+            // Config::hardware_ci_read_concurrency's default and kBulkReadCapUnset are two
+            // spellings of one value (Config is not a literal type, so a unit test pins it:
+            // test_bulk_read_slots.cpp).
+            const int effective_pool =
+                cfg_.postgres_pool_size > 0 ? cfg_.postgres_pool_size : 16;
+            const auto cap =
+                yuzu::server::resolve_bulk_read_cap(cfg_.hardware_ci_read_concurrency, effective_pool);
+            if (!cap) {
+                spdlog::error("[HardwareCI] Refusing to start: {}", cap.error());
+                startup_failed_ = true;
+                hardware_ci_read_slots_ = std::make_unique<yuzu::server::BulkReadSlots>(1);
+            } else {
+                spdlog::info("[HardwareCI] bulk read concurrency cap {} (postgres pool size {}, {})",
+                             cap->cap, effective_pool,
+                             cap->defaulted ? "defaulted" : "set by --hardware-ci-read-concurrency");
+                hardware_ci_read_slots_ = std::make_unique<yuzu::server::BulkReadSlots>(cap->cap);
+            }
+        }
 
         // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
         // BEFORE any Postgres-backed store and validated by a probe checkout so
@@ -7020,32 +7119,55 @@ public:
                         return std::optional<std::string>{};
                     return detail::decode_echo_quarantine_from_detail(rows->front().detail);
                 };
-                auto gate = std::make_shared<detail::EchoCorruptionAuditGate>(std::move(latest));
+                // #5066: every lookup or write failure is counted by reason and logged once (the
+                // reason token is a closed set, safe to log verbatim). A repeat failure by the
+                // same agent opens no gate-wide window; the observer still hears it.
+                auto on_degraded = [this](detail::DegradedCause cause) {
+                    const char* reason = detail::echo_corruption_degraded_cause_token(cause);
+                    metrics_.counter("yuzu_server_echo_corruption_audit_degraded_total",
+                                     {{"reason", reason}})
+                        .increment();
+                    spdlog::warn("echo.db corruption audit failed ({}): new quarantines are not "
+                                 "audited until the retry wait ends (every agent, or only the "
+                                 "failing one when it fails again)",
+                                 reason);
+                };
+                auto gate = std::make_shared<detail::EchoCorruptionAuditGate>(
+                    std::move(latest), &detail::EchoCorruptionAuditGate::steady_seconds,
+                    std::move(on_degraded));
                 health_store_.set_corruption_sink([this, gate](const std::string& agent_id,
                                                                int64_t total,
                                                                const std::string& quarantine) {
-                    if (!audit_store_ || !audit_store_->is_open())
+                    if (!audit_store_ || !audit_store_->is_open()) {
+                        // No row can be written, so the quarantine counter cannot move: say so, or
+                        // the corruption signal would be silent exactly when the store is down.
+                        metrics_
+                            .counter("yuzu_server_echo_corruption_audit_store_closed_total")
+                            .increment();
                         return;
-                    if (!gate->should_log(agent_id, quarantine))
-                        return;
-                    // Reservation completes that agent's slot even if AuditEvent construction
-                    // or audit_store_->log() throws (log() is not noexcept).
-                    detail::EchoCorruptionAuditGate::Reservation res(*gate, agent_id);
-                    AuditEvent ev;
-                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                                       std::chrono::system_clock::now().time_since_epoch())
-                                       .count();
-                    ev.principal = "system";
-                    ev.principal_role = "system";
-                    ev.action = detail::kEchoCorruptionAuditAction;
-                    ev.target_type = detail::kEchoCorruptionAuditTargetType;
-                    ev.target_id = agent_id;
-                    ev.detail = detail::encode_echo_corruption_detail(total, quarantine);
-                    ev.result = "success";
-                    if (audit_store_->log(ev))
-                        res.logged(quarantine);
-                    else
-                        res.failed();
+                    }
+                    // log_echo_corruption_once admits via the gate and completes the reservation
+                    // even if AuditEvent construction or audit_store_->log() throws (log() is
+                    // not noexcept). It returns true only for a row this call wrote, so the
+                    // counter moves once per new quarantine and not for a durable lookup hit
+                    // (an agent back from offline, a failover) or a refused or failed write.
+                    const bool wrote = detail::log_echo_corruption_once(
+                        *gate, agent_id, quarantine, [&] {
+                            AuditEvent ev;
+                            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
+                            ev.principal = "system";
+                            ev.principal_role = "system";
+                            ev.action = detail::kEchoCorruptionAuditAction;
+                            ev.target_type = detail::kEchoCorruptionAuditTargetType;
+                            ev.target_id = agent_id;
+                            ev.detail = detail::encode_echo_corruption_detail(total, quarantine);
+                            ev.result = "success";
+                            return audit_store_->log(ev);
+                        });
+                    if (wrote)
+                        metrics_.counter("yuzu_server_echo_db_quarantines_total").increment();
                 });
             }
 
@@ -10812,6 +10934,11 @@ public:
                 // visible.
                 const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, detail::kAgentHealthStaleness);
+                // #7429: agents on the retired `tar` plugin name. The flag lives on the sessions
+                // this replica holds (AgentRegistry, not the health store), so it is read here
+                // and set per replica; a count over server-held sessions has a true zero.
+                metrics_.gauge("yuzu_fleet_retired_tar_plugin_agents")
+                    .set(static_cast<double>(registry_.retired_tar_only_count()));
                 // PostgreSQL pool gauges (#1368): sampled on the same cadence as
                 // the fleet families. Counters/histogram are fed live by the
                 // pool's observer hooks, so only the level gauges are polled here.
@@ -12037,6 +12164,7 @@ public:
             .offline_endpoint = offline_endpoint_store_.get(),
             .certificate_inventory = certificate_inventory_store_.get(),
             .guaranteed_state = guaranteed_state_store_.get(),
+            .management_group_memberships = mgmt_group_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
@@ -14680,6 +14808,28 @@ private:
     /// store error, or no auth store at all — yields an EMPTY-principal,
     /// deny-all caller, which `build_classified_command` refuses as
     /// `AnonymousOperator` before any permission check runs.
+    /// The ONE arming check, used by BOTH the schedule runner and the outbox delivery loop (a
+    /// second hand-copied lambda is how the two would drift). Tri-state: permitted / denied /
+    /// UNAVAILABLE (a transient auth-store fault while resolving the creator's role): the caller
+    /// holds, it never records "authority denied" for an infrastructure fault. The creator's
+    /// legacy admin role is read LAZILY and fresh (never cached); JIT elevation does not count (a
+    /// background fire has no session). No auth store wired, or no creator = denied (fail closed).
+    [[nodiscard]] yuzu::server::ArmingResult schedule_arming(const std::string& principal,
+                                                             const std::string& plugin,
+                                                             const std::string& action,
+                                                             const std::unordered_map<std::string, std::string>& parameters) {
+        return yuzu::server::schedule_arming_permitted(
+            capability_registry_, rbac_store_.get(), principal, plugin, action, parameters,
+            [this, &principal]() -> yuzu::server::ArmingResult {
+                if (!auth_db_ || principal.empty())
+                    return false;
+                auto user = auth_db_->get_user(principal);
+                if (user)
+                    return user->role == auth::Role::admin;
+                return yuzu::server::legacy_admin_lookup_failure(user.error());
+            });
+    }
+
     yuzu::server::DispatchCaller derive_dispatch_caller_for_username(const std::string& username) {
         bool principal_resolves = false;
         std::string role_label;
@@ -17827,15 +17977,20 @@ private:
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
-            // /metrics: localhost always unauthenticated; remote depends on config
+            // /metrics (WP06 F57): authenticated unless `--metrics-no-auth`, or the operator
+            // opted in to trusting a direct loopback peer (`--metrics-trust-loopback`, default
+            // OFF: a same-host proxy/sidecar makes remote callers look loopback). The loopback
+            // decision is web_utils.hpp `metrics_loopback_peer_exempt` (one copy).
             if (req.path == "/metrics") {
-                if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1") {
+                if (cfg_.metrics_trust_loopback &&
+                    metrics_loopback_peer_exempt(req.remote_addr,
+                                                 request_has_forwarding_evidence(req))) {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
                 if (!cfg_.metrics_require_auth) {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
-                // Remote callers fall through to normal auth check below
+                // Everyone else falls through to the normal auth check below
             }
 
             auto session = auth_routes_->resolve_session(req);
@@ -19294,6 +19449,8 @@ private:
         yuzu::server::legacy_events::register_legacy_events_routes(
             inline_sink, yuzu::server::legacy_events::Deps{
                              .deny_service_scoped_fn = deny_service_scoped_fn,
+                             .fleet_read_fn = fleet_read_fn, // WP06 F11
+                             .audit_fn = audit_fn,
                              .resolve_session_fn = resolve_session_fn,
                              .event_bus = &event_bus_,
                              .stream_budget = stream_budget_.get(),
@@ -20155,6 +20312,32 @@ private:
                           "which denies fail-closed). Zero means the check ran and passed.",
                           "counter");
         metrics_.counter("yuzu_schedule_arming_denied_total");
+        // The arming answer could not be determined (a transient auth-store fault): the occurrence
+        // is HELD (schedule not advanced / outbox rescheduled), never counted as a denial.
+        metrics_.describe("yuzu_schedule_arming_unavailable_total",
+                          "Scheduled occurrences held because the arming principal's authority "
+                          "could not be determined (auth-store fault). Not a denial; retried.",
+                          "counter");
+        metrics_.counter("yuzu_schedule_arming_unavailable_total");
+        // Starvation signal: a held schedule is skipped without being asked, so without these two
+        // series nothing says how much scheduled work is not running during an auth-store outage.
+        metrics_.describe("yuzu_schedule_arming_deferred_total",
+                          "Due scheduled occurrences skipped this tick because an earlier arming "
+                          "check for them was unavailable and their hold has not lapsed. Not a "
+                          "denial; asked again when the hold lapses.",
+                          "counter");
+        metrics_.counter("yuzu_schedule_arming_deferred_total");
+        metrics_.describe("yuzu_schedule_due_held",
+                          "Scheduled occurrences currently held because their arming check was "
+                          "unavailable (auth-store fault), as of the last scheduler tick. 0 = none.",
+                          "gauge");
+        metrics_.gauge("yuzu_schedule_due_held").set(0.0);
+        metrics_.describe("yuzu_server_command_outbox_deliver_arming_unavailable_total",
+                          "Outbox occurrences rescheduled because the arming principal's "
+                          "authority could not be determined at send time (auth-store fault). "
+                          "Not a denial; retried with back-off.",
+                          "counter");
+        metrics_.counter("yuzu_server_command_outbox_deliver_arming_unavailable_total");
         // ADR-1007: absent-vs-zero carries the same meaning as the arming
         // counter above — zero means the second definition read always
         // succeeded and per-device enforcement applied to every fire;
@@ -20226,10 +20409,8 @@ private:
             // cases and the legacy-open posture are documented there.
             .arming_check = [this](const std::string& principal, const std::string& plugin,
                                    const std::string& action,
-                const std::unordered_map<std::string, std::string>& parameters) -> bool {
-                return yuzu::server::schedule_arming_permitted(capability_registry_,
-                                                               rbac_store_.get(), principal,
-                                                               plugin, action, parameters);
+                const std::unordered_map<std::string, std::string>& parameters) -> yuzu::server::ArmingResult {
+                return schedule_arming(principal, plugin, action, parameters);
             },
             // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
             // is an error, not an empty answer, so the runner holds rather than fires.
@@ -20272,12 +20453,10 @@ private:
                 // re-verified AGAIN here at send time (authority may have changed
                 // between enqueue and delivery), the load-bearing re-authorization.
                 .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                       const std::string& action,
-                const std::unordered_map<std::string, std::string>& parameters) -> bool {
-                    return yuzu::server::schedule_arming_permitted(capability_registry_,
-                                                                   rbac_store_.get(), principal,
-                                                                   plugin, action, parameters);
-                },
+                                   const std::string& action,
+                const std::unordered_map<std::string, std::string>& parameters) -> yuzu::server::ArmingResult {
+                return schedule_arming(principal, plugin, action, parameters);
+            },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
                 // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is
                 // measured on. An unwired tracker reads as unreadable, which HOLDS every
@@ -20333,6 +20512,8 @@ private:
                         if (leader_gate_permits<background_job_class("schedule_runner.tick")>(
                                 leader_elector_.get()))
                             schedule_runner_->tick();
+                        else
+                            schedule_runner_->on_demoted();
                     } catch (const std::exception& e) {
                         metrics_.counter("yuzu_schedule_tick_errors_total").increment();
                         spdlog::error("schedule_runner: tick threw ({}) — thread continuing",
@@ -21928,6 +22109,14 @@ private:
                 return std::nullopt;
             return device_inventory_store_->list_device_ci_after(q);
         };
+        // Counts a bulk read refused as busy. The label is chosen here from the closed Surface
+        // enum, never from request text.
+        auto hw_ci_read_busy_fn = [this](hardware_ci_page::Surface surface) {
+            metrics_
+                .counter("yuzu_hardware_ci_read_busy_total",
+                         {{"surface", surface == hardware_ci_page::Surface::kMcp ? "mcp" : "rest"}})
+                .increment();
+        };
         // agent_id -> hostname, one bulk read of the 30-day roster. Shared by the Software
         // devices tables and the Quarantined devices panel.
         auto hw_hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
@@ -22186,6 +22375,8 @@ private:
                              .ci_detail_fn = hw_ci_detail_fn,
                              .ci_page_reader = hw_ci_page_reader,
                              .ci_collation_gate = &collation_gate_,
+                             .ci_read_slots = hardware_ci_read_slots_.get(),
+                             .ci_read_busy_fn = hw_ci_read_busy_fn,
                              // Actions lens (generic action runner): the connected
                              // agent's advertised plugins/actions, copied into the
                              // gRPC-free HwPluginActions shape.
@@ -25169,6 +25360,8 @@ private:
             tool_deps.ci_detail_fn = hw_ci_detail_fn;
             tool_deps.ci_page_reader = hw_ci_page_reader;
             tool_deps.ci_collation_gate = &collation_gate_;
+            tool_deps.ci_read_slots = hardware_ci_read_slots_.get();
+            tool_deps.ci_read_busy_fn = hw_ci_read_busy_fn;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // #7624: records an operator ended by force whose device still owes a release, for
@@ -26118,6 +26311,14 @@ private:
     /// plus the same closures). The initialiser is `kInitialCollationGate` (Unproven), never
     /// Trusted. tests/test_pg_collation_check_wiring_lexical.py pins the order and the initialiser.
     std::atomic<pg::CollationGate> collation_gate_{pg::kInitialCollationGate};
+    /// The bulk device-CI read's concurrency cap (#7949/#7951, bulk_read_slots.hpp): ONE instance
+    /// shared by `hardware_routes_` (`Deps::ci_read_slots`) and `mcp_server_`
+    /// (`ToolDeps::ci_read_slots`), so REST and MCP draw on the same slots. It holds no store
+    /// pointer; it is declared BEFORE both borrowers so it is destroyed after them. Built in the
+    /// constructor (always, never null) once the effective pool size is known, because the
+    /// semaphore's capacity is fixed at construction.
+    /// tests/test_pg_collation_check_wiring_lexical.py pins the order and both wiring sites.
+    std::unique_ptr<yuzu::server::BulkReadSlots> hardware_ci_read_slots_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     /// Fleet health aggregation (heartbeat status_tags -> yuzu_fleet_* gauges, and the per-device

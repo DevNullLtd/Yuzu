@@ -262,6 +262,23 @@ for img in "${GATE_REPORT_IMAGES[@]}"; do
   echo "  ${img}: published by attempt ${n}"
 done
 
+# A degraded pass (an image that passed under a grype provider waiver) keeps
+# `gate: pass`, so nothing above refuses it; say so here, non-fatally, from the
+# published attempt's report (scripts/ci/release-degraded.sh, which also writes
+# the release notes' statement). A report that cannot be read is reported the
+# same way: never silence.
+deg_rc=0
+deg_out="$(bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ci/release-degraded.sh" "$ART_DIR" 2>/dev/null)" || deg_rc=$?
+if [[ "$deg_rc" -ne 0 ]]; then
+  echo "::warning::DEGRADED: an image of this release passed the vulnerability gate under a grype provider waiver, or whether it did could not be determined from its report; the release notes must say so (docs/ci-architecture.md \"A grype DB provider is stale\")" >&2
+  if [[ -n "$deg_out" ]]; then
+    printf '%s\n' "$deg_out" | sed 's/^/  /'
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+      printf '%s\n' "$deg_out" >>"$GITHUB_STEP_SUMMARY" || true
+    fi
+  fi
+fi
+
 # ── Per-package SBOMs, and no SBOM without an artifact (S8) ─────────
 for f in "$ART_DIR"/*.deb "$ART_DIR"/*.rpm "$ART_DIR"/*.exe "$ART_DIR"/*.pkg; do
   [[ -f "$f" ]] || continue
