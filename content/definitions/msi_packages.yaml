@@ -213,7 +213,7 @@ spec:
         platforms: [windows]
       - name: version
         type: string
-        description: 'Inventory rows: the VersionString property, empty when the product has none. Status rows: the failure token, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610, windows:msi_prop:1610 or windows:msi_prop:oversized), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw).'
+        description: 'Inventory rows: the VersionString property, empty when the product has none. Status rows: the failure token, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610, windows:msi_prop:1610, windows:msi_prop:oversized, windows:msi_upgrade_map:<winerror> or windows:msi_upgrade_map:over_cap), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw).'
         example: "26.04.00.0"
         platforms: [windows]
       - name: publisher
@@ -320,7 +320,7 @@ spec:
         platforms: [windows]
       - name: version
         type: string
-        description: 'Record rows: the DisplayVersion value, empty when unset. Status rows: the failure tokens, comma-joined, or "-" when none. Tokens read <os>:installer_records:<detail> (enum:<code>, row_cap, access_denied, msi_db:deadline, msi_db:busy), macos:no_windows_installer, linux:no_msi or msi_packages:exception (the action threw).'
+        description: 'Record rows: the DisplayVersion value, empty when unset. Status rows: the failure tokens, comma-joined, or "-" when none. Tokens read <os>:installer_records:<detail> (enum:<code>, row_cap, access_denied, profile_list_incomplete, msi_db:deadline, msi_db:busy), macos:no_windows_installer, linux:no_msi or msi_packages:exception (the action threw).'
         example: "26.04.00.0"
         platforms: [windows]
       - name: publisher
@@ -335,17 +335,17 @@ spec:
         platforms: [windows]
       - name: install_location
         type: string
-        description: 'Record rows only: the InstallLocation value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder.'
+        description: 'Record rows only: the InstallLocation value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder, `withheld:profile_list_incomplete` when the user-profile list could not be read in full.'
         example: "C:\\Program Files\\7-Zip\\"
         platforms: [windows]
       - name: install_source
         type: string
-        description: 'Record rows only: the InstallSource value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder; a UNC source is reported as recorded.'
+        description: 'Record rows only: the InstallSource value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder, `withheld:profile_list_incomplete` when the user-profile list could not be read in full; a UNC source is reported as recorded.'
         example: "C:\\ProgramData\\Package Cache\\"
         platforms: [windows]
       - name: local_package
         type: string
-        description: 'Record rows only: the LocalPackage value, the cached package the Installer keeps for the product (normally under the Windows Installer directory), empty when unset.'
+        description: 'Record rows only: the LocalPackage value, the cached package the Installer keeps for the product (normally under the Windows Installer directory), empty when unset; `withheld:user_path` or `withheld:profile_list_incomplete` as for the install location.'
         example: "C:\\WINDOWS\\Installer\\1a2b3c.msi"
         platforms: [windows]
       - name: upgrade_code
