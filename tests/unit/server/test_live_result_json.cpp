@@ -31,6 +31,7 @@ TEST_CASE("live_result_json: uptime with only one field, and with empty output",
     const auto empty = live::live_result_json("uptime", "");
     REQUIRE(empty);
     CHECK(empty->body == R"({"kind":"uptime"})");
+    CHECK(empty->empty);
 }
 
 TEST_CASE("live_result_json: processes renders the full and the short row forms", "[live][json]") {
@@ -52,12 +53,50 @@ TEST_CASE("live_result_json: processes renders the full and the short row forms"
     CHECK(r->body.find(R"({"kind":"processes","processes":[{"pid":100,"name":"sshd","sha256":"aabbcc","path":"/usr/sbin/sshd"})") == 0);
 }
 
-TEST_CASE("live_result_json: empty processes output is an empty list, not an error", "[live][json]") {
+TEST_CASE("live_result_json: empty processes output renders an empty list and is flagged empty", "[live][json]") {
     const auto r = live::live_result_json("processes", "");
     REQUIRE(r);
     CHECK(r->body == R"({"kind":"processes","processes":[]})");
     CHECK(r->count == 0);
     CHECK_FALSE(r->truncated);
+    // Both surfaces answer an empty result as outcome device_error, never a 200 success.
+    CHECK(r->empty);
+}
+
+TEST_CASE("live_result_json: the empty flag is set only when nothing usable was rendered", "[live][json]") {
+    SECTION("processes") {
+        CHECK(live::live_result_json("processes", "")->empty);
+        CHECK(live::live_result_json("processes", "garbage\nnot a row\n")->empty); // lines the parser skips
+        CHECK_FALSE(live::live_result_json("processes", "proc|1|init\n")->empty);
+    }
+    SECTION("uptime") {
+        CHECK(live::live_result_json("uptime", "")->empty);
+        CHECK(live::live_result_json("uptime", "unrelated|1\n")->empty);
+        CHECK(live::live_result_json("uptime", "uptime_seconds|notanumber\n")->empty); // unparseable value
+        CHECK_FALSE(live::live_result_json("uptime", "uptime_seconds|42\n")->empty);
+        CHECK_FALSE(live::live_result_json("uptime", "uptime_display|3d\n")->empty);
+        CHECK_FALSE(live::live_result_json("uptime", "uptime_display|3d\nuptime_seconds|1\n")->empty);
+    }
+    SECTION("a row cap that cuts rows never makes a non-empty result empty") {
+        const auto r = live::live_result_json("processes", "proc|1|a\nproc|2|b\n", 1);
+        REQUIRE(r);
+        CHECK(r->truncated);
+        CHECK_FALSE(r->empty);
+    }
+    SECTION("the detail text is the ruled one") {
+        CHECK(live::kLiveNoUsableDataDetail == "the device returned no usable live data");
+    }
+}
+
+TEST_CASE("live_result_json: CRLF device output renders without a carriage return anywhere", "[live][json]") {
+    const auto r = live::live_result_json("processes", "proc|1|a|h|/p1\r\nproc|2|b|h|/p2\r\n");
+    REQUIRE(r);
+    CHECK(r->count == 2);
+    CHECK(r->body.find('\r') == std::string::npos);
+    CHECK(r->body.find("\\r") == std::string::npos);
+    const auto j = json::parse(r->body);
+    CHECK(j["processes"][0]["path"] == "/p1");
+    CHECK(j["processes"][1]["path"] == "/p2");
 }
 
 TEST_CASE("live_result_json: row cap cuts the rows and sets truncated", "[live][json]") {

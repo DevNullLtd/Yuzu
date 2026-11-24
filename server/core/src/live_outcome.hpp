@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file live_outcome.hpp
-/// PURE closed vocabulary for the per-device live read (REST `GET /api/v1/devices/{id}/live/{kind}`
+/// PURE closed vocabulary for the per-device live read (REST `POST /api/v1/dex/devices/{id}/live`
 /// and MCP `get_device_live`): the outcome token and the two metric label sets.
 ///
 /// `yuzu_server_live_requests_total{surface, kind, outcome}` takes every label value from this
@@ -70,12 +70,15 @@ enum class LiveOutcome {
     kDeviceFailed,         ///< a terminal failure row came back from the device
     kDeviceError,          ///< the device answered with an `error|` line
     kOutputTooLarge,       ///< the device output exceeded the byte cap and the surface refuses
-    kTimeout,              ///< no usable answer inside the poll budget
+    kTimeout,              ///< nothing at all came back from the device inside the poll budget
     kStoreDegraded,        ///< every poll read of the response store degraded
     kInternal,             ///< an unexpected exception
     kTierRefused,          ///< the MCP tier does not allow the Execute pair
     kReadOnlyRefused,      ///< refused under --mcp-read-only
     kApprovalRefused,      ///< a token that requires approval for this tool
+    kShuttingDown,         ///< the server is draining or stopping; the read was refused or abandoned
+    kIncomplete,           ///< the device sent output but never a terminal row inside the budget
+    kGateUnreadable,       ///< the permission store could not be read at the re-decision (not a revocation)
 };
 
 [[nodiscard]] constexpr std::string_view to_token(LiveOutcome o) noexcept {
@@ -136,15 +139,21 @@ enum class LiveOutcome {
         return "read_only_refused";
     case LiveOutcome::kApprovalRefused:
         return "approval_refused";
+    case LiveOutcome::kShuttingDown:
+        return "shutting_down";
+    case LiveOutcome::kIncomplete:
+        return "incomplete";
+    case LiveOutcome::kGateUnreadable:
+        return "gate_unreadable";
     }
     return "internal"; // unreachable for a valid enumerator; keeps the function total
 }
 
 /// Every enumerator, in declaration order, so a test (and any exporter that pre-registers label
 /// values) can walk the closed set. The `static_assert` ties its length to the last enumerator:
-/// a new enumerator appended after `kApprovalRefused` must update both, and the `to_token`
+/// a new enumerator appended after `kGateUnreadable` must update both, and the `to_token`
 /// switch above refuses to compile until it has a token.
-inline constexpr std::array<LiveOutcome, 28> kAllLiveOutcomes = {
+inline constexpr std::array<LiveOutcome, 31> kAllLiveOutcomes = {
     LiveOutcome::kOk,
     LiveOutcome::kNotConfigured,
     LiveOutcome::kGateRefused,
@@ -173,9 +182,12 @@ inline constexpr std::array<LiveOutcome, 28> kAllLiveOutcomes = {
     LiveOutcome::kTierRefused,
     LiveOutcome::kReadOnlyRefused,
     LiveOutcome::kApprovalRefused,
+    LiveOutcome::kShuttingDown,
+    LiveOutcome::kIncomplete,
+    LiveOutcome::kGateUnreadable,
 };
 static_assert(kAllLiveOutcomes.size() ==
-                  static_cast<std::size_t>(LiveOutcome::kApprovalRefused) + 1,
+                  static_cast<std::size_t>(LiveOutcome::kGateUnreadable) + 1,
               "kAllLiveOutcomes must list every LiveOutcome enumerator");
 
 } // namespace yuzu::server::live

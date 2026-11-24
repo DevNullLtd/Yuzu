@@ -141,8 +141,8 @@ inline constexpr std::size_t kPerPrincipalMcpPost = 4;
 /// meaningful share of the 128 held-open workers (owner ruling D3, 2026-11-04).
 inline constexpr std::size_t kPerPrincipalWorkflowRun = 2;
 
-/// Max concurrent per-device live reads one principal may hold (`GET
-/// /api/v1/devices/{id}/live/{kind}`, MCP `get_device_live`, and the quarantine release-confirm
+/// Max concurrent per-device live reads one principal may hold (`POST
+/// /api/v1/dex/devices/{id}/live`, MCP `get_device_live`, and the quarantine release-confirm
 /// wait). A live read holds its worker for up to the poll budget (about 20 s) while the device
 /// does real work, so the per-principal share is small: two lets a client overlap one read
 /// behind another while one principal cannot take a meaningful share of the pool.
@@ -177,7 +177,7 @@ enum class SseSurface {
     kSoftwareExport,  ///< GET /api/v1/inventory/software/export: a streamed file, not an SSE stream; the
                       ///< chunked response pins a worker for up to 900 s (software_export::kExportMaxSeconds).
                       ///< Counted under kSoftwareExportSurfaceKey, not a principal.
-    kLiveRead,        ///< a SYNCHRONOUS per-device live read (REST v1 `devices/{id}/live/{kind}`, MCP
+    kLiveRead,        ///< a SYNCHRONOUS per-device live read (REST v1 `POST /api/v1/dex/devices/{id}/live`, MCP
                       ///< `get_device_live`, the quarantine release-confirm wait): not an SSE stream, but
                       ///< the response is held open and a worker pinned for up to the poll budget.
                       ///< Counted per principal with a SURFACE cap (`kLiveReadSurfaceCap`).

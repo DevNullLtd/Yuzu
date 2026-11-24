@@ -31,6 +31,7 @@ std::optional<LiveResultJson> live_result_json(std::string_view kind, const std:
             o["uptime_display"] = *u.display;
         if (u.seconds)
             o["uptime_seconds"] = *u.seconds;
+        r.empty = !u.display && !u.seconds;
     } else {
         auto rows = parse_processes(output);
         if (max_rows > 0 && rows.size() > max_rows) {
@@ -42,6 +43,7 @@ std::optional<LiveResultJson> live_result_json(std::string_view kind, const std:
             procs.push_back(json{{"pid", p.pid}, {"name", p.name}, {"sha256", p.sha256}, {"path", p.path}});
         }
         r.count = rows.size();
+        r.empty = rows.empty();
         o["kind"] = "processes";
         o["processes"] = std::move(procs);
     }

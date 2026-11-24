@@ -11700,7 +11700,7 @@ TEST_CASE("MCP get_device_live uptime: dispatches os_info/uptime as the caller, 
           "[pg][mcp][integration][live][2146]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     LiveMcpFixture f{db.dsn()};
-    f.put_row("live-cmd-1", "WS-1", 0, "uptime_seconds|181740\nuptime_display|2d 2h 29m");
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_seconds|181740\nuptime_display|2d 2h 29m");
     // The lease is held while the dispatch runs and while the `requested` row is written.
     std::size_t leases_in_dispatch = 99, leases_at_requested = 99;
     f.probe.on_dispatch = [&] {
@@ -11767,7 +11767,7 @@ TEST_CASE("MCP get_device_live processes: dispatches processes/list_hashed, pars
           "[pg][mcp][integration][live][2146]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     LiveMcpFixture f{db.dsn()};
-    f.put_row("live-cmd-1", "WS-1", 0,
+    f.put_row("live-cmd-1", "WS-1", 1,
               "proc|0|[System Process]||\n"
               "proc|123|sh|deadbeefcafe0000111122223333444455556666777788889999aaaabbbbccccdddd|/bin/sh\n"
               "proc|9|bash");
@@ -12505,7 +12505,7 @@ TEST_CASE("MCP get_device_live: the poll reads the device's rows only (multi-row
         CHECK(mcp_live_count(f.metrics, "uptime", "device_failed") == 1.0);
     }
     SECTION("an error| output line is a device error with no retry hint") {
-        f.put_row("live-cmd-1", "WS-1", 0, "error|disk subsystem offline");
+        f.put_row("live-cmd-1", "WS-1", 1, "error|disk subsystem offline");
         const auto err = live_error(f.call("WS-1", "uptime"));
         CHECK(err["message"].get<std::string>().find("device reported an error") !=
               std::string::npos);

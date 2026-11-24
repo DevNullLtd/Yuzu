@@ -2,7 +2,7 @@
 
 /// @file live_result_json.hpp
 /// The ONE JSON builder for a per-device live read's `data` object, shared by the REST route
-/// (`GET /api/v1/devices/{id}/live/{kind}`) and the MCP tool `get_device_live`, so the two
+/// (`POST /api/v1/dex/devices/{id}/live`) and the MCP tool `get_device_live`, so the two
 /// surfaces cannot drift.
 ///
 /// Only the kinds flagged `rest_v1` in live_model.hpp's table are rendered, and today those are
@@ -20,6 +20,10 @@
 
 namespace yuzu::server::live {
 
+/// The detail text of the `device_error` outcome a surface answers when `LiveResultJson::empty` is
+/// true: the device finished without error but returned nothing a caller can use.
+inline constexpr std::string_view kLiveNoUsableDataDetail = "the device returned no usable live data";
+
 struct LiveResultJson {
     /// The `data` object, serialised. `{"kind":"uptime", ...}` or
     /// `{"kind":"processes","processes":[...]}`; no envelope fields.
@@ -28,6 +32,12 @@ struct LiveResultJson {
     bool truncated = false;
     /// Process rows emitted into `body` (0 for `uptime`).
     std::size_t count = 0;
+    /// True when the rendered result has no usable content: `processes` with zero rows, or
+    /// `uptime` with neither `uptime_seconds` nor `uptime_display`. Both surfaces answer such a
+    /// result as outcome `device_error` with `kLiveNoUsableDataDetail`, never as a success
+    /// (a device that returned nothing, or only lines the parser could not read, did not
+    /// answer the question).
+    bool empty = false;
 };
 
 /// Render `output` (the device's plugin output) for `kind`.

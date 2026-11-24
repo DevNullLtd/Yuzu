@@ -4102,7 +4102,7 @@ TEST_CASE("REST dex/devices/{id}/live: the caller's confined VisibleSet reaches 
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
-    r.status = 0;
+    r.status = 1; // a terminal row: the poll answers only a finished answer
     r.output = "uptime_seconds|1\nuptime_display|1s";
     h.resp_store->store(r);
 
@@ -4152,7 +4152,7 @@ TEST_CASE("REST dex/devices/{id}/live uptime: dispatches + returns parsed JSON, 
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
-    r.status = 0; // RUNNING row carries the output
+    r.status = 1; // a terminal row carries the output
     r.output = "uptime_seconds|181740\nuptime_display|2d 2h 29m";
     h.resp_store->store(r);
 
@@ -4184,7 +4184,7 @@ TEST_CASE("REST dex/devices/{id}/live processes: parses proc|pid|name|sha256|pat
     StoredResponse r;
     r.instruction_id = "processes-live";
     r.agent_id = "WS-1";
-    r.status = 0;
+    r.status = 1; // a terminal row: the poll answers only a finished answer
     r.output =
         "proc|0|[System Process]||\n"
         "proc|123|sh|deadbeefcafe0000111122223333444455556666777788889999aaaabbbbccccdddd|/bin/sh";
@@ -4346,7 +4346,7 @@ TEST_CASE("REST dex/devices/{id}/live: device error| output → 502",
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
-    r.status = kStatusPending;
+    r.status = kStatusSuccess;
     r.output = "error|disk subsystem offline";
     h.resp_store->store(r);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
@@ -5565,7 +5565,7 @@ TEST_CASE("REST dex/devices/{id}/live: a timeout and a device error are counted 
     StoredResponse r;
     r.instruction_id = "processes-live";
     r.agent_id = "WS-1";
-    r.status = kStatusPending;
+    r.status = kStatusSuccess;
     r.output = "error|disk subsystem offline";
     h.resp_store->store(r);
     auto errored = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");

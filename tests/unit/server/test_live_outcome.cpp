@@ -4,7 +4,9 @@
 /// `yuzu_server_live_requests_total{surface, kind, outcome}`, so the set must stay closed and
 /// every value must be a stable, bounded, lowercase token.
 
+#include "dispatch_zero_reach.hpp"
 #include "live_outcome.hpp"
+#include "live_zero_reach_outcome.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -39,11 +41,46 @@ TEST_CASE("LiveOutcome: the closed token set is exactly the ruled one", "[live][
         "caller_unresolved", "dispatch_denied", "invalid_scope", "containment_unreadable",
         "route_unreadable", "os_gate_unreadable", "quarantined", "plugin_not_found",
         "kill_switched_os", "device_failed", "device_error", "output_too_large", "timeout",
-        "store_degraded", "internal", "tier_refused", "read_only_refused", "approval_refused"};
+        "store_degraded", "internal", "tier_refused", "read_only_refused", "approval_refused",
+        "shutting_down", "incomplete", "gate_unreadable"};
     std::set<std::string> actual;
     for (const auto o : live::kAllLiveOutcomes)
         actual.insert(std::string(live::to_token(o)));
     CHECK(actual == expected);
+    // The vocabulary is 31 tokens: 2 surfaces x 3 kinds x 31 outcomes = 186 series once pre-seeded.
+    CHECK(live::kAllLiveOutcomes.size() == 31);
+    CHECK(expected.size() == 31);
+}
+
+TEST_CASE("LiveOutcome: the three tokens added after the first release keep their spelling and index", "[live][outcome]") {
+    CHECK(live::to_token(live::LiveOutcome::kShuttingDown) == "shutting_down");
+    CHECK(live::to_token(live::LiveOutcome::kIncomplete) == "incomplete");
+    CHECK(live::to_token(live::LiveOutcome::kGateUnreadable) == "gate_unreadable");
+    // Appended after kApprovalRefused, so the existing enumerator values did not move.
+    CHECK(static_cast<std::size_t>(live::LiveOutcome::kApprovalRefused) == 27);
+    CHECK(static_cast<std::size_t>(live::LiveOutcome::kShuttingDown) == 28);
+    CHECK(static_cast<std::size_t>(live::LiveOutcome::kIncomplete) == 29);
+    CHECK(static_cast<std::size_t>(live::LiveOutcome::kGateUnreadable) == 30);
+}
+
+TEST_CASE("live_outcome_for: every ZeroReachCause maps to the outcome with its own token", "[live][outcome]") {
+    using yuzu::server::ZeroReachCause;
+    constexpr ZeroReachCause kAllCauses[] = {
+        ZeroReachCause::Denied,         ZeroReachCause::InvalidScope,    ZeroReachCause::ContainmentUnreadable,
+        ZeroReachCause::RouteUnreadable, ZeroReachCause::OsGateUnreadable, ZeroReachCause::Quarantined,
+        ZeroReachCause::PluginNotFound,  ZeroReachCause::KillSwitchedOs,   ZeroReachCause::Generic};
+    for (const auto cause : kAllCauses) {
+        const auto outcome = live::live_outcome_for(cause);
+        CAPTURE(static_cast<int>(cause), live::to_token(outcome), yuzu::server::zero_reach_token(cause));
+        if (cause == ZeroReachCause::Generic) {
+            // The documented exception: nothing was sent and no named cause applies (the device is
+            // offline, or a residual race), which this vocabulary calls `unavailable`.
+            CHECK(outcome == live::LiveOutcome::kUnavailable);
+            CHECK(live::to_token(outcome) != yuzu::server::zero_reach_token(cause));
+        } else {
+            CHECK(live::to_token(outcome) == yuzu::server::zero_reach_token(cause));
+        }
+    }
 }
 
 TEST_CASE("LiveOutcome: the zero-reach tokens match the shared classifier's spelling", "[live][outcome]") {
