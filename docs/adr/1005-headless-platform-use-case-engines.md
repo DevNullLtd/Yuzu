@@ -2157,7 +2157,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **Poll.** One shared reader scopes the stored rows to the device at the
        store, answers only after the device has finished (a stored row with a
        terminal status; partial output without one is discarded and answered
-       `incomplete`, retryable after the poll's 25 second deadline), joins the output chunks with a newline in stored order,
+       `incomplete`, retryable after the poll's 25 second deadline, except an
+       answer already over the size cap, which MCP cuts and flags `truncated`
+       at once and REST refuses), joins the output chunks with a newline in stored order,
        lets a failure row win, and is bounded by a 25 second wall-clock
        deadline and a bounded store read; the MCP answer is capped at 1000
        rows and 1 MiB with a `truncated` flag (an answer already over the cap is
@@ -2179,6 +2181,16 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        the gate's `403` first. A chokepoint denial of `unclassified` or
        `ambiguous` is answered as a server fault (`-32603`, REST `500`) because
        the pair is server-named; the denial token rides as the error `reason`.
+     - **REST principal binding (2026-11-24).** The REST route now compares the
+       principal of its second resolution (the one the command is dispatched as)
+       with the first (the one every audit row is attributed to). A mismatch is a
+       `401` with a `caller_unresolved` `failure` row, written under the original
+       session and naming the second principal as `now=<principal>`, and nothing is
+       dispatched. The two scoped gates run again before that comparison, so a
+       credential that resolves to a different principal without the grants gets
+       the gate's own `403` (the failure row reads `permission_revoked`); the MCP
+       tool compares the principal first and answers `caller_unresolved` in both
+       cases.
      - Wire reference: `docs/user-manual/mcp.md` (row 246) and
        `docs/user-manual/rest-api.md`; audit rows: `docs/user-manual/audit-log.md`.
      - Recorded by the change author; ADR-owner acceptance pending.

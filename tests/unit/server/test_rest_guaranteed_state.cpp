@@ -5300,11 +5300,17 @@ TEST_CASE("REST dex/devices/{id}/live: a credential that resolves to a different
           "[pg][rest][dex][device][live][audit][7110]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    // The second principal is caller-influenced text: a plain name appears as is, a hostile one
+    // (newline, `=`, space) is tokenised by `audit_token` so it cannot forge a field or a line.
+    const std::vector<std::pair<std::string, std::string>> seconds = {
+        {"mallory", "mallory"}, {"evil\nx=y z", "evil_x_y_z"}};
+    for (const auto& [second, token] : seconds) {
+    INFO("second principal: " << token);
     RestGsHarness h(true, true, true, true, &pool);
     h.session_user = "alice";
     h.on_audit = [&](const std::string& result) {
         if (result == "requested")
-            h.session_user = "mallory"; // the next authentication yields someone else
+            h.session_user = second; // the next authentication yields someone else
     };
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
@@ -5321,6 +5327,10 @@ TEST_CASE("REST dex/devices/{id}/live: a credential that resolves to a different
     CHECK(h.audit_log[1].result == "failure");
     CHECK(h.audit_log[1].target_id == "WS-1");
     CHECK(h.audit_log[1].detail.find("caller_unresolved") == 0);
+    // The second principal is named in the detail, as one token and never as a new field or line.
+    CHECK(h.audit_log[1].detail.find(" now=" + token + " ") != std::string::npos);
+    CHECK(h.audit_log[1].detail.find('\n') == std::string::npos);
+    CHECK(h.audit_log[1].detail.find("x=y") == std::string::npos);
     REQUIRE(h.audit_principals.size() == 2);
     CHECK(h.audit_principals[0] == "alice");
     CHECK(h.audit_principals[1] == "alice"); // the ORIGINAL session, never the new principal
@@ -5328,6 +5338,7 @@ TEST_CASE("REST dex/devices/{id}/live: a credential that resolves to a different
     CHECK(rest_live_count(h, "uptime", "ok") == 0.0);
     CHECK(h.live_budget.active() == 0); // the lease came back
     CHECK(h.metrics.gauge("yuzu_server_live_in_flight").value() == 0.0);
+    }
 }
 
 // QE-8: the REST route renders at most 20000 process rows. One more is refused whole

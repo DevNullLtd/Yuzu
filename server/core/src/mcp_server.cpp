@@ -2776,7 +2776,8 @@ static const ToolDef kTools[] = {
      "SYNCHRONOUS: the call blocks for up to about 20 seconds waiting for the device and "
      "holds one server request slot meanwhile (at most 2 per principal, 4 server-wide; over "
      "that it answers a retryable cap error and sends nothing). The answer is given only after "
-     "the device has finished: partial output without a final row is never returned. A chunk "
+     "the device has finished: partial output without a final row is never returned, except "
+     "that an answer already over the size cap is cut and flagged truncated at once. A chunk "
      "the server failed to store cannot be detected, so the surviving rows may be returned as "
      "a complete answer. "
      "Needs BOTH "
@@ -2795,10 +2796,10 @@ static const ToolDef kTools[] = {
      "that is lost afterwards is flagged on the answer as audit_persisted false. A refusal "
      "for argument shape, tier, permission, a cap or shutdown writes no such row. "
      "Output is bounded: at most 1000 process rows and 1 MiB of device output, with "
-     "'truncated' set when either cut applies. An answer already over the size cap is cut "
-     "and flagged truncated at once, without waiting for the device to finish, and under "
-     "truncation the surviving rows are not a stable prefix of the full answer (when the "
-     "store held rows back they are the newest ones). "
+     "'truncated' set when either cut applies; count 0 with truncated true means the size "
+     "cap cut everything (the first row alone exceeds it) and a retry returns the same. "
+     "Under truncation the surviving rows are not a stable prefix of the full answer (they "
+     "come from the newest stored output). "
      "Errors: most errors carry a 'reason' (a cap, a permission or session withdrawn after "
      "the request was audited, an unreadable gate, a dispatch denial token such as "
      "forbidden or approval_required, an offline or withheld device, a poll outcome, or "
@@ -22314,7 +22315,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (regate != ScopedGateOutcome::Admitted) {
                     outcome = live::live_outcome_for(regate);
                     const std::string withdrawn(live::to_token(*outcome));
-                    const bool row_ok = domain_row("failure", withdrawn);
+                    // A credential that now resolves to a DIFFERENT principal names that second
+                    // principal in the row detail (through `audit_token`: caller-influenced text);
+                    // the row itself stays attributed to the session the call began as.
+                    const bool principal_changed = fresh && fresh->username != session->username;
+                    const bool row_ok = domain_row(
+                        "failure", principal_changed
+                                       ? withdrawn + " now=" + audit_token(fresh->username)
+                                       : withdrawn);
                     res.status = 200;
                     if (*outcome == live::LiveOutcome::kGateUnreadable) {
                         res.set_content(

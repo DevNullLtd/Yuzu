@@ -11945,14 +11945,24 @@ TEST_CASE("MCP get_device_live: the served description states the lease limits t
         " per principal, " + std::to_string(yuzu::server::detail::kLiveReadSurfaceCap) +
         " server-wide";
     CHECK(description.find(expected) != std::string::npos);
-    // F1: the partial-output claim is exact. "never returned" is true only without a final row; a
-    // chunk the server failed to store cannot be detected, so the claim must say so.
+    // F1: the partial-output claim is exact. "never returned" is true only without a final row (and
+    // not for an answer already over the size cap); a chunk the server failed to store cannot be
+    // detected, so the claim must say so.
     CHECK(description.find("partial output is never returned") == std::string::npos);
     CHECK(description.find("partial output without a final row is never returned") !=
           std::string::npos);
     CHECK(description.find("failed to store cannot be detected") != std::string::npos);
+    // The over-cap exception to that claim, and the cut-to-nothing answer, are stated.
+    CHECK(description.find("never returned, except that an answer already over the size cap is "
+                           "cut and flagged truncated at once") != std::string::npos);
     CHECK(description.find("flagged truncated at once") != std::string::npos);
+    CHECK(description.find("count 0 with truncated true means the size cap cut everything") !=
+          std::string::npos);
+    CHECK(description.find("a retry returns the same") != std::string::npos);
     CHECK(description.find("not a stable prefix") != std::string::npos);
+    CHECK(description.find("they come from the newest stored output") != std::string::npos);
+    CHECK(description.find("they are the newest ones") == std::string::npos); // the ambiguous wording
+    CHECK(description.size() < 4096);
     // F2: the reason and retry statements are the ones the handler makes. MCP stamps the denial
     // TOKEN, never `dispatch_denied`, and says which refusals carry no reason; `incomplete` waits
     // the poll deadline (25 s) rather than the timeout's 3 s.
@@ -12492,6 +12502,46 @@ TEST_CASE("MCP get_device_live: the requested and the failure row name the origi
     for (std::size_t i = 0; i < f.ts.audit_log.size(); ++i)
         if (f.ts.audit_log[i].starts_with("device.live."))
             CHECK(f.ts.audit_principals[i] == "test-user"); // never "": that is the re-resolving writer
+}
+
+// A credential that resolves to a DIFFERENT principal at the re-check is caller_unresolved: nothing
+// is sent, both rows stay attributed to the original session, and the failure row names the second
+// principal as one `audit_token`-ed value (a hostile name cannot add a field or a line).
+TEST_CASE("MCP get_device_live: a credential that resolves to a different principal at the re-check "
+          "is caller_unresolved and the failure row names the second principal as one token",
+          "[pg][mcp][integration][live][audit][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    const std::vector<std::pair<std::string, std::string>> seconds = {
+        {"mallory", "mallory"}, {"evil\nx=y z", "evil_x_y_z"}};
+    for (const auto& [second, token] : seconds) {
+        INFO("second principal: " << token);
+        LiveMcpFixture f{db.dsn()};
+        f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+        wire_mg_session_writer(f.ts);
+        f.ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+            if (action == "device.live.uptime")
+                f.ts.mock_username = second; // the next authentication yields someone else
+            return true;
+        };
+        f.start();
+        const auto err = live_error(f.call("WS-1", "uptime"));
+        CHECK(err["data"]["reason"] == "caller_unresolved");
+        CHECK(f.probe.calls == 0); // nothing was sent, as anyone
+        REQUIRE(live_domain_rows(f.ts) ==
+                std::vector<std::string>{"device.live.uptime|requested", "device.live.uptime|failure"});
+        REQUIRE(f.ts.audit_details.size() == f.ts.audit_log.size());
+        const auto& detail = f.ts.audit_details.back();
+        CHECK(detail.find("caller_unresolved") == 0);
+        CHECK(detail.find(" now=" + token + " ") != std::string::npos);
+        CHECK(detail.find('\n') == std::string::npos);
+        CHECK(detail.find("x=y") == std::string::npos);
+        REQUIRE(f.ts.audit_principals.size() == f.ts.audit_log.size());
+        for (std::size_t i = 0; i < f.ts.audit_log.size(); ++i)
+            if (f.ts.audit_log[i].starts_with("device.live."))
+                CHECK(f.ts.audit_principals[i] == "test-user"); // the ORIGINAL session
+        CHECK(mcp_live_count(f.metrics, "uptime", "caller_unresolved") == 1.0);
+        CHECK(f.budget.active() == 0);
+    }
 }
 
 // S3 / QE-4: the unknown-argument refusal echoes the key, cut at 64 bytes. A key whose character

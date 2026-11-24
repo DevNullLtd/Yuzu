@@ -20166,7 +20166,10 @@ void RestApiV1::register_routes(
             // authenticator wired there is no first session and nothing to compare.)
             if (first_session && caller->principal != first_session->username) {
                 outcome = live::LiveOutcome::kCallerUnresolved;
-                fail("caller_unresolved");
+                // The row stays attributed to the first principal; the second is named in the
+                // detail (as the command route's `principal_changed` row does), through
+                // `audit_token` because it is caller-influenced text.
+                fail("caller_unresolved now=" + audit_token(caller->principal));
                 res.status = 401;
                 res.set_content(detail::error_json_a4(401, "authentication required", cid),
                                 "application/json");
