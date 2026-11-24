@@ -2378,11 +2378,12 @@ TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_package
 
 TEST_CASE("collector: msi_packages rows carry package_id and source, and a constrained answer is status-only",
           "[sync][collector][msi_packages]") {
-    SECTION("Windows-shaped run: msi records carry package_id and source; slot 13 stays empty and slot 14 is none until the producer sends an upgrade code") {
+    SECTION("Windows-shaped run: msi records carry package_id and source; slot 13 carries the sixth token as upgrade_code when the row has one") {
         fake_windows();
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         std::size_t msi_records = 0;
+        std::size_t with_upgrade_code = 0;
         for (const auto& rec : plus_records(got->first)) {
             const auto f = fields_of(rec);
             REQUIRE(f.size() == 16);
@@ -2392,11 +2393,18 @@ TEST_CASE("collector: msi_packages rows carry package_id and source, and a const
             CHECK(f[4] == "pkg");
             CHECK(f[5] == "msi");
             CHECK(f[12].empty()); // install_location (reserved, #5186)
-            CHECK(f[13].empty()); // attributes (the captured rows have no 6th token)
+            // attributes: the capture's rows carry a 6th token (the UpgradeCode), a row without
+            // one has none
+            if (!f[13].empty()) {
+                ++with_upgrade_code;
+                CHECK(f[13].starts_with("upgrade_code={"));
+                CHECK(f[13].size() == std::string_view{"upgrade_code="}.size() + 38);
+            }
             CHECK(f[14].size() == 38); // {GUID}
         }
         CHECK(msi_records == msi_sample_mapped_rows());
         CHECK(msi_records > 0);
+        CHECK(with_upgrade_code > 0);
     }
     SECTION("a constrained enumeration is a status-only section with the named reason") {
         fake_windows();
@@ -3283,9 +3291,9 @@ TEST_CASE("characterisation: collector section digests are byte-pinned",
         REQUIRE(hashes.size() == 6);
         CHECK(hashes.at("installed_apps.list_inventory") == "eb1a5ae4dcf7738cb9746fd534a72b3b0feb19f643fdd36377a4564ffb93d553");
         CHECK(hashes.at("windows_optional_features.list") == "0087ac29fe70cd0b85a5cd15c0a9127fb03794965f04a88164d8536b30afdd23");
-        CHECK(hashes.at("msi_packages.list_inventory") == "3ca14b8682e50625f4600008641bb936aa6ecf63fa28cdc51a176feb0351a1cc");
+        CHECK(hashes.at("msi_packages.list_inventory") == "549d2fa0ebd33cf9ab881077fade8a0252ccf352d0e63c7d38760802afeed3ce");
         check_empty_runtimes(hashes);
-        CHECK(report == "v3:4925e695c1dec23c5bcc73dfef7c69b42adc1b84ae2df66b7594442a2ad498c9");
+        CHECK(report == "v3:588eab4df5bf5157e07eb9d5df10c114111b1fa6bf33b0daf3daddc5f889de63");
     }
 #endif
     SECTION("a constrained managers answer drops only the managers facet from the report") {
