@@ -3996,3 +3996,117 @@ TEST_CASE("linux_snapshot_rung: while firewalld's answer is held only an active 
     CHECK(active.rung.answered);
     CHECK(active.rung.rows == Rows{"backend|nftables", "state|active", "ruleset|2"});
 }
+
+// ── the root direct iptables legs read filter, raw, mangle and nat (iptables_direct_answer) ──────
+namespace {
+constexpr std::string_view kDirectRuleRaw = "-P PREROUTING ACCEPT\n-P OUTPUT ACCEPT\n-A PREROUTING -j DROP\n";
+constexpr std::string_view kDirectCleanRaw = "-P PREROUTING ACCEPT\n-P OUTPUT ACCEPT\n";
+
+IptablesTableRead direct_read(bool ip6, std::string_view table, std::string_view out,
+                              bool tool_ran = true, bool exit_ok = true, bool complete = true) {
+    return classify_iptables_table_read(ip6, table, tool_ran, exit_ok, complete, out);
+}
+
+/// All eight tables clean, except those `over` replaces.
+std::vector<IptablesTableRead> direct_reads(std::initializer_list<IptablesTableRead> over = {}) {
+    std::vector<IptablesTableRead> v;
+    for (const bool ip6 : {false, true})
+        for (const auto t : kIptablesDirectTables) {
+            auto r = direct_read(ip6, t, t == "filter" ? kIptClean : kDirectCleanRaw);
+            for (const auto& o : over)
+                if (o.ip6 == ip6 && o.table == t)
+                    r = o;
+            v.push_back(std::move(r));
+        }
+    return v;
+}
+} // namespace
+
+TEST_CASE("iptables direct: every table clean and read is inactive with a count", "[firewall]") {
+    const auto a = iptables_direct_answer(direct_reads(), false);
+    CHECK(a.state == NftVerdict::inactive);
+    CHECK(a.all_read);
+    CHECK(a.appends == 0);
+    CHECK(a.rule_rows.size() == 2 * (3 + 2 + 2 + 2)); // every policy row of every table, no rule
+    CHECK(iptables_direct_answer(direct_reads(), true).state == NftVerdict::unknown);
+}
+
+TEST_CASE("iptables direct: a ruleset only in raw, mangle or nat is active, never inactive",
+          "[firewall]") {
+    for (const bool ip6 : {false, true})
+        for (const std::string_view table : {"raw", "mangle", "nat"}) {
+            const auto a = iptables_direct_answer(
+                direct_reads({direct_read(ip6, table, kDirectRuleRaw)}), false);
+            CHECK(a.state == NftVerdict::active);
+            CHECK(a.all_read);
+            CHECK(a.appends == 1);
+            CHECK(std::ranges::count(
+                      a.rule_rows,
+                      std::format("rule|{}{}|append|PREROUTING|-j DROP",
+                                  ip6 ? "ip6|" : "", table)) == 1);
+        }
+}
+
+TEST_CASE("iptables direct: a user chain or a non-accept policy in any table is active",
+          "[firewall]") {
+    CHECK(iptables_direct_answer(
+              direct_reads({direct_read(false, "nat", "-P PREROUTING ACCEPT\n-N staged\n")}), false)
+              .state == NftVerdict::active);
+    CHECK(iptables_direct_answer(
+              direct_reads({direct_read(true, "filter", "-P INPUT DROP\n-P FORWARD ACCEPT\n"
+                                                        "-P OUTPUT ACCEPT\n")}),
+              false)
+              .state == NftVerdict::active);
+}
+
+TEST_CASE("iptables direct: an unreadable table reads unknown, never inactive", "[firewall]") {
+    for (const bool ip6 : {false, true})
+        for (const auto table : kIptablesDirectTables) {
+            const auto refused = iptables_direct_answer(
+                direct_reads({direct_read(ip6, table, "", true, /*exit_ok=*/false)}), false);
+            CHECK(refused.state == NftVerdict::unknown);
+            CHECK_FALSE(refused.all_read);
+            const auto cut = iptables_direct_answer(
+                direct_reads({direct_read(ip6, table, kDirectCleanRaw, true, true, /*complete=*/false)}),
+                false);
+            CHECK(cut.state == NftVerdict::unknown);
+            const auto no_time = iptables_direct_answer(
+                direct_reads({IptablesTableRead{.ip6 = ip6, .table = std::string{table}}}), false);
+            CHECK(no_time.state == NftVerdict::unknown);
+        }
+}
+
+TEST_CASE("iptables direct: content in one table wins over an unread one; the count is withheld",
+          "[firewall]") {
+    const auto a = iptables_direct_answer(
+        direct_reads({direct_read(false, "raw", kDirectRuleRaw),
+                      direct_read(false, "nat", "", true, false)}),
+        false);
+    CHECK(a.state == NftVerdict::active);
+    CHECK_FALSE(a.all_read);
+    CHECK(std::ranges::count(a.rule_rows, "rule|raw|append|PREROUTING|-j DROP") == 1);
+}
+
+TEST_CASE("iptables direct: an unrecognised listing is unread and says so per tool", "[firewall]") {
+    const auto a = iptables_direct_answer(
+        direct_reads({direct_read(true, "mangle", "garbage\n")}), false);
+    CHECK(a.state == NftVerdict::unknown);
+    CHECK(a.error_rows == std::vector<std::string>{"error|ip6tables:unrecognised_output"});
+}
+
+TEST_CASE("iptables direct: an absent ip6tables is skipped, nothing read is unknown", "[firewall]") {
+    std::vector<IptablesTableRead> v;
+    for (const auto t : kIptablesDirectTables)
+        v.push_back(direct_read(false, t, t == "filter" ? kIptClean : kDirectCleanRaw));
+    for (const auto t : kIptablesDirectTables)
+        v.push_back(direct_read(true, t, "", /*tool_ran=*/false));
+    CHECK(iptables_direct_answer(v, false).state == NftVerdict::inactive);
+    CHECK(iptables_direct_answer({}, false).state == NftVerdict::unknown);
+}
+
+TEST_CASE("nft: has_content -- an empty user-defined chain is content (ADR-3007 clause 6)",
+          "[firewall]") {
+    NftChainInfo c; // table inet filter { chain staged { } }
+    c.is_base_chain = false;
+    CHECK(nft_has_content({c}, {}));
+}

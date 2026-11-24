@@ -90,6 +90,7 @@
 #include <format>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -1454,76 +1455,70 @@ bool try_ufw_rules(yuzu::CommandContext& ctx) {
 
 // ── iptables (rung 2, argv) — the final backend before "none" ──────────
 
+/// Reads the filter, raw, mangle and nat tables of iptables and of ip6tables (`-t <table> -S`), one
+/// bounded run each. All the runs share one deadline, computed once, so the leg stays inside
+/// kAcqDeadline; a run that has no time left is unread, never skipped. nullopt when `iptables`
+/// itself is not installed (the ladder ends at `none`); a missing `ip6tables` leaves its tables
+/// `absent`.
+[[nodiscard]] std::optional<std::vector<yuzu::firewall::IptablesTableRead>> read_iptables_tables() {
+    const auto deadline = std::chrono::steady_clock::now() + kAcqDeadline;
+    std::vector<yuzu::firewall::IptablesTableRead> reads;
+    for (const bool ip6 : {false, true}) {
+        for (const auto table : yuzu::firewall::kIptablesDirectTables) {
+            const auto left = yuzu::firewall::remaining_ms(deadline);
+            if (left.count() <= 0) {
+                reads.push_back({.ip6 = ip6, .table = std::string{table}});
+                continue;
+            }
+            const char* tool = ip6 ? "/usr/sbin/ip6tables" : "/usr/sbin/iptables";
+            auto res = run_bounded_subprocess({tool, "-t", std::string{table}, "-S"},
+                                              SubprocessOptions{.deadline = left});
+            if (!ip6 && reads.empty() && !res.tool_ran)
+                return std::nullopt;
+            reads.push_back(yuzu::firewall::classify_iptables_table_read(
+                ip6, table, res.tool_ran, res.exit_code == 0, subprocess_complete(res),
+                res.output));
+        }
+    }
+    return reads;
+}
+
+// iptables has no on/off concept the way ufw/firewalld do: any policy other than the default
+// ACCEPT, or any non-policy entry in any table read, is "active"; only bare ACCEPT policies and
+// nothing else, in every table that could be read and with none unread, is "inactive". An
+// unreadable table (commonly EPERM -- iptables needs root/CAP_NET_ADMIN, and this is the last
+// backend in the probe order) is an honest unknown, never a false-safe "inactive". The decision is
+// the pure iptables_direct_answer's.
 bool try_iptables_state(yuzu::CommandContext& ctx, bool tables_seen) {
-    auto res = run_bounded_subprocess({"/usr/sbin/iptables", "-S"},
-                                      SubprocessOptions{.deadline = kAcqDeadline});
-    if (!res.tool_ran)
+    const auto reads = read_iptables_tables();
+    if (!reads)
         return false;
     ctx.write_output("backend|iptables");
-    // A nonzero exit (commonly EPERM -- iptables needs root/CAP_NET_ADMIN,
-    // and this is the last backend in the probe order, so there's nowhere
-    // left to fall through to) means the read did not actually happen --
-    // honest unknown, never a false-safe "inactive" from empty output.
-    if (res.exit_code != 0) {
-        ctx.write_output("state|unknown");
-        ctx.write_output("ruleset|unknown");
-        return true;
-    }
-    // iptables has no on/off concept the way ufw/firewalld do: any policy
-    // other than the default ACCEPT, or any non-policy entry, counts as
-    // "active"; three bare ACCEPT policies and nothing else is "inactive" —
-    // matches this leg's pre-migration semantics (the loop is iptables_summary, shared with the
-    // snapshot rung).
-    const auto summary = yuzu::firewall::iptables_summary(res.output);
-    // state| is gated on subprocess_complete(), the same completeness check
-    // ruleset| already used -- exit_code==0 alone doesn't rule out a
-    // timed-out or output-capped read, and a parsed verdict off a partial
-    // -S dump is not trustworthy (governance gate2 security-guardian
-    // finding, r1). gate_state_on_completeness() is the shared,
-    // unit-tested composition of that check.
-    // Output that completed but is not in the shape the parser knows (#4402) reads the same way,
-    // plus a row that says why.
-    const bool complete = subprocess_complete(res);
-    const bool shaped = summary.shaped;
-    auto state = yuzu::firewall::gate_state_on_completeness(
-        complete && shaped, tables_seen,
-        summary.has_content ? yuzu::firewall::FwState::enabled : yuzu::firewall::FwState::disabled);
-    ctx.write_output(std::format(
-        "state|{}", state == yuzu::firewall::FwState::enabled    ? "active"
-                    : state == yuzu::firewall::FwState::disabled ? "inactive"
-                                                                  : "unknown"));
-    ctx.write_output(complete && shaped ? std::format("ruleset|{}", summary.append_count)
-                                        : std::string("ruleset|unknown"));
-    if (complete && !shaped)
-        ctx.write_output(yuzu::firewall::unrecognised_output_row("iptables"));
+    const auto answer = yuzu::firewall::iptables_direct_answer(*reads, tables_seen);
+    ctx.write_output(std::format("state|{}", yuzu::firewall::nft_verdict_name(answer.state)));
+    ctx.write_output(answer.all_read ? std::format("ruleset|{}", answer.appends)
+                                     : std::string("ruleset|unknown"));
+    for (const auto& row : answer.error_rows)
+        ctx.write_output(row);
     return true;
 }
 
 bool try_iptables_rules(yuzu::CommandContext& ctx) {
-    auto res = run_bounded_subprocess({"/usr/sbin/iptables", "-S"},
-                                      SubprocessOptions{.deadline = kAcqDeadline});
-    if (!res.tool_ran)
+    const auto reads = read_iptables_tables();
+    if (!reads)
         return false;
     ctx.write_output("backend|iptables");
-    // Same reasoning as try_iptables_state above: a nonzero exit (commonly
-    // EPERM) means the read did not actually happen -- report an honest
-    // unknown, never a false-safe empty rule set from unparsed empty output.
-    if (res.exit_code != 0) {
+    const auto answer = yuzu::firewall::iptables_direct_answer(*reads, /*tables_seen=*/false);
+    for (const auto& row : answer.rule_rows)
+        ctx.write_output(row);
+    // The rule rows of every table that was read stay written; the count is withheld unless every
+    // table was read, and `rules|unknown` says that the list is not known to be complete.
+    if (!answer.all_read)
         ctx.write_output("rules|unknown");
-        ctx.write_output("ruleset|unknown");
-        return true;
-    }
-    const auto summary = yuzu::firewall::iptables_summary(res.output);
-    for (const auto& r : summary.entries)
-        ctx.write_output(yuzu::firewall::format_iptables_rule_row(r, /*ip6=*/false));
-    // The rule rows already written stay; only the count is withheld (#4402), with the row that
-    // says why, when the output is not in a shape the parser knows.
-    const bool complete = subprocess_complete(res);
-    const bool shaped = summary.shaped;
-    ctx.write_output(complete && shaped ? std::format("ruleset|{}", summary.append_count)
-                                        : std::string("ruleset|unknown"));
-    if (complete && !shaped)
-        ctx.write_output(yuzu::firewall::unrecognised_output_row("iptables"));
+    ctx.write_output(answer.all_read ? std::format("ruleset|{}", answer.appends)
+                                     : std::string("ruleset|unknown"));
+    for (const auto& row : answer.error_rows)
+        ctx.write_output(row);
     return true;
 }
 

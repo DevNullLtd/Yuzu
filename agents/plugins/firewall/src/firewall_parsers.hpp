@@ -332,8 +332,8 @@ struct IptablesRule {
     std::string spec; // policy target ("ACCEPT"/"DROP") for `policy`; empty
                        // for `new_chain`; the rule spec after the chain name
                        // for `append`; the raw line for `unknown`.
-    std::string table; // the xtables table of a save-listing entry; empty for the filter table
-                       // and for every `-S` read (which lists the filter table only)
+    std::string table; // the xtables table of an entry outside the filter table; empty for the
+                       // filter table
 };
 
 /// Parse `iptables -S` into structured rows, replacing the old opaque
@@ -813,17 +813,17 @@ struct NftRuleInfo {
     return out;
 }
 
-/// "Active" heuristic mirroring parse_iptables_save's has_content logic in
-/// firewall_plugin.cpp's try_iptables_state: any actual rule, or any base
-/// chain whose policy is not the default-open "accept", counts as active
-/// content. An empty ruleset (no tables at all, or tables with no base
-/// chains/rules) is inactive — never fabricated as active.
+/// "Active" heuristic: any actual rule, any user-defined (non-base) chain, or any base chain whose
+/// policy is not the default-open "accept", counts as active content. An empty ruleset (no tables
+/// at all, or tables with only accept-policy base chains) is inactive — never fabricated as active.
 [[nodiscard]] inline bool nft_has_content(const std::vector<NftChainInfo>& chains,
                                           const std::vector<NftRuleInfo>& rules) {
     if (!rules.empty())
         return true;
     for (const auto& c : chains) {
-        if (c.is_base_chain && c.policy.has_value() && *c.policy != nft_raw::kNftPolicyAccept)
+        if (!c.is_base_chain) // a user-defined chain is content, empty or not (ADR-3007 clause 6)
+            return true;
+        if (c.policy.has_value() && *c.policy != nft_raw::kNftPolicyAccept)
             return true;
     }
     return false;
@@ -1583,6 +1583,100 @@ inline void iptables_tally(IptablesSummary& sum) {
                                                                 : "unknown";
     return std::format("rule|{}{}{}|{}|{}", ip6 ? "ip6|" : "", r.table.empty() ? "" : r.table + "|", kind,
                        sanitize_field(r.chain), sanitize_field(r.spec));
+}
+
+// ── Linux: the root direct iptables legs read every table the broker's legacy sections list ─────
+//
+// `iptables -S` lists the filter table only, so a root agent that read nothing else answered
+// `inactive` for a host whose rules sit in raw, mangle or nat (#8614). The root direct legs
+// (try_iptables_state, try_iptables_rules) now read `-t <table> -S` for each table below, for
+// iptables and for ip6tables, and this decision is the one place that says what those reads mean.
+// The `security` table is not read: the broker lists it, the root legs have no read for it.
+
+inline constexpr std::array<std::string_view, 4> kIptablesDirectTables{"filter", "raw", "mangle",
+                                                                       "nat"};
+
+/// How one `-t <table> -S` read ended: `read` (ran, exit 0, complete, in the shape this plugin
+/// knows), `unread` (it ran and did not vouch for the table, or there was no time left to run it),
+/// `absent` (the tool is not installed: nothing on the host can list that family).
+enum class IptablesReadOutcome { read, unread, absent };
+
+struct IptablesTableRead {
+    bool ip6 = false;
+    std::string table; // one of kIptablesDirectTables
+    IptablesReadOutcome outcome = IptablesReadOutcome::unread;
+    bool unshaped = false; // complete, exit 0, and not a listing this plugin knows
+    IptablesSummary summary;
+};
+
+/// Reads one `-t <table> -S` run into an IptablesTableRead. `complete` is subprocess_complete().
+[[nodiscard]] inline IptablesTableRead
+classify_iptables_table_read(bool ip6, std::string_view table, bool tool_ran, bool exit_ok,
+                             bool complete, std::string_view output) {
+    IptablesTableRead r;
+    r.ip6 = ip6;
+    r.table = std::string{table};
+    if (!tool_ran) {
+        r.outcome = IptablesReadOutcome::absent;
+        return r;
+    }
+    if (!exit_ok || !complete)
+        return r; // unread
+    r.summary = iptables_summary(output);
+    r.unshaped = !r.summary.shaped;
+    if (r.summary.shaped) {
+        r.outcome = IptablesReadOutcome::read;
+        if (table != "filter")
+            for (auto& e : r.summary.entries)
+                e.table = std::string{table};
+    }
+    return r;
+}
+
+/// What the root direct legs answer. `state`: `active` when any READ table has content; else
+/// `unknown` when nothing was read or any table was UNREAD; else `inactive` (clamped to `unknown`
+/// when `tables_seen`). An `absent` tool is skipped: nothing on the host can list it. `all_read` is
+/// true when at least one table was read and none was unread, which is when the count is written.
+/// `rule_rows` are the rule rows of every READ table in read order (IPv4 tables, then IPv6);
+/// `error_rows` holds one `error|<tool>:unrecognised_output` row per tool that printed a listing
+/// that is not in the known shape.
+struct IptablesDirectAnswer {
+    NftVerdict state = NftVerdict::unknown;
+    bool all_read = false;
+    int appends = 0;
+    std::vector<std::string> rule_rows;
+    std::vector<std::string> error_rows;
+};
+
+[[nodiscard]] inline IptablesDirectAnswer
+iptables_direct_answer(const std::vector<IptablesTableRead>& reads, bool tables_seen) {
+    IptablesDirectAnswer a;
+    bool content = false;
+    bool any_read = false;
+    bool any_unread = false;
+    bool unshaped4 = false;
+    bool unshaped6 = false;
+    for (const auto& r : reads) {
+        if (r.outcome == IptablesReadOutcome::read) {
+            any_read = true;
+            content = content || r.summary.has_content;
+            a.appends += r.summary.append_count;
+            for (const auto& e : r.summary.entries)
+                a.rule_rows.push_back(format_iptables_rule_row(e, r.ip6));
+        } else if (r.outcome == IptablesReadOutcome::unread) {
+            any_unread = true;
+            (r.ip6 ? unshaped6 : unshaped4) |= r.unshaped;
+        }
+    }
+    a.all_read = any_read && !any_unread;
+    const NftVerdict verdict =
+        content ? NftVerdict::active : a.all_read ? NftVerdict::inactive : NftVerdict::unknown;
+    a.state = nft_fallthrough_clamp(tables_seen, verdict);
+    if (unshaped4)
+        a.error_rows.push_back(unrecognised_output_row("iptables"));
+    if (unshaped6)
+        a.error_rows.push_back(unrecognised_output_row("ip6tables"));
+    return a;
 }
 
 // ── Linux: the root snapshot broker (docs/adr/3007-os-activated-read-helpers.md) ─────────────

@@ -501,13 +501,14 @@ def linux_problems(plugin_src, reader_src):
                        f"error|nftables:socket:eperm) at {opens} sites, expected 2: they are never deferred")
 
     # each of the two clamped rungs hands its parameter to the pure function that applies the clamp
-    for name in ("try_ufw_state", "try_iptables_state"):
+    for name, hand_over in (
+            ("try_ufw_state", r"yuzu::firewall::gate_state_on_completeness\( ?complete && shaped, tables_seen,"),
+            ("try_iptables_state", r"yuzu::firewall::iptables_direct_answer\( ?\*reads, tables_seen\)")):
         body = function_body(live, r"bool " + name + r"\(yuzu::CommandContext& ctx, bool tables_seen\) ?(?=\{)")
-        if body is None or not re.search(
-                r"yuzu::firewall::gate_state_on_completeness\( ?complete && shaped, tables_seen,", squash(body)):
-            out.append(f"{name} no longer takes tables_seen and hands it to gate_state_on_completeness("
-                       "complete && shaped, tables_seen, ...) (its own inactive would stand beside tables the "
-                       "netlink read saw)")
+        if body is None or not re.search(hand_over, squash(body)):
+            out.append(f"{name} no longer takes tables_seen and hands it to "
+                       f"{'gate_state_on_completeness(complete && shaped, tables_seen, ...)' if name == 'try_ufw_state' else 'iptables_direct_answer(*reads, tables_seen)'} "
+                       "(its own inactive would stand beside tables the netlink read saw)")
     # the member is named nowhere but in its pinned reads and its one assignment: a reference or a
     # pointer to it, or std::exchange on it, would clear it with no assignment by name
     named = re.sub(r"if \( ?info\.tables_seen ?\)|info\.tables_seen = info\.tables_seen \|\||"
@@ -706,8 +707,8 @@ LINUX_MUTATIONS = [
     # a clamped rung no longer hands the flag to the pure function (ufw, then iptables)
     (_lmut(r"(complete && shaped, )tables_seen(, yuzu::firewall::parse_ufw_status)", r"\1false\2"),
      "try_ufw_state no longer takes tables_seen and hands it to gate_state_on_completeness"),
-    (_lmut(r"(complete && shaped, )tables_seen(,\s*summary\.has_content)", r"\1false\2"),
-     "try_iptables_state no longer takes tables_seen and hands it to gate_state_on_completeness"),
+    (_lmut(r"(iptables_direct_answer\(\*reads, )tables_seen\)", r"\1false)"),
+     "try_iptables_state no longer takes tables_seen and hands it to iptables_direct_answer"),
     # a socket-open diagnostic deferred as well
     (_lmut(r"(for \(const auto& row : yuzu::firewall::nft_open_diag_rows\(open_errnos\)\)\s*)ctx\.write_output\(row\);",
            r"\1info.pending_rows.push_back(row);"), "never deferred"),
