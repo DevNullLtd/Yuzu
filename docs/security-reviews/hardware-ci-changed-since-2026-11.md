@@ -2,9 +2,16 @@
 
 **Date:** 2026-11-24
 **Change:** `GET /api/v1/hardware-ci` and the MCP tool `list_hardware_ci_records` gain a `changed_since`
-filter, a per-row `changed_at` and a per-page `next_changed_since` (PR 1 of 2; PR 2 is the removal feed).
-**Status:** implemented, not merged. The design was reviewed (Fable) and approved by the owner before
-implementation. This record is additive: it does not edit
+filter, a per-row `changed_at` and a `next_changed_since` on the first response of a walk (PR 1 of 2; PR 2 is the removal feed).
+**Status:** implemented, NOT merged, and its residuals are NOT yet owner-accepted. The design was reviewed
+(Fable) and approved by the owner before implementation, and the governance round that followed changed it in
+one respect: the watermark is returned on the first response of a walk only (owner ruling 2026-11-24, decision 5
+below). Residuals that need an explicit owner ruling BEFORE this merges: HWCI-DELTA-PLAN-FLIP,
+HWCI-DELTA-MARGIN-ESTIMATE (including the clock-step and long-commit cases added below),
+HWCI-DELTA-MIXED-BUILDS, HWCI-DELTA-NO-REMOVALS and HWCI-DELTA-REPARSE. Residuals recorded as design
+consequences, which this record does not ask the owner to waive: HWCI-DELTA-SCOPED-REFUSED,
+HWCI-DELTA-LAST-SEEN-STALE and HWCI-DELTA-ENTER-SCOPE. Tracking issues and owners are to be filed at push. This
+record is additive: it does not edit
 `docs/security-reviews/hardware-ci-bulk-read-bounds-2026-11.md`, which stays authoritative for the
 concurrency cap, the byte bound and their residuals, and all of which this change keeps.
 
@@ -23,7 +30,10 @@ A real change marker and a delta filter close that.
 2. **Stamped from the database clock, in SQL** (`EXTRACT(EPOCH FROM clock_timestamp())::bigint`), never the
    replica's `now_secs()`. Under active-active replicas a replica clock that runs behind would stamp a row
    earlier than a watermark another replica already handed out, and the next delta would skip it. One clock
-   (the database's) orders every writer and every watermark.
+   (the database's) orders every writer and every watermark, for a single primary: a clock step, an NTP
+   correction or a failover to a node whose clock is skewed breaks that (HWCI-DELTA-MARGIN-ESTIMATE). `changed_at`
+   is on the database clock while `first_seen` and `last_seen` are on the replica clock
+   (HWCI-DELTA-CLOCK-DOMAINS).
 3. **Backfill by default value, metadata only.** `ADD COLUMN ... DEFAULT (EXTRACT(EPOCH FROM now()))::bigint`
    is a stable (not volatile) default, which PostgreSQL 11 and later apply without rewriting the table.
    Existing rows therefore read as changed at migration time, and the first delta pull returns the fleet
@@ -32,22 +42,42 @@ A real change marker and a delta filter close that.
 4. **Filter `changed_at >= $n`**, so delivery is at-least-once: a row exactly at the boundary is served again
    rather than lost. The client upserts by `agent_id`. With no filter the SQL text and parameters are
    byte-identical to before.
-5. **Watermark `next_changed_since` = database clock minus 300 s** (`kChangedSinceMarginSecs`), on every
-   page. The client keeps the FIRST page's value of a walk. The margin covers a write whose transaction was
-   open (or whose commit was delayed) when the walk began: such a row commits with a `changed_at` earlier
-   than the watermark yet becomes visible only after the read. It is an estimate of that lag, not a bound
-   on it (HWCI-DELTA-MARGIN-ESTIMATE).
+5. **Watermark `next_changed_since` = database clock minus 300 s** (`kChangedSinceMarginSecs`), returned on the
+   FIRST response of a walk ONLY (owner ruling 2026-11-24): a bulk response that carries no `cursor` and no
+   `agent_id`. Cursor pages and `agent_id` point reads omit the key entirely (absent, not null, not 0), so they
+   take no second pool lease and gain no new `503` dependency. A failed watermark read on a first page is a
+   definitive `503` (`retry_after_ms` 5000), never a guessed value. The client keeps that first value. The
+   guarantee is "stamped within 300 s before the clock that minted the value", not "200 s before the value": a
+   write whose transaction was open (or whose commit was delayed) when the walk began commits with a
+   `changed_at` earlier than the watermark yet becomes visible only after the read, and the margin covers it. It
+   is an estimate of that lag, not a bound on it (HWCI-DELTA-MARGIN-ESTIMATE). A client that kept the LAST
+   page's value, or one derived from `max(changed_at)` or its own clock, silently misses changes behind the
+   cursor on a long walk, which is why the first-response-only rule exists and why the manual says to keep that
+   value and nothing else. A first response without the key means the filter was not applied (a replica that
+   predates the feature): the client must not advance its watermark.
 6. **A delta needs a global-read credential.** A scope-confined caller (management group or service scoped)
-   who sends `changed_since` gets a definitive refusal that names no device and no count. A device that
+   who sends `changed_since` gets a definitive refusal that names no device and no count (message `changed_since needs a credential with global read; a scope-confined credential cannot use a delta pull`, remediation `use a credential holding a fleet-wide Inventory:Read grant (a management-group or service-scoped token cannot), or omit changed_since and walk the full set`). On MCP the refusal writes both audit rows (the domain row and the generic row), and on REST its best-effort `denied` row can carry `Sec-Audit-Failed: true`, like the scope-over-10,000 refusal. A device that
    enters a caller's scope does not change its record, so `changed_at` does not move and a scoped delta
    would silently omit it. Pushing the scope into the delta SQL does not make it safe: it would be a
    query that looks complete and is not. The scope-confined caller keeps the full walk.
-7. **Validation.** A malformed, negative or future-dated value is `400` (MCP `-32602`), the precedent of
-   `hardware_routes.cpp` for `limit`. The value is bound into the cursor filter fingerprint; the no-filter
-   fingerprint is byte-identical to before, so a cursor issued before this change still decodes (the `h1`
-   format is frozen).
+7. **Validation.** A malformed or negative value is `400` (MCP `-32602`) with `invalid changed_since (expected epoch seconds as a non-negative integer)`; a value past `now + 60 s` on the replica's wall clock is `400` /
+   `-32602` with `invalid changed_since (it is in the future, or this server's clock is behind the database clock)`, the precedent of `hardware_routes.cpp` for `limit`. The accepted range is therefore 0 up to the
+   server's current time plus 60 seconds (the MCP schema's static maximum is coarser; the server check is the one
+   that applies). The 60 s absorbs clock skew between a client and a replica. The value is bound into the cursor
+   filter fingerprint; the no-filter fingerprint is byte-identical to before, so a cursor issued before this
+   change still decodes (the `h1` format is frozen). The cursor is bound to `agent_id` AND `changed_since`.
 8. **Upgrade safety.** The store constructor's projection probes include `changed_at`, so an old schema
-   fails closed the way v2 to v4 do.
+   fails closed the way v2 to v4 do. Migration v5 also checks, after `ADD COLUMN IF NOT EXISTS`, that an
+   existing `changed_at` is `bigint NOT NULL` and raises an exception when it is not (a pre-existing column of
+   another type would otherwise be skipped by `IF NOT EXISTS`, and every upsert and delta would then fail at run
+   time). The v5 `ALTER` takes `ACCESS EXCLUSIVE`, held through the index build, so reads and writes of
+   `device_ci` are blocked for the migration (about 0.2 to 0.7 s per million rows on 18.4); it waits up to 30 s
+   for the lock and then fails, and a failed v5 migration refuses to start the server on every restart until
+   the lock holder is gone (`docs/user-manual/upgrading.md`). v5 is forward-only: there is no rollback.
+9. **Data classification.** `changed_at` is stored in `device_ci` and served on every row to whoever may read the
+   row; it is in the same behavioural-PII tier as the rest of the record (ADR-0016). The `changed_since`
+   filter on it, and the watermark, are restricted to global-read credentials. It lives and dies with the
+   `device_ci` row: a decommission deletes it and its index entry.
 
 ## Unchanged contract
 
@@ -82,27 +112,49 @@ index is about 7 MB at 1M rows.
 Whole walks at 1M rows: the sparse delta took 2 pages and 9.3 ms in total; the dense delta took 900 pages,
 13.5 ms at most per page and 8.2 s in total, against 8.7 s for the unfiltered walk.
 
-**The one slow case (HWCI-DELTA-PLAN-FLIP).** When about 5% of the rows changed AND they cluster at the end
-of `agent_id` order, the planner picks the `agent_id` index with a filter and scans most of the table
-before it finds a page. At 1M rows that took 2,203 ms for the first page (2,172 ms the worst page of the
-walk), under the 5 s statement limit; by extrapolation the limit is reached at roughly 2.5M rows or more
-(an estimate, not a measurement). Random ids scatter changes and do not trigger it; sequential ids with a
-block of the newest devices changing would.
+**The slow case (HWCI-DELTA-PLAN-FLIP).** The earlier version of this record described one slow case, a
+5% delta clustered at the tail, at 2.2 s a page and an extrapolated limit breach at about 2.5M rows. The governance
+round measured it again at 1M rows and the figure was understated. The planner flips from the
+`device_ci_changed_at_idx` plan to an `agent_id` index scan with a filter at roughly 2 to 3% density, and the
+filter then scans most of the table before it finds a page. The result is slow for ANY clustered delta of 3% or
+more on its first page, on its final page, or after a gap in the middle of a walk. The worst case measured is a
+5% delta clustered at the head of `agent_id` order, whose terminal page took 3.6 to 3.8 s at 1M rows. Against the
+5 s statement limit that breaches at about 1.3M rows on a warm cache, and earlier on a cold one. A page that
+exceeds the limit answers `503` with `retry_after_ms` 5000, but the same `changed_since` reaches the same page
+again, so the answer is deterministic: a retry gets the same `503` and the walk wedges. The `5000` hint is wrong
+advice for it, because nothing about the retry changes. The mitigation for a client is to drop `changed_since` and
+do a full walk (a full walk does not run the delta filter). A composite index `(agent_id COLLATE "C",
+changed_at)` was measured to take the worst page from 3.7 s to 44 ms and costs about 65 MB at 1M rows, but it is
+a full fix only if it REPLACES `device_ci_agent_id_c_idx`: the runtime check at open demands that index's exact
+key list, so adding a second index does not remove the flip, and replacing it is a design change. The earlier
+claim in this record that a composite `(changed_at, agent_id)` index does not change the plan choice was about
+a different key order and does not describe this candidate.
 
 ## Residuals
 
-None of these is accepted by this record; each is stated so a client and a reviewer can plan around it.
+None of these is accepted by this record; each is stated so a client, a reviewer and the owner can plan around
+it. "Ruling needed" means the owner must decide before merge; "design consequence" means the behaviour follows
+from a recorded design decision and is stated, not waived. Owner and tracking issue are **to be filed at push**
+for every row (no issue numbers exist yet).
 
-| Id | Residual | Mitigation and owner |
-|---|---|---|
-| HWCI-DELTA-MARGIN-ESTIMATE | The 300 s margin is an estimate of how late a committed write can become visible to a walk that began earlier. A transaction held open longer than the margin can commit a row stamped before the watermark that was already handed out, and a later delta then misses it. | The documented backstop: a periodic full walk (the manual says weekly and after an upgrade). The margin is a named constant, not a flag. |
-| HWCI-DELTA-SCOPED-REFUSED | A scope-confined caller cannot use `changed_since` and is refused. A device entering a scope does not bump `changed_at`, and the delta cannot see it. | Use a global-read credential for a delta, or a full walk. A caller holding only group-scoped grants is refused even when its groups cover every device, because the scope is engaged either way. A scoped delta is a follow-up only if it can include scope-entry events. |
-| HWCI-DELTA-LAST-SEEN-STALE | `ci.last_seen` moves on the daily sync that finds nothing new and `changed_at` does not, so a CMDB fed only by delta pulls holds a stale `last_seen` for an unchanged device. | Documented in the manual: read `last_seen` from a full walk or `?agent_id=` if it is used as a staleness signal. |
-| HWCI-DELTA-NO-REMOVALS | A delta has no removal signal: a decommissioned device simply stops appearing. | PR 2 (a removals feed) is planned, no date. Until then: confirm absence with `?agent_id=` and retire only through the client's own decommission process. |
-| HWCI-DELTA-REPARSE-NOT-SIGNALLED | A server upgrade that re-parses stored records (a new parser version) does not change `content_hash` and so does not bump `changed_at`. A CMDB holding the old parse is not told. | Run a full walk after every server upgrade (stated in the manual and the upgrade note). |
-| HWCI-DELTA-ENTER-SCOPE | The same mechanism as HWCI-DELTA-SCOPED-REFUSED seen from the data side: any consumer that filters by a scope it computes itself (a management group or a tag) and then uses a delta will miss a device that joined that scope without a content change. | Recompute the scope membership on a full walk, or filter after the pull. |
-| HWCI-DELTA-PLAN-FLIP | A delta of about 5% of the rows, clustered at the tail of `agent_id` order, plans as an `agent_id` index scan with a filter: 2.2 s a page at 1M rows, and an estimated 5 s statement-limit breach at about 2.5M rows or more (a page then answers 503). | Not mitigated in this change; measured only up to 1M rows. Follow-up: a capped pre-count of the delta that picks an index-driven form for a small delta. A composite `(changed_at, agent_id)` index was considered and does not change the plan choice by itself. |
-| HWCI-DELTA-MIXED-BUILDS | An older binary running against the new schema only warns, and writes device-CI rows without maintaining `changed_at` (a new row gets the column default, the insert time; an update of an existing row leaves the old value). A delta taken while one is running can miss its changes. | Hard cutover: every replica on the new build before delta pulls are relied on (see `docs/user-manual/upgrading.md`). Procedural, not enforced. |
+| Id | Residual | Mitigation | Status | Owner / issue |
+|---|---|---|---|---|
+| HWCI-DELTA-MARGIN-ESTIMATE | The 300 s margin is an estimate of how late a committed write can become visible to a walk that began earlier, not a bound. Three ways a row ends up below a watermark that was already handed out, so that a later delta misses it: (1) a transaction held open longer than the margin; (2) a long commit: an ingest transaction whose `COMMIT` is delayed past the margin (a network blackhole, with no `idle_in_transaction_session_timeout`); (3) the database clock stepped backward by more than the margin (an NTP step, a VM resume, or a failover to a skewed node), so new stamps land below watermarks already issued. A replica clock more than about 360 s behind the database clock can also `400` a value the server itself issued (the future check uses the replica clock, the watermark the database clock). | The documented backstop is a periodic full walk (weekly and after an upgrade). The margin is a named constant, not a flag. Mitigations NOT built: stamping `GREATEST(clock_timestamp(), max(changed_at))` for the clock-step case (the candidate), and a pre-`COMMIT` check that `clock - stamp` is still inside the margin for the long-commit case. Operators: run NTP on every replica and the database host. | Ruling needed (including the two new cases) | to be filed at push |
+| HWCI-DELTA-SCOPED-REFUSED | A scope-confined caller cannot use `changed_since` and is refused. A device entering a scope does not bump `changed_at`, and the delta cannot see it. | Use a global-read credential for a delta, or a full walk. A caller holding only group-scoped grants is refused even when its groups cover every device, because the scope is engaged either way. A scoped delta is a follow-up only if it can include scope-entry events. The refusal carries a remediation naming the credential it needs. | Design consequence | to be filed at push |
+| HWCI-DELTA-LAST-SEEN-STALE | `ci.last_seen` moves on the daily sync that finds nothing new and `changed_at` does not, so a CMDB fed only by delta pulls holds a stale `last_seen` for an unchanged device. | Documented in the manual: read `last_seen` from a full walk or `?agent_id=` if it is used as a staleness signal. | Design consequence | to be filed at push |
+| HWCI-DELTA-NO-REMOVALS | A delta has no removal signal: a decommissioned device simply stops appearing. Erasure: `changed_at` and its index live and die with the `device_ci` row, but a CMDB copy of the serial, MAC or UUID is NOT erased by a decommission, and until PR 2 a delta consumer gets no signal to erase it. | PR 2 (a removals feed of tombstones carrying `agent_id` and `removed_at`) is planned, no date. The tombstones will need a retention rule under the clock-guarded-retention row (`docs/clock-guarded-retention.md`) and a data classification. Until then: confirm absence with `?agent_id=` (without `changed_since`) and retire only through the client's own decommission process. | Ruling needed | to be filed at push |
+| HWCI-DELTA-REPARSE | If a server upgrade changes how stored records are interpreted without changing `content_hash`, `changed_at` does not move, and a CMDB holding the old reading is not told. No re-parse-on-upgrade code was found by the reviewers, so this is a conditional, not a present behaviour. | Run a full walk after every server upgrade (stated in the manual and the upgrade note). | Ruling needed | to be filed at push |
+| HWCI-DELTA-ENTER-SCOPE | The same mechanism as HWCI-DELTA-SCOPED-REFUSED seen from the data side: any consumer that filters by a scope it computes itself (a management group or a tag) and then uses a delta will miss a device that joined that scope without a content change. | Recompute the scope membership on a full walk, or filter after the pull. | Design consequence | to be filed at push |
+| HWCI-DELTA-PLAN-FLIP | See "The slow case" above. The planner flips at roughly 2 to 3% density; any clustered delta of 3% or more on its first page, final page or a mid-walk gap is slow; the worst measured case (5% clustered at the head) took 3.6 to 3.8 s on its terminal page at 1M rows and breaches the 5 s statement limit at about 1.3M rows warm, earlier cold. The `503` it produces is deterministic (the same `changed_since` hits the same page), carries `retry_after_ms` 5000, and wedges the walk. | Client: drop `changed_since` and do a full walk. Server: not mitigated in this change. Candidate fix: a composite `(agent_id COLLATE "C", changed_at)` index that REPLACES the v4 index (3.7 s to 44 ms measured, about +65 MB at 1M rows). Not built: a retry-hint cause discriminator, so a deterministic `503` could stop advising a retry. | Ruling needed | to be filed at push |
+| HWCI-DELTA-MIXED-BUILDS | An older binary running against the new schema only warns, and writes device-CI rows without maintaining `changed_at`: a new row gets the column default (the insert time), but a content update of an existing row leaves the old value. The miss is PERMANENT for that row, not a transient one: every later delta skips it, because the stamp is already behind every watermark. | Procedural, not enforced: this is a fresh-deployment contract, not a rolling or mixed-version procedure (`docs/user-manual/upgrading.md`). After the LAST earlier-build replica is gone, do a full walk and take a fresh watermark. v5 is forward-only. | Ruling needed | to be filed at push |
+| HWCI-DELTA-PITR-RESTORE | A point-in-time restore or a restore from backup leaves `changed_at` stamps older than watermarks that clients already hold, so a delta will not show a row whose stored state the restore rolled back. | A full walk after any restore. | Residual | to be filed at push |
+| HWCI-DELTA-HASH-FLAPPING | An agent whose collector output changes nondeterministically (the content hash flaps) bumps `changed_at` on every full send, so that device is re-served on every delta. | Harmless to correctness (at-least-once), a cost only; fix the agent's nondeterminism. | Residual | to be filed at push |
+| HWCI-DELTA-HOT-LOSS | A content update now rewrites an indexed column, so it loses the heap-only-tuple (HOT) update path: measured about +29% cost per content update. The hash-skip path is untouched. | Accepted cost of the marker; not mitigated. | Residual | to be filed at push |
+| HWCI-DELTA-V5-LOCK | The v5 `ALTER` takes `ACCESS EXCLUSIVE` held through the index build and queues behind any long read or write on `device_ci` for up to 30 s, during which every new access queues behind it; then it fails and the server refuses to start on every restart until the holder is gone. | Documented with the log line and recovery in `docs/user-manual/upgrading.md`; the migration is idempotent. | Residual | to be filed at push |
+| HWCI-DELTA-WATERMARK-OBSERVABILITY | A failed watermark read on a first page is indistinguishable from a failed page read in the audit row and in the `503` counters (both are a store failure with `retry_after_ms` 5000). | Not mitigated. The degrade is counted under `yuzu_inventory_read_degrade_total{source="device_ci"}` with the same `reason` labels a page read uses, so the counter does not tell the two apart either. | Residual | to be filed at push |
+| HWCI-DELTA-AUDIT-NO-MARKER | A served delta page writes the same `inventory.devices.ci` `success` row as a full page, with no delta marker, so the audit trail cannot tell a delta read from a full read. Not built: a `delta=1` token in the detail. | Documented in `audit-log.md`; owner-acceptable, to be confirmed. | Residual (documented) | to be filed at push |
+| HWCI-DELTA-INDEX-NO-WARN | The runtime check at open WARNs when `device_ci_agent_id_c_idx` is missing, but nothing warns when `device_ci_changed_at_idx` is missing. A delta stays correct without it. | Not mitigated; the measured plans assume the index. | Residual | to be filed at push |
+| HWCI-DELTA-CLOCK-DOMAINS | `changed_at` is stamped from the database clock, while `first_seen` and `last_seen` are stamped from the replica clock. The three are not comparable to better than the replica-to-database skew. | Documented; run NTP on every replica and the database host. | Residual | to be filed at push |
 
 ## Where to read more
 
