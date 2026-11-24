@@ -17,14 +17,14 @@ class ExistsNoRawFallback(unittest.TestCase):
     def test_refusal_precedes_validation(self):
         b = self.body()
         self.assertIn("path_refusal(path)", b)
-        self.assertLess(b.index("path_refusal(path)"), b.index("validate_path_or_parent("))
+        self.assertLess(b.index("path_refusal(path)"), b.index("validate_path_or_parent_ex("))
 
     def test_the_refusal_branch_is_live_and_returns(self):
         # The up-front refusal must be a real condition that returns an error row: neutralising it
         # (`if (false && ...)`, a removed `return 1`) must fail here.
         b = self.body()
         i = b.index("path_refusal(path)")
-        branch = b[i - 40:b.index("validate_path_or_parent(")]
+        branch = b[i - 40:b.index("validate_path_or_parent_ex(")]
         # The EXACT condition: any extra clause (`; false && ...`) or a different test fails here.
         self.assertIn(
             "if (const auto refusal = path_refusal(path); yuzu::shared::local_path::refused(refusal)) {",

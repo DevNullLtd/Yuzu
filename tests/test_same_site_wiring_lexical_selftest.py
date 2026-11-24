@@ -230,10 +230,9 @@ def m_probe_condition_widened(s):
 
 
 def m_local_metrics_widened(s):
-    old = 'if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1") {'
+    old = 'request_has_forwarding_evidence(req))) {'
     once(s, old)
-    return s.replace(old, 'if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1" || '
-                          'true) {')
+    return s.replace(old, 'request_has_forwarding_evidence(req)) || true) {')
 
 
 def m_refusal_returns_unhandled(s):
