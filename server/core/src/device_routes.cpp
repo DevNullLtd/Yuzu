@@ -400,6 +400,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         auto session = auth_fn_(req, res);
         if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        if (detail::refuse_unsafe_device_id(res, id)) return; // before the scoped check
         // Per-device scope: Infrastructure:Read for THIS device (tier + management
         // group, ancestor-aware). 403 = outside scope; an in-scope-but-absent device
         // falls through to the honest not-found body below.
@@ -424,6 +425,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         auto session = auth_fn_(req, res);
         if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        if (detail::refuse_unsafe_device_id(res, id)) return; // before the scoped check
         if (!scoped_perm_fn_(req, res, "Infrastructure", "Read", id)) return; // per-device scope
         auto result = get_one(id);
         if (!result) {
@@ -491,6 +493,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     sink.Get("/fragments/device/live", [this, note, can_execute](const httplib::Request& req,
                                                                  httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        if (detail::refuse_unsafe_device_id(res, id)) return; // before the scoped check
         // Per-device live surface: scoped Read floor (the run panels re-gate Read +
         // Execute per dispatch). 403 = outside the caller's management scope.
         if (!scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)) return;
@@ -508,6 +511,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                                                httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         const std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "";
+        if (detail::refuse_unsafe_device_id(res, id)) return; // before the scoped check and any audit row
         // Per-device scoped Read floor (tier + management group for THIS device);
         // the Execute probe below is the soft, htmx-friendly note for a read-only
         // operator. Gate before any dispatch so an out-of-scope agent_id is refused.
@@ -570,6 +574,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         const std::string id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
         const std::string command_id2 =
             req.has_param("command_id2") ? req.get_param_value("command_id2") : "";
+        if (detail::refuse_unsafe_device_id(res, id)) return; // before the scoped check and any audit row
         // Per-device scoped Read floor — a poll must honour the same management
         // scope as the dispatch (an out-of-scope agent_id is refused even with a
         // guessed command_id).

@@ -9668,6 +9668,44 @@ McpServer::HandlerFn McpServer::build_handler(
                 return true;
             };
 
+            // The device-id audit floor (auth::agent_id_is_audit_safe) for a raw `agent_id`
+            // argument: an id over 256 bytes or with a byte below 0x20 reaches the permission
+            // denial's target_id, an approval ticket's pending row or a domain audit row, and
+            // the audit store keeps CR, LF and TAB. Every tool that takes one calls this BEFORE
+            // the scoped permission check, the approval mint and any audit write. Writes the
+            // -32602 refusal (fixed text, no request data, no audit row) into `res` and returns
+            // true; the caller then returns. An empty id passes: each tool answers its own
+            // "agent_id is required".
+            const auto refuse_unsafe_agent_id = [&](const std::string& agent_id) -> bool {
+                if (auth::agent_id_is_audit_safe(agent_id))
+                    return false;
+                // retry-hint-exempt: caller-input rejection
+                res.set_content(a4_error(kInvalidParams,
+                                         "agent_id must be at most 256 bytes with no byte below "
+                                         "0x20",
+                                         "fix the argument and re-call"),
+                                "application/json");
+                return true;
+            };
+
+            // The tag-key twin of `refuse_unsafe_agent_id` (auth::tag_key_is_audit_safe): a key
+            // over 64 bytes or with a byte below 0x20 reaches the `agent_id:key` text of the
+            // tag rows. `set_tag` and `delete_tag` call it BEFORE the service-tag guard, the
+            // scoped permission check and any audit write. A size and control-byte check only,
+            // never the key charset: `delete_tag` must still reach a stored key that
+            // `TagStore::validate_key` would refuse. An empty key passes (each tool answers its
+            // own "agent_id and key are required").
+            const auto refuse_unsafe_tag_key = [&](const std::string& key) -> bool {
+                if (auth::tag_key_is_audit_safe(key))
+                    return false;
+                // retry-hint-exempt: caller-input rejection
+                res.set_content(a4_error(kInvalidParams,
+                                         "key must be at most 64 bytes with no byte below 0x20",
+                                         "fix the argument and re-call"),
+                                "application/json");
+                return true;
+            };
+
             // A4 envelope that also carries the durable execution handle. Used by
             // the two streamed-POST 500s, which are the only refusals raised AFTER
             // dispatch - the work is running, so the client needs the id to find it
@@ -10326,6 +10364,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // mcp.<tool>|pending by agent_id (the success audit already
                     // carries it; the mint audit did not).
                     const std::string audit_agent = param_str(args, "agent_id");
+                    // Before any ticket is minted or recalled and before the pending audit
+                    // row (`mint_detail_prefix` below carries the id): the mint covers every
+                    // approval-gated tool at once, so the floor is applied here once for all.
+                    if (refuse_unsafe_agent_id(audit_agent))
+                        return;
                     const std::string mint_detail_prefix =
                         audit_agent.empty() ? std::string{} : "agent_id=" + audit_agent + " ";
 
@@ -13605,6 +13648,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             invalid("agent_id is required (1 to 128 characters)");
                             return;
                         }
+                        if (refuse_unsafe_agent_id(agent_id))
+                            return;
                         // The per-device SCOPED gate, as the REST route: fail closed if unwired.
                         if (!scoped_perm_fn) {
                             res.set_content(a4_error(kInternalError, "scope gate not configured"),
@@ -14755,6 +14800,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id)) // the success row below carries the id
+                    return;
                 bool inventory_truncated = false;
                 auto records = inventory_store->get_agent_inventory(agent_id, &inventory_truncated);
                 if (!records) {
@@ -14807,6 +14854,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The id floor precedes the fail-closed guard (the REST drills also floor before
+                // their scoped gate): an unsafe id is input validation and must reach no audit
+                // row.
+                auto agent_id = param_str(args, "agent_id");
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 // #1717 fail-closed (parity with the REST SLE gate's sle_gate_usable):
                 // a loaded-but-corrupt / unopened rbac.db must refuse, not serve a
                 // legacy-open Read of per-agent licence facts.
@@ -14824,7 +14877,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "agent_id is required"),
                                     "application/json");
@@ -14915,6 +14967,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The id floor precedes the fail-closed guard (the REST drills also floor
+                // before their scoped gate).
+                auto agent_id = param_str(args, "agent_id");
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 if (rbac_enforcement_in_effect(rbac_store) && !(rbac_store && rbac_store->is_open())) {
                     mcp_audit("failure", "authorization subsystem unavailable (#1717 fail-closed)");
                     res.set_content(a4_error(kInternalError, "authorization subsystem unavailable",
@@ -14922,7 +14979,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "agent_id is required"),
                                     "application/json");
@@ -15025,6 +15081,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto agent_id = param_str(args, "agent_id");
+                if (refuse_unsafe_agent_id(agent_id)) // the degrade row below carries the id
+                    return;
                 auto tags = tag_store->get_all_tags(agent_id);
                 if (!tags) {
                     // Degrade → tool error, never an empty tag list
@@ -20277,6 +20335,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id)) // the control-byte half; size held above
+                    return;
                 if (!scoped_perm_fn) {
                     res.set_content(error_response(id, kInternalError, "scope gate not configured"),
                                     "application/json");
@@ -21439,6 +21499,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id)) // the control-byte half; size held above
+                    return;
                 if (!scoped_perm_fn) {
                     res.set_content(error_response(id, kInternalError, "scope gate not configured"),
                                     "application/json");
@@ -21891,6 +21953,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 // Per-device SCOPED gate (GuaranteedState:Read + management group) —
                 // mirrors REST's GET /api/v1/dex/devices/{id} (scoped_perm_fn
                 // mandatory there too), NOT the global perm_fn.
@@ -21964,6 +22028,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 // Per-device SCOPED gate — mirrors REST's GET
                 // /api/v1/dex/devices/{id}/app-perf (scoped_perm_fn mandatory there too).
                 if (!scoped_perm_fn) {
@@ -22228,6 +22294,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 // Per-device SCOPED gate -- mirrors REST's GET
                 // /api/v1/dex/devices/{id}/history (scoped_perm_fn mandatory there too).
                 if (!scoped_perm_fn) {
@@ -22279,6 +22347,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 if (!scoped_perm_fn) {
                     res.set_content(a4_error(kInternalError, "scope gate not configured"),
                                     "application/json");
@@ -25293,6 +25363,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Before the service-tag guard (its denial row carries agent_id:key), the
+                // scoped gate and every other audit row.
+                if (refuse_unsafe_agent_id(agent_id) || refuse_unsafe_tag_key(key))
+                    return;
                 // #3289: value-blind TOCTOU guard, before the scoped gate.
                 if (deny_service_scoped_service_tag_mutation("mcp.set_tag", agent_id, key))
                     return;
@@ -25359,6 +25433,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Before the service-tag guard (its denial row carries agent_id:key), the
+                // scoped gate and every other audit row.
+                if (refuse_unsafe_agent_id(agent_id) || refuse_unsafe_tag_key(key))
+                    return;
                 // #3289: value-blind TOCTOU guard, before the scoped gate.
                 if (deny_service_scoped_service_tag_mutation("mcp.delete_tag", agent_id, key))
                     return;
@@ -25460,6 +25538,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto agent_id = param_str(args, "agent_id");
                 auto reason = param_str(args, "reason");
                 auto whitelist = param_str(args, "whitelist");
+                // Before the store-outage row below (it carries the id) and every other row.
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 if (!quarantine_store || !quarantine_store->is_open()) {
                     // gov-fix(consistency-auditor, Gate 8.2): "agent_id=<id>,
                     // <message>" — same shape as the other two mcp_audit
@@ -26116,6 +26197,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                if (refuse_unsafe_agent_id(agent_id))
+                    return;
                 if (!args.contains("steps")) {
                     res.set_content(error_response(id, kInvalidParams, "steps is required"),
                                     "application/json");
@@ -28149,6 +28232,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 params.expected_sha256 = param_str(args, "expected_sha256");
                 params.retention_class = param_str(args, "retention_class");
                 params.minted_by = session->username;
+                // Before the mint: its failure row carries the id as target_id.
+                if (refuse_unsafe_agent_id(params.agent_id))
+                    return;
                 // Strict: a wrong-typed or above-INT64_MAX value is rejected here. The
                 // lenient reader saturated an unsigned overflow to INT64_MAX, which the
                 // store accepts (it only rejects <= 0), minting a grant with no real
