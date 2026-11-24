@@ -69,7 +69,10 @@ Recorded 2026-11-18. Each is a fact about the code as committed.
 9. Retries are not rate limited, and the server adds no jitter to its `retry_after_ms` hint.
 10. The cap is per replica; fleet capacity is replicas times the cap, and a balancer retry can land on a
     replica with free slots.
-11. The chaos scenarios for an audit outage and a hung database were designed, not run.
+11. Chaos was run once against the real `yuzu-server` binary (see "Chaos run, 2026-11-24" below): an audit-table lock,
+    a frozen database, a backend kill and a SIGTERM. It was one replica on Linux with the default pool of 16 and nothing
+    else. A live multi-replica run, a database reached through a proxy that drops packets, and a degraded (slow, not
+    frozen) database were not run.
 12. ThreadSanitizer was not run on the new concurrency tests; the timing-based tests give lower bounds only.
 13. A restart (SIGTERM) while a bulk read is parked in its audit write on a locked audit table can outlast the
     server's 15 s listener grace and end in a forced exit; any audited handler has the same exposure, so it
@@ -78,8 +81,29 @@ Recorded 2026-11-18. Each is a fact about the code as committed.
     (derived cap 1) and pool 1 (cap 1), in `test_mcp_tools_hardware.cpp` (tag `[pg][hardware][ci_page]`).
     Pool 4 and pool 2 keep a connection for authorization; pool 1 does not, and the test pins that as the
     documented behaviour of residual 3 (a change that reserves a connection should flip it). Still untested:
-    a DSN carrying `options=` or `PGOPTIONS` (which drops the injected statement and lock timeouts), the
-    default pool of 16, and a database that is frozen but still acknowledging packets.
+    a DSN carrying `options=` or `PGOPTIONS` (which drops the injected statement and lock timeouts). The default
+    pool of 16 and a database that is frozen but still acknowledging packets were run in the chaos run below.
+
+## Chaos run, 2026-11-24
+
+What ran: the production `yuzu-server` binary built from `9bb85be84b` (the tree later gained one whitespace-only
+commit) against a throwaway `postgres:18.4-bookworm` container, one replica, default `--postgres-pool-size 16`
+(the boot log reports a derived cap of 2), 40 seeded `device_ci` rows, requests as an admin API token with
+`GET /api/v1/hardware-ci?limit=5`. The scripts were one-off and are not committed. The results are one run each,
+not repeated, and are timings from one machine.
+
+| Injection | Observed |
+|---|---|
+| `audit_store.audit_events` held under `ACCESS EXCLUSIVE` for 25 s, 12 parallel bulk walkers | 10 walkers were refused with 503 within 0.5 s and `yuzu_hardware_ci_read_busy_total{surface="rest"}` went from 0 to 10. The 2 slot holders answered 503 with `Sec-Audit-Failed: true` after 10 s. `/livez` and an authorization-only read (`GET /api/v1/tokens`) stayed fast, and `yuzu_pg_pool_in_use` read 1. |
+| Same lock, a point read `GET /api/v1/hardware/agent-01` | It did not answer within the 8 s client timeout. This is residual 3, seen live: a point read takes no slot and its audit write parks on the lock. |
+| Database frozen but still acknowledging packets (`docker pause`, 85 s in total), 7 walkers started before the freeze and 1 during it | `/livez` answered 200 throughout. The walk started during the freeze did not answer within the 60 s client timeout, so a busy refusal did not help there; the cause was not established. After the unpause the other 7 walkers answered 200, the first later bulk read answered 200 in 10 ms and the busy counter read 0 (no slot was leaked). |
+| Every server backend terminated with `pg_terminate_backend` and no lock held | The first bulk read answered 503 in 27 ms and the next, 2 s later, answered 200. The authorization-only read answered 200 throughout. In an earlier run a 503 within 2 s of the kill coincided with the authorization store's circuit breaker being open; it was not examined further. |
+| Audit lock held 12 s with 2 walkers holding slots, then released | Both answered 503 at 10 s. The first walk after the release answered 200 in 11 ms. |
+| SIGTERM with 2 slots held on a locked audit table | The process exited 8.8 s after the signal, inside the 15 s listener grace. This is one sample and does not contradict residual 13: a hold that outlasts the grace was not constructed. |
+
+What this does and does not show. No slot was leaked in any scenario, recovery needed no restart, and the audit
+outage answered fail-closed, as the manual says. It does not show behaviour under a slow-but-live database, with
+more than one replica, on macOS or Windows, or under ThreadSanitizer (residual 12 stands).
 
 ## Frozen by this change
 
