@@ -143,6 +143,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <expected>
+#include <fcntl.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter/nf_tables.h>
 #include <linux/netfilter/nfnetlink.h>
@@ -1455,26 +1456,63 @@ bool try_ufw_rules(yuzu::CommandContext& ctx) {
 
 // ── iptables (rung 2, argv) — the final backend before "none" ──────────
 
+/// The kernel's list of one family's tables (`/proc/net/ip_tables_names`, `ip6_tables_names`), read
+/// the way the snapshot broker reads it. ENOENT is a family whose core module is not loaded, so it
+/// holds no table, but only while /proc/net itself is visible (without it nothing can be said);
+/// every other failure is unreadable. No file is created and nothing is loaded.
+struct XtNamesRead {
+    yuzu::firewall::IptablesNamesOutcome outcome = yuzu::firewall::IptablesNamesOutcome::unreadable;
+    std::string text;
+};
+
+[[nodiscard]] XtNamesRead read_xt_names(const char* path) {
+    XtNamesRead r;
+    yuzu::agent::ScopedFd fd(::open(path, O_RDONLY | O_CLOEXEC));
+    if (!fd) {
+        if (errno == ENOENT && ::access("/proc/net/dev", F_OK) == 0)
+            r.outcome = yuzu::firewall::IptablesNamesOutcome::none;
+        return r;
+    }
+    std::string buf(4096, '\0'); // the list is a few short names; a longer one is not read
+    const auto n = ::read(fd.get(), buf.data(), buf.size());
+    if (n < 0 || static_cast<std::size_t>(n) == buf.size())
+        return r;
+    buf.resize(static_cast<std::size_t>(n));
+    r.text = std::move(buf);
+    r.outcome = yuzu::firewall::IptablesNamesOutcome::listed;
+    return r;
+}
+
 /// Reads the filter, raw, mangle and nat tables of iptables and of ip6tables (`-t <table> -S`), one
-/// bounded run each. All the runs share one deadline, computed once, so the leg stays inside
-/// kAcqDeadline; a run that has no time left is unread, never skipped. nullopt when `iptables`
-/// itself is not installed (the ladder ends at `none`); a missing `ip6tables` leaves its tables
-/// `absent`.
+/// bounded run each, for the tables the kernel lists (the pure plan_iptables_family decides which
+/// run; a table the kernel does not list reads empty and spawns nothing). All the runs share one
+/// deadline, computed once, so the leg stays inside kAcqDeadline; a run that has no time left, or
+/// whose process does not start or fails, is unread, never skipped. nullopt when `iptables` itself
+/// is not installed (the ladder ends at `none`); a missing `ip6tables` leaves its listed tables
+/// unread and its unlisted ones empty.
 [[nodiscard]] std::optional<std::vector<yuzu::firewall::IptablesTableRead>> read_iptables_tables() {
+    if (::access("/usr/sbin/iptables", X_OK) != 0)
+        return std::nullopt;
     const auto deadline = std::chrono::steady_clock::now() + kAcqDeadline;
     std::vector<yuzu::firewall::IptablesTableRead> reads;
     for (const bool ip6 : {false, true}) {
-        for (const auto table : yuzu::firewall::kIptablesDirectTables) {
+        const char* tool = ip6 ? "/usr/sbin/ip6tables" : "/usr/sbin/iptables";
+        const auto names =
+            read_xt_names(ip6 ? "/proc/net/ip6_tables_names" : "/proc/net/ip_tables_names");
+        const auto plan = yuzu::firewall::plan_iptables_family(names.outcome, names.text,
+                                                               ::access(tool, X_OK) == 0);
+        for (std::size_t i = 0; i < yuzu::firewall::kIptablesDirectTables.size(); ++i) {
+            const auto table = yuzu::firewall::kIptablesDirectTables[i];
             const auto left = yuzu::firewall::remaining_ms(deadline);
-            if (left.count() <= 0) {
-                reads.push_back({.ip6 = ip6, .table = std::string{table}});
+            using Action = yuzu::firewall::IptablesTableAction;
+            if (plan.action[i] != Action::run || left.count() <= 0) {
+                // a table to run with no time left is unread, never skipped
+                reads.push_back(yuzu::firewall::iptables_unrun_read(
+                    ip6, table, plan.action[i] == Action::empty ? Action::empty : Action::unread));
                 continue;
             }
-            const char* tool = ip6 ? "/usr/sbin/ip6tables" : "/usr/sbin/iptables";
             auto res = run_bounded_subprocess({tool, "-t", std::string{table}, "-S"},
                                               SubprocessOptions{.deadline = left});
-            if (!ip6 && reads.empty() && !res.tool_ran)
-                return std::nullopt;
             reads.push_back(yuzu::firewall::classify_iptables_table_read(
                 ip6, table, res.tool_ran, res.exit_code == 0, subprocess_complete(res),
                 res.output));

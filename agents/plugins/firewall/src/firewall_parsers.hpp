@@ -1570,9 +1570,9 @@ inline void iptables_tally(IptablesSummary& sum) {
 }
 
 /// One iptables entry as a row: `rule|[ip6|][<table>|]<kind>|<chain>|<spec>`. `ip6|` marks an
-/// ip6tables entry. `<table>` is written only for an entry of a legacy save listing outside the
-/// filter table, and is one of `nat`, `mangle`, `raw`, `security` (parse_iptables_legacy_save admits
-/// no other table name). `<kind>` is one of `policy`, `new_chain`, `append`, `unknown`. Those are two
+/// ip6tables entry. `<table>` is written only for an entry outside the filter table, from a legacy
+/// save listing or from a direct `-t <table> -S` read, and is one of `nat`, `mangle`, `raw`,
+/// `security` (the save parser admits no other table name; the direct reads name the first three). `<kind>` is one of `policy`, `new_chain`, `append`, `unknown`. Those are two
 /// closed sets of fixed words, so the second field of a row is one of nine words (`ip6`, the four
 /// tables, the four kinds) and never `nftables`, `firewalld` or another backend's word. Chain and
 /// spec are echoed, so they are sanitised.
@@ -1585,21 +1585,73 @@ inline void iptables_tally(IptablesSummary& sum) {
                        sanitize_field(r.chain), sanitize_field(r.spec));
 }
 
-// ── Linux: the root direct iptables legs read every table the broker's legacy sections list ─────
+// ── Linux: the root direct iptables legs read every table the kernel lists of the four below ───
 //
-// `iptables -S` lists the filter table only, so a root agent that read nothing else answered
+// A bare `iptables -S` lists the filter table only, so a root agent that read nothing else answered
 // `inactive` for a host whose rules sit in raw, mangle or nat (#8614). The root direct legs
-// (try_iptables_state, try_iptables_rules) now read `-t <table> -S` for each table below, for
-// iptables and for ip6tables, and this decision is the one place that says what those reads mean.
-// The `security` table is not read: the broker lists it, the root legs have no read for it.
+// (try_iptables_state, try_iptables_rules) now read `-t <table> -S` for the filter, raw, mangle and
+// nat tables of iptables and of ip6tables, and the two decisions below are the one place that says
+// what those reads mean. The kernel's own list of a family's tables (/proc/net/ip_tables_names and
+// /proc/net/ip6_tables_names, the seam the snapshot broker uses) gates the runs: a table the
+// kernel does not list does not exist and reads empty with no process spawned, so a request for it
+// can neither autoload a table module nor take /run/xtables.lock. The `security` table is not
+// read: the broker lists it, the root legs have no read for it, and a listed one is neither content
+// nor hidden (IptablesFamilyPlan::unread_listed).
 
 inline constexpr std::array<std::string_view, 4> kIptablesDirectTables{"filter", "raw", "mangle",
                                                                        "nat"};
 
-/// How one `-t <table> -S` read ended: `read` (ran, exit 0, complete, in the shape this plugin
-/// knows), `unread` (it ran and did not vouch for the table, or there was no time left to run it),
-/// `absent` (the tool is not installed: nothing on the host can list that family).
-enum class IptablesReadOutcome { read, unread, absent };
+/// What reading a family's names file came to: `listed` (read; its text is the list, empty text is
+/// a family with no table), `none` (the file does not exist, ENOENT: the family's core module is
+/// not loaded, so it holds no table; the caller has already seen /proc/net itself), `unreadable`
+/// (any other failure: nothing can say which tables exist).
+enum class IptablesNamesOutcome { listed, none, unreadable };
+
+enum class IptablesTableAction { run, empty, unread };
+
+/// What to do for each of kIptablesDirectTables of one family, from the names read and whether the
+/// family's tool is installed. `unread_listed` holds a listed table that is not one of the four.
+struct IptablesFamilyPlan {
+    std::array<IptablesTableAction, 4> action{};
+    std::vector<std::string> unread_listed;
+};
+
+[[nodiscard]] inline IptablesFamilyPlan plan_iptables_family(IptablesNamesOutcome names,
+                                                             std::string_view names_text,
+                                                             bool tool_installed) {
+    IptablesFamilyPlan plan;
+    plan.action.fill(IptablesTableAction::unread); // an unreadable names file: nothing is known
+    if (names == IptablesNamesOutcome::unreadable)
+        return plan;
+    plan.action.fill(IptablesTableAction::empty); // a table the kernel does not list does not exist
+    if (names == IptablesNamesOutcome::none)
+        return plan;
+    std::size_t pos = 0;
+    while (pos < names_text.size()) {
+        auto end = names_text.find('\n', pos);
+        if (end == std::string_view::npos)
+            end = names_text.size();
+        std::string_view name = names_text.substr(pos, end - pos);
+        pos = end + 1;
+        while (!name.empty() && (name.back() == '\r' || name.back() == ' '))
+            name.remove_suffix(1);
+        if (name.empty())
+            continue;
+        const auto it = std::ranges::find(kIptablesDirectTables, name);
+        if (it == kIptablesDirectTables.end())
+            plan.unread_listed.emplace_back(name);
+        else
+            plan.action[static_cast<std::size_t>(it - kIptablesDirectTables.begin())] =
+                tool_installed ? IptablesTableAction::run : IptablesTableAction::unread;
+    }
+    return plan;
+}
+
+/// How one table read ended: `read` (ran, exit 0, complete, in the shape this plugin knows, or the
+/// kernel lists no such table) or `unread` (it ran and did not vouch for the table, it could not
+/// be run, or there was no time left to run it). A run whose process did not start is unread, never
+/// skipped: a tool that spawned once and fails to spawn later is a host that cannot be read.
+enum class IptablesReadOutcome { read, unread };
 
 struct IptablesTableRead {
     bool ip6 = false;
@@ -1609,6 +1661,19 @@ struct IptablesTableRead {
     IptablesSummary summary;
 };
 
+/// A table that is not run: `empty` reads as an empty, shaped table; `unread` reads as unread.
+[[nodiscard]] inline IptablesTableRead iptables_unrun_read(bool ip6, std::string_view table,
+                                                           IptablesTableAction action) {
+    IptablesTableRead r;
+    r.ip6 = ip6;
+    r.table = std::string{table};
+    if (action == IptablesTableAction::empty) {
+        r.outcome = IptablesReadOutcome::read;
+        r.summary.shaped = true;
+    }
+    return r;
+}
+
 /// Reads one `-t <table> -S` run into an IptablesTableRead. `complete` is subprocess_complete().
 [[nodiscard]] inline IptablesTableRead
 classify_iptables_table_read(bool ip6, std::string_view table, bool tool_ran, bool exit_ok,
@@ -1616,11 +1681,7 @@ classify_iptables_table_read(bool ip6, std::string_view table, bool tool_ran, bo
     IptablesTableRead r;
     r.ip6 = ip6;
     r.table = std::string{table};
-    if (!tool_ran) {
-        r.outcome = IptablesReadOutcome::absent;
-        return r;
-    }
-    if (!exit_ok || !complete)
+    if (!tool_ran || !exit_ok || !complete)
         return r; // unread
     r.summary = iptables_summary(output);
     r.unshaped = !r.summary.shaped;
@@ -1635,11 +1696,10 @@ classify_iptables_table_read(bool ip6, std::string_view table, bool tool_ran, bo
 
 /// What the root direct legs answer. `state`: `active` when any READ table has content; else
 /// `unknown` when nothing was read or any table was UNREAD; else `inactive` (clamped to `unknown`
-/// when `tables_seen`). An `absent` tool is skipped: nothing on the host can list it. `all_read` is
-/// true when at least one table was read and none was unread, which is when the count is written.
-/// `rule_rows` are the rule rows of every READ table in read order (IPv4 tables, then IPv6);
-/// `error_rows` holds one `error|<tool>:unrecognised_output` row per tool that printed a listing
-/// that is not in the known shape.
+/// when `tables_seen`). `all_read` is true when at least one table was read and none was unread,
+/// which is when the count is written. `rule_rows` are the rule rows of every READ table in read
+/// order (IPv4 tables, then IPv6); `error_rows` holds one `error|<tool>:unrecognised_output` row
+/// per tool that printed a listing that is not in the known shape.
 struct IptablesDirectAnswer {
     NftVerdict state = NftVerdict::unknown;
     bool all_read = false;
@@ -1663,7 +1723,7 @@ iptables_direct_answer(const std::vector<IptablesTableRead>& reads, bool tables_
             a.appends += r.summary.append_count;
             for (const auto& e : r.summary.entries)
                 a.rule_rows.push_back(format_iptables_rule_row(e, r.ip6));
-        } else if (r.outcome == IptablesReadOutcome::unread) {
+        } else {
             any_unread = true;
             (r.ip6 ? unshaped6 : unshaped4) |= r.unshaped;
         }

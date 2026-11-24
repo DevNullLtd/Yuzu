@@ -3999,7 +3999,8 @@ TEST_CASE("linux_snapshot_rung: while firewalld's answer is held only an active 
 
 // ── the root direct iptables legs read filter, raw, mangle and nat (iptables_direct_answer) ──────
 namespace {
-constexpr std::string_view kDirectRuleRaw = "-P PREROUTING ACCEPT\n-P OUTPUT ACCEPT\n-A PREROUTING -j DROP\n";
+constexpr std::string_view kDirectRuleRaw =
+    "-P PREROUTING ACCEPT\n-P OUTPUT ACCEPT\n-A PREROUTING -j DROP\n";
 constexpr std::string_view kDirectCleanRaw = "-P PREROUTING ACCEPT\n-P OUTPUT ACCEPT\n";
 
 IptablesTableRead direct_read(bool ip6, std::string_view table, std::string_view out,
@@ -4008,7 +4009,8 @@ IptablesTableRead direct_read(bool ip6, std::string_view table, std::string_view
 }
 
 /// All eight tables clean, except those `over` replaces.
-std::vector<IptablesTableRead> direct_reads(std::initializer_list<IptablesTableRead> over = {}) {
+std::vector<IptablesTableRead>
+direct_reads(std::initializer_list<IptablesTableRead> over = {}) {
     std::vector<IptablesTableRead> v;
     for (const bool ip6 : {false, true})
         for (const auto t : kIptablesDirectTables) {
@@ -4027,11 +4029,11 @@ TEST_CASE("iptables direct: every table clean and read is inactive with a count"
     CHECK(a.state == NftVerdict::inactive);
     CHECK(a.all_read);
     CHECK(a.appends == 0);
-    CHECK(a.rule_rows.size() == 2 * (3 + 2 + 2 + 2)); // every policy row of every table, no rule
+    CHECK(a.rule_rows.size() == 2 * (3 + 2 + 2 + 2)); // every policy row, no rule
     CHECK(iptables_direct_answer(direct_reads(), true).state == NftVerdict::unknown);
 }
 
-TEST_CASE("iptables direct: a ruleset only in raw, mangle or nat is active, never inactive",
+TEST_CASE("iptables direct: a ruleset only in raw, mangle or nat is active, not inactive",
           "[firewall]") {
     for (const bool ip6 : {false, true})
         for (const std::string_view table : {"raw", "mangle", "nat"}) {
@@ -4067,7 +4069,8 @@ TEST_CASE("iptables direct: an unreadable table reads unknown, never inactive", 
             CHECK(refused.state == NftVerdict::unknown);
             CHECK_FALSE(refused.all_read);
             const auto cut = iptables_direct_answer(
-                direct_reads({direct_read(ip6, table, kDirectCleanRaw, true, true, /*complete=*/false)}),
+                direct_reads({direct_read(ip6, table, kDirectCleanRaw, true, true,
+                                          /*complete=*/false)}),
                 false);
             CHECK(cut.state == NftVerdict::unknown);
             const auto no_time = iptables_direct_answer(
@@ -4094,14 +4097,92 @@ TEST_CASE("iptables direct: an unrecognised listing is unread and says so per to
     CHECK(a.error_rows == std::vector<std::string>{"error|ip6tables:unrecognised_output"});
 }
 
-TEST_CASE("iptables direct: an absent ip6tables is skipped, nothing read is unknown", "[firewall]") {
-    std::vector<IptablesTableRead> v;
-    for (const auto t : kIptablesDirectTables)
-        v.push_back(direct_read(false, t, t == "filter" ? kIptClean : kDirectCleanRaw));
-    for (const auto t : kIptablesDirectTables)
-        v.push_back(direct_read(true, t, "", /*tool_ran=*/false));
-    CHECK(iptables_direct_answer(v, false).state == NftVerdict::inactive);
+TEST_CASE("iptables direct: a run whose process did not start is unread, even after a good run",
+          "[firewall]") {
+    for (const bool ip6 : {false, true})
+        for (const auto table : kIptablesDirectTables) {
+            const auto a = iptables_direct_answer(
+                direct_reads({direct_read(ip6, table, "", /*tool_ran=*/false)}), false);
+            CHECK(a.state == NftVerdict::unknown);
+            CHECK_FALSE(a.all_read);
+        }
+    // every table read and empty but the last (nat) of the last family, whose spawn failed
+    const auto last = direct_reads({direct_read(true, "nat", "", false)});
+    CHECK(iptables_direct_answer(last, false).state == NftVerdict::unknown);
     CHECK(iptables_direct_answer({}, false).state == NftVerdict::unknown);
+}
+
+namespace {
+using Act = IptablesTableAction;
+constexpr auto kNone = IptablesNamesOutcome::none;
+constexpr auto kListed = IptablesNamesOutcome::listed;
+constexpr auto kUnreadable = IptablesNamesOutcome::unreadable;
+using Acts = std::array<IptablesTableAction, 4>; // filter, raw, mangle, nat
+} // namespace
+
+TEST_CASE("iptables plan: a family the kernel lists no table of (names file absent) reads empty",
+          "[firewall]") {
+    // ENOENT on the names file with /proc/net visible: ipv6.disable=1, or the module not loaded
+    const auto p = plan_iptables_family(kNone, "", true);
+    CHECK(p.action == Acts{Act::empty, Act::empty, Act::empty, Act::empty});
+    CHECK(p.unread_listed.empty());
+    CHECK(plan_iptables_family(kListed, "", true).action == p.action); // an empty file: no table
+}
+
+TEST_CASE("iptables plan: only a listed table runs, an unlisted one reads empty", "[firewall]") {
+    const auto p = plan_iptables_family(kListed, "filter\nnat\n", true);
+    CHECK(p.action == Acts{Act::run, Act::empty, Act::empty, Act::run});
+    CHECK(plan_iptables_family(kListed, "raw\r\nmangle", true).action ==
+          Acts{Act::empty, Act::run, Act::run, Act::empty});
+}
+
+TEST_CASE("iptables plan: an unreadable names file leaves the family unread, never absent",
+          "[firewall]") {
+    CHECK(plan_iptables_family(kUnreadable, "", true).action ==
+          Acts{Act::unread, Act::unread, Act::unread, Act::unread});
+    CHECK(plan_iptables_family(kUnreadable, "", false).action ==
+          Acts{Act::unread, Act::unread, Act::unread, Act::unread});
+}
+
+TEST_CASE("iptables plan: a listed security table is neither run nor content, and is not hidden",
+          "[firewall]") {
+    const auto p = plan_iptables_family(kListed, "filter\nsecurity\n", true);
+    CHECK(p.action == Acts{Act::run, Act::empty, Act::empty, Act::empty});
+    CHECK(p.unread_listed == std::vector<std::string>{"security"});
+}
+
+TEST_CASE("iptables plan: tables listed for a family with no tool installed are unread",
+          "[firewall]") {
+    CHECK(plan_iptables_family(kListed, "nat\n", false).action ==
+          Acts{Act::empty, Act::empty, Act::empty, Act::unread});
+    CHECK(plan_iptables_family(kNone, "", false).action ==
+          Acts{Act::empty, Act::empty, Act::empty, Act::empty});
+}
+
+TEST_CASE("iptables direct: planned tables compose into the answer", "[firewall]") {
+    const auto read_family = [](bool ip6, const IptablesFamilyPlan& plan, std::string_view out) {
+        std::vector<IptablesTableRead> v;
+        for (std::size_t i = 0; i < 4; ++i)
+            v.push_back(plan.action[i] == Act::run
+                            ? direct_read(ip6, kIptablesDirectTables[i], out)
+                            : iptables_unrun_read(ip6, kIptablesDirectTables[i], plan.action[i]));
+        return v;
+    };
+    // IPv4: filter and nat listed and empty; IPv6 disabled (no names file): inactive
+    auto v = read_family(false, plan_iptables_family(kListed, "filter\nnat\n", true), kIptClean);
+    for (auto& r : read_family(true, plan_iptables_family(kNone, "", true), kIptClean))
+        v.push_back(std::move(r));
+    const auto inactive = iptables_direct_answer(v, false);
+    CHECK(inactive.state == NftVerdict::inactive);
+    CHECK(inactive.all_read);
+    // a listed table whose run fails is unread
+    auto bad = read_family(false, plan_iptables_family(kListed, "filter\nnat\n", true), kIptClean);
+    bad[3] = direct_read(false, "nat", "", true, /*exit_ok=*/false);
+    CHECK(iptables_direct_answer(bad, false).state == NftVerdict::unknown);
+    // an unreadable IPv6 names file is unknown, not inactive
+    for (auto& r : read_family(true, plan_iptables_family(kUnreadable, "", true), kIptClean))
+        v.push_back(std::move(r));
+    CHECK(iptables_direct_answer(v, false).state == NftVerdict::unknown);
 }
 
 TEST_CASE("nft: has_content -- an empty user-defined chain is content (ADR-3007 clause 6)",
