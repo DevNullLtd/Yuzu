@@ -35123,6 +35123,286 @@ TEST_CASE("MCP 2405: wrong-typed argument is rejected before the gate",
     CHECK(h.appr->pending_count() == 0);
 }
 
+// #7811: an `agent_id` argument over 256 bytes or with a byte below 0x20 reaches the permission
+// denial's target_id, an approval ticket's pending row or a domain audit row, and the audit store
+// keeps CR, LF and TAB. Every tool that takes one refuses it with -32602 before the scoped gate, the
+// approval mint and any audit write. The scoped gate here admits every device, so -32602 with the
+// gate never asked proves the floor runs first (a tool that refused late would reach the gate).
+TEST_CASE("MCP: an unsafe agent_id is refused with -32602 before the scoped gate or any audit row, "
+          "on every ungated tool that takes one",
+          "[mcp][audit]") {
+    int scoped_calls = 0;
+    McpTestServer ts;
+    ts.scoped_perm_fn_for_test = [&scoped_calls](const httplib::Request&, httplib::Response&,
+                                                 const std::string&, const std::string&,
+                                                 const std::string&) -> bool {
+        ++scoped_calls;
+        return true;
+    };
+    ts.start("operator");
+
+    const auto call_tool = [&ts](const std::string& tool, const std::string& agent_id) {
+        nlohmann::json args = {{"agent_id", agent_id}};
+        if (tool == "get_dex_observation")
+            args["event_id"] = "o1";
+        const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                    {"method", "tools/call"},
+                                    {"id", 1},
+                                    {"params", {{"name", tool}, {"arguments", args}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    const std::string floor_message = "agent_id must be at most 256 bytes with no byte below 0x20";
+    for (const char* tool :
+         {"get_dex_device_score", "get_dex_device_app_perf", "get_dex_device_history",
+          "get_dex_observation", "get_guardian_device_guards", "get_guardian_agent_status",
+          "get_agent_app_usage", "query_software_licenses",
+          "get_software_host_collection_settings"}) {
+        const std::string name = tool;
+        for (const auto& id : bad) {
+            INFO(name + " " + id.substr(0, 16));
+            const auto body = call_tool(tool, id);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            const auto message = body["error"]["message"].get<std::string>();
+            // Three tools answer an over-long id with their own earlier bound, so that row never
+            // reaches the shared floor (the settings tool's strict() arg check refuses above 128
+            // bytes). Every other row does, and carries the floor's message: reverting the guard
+            // at any of these tools turns its rows into a different answer.
+            if ((name == "get_software_host_collection_settings" && id.size() > 128) ||
+                ((name == "get_guardian_device_guards" || name == "get_guardian_agent_status") &&
+                 id.size() > 256))
+                CHECK(message == "agent_id is too long");
+            else
+                CHECK(message == floor_message);
+        }
+    }
+    CHECK(scoped_calls == 0);
+    CHECK(ts.audit_log.empty());
+
+    // A 256-byte printable id is safe: the same tool reaches the scoped gate.
+    call_tool("get_dex_device_score", std::string(256, 'a'));
+    CHECK(scoped_calls == 1);
+}
+
+// The approval-gated tools: on a gated tier the generic mint covers every one of them, so an unsafe
+// id mints no ticket and writes no pending row. set_tag, delete_tag and quarantine_device stand for
+// the class (the mint is one block for all of them).
+TEST_CASE("MCP: an unsafe agent_id mints no approval ticket and writes no audit row (#7811)",
+          "[pg][mcp][integration][approval][audit]") {
+    SchemaGateHarness h("supervised");
+
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const char* tool : {"set_tag", "delete_tag", "quarantine_device"}) {
+        for (const auto& id : bad) {
+            INFO(std::string(tool) + " " + id.substr(0, 16));
+            nlohmann::json args = {{"agent_id", id}, {"key", "role"}, {"value", "web"}};
+            const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                        {"method", "tools/call"},
+                                        {"id", 1},
+                                        {"params", {{"name", tool}, {"arguments", args}}}};
+            const auto body = h.call(req.dump());
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(body["error"]["message"] ==
+                  "agent_id must be at most 256 bytes with no byte below 0x20");
+        }
+    }
+    CHECK(h.appr->pending_count() == 0);
+    CHECK(h.ts.audit_log.empty());
+}
+
+// #7811: the tools the table above does not reach, driven WITHOUT a database. A store bound to a
+// pool that cannot connect is non-null but closed, which is enough for set_tag, delete_tag,
+// get_tags and execute_bundle to reach their id check; quarantine_device checks the id before it
+// looks at its store. The empty tier carries no tier or approval gate, so delete_tag and
+// quarantine_device run their own handlers (on a gated tier the generic mint refuses the id first,
+// which the [pg] case above covers). The scoped gate admits every device, so -32602 with the gate
+// never asked proves the check runs first.
+TEST_CASE("MCP: an unsafe agent_id or tag key is refused with -32602 on set_tag, delete_tag, "
+          "get_tags, quarantine_device and execute_bundle before the gate or any audit row (#7811)",
+          "[mcp][audit]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid());
+    yuzu::server::TagStore tags(unreachable);
+    yuzu::server::ResponseStore responses(unreachable);
+
+    int scoped_calls = 0;
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.response_store_for_test = &responses; // with the dispatch below, wires the bundle path
+    ts.scoped_perm_fn_for_test = [&scoped_calls](const httplib::Request&, httplib::Response&,
+                                                 const std::string&, const std::string&,
+                                                 const std::string&) -> bool {
+        ++scoped_calls;
+        return true;
+    };
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    const auto call_tool = [&ts](const std::string& tool, const std::string& agent_id,
+                                 const std::string& key) {
+        const nlohmann::json args = {{"agent_id", agent_id}, {"key", key}, {"value", "x"}};
+        const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                    {"method", "tools/call"},
+                                    {"id", 1},
+                                    {"params", {{"name", tool}, {"arguments", args}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto message_of = [](const nlohmann::json& body) {
+        REQUIRE(body.contains("error"));
+        return body["error"]["message"].get<std::string>();
+    };
+
+    const std::string id_message = "agent_id must be at most 256 bytes with no byte below 0x20";
+    const std::string key_message = "key must be at most 64 bytes with no byte below 0x20";
+    const std::vector<std::string> bad_ids = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                              "dev\r\nA", "dev\nA", "dev\tA"};
+    const std::vector<std::string> bad_keys = {std::string(65, 'k'), std::string("k\0y", 3),
+                                               "k\r\ny", "k\ny", "k\ty"};
+
+    for (const char* tool :
+         {"set_tag", "delete_tag", "get_tags", "quarantine_device", "execute_bundle"}) {
+        for (const auto& id : bad_ids) {
+            INFO(std::string(tool) + " " + id.substr(0, 16));
+            const auto body = call_tool(tool, id, "team");
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(message_of(body) == id_message);
+        }
+    }
+    // The tag key: a safe device id, an unsafe key. The key reaches the `agent_id:key` text of
+    // every tag audit row, so it is refused before the service-tag guard, the gate and any row.
+    for (const char* tool : {"set_tag", "delete_tag"}) {
+        for (const auto& key : bad_keys) {
+            INFO(std::string(tool) + " key " + key.substr(0, 16));
+            const auto body = call_tool(tool, "agent-1", key);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(message_of(body) == key_message);
+        }
+    }
+    CHECK(scoped_calls == 0);
+    CHECK(ts.audit_log.empty());
+
+    // A 256-byte printable id is safe: every tool gets past the id check (the tag tools reach the
+    // scoped gate and then stop at the closed store; execute_bundle stops at its missing steps).
+    for (const char* tool :
+         {"set_tag", "delete_tag", "get_tags", "quarantine_device", "execute_bundle"}) {
+        INFO(tool);
+        const auto body = call_tool(tool, std::string(256, 'a'), "team");
+        CHECK(message_of(body) != id_message);
+    }
+    CHECK(message_of(call_tool("execute_bundle", std::string(256, 'a'), "team")) ==
+          "steps is required");
+    CHECK(scoped_calls == 2);
+
+    // A 64-byte key is safe: set_tag and delete_tag reach the scoped gate with it.
+    for (const char* tool : {"set_tag", "delete_tag"}) {
+        INFO(tool);
+        const auto body = call_tool(tool, "agent-1", std::string(64, 'k'));
+        CHECK(message_of(body) != key_message);
+    }
+    CHECK(scoped_calls == 4);
+}
+
+// The two tools that need an OPEN store (get_agent_inventory, mint_upload_grant), so [pg]. The
+// empty tier carries no tier gate. Same assertions as the table above: -32602 with the floor's
+// message and no audit row, then a 256-byte id that is served.
+TEST_CASE("MCP: an unsafe agent_id is refused with -32602 on get_agent_inventory before any "
+          "audit row (#7811)",
+          "[pg][mcp][integration][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+
+    McpTestServer ts;
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+
+    const auto call = [&ts](const std::string& agent_id) {
+        const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                    {"method", "tools/call"},
+                                    {"id", 1},
+                                    {"params",
+                                     {{"name", "get_agent_inventory"},
+                                      {"arguments", {{"agent_id", agent_id}}}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const auto& id : std::vector<std::string>{std::string(257, 'a'), std::string("dev\0A", 5),
+                                                   "dev\r\nA", "dev\nA", "dev\tA"}) {
+        INFO(id.substr(0, 16));
+        const auto body = call(id);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] ==
+              "agent_id must be at most 256 bytes with no byte below 0x20");
+    }
+    CHECK(ts.audit_log.empty());
+
+    const auto ok = call(std::string(256, 'a'));
+    CHECK_FALSE(ok.contains("error"));
+    CHECK(ts.audit_log == std::vector<std::string>{"mcp.get_agent_inventory|success"});
+}
+
+TEST_CASE("MCP: an unsafe agent_id is refused with -32602 on mint_upload_grant before the mint "
+          "or any audit row (#7811)",
+          "[pg][mcp][integration][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    const auto call = [&ts](const std::string& agent_id) {
+        const nlohmann::json req = {{"jsonrpc", "2.0"},
+                                    {"method", "tools/call"},
+                                    {"id", 1},
+                                    {"params",
+                                     {{"name", "mint_upload_grant"},
+                                      {"arguments",
+                                       {{"agent_id", agent_id}, {"declared_max_size", 4096}}}}}};
+        auto res = ts.call(req.dump());
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    for (const auto& id : std::vector<std::string>{std::string(257, 'a'), std::string("dev\0A", 5),
+                                                   "dev\r\nA", "dev\nA", "dev\tA"}) {
+        INFO(id.substr(0, 16));
+        const auto body = call(id);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] ==
+              "agent_id must be at most 256 bytes with no byte below 0x20");
+    }
+    CHECK(ts.audit_log.empty());
+    auto none = store.list_for_agent(); // every agent: nothing was minted for any refused id
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+
+    // A 256-byte printable id is safe: the grant is minted.
+    const auto ok = call(std::string(256, 'a'));
+    CHECK_FALSE(ok.contains("error"));
+    CHECK(ts.audit_log ==
+          std::vector<std::string>{"upload_grant.mint|success", "mcp.mint_upload_grant|success"});
+}
+
 TEST_CASE("MCP 2405: non-string approval_id is rejected on declaring and non-declaring tools",
           "[pg][mcp][integration][approval][schema]") {
     // approval_id is control-plane: only delete_tag/quarantine_device declare

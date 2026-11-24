@@ -306,7 +306,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             send_html(res, "<div class=\"gp-placeholder\">Missing device id.</div>");
             return;
         }
-        if (!id_is_audit_safe(id)) {
+        if (!auth::agent_id_is_audit_safe(id)) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
             return;
@@ -435,7 +435,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                         httplib::Response& res) {
         detail::ensure_correlation_id(res);
         const std::string id = req.matches[1].str();
-        if (!id_is_audit_safe(id)) {
+        if (!auth::agent_id_is_audit_safe(id)) {
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid device id"), "application/json");
             return;
@@ -911,7 +911,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!gate.admitted) return;
 
         const std::string agent_id = req.matches[1].str();
-        if (!id_is_audit_safe(agent_id)) {
+        if (!auth::agent_id_is_audit_safe(agent_id)) {
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid device id"), "application/json");
             return;
@@ -1004,7 +1004,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                       httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
-        if (!id_is_audit_safe(id)) {
+        if (!auth::agent_id_is_audit_safe(id)) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
             return;
@@ -1093,7 +1093,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // from the client.
         const std::string caption_plugin = req.has_param("plugin") ? req.get_param_value("plugin") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
-        if (!id_is_audit_safe(id)) {
+        if (!auth::agent_id_is_audit_safe(id)) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
             return;

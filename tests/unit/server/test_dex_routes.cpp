@@ -34,6 +34,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -3315,4 +3316,88 @@ TEST_CASE("DEX apps route: a degraded model with reason statement_timeout reache
     REQUIRE(day);
     CHECK(day->body.find("already the shortest window") != std::string::npos);
     CHECK(day->body.find("Choose a shorter window") == std::string::npos);
+}
+
+// #7811: every per-device DEX fragment takes the device id raw from the URL and hands it to the
+// scoped permission check, whose denial audit carries it, and to `target_id`. An over-long or
+// control-byte id is refused with a 400 before that check, before any audit row and before any
+// dispatch. The scoped gate below refuses every device, so a route that reached it would answer
+// 403: a 400 with `scoped_calls == 0` proves the id check runs first, where an empty audit log
+// alone is also true of a route that never audits. No store is wired, so this runs without Postgres.
+TEST_CASE("DEX routes: a per-device fragment refuses an unsafe device id before the scoped check, "
+          "any audit row or dispatch",
+          "[dex][routes][audit][authz]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    int scoped_calls = 0;
+    auto denyScoped = [&scoped_calls](const httplib::Request&, httplib::Response& res,
+                                      const std::string&, const std::string&, const std::string&) {
+        ++scoped_calls;
+        res.status = 403;
+        return false;
+    };
+    std::vector<std::string> audited;
+    auto audit = [&audited](const httplib::Request&, const std::string& action, const std::string&,
+                            const std::string&, const std::string& target_id,
+                            const std::string&) -> bool {
+        audited.push_back(action + "|" + target_id);
+        return true;
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string& plugin, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = plugin + "-x"};
+    };
+    auto responses = [](const std::string&, const std::string&) {
+        return std::vector<DexAgentResponse>{};
+    };
+    DexRoutes routes;
+    yuzu::server::test::TestRouteSink sink; // after `routes`: its handlers capture `this`
+    routes.register_routes(sink, okAuth, okPerm, /*store=*/nullptr, /*fleet_fn=*/{}, audit, dispatch,
+                           responses, denyScoped);
+
+    struct Route {
+        const char* path;
+        const char* id_param;
+        const char* rest; // the other parameters a real request carries
+    };
+    const std::vector<Route> device_routes = {
+        {"/fragments/dex/device", "id", ""},
+        {"/fragments/dex/observation", "agent_id", "&event_id=e1"},
+        {"/fragments/dex/device/perf", "agent_id", ""},
+        {"/fragments/dex/device/perf/result", "agent_id", "&command_id=echo-1"},
+        {"/fragments/dex/device/procperf", "agent_id", ""},
+        {"/fragments/dex/device/procperf/result", "agent_id", "&command_id=echo-1"},
+        {"/fragments/dex/device/app-perf", "agent_id", ""},
+    };
+    const std::vector<std::string> bad = {std::string(257, 'a'), "dev%00A", "dev%0D%0AA", "dev%0AA",
+                                          "dev%09A"};
+    for (const auto& route : device_routes) {
+        INFO(route.path);
+        for (const auto& id : bad) {
+            INFO(id.substr(0, 16));
+            auto r = sink.Get(std::string(route.path) + "?" + route.id_param + "=" + id + route.rest);
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(r->body.find("Invalid device id.") != std::string::npos);
+        }
+        // The same route does reach the permission check for a safe id, at the 256-byte limit.
+        const int before = scoped_calls;
+        auto safe = sink.Get(std::string(route.path) + "?" + route.id_param + "=" +
+                             std::string(256, 'a') + route.rest);
+        REQUIRE(safe);
+        CHECK(safe->status == 403);
+        CHECK(safe->body.find("Invalid device id.") == std::string::npos);
+        CHECK(scoped_calls == before + 1);
+    }
+    // Only the safe-id controls reached the gate: one per route, none for any refused id.
+    CHECK(scoped_calls == static_cast<int>(device_routes.size()));
+    CHECK(audited.empty());
+    CHECK(dispatched == 0);
 }
