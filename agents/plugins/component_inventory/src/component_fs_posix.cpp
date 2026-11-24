@@ -591,6 +591,64 @@ std::vector<std::string> native_excluded_dirs() {
 #endif
 }
 
+namespace {
+
+/// `python3` (when `bare`) or `python3.<digits>`: the name of an interpreter's library directory.
+[[nodiscard]] bool is_python_dir_name(std::string_view n, bool bare) {
+    constexpr std::string_view kPrefix = "python3";
+    if (!n.starts_with(kPrefix))
+        return false;
+    n.remove_prefix(kPrefix.size());
+    if (n.empty())
+        return bare;
+    if (n.size() < 2 || n.front() != '.')
+        return false;
+    return std::ranges::all_of(n.substr(1), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+/// The `python3[.N]` children of `parent`, sorted so the walk order does not depend on the lister. A parent
+/// that could not be listed is offered itself, so the root checks count a network mount or a link and the
+/// walk reports an unreadable one, instead of the parent vanishing without a count.
+void append_python_dirs(std::vector<std::string>& out, const ChildLister& children, const std::string& parent,
+                        bool bare) {
+    auto listed = children(parent);
+    if (!listed) {
+        out.push_back(parent);
+        return;
+    }
+    std::vector<std::string> names;
+    for (auto& n : *listed)
+        if (is_python_dir_name(n, bare))
+            names.push_back(std::move(n));
+    std::ranges::sort(names);
+    for (const auto& n : names)
+        out.push_back(parent + '/' + n);
+}
+
+} // namespace
+
+std::vector<std::string> python_candidate_roots(const ChildLister& children) {
+    std::vector<std::string> roots;
+#if defined(__APPLE__)
+    roots.push_back("/Library/Frameworks/Python.framework/Versions");
+    append_python_dirs(roots, children, "/opt/homebrew/lib", false);
+    append_python_dirs(roots, children, "/usr/local/lib", false);
+#else
+    // /usr/lib is deliberately absent: the package manager owns the interpreter trees under it.
+    append_python_dirs(roots, children, "/usr/local/lib", true);
+    roots.push_back("/opt");
+#endif
+    return roots;
+}
+
+std::vector<std::string> node_candidate_roots() {
+#if defined(__APPLE__)
+    return {"/opt/homebrew/lib/node_modules", "/usr/local/lib/node_modules", "/Applications"};
+#else
+    return {"/usr/lib/node_modules", "/usr/local/lib/node_modules", "/opt"};
+#endif
+}
+
 Targets plan_targets(const std::vector<std::string>& candidates, const std::vector<std::string>& network_mount_points,
                      bool table_ok) {
     Targets t;
@@ -644,6 +702,39 @@ Targets scan_targets() {
 
 Targets scan_native_targets() {
     return scan_targets(native_candidate_roots(), read_network_mounts);
+}
+
+ChildLister make_child_lister(const decltype(FsOps::list)& list) {
+    return [list](const std::string& dir) -> std::optional<std::vector<std::string>> {
+        const ListResult lr = list(dir, WalkLimits{}.max_dir_entries);
+        // A listing cut at the walk's per-directory cap holds only some of the python3.N names, and the
+        // walk reports the same cut as dir_truncated. Offering the parent as a root in their place makes
+        // the answer say so; a partial root set must never read as the whole one.
+        if (lr.error || lr.truncated)
+            return std::nullopt;
+        std::vector<std::string> names;
+        for (const auto& e : lr.entries)
+            // A network mount is kept too: it is never opened here, and as a root it is counted into
+            // roots_network_skipped by plan_targets instead of vanishing uncounted.
+            if (e.type == DirEntry::Type::dir || e.type == DirEntry::Type::link ||
+                e.type == DirEntry::Type::network_mount)
+                names.push_back(e.name);
+        return names;
+    };
+}
+
+Targets scan_python_targets() {
+    const auto mounts = read_network_mounts();
+    if (!mounts)
+        return scan_targets({}, [] { return std::nullopt; }); // no table, no listing: reported as unreadable
+    const PosixFs fs{*mounts};
+    const ChildLister children = make_child_lister(
+        [&fs](const std::string& dir, std::size_t cap) { return fs.list(dir, cap); });
+    return scan_targets(python_candidate_roots(children), [&mounts] { return mounts; });
+}
+
+Targets scan_node_targets() {
+    return scan_targets(node_candidate_roots(), read_network_mounts);
 }
 
 FsOps make_fs_ops(const Targets& targets, AccessLog on_access) {
