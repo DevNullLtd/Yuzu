@@ -21,7 +21,9 @@
 #include "process_introspect_legs.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <cstdint>
 #include <deque>
 #include <map>
 #include <new>
@@ -1225,7 +1227,9 @@ TEST_CASE("process_introspect macOS: the monotonic start stamp is part of the id
     CHECK(z.rows.empty());
     CHECK(unset.boot_calls == 0);
     // The token keeps its contract: the shape the request validator accepts, 29 bytes at most.
-    for (const std::uint64_t ab : {1ULL, 10088783211851ULL, UINT64_MAX}) {
+    // An array, not a braced list: UINT64_MAX is `unsigned long` on LP64 glibc and a list of
+    // mixed types does not deduce.
+    for (const std::uint64_t ab : std::array<std::uint64_t, 3>{1, 10088783211851ULL, UINT64_MAX}) {
         MacFake fk;
         fk.info.start_abstime = ab;
         const auto t = run_mac(fk, Facet::sched);
