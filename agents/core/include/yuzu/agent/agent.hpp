@@ -16,6 +16,9 @@ struct Config {
     std::string agent_id;             // Stable UUID; generated on first run if empty
     std::filesystem::path plugin_dir; // Directory to scan for plugin .so/.dll
     std::filesystem::path data_dir;   // Directory for persistent state (agent.db)
+    // Resolved agent log file (empty = none). Published to plugins as `agent.log_file` so the
+    // filesystem plugin can refuse it (WP06 F55) and agent_logging reads the real path.
+    std::filesystem::path log_file;
     std::chrono::seconds heartbeat_interval{30};
     bool tls_enabled{true};
     std::filesystem::path tls_ca_cert;     // PEM CA certificate for server verification

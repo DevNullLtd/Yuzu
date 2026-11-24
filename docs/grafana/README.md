@@ -4,7 +4,7 @@ This directory contains Grafana dashboard JSON files and documentation for monit
 
 ## Prometheus Metric Families
 
-Yuzu exposes Prometheus metrics from two scrape targets: the **server** (`/metrics` on the web port, default `:8080`) and the **gateway** (`/metrics` on its Prometheus port, default `:9568`). Per-agent metrics are *not* scraped — the agent has no HTTP metrics endpoint; it piggybacks its counters into heartbeats, and fleet-wide health is re-exported by the server as the `yuzu_fleet_*` gauges below. All metric names use the `yuzu_` prefix. The metric names, types, and labels below are taken from the emitting code (`server/core/src`, `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl`); only metrics that are actually emitted are listed.
+Yuzu exposes Prometheus metrics from two scrape targets: the **server** (`/metrics` on the HTTPS port, default `:8443`; on `--web-port` only with `--no-https`) and the **gateway** (`/metrics` on its Prometheus port, default `:9568`). Per-agent metrics are *not* scraped — the agent has no HTTP metrics endpoint; it piggybacks its counters into heartbeats, and fleet-wide health is re-exported by the server as the `yuzu_fleet_*` gauges below. All metric names use the `yuzu_` prefix. The metric names, types, and labels below are taken from the emitting code (`server/core/src`, `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl`); only metrics that are actually emitted are listed.
 
 ### Server Metrics
 
@@ -157,8 +157,14 @@ Add the following targets to your `prometheus.yml`:
 scrape_configs:
   - job_name: 'yuzu-server'
     static_configs:
-      - targets: ['localhost:8080']
+      - targets: ['localhost:8443']
     metrics_path: '/metrics'
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/yuzu-ca.pem
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/yuzu-metrics-token
 
   - job_name: 'yuzu-gateway'
     static_configs:
@@ -168,4 +174,4 @@ scrape_configs:
 
 There is no `yuzu-agent` scrape job: agents do not expose an HTTP `/metrics` endpoint. Per-agent counters are delivered to the server inside heartbeats and surfaced as the server-side `yuzu_fleet_*` / `yuzu_agents_*` series, so the server target above already covers fleet-wide agent health.
 
-Adjust addresses and ports to match your deployment. For Docker Compose deployments, the `deploy/docker/docker-compose.yml` file includes a pre-configured Prometheus instance.
+`/metrics` requires a bearer token (the recipe: [Scraping /metrics with a bearer token](../user-manual/metrics.md#scraping-metrics-with-a-bearer-token)). Adjust addresses and ports to match your deployment. For Docker Compose deployments, the `deploy/docker/docker-compose.yml` file includes a pre-configured Prometheus instance.

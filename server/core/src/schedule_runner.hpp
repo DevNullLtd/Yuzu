@@ -63,6 +63,7 @@
 /// not a second copy of it — a denial here means fire_with_approval never
 /// runs at all for that occurrence.
 
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <string>
@@ -107,7 +108,7 @@ public:
     /// leave every auto schedule dispatching under stale authority. This
     /// package owns only the fail-closed seam and its tests: an UNSET
     /// callback denies every fire. p14 wires the real RBAC/arming lookup.
-    using ArmingCheckFn = std::function<bool(const std::string& principal,
+    using ArmingCheckFn = std::function<std::expected<bool, std::string>(const std::string& principal,
                                              const std::string& plugin,
                                              const std::string& action,
                                              const std::unordered_map<std::string, std::string>&
@@ -143,6 +144,9 @@ public:
         // (governance Gate 5, #3425). Unset (default) = never stop, matching
         // every existing production/test Deps that predates this field.
         std::function<bool()> should_stop;
+        // Wall clock in epoch seconds for the arming hold below. Unset = the system clock;
+        // a test injects one to step past the hold without sleeping.
+        std::function<std::int64_t()> now_epoch_fn;
     };
 
     explicit ScheduleRunner(Deps deps);
@@ -152,7 +156,28 @@ public:
     /// (logged + counted) so one bad schedule cannot starve the rest.
     void tick();
 
+    /// Called by the owner's loop on a tick it is NOT the leader for: drops every arming hold and
+    /// zeroes `yuzu_schedule_due_held` so a demoted replica does not keep reporting held work it is
+    /// no longer responsible for. Same thread as tick().
+    void on_demoted();
+
 private:
+    // Round-robin start for the next tick: the id of the last schedule asked UNAVAILABLE. Holds lapse
+    // after kArmingHoldSeconds, so without a cursor the head of the due order is asked again before
+    // the tail is ever reached.
+    std::string arming_cursor_;
+    // UNAVAILABLE arming answers spent by the current tick (reset at the top of tick(); the
+    // runner's tick is single-threaded). See kMaxArmingUnavailablePerTick.
+    int arming_unavailable_this_tick_{0};
+
+    // Per-schedule hold: a schedule whose arming answer was UNAVAILABLE is not asked again (and not
+    // counted against the per-tick cap) until this epoch second. Without it the held schedules
+    // pinned the head of the due order and every schedule behind them - including a Read-pair one
+    // that needs no auth-store read - was starved for the whole outage. Erased on any answer and
+    // pruned of ids no longer due. Touched only by the single tick thread.
+    std::unordered_map<std::string, std::int64_t> arming_held_until_;
+    [[nodiscard]] std::int64_t now_secs() const;
+
     // Fire one due schedule: approval gate, tracked dispatch, advance.
     void fire(const InstructionSchedule& s);
 
