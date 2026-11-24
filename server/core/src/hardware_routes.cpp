@@ -306,7 +306,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             send_html(res, "<div class=\"gp-placeholder\">Missing device id.</div>");
             return;
         }
-        if (!id_is_audit_safe(id)) {
+        if (!auth::agent_id_is_audit_safe(id)) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
             return;
@@ -435,7 +435,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                         httplib::Response& res) {
         detail::ensure_correlation_id(res);
         const std::string id = req.matches[1].str();
-        if (!id_is_audit_safe(id)) {
+        if (!auth::agent_id_is_audit_safe(id)) {
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid device id"), "application/json");
             return;
@@ -834,8 +834,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const hardware_ci_page::Request& rq = *parsed;
         // `deps_.ci_collation_gate` is the collation gate (device_ci_read_gate.hpp): not Trusted
         // refuses the page before the store is asked. Null means no gate was wired (tests only).
-        const auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope,
-                                                      deps_.ci_collation_gate);
+        // `deps_.ci_read_slots` is the bulk-read concurrency cap (bulk_read_slots.hpp), held across
+        // the store call and this page's access-audit write (Page::hold); a point read (agent_id)
+        // takes none. Null means no cap (tests only).
+        auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope,
+                                                deps_.ci_collation_gate, deps_.ci_read_slots,
+                                                hardware_ci_page::kRestRowBudgetBytes);
         if (!read) {
             // ONE answer per failure, shared with MCP (hardware_ci_page::describe_read_error): a
             // scope too wide is TERMINAL (400, no retry hint, audited as a refusal with no count),
@@ -851,10 +855,13 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     hardware_ci_page::audit_target_type(rq), hardware_ci_page::audit_target_id(rq),
                     f.audit_detail);
             res.status = f.unavailable ? 503 : 400;
-            // The unverified-ordering refusal clears on the recheck's schedule, so the header
-            // agrees with the body's retry_after_ms (the other refusals send the body hint only).
-            if (read.error() == hardware_ci_page::ReadError::kOrderingUnverified)
-                res.set_header("Retry-After", std::to_string(f.retry_after_ms / 1000));
+            if (read.error() == hardware_ci_page::ReadError::kBusy && deps_.ci_read_busy_fn)
+                deps_.ci_read_busy_fn(hardware_ci_page::Surface::kRest);
+            // The refusals that clear on a known schedule (an unverified ordering, a busy cap)
+            // send the header too, so it agrees with the body's retry_after_ms; the others send
+            // the body hint only. The shared table decides (ReadFailure::retry_after_header).
+            if (f.retry_after_header)
+                res.set_header("Retry-After", std::to_string((f.retry_after_ms + 999) / 1000));
             detail::A4ErrorOpts opts;
             if (f.retry_after_ms >= 0)
                 opts.retry_after_ms = f.retry_after_ms;
@@ -862,7 +869,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(detail::a4_error(res, std::string(f.message), opts), "application/json");
             return;
         }
-        const hardware_ci_page::Page& page = *read;
+        hardware_ci_page::Page& page = *read;
 
         // A confined caller never receives an out-of-scope row, id or count: the scope is applied
         // in SQL, so no row is filtered after the read and neither the body, the cursor nor the
@@ -876,6 +883,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             hardware_ci_page::audit_target_type(rq), hardware_ci_page::audit_target_id(rq),
             page.target_denied ? hardware_ci_page::audit_detail_target_denied("REST")
                                : hardware_ci_page::audit_detail(page, rq, "REST", confined));
+        // The bulk-read slot was held through the audit write above (#7951); free it now, before
+        // the response is built.
+        page.release_slot();
         if (!persisted) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
@@ -911,7 +921,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!gate.admitted) return;
 
         const std::string agent_id = req.matches[1].str();
-        if (!id_is_audit_safe(agent_id)) {
+        if (!auth::agent_id_is_audit_safe(agent_id)) {
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid device id"), "application/json");
             return;
@@ -1004,7 +1014,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                       httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
-        if (!id_is_audit_safe(id)) {
+        if (!auth::agent_id_is_audit_safe(id)) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
             return;
@@ -1093,7 +1103,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // from the client.
         const std::string caption_plugin = req.has_param("plugin") ? req.get_param_value("plugin") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
-        if (!id_is_audit_safe(id)) {
+        if (!auth::agent_id_is_audit_safe(id)) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
             return;

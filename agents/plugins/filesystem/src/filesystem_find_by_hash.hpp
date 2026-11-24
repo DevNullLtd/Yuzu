@@ -37,7 +37,8 @@
 
 #include "filesystem_acl_parsers.hpp" // yuzu::filesystem::acl::row_field (row-field escaping)
 
-#include <sha256.hpp> // yuzu::shared::Sha256
+#include <macos_dataless_off.hpp> // yuzu::shared::DatalessMaterializationOff (self-gated to __APPLE__)
+#include <sha256.hpp>             // yuzu::shared::Sha256
 
 #include <atomic>
 #include <chrono>
@@ -74,9 +75,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#ifdef __APPLE__
-#include <sys/resource.h> // getiopolicy_np / setiopolicy_np (DatalessMaterializationOff)
-#endif
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <sys/vfs.h> // fstatfs
@@ -440,33 +438,8 @@ enum class EntryKind { directory, regular };
 enum class Visit { none, match, stop };
 
 #ifdef __APPLE__
-// Dataless (iCloud / File Provider) files and directories must not be materialised by a walk: the
-// download runs inside a read the deadline cannot interrupt. The policy is per THREAD and this
-// runs on a shared pool thread, so it is read, switched OFF for the walk and restored on every
-// exit path. With it off a dataless file or directory fails its open with EDEADLK, which the walk
-// already counts as unreadable (CONSTRAINED), and a dataless directory is refused by the
-// directory open before the iterator names its children.
-class DatalessMaterializationOff {
-public:
-    DatalessMaterializationOff() {
-        previous_ = ::getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD);
-        if (previous_ < 0)
-            previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
-        changed_ = ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
-                                    IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0;
-    }
-    ~DatalessMaterializationOff() {
-        if (changed_)
-            ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
-                             previous_);
-    }
-    DatalessMaterializationOff(const DatalessMaterializationOff&) = delete;
-    DatalessMaterializationOff& operator=(const DatalessMaterializationOff&) = delete;
-
-private:
-    int previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
-    bool changed_ = false;
-};
+// The walk's dataless guard is the shared one (agents/shared/macos_dataless_off.hpp).
+using yuzu::shared::DatalessMaterializationOff;
 #endif
 
 /// THE bounded, symlink-safe walker of the plugin: `root` to `max_depth` (root's children are

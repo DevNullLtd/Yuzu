@@ -372,6 +372,10 @@ void register_mint(HttpRouteSink& sink, Deps deps) {
         params.expected_sha256 = string_field(body, "expected_sha256");
         params.retention_class = string_field(body, "retention_class");
         params.minted_by = session->username;
+        // Before the mint: its failure row carries the id as target_id, and the store would
+        // refuse a bad id only after that row's text is built from it.
+        if (detail::refuse_unsafe_device_id_a4(res, params.agent_id))
+            return;
         if (auto it = body.find("declared_max_size"); it != body.end() && it->is_number_integer())
             params.declared_max_size = it->get<std::int64_t>();
         // ABSENT keeps the server default; a PRESENT ttl_secs must be one JSON integer >= 1 (#4644).

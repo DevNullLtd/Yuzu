@@ -3,6 +3,7 @@
 #include "custom_properties_store.hpp"
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "rest_audit.hpp"  // detail::refuse_unsafe_device_id_a4: the device-id audit floor
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -36,6 +37,9 @@ void register_custom_properties_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get(R"(/api/agents/([^/]+)/properties)", [deps](const httplib::Request& req,
                                                           httplib::Response& res) {
         auto agent_id = req.matches[1].str();
+        // Before the scoped gate and any audit row: the id reaches target_id on both.
+        if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+            return;
         // #3700: per-TARGET authorization -- NOT a global Infrastructure:Read
         // gate. The old require_permission("Infrastructure","Read") admitted
         // a global-permission holder with no target check, disclosing
@@ -75,6 +79,9 @@ void register_custom_properties_routes(HttpRouteSink& sink, Deps deps) {
     sink.Put(R"(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))",
              [deps](const httplib::Request& req, httplib::Response& res) {
         auto agent_id = req.matches[1].str();
+        // Before the scoped gate and any audit row: the id reaches target_id on both.
+        if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+            return;
         // #3700: per-TARGET authorization -- NOT a global Infrastructure:Write
         // gate. The old require_permission("Infrastructure","Write") admitted
         // any global-permission holder with no target check, letting a
@@ -163,6 +170,9 @@ void register_custom_properties_routes(HttpRouteSink& sink, Deps deps) {
     sink.Delete(R"(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))",
                 [deps](const httplib::Request& req, httplib::Response& res) {
         auto agent_id = req.matches[1].str();
+        // Before the scoped gate and any audit row: the id reaches target_id on both.
+        if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+            return;
         // #3700: per-TARGET authorization -- NOT a global Infrastructure:Write
         // gate. The old require_permission("Infrastructure","Write") admitted
         // any global-permission holder with no target check, letting a

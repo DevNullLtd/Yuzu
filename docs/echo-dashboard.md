@@ -200,8 +200,8 @@ No changes to the `echo.sql` agent action; the change is purely server-side scop
   an answer at that count is flagged ("Results were cut at 10,000 rows for this hour"). A
   long answer arrives as several response frames; the page reads every frame of the
   command, and keeps polling until the command has finished. A row with the wrong number
-  of cells is dropped and counted ("N rows unreadable"); a failed read or a device whose
-  agent has no roll-up store says so ("upgrade the agent") instead of showing an empty
+  of cells is dropped and counted ("N rows unreadable"); a failed read says so, showing the
+  device's own error ("The device reported an error: ..."), instead of showing an empty
   tree. The agent writes each cell raw, joined by `|`, so a process name that itself
   contains `|` or a newline can still shift cells or forge a row until the agent escapes
   them (the server cannot tell a forged row with the right cell count from a real one).
@@ -284,6 +284,19 @@ in-panel error and caches nothing rather than minting a weak token.
 | `GET /fragments/echo/process-tree/result?…&pcmd=&tcmd=&n=` | Poll both commands, build the name-level tree for the chosen hour (newest by default) with the Hour selector, cache, render |
 | `GET /fragments/echo/process-tree/device-net?device=&dcmd=&acmd=&hour=&n=` | Dispatch and poll the hourly DNS and ARP queries, render the device network panels for the hour |
 | `GET /fragments/echo/process-tree/detail?token=&node=` | Render one node's detail from the cache (re-checks scope **+ Execute + originating principal**) |
+
+A `device` longer than 256 bytes or containing a byte below 0x20 (a control character) is
+refused with status 400 on `run`, `result`, `device-net` and the capture-sources load and push
+routes, before any permission check, dispatch or audit row. The routes answer with the note
+"Invalid device id."; the capture-sources push also raises the error toast "Invalid device id.",
+which is the only signal visible there, because the dashboard's htmx drops a 4xx body. Agent
+registration and enrolment already refuse such an id (over 256 bytes, or a control byte), so
+the case cannot arise for a registered device: only a hand-built URL reaches this refusal. The
+DEX per-device fragments, the device-page fragments, the REST purge
+(`POST /api/v1/echo/retention-paused/purge`) and the two retention-paused posts on the Echo page
+(`POST /fragments/echo/retention-paused/reenable` and `.../purge`, which answer
+"Invalid device id." and count the refusal as `invalid_input`) refuse the same ids with a 400 before
+the per-device permission check.
 
 ### 5.5 Permissions & audit
 

@@ -8907,50 +8907,51 @@ groups:
     # No alert on the echo.status registry_* keys yet (no fleet gauge); decision and follow-up in
     # docs/observability-conventions.md (#6521).
     rules:
-      # The gauge counts agents once per sweep, so a rise is a net rise in the agents reporting a
-      # quarantine history, not an event count (limits spelled out in the description). It is a gauge, so `delta`, not `increase`: an
-      # agent that leaves and returns takes the count down and back up, and `increase` would
-      # read the return as a rise. `for: 0m`: a rise is an event, a sustained condition would
-      # never clear. Warning, not critical: the value is agent-self-reported inside the
-      # heartbeat trust boundary, so one forged or buggy agent can raise it.
+      # NEW quarantines, counted at the source (#7486, alert half of #5033). The server counts
+      # one per echo.db corruption audit row it writes (yuzu_server_echo_db_quarantines_total):
+      # the audit gate writes a row only for a (agent, quarantine identity) it has not recorded
+      # and the audit store does not already hold, so an agent returning from offline, a failover
+      # and a reconnect wave add nothing. The alert used to watch yuzu_fleet_echo_db_corruption_agents,
+      # a population gauge that rises whenever agents with an old quarantine reconnect; that
+      # gauge stays published but no rule reads it.
       #
-      # THE RESTART GUARD. The server publishes the gauge every sweep, 0 included, over agents
-      # with a live heartbeat, so a restarted replica starts at 0 and ramps back to N as agents
-      # reconnect. About an hour later the 1h window start slides into that ramp and
-      # `delta(...[1h]) > 0` fires with no new corruption (the same happens on a series younger
-      # than 1h). `unless ... (yuzu_server_uptime_seconds < 3900)` suppresses the rule for the
-      # first 65 minutes of a replica's life: the 1h window plus a 5 minute reconnect ramp. A
-      # real rise stays visible to `delta[1h]` for an hour, so the guard loses a rise inside the
-      # first ~5 minutes of a boot and delays one later in the first 65. If agents take longer than 5 minutes to
-      # reconnect, the tail of the ramp can still leak. An absent uptime series suppresses
-      # nothing. The join is `on (job, instance)` because the guard is about one replica's own
-      # uptime (both series must come from the same scrape job and target, as the shipped scrape
-      # config does; otherwise the guard silently never matches): any label a scrape attaches to only one of the two series would otherwise
-      # defeat the join and silence the guard, and `on (job)` alone would let a young sibling
-      # replica silence an old one (pinned by the two-replica case). The 1h any-rise threshold
-      # is the #5065 starting default, not sized from fleet data.
+      # `increase`, not `delta`: it is a counter, and increase() handles the reset a restart
+      # causes. The server pre-seeds the counter to 0 at boot, so the first quarantine reads as
+      # an increase from 0; a series whose first sample is already 1 shows no increase (pinned by
+      # CORRUPTION CASE 5), so the pre-seed is load-bearing. A replica that goes stale and returns at 0
+      # (a rolling restart) adds nothing, so no uptime guard is needed. `sum by (job)` makes one
+      # alert per job however many replicas recorded one. `for: 0m`: a quarantine is an event; a
+      # sustained condition would never clear. Warning, not critical: the value is
+      # agent-self-reported inside the heartbeat trust boundary, so one forged or buggy agent can
+      # raise it, and it is a count of audit rows written: a row pruned by audit retention and
+      # reported again, or two HA replicas racing on one identity, counts twice, and a crash
+      # between the write and the scrape loses a count. Any increase in 1h is a starting default
+      # (the #5065 one, now over a counter), not sized from fleet data.
       - alert: YuzuEchoDbCorruptionDetected
         expr: |
-          delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0
-            unless on (job, instance) (yuzu_server_uptime_seconds < 3900)
+          sum by (job) (increase(yuzu_server_echo_db_quarantines_total[1h])) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "The count of agents with a quarantined Echo database rose in the last hour"
+          summary: "An agent quarantined its Echo database in the last hour"
           description: >-
-            At least one more agent than an hour ago reports that its Echo database failed its
-            integrity check and was quarantined. This is a net rise in the agents reporting a
-            quarantine history, not an event count: the gauge counts agents once per sweep, so an
-            agent returning from offline with an old quarantine raises it, a repeat quarantine on
-            an agent already counted does not, and an agent leaving in the same window can mask
-            one arriving. A rise seen while the reporting replica has been up under 65 minutes is
-            held until the guard lifts. A failover, a rolling upgrade, agents returning after a
-            site or gateway outage, or ordinary endpoint churn can all raise it with no new
-            corruption, once per replica that gains agents; treat it as a ticket, not a page. The
-            signal is agent-self-reported, so one agent can raise or mask it; the
-            echo.db.corruption_quarantined audit rows name the affected agents but corroborate
-            rather than prove it.
+            The server recorded at least one new Echo database quarantine in the last hour: an
+            agent's echo.db failed its integrity check and was moved aside. Open the
+            echo.db.corruption_quarantined audit rows to see which agents, then check each
+            agent's log for the cause (disk fault, full disk, unclean shutdown). Each row is a
+            new quarantine identity, so an agent returning from offline, a failover and a
+            reconnect wave add none. Any increase in an hour fires: that is a starting default,
+            not sized from fleet data. The count is the server's own audit-row writes, so a row
+            pruned by audit retention and reported again, or two HA replicas racing on one
+            identity, counts twice, and a crash between a write and the next scrape loses that
+            count; the audit rows stay the record. No alert does not mean no quarantine: a
+            quarantine a replica records before Prometheus has scraped it once can be missed (the
+            first sample is already above 0), and no row is written, so none is counted, while the
+            audit store is closed or the gate is waiting out a failed audit lookup or write (every
+            agent after an agent's first failure; only that agent when it fails again, for up to
+            16 failing agents the gate remembers). The signal is agent-self-reported, so one agent
+            can raise it; treat it as a ticket, not a page.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
 
       # DECISION (#6696): one generic rule keyed on the plugin label, not an Echo-only twin; the

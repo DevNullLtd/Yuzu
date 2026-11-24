@@ -184,6 +184,15 @@ struct Config {
     // --postgres-pool-size / YUZU_POSTGRES_POOL_SIZE.
     int postgres_pool_size{16};
 
+    // Concurrency cap on the bulk device-CI read (GET /api/v1/hardware-ci and MCP
+    // list_hardware_ci_records), shared by both: how many may hold a pooled Postgres connection at
+    // once on this replica (#7949, #7951). -1 (the default) = not given: the effective cap is
+    // derived from the pool size and logged at boot. An explicit value outside 1..8, or above half
+    // the effective pool, refuses boot. Wired via --hardware-ci-read-concurrency /
+    // YUZU_HARDWARE_CI_READ_CONCURRENCY; the arithmetic is bulk_read_slots.hpp's
+    // resolve_bulk_read_cap (kBulkReadCapUnset is -1).
+    int hardware_ci_read_concurrency{-1};
+
     // HA WS-8 (ADR-2002 §12): minimum seconds stop() keeps the listener open
     // after /readyz starts answering 503 `draining`, so a load balancer stops
     // routing here before the socket closes. 0 = no minimum (the single-node

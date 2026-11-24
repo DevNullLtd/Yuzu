@@ -417,7 +417,7 @@ fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
 
 **A check that runs a Forensics-tier plugin is not dispatched.** Every action of the
 Forensics-tier plugins (`app_usage`, `browser_inventory`, `execution_artifacts`,
-`privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is derived from the
+`file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is derived from the
 capability catalogue) carries an execute gate, so policy evaluation refuses such a check
 before anything is sent (see [Action approval and the `blocked`
 status](#action-approval-and-the-blocked-status)). The policy shows `blocked` for every

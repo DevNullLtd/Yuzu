@@ -211,6 +211,8 @@ TEST_CASE("resume contract: an unchanged tree cut by entries, rows or the deadli
     SECTION("fake-clock deadline") {
         s.gl.slice = 25ms;
         s.gl.work_quantum = 10ms; // the pacer naps inside the slice
+        s.gl.slow_list_hard = 25ms; // the back-off limits stay inside this short slice (valid() says so)
+        s.gl.max_backoff_pause = 25ms;
         s.visit_step = 10ms;
         expect = Stop::budget_time;
     }

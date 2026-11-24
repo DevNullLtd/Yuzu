@@ -1,5 +1,6 @@
 #include "approval_manager.hpp"
 
+#include "approval_continuation.hpp"
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -87,11 +88,12 @@ constexpr const char* kDbNowEpochSql = "EXTRACT(EPOCH FROM now())::bigint";
 constexpr const char* kDbWallEpochSql = "EXTRACT(EPOCH FROM clock_timestamp())::bigint";
 
 // THE ticket-liveness predicate, as a SQL boolean over `reviewed_at`. ONE definition of the
-// window, used by the consume CAS, its diagnostic read, submit()'s approved-ticket sweep and
-// `ticket_is_live()` (which ScheduleRunner calls), so those four cannot drift apart about
-// the bounds of when an approved ticket may still be redeemed or fired. The clock the bounds
-// are measured on is chosen by the caller (`wall_clock`, below): the consume statements read
-// the wall clock, the other two sites the transaction start.
+// window, used by the consume CAS, its diagnostic read, submit()'s approved-ticket sweep,
+// `ticket_is_live()` (which ScheduleRunner calls) and the continuation cover
+// (`covers_continuation`), so those five cannot drift apart about the bounds of when an
+// approved ticket may still be redeemed, fired or ridden. The clock the bounds are measured on
+// is chosen by the caller (`wall_clock`, below): the consume statements read the wall clock,
+// the other three sites the transaction start.
 //   lower bound: reviewed_at >= now - kApprovalTicketTtlSeconds   (the 7-day lifetime)
 //   upper bound: reviewed_at <= now + kApprovalReviewedAtSlackSeconds
 // The upper bound is what makes the lower one safe: a `reviewed_at` far in the future
@@ -1735,6 +1737,55 @@ std::expected<bool, std::string> ApprovalManager::ticket_is_live(const std::stri
         spdlog::error("ApprovalManager::ticket_is_live: read failed for id={}: {}", redact_id(id),
                       PQresultErrorMessage(res.get()));
         return std::unexpected("approval store temporarily unavailable (read failed)");
+    }
+    return PQntuples(res.get()) > 0;
+}
+
+std::expected<bool, StoreReadError>
+ApprovalManager::covers_continuation(const std::string& id, const std::string& principal,
+                                     ApprovalOrigin expected_origin,
+                                     const std::string& definition_id,
+                                     const std::string& scope_expression) const {
+    if (!open_)
+        return std::unexpected(StoreReadError{"database not open"});
+    // Nothing to ask is a refusal, not a fault. An origin that names no concrete surface can match
+    // no ticket (origin_redeemable_as), and the stored column of such a row is not a surface either.
+    if (id.empty() || principal.empty() || definition_id.empty() || scope_expression.empty() ||
+        !origin_redeemable_as(expected_origin, expected_origin))
+        return false;
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(StoreReadError{"approval store temporarily unavailable "
+                                              "(pool exhausted)"});
+    // The DATABASE's clock (kDbNowEpochSql), read in this one statement, as ticket_is_live() does:
+    // the cover is bounded from the instant of FIRST USE, `consumed_at`, which consume stamped from
+    // this same database clock, and no replica's own clock is consulted. It also ends with the
+    // approval's own lifetime (the ticket-liveness predicate), so a ticket first used near the end
+    // of its 7 days covers no slice after them. One autocommit statement, so the reading is the
+    // statement's own, never a caller's long transaction start.
+    const std::string db_epoch = kDbNowEpochSql;
+    const std::string sql =
+        "SELECT 1 FROM approval_manager.approvals WHERE id = $1 AND status = 'approved'"
+        " AND origin = $2 AND definition_id = $3 AND scope_expression = $4"
+        " AND submitted_by = $5 AND consumed_by = $5"
+        " AND reviewed_by <> '' AND reviewed_by <> submitted_by"
+        " AND request_json = '' AND request_digest = '' AND excluded_roots = ''"
+        " AND consumed_at > 0"
+        " AND consumed_at >= (" + db_epoch + " - " +
+        std::to_string(approval_continuation::kCoverSeconds) + ")"
+        " AND consumed_at <= (" + db_epoch + " + " +
+        std::to_string(kApprovalReviewedAtSlackSeconds) + ")"
+        " AND " + ticket_live_sql();
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{id, to_string(expected_origin), definition_id, scope_expression,
+                                 principal});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ApprovalManager::covers_continuation: read failed for id={}: {}",
+                      redact_id(id), PQresultErrorMessage(res.get()));
+        return std::unexpected(StoreReadError{
+            std::string("read failed: ") + PQresultErrorMessage(res.get()), result_sqlstate(res)});
     }
     return PQntuples(res.get()) > 0;
 }
