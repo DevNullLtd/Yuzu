@@ -30,14 +30,19 @@
  * 0x420 with 0x9000601A or 0x9000201A. Seen through this plugin in its default view (no switch) on the
  * same host: a hydrated file is 0x20 with no tag, an unhydrated file 0x400020, a populated folder 0x10, a
  * folder that is not populated 0x400010, and the sync-root folder, listed from its plain parent, 0x430 with
- * 0x9000701A. The recall-on-data-access bit (0x400000) was present in both views. The switch itself was
- * not measured. Also measured on that host: an app-execution alias is 0x420 with 0x8000001B; a `compact
+ * 0x9000701A. The recall-on-data-access bit (0x400000) was present in both views. With the switch on, on
+ * that same host, this plugin's output was: a hydrated in-sync cloud file read `ok:cloud` with a real extent
+ * when the search was rooted at the sync root's parent, at the sync-root folder or at the populated folder;
+ * the populated folder was entered and its files listed; and the provider's data-fetch and placeholder-fetch
+ * counters did not move in any of four plugin runs (those three roots and the not-populated folder). That
+ * run did not capture the attribute and tag values the plugin itself read in the exposed view, so none are
+ * claimed. Also measured on that host: an app-execution alias is 0x420 with 0x8000001B; a `compact
  * /exe` file is a plain file (0x20, no tag) whose retrieval pointers read as ONE hole; a sparse hole is an
  * lcn -1 run, a wholly sparse file answers success with one lcn -1 run, and a resident or empty file
  * answers ERROR_HANDLE_EOF; a buffer under 32 bytes answers ERROR_INSUFFICIENT_BUFFER, not
- * ERROR_MORE_DATA. NOT MEASURED, stated where each rule uses it: the switch, EFS (the `encrypted` flag
- * follows the documented attribute), deduplication (detected by its tag), ReFS, a commercial sync client,
- * and a recall-on-open directory.
+ * ERROR_MORE_DATA. NOT MEASURED, stated where each rule uses it: the switch on any other host or build, a
+ * host without the call, a call that fails, EFS (the `encrypted` flag follows the documented attribute),
+ * deduplication (detected by its tag), ReFS, a commercial sync client, and a recall-on-open directory.
  */
 #pragma once
 
