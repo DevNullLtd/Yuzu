@@ -544,7 +544,7 @@ int(result.value) >= 22621
 #### Recipe: Preview, Apply and Undo a Registry Plan
 
 `windows.registry.apply` is Destructive, so it takes explicit `agent_ids` (scope and broadcast are refused) and an
-administrator or an approval; it needs registry 2.1.0 on the agent (see [Upgrading](upgrading.md)).
+administrator or an approval.
 
 1. **Preview.** Run it with the default `dry_run=true` and this `plan`:
 
@@ -569,8 +569,8 @@ administrator or an approval; it needs registry 2.1.0 on the agent (see [Upgradi
 #### Recipe: Change One Value in a User's Hive
 
 `hive=HKCU` is the agent's own hive (LocalSystem's `HKU\.DEFAULT`), not the logged-on user's, so a person's setting
-is changed with `windows.registry.set_user_value`. It needs an administrator or an approval and registry 2.1.0 on the
-agent, and it has no dry run: it writes at once. Its twin `windows.registry.delete_user_value` is Destructive, so it
+is read with `windows.registry.get_user_value` (the ungated reads refuse `hive=HKU` with a user SID and answer
+`per_user_hive_requires_get_user_value`) and changed with `windows.registry.set_user_value`. It needs an administrator or an approval, and it has no dry run: it writes at once. Its twin `windows.registry.delete_user_value` is Destructive, so it
 also takes explicit `agent_ids`.
 
 1. **Find the profile.** Run `windows.registry.list_profiles` on the device. Each row is
@@ -602,8 +602,7 @@ also takes explicit `agent_ids`.
 #### Recipe: Remove a Registry Branch Safely
 
 `windows.registry.delete_key` is Destructive (explicit `agent_ids`, administrator or approval) and deletes by default.
-Send `dry_run=true` only to agents verified at registry 2.1.0: an older agent ignores it and DELETES a key that has no
-subkeys (see [Upgrading](upgrading.md)).
+An earlier registry agent is unsupported (see the registry README, "Earlier agents").
 
 1. **Preview.** Run it with `hive` = `HKLM`, `key` = `SOFTWARE\AcmeLegacy`, `recursive=true` and `dry_run=true`. The
    reply ends `status|ok`, `counted_keys|<n>`, `counted_values|<n>`, `dry_run|1` and `capped|0`. Nothing is deleted;

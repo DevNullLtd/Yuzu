@@ -1,3 +1,5 @@
+#include <yuzu/log_token.hpp>
+#include "schedule_arming_check.hpp"
 #include "schedule_runner.hpp"
 
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
@@ -12,6 +14,8 @@
 #include "schedule_params_parsers.hpp"
 
 #include <yuzu/metrics.hpp>
+
+#include <unordered_set>
 
 #include <spdlog/spdlog.h>
 
@@ -47,7 +51,54 @@ void ScheduleRunner::tick() {
     if (!d_.schedule_engine || !d_.instruction_store || !d_.enqueue_fn)
         return;
 
-    for (const auto& s : d_.schedule_engine->evaluate_due()) {
+    arming_unavailable_this_tick_ = 0;
+    auto due_res = d_.schedule_engine->evaluate_due_checked();
+    if (!due_res) {
+        // A failed read is NOT "nothing due": leave the holds and the gauge exactly as they were.
+        spdlog::warn("schedule_runner: due read failed ({}); holds left as they were", due_res.error());
+        return;
+    }
+    auto due = std::move(*due_res);
+    const std::int64_t now = now_secs();
+    // Forget holds for schedules that are no longer due (fired, deleted, disabled) or have lapsed.
+    if (!arming_held_until_.empty()) {
+        std::unordered_set<std::string> due_ids;
+        for (const auto& s : due)
+            due_ids.insert(s.id);
+        for (auto it = arming_held_until_.begin(); it != arming_held_until_.end();) {
+            if (it->second <= now || !due_ids.contains(it->first))
+                it = arming_held_until_.erase(it);
+            else
+                ++it;
+        }
+    }
+    // Start after the last schedule asked unavailable (round-robin), so a lapsed hold at the head
+    // cannot keep pre-empting the tail.
+    if (!arming_cursor_.empty()) {
+        const auto pos = std::find_if(due.begin(), due.end(),
+                                      [&](const InstructionSchedule& s) { return s.id == arming_cursor_; });
+        if (pos != due.end())
+            std::rotate(due.begin(), std::next(pos), due.end());
+        else
+            arming_cursor_.clear();
+    }
+    bool cap_hit = false;
+    for (const auto& s : due) {
+        // A schedule held on an UNAVAILABLE arming answer is skipped WITHOUT asking and WITHOUT
+        // counting against the cap: the schedules behind it must still get their turn.
+        if (const auto h = arming_held_until_.find(s.id); h != arming_held_until_.end()) {
+            count("yuzu_schedule_arming_deferred_total");
+            continue;
+        }
+        // The arming read is evidently failing: stop spending the shared tick thread on it. The
+        // rest stay due and the cursor resumes after the last one asked.
+        if (arming_unavailable_this_tick_ >= kMaxArmingUnavailablePerTick) {
+            spdlog::warn("schedule_runner: {} arming checks unavailable this tick - remaining "
+                         "due schedule(s) deferred to the next tick",
+                         arming_unavailable_this_tick_);
+            cap_hit = true;
+            break;
+        }
         // #3495: bounds how many MORE schedules a single tick() call fires
         // once shutdown begins — a schedule already firing below still
         // completes cleanly, this only stops the next one from starting.
@@ -69,6 +120,23 @@ void ScheduleRunner::tick() {
             d_.schedule_engine->advance_schedule(s.id);
         }
     }
+    if (!cap_hit)
+        arming_cursor_.clear(); // a full pass: start from the head again
+    // How much scheduled work is parked on the arming hold right now (0 when nothing is).
+    if (d_.metrics) {
+        d_.metrics->gauge("yuzu_schedule_due_held").set(static_cast<double>(arming_held_until_.size()));
+    }
+}
+
+void ScheduleRunner::on_demoted() {
+    arming_held_until_.clear();
+    arming_cursor_.clear();
+    if (d_.metrics)
+        d_.metrics->gauge("yuzu_schedule_due_held").set(0.0);
+}
+
+std::int64_t ScheduleRunner::now_secs() const {
+    return d_.now_epoch_fn ? d_.now_epoch_fn() : now_epoch();
 }
 
 void ScheduleRunner::fire(const InstructionSchedule& s) {
@@ -113,10 +181,28 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
     // tick forever.
     // sg10: the arming check judges the schedule's own stored parameters (a parameter-escalated
     // securable, e.g. patch_connectivity + `targets`, is the arming principal's to hold). Stored
-    // parameters that do not decode are a denial: authority is never decided on a guess.
+    // parameters that do not decode are a DENIAL (never a hold): authority is never decided on a
+    // guess, and the check is not asked at all.
     const auto arming_params = decode_arming_parameters(s.parameter_values);
-    if (!d_.arming_check || !arming_params ||
-        !d_.arming_check(s.created_by, def.plugin, def.action, *arming_params)) {
+    std::expected<bool, std::string> arming{false};
+    if (d_.arming_check && arming_params)
+        arming = d_.arming_check(s.created_by, def.plugin, def.action, *arming_params);
+    if (arming)
+        arming_held_until_.erase(s.id); // any definitive answer ends the hold
+    if (!arming) {
+        // The answer could not be determined (a transient auth-store fault): NOT a denial. HOLD
+        // without advancing, so the schedule is evaluated again on the next tick and the
+        // occurrence is not lost.
+        count("yuzu_schedule_arming_unavailable_total");
+        ++arming_unavailable_this_tick_;
+        arming_held_until_[s.id] = now_secs() + kArmingHoldSeconds;
+        arming_cursor_ = s.id;
+        spdlog::warn("schedule_runner: schedule '{}' (id={}) arming check unavailable ({}); "
+                     "holding, not advancing",
+                     s.name, s.id, ::yuzu::log_token(arming.error()));
+        return;
+    }
+    if (!*arming) {
         count("yuzu_schedule_arming_denied_total");
         spdlog::warn("schedule_runner: schedule '{}' (id={}) arming check denied — "
                      "principal='{}' target={}.{}",

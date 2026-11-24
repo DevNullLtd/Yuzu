@@ -64,6 +64,8 @@
 ///                  route, exactly as documented in the handler's own
 ///                  in-body comment, preserved verbatim below)
 
+#include "authz_gates.hpp" // authz::FleetReadGate - FleetReadFn (WP06 F11)
+
 #include <yuzu/server/auth.hpp>
 
 #include <httplib.h>
@@ -104,7 +106,27 @@ struct Deps {
     /// never a denial.
     using ResolveSessionFn = std::function<std::optional<auth::Session>(const httplib::Request&)>;
 
+    /// WP06 F11: the injected twin of `AuthRoutes::require_fleet_read` (same
+    /// shape and the SAME server.cpp lambda as `WorkflowRoutes::FleetReadFn`).
+    /// The legacy bus carries pre-rendered, UNTAGGED fragments for every agent,
+    /// so it cannot be filtered per agent: the stream is admitted ONLY to a
+    /// caller with unrestricted (TOP) `Response:Read` AND `Execution:Read`
+    /// authority. Empty (unwired) fails CLOSED (503), never falls through.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+
+    /// Same shape as every sibling route's audit closure (`WorkflowRoutes::Deps::audit_fn`). Used
+    /// to record the refusal of an ADMITTED-but-scoped caller (the fleet-read gate audits its own
+    /// 401/403/503 refusals; this one is the route's own). Unwired: the refusal still stands.
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
+                                       const std::string& result, const std::string& target_type,
+                                       const std::string& target_id, const std::string& detail)>;
+
     DenyServiceScopedFn deny_service_scoped_fn;
+    FleetReadFn fleet_read_fn;
+    AuditFn audit_fn;
     ResolveSessionFn resolve_session_fn;
     /// `ServerImpl::event_bus_` (`detail::EventBus`, by-value member) — the
     /// legacy dashboard bus this route subscribes to. Never null in
