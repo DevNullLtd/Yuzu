@@ -7,8 +7,9 @@
 ## Sources by platform (see agents/plugins/firewall/README.md):
 ##   Windows: INetFwPolicy2 COM (Domain/Private/Public profiles; INetFwRules
 ##            enumeration for rules)
-##   Linux:   firewalld (sd-bus), else nftables (netlink), else ufw, else
-##            iptables (auto-detected in that order)
+##   Linux:   firewalld (sd-bus), else nftables (netlink), else the root
+##            snapshot broker, else ufw, else iptables (auto-detected in
+##            that order)
 ##   macOS:   state: Application Firewall (socketfilterfw) primary, pf (pfctl)
 ##            secondary, plus pf anchors/rule count (pfctl, root-only);
 ##            rules: per-app allow/block list (socketfilterfw --listapps,

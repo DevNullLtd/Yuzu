@@ -1009,13 +1009,13 @@
       "changelog.d/2026-11-09-firewall-containment-actions.added.md",
       "changelog.d/2026-11-11-firewall-only-containment.changed.md",
       "changelog.d/2026-11-11-firewall-only-containment.removed.md",
-      "changelog.d/2026-11-21-firewall-read-path-and-real-host-proof.changed.md",
-      "changelog.d/2026-11-21-firewall-read-path-and-real-host-proof.fixed.md",
-      "changelog.d/2026-11-21-firewall-read-path-and-real-host-proof.security.md",
-      "changelog.d/2026-11-22-firewall-read-privilege.changed.md",
-      "changelog.d/2026-11-22-firewall-read-privilege.fixed.md",
-      "changelog.d/2026-11-22-firewall-read-privilege.security.md",
-      "changelog.d/7530-firewall-protective-set.changed.md"
+      "changelog.d/7530-firewall-protective-set.changed.md",
+      "changelog.d/8698-firewall-read-path-and-real-host-proof.changed.md",
+      "changelog.d/8698-firewall-read-path-and-real-host-proof.fixed.md",
+      "changelog.d/8698-firewall-read-path-and-real-host-proof.security.md",
+      "changelog.d/8698-firewall-read-privilege.changed.md",
+      "changelog.d/8698-firewall-read-privilege.fixed.md",
+      "changelog.d/8698-firewall-read-privilege.security.md"
     ],
     "definitions": [
       "content/definitions/firewall.yaml"
