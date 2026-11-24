@@ -1478,13 +1478,15 @@ TEST_CASE("#4402 nft_open_diag_rows: each actionable condition once, in first-se
           Rows{"error|fd_exhausted", "error|nftables:socket:eperm"});
     CHECK(nft_open_diag_rows(std::vector<int>{EACCES, EMFILE, EPERM}) ==
           Rows{"error|nftables:socket:eperm", "error|fd_exhausted"});
-    // a kernel with no NETLINK_NETFILTER, or an unclassified errno, is silent
+    // a kernel with no NETLINK_NETFILTER, a denied address family, or an unclassified errno, is
+    // silent
     CHECK(nft_open_diag_rows(std::vector<int>{EPROTONOSUPPORT, EAFNOSUPPORT, EINVAL}).empty());
     CHECK(nft_open_diag_rows(std::vector<int>{}).empty());
     // the classification the rows rest on
     CHECK(classify_open_errno(EMFILE) == OpenNftErrClass::fd_exhausted);
     CHECK(classify_open_errno(EPERM) == OpenNftErrClass::permission_denied);
     CHECK(classify_open_errno(EPROTONOSUPPORT) == OpenNftErrClass::unsupported);
+    CHECK(classify_open_errno(EAFNOSUPPORT) == OpenNftErrClass::family_denied);
     CHECK(classify_open_errno(EINVAL) == OpenNftErrClass::other);
 }
 
@@ -4368,10 +4370,11 @@ constexpr std::array kNftCases{
     NftCase{"other failure (table seen, chains untrusted)", false, true, std::nullopt, true},
     NftCase{"other failure (socket fd_exhausted)", false, false, EMFILE, true},
     NftCase{"other failure (socket ENOBUFS)", false, false, ENOBUFS, true},
-    NftCase{"other failure (re-run socket unsupported after a table)", false, true, EAFNOSUPPORT,
-            true},
-    NftCase{"tool absent (EAFNOSUPPORT)", false, false, EAFNOSUPPORT, false},
-    NftCase{"tool absent (EPROTONOSUPPORT)", false, false, EPROTONOSUPPORT, false},
+    NftCase{"other failure (re-run socket unsupported after a table)", false, true,
+            EPROTONOSUPPORT, true},
+    NftCase{"family denied (EAFNOSUPPORT)", false, false, EAFNOSUPPORT, true},
+    NftCase{"family denied after a table (EAFNOSUPPORT)", false, true, EAFNOSUPPORT, true},
+    NftCase{"tool absent (EPROTONOSUPPORT: no nfnetlink)", false, false, EPROTONOSUPPORT, false},
 };
 
 enum class IptCase {
@@ -4490,8 +4493,48 @@ TEST_CASE("U1: refused nft dump, legacy alternative with no legacy module, reads
     CHECK(a.state == NftVerdict::unknown);
     CHECK_FALSE(a.all_read);
     CHECK(a.appends == 0);
-    // the same reads with nf_tables absent from the kernel are read and empty
-    const auto absent = iptables_direct_answer(v, nft_source(false, false, EAFNOSUPPORT));
+    // the same reads on a kernel with no nfnetlink (EPROTONOSUPPORT) are read and empty
+    const auto absent = iptables_direct_answer(v, nft_source(false, false, EPROTONOSUPPORT));
     CHECK(absent.state == NftVerdict::inactive);
     CHECK(absent.all_read);
+}
+
+TEST_CASE("a denied address family (EAFNOSUPPORT) with legacy gated out reads unknown, any account",
+          "[firewall]") {
+    // AF_NETLINK refused (systemd RestrictAddressFamilies=, seccomp) while an nf_tables ruleset is
+    // in force that no read showed. The decision reads nothing about the account: a non-root
+    // agent and a root agent with the family denied get the same inputs and the same answer.
+    for (const char* account : {"non-root", "root"}) {
+        INFO(account);
+        const auto src = nft_source(/*trusted=*/false, /*tables_seen=*/false, EAFNOSUPPORT);
+        REQUIRE(src == NftSource::unreadable);
+        auto v = matrix_family(false, IptCase::legacy_gated_out);
+        for (auto& r : matrix_family(true, IptCase::legacy_gated_out))
+            v.push_back(std::move(r));
+        const auto a = iptables_direct_answer(v, src);
+        CHECK(a.state == NftVerdict::unknown);
+        CHECK_FALSE(a.all_read); // no count, and `rules|unknown`
+        // `active` still stands when a table that was read has content
+        auto ruled = matrix_family(false, IptCase::legacy_rules);
+        for (auto& r : matrix_family(true, IptCase::legacy_gated_out))
+            ruled.push_back(std::move(r));
+        CHECK(iptables_direct_answer(ruled, src).state == NftVerdict::active);
+        CHECK_FALSE(iptables_direct_answer(ruled, src).all_read);
+    }
+}
+
+TEST_CASE("root, family denied: an inactive ufw reads unknown and has no count", "[firewall]") {
+    const auto src = nft_source(false, false, EAFNOSUPPORT);
+    // the state clamp try_ufw_state applies, and the flag that withholds its count
+    CHECK(gate_state_on_completeness(true, nft_unshown(src), FwState::disabled) ==
+          FwState::unknown);
+    CHECK(nft_unshown(src)); // try_ufw_state and try_ufw_rules write ruleset|unknown
+    // an active ufw still stands
+    CHECK(gate_state_on_completeness(true, nft_unshown(src), FwState::enabled) ==
+          FwState::enabled);
+    // a kernel with no nfnetlink leaves ufw to answer alone
+    const auto none = nft_source(false, false, EPROTONOSUPPORT);
+    CHECK(gate_state_on_completeness(true, nft_unshown(none), FwState::disabled) ==
+          FwState::disabled);
+    CHECK_FALSE(nft_unshown(none));
 }

@@ -1101,10 +1101,13 @@ nft_dump_generation(std::span<const std::byte> buf, std::uint16_t expected_type)
 /// How an open_nft_socket() failure should be handled by the caller.
 enum class OpenNftErrClass {
     fd_exhausted,      // EMFILE/ENFILE -- a system-wide condition worth surfacing
-    unsupported,       // EPROTONOSUPPORT/EAFNOSUPPORT -- this kernel has no
-                       // NETLINK_NETFILTER at all; not worth a diagnostic row. A
-                       // denied address family (systemd RestrictAddressFamilies=
-                       // answers EAFNOSUPPORT) reads the same way: no row.
+    unsupported,       // EPROTONOSUPPORT -- this kernel has no NETLINK_NETFILTER
+                       // (no nfnetlink): the one open failure that counts as
+                       // "no nf_tables" (nft_source). No row.
+    family_denied,     // EAFNOSUPPORT -- AF_NETLINK itself was refused (systemd
+                       // RestrictAddressFamilies=, seccomp). Not evidence that
+                       // nf_tables is absent: nft_source reads it as unreadable.
+                       // No row.
     permission_denied, // EPERM/EACCES -- socket()/bind() itself was refused
                        // (seccomp, AppArmor). Distinct
                        // from `other`: this is diagnosable and actionable the
@@ -1118,8 +1121,10 @@ enum class OpenNftErrClass {
 [[nodiscard]] inline OpenNftErrClass classify_open_errno(int err) noexcept {
     if (err == EMFILE || err == ENFILE)
         return OpenNftErrClass::fd_exhausted;
-    if (err == EPROTONOSUPPORT || err == EAFNOSUPPORT)
+    if (err == EPROTONOSUPPORT)
         return OpenNftErrClass::unsupported;
+    if (err == EAFNOSUPPORT)
+        return OpenNftErrClass::family_denied;
     if (err == EPERM || err == EACCES)
         return OpenNftErrClass::permission_denied;
     return OpenNftErrClass::other;
@@ -1127,8 +1132,9 @@ enum class OpenNftErrClass {
 
 /// The diagnostic rows for the socket-open errnos one probe collected, each actionable row once
 /// and in the order it was first seen: `fd_exhausted` and `permission_denied` only. `unsupported`
-/// (this kernel has no NETLINK_NETFILTER) and `other` stay silent. The three dumps of a pass, and
-/// the re-run, hit the same condition together, so one row says it, not one per dump.
+/// (this kernel has no NETLINK_NETFILTER), `family_denied` and `other` stay silent. The three
+/// dumps of a pass, and the re-run, hit the same condition together, so one row says it, not one
+/// per dump.
 [[nodiscard]] inline std::vector<std::string> nft_open_diag_rows(std::span<const int> errnos) {
     std::vector<std::string> rows;
     auto add = [&rows](std::string row) {
@@ -1144,6 +1150,7 @@ enum class OpenNftErrClass {
             add("error|nftables:socket:eperm");
             break;
         case OpenNftErrClass::unsupported:
+        case OpenNftErrClass::family_denied:
         case OpenNftErrClass::other:
             break;
         }
@@ -1154,10 +1161,11 @@ enum class OpenNftErrClass {
 /// What the netlink read of the nf_tables ruleset came to, for the narrower rungs (ufw, the direct
 /// iptables legs) that answer after it. `read`: every dump of the last pass was trusted. `absent`:
 /// the table socket could not be opened because this kernel has no NETLINK_NETFILTER (the
-/// `unsupported` open class, which a denied address family also answers), and no earlier pass saw
-/// a table, so no nf_tables ruleset is there to hold rules. `unreadable`: anything else (a refused
-/// or failed table dump, EPERM included, a socket refused for any other reason, or a pass that saw
-/// a table, or none, and could not trust its chains or rules): the ruleset may hold rules no read
+/// `unsupported` open class, EPROTONOSUPPORT only), and no earlier pass saw a table, so no
+/// nf_tables ruleset is there to hold rules. `unreadable`: anything else (a refused or failed
+/// table dump, EPERM included, a denied address family (EAFNOSUPPORT: the family was refused, which
+/// says nothing about nf_tables), a socket refused for any other reason, or a pass that saw a
+/// table, or none, and could not trust its chains or rules): the ruleset may hold rules no read
 /// showed, so no narrower rung may answer `inactive` or a count.
 enum class NftSource { read, unreadable, absent };
 
