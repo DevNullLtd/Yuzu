@@ -1610,17 +1610,44 @@ enum class IptablesNamesOutcome { listed, none, unreadable };
 
 enum class IptablesTableAction { run, empty, unread };
 
-/// What to do for each of kIptablesDirectTables of one family, from the names read and whether the
-/// family's tool is installed. `unread_listed` holds a listed table that is not one of the four.
+/// Which implementation a tool is, from its own `--version` line (`iptables v1.8.7 (nf_tables)` or
+/// `(legacy)`). Only `legacy` keeps its tables in the /proc/net names files; an nf_tables shim
+/// keeps them in nf_tables, so the names files say nothing about its rules. A run that failed or
+/// timed out, did not start, was not complete, or printed neither marker (or both) is `unknown`,
+/// which is never read as legacy.
+enum class IptablesFlavour { legacy, nf_tables, unknown };
+
+[[nodiscard]] inline IptablesFlavour parse_iptables_flavour(bool tool_ran, bool exit_ok,
+                                                            bool complete,
+                                                            std::string_view output) {
+    if (!tool_ran || !exit_ok || !complete)
+        return IptablesFlavour::unknown;
+    const bool nft = output.find("(nf_tables)") != std::string_view::npos;
+    const bool legacy = output.find("(legacy)") != std::string_view::npos;
+    if (nft == legacy)
+        return IptablesFlavour::unknown;
+    return nft ? IptablesFlavour::nf_tables : IptablesFlavour::legacy;
+}
+
+/// What to do for each of kIptablesDirectTables of one family. The kernel's table list gates the
+/// runs only for a tool that is `legacy` (its tables are the ones the names files list). A tool
+/// that is an nf_tables shim or of unknown flavour runs every table: the names files say nothing
+/// about nf_tables rules, and a run that is not ok is unread (never empty, never skipped). A tool
+/// that is not installed cannot be run: the names alone say whether tables exist for it.
+/// `unread_listed` holds a legacy-listed table that is not one of the four.
 struct IptablesFamilyPlan {
     std::array<IptablesTableAction, 4> action{};
     std::vector<std::string> unread_listed;
 };
 
-[[nodiscard]] inline IptablesFamilyPlan plan_iptables_family(IptablesNamesOutcome names,
-                                                             std::string_view names_text,
-                                                             bool tool_installed) {
+[[nodiscard]] inline IptablesFamilyPlan
+plan_iptables_family(IptablesFlavour flavour, IptablesNamesOutcome names,
+                     std::string_view names_text, bool tool_installed) {
     IptablesFamilyPlan plan;
+    if (tool_installed && flavour != IptablesFlavour::legacy) {
+        plan.action.fill(IptablesTableAction::run);
+        return plan;
+    }
     plan.action.fill(IptablesTableAction::unread); // an unreadable names file: nothing is known
     if (names == IptablesNamesOutcome::unreadable)
         return plan;

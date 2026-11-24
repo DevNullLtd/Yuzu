@@ -439,8 +439,19 @@ DIRECT_IPTABLES_PINS = (
      r'const char\* tool = ip6 \? "/usr/sbin/ip6tables" : "/usr/sbin/iptables";'),
     ("each family's own names file",
      r'read_xt_names\( ?ip6 \? "/proc/net/ip6_tables_names" : "/proc/net/ip_tables_names" ?\)'),
-    ("the plan decided by plan_iptables_family from the names read and the tool's presence",
-     r"plan_iptables_family\( ?names\.outcome, names\.text, ::access\(tool, X_OK\) == 0 ?\)"),
+    ("the tool's presence checked once per family",
+     r"const bool installed = ::access\(tool, X_OK\) == 0;"),
+    ("the flavour starting as unknown (a version run that is not made gates nothing)",
+     r"auto flavour = yuzu::firewall::IptablesFlavour::unknown;"),
+    ("the one literal `<tool> --version` run, on the remaining deadline, only for an installed tool",
+     r'if \( ?installed ?\) \{ const auto left = yuzu::firewall::remaining_ms\(deadline\); '
+     r'if \( ?left\.count\(\) > 0 ?\) \{ const auto ver = run_bounded_subprocess\( ?\{tool, "--version"\}, '
+     r"SubprocessOptions\{\.deadline = left\} ?\);"),
+    ("the flavour parsed from the version run's own ran, exit, completeness and output",
+     r"flavour = yuzu::firewall::parse_iptables_flavour\( ?ver\.tool_ran, ver\.exit_code == 0, "
+     r"subprocess_complete\(ver\), ver\.output ?\);"),
+    ("the plan decided by plan_iptables_family from the flavour, the names read and the tool's presence",
+     r"plan_iptables_family\( ?flavour, names\.outcome, names\.text, installed ?\)"),
     ("every table of kIptablesDirectTables, by index",
      r"i < yuzu::firewall::kIptablesDirectTables\.size\(\)"),
     ("a table that is not to run, or has no time left, pushed as a read (never skipped)",
@@ -463,8 +474,8 @@ def direct_iptables_problems(live):
     text = squash(body)
     out = [f"read_iptables_tables no longer has {what}" for what, pat in DIRECT_IPTABLES_PINS
            if not re.search(pat, text)]
-    if len(re.findall(r"run_bounded_subprocess\(", text)) != 1:
-        out.append("read_iptables_tables spawns other than its one `-t <table> -S` run")
+    if len(re.findall(r"run_bounded_subprocess\(", text)) != 2:
+        out.append("read_iptables_tables spawns other than its `--version` run and its `-t <table> -S` run")
     return out
 
 
@@ -736,6 +747,16 @@ _HELD_ROWS = r"\{\s*for \(const auto& row : firewalld\.rows\)\s*ctx\.write_outpu
 
 LINUX_MUTATIONS = [
     # the root direct iptables read: nat dropped by an off-by-one, the IPv6 pass dropped, a swapped tool
+    # the flavour: the version run dropped, parsed from the wrong run result, gating handed the wrong flavour
+    (_lmut(r"const auto ver = run_bounded_subprocess\(\{tool, \"--version\"\},\s*SubprocessOptions\{\.deadline = left\}\);",
+           'const auto ver = run_bounded_subprocess({tool, "-V"}, SubprocessOptions{.deadline = left});'),
+     "read_iptables_tables no longer has the one literal"),
+    (_lmut(r"ver\.tool_ran, ver\.exit_code == 0", "true, ver.exit_code == 0"),
+     "read_iptables_tables no longer has the flavour parsed"),
+    (_lmut(r"plan_iptables_family\(flavour, names\.outcome", "plan_iptables_family(yuzu::firewall::IptablesFlavour::legacy, names.outcome"),
+     "read_iptables_tables no longer has the plan decided"),
+    (_lmut(r"auto flavour = yuzu::firewall::IptablesFlavour::unknown;", "auto flavour = yuzu::firewall::IptablesFlavour::legacy;"),
+     "read_iptables_tables no longer has the flavour starting as unknown"),
     (_lmut(r"i < yuzu::firewall::kIptablesDirectTables\.size\(\)",
            "i + 1 < yuzu::firewall::kIptablesDirectTables.size()"), "read_iptables_tables no longer has every table"),
     (_lmut(r"for \(const bool ip6 : \{false, true\}\)", "for (const bool ip6 : {false})"),
@@ -990,6 +1011,24 @@ class LinuxSnapshotWiring(unittest.TestCase):
                 p = linux_problems(mutated, self.reader)
                 self.assertTrue(p, "mutation was NOT detected by the gate")
                 self.assertTrue(any(expected in m for m in p), f"expected {expected!r} in {p}")
+
+    def test_the_flavour_gate_is_pinned(self):
+        hpp = PARSERS_HPP.read_text(encoding="utf-8")
+        gate = r"if \(tool_installed && flavour != IptablesFlavour::legacy\) \{\s*plan\.action\.fill\(IptablesTableAction::run\);"
+        parse = (r"if \(!tool_ran \|\| !exit_ok \|\| !complete\)\s*return IptablesFlavour::unknown;.*?"
+                 r"if \(nft == legacy\)\s*return IptablesFlavour::unknown;")
+        for what, pat in (("the shim and unknown flavours running every table", gate),
+                          ("a version run that failed, timed out or printed neither marker reading unknown", parse)):
+            self.assertTrue(re.search(pat, hpp, re.S), f"firewall_parsers.hpp no longer has {what}")
+        for what, pat, repl in (
+                ("unknown flavour gated like legacy", r"flavour != IptablesFlavour::legacy", "flavour == IptablesFlavour::nf_tables"),
+                ("a shim gated like legacy", r"flavour != IptablesFlavour::legacy", "false"),
+                ("a failed version run read as a flavour", r"if \(!tool_ran \|\| !exit_ok \|\| !complete\)", "if (false)"),
+                ("both markers read as a flavour", r"if \(nft == legacy\)", "if (false)")):
+            mutated, n = re.subn(pat, repl, hpp, count=1)
+            self.assertEqual(n, 1, "mutation changed nothing (stale pattern)")
+            self.assertFalse(re.search(gate, mutated, re.S) and re.search(parse, mutated, re.S),
+                             f"{what} was not detected")
 
     def test_the_direct_table_list_is_pinned(self):
         hpp = PARSERS_HPP.read_text(encoding="utf-8")

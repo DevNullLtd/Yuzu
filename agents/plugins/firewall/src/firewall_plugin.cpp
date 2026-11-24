@@ -1484,8 +1484,11 @@ struct XtNamesRead {
 }
 
 /// Reads the filter, raw, mangle and nat tables of iptables and of ip6tables (`-t <table> -S`), one
-/// bounded run each, for the tables the kernel lists (the pure plan_iptables_family decides which
-/// run; a table the kernel does not list reads empty and spawns nothing). All the runs share one
+/// bounded run each. Each tool is first asked its flavour once (`--version`). Only a legacy tool
+/// is gated by the kernel's table list (the pure plan_iptables_family decides which tables run;
+/// one the kernel does not list reads empty and spawns nothing, so no table module is autoloaded).
+/// An nf_tables shim, or a tool whose flavour could not be read, runs all four tables; for an
+/// unknown flavour a request for an unloaded table can load its module. All the runs share one
 /// deadline, computed once, so the leg stays inside kAcqDeadline; a run that has no time left, or
 /// whose process does not start or fails, is unread, never skipped. nullopt when `iptables` itself
 /// is not installed (the ladder ends at `none`); a missing `ip6tables` leaves its listed tables
@@ -1497,10 +1500,24 @@ struct XtNamesRead {
     std::vector<yuzu::firewall::IptablesTableRead> reads;
     for (const bool ip6 : {false, true}) {
         const char* tool = ip6 ? "/usr/sbin/ip6tables" : "/usr/sbin/iptables";
+        const bool installed = ::access(tool, X_OK) == 0;
+        // The flavour decides whether the kernel's table list may gate the runs (legacy only). One
+        // bounded `--version` run per tool on the shared deadline; a run that cannot be made, fails
+        // or prints neither marker is unknown flavour, which gates nothing.
+        auto flavour = yuzu::firewall::IptablesFlavour::unknown;
+        if (installed) {
+            const auto left = yuzu::firewall::remaining_ms(deadline);
+            if (left.count() > 0) {
+                const auto ver = run_bounded_subprocess({tool, "--version"},
+                                                        SubprocessOptions{.deadline = left});
+                flavour = yuzu::firewall::parse_iptables_flavour(
+                    ver.tool_ran, ver.exit_code == 0, subprocess_complete(ver), ver.output);
+            }
+        }
         const auto names =
             read_xt_names(ip6 ? "/proc/net/ip6_tables_names" : "/proc/net/ip_tables_names");
-        const auto plan = yuzu::firewall::plan_iptables_family(names.outcome, names.text,
-                                                               ::access(tool, X_OK) == 0);
+        const auto plan =
+            yuzu::firewall::plan_iptables_family(flavour, names.outcome, names.text, installed);
         for (std::size_t i = 0; i < yuzu::firewall::kIptablesDirectTables.size(); ++i) {
             const auto table = yuzu::firewall::kIptablesDirectTables[i];
             const auto left = yuzu::firewall::remaining_ms(deadline);
