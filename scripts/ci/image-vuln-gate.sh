@@ -358,7 +358,7 @@ summary_header() {
     summary "### Image vulnerability gate (Trivy ${TRIVY_VERSION}, DB ${DB_REF}, UpdatedAt ${db_updated}; grype ${GRYPE_VERSION}, DB ${GRYPE_DB_REF})"
     summary ""
     if [ "${#GRYPE_DB_WAIVERS[@]}" -gt 0 ]; then
-        summary "**DEGRADED: provider waiver in force** for grype DB provider(s) $(waived_desc), older than 72 hours: every image judged while it is in force uses it (each grype .gate.txt names the waiver)."
+        summary "**Provider waiver in force** for grype DB provider(s) $(waived_desc), older than 72 hours: an image that passes while it is in force is marked in its report, its row and the end-of-run line (each grype .gate.txt names the waiver)."
         summary ""
     fi
     summary "| Image | OS packages | Coverage | Result |"
@@ -379,10 +379,11 @@ grype_ignore_desc="(not validated)"
 GRYPE_DB_WAIVERS=()
 IMAGE_WAIVERS=()
 declare -A waived_providers=()
+n_degraded=0
 UNJUDGED=0
-IMAGE_LAPSED=0
-# Set once an image found the run-wide waiver lapsed (a run crossing UTC
-# midnight on its expiry day), so images reported later say so too.
+IMAGE_RECHECK=ok
+# Set once an image positively found the run-wide waiver stale and not waived
+# (a run crossing UTC midnight on its expiry day), so images reported later say so.
 RUN_LAPSED=0
 ABORT_REASON=""
 declare -A reported=()
@@ -419,7 +420,7 @@ write_grype_gate_txt() {
         [ -z "$ATTEMPT" ] || echo "run attempt: $ATTEMPT"
         echo "grype: $GRYPE_VERSION"
         echo "grype db: $GRYPE_DB_REF"
-        waiver_lines
+        waiver_lines "$res"
         [ $# -eq 0 ] || printf '%s\n' "$@"
         echo "ignore file: $grype_ignore_desc"
         echo "gate: $res"
@@ -428,11 +429,13 @@ write_grype_gate_txt() {
     grype_reported[$n]=1
 }
 
-# waiver_lines: the provider waivers used for the image being reported, one
-# `provider waiver: ...` line each and a `DEGRADED: ...` line, or a line saying
-# none was used. Never a line a `gate:` reader would count.
+# waiver_lines RESULT: the provider waiver lines for the image being reported.
+# The contract: a `DEGRADED:` line appears ONLY when the image PASSED under a
+# waiver; a waiver that lapsed is reported only with an explicit `stale and not
+# waived` line; every other case says the waiver admitted nothing. Never a line
+# a `gate:` reader would count.
 waiver_lines() {
-    local w provs=""
+    local res="$1" w provs=""
     if [ $((${#GRYPE_DB_WAIVERS[@]} + ${#IMAGE_WAIVERS[@]})) -eq 0 ]; then
         echo "provider waiver: none used"
         return 0
@@ -440,20 +443,25 @@ waiver_lines() {
     if [ "$UNJUDGED" = 1 ]; then
         # The run's waiver was in force (or lapsed), but this image was never judged.
         if [ "$RUN_LAPSED" = 1 ]; then
-            echo "provider waiver: lapsed during this run ($(waived_desc run)), and the image was not judged"
+            echo "provider waiver: stale and not waived: the $(waived_desc run) waiver lapsed during this run, and the image was not judged"
         else
             echo "provider waiver: in force for this run ($(waived_desc)), but the image was not judged"
         fi
         return 0
     fi
-    if [ "$IMAGE_LAPSED" = 1 ]; then
-        # The run-wide (nvd) waiver lapsed before this image was judged: name
-        # only that one as lapsed; an OS-provider waiver the image did use is
-        # still listed. The image failed, so nothing here says DEGRADED.
-        echo "provider waiver: lapsed during this run ($(waived_desc run)), so it did not admit the stale provider for this image"
-        for w in "${IMAGE_WAIVERS[@]}"; do
-            echo "provider waiver: ${w#waiver: }"
-        done
+    case "$IMAGE_RECHECK" in
+        lapsed)
+            echo "provider waiver: stale and not waived: the $(waived_desc run) waiver lapsed during this run, so it did not admit the stale provider for this image"
+            return 0 ;;
+        unreadable)
+            echo "provider waiver: not admitted: the waivers file could not be read again for this image"
+            return 0 ;;
+        failed)
+            echo "provider waiver: not admitted: re-checking the run's provider waiver failed for this image (see the run log)"
+            return 0 ;;
+    esac
+    if [ "$res" != pass ]; then
+        echo "provider waiver: in force ($(waived_desc)), but the image did not pass, so nothing was admitted by it"
         return 0
     fi
     for w in "${GRYPE_DB_WAIVERS[@]}" "${IMAGE_WAIVERS[@]}"; do
@@ -497,7 +505,7 @@ report_unjudged() {
     fi
     UNJUDGED=1
     IMAGE_WAIVERS=()
-    IMAGE_LAPSED=0
+    IMAGE_RECHECK=ok
     for i in "${!NAMES[@]}"; do
         if [ -z "${reported[${NAMES[$i]}]:-}" ]; then
             write_gate_txt "${NAMES[$i]}" "${REFS[$i]}" "$res" || true
@@ -814,10 +822,9 @@ printf '%s\n' "$gprov" | sed 's/^/    /'
 mapfile -t GRYPE_DB_WAIVERS < <(printf '%s\n' "$gprov" | grep '^waiver: ' || true)
 for w in "${GRYPE_DB_WAIVERS[@]}"; do
     w="${w#waiver: provider }"
-    waived_providers[${w%% *}]=1
-    [ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::DEGRADED: provider waiver in force: grype DB provider ${w%% *} is older than 72 hours (every image)"
+    [ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::provider waiver in force: grype DB provider ${w%% *} is older than 72 hours (an image that passes under it is marked in its report)"
 done
-[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    DEGRADED: provider waiver in force for $(waived_desc): every image judged while it is in force uses it"
+[ "${#GRYPE_DB_WAIVERS[@]}" -eq 0 ] || echo "    provider waiver in force for $(waived_desc): an image that passes while it is in force is marked in its report"
 GRYPE_DB_REF="$GRYPE_DB_URL/$gdb_path ($gdb_sum, schema $gdb_schema, built $gdb_built)"
 printf '%s\n' "$gstat" | sed 's/^/    /'
 echo "    $GRYPE_DB_REF"
@@ -862,7 +869,7 @@ grype_scan() {
     local distro="?" matches="?" ignored="?" fcrit="?" fcrit_acc="?" gid="?"
     stem="grype-${n}${ATTEMPT_SUFFIX}"
     IMAGE_WAIVERS=()
-    IMAGE_LAPSED=0
+    IMAGE_RECHECK=ok
     gjson="$WORK/${stem}.json"
     gtable="$WORK/${stem}.txt"
     gcdx="$WORK/${stem}.cdx.json"
@@ -945,27 +952,33 @@ grype_scan() {
     rm -f "$ARCHIVE"
     # A run that started on a run-wide (nvd) waiver re-checks it for each image:
     # it may have lapsed since (a run crossing UTC midnight on its expiry day).
-    # A waivers file that cannot be read is told apart from a lapse.
-    local recheck="ok"
+    # A waivers file that cannot be read is told apart from a lapse, and a lapse
+    # is only the checker's positive "stale and no waiver admits it" answer; any
+    # other failure is reported as a failed re-check, never as a lapse.
     if [ "${#GRYPE_DB_WAIVERS[@]}" -gt 0 ] && ! "${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" \
             --waivers "$GRYPE_WAIVERS" "${GRYPE_REQUIRED_PROVIDERS[@]}" > /dev/null 2>"$WORK/grype-recheck.err"; then
         cat "$WORK/grype-recheck.err" >&2 || true
         if grep -q '^provider waivers .* missing or unreadable' "$WORK/grype-recheck.err"; then
-            recheck="unreadable"
-        else
-            recheck="lapsed"
-            IMAGE_LAPSED=1
+            IMAGE_RECHECK="unreadable"
+        elif grep -q 'only a reviewed provider waiver for' "$WORK/grype-recheck.err"; then
+            IMAGE_RECHECK="lapsed"
             RUN_LAPSED=1
+        else
+            IMAGE_RECHECK="failed"
         fi
     fi
     case "$rc" in
-        0) if [ "$recheck" = lapsed ]; then
+        0) if [ "$IMAGE_RECHECK" = lapsed ]; then
                err "$img: the $(waived_desc run) provider waiver lapsed during this run, so the stale provider is not admitted for this image (treated as a failure)"
                gres="FAIL: provider waiver lapsed during the run"
                failed=1
-           elif [ "$recheck" = unreadable ]; then
+           elif [ "$IMAGE_RECHECK" = unreadable ]; then
                err "$img: the provider waivers could not be read again for this image (above; treated as a failure)"
                gres="FAIL: provider waivers unreadable"
+               failed=1
+           elif [ "$IMAGE_RECHECK" = failed ]; then
+               err "$img: re-checking the run's provider waiver failed for this image (above; treated as a failure)"
+               gres="FAIL: provider waiver re-check failed"
                failed=1
            elif [ -n "$want_family" ] && ! pinfo="$("${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" \
                    --waivers "$GRYPE_WAIVERS" "$want_family")"; then
@@ -1002,16 +1015,23 @@ grype_scan() {
     # The image's own provider waiver, when the OS provider check above used one
     # (pinfo holds that check's output; a failed check prints no `waiver:` line).
     mapfile -t IMAGE_WAIVERS < <(printf '%s\n' "$pinfo" | grep '^waiver: ' || true)
-    local wdesc w
-    wdesc="$(waived_desc)"
-    for w in "${IMAGE_WAIVERS[@]}"; do
-        [ "$IMAGE_LAPSED" = 0 ] || break
-        w="${w#waiver: provider }"
-        waived_providers[${w%% *}]=1
-        printf '    %s\n' "DEGRADED: provider waiver in force: grype DB provider ${w%% *} is older than 72 hours"
-        [ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::$n: DEGRADED: provider waiver in force: grype DB provider ${w%% *} is older than 72 hours"
-    done
-    if [ -n "$wdesc" ] && [ "$IMAGE_LAPSED" = 0 ]; then
+    local wdesc="" w
+    if [ "$gres" = pass ]; then
+        # DEGRADED only here: the image passed under a waiver. The end-of-run
+        # line counts exactly these images.
+        wdesc="$(waived_desc)"
+        [ -z "$wdesc" ] || n_degraded=$((n_degraded + 1))
+        for w in "${GRYPE_DB_WAIVERS[@]}" "${IMAGE_WAIVERS[@]}"; do
+            w="${w#waiver: provider }"
+            waived_providers[${w%% *}]=1
+        done
+        for w in "${IMAGE_WAIVERS[@]}"; do
+            w="${w#waiver: provider }"
+            printf '    %s\n' "DEGRADED: provider waiver in force: grype DB provider ${w%% *} is older than 72 hours"
+            [ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::$n: DEGRADED: provider waiver in force: grype DB provider ${w%% *} is older than 72 hours"
+        done
+    fi
+    if [ -n "$wdesc" ]; then
         summary "| $n (grype) | - | distro ${distro:-none} | $gres (DEGRADED: provider waiver in force: $wdesc) |"
     else
         summary "| $n (grype) | - | distro ${distro:-none} | $gres |"
@@ -1028,7 +1048,7 @@ grype_scan() {
     fi
     grype_reported[$n]=1
     IMAGE_WAIVERS=()
-    IMAGE_LAPSED=0
+    IMAGE_RECHECK=ok
 }
 
 # ── Scan ─────────────────────────────────────────────────────────────────────
@@ -1156,10 +1176,10 @@ for idx in "${!NAMES[@]}"; do
     grype_scan "$name" "$image" "$want_family"
 done
 
-if [ "${#waived_providers[@]}" -gt 0 ]; then
+if [ "$n_degraded" -gt 0 ]; then
     wsum="$(printf '%s\n' "${!waived_providers[@]}" | sort | paste -sd, - | sed 's/,/, /g')"
-    echo "DEGRADED: provider waiver in force for grype DB provider(s) $wsum (older than 72 hours; each grype .gate.txt names the waiver)"
+    echo "DEGRADED: provider waiver in force for grype DB provider(s) $wsum (older than 72 hours): $n_degraded image(s) passed under it; each grype .gate.txt names the waiver"
     summary ""
-    summary "**DEGRADED: provider waiver in force** for grype DB provider(s) $wsum (older than 72 hours; each grype .gate.txt names the waiver)."
+    summary "**DEGRADED: provider waiver in force** for grype DB provider(s) $wsum (older than 72 hours): $n_degraded image(s) passed under it; each grype .gate.txt names the waiver."
 fi
 exit "$failed"
