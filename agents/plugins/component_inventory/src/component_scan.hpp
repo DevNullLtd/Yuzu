@@ -80,10 +80,11 @@ inline constexpr std::string_view kSourceUnreadable = "unreadable";
 inline constexpr std::size_t kMaxEntryBytes = 64 * 1024;
 
 struct Row {
-    std::string kind{"java"}; // the wire row's second field: java | native
+    std::string kind{"java"}; // the wire row's second field: java | native | python | node
     std::string name;
     std::string version;
-    std::string version_source; // java: filename | pom | manifest | unreadable; native: filename | elf | macho | unreadable
+    std::string version_source; // java: filename | pom | manifest | unreadable; native: filename | elf | macho | unreadable;
+                                // python: metadata | filename | unreadable; node: package_json | unreadable
     std::string path;           // nested: <outer>!<entry>
     std::uint64_t size{0};
     std::int64_t mtime{0};
