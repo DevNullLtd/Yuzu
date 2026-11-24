@@ -687,6 +687,8 @@ agent_test_exe = executable(
     'unit/test_component_zip.cpp',               # component_inventory: bounded zip reader (wave 1)
     'unit/test_component_java_parsers.cpp',      # component_inventory: Java manifest/pom parsers (wave 1)
     'unit/test_component_native_parsers.cpp',    # component_inventory: the native adapter over the shared binary_header readers (outcome mapping, universal slice choice), name and version rules, deterministic sweep (SAM-22)
+    'unit/test_component_python_parsers.cpp',    # component_inventory: Python distribution metadata parsers over real captured METADATA, PKG-INFO and egg-info fixtures (SAM-49)
+    'unit/test_component_node_parsers.cpp',      # component_inventory: Node package.json reader and node_modules path shape over real captured fixtures (SAM-49)
     'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
     'unit/test_component_walk_ordered.cpp',      # file search core: sorted depth-first resumable walk_ordered over MemTree and a fake clock, unguarded on every OS
     'unit/test_file_search_walk_win_macros.cpp', # file search core: the walker and the driver compile with min and max defined as function-like macros (the #8272 acceptance; the macros are Windows-only)
@@ -706,6 +708,7 @@ agent_test_exe = executable(
     'unit/test_file_search_local_dispatcher.cpp', # file search plugin: real plugin via LocalDispatcher, unguarded on every OS (one real slice over a fixture under the build root on POSIX)
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
     'unit/test_component_native_scan.cpp',       # component_inventory: native-library scan over an in-memory tree and a fake clock; one POSIX-only case through the real leg and parsers (SAM-22)
+    'unit/test_component_pkg_scan.cpp',          # component_inventory: Python and Node scans over an in-memory tree and a fake clock (SAM-49)
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
     'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
@@ -5794,6 +5797,16 @@ test('dashboard audit checked lexical',
 test('Echo security wiring lexical gate',
   _python3_test,
   args: [files('test_echo_security_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# Echo corruption-audit gate signals: server.cpp's pre-seeds of the three new counters (the
+# quarantine alert's 0 sample), the wrote-guarded quarantine increment, the degraded-observer
+# counter and the sweep gauge, plus DegradedCause vs its pre-seed list. server.cpp is built by no
+# Mac unit binary; the script self-checks its detector.
+test('Echo corruption-audit gate wiring lexical gate',
+  _python3_test,
+  args: [files('test_corruption_audit_gate_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

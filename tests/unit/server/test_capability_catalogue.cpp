@@ -856,17 +856,17 @@ TEST_CASE("capability catalogue: runtimes.dotnet, runtimes.jvm and runtimes.pyth
     }
 }
 
-/// Exact-row pin for `component_inventory.scan` and `component_inventory.native`, the two rows of
-/// its fragment. `Inventory` (a software-inventory fact), not `Infrastructure`: both are seeded
+/// Exact-row pin for `component_inventory.scan`, `.native`, `.python` and `.node`, the four rows of
+/// its fragment. `Inventory` (a software-inventory fact), not `Infrastructure`: all four are seeded
 /// securables, so the generic invariants accept either and only this pin catches a silent
 /// re-typing. `native` ships off through an action-level kill-switch seed, so its gate stays None:
-/// a gate here would be a second, different off-switch.
-TEST_CASE("capability catalogue: component_inventory.scan and .native pin their exact classification",
+/// a gate here would be a second, different off-switch. `python` and `node` ship enabled, gate None.
+TEST_CASE("capability catalogue: component_inventory's four rows pin their exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_component_inventory();
-    REQUIRE(rows.size() == 2);
-    const char* const kActions[] = {"scan", "native"};
-    for (std::size_t i = 0; i < 2; ++i) {
+    REQUIRE(rows.size() == 4);
+    const char* const kActions[] = {"scan", "native", "python", "node"};
+    for (std::size_t i = 0; i < 4; ++i) {
         const auto& row = rows[i];
         INFO("action " << kActions[i]);
         CHECK(row.plugin == "component_inventory");

@@ -146,10 +146,10 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // middleware ibm_mq added by SAM.2; runtimes python added 2026-10-28; hardware drivers_inventory
 // added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added 2026-11-08,
 // virtualization runtime_posture added by PR12.1-b2; firewall quarantine, release, quarantine_status
-// and quarantine_allow added by PRQ.1; PRQ.2 removed the old containment plugin's four rows; component_inventory scan added by SAM-16 and native by SAM-22, Windows leg
-// planned for both; process_introspect inspect added by PR13.1-a, Windows and macOS legs planned so applicable on all three;
-// file_search search added with the file_search plugin, applicable on all three), 252 rows.
-inline constexpr std::array<UnitOsRow, 252> kUnitOs{{
+// and quarantine_allow added by PRQ.1; PRQ.2 removed the old containment plugin's four rows; component_inventory scan added by SAM-16, native by SAM-22 and python and node
+// by SAM-49 (POSIX legs supported, Windows leg planned for all four); process_introspect inspect added by PR13.1-a, Windows and macOS legs planned so applicable on all three;
+// file_search search added with the file_search plugin, applicable on all three), 254 rows.
+inline constexpr std::array<UnitOsRow, 254> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -179,6 +179,8 @@ inline constexpr std::array<UnitOsRow, 252> kUnitOs{{
     {"chargen", "chargen_stop", kWin | kLin | kMac},
     {"component_inventory", "scan", kWin | kLin | kMac},
     {"component_inventory", "native", kWin | kLin | kMac},
+    {"component_inventory", "python", kWin | kLin | kMac},
+    {"component_inventory", "node", kWin | kLin | kMac},
     {"content_dist", "stage", kWin | kLin | kMac},
     {"content_dist", "execute_staged", kWin | kLin | kMac},
     {"content_dist", "list_staged", kWin | kLin | kMac},
