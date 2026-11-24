@@ -1020,6 +1020,19 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "non-admin also needs approval); pid from crossplatform.process.list; a degraded read is "
          "CONSTRAINED, never an empty OK; no_such_process* and pid_reused terminal, torn_read "
          "retryable"},
+        {"file_search.search",
+         "On-demand, resumable search of the local disks of one device under an absolute root, by "
+         "leaf-name pattern: names, types, sizes, times and the extents of every matched file; "
+         "matched files are opened and never read and no file content is read or hashed. One call is one slice: "
+         "repeat with the cursor row until a slice answers without one, and read the coverage row "
+         "(an empty result is never confusable with a partial or failed one). Linux and macOS, "
+         "Windows is planned; read-only, default-off, AdminOrApproval; stored results are "
+         "readable only with Forensics:Read; busy, timed_out, rejected, no_progress retryable "
+         "on the same cursor; bad_cursor, max_slices, mount_table_changed terminal; each slice "
+         "is its own dispatch, and a non-admin on the supervised MCP tier needs ONE approval "
+         "for the whole search (the first slice spends it, later slices that carry the cursor "
+         "ride it for 24 hours, or until the approval's 7-day lifetime ends, whichever comes "
+         "first)"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},

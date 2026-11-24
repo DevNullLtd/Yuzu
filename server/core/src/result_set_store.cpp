@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -262,12 +263,27 @@ ResultSet read_row(PGresult* res, int i) {
     return r;
 }
 
-std::vector<std::string_view> as_views(const std::vector<std::string>& v) {
-    std::vector<std::string_view> out;
-    out.reserve(v.size());
-    for (const auto& s : v)
-        out.emplace_back(s);
-    return out;
+// The caller owns the transaction. A failed batch or pending-state guard rolls
+// back every preceding batch together with the header change.
+bool insert_members(PGconn* conn, const std::string& id, const std::vector<std::string>& members) {
+    constexpr std::size_t kBatchSize = 1000;
+    std::vector<std::string_view> batch;
+    batch.reserve(std::min(members.size(), kBatchSize));
+    for (std::size_t start = 0; start < members.size();) {
+        const auto count = std::min(kBatchSize, members.size() - start);
+        batch.assign(members.begin() + start, members.begin() + start + count);
+        auto result = pg::exec_params(
+            conn,
+            "INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
+            "SELECT $1, d FROM unnest($2::text[]) AS d ON CONFLICT DO NOTHING",
+            std::vector<std::string>{id, pg::to_text_array(batch)});
+        if (result.status() != PGRES_COMMAND_OK) {
+            spdlog::error("ResultSetStore: member insert failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        start += count;
+    }
+    return true;
 }
 
 // Shared by pin() (same connection, no extra round trip) and the public
@@ -347,7 +363,6 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
     row.agents_failed = req.agents_failed;
     row.agents_unanswered = req.agents_unanswered;
 
-    const std::vector<std::string_view> member_views = as_views(uniq);
     bool quota_exceeded = false;
 
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
@@ -394,19 +409,7 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
             return false;
         }
 
-        if (!uniq.empty()) {
-            pg::PgResult r2 = pg::exec_params(
-                conn,
-                "INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
-                "SELECT $1, d FROM unnest($2::text[]) AS d ON CONFLICT DO NOTHING",
-                std::vector<std::string>{row.id, pg::to_text_array(member_views)});
-            if (r2.status() != PGRES_COMMAND_OK && r2.status() != PGRES_TUPLES_OK) {
-                spdlog::error("ResultSetStore::insert_row_impl: member insert failed: {}",
-                              PQerrorMessage(conn));
-                return false;
-            }
-        }
-        return true;
+        return insert_members(conn, row.id, uniq);
     });
 
     if (!ok)
@@ -1062,22 +1065,11 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
             if (!dev.empty() && seen.insert(dev).second)
                 uniq.push_back(dev);
     }
-    const std::vector<std::string_view> member_views = as_views(uniq);
     bool not_found = false;
 
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        if (!uniq.empty()) {
-            pg::PgResult r = pg::exec_params(
-                conn,
-                "INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
-                "SELECT $1, d FROM unnest($2::text[]) AS d ON CONFLICT DO NOTHING",
-                std::vector<std::string>{id, pg::to_text_array(member_views)});
-            if (r.status() != PGRES_COMMAND_OK && r.status() != PGRES_TUPLES_OK) {
-                spdlog::error("ResultSetStore::materialize: member insert failed: {}",
-                              PQerrorMessage(conn));
-                return false;
-            }
-        }
+        if (!insert_members(conn, id, uniq))
+            return false;
         pg::PgResult upd = pg::exec_params(
             conn,
             // The counters ADD to what the pending row carries: a child inherits its parent's

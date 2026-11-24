@@ -4798,6 +4798,49 @@ MaterialisedRead materialise_and_read(AsyncHarness& h, ResponseStore& responses,
 
 } // namespace
 
+TEST_CASE("REST result-set producers store distinct members across insert batches",
+          "[pg][result_set][bulk_insert]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AsyncHarness h(pool);
+    h.all_agent_ids_override.clear();
+    for (int i = 0; i < 1001; ++i)
+        h.all_agent_ids_override.push_back(std::format("agent-{}", i));
+
+    int status = 0;
+    std::string set_id;
+    SECTION("operator list") {
+        auto ids = h.all_agent_ids_override;
+        ids.push_back(ids.front());
+        auto created = h.post("/api/v1/result-sets",
+                              nlohmann::json{{"name", "bulk"}, {"device_ids", ids}}.dump(), status);
+        REQUIRE(status == 201);
+        CHECK(created["data"]["device_count"] == 1001);
+        set_id = created["data"]["id"].get<std::string>();
+    }
+    SECTION("asynchronous echo query") {
+        ResponseStore responses{pool};
+        REQUIRE(responses.is_open());
+        auto created = h.post("/api/v1/result-sets/from-echo-query",
+                              R"({"sql":"SELECT pid FROM $Process_Hourly"})", status);
+        REQUIRE(status == 202);
+        set_id = created["data"]["id"].get<std::string>();
+        const auto pending = get_ok(*h.store, set_id);
+        REQUIRE(pending.has_value());
+        for (const auto& agent : h.all_agent_ids_override)
+            put_exec_row(responses, pending->source_execution_id, agent, 1, kOneRow, 100);
+        put_exec_row(responses, pending->source_execution_id, h.all_agent_ids_override.front(), 1,
+                     kOneRow, 200);
+        const auto read = materialise_and_read(h, responses, set_id, pending->source_execution_id);
+        CHECK(read.device_count == 1001);
+        CHECK_FALSE(read.partial);
+    }
+    const auto stored = h.store->member_set_owned(set_id, "operator-1");
+    REQUIRE(stored.has_value());
+    CHECK(*stored == std::unordered_set<std::string>(h.all_agent_ids_override.begin(),
+                                                      h.all_agent_ids_override.end()));
+}
+
 TEST_CASE("materialise: one agent that answers error|refused is counted and the set is partial",
           "[pg][result_set][async][echo][agents_failed]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
