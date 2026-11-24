@@ -5536,3 +5536,4 @@ comp|native|libredacted2530|16.200.37102.1|pe|C:/Program Files (x86)/App27/dir32
 comp|native|libredacted2531|16.200.37102.1|pe|C:/Program Files (x86)/App27/dir328/dir329/dir330/dir331/dir398/dir399/libredacted2531.dll|52808|1791839100|App27
 comp|native|libredacted2292|17.14.20609.2|pe|C:/Program Files (x86)/App27/dir328/dir329/dir330/dir331/dir398/dir399/libredacted2292.dll|37432|1791839084|App27
 [result_status] CONSTRAINED / PARTIAL / windows:component_inventory:dir_unreadable
+
