@@ -1097,6 +1097,9 @@ struct NftFallthroughInfo {
     /// answer, as the fallthrough rows of a pass that got past its table dump can: it names a
     /// re-run that failed after a pass that saw a table, not an account that cannot read.
     std::vector<std::string> pending_rows;
+    /// What the netlink read came to (the pure nft_source): the ufw and iptables rungs read it, and
+    /// answer neither `inactive` nor a count while the ruleset was not shown.
+    yuzu::firewall::NftSource netlink = yuzu::firewall::NftSource::unreadable;
 };
 
 /// Consecutive probes whose last pass still ended in torn or generation_changed. A trusted
@@ -1210,6 +1213,7 @@ struct NftProbeResult {
                     info.pending_rows.push_back(yuzu::firewall::nft_diag_row("table", table.res));
             }
             note_probe_end(/*ended_in_churn=*/false);
+            info.netlink = yuzu::firewall::nft_source(false, info.tables_seen, table.open_errno);
             return std::nullopt; // unreachable -- fall through
         }
         info.tables_seen = info.tables_seen || !yuzu::firewall::parse_nft_tables(table.buf).empty();
@@ -1238,6 +1242,7 @@ struct NftProbeResult {
     // BR-04: the pure decision, not a re-derived `&&` here: a pass with no failed dump is
     // trusted (#3463-2, #4400, #4401).
     result.trusted = failed.empty();
+    info.netlink = yuzu::firewall::nft_source(result.trusted, info.tables_seen, std::nullopt);
     const unsigned streak = note_probe_end(yuzu::firewall::nft_churn_only(failed));
     if (!result.trusted) {
         info.failed = failed;
@@ -1250,7 +1255,7 @@ struct NftProbeResult {
 
 /// true iff a trustworthy state| row was written (dispatch should stop);
 /// false means the caller continues probing ufw/iptables, clamped per
-/// `info.tables_seen` (C4). While `info.firewalld_running`, only an active
+/// `info.netlink` (C4). While `info.firewalld_running`, only an active
 /// ruleset answers: anything else returns false with no backend row, so
 /// firewalld's held answer is replaced only by a read that shows content.
 bool try_nftables_state(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
@@ -1382,12 +1387,12 @@ bool try_snapshot(yuzu::CommandContext& ctx, const NftFallthroughInfo& info,
 // site in this file — a distro that installs ufw elsewhere falls through to
 // iptables, same as ufw being genuinely absent.
 
-// `tables_seen` (true only when reached via nftables' C4 fallthrough, false
-// on the ordinary probe-order path where it's always a no-op) routes this
-// backend's own verdict through nft_fallthrough_clamp() before it's written,
-// so a "disabled" reading here can't contradict nftables tables already
-// known to exist.
-bool try_ufw_state(yuzu::CommandContext& ctx, bool tables_seen) {
+// `netlink` is what the netlink read came to. While it is unreadable (nft_unshown: a table
+// seen whose content was not trusted, or a refused or failed read) this backend's own verdict
+// goes through nft_fallthrough_clamp() before it is written and its count is withheld, so a
+// "disabled" reading here can't stand for a host whose nf_tables ruleset may hold rules no read
+// showed.
+bool try_ufw_state(yuzu::CommandContext& ctx, yuzu::firewall::NftSource netlink) {
     auto res = run_bounded_subprocess({"/usr/sbin/ufw", "status", "numbered"},
                                       SubprocessOptions{.deadline = kAcqDeadline});
     if (!res.tool_ran)
@@ -1413,13 +1418,14 @@ bool try_ufw_state(yuzu::CommandContext& ctx, bool tables_seen) {
     // way, plus a row that says why.
     const bool complete = subprocess_complete(res);
     const bool shaped = yuzu::firewall::ufw_shape_ok(res.output);
+    const bool unshown = yuzu::firewall::nft_unshown(netlink);
     auto state = yuzu::firewall::gate_state_on_completeness(
-        complete && shaped, tables_seen, yuzu::firewall::parse_ufw_status(res.output));
+        complete && shaped, unshown, yuzu::firewall::parse_ufw_status(res.output));
     ctx.write_output(std::format(
         "state|{}", state == yuzu::firewall::FwState::enabled    ? "active"
                     : state == yuzu::firewall::FwState::disabled ? "inactive"
                                                                   : "unknown"));
-    ctx.write_output(complete && shaped
+    ctx.write_output(complete && shaped && !unshown
                           ? std::format("ruleset|{}", yuzu::firewall::parse_ufw_rules(res.output).size())
                           : std::string("ruleset|unknown"));
     if (complete && !shaped)
@@ -1427,7 +1433,7 @@ bool try_ufw_state(yuzu::CommandContext& ctx, bool tables_seen) {
     return true;
 }
 
-bool try_ufw_rules(yuzu::CommandContext& ctx) {
+bool try_ufw_rules(yuzu::CommandContext& ctx, yuzu::firewall::NftSource netlink) {
     auto res = run_bounded_subprocess({"/usr/sbin/ufw", "status", "numbered"},
                                       SubprocessOptions{.deadline = kAcqDeadline});
     if (!res.tool_ran)
@@ -1443,12 +1449,16 @@ bool try_ufw_rules(yuzu::CommandContext& ctx) {
                                      sanitize_field(r.to), sanitize_field(r.action),
                                      sanitize_field(r.from)));
     }
-    // Rule rows already parsed stay written; only the trailing count is withheld when the output
-    // is not in a shape the parser knows (#4402), with the row that says why.
+    // Rule rows already parsed stay written; the trailing count is withheld when the output is not
+    // in a shape the parser knows (#4402), with the row that says why, and while the nf_tables
+    // ruleset was not shown, with `rules|unknown` (the list is not known to be complete).
     const bool complete = subprocess_complete(res);
     const bool shaped = yuzu::firewall::ufw_shape_ok(res.output);
-    ctx.write_output(complete && shaped ? std::format("ruleset|{}", rules.size())
-                                        : std::string("ruleset|unknown"));
+    const bool unshown = yuzu::firewall::nft_unshown(netlink);
+    if (unshown)
+        ctx.write_output("rules|unknown");
+    ctx.write_output(complete && shaped && !unshown ? std::format("ruleset|{}", rules.size())
+                                                        : std::string("ruleset|unknown"));
     if (complete && !shaped)
         ctx.write_output(yuzu::firewall::unrecognised_output_row("ufw"));
     return true;
@@ -1544,16 +1554,18 @@ struct XtNamesRead {
 
 // iptables has no on/off concept the way ufw/firewalld do: any policy other than the default
 // ACCEPT, or any non-policy entry in any table read, is "active"; only bare ACCEPT policies and
-// nothing else, in every table that could be read and with none unread, is "inactive". An
-// unreadable table (commonly EPERM -- iptables needs root/CAP_NET_ADMIN, and this is the last
-// backend in the probe order) is an honest unknown, never a false-safe "inactive". The decision is
-// the pure iptables_direct_answer's.
-bool try_iptables_state(yuzu::CommandContext& ctx, bool tables_seen) {
+// nothing else, in every table that could be read and with none unread, and with the nf_tables
+// ruleset read or absent (`netlink`), is "inactive". An unreadable table (commonly EPERM --
+// iptables needs root/CAP_NET_ADMIN, and this is the last backend in the probe order), or an
+// nf_tables ruleset the netlink read could not show, is an honest unknown, never a false-safe
+// "inactive".
+// The decision is the pure iptables_direct_answer's.
+bool try_iptables_state(yuzu::CommandContext& ctx, yuzu::firewall::NftSource netlink) {
     const auto reads = read_iptables_tables();
     if (!reads)
         return false;
     ctx.write_output("backend|iptables");
-    const auto answer = yuzu::firewall::iptables_direct_answer(*reads, tables_seen);
+    const auto answer = yuzu::firewall::iptables_direct_answer(*reads, netlink);
     ctx.write_output(std::format("state|{}", yuzu::firewall::nft_verdict_name(answer.state)));
     ctx.write_output(answer.all_read ? std::format("ruleset|{}", answer.appends)
                                      : std::string("ruleset|unknown"));
@@ -1562,16 +1574,17 @@ bool try_iptables_state(yuzu::CommandContext& ctx, bool tables_seen) {
     return true;
 }
 
-bool try_iptables_rules(yuzu::CommandContext& ctx) {
+bool try_iptables_rules(yuzu::CommandContext& ctx, yuzu::firewall::NftSource netlink) {
     const auto reads = read_iptables_tables();
     if (!reads)
         return false;
     ctx.write_output("backend|iptables");
-    const auto answer = yuzu::firewall::iptables_direct_answer(*reads, /*tables_seen=*/false);
+    const auto answer = yuzu::firewall::iptables_direct_answer(*reads, netlink);
     for (const auto& row : answer.rule_rows)
         ctx.write_output(row);
     // The rule rows of every table that was read stay written; the count is withheld unless every
-    // table was read, and `rules|unknown` says that the list is not known to be complete.
+    // table was read and the nf_tables ruleset was not left unshown, and `rules|unknown` says that
+    // the list is not known to be complete.
     if (!answer.all_read)
         ctx.write_output("rules|unknown");
     ctx.write_output(answer.all_read ? std::format("ruleset|{}", answer.appends)
@@ -1584,9 +1597,10 @@ bool try_iptables_rules(yuzu::CommandContext& ctx) {
 // ── Linux dispatch (C4-aware) ───────────────────────────────────────────
 //
 // Not a simple `!try_a() && !try_b() && ...` chain any more: the nftables
-// leg's C4 fallthrough needs to thread `tables_seen` into ufw/iptables (to
-// clamp their verdict) and needs its own diagnostic row if NEITHER of them
-// answers either — bookkeeping a boolean chain can't carry.
+// leg's C4 fallthrough needs to thread what the netlink read came to
+// (info.netlink) into ufw/iptables (to clamp their verdict and count) and
+// needs its own diagnostic row if NEITHER of them answers either —
+// bookkeeping a boolean chain can't carry.
 
 void do_state_linux(yuzu::CommandContext& ctx) {
     // firewalld answers first only when its read was complete. A partial read (getServices refused
@@ -1624,18 +1638,18 @@ void do_state_linux(yuzu::CommandContext& ctx) {
         return;
     }
 
+    // ufw and iptables next, handed what the netlink read came to: while it did not show the
+    // nf_tables ruleset (a table seen whose content couldn't be trusted, or a refused or failed
+    // read: info.netlink), neither can report a confident "disabled" or a count, since the
+    // ruleset may hold rules no read showed. Any fallthrough row, or the table-dump row, is
+    // already written.
+    if (try_ufw_state(ctx, info.netlink))
+        return;
+    if (try_iptables_state(ctx, info.netlink))
+        return;
     if (info.tables_seen) {
-        // GETTABLE succeeded (something IS managing nftables here) but the
-        // chain/rule content couldn't be trusted -- any fallthrough row, or
-        // the table-dump row of a re-run that failed after a table was seen,
-        // was already written by run_nft_probe. Probe ufw/iptables next,
-        // clamped so neither can report a confident "disabled" that
-        // contradicts the tables just seen.
-        if (try_ufw_state(ctx, /*tables_seen=*/true))
-            return;
-        if (try_iptables_state(ctx, /*tables_seen=*/true))
-            return;
-        // Nothing downstream answered either -- end at nftables' own
+        // GETTABLE succeeded (something IS managing nftables here) and
+        // nothing downstream answered either -- end at nftables' own
         // unknown (not backend|none: nftables DID answer, just not
         // trustworthily) plus the diagnostic for which dump failed.
         ctx.write_output("backend|nftables");
@@ -1650,12 +1664,6 @@ void do_state_linux(yuzu::CommandContext& ctx) {
         return;
     }
 
-    // nftables was entirely unreachable (GETTABLE itself never succeeded) --
-    // fall through exactly as before the C4 restructure, no clamp applies.
-    if (try_ufw_state(ctx, /*tables_seen=*/false))
-        return;
-    if (try_iptables_state(ctx, /*tables_seen=*/false))
-        return;
     ctx.write_output("backend|none");
     ctx.write_output("state|unknown");
     ctx.write_output("ruleset|unknown");
@@ -1687,9 +1695,9 @@ void do_rules_linux(yuzu::CommandContext& ctx) {
         return;
     }
 
-    if (try_ufw_rules(ctx))
+    if (try_ufw_rules(ctx, info.netlink))
         return;
-    if (try_iptables_rules(ctx))
+    if (try_iptables_rules(ctx, info.netlink))
         return;
 
     if (info.tables_seen) {
@@ -3415,7 +3423,7 @@ public:
 #elif defined(__linux__)
             // Every-backend-unreachable and nftables-C4-dead-end honest-
             // unknown fallbacks live in do_state_linux() itself now (the
-            // C4 clamp needs to thread tables_seen through ufw/iptables,
+            // C4 clamp needs to thread the netlink outcome through ufw/iptables,
             // which a flat `!a() && !b() && ...` chain can't carry).
             do_state_linux(ctx);
 #elif defined(__APPLE__)

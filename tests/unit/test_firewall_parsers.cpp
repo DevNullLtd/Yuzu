@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstring>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -4025,12 +4026,14 @@ direct_reads(std::initializer_list<IptablesTableRead> over = {}) {
 } // namespace
 
 TEST_CASE("iptables direct: every table clean and read is inactive with a count", "[firewall]") {
-    const auto a = iptables_direct_answer(direct_reads(), false);
+    const auto a = iptables_direct_answer(direct_reads(), NftSource::absent);
     CHECK(a.state == NftVerdict::inactive);
     CHECK(a.all_read);
     CHECK(a.appends == 0);
     CHECK(a.rule_rows.size() == 2 * (3 + 2 + 2 + 2 + 2)); // every policy row, no rule
-    CHECK(iptables_direct_answer(direct_reads(), true).state == NftVerdict::unknown);
+    const auto unshown = iptables_direct_answer(direct_reads(), NftSource::unreadable);
+    CHECK(unshown.state == NftVerdict::unknown);
+    CHECK_FALSE(unshown.all_read); // no count while nf_tables may hold rules no read showed
 }
 
 TEST_CASE("iptables direct: a ruleset only in raw, mangle or nat is active, not inactive",
@@ -4038,7 +4041,7 @@ TEST_CASE("iptables direct: a ruleset only in raw, mangle or nat is active, not 
     for (const bool ip6 : {false, true})
         for (const std::string_view table : {"raw", "mangle", "nat"}) {
             const auto a = iptables_direct_answer(
-                direct_reads({direct_read(ip6, table, kDirectRuleRaw)}), false);
+                direct_reads({direct_read(ip6, table, kDirectRuleRaw)}), NftSource::absent);
             CHECK(a.state == NftVerdict::active);
             CHECK(a.all_read);
             CHECK(a.appends == 1);
@@ -4052,12 +4055,13 @@ TEST_CASE("iptables direct: a ruleset only in raw, mangle or nat is active, not 
 TEST_CASE("iptables direct: a user chain or a non-accept policy in any table is active",
           "[firewall]") {
     CHECK(iptables_direct_answer(
-              direct_reads({direct_read(false, "nat", "-P PREROUTING ACCEPT\n-N staged\n")}), false)
+              direct_reads({direct_read(false, "nat", "-P PREROUTING ACCEPT\n-N staged\n")}),
+              NftSource::absent)
               .state == NftVerdict::active);
     CHECK(iptables_direct_answer(
               direct_reads({direct_read(true, "filter", "-P INPUT DROP\n-P FORWARD ACCEPT\n"
                                                         "-P OUTPUT ACCEPT\n")}),
-              false)
+              NftSource::absent)
               .state == NftVerdict::active);
 }
 
@@ -4065,16 +4069,18 @@ TEST_CASE("iptables direct: an unreadable table reads unknown, never inactive", 
     for (const bool ip6 : {false, true})
         for (const auto table : kIptablesDirectTables) {
             const auto refused = iptables_direct_answer(
-                direct_reads({direct_read(ip6, table, "", true, /*exit_ok=*/false)}), false);
+                direct_reads({direct_read(ip6, table, "", true, /*exit_ok=*/false)}),
+                NftSource::absent);
             CHECK(refused.state == NftVerdict::unknown);
             CHECK_FALSE(refused.all_read);
             const auto cut = iptables_direct_answer(
                 direct_reads({direct_read(ip6, table, kDirectCleanRaw, true, true,
                                           /*complete=*/false)}),
-                false);
+                NftSource::absent);
             CHECK(cut.state == NftVerdict::unknown);
             const auto no_time = iptables_direct_answer(
-                direct_reads({IptablesTableRead{.ip6 = ip6, .table = std::string{table}}}), false);
+                direct_reads({IptablesTableRead{.ip6 = ip6, .table = std::string{table}}}),
+                NftSource::absent);
             CHECK(no_time.state == NftVerdict::unknown);
         }
 }
@@ -4084,7 +4090,7 @@ TEST_CASE("iptables direct: content in one table wins over an unread one; the co
     const auto a = iptables_direct_answer(
         direct_reads({direct_read(false, "raw", kDirectRuleRaw),
                       direct_read(false, "nat", "", true, false)}),
-        false);
+        NftSource::absent);
     CHECK(a.state == NftVerdict::active);
     CHECK_FALSE(a.all_read);
     CHECK(std::ranges::count(a.rule_rows, "rule|raw|append|PREROUTING|-j DROP") == 1);
@@ -4092,7 +4098,7 @@ TEST_CASE("iptables direct: content in one table wins over an unread one; the co
 
 TEST_CASE("iptables direct: an unrecognised listing is unread and says so per tool", "[firewall]") {
     const auto a = iptables_direct_answer(
-        direct_reads({direct_read(true, "mangle", "garbage\n")}), false);
+        direct_reads({direct_read(true, "mangle", "garbage\n")}), NftSource::absent);
     CHECK(a.state == NftVerdict::unknown);
     CHECK(a.error_rows == std::vector<std::string>{"error|ip6tables:unrecognised_output"});
 }
@@ -4102,14 +4108,14 @@ TEST_CASE("iptables direct: a run whose process did not start is unread, even af
     for (const bool ip6 : {false, true})
         for (const auto table : kIptablesDirectTables) {
             const auto a = iptables_direct_answer(
-                direct_reads({direct_read(ip6, table, "", /*tool_ran=*/false)}), false);
+                direct_reads({direct_read(ip6, table, "", /*tool_ran=*/false)}), NftSource::absent);
             CHECK(a.state == NftVerdict::unknown);
             CHECK_FALSE(a.all_read);
         }
     // every table read and empty but the last (nat) of the last family, whose spawn failed
     const auto last = direct_reads({direct_read(true, "nat", "", false)});
-    CHECK(iptables_direct_answer(last, false).state == NftVerdict::unknown);
-    CHECK(iptables_direct_answer({}, false).state == NftVerdict::unknown);
+    CHECK(iptables_direct_answer(last, NftSource::absent).state == NftVerdict::unknown);
+    CHECK(iptables_direct_answer({}, NftSource::absent).state == NftVerdict::unknown);
 }
 
 namespace {
@@ -4172,7 +4178,7 @@ TEST_CASE("iptables direct: a listed security table is read, never skipped into 
                             ? direct_read(false, t, security_out, true, exit_ok)
                             : iptables_unrun_read(false, t, plan.action[i]));
         }
-        return iptables_direct_answer(v, false);
+        return iptables_direct_answer(v, NftSource::absent);
     };
     const auto rules = compose(kDirectRuleRaw, true);
     CHECK(rules.state == NftVerdict::active);
@@ -4182,7 +4188,7 @@ TEST_CASE("iptables direct: a listed security table is read, never skipped into 
     // the original probe: the other four empty and security listed, but never read
     std::vector<IptablesTableRead> unread = direct_reads({});
     unread[4] = iptables_unrun_read(false, "security", Act::unread);
-    CHECK(iptables_direct_answer(unread, false).state == NftVerdict::unknown);
+    CHECK(iptables_direct_answer(unread, NftSource::absent).state == NftVerdict::unknown);
 }
 
 TEST_CASE("iptables plan: a shim or unknown tool with legacy tables loaded leaves them unseen",
@@ -4204,13 +4210,13 @@ TEST_CASE("iptables direct: a shim with legacy tables loaded is unknown, or acti
         REQUIRE(plan.unseen);
         auto v = direct_reads(); // every table read and empty
         v.push_back(iptables_unrun_read(false, "legacy", Act::unread));
-        CHECK(iptables_direct_answer(v, false).state == NftVerdict::unknown);
+        CHECK(iptables_direct_answer(v, NftSource::absent).state == NftVerdict::unknown);
         v[3] = direct_read(false, "nat", kDirectRuleRaw);
-        CHECK(iptables_direct_answer(v, false).state == NftVerdict::active);
+        CHECK(iptables_direct_answer(v, NftSource::absent).state == NftVerdict::active);
     }
     // names empty or absent: today's behaviour, a shim with empty tables reads inactive
     CHECK_FALSE(plan_iptables_family(kShim, kNone, "", true).unseen);
-    CHECK(iptables_direct_answer(direct_reads(), false).state == NftVerdict::inactive);
+    CHECK(iptables_direct_answer(direct_reads(), NftSource::absent).state == NftVerdict::inactive);
 }
 
 TEST_CASE("iptables plan: a family whose tool is not installed is entirely unread", "[firewall]") {
@@ -4231,9 +4237,9 @@ TEST_CASE("iptables direct: a host without ip6tables reads unknown, never inacti
     const auto missing = plan_iptables_family(kUnknownFlavour, kNone, "", false);
     for (std::size_t i = 0; i < 5; ++i)
         v.push_back(iptables_unrun_read(true, kIptablesDirectTables[i], missing.action[i]));
-    CHECK(iptables_direct_answer(v, false).state == NftVerdict::unknown);
+    CHECK(iptables_direct_answer(v, NftSource::absent).state == NftVerdict::unknown);
     v[3] = direct_read(false, "nat", kDirectRuleRaw); // a rule in IPv4 nat still reads active
-    CHECK(iptables_direct_answer(v, false).state == NftVerdict::active);
+    CHECK(iptables_direct_answer(v, NftSource::absent).state == NftVerdict::active);
 }
 
 TEST_CASE("iptables direct: planned tables compose into the answer", "[firewall]") {
@@ -4249,17 +4255,17 @@ TEST_CASE("iptables direct: planned tables compose into the answer", "[firewall]
     auto v = read_family(false, legacy_plan(kListed, "filter\nnat\n"), kIptClean);
     for (auto& r : read_family(true, plan_iptables_family(kLegacy, kNone, "", true), kIptClean))
         v.push_back(std::move(r));
-    const auto inactive = iptables_direct_answer(v, false);
+    const auto inactive = iptables_direct_answer(v, NftSource::absent);
     CHECK(inactive.state == NftVerdict::inactive);
     CHECK(inactive.all_read);
     // a listed table whose run fails is unread
     auto bad = read_family(false, legacy_plan(kListed, "filter\nnat\n"), kIptClean);
     bad[3] = direct_read(false, "nat", "", true, /*exit_ok=*/false);
-    CHECK(iptables_direct_answer(bad, false).state == NftVerdict::unknown);
+    CHECK(iptables_direct_answer(bad, NftSource::absent).state == NftVerdict::unknown);
     // an unreadable IPv6 names file is unknown, not inactive
     for (auto& r : read_family(true, legacy_plan(kUnreadable), kIptClean))
         v.push_back(std::move(r));
-    CHECK(iptables_direct_answer(v, false).state == NftVerdict::unknown);
+    CHECK(iptables_direct_answer(v, NftSource::absent).state == NftVerdict::unknown);
 }
 
 TEST_CASE("iptables flavour: the marker decides, anything else is unknown, never legacy",
@@ -4300,7 +4306,7 @@ TEST_CASE("iptables direct: an nft shim with rules only in nat is active, names 
             const auto t = kIptablesDirectTables[i];
             v.push_back(direct_read(false, t, t == "nat" ? kDirectRuleRaw : kIptClean));
         }
-        const auto a = iptables_direct_answer(v, false);
+        const auto a = iptables_direct_answer(v, NftSource::absent);
         CHECK(a.state == NftVerdict::active);
     }
 }
@@ -4314,7 +4320,7 @@ TEST_CASE("iptables direct: a shim or unknown-flavour table run that fails is un
             v.push_back(i == 3 ? direct_read(false, "nat", "", true, /*exit_ok=*/false)
                                : direct_read(false, kIptablesDirectTables[i], kIptClean));
         REQUIRE(plan.action[3] == Act::run);
-        CHECK(iptables_direct_answer(v, false).state == NftVerdict::unknown);
+        CHECK(iptables_direct_answer(v, NftSource::absent).state == NftVerdict::unknown);
     }
 }
 
@@ -4332,7 +4338,7 @@ TEST_CASE("iptables plan: IPv6 disabled reads empty for a legacy ip6tables, unre
     std::vector<IptablesTableRead> v;
     for (std::size_t i = 0; i < 5; ++i)
         v.push_back(direct_read(true, kIptablesDirectTables[i], "", true, /*exit_ok=*/false));
-    CHECK(iptables_direct_answer(v, false).state == NftVerdict::unknown);
+    CHECK(iptables_direct_answer(v, NftSource::absent).state == NftVerdict::unknown);
 }
 
 TEST_CASE("nft: has_content -- an empty user-defined chain is content (ADR-3007 clause 6)",
@@ -4340,4 +4346,152 @@ TEST_CASE("nft: has_content -- an empty user-defined chain is content (ADR-3007 
     NftChainInfo c; // table inet filter { chain staged { } }
     c.is_base_chain = false;
     CHECK(nft_has_content({c}, {}));
+}
+
+// ── the netlink outcome reaches the direct iptables answer (U1: a refused nft read beside an
+// empty or gated-out legacy read is unknown, never inactive) ────────────────────────────────────
+namespace {
+/// How the netlink read of nf_tables ended, as run_nft_probe hands it to nft_source.
+struct NftCase {
+    const char* name;
+    bool trusted;
+    bool tables_seen;
+    std::optional<int> table_open_errno;
+    bool unshown; // expected: may hold rules no read showed
+};
+constexpr std::array kNftCases{
+    NftCase{"readable-active", true, true, std::nullopt, false},
+    NftCase{"readable-empty", true, false, std::nullopt, false},
+    NftCase{"eperm (table dump refused)", false, false, std::nullopt, true},
+    NftCase{"eperm (socket refused)", false, false, EPERM, true},
+    NftCase{"other failure (table dump timeout)", false, false, std::nullopt, true},
+    NftCase{"other failure (table seen, chains untrusted)", false, true, std::nullopt, true},
+    NftCase{"other failure (socket fd_exhausted)", false, false, EMFILE, true},
+    NftCase{"other failure (socket ENOBUFS)", false, false, ENOBUFS, true},
+    NftCase{"other failure (re-run socket unsupported after a table)", false, true, EAFNOSUPPORT,
+            true},
+    NftCase{"tool absent (EAFNOSUPPORT)", false, false, EAFNOSUPPORT, false},
+    NftCase{"tool absent (EPROTONOSUPPORT)", false, false, EPROTONOSUPPORT, false},
+};
+
+enum class IptCase {
+    legacy_gated_out,
+    legacy_empty,
+    legacy_rules,
+    shim_readable,
+    shim_unreadable,
+    tool_absent
+};
+constexpr std::array kIptCases{IptCase::legacy_gated_out, IptCase::legacy_empty,
+                               IptCase::legacy_rules,     IptCase::shim_readable,
+                               IptCase::shim_unreadable,  IptCase::tool_absent};
+
+/// One family read the way read_iptables_tables reads it: the plan, then a run or an unrun read
+/// per table, then the unseen entry.
+std::vector<IptablesTableRead> matrix_family(bool ip6, IptCase c) {
+    auto flavour = IptablesFlavour::legacy;
+    auto names = IptablesNamesOutcome::none; // no legacy module: the names file is absent
+    std::string_view text;
+    bool installed = true;
+    bool run_ok = true;
+    std::string_view raw = kDirectCleanRaw;
+    switch (c) {
+    case IptCase::legacy_gated_out:
+        break;
+    case IptCase::legacy_empty:
+        names = IptablesNamesOutcome::listed;
+        text = "filter\n";
+        break;
+    case IptCase::legacy_rules:
+        names = IptablesNamesOutcome::listed;
+        text = "filter\nraw\n";
+        raw = kDirectRuleRaw;
+        break;
+    case IptCase::shim_readable:
+        flavour = IptablesFlavour::nf_tables;
+        break;
+    case IptCase::shim_unreadable:
+        flavour = IptablesFlavour::nf_tables;
+        run_ok = false;
+        break;
+    case IptCase::tool_absent:
+        installed = false;
+        break;
+    }
+    const auto plan = plan_iptables_family(flavour, names, text, installed);
+    std::vector<IptablesTableRead> v;
+    for (std::size_t i = 0; i < kIptablesDirectTables.size(); ++i) {
+        const auto t = kIptablesDirectTables[i];
+        const auto out = t == "filter" ? kIptClean : t == "raw" ? raw : kDirectCleanRaw;
+        v.push_back(plan.action[i] == IptablesTableAction::run
+                        ? classify_iptables_table_read(ip6, t, true, run_ok, true, out)
+                        : iptables_unrun_read(ip6, t, plan.action[i]));
+    }
+    if (plan.unseen)
+        v.push_back(iptables_unrun_read(ip6, "legacy", IptablesTableAction::unread));
+    return v;
+}
+
+bool family_read(IptCase c) {
+    return c == IptCase::legacy_gated_out || c == IptCase::legacy_empty ||
+           c == IptCase::legacy_rules || c == IptCase::shim_readable;
+}
+} // namespace
+
+TEST_CASE("nft_source: only a kernel with no nf_tables netlink family is absent", "[firewall]") {
+    for (const auto& n : kNftCases) {
+        INFO(n.name);
+        const auto s = nft_source(n.trusted, n.tables_seen, n.table_open_errno);
+        CHECK(nft_unshown(s) == n.unshown);
+        CHECK((s == NftSource::read) == n.trusted);
+    }
+}
+
+TEST_CASE("netlink outcome x iptables outcome x IPv6: inactive only when every source was read",
+          "[firewall]") {
+    for (const auto& n : kNftCases)
+        for (const auto ipt : kIptCases)
+            for (const bool v6_present : {false, true}) {
+                INFO(n.name << " / iptables case " << static_cast<int>(ipt) << " / ip6tables "
+                            << (v6_present ? "present" : "absent"));
+                const auto src = nft_source(n.trusted, n.tables_seen, n.table_open_errno);
+                auto v = matrix_family(false, ipt);
+                for (auto& r : matrix_family(true, v6_present ? ipt : IptCase::tool_absent))
+                    v.push_back(std::move(r));
+                const auto a = iptables_direct_answer(v, src);
+
+                const bool rules = ipt == IptCase::legacy_rules;
+                const bool every_source = family_read(ipt) && v6_present && !n.unshown;
+                const auto want = rules          ? NftVerdict::active
+                                  : every_source ? NftVerdict::inactive
+                                                 : NftVerdict::unknown;
+                CHECK(a.state == want);
+                CHECK(a.all_read == every_source); // the count, and no `rules|unknown`
+                CHECK((std::ranges::count(a.rule_rows, "rule|raw|append|PREROUTING|-j DROP") >
+                       0) == rules);
+                // ufw, the other narrower rung, is clamped by the same outcome
+                CHECK((gate_state_on_completeness(true, nft_unshown(src), FwState::disabled) ==
+                       FwState::disabled) == !n.unshown);
+            }
+}
+
+TEST_CASE("U1: refused nft dump, legacy alternative with no legacy module, reads unknown",
+          "[firewall]") {
+    // The packaged account with the broker stopped and no helper grant: the netlink table dump is
+    // refused (error|nftables:table:eperm), the legacy tools are gated out by the absent names
+    // files, so every legacy table reads empty and nothing is spawned. A drop-policy nft chain is
+    // in force, which no read showed: unknown, never inactive, and no count.
+    const auto src = nft_source(/*trusted=*/false, /*tables_seen=*/false, std::nullopt);
+    REQUIRE(src == NftSource::unreadable);
+    auto v = matrix_family(false, IptCase::legacy_gated_out);
+    for (auto& r : matrix_family(true, IptCase::legacy_gated_out))
+        v.push_back(std::move(r));
+    const auto a = iptables_direct_answer(v, src);
+    CHECK(a.state == NftVerdict::unknown);
+    CHECK_FALSE(a.all_read);
+    CHECK(a.appends == 0);
+    // the same reads with nf_tables absent from the kernel are read and empty
+    const auto absent = iptables_direct_answer(v, nft_source(false, false, EAFNOSUPPORT));
+    CHECK(absent.state == NftVerdict::inactive);
+    CHECK(absent.all_read);
 }

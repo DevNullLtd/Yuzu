@@ -29,17 +29,20 @@ wiring around them, per OS class below:
                      only the netlink table-dump row is deferred (to
                      the decline path), and only while no table has been seen (a second pass whose
                      table dump fails after a table was seen writes its row at once), never the
-                     socket-open diagnostics; info.tables_seen decides that and is what every clamp
-                     reads. Its reads are pinned: try_snapshot hands it to linux_snapshot_rung, and
-                     do_state_linux, straight after the held firewalld answer, calls try_ufw_state
-                     and try_iptables_state with `true` inside `if (info.tables_seen)`, a block that
-                     returns, and with `false` only after it, each handing its parameter to
-                     gate_state_on_completeness (the rules ladder has no clamp at ufw or iptables:
-                     there the flag picks between two endings that both read `unknown`). Its writes
-                     are pinned by name: the file assigns tables_seen in one statement, which can
-                     only turn it on; names the member nowhere but in that statement, an
-                     `if (info.tables_seen)` and the linux_snapshot_rung argument; and assigns the
-                     struct as a whole in no function that holds it as a writable `info`. A write
+                     socket-open diagnostics; info.tables_seen decides that, and try_snapshot hands
+                     it to linux_snapshot_rung. What the netlink read came to (info.netlink, the pure
+                     nft_source of the pass's trust, tables_seen and the table socket's errno) is
+                     set at both exits of run_nft_probe and nowhere else, and both dispatchers,
+                     straight after the held firewalld answer, hand it to the ufw and iptables
+                     rungs of their action: try_ufw_state gives nft_unshown(netlink) to
+                     gate_state_on_completeness and withholds its count, try_ufw_rules writes
+                     `rules|unknown` and withholds its count, and both iptables rungs hand it to
+                     iptables_direct_answer (a refused nft read beside an empty or gated-out
+                     legacy read is `unknown`, never `inactive`). The tables_seen writes are pinned
+                     by name: the file assigns tables_seen in one statement, which can only turn it
+                     on; names the member nowhere but in that statement, an `if (info.tables_seen)`,
+                     the two nft_source arguments and the linux_snapshot_rung argument; and assigns
+                     the struct as a whole in no function that holds it as a writable `info`. A write
                      that neither names the member nor assigns `info` (through a reference, a
                      pointer or a structured binding to the struct, for example) is not seen
                      (review-enforced). The broker reader (in
@@ -528,18 +531,15 @@ def linux_problems(plugin_src, reader_src):
         if not held or not written or held.start() < written.start() or held.start() > text.find(rungs[3] + "("):
             out.append(f"{fn} no longer writes the held firewalld rows and returns after info.pending_rows and "
                        f"before {rungs[3]} (ufw and iptables are not consulted behind a running firewalld)")
-        # the flag clamps the ufw and iptables rungs of the state ladder (the rules ladder has no
-        # clamp there): straight after the held firewalld answer they run with `true` inside
-        # `if (info.tables_seen)`, a block that returns, and with `false` only after it
-        if fn == "do_state_linux" and held and not re.compile(
-                r" ?if \( ?info\.tables_seen ?\) \{ if \( ?try_ufw_state\(ctx, ?true\) ?\) return; "
-                r"if \( ?try_iptables_state\(ctx, ?true\) ?\) return; [^{}]*\breturn; \} "
-                r"if \( ?try_ufw_state\(ctx, ?false\) ?\) return; "
-                r"if \( ?try_iptables_state\(ctx, ?false\) ?\) return;").match(text, held.end()):
-            out.append("do_state_linux no longer calls try_ufw_state and try_iptables_state clamped (`true`) "
-                       "inside `if (info.tables_seen) { ... return; }` straight after the held firewalld "
-                       "answer, and unclamped (`false`) only after that block (unclamped, either rung can "
-                       "answer inactive beside tables the netlink read saw)")
+        # what the netlink read came to clamps the ufw and iptables rungs of both ladders: straight
+        # after the held firewalld answer they run, each handed info.netlink
+        if held and not re.compile(
+                r" ?if \( ?try_ufw_%s\(ctx, info\.netlink\) ?\) return; "
+                r"if \( ?try_iptables_%s\(ctx, info\.netlink\) ?\) return; " % (action, action)
+        ).match(text, held.end()):
+            out.append(f"{fn} no longer calls try_ufw_{action} and then try_iptables_{action}, each handed "
+                       "info.netlink, straight after the held firewalld answer (unclamped, either rung can "
+                       "answer inactive or a count beside an nf_tables ruleset the netlink read did not show)")
 
     # the firewalld rung reads and returns rows: it writes nothing itself
     rung = function_body(live, r"FirewalldRung firewalld_rung\(yuzu::firewall::FwReadAction action\) ?(?=\{)")
@@ -600,6 +600,17 @@ def linux_problems(plugin_src, reader_src):
                        "snapshot, ufw and iptables rungs can answer inactive beside tables the "
                        "netlink read saw; set early, every read is clamped and an EPERM row sits "
                        "beside a snapshot answer)")
+        # what the netlink read came to is set at both of its exits, through the pure nft_source,
+        # and nowhere else in the file
+        exits = (r"info\.netlink = yuzu::firewall::nft_source\( ?false, info\.tables_seen, table\.open_errno ?\); "
+                 r"return std::nullopt;",
+                 r"result\.trusted = failed\.empty\(\); info\.netlink = yuzu::firewall::nft_source\( ?result\.trusted, "
+                 r"info\.tables_seen, std::nullopt ?\);")
+        if len(re.findall(r"\bnetlink ?=(?!=)", squash(live))) != 3 or not all(re.search(e, text) for e in exits):
+            out.append("firewall_plugin.cpp no longer sets info.netlink exactly at run_nft_probe's two exits, "
+                       "from nft_source(false, info.tables_seen, table.open_errno) where the table dump fails "
+                       "and from nft_source(result.trusted, info.tables_seen, std::nullopt) after the last pass "
+                       "(never set, or set elsewhere, a refused nft read leaves ufw and iptables unclamped)")
         opens = len(re.findall(r"for \( ?const auto& row : yuzu::firewall::nft_open_diag_rows\(open_errnos\) ?\) "
                                r"ctx\.write_output\(row\);", text))
         if opens != 2:
@@ -610,23 +621,32 @@ def linux_problems(plugin_src, reader_src):
     # gating each run, one deadline, one literal argv per run
     out += direct_iptables_problems(live)
 
-    # each of the two clamped rungs hands its parameter to the pure function that applies the clamp
-    for name, hand_over in (
-            ("try_ufw_state", r"yuzu::firewall::gate_state_on_completeness\( ?complete && shaped, tables_seen,"),
-            ("try_iptables_state", r"yuzu::firewall::iptables_direct_answer\( ?\*reads, tables_seen\)")):
-        body = function_body(live, r"bool " + name + r"\(yuzu::CommandContext& ctx, bool tables_seen\) ?(?=\{)")
-        if body is None or not re.search(hand_over, squash(body)):
-            out.append(f"{name} no longer takes tables_seen and hands it to "
-                       f"{'gate_state_on_completeness(complete && shaped, tables_seen, ...)' if name == 'try_ufw_state' else 'iptables_direct_answer(*reads, tables_seen)'} "
-                       "(its own inactive would stand beside tables the netlink read saw)")
+    # each of the four clamped rungs takes the netlink outcome and hands it to the pure decision
+    unshown = r"const bool unshown = yuzu::firewall::nft_unshown\(netlink\);"
+    for name, hand_overs in (
+            ("try_ufw_state", (unshown,
+                               r"yuzu::firewall::gate_state_on_completeness\( ?complete && shaped, unshown,",
+                               r"complete && shaped && !unshown \? std::format\(\"ruleset\|\{\}\"")),
+            ("try_ufw_rules", (unshown, r'if \( ?unshown ?\) ctx\.write_output\("rules\|unknown"\);',
+                               r"complete && shaped && !unshown \? std::format\(\"ruleset\|\{\}\"")),
+            ("try_iptables_state", (r"yuzu::firewall::iptables_direct_answer\( ?\*reads, netlink\)",)),
+            ("try_iptables_rules", (r"yuzu::firewall::iptables_direct_answer\( ?\*reads, netlink\)",))):
+        body = function_body(live, r"bool " + name +
+                             r"\(yuzu::CommandContext& ctx, yuzu::firewall::NftSource netlink\) ?(?=\{)")
+        if body is None or not all(re.search(h, squash(body)) for h in hand_overs):
+            out.append(f"{name} no longer takes the netlink outcome (NftSource netlink) and hands it to the pure "
+                       "decision (gate_state_on_completeness through nft_unshown and a withheld count for ufw, "
+                       "iptables_direct_answer for iptables): its own inactive or count would stand beside an "
+                       "nf_tables ruleset the netlink read did not show")
     # the member is named nowhere but in its pinned reads and its one assignment: a reference or a
     # pointer to it, or std::exchange on it, would clear it with no assignment by name
     named = re.sub(r"if \( ?info\.tables_seen ?\)|info\.tables_seen = info\.tables_seen \|\||"
-                   r"linux_snapshot_rung\( ?read, info\.tables_seen,", "", squash(live))
+                   r"linux_snapshot_rung\( ?read, info\.tables_seen,|"
+                   r"nft_source\( ?(?:false|result\.trusted), info\.tables_seen,", "", squash(live))
     if re.search(r"[.>:]tables_seen\b", named):
         out.append("firewall_plugin.cpp names the tables_seen member outside `if (info.tables_seen)`, the "
-                   "linux_snapshot_rung argument and its one assignment (a reference or a pointer to it, or "
-                   "std::exchange on it, can clear the flag every clamp reads)")
+                   "nft_source and linux_snapshot_rung arguments and its one assignment (a reference or a "
+                   "pointer to it, or std::exchange on it, can clear the flag the clamps read)")
     # ... and no function that holds the struct as a writable `info` assigns it as a whole
     for name in ("run_nft_probe", "try_nftables_state", "try_nftables_rules", "do_state_linux", "do_rules_linux"):
         body = function_body(live, r"\b" + name + r"\(yuzu::CommandContext& ctx[^)]*\) ?(?=\{)")
@@ -789,7 +809,7 @@ LINUX_MUTATIONS = [
     # ... and from the rules ladder
     (_lmut(r"\s*if \(try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::rules\)\)\s*return;", ""), "do_rules_linux"),
     # moved after ufw: the snapshot must come before it
-    (_lmut(r"(\s*if \(try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::rules\)\)\s*return;)(.*?if \(try_ufw_rules\(ctx\)\)\s*return;)",
+    (_lmut(r"(\s*if \(try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::rules\)\)\s*return;)(.*?if \(try_ufw_rules\(ctx, info\.netlink\)\)\s*return;)",
            r"\2\1"), "in that order"),
     # the snapshot asked for the wrong action
     (_lmut(r"try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::state\)", "try_snapshot(ctx, info, yuzu::firewall::FwReadAction::rules)"),
@@ -832,27 +852,42 @@ LINUX_MUTATIONS = [
     (_lmut(r"(if \(try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::state\)\))",
            r"info = NftFallthroughInfo{}; \1"),
      "do_state_linux assigns `info` as a whole"),
-    # the state dispatcher no longer reads the flag for ufw and iptables: both run unclamped
-    (_lmut(r"if \(info\.tables_seen\) \{(?=(?:\s*//[^\n]*)*\s*if \(try_ufw_state)", "if (false) {"),
-     "no longer calls try_ufw_state and try_iptables_state clamped"),
-    # ... the clamp argument of the ufw rung, then of the iptables rung, turned off
-    (_lmut(r"try_ufw_state\(ctx, /\*tables_seen=\*/true\)", "try_ufw_state(ctx, /*tables_seen=*/false)"),
-     "no longer calls try_ufw_state and try_iptables_state clamped"),
-    (_lmut(r"try_iptables_state\(ctx, /\*tables_seen=\*/true\)", "try_iptables_state(ctx, /*tables_seen=*/false)"),
-     "no longer calls try_ufw_state and try_iptables_state clamped"),
-    # ... the clamped block falls through to the unclamped rungs
-    (_lmut(r'(ctx\.write_output\("ruleset\|unknown"\);[^\n]*\n\s*)return;'
-           r"(\s*\}\s*(?://[^\n]*\s*)*if \(try_ufw_state\(ctx, /\*tables_seen=\*/false\)\))", r"\1\2"),
-     "no longer calls try_ufw_state and try_iptables_state clamped"),
-    # ... an unclamped rung ahead of the block
-    (_lmut(r"(if \(info\.tables_seen\) \{(?:\s*//[^\n]*)*\s*if \(try_ufw_state)",
-           r"if (try_ufw_state(ctx, false)) return; \1"),
-     "no longer calls try_ufw_state and try_iptables_state clamped"),
-    # a clamped rung no longer hands the flag to the pure function (ufw, then iptables)
-    (_lmut(r"(complete && shaped, )tables_seen(, yuzu::firewall::parse_ufw_status)", r"\1false\2"),
-     "try_ufw_state no longer takes tables_seen and hands it to gate_state_on_completeness"),
-    (_lmut(r"(iptables_direct_answer\(\*reads, )tables_seen\)", r"\1false)"),
-     "try_iptables_state no longer takes tables_seen and hands it to iptables_direct_answer"),
+    # a dispatcher hands ufw or iptables a fixed outcome, not the netlink read's (state, rules)
+    (_lmut(r"try_ufw_state\(ctx, info\.netlink\)", "try_ufw_state(ctx, yuzu::firewall::NftSource::absent)"),
+     "do_state_linux no longer calls try_ufw_state and then try_iptables_state"),
+    (_lmut(r"try_iptables_state\(ctx, info\.netlink\)", "try_iptables_state(ctx, yuzu::firewall::NftSource::read)"),
+     "do_state_linux no longer calls try_ufw_state and then try_iptables_state"),
+    (_lmut(r"try_ufw_rules\(ctx, info\.netlink\)", "try_ufw_rules(ctx, yuzu::firewall::NftSource::absent)"),
+     "do_rules_linux no longer calls try_ufw_rules and then try_iptables_rules"),
+    (_lmut(r"try_iptables_rules\(ctx, info\.netlink\)", "try_iptables_rules(ctx, yuzu::firewall::NftSource::read)"),
+     "do_rules_linux no longer calls try_ufw_rules and then try_iptables_rules"),
+    # ... an unclamped iptables answer ahead of the clamped rungs
+    (_lmut(r"(if \(try_ufw_state\(ctx, info\.netlink\)\))",
+           r"if (try_iptables_state(ctx, yuzu::firewall::NftSource::absent)) return; \1"),
+     "do_state_linux no longer calls try_ufw_state and then try_iptables_state"),
+    # the netlink outcome never set at one exit, set to a constant, or set again elsewhere
+    (_lmut(r"\n\s*info\.netlink = yuzu::firewall::nft_source\(false, info\.tables_seen, table\.open_errno\);", ""),
+     "no longer sets info.netlink exactly at run_nft_probe's two exits"),
+    (_lmut(r"info\.netlink = yuzu::firewall::nft_source\(result\.trusted, info\.tables_seen, std::nullopt\);",
+           "info.netlink = yuzu::firewall::NftSource::absent;"),
+     "no longer sets info.netlink exactly at run_nft_probe's two exits"),
+    (_lmut(r"(if \(try_snapshot\(ctx, info, yuzu::firewall::FwReadAction::state\)\))",
+           r"info.netlink = yuzu::firewall::NftSource::absent; \1"),
+     "no longer sets info.netlink exactly at run_nft_probe's two exits"),
+    # a clamped rung no longer hands the outcome to the pure decision (ufw state and rules, iptables)
+    (_lmut(r"(complete && shaped, )unshown(, yuzu::firewall::parse_ufw_status)", r"\1false\2"),
+     "try_ufw_state no longer takes the netlink outcome"),
+    (_lmut(r"(complete && shaped && )!unshown(\s*\? std::format\(\"ruleset\|\{\}\", yuzu)", r"\1true\2"),
+     "try_ufw_state no longer takes the netlink outcome"),
+    (_lmut(r'if \(unshown\)\s*ctx\.write_output\("rules\|unknown"\);', ""),
+     "try_ufw_rules no longer takes the netlink outcome"),
+    (_lmut(r"(complete && shaped && )!unshown(\s*\? std::format\(\"ruleset\|\{\}\", rules)", r"\1true\2"),
+     "try_ufw_rules no longer takes the netlink outcome"),
+    (_lmut(r"(iptables_direct_answer\(\*reads, )netlink\)", r"\1yuzu::firewall::NftSource::read)"),
+     "try_iptables_state no longer takes the netlink outcome"),
+    (_lmut(r"(iptables_direct_answer\(\*reads, )netlink\)(.*?iptables_direct_answer\(\*reads, )netlink\)",
+           r"\1netlink)\2yuzu::firewall::NftSource::read)"),
+     "try_iptables_rules no longer takes the netlink outcome"),
     # a socket-open diagnostic deferred as well
     (_lmut(r"(for \(const auto& row : yuzu::firewall::nft_open_diag_rows\(open_errnos\)\)\s*)ctx\.write_output\(row\);",
            r"\1info.pending_rows.push_back(row);"), "never deferred"),
@@ -886,7 +921,7 @@ LINUX_MUTATIONS = [
            r"((?:\s*//[^\n]*)*\s*if \(info\.firewalld_running\) " + _HELD_ROWS + r")", r"\2\1"),
      "no longer writes the held firewalld rows and returns after info.pending_rows"),
     # ... and the held write after ufw has been consulted (rules ladder)
-    (_lmut(r"(\s*if \(info\.firewalld_running\) " + _HELD_ROWS + r")(\s*if \(try_ufw_rules\(ctx\)\)\s*return;)", r"\2\1"),
+    (_lmut(r"(\s*if \(info\.firewalld_running\) " + _HELD_ROWS + r")(\s*if \(try_ufw_rules\(ctx, info\.netlink\)\)\s*return;)", r"\2\1"),
      "no longer writes the held firewalld rows and returns after info.pending_rows and before try_ufw_rules"),
     # the nft rung answers a non-active ruleset while firewalld is held, or writes its row first
     (_lmut(r"if \(info\.firewalld_running && verdict != yuzu::firewall::NftVerdict::active\)\s*return false;", ""),

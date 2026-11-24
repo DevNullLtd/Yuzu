@@ -1151,6 +1151,32 @@ enum class OpenNftErrClass {
     return rows;
 }
 
+/// What the netlink read of the nf_tables ruleset came to, for the narrower rungs (ufw, the direct
+/// iptables legs) that answer after it. `read`: every dump of the last pass was trusted. `absent`:
+/// the table socket could not be opened because this kernel has no NETLINK_NETFILTER (the
+/// `unsupported` open class, which a denied address family also answers), and no earlier pass saw
+/// a table, so no nf_tables ruleset is there to hold rules. `unreadable`: anything else (a refused
+/// or failed table dump, EPERM included, a socket refused for any other reason, or a pass that saw
+/// a table, or none, and could not trust its chains or rules): the ruleset may hold rules no read
+/// showed, so no narrower rung may answer `inactive` or a count.
+enum class NftSource { read, unreadable, absent };
+
+/// `table_open_errno` is the errno of the last table socket that would not open, if it did not.
+[[nodiscard]] inline NftSource nft_source(bool trusted, bool tables_seen,
+                                          std::optional<int> table_open_errno) noexcept {
+    if (trusted)
+        return NftSource::read;
+    if (!tables_seen && table_open_errno &&
+        classify_open_errno(*table_open_errno) == OpenNftErrClass::unsupported)
+        return NftSource::absent;
+    return NftSource::unreadable;
+}
+
+/// true when the nf_tables ruleset may hold rules no read showed (`unreadable`).
+[[nodiscard]] constexpr bool nft_unshown(NftSource s) noexcept {
+    return s == NftSource::unreadable;
+}
+
 /// Formats a failed-dump diagnostic row for one nftables sub-dump (`dump` is
 /// "table"/"chain"/"rule") in the same `<kind>|nftables|...` row family the
 /// rest of this backend writes.
@@ -1740,9 +1766,11 @@ classify_iptables_table_read(bool ip6, std::string_view table, bool tool_ran, bo
 }
 
 /// What the root direct legs answer. `state`: `active` when any READ table has content; else
-/// `unknown` when nothing was read or any table was UNREAD; else `inactive` (clamped to `unknown`
-/// when `tables_seen`). `all_read` is true when at least one table was read and none was unread,
-/// which is when the count is written. `rule_rows` are the rule rows of every READ table in read
+/// `unknown` when nothing was read, any table was UNREAD or the nf_tables ruleset was not shown
+/// (`nft` is NftSource::unreadable: it may hold rules no read showed); else `inactive`. So
+/// `inactive` stands only when every source that could hold rules was read. `all_read` is true when
+/// at least one table was read, none was unread and nf_tables was not unshown, which is when the
+/// count is written. `rule_rows` are the rule rows of every READ table in read
 /// order (IPv4 tables, then IPv6); `error_rows` holds one `error|<tool>:unrecognised_output` row
 /// per tool that printed a listing that is not in the known shape.
 struct IptablesDirectAnswer {
@@ -1754,7 +1782,7 @@ struct IptablesDirectAnswer {
 };
 
 [[nodiscard]] inline IptablesDirectAnswer
-iptables_direct_answer(const std::vector<IptablesTableRead>& reads, bool tables_seen) {
+iptables_direct_answer(const std::vector<IptablesTableRead>& reads, NftSource nft) {
     IptablesDirectAnswer a;
     bool content = false;
     bool any_read = false;
@@ -1773,10 +1801,10 @@ iptables_direct_answer(const std::vector<IptablesTableRead>& reads, bool tables_
             (r.ip6 ? unshaped6 : unshaped4) |= r.unshaped;
         }
     }
-    a.all_read = any_read && !any_unread;
-    const NftVerdict verdict =
-        content ? NftVerdict::active : a.all_read ? NftVerdict::inactive : NftVerdict::unknown;
-    a.state = nft_fallthrough_clamp(tables_seen, verdict);
+    a.all_read = any_read && !any_unread && !nft_unshown(nft);
+    a.state = content    ? NftVerdict::active
+              : a.all_read ? NftVerdict::inactive
+                           : NftVerdict::unknown;
     if (unshaped4)
         a.error_rows.push_back(unrecognised_output_row("iptables"));
     if (unshaped6)
