@@ -655,8 +655,8 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
         read_product_property,
         [&upgrades](const std::string& code) { return upgrades.resolve(code); });
     if (upgrades.over_cap) {
-        spdlog::warn("msi_packages: the UpgradeCodes map is over its cap; every upgrade_code "
-                     "token is empty for this dispatch");
+        spdlog::warn("msi_packages: the UpgradeCodes map is over its cap; the roster is "
+                     "constrained (windows:msi_upgrade_map:over_cap)");
     } else {
         if (upgrades.bad_names != 0)
             spdlog::warn(

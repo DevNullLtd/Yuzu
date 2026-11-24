@@ -99,6 +99,8 @@ inline constexpr std::string_view kTokenRowCap = "windows:installer_records:row_
 inline constexpr std::string_view kTokenDbDeadline = "windows:installer_records:msi_db:deadline";
 inline constexpr std::string_view kTokenDbBusy = "windows:installer_records:msi_db:busy";
 inline constexpr std::string_view kTokenAccessDenied = "windows:installer_records:access_denied";
+/// The UpgradeCodes walk was cut short by a bound: constrained like a failed read.
+inline constexpr std::string_view kTokenUpgradeMapOverCap = "windows:msi_upgrade_map:over_cap";
 
 [[nodiscard]] inline std::string enum_token(unsigned rc) {
     return "windows:installer_records:enum:" + std::to_string(rc);
@@ -522,12 +524,14 @@ struct UpgradeMap {
     };
     std::unordered_map<std::string, Entry> by_product; ///< upper-case braced product code
     std::size_t bad_names = 0;  ///< subkey or value names that are not packed GUIDs (skipped)
-    bool over_cap = false;      ///< too many subkeys or value names (per key or in all): every token is empty
-    std::optional<std::string> failure; ///< a read fault (anything but an absent key)
+    bool over_cap = false;      ///< too many subkeys or value names (per key or in all)
+    /// A read fault (anything but an absent key) or the over-cap token: the roster is then
+    /// constrained, never a clean one with every token emptied.
+    std::optional<std::string> failure;
 
     /// The upgrade code of `product_code`; empty when no upgrade code names it, more than
-    /// one does, or the map is over its cap. A read fault is the failure token, so the
-    /// roster is constrained rather than carrying a token a fault emptied.
+    /// one does. A read fault or an over-cap map is the failure token, so the roster is
+    /// constrained rather than carrying a token a fault or a bound emptied.
     [[nodiscard]] std::expected<std::string, std::string> resolve(std::string_view product_code) const {
         if (failure)
             return std::unexpected(*failure);
@@ -572,8 +576,10 @@ UpgradeMap build_upgrade_map(Enumerate&& enumerate) {
         return true;
     };
     m.failure = enumerate(on_upgrade);
-    if (m.over_cap || m.failure)
-        m.by_product.clear(); // every token empty (over cap) or the roster constrained (fault)
+    if (m.over_cap && !m.failure)
+        m.failure = std::string{kTokenUpgradeMapOverCap};
+    if (m.failure)
+        m.by_product.clear(); // the roster is constrained: no row carries a partial token
     return m;
 }
 

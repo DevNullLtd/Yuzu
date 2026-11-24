@@ -440,6 +440,31 @@ TEST_CASE("msi inventory: the same map and product list give byte-identical rows
     CHECK(first == again);
 }
 
+TEST_CASE("msi inventory: an UpgradeCodes map cut short by a bound constrains the roster",
+          "[msi_packages][msi_inventory]") {
+    // 257 value names under one subkey: the builder stops the walk and the map is over its cap
+    const auto capped = rec::build_upgrade_map([](auto&& on_upgrade) -> std::optional<std::string> {
+        on_upgrade(kPackedUpgradeA, std::vector<std::string>(rec::kMaxUpgradeValueNames + 1,
+                                                             std::string{kPackedCMake}));
+        return std::nullopt;
+    });
+    REQUIRE(capped.over_cap);
+    FakeSource src;
+    src.rows = load_fixture();
+    const auto lines = inv::render(run(src, &capped));
+    CHECK(lines[0] == "status|list_inventory|constrained|windows:msi_upgrade_map:over_cap");
+    CHECK(lines.size() == 119); // every row is still there; the sync sends a status-only section
+    for (std::size_t i = 1; i < lines.size(); ++i)
+        CHECK(split_raw(lines[i])[5].empty());
+
+    // a clean map (not over its cap) stays supported
+    FakeSource clean_src;
+    clean_src.rows = load_fixture();
+    const auto ok = make_map();
+    CHECK_FALSE(ok.over_cap);
+    CHECK(inv::render(run(clean_src, &ok))[0] == "status|list_inventory|supported|-");
+}
+
 TEST_CASE("msi inventory: a map read fault constrains the roster; an absent map leaves the sixth token empty",
           "[msi_packages][msi_inventory]") {
     // a fault: the status row names it, every row is still there, and no sixth token is served

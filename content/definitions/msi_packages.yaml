@@ -223,7 +223,7 @@ spec:
         platforms: [windows]
       - name: upgrade_code
         type: string
-        description: 'Inventory rows only: the product''s UpgradeCode as the Windows Installer registry map (HKLM\SOFTWARE\Classes\Installer\UpgradeCodes) records it, braced and upper case. Empty when no upgrade code names the product, when more than one does, or when the map is absent or over its cap. A failed read of the map makes the status row `constrained` with a `windows:msi_upgrade_map:<code>` token instead.'
+        description: 'Inventory rows only: the product''s UpgradeCode as the Windows Installer registry map (HKLM\SOFTWARE\Classes\Installer\UpgradeCodes) records it, braced and upper case. Empty when no upgrade code names the product, when more than one does, or when the map is absent. A failed read of the map, or a read cut short by one of its bounds, makes the status row `constrained` with a `windows:msi_upgrade_map:<code>` or `windows:msi_upgrade_map:over_cap` token instead.'
         example: "{23170F69-40C1-2702-2604-000000000000}"
         platforms: [windows]
     aggregation:

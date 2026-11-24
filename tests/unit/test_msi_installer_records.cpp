@@ -853,7 +853,7 @@ TEST_CASE("installer records: a name that is not a packed GUID is skipped and co
     CHECK_FALSE(map.over_cap);
 }
 
-TEST_CASE("installer records: over its cap the upgrade map leaves every token empty",
+TEST_CASE("installer records: over its cap the upgrade map is a failure, so the roster is constrained",
           "[msi_packages][installer_records]") {
     // 257 value names under one subkey
     {
@@ -863,9 +863,9 @@ TEST_CASE("installer records: over its cap the upgrade map leaves every token em
         std::vector<FxUpgrade> up{load_fixture().upgrades[0], u};
         const auto map = build_map(up);
         CHECK(map.over_cap);
-        CHECK_FALSE(map.failure.has_value());
+        CHECK(map.failure == std::string{rec::kTokenUpgradeMapOverCap});
         CHECK(map.by_product.empty()); // even the product read before the cap
-        CHECK(*map.resolve(kPythonLauncher) == "");
+        CHECK(map.resolve(kPythonLauncher).error() == "windows:msi_upgrade_map:over_cap");
         // exactly 256 is fine
         u.products.pop_back();
         CHECK_FALSE(build_map({u}).over_cap);
@@ -878,7 +878,7 @@ TEST_CASE("installer records: over its cap the upgrade map leaves every token em
         const auto map = build_map(up, std::nullopt, &calls);
         CHECK(map.over_cap);
         CHECK(calls == rec::kMaxSubkeysVisited + 1);
-        CHECK(*map.resolve(kPythonLauncher) == "");
+        CHECK(map.failure == std::string{rec::kTokenUpgradeMapOverCap});
     }
 }
 
@@ -916,9 +916,9 @@ TEST_CASE("installer records: the upgrade map caps the value names in all, not o
     const auto over = build_map(up, std::nullopt, &calls);
     CHECK(over.over_cap);
     CHECK(calls == full_subkeys + 2);
-    CHECK_FALSE(over.failure.has_value());
+    CHECK(over.failure == std::string{rec::kTokenUpgradeMapOverCap});
     CHECK(over.by_product.empty()); // even the products read before the cap
-    CHECK(*over.resolve("{00000000-0000-0000-0000-000000000000}") == "");
+    CHECK_FALSE(over.resolve("{00000000-0000-0000-0000-000000000000}").has_value());
 }
 
 TEST_CASE("installer records: an absent UpgradeCodes key is an empty map; a read fault is a failure token",
