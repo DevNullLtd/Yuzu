@@ -41,7 +41,9 @@ class ComponentInventoryDefinitionColumns(unittest.TestCase):
             self.assertEqual(d["metadata"]["id"], f"crossplatform.components.{action}")
             self.assertEqual(d["spec"]["execution"]["plugin"], "component_inventory")
             self.assertEqual(d["spec"]["parameters"]["properties"], {})
-            self.assertEqual(d["spec"]["platforms"], ["darwin", "linux", "windows"])
+            # python and node have no Windows leg yet (planned, #8440): their definitions stay off Windows.
+            want = ["darwin", "linux", "windows"] if action in ("scan", "native") else ["darwin", "linux"]
+            self.assertEqual(d["spec"]["platforms"], want, action)
 
     def test_row_kind_leads_and_the_columns_match_the_wire_row(self):
         for action in ACTIONS:
