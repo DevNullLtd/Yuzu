@@ -2378,7 +2378,7 @@ TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_package
 
 TEST_CASE("collector: msi_packages rows carry package_id and source, and a constrained answer is status-only",
           "[sync][collector][msi_packages]") {
-    SECTION("Windows-shaped run: msi records carry package_id and source; slot 13 carries the sixth token as upgrade_code when the row has one") {
+    SECTION("Windows-shaped run: msi records carry package_id and source; slot 13 stays empty and slot 14 carries upgrade_code when the row has one") {
         fake_windows();
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
