@@ -30,6 +30,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 using yuzu::server::Deps;
 using yuzu::server::RestApiV1;
@@ -290,6 +291,48 @@ TEST_CASE("mint denies when perm_fn refuses", "[server][routes][upload]") {
         nlohmann::json{{"agent_id", "agent-1"}, {"declared_max_size", 100}}.dump());
     REQUIRE(res != nullptr);
     CHECK(res->status == 403);
+}
+
+// #7811: the grant's agent id is stored verbatim and reaches `target_id` on the mint failure row and
+// the `agent_id=` detail of the success row, so an over-long or control-byte id is refused with a
+// 400 before the store and any audit row, and nothing is minted.
+TEST_CASE("mint refuses an unsafe agent id with a 400 before the store, any audit row or a grant",
+          "[server][routes][upload][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, routes_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::test::TempDir blob_dir{"yuzu_test_upload_blobs_"};
+    TestRouteSink sink;
+    auto deps = make_deps(store, blob_dir.path, std::make_shared<std::int64_t>(1000));
+    std::string audited;
+    deps.audit_fn = [&audited](const httplib::Request&, const std::string& a, const std::string& r,
+                               const std::string& tt, const std::string& ti, const std::string& d) {
+        audited += a + "|" + r + "|" + tt + "|" + ti + "|" + d + "\n";
+        return true;
+    };
+    yuzu::server::register_file_retrieval_routes(sink, std::move(deps));
+
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        auto res = sink.dispatch(
+            "POST", "/api/v1/upload-grants",
+            nlohmann::json{{"agent_id", id}, {"declared_max_size", 100}}.dump());
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 400);
+        CHECK(body_json(res)["error"]["message"] == "Invalid device id.");
+    }
+    CHECK(audited.empty());
+    CHECK(store.list_for_agent().value().empty()); // nothing was minted
+
+    // A 256-byte printable id is safe and mints.
+    auto edge = sink.dispatch(
+        "POST", "/api/v1/upload-grants",
+        nlohmann::json{{"agent_id", std::string(256, 'a')}, {"declared_max_size", 100}}.dump());
+    REQUIRE(edge != nullptr);
+    CHECK(edge->status == 201);
 }
 
 TEST_CASE("list honours kDenyAll / kAdmitAll / kAdmitScoped visibility", "[server][routes][upload]") {

@@ -2606,6 +2606,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      echo_source::count(metrics_, kFamily, kSurface, "invalid_input");
                      return;
                  }
+                 // #7811: the posted id reaches the scoped gate's denial row and the
+                 // `attempted` row detail, and the audit store keeps CR, LF and TAB, so an
+                 // over-long or control-byte id is refused before the gate; no audit row.
+                 if (!auth::agent_id_is_audit_safe(device_id)) {
+                     res.status = 400;
+                     res.set_content("<span class=\"echo-row-error\">Invalid device id.</span>",
+                                     "text/html; charset=utf-8");
+                     echo_source::count(metrics_, kFamily, kSurface, "invalid_input");
+                     return;
+                 }
                  // Validate source against the canonical four. Anything else
                  // would be a forged form submission; reject rather than
                  // dispatch a configure command with an arbitrary key.
@@ -2840,6 +2850,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      res.status = 400;
                      res.set_content("<span class=\"echo-row-error\">"
                                      "device_id and source are required.</span>",
+                                     "text/html; charset=utf-8");
+                     echo_source::count(metrics_, kFamily, kSurface, "invalid_input");
+                     return;
+                 }
+                 // #7811: the same id floor as reenable, before the scoped gate.
+                 if (!auth::agent_id_is_audit_safe(device_id)) {
+                     res.status = 400;
+                     res.set_content("<span class=\"echo-row-error\">Invalid device id.</span>",
                                      "text/html; charset=utf-8");
                      echo_source::count(metrics_, kFamily, kSurface, "invalid_input");
                      return;

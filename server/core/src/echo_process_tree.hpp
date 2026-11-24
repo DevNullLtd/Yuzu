@@ -213,9 +213,8 @@ std::vector<std::int64_t> parse_echo_hours_output(const std::string& output,
                                                   EchoParseStats* stats = nullptr);
 
 /// Turn an agent's failure text (an `error|…` reply, or a command's error detail) into the
-/// sentence shown to the operator. An agent that predates the roll-up tables answers with a
-/// SQLite "no such column" / "no such table" or the registry's "unknown table"; that gets
-/// the one actionable instruction instead of the raw text. Plain text: the caller escapes.
+/// sentence shown to the operator: "The device reported an error: <first record>", or the
+/// bare "The device reported an error." when the text is empty. Plain text: the caller escapes.
 std::string echo_agent_error_note(const std::string& agent_text);
 
 /// What a read could not give the operator, shown beside (or instead of) the rows.
