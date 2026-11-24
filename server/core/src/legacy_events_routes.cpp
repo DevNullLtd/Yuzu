@@ -4,6 +4,7 @@
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // adopt_quota_slot_into_stream
 #include "rest_a4_envelope.hpp"
+#include "rest_a4_envelope_http.hpp" // a4_denial: body + X-Correlation-Id header together
 #include "stream_budget.hpp"
 
 #include <httplib.h>
@@ -60,8 +61,7 @@ void register_legacy_events_routes(HttpRouteSink& sink, Deps deps) {
             spdlog::error("/events: fleet_read_fn unwired -- misconfigured call site; "
                           "failing closed");
             res.status = 503;
-            res.set_content(detail::error_json_a4(503, "service unavailable",
-                                                  detail::make_correlation_id()),
+            res.set_content(detail::a4_denial(res, 503, "service unavailable"),
                             "application/json");
             return;
         }
@@ -76,10 +76,8 @@ void register_legacy_events_routes(HttpRouteSink& sink, Deps deps) {
                                         std::string("reason=scoped_authority securable=") + type);
                 res.status = 403;
                 res.set_content(
-                    detail::error_json_a4(
-                        403, std::string("permission denied: ") + type + ":Read",
-                        detail::make_correlation_id(),
-                        detail::A4ErrorOpts{.permission = std::string(type) + ":Read"}),
+                    detail::a4_denial(res, 403, std::string("permission denied: ") + type + ":Read",
+                                      detail::A4ErrorOpts{.permission = std::string(type) + ":Read"}),
                     "application/json");
                 return;
             }

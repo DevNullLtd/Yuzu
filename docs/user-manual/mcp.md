@@ -547,12 +547,11 @@ admission check now prevents.
 > enforcement, and a client that ignores every hint still cannot run an
 > approval-gated tool without a ticket.
 >
-> **Over-deep arguments.** The arguments of an approval-gated call may nest at most
-> 64 levels. A deeper call is refused with `-32602` and `error.data.reason`
-> `arguments_too_deep` before any ticket is minted or consumed; `retry_after_ms` is
-> `null` because the fault is in the call, not transient. Flatten the arguments and
-> call again. The refusal is audited as `mcp.<tool>` `denied` with
-> `reason=arguments_too_deep`.
+> **Over-deep arguments.** A request may nest at most 32 JSON levels in total, the
+> `jsonrpc` envelope and `params` included, so the arguments of an approval-gated call
+> get fewer. A deeper request is refused at parse with `-32700` before any ticket is
+> minted or consumed. The fault is in the call, not transient: flatten the arguments
+> and call again.
 >
 > **Upgrade note — confirmation UX.** A connected agentic worker that renders a
 > confirmation prompt off `destructiveHint` will, for the first time, prompt on

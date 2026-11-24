@@ -11055,7 +11055,7 @@ tests:
       - expr: 'ALERTS{alertname="YuzuAgentPluginMetaDropped", alertstate="firing"}'
         eval_time: 10m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuAgentPluginMetaDropped", alertstate="firing", field="name", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuAgentPluginMetaDropped", alertstate="firing", field="name", instance="s1", job="yuzu-server", severity="warning"}'
             value: 1
 
   # CASE - the `for: 5m` clause is pinned from both sides. s_short is down for 4 samples

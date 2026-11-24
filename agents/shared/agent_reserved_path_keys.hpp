@@ -8,8 +8,11 @@
 /// values; `tests/test_agent_reserved_path_keys.py` fails when agent.cpp publishes a new path-like
 /// `agent.*` key that is in none of the three arrays, so a new credential path cannot ship
 /// readable through `FileRetrieval:Read`. EXTEND these arrays, never fork a second list.
-/// Not covered (cannot be enumerated): well-known install-path certificates found by
-/// auto-discovery outside cert_dir/data_dir, and Windows certificate-store material.
+/// Auto-discovered client cert/key and install CA are resolved at the top of AgentImpl::run(),
+/// BEFORE the config map below is published and before any plugin init (the filesystem plugin
+/// builds its reserved set once at init), so a discovered path is reserved like a configured one;
+/// `tests/test_agent_reserved_path_keys.py` pins that order.
+/// Not covered: Windows certificate-store material (it has no file).
 
 #include <array>
 #include <string_view>

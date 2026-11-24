@@ -109,7 +109,13 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     }
     std::size_t plugin_meta_entries = 0;
     for (const auto& p : info.plugins()) {
-        session->plugin_names.push_back(p.name());
+        // One entry per plugin name, bounded in count and length: a repeated entry would
+        // otherwise be one catalogue vote per copy, and an unbounded name list would grow
+        // the session (review M3). The first entry for a name is the one kept.
+        if (p.name().size() <= plugin_meta_rules::kMaxNameLen &&
+            session->plugin_names.size() < plugin_meta_rules::kMaxPluginsPerAgent &&
+            std::ranges::find(session->plugin_names, p.name()) == session->plugin_names.end())
+            session->plugin_names.push_back(p.name());
         // WP06 F31: the PluginMeta copy (served to LLM clients as the plugin catalogue) is
         // bounded at ingest; an out-of-bound field is DROPPED and counted, never truncated.
         auto drop = [&](const char* field) {
@@ -119,6 +125,10 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         };
         if (!plugin_meta_rules::plugin_name_ok(p.name())) {
             drop("name");
+            continue;
+        }
+        if (std::ranges::any_of(session->plugin_meta, [&](const PluginMeta& m) { return m.name == p.name(); })) {
+            drop("duplicate");
             continue;
         }
         if (++plugin_meta_entries > plugin_meta_rules::kMaxPluginsPerAgent) {

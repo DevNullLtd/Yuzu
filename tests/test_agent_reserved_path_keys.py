@@ -41,6 +41,18 @@ class AgentReservedPathKeys(unittest.TestCase):
         self.assertIn("kReservedFileKeys", p)
         self.assertNotIn('get_config("agent.tls_client_key")', p)
 
+    def test_credential_discovery_runs_before_plugin_config_is_published(self):
+        # The filesystem plugin builds its reserved set once at init from plugin_ctx_.config, so
+        # a client key / CA that auto-discovery fills in AFTER the first publish is never refused
+        # (review finding H1). Best-effort lexical pin of the startup order inside run().
+        src = (ROOT / "agents/core/src/agent.cpp").read_text()
+        publish = src.index('plugin_ctx_.config["agent.tls_client_key"]')
+        for call in ("discover_client_cert()", "discover_install_ca_path()"):
+            sites = [m.start() for m in re.finditer(re.escape(call), src)
+                     if not src[src.rfind("\n", 0, m.start()) + 1:m.start()].lstrip().startswith("//")]
+            self.assertEqual(1, len(sites), f"{call}: expected exactly one live call in agent.cpp")
+            self.assertLess(sites[0], publish, f"{call} must run before the plugin config is published")
+
 
 if __name__ == "__main__":
     unittest.main()

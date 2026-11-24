@@ -1045,6 +1045,38 @@ public:
             candidates.push_back(std::move(handle));
         }
 
+        // Resolve every credential path the agent will use BEFORE the plugin config map is
+        // published below: the filesystem plugin builds its reserved set once, at init, from
+        // that map, so an auto-discovered client key or install CA resolved later would never
+        // be refused (WP06 F55; agent_reserved_path_keys.hpp). Discovery only reads the
+        // filesystem and the environment, so running it first changes nothing else.
+        // Auto-discover client certificate if none explicitly configured
+        if (cfg_.cert_auto_discovery && cfg_.tls_client_cert.empty() && cfg_.cert_store.empty()) {
+            auto discovered = discover_client_cert();
+            if (discovered) {
+                cfg_.tls_client_cert = discovered->cert_path;
+                cfg_.tls_client_key = discovered->key_path;
+                spdlog::info("Using auto-discovered cert from {} (source: {})",
+                             discovered->cert_path.string(), discovered->source);
+            }
+        }
+
+        // HIGH-1 (#1314): resolve the effective CA path BEFORE the provisioning gate.
+        // The install-CA auto-discovery used to live only inside build_channel and
+        // never wrote back cfg_.tls_ca_cert, so a no-`--ca-cert` agent connected over
+        // server-authenticated TLS but `provisioning_eligible` stayed false → it sent
+        // no CSR and never got its per-agent client leaf, with no error. Promoting the
+        // discovered path into cfg_.tls_ca_cert here makes both the provisioning gate
+        // and build_channel see the same effective CA (an explicit --ca-cert is left
+        // untouched, so this is a no-op when one was given).
+        if (cfg_.tls_enabled && cfg_.tls_ca_cert.empty()) {
+            if (auto ca = discover_install_ca_path()) {
+                cfg_.tls_ca_cert = *ca;
+                spdlog::info("PKI: auto-discovered install CA at {} — using it as the trust "
+                             "anchor and enabling per-agent enrollment",
+                             cfg_.tls_ca_cert.string());
+            }
+        }
         // Build the plugin context config map with agent state
         plugin_ctx_.config["agent.id"] = cfg_.agent_id;
         plugin_ctx_.config["agent.version"] = std::string{yuzu::kFullVersionString};
@@ -1812,17 +1844,6 @@ public:
         ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
 
-        // Auto-discover client certificate if none explicitly configured
-        if (cfg_.cert_auto_discovery && cfg_.tls_client_cert.empty() && cfg_.cert_store.empty()) {
-            auto discovered = discover_client_cert();
-            if (discovered) {
-                cfg_.tls_client_cert = discovered->cert_path;
-                cfg_.tls_client_key = discovered->key_path;
-                spdlog::info("Using auto-discovered cert from {} (source: {})",
-                             discovered->cert_path.string(), discovered->source);
-            }
-        }
-
         // PKI PR3: per-agent mTLS provisioning. When TLS is on with a CA but the
         // operator supplied no explicit client cert / OS-store cert, the agent
         // obtains its OWN client leaf from the server — it generates a keypair +
@@ -1848,22 +1869,7 @@ public:
         int csr_attempts = 0; // Hermes HIGH-2: bound enrolled-but-no-cert retries.
         const std::filesystem::path cert_dir =
             cfg_.cert_dir.empty() ? (cfg_.data_dir / "certs") : cfg_.cert_dir;
-        // HIGH-1 (#1314): resolve the effective CA path BEFORE the provisioning gate.
-        // The install-CA auto-discovery used to live only inside build_channel and
-        // never wrote back cfg_.tls_ca_cert, so a no-`--ca-cert` agent connected over
-        // server-authenticated TLS but `provisioning_eligible` stayed false → it sent
-        // no CSR and never got its per-agent client leaf, with no error. Promoting the
-        // discovered path into cfg_.tls_ca_cert here makes both the provisioning gate
-        // and build_channel see the same effective CA (an explicit --ca-cert is left
-        // untouched, so this is a no-op when one was given).
-        if (cfg_.tls_enabled && cfg_.tls_ca_cert.empty()) {
-            if (auto ca = discover_install_ca_path()) {
-                cfg_.tls_ca_cert = *ca;
-                spdlog::info("PKI: auto-discovered install CA at {} — using it as the trust "
-                             "anchor and enabling per-agent enrollment",
-                             cfg_.tls_ca_cert.string());
-            }
-        }
+        // The effective CA path is resolved at the top of run(), before plugin init (HIGH-1, #1314).
         const bool provisioning_eligible =
             cfg_.auto_provision_cert && cfg_.tls_enabled && !cfg_.tls_ca_cert.empty() &&
             cfg_.tls_client_cert.empty() && cfg_.cert_store.empty();

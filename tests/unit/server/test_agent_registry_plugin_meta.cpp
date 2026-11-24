@@ -143,6 +143,32 @@ TEST_CASE("one agent reporting more actions cannot override the fleet's entry fo
     CHECK(p["actions"].size() == 2);
 }
 
+TEST_CASE("one agent that repeats a plugin entry casts ONE vote for the catalogue, not one per copy "
+          "(review M3)",
+          "[agent_registry][plugin_meta][31]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.set_catalogue_filter([](std::string_view, std::string_view) { return true; });
+
+    for (const char* id : {"a1", "a2", "a3"}) {
+        auto info = make_info(id);
+        add_plugin(info, "status", "1.0.0", "", {"switch", "version"});
+        REQUIRE(registry.register_agent(info).has_value());
+    }
+    // One endpoint repeats the same entry far more often than there are honest agents.
+    auto rogue = make_info("rogue");
+    for (int i = 0; i < 100; ++i)
+        add_plugin(rogue, "status", "9.9.9", "", {"switch", "version", "extra1"});
+    REQUIRE(registry.register_agent(rogue).has_value());
+
+    auto help = nlohmann::json::parse(registry.help_json());
+    auto p = plugin_named(help, "status");
+    REQUIRE_FALSE(p.is_null());
+    CHECK(p["version"] == "1.0.0");
+    CHECK(p["actions"].size() == 2);
+}
+
 TEST_CASE("plugins and actions the capability catalogue does not recognise are omitted, and an "
           "unset filter serves nothing (fail closed)",
           "[agent_registry][plugin_meta][31]") {

@@ -5883,7 +5883,7 @@ public:
         registry_.set_catalogue_filter([this](std::string_view plugin, std::string_view action) {
             return capability_registry_.classify(std::string(plugin), std::string(action)).has_value();
         });
-        for (const char* field : {"name", "version", "description", "actions", "action", "plugins"})
+        for (const char* field : {"name", "version", "description", "actions", "action", "plugins", "duplicate"})
             metrics_.counter("yuzu_server_agent_registry_plugin_meta_dropped_total",
                              {{"field", field}});
         metrics_.describe("yuzu_server_agent_registry_plugin_meta_dropped_total",

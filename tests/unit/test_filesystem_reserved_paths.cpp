@@ -627,6 +627,43 @@ TEST_CASE("filesystem plugin: write_content refuses a dangling symlink leaf; lis
     handle->descriptor()->shutdown(ctx.get());
 }
 
+TEST_CASE("filesystem plugin: create_temp and create_temp_dir refuse a prefix or suffix that is not one "
+          "filename component (review M2)",
+          "[agent][filesystem_plugin][reserved]") {
+    auto handle = load_fs_plugin();
+    REQUIRE(handle);
+    yuzu::test::TempDir root{"yuzu_test_fs_reserved_tmp_"};
+    std::error_code ec;
+    const auto data_dir = root.path / "data";
+    const auto other = root.path / "other";
+    fs::create_directories(data_dir, ec);
+    fs::create_directories(other, ec);
+
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {{"agent.data_dir", data_dir.string()}}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    auto run = make_runner(*handle);
+    const auto count_entries = [](const fs::path& d) {
+        std::error_code e;
+        return std::distance(fs::recursive_directory_iterator(d, e), fs::recursive_directory_iterator{});
+    };
+
+    // `directory` is a clean, unreserved dir, but the prefix climbs into the reserved data dir.
+    const std::string climb = "../data/x-";
+    const auto before = count_entries(data_dir);
+    auto f1 = run("create_temp", {{"directory", other.string()}, {"prefix", climb}});
+    CHECK(f1.rc != 0);
+    auto f2 = run("create_temp", {{"directory", other.string()}, {"suffix", "/../../data/y"}});
+    CHECK(f2.rc != 0);
+    auto d1 = run("create_temp_dir", {{"directory", other.string()}, {"prefix", climb}});
+    CHECK(d1.rc != 0);
+    CHECK(count_entries(data_dir) == before);
+
+    // An ordinary prefix and suffix still work.
+    auto ok = run("create_temp", {{"directory", other.string()}, {"prefix", "yuzu_test_ok-"}, {"suffix", ".tmp"}});
+    CHECK(ok.rc == 0);
+    handle->descriptor()->shutdown(ctx.get());
+}
+
 TEST_CASE("filesystem plugin: a reserved path that did not exist at init is followed through a symlink "
           "planted afterwards (WP06 F55)",
           "[agent][filesystem_plugin][reserved][symlink]") {

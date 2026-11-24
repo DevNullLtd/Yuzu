@@ -1427,11 +1427,32 @@ private:
         return 0;
     }
 
+    /// A temp-file prefix or suffix is spliced into `<directory>/<prefix>XXXXXX<suffix>`, so a
+    /// separator in either would move the object out of the directory that was validated (and
+    /// into a reserved one). Accept one filename component only: no separator, no NUL, and on
+    /// Windows no ':' (an alternate data stream).
+    static bool is_single_name_component(std::string_view v) {
+        for (const char c : v) {
+            if (c == '/' || c == '\\' || c == '\0')
+                return false;
+#ifdef _WIN32
+            if (c == ':')
+                return false;
+#endif
+        }
+        return true;
+    }
+
     int do_create_temp(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto prefix = params.get("prefix", "yuzu-");
         auto suffix = params.get("suffix", ".tmp");
         auto directory = params.get("directory");
         auto persist = params.get("persist", "true");
+
+        if (!is_single_name_component(prefix) || !is_single_name_component(suffix)) {
+            ctx.write_output("error|prefix and suffix must be a single file name component");
+            return 1;
+        }
 
         // Validate directory if provided
         if (!directory.empty()) {
@@ -1588,6 +1609,11 @@ private:
         auto prefix = params.get("prefix", "yuzu-");
         auto directory = params.get("directory");
         auto persist = params.get("persist", "true");
+
+        if (!is_single_name_component(prefix)) {
+            ctx.write_output("error|prefix must be a single file name component");
+            return 1;
+        }
 
         if (!directory.empty()) {
             auto validated = validate_path(directory, {});
