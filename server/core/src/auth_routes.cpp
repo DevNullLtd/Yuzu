@@ -2701,8 +2701,8 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
     //    answer is never cached and is never recorded as "not armed".
     // The refresh itself is bounded in time (break_glass_status caps the pool acquire, the lock
     // wait and the statement). Two facts are kept across failed reads for the MFA step's second
-    // re-check: the id of the last definitive armed read and when the last definitive not-armed
-    // read started.
+    // re-check: the id of the last definitive armed read and the newest "not armed" time (an
+    // own read's end, a shared refresh's start; it never moves back).
     auto* metrics = auth_mgr_.metrics_registry();
     const auto count = [metrics](const char* result) {
         if (metrics)
@@ -2831,8 +2831,11 @@ SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& us
         out.read_wall_at = started_wall;
         return out;
     }
-    // A definitive "not armed". The last armed id is left in place on purpose.
-    bg_last_not_armed_at_ = started;
+    // A definitive "not armed". The last armed id is left in place on purpose. The time is this
+    // read's START, and it only ever moves forward: an own read that ended later may already have
+    // recorded a newer time, which a slow shared read must not lower (SG-1).
+    if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < started)
+        bg_last_not_armed_at_ = started;
     out.last_not_armed_at = bg_last_not_armed_at_;
     out.state = SsoOnlyLocalGate::kRefused;
     out.why = read.armed_until.empty() ? SsoOnlyRefusedWhy::kDisarmed
@@ -3838,7 +3841,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             mfa_verify_barrier_for_test_("/login/mfa", proof);
         // Re-check the arm state once more at the mint (the code verification took time). A code
         // may already be spent here, so the three answers are kept apart:
-        //  - armed: mint;
+        //  - armed: mint, unless the "not armed" time this server holds is at or after this
+        //    read started (then it is a disarm, refused);
         //  - a definitive "not armed": refuse (the refusal is honest about a spent code);
         // This check reads the arm state ITSELF (no shared cache, no single flight), so a refresh
         // held by another request, or an old cache, cannot refuse a login whose code is spent.
@@ -3864,9 +3868,16 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 wall2 - arm1->wall_at <= kArmSnapshotMaxAge &&
                 !arm1->arm_id.empty() && gate2.arm_id == arm1->arm_id &&
                 !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at);
-            const bool admit =
-                arm1.has_value() &&
-                (gate2.state == SsoOnlyLocalGate::kBreakGlassArmed || transient_ok);
+            // An armed own read is honoured only if the "not armed" time this server holds is
+            // before it STARTED; a time at or after that is the newer fact (C-01, PR #8626
+            // review). An own read records that time at its END, a shared refresh at its START,
+            // so a shared "not armed" read that started before this read but finished during it
+            // does not refuse it (a documented residual, auth-architecture.md arm-gate
+            // invariant (2)).
+            const bool armed_ok =
+                gate2.state == SsoOnlyLocalGate::kBreakGlassArmed &&
+                !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= gate2.read_at);
+            const bool admit = arm1.has_value() && (armed_ok || transient_ok);
             if (!admit) {
                 const char* reason = "transient";
                 const char* detail = "reason=break_glass_arm_state_unreadable_before_mint";
@@ -6103,11 +6114,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         }
-        // Revoking eligibility must terminate any in-flight elevation
-        // immediately (governance UP-1) — symmetric with the session
-        // wipe on demote/delete, so an incident-response "revoke now"
-        // actually drops the operator's admin access rather than
-        // leaving it standing for up to the window.
+        // Revoking eligibility must terminate any in-flight elevation (governance UP-1):
+        // at once on this replica, and on the others at their next session-generation poll
+        // (about 1 s, up to about 30 s while that read is failing or slow; neither bound holds
+        // after a database restore or a failover to a lagging standby, which can bring a cleared
+        // elevation back: restart every replica, see docs/ops-runbooks/auth-db-recovery.md,
+        // "Sessions are durable"). Symmetric with the
+        // session wipe on demote/delete, so an incident-response "revoke now" actually drops
+        // the operator's admin access rather than leaving it standing for up to the window.
         int cleared = 0;
         if (!eligible) {
             auto rv = auth_mgr_.revoke_user_elevations(target);
@@ -6438,6 +6452,61 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
+        // Re-read eligibility AFTER the elevation has committed, fail CLOSED. The eligibility revoke flips the flag BEFORE it clears the user's durable
+        // elevations, so either this re-read sees the flipped flag (and this branch rolls the
+        // elevation back), or the flip comes after this re-read, which means the revoke's clear
+        // runs after the elevation committed and ends it. The check before elevate_session
+        // alone leaves a window in which the clear matches no row and the elevation then
+        // commits. No `role.elevation.granted` row is written in any of the three outcomes (403,
+        // 503, 500). In the first two the elevation was rolled back; in the third (the
+        // compensating revoke failed) it may still be live.
+        if (auto post = db->is_elevation_eligible(session->username); !post || !*post) {
+            auto undo = auth_mgr_.revoke_elevation(token); // same compensation as the audit arm
+            if (!undo) {
+                // The compensating revoke itself failed durably: the elevation is LIVE for an
+                // account that is no longer eligible (or whose eligibility is unreadable).
+                spdlog::critical("elevation for '{}' committed but eligibility {} AND the "
+                                 "compensating revoke FAILED ({}) - elevation is LIVE; manual "
+                                 "revocation required",
+                                 ::yuzu::log_key_token(session->username),
+                                 post ? "was revoked" : "could not be re-read", undo.error());
+                audit_log_for_principal(req, "role.elevation.denied", "error", session->username,
+                                        auth::role_to_string(session->role), "User",
+                                        session->username,
+                                        "eligibility recheck after grant failed; "
+                                        "rollback_failed=true");
+                res.status = 500;
+                res.set_content(
+                    detail::error_json_a4(
+                        500, "elevation could not be rolled back; it may be active", cid,
+                        "end it with POST /api/v1/elevate/revoke from this session, or have an "
+                        "administrator send POST /api/v1/users/{name}/elevation-eligibility with "
+                        "{\"eligible\": false}; then check the auth + session stores"),
+                    "application/json");
+                return;
+            }
+            audit_log_for_principal(req, "role.elevation.denied", post ? "denied" : "error",
+                                    session->username, auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    post ? "eligibility revoked during elevation"
+                                         : "eligibility read failed after elevation");
+            if (!post) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "eligibility could not be confirmed "
+                                                           "after the elevation; the elevation "
+                                                           "was rolled back",
+                                                      cid, "retry shortly or contact an "
+                                                           "administrator"),
+                                "application/json");
+                return;
+            }
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid,
+                                                  "ask an administrator to grant you elevation "
+                                                  "eligibility"),
+                            "application/json");
+            return;
+        }
         // `until` may be CLAMPED to the session's own absolute expiry
         // (follow-up B, security review 2026-06-30) — report the TRUE
         // remaining time, not the requested/capped `duration`. A live window
@@ -6542,7 +6611,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
-                  auto rev = auth_mgr_.revoke_elevation(token);
+                  bool lookup_degraded = false;
+                  auto rev = auth_mgr_.revoke_elevation(token, &lookup_degraded);
                   if (!rev) {
                       // Durable clear failed — the elevation may still be LIVE.
                       // Fail CLOSED (503 + error audit) rather than auditing a
@@ -6561,10 +6631,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       return;
                   }
                   const bool was_elevated = *rev;
+                  // A degraded pre-clear lookup means the clear succeeded but whether the
+                  // session WAS elevated is unknown (`*rev` is then only "a row existed"):
+                  // never claim an elevation was ended.
                   audit_log_for_principal(req, "role.elevation.revoked", "ok", session->username,
                                           auth::role_to_string(session->role), "User",
                                           session->username,
-                                          was_elevated ? "was_elevated=true" : "was_elevated=false");
+                                          lookup_degraded ? "was_elevated=unknown"
+                                          : was_elevated  ? "was_elevated=true"
+                                                          : "was_elevated=false");
                   res.set_content(R"({"status":"ok"})", "application/json");
               });
 }

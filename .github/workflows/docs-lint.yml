@@ -211,6 +211,27 @@ jobs:
       - name: Response store read tripwire self-test (#4990)
         run: python3 -I tests/test_response_store_read_tripwire_selftest.py
 
+      # The stored rows of the file_search plugin stay in the existing Forensics read tier through one
+      # catalogue flag: no second tier, no new audit verb, the flag and the plugin name confined to a
+      # pinned handful of files. The self-test deletes each required statement in memory and proves the
+      # gate names it.
+      - name: File search read tier tripwire
+        run: python3 -I tests/test_file_search_read_tier_tripwire.py
+
+      - name: File search read tier tripwire self-test
+        run: python3 -I tests/test_file_search_read_tier_tripwire.py --selftest
+
+      # The file_search plugin sources spell no call that reads a matched file's bytes, writes, syncs
+      # or creates a file (the pinned spellings are listed in the script's docstring), and the
+      # one-approval cover of a multi-slice read keeps its single production caller (the MCP
+      # execute_instruction arm). The self-test appends each forbidden spelling and deletes each
+      # required statement in memory and proves the gate names it.
+      - name: File search source tripwire
+        run: python3 -I tests/test_file_search_source_tripwire.py
+
+      - name: File search source tripwire self-test
+        run: python3 -I tests/test_file_search_source_tripwire.py --selftest
+
       # #4990: server.cpp keeps wiring the Forensics plugin set and the visibility resolver into
       # every surface that reads stored responses. A route class built without them fails closed
       # and would silently lose Forensics rows for every caller, so no unit test notices a
@@ -221,6 +242,16 @@ jobs:
 
       - name: Forensics tier wiring gate self-test (#4990)
         run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
+
+      # G01: server.cpp keeps handing the policy evaluator its capability registry (an evaluator
+      # without one refuses every dispatch, so a dropped line stops every policy and no unit test
+      # notices) and policy_evaluator.cpp keeps one dispatch site behind the refusal seam. The
+      # self-test mutates each required statement in memory and proves the gate names it.
+      - name: Policy dispatch wiring gate (G01)
+        run: python3 -I tests/test_policy_dispatch_wiring_lexical.py
+
+      - name: Policy dispatch wiring gate self-test (G01)
+        run: python3 -I tests/test_policy_dispatch_wiring_lexical_selftest.py
 
       # WP01: the agent re-registration proof gate stays wired into the direct and gateway ingest
       # paths (unit tests use fake hooks, so a deleted wiring line would leave them green).

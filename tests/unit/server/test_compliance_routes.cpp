@@ -1040,6 +1040,27 @@ TEST_CASE("compliance page: actions use one delegated [data-act] listener, no in
     CHECK(page.find("r.data.deleted === true") != std::string::npos);
 }
 
+TEST_CASE("compliance page: the remediate copy says what policy evaluation refuses, and a refused "
+          "dispatch toast carries its reason",
+          "[compliance][fragments]") {
+    const std::string page = kComplianceHtml;
+    // The confirm copy no longer says the fix has no approval step: a fix whose action has an
+    // execute gate, is destructive or is reserved for the server is refused, not dispatched.
+    // Both approval controls are named: the action's execute gate and the instruction's own
+    // approval_mode (policy evaluation refuses a definition whose mode is not auto).
+    CHECK(page.find("with no approval step") == std::string::npos);
+    CHECK(page.find("A fix whose action has an execute gate, is destructive or is reserved for "
+                    "the server, or whose instruction needs approval, is refused, not dispatched") !=
+          std::string::npos);
+    CHECK(page.find("A fix that needs approval") == std::string::npos);
+    // The toast text is composed from the A4 body's remediation when the 409 is a refused
+    // dispatch, so the reason reaches the operator and not only "policy dispatch refused".
+    CHECK(page.find("policy_dispatch_refused: ") != std::string::npos);
+    CHECK(page.find("d.error.remediation") != std::string::npos);
+    // An authoring 400 keeps the instruction id its message names.
+    CHECK(page.find("m.indexOf('instruction ') === 0") != std::string::npos);
+}
+
 TEST_CASE("/fragments/compliance/summary: probes Write, Execute and Delete once and echoes them",
           "[compliance][fragments]") {
     {
@@ -1075,4 +1096,111 @@ TEST_CASE("/fragments/compliance/summary: probes Write, Execute and Delete once 
         h.sink.Get("/fragments/policy-fragments");
         REQUIRE(h.perm_calls.size() == 1);
     }
+}
+
+namespace {
+
+/// One enabled policy whose devices are all blocked (policy evaluation refused to dispatch its
+/// check), so the summary route has a blocked tally to carry end to end.
+class BlockedPolicyApi final : public ComplianceApi {
+public:
+    std::expected<std::vector<PolicyFragment>, PolicyReadError>
+    list_fragments(const FragmentQuery&) const override {
+        return std::vector<PolicyFragment>{};
+    }
+    std::expected<std::vector<Policy>, PolicyReadError>
+    list_policies(const PolicyQuery&) const override {
+        Policy p;
+        p.id = "pol-blocked";
+        p.name = "blocked policy";
+        p.scope_expression = "tag:env == 'prod'";
+        p.enabled = true;
+        return std::vector<Policy>{p};
+    }
+    std::expected<std::optional<PolicyDetail>, PolicyReadError>
+    get_policy(const std::string&) const override {
+        return std::optional<PolicyDetail>{};
+    }
+    std::expected<FleetCompliance, PolicyReadError> fleet_compliance() const override {
+        FleetCompliance fc;
+        fc.total_checks = 3;
+        fc.blocked = 3;
+        return fc;
+    }
+    std::expected<ComplianceSummary, PolicyReadError>
+    compliance_summary(const std::string&) const override {
+        ComplianceSummary cs;
+        cs.policy_id = "pol-blocked";
+        cs.blocked = 3;
+        cs.total = 3;
+        return cs;
+    }
+    std::expected<std::vector<PolicyAgentStatus>, PolicyReadError>
+    policy_agent_statuses(const std::string&) const override {
+        return std::vector<PolicyAgentStatus>{};
+    }
+    std::expected<std::vector<ComplianceSummary>, PolicyReadError>
+    compliance_by_policy() const override {
+        return std::vector<ComplianceSummary>{};
+    }
+};
+
+} // namespace
+
+TEST_CASE("/fragments/compliance/summary: a policy whose devices are blocked reads as failing, "
+          "not compliant",
+          "[compliance]") {
+    ComplianceHarness h{nullptr, true, std::make_shared<BlockedPolicyApi>()};
+
+    auto res = h.sink.Get("/fragments/compliance/summary");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("3 failing") != std::string::npos);
+    CHECK(res->body.find("Compliant</span>") == std::string::npos);
+}
+
+// The three legacy `/api/*` producers build their JSON inline (the v1 twins and the MCP tools go
+// through the shared builders), so each needs its own pin that `blocked` reaches the response.
+TEST_CASE("legacy /api/policies/{id}, /api/compliance and /api/compliance/{id} carry the blocked "
+          "tally",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    auto pid = store.create_policy(make_policy_yaml(frag.value(), "Blocked Policy"));
+    REQUIRE(pid.has_value());
+    auto marked = store.mark_blocked(pid.value(), {"agentA", "agentB"}, "check", "content_dist",
+                                     "execute_staged", "gated");
+    REQUIRE(marked.has_value());
+    REQUIRE(marked->changed == 2);
+
+    ComplianceHarness h{&store};
+
+    auto detail = h.sink.Get("/api/policies/" + pid.value());
+    REQUIRE(detail);
+    REQUIRE(detail->status == 200);
+    auto dj = nlohmann::json::parse(detail->body);
+    REQUIRE(dj["compliance"].contains("blocked"));
+    CHECK(dj["compliance"]["blocked"] == 2);
+    CHECK(dj["compliance"]["total"] == 2);
+
+    auto fleet = h.sink.Get("/api/compliance");
+    REQUIRE(fleet);
+    REQUIRE(fleet->status == 200);
+    auto fj = nlohmann::json::parse(fleet->body);
+    REQUIRE(fj.contains("blocked"));
+    CHECK(fj["blocked"] == 2);
+    CHECK(fj["total_checks"] == 2);
+    CHECK(fj["compliant"] == 0);
+
+    auto per_policy = h.sink.Get("/api/compliance/" + pid.value());
+    REQUIRE(per_policy);
+    REQUIRE(per_policy->status == 200);
+    auto pj = nlohmann::json::parse(per_policy->body);
+    REQUIRE(pj["summary"].contains("blocked"));
+    CHECK(pj["summary"]["blocked"] == 2);
+    CHECK(pj["summary"]["total"] == 2);
 }

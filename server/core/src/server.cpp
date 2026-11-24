@@ -2478,24 +2478,29 @@ public:
         // #4966: a store fault inside the account-lifecycle guard (a lock wait that expired, a
         // lost connection, an unwired guard), by the guarded operation. NOT a refusal: the
         // request was neither allowed nor judged. Counted in AuthManager, so the dashboard, SCIM
-        // and every other caller through it share one series. No alert rule ships with it yet
-        // (a later change owns the alerts).
+        // and every other caller through it share one series, except op=unassign, which
+        // RbacStore counts for a failed role unassignment of any role or principal type. No
+        // alert rule ships with it yet (a later change owns the alerts).
         metrics_.describe("yuzu_server_rbac_lifecycle_store_failure_total",
-                          "Store faults inside the account-lifecycle last-Administrator guard, "
-                          "by operation (deactivate: account removal; set_role: role write; "
-                          "would_strand: the advisory pre-check, after which the request still "
-                          "proceeds to the guarded write; grant_read: the SCIM "
-                          "pre-provisioning Administrator-grant read). The unwired fail-closed "
+                          "Store faults in the account-lifecycle last-Administrator guard and in "
+                          "role unassignment, by operation (deactivate: account removal; "
+                          "set_role: role write; would_strand: the advisory pre-check, after "
+                          "which the request still proceeds to the guarded write; grant_read: "
+                          "the SCIM pre-provisioning Administrator-grant read; unassign: a "
+                          "role unassignment, of any role or principal type, whose transaction "
+                          "failed with a store fault; a last-Administrator refusal is not "
+                          "counted). The unwired fail-closed "
                           "arm also counts, for deactivate and set_role only. A sustained "
-                          "non-zero rate means deprovisioning or role changes are being "
-                          "answered with a store-unavailable error rather than judged, except "
-                          "for would_strand, which never stops the request (SCIM answers 503 "
-                          "with Retry-After; the dashboard role route gives no retry hint): "
-                          "look at yuzu_pg_pool_waiters and "
-                          "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
-                          "holder.",
+                          "non-zero rate means deprovisioning, role changes or unassignments "
+                          "are being answered with a store-unavailable error rather than "
+                          "judged, except for would_strand, which never stops the request "
+                          "(SCIM answers 503 with Retry-After; the dashboard role route gives "
+                          "no retry hint): look at yuzu_pg_pool_waiters and "
+                          "yuzu_pg_acquire_wait_seconds, and for a stuck lock holder (the "
+                          "rbac_enabled row for deactivate and set_role; an unassign takes no "
+                          "rbac_enabled lock).",
                           "counter");
-        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read"})
+        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read", "unassign"})
             metrics_.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}});
         // #4966: a SCIM same-request compensation (the guarded undo of a just-created or
         // just-revived account) that did NOT complete. Written beside the
@@ -2924,9 +2929,10 @@ public:
                           "(cumulative per agent since install; a rising value is the signal)",
                           "gauge");
         metrics_.describe("yuzu_fleet_echo_storage_offline",
-                          "Agents whose Echo database is offline and being retried, by reason "
-                          "(free_space, migration_failed, open_failed; anything else sums under "
-                          "unknown). Published for every reason each sweep, 0 included",
+                          "Agents whose Echo database is offline, by reason (free_space, "
+                          "migration_failed, open_failed are retried; rollback_wedged is not and "
+                          "needs an agent restart; anything else sums under unknown). Published "
+                          "for every reason each sweep, 0 included",
                           "gauge");
         metrics_.describe("yuzu_fleet_plugin_init_failed",
                           "Agents reporting a plugin that failed init, by plugin name (absent "
@@ -6531,6 +6537,21 @@ public:
             }
         }
 
+        // file_search ships default-off (it lists file names under every user's directories;
+        // its stored rows are Forensics-tier). Enable via PUT
+        // /api/v1/plugin-config/file_search/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "file_search",
+                    "default-off: lists file names under every user's directories; enable per PUT "
+                    "/api/v1/plugin-config/file_search/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: file_search default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
         // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
         // and session credentials are stored as SHA-256 digests, never a
         // sealed SecretCodec blob (upload_grant_store.hpp file header).
@@ -7940,6 +7961,33 @@ public:
                 // does not exist until this block. Nulled at teardown beside
                 // set_credential_change_owner(nullptr).
                 auth_mgr_.set_rbac_store(rbac_store_.get());
+                // An Administrator unassign clears the target's durable elevations in
+                // its own transaction (the RbacStore default mode; this file never opts out).
+                // That clear needs the session_store schema, which only an OPEN SessionStore
+                // guarantees. The SessionStore construction block earlier in this startup path
+                // already sets `startup_failed_` when the store fails to open, and this block
+                // runs only while `startup_failed_` is false, so the check below is a backstop
+                // against a future reordering, not a new boot refusal in a healthy configuration;
+                // it exists so a console where every user Administrator unassign would fail is
+                // never served. The callback then drops THIS
+                // replica's cached sessions of the user (other replicas converge on their next
+                // generation poll). `auth_mgr_` is a reference to main.cpp's AuthManager, which
+                // outlives ServerImpl; the callback is never cleared at teardown (it is
+                // read lock-free by serving threads) and only takes AuthManager's own lock.
+                if (!session_store_ || !session_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: the RbacStore Administrator unassign "
+                                  "ends the target's JIT elevation in its own transaction, which "
+                                  "needs an open SessionStore (session_store schema), and none is "
+                                  "available");
+                    startup_failed_ = true;
+                } else if (!rbac_store_->set_local_session_drop(
+                               [&auth_mgr = auth_mgr_](const std::string& username) {
+                                   auth_mgr.drop_local_sessions_of_user(username);
+                               })) {
+                    spdlog::error("[PG] Refusing to start: the RbacStore local session-drop "
+                                  "callback was already set; it must be wired exactly once");
+                    startup_failed_ = true;
+                }
             }
         }
         // #4966 boot self-check: an AuthDB without the guard would leave
@@ -19710,6 +19758,15 @@ private:
             // flips — same field and wiring as the other three background
             // engines' Deps.
             .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
+            // G01: the capability registry policy evaluation classifies a pair against before it
+            // dispatches (execute gate, Destructive class, reserved rows). Without it the
+            // evaluator refuses every dispatch (`unwired`), so this wiring is what lets a policy
+            // run at all. `capability_registry_` is declared before `policy_evaluator_`, so it
+            // outlives the evaluator.
+            .capability_registry = &capability_registry_,
+            // The `policy.dispatch` / `denied` audit rows; same store the other background
+            // engines write to.
+            .audit_store = audit_store_.get(),
         });
         policy_eval_thread_ = std::thread([this]() {
             spdlog::info("Policy evaluation thread started (cadence=10s, grace=15s)");
@@ -22435,8 +22492,11 @@ private:
                     auto fc = compliance_api->fleet_compliance();
                     if (!fc)
                         return std::nullopt;
-                    return home::ComplianceFigure{fc->total_checks, fc->compliant, fc->non_compliant,
-                                                  fc->unknown, fc->compliance_pct};
+                    // `error` and `blocked` count as failing, like `non_compliant`: the tile,
+                    // the compliance page's readout and its row pills are defined to agree.
+                    return home::ComplianceFigure{fc->total_checks, fc->compliant,
+                                                  fc->non_compliant, fc->unknown,
+                                                  fc->compliance_pct, fc->error, fc->blocked};
                 },
                 .failed_fn = [this]() -> std::optional<std::vector<home::FailedRow>> {
                     if (!execution_tracker_)

@@ -2150,7 +2150,7 @@ Grant or revoke a user's **JIT-admin-elevation eligibility** — who may activat
 
 **Body:** `{"eligible": <bool>}`.
 
-**Side effect:** setting `eligible=false` immediately terminates any in-flight elevation for that user.
+**Side effect:** setting `eligible=false` terminates any in-flight elevation for that user: at once on the replica that handled the call, and on the other replicas on their next poll of the session generation (about 1 second, up to about 30 seconds while that read is failing or slow; neither bound holds after a database restore or a failover to a lagging standby, so restart every replica then). A `POST /api/v1/elevate` in flight at that moment is covered: that route re-reads eligibility after its elevation commits, and either sees the revoked flag and rolls the elevation back (`403`), or the revoke's clear runs after the elevation committed and ends it.
 
 Two route forms, same handler:
 
@@ -2186,7 +2186,7 @@ The query-parameter form of the route above. It uses the same handler, permissio
 (`oidc:<iss>#<sub>`; URL-encode the `#` as `%23`), because a path segment cannot carry that principal's
 `/` and `#`. A local username may use either form. A missing or empty `username` returns `400`. See the
 section above for the full permission rules (admin plus MFA step-up, self-grant blocked, granting needs
-the caller's own administrator role). Revoking with `eligible:false` also ends any active elevation. If
+the caller's own administrator role). Revoking with `eligible:false` also ends any active elevation (at once on the replica that handled the call, and on the others within the bound given above). If
 that clean-up fails, the route returns `503` even though the flag change was saved; retry to finish the
 revocation.
 
@@ -3612,6 +3612,44 @@ identical SAML gap in the last-Administrator guard. Audited `rbac.role.assigned`
 Revoke a fleet-wide RBAC role grant from a human user. Idempotent —
 unassigning a role the principal did not hold still returns success.
 
+**Removing a user's `Administrator` grant also ends that user's JIT elevation
+window**, in the same database transaction as the removal: the removal and the
+clear commit together or not at all, so if the clear cannot be done the removal
+is rolled back and the route answers `503`. The clear runs only when a grant row
+was actually removed. Unassigning an `Administrator` grant the user does not
+hold (the usual case for a just-in-time user who elevates through eligibility
+alone) is an idempotent no-op: it answers success, the audit detail records
+`removed=false`, and no elevation is ended. This replica drops its cached
+sessions of the user after the commit (all of them, elevated or not, each re-read from the
+durable store on its next request); other replicas converge within about a
+second (up to about 30 seconds while their session-generation read is failing
+or slow; neither bound holds after a database restore or a failover to a lagging
+standby, which can bring the cleared elevation back and leave a restored
+generation equal to a replica's cached one unnoticed, so restart every replica).
+It does not change the user's elevation eligibility and does not
+block a later `POST /api/v1/elevate`: an eligible user can open a new window. To
+end elevated access for good, first call
+`POST /api/v1/users/{name}/elevation-eligibility` with `{"eligible": false}`
+(it refuses service-scoped and MCP-tier tokens, needs the caller's own
+administrator role or an active elevation rather than an `Administrator` grant, and also
+ends live elevations, at once on the replica that handled it and on the others within the
+same bound as above); for a user with no grant that call is the only step needed. A
+request already past its authorization check when the clear lands is not
+recalled, a `POST /api/v1/elevate` that had already passed its eligibility check
+can wait on the unassign's session-row lock and complete just after the unassign
+commits (so a new window can stand; revoking eligibility closes that race, see the
+eligibility route), and an open event stream is not re-checked
+for elevation. For this
+case the transaction bounds each lock wait at 2000 ms (other unassigns keep the
+pool default), so it can answer a retryable `503` when it cannot take its locks
+in time. A server log warning `rbac.role.unassigned store fault` (a failed unassign of an engine
+principal's role logs `engine_principal.role.unassigned store fault` on its own route, and, when
+the store has no error text, also the `RbacStore: unassign_role transaction did not complete`
+warning) and the
+counter `yuzu_server_rbac_lifecycle_store_failure_total{op="unassign"}` record
+such a fault; each logged value is capped at 256 bytes and a space, `=` or `,` in it is
+written as `_`. See "Fleet-Wide Role Assignment" in `rbac.md`.
+
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
 above (including the MCP-tier-token structural denial), plus MFA step-up.
 
@@ -3643,9 +3681,23 @@ surface) principal is never counted as a surviving administrator (the guard has
 known residual gaps, see "Fleet-Wide Role Assignment" in `rbac.md`); `503` — the
 RBAC store is unavailable (including when the admin gate itself cannot
 confirm durable authority — logged and audited as a `denied` row), a
-genuine store/query fault removing the grant, or (on an otherwise-successful
-unassignment) its audit row could not persist — treat the removal as
-unconfirmed and reconcile via a read. Audited `rbac.role.unassigned`.
+genuine store/query fault removing the grant (for a user `Administrator`
+grant this includes a lock wait over 2000 ms, a deadlock, or a failure to clear
+the elevation: the removal is rolled back and a retry is safe, but if the
+database's commit acknowledgement was lost the removal and the clear may have
+committed, so read the grant list before assuming nothing changed), or (on an
+otherwise-successful unassignment) its audit row could not persist — the
+removal is already committed, so treat it as unconfirmed and reconcile via a
+read; do not repeat the call to restore the missing row (a repeat reports
+`removed=false` and writes neither addition). Audited `rbac.role.unassigned`;
+when the clear changed N > 0 session rows that held an elevation window (an
+expired window not yet reaped is counted), its `detail` ends with
+` elevations_cleared=N` and one `role.elevation.revoked` row
+(`detail=reason=administrator_unassign cleared=N role=Administrator`, target the
+user) is written too, either failing to persist giving the same audit-gap `503`.
+A no-op unassign, and a retry after a lost commit acknowledgement, write
+neither addition. The response body is the same in every case. See
+`docs/user-manual/audit-log.md`.
 
 MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see
 `docs/user-manual/mcp.md`.
@@ -4678,10 +4730,12 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). A collation that serves a Forensics-tier step's output also writes `response.forensics.read` with `surface=bundle` (see `response.forensics.read` in the [Audit log](audit-log.md) guide). |
-| `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
-| `policy.create` | Policy created via `POST /api/policies`. `result` = `success`. Detail (#2123) records the targeting **as stored**: `scope=<scope_expression>` (`-` when empty; cut to 1024 bytes, then `~` appended; the cut can fall inside a multi-byte character) and `groups=<n>` followed by `:<id>,<id>…` (at most 32 ids, then `,~`; each id cut to 64 bytes, then `~`), each value neutralised with `audit_token` (space, `=`, `,` and control bytes become `_`), e.g. `scope=ostype____"windows"_AND_EXISTS_tag:prod groups=1:abc123def456`. `scope=unreadable groups=unreadable` means the read-back after the write failed. A refused create (`400`/`503`) writes no row, and a policy installed from a product pack writes none (#7011). |
-| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
-| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
+| `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. The denied row's `target_id` is the `displayName`, name or id the submitted YAML carries (no policy or fragment exists yet). Denied detail values: `duplicate_name` (409, fragment with the same `name` already exists) and `reason=<token> instruction=<id>` (400, an instruction policy evaluation does not dispatch; see `POST /api/policy-fragments`). |
+| `policy.create` | Policy created via `POST /api/policies`. `result` = `success`. Detail (#2123) records the targeting **as stored**: `scope=<scope_expression>` (`-` when empty; cut to 1024 bytes, then `~` appended; the cut can fall inside a multi-byte character) and `groups=<n>` followed by `:<id>,<id>…` (at most 32 ids, then `,~`; each id cut to 64 bytes, then `~`), each value neutralised with `audit_token` (space, `=`, `,` and control bytes become `_`), e.g. `scope=ostype____"windows"_AND_EXISTS_tag:prod groups=1:abc123def456`. `scope=unreadable groups=unreadable` means the read-back after the write failed. A create refused because its fragment names an instruction policy evaluation does not dispatch (`400`) writes a `result=denied` row with detail `reason=<token> instruction=<id>` and a `target_id` of the `displayName`, name or id the submitted YAML carries (no policy exists yet); any other refused create (`400`/`503`) writes no row, and a policy installed from a product pack writes none (#7011). |
+| `policy.dispatch` | Written by the server (principal `system`) when policy evaluation refuses to dispatch a check, fix or post-fix check; `result=denied`. When it is written and when it can be lost: see the audit log manual. |
+| `policy.enable` | A policy enabled via `POST /api/policies/{id}/enable`. `result` ∈ {`success`, `denied`}. Denied detail is `reason=<token> instruction=<id>` (400, a fragment instruction policy evaluation does not dispatch). |
+| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `denied`, `error`}. Success detail format `execution_id=<id>`. A refused dispatch (the check names an action policy evaluation does not run) answers its own `409` and audits `result=denied` with `detail=reason=<token>`. Note: the other `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
+| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (`reason=<token>` when the fix names an action policy evaluation does not run, which answers `409`; or e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined (`attempt`, `success` or `failure`; `denied` when the dispatch approval check refuses the request, with `reason=<label> securable=<name>` in the detail, or when the request's two session look-ups named different principals, with `authenticated principal changed during the request now=<account>` in the detail) |
 | `quarantine.disable` | Device released from quarantine (`attempt`, `success` or `failure`; `denied` in the same two cases as `quarantine.enable`) |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. Also emitted by `POST /api/v1/ca/issue-code-signing` (gap-matrix #10) / MCP `issue_code_signing_cert`: `target_type=CodeSigningCertificate`, `target_id=<label>` on a rejected request or `<serial_hex>` on success, `detail` carries `purpose=code-signing`; `result=success`, `result=denied` (no CA root, or a bad/unparseable CSR), or `result=failure` (a genuine 5xx — key-load, signing, or `ca_store` write failure). |
@@ -5356,7 +5410,9 @@ Create a new policy fragment from YAML.
 
 **Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
 
-**Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body).
+**Response (400), refused instruction:** a fragment whose `check`, `fix` or `postCheck` instruction names an action policy evaluation will not dispatch (an execute gate, a destructive or reserved action, or one the server cannot classify) or has an approval mode other than `auto` is refused before it is stored. Body is the A4 error envelope, `{"error":{"code":400,"message":"instruction <id> names an action that policy evaluation does not dispatch (<reason>)","correlation_id":"<id>","retry_after_ms":null,"remediation":"policy_dispatch_refused: <reason>. ..."},"meta":{"api_version":"v1"}}`, with the same `X-Correlation-Id` header, where `<reason>` is `unclassified`, `ambiguous`, `gated`, `destructive`, `reserved`, `approval_required` or `dispatch_identifier_invalid` (`unwired` answers `503`, below). For `approval_required` the message reads `instruction <id> has an approval mode that policy evaluation does not dispatch (approval_required)`: the instruction's approval mode is not `auto`. Unlike the other `400`s on these routes, whose `error` is a string, the `error` of this one is an object, and its `remediation` starts `policy_dispatch_refused: ` followed by the reason; that is how a client tells it apart. Audit event `policy_fragment.create / denied`, detail `reason=<reason> instruction=<id>`. The check is advisory: an instruction that does not exist yet is accepted, and the dispatch check is the control.
+
+**Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body). Also `503` when the refused-instruction check cannot be answered, and the fragment is never accepted in that case. The body is the A4 error envelope with a correlation id. When the instruction store failed (a retry may clear it) the message is `instruction lookup unavailable, try again` and `retry_after_ms` is 5000; when the evaluator has no capability registry or instruction store (`unwired`, which no retry clears) the message is `instruction lookup unavailable` and `retry_after_ms` is `null`.
 
 ---
 
@@ -5475,7 +5531,9 @@ Create a new policy from YAML.
 
 **Response (400):** YAML missing required fields, unknown `fragment_id`, invalid scope expression, or an explicit `id` that is longer than 128 characters, holds a character other than letters, digits, `.`, `_` and `-`, or consists only of dots. Also `400` (#2123): a `spec.scope.selector.tags` or `managementGroups` list the server cannot read as written — an inline `[ ]` list that does not close on its own line, a `- item` line out of line with the list's other items (including one indented to `selector:`'s own column), a line missing its `- `, an item continued on the next line, an empty-string item, a single value where a list is expected, list lines written after a value on the key line (`tags: null` or `tags: [a]` followed by `- prod`), or a list followed directly by an outer list's next item — and a `managementGroups` entry that is not a management group id (ids are letters, digits and `_ . : * -`). The reason names the field and, except for a `- item` outside `selector:` (which names `spec.scope`), the entry. Body is `{"error": "<reason>"}`.
 
-**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body.
+**Response (400), refused instruction:** when the policy's fragment names an instruction policy evaluation will not dispatch, the create is refused with the same body as `POST /api/policy-fragments` (the A4 error envelope, `error.code` 400, a `message` of `instruction <id> names an action that policy evaluation does not dispatch (<reason>)` and a `remediation` starting `policy_dispatch_refused: <reason>`) and audited `policy.create / denied`, detail `reason=<reason> instruction=<id>`. A fragment that does not exist yet is left to the store's own check below.
+
+**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body. Also `503` when the refused-instruction check cannot be answered (the A4 error envelope: message `instruction lookup unavailable, try again` with `retry_after_ms` 5000 when the instruction store failed; message `instruction lookup unavailable` with `retry_after_ms` `null` for an unwired evaluator). The check is skipped, and the write goes ahead, when the fragment the policy names cannot be read at that moment (the dispatch check still applies at the policy's first dispatch).
 
 ---
 
@@ -5508,6 +5566,7 @@ Get policy detail including compliance summary.
     "unknown": 5,
     "fixing": 1,
     "error": 0,
+    "blocked": 0,
     "total": 51
   }
 }
@@ -5545,9 +5604,9 @@ Enable a previously disabled policy.
 }
 ```
 
-**Response (400):** `policy not found`. **Response (503):** a genuine internal
+**Response (400):** `policy not found`. **Response (400), refused instruction:** enabling is where a policy starts to run, so the same refused-instruction check runs here (a policy installed by a product pack was never checked at install); same body as `POST /api/policy-fragments`, audited `policy.enable / denied`, detail `reason=<reason> instruction=<id>`. **Response (503):** a genuine internal
 store failure on the write — safe to retry, internal error string never
-included in the body.
+included in the body; also `503` when the refused-instruction check cannot be answered (the A4 error envelope: message `instruction lookup unavailable, try again` with `retry_after_ms` 5000 when the instruction store failed; message `instruction lookup unavailable` with `retry_after_ms` `null` for an unwired evaluator). The check is skipped, and the write goes ahead, when the policy or its fragment cannot be read at that moment (the dispatch check still applies at the policy's first dispatch).
 
 ---
 
@@ -5617,7 +5676,7 @@ Force an immediate compliance evaluation of a policy, ignoring its interval. The
 server dispatches the bound fragment's `check` instruction to the policy's scope
 and, once responses arrive (within a short grace window), evaluates the CEL
 `check_compliance` per agent and writes `compliant` / `non_compliant` /
-`unknown` / `error` to each agent's status — which is what
+`unknown` / `error` (or `blocked`, see below) to each agent's status — which is what
 `GET /api/compliance` and `GET /api/policies/{id}` then report. Evaluation is
 asynchronous: this returns immediately with the dispatch `execution_id`; the
 verdicts appear a few seconds later.
@@ -5635,7 +5694,15 @@ verdicts appear a few seconds later.
 
 **Response (404):** policy not found. **Response (409):** the policy's fragment
 has no `check` instruction, the policy matches no agents, or a check for this
-policy is already in flight. **Response (503):** either the policy evaluator
+policy is already in flight; or the check names an action that policy evaluation
+does not run, or an instruction whose approval mode is not `auto` (a refused dispatch). The refused dispatch has its own error body,
+built like every other A4 error (`error.code` 409, `message` "policy dispatch
+refused", a `correlation_id`, and a `remediation` text that starts
+`policy_dispatch_refused: ` followed by the reason: `gated`, `destructive`,
+`reserved`, `unclassified`, `ambiguous`, `unwired`, `approval_required` or
+`dispatch_identifier_invalid`; the text tells the caller to change the instruction, except for
+`unwired`, where it says to try again later). Nothing was sent; the policy's devices are
+`blocked` and the attempt is audited as `policy.evaluate` `denied`. **Response (503):** either the policy evaluator
 isn't wired, a genuine internal store failure occurred while reading the policy
 or fragment, recording the dispatch claim, or (ADR-0058) resolving the check
 instruction against InstructionStore, **or (#4981 PR-1) the policy's scope
@@ -5697,7 +5764,10 @@ absent) releases its claim without consuming a retry attempt and is excluded
 from the count, so `agents` may be smaller than the number of `agent_ids`
 requested.
 
-**Response (404):** policy not found. **Response (409):** the fragment defines no
+**Response (404):** policy not found. **Response (409):** the fix names an action
+that policy evaluation does not run, or an instruction whose approval mode is not `auto` (a refused dispatch, with the same error body
+as `/evaluate` above; the targets become `blocked` and their claims are released;
+this is decided at dispatch, after the no-fix-instruction, no-agents and claim rejections below, which answer first), the fragment defines no
 `fix` instruction, there are no non-compliant agents to remediate, or a target
 could not be claimed — either it is already claimed for remediation (a durable
 per-`(policy, agent)` claim in `PolicyStore`, safe across replicas, HA WS-3
@@ -5772,6 +5842,7 @@ top-level fields (not nested under a `"policy"` key), A4-enveloped. MCP twin:
       "unknown": 5,
       "fixing": 1,
       "error": 0,
+      "blocked": 0,
       "total": 51
     }
   },
@@ -5803,7 +5874,8 @@ Fleet compliance summary across all active policies.
   "non_compliant": 8,
   "unknown": 5,
   "fixing": 2,
-  "error": 0
+  "error": 0,
+  "blocked": 0
 }
 ```
 
@@ -5829,6 +5901,7 @@ Per-policy compliance detail with per-agent statuses.
     "unknown": 5,
     "fixing": 1,
     "error": 0,
+    "blocked": 0,
     "total": 51
   },
   "agents": [
@@ -5842,6 +5915,8 @@ Per-policy compliance detail with per-agent statuses.
   ]
 }
 ```
+
+`blocked` counts devices whose check or fix policy evaluation refused to dispatch, because the instruction names an action with an execute gate, a destructive or reserved action, or one the server cannot classify, or has an approval mode other than `auto` (see "Action approval and the `blocked` status" in the policy engine manual). It counts as failing, nothing was sent, and the other routes in this section carry the same field. For a `blocked` device `check_result` is not agent output but a JSON string the server wrote: `{"action":"execute_staged","phase":"check","plugin":"content_dist","reason":"gated","result":"blocked"}` (keys in this order; `result` is always `blocked`). `phase` is `check`, `fix` or `verify`; `reason` is one of `unclassified`, `ambiguous`, `gated`, `destructive`, `reserved`, `unwired`, `approval_required` and `dispatch_identifier_invalid`; `plugin` and `action` are `null` when the refused pair was not a well formed identifier (the reason is then `dispatch_identifier_invalid`).
 
 **Response (503):** `policy store degraded`, on either the summary or the
 per-agent-status read.
@@ -5866,7 +5941,8 @@ MCP twin: `get_fleet_compliance`.
     "non_compliant": 8,
     "unknown": 5,
     "fixing": 2,
-    "error": 0
+    "error": 0,
+    "blocked": 0
   },
   "meta": { "api_version": "v1" }
 }
@@ -5901,6 +5977,7 @@ the store's unfiltered fleet-wide aggregate. MCP twin: `get_policy_agent_statuse
       "unknown": 5,
       "fixing": 1,
       "error": 0,
+      "blocked": 0,
       "total": 51
     },
     "agents": [
@@ -5933,11 +6010,12 @@ field rather than a header/status code.
 
 **Forensics-tier checks.** The one case where `check_result` is not the check's output: when
 the check instruction runs a Forensics-tier plugin (`app_usage`, `browser_inventory`,
-`execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), the agent's `status` is
-`unknown` and `check_result` is empty, because the evaluator does not read or store that plugin's
-output. `unknown` there says nothing about the device. Check output of such a policy is never
-stored. See "Forensics-tier rows" in the
-Command/Instruction Responses section.
+`execution_artifacts`, `file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), policy evaluation does not dispatch it: every action of these plugins has an execute gate, so the
+check is refused and the agent's `status` is `blocked` with a `check_result` of
+`{"phase":"check","result":"blocked","reason":"gated","plugin":...,"action":...}`. Check output of such a
+policy is never stored, and the evaluator would not read it if it were (a stored Forensics row is
+excluded from the evaluator's read). See "Forensics-tier rows" in the Command/Instruction Responses
+section.
 
 ---
 
@@ -8158,7 +8236,7 @@ and is marked itself only if frames are refused after it, so a capped pair can c
 rows). See [Response Store](response-store.md).
 
 **Forensics-tier rows (#4990).** Rows written by Forensics-tier plugins (`app_usage`,
-`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is
+`browser_inventory`, `execution_artifacts`, `file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is
 derived from the capability catalogue) are served only to callers who hold `Forensics:Read` in
 addition to `Response:Read`. This applies to every route that reads stored responses: the legacy
 `GET /api/responses/{id}[/aggregate|/export]`, the v1 twins above, `GET
@@ -8194,7 +8272,7 @@ browser sign-in does not), so expect denial rows from automation that polls stor
 The filter is per plugin, because only the `plugin` name is stored with a row, and it is a rule
 about these plugins' rows, not about a kind of data: other plugins can return comparable
 information under their own securables, and their stored rows stay under `Response:Read`. The same filter is applied to the
-server's own consumers of these rows: policy check output (such a policy scores `unknown`), result
+server's own consumers of these rows: policy check output (policy evaluation does not dispatch such a check, so the policy shows `blocked`; the filter excludes any stored row), result
 set membership (the set producers refuse such a command as a source, `RESULT_SET_SOURCE_NOT_SUPPORTED`) and the live output stream,
 which publishes no row of a Forensics-tier plugin on `GET /events`, `GET /sse/executions/{id}` or
 `GET /api/v1/events`. (Such a frame publishes nothing to the live output stream, not a row and not a notice, and
@@ -11709,6 +11787,11 @@ Its audit detail is marked `protective_exempt=true` (`protective_exempt=partial`
 rule delivery, disable or remove the rules instead. The response returns the row that was **written**,
 not the effective state, in the same shape as the `GET` above.
 
+**Plugins that start off.** `execution_artifacts`, `browser_inventory`, `privacy_permissions`,
+`remote_access_audit`, `process_introspect` and `file_search` are seeded as switched off when the server
+starts, and a restart does not overwrite a choice an operator has made. Turn one on with this `PUT` and
+`enabled` set to `true`.
+
 **Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
 plugin/action/os/reason, or `?os=` present but empty), `413`, `500` (the store write failed and may or
 may not have been applied: see "After a `500`" below), `503` (store unavailable, or the audit row could not be saved).
@@ -14128,6 +14211,10 @@ transaction did not report success) answers `503` with `error.outcome` set to `u
 `retry_after_ms`, audited `result=failure`, `detail=outcome_unknown`: the schedule may or may not
 exist, so list schedules before creating it again.
 
+A `parameters` object that carries a resume token (`cursor`) or a classified secret key (a grant
+secret or id, or a client secret) is `400` with the refusal text in `error`, and nothing is created;
+no audit row is written for this refusal.
+
 #### `DELETE /api/schedules/{id}`
 
 Delete a schedule you created. Requires `Schedule:Delete`; a schedule created by another
@@ -14763,7 +14850,7 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 - **Content-Type:** `text/event-stream`
 - **Headers:** `Cache-Control: no-cache`, `X-Accel-Buffering: no` (so reverse proxies don't buffer the stream into chunks).
 
-**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
+**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check - a management-group-confined operator is admitted and then sees only their in-scope agents' events. The caller who **dispatched** the execution is always admitted to the stream (visibility only - avoids a false 404 on a just-dispatched execution with zero responses yet), but that ownership never bypasses the per-event redaction below. A service-scoped token has no dispatcher admission (#5557): it is admitted only once an agent in its service scope has a status row for the execution, and before that the stream answers `404` as for a nonexistent execution. RBAC-off → unrestricted (legacy-open). **This gate is evaluated once, at subscribe time** - it is not re-checked for the life of the connection. If your scope is narrowed, or your session is revoked, mid-stream, an already-open subscription is not automatically disconnected (tracked: #3788); a full server restart is the only thing that currently drops every live stream. A stream's scope is fixed when it attaches: revoking a service-scoped token, retagging an agent out of its service scope or switching RBAC enforcement off does not close an open stream either; this is tracked as #7815. **Residual: the number of withheld events is inferable.** Event ids are per-execution counters, one per published event (every `agent-transition`, every `execution-progress` tick and the `execution-completed`, for all agents), and both this route and `GET /api/v1/events` put the raw id on the wire. A confined or service-scoped subscriber of an execution it is admitted to can therefore infer how many events were withheld from it, namely every dropped `execution-progress` tick and every out-of-scope `agent-transition`, so roughly two per status update of an agent outside its scope, from gaps between the ids it receives and from the id on the sanitized `execution-completed` frame. No event content and no per-agent attribution is disclosed, but the fleet-count withholding protects values, not counts. A dense per-connection id cannot be substituted without breaking `Last-Event-ID` resume; an opaque resumable cursor is tracked as #7816.
 
@@ -14855,7 +14942,7 @@ The browser-oriented `/sse/executions/{id}` route is preserved for the dashboard
 **Permission:** `Execution:Read`.
 **Auth:** Bearer token, `X-Yuzu-Token` header, or session cookie. Same auth surface as every other `/api/v1/*` endpoint.
 
-**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
+**Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check - a management-group-confined operator is admitted and then sees only their in-scope agents' events. The execution's dispatcher is always admitted to the stream (visibility only - avoids a false 404 on a just-dispatched execution with zero responses yet), never a bypass of the per-event redaction below. A service-scoped token has no dispatcher admission (#5557): it is admitted only once an agent in its service scope has a status row for the execution, and before that the route answers `404` as for a nonexistent execution. RBAC-off → unrestricted (legacy-open). This route shares one event projector (`execution_event_scope.hpp`) with the dashboard's `/sse/executions/{id}` sibling - see that section for the drop/sanitize table (`agent-transition` filtered by `agent_id`, `execution-progress` dropped, `execution-completed` sanitized to `status` only), and for the same subscribe-time-only gate staleness caveat (tracked: #3788) - this route shares that gap. The same applies to a service-scoped token: a stream's scope is fixed when it attaches, and revoking the token, retagging an agent out of its service scope or switching RBAC enforcement off does not close an open stream (tracked as #7815). **Residual: the number of withheld events is inferable.** Event ids are per-execution counters, one per published event (every `agent-transition`, every `execution-progress` tick and the `execution-completed`, for all agents), and this route puts the raw id on the wire (the `id:` line and the JSON `event_id`). A confined or service-scoped subscriber of an execution it is admitted to can therefore infer how many events were withheld from it, namely every dropped `execution-progress` tick and every out-of-scope `agent-transition`, so roughly two per status update of an agent outside its scope, from gaps between the ids it receives and from the id on the sanitized `execution-completed` frame. On this route the `replay-gap` frame is a further signal: its `missing_to` is computed from the raw ring front, so it is present only once the ring has evicted (about 1000 events), and probing `since=` reads it at will. No event content and no per-agent attribution is disclosed, but the fleet-count withholding protects values, not counts. A dense per-connection id cannot be substituted without breaking `Last-Event-ID` resume; an opaque resumable cursor is tracked as #7816.
 
@@ -15778,15 +15865,17 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
   "https://yuzu.example.com/api/v1/elevate"
 ```
 
+**Post-commit recheck.** After the elevation has committed and before the `role.elevation.granted` row is written, the route reads eligibility once more, failing closed. This closes a race with `POST /api/v1/users/{username}/elevation-eligibility` with `eligible=false`, which flips the flag before it clears the user's elevations: either this re-read sees the revoked flag and the route rolls the elevation back, or the flip came after the re-read and the revoke's clear runs after the elevation committed and ends it. A revoked flag answers `403` (`not authorized to elevate`) and an unreadable one `503`; if the rollback itself fails the route logs at CRITICAL and answers `500` and the elevation may be active: the user can end it from the session that holds it with `POST /api/v1/elevate/revoke` (it needs only that session and is exempt from the step-up), or an administrator can send the eligibility revoke, `POST /api/v1/users/{name}/elevation-eligibility` with `{"eligible": false}` (REST-only; it ends every live elevation of that user and stops new ones); if the store is still failing, either call can fail too, so retry it. An `Administrator` unassign does not end an elevation that rests on eligibility alone. No `role.elevation.granted` row is written in any of these cases.
+
 **Response (200):** `{"status":"ok","expires_in":<seconds>,"expires_at":"<RFC3339 UTC>"}`. `expires_in` is the TRUE remaining time computed after the grant (not an echo of the requested `duration_secs`) — the window is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute expiry (an elevation can never outlive the cookie session that carries it), so `expires_in` is always `<=` the requested duration. `expires_at` is the wall-clock projection of that same window.
 
-**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"), **or a fresh MFA step-up is required** (a stale or absent proof; the answer is the standard step-up `401` challenge envelope, see `meta.challenge_url` and `/login/mfa/stepup`; a failure to read the MFA status other than a store outage is also a `401`, with an `auth_db unavailable` remediation); `403` — not eligible, eligibility read failed (fail-closed), the account's identity source could not be read or does not match the session, **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), **OIDC-amr elevation is disabled** (`--no-jit-oidc-amr-elevation` set), or eligibility was revoked while the step-up was in progress. A SAML session cannot elevate in this release and is always refused: it has no account row to mark eligible, so it is turned away at the eligibility check (see `authentication.md`, "JIT Admin Elevation"); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — the persistent auth store is not available, or the second-factor state cannot be verified. Retry while `error.retry_after_ms` is `5000`; `null` is no retry hint, not a promise that nothing will clear it (the two store-outage `503`s of this route before the step-up check carry no hint either). For a `503` that names the second-factor state, `null` means: do not loop and follow the MFA binding enforcement runbook. Run `yuzu-server --mfa-reset <user>` only for an account that reads `mfa_factor_gen <= 0`; an unenforced binding trigger or an inconclusive trigger validation is not repaired by it.
+**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"), **or a fresh MFA step-up is required** (a stale or absent proof; the answer is the standard step-up `401` challenge envelope, see `meta.challenge_url` and `/login/mfa/stepup`; a failure to read the MFA status other than a store outage is also a `401`, with an `auth_db unavailable` remediation); `403` — not eligible, eligibility read failed (fail-closed), the account's identity source could not be read or does not match the session, **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), **OIDC-amr elevation is disabled** (`--no-jit-oidc-amr-elevation` set), or eligibility was revoked while the step-up was in progress, or after the elevation committed (the final eligibility re-read, see "Post-commit recheck" above: the elevation is rolled back and the answer is `403` `not authorized to elevate`). A SAML session cannot elevate in this release and is always refused: it has no account row to mark eligible, so it is turned away at the eligibility check (see `authentication.md`, "JIT Admin Elevation"); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted, or (without that header) the final eligibility re-read refused the elevation and its rollback failed, so the elevation may be active until it is ended (see "Post-commit recheck" above for the two ways); `503` — the persistent auth store is not available, eligibility could not be re-read after the elevation committed (the elevation is rolled back), or the second-factor state cannot be verified. Retry while `error.retry_after_ms` is `5000`; `null` is no retry hint, not a promise that nothing will clear it (the two store-outage `503`s of this route before the step-up check carry no hint either). For a `503` that names the second-factor state, `null` means: do not loop and follow the MFA binding enforcement runbook. Run `yuzu-server --mfa-reset <user>` only for an account that reads `mfa_factor_gen <= 0`; an unenforced binding trigger or an inconclusive trigger validation is not repaired by it.
 
-**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a `403`, with a distinct `detail` reason per cause (not eligible / eligibility read failed / identity-source lookup failed / identity-source mismatch / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / eligibility revoked during step-up); the `detail` `mfa_step_up_refused` is also written when the shared step-up gate refuses the call: a stale or absent proof is a `401`; an unwired auth store, an MFA store or decrypt outage, or an internal fault in the gate itself is a `503`; any other failure to read the MFA status is a `401` whose remediation says `auth_db unavailable`. None of them is a `403`. When the second-factor store cannot be read, the `503` also writes `role.elevation.denied`, with `result=error` rather than `denied` and a detail that says the secret or store was unavailable (fail-closed). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
+**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a refusal (a `403` for most causes; the post-commit recheck also writes it for its `503` and `500`, and the cases named below for a `401` or `503`), with a distinct `detail` reason per cause (not eligible / eligibility read failed / identity-source lookup failed / identity-source mismatch / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / eligibility revoked during step-up / eligibility revoked during elevation / eligibility read failed after elevation, the last with `result=error`; a failed rollback there is also `result=error`, with `rollback_failed=true` in the `detail`); the `detail` `mfa_step_up_refused` is also written when the shared step-up gate refuses the call: a stale or absent proof is a `401`; an unwired auth store, an MFA store or decrypt outage, or an internal fault in the gate itself is a `503`; any other failure to read the MFA status is a `401` whose remediation says `auth_db unavailable`. None of them is a `403`. When the second-factor store cannot be read, the `503` also writes `role.elevation.denied`, with `result=error` rather than `denied` and a detail that says the secret or store was unavailable (fail-closed). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
 
 #### `POST /api/v1/elevate/revoke`
 
-Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Answers `200 {"status":"ok"}` once the elevation is cleared, whether or not a window was active; that is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body. If the server cannot durably clear the elevation it answers `503` (retry) and writes the same action with `result=error`, because the elevation may still be live.
+Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Answers `200 {"status":"ok"}` once the elevation is cleared, whether or not a window was active; that is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body (`was_elevated=unknown` when the lookup of the session before the clear was degraded: the clear succeeded, so any elevation has ended). If the server cannot durably clear the elevation it answers `503` (retry) and writes the same action with `result=error`, because the elevation may still be live.
 
 #### `POST /logout`
 
