@@ -94,7 +94,7 @@ What a result proves. `supported` means the scan finished: no bound was reached 
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`native` / Windows** — measured on one host (Windows 11 build 26200, elevated administrator session), where a system directory whose access list excludes Administrators was refused and the 5,000-row cap was reached, so the action answered constrained; libraries inside applications only; machine roots only; the server refuses it until an operator switches it on; a reparse point is counted and never read; any budget, unreadable directory or changed file answers constrained
+- **`native` / Windows** — measured on one host (Windows 11 build 26200, elevated administrator session), where a system directory whose access list excludes Administrators was refused and the walk returned exactly 5,000 rows, the row limit, so the action answered constrained; libraries inside applications only; machine roots only; the server refuses it until an operator switches it on; a reparse point is counted and never read; any budget, unreadable directory or changed file answers constrained
 - **`native` / macOS** — versioned dynamic libraries inside applications only: extension-less framework binaries are not read; machine roots only; the server refuses it until an operator switches it on; any budget, unreadable directory or changed file answers constrained
 - **`native` / Linux** — versioned shared libraries inside applications only: package-owned trees (/usr/lib and friends) are not walked; machine roots only; the server refuses it until an operator switches it on; any budget, unreadable directory or changed file answers constrained
 - **`node` / Windows** — not read yet: one unsupported status row, windows:planned

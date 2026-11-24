@@ -19,7 +19,7 @@
           "support": "supported"
         },
         "windows": {
-          "fallback": "measured on one host (Windows 11 build 26200, elevated administrator session), where a system directory whose access list excludes Administrators was refused and the 5,000-row cap was reached, so the action answered constrained; libraries inside applications only; machine roots only; the server refuses it until an operator switches it on; a reparse point is counted and never read; any budget, unreadable directory or changed file answers constrained",
+          "fallback": "measured on one host (Windows 11 build 26200, elevated administrator session), where a system directory whose access list excludes Administrators was refused and the walk returned exactly 5,000 rows, the row limit, so the action answered constrained; libraries inside applications only; machine roots only; the server refuses it until an operator switches it on; a reparse point is counted and never read; any budget, unreadable directory or changed file answers constrained",
           "mechanism": "bounded read-only walk of the Program Files and Program Files (x86) directories for .dll files, at most 5,000 rows; every directory and file opened relative to its volume root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); the PE fixed file version read in-process within fixed bounds; WindowsApps under each root excluded and counted",
           "rung": "1",
           "support": "supported"
