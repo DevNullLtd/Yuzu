@@ -95,10 +95,10 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -860,16 +860,47 @@ private:
     std::string end_reason_;
 };
 
-/// One loud stderr line when a cleanup could not bring the host back to `inactive` (or threw).
-/// Never a REQUIRE/CHECK: those are not thread-safe and cannot throw from a destructor or thread.
+/// Set when any cleanup failed to confirm a clean host; the last case of the file turns it into a
+/// failing run (a destructor and a watchdog thread cannot fail a case themselves).
+inline std::atomic<bool> g_unsettled{false};
+inline std::mutex g_status_m;
+inline std::string g_last_status = "(none read)";
+
+/// The last status the cleanup saw from the host (the `status|...` row, or the leg's status word).
+inline void note_status(std::string s) {
+    std::lock_guard lk(g_status_m);
+    g_last_status = std::move(s);
+}
+
+inline std::string host_label() {
+#if defined(_WIN32)
+    const char* h = std::getenv("COMPUTERNAME");
+    return h ? h : "this host";
+#else
+    char b[256]{};
+    return ::gethostname(b, sizeof(b) - 1) == 0 ? std::string{b} : std::string{"this host"};
+#endif
+}
+
+/// One loud stderr line when a cleanup could not bring the host back to `inactive` (or threw), and
+/// the flag the last case checks. Never a REQUIRE/CHECK: those are not thread-safe and cannot throw
+/// from a destructor or thread.
 inline void report_unsettled(const std::string& who, const std::string& test, bool settled,
                              const char* threw = nullptr) {
     if (settled && !threw)
         return;
+    g_unsettled = true;
+    std::string last;
+    {
+        std::lock_guard lk(g_status_m);
+        last = g_last_status;
+    }
     std::fprintf(stderr,
-                 "\nFIREWALL LIVE HARNESS: %s could not confirm the host is back to inactive after "
-                 "case \"%s\"%s%s: the host may still be contained, release it by hand\n",
-                 who.c_str(), test.c_str(), threw ? ", cleanup threw: " : "", threw ? threw : "");
+                 "\nFIREWALL LIVE HARNESS: %s could not confirm host %s is back to inactive after "
+                 "case \"%s\"%s%s (last status seen: %s): the host may still be contained, "
+                 "release it by hand\n",
+                 who.c_str(), host_label().c_str(), test.c_str(), threw ? ", cleanup threw: " : "",
+                 threw ? threw : "", last.c_str());
     std::fflush(stderr);
 }
 
@@ -1012,15 +1043,19 @@ template <class Once> bool settle_until(Once&& once) {
     return false;
 }
 
-/// Releases whatever is applied until the plugin itself answers `status|inactive`. `repair_first` is
-/// for a case that tampered with the host: the stored set is re-applied through the plugin (a no-op
-/// when nothing is contained) so the release finds the state it recorded, not the tampered one.
+/// Releases whatever is applied until the plugin itself answers `status|inactive`.
+/// `repair_first` is for a case that tampered with the host: the stored set is re-applied through
+/// the plugin (a no-op when nothing is contained) so the release finds the state it recorded.
 bool settle_release(PluginRig& rig, bool repair_first = false) {
     if (repair_first)
         (void)rig.run("quarantine", {{"repair", "1"}});
     return settle_until([&] {
         (void)rig.run("release");
-        return has_row(rig.run("quarantine_status").captured, "status|inactive");
+        const auto status = rig.run("quarantine_status").captured;
+        const auto at = status.find("status|");
+        note_status(at == std::string::npos ? "(no status row)"
+                                            : status.substr(at, status.find('\n', at) - at));
+        return has_row(status, "status|inactive");
     });
 }
 
@@ -1028,7 +1063,10 @@ bool settle_release(PluginRig& rig, bool repair_first = false) {
 template <class FqEnv> bool settle_fq_release(FqEnv& fenv) {
     return settle_until([&] {
         fq::Deadline dl;
-        return fq::release(fenv, fq::ReleaseRequest{}, dl).status == "inactive";
+        auto status = fq::release(fenv, fq::ReleaseRequest{}, dl).status;
+        const bool settled = status == "inactive";
+        note_status("release status|" + std::move(status));
+        return settled;
     });
 }
 
@@ -1039,12 +1077,12 @@ struct LiveRig : PluginRig {
     ~LiveRig() {
         if (!plugin || !ctx)
             return;
+        std::string test = "(unknown case)";
         try {
-            report_unsettled("LiveRig", Catch::getResultCapture().getCurrentTestName(),
-                             settle_release(*this));
+            test = Catch::getResultCapture().getCurrentTestName();
+            report_unsettled("LiveRig", test, settle_release(*this));
         } catch (...) { // a destructor must not throw; the failure is reported, not swallowed
-            report_unsettled("LiveRig", Catch::getResultCapture().getCurrentTestName(), false,
-                             "an exception");
+            report_unsettled("LiveRig", test, false, "an exception");
         }
     }
 };
@@ -2389,3 +2427,11 @@ TEST_CASE("live (macOS pf): a failed update keeps the previous generation in for
     CHECK(fq::release(fenv, fq::ReleaseRequest{}, dl3).status == "inactive");
 }
 #endif
+
+// Last in the file, so it runs last when the live cases are selected together: a cleanup that could
+// not confirm a clean host (reported on stderr by report_unsettled) fails the run.
+TEST_CASE("live: every cleanup confirmed the host is back to inactive",
+          "[.][firewall_quarantine_live]") {
+    INFO("see the FIREWALL LIVE HARNESS lines on stderr; last status seen: " << g_last_status);
+    CHECK_FALSE(g_unsettled.load());
+}
