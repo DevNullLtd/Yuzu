@@ -2312,7 +2312,8 @@
       "changelog.d/7551-hardware-record-online-other-replica.fixed.md",
       "changelog.d/7566-hardware-online-from-roster-read.fixed.md",
       "changelog.d/7949-hardware-ci-read-concurrency-cap.added.md",
-      "changelog.d/7950-hardware-ci-page-byte-bound.changed.md"
+      "changelog.d/7950-hardware-ci-page-byte-bound.changed.md",
+      "changelog.d/NNNN-hardware-ci-changed-since.added.md"
     ],
     "definitions": [
       "content/definitions/hardware.yaml"
