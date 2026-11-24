@@ -1182,6 +1182,8 @@ TEST_CASE("process_introspect macOS: a bounded call that did not answer is never
     const Case cases[] = {
         {MacBsdInfo::Bound::deadline_exceeded, "deadline_exceeded"},
         {MacBsdInfo::Bound::abandoned_pending, "abandoned_call_pending"},
+        // A healthy read of another dispatch is its own retryable answer, never "abandoned".
+        {MacBsdInfo::Bound::call_in_progress, "call_in_progress"},
     };
     for (const auto& c : cases) {
         MacFake fk;

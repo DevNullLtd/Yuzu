@@ -151,7 +151,9 @@ static_assert(kFacetNames.size() == 6, "rule every new facet for macOS in mac_fa
 /// monotonic start stamp (mach absolute time, which a wall-clock step cannot move), written in
 /// decimal so the token keeps its `<8 hex>.<1-20 digits>` shape. Both stamps are fixed at fork and
 /// survive an exec, so the number is stable for a process's whole life; a recycled pid collides
-/// only if BOTH stamps are equal, and the monotonic one strictly increases within a boot session.
+/// only if BOTH stamps are equal (the monotonic one strictly increases within a boot session) or
+/// by an accidental 64-bit fold collision (about 2^-64; FNV-1a is not cryptographic, but neither
+/// stamp is attacker-chosen).
 /// Refuses an unusable wall stamp and a zero monotonic stamp (a failed or unset read).
 [[nodiscard]] inline std::optional<std::uint64_t>
 mac_identity_number(std::uint64_t sec, std::uint64_t usec, std::uint64_t abstime) noexcept {

@@ -2,13 +2,17 @@
  * test_proc_snapshot_read.cpp -- yuzu::agent::read_proc_snapshot_bounded (SRE-1).
  *
  * Load-bearing cases: a normal read returns its numbers; a reader that NEVER returns still gives
- * the caller its thread back (TimedOut), a second call while it is blocked is Busy without a
- * second reader being started, and once the reader returns the next call reads normally again;
- * a Rejected admission does not leave the in-flight flag set.
+ * the caller its thread back (TimedOut), a second call while it is blocked is Abandoned without a
+ * second reader being started, and once the reader returns the next call reads normally again; a
+ * second call while a HEALTHY read is in flight is Busy (not Abandoned); a Rejected admission
+ * does not leave the slot held.
  *
- * Rejected instantiates the header-only driver in THIS image with a test-owned flag: the
+ * Rejected instantiates the header-only driver in THIS image with a test-owned slot: the
  * outstanding-call ceiling is per image (see keychain_read.hpp), so saturating it from here
  * cannot reach agent-core's copy used by read_proc_snapshot_bounded_for_test.
+ *
+ * No sleep is used as synchronisation: ordering comes from promises, and recovery is awaited with
+ * yuzu::test::spin_until. Anything an abandonable reader touches is captured BY VALUE.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -19,31 +23,50 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
 #include <memory>
-#include <thread>
+#include <type_traits>
 
 using namespace std::chrono_literals;
 using yuzu::agent::ProcSnapshot;
 using yuzu::agent::ProcSnapshotStatus;
 using yuzu::agent::read_proc_snapshot_bounded_for_test;
 
+TEST_CASE("ProcSnapshot carries numbers only", "[proc_snapshot][agent]") {
+    // A further member (a process-name field, say) breaks this structured binding.
+    ProcSnapshot s;
+    const auto& [err, start_sec, start_usec, nice, start_abstime] = s;
+    static_assert(std::is_same_v<decltype(ProcSnapshot::err), int>);
+    static_assert(std::is_same_v<decltype(ProcSnapshot::start_sec), std::uint64_t>);
+    static_assert(std::is_same_v<decltype(ProcSnapshot::start_usec), std::uint64_t>);
+    static_assert(std::is_same_v<decltype(ProcSnapshot::nice), std::int32_t>);
+    static_assert(std::is_same_v<decltype(ProcSnapshot::start_abstime), std::uint64_t>);
+    CHECK(err == 0);
+    CHECK(start_sec == 0);
+    CHECK(start_usec == 0);
+    CHECK(nice == 0);
+    CHECK(start_abstime == 0);
+}
+
 TEST_CASE("read_proc_snapshot_bounded returns the reader's numbers", "[proc_snapshot][agent]") {
-    int seen_pid = 0;
-    const auto r = read_proc_snapshot_bounded_for_test(4242, 5000ms, [&](int pid) {
-        seen_pid = pid;
+    auto seen_pid = std::make_shared<std::atomic<int>>(0); // by value: the reader is abandonable
+    const auto r = read_proc_snapshot_bounded_for_test(4242, 5000ms, [seen_pid](int pid) {
+        *seen_pid = pid;
         ProcSnapshot s;
         s.start_sec = 1700000000;
         s.start_usec = 123456;
         s.nice = 7;
+        s.start_abstime = 99;
         return s;
     });
     REQUIRE(r.status == ProcSnapshotStatus::Completed);
-    CHECK(seen_pid == 4242);
+    CHECK(seen_pid->load() == 4242);
     CHECK(r.snap.err == 0);
     CHECK(r.snap.start_sec == 1700000000);
     CHECK(r.snap.start_usec == 123456);
     CHECK(r.snap.nice == 7);
+    CHECK(r.snap.start_abstime == 99);
 }
 
 TEST_CASE("a reader's errno passes through a Completed call", "[proc_snapshot][agent]") {
@@ -56,7 +79,7 @@ TEST_CASE("a reader's errno passes through a Completed call", "[proc_snapshot][a
     CHECK(r.snap.err == 3);
 }
 
-TEST_CASE("a blocked reader times out, blocks a second call (Busy), then recovers",
+TEST_CASE("a blocked reader times out, blocks a second call (Abandoned), then recovers",
           "[proc_snapshot][agent]") {
     std::promise<void> gate;
     bool gate_open = false;
@@ -66,17 +89,14 @@ TEST_CASE("a blocked reader times out, blocks a second call (Busy), then recover
             gate.set_value();
         }
     };
-    // A failing REQUIRE must not leave a worker wedged: it would hold the process-wide
-    // in-flight flag and turn every later test into Busy.
+    // A failing REQUIRE must not leave a worker wedged: it would hold the process-wide slot and
+    // turn every later test into Busy/Abandoned. Declared AFTER the promise it opens.
     yuzu::test::ScopeExit opener{release};
-    // The abandoned worker outlives this scope on failure: everything it touches is captured
-    // BY VALUE (shared state), never by reference to the stack.
     auto gate_f = gate.get_future().share();
     auto entered = std::make_shared<std::promise<void>>();
     auto entered_f = entered->get_future();
     auto readers_started = std::make_shared<std::atomic<int>>(0);
 
-    const auto t0 = std::chrono::steady_clock::now();
     auto r1 = read_proc_snapshot_bounded_for_test(
         10, 300ms, [gate_f, entered, readers_started](int) -> ProcSnapshot {
             ++*readers_started;
@@ -84,50 +104,110 @@ TEST_CASE("a blocked reader times out, blocks a second call (Busy), then recover
             gate_f.wait();
             return ProcSnapshot{};
         });
-    CHECK(r1.status == ProcSnapshotStatus::TimedOut);
-    CHECK(std::chrono::steady_clock::now() - t0 < 4s); // the caller got its thread back
+    CHECK(r1.status == ProcSnapshotStatus::TimedOut); // the caller got its thread back
     REQUIRE(entered_f.wait_for(5s) == std::future_status::ready);
 
-    // The worker is still blocked: a second dispatch is refused without starting a reader.
+    // The worker is still blocked past a deadline: a second dispatch is told so, and no reader
+    // is started.
     auto r2 = read_proc_snapshot_bounded_for_test(11, 300ms, [readers_started](int) {
         ++*readers_started;
         return ProcSnapshot{};
     });
-    CHECK(r2.status == ProcSnapshotStatus::Busy);
+    CHECK(r2.status == ProcSnapshotStatus::Abandoned);
     CHECK(readers_started->load() == 1);
 
-    // The worker returns and releases the flag itself: the next call reads normally.
+    // The worker returns and releases the slot itself: the next call reads normally.
     release();
-    ProcSnapshotStatus st = ProcSnapshotStatus::Busy;
-    for (int i = 0; i < 500 && st == ProcSnapshotStatus::Busy; ++i) {
-        auto r3 = read_proc_snapshot_bounded_for_test(12, 5000ms, [](int) {
+    ProcSnapshotStatus st = ProcSnapshotStatus::Abandoned;
+    int nice = 0;
+    CHECK(yuzu::test::spin_until([&] {
+        const auto r3 = read_proc_snapshot_bounded_for_test(12, 5000ms, [](int) {
             ProcSnapshot s;
             s.nice = 3;
             return s;
         });
         st = r3.status;
-        if (st == ProcSnapshotStatus::Completed)
-            CHECK(r3.snap.nice == 3);
-        else
-            std::this_thread::sleep_for(10ms);
-    }
+        nice = r3.snap.nice;
+        return st != ProcSnapshotStatus::Abandoned && st != ProcSnapshotStatus::Busy;
+    }));
     CHECK(st == ProcSnapshotStatus::Completed);
+    CHECK(nice == 3);
 }
 
-TEST_CASE("a spent deadline starts nothing and leaves the flag clear", "[proc_snapshot][agent]") {
-    std::atomic<int> started{0};
-    const auto r = read_proc_snapshot_bounded_for_test(1, 0ms, [&](int) {
-        ++started;
+TEST_CASE("a second dispatch during a healthy read is Busy, not Abandoned",
+          "[proc_snapshot][agent]") {
+    std::promise<void> gate;
+    bool gate_open = false;
+    const auto release = [&] {
+        if (!gate_open) {
+            gate_open = true;
+            gate.set_value();
+        }
+    };
+    auto gate_f = gate.get_future().share();
+    auto entered = std::make_shared<std::promise<void>>();
+    auto entered_f = entered->get_future();
+    auto readers_started = std::make_shared<std::atomic<int>>(0);
+
+    // The first dispatch has a generous deadline, so it never times out here.
+    auto first = std::async(std::launch::async, [gate_f, entered, readers_started] {
+        return read_proc_snapshot_bounded_for_test(
+            20, 30000ms, [gate_f, entered, readers_started](int) -> ProcSnapshot {
+                ++*readers_started;
+                entered->set_value();
+                gate_f.wait();
+                ProcSnapshot s;
+                s.nice = 5;
+                return s;
+            });
+    });
+    // Declared AFTER the future: destructs first, so a failing REQUIRE opens the gate before the
+    // future's destructor joins.
+    yuzu::test::ScopeExit opener{release};
+    REQUIRE(entered_f.wait_for(5s) == std::future_status::ready);
+
+    const auto second = read_proc_snapshot_bounded_for_test(21, 300ms, [readers_started](int) {
+        ++*readers_started;
+        return ProcSnapshot{};
+    });
+    CHECK(second.status == ProcSnapshotStatus::Busy);
+    CHECK(readers_started->load() == 1);
+
+    release();
+    const auto r = first.get();
+    REQUIRE(r.status == ProcSnapshotStatus::Completed);
+    CHECK(r.snap.nice == 5);
+}
+
+TEST_CASE("a spent deadline starts nothing and leaves the slot free", "[proc_snapshot][agent]") {
+    auto started = std::make_shared<std::atomic<int>>(0);
+    const auto r = read_proc_snapshot_bounded_for_test(1, 0ms, [started](int) {
+        ++*started;
         return ProcSnapshot{};
     });
     CHECK(r.status == ProcSnapshotStatus::TimedOut);
-    CHECK(started.load() == 0);
+    CHECK(started->load() == 0);
     const auto r2 =
         read_proc_snapshot_bounded_for_test(1, 5000ms, [](int) { return ProcSnapshot{}; });
     CHECK(r2.status == ProcSnapshotStatus::Completed);
 }
 
-TEST_CASE("a Rejected admission releases the in-flight flag", "[proc_snapshot][agent]") {
+TEST_CASE("a throwing reader answers TimedOut at once and frees the slot",
+          "[proc_snapshot][agent]") {
+    const auto r = read_proc_snapshot_bounded_for_test(
+        1, 30000ms, [](int) -> ProcSnapshot { throw 1; });
+    CHECK(r.status == ProcSnapshotStatus::TimedOut);
+    // The worker's releaser has run or is about to: the slot becomes free, never Abandoned.
+    ProcSnapshotStatus st = ProcSnapshotStatus::Busy;
+    CHECK(yuzu::test::spin_until([&] {
+        st = read_proc_snapshot_bounded_for_test(1, 5000ms, [](int) { return ProcSnapshot{}; })
+                 .status;
+        return st != ProcSnapshotStatus::Busy && st != ProcSnapshotStatus::Abandoned;
+    }));
+    CHECK(st == ProcSnapshotStatus::Completed);
+}
+
+TEST_CASE("a Rejected admission releases the slot", "[proc_snapshot][agent]") {
     using yuzu::shared::detail::g_outstanding_bounded_calls;
     using yuzu::shared::detail::kMaxOutstandingBoundedCalls;
 
@@ -135,7 +215,7 @@ TEST_CASE("a Rejected admission releases the in-flight flag", "[proc_snapshot][a
     // their own threads shortly after they finish).
     REQUIRE(yuzu::test::spin_until([] { return g_outstanding_bounded_calls.load() == 0; }, 10s));
 
-    static std::atomic_flag flag; // outlives any worker
+    static yuzu::agent::ProcSnapshotSlot slot; // outlives any worker
     std::promise<void> gate;
     bool gate_open = false;
     yuzu::test::ScopeExit opener{[&] {
@@ -154,8 +234,9 @@ TEST_CASE("a Rejected admission releases the in-flight flag", "[proc_snapshot][a
     }
 
     const auto r = yuzu::agent::detail::bounded_proc_snapshot(
-        flag, 1, 5000ms, [](int) { return ProcSnapshot{}; });
+        slot, 1, 5000ms, [](int) { return ProcSnapshot{}; });
     CHECK(r.status == ProcSnapshotStatus::Rejected);
-    CHECK_FALSE(flag.test_and_set()); // clear: the worker never ran, the caller released it
-    flag.clear();
+    // The worker never ran, so the caller released the slot: it is acquirable again.
+    CHECK(slot.try_acquire() == yuzu::agent::ProcSnapshotSlot::Acquire::acquired);
+    slot.release();
 }

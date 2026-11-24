@@ -18,12 +18,13 @@
  *
  * ONE READ, ONE THREAD, ONE IN FLIGHT
  * -----------------------------------
- * A process-wide in-flight flag admits one read at a time. While an abandoned (TimedOut) read is
- * still blocked in the kernel, the next call returns Busy at once instead of stacking another
- * blocked thread. The worker releases the flag itself when it returns, so recovery is
- * automatic. A Rejected admission means the worker never ran, so the caller releases the flag.
+ * A process-wide slot admits one read at a time. While a read is in flight the next call answers
+ * at once instead of stacking another thread: Busy when the read is healthy (a concurrent
+ * dispatch, retry shortly), Abandoned when an earlier call hit its deadline and its worker is
+ * still blocked in the kernel. The worker releases the slot itself when it returns, so recovery
+ * is automatic. A Rejected admission means the worker never ran, so the caller releases the slot.
  * The outstanding-call ceiling that produces Rejected is PER IMAGE, so the driver is a
- * header-only template taking the flag by reference: production binds agent-core's flag, tests
+ * header-only template taking the slot by reference: production binds agent-core's slot, tests
  * bind their own.
  *
  * WHAT IS READ
@@ -59,9 +60,10 @@ struct ProcSnapshot {
 
 enum class ProcSnapshotStatus {
     Completed, ///< the read returned within the deadline (snap.err may still be nonzero)
-    TimedOut,  ///< deadline hit; the worker is abandoned and holds the in-flight flag
-    Busy,      ///< a previous (abandoned) read is still blocked; nothing was read
-    Rejected,  ///< the outstanding-call ceiling refused, or setup failed; nothing was read
+    TimedOut,  ///< deadline hit (or the reader threw, or the budget was already spent): no answer
+    Busy,      ///< another read is in flight and healthy; none was started by this call
+    Abandoned, ///< an earlier call hit its deadline and its worker is still blocked; none started
+    Rejected,  ///< the outstanding-call ceiling refused, or setup failed: the worker never ran
 };
 
 struct ProcSnapshotResult {
@@ -72,32 +74,69 @@ struct ProcSnapshotResult {
 /// libproc answers in microseconds; this only bounds a kernel wait that never ends.
 inline constexpr std::chrono::milliseconds kProcSnapshotDeadline{5000};
 
+/// The single-flight slot: free, busy (a healthy read in flight) or abandoned (a read past its
+/// deadline whose worker is still blocked). Pure and thread-free, like DismSlot.
+class ProcSnapshotSlot {
+public:
+    enum class Acquire { acquired, busy, abandoned };
+
+    [[nodiscard]] Acquire try_acquire() noexcept {
+        int expected = kFree;
+        if (state_.compare_exchange_strong(expected, kBusy, std::memory_order_acquire,
+                                           std::memory_order_acquire))
+            return Acquire::acquired;
+        return expected == kAbandoned ? Acquire::abandoned : Acquire::busy;
+    }
+    /// Called by the caller whose deadline fired. A CAS, not a store: a worker that finished at
+    /// the deadline has already released, and that release must not be undone.
+    void mark_abandoned() noexcept {
+        int expected = kBusy;
+        state_.compare_exchange_strong(expected, kAbandoned, std::memory_order_acq_rel,
+                                       std::memory_order_relaxed);
+    }
+    /// Called by the worker when its read returns or throws (or by the caller when the worker
+    /// never ran).
+    void release() noexcept { state_.store(kFree, std::memory_order_release); }
+
+private:
+    static constexpr int kFree = 0;
+    static constexpr int kBusy = 1;
+    static constexpr int kAbandoned = 2;
+    std::atomic<int> state_{kFree};
+};
+
 namespace detail {
 
 /// Header-only so tests can instantiate it in their own image. `reader` is a callable
-/// `ProcSnapshot(int pid)`; `in_flight` must outlive any abandoned worker (a static).
+/// `ProcSnapshot(int pid)`; `slot` must outlive any abandoned worker (a static).
 template <typename Reader>
-ProcSnapshotResult bounded_proc_snapshot(std::atomic_flag& in_flight, int pid,
+ProcSnapshotResult bounded_proc_snapshot(ProcSnapshotSlot& slot, int pid,
                                          std::chrono::milliseconds deadline, Reader reader) {
     static_assert(std::is_nothrow_move_constructible_v<Reader>,
-                  "a throwing Reader move would escape with the in-flight flag set");
+                  "a throwing Reader move would escape with the slot held");
     ProcSnapshotResult out;
-    // Admission first: a call during an abandoned read is Busy even with a spent budget.
-    if (in_flight.test_and_set(std::memory_order_acquire)) {
+    // Admission first: a call during an in-flight read is Busy/Abandoned even with a spent budget.
+    switch (slot.try_acquire()) {
+    case ProcSnapshotSlot::Acquire::acquired:
+        break;
+    case ProcSnapshotSlot::Acquire::busy:
         out.status = ProcSnapshotStatus::Busy;
+        return out;
+    case ProcSnapshotSlot::Acquire::abandoned:
+        out.status = ProcSnapshotStatus::Abandoned;
         return out;
     }
     if (deadline <= std::chrono::milliseconds::zero()) {
-        in_flight.clear(std::memory_order_release); // nothing handed off
+        slot.release(); // nothing handed off
         out.status = ProcSnapshotStatus::TimedOut;
         return out;
     }
-    auto worker = [&in_flight, pid, reader = std::move(reader)]() mutable -> ProcSnapshot {
+    auto worker = [&slot, pid, reader = std::move(reader)]() mutable -> ProcSnapshot {
         // Releaser FIRST: runs when the worker returns or throws, long after a TimedOut caller.
         struct Releaser {
-            std::atomic_flag& f;
-            ~Releaser() { f.clear(std::memory_order_release); }
-        } releaser{in_flight};
+            ProcSnapshotSlot& s;
+            ~Releaser() { s.release(); }
+        } releaser{slot};
         return reader(pid);
     };
     auto r = yuzu::shared::bounded_call_ex(deadline, std::move(worker));
@@ -107,11 +146,14 @@ ProcSnapshotResult bounded_proc_snapshot(std::atomic_flag& in_flight, int pid,
         out.snap = *r.value;
         break;
     case yuzu::shared::BoundedCallStatus::TimedOut:
-        out.status = ProcSnapshotStatus::TimedOut; // also a throwing reader: no value either way
+        // Also a throwing reader, which returns at once with no value. If the worker is still
+        // running, mark it abandoned so the next dispatch is told so, not just "busy".
+        slot.mark_abandoned();
+        out.status = ProcSnapshotStatus::TimedOut;
         break;
     case yuzu::shared::BoundedCallStatus::Rejected:
-        // The worker never ran, so no releaser exists: clear the flag here.
-        in_flight.clear(std::memory_order_release);
+        // The worker never ran, so no releaser exists: release the slot here.
+        slot.release();
         out.status = ProcSnapshotStatus::Rejected;
         break;
     }
@@ -125,7 +167,7 @@ ProcSnapshotResult bounded_proc_snapshot(std::atomic_flag& in_flight, int pid,
 YUZU_EXPORT ProcSnapshotResult read_proc_snapshot_bounded(int pid,
                                                           std::chrono::milliseconds deadline);
 
-/// Test seam: same driver and process-wide in-flight flag, injected reader. No default
+/// Test seam: same driver and process-wide slot, injected reader. No default
 /// arguments (see keychain_read.hpp).
 YUZU_EXPORT ProcSnapshotResult read_proc_snapshot_bounded_for_test(
     int pid, std::chrono::milliseconds deadline,

@@ -24,11 +24,12 @@
  * (xnu-12377.1.9: kern_proc.c proc_ref_wait_for_exec, kern_exec.c proc_exec_switch_task), not
  * the kernel on a test host, and not reproduced. The call therefore runs on ONE worker owned by
  * agent-core with a deadline; the worker cannot be cancelled, so at the deadline it is abandoned
- * (recorded in agent-core's single in-flight flag), the dispatch answers `deadline_exceeded`,
- * and the next dispatch answers `abandoned_call_pending` instead of starting a second blocked
- * thread, until the worker returns and releases the flag. The worker's code is agent-core's, so
- * an unloaded plugin cannot pull it out from under it (the dlclose hazard documented in
- * agents/core/include/yuzu/agent/passwd_lookup.hpp). A blocked worker still pins one thread of
+ * (recorded in agent-core's single-flight slot), the dispatch answers `deadline_exceeded`, and
+ * the next dispatch answers `abandoned_call_pending` instead of starting a second blocked
+ * thread, until the worker returns and releases the slot. A dispatch that meets a healthy
+ * read of another dispatch answers `call_in_progress` (retry shortly). The worker's code is
+ * agent-core's, so an unloaded plugin cannot pull it out from under it (the dlclose hazard
+ * documented in agents/core/include/yuzu/agent/passwd_lookup.hpp). A blocked worker still pins one thread of
  * the agent until the kernel releases it; that thread is not a command-pool worker.
  */
 #if defined(__APPLE__)
@@ -51,11 +52,16 @@ int run_macos(yuzu::CommandContext& ctx, const Request& req) {
         MacBsdInfo out;
         const auto r =
             yuzu::agent::read_proc_snapshot_bounded(pid, yuzu::agent::kProcSnapshotDeadline);
-        if (r.status == ProcSnapshotStatus::Busy) {
+        if (r.status == ProcSnapshotStatus::Abandoned) {
             out.bound = MacBsdInfo::Bound::abandoned_pending;
             return out;
         }
-        // TimedOut, and Rejected (the call was never started): no answer arrived.
+        if (r.status == ProcSnapshotStatus::Busy) {
+            out.bound = MacBsdInfo::Bound::call_in_progress;
+            return out;
+        }
+        // TimedOut, a throwing reader, and Rejected (the worker never ran, so this answers at
+        // once, not after the deadline): no answer arrived.
         if (r.status != ProcSnapshotStatus::Completed) {
             out.bound = MacBsdInfo::Bound::deadline_exceeded;
             return out;

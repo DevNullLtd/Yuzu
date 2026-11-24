@@ -19,7 +19,7 @@ namespace {
 
 // Process-wide: one read in flight. Static storage so an abandoned worker's releaser never
 // touches a destroyed object.
-std::atomic_flag g_snapshot_in_flight;
+ProcSnapshotSlot g_snapshot_slot;
 
 #if defined(__APPLE__)
 
@@ -34,7 +34,10 @@ ProcSnapshot read_snapshot(int pid) {
         return out;
     }
     // Second call, same worker: the monotonic start stamp. If the pid were recycled between the
-    // two calls the pair is mixed, which can only fail a supplied token (never match one).
+    // two calls the pair is mixed: a supplied token then fails (never matches), and an unguarded
+    // inspect hands out a token that matches no process, which a later call reads as pid_reused.
+    // It needs a pid wrap inside the gap between these two calls; a second proc_pidinfo and a
+    // stamp compare would close it.
     struct rusage_info_v0 ru;
     std::memset(&ru, 0, sizeof(ru));
     errno = 0;
@@ -64,13 +67,13 @@ ProcSnapshot read_snapshot(int) {
 // The driver is instantiated here so every byte the detached thread runs is agent-core text.
 
 ProcSnapshotResult read_proc_snapshot_bounded(int pid, std::chrono::milliseconds deadline) {
-    return detail::bounded_proc_snapshot(g_snapshot_in_flight, pid, deadline, read_snapshot);
+    return detail::bounded_proc_snapshot(g_snapshot_slot, pid, deadline, read_snapshot);
 }
 
 ProcSnapshotResult
 read_proc_snapshot_bounded_for_test(int pid, std::chrono::milliseconds deadline,
                                     const std::function<ProcSnapshot(int)>& reader) {
-    return detail::bounded_proc_snapshot(g_snapshot_in_flight, pid, deadline, reader);
+    return detail::bounded_proc_snapshot(g_snapshot_slot, pid, deadline, reader);
 }
 
 } // namespace yuzu::agent

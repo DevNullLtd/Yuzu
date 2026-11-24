@@ -430,8 +430,9 @@ struct MacBsdInfo {
     /// Whether the bounded call produced an answer. Anything but `answered` carries no numbers.
     enum class Bound {
         answered,          ///< the call returned within the deadline (err may still be set)
-        deadline_exceeded, ///< no answer arrived: deadline hit, or the call could not be started
-        abandoned_pending, ///< an earlier call is still blocked in the kernel; none was started
+        deadline_exceeded, ///< no answer arrived: deadline hit, read threw, or never started
+        abandoned_pending, ///< an earlier call hit its deadline and is still blocked in the kernel
+        call_in_progress,  ///< another dispatch's healthy read is in flight; none was started
     };
     Bound bound = Bound::answered;
 };
@@ -471,6 +472,8 @@ struct MacSource {
         return refuse(StatusState::unavailable, "deadline_exceeded", kMacTok);
     if (b.bound == MacBsdInfo::Bound::abandoned_pending)
         return refuse(StatusState::unavailable, "abandoned_call_pending", kMacTok);
+    if (b.bound == MacBsdInfo::Bound::call_in_progress)
+        return refuse(StatusState::unavailable, "call_in_progress", kMacTok);
     switch (classify_macos_errno(b.err)) {
     case ReadState::ok:
         break;

@@ -25,12 +25,12 @@ early return, `bad_alloc` unwind) releases exactly the resource listed.
 - **Site:** `detail::bounded_proc_snapshot` (`proc_snapshot_read.hpp`), instantiated only in
   `proc_snapshot_read.cpp`, over `yuzu::shared::bounded_call_ex`.
 - **Owner type:** the worker thread owns its reader copy and a shared result state; the
-  process-wide `std::atomic_flag` (static storage, agent-core) records "a read is in flight".
-- **Release point:** the worker's `Releaser` clears the flag when the read returns or throws, even
-  long after the caller gave up. A Rejected admission (the worker never ran) is cleared by the
+  process-wide `ProcSnapshotSlot` (free, busy or abandoned; static storage, agent-core) records the in-flight read.
+- **Release point:** the worker's `Releaser` frees the slot when the read returns or throws, even
+  long after the caller gave up. A Rejected admission (the worker never ran) is released by the
   caller.
 - **At the deadline:** the worker is abandoned, not cancelled (a blocked kernel call cannot be);
-  the flag stays set, so the next dispatch answers `abandoned_call_pending` and starts nothing.
+  the slot is marked abandoned, so the next dispatch answers `abandoned_call_pending` and starts nothing (a dispatch that meets a healthy read answers `call_in_progress` instead).
   At most ONE such thread exists at a time. It runs only agent-core text, so unloading the plugin
   cannot unmap code under it.
 - **Transfer:** never.
@@ -61,6 +61,6 @@ read from the public XNU source (xnu-12377.1.9: `kern_proc.c` `proc_ref_wait_for
 wait is shared by every `proc_find` caller (`ps`, `kill`). The bound is agent-core's, because a
 detached thread in a plugin that can be unloaded is a use-after-unload
 (`agents/core/include/yuzu/agent/passwd_lookup.hpp`): one owned worker, a 5 second deadline, one
-in-flight flag (the abandoned-worker state), the module never involved. The deadline is a
+single-flight slot (the abandoned-worker state), the module never involved. The deadline is a
 documented plugin choice (libproc answers in microseconds), not a measured value. The cost of an
 abandoned worker is one blocked agent thread that is not a command-pool worker.
