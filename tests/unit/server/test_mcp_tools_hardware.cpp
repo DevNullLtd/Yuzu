@@ -3361,8 +3361,10 @@ TEST_CASE("mcp list_hardware_ci_records: the changed_since input, the per-row ch
                                "never resume a saved cursor across days", "Do NOT send changed_since on an agent_id confirm read",
                                "does NOT mean no records exist",
                                // the conditional, capped fallback (round 2): never an unconditional loop
-                               "If the SAME delta page keeps returning an internal error (-32603) with retry_after_ms 5000 while unfiltered pages succeed, drop changed_since and run ONE full walk, at most once per walk and not on every scheduled run",
+                               "If the same delta page returns the same error (-32603) with retry_after_ms 5000 at least 3 times over at least 60 s while unfiltered pages succeed, drop changed_since and run ONE full walk, at most once per walk and not on every scheduled run",
                                "honour every other hint (2000, 60000, an audit failure) and do not fall back for them",
+                               // how to recognise the audit failure: the exact message of answer_audit_withheld
+                               "An audit failure is the internal error whose message is \"audit subsystem unavailable, request not served\"",
                                "If that full walk's first page also fails (it reads the watermark too) or the fallback recurs, stop and alert: the delta plan is slow, raise it with the operator",
                                "Run the first full walk under the SAME global credential that will run the deltas",
                                "first-page next_changed_since is NOT valid for a later global delta",
