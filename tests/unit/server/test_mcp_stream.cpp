@@ -177,9 +177,29 @@ std::size_t contend_for_live_reads(detail::StreamBudget& budget, yuzu::Gauge& ga
                                    const std::vector<std::string>& principals) {
     const std::size_t n = principals.size();
     std::atomic<bool> go{false};
+    std::atomic<bool> abandoned{false};
     std::atomic<std::size_t> attempted{0};
     std::atomic<std::size_t> admitted{0};
     std::vector<std::thread> threads;
+    // Joins every thread on ANY exit, including a throw from `reserve`/`emplace_back` partway
+    // through (std::thread's destructor terminates the process on a joinable thread). It releases
+    // the start flag and the hold loop first, or a started thread would wait forever on a thread
+    // that was never created. Declared after the state the threads read, so it runs first.
+    struct Joiner {
+        std::vector<std::thread>& threads;
+        std::atomic<bool>& go;
+        std::atomic<bool>& abandoned;
+        void join_all() {
+            for (auto& t : threads)
+                if (t.joinable())
+                    t.join();
+        }
+        ~Joiner() {
+            abandoned.store(true, std::memory_order_release);
+            go.store(true, std::memory_order_release);
+            join_all();
+        }
+    } joiner{threads, go, abandoned};
     threads.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
         threads.emplace_back([&, i] {
@@ -194,13 +214,13 @@ std::size_t contend_for_live_reads(detail::StreamBudget& budget, yuzu::Gauge& ga
             attempted.fetch_add(1, std::memory_order_release);
             // Hold the lease until every thread has attempted: no thread frees a slot another is
             // still trying to take.
-            while (attempted.load(std::memory_order_acquire) < n)
+            while (attempted.load(std::memory_order_acquire) < n &&
+                   !abandoned.load(std::memory_order_acquire))
                 std::this_thread::yield();
         });
     }
     go.store(true, std::memory_order_release);
-    for (auto& t : threads)
-        t.join();
+    joiner.join_all();
     return admitted.load();
 }
 

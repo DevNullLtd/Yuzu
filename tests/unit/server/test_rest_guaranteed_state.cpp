@@ -5231,6 +5231,10 @@ TEST_CASE("REST dex/devices/{id}/live: a scoped gate or the caller withdrawn ins
             CHECK(h.audit_log[1].result == "failure");
             CHECK(h.audit_log[1].target_id == "WS-1");
             CHECK(h.audit_log[1].detail.find(w.detail) == 0);
+            // QE-12: both rows name the session that made the call (also when it then lapsed).
+            REQUIRE(h.audit_principals.size() == 2);
+            CHECK(h.audit_principals[0] == "alice");
+            CHECK(h.audit_principals[1] == "alice");
         }
     }
 }
@@ -5287,6 +5291,94 @@ TEST_CASE("REST dex/devices/{id}/live: the requested and the failure row name th
     CHECK(rest_live_count(h, "uptime", "caller_unresolved") == 1.0);
 }
 
+// N1: every audit row of the call is bound to the FIRST session, and the dispatch runs as the
+// SECOND resolution, which (like each gate) re-authenticates independently. The credential here
+// resolves to a DIFFERENT principal once the `requested` row is written: nothing may be sent as
+// that principal, the answer is the unresolved-caller 401, and both rows still name the original.
+TEST_CASE("REST dex/devices/{id}/live: a credential that resolves to a different principal at the "
+          "re-resolution dispatches nothing and is caller_unresolved, naming the original session (N1)",
+          "[pg][rest][dex][device][live][audit][7110]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    h.session_user = "alice";
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested")
+            h.session_user = "mallory"; // the next authentication yields someone else
+    };
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    const auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 401);
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    CHECK(h.live_dispatches == 0); // nothing was sent, as anyone
+    CHECK(h.last_live_plugin.empty());
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[0].result == "requested");
+    CHECK(h.audit_log[1].action == "device.live.uptime");
+    CHECK(h.audit_log[1].result == "failure");
+    CHECK(h.audit_log[1].target_id == "WS-1");
+    CHECK(h.audit_log[1].detail.find("caller_unresolved") == 0);
+    REQUIRE(h.audit_principals.size() == 2);
+    CHECK(h.audit_principals[0] == "alice");
+    CHECK(h.audit_principals[1] == "alice"); // the ORIGINAL session, never the new principal
+    CHECK(rest_live_count(h, "uptime", "caller_unresolved") == 1.0);
+    CHECK(rest_live_count(h, "uptime", "ok") == 0.0);
+    CHECK(h.live_budget.active() == 0); // the lease came back
+    CHECK(h.metrics.gauge("yuzu_server_live_in_flight").value() == 0.0);
+}
+
+// QE-8: the REST route renders at most 20000 process rows. One more is refused whole
+// (502 output_too_large), never silently cut; exactly the cap is served in full.
+TEST_CASE("REST dex/devices/{id}/live: 20001 process rows is 502 output_too_large, 20000 is a 200 "
+          "(QE-8)",
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    const auto rows = [](int n) {
+        std::string out;
+        for (int i = 1; i <= n; ++i)
+            out += "proc|" + std::to_string(i) + "|p\n"; // short rows: well under the ingest cap
+        return out;
+    };
+    SECTION("20001 rows") {
+        RestGsHarness h(true, true, true, true, &pool);
+        StoredResponse r;
+        r.instruction_id = "processes-live";
+        r.agent_id = "WS-1";
+        r.status = kStatusSuccess;
+        r.output = rows(20001);
+        h.resp_store->store(r);
+        auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+        REQUIRE(res);
+        CHECK(res->status == 502);
+        const auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["reason"].get<std::string>() == "output_too_large");
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(res->body.find("\"processes\"") == std::string::npos); // no rows leaked
+        CHECK(rest_live_count(h, "processes", "output_too_large") == 1.0);
+        CHECK(rest_live_count(h, "processes", "ok") == 0.0);
+    }
+    SECTION("20000 rows") {
+        RestGsHarness h(true, true, true, true, &pool);
+        StoredResponse r;
+        r.instruction_id = "processes-live";
+        r.agent_id = "WS-1";
+        r.status = kStatusSuccess;
+        r.output = rows(20000);
+        h.resp_store->store(r);
+        auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto j = nlohmann::json::parse(res->body);
+        CHECK(j["data"]["processes"].size() == 20000);
+        CHECK(rest_live_count(h, "processes", "ok") == 1.0);
+        CHECK(rest_live_count(h, "processes", "output_too_large") == 0.0);
+    }
+}
+
 // UP-8 / CO-2: a store DEGRADE between the two gate decisions is not a revocation. The failure row
 // says `gate_unreadable`, the counter says `gate_unreadable`, and the answer is retryable; a true
 // withdrawal in the same window still says `permission_revoked` (403, no retry hint).
@@ -5332,8 +5424,21 @@ TEST_CASE("REST dex/devices/{id}/live: an unreadable gate at the re-decision is 
             CHECK(h.audit_log[1].action == "device.live.uptime");
             CHECK(h.audit_log[1].result == "failure");
             CHECK(h.audit_log[1].detail.find(c.token) == 0);
+            // QE-12: the failure row names the session that made the call, for every refusal class
+            // (the `requested` row too), never the re-resolving writer's blank.
+            REQUIRE(h.audit_principals.size() == 2);
+            CHECK(h.audit_principals[0] == "alice");
+            CHECK(h.audit_principals[1] == "alice");
             CHECK(rest_live_count(h, "uptime", c.token) == 1.0);
             CHECK(rest_live_count(h, "uptime", c.counted_other) == 0.0);
+            if (!c.retryable) {
+                // A definitive denial or a lapsed session is not worth retrying: no hint, header or
+                // body (this harness's gate writes no body; production's carries none either).
+                CHECK_FALSE(res->has_header("Retry-After"));
+                const auto denied = nlohmann::json::parse(res->body, nullptr, false);
+                if (!denied.is_discarded() && denied.contains("error"))
+                    CHECK(denied["error"]["retry_after_ms"].is_null());
+            }
             // The gate's own 503 (Unavailable) keeps the body the gate wrote (this harness's stub
             // writes none); the degraded-read 403s are re-stated as a retryable 503.
             if (std::string_view(c.token) == "gate_unreadable" &&
@@ -5443,7 +5548,11 @@ TEST_CASE("REST dex/devices/{id}/live: output with no terminal row is 504 incomp
     const auto j = nlohmann::json::parse(res->body);
     CHECK(j["error"]["message"].get<std::string>() == "the device began to answer but did not finish");
     CHECK(j["error"]["reason"].get<std::string>() == "incomplete");
-    CHECK(j["error"]["retry_after_ms"].get<int>() == 3000);
+    // UP-17: the device was working, so its first run may still be hashing; the hint is the poll's
+    // own wall deadline (25 s), NOT the 3 s a timeout carries, so a retry cannot land inside it.
+    CHECK(j["error"]["retry_after_ms"].get<int>() == 25000);
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() ==
+          yuzu::server::mcp::kLiveReadIncompleteRetryMs);
     CHECK(res->body.find("PARTIAL_MARKER") == std::string::npos);
     CHECK(rest_live_count(h, "processes", "incomplete") == 1.0);
     CHECK(rest_live_count(h, "processes", "timeout") == 0.0);

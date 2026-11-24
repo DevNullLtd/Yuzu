@@ -2776,7 +2776,10 @@ static const ToolDef kTools[] = {
      "SYNCHRONOUS: the call blocks for up to about 20 seconds waiting for the device and "
      "holds one server request slot meanwhile (at most 2 per principal, 4 server-wide; over "
      "that it answers a retryable cap error and sends nothing). The answer is given only after "
-     "the device has finished; partial output is never returned. Needs BOTH "
+     "the device has finished: partial output without a final row is never returned. A chunk "
+     "the server failed to store cannot be detected, so the surviving rows may be returned as "
+     "a complete answer. "
+     "Needs BOTH "
      "GuaranteedState:Read and Execution:Execute, each scoped to this device; a 'readonly' "
      "token and a 'supervised' token are refused (a live probe has no approval ticket), and "
      "so is every call while the server runs in read-only mode. "
@@ -2790,17 +2793,26 @@ static const ToolDef kTools[] = {
      "that is lost afterwards is flagged on the answer as audit_persisted false. A refusal "
      "for argument shape, tier, permission, a cap or shutdown writes no such row. "
      "Output is bounded: at most 1000 process rows and 1 MiB of device output, with "
-     "'truncated' set when either cut applies. "
-     "Errors: an error carries 'reason', and ONLY an error that carries retry_after_ms is "
-     "worth retrying (a device timeout, a device that began to answer but did not finish "
-     "(incomplete), a response store read fault, a cap, an audit store fault, an offline "
-     "device (no_agents_reached), or a store that could not be read: gate_unreadable, "
-     "containment_unreadable, route_unreadable, os_gate_unreadable). Never retry quarantined, "
-     "plugin_not_found, "
-     "kill_switched_os, device_failed, device_error (which includes a device that returned "
-     "nothing usable), dispatch_denied or permission_revoked. shutting_down means the server "
-     "is stopping: retry later or against another replica. Mirrors POST "
-     "/api/v1/dex/devices/{id}/live.",
+     "'truncated' set when either cut applies. An answer already over the size cap is cut "
+     "and flagged truncated at once, without waiting for the device to finish, and under "
+     "truncation the surviving rows are not a stable prefix of the full answer (when the "
+     "store held rows back they are the newest ones). "
+     "Errors: most errors carry a 'reason' (a cap, a permission or session withdrawn after "
+     "the request was audited, an unreadable gate, a dispatch denial token such as "
+     "forbidden or approval_required, an offline or withheld device, a poll outcome, or "
+     "exception); an audit store fault (audit_failed), a missing server dependency "
+     "(not_configured), an argument or kind refusal, a tier, approval-gate or read-only "
+     "refusal, and a render fault (render_failed) carry none. ONLY an error that carries "
+     "retry_after_ms is "
+     "worth retrying (a device timeout, a response store read fault, a cap, an audit store "
+     "fault, an offline device (no_agents_reached), or a store that could not be read: "
+     "gate_unreadable, containment_unreadable, route_unreadable, os_gate_unreadable). A device "
+     "that began to answer but did not finish (incomplete) is retryable with a longer wait, the "
+     "poll's own 25 second deadline, because its first run may still be hashing. Never retry "
+     "quarantined, plugin_not_found, kill_switched_os, device_failed, device_error (which "
+     "includes a device that returned nothing usable), a dispatch denial token or "
+     "permission_revoked. shutting_down means the server is stopping: retry later or against "
+     "another replica. Mirrors POST /api/v1/dex/devices/{id}/live.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact agent/device id (never __all__)"},)j"
      R"j("kind":{"type":"string","enum":["uptime","processes"],"description":"uptime: uptime display text and seconds. processes: running processes with pid, name, path and SHA-256 (hashes executables on the device)"})j"
@@ -22290,9 +22302,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     regate = scoped_gate_fn_(req, res, "GuaranteedState", "Read", agent_id);
                     if (regate == ScopedGateOutcome::Admitted)
                         regate = scoped_gate_fn_(req, res, "Execution", "Execute", agent_id);
-                } else if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id) ||
-                           !scoped_perm_fn(req, res, "Execution", "Execute", agent_id)) {
-                    regate = ScopedGateOutcome::Denied; // the bool gate cannot say more
+                } else {
+                    // The typed gate was never wired (production always wires it): the bool gate
+                    // cannot tell a withdrawal from an unreadable store, so reading its refusal as
+                    // a revocation would mislabel a degrade. Fail CLOSED to a retryable
+                    // `gate_unreadable`; the first decision above is the one that used the bool gate.
+                    regate = ScopedGateOutcome::Unavailable;
                 }
                 if (regate != ScopedGateOutcome::Admitted) {
                     outcome = live::live_outcome_for(regate);
@@ -22434,7 +22449,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                             "application/json");
                             return;
                         }
-                        if (rendered->empty) {
+                        // N2: an answer the poll CUT to nothing (one line past the cap, no newline
+                        // inside it) renders empty, but the device did answer: the cut is what left
+                        // nothing, so it is reported truncated below, never as a device that had
+                        // nothing to say. Truncation is therefore decided before emptiness.
+                        if (rendered->empty && !polled.truncated) {
                             // The device finished without error but returned nothing usable: it did
                             // not answer the question, so this is not a success.
                             outcome = live::LiveOutcome::kDeviceError;
@@ -22504,7 +22523,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     case live::LiveOutcome::kShuttingDown:
                         // The server began closing while the device was answering: the command may
-                        // have been sent, so this is not the "nothing was sent" refusal above.
+                        // have been sent, so this is not the "nothing was sent" refusal above. The
+                        // same 503 the admission refusal and the REST route answer.
+                        res.status = 503;
                         res.set_content(
                             a4_error(kMcpShuttingDown,
                                      "the server began shutting down before the device answered",
@@ -22515,11 +22536,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     case live::LiveOutcome::kIncomplete:
                         // Output arrived and no terminal row followed (the partial output was
-                        // discarded): retryable like a timeout, but named apart so a caller knows
-                        // the device was working on it.
+                        // discarded): retryable, but NOT as soon as a timeout. The device was working,
+                        // so its first run may still be hashing; the hint is the poll's own wall
+                        // deadline, so a retry does not land inside it.
                         res.set_content(
                             a4_error(kInternalError, std::string(polled.detail),
-                                     "retry the request", mcp::kMcpLiveReadDeviceTimeoutRetryMs,
+                                     "retry the request", mcp::kLiveReadIncompleteRetryMs,
                                      cid, true, live::to_token(polled.outcome)),
                             "application/json");
                         return;

@@ -123,6 +123,15 @@ inline constexpr std::int64_t kMcpLiveReadCapRetryMs = 2000;
 /// route's own pricing of that trade and is kept identical so the two surfaces agree.
 inline constexpr std::int64_t kMcpLiveReadDeviceTimeoutRetryMs = 3000;
 
+/// `retry_after_ms` for a live read that ended `incomplete` (REST and MCP alike): the device sent
+/// output but never a terminal row inside the poll budget, so its first run may STILL be hashing
+/// when the caller retries. A retry that lands inside that run only adds device load and starts a
+/// second read of every executable image, so the hint is the poll's own wall deadline (the same
+/// 25 s as `LivePollLimits::deadline`, pinned equal by a `static_assert` in live_read_poll.hpp):
+/// by then the first run has either finished or been given its full budget. Deliberately NOT the
+/// timeout hint above, which fits a device that never answered at all.
+inline constexpr std::int64_t kLiveReadIncompleteRetryMs = 25000;
+
 /// Metric-name symbol for the poll-rate counter (#3344), so the `describe`/
 /// pre-seed site (`server.cpp`) and the increment site (`mcp_server.cpp`)
 /// cannot silently diverge into a shadow series — same precedent as

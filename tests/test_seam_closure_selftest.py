@@ -75,6 +75,9 @@ EXPECTED_FAMILIES = {
             "server/core/src/live_result_json.cpp",
             "server/core/src/live_result_json.hpp",
             "server/core/src/live_outcome.hpp",
+            "server/core/src/live_admission.hpp",
+            "server/core/src/utf8_clamp.hpp",
+            "server/core/src/live_zero_reach_outcome.hpp",
         ],
     },
     "network": {

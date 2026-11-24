@@ -510,17 +510,17 @@ TEST_CASE("shutdown_drain: a workflow run in flight extends the wait, and the SA
     using yuzu::server::shutdown_drain::keep_draining_for_work;
     using yuzu::server::shutdown_drain::kExecutionDrainCap;
     // Nothing in the tracker, no grace: only the engine's own run count holds the drain.
-    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0));
-    CHECK(keep_draining_for_work(0s, 0s, 0, 1));
-    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, 3));
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 0, 1, 0));
+    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, 3, 0));
     // The cap bounds it exactly as it bounds a tracked execution: a run still going at the cap is
     // stopped by stop_requested_, not waited for.
-    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, 1));
-    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap + 5s, 0s, 4, 4));
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, 1, 0));
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap + 5s, 0s, 4, 4, 0));
     // A tracked execution alone, and the minimum grace, behave as before.
-    CHECK(keep_draining_for_work(1s, 0s, 2, 0));
-    CHECK(keep_draining_for_work(5s, 10s, 0, 0));
-    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, 0));
+    CHECK(keep_draining_for_work(1s, 0s, 2, 0, 0));
+    CHECK(keep_draining_for_work(5s, 10s, 0, 0, 0));
+    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, 0, 0));
 }
 
 // CS-1 (b): a per-device live read holds a worker for up to its poll budget and is neither tracked
@@ -538,10 +538,10 @@ TEST_CASE("shutdown_drain: a live read in flight extends the wait, and the SAME 
     // A leaked lease costs at most the cap.
     CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, 0, 1));
     CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap + 5s, 0s, 3, 3, 4));
-    // The four-argument form (no live reads) is exactly the old rule.
-    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0));
-    CHECK(keep_draining_for_work(0s, 0s, 1, 0));
-    CHECK(keep_draining_for_work(0s, 0s, 0, 1));
+    // With no live reads the rule is exactly the old one (live_reads is a required argument).
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 1, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 0, 1, 0));
     // The minimum grace is unchanged.
     CHECK(keep_draining_for_work(5s, 10s, 0, 0, 0));
     CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, 0, 0));
@@ -555,15 +555,15 @@ TEST_CASE("shutdown_drain: a run holding a lease but not yet in the engine (in p
     using yuzu::server::shutdown_drain::kExecutionDrainCap;
     using yuzu::server::shutdown_drain::workflow_runs_to_drain;
     // Lease taken, engine not entered: the engine count alone would stop the drain.
-    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0));
-    CHECK(keep_draining_for_work(0s, 0s, 0, workflow_runs_to_drain(0, 1)));
-    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, workflow_runs_to_drain(0, 2)));
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 0, workflow_runs_to_drain(0, 1), 0));
+    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, workflow_runs_to_drain(0, 2), 0));
     // Both zero stops; the cap releases a lease-held run exactly as it releases an engine one.
-    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, workflow_runs_to_drain(0, 0)));
-    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, workflow_runs_to_drain(0, 1)));
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, workflow_runs_to_drain(0, 0), 0));
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, workflow_runs_to_drain(0, 1), 0));
     // The minimum grace is unchanged.
-    CHECK(keep_draining_for_work(5s, 10s, 0, workflow_runs_to_drain(0, 0)));
-    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, workflow_runs_to_drain(0, 0)));
+    CHECK(keep_draining_for_work(5s, 10s, 0, workflow_runs_to_drain(0, 0), 0));
+    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, workflow_runs_to_drain(0, 0), 0));
 }
 
 TEST_CASE("shutdown_drain: workflow_runs_to_drain is the larger of the two counts, never a sum, "

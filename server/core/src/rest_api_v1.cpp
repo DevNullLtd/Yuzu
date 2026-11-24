@@ -1628,7 +1628,7 @@ const std::string& openapi_spec() {
     {"name": "DEX", "description": "Digital employee experience data (signal rollups, device scores, fleet performance now, retained app performance over time, and a live per-device read) and the customer score policy, which can be read, replaced and reset.", "x-yuzu-guide": {
       "overview": ["DEX stands for digital employee experience. These calls return, as JSON, the same read models the /dex dashboard pages show, so an operator or an agentic worker can ask the questions those pages answer. Apart from the score policy, the group only reads. It reports what agents observed on endpoints and does not author or enforce anything. The score policy is the one thing here that can be written: GET, PUT and DELETE /dex/score-policy read, replace and reset the customer policy that scores devices. Rules and enforcement belong to Guardian.", "Three kinds of data sit behind it. Signal observations (app crashes and hangs, service failures, boot, network and similar problems) are events sent by the agent and read over a time window. Fleet performance is a snapshot built from the latest heartbeat of each reporting device. App performance over time is a retained daily summary per application and version.", "Some of these reads name individual devices, and a device's history shows which applications a person runs. Those calls are audited, and most of them refuse to return data when the audit record cannot be saved. The tables and the access section show which calls they are."],
       "how_it_works": [{"title": "Observe on device", "text": "The DEX observer in the agent daemon watches the operating system for problem signals and sends each one to the server as a Guardian event. Starting the agent with --dex-disable stops this, and the agent then sends no DEX telemetry."}, {"title": "Project on server", "text": "The server stores the event and copies DEX observations (signals that no rule produced) into a read table that these calls query. The copy expires together with the event it came from."}, {"title": "Sample heartbeats", "text": "Each heartbeat carries the device's current CPU and memory commit figures, and on Windows disk latency too. The server aggregates the latest sample of every reporting device when you ask, so performance figures are a snapshot with no history."}, {"title": "Sync app summaries", "text": "When per-application sampling is switched on for a device, the agent sends a daily summary per application and version over the daily sync. The server keeps 31 days per device and 180 days as a fleet aggregate."}, {"title": "Read through API", "text": "The calls read these stores and return aggregates or rows. The device score, the catalogue, the application stability list and the app performance reads answer 503 when the store cannot be read. The score policy calls (GET, PUT and DELETE score-policy) read and write the server's runtime configuration store and answer 503 when it cannot be used. The other signal reads return empty results instead, so see Degraded reads before treating an empty answer as a healthy fleet."}],
-      "tables": [{"title": "What each kind of data is", "caption": "Which calls read which data, and how fresh it is.", "columns": ["Data", "Comes from", "Time range", "Calls"], "rows": [["Signal observations", "Agent DEX observer events", "Window of 24h, 7d, 30d or all (default 7d)", "signals, scope, signals/{obs_type}, catalogue, catalogue/group, health, trends, overview, apps, app, devices/{id}, devices/{id}/history, devices/{id}/observations/{event_id}"], ["Fleet performance now", "Latest heartbeat of each reporting device", "Snapshot at request time, no window", "perf/fleet, perf/cohorts, perf/cohort-diff, perf/devices"], ["App performance over time", "Daily app summaries from the agent", "180 days fleet, 31 days per device, group, tag and compare", "perf/apps, perf/app, perf/group, perf/tag, perf/compare, perf/app/devices, devices/{id}/app-perf"], ["Live device read", "One plugin command sent to the device now", "Nothing stored, uptime or processes only", "devices/{id}/live"], ["Customer score policy", "A document an operator writes through the API, the dashboard Scoring tab or the MCP tools, held in the server's runtime configuration", "The policy in force now, no window", "score-policy (GET, PUT and DELETE)"]]}, {"title": "Calls that name devices", "caption": "The gate each one uses and the audit verb it writes.", "columns": ["Call", "What it names", "Gate", "Audit verb"], "rows": [["signals/{obs_type}", "Most-affected devices", "Global read, service-scoped token refused", "dex.signal.view"], ["app", "Affected devices for one app", "Global read, service-scoped token refused", "dex.app.view"], ["overview", "Top devices", "Global read, service-scoped token refused", "dex.overview.view"], ["perf/devices", "Device list with perf figures", "Global read, service-scoped token refused", "dex.perf.device.view"], ["perf/app/devices", "Devices that ran one app version", "Fleet read narrowed to the caller's visible devices", "dex.app_perf.devices.view"], ["devices/{id}", "One device's score", "Read scoped to that device", "dex.device.view"], ["devices/{id}/history", "One device's signal history", "Read scoped to that device", "dex.device.view"], ["devices/{id}/observations/{event_id}", "One observation", "Read scoped to that device", "dex.observation.view"], ["devices/{id}/app-perf", "One device's app history", "Read scoped to that device", "dex.device.app_perf.view"], ["devices/{id}/live", "Live uptime or processes", "Read and Execute scoped to that device", "device.live.uptime or device.live.processes"], ["perf/compare", "No device rows, a small-cohort aggregate", "Global read, service-scoped token refused", "dex.app_perf.compare"]]}],
+      "tables": [{"title": "What each kind of data is", "caption": "Which calls read which data, and how fresh it is.", "columns": ["Data", "Comes from", "Time range", "Calls"], "rows": [["Signal observations", "Agent DEX observer events", "Window of 24h, 7d, 30d or all (default 7d)", "signals, scope, signals/{obs_type}, catalogue, catalogue/group, health, trends, overview, apps, app, devices/{id}, devices/{id}/history, devices/{id}/observations/{event_id}"], ["Fleet performance now", "Latest heartbeat of each reporting device", "Snapshot at request time, no window", "perf/fleet, perf/cohorts, perf/cohort-diff, perf/devices"], ["App performance over time", "Daily app summaries from the agent", "180 days fleet, 31 days per device, group, tag and compare", "perf/apps, perf/app, perf/group, perf/tag, perf/compare, perf/app/devices, devices/{id}/app-perf"], ["Live device read", "One plugin command sent to the device now", "Stored in the response store for the retention period (default 90 days); uptime or processes only", "devices/{id}/live"], ["Customer score policy", "A document an operator writes through the API, the dashboard Scoring tab or the MCP tools, held in the server's runtime configuration", "The policy in force now, no window", "score-policy (GET, PUT and DELETE)"]]}, {"title": "Calls that name devices", "caption": "The gate each one uses and the audit verb it writes.", "columns": ["Call", "What it names", "Gate", "Audit verb"], "rows": [["signals/{obs_type}", "Most-affected devices", "Global read, service-scoped token refused", "dex.signal.view"], ["app", "Affected devices for one app", "Global read, service-scoped token refused", "dex.app.view"], ["overview", "Top devices", "Global read, service-scoped token refused", "dex.overview.view"], ["perf/devices", "Device list with perf figures", "Global read, service-scoped token refused", "dex.perf.device.view"], ["perf/app/devices", "Devices that ran one app version", "Fleet read narrowed to the caller's visible devices", "dex.app_perf.devices.view"], ["devices/{id}", "One device's score", "Read scoped to that device", "dex.device.view"], ["devices/{id}/history", "One device's signal history", "Read scoped to that device", "dex.device.view"], ["devices/{id}/observations/{event_id}", "One observation", "Read scoped to that device", "dex.observation.view"], ["devices/{id}/app-perf", "One device's app history", "Read scoped to that device", "dex.device.app_perf.view"], ["devices/{id}/live", "Live uptime or processes", "Read and Execute scoped to that device", "device.live.uptime or device.live.processes"], ["perf/compare", "No device rows, a small-cohort aggregate", "Global read, service-scoped token refused", "dex.app_perf.compare"]]}],
       "access": {"permissions": ["GuaranteedState:Read (global grant), on the aggregate and fleet reads: signals, scope, signals/{obs_type}, perf/fleet, perf/cohorts, perf/cohort-diff, perf/devices, perf/apps, perf/app, perf/group, perf/tag, perf/compare, app, apps, catalogue, catalogue/group, health, trends and overview.", "GuaranteedState:Read (scoped to the device, management-group aware), on devices/{id}, devices/{id}/history, devices/{id}/observations/{event_id}, devices/{id}/app-perf and devices/{id}/live. These routes answer 500 if the scope gate is not configured, and never widen to a global check.", "GuaranteedState:Read through the fleet-read check, on perf/app/devices only. A caller confined to a management group or a service sees only the devices they may see.", "Execution:Execute (scoped to the device), required in addition to Read on devices/{id}/live.",
       "GuaranteedState:Read (global grant) on GET score-policy. Infrastructure:Write on PUT and DELETE score-policy, and a cookie session must also be same-site. The MCP twins also require GuaranteedState:Read on set and reset, a supervised-tier token for both, and for reset Infrastructure:Delete and an approval ticket."], "audit": ["dex.device.view, written when a device's score or signal history is read. It is written before the read and fails the request closed.", "dex.signal.view, dex.app.view, dex.overview.view, dex.perf.device.view and dex.app_perf.devices.view, written on the fleet calls that list devices. Each fails the request closed. The app version devices call also writes a failure row, best effort, when the store cannot be read.", "dex.observation.view and dex.device.app_perf.view, written on a single observation and on a device's app history. Both fail closed. The observation row is written only after the observation was found.", "device.live.uptime or device.live.processes, written with result requested before the command is sent. If the row cannot be saved the command is not sent.", "dex.app_perf.compare, written on the before and after comparison. This one is set and proceed, so the data is returned and the Sec-Audit-Failed header flags a row that was lost.", "dex.perf.group.view and dex.perf.tag.view, written with result denied when a service-scoped token is refused on those two calls.",
 )json"
@@ -8639,16 +8639,18 @@ void RestApiV1::register_routes(
                 // the live reads (`SseSurface::kLiveRead`, keyed by the operator), because that
                 // budget is what bounds how many httplib workers any handler may pin, and a second
                 // budget for DELETE would raise that bound. A request over budget skips the wait
-                // and answers 202 (never 429): the record is already releasing and the reconciler
-                // finishes it. The mirror is declared before the lease so the gauge is published
-                // after the lease is returned. A null budget is the unmetered seam (tests only).
+                // and answers 202 (never 429) for a plain call: the record is already releasing and
+                // the reconciler finishes it. A FORCED call without a slot ends the record at once
+                // and answers 200 `device_confirmed:false` (the operator's own end). The mirror is
+                // declared before the lease so the gauge is published after the lease is returned.
+                // A null budget is the unmetered seam (tests only).
                 detail::LiveGaugeMirror gauge_mirror{
                     stream_budget, metrics_registry
                                        ? &metrics_registry->gauge(live::kLiveInFlightMetric)
                                        : nullptr};
                 // A draining server refuses the wait like a full budget: the answer is the same
-                // 202 and the reconciler finishes the release, so the shutdown drain never has a
-                // new lease to wait for.
+                // (202 plain, 200 `device_confirmed:false` forced) and the reconciler finishes the
+                // release, so the shutdown drain never has a new lease to wait for.
                 const auto admission =
                     live::admit_live_read(stream_budget, draining_fn, session->username);
                 gauge_mirror.publish();
@@ -20157,6 +20159,19 @@ void RestApiV1::register_routes(
                 fail("caller_unresolved");
                 return;
             }
+            // N1: every audit row above is bound to the FIRST session, and the dispatch runs as
+            // THIS resolution, which (like each gate) re-authenticates independently. Dispatch only
+            // as the principal the audit rows name: a credential that now resolves to someone else
+            // is the same refusal as one that no longer resolves, and nothing is sent. (With no
+            // authenticator wired there is no first session and nothing to compare.)
+            if (first_session && caller->principal != first_session->username) {
+                outcome = live::LiveOutcome::kCallerUnresolved;
+                fail("caller_unresolved");
+                res.status = 401;
+                res.set_content(detail::error_json_a4(401, "authentication required", cid),
+                                "application/json");
+                return;
+            }
             const auto dispatch_outcome = command_dispatch_fn(plugin, action, {agent_id}, "", {},
                                                               /*execution_id=*/"", *caller);
             const auto& command_id = dispatch_outcome.command_id;
@@ -20224,7 +20239,10 @@ void RestApiV1::register_routes(
                 res.set_content(detail::error_json_a4(status, message, cid, opts),
                                 "application/json");
             };
-            outcome = polled.outcome;
+            // `ok` is recorded only once the body has rendered (the kOk arm sets it last): an
+            // exception while rendering is counted `internal`, never as an answered read.
+            outcome = polled.outcome == live::LiveOutcome::kOk ? live::LiveOutcome::kInternal
+                                                              : polled.outcome;
             switch (polled.outcome) {
             case live::LiveOutcome::kOk: {
                 // REST bounds the rows it renders (the ordered tree is built from at most this
@@ -20250,6 +20268,7 @@ void RestApiV1::register_routes(
                     return;
                 }
                 res.set_content(ok_json(rendered->body), "application/json");
+                outcome = live::LiveOutcome::kOk; // only now: an exception above counts as internal
                 return;
             }
             case live::LiveOutcome::kDeviceFailed:
@@ -20280,14 +20299,15 @@ void RestApiV1::register_routes(
                        "may have been sent");
                 return;
             case live::LiveOutcome::kIncomplete:
-                // Output arrived and no terminal row followed: retryable like a timeout, but
-                // named apart so a caller knows the device was working (the partial output is
-                // discarded, never returned).
-                answer(504, polled.detail, 3000, "retry the request");
+                // Output arrived and no terminal row followed: retryable, but NOT as soon as a
+                // timeout (the device was working, so its first run may still be hashing: the hint
+                // is the poll's own wall deadline). The partial output is discarded, never returned.
+                answer(504, polled.detail, mcp::kLiveReadIncompleteRetryMs, "retry the request");
                 return;
             default: // kTimeout (the only other value the poll returns)
                 outcome = live::LiveOutcome::kTimeout;
-                answer(504, "device did not respond in time", 3000, "retry the request");
+                answer(504, "device did not respond in time", mcp::kMcpLiveReadDeviceTimeoutRetryMs,
+                       "retry the request");
                 return;
             }
         });

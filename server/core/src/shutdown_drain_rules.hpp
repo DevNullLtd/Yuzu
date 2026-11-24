@@ -16,8 +16,9 @@
 ///      listener immediately and the LB learned about it from refused
 ///      connections. Default 0 (single-node shutdown unchanged).
 ///   2. In-flight executions — the pre-existing wait, capped at
-///      `kExecutionDrainCap` from drain start. Two things count: the tracker's `running`
-///      executions and the workflow runs this process holds IN-PROCESS, never a count of
+///      `kExecutionDrainCap` from drain start. Three things count: the tracker's `running`
+///      executions, the workflow runs this process holds IN-PROCESS, and the per-device live
+///      reads this process holds (below), never a count of
 ///      `running` rows in Postgres (an orphan left by a crash, or a run owned by another replica,
 ///      must not hold this replica's shutdown). A run is counted two ways, combined by
 ///      `workflow_runs_to_drain`: the `StreamBudget` `kWorkflowRun` leases (taken at admission,
@@ -91,7 +92,7 @@ constexpr int workflow_runs_to_drain(int engine_runs, std::size_t leased_runs) n
 /// the cap, never an unbounded wait.
 constexpr bool keep_draining_for_work(std::chrono::steady_clock::duration elapsed,
                                       std::chrono::seconds min_grace, std::size_t tracker_running,
-                                      int workflow_runs, std::size_t live_reads = 0) noexcept {
+                                      int workflow_runs, std::size_t live_reads) noexcept {
     return keep_draining(elapsed, min_grace,
                          tracker_running > 0 || workflow_runs > 0 || live_reads > 0);
 }

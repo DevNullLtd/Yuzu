@@ -45,6 +45,7 @@
 /// be returned with a hole in it. The poll cannot see a dropped frame.
 
 #include "live_outcome.hpp"
+#include "mcp_retry.hpp" // kLiveReadIncompleteRetryMs, pinned to LivePollLimits::deadline below
 #include "response_store.hpp"
 
 #include <chrono>
@@ -99,12 +100,18 @@ struct LivePollLimits {
     std::chrono::milliseconds interval{500};
     /// Wall-clock budget for the whole poll, measured on a steady clock and checked every
     /// iteration (the first read always happens). It covers slow store reads, which the
-    /// iteration count alone does not: the poll never holds its worker past roughly this
-    /// plus one read.
+    /// iteration count alone does not: the poll never holds its worker past this deadline plus
+    /// one interval and one read.
     std::chrono::milliseconds deadline{25000};
     std::size_t max_output_bytes = 4u * 1024u * 1024u;
     OverCapPolicy over_cap = OverCapPolicy::kRefuse;
 };
+
+// The `incomplete` retry hint is the poll's own wall deadline (see mcp_retry.hpp): a caller told
+// to retry sooner could land inside a first run that is still hashing.
+static_assert(std::chrono::milliseconds{yuzu::server::mcp::kLiveReadIncompleteRetryMs} ==
+                  LivePollLimits{}.deadline,
+              "the incomplete retry hint must equal the poll's wall deadline");
 
 /// How a poll ended. `outcome` is one of: kOk, kDeviceFailed, kDeviceError, kOutputTooLarge,
 /// kTimeout, kIncomplete, kStoreDegraded, kShuttingDown.

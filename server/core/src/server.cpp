@@ -12127,7 +12127,8 @@ public:
                                          yuzu::server::detail::SseSurface::kWorkflowRun)
                                    : 0);
                 // Per-device live reads (REST, MCP, the quarantine release wait) hold a worker
-                // for up to the poll budget (25 s), and the same cap bounds the wait: a lease that
+                // for about 20 s typical, 25 s hard deadline (the poll's wall deadline), and the
+                // same cap bounds the wait: a lease that
                 // leaked would cost at most kExecutionDrainCap, never wedge the shutdown. New
                 // reads are refused once draining_ is set, so this count only falls.
                 const std::size_t live_reads =

@@ -464,6 +464,12 @@ FAMILIES = {
             "server/core/src/live_result_json.cpp",
             "server/core/src/live_result_json.hpp",
             "server/core/src/live_outcome.hpp",
+            # live_admission.hpp + utf8_clamp.hpp + live_zero_reach_outcome.hpp: the shared
+            # held-open admission step, the UTF-8 boundary clamp and the zero-reach/gate to
+            # outcome mapping (all pure decision code; none reaches a store).
+            "server/core/src/live_admission.hpp",
+            "server/core/src/utf8_clamp.hpp",
+            "server/core/src/live_zero_reach_outcome.hpp",
         ],
     },
     "network": {

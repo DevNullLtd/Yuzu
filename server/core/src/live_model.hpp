@@ -117,7 +117,7 @@ struct LiveKind {
     std::string row_prefix;
     std::vector<std::string> columns;
     /// True iff the REST route /api/v1/dex/devices/{id}/live accepts this kind. Exactly
-    /// the rows that live_result_json.cpp's live_result_json can render; widening the REST
+    /// the rows that `live::live_result_json` (live_result_json.cpp) can render; widening the REST
     /// surface means flipping this flag AND teaching that function the kind.
     bool rest_v1{false};
     /// True only for a kind whose producing action writes every free-text field of the row through
