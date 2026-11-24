@@ -19,7 +19,11 @@
 /// device was erased. It does not for `guaranteed_state` (#5675): that store deletes the device's
 /// per-agent order row and the compliance census rows and retires the pending census evidence,
 /// and the Guardian event log and the DEX observations are retained until retention expiry (never,
-/// when the retention setting is 0 or below). The Art.17 reading of a result must therefore go
+/// when the retention setting is 0 or below). For `management_group_memberships` (#6352) it
+/// means the agent's rows in every management group (static, dynamic and root) were removed in one
+/// statement; the enrolment row is untouched, so the same id can still reconnect and its next
+/// Register attempts to add the ROOT group back (best effort) and no other, and a later add can
+/// re-insert the id (point-in-time, see `ManagementGroupStore::delete_agent`). The Art.17 reading of a result must therefore go
 /// through each store's own contract, not through the word `Deleted` alone.
 ///
 /// STANDING RULE — the gate is the single `Decommission:Delete` securable, so
@@ -28,7 +32,9 @@
 /// you MUST: (a) append the store here, (b) register it in
 /// `agent_decommission.cpp`'s registration list, (c) bump `kCascadeStoreCount` in
 /// `test_agent_decommission.cpp` (the drift guard, the null-store case's two counts, the
-/// unconfigured-store case's skipped count and the real-store fan-out's counts: four pins), (d) add
+/// unconfigured-store case's skipped count and the real-store fan-out's counts, including the
+/// two failing-census counts and the two failing-membership counts: nine numeric sites in six
+/// tests, plus `_MIN_FIELDS` in `tests/test_decommission_wiring_lexical.py`), (d) add
 /// the store to the blast-radius lists in `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete
 /// block, ADR-0024 Decisions 9/11, and `rest-api.md`, (e) hand the live pointer over in
 /// `ServerImpl::decommission_agent` (`server.cpp`). The drift guard in
@@ -76,6 +82,7 @@ class AppUsageStore;
 class CertificateInventoryStore;
 class OfflineEndpointStore;
 class GuaranteedStateStore;
+class ManagementGroupStore;
 
 /// Per-store outcome of one decommission fan-out.
 enum class DecommissionOutcome {
@@ -85,9 +92,24 @@ enum class DecommissionOutcome {
              ///< merely "invoked".
     Skipped, ///< the store was not configured on this deployment (null pointer).
     Failed,  ///< delete_agent reported failure (returned false — e.g. a transient
-             ///< PG outage rolled the DELETE back) OR threw. Either way the delete
-             ///< did NOT commit; every OTHER store was still attempted.
+             ///< PG outage rolled the DELETE back) OR threw before reporting.
+             ///< The delete did NOT commit, except for a store that documents
+             ///< otherwise (the membership store reports a committed delete as
+             ///< `Deleted` even if its evidence could not be built); every OTHER
+             ///< store was still attempted.
 };
+
+/// `<n>:<id>,<id>,...` evidence text for the groups a decommission removed an agent from: the ids
+/// sorted, at most `kMaxGroupEvidenceIds` listed and the rest counted (`+<k>`), so one audit row
+/// stays bounded. An empty set is `0:`. Pure.
+inline constexpr std::size_t kMaxGroupEvidenceIds = 100;
+[[nodiscard]] std::string format_group_evidence(std::vector<std::string> group_ids);
+/// Like `format_group_evidence`, for a store that knows how many groups it removed (`group_count`)
+/// but may have been unable to copy the ids (`group_ids.size() != group_count`, out of memory after
+/// the delete committed). Complete ids format as above; incomplete ones give `<group_count>:unrecorded`,
+/// so the audit row never claims a group set it does not have. Pure.
+[[nodiscard]] std::string format_group_evidence(std::vector<std::string> group_ids,
+                                                std::size_t group_count);
 
 /// Human-readable outcome tag for logs/audit ("deleted"|"skipped"|"failed").
 [[nodiscard]] const char* to_string(DecommissionOutcome o) noexcept;
@@ -101,6 +123,11 @@ struct DecommissionStoreResult {
     /// mismatch): the removal was not attempted, and a retry after the repair is the remedy.
     /// Distinct from a PostgreSQL fault so the operator is not sent to look for one.
     bool write_paused{false};
+    /// Optional evidence the store reports about what it removed (empty = none, or, after a
+    /// committed delete, lost: the last-resort fallback when even `<n>:unrecorded` could not be built). Recorded in the
+    /// outcome audit row next to the outcome; today only `management_group_memberships` sets it, to
+    /// `<n>:<group id>,<group id>,...` or `<n>:unrecorded` (see `format_group_evidence`).
+    std::string detail{};
 };
 
 /// Aggregate result of a single `decommission(agent_id)` call — one entry per
@@ -145,6 +172,10 @@ struct AgentDecommissionStores {
     CertificateInventoryStore* certificate_inventory{nullptr}; ///< PG certificate_inventory_store (erase only)
     /// PG guardian_agent_order row + guardian_agent_rule_status census rows + pending-evidence retire (#5675)
     GuaranteedStateStore* guaranteed_state{nullptr};
+    /// PG management_group_members rows for the agent: every group, static and dynamic, root included
+    /// (#6352). Registered LAST. `Deleted` means the membership rows are gone, nothing more: the
+    /// enrolment row, the groups, their role assignments and the agent's tags are not touched.
+    ManagementGroupStore* management_group_memberships{nullptr};
 };
 
 /// A single decommission entry point that fans `delete_agent` across a fixed set
@@ -171,6 +202,12 @@ public:
     /// is registered as an always-Skipped target.
     void add_store(std::string name, std::function<bool(std::string_view)> deleter);
 
+    /// As `add_store`, for a store that also reports evidence of what it removed: the deleter
+    /// receives a string to fill, which is kept in `DecommissionStoreResult::detail` when the
+    /// delete committed and dropped otherwise.
+    void add_store_with_detail(std::string name,
+                               std::function<bool(std::string_view, std::string&)> deleter);
+
     /// Fan `delete_agent(agent_id)` across every registered store. Best-effort:
     /// attempts every store even if one throws OR reports failure (a delete that
     /// did not commit). Returns the per-store outcomes.
@@ -190,6 +227,8 @@ private:
         /// Optional: consulted only after `deleter` returned false; true ⇒ the false was the
         /// store's write pause, not a failed DELETE. Null for every store without a pause.
         std::function<bool()> write_paused{};
+        /// Used instead of `deleter` when set (a store that reports evidence).
+        std::function<bool(std::string_view, std::string&)> detail_deleter{nullptr};
     };
     std::vector<Target> targets_;
 };

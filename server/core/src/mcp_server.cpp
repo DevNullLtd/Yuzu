@@ -9785,10 +9785,21 @@ McpServer::HandlerFn McpServer::build_handler(
             // dump in sorted order, so client key order does not matter. The
             // `approval_id` argument is stripped on BOTH submit and recall so the
             // ticket-carrying re-call hashes identically to the original mint.
-            auto canonical_args = [](nlohmann::json a) -> std::string {
+            // WP06 F12: secret-bearing keys (`secret`, grant_secret/client_secret and
+            // the other kRedactedInstructionParamKeys, at any depth, inside `params`
+            // and bundle `steps`) are replaced by a SHA-256 marker BEFORE the subject
+            // is bound/persisted, so approvals.scope_expression never holds a raw
+            // credential (ADR-0010). nullopt (over-depth / digest failure) = refuse.
+            auto canonical_args = [](nlohmann::json a, bool* over_depth = nullptr)
+                -> std::optional<std::string> {
                 if (a.is_object())
                     a.erase("approval_id");
-                return a.dump();
+                auto red = yuzu::server::redact_tool_args_for_ticket(std::move(a), over_depth);
+                if (!red)
+                    return std::nullopt;
+                // `replace`: invalid UTF-8 in an argument must not throw out of the handler
+                // (dump() would raise type_error 316); the binding stays deterministic.
+                return red->dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             };
 
             // ── C8 pre-gate: three-way knownness classification (#2383) ─
@@ -10352,7 +10363,34 @@ McpServer::HandlerFn McpServer::build_handler(
                     // The ticket's bound subject. For every tool but the three L1 tools below it
                     // is exactly the canonical arguments (byte-identical to before); for those
                     // three an `effect_binding()` line is PREPENDED once the effect is resolved.
-                    const std::string args_canon = canonical_args(args);
+                    bool args_over_depth = false;
+                    const auto args_canon_opt = canonical_args(args, &args_over_depth);
+                    if (!args_canon_opt && args_over_depth) {
+                        // The caller's own nesting: a request fault, not retryable.
+                        const std::string cid = yuzu::server::detail::make_correlation_id();
+                        const bool audit_ok = mcp_audit(
+                            "denied", "reason=arguments_too_deep correlation_id=" + cid);
+                        res.set_content(
+                            a4_error(kInvalidParams, "the tool arguments are nested too deeply",
+                                     "flatten the arguments and re-call; no approval ticket was "
+                                     "created or consumed",
+                                     -1, cid, audit_ok, "arguments_too_deep"),
+                            "application/json");
+                        return;
+                    }
+                    if (!args_canon_opt) {
+                        const std::string cid = yuzu::server::detail::make_correlation_id();
+                        const bool audit_ok = mcp_audit(
+                            "failure", "reason=digest_unavailable correlation_id=" + cid);
+                        res.set_content(
+                            a4_error(kInternalError, "the approval subject could not be computed",
+                                     "retry shortly; no approval ticket was created or consumed",
+                                     mcp::kMcpStoreFaultRetryMs, cid, audit_ok,
+                                     "digest_unavailable"),
+                            "application/json");
+                        return;
+                    }
+                    const std::string args_canon = *args_canon_opt;
                     std::string canon = args_canon;
                     // The continuation parameter of a covered read (approval_continuation.hpp),
                     // else empty. Set below, for execute_instruction only, once the row is
