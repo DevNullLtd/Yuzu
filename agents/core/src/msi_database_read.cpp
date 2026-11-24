@@ -172,12 +172,17 @@ Outcome read_worker(const std::string&) {
 
 ReadResult read_property_table(SingleFlightSlot& slot, const std::string& path_utf8,
                                std::chrono::milliseconds deadline) {
+    return read_property_table(slot, path_utf8, deadline, &read_worker);
+}
+
+ReadResult read_property_table(SingleFlightSlot& slot, const std::string& path_utf8,
+                               std::chrono::milliseconds deadline, ReadFn reader) {
     ReadResult result;
     // The worker closure (it copies the path, which can throw) is built BEFORE the slot is
     // taken, so a throw here cannot leave the slot held with no worker to release it.
-    auto worker = [&slot, path = path_utf8]() {
+    auto worker = [&slot, reader, path = path_utf8]() {
         SlotRelease release{slot}; // constructed first, destroyed last, on the worker
-        return read_worker(path);
+        return reader(path);
     };
     // Taken on the DISPATCHING thread, before any thread exists: a held slot is Busy and
     // starts nothing.

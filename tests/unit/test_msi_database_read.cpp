@@ -3,11 +3,12 @@
  * cached Windows Installer package (agents/core/src/msi_database_read.cpp), SAM-46.
  *
  * Two parts:
- *   - Every OS: the single-flight slot protocol. The seam is the overload that takes a
- *     caller-owned slot, so the test holds the slot itself and needs no genuinely hung read.
+ *   - Every OS: the single-flight slot protocol and the deadline. The seams are the overloads
+ *     that take a caller-owned slot and a worker body, so the test holds the slot itself and
+ *     blocks a worker on a gate (the zero-deadline case is deterministic: TimedOut).
  *   - Windows only: the read through the REAL Installer API (a corrupt file, a missing file,
- *     a real cached package read while this test holds a no-reparse handle on it, a zero
- *     deadline). The Windows body is an empty TU elsewhere.
+ *     a real cached package read while this test holds a no-reparse handle on it, which SKIPs
+ *     when no cached package is readable). The Windows body is an empty TU elsewhere.
  *
  * TEST-EFFICIENCY JUSTIFICATION (a test whose runtime depends on the file system): the Windows
  * cases open at most a handful of files and read at most 64 packages' Property tables in the
@@ -19,6 +20,7 @@
 
 #include <yuzu/agent/msi_database_read.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <string>
 
@@ -54,6 +56,46 @@ TEST_CASE("msi database read: the slot is free again once a read has returned",
     CHECK_FALSE(slot.in_flight());
     REQUIRE(slot.try_acquire()); // not Busy
     slot.release();
+}
+
+namespace {
+// A worker body that blocks until the test opens the gate: a read that cannot finish, with no
+// real Installer call and no sleep. Static, because a timed-out worker outlives the test body.
+std::atomic<bool> g_gate{false};
+msi::Outcome blocked_reader(const std::string&) {
+    g_gate.wait(false, std::memory_order_acquire); // an atomic wait, not a poll
+    msi::Outcome out;
+    out.kind = msi::Outcome::Kind::ReadFailed;
+    return out;
+}
+} // namespace
+
+TEST_CASE("msi database read: a worker that cannot finish times out at once and holds the slot",
+          "[msi_packages][msi_database_read]") {
+    static msi::SingleFlightSlot slot;
+    g_gate.store(false);
+    // Zero deadline and a worker that is blocked: TimedOut is the only possible answer.
+    const auto r = msi::read_property_table(slot, "x.msi", milliseconds{0}, &blocked_reader);
+    CHECK(r.status == msi::ReadStatus::TimedOut);
+    CHECK(slot.in_flight()); // the worker still owns the slot
+
+    // A read asked for while that worker runs is Busy and starts nothing.
+    const auto busy = msi::read_property_table(slot, "y.msi", milliseconds{30000}, &blocked_reader);
+    CHECK(busy.status == msi::ReadStatus::Busy);
+
+    // Release the worker; it frees the slot on return (an atomic wait), and the next read runs.
+    g_gate.store(true, std::memory_order_release);
+    g_gate.notify_all();
+    slot.wait_free();
+    const auto again = msi::read_property_table(slot, "z.msi", milliseconds{30000},
+                                                [](const std::string&) {
+                                                    msi::Outcome o;
+                                                    o.kind = msi::Outcome::Kind::Ok;
+                                                    return o;
+                                                });
+    CHECK(again.status == msi::ReadStatus::Completed);
+    CHECK(again.outcome.kind == msi::Outcome::Kind::Ok);
+    CHECK_FALSE(slot.in_flight());
 }
 
 #ifndef _WIN32
@@ -178,29 +220,12 @@ TEST_CASE("msi database read: a real cached package reads while a no-reparse han
         CHECK(code == bare.outcome.props.product_code);
     }
     if (!exercised)
-        SKIP("the Installer cache holds no package this identity can read without a held handle");
-}
-
-TEST_CASE("msi database read: a zero deadline never blocks and the slot frees when the worker returns",
-          "[msi_packages][msi_database_read][windows_actions]") {
-    yuzu::test::TempDir dir{"yuzu_test_msi_read_"};
-    std::error_code ec;
-    fs::create_directories(dir.path, ec);
-    REQUIRE_FALSE(ec);
-    const auto copy = dir.path / "corrupt.msi";
-    fs::copy_file(fixture_package(), copy, ec);
-    REQUIRE_FALSE(ec);
-
-    static msi::SingleFlightSlot slot;
-    const auto r = msi::read_property_table(slot, copy.string(), milliseconds{0});
-    CHECK((r.status == msi::ReadStatus::TimedOut || r.status == msi::ReadStatus::Completed));
-    // A TimedOut worker still holds the slot and releases it when it returns; wait for that
-    // (an atomic wait, not a poll), then the next read is not Busy.
-    slot.wait_free();
-    const auto again = msi::read_property_table(slot, copy.string(), milliseconds{30000});
-    CHECK(again.status == msi::ReadStatus::Completed);
-    CHECK(again.outcome.kind == msi::Outcome::Kind::OpenFailed);
-    slot.wait_free();
+        // What this SKIP leaves UNPROVEN: that the Installer API's own read-only open succeeds
+        // while this process holds a share-read handle on a real package. The held-handle read
+        // is exercised only on a host whose cache has a package this identity can read bare.
+        SKIP("UNPROVEN on this host: the Installer cache holds no package this identity can read "
+             "without a held handle, so a successful read under a held share-read handle was not "
+             "exercised");
 }
 
 #endif // _WIN32

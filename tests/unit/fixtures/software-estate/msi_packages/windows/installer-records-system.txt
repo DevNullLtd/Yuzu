@@ -1,4 +1,4 @@
-# identity=NT AUTHORITY\SYSTEM host=KINGSLEY build=26200 date=2026-11-23T23:40:40Z
+# identity=NT AUTHORITY\SYSTEM host=capture-host build=26200 date=2026-11-23T23:40:40Z
 # READ-ONLY registry reads: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\<packed>\InstallProperties and HKLM\SOFTWARE\Classes\Installer\UpgradeCodes
 # P|<packed product key>|<expected braced code>|DisplayName|DisplayVersion|Publisher|InstallDate|InstallLocation|InstallSource|LocalPackage
 # N|<packed product key>|<expected braced code>   (a Products subkey with no InstallProperties key)

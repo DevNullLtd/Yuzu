@@ -128,6 +128,17 @@ private:
                                                          const std::string& path_utf8,
                                                          std::chrono::milliseconds deadline);
 
+/// The body of a worker: what runs on the detached thread for one path.
+using ReadFn = Outcome (*)(const std::string& path_utf8);
+
+/// The same read with the worker body supplied: the seam the unit test uses to hold a worker
+/// (a reader that blocks until the test releases it) so the deadline and slot behaviour are
+/// observable without a genuinely hung Installer call. Production code passes no reader.
+[[nodiscard]] YUZU_EXPORT ReadResult read_property_table(SingleFlightSlot& slot,
+                                                         const std::string& path_utf8,
+                                                         std::chrono::milliseconds deadline,
+                                                         ReadFn reader);
+
 /// True while a process-wide worker is in flight. For the plugin's shutdown quiesce.
 [[nodiscard]] YUZU_EXPORT bool read_in_flight() noexcept;
 
