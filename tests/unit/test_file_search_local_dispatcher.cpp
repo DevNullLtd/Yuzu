@@ -499,20 +499,22 @@ TEST_CASE("file_search plugin (Windows): one real search over a fixture finds th
                 CHECK(f[4] == "0");
             }
             CHECK(f[5] != "-"); // a modification time
-            // The file's extents row is the row right after its match row, keyed by the match's identity column. The
-            // key alone cannot count them: where the listing id is unknown (an id wider than 64 bits, as on ReFS, or
-            // a FAT-family volume) every file of the volume reads the same `device:0`, so a count by key would see
-            // both controls' rows under each.
+            // A file's extents row follows its match row. Counting by the identity key would see
+            // both controls' rows under each where the id is unknown (`device:0`: ReFS, FAT).
             const auto next = static_cast<std::size_t>(&row - s.rows.data()) + 1;
             REQUIRE(next < s.rows.size());
             REQUIRE(starts(s.rows[next], "extents|" + f[3] + "|"));
             const auto e = split(s.rows[next]);
             REQUIRE(e.size() == 5);
             const std::string state = e[2].substr(0, e[2].find(':'));
-            CHECK((state == "ok" || state == "unsupported" || state == "compressed" || state == "failed"));
+            CHECK((state == "ok" || state == "unsupported" || state == "compressed" ||
+                   state == "failed"));
         }
-        CHECK(std::ranges::count_if(s.rows, [](const std::string& r) { return starts(r, "extents|"); }) ==
-              std::ranges::count_if(s.rows, [](const std::string& r) { return starts(r, "match|"); }));
+        const auto count_kind = [&](const std::string& kind) {
+            return std::ranges::count_if(s.rows,
+                                         [&](const std::string& r) { return starts(r, kind); });
+        };
+        CHECK(count_kind("extents|") == count_kind("match|"));
         CHECK(std::ranges::none_of(s.rows, [](const std::string& r) { return starts(r, "gap|"); }));
         CHECK(std::ranges::any_of(s.rows, [](const std::string& r) { return starts(r, "coverage|complete|"); }));
         CHECK(t[2] == "none");
