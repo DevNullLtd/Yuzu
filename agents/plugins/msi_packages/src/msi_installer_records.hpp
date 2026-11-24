@@ -132,8 +132,8 @@ inline constexpr std::string_view kWithheldUserPath = "withheld:user_path";
 /// The user-profile list could not be read in full, so no path can be shown to be outside a
 /// profile: every path-bearing field is withheld under this value (fail closed).
 inline constexpr std::string_view kWithheldProfileList = "withheld:profile_list_incomplete";
-/// A path that cannot be placed on a volume (rooted, drive-relative, a namespace or device
-/// path, a possible 8.3 name) is withheld: it cannot be compared with a profile root.
+/// A path off the path allow-list (see THE RULE under Privacy: not a plain drive-absolute or
+/// UNC path of plain segments) is withheld: it cannot be compared with a profile root.
 inline constexpr std::string_view kWithheldPathUnverifiable = "withheld:path_unverifiable";
 
 // ── Packed GUID codec ───────────────────────────────────────────────────────────
@@ -246,20 +246,48 @@ namespace detail {
     return share.find('$') == std::string_view::npos && segment_allowed(share);
 }
 
-/// ASCII-fold equality, except that two non-ASCII bytes always compare equal: the NTFS case
-/// table is not reproduced, so a non-ASCII difference is treated as a possible case variant
-/// and matches (over-withholds), never the reverse. A variant whose UTF-8 form has a
-/// different length is not seen.
-[[nodiscard]] inline bool fold_equal_prefix(const std::string& p, const std::string& root) {
-    if (p.size() < root.size())
-        return false;
-    for (std::size_t i = 0; i < root.size(); ++i) {
-        const auto a = static_cast<unsigned char>(p[i]);
-        const auto b = static_cast<unsigned char>(root[i]);
-        if ((a < 0x80 || b < 0x80) && a != b)
+/// One code point of a folded UTF-8 path: an ASCII byte, or `wide` for any non-ASCII code
+/// point (a malformed byte counts as one).
+struct Cp {
+    char c = 0;
+    bool wide = false;
+};
+
+[[nodiscard]] inline Cp take_cp(std::string_view s, std::size_t& i) noexcept {
+    const auto b = static_cast<unsigned char>(s[i++]);
+    if (b < 0x80)
+        return {static_cast<char>(b), false};
+    while (i < s.size() && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80)
+        ++i;
+    return {0, true};
+}
+
+/// ASCII code points compare exactly (already folded). A non-ASCII code point may be a case
+/// variant of any ASCII letter (U+017F is `s`, U+0131 is `i`, U+212A is `k`) or of any other
+/// non-ASCII code point, and the NTFS case table is not reproduced, so it possibly equals
+/// either: the gate over-withholds, never the reverse. It still never equals a digit,
+/// punctuation or the separator.
+[[nodiscard]] constexpr bool cp_may_equal(Cp a, Cp b) noexcept {
+    if (!a.wide && !b.wide)
+        return a.c == b.c;
+    const Cp other = a.wide ? b : a;
+    return other.wide || (other.c >= 'a' && other.c <= 'z');
+}
+
+/// True when `root` is, code point by code point under cp_may_equal, a prefix of `p` that ends
+/// on a segment boundary.
+[[nodiscard]] inline bool key_under(std::string_view p, std::string_view root) noexcept {
+    std::size_t i = 0;
+    std::size_t j = 0;
+    while (j < root.size()) {
+        if (i >= p.size())
+            return false;
+        const Cp a = take_cp(p, i);
+        const Cp b = take_cp(root, j);
+        if (!cp_may_equal(a, b))
             return false;
     }
-    return true;
+    return i == p.size() || p[i] == '\\';
 }
 } // namespace detail
 
@@ -351,13 +379,23 @@ namespace detail {
 // `withheld:path_unverifiable`. A root must pass (1) and (2) as well, or the profile list is
 // incomplete. Residual, still emitted because nothing here can see them: junctions, symbolic
 // links, mount points, `subst` and mapped drives, a UNC path naming this machine by its own
-// DNS name, and a non-ASCII case variant whose UTF-8 form has a different length.
+// DNS name, and a case variant that needs a multi-character fold (such as `ss` for U+00DF).
 
 /// A path reduced to its comparable form. `comparable` is false when it is not on the
 /// allow-list: it is then neither compared nor emitted.
 struct NormalPath {
     std::string text; ///< folded, no `.`/`..`; meaningful only if comparable
     bool comparable = false;
+    bool unc = false;
+    /// What a root is matched on: the whole text for a drive path, and share plus rest (the
+    /// server dropped) for a UNC path, so the root `\\fs\home\carol` also covers
+    /// `\\fs.corp.example\home\carol\x`.
+    [[nodiscard]] std::string_view key() const noexcept {
+        std::string_view k = text;
+        if (unc)
+            k.remove_prefix(k.find('\\', 2));
+        return k;
+    }
 };
 
 /// Normalises a path as Win32 reads a plain path, and gives up (not comparable) on anything
@@ -425,6 +463,7 @@ struct NormalPath {
     for (const auto& seg : stack)
         out.text += "\\" + seg;
     out.comparable = true;
+    out.unc = unc;
     return out;
 }
 
@@ -433,22 +472,27 @@ enum class PathVerdict { keep, user_path, unverifiable };
 /// The profile roots, normalised once. A root that is not comparable is skipped here (the
 /// profile list is then incomplete: see count_unresolved_roots).
 struct ProfileGate {
-    std::vector<std::string> roots;
+    struct Root {
+        bool unc = false;
+        std::string key; ///< NormalPath::key()
+    };
+    std::vector<Root> roots;
     explicit ProfileGate(const std::vector<std::string>& raw) {
         for (const auto& r : raw)
-            if (auto n = normalise_path(r); n.comparable)
-                roots.push_back(std::move(n.text));
+            if (const auto n = normalise_path(r); n.comparable)
+                roots.push_back({n.unc, std::string{n.key()}});
     }
 };
 
-/// The gate's decision for a non-empty path (see THE RULE above).
+/// The gate's decision for a non-empty path (see THE RULE above). A UNC root matches on its
+/// share and path whatever the server's spelling (fail closed: the same share under a short
+/// name, an FQDN or an alias is the same profile).
 [[nodiscard]] inline PathVerdict classify_path(std::string_view path, const ProfileGate& gate) {
     const NormalPath p = normalise_path(path);
     if (!p.comparable)
         return PathVerdict::unverifiable;
     for (const auto& root : gate.roots)
-        if (detail::fold_equal_prefix(p.text, root) &&
-            (p.text.size() == root.size() || p.text[root.size()] == '\\'))
+        if (root.unc == p.unc && detail::key_under(p.key(), root.key))
             return PathVerdict::user_path;
     return PathVerdict::keep;
 }
@@ -469,7 +513,7 @@ struct ProfileListFacts {
     bool truncated = false;                ///< the cap was reached and more subkeys exist
     std::size_t record_failures = 0;       ///< SID keys / ProfileImagePath values that failed
     std::size_t unreadable_paths = 0;      ///< ProfileImagePath exists but is unusable
-    std::size_t unresolved_roots = 0;      ///< roots that are not a drive-absolute or UNC path
+    std::size_t unresolved_roots = 0;      ///< roots that are off the path allow-list or hold `%`
     std::size_t profiles_without_path = 0; ///< non-system profiles with no ProfileImagePath
     bool profiles_dir_failed = false;      ///< ProfilesDirectory could not be read
 };
@@ -486,8 +530,8 @@ struct ProfileListFacts {
 
 /// True only when every profile subkey was enumerated and read: the list is then a complete
 /// set of profile folders. Any open or enumeration fault, the 512-profile cap with more behind
-/// it, one profile whose key or path could not be read or is absent, or a root that is not a
-/// usable path makes it incomplete, and the privacy gate then withholds every path.
+/// it, one profile whose key or path could not be read or is absent, or a root that is off the
+/// path allow-list makes it incomplete, and the privacy gate then withholds every path.
 [[nodiscard]] constexpr bool profile_list_complete(const ProfileListFacts& f) noexcept {
     if (f.root_rc != 0 || f.truncated || f.record_failures != 0 || f.unreadable_paths != 0 ||
         f.unresolved_roots != 0 || f.profiles_without_path != 0 || f.profiles_dir_failed)

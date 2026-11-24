@@ -339,8 +339,8 @@ std::string system_windows_directory() {
 // a substitute for the list, because a profile redirected elsewhere is not under it. Any
 // failure to read the list in full (rec::profile_list_complete: an open or enumeration fault,
 // the 512-profile cap with more behind it, one unreadable or absent profile key or path, a root
-// that is not a drive-absolute or UNC path, or an unreadable ProfilesDirectory) is reported as
-// incomplete, and the gate then withholds every path.
+// that is off the path allow-list, or an unreadable ProfilesDirectory) is reported as incomplete,
+// and the gate then withholds every path.
 struct ProfileRoots {
     std::vector<std::string> roots;
     bool complete = false;

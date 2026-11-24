@@ -911,13 +911,21 @@ std::vector<GateCase> gate_table() {
          "C:\\..\\..\\..\\Users\\jsmith\\a",
          "C:\\Users\\jsmith\\..\\..\\..\\Users\\jsmith\\setup", "D:\\Profiles\\Alice\\setup",
          "d:\\PROFILES\\alice\\x", "\\\\fs\\profiles\\bob\\docs", "\\\\FS\\Profiles\\BOB",
-         "\\\\fs\\profiles\\bob\\a\\..\\..\\..\\bob\\x", "C:\\Users", "c:\\users\\jsmith\xC3\xA9",
+         "\\\\fs\\profiles\\bob\\a\\..\\..\\..\\bob\\x", "C:\\Users",
+         "\\\\fs.corp.example\\profiles\\bob\\x", "\\\\FS.CORP.EXAMPLE\\Profiles\\Bob",
+         "\\\\other\\profiles\\bob\\docs",
+         "\\\\10-fs.example.com\\profiles\\bob\\x", "c:\\users\\jsmith\xC3\xA9",
          "C:\\Users\\jsmith\xC3\x89\\x"});
     add(V::keep,
         {"C:\\Program Files\\Vendor\\a", "E:\\Data\\x", "C:\\UsersX\\y", "D:\\Profiles\\Alice2\\z",
          "C:\\Users\\..\\Program Files", "\\\\fs\\other\\x", "\\\\file-server01\\shared\\a",
          "\\\\fs.example.com\\share\\a", "C:\\ProgramData\\Package Cache\\{AB-12}v1.0\\",
-         "C:\\Program Files (x86)\\Foo & Bar, Inc\\x", "c:\\a\\.\\b\\\\c", "C:\\$Recycle.Bin\\x"});
+         "C:\\Program Files (x86)\\Foo & Bar, Inc\\x", "c:\\a\\.\\b\\\\c", "C:\\$Recycle.Bin\\x",
+         // a UNC root covers its share on any server spelling only; a drive root never covers UNC
+         "\\\\fs\\profiles\\bobby", "\\\\fs.corp.example\\profiles\\bo", "C:\\profiles\\bob\\x",
+         "\\\\fs\\users\\x", "\\\\fs\\share\\Documents and Settings\\x", "C:\\a\\b~",
+         "C:\\a\\~x", "C:\\a\\a~b", "\\\\fs01\\share\\x", "\\\\1a.example\\share\\x",
+         "\\\\fs--x\\s\\y", "\\\\a-b.example.com\\s\\x"});
     add(V::unverifiable,
         {// an NTFS stream or a colon anywhere after the drive
          "D:\\Profiles\\Alice::$INDEX_ALLOCATION", "C:\\Users\\jsmith:s", "C:\\x\\a:$DATA",
@@ -935,6 +943,10 @@ std::vector<GateCase> gate_table() {
          "\\\\localhost1\\share\\x", "\\\\a.localhost\\share\\x", "\\\\fs\\ADMIN$\\x",
          "\\\\fs\\IPC$", "\\\\fs\\print$\\x", "\\\\fs\\c$\\x", "\\\\fs", "\\\\", "\\\\\\fs\\s\\x",
          "\\\\fs.\\share\\x", "\\\\-a\\share\\x", "\\\\fs\\sha~1\\x",
+         "\\\\0x7f000001\\share\\x", "\\\\serv_er\\share\\x", "\\\\fs&x\\share\\x",
+         "ab\\x", "1:\\x", "[:\\x", "a1:\\x", "C:\\a\\b~0", "\\\\fs\\s\\a\\b~0",
+         "\\\\fs-\\share\\x", "\\\\a.b-\\share\\x", "C:\\a\\.hidden\\x",
+         "\\\\fs\\.share\\x",
          // namespace, device, rooted, relative and drive-relative forms
          "\\\\.\\C$\\x", "\\\\.\\C:\\Users\\x", "\\\\?\\C:\\Users\\x",
          "\\\\?\\UNC\\fs\\profiles\\bob\\x", "\\\\.\\GLOBALROOT\\Device\\x",
@@ -974,6 +986,34 @@ TEST_CASE("installer records: the gate keeps a path only when it is allowed and 
                              std::vector<std::string>{"C:\\Users\\jsmith\xC3\x89"}) == V::keep);
 }
 
+TEST_CASE("installer records: a non-ASCII code point possibly equals any letter or non-ASCII point",
+          "[msi_packages][installer_records]") {
+    const std::vector<std::string> roots{"D:\\Profiles\\jsmith", "D:\\Profiles\\kim"};
+    // U+017F (long s) for `s`, U+0131 (dotless i) for `i`, U+212A (Kelvin sign) for `k`
+    CHECK(rec::classify_path("D:\\Profiles\\j\xC5\xBFmith\\x", roots) == V::user_path);
+    CHECK(rec::classify_path("D:\\Profiles\\jsm\xC4\xB1th", roots) == V::user_path);
+    CHECK(rec::classify_path("D:\\Profiles\\\xE2\x84\xAAim\\a", roots) == V::user_path);
+    // a non-ASCII point against a non-ASCII point, whatever their byte lengths
+    const std::vector<std::string> wide{"D:\\Profiles\\jsmith\xC3\x89"};
+    CHECK(rec::classify_path("D:\\Profiles\\jsmith\xE2\x84\xAA\\x", wide) == V::user_path);
+    CHECK(rec::classify_path("D:\\Profiles\\jsmith\xC3\xA9", wide) == V::user_path);
+    // it never equals a digit, punctuation or the separator, and the root must be fully matched
+    CHECK(rec::classify_path("D:\\Profiles\\jsmith\\x", wide) == V::keep);
+    CHECK(rec::classify_path("D:\\Profiles\\jsmith1", wide) == V::keep);
+    CHECK(rec::classify_path("D:\\Profiles\\jsmith-", wide) == V::keep);
+    CHECK(rec::classify_path("D:\\Profiles\\jsmit", wide) == V::keep);
+    // a malformed byte counts as one code point and the match still ends on a boundary
+    CHECK(rec::classify_path("D:\\Profiles\\jsmith\x80\\x", wide) == V::user_path);
+    // UNC roots match on share and path under any server spelling, and a UNC path never
+    // matches a drive root or the reverse
+    const std::vector<std::string> unc{"\\\\fs\\home\\carol"};
+    CHECK(rec::classify_path("\\\\fs.corp.example\\home\\carol\\x", unc) == V::user_path);
+    CHECK(rec::classify_path("\\\\fs.corp.example\\home\\caro\xC4\xB1", unc) == V::user_path);
+    CHECK(rec::classify_path("\\\\fs.corp.example\\home\\caro\xC4\xB1x", unc) == V::keep);
+    CHECK(rec::classify_path("\\\\fs.corp.example\\home\\carolx", unc) == V::keep);
+    CHECK(rec::classify_path("C:\\home\\carol\\x", unc) == V::keep);
+}
+
 TEST_CASE("installer records: a generated matrix never emits a hostile or profile path",
           "[msi_packages][installer_records]") {
     // Expectation is the simple invariant, built into each case: a path made under a root, or
@@ -1000,7 +1040,12 @@ TEST_CASE("installer records: a generated matrix never emits a hostile or profil
     for (int i = 0; i < 4000; ++i) {
         std::string tail;
         for (std::size_t n = 1 + next(4); n > 0; --n)
-            tail += cosmetic[next(cosmetic.size())] + benign[next(benign.size())];
+        {
+            // sequenced explicitly: the order of two next() calls in one expression is unspecified
+            const std::string& sep = cosmetic[next(cosmetic.size())];
+            const std::string& seg = benign[next(benign.size())];
+            tail += sep + seg;
+        }
         // (a) under a root, with random cosmetic separators: never emitted
         std::string under = under_roots[next(under_roots.size())] + tail;
         CHECK(rec::classify_path(under, gate) != V::keep);
