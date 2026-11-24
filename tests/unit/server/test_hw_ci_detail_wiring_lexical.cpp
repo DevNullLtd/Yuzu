@@ -382,7 +382,8 @@ TEST_CASE("bulk read cap wiring (LEXICAL pin, not behaviour): both bulk-read con
 // WITHOUT the watermark (a delta client would then keep a stale or zero value). This pins the
 // production wiring: both bulk-read consumers are handed the ONE `hw_ci_watermark_fn` closure, which
 // binds `DeviceInventoryStore::device_ci_watermark` and answers nullopt for an unwired store, and
-// each transport's one `read_page` call sits inside `with_watermark` with its deps' provider.
+// each transport's one `read_page` call sits inside `with_watermark` with the request it answered
+// (the first-page-only rule reads it) and its deps' provider.
 TEST_CASE("changed_since watermark wiring (LEXICAL pin, not behaviour): both bulk-read consumers are handed the "
           "one production provider and wrap read_page in with_watermark",
           "[hardware][wiring][lexical][changed_since]") {
@@ -409,9 +410,9 @@ TEST_CASE("changed_since watermark wiring (LEXICAL pin, not behaviour): both bul
     const std::string rest = squeeze(comment_free_source("hardware_routes.cpp"));
     CHECK(count_occurrences(rest, "hardware_ci_page::with_watermark(") == 1);
     CHECK(count_occurrences(rest, "hardware_ci_page::with_watermark(hardware_ci_page::read_page(") == 1);
-    CHECK(count_occurrences(rest, "hardware_ci_page::kRestRowBudgetBytes),deps_.ci_watermark_fn)") == 1);
+    CHECK(count_occurrences(rest, "hardware_ci_page::kRestRowBudgetBytes),rq,deps_.ci_watermark_fn)") == 1);
     const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
     CHECK(count_occurrences(mcp, "hardware_ci_page::with_watermark(") == 1);
     CHECK(count_occurrences(mcp, "hardware_ci_page::with_watermark(hardware_ci_page::read_page(") == 1);
-    CHECK(count_occurrences(mcp, "hardware_ci_page::kMcpRowBudgetBytes),deps->ci_watermark_fn)") == 1);
+    CHECK(count_occurrences(mcp, "hardware_ci_page::kMcpRowBudgetBytes),*rq,deps->ci_watermark_fn)") == 1);
 }

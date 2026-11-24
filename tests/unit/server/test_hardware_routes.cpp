@@ -3587,7 +3587,8 @@ TEST_CASE("route: GET /api/v1/hardware-ci refuses a malformed, negative or futur
     auto future = h.sink.Get("/api/v1/hardware-ci?changed_since=" + std::to_string(delta_now() + 3600));
     REQUIRE(future);
     CHECK(future->status == 400);
-    CHECK(nlohmann::json::parse(future->body)["error"]["message"] == "invalid changed_since (it is in the future)");
+    CHECK(nlohmann::json::parse(future->body)["error"]["message"] ==
+          "invalid changed_since (it is in the future, or this server's clock is behind the database clock)");
     CHECK(h.ci_store.reads == 0);        // refused before any read
     CHECK(h.audit_full.empty());         // like a malformed limit: no row, nothing was served
     // an empty value is "not given", like limit and cursor
@@ -3685,8 +3686,8 @@ TEST_CASE("route: GET /api/v1/hardware-ci changed_since from a scope-confined ca
             CHECK(body["error"]["message"] == msg);
             CHECK(body["error"]["retry_after_ms"].is_null()); // terminal: not retryable
             CHECK(body["error"]["remediation"] ==
-                  "use a credential with global read for a changed_since delta pull, or omit changed_since and "
-                  "walk the full set");
+                  "use a credential holding a fleet-wide Inventory:Read grant (a management-group or "
+                  "service-scoped token cannot), or omit changed_since and walk the full set");
             // no device, no count, no scope detail
             for (const char* leak : {"in-a", "out-b", "in-d", "ghost", "pad-", "10000", "authority_scoped"})
                 CHECK_FALSE(contains(res->body, leak));
@@ -3786,10 +3787,84 @@ TEST_CASE("route: GET /api/v1/hardware-ci answers 503 when the watermark cannot 
         REQUIRE(res);
         CHECK(res->status == 503);
         CHECK_FALSE(contains(res->body, "next_changed_since"));
+        // a point read and a cursor page take no watermark, so an unwired provider cannot 503 them
         auto named = h.sink.Get("/api/v1/hardware-ci?agent_id=a");
         REQUIRE(named);
-        CHECK(named->status == 503);
+        CHECK(named->status == 200);
+        CHECK_FALSE(contains(named->body, "next_changed_since"));
     }
+    SECTION("a failed provider cannot 503 a point read or a cursor page (first-response-only watermark)") {
+        HwHarness h;
+        seed_ci(h, {"a", "b", "c"});
+        auto head = h.sink.Get("/api/v1/hardware-ci?limit=1");
+        REQUIRE(head);
+        REQUIRE(head->status == 200);
+        const std::string cursor = nlohmann::json::parse(head->body)["data"]["next_cursor"];
+        REQUIRE_FALSE(cursor.empty());
+        h.ci_watermark = std::nullopt;
+        const int calls = h.ci_watermark_calls;
+        auto next = h.sink.Get("/api/v1/hardware-ci?limit=1&cursor=" + cursor);
+        REQUIRE(next);
+        CHECK(next->status == 200);
+        auto named = h.sink.Get("/api/v1/hardware-ci?agent_id=a");
+        REQUIRE(named);
+        CHECK(named->status == 200);
+        CHECK(h.ci_watermark_calls == calls); // neither read the watermark
+        // the first page still fails closed
+        auto first = h.sink.Get("/api/v1/hardware-ci");
+        REQUIRE(first);
+        CHECK(first->status == 503);
+    }
+}
+
+// Kills (owner ruling 2026-11-24): a watermark on a cursor page or a point read (a client keeping the
+// last page's value would silently miss changes), a missing one on a first page, and a second
+// lease taken per page.
+TEST_CASE("route: GET /api/v1/hardware-ci next_changed_since is on the first response only: key absent, not "
+          "null or 0, on cursor pages and agent_id reads, with zero watermark reads",
+          "[hardware][route][rest][ci_page][changed_since][watermark]") {
+    HwHarness h;
+    seed_ci(h, {"a", "b", "c"});
+    // the first page: exactly one watermark read, the key present
+    auto first = h.sink.Get("/api/v1/hardware-ci?limit=1");
+    REQUIRE(first);
+    REQUIRE(first->status == 200);
+    const auto fb = nlohmann::json::parse(first->body);
+    CHECK(h.ci_watermark_calls == 1);
+    REQUIRE(fb["data"].contains("next_changed_since"));
+    CHECK(fb["data"]["next_changed_since"] == HwHarness::kWatermark);
+    std::string cursor = fb["data"]["next_cursor"];
+    // every cursor page: no key at all, no read
+    int pages = 0;
+    while (!cursor.empty()) {
+        auto res = h.sink.Get("/api/v1/hardware-ci?limit=1&cursor=" + cursor);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK_FALSE(body["data"].contains("next_changed_since"));
+        CHECK_FALSE(contains(res->body, "next_changed_since"));
+        cursor = body["data"]["next_cursor"];
+        ++pages;
+    }
+    CHECK(pages == 2);
+    CHECK(h.ci_watermark_calls == 1);
+    // a point read, with and without a filter: no key, no read
+    for (const char* url : {"/api/v1/hardware-ci?agent_id=a", "/api/v1/hardware-ci?agent_id=ghost"}) {
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK_FALSE(contains(res->body, "next_changed_since"));
+    }
+    auto confirm = h.sink.Get("/api/v1/hardware-ci?agent_id=a&changed_since=" + std::to_string(delta_now() - 5));
+    REQUIRE(confirm);
+    CHECK(confirm->status == 200);
+    CHECK_FALSE(contains(confirm->body, "next_changed_since"));
+    CHECK(h.ci_watermark_calls == 1);
+    // a delta's first page carries it again, and exactly one more read
+    auto delta = h.sink.Get("/api/v1/hardware-ci?changed_since=" + std::to_string(delta_now() - 5));
+    REQUIRE(delta);
+    CHECK(nlohmann::json::parse(delta->body)["data"]["next_changed_since"] == HwHarness::kWatermark);
+    CHECK(h.ci_watermark_calls == 2);
 }
 
 // The new fields count toward the byte bound: a page of worst-case rows is still cut at 4 MiB of

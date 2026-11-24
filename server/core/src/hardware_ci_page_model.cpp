@@ -10,6 +10,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <iterator>
 #include <system_error>
@@ -61,6 +62,16 @@ std::optional<int> parse_rest_limit(std::string_view s) {
     return static_cast<int>(std::clamp<std::int64_t>(v, 1, kPageMax));
 }
 
+// True when `v` is past `now_secs + kChangedSinceFutureSkewSecs`. The sum saturates at INT64_MAX
+// instead of overflowing (an injected or hostile-clock `now_secs` near the top of the range would
+// otherwise be signed overflow, undefined behaviour), so the bound is never below the true one.
+bool changed_since_is_future(std::int64_t v, std::int64_t now_secs) {
+    const std::int64_t bound = now_secs > INT64_MAX - kChangedSinceFutureSkewSecs
+                                   ? INT64_MAX
+                                   : now_secs + kChangedSinceFutureSkewSecs;
+    return v > bound;
+}
+
 // REST `changed_since`: decimal digits only (no sign, no space, no exponent), at most 64 bits. A
 // negative value or any other shape is invalid; a well-formed value past `now + skew` is a
 // distinct, equally terminal refusal. `now_secs` is injected.
@@ -72,7 +83,7 @@ std::expected<std::int64_t, std::string_view> parse_changed_since_text(std::stri
     const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
     if (ec != std::errc{} || ptr != s.data() + s.size())
         return std::unexpected(kChangedSinceInvalidMessage); // out of 64 bits
-    if (v > now_secs + kChangedSinceFutureSkewSecs)
+    if (changed_since_is_future(v, now_secs))
         return std::unexpected(kChangedSinceFutureMessage);
     return v;
 }
@@ -133,9 +144,11 @@ std::expected<Request, std::string> parse_params(const Params& p, std::int64_t n
             return std::unexpected("invalid limit (expected integer)");
         r.limit = *n;
     }
-    // An empty value is "not given", like `limit` and `cursor`. A bad one is a 400, never a silent
-    // full read: a client whose delta filter was dropped would otherwise re-read everything and
-    // never know, and a future-dated one would read as "nothing changed".
+    // An EMPTY value (`changed_since=`) is treated as NOT GIVEN, like `limit` and `cursor`, so it IS
+    // a full read (a client that interpolates an empty variable gets the whole set back and, from
+    // the first page, the watermark, so it still learns where to resume). A non-empty bad one is a
+    // 400, never a silent full read: a malformed value would otherwise re-read everything, and a
+    // future-dated one would read as "nothing changed".
     if (const std::string changed = first("changed_since"); !changed.empty()) {
         const auto v = parse_changed_since_text(changed, now_secs);
         if (!v)
@@ -194,7 +207,7 @@ std::expected<Request, ArgError> request_from_args(const nlohmann::json& args, s
         const auto v = c.get<std::int64_t>();
         if (v < 0)
             return std::unexpected(ArgError{std::string(kChangedSinceInvalidMessage)});
-        if (v > now_secs + kChangedSinceFutureSkewSecs)
+        if (changed_since_is_future(v, now_secs))
             return std::unexpected(ArgError{std::string(kChangedSinceFutureMessage)});
         r.changed_since = v;
     }
@@ -400,8 +413,10 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
         incoming = std::move(*cur);
     }
     Page out;
-    // A named device outside the scope is answered without touching the store: nothing of it is
-    // read, and the page is the same empty page a scoped caller gets for a device that has no row.
+    // A named device outside the scope is answered by `read_page` without touching the store:
+    // nothing of it is read, and the page is the same empty page a scoped caller gets for a device
+    // that has no row. It is a point read (it names an `agent_id`), so `with_watermark` makes no
+    // watermark read for it either: no SQL runs at all.
     if (!rq.agent_id.empty() && !authz::in_scope(scope, rq.agent_id)) {
         out.target_denied = true;
         return out;
@@ -481,13 +496,19 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
     return out;
 }
 
-std::expected<Page, ReadError> with_watermark(std::expected<Page, ReadError> read,
+std::expected<Page, ReadError> with_watermark(std::expected<Page, ReadError> read, const Request& rq,
                                               const Watermark& watermark) {
     if (!read)
         return read;
-    // An unwired provider and a failed read are the same answer: no page, never a page without the
-    // field and never a guessed value. Overwriting `read` below would release the slot too; the
-    // early return does it as `read` goes out of scope.
+    // Owner ruling 2026-11-24: the watermark belongs to the FIRST page of a walk only. A cursor page
+    // or a point read is served as it is and the provider is never called for it, so it takes no
+    // second pool lease and gains no new 503 dependency.
+    if (!rq.cursor.empty() || !rq.agent_id.empty())
+        return read;
+    // An unwired provider and a failed read are the same answer: no page, never a first page without
+    // the field and never a guessed value. Overwriting `read` below would release the slot too; the
+    // early return does it as `read` goes out of scope, and so does an exception from the provider
+    // (the slot is an RAII member of the `Page` held in `read`).
     const auto w = watermark ? watermark() : std::nullopt;
     if (!w)
         return std::unexpected(ReadError::kDegraded);
@@ -525,7 +546,9 @@ nlohmann::json page_json(const Page& page) {
     nlohmann::json out = nlohmann::json::object();
     out["devices"] = std::move(devices);
     out["next_cursor"] = page.next_cursor;
-    out["next_changed_since"] = page.next_changed_since;
+    // Present only on a first page: absent (not null, not 0) on a cursor page and a point read.
+    if (page.next_changed_since)
+        out["next_changed_since"] = *page.next_changed_since;
     if (page.byte_capped)
         out["page_bytes_capped"] = true;
     return out;

@@ -201,7 +201,7 @@ public:
 
     /// The value a delta client keeps as its next `changed_since`: the PostgreSQL clock in epoch
     /// seconds (`EXTRACT(EPOCH FROM clock_timestamp())::bigint`, the SAME expression that authors
-    /// `changed_at`) MINUS `kChangedSinceMarginSecs`. `std::nullopt` on a closed store, a lease
+    /// `changed_at`, so one primary's stamps and watermark share a clock) MINUS `kChangedSinceMarginSecs`. `std::nullopt` on a closed store, a lease
     /// timeout or a query error, NEVER a guess from the replica's own clock.
     [[nodiscard]] std::optional<std::int64_t> device_ci_watermark();
 

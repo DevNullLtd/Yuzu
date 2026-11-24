@@ -1760,7 +1760,8 @@ TEST_CASE("mcp list_hardware_ci_records: served as a confined Inventory:Read rea
     CHECK(tool["annotations"]["readOnlyHint"] == true);
     CHECK(tool["annotations"]["idempotentHint"] == true);
     CHECK(tool["outputSchema"]["type"] == "object");
-    CHECK(tool["outputSchema"]["required"] == json::array({"devices", "next_cursor", "next_changed_since"}));
+    // next_changed_since is NOT required: it is on the first response of a walk only
+    CHECK(tool["outputSchema"]["required"] == json::array({"devices", "next_cursor"}));
     const auto& p = tool["inputSchema"]["properties"];
     CHECK(p["limit"]["minimum"] == 1);
     CHECK(p["limit"]["maximum"] == 1000);
@@ -3343,13 +3344,25 @@ TEST_CASE("mcp list_hardware_ci_records: the changed_since input, the per-row ch
     CHECK(tool["annotations"]["readOnlyHint"] == true);
     const auto& out = tool["outputSchema"];
     CHECK(out["properties"]["next_changed_since"]["type"] == "integer");
+    CHECK(out["properties"]["next_changed_since"]["description"].get<std::string>().find("FIRST response") !=
+          std::string::npos);
     CHECK(out["properties"]["devices"]["items"]["properties"]["changed_at"]["type"] == "integer");
     CHECK(out["properties"]["devices"]["items"]["required"].dump().find("changed_at") != std::string::npos);
     const std::string desc = tool["description"].get<std::string>();
-    for (const char* needle : {"changed_since", "next_changed_since", "FIRST page", "at-least-once",
+    for (const char* needle : {"changed_since", "next_changed_since", "at-least-once",
                                "upsert by agent_id", "full walk", "backstop", "removal signal",
-                               "credential with global read", "terminal", "300 seconds"})
+                               "credential with global read", "terminal", "300 seconds",
+                               // the first-response-only rule and the client protocol (owner ruling 2026-11-24)
+                               "Only the FIRST response of a walk", "keep ONLY that value", "max(changed_at)",
+                               "your own clock", "restart a failed walk from page 1",
+                               "never resume a saved cursor across days", "Do NOT send changed_since on an agent_id confirm read",
+                               "does NOT mean no records exist", "persistent 503 on a delta means drop changed_since",
+                               "a replica whose clock is behind the database", "fleet-wide Inventory:Read grant",
+                               "agent_id and changed_since it was issued with"})
+    {
+        INFO(needle);
         CHECK(desc.find(needle) != std::string::npos);
+    }
     CHECK(desc.find("last_seen") != std::string::npos);
 }
 
@@ -3411,7 +3424,8 @@ TEST_CASE("mcp list_hardware_ci_records: a changed_since that is not a non-negat
     CHECK_FALSE(t.call("list_hardware_ci_records", {{"changed_since", mcp_delta_now()}}).contains("error"));
     // the REST twin refuses what MCP refuses: the same two messages
     const json future = t.call("list_hardware_ci_records", {{"changed_since", mcp_delta_now() + 3600}});
-    CHECK(future["error"]["message"] == "invalid changed_since (it is in the future)");
+    CHECK(future["error"]["message"] ==
+          "invalid changed_since (it is in the future, or this server's clock is behind the database clock)");
     const json neg = t.call("list_hardware_ci_records", {{"changed_since", -1}});
     CHECK(neg["error"]["message"] == "invalid changed_since (expected epoch seconds as a non-negative integer)");
 }
@@ -3476,8 +3490,8 @@ TEST_CASE("mcp list_hardware_ci_records: changed_since from a scope-confined cal
                   "changed_since needs a credential with global read; a scope-confined credential cannot "
                   "use a delta pull");
             CHECK(r["error"]["data"]["remediation"] ==
-                  "use a credential with global read for a changed_since delta pull, or omit changed_since and "
-                  "walk the full set");
+                  "use a credential holding a fleet-wide Inventory:Read grant (a management-group or "
+                  "service-scoped token cannot), or omit changed_since and walk the full set");
             CHECK(r["error"]["data"]["retry_after_ms"].is_null()); // terminal
             CHECK_FALSE(r["error"]["data"].contains("audit_persisted"));
             for (const char* leak : {"in-a", "out-b", "ghost", "pad-", "10000", "authority_scoped"})
@@ -3526,9 +3540,57 @@ TEST_CASE("mcp list_hardware_ci_records: a watermark that cannot be read is a re
         const json r = t.call("list_hardware_ci_records");
         REQUIRE(r.contains("error"));
         CHECK(r["error"]["code"] == mcp::kInternalError);
+        // a point read takes no watermark, so an unwired provider cannot fail it
         const json named = t.call("list_hardware_ci_records", {{"agent_id", "a"}});
-        REQUIRE(named.contains("error"));
+        REQUIRE_FALSE(named.contains("error"));
+        CHECK_FALSE(named["result"]["structuredContent"].contains("next_changed_since"));
     }
+    SECTION("a failed provider cannot fail a point read or a cursor page") {
+        Twin t;
+        seed(t, {"a", "b", "c"});
+        const std::string cursor =
+            t.call("list_hardware_ci_records", {{"limit", 1}})["result"]["structuredContent"]["next_cursor"];
+        REQUIRE_FALSE(cursor.empty());
+        t.ci_watermark = std::nullopt;
+        const int calls = t.ci_watermark_calls;
+        CHECK_FALSE(t.call("list_hardware_ci_records", {{"limit", 1}, {"cursor", cursor}}).contains("error"));
+        CHECK_FALSE(t.call("list_hardware_ci_records", {{"agent_id", "a"}}).contains("error"));
+        CHECK(t.ci_watermark_calls == calls);
+        CHECK(t.call("list_hardware_ci_records", {{"limit", 1}}).contains("error")); // the first page fails closed
+    }
+}
+
+// Kills (owner ruling 2026-11-24): a watermark on a cursor page or a point read, none on a first
+// page, and a second lease per page; and the MCP twin diverging from REST's bytes.
+TEST_CASE("mcp list_hardware_ci_records: next_changed_since is on the first response only, absent (not null or 0) "
+          "on cursor pages and agent_id reads, with zero extra watermark reads",
+          "[mcp][hardware][ci_page][changed_since][watermark]") {
+    Twin t;
+    seed(t, {"a", "b", "c"});
+    const json first = t.call("list_hardware_ci_records", {{"limit", 1}});
+    REQUIRE_FALSE(first.contains("error"));
+    const json fp = first["result"]["structuredContent"];
+    CHECK(t.ci_watermark_calls == 1);
+    REQUIRE(fp.contains("next_changed_since"));
+    CHECK(fp["next_changed_since"] == Twin::kWatermark);
+    std::string cursor = fp["next_cursor"];
+    int pages = 0;
+    while (!cursor.empty()) {
+        const json r = t.call("list_hardware_ci_records", {{"limit", 1}, {"cursor", cursor}});
+        REQUIRE_FALSE(r.contains("error"));
+        const json page = r["result"]["structuredContent"];
+        CHECK_FALSE(page.contains("next_changed_since"));
+        CHECK(r.dump().find("next_changed_since") == std::string::npos); // not in the text copy either
+        cursor = page["next_cursor"];
+        ++pages;
+    }
+    CHECK(pages == 2);
+    const json point = t.call("list_hardware_ci_records", {{"agent_id", "a"}});
+    REQUIRE_FALSE(point.contains("error"));
+    CHECK(point.dump().find("next_changed_since") == std::string::npos);
+    CHECK(t.ci_watermark_calls == 1);
+    // and the REST twin agrees page for page on both shapes
+    CHECK(fp == t.rest_data("/api/v1/hardware-ci?limit=1"));
 }
 
 // The bulk-read slot is held while the watermark is read (a bulk page's watermark read is inside the
@@ -3547,10 +3609,11 @@ TEST_CASE("mcp list_hardware_ci_records: the watermark is read while the bulk-re
     CHECK(t.ci_watermark_calls == 1);
     CHECK_FALSE(second_acquired); // the one slot was still held when the watermark was read
     // a point read takes no slot, so its watermark read is outside the cap (documented residual)
-    bool point_probe = false;
-    t.on_watermark = [&] { point_probe = t.ci_slots->try_acquire().has_value(); };
+    // (and, as the watermark is first-response-only, makes no watermark read at all)
+    const int calls_before_point = t.ci_watermark_calls;
+    t.on_watermark = [&] { FAIL("a point read must not read the watermark"); };
     REQUIRE_FALSE(t.call("list_hardware_ci_records", {{"agent_id", "a"}}).contains("error"));
-    CHECK(point_probe);
+    CHECK(t.ci_watermark_calls == calls_before_point);
     // a failed watermark releases the slot: the next call is served, not busy
     t.on_watermark = nullptr;
     t.ci_watermark = std::nullopt;

@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -924,10 +925,10 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
          "delta pull",
          true, "denied", "hardware CI records (REST) state=changed_since needs global read",
          "hardware CI records (MCP) state=changed_since needs global read",
-         "use a credential with global read for a changed_since delta pull, or omit changed_since and "
-         "walk the full set",
-         "use a credential with global read for a changed_since delta pull, or omit changed_since and "
-         "walk the full set",
+         "use a credential holding a fleet-wide Inventory:Read grant (a management-group or "
+         "service-scoped token cannot), or omit changed_since and walk the full set",
+         "use a credential holding a fleet-wide Inventory:Read grant (a management-group or "
+         "service-scoped token cannot), or omit changed_since and walk the full set",
          -1},
     }};
     static_assert(table.size() == static_cast<std::size_t>(hcp::ReadError::kCount),
@@ -1029,11 +1030,20 @@ TEST_CASE("hardware ci page: page JSON shape and audit text", "[hardware_ci_page
     page.rows.push_back(make_record("a"));
     page.next_cursor = "tok";
     const json j = hcp::page_json(page);
-    CHECK(j.size() == 3);
+    CHECK(j.size() == 2);
     CHECK(j["devices"].size() == 1);
     CHECK(j["next_cursor"] == "tok");
-    CHECK(j["next_changed_since"] == 0); // a page that never passed through with_watermark
+    // a page that never passed through with_watermark (a cursor page, a point read) has NO key:
+    // absent, not null and not 0
+    CHECK_FALSE(j.contains("next_changed_since"));
     CHECK_FALSE(j.contains("devices_omitted"));
+    page.next_changed_since = 1'699'999'700;
+    const json first = hcp::page_json(page);
+    CHECK(first.size() == 3);
+    CHECK(first["next_changed_since"] == 1'699'999'700);
+    page.next_changed_since = 0; // 0 is a value, not absence
+    CHECK(hcp::page_json(page)["next_changed_since"] == 0);
+    page.next_changed_since.reset();
 
     hcp::Page last;
     CHECK(hcp::page_json(last)["next_cursor"] == "");
@@ -1062,6 +1072,7 @@ TEST_CASE("hardware ci page: a confined caller's body carries scope_basis and no
           "[hardware_ci_page][json][security]") {
     hcp::Page page;
     page.rows.push_back(make_record("a"));
+    page.next_changed_since = 1'699'999'700; // a first page: devices, next_cursor, next_changed_since
 
     json confined = hcp::page_json(page);
     hcp::apply_scope_disclosure(confined, /*confined=*/true);
@@ -1311,11 +1322,11 @@ TEST_CASE("hardware ci page: byte_capped reaches the body and the audit text onl
     page.next_cursor = "tok";
     hcp::Request rq;
     // Not capped: byte-identical to the pre-existing shapes.
-    CHECK(hcp::page_json(page).size() == 3); // devices, next_cursor, next_changed_since
+    CHECK(hcp::page_json(page).size() == 2); // devices, next_cursor (no watermark off a first page)
     CHECK(hcp::audit_detail(page, rq, "REST", false) == "hardware CI records (REST): rows=1 scope=fleet");
     page.byte_capped = true;
     const json j = hcp::page_json(page);
-    CHECK(j.size() == 4);
+    CHECK(j.size() == 3);
     CHECK(j["page_bytes_capped"] == true);
     CHECK(hcp::audit_detail(page, rq, "REST", false) ==
           "hardware CI records (REST): rows=1 scope=fleet byte_capped=1");
@@ -1466,6 +1477,40 @@ TEST_CASE("hardware ci page: MCP changed_since is a strict non-negative integer 
     CHECK(hcp::parse_params(params({{"changed_since", "-1"}}), kNow).error() == args(-1).error().message);
 }
 
+// Kills: the two messages drifting from the spelling the docs quote, and a future bound that overflows
+// (signed overflow is undefined behaviour; on the usual wrap it turns a huge `now` into a negative
+// bound and refuses every value).
+TEST_CASE("hardware ci page: the changed_since messages are pinned and the future bound cannot overflow",
+          "[hardware_ci_page][params][changed_since]") {
+    CHECK(std::string(hcp::kChangedSinceInvalidMessage) ==
+          "invalid changed_since (expected epoch seconds as a non-negative integer)");
+    CHECK(std::string(hcp::kChangedSinceFutureMessage) ==
+          "invalid changed_since (it is in the future, or this server's clock is behind the database clock)");
+    const auto rest = [](const std::string& v, std::int64_t now) {
+        return hcp::parse_params(params({{"changed_since", v.c_str()}}), now);
+    };
+    const auto mcp = [](std::int64_t v, std::int64_t now) {
+        return hcp::request_from_args(json{{"changed_since", v}}, now);
+    };
+    // a clock at the very top of the range: the bound saturates, so nothing is "in the future" and
+    // nothing is refused by a wrapped (negative) bound
+    for (const std::int64_t now : {INT64_MAX, INT64_MAX - 59, INT64_MAX - 60}) {
+        INFO(now);
+        const auto r = rest(std::to_string(INT64_MAX), now);
+        REQUIRE(r.has_value());
+        CHECK(*r->changed_since == INT64_MAX);
+        const auto m = mcp(INT64_MAX, now);
+        REQUIRE(m.has_value());
+        CHECK(*m->changed_since == INT64_MAX);
+        CHECK(rest("5", now).has_value());
+        CHECK(mcp(5, now).has_value());
+    }
+    // just below the saturation point the bound is still exact
+    CHECK(rest(std::to_string(INT64_MAX - 1), INT64_MAX - 62).error() ==
+          std::string(hcp::kChangedSinceFutureMessage));
+    CHECK(rest(std::to_string(INT64_MAX - 1), INT64_MAX - 61).has_value());
+}
+
 // Kills: a store query without the filter, `>` for `>=`, and a delta walk that skips or doubles a
 // row across pages. The fake applies the SAME rule as the SQL, and the exact set is asserted.
 TEST_CASE("hardware ci page: a delta walk visits exactly the rows at or after changed_since, once each, in order",
@@ -1573,9 +1618,10 @@ TEST_CASE("hardware ci page: a global caller's delta is served and a scoped call
     }
 }
 
-// Kills: serving a page with no watermark or a guessed one, serving the rows of a page whose
-// watermark failed, a watermark taken outside the held slot, and leaking the slot on failure.
-TEST_CASE("hardware ci page: with_watermark stamps every served page while its slot is held, and fails closed",
+// Kills: serving a first page with no watermark or a guessed one, serving the rows of a first page
+// whose watermark failed, a watermark taken outside the held slot, leaking the slot on failure, and
+// (owner ruling 2026-11-24) a watermark read for a cursor page or a point read.
+TEST_CASE("hardware ci page: with_watermark stamps a first page while its slot is held, and fails closed",
           "[hardware_ci_page][watermark][changed_since]") {
     FakeStore store;
     store.add("a");
@@ -1588,10 +1634,13 @@ TEST_CASE("hardware ci page: with_watermark stamps every served page while its s
         in_use_at_call = slots.in_use();
         return 1'699'999'700;
     };
+    const hcp::Request first_rq; // no cursor, no agent_id: a first page
     auto page = hcp::with_watermark(
-        hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), good);
+        hcp::read_page(store.reader(), first_rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes),
+        first_rq, good);
     REQUIRE(page.has_value());
-    CHECK(page->next_changed_since == 1'699'999'700);
+    REQUIRE(page->next_changed_since.has_value());
+    CHECK(*page->next_changed_since == 1'699'999'700);
     CHECK(calls == 1);
     CHECK(in_use_at_call == 1);      // read while the bulk-read slot was held
     CHECK(slots.in_use() == 1);      // and still held for the caller's audit write
@@ -1599,20 +1648,37 @@ TEST_CASE("hardware ci page: with_watermark stamps every served page while its s
     page->release_slot();
     CHECK(slots.in_use() == 0);
 
-    SECTION("a failed provider replaces the page with kDegraded and frees the slot") {
+    SECTION("a failed provider replaces a first page with kDegraded and frees the slot") {
         const hcp::Watermark bad = []() -> std::optional<std::int64_t> { return std::nullopt; };
         const auto r = hcp::with_watermark(
-            hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), bad);
+            hcp::read_page(store.reader(), first_rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes),
+            first_rq, bad);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == hcp::ReadError::kDegraded);
         CHECK(slots.in_use() == 0);
     }
     SECTION("an unwired (empty) provider is the same answer") {
         const auto r = hcp::with_watermark(
-            hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes),
-            hcp::Watermark{});
+            hcp::read_page(store.reader(), first_rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes),
+            first_rq, hcp::Watermark{});
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == hcp::ReadError::kDegraded);
+        CHECK(slots.in_use() == 0);
+    }
+    // Kills: a provider that throws while the slot is held leaking the slot (the Page, and so its
+    // RAII slot, must unwind with the exception).
+    SECTION("a provider that THROWS while the slot is held frees the slot") {
+        int thrown_at = -1;
+        const hcp::Watermark boom = [&]() -> std::optional<std::int64_t> {
+            thrown_at = slots.in_use();
+            throw std::runtime_error("watermark provider failed");
+        };
+        CHECK_THROWS_AS(
+            hcp::with_watermark(hcp::read_page(store.reader(), first_rq, std::nullopt, nullptr, &slots,
+                                               hcp::kRestRowBudgetBytes),
+                                first_rq, boom),
+            std::runtime_error);
+        CHECK(thrown_at == 1); // it really threw with the slot held
         CHECK(slots.in_use() == 0);
     }
     SECTION("an error from read_page passes through untouched and asks for no watermark") {
@@ -1620,32 +1686,89 @@ TEST_CASE("hardware ci page: with_watermark stamps every served page while its s
         hcp::Request rq;
         rq.cursor = "garbage";
         const auto r = hcp::with_watermark(
-            hcp::read_page(store.reader(), rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), good);
+            hcp::read_page(store.reader(), rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), rq, good);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == hcp::ReadError::kCursorMalformed);
         CHECK(calls == 0);
     }
-    SECTION("the empty page, the denied named device and a point read all carry it") {
+    SECTION("an empty first page carries it") {
         calls = 0;
         FakeStore empty;
         const auto none = hcp::with_watermark(
-            hcp::read_page(empty.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), good);
+            hcp::read_page(empty.reader(), first_rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes),
+            first_rq, good);
         REQUIRE(none.has_value());
         CHECK(none->rows.empty());
-        CHECK(none->next_changed_since == 1'699'999'700);
+        REQUIRE(none->next_changed_since.has_value());
+        CHECK(*none->next_changed_since == 1'699'999'700);
+        CHECK(calls == 1);
+    }
+    // The owner ruling: NO watermark off a first page. The provider is not called at all (it would
+    // throw if it were), so a cursor page and a point read take no second lease and gain no 503.
+    SECTION("a point read (agent_id) makes zero watermark calls and carries no key") {
+        calls = 0;
+        const hcp::Watermark never = [&]() -> std::optional<std::int64_t> {
+            ++calls;
+            throw std::runtime_error("must not be called");
+        };
         hcp::Request named;
         named.agent_id = "a";
+        const auto point = hcp::with_watermark(
+            hcp::read_page(store.reader(), named, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes),
+            named, never);
+        REQUIRE(point.has_value());
+        CHECK(point->rows.size() == 1);
+        CHECK_FALSE(point->next_changed_since.has_value());
+        CHECK_FALSE(hcp::page_json(*point).contains("next_changed_since"));
         const authz::VisibleSet other = std::unordered_set<std::string>{"zzz"};
         const auto denied = hcp::with_watermark(
-            hcp::read_page(store.reader(), named, other, nullptr, &slots, hcp::kRestRowBudgetBytes), good);
+            hcp::read_page(store.reader(), named, other, nullptr, &slots, hcp::kRestRowBudgetBytes), named, never);
         REQUIRE(denied.has_value());
         CHECK(denied->target_denied);
-        CHECK(denied->next_changed_since == 1'699'999'700);
-        const auto point = hcp::with_watermark(
-            hcp::read_page(store.reader(), named, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), good);
-        REQUIRE(point.has_value());
-        CHECK(point->next_changed_since == 1'699'999'700);
-        CHECK(calls == 3);
+        CHECK_FALSE(denied->next_changed_since.has_value());
+        CHECK(calls == 0);
+        // a failing or unwired provider cannot 503 a point read either
+        const auto unwired = hcp::with_watermark(
+            hcp::read_page(store.reader(), named, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes),
+            named, hcp::Watermark{});
+        CHECK(unwired.has_value());
+    }
+    SECTION("a cursor page makes zero watermark calls and carries no key") {
+        calls = 0;
+        const hcp::Watermark never = [&]() -> std::optional<std::int64_t> {
+            ++calls;
+            throw std::runtime_error("must not be called");
+        };
+        hcp::Request rq;
+        rq.limit = 1;
+        auto head = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
+        REQUIRE(head.has_value());
+        REQUIRE_FALSE(head->next_cursor.empty());
+        head->release_slot();
+        hcp::Request next = rq;
+        next.cursor = head->next_cursor;
+        auto cursor_page = hcp::with_watermark(
+            hcp::read_page(store.reader(), next, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), next,
+            never);
+        REQUIRE(cursor_page.has_value());
+        CHECK_FALSE(cursor_page->next_changed_since.has_value());
+        CHECK_FALSE(hcp::page_json(*cursor_page).contains("next_changed_since"));
+        CHECK(calls == 0);
+        // an unwired provider cannot 503 a cursor page (the one slot is free again first)
+        cursor_page->release_slot();
+        auto again = hcp::with_watermark(
+            hcp::read_page(store.reader(), next, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), next,
+            hcp::Watermark{});
+        CHECK(again.has_value());
+    }
+    SECTION("the first page of a delta walk makes exactly one call") {
+        calls = 0;
+        hcp::Request rq;
+        rq.changed_since = 5;
+        const auto r = hcp::with_watermark(
+            hcp::read_page(store.reader(), rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), rq, good);
+        REQUIRE(r.has_value());
+        CHECK(calls == 1);
     }
 }
 

@@ -406,9 +406,11 @@ TEST_CASE("openapi_spec_json(): GET /hardware-ci and DELETE /sle/agents state th
 }
 
 // The `changed_since` delta pull is in the spec, not only the manual: the query parameter, the
-// per-row `changed_at`, the per-page `next_changed_since` (both required, so a generated client
-// treats them as always present), the terminal 400 for a scope-confined caller and the recipe.
-// Kills a spec edit that drops the parameter, makes a field optional, or loses the refusal.
+// per-row `changed_at` (required on every row), the first-response-only `next_changed_since` (NOT
+// required: the key is absent on cursor pages and agent_id reads), the terminal 400 for a
+// scope-confined caller and the recipe. Kills a spec edit that drops the parameter, makes the row
+// field optional, makes the watermark required again (a generated client would then fail every
+// cursor page), or loses the refusal.
 TEST_CASE("openapi_spec_json(): GET /hardware-ci documents changed_since, changed_at and next_changed_since",
           "[openapi][changed_since]") {
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
@@ -425,13 +427,25 @@ TEST_CASE("openapi_spec_json(): GET /hardware-ci documents changed_since, change
     CHECK((*param)["schema"]["minimum"] == 0);
 
     const std::string d = get["description"].get<std::string>();
-    for (const char* needle : {"changed_since", "next_changed_since", "FIRST page", "at-least-once",
-                               "upsert by agent_id", "removal signal", "full walk"})
+    for (const char* needle : {"changed_since", "next_changed_since", "FIRST response", "at-least-once",
+                               "upsert by agent_id", "removal signal", "full walk",
+                               "never derive it from max(changed_at), a later page or your own clock",
+                               "never resume a saved cursor across days",
+                               "do NOT send changed_since on a confirm read",
+                               "persistent 503 on a delta means drop changed_since and do a full walk",
+                               "a replica whose clock is behind the database clock can refuse a value the server issued",
+                               "fleet-wide Inventory:Read grant"}) {
+        INFO(needle);
         CHECK(d.find(needle) != std::string::npos);
+    }
     const std::string r400 = get["responses"]["400"]["description"].get<std::string>();
     CHECK(r400.find("changed_since was sent by a caller whose read is confined to a scope") !=
           std::string::npos);
     CHECK(r400.find("terminal") != std::string::npos);
+    CHECK(r400.find("invalid changed_since (expected epoch seconds as a non-negative integer)") !=
+          std::string::npos);
+    CHECK(r400.find("invalid changed_since (it is in the future, or this server's clock is behind the "
+                    "database clock)") != std::string::npos);
 
     const auto& schemas = spec["components"]["schemas"];
     const json& row = schemas["HardwareCiPageRow"];
@@ -439,8 +453,11 @@ TEST_CASE("openapi_spec_json(): GET /hardware-ci documents changed_since, change
     CHECK(std::find(row["required"].begin(), row["required"].end(), "changed_at") != row["required"].end());
     const json& data = schemas["HardwareCiPageResponse"]["properties"]["data"];
     CHECK(data["properties"]["next_changed_since"]["type"] == "integer");
-    CHECK(std::find(data["required"].begin(), data["required"].end(), "next_changed_since") !=
-          data["required"].end());
+    CHECK(std::find(data["required"].begin(), data["required"].end(), "next_changed_since") ==
+          data["required"].end()); // first response only: never required
+    CHECK(data["required"] == json::array({"devices", "next_cursor"}));
+    CHECK(data["properties"]["next_changed_since"]["description"].get<std::string>().find("ABSENT on cursor pages") !=
+          std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): the strict instruction create requests are closed schemas",

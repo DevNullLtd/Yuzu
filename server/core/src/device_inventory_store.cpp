@@ -78,6 +78,9 @@ std::int64_t now_secs() {
 // `changed_at` (the content upsert, `device_ci_watermark`), so the stamp and the watermark that
 // brackets it come from the same clock and the same rounding. clock_timestamp(), not now(): it
 // advances inside a transaction, so a long ingest transaction does not stamp an old instant.
+// "Same clock" holds for ONE primary: a failover to a node whose clock differs, or a clock step,
+// puts new stamps and an already-issued watermark on different timelines (a residual of the
+// margin, docs/security-reviews/hardware-ci-changed-since-2026-11.md).
 constexpr const char* kDbClockSecsExpr = "EXTRACT(EPOCH FROM clock_timestamp())::bigint";
 
 // Per-site degrade-WARN state (one static instance per call site).
@@ -279,11 +282,27 @@ const std::string kMigrationV4Sql = "SET LOCAL lock_timeout = '30s'; "
 // and the pool's 30 s statement_timeout / 10 s lock_timeout would otherwise bound it, and a failed
 // migration refuses to start the server on every restart). Not CONCURRENTLY: the runner's
 // transaction refuses it.
+//
+// The type guard between the two statements: IF NOT EXISTS skips the ADD COLUMN for a column of
+// ANOTHER type or nullability that is already there (a hand-made or half-restored table), and the
+// migration would then be stamped as applied over a column every content upsert fails on (`CASE
+// types text and bigint cannot be matched`) and every delta 503s on. So the DO block RAISEs, which
+// aborts the migration's transaction: v5 is not stamped, the store refuses to open, and the log
+// names the column and what was found. `device_ci` resolves through the runner's transaction-local
+// search_path (the store schema first), exactly like the unqualified DDL around it.
 const std::string kMigrationV5Sql =
     "SET LOCAL lock_timeout = '30s'; "
     "SET LOCAL statement_timeout = 0; "
     "ALTER TABLE device_ci ADD COLUMN IF NOT EXISTS changed_at BIGINT NOT NULL "
     "DEFAULT (EXTRACT(EPOCH FROM now()))::bigint; "
+    "DO $v5guard$ DECLARE col_type text; col_not_null boolean; BEGIN "
+    "SELECT format_type(a.atttypid, a.atttypmod), a.attnotnull INTO col_type, col_not_null "
+    "FROM pg_attribute a WHERE a.attrelid = 'device_ci'::regclass AND a.attname = 'changed_at' "
+    "AND NOT a.attisdropped; "
+    "IF col_type IS DISTINCT FROM 'bigint' OR col_not_null IS DISTINCT FROM true THEN "
+    "RAISE EXCEPTION 'device_inventory_store.device_ci.changed_at must be bigint NOT NULL "
+    "(found type %, not null %)', coalesce(col_type, 'missing'), coalesce(col_not_null::text, 'missing'); "
+    "END IF; END $v5guard$; "
     "CREATE INDEX IF NOT EXISTS device_ci_changed_at_idx ON device_ci (changed_at);";
 
 // The index as the runtime check (and an operator by hand) creates it: schema-qualified, because
@@ -1109,7 +1128,8 @@ std::optional<std::int64_t> DeviceInventoryStore::device_ci_watermark() {
         return std::nullopt;
     }
     // The database's clock, minus the margin, in one statement: the same expression that authors
-    // `changed_at`, so the watermark and the stamps it brackets cannot disagree about the clock.
+    // `changed_at`, so on ONE primary the watermark and the stamps it brackets read the same clock
+    // and rounding (across a failover or a clock step they can disagree: the margin's residual).
     const std::string sql = std::string("SELECT (") + kDbClockSecsExpr + ") - $1::bigint";
     pg::PgResult res = pg::exec_params(
         lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(kChangedSinceMarginSecs)});
