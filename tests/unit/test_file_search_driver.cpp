@@ -452,6 +452,7 @@ TEST_CASE("file_search state: a volume query that timed out is not asked again u
     // The rule the Windows volume reader makes of every query, over a fake runner: no thread, no clock.
     enum class Run { hold, run_then_time_out, complete, reject };
     Run mode = Run::hold;
+    bool throws = false; // the query throws instead of answering
     int runner_calls = 0;
     std::function<int()> held; // the work the runner kept when it timed out
     const BoundedRunner<int> runner = [&](std::chrono::milliseconds, std::function<int()> work) -> RunOutcome<int> {
@@ -460,8 +461,11 @@ TEST_CASE("file_search state: a volume query that timed out is not asked again u
         case Run::hold:
             held = std::move(work);
             return {RunStatus::timed_out, std::nullopt};
-        case Run::run_then_time_out: // the thrown-query path: the work ran and the status is still timed_out
-            (void)work();
+        case Run::run_then_time_out: // like bounded_wait: the work ran, a throw is swallowed, the status is timed_out
+            try {
+                (void)work();
+            } catch (...) {
+            }
             return {RunStatus::timed_out, std::nullopt};
         case Run::complete:
             return {RunStatus::completed, work()};
@@ -472,7 +476,11 @@ TEST_CASE("file_search state: a volume query that timed out is not asked again u
     };
     BlockedQueries q;
     const auto ask = [&](const std::string& volume) {
-        return driver_detail::bounded_blockable_query<int>(q, volume, std::chrono::seconds{5}, runner, [] { return 7; });
+        return driver_detail::bounded_blockable_query<int>(q, volume, std::chrono::seconds{5}, runner, [&] {
+            if (throws)
+                throw std::runtime_error("query");
+            return 7;
+        });
     };
 
     // timed out with the work held: no answer, and the next ask for that spelling never reaches the runner
@@ -502,10 +510,20 @@ TEST_CASE("file_search state: a volume query that timed out is not asked again u
     mode = Run::reject;
     CHECK_FALSE(ask("E:").has_value());
     CHECK_FALSE(q.blocked("E:"));
+
+    // a query that throws still sets its flag as it unwinds: the timed_out outcome has no value, and the volume
+    // is not left blocked for good (the flag would never set)
+    mode = Run::run_then_time_out;
+    throws = true;
+    CHECK_FALSE(ask("F:").has_value());
+    CHECK_FALSE(q.blocked("F:"));
+    throws = false;
+
     mode = Run::complete;
     CHECK(ask("D:") == 7);
     CHECK(ask("E:") == 7);
-    CHECK(runner_calls == 7);
+    CHECK(ask("F:") == 7);
+    CHECK(runner_calls == 9);
 }
 
 TEST_CASE("file_search state: abandoned workers and stall counts are bounded and in memory only",
