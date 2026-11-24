@@ -47,3 +47,30 @@ throwing `emplace_back`. The `[pg]` tests use the standard `YUZU_REQUIRE_PG_DB_T
 hand-expanded copy of that skip pattern is noted in the quality-engineer report). No real file,
 process or socket is opened. Suggested sanitizer coverage: ASan/UBSan over the live, MCP and REST
 suites, and a targeted TSan run of the two concurrent-admission tests and the shutdown REST tests.
+
+## Fix rounds after the adversarial review
+
+Range: `eac55cbedb..3893161b04` (commits `ac3aa7f364`, `b3c70749c2`, `4c8eb0c1ce`, `f726c8e194`, `3893161b04`). Recorded by:
+Claude Sonnet 5.5 (orchestrator); cpp-safety reviewed round 1 at Gate 3 and rounds 2, 3 and 4 at Gate 8. This section supersedes the
+header range above and the two statements below that the fix rounds made stale; nothing else in this ledger changed.
+
+**No new owned resource in any of the five commits**: no fd, HANDLE, SOCKET, `FILE*`, `sqlite3*`, OpenSSL or BCrypt object,
+allocated C string, mapped library, temp path, subprocess, callback context or thread; no manual cleanup, no cast, no
+manual-cleanup exception (so no `adjudicated_by`). The added code is:
+
+| Item | Type | Owner and lifetime |
+|---|---|---|
+| `ResponseQuery::order_by_id` | `bool`, default false, honoured only by `query_bounded` | a field of the caller's stack `ResponseQuery`; the live poll sets it on its own local |
+| `rank` / `out_rank` in `query_bounded` | two `const char* const` pointing at string literals | static storage, used inside the `resp_read` lambda while the SQL `std::string` is built (the `+` chain copies); never stored |
+| `live_read_timeout_retry_ms`, `live_read_incomplete_retry_ms` | `[[nodiscard]] inline constexpr ... noexcept` over `std::string_view`, returning `std::int64_t` | the view is only compared, never stored; both call sites pass a handler-local `std::string kind` that outlives the call |
+| REST null-Forensics-set refusal | one added `|| forensics_plugins == nullptr` term | a pointer the route lambda already captured by value at registration; takes no lease and writes no audit row (it sits before admission) |
+| Tests | Catch2 locals, `PostgresTestDb` then `PgPool` then `ResponseStore` (reverse-order RAII), `AtomicSave` (non-copyable, restores the poll atomics on every exit path), one `RestGsHarness` constructor flag, one pure-Python lexical gate with no subprocess or network | scope-exit |
+
+Statements in the sections above that this change set made stale (kept for the record, not edited):
+the header range ends at `9ad2654d3b`; Table 2's `ResponseStore` reads row omits that `query_bounded` now ranks by `id DESC` when the
+live poll sets `order_by_id` (the scope clause, the `ResponseTierFilter::for_fixed_plugin_poll` tier clause and the four
+`unrestricted_internal_consumer()` sites are unchanged); and "cpp-safety at Gate 3 and Gate 8 (two rounds)" and "grepped at Gate 1
+and both Gate 8 rounds" now read as five rounds (the mechanical trigger grep was repeated on every fix commit).
+
+Suggested sanitizer coverage: unchanged (no lifetime or threading surface was added). The Postgres-backed tests ran in the
+scoped suite with `YUZU_TEST_POSTGRES_DSN` set (4934 cases, 438572 assertions, exit 0, on the tip tree).
