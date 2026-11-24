@@ -5,9 +5,9 @@
 |---|---|
 | **What it does** | Enumerates installed packages and product codes (Windows MSI / macOS pkgutil) |
 | **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · gathered (windows.software.msi.list, windows.software.msi.product_codes, windows.software.msi.list_inventory) |
+| **Kind** | Collector · read-only · gathered (windows.software.msi.list, windows.software.msi.product_codes, windows.software.msi.list_inventory, windows.software.msi.installer_records) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ⛔ unsupported |
-| **Actions** | `list` (definition `windows.software.msi.list`) · `list_inventory` (definition `windows.software.msi.list_inventory`) · `product_codes` (definition `windows.software.msi.product_codes`) |
+| **Actions** | `installer_records` (definition `windows.software.msi.installer_records`) · `list` (definition `windows.software.msi.list`) · `list_inventory` (definition `windows.software.msi.list_inventory`) · `product_codes` (definition `windows.software.msi.product_codes`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
@@ -98,12 +98,16 @@ Nothing is written to the result until the whole walk has been judged, because t
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
+| `installer_records` | 🟡 constrained · rung 1 · registry (Installer UserData, Reg*W) + bounded read-only MsiOpenDatabaseW of the cached package | ⛔ unsupported | ⛔ unsupported |
 | `list` | ✅ supported · rung 1 · msi_api | ✅ supported · rung 2 · pkgutil via bounded argv runner | ⛔ unsupported |
 | `list_inventory` | ✅ supported · rung 1 · msi_api (MsiEnumProductsExW machine context) | ⛔ unsupported | ⛔ unsupported |
 | `product_codes` | ✅ supported · rung 1 · msi_api | ✅ supported · rung 2 · pkgutil via bounded argv runner | ⛔ unsupported |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
+- **`installer_records` / Windows** — not yet verified against a real capture; machine context only; nothing is executed; 5000 records, 5 s per package, 45 s of package reads per dispatch
+- **`installer_records` / macOS** — Windows Installer records exist only on Windows
+- **`installer_records` / Linux** — no Windows Installer on Linux
 - **`list_inventory` / Windows** — machine context only: per-user MSI products are never listed; measured as SYSTEM and as an admin user, non-elevated unmeasured
 - **`list_inventory` / macOS** — installed_apps.list_inventory owns the pkgutil receipt roster (ecosystem macos_pkgutil)
 - **`list_inventory` / Linux** — no Windows Installer on Linux
@@ -132,6 +136,26 @@ No action takes parameters.
 Pipe-delimited rows. `list` rows use the literal discriminator `msi`; `product_codes` rows use the literal discriminator `product_code`; `list_inventory` rows use `inv`, and `installer_records` rows use `rec`, each led by exactly one `status` row. Every dynamic macOS field is pipe/newline-escaped before being written, so an identifier, version, or path containing `|` or a newline can never shift columns or inject a row. On `list` and `product_codes`, `-` means the property was empty, absent, or (Windows) too long to read into the 511-byte buffer; a failed macOS acquisition is instead a single `error|...` row and a nonzero return code, never a placeholder data row.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+**`windows.software.msi.installer_records` — `row_kind|product_code|name|version|publisher|install_date|install_location|install_source|local_package|upgrade_code|db_product_code|db_version|db_manufacturer|db_name|reason`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `rec` | Windows | `rec` | Row shape discriminator. Values: status (exactly one per result, always first), rec (one per machine-context product). |
+| `product_code` | string | - | Windows | `{23170F69-40C1-2702-2604-000001000000}` | Record rows: the product code, unpacked from the registry key name (braced, upper case). Status rows: the action name, always installer_records. |
+| `name` | string | - | Windows | `7-Zip 26.04 (x64 edition)` | Record rows: the InstallProperties DisplayName value, empty when unset. Status rows: the completeness level. Values: supported, constrained (a registry read failed or a bound cut the read short), unsupported (macOS, Linux). |
+| `version` | string | - | Windows | `26.04.00.0` | Record rows: the DisplayVersion value, empty when unset. Status rows: the failure tokens, comma-joined, or "-" when none. Tokens read <os>:installer_records:<detail> (enum:<code>, row_cap, access_denied, msi_db:deadline, msi_db:busy), macos:no_windows_installer, linux:no_msi or msi_packages:exception (the action threw). |
+| `publisher` | string | - | Windows | `Igor Pavlov` | Record rows only: the Publisher value, empty when unset. |
+| `install_date` | string | - | Windows | `20261017` | Record rows only: the InstallDate value as recorded (normally YYYYMMDD), empty when unset. |
+| `install_location` | string | - | Windows | `C:\Program Files\7-Zip\` | Record rows only: the InstallLocation value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder. |
+| `install_source` | string | - | Windows | `C:\ProgramData\Package Cache\` | Record rows only: the InstallSource value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder; a UNC source is reported as recorded. |
+| `local_package` | string | - | Windows | `C:\WINDOWS\Installer\1a2b3c.msi` | Record rows only: the LocalPackage value, the cached package the Installer keeps for the product (normally under the Windows Installer directory), empty when unset. |
+| `upgrade_code` | string | - | Windows | `{23170F69-40C1-2702-2604-000000000000}` | Record rows only: the UpgradeCode Property of the cached package, braced and upper case. Empty when the package was not read or has none. |
+| `db_product_code` | string | - | Windows | `{23170F69-40C1-2702-2604-000001000000}` | Record rows only: the ProductCode Property of the cached package, braced and upper case. Empty when the package was not read. A value that differs from product_code carries the `product_code_mismatch` reason. |
+| `db_version` | string | - | Windows | `26.04.00.0` | Record rows only: the ProductVersion Property of the cached package, empty when the package was not read. |
+| `db_manufacturer` | string | - | Windows | `Igor Pavlov` | Record rows only: the Manufacturer Property of the cached package, empty when the package was not read. |
+| `db_name` | string | - | Windows | `7-Zip 26.04 (x64 edition)` | Record rows only: the ProductName Property of the cached package, empty when the package was not read. |
+| `reason` | string | - | Windows | `-` | Record rows only: why the row is incomplete, or "-". Values: package_missing, package_path_refused, package_unreadable:<code>, deadline_skipped, no_install_properties, install_properties_unreadable, no_local_package, product_code_mismatch. |
+
 **`windows.software.msi.list` — `product_code|name|version|install_location`**
 
 | Field | Type | Values | Available | Example | Description |
@@ -141,7 +165,7 @@ Pipe-delimited rows. `list` rows use the literal discriminator `msi`; `product_c
 | `version` | string | - | Windows, macOS | `16.0.19822.20104` | The package's version string — the Windows MsiGetProductInfoA `VersionString` property, or the macOS pkgutil receipt's `version:` field. Values: free text version string, or `-` when unavailable. |
 | `install_location` | string | - | Windows, macOS | `C:\Program Files (x86)\NordVPN network TAP\` | The package's install path — the Windows MsiGetProductInfoA `InstallLocation` property (frequently unset by the installer), or the macOS receipt's volume and location joined. Values: filesystem path, or `-` when the property is empty or absent. |
 
-**`windows.software.msi.list_inventory` — `row_kind|product_code|name|version|publisher`**
+**`windows.software.msi.list_inventory` — `row_kind|product_code|name|version|publisher|upgrade_code`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
@@ -150,6 +174,7 @@ Pipe-delimited rows. `list` rows use the literal discriminator `msi`; `product_c
 | `name` | string | - | Windows | `7-Zip 26.04 (x64 edition)` | Inventory rows: the InstalledProductName property, empty when the product has none. Status rows: the completeness level. Values: supported, constrained (the enumeration or a property read did not complete), unsupported (macOS, Linux). |
 | `version` | string | - | Windows | `26.04.00.0` | Inventory rows: the VersionString property, empty when the product has none. Status rows: the failure token, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610, windows:msi_prop:1610 or windows:msi_prop:oversized), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw). |
 | `publisher` | string | - | Windows | `Igor Pavlov` | Inventory rows only: the Publisher property, empty when the product has none. |
+| `upgrade_code` | string | - | Windows | `{23170F69-40C1-2702-2604-000000000000}` | Inventory rows only: the product's UpgradeCode as the Windows Installer registry map (HKLM\SOFTWARE\Classes\Installer\UpgradeCodes) records it, braced and upper case. Empty when no upgrade code names the product, when more than one does, or when the map is absent or over its cap. A failed read of the map makes the status row `constrained` with a `windows:msi_upgrade_map:<code>` token instead. |
 
 **`windows.software.msi.product_codes` — `product_code|name`**
 
@@ -194,59 +219,75 @@ Two additional macOS-only sentinel rows exist outside the schema above: `msi|__t
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-18 · LocalSystem (elevated) · leg-hash bfd1288728c5
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-24 · LocalSystem (elevated) · leg-hash 1aaf3cf67f95
 
 ```
 == action=list
 msi|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|Python Launcher|3.14.6150.0|-
 msi|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|-
+msi|{52B54330-F546-418F-9991-BFE30BF4BF37}|Microsoft .NET Host FX Resolver - 8.0.33 (x86)|64.132.61667|-
 msi|{B7526150-1C45-45B5-932D-A4CF5A23403C}|CMake|4.3.4|C:\Program Files\CMake\
 msi|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK|10.1.26100.7705|-
 msi|{AA11F890-8A6F-D292-8A1D-D70710A87852}|Windows IoT Extension SDK Contracts|10.1.26100.7705|-
 msi|{0A1B70B0-DD98-1BCC-6958-D5AD8BBAF2B2}|Windows SDK Desktop Headers arm64|10.1.26100.7705|-
 msi|{B7BC83B0-1A94-0290-4309-820859276E72}|Windows App Certification Kit x64|10.1.26100.7705|-
-msi|{43B0D101-A022-48F4-9D04-BA404CEB1D53}|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.44.35211|14.44.35211|-
+msi|{931A2CF0-2404-45EA-82F5-345735AE6A90}|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.51.36247|14.51.36247|-
 msi|{80F76A51-EAF7-DA8E-C732-B26C591BCC23}|Windows SDK OnecoreUap Headers x64|10.1.26100.7705|-
 msi|{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|Windows App Certification Kit Native Components|10.1.26100.7705|-
 msi|{AF4ED0C1-A3D7-450B-A163-62CD3C7BBB27}|Python 3.14.6 Add to Path (64-bit)|3.14.6150.0|-
-msi|{AA86DFC1-17A2-6133-1D55-92818B9D3082}|SDK ARM64 Redistributables|10.1.26100.7705|-
-… 12 of 118 rows shown
+… 12 of 136 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=product_codes
 product_code|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|Python Launcher
 product_code|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider
+product_code|{52B54330-F546-418F-9991-BFE30BF4BF37}|Microsoft .NET Host FX Resolver - 8.0.33 (x86)
 product_code|{B7526150-1C45-45B5-932D-A4CF5A23403C}|CMake
 product_code|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK
 product_code|{AA11F890-8A6F-D292-8A1D-D70710A87852}|Windows IoT Extension SDK Contracts
 product_code|{0A1B70B0-DD98-1BCC-6958-D5AD8BBAF2B2}|Windows SDK Desktop Headers arm64
 product_code|{B7BC83B0-1A94-0290-4309-820859276E72}|Windows App Certification Kit x64
-product_code|{43B0D101-A022-48F4-9D04-BA404CEB1D53}|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.44.35211
+product_code|{931A2CF0-2404-45EA-82F5-345735AE6A90}|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.51.36247
 product_code|{80F76A51-EAF7-DA8E-C732-B26C591BCC23}|Windows SDK OnecoreUap Headers x64
 product_code|{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|Windows App Certification Kit Native Components
 product_code|{AF4ED0C1-A3D7-450B-A163-62CD3C7BBB27}|Python 3.14.6 Add to Path (64-bit)
-product_code|{AA86DFC1-17A2-6133-1D55-92818B9D3082}|SDK ARM64 Redistributables
-… 12 of 118 rows shown
+… 12 of 136 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=list_inventory
 status|list_inventory|supported|-
-inv|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|Python Launcher|3.14.6150.0|Python Software Foundation
-inv|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|Microsoft Corporation
-inv|{B7526150-1C45-45B5-932D-A4CF5A23403C}|CMake|4.3.4|Kitware
-inv|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK|10.1.26100.7705|Microsoft Corporation
-inv|{AA11F890-8A6F-D292-8A1D-D70710A87852}|Windows IoT Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation
-inv|{0A1B70B0-DD98-1BCC-6958-D5AD8BBAF2B2}|Windows SDK Desktop Headers arm64|10.1.26100.7705|Microsoft Corporation
-inv|{B7BC83B0-1A94-0290-4309-820859276E72}|Windows App Certification Kit x64|10.1.26100.7705|Microsoft Corporation
-inv|{43B0D101-A022-48F4-9D04-BA404CEB1D53}|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.44.35211|14.44.35211|Microsoft Corporation
-inv|{80F76A51-EAF7-DA8E-C732-B26C591BCC23}|Windows SDK OnecoreUap Headers x64|10.1.26100.7705|Microsoft Corporation
-inv|{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|Windows App Certification Kit Native Components|10.1.26100.7705|Microsoft Corporation
-inv|{AF4ED0C1-A3D7-450B-A163-62CD3C7BBB27}|Python 3.14.6 Add to Path (64-bit)|3.14.6150.0|Python Software Foundation
-… 12 of 119 rows shown
+inv|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|Python Launcher|3.14.6150.0|Python Software Foundation|{1B68A0EC-4DD3-5134-840E-73854B0863F1}
+inv|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|Microsoft Corporation|{0A671536-ACC6-4075-BCDF-2F1FA4C794EA}
+inv|{52B54330-F546-418F-9991-BFE30BF4BF37}|Microsoft .NET Host FX Resolver - 8.0.33 (x86)|64.132.61667|Microsoft Corporation|{D52CB518-58E7-5391-B28C-BED4F2BAF204}
+inv|{B7526150-1C45-45B5-932D-A4CF5A23403C}|CMake|4.3.4|Kitware|{8FFD1D72-B7F1-11E2-8EE5-00238BCA4991}
+inv|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK|10.1.26100.7705|Microsoft Corporation|{EC0E61F5-6C33-1AAE-61C1-ED23BE5B60AF}
+inv|{AA11F890-8A6F-D292-8A1D-D70710A87852}|Windows IoT Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|{DA54E0F6-E3F1-153B-D081-57F57D9FF48E}
+inv|{0A1B70B0-DD98-1BCC-6958-D5AD8BBAF2B2}|Windows SDK Desktop Headers arm64|10.1.26100.7705|Microsoft Corporation|{7F031EB7-41B9-F83A-8DC1-174BE68AB11C}
+inv|{B7BC83B0-1A94-0290-4309-820859276E72}|Windows App Certification Kit x64|10.1.26100.7705|Microsoft Corporation|{A43D9F71-8069-869D-5689-6FDC76071B8E}
+inv|{931A2CF0-2404-45EA-82F5-345735AE6A90}|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.51.36247|14.51.36247|Microsoft Corporation|{36F68A90-239C-34DF-B58C-64B30153CE35}
+inv|{80F76A51-EAF7-DA8E-C732-B26C591BCC23}|Windows SDK OnecoreUap Headers x64|10.1.26100.7705|Microsoft Corporation|{1EF02066-8B0C-AE04-CAD0-93F7E4164DC8}
+inv|{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|Windows App Certification Kit Native Components|10.1.26100.7705|Microsoft Corporation|{71F94612-0CE4-423D-3769-AC3BAB695E7C}
+… 12 of 137 rows shown
+[result_status] OK / FULL
+
+== action=installer_records
+status|installer_records|supported|-
+rec|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|Python Launcher|3.14.6150.0|Python Software Foundation|20261012||C:\ProgramData\Package Cache\{0B1B5000-3C0E-41C0-83C4-4C914420AE93}v3.14.6150.0\|C:\Windows\Installer\db826.msi|{1B68A0EC-4DD3-5134-840E-73854B0863F1}|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|3.14.6150.0|Python Software Foundation|Python Launcher|-
+rec|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|Microsoft Corporation|20261012||C:\ProgramData\Microsoft\VisualStudio\Packages\Microsoft.VisualStudio.Setup.WMIProvider,version=3.12.2140.44225\|C:\Windows\Installer\da414.msi|{0A671536-ACC6-4075-BCDF-2F1FA4C794EA}|{49727420-70BA-4495-9405-31F8D711CB5A}|3.12.2140.44225|Microsoft Corporation|Microsoft Visual Studio Setup WMI Provider|-
+rec|{52B54330-F546-418F-9991-BFE30BF4BF37}|Microsoft .NET Host FX Resolver - 8.0.33 (x86)|64.132.61667|Microsoft Corporation|20261103||C:\ProgramData\Package Cache\{52B54330-F546-418F-9991-BFE30BF4BF37}v64.132.61667\|C:\Windows\Installer\6bd0266d.msi|{D52CB518-58E7-5391-B28C-BED4F2BAF204}|{52B54330-F546-418F-9991-BFE30BF4BF37}|64.132.61667|Microsoft Corporation|Microsoft .NET Host FX Resolver - 8.0.33 (x86)|-
+rec|{B7526150-1C45-45B5-932D-A4CF5A23403C}|CMake|4.3.4|Kitware|20261012|C:\Program Files\CMake\|withheld:user_path|C:\Windows\Installer\db832.msi|{8FFD1D72-B7F1-11E2-8EE5-00238BCA4991}|{B7526150-1C45-45B5-932D-A4CF5A23403C}|4.3.4|Kitware|CMake|-
+rec|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK|10.1.26100.7705|Microsoft Corporation|20261012||C:\ProgramData\Package Cache\{FED10190-CF54-E72D-7A92-E3F9CA9B7950}v10.1.26100.7705\Installers\|C:\Windows\Installer\da4bf.msi|{EC0E61F5-6C33-1AAE-61C1-ED23BE5B60AF}|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|10.1.26100.7705|Microsoft Corporation|Windows Desktop Extension SDK|-
+rec|{AA11F890-8A6F-D292-8A1D-D70710A87852}|Windows IoT Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20261012||C:\ProgramData\Package Cache\{AA11F890-8A6F-D292-8A1D-D70710A87852}v10.1.26100.7705\Installers\|C:\Windows\Installer\da4c3.msi|{DA54E0F6-E3F1-153B-D081-57F57D9FF48E}|{AA11F890-8A6F-D292-8A1D-D70710A87852}|10.1.26100.7705|Microsoft Corporation|Windows IoT Extension SDK Contracts|-
+rec|{0A1B70B0-DD98-1BCC-6958-D5AD8BBAF2B2}|Windows SDK Desktop Headers arm64|10.1.26100.7705|Microsoft Corporation|20261012||C:\ProgramData\Package Cache\{0A1B70B0-DD98-1BCC-6958-D5AD8BBAF2B2}v10.1.26100.7705\Installers\|C:\Windows\Installer\da565.msi|{7F031EB7-41B9-F83A-8DC1-174BE68AB11C}|{0A1B70B0-DD98-1BCC-6958-D5AD8BBAF2B2}|10.1.26100.7705|Microsoft Corporation|Windows SDK Desktop Headers arm64|-
+rec|{B7BC83B0-1A94-0290-4309-820859276E72}|Windows App Certification Kit x64|10.1.26100.7705|Microsoft Corporation|20261012||C:\ProgramData\Package Cache\{B7BC83B0-1A94-0290-4309-820859276E72}v10.1.26100.7705\Installers\|C:\Windows\Installer\da47f.msi|{A43D9F71-8069-869D-5689-6FDC76071B8E}|{B7BC83B0-1A94-0290-4309-820859276E72}|10.1.26100.7705|Microsoft Corporation|Windows App Certification Kit x64|-
+rec|{931A2CF0-2404-45EA-82F5-345735AE6A90}|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.51.36247|14.51.36247|Microsoft Corporation|20261103||C:\ProgramData\Package Cache\{931A2CF0-2404-45EA-82F5-345735AE6A90}v14.51.36247\packages\vcRuntimeMinimum_amd64\|C:\Windows\Installer\6bd02645.msi|{36F68A90-239C-34DF-B58C-64B30153CE35}|{931A2CF0-2404-45EA-82F5-345735AE6A90}|14.51.36247|Microsoft Corporation|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.51.36247|-
+rec|{80F76A51-EAF7-DA8E-C732-B26C591BCC23}|Windows SDK OnecoreUap Headers x64|10.1.26100.7705|Microsoft Corporation|20261012||C:\ProgramData\Package Cache\{80F76A51-EAF7-DA8E-C732-B26C591BCC23}v10.1.26100.7705\Installers\|C:\Windows\Installer\da55d.msi|{1EF02066-8B0C-AE04-CAD0-93F7E4164DC8}|{80F76A51-EAF7-DA8E-C732-B26C591BCC23}|10.1.26100.7705|Microsoft Corporation|Windows SDK OnecoreUap Headers x64|-
+rec|{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|Windows App Certification Kit Native Components|10.1.26100.7705|Microsoft Corporation|20261012||C:\ProgramData\Package Cache\{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}v10.1.26100.7705\Installers\|C:\Windows\Installer\da487.msi|{71F94612-0CE4-423D-3769-AC3BAB695E7C}|{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|10.1.26100.7705|Microsoft Corporation|Windows App Certification Kit Native Components|-
+… 12 of 138 rows shown
 [result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash bfd1288728c5
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-24 · euid 501 (interactive user) · leg-hash 1aaf3cf67f95
 
 ```
 == action=list
@@ -262,7 +303,7 @@ msi|com.apple.pkg.MobileAssets|MobileAssets|1.0.0.0.1645860813|/
 msi|com.apple.pkg.MAContent10_AssetPack_0317_AppleLoopsModernRnB1|MAContent10_AssetPack_0317_AppleLoopsModernRnB1|2.0.0.0.1.1601920555|/
 msi|com.apple.pkg.MAContent10_AssetPack_0537_DrummerShaker|MAContent10_AssetPack_0537_DrummerShaker|2.0.0.0.1.1602002531|/
 msi|com.apple.pkg.MAContent10_AssetPack_0482_EXS_OrchWoodwindAltoSax|MAContent10_AssetPack_0482_EXS_OrchWoodwindAltoSax|2.0.0.0.1.1602004766|/
-… 12 of 68 rows shown
+… 12 of 84 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=product_codes
@@ -278,11 +319,19 @@ product_code|com.apple.pkg.MobileAssets|MobileAssets
 product_code|com.apple.pkg.MAContent10_AssetPack_0317_AppleLoopsModernRnB1|MAContent10_AssetPack_0317_AppleLoopsModernRnB1
 product_code|com.apple.pkg.MAContent10_AssetPack_0537_DrummerShaker|MAContent10_AssetPack_0537_DrummerShaker
 product_code|com.apple.pkg.MAContent10_AssetPack_0482_EXS_OrchWoodwindAltoSax|MAContent10_AssetPack_0482_EXS_OrchWoodwindAltoSax
-… 12 of 68 rows shown
+… 12 of 84 rows shown
 [result_status] UNDECLARED / UNKNOWN
+
+== action=list_inventory
+status|list_inventory|unsupported|macos:owned_by_installed_apps
+[result_status] UNAVAILABLE / PARTIAL / macos:owned_by_installed_apps
+
+== action=installer_records
+status|installer_records|unsupported|macos:no_windows_installer
+[result_status] UNAVAILABLE / PARTIAL / macos:no_windows_installer
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash bfd1288728c5
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-24 · euid 0 · leg-hash 1aaf3cf67f95
 
 ```
 == action=list
@@ -294,6 +343,14 @@ error|platform not supported
 error|platform not supported
 [result_status] UNDECLARED / UNKNOWN
 [rc] 1
+
+== action=list_inventory
+status|list_inventory|unsupported|linux:no_msi
+[result_status] UNAVAILABLE / PARTIAL / linux:no_msi
+
+== action=installer_records
+status|installer_records|unsupported|linux:no_msi
+[result_status] UNAVAILABLE / PARTIAL / linux:no_msi
 ```
 <!-- END GENERATED -->
 
@@ -308,7 +365,7 @@ error|platform not supported
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/msi_packages/src/msi_packages_inventory.hpp` · `agents/plugins/msi_packages/src/msi_packages_macos.hpp` · `agents/plugins/msi_packages/src/msi_packages_plugin.cpp`
+- Plugin: `agents/plugins/msi_packages/src/msi_installer_records.hpp` · `agents/plugins/msi_packages/src/msi_packages_inventory.hpp` · `agents/plugins/msi_packages/src/msi_packages_macos.hpp` · `agents/plugins/msi_packages/src/msi_packages_plugin.cpp`
 - Definitions: `content/definitions/msi_packages.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/test_msi_packages_actions.cpp` · `tests/unit/test_msi_packages_inventory.cpp`
