@@ -918,12 +918,6 @@ std::string render_echo_proc_detail(const EchoProcNode& node, const std::vector<
 
 std::string echo_agent_error_note(const std::string& agent_text) {
     const std::string shown = agent_error_display(agent_text);
-    const std::string lower = to_lower(shown);
-    // A device whose agent predates the roll-up tables fails the whole query: SQLite names the
-    // missing column or table, and the registry names an unknown `$` table.
-    for (const char* skew : {"no such column", "no such table", "unknown table"})
-        if (lower.find(skew) != std::string::npos)
-            return "This device runs an agent without the roll-up store: upgrade the agent";
     return shown.empty() ? std::string("The device reported an error.")
                          : "The device reported an error: " + shown;
 }

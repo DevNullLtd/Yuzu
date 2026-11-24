@@ -87,6 +87,25 @@ Invariants:
      Both compile and pass every unit test.
   16. The `collation_gate_` member is declared before the `device_inventory_store_` member that
      borrows a pointer to it, so it outlives the store.
+  17. The bulk device-CI read's concurrency cap (#7949/#7951, `bulk_read_slots.hpp`) is wired at
+     both consumers and constructed on every boot path: `.ci_read_slots = hardware_ci_read_slots_.get(),`
+     (the hardware routes) and `tool_deps.ci_read_slots = hardware_ci_read_slots_.get();` (the MCP
+     tools) each appear exactly once and nothing assigns `ci_read_slots` to null (a null pointer
+     means "no cap" and serves, so a dropped wire leaves the pool unbounded with every unit test
+     green); the `hardware_ci_read_slots_` member is declared before `hardware_routes_` and
+     `mcp_server_`, which borrow it; the boot resolution (`resolve_bulk_read_cap(`) is called once
+     and its refusal arm sets `startup_failed_` and still constructs the slots object.
+  18. The busy counter is wired at both consumers: `.ci_read_busy_fn = hw_ci_read_busy_fn` (the
+     hardware routes' Deps) and `tool_deps.ci_read_busy_fn = hw_ci_read_busy_fn` (the MCP tools)
+     each appear exactly once, and the closed two-value surface label
+     `surface == hardware_ci_page::Surface::kMcp ? "mcp" : "rest"` is present (a dropped wire
+     leaves `yuzu_hardware_ci_read_busy_total` flat while the 503s still flow). The lambda body
+     of `hw_ci_read_busy_fn` must also name the counter `yuzu_hardware_ci_read_busy_total` and
+     call `.increment()` (a lambda that is wired but never moves the counter is the same flat
+     gauge). The label and counter-name checks read the RAW source, because normalisation blanks
+     string literals; they strip comments from the lambda body first and are otherwise best
+     effort, while the structural half (blanked literals) still guards the wires and the
+     `.increment()` call.
 
 `//` and block comments are stripped and whitespace collapsed before matching; string and
 character literals are blanked first so a token in a literal cannot satisfy or break a check, and
@@ -467,6 +486,241 @@ def problems(src):
             out.append(MSG_DESCRIBE)
             break
     return out + recheck_problems(t, pos)
+
+
+SLOTS_RESOLVE = "resolve_bulk_read_cap("
+SLOTS_REST_WIRE = ".ci_read_slots = hardware_ci_read_slots_.get(),"
+SLOTS_MCP_WIRE = "tool_deps.ci_read_slots = hardware_ci_read_slots_.get();"
+SLOTS_DECL = "std::unique_ptr<yuzu::server::BulkReadSlots> hardware_ci_read_slots_;"
+SLOTS_MAKE = "hardware_ci_read_slots_ = std::make_unique<yuzu::server::BulkReadSlots>("
+SLOTS_REFUSE_ARM = "if (!cap) {"
+MSG_SLOTS_REST_WIRE = ("the hardware routes' Deps is not handed `hardware_ci_read_slots_.get()` exactly "
+                       "once as `.ci_read_slots` (a null slots pointer means no cap and serves)")
+MSG_SLOTS_MCP_WIRE = ("the MCP ToolDeps is not handed `hardware_ci_read_slots_.get()` exactly once as "
+                      "`tool_deps.ci_read_slots` (a null slots pointer means no cap and serves)")
+MSG_SLOTS_NULL = "`ci_read_slots` is assigned null somewhere in server.cpp"
+MSG_SLOTS_DECL_ORDER = ("the hardware_ci_read_slots_ member is missing or is not declared before the "
+                        "{name} member that borrows a pointer to it")
+MSG_SLOTS_RESOLVE = ("server.cpp must call `resolve_bulk_read_cap(` exactly once, with "
+                     "`cfg_.hardware_ci_read_concurrency`: the boot arithmetic and its refusal")
+MSG_SLOTS_MAKE = ("`hardware_ci_read_slots_` must be constructed in exactly two places, the refusal "
+                  "arm and the accepted arm of the boot resolution, so it is never null")
+MSG_SLOTS_REFUSE = ("the refusal arm of the bulk read cap resolution does not set `startup_failed_` "
+                    "(an invalid explicit --hardware-ci-read-concurrency must refuse boot)")
+SLOTS_BORROWER_DECLS = (
+    ("hardware_routes_", "std::unique_ptr<HardwareRoutes> hardware_routes_;"),
+    ("mcp_server_", "std::unique_ptr<mcp::McpServer> mcp_server_;"),
+)
+
+
+def slots_problems(src):
+    """Wiring of the bulk read concurrency cap (invariant 17)."""
+    t = normalise(src)
+    out = []
+    if len(re.findall(re.escape(SLOTS_REST_WIRE), t)) != 1:
+        out.append(MSG_SLOTS_REST_WIRE)
+    if len(re.findall(re.escape(SLOTS_MCP_WIRE), t)) != 1:
+        out.append(MSG_SLOTS_MCP_WIRE)
+    if re.search(r"ci_read_slots\s*=\s*(nullptr|\{\}|NULL)", t) or len(re.findall(r"ci_read_slots =", t)) != 2:
+        out.append(MSG_SLOTS_NULL)
+    decl = t.find(SLOTS_DECL)
+    for name, borrower in SLOTS_BORROWER_DECLS:
+        pos = t.find(borrower)
+        if decl < 0 or pos < 0 or decl > pos:
+            out.append(MSG_SLOTS_DECL_ORDER.format(name=name))
+    resolves = [m.start() for m in re.finditer(re.escape(SLOTS_RESOLVE), t)]
+    if len(resolves) != 1 or "cfg_.hardware_ci_read_concurrency" not in t[resolves[0]:resolves[0] + 120]:
+        out.append(MSG_SLOTS_RESOLVE)
+    if len(re.findall(re.escape(SLOTS_MAKE), t)) != 2:
+        out.append(MSG_SLOTS_MAKE)
+    arm = t.find(SLOTS_REFUSE_ARM, resolves[0]) if resolves else -1
+    arm_end = t.find("} else {", arm) if arm >= 0 else -1
+    if arm < 0 or arm_end < 0 or "startup_failed_ = true;" not in t[arm:arm_end]:
+        out.append(MSG_SLOTS_REFUSE)
+    return out
+
+
+class HardwareCiReadSlotsWiring(unittest.TestCase):
+    def setUp(self):
+        self.src = SERVER_CPP.read_text(encoding="utf-8")
+
+    def test_clean(self):
+        self.assertEqual(slots_problems(self.src), [])
+
+    def test_rest_wire_dropped_or_nulled(self):
+        m = self.src.replace(SLOTS_REST_WIRE, ".ci_read_slots = nullptr,", 1)
+        self.assertNotEqual(m, self.src)
+        got = slots_problems(m)
+        self.assertIn(MSG_SLOTS_REST_WIRE, got)
+        self.assertIn(MSG_SLOTS_NULL, got)
+
+    def test_mcp_wire_dropped_or_nulled(self):
+        m = self.src.replace(SLOTS_MCP_WIRE, "tool_deps.ci_read_slots = nullptr;", 1)
+        self.assertNotEqual(m, self.src)
+        got = slots_problems(m)
+        self.assertIn(MSG_SLOTS_MCP_WIRE, got)
+        self.assertIn(MSG_SLOTS_NULL, got)
+        m = self.src.replace(SLOTS_MCP_WIRE, "(void)0;", 1)
+        self.assertIn(MSG_SLOTS_MCP_WIRE, slots_problems(m))
+
+    def test_wire_inside_if_0_does_not_count(self):
+        m = self.src.replace(SLOTS_REST_WIRE, "\n#if 0\n" + SLOTS_REST_WIRE + "\n#endif\n", 1)
+        self.assertIn(MSG_SLOTS_REST_WIRE, slots_problems(m))
+
+    def test_wired_twice(self):
+        m = self.src.replace(SLOTS_MCP_WIRE, SLOTS_MCP_WIRE + "\n" + SLOTS_MCP_WIRE, 1)
+        self.assertIn(MSG_SLOTS_MCP_WIRE, slots_problems(m))
+
+    def test_member_declared_after_each_borrower(self):
+        for name, borrower in SLOTS_BORROWER_DECLS:
+            with self.subTest(borrower=name):
+                i = self.src.index(SLOTS_DECL)
+                rest = self.src[:i] + self.src[i + len(SLOTS_DECL):]
+                k = rest.index(borrower) + len(borrower)
+                m = rest[:k] + "\n    " + SLOTS_DECL + rest[k:]
+                self.assertIn(MSG_SLOTS_DECL_ORDER.format(name=name), slots_problems(m))
+
+    def test_member_deleted(self):
+        m = self.src.replace(SLOTS_DECL, "", 1)
+        got = slots_problems(m)
+        for name, _ in SLOTS_BORROWER_DECLS:
+            self.assertIn(MSG_SLOTS_DECL_ORDER.format(name=name), got)
+
+    def test_resolution_deleted_or_not_fed_the_flag(self):
+        m = self.src.replace(SLOTS_RESOLVE, "resolve_bulk_read_cap_renamed(", 1)
+        self.assertIn(MSG_SLOTS_RESOLVE, slots_problems(m))
+        m = self.src.replace("resolve_bulk_read_cap(cfg_.hardware_ci_read_concurrency",
+                             "resolve_bulk_read_cap(2", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertIn(MSG_SLOTS_RESOLVE, slots_problems(m))
+
+    def test_a_construction_arm_deleted(self):
+        i = self.src.index(SLOTS_MAKE)
+        j = self.src.index(";", i) + 1
+        m = self.src[:i] + "(void)0;" + self.src[j:]
+        self.assertIn(MSG_SLOTS_MAKE, slots_problems(m))
+
+    def test_refusal_arm_no_longer_refuses_boot(self):
+        i = self.src.index(SLOTS_REFUSE_ARM, self.src.index(SLOTS_RESOLVE))
+        j = self.src.index("startup_failed_ = true;", i)
+        m = self.src[:j] + "(void)0;" + self.src[j + len("startup_failed_ = true;"):]
+        self.assertIn(MSG_SLOTS_REFUSE, slots_problems(m))
+
+
+BUSY_REST_WIRE = ".ci_read_busy_fn = hw_ci_read_busy_fn,"
+BUSY_MCP_WIRE = "tool_deps.ci_read_busy_fn = hw_ci_read_busy_fn;"
+BUSY_LABEL_NORM = 'surface == hardware_ci_page::Surface::kMcp ? "" : ""'
+BUSY_LABEL_RAW = 'surface == hardware_ci_page::Surface::kMcp ? "mcp" : "rest"'
+MSG_BUSY_REST_WIRE = ("the hardware routes' Deps is not handed `hw_ci_read_busy_fn` exactly once as "
+                      "`.ci_read_busy_fn` (the busy counter would never move)")
+MSG_BUSY_MCP_WIRE = ("the MCP ToolDeps is not handed `hw_ci_read_busy_fn` exactly once as "
+                     "`tool_deps.ci_read_busy_fn` (the busy counter would never move)")
+MSG_BUSY_LABEL = ("the busy counter's closed surface label ternary "
+                  "`surface == hardware_ci_page::Surface::kMcp ? \"mcp\" : \"rest\"` is missing")
+BUSY_LAMBDA = re.compile(r"auto\s+hw_ci_read_busy_fn\s*=\s*\[[^\]]*\]\s*\([^)]*\)\s*\{")
+BUSY_COUNTER = "yuzu_hardware_ci_read_busy_total"
+MSG_BUSY_COUNTER_NAME = ("the `hw_ci_read_busy_fn` lambda body does not name the counter "
+                         "`yuzu_hardware_ci_read_busy_total` (the alerted series would never move)")
+MSG_BUSY_INCREMENT = ("the `hw_ci_read_busy_fn` lambda body does not call `.increment()` "
+                      "(a refusal would not move the busy counter)")
+
+
+def busy_lambda_body(text):
+    """The brace-balanced body of the `hw_ci_read_busy_fn` lambda in `text`, or None."""
+    m = BUSY_LAMBDA.search(text)
+    if not m:
+        return None
+    depth, i = 1, m.end()
+    while i < len(text) and depth:
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        i += 1
+    return text[m.end():i - 1] if depth == 0 else None
+
+
+def busy_problems(src):
+    """Wiring of the bulk read busy counter (invariant 18)."""
+    t = normalise(src)
+    out = []
+    if len(re.findall(re.escape(BUSY_REST_WIRE), t)) != 1:
+        out.append(MSG_BUSY_REST_WIRE)
+    if len(re.findall(re.escape(BUSY_MCP_WIRE), t)) != 1:
+        out.append(MSG_BUSY_MCP_WIRE)
+    if len(re.findall(re.escape(BUSY_LABEL_NORM), t)) != 1 or BUSY_LABEL_RAW not in src:
+        out.append(MSG_BUSY_LABEL)
+    body = busy_lambda_body(t)
+    if body is None or ".increment()" not in body:
+        out.append(MSG_BUSY_INCREMENT)
+    raw = busy_lambda_body(src)
+    if raw is not None:
+        raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
+        raw = re.sub(r"//[^\n]*", "", raw)
+    if raw is None or BUSY_COUNTER not in raw:
+        out.append(MSG_BUSY_COUNTER_NAME)
+    return out
+
+
+class HardwareCiReadBusyWiring(unittest.TestCase):
+    def setUp(self):
+        self.src = SERVER_CPP.read_text(encoding="utf-8")
+
+    def test_clean(self):
+        self.assertEqual(busy_problems(self.src), [])
+
+    def test_rest_wire_dropped(self):
+        m = self.src.replace(BUSY_REST_WIRE, ".ci_read_busy_fn = nullptr,", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertIn(MSG_BUSY_REST_WIRE, busy_problems(m))
+
+    def test_mcp_wire_dropped_or_doubled(self):
+        m = self.src.replace(BUSY_MCP_WIRE, "(void)0;", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertIn(MSG_BUSY_MCP_WIRE, busy_problems(m))
+        m = self.src.replace(BUSY_MCP_WIRE, BUSY_MCP_WIRE + "\n" + BUSY_MCP_WIRE, 1)
+        self.assertIn(MSG_BUSY_MCP_WIRE, busy_problems(m))
+
+    def test_wire_inside_if_0_does_not_count(self):
+        m = self.src.replace(BUSY_MCP_WIRE, "\n#if 0\n" + BUSY_MCP_WIRE + "\n#endif\n", 1)
+        self.assertIn(MSG_BUSY_MCP_WIRE, busy_problems(m))
+
+    def test_label_ternary_changed(self):
+        m = self.src.replace(BUSY_LABEL_RAW, 'surface == hardware_ci_page::Surface::kMcp ? "mcp" : "other"', 1)
+        self.assertNotEqual(m, self.src)
+        self.assertIn(MSG_BUSY_LABEL, busy_problems(m))
+        m = self.src.replace(BUSY_LABEL_RAW, "std::string{}", 1)
+        self.assertIn(MSG_BUSY_LABEL, busy_problems(m))
+
+    def _mutate_in_lambda(self, old, new):
+        """Replace the first `old` after the lambda header only (the name occurs elsewhere)."""
+        h = BUSY_LAMBDA.search(self.src)
+        self.assertIsNotNone(h)
+        i = self.src.index(old, h.end())
+        return self.src[:i] + new + self.src[i + len(old):]
+
+    def test_counter_name_removed_or_commented_out(self):
+        m = self._mutate_in_lambda(BUSY_COUNTER, "yuzu_some_other_total")
+        self.assertNotEqual(m, self.src)
+        got = busy_problems(m)
+        self.assertIn(MSG_BUSY_COUNTER_NAME, got)
+        self.assertNotIn(MSG_BUSY_INCREMENT, got)
+        m = self._mutate_in_lambda(BUSY_COUNTER, "yuzu_some_other_total /* " + BUSY_COUNTER + " */")
+        self.assertIn(MSG_BUSY_COUNTER_NAME, busy_problems(m))
+
+    def test_increment_removed_or_commented_out(self):
+        m = self._mutate_in_lambda(".increment();", ";")
+        self.assertNotEqual(m, self.src)
+        got = busy_problems(m)
+        self.assertIn(MSG_BUSY_INCREMENT, got)
+        self.assertNotIn(MSG_BUSY_COUNTER_NAME, got)
+        m = self._mutate_in_lambda(".increment();", "; // .increment();")
+        self.assertIn(MSG_BUSY_INCREMENT, busy_problems(m))
+
+    def test_lambda_deleted_or_renamed(self):
+        m = self.src.replace("auto hw_ci_read_busy_fn = [this]",
+                             "auto hw_ci_read_busy_fn_x = [this]", 1)
+        self.assertNotEqual(m, self.src)
+        got = busy_problems(m)
+        self.assertIn(MSG_BUSY_INCREMENT, got)
+        self.assertIn(MSG_BUSY_COUNTER_NAME, got)
 
 
 class PgCollationCheckWiring(unittest.TestCase):

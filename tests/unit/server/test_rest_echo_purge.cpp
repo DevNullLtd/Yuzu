@@ -259,6 +259,36 @@ TEST_CASE("REST purge: rejects non-JSON / missing fields / bad source (400, no d
     CHECK(h.audits_for("echo.source.purge") == 0); // never reached the pre-dispatch audit
 }
 
+// #7811: the device id reaches the permission-denial audit and `target_id`, so an over-long or
+// control-byte id is refused with a 400 before the scope gate, any audit row and any dispatch.
+// The gate here refuses every device (403), so a 400 with `scoped_calls == 0` proves the id check
+// runs first, where an empty audit log and no dispatch are also true of a route that refuses late.
+TEST_CASE("REST purge: an unsafe device id answers 400 before the scope gate, any audit row or dispatch",
+          "[server][echo][purge][rest][audit]") {
+    PurgeHarness h;
+    h.scope_allow = false;
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        int st = 0;
+        const auto j = h.post(nlohmann::json{{"device_id", id}, {"source", "process"}}.dump(), st);
+        CHECK(st == 400);
+        REQUIRE(j.is_object());
+        CHECK(j["error"]["message"] == "Invalid device id.");
+    }
+    CHECK(h.scoped_calls == 0);
+    CHECK(h.calls.empty());
+    CHECK(h.audits.empty());
+    CHECK(h.metric("invalid_input") == static_cast<double>(bad.size()));
+
+    // The same route does reach the scope gate for a safe id at the 256-byte limit.
+    int st = 0;
+    h.post(nlohmann::json{{"device_id", std::string(256, 'a')}, {"source", "process"}}.dump(), st);
+    CHECK(st == 403);
+    CHECK(h.scoped_calls == 1);
+}
+
 TEST_CASE("REST purge: per-device scope gate denies (403, no dispatch, no audit)",
           "[server][echo][purge][rest]") {
     PurgeHarness h;

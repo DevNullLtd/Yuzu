@@ -9212,163 +9212,164 @@ tests:
 
   # -- YuzuEchoDbCorruptionDetected / YuzuPluginInitFailed (#5065, #6696; alert half of #5033) --
   #
-  # Mutation-checked, YuzuEchoDbCorruptionDetected: [1h] -> [5m] reddens A and D; [1h] -> [2h]
-  # reddens A (90m); [59m] or [61m] redden A (the 89m and 90m evals pin the window to the minute);
-  # dropping the uptime guard or 3600 reddens C and D; `<= 3900` reddens D; `increase` reddens E;
-  # `unless on (job)` reddens E3; a plain `unless` without `on` reddens C (its gauge series carries
-  # a stray label); `sum by (job)` reddens E2; the shipped annotations are pinned by E2 at 40m.
-  # Mutation-checked, YuzuPluginInitFailed: `for:` 5m or 16m, the bare gauge, a [1m], [4m] or [6m]
+  # Mutation-run, YuzuEchoDbCorruptionDetected (counter rule, #7486), against the pinned promtool
+  # (prom/prometheus:v3.13.1); each mutant changed only the counter expression, and the cases that
+  # went RED (by case number below) were: [1h] -> [5m] reddens cases 1 (89m), 6 (45m) and 7 (46m);
+  # [1h] -> [2h] reddens case 1 only (90m); [59m] reddens case 1 only (89m) and [61m] case 1 only
+  # (90m), so those two evals pin the window to the minute; the bare counter (`sum by (job)
+  # (yuzu_server_echo_db_quarantines_total) > 0`) reddens cases 1 (90m), 2, 3 (35m and 65m) and 5
+  # (a flat or restarted counter fires); `increase` -> `delta` reddens case 7 only (a restart from
+  # 5 followed by a new quarantine reads as -4); dropping `sum by (job)` or keeping `instance`
+  # each redden cases 1 (31m and 89m), 6 (45m) and 7 (46m): the surviving `instance` label breaks
+  # the expected label set, and case 6 additionally shows two alerts, one per replica. Case 4 is
+  # not reddened by any mutant above (it guards an absent series). The shipped annotations are
+  # pinned by case 6.
+  # YuzuPluginInitFailed: the mutations `for:` 5m or 16m, the bare gauge, a [1m], [4m] or [6m]
   # window, `sum by` keeping `instance` or dropping `plugin`, `max by` for `sum by` (case F has two
-  # replicas reporting), and an Echo-only selector each redden at least one case.
+  # replicas reporting), and an Echo-only selector were reasoned to redden at least one case, not
+  # mutation-run.
 
-  # CASE A -- the corruption gauge steps 0 -> 1 at minute 31 (no uptime series present: an absent
-  # right-hand side must not suppress). Fires at 31m and still at 89m (the last eval whose window
-  # reaches back to the 0 sample at 30m), and is gone at 90m: pins the [1h] window to the minute.
+  # CORRUPTION CASE 1 -- a pre-seeded counter steps 0 -> 1 at minute 31. Quiet at 30m, fires from
+  # the first eval after the step (31m) and still at 89m (the last eval whose window reaches back
+  # to the 0 sample at 30m), and is gone at 90m: pins the [1h] window to the minute.
   - interval: 1m
-    name: echo corruption gauge rising by one fires, window is 1h
+    name: echo quarantine counter stepping 0 to 1 fires, window is 1h
     input_series:
-      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
+      - series: 'yuzu_server_echo_db_quarantines_total{job="yuzu",instance="s1"}'
         values: "0x30 1x70"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
         eval_time: 31m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
       - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
         eval_time: 89m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
       - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
         eval_time: 90m
         exp_samples: []
 
-  # CASE B -- negative control: a flat non-zero gauge (old, already-counted quarantines) stays quiet.
+  # CORRUPTION CASE 2 -- negative control: a high but flat counter (old, already-counted
+  # quarantines) stays quiet for two hours. RED if the rule reads the raw counter.
   - interval: 1m
-    name: echo corruption gauge flat and non-zero stays quiet
+    name: echo quarantine counter high and flat stays quiet for two hours
     input_series:
-      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
-        values: "2x90"
-      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
-        values: "100000x90"
-    alert_rule_test:
-      - eval_time: 31m
-        alertname: YuzuEchoDbCorruptionDetected
-        exp_alerts: []
-
-  # CASE C -- a server restart: the gauge is 3, the replica restarts (absent for the gap), then
-  # the gauge ramps 0 1 2 3 as agents reconnect, with the uptime counter reset at the same moment.
-  # An hour later the 1h window start lands in the ramp (a bare delta is positive from 160m to
-  # 167m) and fires with no new corruption; the guard keeps it quiet. Uptime is exactly 3600 s at
-  # 166m, which pins the threshold against 3600. The gauge series carries a stray `pod` label the
-  # uptime series lacks, so a plain `unless` (no `on`) would not match and the rule would fire.
-  - interval: 1m
-    name: echo corruption gauge ramp after a server restart stays quiet
-    input_series:
-      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1",pod="a"}'
-        values: "3x100 _x5 0 1 2 3x120"
-      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
-        values: "100000x100 _x5 0+60x130"
+      - series: 'yuzu_server_echo_db_quarantines_total{job="yuzu",instance="s1"}'
+        values: "5x130"
     promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
-        eval_time: 166m
-        exp_samples: []
-
-  # CASE D -- a genuine rise 31 minutes into a replica's life is held back by the guard until
-  # uptime reaches 3900 s (65m), then fires: quiet at 64m, firing at 65m (pins `<` against `<=`).
-  - interval: 1m
-    name: echo corruption rise inside the guard window fires once uptime passes 65m
-    input_series:
-      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
-        values: "0x30 1x60"
-      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
-        values: "0+60x90"
-    promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
-        eval_time: 64m
-        exp_samples: []
-      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
-        eval_time: 65m
-        exp_samples:
-          - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
-            value: 1
-
-  # CASE E -- an agent leaves and returns (2 -> 1 -> 2): delta is 0 and stays quiet, `increase`
-  # would read the return as a rise. Uptime is above the guard throughout, so only delta decides.
-  - interval: 1m
-    name: echo corruption gauge falling then returning to its old value stays quiet
-    input_series:
-      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
-        values: "2x40 1x10 2x40"
-      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
-        values: "100000x100"
-    promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate=~"firing|pending"}'
         eval_time: 60m
         exp_samples: []
-      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
-        eval_time: 90m
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate=~"firing|pending"}'
+        eval_time: 120m
         exp_samples: []
 
-  # CASE E2 -- a failover (or the agent shuffle of a rolling upgrade) moves 3 agents from old
-  # replica s1 to old replica s2: s2 gains agents, so its per-instance gauge rises with no new
-  # corruption and fires once (accepted for a warning; the description says so). s1 falling is
-  # quiet. RED if the rule becomes `sum by (job)` (the sum stays flat at 3 and 40m goes empty).
-  # The 40m alert also pins the shipped annotations, verbatim: this is the only case that does, so
-  # a change to the summary, description or runbook link must update the strings here.
+  # CORRUPTION CASE 3 -- a 3-replica rolling restart: each replica's counter (3, already counted)
+  # goes absent for three minutes and returns at 0, one replica after another, with no new
+  # quarantine. Quiet throughout, including an hour after each restart (no uptime guard needed:
+  # the counter has no ramp).
   - interval: 1m
-    name: echo corruption - a failover onto an old replica fires that replica once
+    name: echo quarantine counter rolling restart of three replicas stays quiet
     input_series:
-      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
-        values: "3x30 0x60"
-      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s2"}'
-        values: "0x30 3x60"
-      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
-        values: "100000x90"
-      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s2"}'
-        values: "100000x90"
+      - series: 'yuzu_server_echo_db_quarantines_total{job="yuzu",instance="s1"}'
+        values: "3x30 _x3 0x150"
+      - series: 'yuzu_server_echo_db_quarantines_total{job="yuzu",instance="s2"}'
+        values: "3x60 _x3 0x120"
+      - series: 'yuzu_server_echo_db_quarantines_total{job="yuzu",instance="s3"}'
+        values: "3x90 _x3 0x90"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate=~"firing|pending"}'
+        eval_time: 35m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate=~"firing|pending"}'
+        eval_time: 65m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate=~"firing|pending"}'
+        eval_time: 95m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate=~"firing|pending"}'
+        eval_time: 150m
+        exp_samples: []
+
+  # CORRUPTION CASE 4 -- the counter is not exposed at all (a server that predates it): no series,
+  # no alert. An unrelated series keeps the test input non-empty.
+  - interval: 1m
+    name: echo quarantine counter absent stays quiet
+    input_series:
+      - series: 'up{job="yuzu",instance="s1"}'
+        values: "1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate=~"firing|pending"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CORRUPTION CASE 5 -- why the server pre-seeds the counter: a series whose first sample is
+  # already 1 (no 0 sample before it) shows no increase, so a first quarantine on an unseeded
+  # counter would be invisible. Documents the dependency; the server seeds it at boot.
+  - interval: 1m
+    name: echo quarantine counter first seen at 1 with no zero sample does not fire
+    input_series:
+      - series: 'yuzu_server_echo_db_quarantines_total{job="yuzu",instance="s1"}'
+        values: "1x90"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate=~"firing|pending"}'
+        eval_time: 31m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate=~"firing|pending"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CORRUPTION CASE 6 -- two replicas each record one quarantine in the hour (s1 at minute 31, s2
+  # at minute 41): ONE alert for the job, with no instance label. RED if `sum by (job)` is dropped
+  # or keeps `instance` (two alerts). The 45m alert pins the shipped annotations, verbatim: this
+  # is the only case that does, so a change to the summary, description or runbook link must
+  # update the strings here.
+  - interval: 1m
+    name: echo quarantine two replicas each record one gives one alert for the job
+    input_series:
+      - series: 'yuzu_server_echo_db_quarantines_total{job="yuzu",instance="s1"}'
+        values: "0x30 1x60"
+      - series: 'yuzu_server_echo_db_quarantines_total{job="yuzu",instance="s2"}'
+        values: "0x40 1x50"
     alert_rule_test:
-      - eval_time: 40m
+      - eval_time: 45m
         alertname: YuzuEchoDbCorruptionDetected
         exp_alerts:
           - exp_labels:
               severity: warning
               job: yuzu
-              instance: s2
             exp_annotations:
-              summary: "The count of agents with a quarantined Echo database rose in the last hour"
-              description: "At least one more agent than an hour ago reports that its Echo database failed its integrity check and was quarantined. This is a net rise in the agents reporting a quarantine history, not an event count: the gauge counts agents once per sweep, so an agent returning from offline with an old quarantine raises it, a repeat quarantine on an agent already counted does not, and an agent leaving in the same window can mask one arriving. A rise seen while the reporting replica has been up under 65 minutes is held until the guard lifts. A failover, a rolling upgrade, agents returning after a site or gateway outage, or ordinary endpoint churn can all raise it with no new corruption, once per replica that gains agents; treat it as a ticket, not a page. The signal is agent-self-reported, so one agent can raise or mask it; the echo.db.corruption_quarantined audit rows name the affected agents but corroborate rather than prove it."
+              summary: "An agent quarantined its Echo database in the last hour"
+              description: "The server recorded at least one new Echo database quarantine in the last hour: an agent's echo.db failed its integrity check and was moved aside. Open the echo.db.corruption_quarantined audit rows to see which agents, then check each agent's log for the cause (disk fault, full disk, unclean shutdown). Each row is a new quarantine identity, so an agent returning from offline, a failover and a reconnect wave add none. Any increase in an hour fires: that is a starting default, not sized from fleet data. The count is the server's own audit-row writes, so a row pruned by audit retention and reported again, or two HA replicas racing on one identity, counts twice, and a crash between a write and the next scrape loses that count; the audit rows stay the record. No alert does not mean no quarantine: a quarantine a replica records before Prometheus has scraped it once can be missed (the first sample is already above 0), and no row is written, so none is counted, while the audit store is closed or the gate is waiting out a failed audit lookup or write (every agent after an agent's first failure; only that agent when it fails again, for up to 16 failing agents the gate remembers). The signal is agent-self-reported, so one agent can raise it; treat it as a ticket, not a page."
               runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
-    promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
-        eval_time: 40m
-        exp_samples:
-          - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
-            value: 1
-      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
-        eval_time: 91m
-        exp_samples: []
 
-  # CASE E3 -- two replicas: s1 is old and sees a real rise at minute 30; s2 is young (uptime
-  # 0..90 min) and flat. The guard must join on the SAME replica: s1 fires, and a young sibling
-  # does not silence it. RED if the join is `on (job)` (s2's young uptime then suppresses s1).
+  # CORRUPTION CASE 7 -- a replica restarts (its counter was 5, back to 0) and then records a new
+  # quarantine: still fires, and is gone once the window passes it. RED if `increase` becomes
+  # `delta` (1 - 5 reads as a fall, so a real quarantine after a restart is missed) and RED if
+  # the window is shortened to [5m]: the series is 5 for 0-30m, absent 31-33m, 0 for 34-41m and 1
+  # from 42m, so the last 0 sample is at 41m and the 46m window, (41m, 46m] under the pinned
+  # promtool's left-open range windows, holds only 1s. Executed: the [5m] mutant reddens the 46m
+  # eval (as it does case 1 at 89m and case 6 at 45m). That holds by one sample: re-apply the [5m]
+  # mutation to confirm this case reddens after any change to this series or the eval time.
   - interval: 1m
-    name: echo corruption - a young sibling replica does not silence an old one
+    name: echo quarantine a new quarantine after a replica restart still fires
     input_series:
-      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
-        values: "0x30 1x60"
-      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s2"}'
-        values: "0x90"
-      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
-        values: "100000x90"
-      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s2"}'
-        values: "0+60x90"
+      - series: 'yuzu_server_echo_db_quarantines_total{job="yuzu",instance="s1"}'
+        values: "5x30 _x3 0x7 1x80"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
         eval_time: 40m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
+        eval_time: 46m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
 
   # CASE F -- held for the full 15m: quiet at 14m, firing at 15m and 16m, with the plugin label and

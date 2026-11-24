@@ -63,6 +63,38 @@ struct Targets {
 /// /Applications, /usr/local, /opt/homebrew.
 [[nodiscard]] std::vector<std::string> native_candidate_roots();
 
+/// Test seam and the one listing the python roots need: the names of the directories (and links and
+/// network mounts, which the root checks then count and drop) directly inside `dir`, nothing below
+/// them; nullopt when `dir` could not be listed in full (absent, a link, on a network mount,
+/// unreadable, or cut at the per-directory entry cap, where the names it got are only some of them).
+/// The live one lists through the leg's own no-follow PosixFs and never opens a path under a network
+/// mount; a test passes a fake, so python_candidate_roots stays unit-testable without touching the host.
+using ChildLister = std::function<std::optional<std::vector<std::string>>(const std::string& dir)>;
+
+/// The ChildLister over a directory-listing function (the live one is PosixFs::list; a test passes a
+/// fake): nullopt for a listing that failed or was cut at the per-directory cap.
+[[nodiscard]] ChildLister make_child_lister(const decltype(FsOps::list)& list);
+
+/// The machine roots the `python` action walks, in walk order. A Python install is a directory
+/// `python3` or `python3.<digits>` beside the libraries, and the scan wants the distributions inside it,
+/// so this lists the parent directories named below through `children` (one on Linux, two on macOS;
+/// it does no I/O of its own, only through the injected lister) and keeps those names; nothing else
+/// under them is walked here. Linux: each child of /usr/local/lib named `python3` or
+/// `python3.<digits>`, then /opt. /usr/lib is NOT a root: the interpreter trees under it are owned by
+/// the package manager and their distributions are already package rows, the same principle the
+/// `native` roots state above. macOS: /Library/Frameworks/Python.framework/Versions, then each child
+/// of /opt/homebrew/lib and /usr/local/lib named `python3.<digits>`. A parent the lister could not
+/// list in full is itself kept as a candidate in its children's place, so it takes the checks every
+/// other root takes: counted when on a network mount or behind a link, dropped silently when absent,
+/// left for the walk to report as dir_unreadable when it fails to open for any other reason and as
+/// dir_truncated when it holds more entries than the per-directory cap.
+[[nodiscard]] std::vector<std::string> python_candidate_roots(const ChildLister& children);
+
+/// The machine roots the `node` action walks, in walk order. Linux: /usr/lib/node_modules,
+/// /usr/local/lib/node_modules, /opt. macOS: /opt/homebrew/lib/node_modules,
+/// /usr/local/lib/node_modules, /Applications.
+[[nodiscard]] std::vector<std::string> node_candidate_roots();
+
 /// Directories the `native` walk must not list, by exact path: the macOS Homebrew package trees
 /// (/usr/local/Cellar, /opt/homebrew/Cellar), which held most of a measured host's native libraries
 /// and are the package manager's, not an application's. Empty on Linux, where the package-owned trees
@@ -136,6 +168,16 @@ using MountTableReader = std::function<std::optional<std::vector<std::string>>()
 /// scan_targets for the `native` action: native_candidate_roots() against the same live mount table,
 /// with the same mount-table guard, link refusal and network-mount skip.
 [[nodiscard]] Targets scan_native_targets();
+
+/// scan_targets for the `python` action. The mount table is read first and the one parent listing
+/// python_candidate_roots needs goes through the leg with that table's mounts, so a parent on or under a
+/// network mount is never opened; an unreadable table lists nothing and yields no roots, as for scan.
+/// A parent that fails to list is offered to the root checks as a candidate, so the roots then take the
+/// same link refusal and network-mount skip, counted, as every other action.
+[[nodiscard]] Targets scan_python_targets();
+
+/// scan_targets for the `node` action: node_candidate_roots() against the live mount table.
+[[nodiscard]] Targets scan_node_targets();
 
 /// Types one entry of the directory `dir` (open as `dir_fd`). A path in `network_mounts` is
 /// network_mount decided from the path alone, whatever d_type says: it is never passed to stat. DT_UNKNOWN
