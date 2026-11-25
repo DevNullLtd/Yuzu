@@ -4342,6 +4342,27 @@ TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
     CHECK(rest_live_count(h, "bogus", "bad_kind") == 0.0);
 }
 
+// A device id the floor refuses (control byte or over 256 bytes) is counted `bad_device_id` under
+// the kind the call asked for, never as `internal` (the word for an unexpected exception), and
+// before the scoped gate, any audit row or any dispatch.
+TEST_CASE("REST dex/devices/{id}/live: an unsafe device id is counted bad_device_id, not internal",
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    auto res = h.sink.Post("/api/v1/dex/devices/dev\nA/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.last_live_plugin.empty());
+    CHECK(h.audit_log.empty());
+    CHECK(rest_live_count(h, "uptime", "bad_device_id") == 1.0);
+    CHECK(rest_live_count(h, "uptime", "internal") == 0.0);
+    auto res2 = h.sink.Post("/api/v1/dex/devices/dev\nA/live?kind=bogus", "");
+    REQUIRE(res2);
+    CHECK(res2->status == 400);
+    CHECK(rest_live_count(h, "unknown", "bad_device_id") == 1.0); // an unserved kind is `unknown`
+}
+
 // QE-1: a dashboard-only kind (a REAL row of the live kind table that the REST view does not
 // admit) must be refused exactly like an unknown token: 400, no dispatch, metric label
 // `unknown`. This is what fails if the route's resolver is ever swapped from resolve_rest_kind
@@ -4574,7 +4595,7 @@ TEST_CASE("REST dex/devices/{id}/live: every {surface, kind, outcome} series and
     constexpr std::size_t kExpected = yuzu::server::live::kAllLiveSurfaces.size() *
                                       yuzu::server::live::kAllKindLabels.size() *
                                       yuzu::server::live::kAllLiveOutcomes.size();
-    static_assert(kExpected == 2 * 3 * 31, "the closed set the docs state");
+    static_assert(kExpected == 2 * 3 * 32, "the closed set the docs state");
     CHECK(series == kExpected);
     // Every outcome token, both surfaces, every kind label, each at exactly 0.
     for (const auto surface : yuzu::server::live::kAllLiveSurfaces)

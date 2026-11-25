@@ -43,14 +43,14 @@ TEST_CASE("LiveOutcome: the closed token set is exactly the ruled one", "[live][
         "route_unreadable", "os_gate_unreadable", "quarantined", "plugin_not_found",
         "kill_switched_os", "device_failed", "device_error", "output_too_large", "timeout",
         "store_degraded", "internal", "tier_refused", "read_only_refused", "approval_refused",
-        "shutting_down", "incomplete", "gate_unreadable"};
+        "shutting_down", "incomplete", "gate_unreadable", "bad_device_id"};
     std::set<std::string> actual;
     for (const auto o : live::kAllLiveOutcomes)
         actual.insert(std::string(live::to_token(o)));
     CHECK(actual == expected);
-    // The vocabulary is 31 tokens: 2 surfaces x 3 kinds x 31 outcomes = 186 series once pre-seeded.
-    CHECK(live::kAllLiveOutcomes.size() == 31);
-    CHECK(expected.size() == 31);
+    // The vocabulary is 32 tokens: 2 surfaces x 3 kinds x 32 outcomes = 192 series once pre-seeded.
+    CHECK(live::kAllLiveOutcomes.size() == 32);
+    CHECK(expected.size() == 32);
 }
 
 TEST_CASE("LiveOutcome: the three tokens added after the first release keep their spelling and index", "[live][outcome]") {
@@ -62,6 +62,9 @@ TEST_CASE("LiveOutcome: the three tokens added after the first release keep thei
     CHECK(static_cast<std::size_t>(live::LiveOutcome::kShuttingDown) == 28);
     CHECK(static_cast<std::size_t>(live::LiveOutcome::kIncomplete) == 29);
     CHECK(static_cast<std::size_t>(live::LiveOutcome::kGateUnreadable) == 30);
+    // Appended by the merge with dev's device-id floor: the earlier enumerator values did not move.
+    CHECK(live::to_token(live::LiveOutcome::kBadDeviceId) == "bad_device_id");
+    CHECK(static_cast<std::size_t>(live::LiveOutcome::kBadDeviceId) == 31);
 }
 
 TEST_CASE("live_outcome_for: every ZeroReachCause maps to the outcome with its own token", "[live][outcome]") {

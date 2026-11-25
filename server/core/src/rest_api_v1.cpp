@@ -20029,8 +20029,10 @@ void RestApiV1::register_routes(
             } recorder{metrics_registry, live::kind_label(lk ? kind : std::string_view{}), outcome};
             // Before the scoped gate and any audit row: the id reaches target_id on both. After the
             // outcome recorder, so the refusal is counted under its 400.
-            if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+            if (detail::refuse_unsafe_device_id_a4(res, agent_id)) {
+                outcome = live::LiveOutcome::kBadDeviceId;
                 return;
+            }
             std::string plugin, action, audit_action;
             if (lk) {
                 plugin = lk->plugin;
