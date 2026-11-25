@@ -331,6 +331,27 @@ TEST_CASE("reduce_rows: when the oldest rows were cut, the true head chunk decid
         const auto v = live::reduce_rows(data, "agent-1", &facts, true);
         CHECK(v.outcome == live::LiveOutcome::kOk);
     }
+    SECTION("no terminal row yet, the head chunk was an error| answer the cut dropped: decided as a device error") {
+        const std::vector<StoredResponse> open{row(90, 100, 0, "later|1\n")};
+        facts.any_terminal = false;
+        facts.head_output = "error|device said no";
+        const auto v = live::reduce_rows(open, "agent-1", &facts, true);
+        CHECK(v.outcome == live::LiveOutcome::kDeviceError);
+        CHECK(v.detail == "device said no");
+        // Nothing was cut: an error| line without a terminal row is still undecided.
+        const auto uncut = live::reduce_rows(open, "agent-1", &facts, false);
+        CHECK(uncut.outcome == live::LiveOutcome::kTimeout);
+    }
+    SECTION("a multi-byte failure text from the facts is clamped to 200 bytes on a character boundary") {
+        BoundedFacts f;
+        f.any_failed = true;
+        for (int i = 0; i < 250; ++i)
+            f.failed_detail += "\xC3\xA9";
+        const auto v = live::reduce_rows({}, "agent-1", &f, true);
+        CHECK(v.outcome == live::LiveOutcome::kDeviceFailed);
+        CHECK(v.detail.size() == live::kLiveDetailMaxBytes);
+        CHECK(v.detail == f.failed_detail.substr(0, live::kLiveDetailMaxBytes)); // 100 whole characters
+    }
     SECTION("nothing was cut: the joined output decides, as before") {
         facts.head_output = "error|ignored"; // would flip the answer if it were read without a cut
         const std::vector<StoredResponse> whole{row(1, 100, 1, "proc|1|a\n")};
@@ -782,7 +803,8 @@ void seed(ResponseStore& store, const std::string& cmd, const std::string& agent
     r.output = output;
     r.error_detail = err;
     r.plugin = plugin;
-    store.store(r);
+    // A refused row (the per-agent cap) would silently weaken a cut test: fail loudly instead.
+    REQUIRE(store.store(r) == StoreOutcome::Stored);
 }
 } // namespace
 
@@ -1071,13 +1093,15 @@ TEST_CASE("poll_live_output [pg]: a terminal row or an error| head chunk the cut
     REQUIRE(store.is_open());
     const auto* plugins = &yuzu::server::test::forensics_plugin_set();
 
-    SECTION("a success terminal finalized in place, then late rows: decided and flagged, never incomplete") {
+    SECTION("a success terminal finalized in place, then late rows with NO output: decided, never a timeout") {
+        // The late rows are empty, so the surviving rows are neither a partial answer nor a terminal row:
+        // without the facts this poll reads nothing decisive and ends as a timeout.
         for (int i = 0; i < 3; ++i)
             seed(store, "cmd-late-ok", "agent-1", 0, "proc|" + std::to_string(i) + "|x\n");
         REQUIRE(store.finalize_terminal_status("cmd-late-ok", "agent-1", 1, "", "", 0) ==
                 ResponseStore::FinalizeResult::Updated);
         for (int i = 0; i < live::kLivePollRowLimit + 6; ++i)
-            seed(store, "cmd-late-ok", "agent-1", 0, "late|" + std::to_string(i) + "\n");
+            seed(store, "cmd-late-ok", "agent-1", 0, "");
 
         auto limits = fast_limits(1);
         limits.over_cap = live::OverCapPolicy::kTruncateAtNewline;
@@ -1087,6 +1111,17 @@ TEST_CASE("poll_live_output [pg]: a terminal row or an error| head chunk the cut
         limits.over_cap = live::OverCapPolicy::kRefuse;
         const auto refused = live::poll_live_output(store, "cmd-late-ok", "agent-1", plugins, limits, no_sleep);
         CHECK(refused.outcome == live::LiveOutcome::kOutputTooLarge);
+    }
+    SECTION("an error| head chunk, then more than the row limit of RUNNING rows and NO terminal row") {
+        seed(store, "cmd-head-err-open", "agent-1", 0, "error|device said no");
+        for (int i = 0; i < live::kLivePollRowLimit + 6; ++i)
+            seed(store, "cmd-head-err-open", "agent-1", 0, "later|" + std::to_string(i) + "\n");
+
+        auto limits = fast_limits(1);
+        limits.over_cap = GENERATE(live::OverCapPolicy::kTruncateAtNewline, live::OverCapPolicy::kRefuse);
+        const auto out = live::poll_live_output(store, "cmd-head-err-open", "agent-1", plugins, limits, no_sleep);
+        CHECK(out.outcome == live::LiveOutcome::kDeviceError);
+        CHECK(out.detail == "device said no");
     }
     SECTION("an error| head chunk, then more than the row limit of later rows and a terminal row") {
         seed(store, "cmd-head-err", "agent-1", 0, "error|device said no");
@@ -1107,10 +1142,14 @@ TEST_CASE("poll_live_output [pg]: a terminal row or an error| head chunk the cut
         seed(store, "cmd-head-data", "agent-1", 1, "");
 
         auto limits = fast_limits(1);
-        limits.over_cap = live::OverCapPolicy::kTruncateAtNewline;
+        limits.over_cap = GENERATE(live::OverCapPolicy::kTruncateAtNewline, live::OverCapPolicy::kRefuse);
         const auto out = live::poll_live_output(store, "cmd-head-data", "agent-1", plugins, limits, no_sleep);
-        CHECK(out.outcome == live::LiveOutcome::kOk);
-        CHECK(out.truncated);
+        if (limits.over_cap == live::OverCapPolicy::kRefuse) {
+            CHECK(out.outcome == live::LiveOutcome::kOutputTooLarge); // never a device error
+        } else {
+            CHECK(out.outcome == live::LiveOutcome::kOk);
+            CHECK(out.truncated);
+        }
     }
 }
 
@@ -1165,6 +1204,10 @@ TEST_CASE("ResponseStore::query_bounded [pg]: decision facts cover every permitt
         CHECK(got->facts->failed_detail.empty());
     }
     SECTION("another agent's failure and a Forensics-tier failure reach no fact") {
+        // The withheld rows hold the LOWEST ids, so an unscoped head (the oldest row with output) would
+        // be one of them.
+        seed(store, "cmd-facts-vis", "agent-2", 0, "error|foreign secret\n");
+        seed(store, "cmd-facts-vis", "agent-1", 0, "error|forensics secret\n", yuzu::server::test::kForensicsPlugin);
         seed(store, "cmd-facts-vis", "agent-1", 0, "mine\n");
         seed(store, "cmd-facts-vis", "agent-2", 2, "", "os_info", "foreign failure");
         seed(store, "cmd-facts-vis", "agent-1", 2, "", yuzu::server::test::kForensicsPlugin, "secret failure");
@@ -1178,6 +1221,78 @@ TEST_CASE("ResponseStore::query_bounded [pg]: decision facts cover every permitt
         CHECK(got->facts->failed_detail.empty());
         CHECK(got->facts->head_output == "mine\n");
         CHECK_FALSE(got->row_cap_hit); // the withheld rows set no cap flag either
+    }
+    SECTION("an unwired plugin set (every row refused): facts are present and empty") {
+        seed(store, "cmd-facts-unwired", "agent-1", 2, "x\n", "os_info", "boom");
+        const auto refused = ResponseTierFilter::for_fixed_plugin_poll(nullptr);
+        q.with_decision_facts = true;
+        const auto got = store.query_bounded("cmd-facts-unwired", refused, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        CHECK(got->rows.empty());
+        REQUIRE(got->facts.has_value());
+        CHECK_FALSE(got->facts->any_failed);
+        CHECK_FALSE(got->facts->any_terminal);
+        CHECK(got->facts->head_output.empty());
+    }
+    SECTION("an empty agent_id would span every agent: no facts are returned") {
+        seed(store, "cmd-facts-noagent", "agent-2", 2, "", "os_info", "foreign failure");
+        q.agent_id.clear();
+        q.with_decision_facts = true;
+        const auto got = store.query_bounded("cmd-facts-noagent", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->facts.has_value());
+    }
+    SECTION("the cut is in characters: 300 two-byte characters cut to 256, no character split") {
+        std::string text;
+        for (int i = 0; i < 300; ++i)
+            text += "\xC3\xA9";
+        seed(store, "cmd-facts-mb", "agent-1", 2, text, "os_info", text);
+        q.with_decision_facts = true;
+        const auto got = store.query_bounded("cmd-facts-mb", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        REQUIRE(got->facts.has_value());
+        CHECK(got->facts->failed_detail.size() == 2u * kBoundedFactsTextChars);
+        CHECK(got->facts->head_output.size() == 2u * kBoundedFactsTextChars);
+        CHECK(got->facts->failed_detail == text.substr(0, 2u * kBoundedFactsTextChars));
+    }
+    SECTION("a status, since and until filter narrow the facts as they narrow the rows") {
+        seed(store, "cmd-facts-filter", "agent-1", 0, "head|chunk\n");
+        seed(store, "cmd-facts-filter", "agent-1", 2, "", "os_info", "boom");
+        q.with_decision_facts = true;
+        q.status = 2;
+        q.since = 0;
+        q.until = 9999999999;
+        const auto got = store.query_bounded("cmd-facts-filter", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        REQUIRE(got->facts.has_value());
+        CHECK(got->rows.size() == 1);
+        CHECK(got->facts->any_failed);
+        CHECK(got->facts->failed_detail == "boom");
+        CHECK(got->facts->head_output.empty()); // the status filter left the head row out of the facts too
+    }
+    SECTION("a status outside 0..4: >= 1 is terminal, >= 2 a failure, a negative status neither") {
+        seed(store, "cmd-facts-neg", "agent-1", -1, "x\n");
+        q.with_decision_facts = true;
+        const auto neg = store.query_bounded("cmd-facts-neg", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(neg.has_value());
+        REQUIRE(neg->facts.has_value());
+        CHECK_FALSE(neg->facts->any_terminal);
+        CHECK_FALSE(neg->facts->any_failed);
+        seed(store, "cmd-facts-big", "agent-1", 99, "x\n", "os_info", "odd status");
+        const auto big = store.query_bounded("cmd-facts-big", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(big.has_value());
+        REQUIRE(big->facts.has_value());
+        CHECK(big->facts->any_terminal);
+        CHECK(big->facts->any_failed);
+    }
+    SECTION("a single success row: terminal, not failed") {
+        seed(store, "cmd-facts-ok", "agent-1", 1, "x\n");
+        q.with_decision_facts = true;
+        const auto got = store.query_bounded("cmd-facts-ok", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        REQUIRE(got->facts.has_value());
+        CHECK(got->facts->any_terminal);
+        CHECK_FALSE(got->facts->any_failed);
     }
     SECTION("no rows: facts are present and empty") {
         q.with_decision_facts = true;

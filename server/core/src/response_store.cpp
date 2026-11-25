@@ -1121,9 +1121,14 @@ ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTi
             std::string facts_cte;
             std::string facts_cols;
             std::string facts_join;
-            if (q.with_decision_facts) {
+            // Facts are per agent: with no agent predicate they would span the whole command.
+            const bool want_facts = q.with_decision_facts && !q.agent_id.empty();
+            if (want_facts) {
+                // MATERIALIZED: the CTE is referenced once, so Postgres would inline it, and the
+                // planner (which underestimates the pair's rows) then re-runs the aggregate once
+                // per kept row (measured 4 ms against 0.8 ms at 256 rows).
                 facts_cte =
-                    ", facts AS (SELECT COALESCE(bool_or(status >= 2), false) AS any_failed, "
+                    ", facts AS MATERIALIZED (SELECT COALESCE(bool_or(status >= 2), false) AS any_failed, "
                     "COALESCE(bool_or(status >= 1), false) AS any_terminal, "
                     "COALESCE((SELECT left(error_detail, " + chars +
                     ") FROM response_store.responses" + where +
@@ -1167,7 +1172,7 @@ ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTi
             out.rows.reserve(static_cast<std::size_t>(n));
             for (int i = 0; i < n; ++i)
                 out.rows.push_back(parse_response_row(res.get(), i));
-            if (q.with_decision_facts)
+            if (want_facts)
                 out.facts = BoundedFacts{}; // no kept row means no permitted row: all facts empty
             if (n > 0) {
                 // A zero-row result still carries its column descriptors, so the memory
@@ -1175,7 +1180,7 @@ ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTi
                 out.result_bytes = PQresultMemorySize(res.get());
                 out.row_cap_hit = to_i64(PQgetvalue(res.get(), 0, 12)) > limit;
                 out.byte_cap_hit = to_i64(PQgetvalue(res.get(), 0, 13)) > 0;
-                if (q.with_decision_facts) {
+                if (want_facts) {
                     out.facts->any_failed = PQgetvalue(res.get(), 0, 14)[0] == 't';
                     out.facts->any_terminal = PQgetvalue(res.get(), 0, 15)[0] == 't';
                     out.facts->failed_detail = PQgetvalue(res.get(), 0, 16);

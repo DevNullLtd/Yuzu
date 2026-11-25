@@ -77,6 +77,14 @@ LiveRowsVerdict reduce_rows(std::span<const StoredResponse> rows, std::string_vi
         append_chunk(joined, r->output);
 
     if (!terminal) {
+        // The head chunk is a device `error|` answer that the store's cut dropped: the answer is
+        // already over the bounded read (the poll decides an over-cap partial at once, as an
+        // answer), so it is decided as the device error it is, not as truncated output.
+        if (facts != nullptr && rows_cut && facts->head_output.starts_with("error|")) {
+            v.outcome = LiveOutcome::kDeviceError;
+            v.detail = detail_of(std::string_view(facts->head_output).substr(6));
+            return v;
+        }
         // Nothing decided: output may be on its way (a RUNNING chunk landed before the terminal
         // frame). The joined text is handed back only so the loop can stop early over the cap.
         v.partial = !joined.empty();
