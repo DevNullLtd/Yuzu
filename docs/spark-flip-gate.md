@@ -1848,8 +1848,8 @@ flip, with a red-first test each:
       are item 31 (R1: with the opt-in check enabled, a parent renamed away and its path re-created is now detected at
       the next verification sample, by comparing the held handle's name with the one recorded at commit and the fresh
       open's name with the held one; a rename away and back inside one interval stays an ACCEPTED residual, Dave, no
-      independent adjudicator, and the HKCR merged view and a link re-point are covered by the second compare only by
-      construction, unverified on a rig) and two more accepted residuals found by the #7836 governance
+      independent adjudicator; the name reported through HKCR was measured on the 2026-11-25 rig, but a per-user key
+      appearing over a held machine key and a link re-point were not observed and stay unverified) and two more accepted residuals found by the #7836 governance
       review: item 32 (an undecided verification keeps the old handle and so misses a rename it saw until the next
       verification that decides) and item 33 (an Ancestor-mode watch is never verified, so a later rename of its
       shelter ancestor, including one re-committed in Ancestor mode after a verdict, is missed); item 34 (a Fired
@@ -2014,8 +2014,8 @@ flip, with a red-first test each:
     (`NtQueryKey(KeyNameInformation)` on a duplicate taken under the pass lock) is compared with the name recorded at
     commit, and the fresh open's name with the held one. The first compare runs only for a watch whose commit recorded
     a name, and a deny-ACE re-creation that makes the fresh open fail is caught by it and stays a visible fault. What R1
-    does not close is stated in the clauses below (the rename away and back inside one interval; the HKCR and link
-    sub-cases, unverified). An undecided verification keeps the old handle, so a
+    does not close is stated in the clauses below (the rename away and back inside one interval; the shadowing and
+    link re-point sub-cases, not observed on a rig). An undecided verification keeps the old handle, so a
     rename the probe saw but could not conclude on (its ancestor walk failed) is missed until the next verification that
     decides; an Ancestor-mode watch is never verified, so after a verdict re-commits the watch in Ancestor mode a later
     rename of its shelter ancestor is missed (and an Ancestor-mode watch whose shelter ancestor is renamed is not
@@ -2026,11 +2026,14 @@ flip, with a red-first test each:
     File), except where the held handle's name shows the key moved (item 31 above); HKCR is a merged view, so a
     user-hive key that appears later changes what the path resolves to, and a registry link re-pointed to another target
     does the same (the verification open follows links; both are sub-cases of the item 31 class): the second compare
-    covers both by construction, but that rests on `NtQueryKey(KeyNameInformation)` on a handle opened through HKCR
-    reporting the underlying hive's canonical name, which is UNVERIFIED (no rig case exists), and for a link the name
-    reported through it was not measured (a volatile link key was created and resolved on the rig on 2026-11-25), so
-    neither sub-case is claimed as detected; an `HKCR` watch can also fault and recover at the retry when a per-user
-    class key appears over the machine one (unverified on a rig); every
+    is built to catch both. `NtQueryKey(KeyNameInformation)` on a handle opened through HKCR was MEASURED on the
+    2026-11-25 rig to report the underlying key's canonical name (`\REGISTRY\USER\<SID>_Classes\...` for `.txt`,
+    `Directory`, `CLSID`, `*`, `AppID`, `Interface`, `TypeLib`, `Installer` and `MIME`; `\REGISTRY\MACHINE\SOFTWARE\Classes\Licenses`
+    for `Licenses`), not an HKCR spelling. NOT observed on a rig, and so unverified: a per-user key appearing over a
+    held machine key while a watch is held, and a registry link re-pointed to another target (a volatile link key was
+    created and resolved on the rig on 2026-11-25, but no watch held it across a re-point), so neither sub-case is
+    claimed as detected; an `HKCR` watch can also fault and recover at the retry when a per-user class key appears
+    over the machine one (not observed on a rig); every
     watch commits at about the same time at startup, so N watches launch their verifications together against the
     16-slot probe lane (no fairness queue like File's; a refused launch is retried on the admission backoff and does not
     demote coverage); a verification that hangs pins one probe-lane slot and that watch stays unverified, and because the
@@ -2453,7 +2456,8 @@ flip, with a red-first test each:
     path`, `registry watch path re-pointed to another key` and `registry watch hive unloaded`). The bytes, md5s, counts
     and runs recorded in this record are the #7836 bytes and stand; they were not re-run for R1. R1 does not close the
     family: a rename away and back inside one interval, the HKCR merged view and a link re-point remain (see the open
-    residuals above), and the check stays off by default until R3. Measurements taken for R1 on 2026-11-25 on the
+    residuals above; the HKCR name reporting was later measured, see the R1 rig run paragraph below), and the
+    check stays off by default until R3. Measurements taken for R1 on 2026-11-25 on the
     weecolin rig (build 26100, elevated, peer-run and spot-checked, author-reported like the rest of this record, not
     a CI run, scripts not in the tree): three runs of 33 checks each, 33 passed, 0 failed, re-measured the three
     `DuplicateHandle` facts above (works on a `KEY_NOTIFY`-only `HKEY`; the duplicate's name tracks a rename of the
@@ -2468,9 +2472,30 @@ flip, with a red-first test each:
     instead of 1; the Registry-only single-event figure is from an earlier peer run), and the new `NtQueryKey` calls add none. That is 1,440 events a day per key at a 60 s interval
     (17,280 at 5 s) with Registry auditing alone, and 8,640 (103,680 at 5 s) with Handle Manipulation also on; a
     narrower SACL yields fewer. There is no independent positive control for the Handle Manipulation subcategory, so
-    its zeros mean zero observed. Not measured: establishment and re-arm latency through the real probe job, the name
-    `NtQueryKey` reports through HKCR or a registry link, a profile unload against the mechanism, and the real
+    its zeros mean zero observed. Not measured in these runs: establishment and re-arm latency through the real probe job, the name
+    `NtQueryKey` reports through HKCR (measured later the same day, see the next paragraph) or a registry link, a profile unload against the mechanism, and the real
     (narrower) SACLs of a fleet.
+    **2026-11-25 (later), R1 (#7877 item 31): first Windows rig run of the item 31 code and tests; author-reported, weecolin
+    rig, build 26100, not a CI run, raw logs not in the tree.** The item 31 code compiles on MSVC. All 15 `[7877]` cases
+    pass (445 assertions) and passed 20 of 20 repeat runs; `[spark][mechanism][windows]` passed 159 of 159 twice; the
+    deny-ACE case ran (it did not skip) and passed. Red proof: with only the primary compare neutralised, 5 of the 15
+    cases go red (the deny-ACE case sees no fault at all); with the whole name verdict neutralised, 9 of 15 go red.
+    HKCR: `NtQueryKey` on a key opened through HKCR reports the underlying canonical name (`\REGISTRY\USER\<SID>_Classes\...`
+    for `.txt`, `Directory`, `CLSID`, `*`, `AppID`, `Interface`, `TypeLib`, `Installer` and `MIME`;
+    `\REGISTRY\MACHINE\SOFTWARE\Classes\Licenses` for `Licenses`), so the HKCR name reporting is now measured. NOT
+    observed, and still unverified: a per-user key appearing over a held machine key, and a registry link re-pointed.
+    **Root-key watch (a finding, PRE-EXISTING, not caused or changed by R1):** `RegOpenKeyExW` on `HKCU`, `HKLM`, `HKCR` or
+    `HKU` with an empty or NULL subkey returns the predefined pseudo-handle itself, and `NtQueryKey` on it answers
+    `0xC0000008` (`STATUS_INVALID_HANDLE`). A root-key (empty subkey) watch driven through the raw mechanism with
+    verification on never reaches the verdict: the first verification's own notify registration signals the live
+    notify (a second `RegNotifyChangeKeyValue` on the shared predefined handle signals the first event, and
+    `RegCloseKey` signals the new one), so the watch re-arms about every 31 ms with a synthetic fire each time, and
+    `verify_launched` stays at 1. It is not reachable through the engine (`spark_engine.cpp` refuses an empty key), and
+    R1 only guarantees that no duplicate handle is staged for it. Options, not decided: (a) leave it, as the engine
+    refuses the key; (b) have the mechanism refuse an empty subkey at `watch()`, so the engine and the mechanism agree;
+    (c) support a root-key watch properly (for example by not verifying it, or by opening a real handle for it).
+    Environment note: the shared `vcpkg_installed` on the rig was stale (sqlite3 3.52.0 against the pinned 3.54.1), so the
+    run used a private manifest install. Not yet run: the ASan leg and a 50-repeat run.
     **Governance review and the fixes after it (#7836).** A scoped `/governance` run (range `da67bf0371..5731eb0632`, ten
     governance agents; happy-path, compliance-officer and enterprise-readiness were omitted by the caller, and the chaos
     plan was written, not executed) was NOT a pass: it raised 43 findings (REG-01 to REG-43), four of them blocking-provisional
@@ -4155,7 +4180,8 @@ stay deaf after a rename; review ids REG-04, REG-01, REG-02)
   its path` (the held handle's name differs from the one recorded at commit), `registry watch path re-pointed to
   another key` (the fresh open names another key than the held one) or `registry watch hive unloaded`; the new name
   counters are test-only too (#7658). The residual for item 31 is a parent renamed away and back inside one interval
-  (not noticed), plus the HKCR and link sub-cases, which are unverified on a rig.
+  (not noticed), plus the sub-cases of a per-user key appearing over a held machine key and a link re-point, which
+  were not observed on a rig (the name reported through HKCR was measured, 2026-11-25).
 - Operator action: none exists beyond restarting the agent or `--spark-disable`. Not confirmed as a documented
   runbook step.
 - Compensating control: Spark File and Registry are not live (`prefer_spark_` is false in production), so only
