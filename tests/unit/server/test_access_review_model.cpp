@@ -70,6 +70,8 @@ using yuzu::server::AccessReviewRow;
 using yuzu::server::AuthDB;
 using yuzu::server::build_access_review;
 using yuzu::server::EnginePrincipalStore;
+using yuzu::server::freeze_population;
+using yuzu::server::kSnapshotOwnerKey;
 using yuzu::server::Permission;
 using yuzu::server::PrincipalRole;
 using yuzu::server::RbacGroup;
@@ -766,4 +768,90 @@ TEST_CASE("valid_campaign_id: length and alphabet boundaries",
     CHECK_FALSE(valid_campaign_id(std::string("\0", 1)));
     CHECK_FALSE(valid_campaign_id(std::string("abc\0def", 7)));
     CHECK_FALSE(valid_campaign_id(std::string("abc\0", 4)));
+}
+
+// ---------------------------------------------------------------------------
+// freeze_population: the ONE expansion of export rows into frozen grants (REST and MCP campaign
+// open). No Postgres. The expected snapshot strings below are the output of the hand-built
+// builder this function replaced (the REST handler's JObj chain), run over the same inputs:
+// same key order, same escaping, same number formatting.
+// ---------------------------------------------------------------------------
+
+namespace {
+AccessReviewRow freeze_row(std::string type, std::string id, std::string display, std::string owner,
+                           std::vector<std::string> roles, int perms, std::int64_t last_ms,
+                           std::string kind, std::string cls, std::string lifecycle,
+                           std::string source) {
+    AccessReviewRow r;
+    r.principal_type = std::move(type);
+    r.principal_id = std::move(id);
+    r.display_name = std::move(display);
+    r.owner_or_email = std::move(owner);
+    r.roles = std::move(roles);
+    r.effective_permission_count = perms;
+    r.last_activity_ms = last_ms;
+    r.last_activity_kind = std::move(kind);
+    r.classification = std::move(cls);
+    r.lifecycle_state = std::move(lifecycle);
+    r.source = std::move(source);
+    return r;
+}
+} // namespace
+
+TEST_CASE("freeze_population: one GrantRef per (row, role), snapshot byte for byte",
+          "[access_review][model][freeze]") {
+    const std::vector<AccessReviewRow> rows = {
+        freeze_row("user", "alice", "Alice", "alice@example.com", {"Operator", "Viewer"}, 7, 0,
+                   "n/a", "", "active", "local"),
+        freeze_row("engine", "engine:svc", "svc", "ops-owner", {"Writer"}, 12, 1700000000000LL,
+                   "last_used", "external", "active", "engine"),
+        // Escaping: quote, backslash, newline, a C0 control and a multi-byte UTF-8 character.
+        freeze_row("group", "eng", "Eng \"Team\"\\ \n\x01 \xc3\xa9", "", {"Reader"}, 0, 0, "n/a",
+                   "", "", "idp"),
+        // A row with no roles yields no grant (as the hand-built loop did).
+        freeze_row("user", "ghost", "ghost", "", {}, 0, 0, "n/a", "", "unknown", "orphan"),
+    };
+
+    const auto frozen = freeze_population(rows);
+    REQUIRE(frozen.size() == 4);
+
+    const std::string alice_snap =
+        R"({"display_name":"Alice","owner_or_email":"alice@example.com",)"
+        R"("effective_permission_count":7,"last_activity_ms":0,"last_activity_kind":"n/a",)"
+        R"("classification":"","lifecycle_state":"active","source":"local"})";
+    const std::string engine_snap =
+        R"({"display_name":"svc","owner_or_email":"ops-owner","effective_permission_count":12,)"
+        R"("last_activity_ms":1700000000000,"last_activity_kind":"last_used",)"
+        R"("classification":"external","lifecycle_state":"active","source":"engine"})";
+    const std::string group_snap =
+        "{\"display_name\":\"Eng \\\"Team\\\"\\\\ \\n\\u0001 \xc3\xa9\","
+        R"("owner_or_email":"","effective_permission_count":0,"last_activity_ms":0,)"
+        R"("last_activity_kind":"n/a","classification":"","lifecycle_state":"",)"
+        R"("source":"idp"})";
+
+    CHECK(frozen[0].principal_type == "user");
+    CHECK(frozen[0].principal_id == "alice");
+    CHECK(frozen[0].role_name == "Operator");
+    CHECK(frozen[0].grant_snapshot == alice_snap);
+    // One snapshot per row, shared by each of its roles.
+    CHECK(frozen[1].principal_id == "alice");
+    CHECK(frozen[1].role_name == "Viewer");
+    CHECK(frozen[1].grant_snapshot == alice_snap);
+
+    CHECK(frozen[2].principal_type == "engine");
+    CHECK(frozen[2].principal_id == "engine:svc");
+    CHECK(frozen[2].role_name == "Writer");
+    CHECK(frozen[2].grant_snapshot == engine_snap);
+    // The engine owner is under the key the store reads back at attest time.
+    CHECK(frozen[2].grant_snapshot.find(std::string("\"") + kSnapshotOwnerKey +
+                                        "\":\"ops-owner\"") != std::string::npos);
+
+    CHECK(frozen[3].principal_type == "group");
+    CHECK(frozen[3].principal_id == "eng");
+    CHECK(frozen[3].role_name == "Reader");
+    CHECK(frozen[3].grant_snapshot == group_snap);
+}
+
+TEST_CASE("freeze_population: empty input yields no grants", "[access_review][model][freeze]") {
+    CHECK(freeze_population({}).empty());
 }

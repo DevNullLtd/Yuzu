@@ -268,11 +268,55 @@ class StoreAuthorship(unittest.TestCase):
             self.assertIn(col, self.store)
 
     def test_snapshot_owner_key_is_shared(self):
+        # The store reads the key back; the ONE snapshot builder (freeze_population) writes it.
         self.assertIn("kSnapshotOwnerKey", self.store)
-        for name in ("rest_api_v1.cpp", "mcp_server.cpp"):
-            text = normalise((SRC_DIR / name).read_text(encoding="utf-8"))
-            self.assertIn(".add(kSnapshotOwnerKey, r.owner_or_email)", text,
-                          f"{name}: the open-campaign snapshot no longer uses the shared owner key")
+        model = normalise((SRC_DIR / "access_review_model.cpp").read_text(encoding="utf-8"))
+        at = model.find("freeze_population(const std::vector<AccessReviewRow>& rows)")
+        self.assertGreaterEqual(at, 0, "access_review_model.cpp no longer defines freeze_population")
+        self.assertIn("freeze_snapshot(r)", model[at:at + 600],
+                      "freeze_population no longer builds each snapshot through freeze_snapshot")
+        at = model.find("std::string freeze_snapshot(const AccessReviewRow& r)")
+        self.assertGreaterEqual(at, 0, "access_review_model.cpp no longer defines freeze_snapshot")
+        self.assertIn("append_json_string_member(out, kSnapshotOwnerKey, r.owner_or_email)",
+                      model[at:at + 1200],
+                      "freeze_snapshot no longer writes the snapshot owner under the shared key")
+
+
+FREEZE_HANDLERS = ("rest_api_v1.cpp", "mcp_server.cpp")
+
+
+def freeze_problems(name, src):
+    """The campaign-open handlers must expand the population through the ONE `freeze_population(`
+    and hold no hand-built `GrantRef{` (a second copy is how the two transports drift apart; the
+    engine owner key the store reads back at attest time is written only by the shared builder).
+    Comments are stripped first: a comment naming either token is not code."""
+    t = normalise(strip_block_comments(src))
+    out = []
+    if "freeze_population(" not in t:
+        out.append(f"{name}: the open-campaign handler no longer calls freeze_population(")
+    if re.search(r"\bGrantRef\s*\{", t):
+        out.append(f"{name}: a hand-built GrantRef{{ is back in a handler (use freeze_population)")
+    return out
+
+
+class FreezePopulation(unittest.TestCase):
+    def test_both_handlers_use_the_one_builder(self):
+        for name in FREEZE_HANDLERS:
+            p = freeze_problems(name, (SRC_DIR / name).read_text(encoding="utf-8"))
+            for m in p:
+                print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+            self.assertEqual(p, [])
+
+    def test_pattern_is_live(self):
+        for name in FREEZE_HANDLERS:
+            text = (SRC_DIR / name).read_text(encoding="utf-8")
+            # Dropping the call is caught.
+            self.assertTrue(freeze_problems(name, text.replace("freeze_population(", "freeze_popul(")))
+            # A hand-built GrantRef is caught, with or without a space before the brace.
+            self.assertTrue(freeze_problems(name, text + "\nauto g = GrantRef{a, b, c, d};\n"))
+            self.assertTrue(freeze_problems(name, text + "\nauto g = GrantRef {a, b, c, d};\n"))
+            # A mention in a comment is not code.
+            self.assertEqual(freeze_problems(name, text + "\n// GrantRef{a}\n/* GrantRef{b} */\n"), [])
 
 
 class DashboardDecisionFeedback(unittest.TestCase):

@@ -9,9 +9,11 @@
 #include <yuzu/server/auth_db.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <locale>
 #include <map>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -311,6 +313,91 @@ std::string to_csv(const std::vector<AccessReviewRow>& rows, const std::string& 
 
 std::string access_review_rbac_enforcement(const RbacStore* rbac) {
     return std::string(to_string(rbac_enforcement_label(rbac)));
+}
+
+namespace {
+
+/// Append `sv` as a JSON string body (no surrounding quotes): the double quote, the backslash and
+/// the C0 controls escaped, every other byte copied. Same escaping as the REST and MCP
+/// `json_escape` this replaces, so a frozen snapshot is byte-identical to the one the handlers
+/// used to build.
+void append_json_escaped(std::string& out, std::string_view sv) {
+    for (char c : sv) {
+        switch (c) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                char hex[8];
+                std::snprintf(hex, sizeof(hex), "\\u%04x",
+                              static_cast<unsigned int>(static_cast<unsigned char>(c)));
+                out += hex;
+            } else {
+                out += c;
+            }
+        }
+    }
+}
+
+void append_json_string_member(std::string& out, std::string_view key, std::string_view value) {
+    out += '"';
+    append_json_escaped(out, key);
+    out += "\":\"";
+    append_json_escaped(out, value);
+    out += '"';
+}
+
+/// The freeze-time snapshot of a row's non-role fields. Key order is part of the stored evidence.
+std::string freeze_snapshot(const AccessReviewRow& r) {
+    std::string out = "{";
+    append_json_string_member(out, "display_name", r.display_name);
+    out += ',';
+    append_json_string_member(out, kSnapshotOwnerKey, r.owner_or_email);
+    out += ",\"effective_permission_count\":" + std::to_string(r.effective_permission_count);
+    out += ",\"last_activity_ms\":" + std::to_string(r.last_activity_ms);
+    out += ',';
+    append_json_string_member(out, "last_activity_kind", r.last_activity_kind);
+    out += ',';
+    append_json_string_member(out, "classification", r.classification);
+    out += ',';
+    append_json_string_member(out, "lifecycle_state", r.lifecycle_state);
+    out += ',';
+    append_json_string_member(out, "source", r.source);
+    out += '}';
+    return out;
+}
+
+} // namespace
+
+std::vector<GrantRef> freeze_population(const std::vector<AccessReviewRow>& rows) {
+    std::vector<GrantRef> frozen;
+    for (const auto& r : rows) {
+        if (r.roles.empty())
+            continue;
+        const std::string snapshot = freeze_snapshot(r);
+        for (const auto& role : r.roles)
+            frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot});
+    }
+    return frozen;
 }
 
 } // namespace yuzu::server

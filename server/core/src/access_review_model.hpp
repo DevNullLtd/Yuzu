@@ -90,6 +90,8 @@
 /// DOES propagate — the pointer being present makes it part of the read set
 /// this call promised to read completely.
 
+#include "access_review_store.hpp" // GrantRef, the element type freeze_population builds
+
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -147,6 +149,15 @@ struct AccessReviewRow {
 [[nodiscard]] std::expected<std::vector<AccessReviewRow>, std::string>
 build_access_review(AuthDB* users, RbacStore* rbac, EnginePrincipalStore* engines,
                     ApiTokenStore* tokens, DirectorySync* dirsync);
+
+/// Expand export rows into the grants a campaign freezes at open: one `GrantRef` per (row, role)
+/// pair, in row order then role order, each carrying the row's non-role fields as an opaque JSON
+/// snapshot (freeze-time evidence; a later grant revoke does not change it). A row with no roles
+/// yields nothing. Pure. The ONE builder for both open-campaign handlers (REST and MCP): the
+/// snapshot key set and order are what the store's frozen-owner backstop and the stored evidence
+/// depend on (the engine owner is written under `kSnapshotOwnerKey`), so never hand-build a
+/// `GrantRef` in a handler.
+[[nodiscard]] std::vector<GrantRef> freeze_population(const std::vector<AccessReviewRow>& rows);
 
 /// Serialize rows to CSV (leading metadata line + header + one row per
 /// principal). `roles` is semicolon-joined within a field. RFC 4180-style
@@ -258,9 +269,9 @@ inline constexpr std::string_view kStoreForbiddenEngineOwner =
     "forbidden: reviewer owned the engine principal named by this grant when the campaign opened";
 
 /// The key under which a frozen grant snapshot carries the engine principal's owner
-/// (`owner_username` for an engine row). The two open-campaign builders (REST, MCP) WRITE it and
-/// the store's frozen-owner backstop READS it: one name, so a rename cannot silently disable the
-/// backstop.
+/// (`owner_username` for an engine row). `freeze_population` (the one open-campaign builder) WRITES
+/// it and the store's frozen-owner backstop READS it: one name, so a rename cannot silently
+/// disable the backstop.
 inline constexpr const char* kSnapshotOwnerKey = "owner_or_email";
 
 /// The `bad_request: ` prefix the store puts on a refusal it classifies as the caller's.

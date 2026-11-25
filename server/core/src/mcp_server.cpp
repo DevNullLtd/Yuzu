@@ -33675,26 +33675,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the REST twin's comment, not byte-identical.
                 const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
 
-                // Expand each row to one GrantRef per (principal, role) — the shape
-                // access_review_store.hpp's open_campaign requires — carrying an
-                // opaque JSON snapshot of the row's non-role fields as observed right
-                // now (freeze-time evidence; matches the REST twin exactly).
-                std::vector<GrantRef> frozen;
-                for (const auto& r : *rows_res) {
-                    std::string snapshot =
-                        JObj()
-                            .add("display_name", r.display_name)
-                            .add(kSnapshotOwnerKey, r.owner_or_email)
-                            .add("effective_permission_count", r.effective_permission_count)
-                            .add("last_activity_ms", r.last_activity_ms)
-                            .add("last_activity_kind", r.last_activity_kind)
-                            .add("classification", r.classification)
-                            .add("lifecycle_state", r.lifecycle_state)
-                            .add("source", r.source)
-                            .str();
-                    for (const auto& role : r.roles)
-                        frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot});
-                }
+                // One GrantRef per (principal, role) pair, each carrying the freeze-time
+                // snapshot of the row's non-role fields: the single builder shared with the
+                // REST twin.
+                const std::vector<GrantRef> frozen = freeze_population(*rows_res);
                 auto open_res = access_review_store->open_campaign(title, session->username, frozen,
                                                                     rbac_enforcement);
                 if (!open_res) {
