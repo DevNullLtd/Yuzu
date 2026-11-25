@@ -5,6 +5,8 @@ status-note: >-
   the listed items on merge, and it is merged; the five items it excludes stay unsettled.
   Implementation has not started: no user-session helper code exists under `agents/`.
   Kept accepted while unimplemented by @Tr3kkR (Nathan Dornbrook), 2026-11-14.
+  Item (a) is written for helpers that the system service manager starts and that take no input
+  by ADR-3007 (2026-11-22); per-user resident activation stays open.
 date: 2026-07-30
 owner: "@Doomgoose (Alex Young)"
 deciders: >-

@@ -384,14 +384,14 @@ spec:
       prefix:
         type: string
         displayName: Filename Prefix
-        description: Prefix for the temp file name.
+        description: Prefix for the temp file name. Must be a single file name component (no slash or backslash, and no colon on Windows).
         default: "yuzu-"
         validation:
           maxLength: 64
       suffix:
         type: string
         displayName: Filename Suffix
-        description: Suffix/extension for the temp file name.
+        description: Suffix/extension for the temp file name. Must be a single file name component (no slash or backslash, and no colon on Windows).
         default: ".tmp"
         validation:
           maxLength: 32
@@ -474,7 +474,7 @@ spec:
       prefix:
         type: string
         displayName: Directory Prefix
-        description: Prefix for the temp directory name.
+        description: Prefix for the temp directory name. Must be a single file name component (no slash or backslash, and no colon on Windows).
         default: "yuzu-"
         validation:
           maxLength: 64

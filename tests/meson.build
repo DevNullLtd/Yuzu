@@ -370,7 +370,8 @@ agent_test_exe = executable(
     'unit/test_disk_actions_partitions.cpp', # H.5b: pure layer of the Windows partitions leg (runs on every host)
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_firewall_quarantine_parsers.cpp', # PRQ.1: pure quarantine core (allow set, exception grammar, verify/rollback, generations, phases, TTL, state, argv plans), fake seam, unguarded on every OS
-    'unit/test_firewall_quarantine_live.cpp', # PRQ.1: the built firewall plugin's action boundary ([agent][firewall_quarantine], refuses before any OS call, every OS) plus hidden [.] real-host runs; those need YUZU_FIREWALL_QUARANTINE_LIVE=1 and root/admin
+    'unit/test_firewall_quarantine_live.cpp', # PRQ.1: the built firewall plugin's action boundary ([agent][firewall_quarantine], refuses before any OS call, every OS) plus hidden [.] real-host runs; those need YUZU_FIREWALL_QUARANTINE_LIVE=1 and root/admin, or the agent account on a host where install-agent-user.sh --check is clean
+    'unit/test_firewall_restore_compare.cpp', # #8318: the pure restore comparison the live harness decides with (firewall_restore_compare.hpp), fed sanitised lab excerpts, every OS
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
     'unit/test_enrollment_token_file.cpp', # --enrollment-token-file: shared token shape + text parser (common/include/yuzu/enrollment_token_shape.hpp), the no-follow reader and source precedence (agents/core/include/yuzu/agent/enrollment_token_file.hpp)
@@ -433,6 +434,7 @@ agent_test_exe = executable(
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_filesystem_acl_parsers.cpp',   # filesystem get_acl: pure posix_acl xattr / acl_to_text / Windows ACE-row decoders over real-capture fixtures (+ real-syscall macOS cases under __APPLE__)
     'unit/test_filesystem_get_acl_dispatcher.cpp',  # filesystem get_acl: real plugin via LocalDispatcher (row order, failure rows, Linux default-ACL-only aggregation)
+    'unit/test_filesystem_reserved_paths.cpp',  # WP06 F55: filesystem plugin refuses the agent's own data dir/log/key paths
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_event_logs_parsers.cpp',       # Wave 4 PR4.2: pure Windows event-XML / journal row parse+format helpers
     'unit/test_event_logs_journalctl.cpp',    # Wave 4 PR4.2: pure Linux journalctl-fallback outcome classifier (runs on every host)
@@ -550,6 +552,7 @@ agent_test_exe = executable(
     'unit/test_installed_apps_win_actions.cpp', # #4716: real installed_apps.dll `list` via LocalDispatcher (Windows-only; no-op TU elsewhere via #ifdef _WIN32)
     'unit/test_installed_apps_registry_walk.cpp', # #4711: Uninstall-hive walk against a process-suffixed scratch key: ok/absent/failed/mixed (Windows-only; no-op TU elsewhere)
     'unit/test_bundle_id_read.cpp',            # #4710: agent-core bounded bundle-id pass driver (portable; the CF reader is injected)
+    'unit/test_proc_snapshot_read.cpp',        # SRE-1: agent-core bounded libproc snapshot driver (portable; the reader is injected)
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (macOS and Windows, self-gated)
     'unit/test_msi_packages_inventory.cpp',   # pure list_inventory builder over the committed Kingsley REAL CAPTURE (fixture via YUZU_TEST_FIXTURE_DIR; runs on every OS)
@@ -659,8 +662,8 @@ agent_test_exe = executable(
     'unit/test_remote_access_audit_legs.cpp',            # remote_access_audit: OS-free list_posix decision seam over injected fakes; portable
     'unit/test_remote_access_audit_posix_fs.cpp',        # remote_access_audit: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd/mountinfo); body #if !defined(_WIN32)
     'unit/test_remote_access_audit_local_dispatcher.cpp',  # remote_access_audit: real plugin via LocalDispatcher + execute seam, unguarded on every OS
-    'unit/test_process_introspect_parsers.cpp',          # process_introspect: pure /proc parsers, hidepid mount-table check and row formatters over REAL CAPTURE + labelled fixtures; portable
-    'unit/test_process_introspect_legs.cpp',             # process_introspect: errno classifiers + OS-free inspect_linux decision seam over an in-memory fake /proc; portable
+    'unit/test_process_introspect_parsers.cpp',          # process_introspect: pure /proc parsers, hidepid mount-table check, macOS pure core (facet answer table, boot-session prefix, start number, nice, sched row) and row formatters over REAL CAPTURE + labelled fixtures; portable
+    'unit/test_process_introspect_legs.cpp',             # process_introspect: errno classifiers + OS-free inspect_linux and inspect_macos decision seams over an in-memory fake /proc and a fake libproc; portable
     'unit/test_process_introspect_local_dispatcher.cpp', # process_introspect: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
@@ -2190,6 +2193,7 @@ if build_server
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_agent_registry_presence.cpp',
       'unit/server/test_agent_registry_log_neutralisation.cpp',   # #5513: register_agent log lines neutralised
+      'unit/server/test_agent_registry_plugin_meta.cpp',   # WP06 F31: agent-reported plugin metadata bounded at ingest, never served as docs
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_inventory_reads_v3.cpp', # SAM-33 reads: hosts, change feed, facet health, summary ([pg][software_inventory][reads_v3], shard E)
@@ -4256,6 +4260,16 @@ test('process_introspect definition columns',
   timeout: 30,
 )
 
+# process_introspect never requests a task port (a write-capable handle on the target): no
+# task_for_pid or Mach VM call, no <mach/...> include, no ptrace, a libproc flavour allow-list
+# and a single sysctlbyname name. The macOS leg reads through libproc only.
+test('process_introspect no-task-port lexical gate',
+  _python3_test,
+  args: [files('test_process_introspect_no_task_port_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # file_search's definition contract (content/definitions/file_search.yaml): the row_kind-first
 # field_1..field_6 columns pinned to the wire rows the plugin and the shared coverage header emit
 # (nine row kinds, plus the planned-leg status row), the root/pattern/kinds/cursor parameter grammar
@@ -4298,6 +4312,15 @@ test('plugin readme gate',
   # the old 60s timeout under exactly that kind of concurrent docs-suite
   # load on this session's own Mac (governance Gate 3, build-ci finding).
   timeout: 120,
+)
+
+# #4398: every captured firewall state and rules block carries one ruleset row, and a privileged
+# (Linux, Windows) capture carries a count and no error row. Parser-only, well under a second.
+test('firewall sample shape gate',
+  _python3_test,
+  args: [files('test_firewall_sample_shape.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
@@ -4781,6 +4804,25 @@ test('firewall Windows release-guard wiring lexical gate',
   timeout: 30,
 )
 
+# Firewall state and rules reads: static lexical gate over the OS-specific wiring that only that OS
+# compiles. macOS: every pf read is run_bounded_subprocess(sudo_wrap(fq::pfctl_*_argv())) with stderr
+# unmerged and no /sbin/pfctl literal (a bare pfctl exits 1 for the least-privilege account).
+# Windows: every per-rule property read lands in an HRESULT that reaches the pure row builder (no
+# FAILED() decides a field) and neither skip site drops a rule without its row. Linux: the ladder
+# firewalld -> nftables -> root snapshot broker -> ufw -> iptables (a partly read firewalld is held
+# behind the broker, which replaces it only with an active ruleset), the broker reader's bounds and the
+# installer-helper transport. Broker units: the shipped socket, template service and snapshot script,
+# what the deb and rpm install, the agent unit's untouched sandbox, and `systemd-analyze verify` of the
+# three units where that tool exists (only the lines it prints about the unit under test count). Carries
+# its own in-memory mutation self-test. No build required; measured at about 4 s on a developer Mac
+# without systemd-analyze and 3.9 s on Ubuntu 26.04 with it.
+test('firewall read-path wiring lexical gate',
+  _python3_test,
+  args: [files('test_firewall_read_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
 # stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
 # page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes
@@ -5043,6 +5085,22 @@ test('access audit production wiring lexical gate',
 test('same-site gate production wiring lexical gate',
   _python3_test,
   args: [files('test_same_site_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# The filesystem plugin's reserved-path decision keeps its NUL, /dev/fd, macOS /.vol/ and re-resolution
+# calls (not reachable through the plugin seam on Linux): source-text only, so Python.
+test('filesystem reserved path wiring lexical gate',
+  _python3_test,
+  args: [files('test_filesystem_reserved_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# The agent's reserved-path key list: every path-like `agent.*` key agent.cpp publishes to plugins
+# must be classified in agents/shared/agent_reserved_path_keys.hpp (source-text only, so Python).
+test('agent reserved path keys lexical gate',
+  _python3_test,
+  args: [files('test_agent_reserved_path_keys.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -5486,8 +5544,13 @@ test('issue lifecycle docs',
 # The old standalone containment agent plugin is removed and nothing names it again (device
 # containment is the firewall plugin's four actions): no tracked file outside the history
 # allowlist names its files, actions, rule or chain prefixes or definition ids. The same file runs
-# the Linux firewall helper under every POSIX shell on the host (a few hundred short processes), so
-# its budget is wider than the source-text gates around it.
+# the Linux firewall helper (its containment words and its `snapshot` word) under every POSIX shell on
+# the host, and the broker script's own cases (argument refusal, standard input, the cap, one whole
+# reply) once under each; the script's functions are the helper's byte for byte, so the shell matrix of
+# their branches runs once, on the helper. That is thousands of short processes, so its budget is wider
+# than the source-text gates around it. Measured under sh, dash and bash on 2026-11-23: about 38 to
+# 46 s on a developer Mac at load averages between 2.7 and 3.8, and 8.4 s on Ubuntu 26.04 (134
+# cases), where CI runs it. The budget is 120 s.
 test('removed containment plugin lexical gate',
   _python3_test,
   args: [files('test_legacy_quarantine_plugin_removed_lexical.py')],
