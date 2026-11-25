@@ -1124,6 +1124,9 @@ ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTi
             // Facts are per agent: with no agent predicate they would span the whole command.
             const bool want_facts = q.with_decision_facts && !q.agent_id.empty();
             if (want_facts) {
+                // `id + 0` in the two top-1 subselects: a bare `ORDER BY id` lets the planner walk
+                // `responses_pkey` and filter on the pair, which reads every older row of the table
+                // (measured 41 to 95 ms against 0.5 ms); the expression keeps the pair's index plan.
                 // MATERIALIZED: the CTE is referenced once, so Postgres would inline it, and the
                 // planner (which underestimates the pair's rows) then re-runs the aggregate once
                 // per kept row (measured 4 ms against 0.8 ms at 256 rows).
@@ -1132,10 +1135,10 @@ ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTi
                     "COALESCE(bool_or(status >= 1), false) AS any_terminal, "
                     "COALESCE((SELECT left(error_detail, " + chars +
                     ") FROM response_store.responses" + where +
-                    " AND status >= 2 ORDER BY id DESC LIMIT 1), '') AS failed_detail, "
+                    " AND status >= 2 ORDER BY id + 0 DESC LIMIT 1), '') AS failed_detail, "
                     "COALESCE((SELECT left(output, " + chars + ") FROM response_store.responses" +
                     where +
-                    " AND COALESCE(output, '') <> '' ORDER BY id ASC LIMIT 1), '') AS head_output "
+                    " AND COALESCE(output, '') <> '' ORDER BY id + 0 ASC LIMIT 1), '') AS head_output "
                     "FROM response_store.responses" + where + ")";
                 facts_cols = ", facts.any_failed, facts.any_terminal, facts.failed_detail, "
                              "facts.head_output";

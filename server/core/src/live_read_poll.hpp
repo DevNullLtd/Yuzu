@@ -42,7 +42,7 @@
 ///     head chunk that is `error|` is also decided without a terminal row, because an answer
 ///     already over the bounded read is decided at once); its detail is then the head chunk only,
 ///     where an uncut answer's detail runs on into the next chunks, so the detail is a bounded
-///     excerpt of the device text, never the whole of it;
+///     excerpt of the device text, never the whole of it. A cut answer whose head chunk is `error|` answers `device_error` even where the same device, read uncut, would end as `device_failed` on its terminal row: both are the same 502;
 ///   - otherwise nothing is decided yet.
 ///
 /// How a poll ends without an answer: nothing at all by the deadline is `timeout`; output but no
@@ -51,9 +51,9 @@
 ///
 /// Known limits (response-store ingest, not this unit). If the server fails to store one MIDDLE
 /// chunk of a multi-chunk answer, the remaining rows still look complete here, so the answer can
-/// be returned with a hole in it: the poll cannot see a dropped frame (UP-4). A chunk delivered
+/// be returned with a hole in it: the poll cannot see a dropped frame. A chunk delivered
 /// twice is stored twice and both copies are joined, so its text can appear twice in a successful
-/// answer: only a chunk sequence number on the wire could tell the copies apart (UP-16). The
+/// answer: only a chunk sequence number on the wire could tell the copies apart. The
 /// decision facts protect the verdict (failure, finished, `error|` head) from late rows, not the
 /// content of a successful answer.
 

@@ -345,12 +345,12 @@ TEST_CASE("reduce_rows: when the oldest rows were cut, the true head chunk decid
     SECTION("a multi-byte failure text from the facts is clamped to 200 bytes on a character boundary") {
         BoundedFacts f;
         f.any_failed = true;
-        for (int i = 0; i < 250; ++i)
-            f.failed_detail += "\xC3\xA9";
+        for (int i = 0; i < 100; ++i)
+            f.failed_detail += "\xE2\x82\xAC"; // U+20AC, 3 bytes: byte 200 falls inside a character
         const auto v = live::reduce_rows({}, "agent-1", &f, true);
         CHECK(v.outcome == live::LiveOutcome::kDeviceFailed);
-        CHECK(v.detail.size() == live::kLiveDetailMaxBytes);
-        CHECK(v.detail == f.failed_detail.substr(0, live::kLiveDetailMaxBytes)); // 100 whole characters
+        CHECK(v.detail.size() == 198); // 66 whole characters, never a split one
+        CHECK(v.detail == f.failed_detail.substr(0, 198));
     }
     SECTION("nothing was cut: the joined output decides, as before") {
         facts.head_output = "error|ignored"; // would flip the answer if it were read without a cut
@@ -1243,6 +1243,14 @@ TEST_CASE("ResponseStore::query_bounded [pg]: decision facts cover every permitt
         CHECK_FALSE(got->facts.has_value());
     }
     SECTION("the cut is in characters: 300 two-byte characters cut to 256, no character split") {
+        // left() counts characters only in a UTF8 database; a SQL_ASCII cluster would count bytes.
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            pg::PgResult enc{PQexec(lease.get(), "SHOW server_encoding")};
+            if (enc.status() != PGRES_TUPLES_OK || std::string(PQgetvalue(enc.get(), 0, 0)) != "UTF8")
+                SKIP("the test database is not UTF8");
+        }
         std::string text;
         for (int i = 0; i < 300; ++i)
             text += "\xC3\xA9";
@@ -1255,13 +1263,11 @@ TEST_CASE("ResponseStore::query_bounded [pg]: decision facts cover every permitt
         CHECK(got->facts->head_output.size() == 2u * kBoundedFactsTextChars);
         CHECK(got->facts->failed_detail == text.substr(0, 2u * kBoundedFactsTextChars));
     }
-    SECTION("a status, since and until filter narrow the facts as they narrow the rows") {
+        SECTION("a status filter narrows the facts as it narrows the rows") {
         seed(store, "cmd-facts-filter", "agent-1", 0, "head|chunk\n");
         seed(store, "cmd-facts-filter", "agent-1", 2, "", "os_info", "boom");
         q.with_decision_facts = true;
         q.status = 2;
-        q.since = 0;
-        q.until = 9999999999;
         const auto got = store.query_bounded("cmd-facts-filter", tier, q, std::nullopt, 1u << 20);
         REQUIRE(got.has_value());
         REQUIRE(got->facts.has_value());
@@ -1269,6 +1275,20 @@ TEST_CASE("ResponseStore::query_bounded [pg]: decision facts cover every permitt
         CHECK(got->facts->any_failed);
         CHECK(got->facts->failed_detail == "boom");
         CHECK(got->facts->head_output.empty()); // the status filter left the head row out of the facts too
+    }
+    SECTION("a since and until window narrows the facts as it narrows the rows") {
+        seed(store, "cmd-facts-window", "agent-1", 2, "old|head\n", "os_info", "old failure", 100);
+        seed(store, "cmd-facts-window", "agent-1", 2, "mid|head\n", "os_info", "mid failure", 200);
+        seed(store, "cmd-facts-window", "agent-1", 2, "new|head\n", "os_info", "new failure", 300);
+        q.with_decision_facts = true;
+        q.since = 150;
+        q.until = 250;
+        const auto got = store.query_bounded("cmd-facts-window", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        REQUIRE(got->facts.has_value());
+        CHECK(got->rows.size() == 1);
+        CHECK(got->facts->failed_detail == "mid failure");
+        CHECK(got->facts->head_output == "mid|head\n"); // neither the older nor the newer row reaches a fact
     }
     SECTION("a status outside 0..4: >= 1 is terminal, >= 2 a failure, a negative status neither") {
         seed(store, "cmd-facts-neg", "agent-1", -1, "x\n");
