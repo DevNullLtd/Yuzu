@@ -34,11 +34,13 @@
 #include "management_group_types.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -148,6 +150,37 @@ public:
                                                 const std::string& agent_id);
     std::expected<void, std::string> remove_member(const std::string& group_id,
                                                    const std::string& agent_id);
+    /// Decommission erasure (#6352, `AgentDecommissionStores::management_group_memberships`):
+    /// removes the agent from EVERY group in one statement, whatever the `source` (static or
+    /// dynamic) and including the root group, unlike `remove_member`, which is one group and
+    /// `source = 'static'` only. Returns true iff the DELETE committed (zero rows included, so an
+    /// unknown id and a re-issued decommission stay idempotent); false on an empty id, a store that
+    /// is not open, no lease within `kWriteTimeout`, or any SQL failure (a deadlock or lock timeout
+    /// included), so the cascade records `Failed`, never a false erasure. It touches ONLY
+    /// `management_group_members`: groups, group role assignments, tags and the enrolment row are
+    /// untouched, so decommission still does not un-enrol the agent and its next Register attempts to
+    /// add the ROOT group back (best effort: Register ignores the result of that write) and no other.
+    ///
+    /// POINT-IN-TIME, not a tombstone. `true` means a DELETE committed, not that no membership
+    /// exists afterwards: `add_member` and `refresh_dynamic_membership` are `INSERT ... ON CONFLICT
+    /// DO NOTHING` with no agent-existence check, so an operator add, or a dynamic or `Service:` group
+    /// created later (the tags decommission leaves in place feed `ensure_service_management_group`),
+    /// can insert the id again after this statement has committed, with no race needed.
+    ///
+    /// The statement is `DELETE ... WHERE agent_id = $1 RETURNING group_id` (no `source` filter). When
+    /// `removed_group_ids` is non-null it is cleared and, when the copy succeeds, filled, on success only, with the ids of the
+    /// groups the agent was removed from, so the caller can record WHICH scopes the device left (the
+    /// decommission audit evidence); on any failure it is left empty. A failure is logged at warn
+    /// level with the reason.
+    ///
+    /// Once the DELETE has committed nothing here may report failure: `removed_count`, when non-null,
+    /// receives the number of rows removed (set before any allocation; 0 on a `false` return), and
+    /// the copy into `removed_group_ids` is best effort. If it throws (out of memory) the id vector is
+    /// left EMPTY while `removed_count` is still the true count and the call still returns true, so a
+    /// caller detects incomplete evidence by `removed_group_ids->size() != *removed_count`.
+    [[nodiscard]] bool delete_agent(std::string_view agent_id,
+                                    std::vector<std::string>* removed_group_ids = nullptr,
+                                    std::size_t* removed_count = nullptr);
     /// LEGACY fail-soft: `get_members_checked(group_id).value_or({})` — a
     /// store-not-open / pool-acquire-timeout / query-error degrade renders as
     /// an empty vector, INDISTINGUISHABLE from a genuinely empty group (#1762).

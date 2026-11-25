@@ -1047,15 +1047,18 @@ inline int64_t now_epoch_seconds() {
 
 /// Format epoch seconds as RFC 3339 / ISO 8601 in UTC: "YYYY-MM-DDTHH:MM:SSZ".
 /// Used in `title=` attributes so operators can copy a precise timestamp.
-/// Returns "—" for non-positive input (sentinel "never").
+/// Returns "—" (sentinel "never") for non-positive input and for a value past year 9999
+/// (253402300799) on every platform, and past year 3000 (32535215999) on Windows, where the
+/// platform conversion fails.
 inline std::string format_iso_utc(int64_t epoch_secs) {
-    if (epoch_secs <= 0) return "—";
+    static_assert(sizeof(std::time_t) >= 8, "the year-9999 bound makes the time_t cast lossless only on a 64-bit time_t");
+    if (epoch_secs <= 0 || epoch_secs > 253402300799LL) return "—";
     std::time_t t = static_cast<std::time_t>(epoch_secs);
     std::tm tm_val{};
 #ifdef _WIN32
-    gmtime_s(&tm_val, &t);
+    if (gmtime_s(&tm_val, &t) != 0) return "—";
 #else
-    gmtime_r(&t, &tm_val);
+    if (gmtime_r(&t, &tm_val) == nullptr) return "—";
 #endif
     return std::format("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
                         tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
@@ -1257,5 +1260,26 @@ template <typename Req>
 [[nodiscard]] inline bool declares_framed_body(const Req& req) {
     return content_length_for_body_cap(req) > 0 || transfer_encoding_present(req);
 }
+
+
+/// WP06 F57: the ONE loopback-exemption decision for `GET /metrics`, called from server.cpp's
+/// pre-routing handler (extend, never fork). A loopback TCP peer is NOT proof of a local
+/// caller: a same-host reverse proxy, mesh sidecar or tunnel relays remote requests that the
+/// server sees as 127.0.0.1. So the exemption is an explicit opt-in (`--metrics-trust-loopback`,
+/// default OFF; the caller checks `cfg_.metrics_trust_loopback` first), and even then a request
+/// carrying forwarding evidence is treated as remote (defence in depth: a header-less proxy is
+/// NOT caught, so the operator must also block /metrics on any same-host proxy). Fails closed:
+/// an empty or unparseable peer address is not loopback. `--metrics-no-auth` is a separate,
+/// unchanged branch in the caller.
+[[nodiscard]] inline bool metrics_loopback_peer_exempt(std::string_view remote_addr,
+                                                       bool has_forwarding_header) noexcept {
+    if (has_forwarding_header)
+        return false;
+    return remote_addr == "127.0.0.1" || remote_addr == "::1";
+}
+
+/// Header names whose presence on a request means it passed through a proxy (WP06 F57).
+inline constexpr std::string_view kForwardingEvidenceHeaders[] = {
+    "X-Forwarded-For", "Forwarded", "X-Real-IP", "Via", "X-Forwarded-Host", "X-Forwarded-Proto"};
 
 } // namespace yuzu::server

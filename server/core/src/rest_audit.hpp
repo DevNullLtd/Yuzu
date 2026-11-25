@@ -107,7 +107,10 @@
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 
+#include "rest_a4_envelope_http.hpp" // a4_error — the JSON refusal of refuse_unsafe_device_id_a4
 #include "web_utils.hpp" // audit_token — CWE-117 neutralisation for a hostile target_id (#4665)
+
+#include <yuzu/server/auth.hpp> // auth::agent_id_is_audit_safe
 
 #include <exception>
 #include <string>
@@ -232,6 +235,47 @@ template <class AuditFn>
     if (!persisted && !res.has_header("Sec-Audit-Failed"))
         res.set_header("Sec-Audit-Failed", "true");
     return persisted;
+}
+
+/// Refusal for a device id that fails the audit-trail floor (`auth::agent_id_is_audit_safe`) on
+/// an HTML fragment route: answers 400 with a static `Invalid device id.` note and returns true
+/// (the handler then returns). Call it FIRST, before the scoped permission check and before any
+/// audit write, because the id reaches `target_id` on the permission-denial audit and on every
+/// row the route writes, and the audit store keeps CR, LF and TAB. It writes no audit row
+/// itself, so a refused id leaves no row at all. Never put request data in the note.
+[[nodiscard]] inline bool refuse_unsafe_device_id(httplib::Response& res, const std::string& id) {
+    if (auth::agent_id_is_audit_safe(id))
+        return false;
+    res.status = 400;
+    res.set_content("<div class=\"gp-note\">Invalid device id.</div>", "text/html; charset=utf-8");
+    return true;
+}
+
+/// The JSON twin of `refuse_unsafe_device_id` for `/api` and `/api/v1` routes: the same floor,
+/// answered with a 400 A4 envelope whose message is the static `Invalid device id.` (the
+/// `X-Correlation-Id` header is reused when the handler already set one). Call it right after the
+/// id is read from the path, query or body, before the permission check and before any audit
+/// write; it writes no audit row. Never put request data in the message.
+[[nodiscard]] inline bool refuse_unsafe_device_id_a4(httplib::Response& res, const std::string& id) {
+    if (auth::agent_id_is_audit_safe(id))
+        return false;
+    res.status = 400;
+    res.set_content(a4_error(res, "Invalid device id."), "application/json");
+    return true;
+}
+
+/// The tag-key twin of `refuse_unsafe_device_id_a4`: the key reaches `target_id` (`agent_id:key`)
+/// on every tag audit row, so a key over 64 bytes or with a byte below `0x20`
+/// (`auth::tag_key_is_audit_safe`) answers 400 with the static message `Invalid tag key.`. A size
+/// and control-byte check only, never the key charset, so a delete route still reaches a stored
+/// key `TagStore::validate_key` would refuse. Call it right after the key is read, before the
+/// service-tag guard, the permission check and any audit write; it writes no audit row.
+[[nodiscard]] inline bool refuse_unsafe_tag_key_a4(httplib::Response& res, const std::string& key) {
+    if (auth::tag_key_is_audit_safe(key))
+        return false;
+    res.status = 400;
+    res.set_content(a4_error(res, "Invalid tag key."), "application/json");
+    return true;
 }
 
 } // namespace yuzu::server::detail

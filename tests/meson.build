@@ -370,7 +370,8 @@ agent_test_exe = executable(
     'unit/test_disk_actions_partitions.cpp', # H.5b: pure layer of the Windows partitions leg (runs on every host)
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_firewall_quarantine_parsers.cpp', # PRQ.1: pure quarantine core (allow set, exception grammar, verify/rollback, generations, phases, TTL, state, argv plans), fake seam, unguarded on every OS
-    'unit/test_firewall_quarantine_live.cpp', # PRQ.1: the built firewall plugin's action boundary ([agent][firewall_quarantine], refuses before any OS call, every OS) plus hidden [.] real-host runs; those need YUZU_FIREWALL_QUARANTINE_LIVE=1 and root/admin
+    'unit/test_firewall_quarantine_live.cpp', # PRQ.1: the built firewall plugin's action boundary ([agent][firewall_quarantine], refuses before any OS call, every OS) plus hidden [.] real-host runs; those need YUZU_FIREWALL_QUARANTINE_LIVE=1 and root/admin, or the agent account on a host where install-agent-user.sh --check is clean
+    'unit/test_firewall_restore_compare.cpp', # #8318: the pure restore comparison the live harness decides with (firewall_restore_compare.hpp), fed sanitised lab excerpts, every OS
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
     'unit/test_enrollment_token_file.cpp', # --enrollment-token-file: shared token shape + text parser (common/include/yuzu/enrollment_token_shape.hpp), the no-follow reader and source precedence (agents/core/include/yuzu/agent/enrollment_token_file.hpp)
@@ -433,6 +434,7 @@ agent_test_exe = executable(
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_filesystem_acl_parsers.cpp',   # filesystem get_acl: pure posix_acl xattr / acl_to_text / Windows ACE-row decoders over real-capture fixtures (+ real-syscall macOS cases under __APPLE__)
     'unit/test_filesystem_get_acl_dispatcher.cpp',  # filesystem get_acl: real plugin via LocalDispatcher (row order, failure rows, Linux default-ACL-only aggregation)
+    'unit/test_filesystem_reserved_paths.cpp',  # WP06 F55: filesystem plugin refuses the agent's own data dir/log/key paths
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_event_logs_parsers.cpp',       # Wave 4 PR4.2: pure Windows event-XML / journal row parse+format helpers
     'unit/test_event_logs_journalctl.cpp',    # Wave 4 PR4.2: pure Linux journalctl-fallback outcome classifier (runs on every host)
@@ -549,6 +551,7 @@ agent_test_exe = executable(
     'unit/test_installed_apps_win_actions.cpp', # #4716: real installed_apps.dll `list` via LocalDispatcher (Windows-only; no-op TU elsewhere via #ifdef _WIN32)
     'unit/test_installed_apps_registry_walk.cpp', # #4711: Uninstall-hive walk against a process-suffixed scratch key: ok/absent/failed/mixed (Windows-only; no-op TU elsewhere)
     'unit/test_bundle_id_read.cpp',            # #4710: agent-core bounded bundle-id pass driver (portable; the CF reader is injected)
+    'unit/test_proc_snapshot_read.cpp',        # SRE-1: agent-core bounded libproc snapshot driver (portable; the reader is injected)
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (macOS and Windows, self-gated)
     'unit/test_msi_packages_inventory.cpp',   # pure list_inventory builder over the committed Kingsley REAL CAPTURE (fixture via YUZU_TEST_FIXTURE_DIR; runs on every OS)
@@ -658,8 +661,8 @@ agent_test_exe = executable(
     'unit/test_remote_access_audit_legs.cpp',            # remote_access_audit: OS-free list_posix decision seam over injected fakes; portable
     'unit/test_remote_access_audit_posix_fs.cpp',        # remote_access_audit: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd/mountinfo); body #if !defined(_WIN32)
     'unit/test_remote_access_audit_local_dispatcher.cpp',  # remote_access_audit: real plugin via LocalDispatcher + execute seam, unguarded on every OS
-    'unit/test_process_introspect_parsers.cpp',          # process_introspect: pure /proc parsers, hidepid mount-table check and row formatters over REAL CAPTURE + labelled fixtures; portable
-    'unit/test_process_introspect_legs.cpp',             # process_introspect: errno classifiers + OS-free inspect_linux decision seam over an in-memory fake /proc; portable
+    'unit/test_process_introspect_parsers.cpp',          # process_introspect: pure /proc parsers, hidepid mount-table check, macOS pure core (facet answer table, boot-session prefix, start number, nice, sched row) and row formatters over REAL CAPTURE + labelled fixtures; portable
+    'unit/test_process_introspect_legs.cpp',             # process_introspect: errno classifiers + OS-free inspect_linux and inspect_macos decision seams over an in-memory fake /proc and a fake libproc; portable
     'unit/test_process_introspect_local_dispatcher.cpp', # process_introspect: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
@@ -687,6 +690,8 @@ agent_test_exe = executable(
     'unit/test_component_zip.cpp',               # component_inventory: bounded zip reader (wave 1)
     'unit/test_component_java_parsers.cpp',      # component_inventory: Java manifest/pom parsers (wave 1)
     'unit/test_component_native_parsers.cpp',    # component_inventory: the native adapter over the shared binary_header readers (outcome mapping, universal slice choice), name and version rules, deterministic sweep (SAM-22)
+    'unit/test_component_python_parsers.cpp',    # component_inventory: Python distribution metadata parsers over real captured METADATA, PKG-INFO and egg-info fixtures (SAM-49)
+    'unit/test_component_node_parsers.cpp',      # component_inventory: Node package.json reader and node_modules path shape over real captured fixtures (SAM-49)
     'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
     'unit/test_component_walk_ordered.cpp',      # file search core: sorted depth-first resumable walk_ordered over MemTree and a fake clock, unguarded on every OS
     'unit/test_network_fstype_mounts.cpp',       # shared mount-table entries + local filesystem allow-list (agents/shared/network_fstype.hpp), portable
@@ -696,8 +701,14 @@ agent_test_exe = executable(
     'unit/test_file_search_coverage.cpp',        # file search core: coverage envelope rows (agents/shared/file_search_coverage.hpp), portable
     'unit/test_file_search_governor.cpp',        # file search core: slice governor with injected clock and sleep (agents/shared/file_search_governor.hpp), portable
     'unit/test_file_search_resume_contract.cpp', # file search core: walk_ordered + cursor transitions + governor + coverage composed over MemTree (the resume contract), portable
+    'unit/test_file_search_volumes.cpp',         # file search plugin: volume plan, units and refused rows, fsv1 cursor and its transition rule (agents/plugins/file_search/src), portable
+    'unit/test_file_search_driver.cpp',          # file search plugin: request parsing, in-memory state and the one-slice driver over fakes (MemTree, fake clock, fake runner), portable
+    'unit/test_file_search_rows.cpp',            # file search plugin: row arity, budgets, extents model and the user-directory tag (agents/plugins/file_search/src), portable
+    'unit/test_file_search_posix_shell.cpp',     # file search plugin: the POSIX shell's own pieces -- extents of real files, the macOS name rule and mount converter, the thread-capability planner (body POSIX-only; the capability syscalls Linux-only and root-only)
+    'unit/test_file_search_local_dispatcher.cpp', # file search plugin: real plugin via LocalDispatcher, unguarded on every OS (one real slice over a fixture under the build root on POSIX)
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
     'unit/test_component_native_scan.cpp',       # component_inventory: native-library scan over an in-memory tree and a fake clock; one POSIX-only case through the real leg and parsers (SAM-22)
+    'unit/test_component_pkg_scan.cpp',          # component_inventory: Python and Node scans over an in-memory tree and a fake clock (SAM-49)
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
     'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
@@ -718,6 +729,9 @@ agent_test_exe = executable(
     'unit/test_middleware_local_dispatcher.cpp',    # SAM.2: real middleware plugin via LocalDispatcher and the table-generated descriptors, unguarded on every OS
     '../agents/plugins/middleware/src/middleware_linux.cpp', # SAM.2: run_linux (self-gated to __linux__, empty elsewhere)
     '../agents/plugins/component_inventory/src/component_fs_posix.cpp',  # SAM-16: POSIX filesystem leg (self-gated to non-Windows, empty on Windows)
+    '../agents/plugins/file_search/src/file_search_posix.cpp',          # file search plugin: the POSIX shell (self-gated to non-Windows, empty on Windows)
+    '../agents/plugins/file_search/src/file_search_extents_linux.cpp',  # file search plugin: FIEMAP shell (self-gated to __linux__, empty elsewhere)
+    '../agents/plugins/file_search/src/file_search_extents_macos.cpp',  # file search plugin: F_LOG2PHYS_EXT shell (self-gated to __APPLE__, empty elsewhere)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp, config_checks.hpp
@@ -732,6 +746,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/browser_policy/src'),  # browser_policy_*.hpp (Wave 10 PR10.2-b)
     include_directories('../agents/plugins/runtimes/src'),  # runtimes_*parsers.hpp / runtimes_legs.hpp (Wave 10 PR10.1-b pure helpers)
     include_directories('../agents/plugins/component_inventory/src'),  # component_walk.hpp / component_*.hpp (pure helpers)
+    include_directories('../agents/plugins/file_search/src'),  # file_search_*.hpp (pure helpers)
     include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/local_security_policy/src'),  # Wave 8 PR8.3
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
@@ -954,6 +969,7 @@ agent_test_exe = executable(
                 pkg_inventory_plugin_lib,  # Wave 10 PR10.1-c
                 middleware_plugin_lib,  # SAM.2: test_middleware_local_dispatcher.cpp loads the real plugin by path
                 component_inventory_plugin_lib,  # SAM-16: test_component_inventory_local_dispatcher.cpp loads the real plugin by path
+                file_search_plugin_lib,  # test_file_search_local_dispatcher.cpp loads the real plugin by path
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -1079,6 +1095,8 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
                           include_directories('../agents/plugins/virtualization/src'),
                           include_directories('../agents/plugins/remote_access_audit/src'),
                           include_directories('../agents/plugins/process_introspect/src'),
+                          include_directories('../agents/plugins/file_search/src'),
+                          include_directories('../agents/plugins/component_inventory/src'),  # component_walk.hpp, which file_search_driver.hpp includes
                           include_directories('../agents/plugins/update_source_trust/src'),
                           include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
                           include_directories('../agents/shared')],
@@ -1652,6 +1670,7 @@ if build_server
       'unit/server/test_instruction_param_golden.cpp', # golden accept/reject table over the shipped definitions
       'unit/server/test_instruction_canonical_schema.cpp', # canonicalise_param_schema: the discovery input_schema source
       'unit/server/test_sensitive_instruction_params.cpp',
+      'unit/server/test_approval_continuation.cpp', # one approval for a whole multi-slice read: pure subject/token/row rules
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
       'unit/server/test_compliance_fragments.cpp', # pure renderers for the Compliance page fragments + tag table
@@ -1874,6 +1893,8 @@ if build_server
       'unit/server/test_device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
       'unit/server/test_bulk_ci_page_model.cpp', # bulk device-CI keyset page: params, cursor, scope walk, JSON
+      'unit/server/test_hardware_ci_read_cap_pg.cpp', # #7949: [pg] the cap keeps pool connections free for authz + audit
+      'unit/server/test_bulk_read_slots.cpp', # #7949/#7951: bulk device-CI read concurrency cap (slots, boot arithmetic, read_page)
       'unit/server/test_quarantine_read_model.cpp', # Seam PR2: shared quarantine list JSON builder (key order, escaping)
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
@@ -2173,6 +2194,7 @@ if build_server
       'unit/server/test_offline_endpoint_store.cpp',
       'unit/server/test_agent_registry_presence.cpp',
       'unit/server/test_agent_registry_log_neutralisation.cpp',   # #5513: register_agent log lines neutralised
+      'unit/server/test_agent_registry_plugin_meta.cpp',   # WP06 F31: agent-reported plugin metadata bounded at ingest, never served as docs
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_inventory_reads_v3.cpp', # SAM-33 reads: hosts, change feed, facet health, summary ([pg][software_inventory][reads_v3], shard E)
@@ -4239,6 +4261,27 @@ test('process_introspect definition columns',
   timeout: 30,
 )
 
+# process_introspect never requests a task port (a write-capable handle on the target): no
+# task_for_pid or Mach VM call, no <mach/...> include, no ptrace, a libproc flavour allow-list
+# and a single sysctlbyname name. The macOS leg reads through libproc only.
+test('process_introspect no-task-port lexical gate',
+  _python3_test,
+  args: [files('test_process_introspect_no_task_port_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# file_search's definition contract (content/definitions/file_search.yaml): the row_kind-first
+# field_1..field_6 columns pinned to the wire rows the plugin and the shared coverage header emit
+# (nine row kinds, plus the planned-leg status row), the root/pattern/kinds/cursor parameter grammar
+# and its bounds, the approval mode against the catalogue gate and the never-disclosed wording.
+test('file_search definition columns',
+  _python3_test,
+  args: [files('test_file_search_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # update_source_trust's failure-token contract (#4874): every `note_failure` literal and every
 # errno_detail token in the plugin headers is named in the README's Result status row and gloss
 # table, and nothing in those tables is undefined in the source.
@@ -4270,6 +4313,15 @@ test('plugin readme gate',
   # the old 60s timeout under exactly that kind of concurrent docs-suite
   # load on this session's own Mac (governance Gate 3, build-ci finding).
   timeout: 120,
+)
+
+# #4398: every captured firewall state and rules block carries one ruleset row, and a privileged
+# (Linux, Windows) capture carries a count and no error row. Parser-only, well under a second.
+test('firewall sample shape gate',
+  _python3_test,
+  args: [files('test_firewall_sample_shape.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
@@ -4753,6 +4805,25 @@ test('firewall Windows release-guard wiring lexical gate',
   timeout: 30,
 )
 
+# Firewall state and rules reads: static lexical gate over the OS-specific wiring that only that OS
+# compiles. macOS: every pf read is run_bounded_subprocess(sudo_wrap(fq::pfctl_*_argv())) with stderr
+# unmerged and no /sbin/pfctl literal (a bare pfctl exits 1 for the least-privilege account).
+# Windows: every per-rule property read lands in an HRESULT that reaches the pure row builder (no
+# FAILED() decides a field) and neither skip site drops a rule without its row. Linux: the ladder
+# firewalld -> nftables -> root snapshot broker -> ufw -> iptables (a partly read firewalld is held
+# behind the broker, which replaces it only with an active ruleset), the broker reader's bounds and the
+# installer-helper transport. Broker units: the shipped socket, template service and snapshot script,
+# what the deb and rpm install, the agent unit's untouched sandbox, and `systemd-analyze verify` of the
+# three units where that tool exists (only the lines it prints about the unit under test count). Carries
+# its own in-memory mutation self-test. No build required; measured at about 4 s on a developer Mac
+# without systemd-analyze and 3.9 s on Ubuntu 26.04 with it.
+test('firewall read-path wiring lexical gate',
+  _python3_test,
+  args: [files('test_firewall_read_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
 # stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
 # page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes
@@ -5015,6 +5086,22 @@ test('access audit production wiring lexical gate',
 test('same-site gate production wiring lexical gate',
   _python3_test,
   args: [files('test_same_site_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# The filesystem plugin's reserved-path decision keeps its NUL, /dev/fd, macOS /.vol/ and re-resolution
+# calls (not reachable through the plugin seam on Linux): source-text only, so Python.
+test('filesystem reserved path wiring lexical gate',
+  _python3_test,
+  args: [files('test_filesystem_reserved_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# The agent's reserved-path key list: every path-like `agent.*` key agent.cpp publishes to plugins
+# must be classified in agents/shared/agent_reserved_path_keys.hpp (source-text only, so Python).
+test('agent reserved path keys lexical gate',
+  _python3_test,
+  args: [files('test_agent_reserved_path_keys.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -5458,8 +5545,13 @@ test('issue lifecycle docs',
 # The old standalone containment agent plugin is removed and nothing names it again (device
 # containment is the firewall plugin's four actions): no tracked file outside the history
 # allowlist names its files, actions, rule or chain prefixes or definition ids. The same file runs
-# the Linux firewall helper under every POSIX shell on the host (a few hundred short processes), so
-# its budget is wider than the source-text gates around it.
+# the Linux firewall helper (its containment words and its `snapshot` word) under every POSIX shell on
+# the host, and the broker script's own cases (argument refusal, standard input, the cap, one whole
+# reply) once under each; the script's functions are the helper's byte for byte, so the shell matrix of
+# their branches runs once, on the helper. That is thousands of short processes, so its budget is wider
+# than the source-text gates around it. Measured under sh, dash and bash on 2026-11-23: about 38 to
+# 46 s on a developer Mac at load averages between 2.7 and 3.8, and 8.4 s on Ubuntu 26.04 (134
+# cases), where CI runs it. The budget is 120 s.
 test('removed containment plugin lexical gate',
   _python3_test,
   args: [files('test_legacy_quarantine_plugin_removed_lexical.py')],
@@ -5566,6 +5658,43 @@ test('response store read tripwire selftest',
   # Runs the scan over a mutated copy of the whole server tree once per mutation. Memoised per file
   # it takes a few seconds; the headroom is for a loaded shared CI box, not for the work.
   timeout: 120,
+)
+
+# The stored rows of file_search stay in the EXISTING Forensics read tier through one catalogue flag:
+# no second tier, no second permission check, no new audit verb, and the flag and the plugin name are
+# read in a pinned handful of files. The self-test mutates the sources in memory and requires each
+# mutation to be named. Both also run in .github/workflows/docs-lint.yml on every PR.
+test('file_search read tier tripwire',
+  _python3_test,
+  args: [files('test_file_search_read_tier_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('file_search read tier tripwire selftest',
+  _python3_test,
+  args: [files('test_file_search_read_tier_tripwire.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 60,
+)
+
+# The file_search plugin sources spell no call that reads a matched file's bytes, writes, syncs or creates
+# a file (the pinned spellings are listed in the script's docstring: the FIEMAP sync flag, the write,
+# create, truncate and append open flags, write, sync, stdio, stream, vectored, receive, pread and mmap
+# calls, the shared bounded readers, any read call beyond the mount table reader, and a second fm_flags
+# assignment), and ApprovalManager::covers_continuation keeps its one production caller, the MCP
+# execute_instruction arm. The self-test mutates the sources in memory and requires each mutation to be
+# named. Both also run in .github/workflows/docs-lint.yml on every PR.
+test('file_search source tripwire',
+  _python3_test,
+  args: [files('test_file_search_source_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('file_search source tripwire selftest',
+  _python3_test,
+  args: [files('test_file_search_source_tripwire.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # #4990: server.cpp must keep wiring the Forensics plugin set and the visibility resolver into every
@@ -5738,6 +5867,16 @@ test('dashboard audit checked lexical',
 test('Echo security wiring lexical gate',
   _python3_test,
   args: [files('test_echo_security_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# Echo corruption-audit gate signals: server.cpp's pre-seeds of the three new counters (the
+# quarantine alert's 0 sample), the wrote-guarded quarantine increment, the degraded-observer
+# counter and the sweep gauge, plus DegradedCause vs its pre-seed list. server.cpp is built by no
+# Mac unit binary; the script self-checks its detector.
+test('Echo corruption-audit gate wiring lexical gate',
+  _python3_test,
+  args: [files('test_corruption_audit_gate_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

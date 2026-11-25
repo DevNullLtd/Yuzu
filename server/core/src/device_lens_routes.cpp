@@ -30,6 +30,8 @@ void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_
     // -- DEX lens: per-device score + signal summary (+ link to the full drill) --
     sink.Get("/fragments/device/dex", [this](const httplib::Request& req, httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        if (detail::refuse_unsafe_device_id(res, id)) // before the scoped check and any audit row
+            return;
         // bare=1: mounted as a lens inside the Hardware CI record, which already
         // renders its own 7-tab bar — suppress this fragment's own 3-chip bar.
         const bool tabs = !req.has_param("bare");
@@ -73,6 +75,8 @@ void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_
     sink.Get("/fragments/device/guardian", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        if (detail::refuse_unsafe_device_id(res, id)) // before the scoped check and any audit row
+            return;
         // bare=1: mounted as a lens inside the Hardware CI record — see the dex
         // fragment above for the same suppression.
         const bool tabs = !req.has_param("bare");

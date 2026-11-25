@@ -72,6 +72,7 @@ tus=(
     agents/plugins/middleware/src/middleware_linux.cpp # empty on Windows: checks the portable half
     agents/plugins/component_inventory/src/component_inventory_plugin.cpp # Windows answers planned; checks the portable scan headers
     agents/plugins/process_introspect/src/process_introspect_plugin.cpp # Windows answers planned; checks the portable parsers and seam headers
+    agents/plugins/file_search/src/file_search_plugin.cpp # Windows answers planned; checks the portable driver, plan and row headers
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
     agents/plugins/firmware_posture/src/firmware_posture_win.cpp
@@ -137,6 +138,12 @@ for tu in "${tus[@]}"; do
         fi
         extra_inc+=(-I "$nlohmann_include")
     fi
+    # file_search compiles the walker of component_inventory into itself (one recorded lateral
+    # include, see agents/plugins/file_search/meson.build), so its portable headers include
+    # component_walk.hpp from that directory.
+    case "$tu" in
+        agents/plugins/file_search/*) extra_inc+=(-I agents/plugins/component_inventory/src) ;;
+    esac
     if grep -lq "libxml/parser.h" "$src_dir"/*.hpp "$src_dir"/*.cpp 2>/dev/null; then
         if [ -z "$libxml2_include" ]; then
             echo "  SKIP  $tu (needs libxml/parser.h — bootstrap vcpkg_installed to check it)"

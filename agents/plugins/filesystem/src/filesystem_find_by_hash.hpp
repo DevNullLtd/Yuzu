@@ -37,7 +37,8 @@
 
 #include "filesystem_acl_parsers.hpp" // yuzu::filesystem::acl::row_field (row-field escaping)
 
-#include <sha256.hpp> // yuzu::shared::Sha256
+#include <macos_dataless_off.hpp> // yuzu::shared::DatalessMaterializationOff (self-gated to __APPLE__)
+#include <sha256.hpp>             // yuzu::shared::Sha256
 
 #include <atomic>
 #include <chrono>
@@ -74,9 +75,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#ifdef __APPLE__
-#include <sys/resource.h> // getiopolicy_np / setiopolicy_np (DatalessMaterializationOff)
-#endif
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <sys/vfs.h> // fstatfs
@@ -409,6 +407,15 @@ struct WalkEnv {
     std::function<bool(const fs::path&)> can_enter = [](const fs::path&) {
         return true;
     };
+    /// WP06 F55: true = the entry is refused (a reserved agent path). It canonicalises, so it is
+    /// asked only AFTER the mount check and the symlink_status classification: for a directory (before
+    /// can_enter; a refused one is not descended into and not visited) and for a regular file (before
+    /// the visitor, so the walk cannot be used as a content-hash oracle on one). Never asked for a
+    /// symlink, a junction, a FIFO, a device, a socket or an entry under a mount. A refused entry is
+    /// counted as unreadable.
+    std::function<bool(const fs::path&)> is_refused = [](const fs::path&) {
+        return false;
+    };
     /// Mount points whose subtrees are refused. Empty = no guard.
     std::vector<std::string> network_mounts;
     /// False when the mount table could not be read in full: the list above is then empty or
@@ -431,41 +438,19 @@ enum class EntryKind { directory, regular };
 enum class Visit { none, match, stop };
 
 #ifdef __APPLE__
-// Dataless (iCloud / File Provider) files and directories must not be materialised by a walk: the
-// download runs inside a read the deadline cannot interrupt. The policy is per THREAD and this
-// runs on a shared pool thread, so it is read, switched OFF for the walk and restored on every
-// exit path. With it off a dataless file or directory fails its open with EDEADLK, which the walk
-// already counts as unreadable (CONSTRAINED), and a dataless directory is refused by the
-// directory open before the iterator names its children.
-class DatalessMaterializationOff {
-public:
-    DatalessMaterializationOff() {
-        previous_ = ::getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD);
-        if (previous_ < 0)
-            previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
-        changed_ = ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
-                                    IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0;
-    }
-    ~DatalessMaterializationOff() {
-        if (changed_)
-            ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
-                             previous_);
-    }
-    DatalessMaterializationOff(const DatalessMaterializationOff&) = delete;
-    DatalessMaterializationOff& operator=(const DatalessMaterializationOff&) = delete;
-
-private:
-    int previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
-    bool changed_ = false;
-};
+// The walk's dataless guard is the shared one (agents/shared/macos_dataless_off.hpp).
+using yuzu::shared::DatalessMaterializationOff;
 #endif
 
 /// THE bounded, symlink-safe walker of the plugin: `root` to `max_depth` (root's children are
-/// depth 1). The ORDER of the checks is the safety property: the mount check is a string comparison
-/// that precedes every call touching the path. `visit(entry, kind, budget, counters)` is called for
-/// a directory AFTER its depth and can_enter decisions were applied (so it may be asked about one
-/// that is never opened), and for a regular file; a symlink, junction, FIFO, device or socket is
-/// counted and never reaches it. find_by_hash and search_dir are both thin visitors over this.
+/// depth 1). The ORDER of the checks is the safety property: the mount check is a string
+/// comparison that precedes every call touching the path, and `env.is_refused` (which
+/// canonicalises, and so follows a link) is asked only for a directory or regular file that is
+/// neither under a mount nor a link. `visit(entry, kind, budget, counters)` is called for a
+/// directory AFTER its depth and can_enter decisions were applied (so it may be asked about one
+/// that is never opened), and for a regular file; a symlink, junction, FIFO, device, socket or
+/// refused entry is counted and never reaches it. find_by_hash and search_dir are both thin
+/// visitors over this.
 template <class VisitFn>
 WalkOutcome walk_bounded(const std::string& root, int max_depth, const WalkLimits& limits,
                          const WalkEnv& env, VisitFn visit) {
@@ -529,18 +514,28 @@ WalkOutcome walk_bounded(const std::string& root, int max_depth, const WalkLimit
             ++c.skipped_symlink;
             it.disable_recursion_pending();
         } else if (fs::is_directory(st)) {
-            // Children of a directory at depth d sit at d + 1: a directory AT the limit is never
-            // opened, and one we cannot list is counted instead of being skipped silently.
-            if (it.depth() + 1 >= max_depth) {
+            // The reserved decision (it canonicalises, so it follows links) is asked ONLY for an
+            // entry that is neither under a mount nor a link, never before the mount check and the
+            // symlink_status classification above. A refused directory is not descended into.
+            bool refused_dir = false;
+            if (env.is_refused(path)) {
+                refused_dir = true;
+                ++c.skipped_unreadable;
+                it.disable_recursion_pending();
+            } else if (it.depth() + 1 >= max_depth) {
                 it.disable_recursion_pending();
             } else if (!env.can_enter(path)) {
                 ++c.skipped_unreadable;
                 it.disable_recursion_pending();
             }
-            verdict = visit(entry, EntryKind::directory, budget, c);
+            if (!refused_dir)
+                verdict = visit(entry, EntryKind::directory, budget, c);
         } else if (st.type() != fs::file_type::regular) {
             // FIFO, device, socket: never opened (an open of a FIFO can block).
             ++c.skipped_not_regular;
+        } else if (env.is_refused(path)) {
+            // A refused file is counted as unreadable and never hashed or matched.
+            ++c.skipped_unreadable;
         } else {
             verdict = visit(entry, EntryKind::regular, budget, c);
         }

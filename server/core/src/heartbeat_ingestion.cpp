@@ -76,7 +76,13 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     const std::string via_str(via);
 
     if (health_store_) {
-        health_store_->upsert(agent_id_str, hb.status_tags());
+        // #7475: upsert runs the corruption sink (an audit-store round-trip) and the other
+        // heartbeat hooks inline. A throw out of it must not escape the handler, or the gateway
+        // batch counts the entry as failed and the presence write and reconcile hooks below
+        // are skipped for this heartbeat.
+        guarded_reconcile(metrics_, "yuzu_server_health_upsert_exceptions_total", "health upsert",
+                          via_str, agent_id_str,
+                          [&] { health_store_->upsert(agent_id_str, hb.status_tags()); });
     }
     if (metrics_) {
         metrics_->counter("yuzu_heartbeats_received_total", {{"via", via_str}}).increment();

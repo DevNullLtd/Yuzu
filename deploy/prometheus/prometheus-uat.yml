@@ -1,6 +1,10 @@
 # Prometheus config for UAT (native services, Docker Prometheus)
 # Targets use host.docker.internal to reach services on the Windows host
 
+# /metrics: every UAT launcher starts the native server with --metrics-no-auth, so this scrape sends no
+# credential. Against a server that authenticates /metrics add an `authorization` block per
+# docs/user-manual/metrics.md.
+
 global:
   scrape_interval: 10s
   evaluation_interval: 10s

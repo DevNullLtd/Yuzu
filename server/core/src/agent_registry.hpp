@@ -510,6 +510,9 @@ struct AgentSession {
     std::string agent_version;
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
+    /// True when the inventory reported the retired plugin name `tar` and no `echo` (set once in
+    /// register_agent, before the session is published). Counted by retired_tar_only_count().
+    bool retired_tar_only = false;
     std::unordered_map<std::string, std::string> scopable_tags;
     std::string gateway_node; // Non-empty if agent is connected via gateway
     /// HA WS-4 4.3: the gateway cluster this session's most recent CONNECTED
@@ -972,6 +975,13 @@ public:
     // Per-action description map: "plugin.action" -> human-readable description.
     static const std::unordered_map<std::string, std::string>& action_descriptions();
 
+    /// WP06 F31: the predicate that decides which agent-reported (plugin, action) pairs may appear
+    /// in the served plugin catalogue (`help_json` and the dashboard help): the server's
+    /// capability catalogue (`CommandCapabilityRegistry::classify`). UNSET = nothing agent-reported
+    /// is served (fail closed). Does not touch `plugin_names` (Echo gating, heartbeat logic).
+    using CatalogueFilterFn = std::function<bool(std::string_view plugin, std::string_view action)>;
+    void set_catalogue_filter(CatalogueFilterFn fn);
+
     // Build help catalog: deduplicated plugin metadata across all agents.
     std::string help_json() const;
 
@@ -1105,6 +1115,11 @@ public:
         grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) const;
 
     std::size_t agent_count() const;
+
+    /// Server-held sessions whose agent reports the retired `tar` plugin and no `echo` (not an
+    /// Echo agent: its corruption signal is never read). A count over this replica's sessions,
+    /// so a true zero; published by the health sweep as yuzu_fleet_retired_tar_plugin_agents.
+    std::size_t retired_tar_only_count() const;
 
     // Map a session_id to an agent_id (called when Subscribe completes handshake).
     void map_session(const std::string& session_id, const std::string& agent_id);
@@ -1322,6 +1337,16 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;
+    // The served plugin catalogue (WP06 F31), recomputed only when `catalogue_gen_` moved.
+    std::function<bool(std::string_view, std::string_view)> catalogue_filter_;
+    std::uint64_t catalogue_gen_{0};
+    mutable std::uint64_t catalogue_cache_gen_{~std::uint64_t{0}};
+    mutable std::vector<PluginMeta> catalogue_cache_;
+    [[nodiscard]] const std::vector<PluginMeta>& catalogue_locked() const;
+    /// Entries of agents_ with retired_tar_only, kept at every insert, replace and erase (guarded
+    /// by mu_), so the health sweep reads it in O(1) instead of scanning the fleet under the
+    /// routing lock.
+    std::size_t retired_tar_only_n_ = 0;
     std::unordered_map<std::string, std::string> session_to_agent_;
     EventBus& bus_;
     yuzu::MetricsRegistry& metrics_;

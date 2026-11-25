@@ -477,17 +477,41 @@ common case) and `heartbeat.db_quarantine_last` (`<epoch>:<file>`) in its plugin
 storage, which the
 agent forwards on every heartbeat as `yuzu.plugin.echo.db_corruption_total` /
 `yuzu.plugin.echo.db_quarantine_last`. The server exposes
-`yuzu_fleet_echo_db_corruption_agents` (see the metrics reference) and writes a
+`yuzu_fleet_echo_db_corruption_agents` (agents that have ever quarantined: a
+population, which rises when an agent with an old quarantine reconnects) and
+`yuzu_server_echo_db_quarantines_total` (new quarantines: one per audit row
+written; the `YuzuEchoDbCorruptionDetected` alert watches its increase over an
+hour, and any increase fires, a starting default not sized from fleet data) — see
+the metrics reference — and writes a
 `echo.db.corruption_quarantined` audit row per (agent, quarantine identity),
 deduplicated against the audit store and bounded to one row per agent per 10
 minutes per server process (intermediate quarantines inside that window collapse
 to the newest identity; another HA node can add a second row for the same
-identity) — see the audit-log reference. Devices are not queued behind one
-another, so a quarantine that hits many devices at once writes each device's
-audit row on the heartbeat that reports it while the audit store is healthy. A
-report is deferred to a later heartbeat if the same device's lookup is already
-in flight, if it arrives inside the server-wide 60 s back-off that follows any
-failed lookup or write, or if the in-flight set is at capacity. A plugin that
+identity; once the per-process table of 65,536 agents is full the limit is best
+effort, and an agent inside its window can be forgotten early and get a second
+row sooner) — see the audit-log reference. Devices are not queued behind one
+another, but at most 4 are admitted at a time: each holds one connection of the
+shared PostgreSQL pool (default 16) for its lookup and write, so a quarantine
+that hits many devices at once writes the rows over successive heartbeats while
+the audit store is healthy, not all on the first. A report is deferred to a later
+heartbeat if the same device's lookup is already in flight, if 4 devices are
+already in flight, or if it arrives inside the server-wide 60 s back-off that
+follows a failed lookup (including one that throws) or failed write. The one
+exception is a device the server already remembers as failing: the first failure
+by a device it does not remember opens the back-off for every device and the
+server remembers that device, and a later failure by a remembered device makes
+only that device wait 60 s from its failure. So a device whose own lookup or
+write fails every time pauses the others once, not on every retry. The server
+remembers up to 16 failing devices, each until its own lookup finds the row or its
+write succeeds, with no time limit. With more than 16 devices failing and none
+succeeding it forgets the one whose wait ends earliest, and a forgotten device's
+next failure opens the back-off again, so other devices' rows are delayed, not
+lost. While the audit store itself is failing, each remembered device tries at
+most once per 60 s. The back-off is dated from the failure and a later failure never
+shortens it; there is no separate probe, so when it ends, up to 4 devices look up
+at once and the first failure by a device that is not remembered re-opens it. Each
+failure is counted in `yuzu_server_echo_corruption_audit_degraded_total{reason}`
+and logged. A plugin that
 failed to initialise (including Echo when the corrupt file cannot be moved
 aside) is reported in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
 which distinguishes "failed to load" from "not installed". An Echo that loads
@@ -605,7 +629,7 @@ The third frame on the `/echo` page shows a **per-host process tree for one hour
 - **Names only.** The hourly roll-up keeps counts per name, not individual processes: **process ids, command lines and file paths are not kept**, on any platform, and processes that share a name share one position in the tree. Loaded modules (DLLs) are not part of the tree: on Windows the separate `module` source captures them into `$Module_Hourly` (shown on the capture-source cards), and on Linux and macOS that source returns no rows until an OS collector ships.
 - **One hour at a time, whole hours.** A process that started before the chosen hour appears only through its stops; a window covers hourly buckets that exist. If the host has no rows for the hour the tree says so. A newly enrolled host, or one whose agent has only just been upgraded, has no earlier hours to show.
 - **Never shown as complete when it may not be.** The device answers at most 10,000 rows per query, so an hour with more process names (or more connections) than that is shown with a "Results were cut at 10,000 rows for this hour" note, and a row the server could not read is counted ("N rows unreadable"). Pick a quieter hour or ask the device with `echo.sql` for the rest.
-- **A failed read is said, not hidden.** A device whose agent has no roll-up store shows "upgrade the agent" in the tree and in the DNS and ARP panels; the panels are never left reading "nothing recorded" for a read that failed. See "Behaviour change: the Echo page reads the roll-up tables" in the upgrade guide.
+- **A failed read is said, not hidden.** A device that answers a read with an error, a missing roll-up table included, shows "The device reported an error: ..." with the device's own text in the tree and in the DNS and ARP panels; the panels are never left reading "nothing recorded" for a read that failed. See "Behaviour change: the Echo page reads the roll-up tables" in the upgrade guide.
 - **Spawn flags survive placement.** The suspicious-spawn check looks at every parent a name was started under in the hour, including a parent that was already running and has no row of its own, so it does not depend on which parent the name is shown under (the one that started it most).
 - **No boot or agent-install anchors.** They need process ids and raw capture rows, which the roll-up does not keep.
 - **Not measured yet.** The DNS panel has no "no such name" count and the ARP panel has no router role or MAC-rebind column: the agent does not write those values yet, so the page does not show them (they return when it does).

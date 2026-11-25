@@ -7,7 +7,8 @@
  * tests/unit/test_hmac_sha256.cpp.
  *
  * This is a MAC primitive, not a password hash and not a KDF; it carries no secrecy of its own.
- * What the key buys depends on the caller -- see machine_id_hash.hpp for the one current use.
+ * What the key buys depends on the caller -- see machine_id_hash.hpp (a keyed hash) and the search
+ * plugin's file_search_volumes.hpp (a MAC under a per-process secret key).
  */
 #pragma once
 

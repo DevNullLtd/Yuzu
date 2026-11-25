@@ -381,6 +381,13 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
             "parameters contain a secret value (a grant secret or id, or a client secret) that "
             "cannot be stored in a schedule — dispatch the instruction directly with a fresh "
             "value instead");
+    // A resume token (`cursor`) is not a secret, but it is never kept: the server erases it from
+    // the execution record, and a schedule's stored blob is what fires, so it cannot be erased
+    // here either. Refused with its own wording, not the secret one.
+    if (schedule_params_contain_unretained_key(*canon_params))
+        return std::unexpected(
+            "parameters contain a resume token that cannot be stored in a schedule — remove "
+            "it (a schedule starts a fresh run each time)");
 
     auto id = sched.id.empty() ? generate_id() : sched.id;
     auto now = now_epoch();
@@ -513,12 +520,17 @@ bool ScheduleEngine::set_enabled(const std::string& id, bool enabled,
 // ---------------------------------------------------------------------------
 
 std::vector<InstructionSchedule> ScheduleEngine::evaluate_due() const {
+    auto r = evaluate_due_checked();
+    return r ? std::move(*r) : std::vector<InstructionSchedule>{};
+}
+
+std::expected<std::vector<InstructionSchedule>, std::string> ScheduleEngine::evaluate_due_checked() const {
     std::vector<InstructionSchedule> results;
     if (!open_)
-        return results;
+        return std::unexpected(std::string("schedule store not open"));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return results;
+        return std::unexpected(std::string("schedule store unavailable"));
 
     auto now = now_epoch();
 
@@ -526,14 +538,14 @@ std::vector<InstructionSchedule> ScheduleEngine::evaluate_due() const {
                       " FROM schedule_engine.schedules WHERE enabled = TRUE"
                       " AND next_execution_at > 0"
                       " AND next_execution_at <= $1"
-                      " ORDER BY next_execution_at ASC";
+                      " ORDER BY next_execution_at ASC, id ASC";
 
     pg::PgResult res =
         pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(now)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ScheduleEngine::evaluate_due: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return results;
+        return std::unexpected(std::string("schedule query failed"));
     }
 
     const int rows = PQntuples(res.get());

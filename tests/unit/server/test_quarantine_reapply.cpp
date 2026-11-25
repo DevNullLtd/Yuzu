@@ -199,6 +199,9 @@ TEST_CASE("parse_containment_reply: the allow-set note is the exact line only",
         "status|active\n" + note + "\n",
         "status|active_unproven\r\nnote|already_active=1\r\n" + note + "\r\n",
         note + "\nstatus|active",
+        // a refusal carries the note too: the device's own record is active and it kept its set
+        "status|refused|self_host\nrefused|self_host\n" + note,
+        "status|refused|own_addresses_unreadable\nrefused|own_addresses_unreadable\n" + note,
     };
     for (const auto& payload : carrying) {
         INFO(payload);
@@ -207,6 +210,8 @@ TEST_CASE("parse_containment_reply: the allow-set note is the exact line only",
     // the note says nothing about the state: it rides with whatever the device reported
     CHECK(parse_containment_reply("status|active\n" + note).state == QuarantineEndpointState::active);
     CHECK(parse_containment_reply("status|degraded|policy_not_blocking\n" + note).state ==
+          QuarantineEndpointState::unconfirmed);
+    CHECK(parse_containment_reply("status|refused|self_host\nrefused|self_host\n" + note).state ==
           QuarantineEndpointState::unconfirmed);
     const std::vector<std::string> not_carrying{
         "status|active",

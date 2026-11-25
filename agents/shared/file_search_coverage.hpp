@@ -41,10 +41,20 @@ enum class Reason {
     other_device,
     stalled,
     unstable,
-    unsupported
+    unsupported,
+    // a second mount of a filesystem another mount already searches (same device label and root)
+    duplicate_mount,
+    // a filesystem mounted beneath a network mount: reaching it would open a directory on that mount
+    behind_network_mount,
+    // the search reached its slice maximum
+    max_slices,
+    // the set of searchable mounts changed between two slices of one search
+    mount_table_changed,
+    // a macOS data volume, searched only through the firmlinks of the system volume
+    firmlinks_only
 };
 
-// Nothing collects extents yet; the field lets the envelope already say a volume cannot report them.
+// Whether a volume's matches carry extents; `unsupported` says a volume cannot report them.
 enum class Extents { not_collected, collected, unsupported };
 
 [[nodiscard]] constexpr const char* to_token(VolumeState s) noexcept {
@@ -89,6 +99,16 @@ enum class Extents { not_collected, collected, unsupported };
         return "unstable";
     case Reason::unsupported:
         return "unsupported";
+    case Reason::duplicate_mount:
+        return "duplicate_mount";
+    case Reason::behind_network_mount:
+        return "behind_network_mount";
+    case Reason::max_slices:
+        return "max_slices";
+    case Reason::mount_table_changed:
+        return "mount_table_changed";
+    case Reason::firmlinks_only:
+        return "firmlinks_only";
     }
     return "unknown";
 }
@@ -125,6 +145,9 @@ struct CoverageEnvelope {
     std::vector<VolumeCoverage> volumes;
     std::vector<Gap> gaps;
     std::size_t gaps_dropped{0};
+    // Searchable volumes the plan could not list (more than the per-search maximum): never searched,
+    // so the verdict can never read complete. Printed as `volumes_dropped|<n>`.
+    std::size_t volumes_dropped{0};
     std::uint32_t slices{1};
     std::uint32_t prior_gaps{0}; // running count carried by the cursor (Cursor::prior_gaps)
     bool has_cursor{false};      // a continuation cursor remains: the search is not finished
@@ -146,9 +169,14 @@ struct CoverageEnvelope {
     }
 
     // True only for a finished search that saw every volume completely. Zero volumes is never
-    // complete: an empty answer must not be confusable with a search that did not run.
+    // complete: an empty answer must not be confusable with a search that did not run. An envelope
+    // that is not valid() is never complete: a volume that says complete while naming a reason
+    // contradicts itself.
     [[nodiscard]] bool complete() const noexcept {
-        if (volumes.empty() || !gaps.empty() || gaps_dropped != 0 || prior_gaps != 0 || has_cursor)
+        if (!valid())
+            return false;
+        if (volumes.empty() || !gaps.empty() || gaps_dropped != 0 || volumes_dropped != 0 ||
+            prior_gaps != 0 || has_cursor)
             return false;
         for (const auto& v : volumes) {
             if (v.state != VolumeState::complete)
@@ -170,6 +198,8 @@ struct CoverageEnvelope {
         rows.push_back("gap|" + encode_name(g.path) + "|" + to_token(g.cause));
     if (e.gaps_dropped != 0)
         rows.push_back("gaps_dropped|" + std::to_string(e.gaps_dropped));
+    if (e.volumes_dropped != 0)
+        rows.push_back("volumes_dropped|" + std::to_string(e.volumes_dropped));
     rows.push_back(std::string("coverage|") + (e.complete() ? "complete" : "partial") +
                    "|slices=" + std::to_string(e.slices) +
                    "|prior_gaps=" + std::to_string(e.prior_gaps) + "|consistency=" +

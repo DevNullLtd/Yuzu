@@ -2,7 +2,8 @@
  * process_introspect_plugin.cpp -- read-only introspection of ONE process.
  *
  * "inspect" -- one numeric pid and one closed-enum facet per dispatch: resource_limits,
- * sigmasks, caps, seccomp, oom, sched (Linux; macOS and Windows are PLANNED). Numbers, masks and
+ * sigmasks, caps, seccomp, oom, sched (Linux; macOS answers sched's nice value through libproc and
+ * the rest as permanent unsupported rows; Windows is PLANNED). Numbers, masks and
  * fixed tokens only: never file or memory contents, environment values, socket payloads or
  * command-line arguments. One action covers every facet; data above that tier is a NEW action,
  * never a new facet.
@@ -35,29 +36,45 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "answers no_such_process_or_hidden (the mount table is read only when the pid is not "
          "found); a thread id reads that thread; an exec during the read is not detected"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1, "libproc proc_pidinfo, no task port",
-         "not read yet: one unsupported status row, macos:planned"},
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "libproc proc_pidinfo(PROC_PIDTBSDINFO) and the kern.bootsessionuuid sysctl; no task port",
+         "constrained: of the six facets only sched is read, and of it only the nice value "
+         "(policy, realtime priority and CPU list read as a dash); resource_limits, sigmasks and "
+         "oom are not exposed by libproc and caps and seccomp have no macOS equivalent, so each "
+         "answers one unsupported status row and reads nothing; these answers and the constrained "
+         "sched status are permanent, not a degraded read: do not retry or alert on them; a "
+         "process of another account answers permission_denied unless the agent runs as root "
+         "(root not measured); for sched, a supplied start_time that no longer matches is refused "
+         "as pid_reused (the other five facets are answered before any read and never check it); "
+         "the libproc call has a 5 second deadline: no answer reads deadline_exceeded, while that "
+         "call is still blocked in the kernel the next dispatch reads abandoned_call_pending "
+         "instead of starting another, and a dispatch that overlaps another's healthy read reads "
+         "call_in_progress (each is one unavailable status row and no other row); "
+         "the token folds the wall-clock start with the monotonic start stamp (one more libproc "
+         "call, proc_pid_rusage(RUSAGE_INFO_V0)), so a pid recycled after a wall-clock step still "
+         "reads pid_reused; "
+         "the start time survives an exec, so the token does not tell a program from the one it "
+         "exec'd into"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1, "NtQueryInformationProcess and toolhelp snapshots",
          "not read yet: one unsupported status row, windows:planned"},
     },
 };
 
-// This build's leg and its exception token, defined together. macOS and Windows answer
-// `planned` through the shared reporter.
+// This build's leg and its exception token, defined together. Windows answers `planned` through
+// the shared reporter.
 #if defined(__linux__)
 constexpr yuzu::process_introspect::LegFn kLeg = &yuzu::process_introspect::run_linux;
 constexpr const char* kLegExceptionToken = "linux:leg:exception";
-#elif defined(_WIN32) || defined(__APPLE__)
+#elif defined(__APPLE__)
+constexpr yuzu::process_introspect::LegFn kLeg = &yuzu::process_introspect::run_macos;
+constexpr const char* kLegExceptionToken = "macos:leg:exception";
+#elif defined(_WIN32)
 int run_planned(yuzu::CommandContext& ctx, const yuzu::process_introspect::Request&) {
     return yuzu::shared::report_planned(ctx, "inspect");
 }
 constexpr yuzu::process_introspect::LegFn kLeg = &run_planned;
-#if defined(_WIN32)
 constexpr const char* kLegExceptionToken = "windows:leg:exception";
-#else
-constexpr const char* kLegExceptionToken = "macos:leg:exception";
-#endif
 #else
 #error "process_introspect: unsupported platform"
 #endif

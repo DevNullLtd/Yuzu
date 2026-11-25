@@ -115,10 +115,10 @@
 ///
 /// Routes (7), plus /livez, /readyz, /health and /api/health again on
 /// `deps.plaintext_probe_sink` when set:
-///   GET /metrics                    (unauthenticated from 127.0.0.1/::1 always;
-///                                     remote depends on cfg_.metrics_require_auth
-///                                     — that branch lives in server.cpp's
-///                                     pre-routing middleware, NOT here)
+///   GET /metrics                    (every client authenticates, loopback included,
+///                                     unless --metrics-trust-loopback or
+///                                     --metrics-no-auth is set; the decision lives in
+///                                     server.cpp's pre-routing middleware, NOT here)
 ///   GET /health                     (health_handler — see AUTH POSTURE above)
 ///   GET /api/health                 (SAME `health_handler` instance as /health —
 ///                                     do not split into two lambda bodies; the

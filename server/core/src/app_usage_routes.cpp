@@ -110,6 +110,9 @@ void AppUsageRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_pe
                  const auto cid = make_cid();
                  res.set_header("X-Correlation-Id", cid);
                  const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+                 // Before the scope gate and any audit row: the id reaches target_id on both.
+                 if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                     return;
 
                  if (!scoped_perm_fn_) {
                      send_json(res, 503, a4_error(503, "scope gate not configured", cid));

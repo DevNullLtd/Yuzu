@@ -12,8 +12,10 @@
 /// reading the implementation.
 ///
 /// `inspect` is ReadOnly/None -- the plugin never writes, signals or attaches to a process. It
-/// opens `/proc/<pid>` once and reads bounded numbers, masks and fixed tokens (resource limits,
-/// signal masks, capabilities, seccomp, OOM and scheduling state) of ONE named process.
+/// opens `/proc/<pid>` once (Linux) and reads bounded numbers, masks and fixed tokens (resource
+/// limits, signal masks, capabilities, seccomp, OOM and scheduling state) of ONE named process.
+/// On macOS it reads only the nice value, through libproc (one `proc_pidinfo` call, never a task
+/// port); the other facets answer a permanent `unsupported` row and read nothing.
 ///
 /// ONE row covers every facet at the top tier: data above this contract (file or memory
 /// contents, environment values, socket payloads, command-line arguments) is a NEW action with
