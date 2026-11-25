@@ -28,7 +28,12 @@ and gate_notes):
                     (everything but safe and mutating by default), or a
                     destructive/forensic definition the targeted run may not
                     dispatch (no override entry, required parameter missing,
-                    server.* row, not eligible on the target's OS)
+                    server.* row, not eligible on the target's OS), a definition
+                    whose host platforms exclude this host, or a row skipped by name
+                    (named_skip_reason: agent.http_client.get/head always,
+                    crossplatform.echo.configure always, network_actions.ping/flush_dns
+                    only with YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1); the reason is the
+                    row's note
   error             internal runner error (network, JSON parse, etc.) -
                     distinct from `fail` so flake-watching can separate
                     "instruction broken" from "test infra broken"
@@ -388,7 +393,8 @@ def seeded_directory(base: str | None = None):
         break
     if path is None:
         say(f"instructions_runner: seed directory unavailable ({last_error}); "
-            "find_by_hash will use the host default", file=sys.stderr)
+            "find_by_hash will use the host default and device.filesystem.list_dir/read "
+            "will be sent the host default file, which they refuse", file=sys.stderr)
     try:
         yield path
     finally:
@@ -408,9 +414,10 @@ _DEFINITION_PARAM_SEEDS: dict[tuple[str, str], str] = {
 
 # Parameters whose accepted shape is fixed by their documented contract, matched by exact name.
 # `from`/`to` are Unix epoch seconds (echo.query, echo.export; a non-numeric value is refused with
-# "invalid 'from' parameter (must be epoch seconds)"). `db_budget_bytes` is a whole number of bytes
-# >= 33554432; its documented default is sent, which leaves the configured budget unchanged.
-_ECHO_DB_BUDGET_DEFAULT = "262144000"
+# "invalid 'from' parameter (must be epoch seconds)"). There is deliberately NO rule for
+# echo.configure's `db_budget_bytes`: any valid value is a real write of the agent's Echo budget
+# (the documented default included, which would lower or raise a non-default budget and, when
+# lowering, delete history for good), so that row is skipped by name instead (_UNSAFE_TO_SYNTHESISE).
 
 
 def _contract_string(name: str) -> str | None:
@@ -418,8 +425,6 @@ def _contract_string(name: str) -> str | None:
         return "0"
     if name == "to":
         return str(int(time.time()))
-    if name == "db_budget_bytes":
-        return _ECHO_DB_BUDGET_DEFAULT
     return None
 
 
@@ -955,7 +960,9 @@ def _post_verdict(code: int, payload: Any) -> str:
 
 
 # Rows the runner cannot make succeed in the environment it is run from, skipped with a recorded
-# reason (never passed, and never hidden: the reason lands in the Outcome note and the test-runs DB).
+# reason (never passed, and never hidden: the reason is the Outcome note, so it reaches the console
+# line for a fail/error/--verbose run and the --output JSON; the test-runs DB records only the row's
+# id and duration, plus the aggregate skip count).
 # A plugin FAILURE on any other row still fails the gate; this is not a verdict loosening.
 #
 # These two always need a public host: the plugin refuses private, loopback and unresolvable
@@ -970,6 +977,13 @@ _NO_PUBLIC_EGRESS_SKIPS = frozenset({"agent.http_client.get", "agent.http_client
 _PRIVILEGED_SKIPS = frozenset({"device.network_actions.ping", "device.network_actions.flush_dns"})
 SKIP_PRIVILEGED_ENV = "YUZU_INSTRUCTIONS_SKIP_PRIVILEGED"
 
+# A mutating row whose only synthesisable value is a REAL write to every reached agent's own
+# configuration. echo.configure takes one optional setting per call and the runner sends the first
+# property when none is required, so it would overwrite each agent's Echo database byte budget; a
+# value that is a no-op is the agent's CURRENT one, which the runner cannot know without a
+# read-then-write step this runner does not have.
+_UNSAFE_TO_SYNTHESISE = frozenset({"crossplatform.echo.configure"})
+
 
 def named_skip_reason(def_id: str, environ: dict[str, str] | None = None) -> str:
     """Why `def_id` is skipped as unrunnable here, or "" when it runs."""
@@ -977,6 +991,9 @@ def named_skip_reason(def_id: str, environ: dict[str, str] | None = None) -> str
     if def_id in _NO_PUBLIC_EGRESS_SKIPS:
         return ("needs a public host: the plugin SSRF-blocks private, loopback and unresolvable "
                 "targets, so no synthesised URL can succeed")
+    if def_id in _UNSAFE_TO_SYNTHESISE:
+        return ("any synthesised value is a real write of each reached agent's Echo byte budget "
+                "(lowering it deletes history for good); needs the agent's current value")
     if def_id in _PRIVILEGED_SKIPS and env.get(SKIP_PRIVILEGED_ENV, "") == "1":
         return (f"{SKIP_PRIVILEGED_ENV}=1: this run lacks the host privileges the "
                 "action needs (sudo NOPASSWD grant / cap_net_raw)")
@@ -1731,6 +1748,13 @@ def run(args: argparse.Namespace) -> int:
     say(f"instructions_runner: {len(all_defs)} total definitions, "
           f"{len(runnable)} runnable (risks={','.join(sorted(selected_risks))}), "
           f"{len(skipped)} skipped")
+    named = sorted(d.id for d in runnable if named_skip_reason(d.id))
+    if named:   # always visible: a skip the operator did not select must not be silent
+        say(f"instructions_runner: {len(named)} runnable row(s) will be skipped by name "
+            f"(reason in each row's note): {', '.join(esc(i) for i in named)}")
+    if os.environ.get(SKIP_PRIVILEGED_ENV, "") == "1":
+        say(f"instructions_runner: {SKIP_PRIVILEGED_ENV}=1 is set: network_actions.ping and "
+            "flush_dns are skipped on this run", file=sys.stderr)
 
     known = {d.id for d in all_defs}
     for stray in sorted(set(param_overrides) - known):

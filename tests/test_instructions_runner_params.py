@@ -92,11 +92,16 @@ class ContractShapedParameters(unittest.TestCase):
             self.assertEqual(ir._synth_string("from", {}), "0")
             self.assertEqual(ir._synth_string("to", {}), "1234567890")
 
-    def test_echo_configure_sends_the_documented_default_budget(self):
-        params = ir.synthesise_params(self.real("crossplatform.echo.configure").parameters,
-                                      def_id="crossplatform.echo.configure")
-        self.assertEqual(params, {"db_budget_bytes": "262144000"})
-        self.assertGreaterEqual(int(params["db_budget_bytes"]), 33554432)
+    def test_no_rule_synthesises_a_budget_value_for_echo_configure(self):
+        # Any db_budget_bytes value is a real write of the agent's Echo budget (the documented
+        # default included), so the row is skipped by name instead and no rule may invent one.
+        self.assertIsNone(ir._contract_string("db_budget_bytes"))
+        self.assertIn("Echo byte budget", ir.named_skip_reason("crossplatform.echo.configure", {}))
+
+    def test_contract_rules_match_exact_names_only(self):
+        for name in ("from_date", "xfrom", "From", "to_address", "tool", "total", "since"):
+            with self.subTest(name=name):
+                self.assertIsNone(ir._contract_string(name))
 
     def test_list_dir_gets_the_seeded_directory_and_read_the_seeded_text_file(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_seedcase_") as base, \
@@ -142,7 +147,13 @@ class NamedSkips(unittest.TestCase):
         skipped = {d.id for d in ir.load_definitions(ROOT / "content" / "definitions", {})
                    if ir.named_skip_reason(d.id, env)}
         self.assertEqual(skipped, {"agent.http_client.get", "agent.http_client.head",
+                                   "crossplatform.echo.configure",
                                    "device.network_actions.ping", "device.network_actions.flush_dns"})
+
+    def test_an_empty_environ_argument_is_honoured_not_replaced_by_the_process_one(self):
+        with mock.patch.dict(os.environ, {ir.SKIP_PRIVILEGED_ENV: "1"}):
+            self.assertEqual(ir.named_skip_reason("device.network_actions.ping", {}), "")
+            self.assertNotEqual(ir.named_skip_reason("device.network_actions.ping"), "")
 
 
 class SeededDirectory(unittest.TestCase):

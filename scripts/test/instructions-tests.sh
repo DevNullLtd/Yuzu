@@ -40,7 +40,9 @@
 # evidence; see the runner's --help for the recovery recipe after a stop.
 #
 # Rows the runner skips by name, with the reason recorded (never passed): agent.http_client.get/head
-# always (the plugin SSRF-blocks every target the runner could reach offline), and
+# always (the plugin SSRF-blocks every target the runner could reach offline),
+# crossplatform.echo.configure always (any synthesised value would overwrite each reached agent's
+# Echo byte budget), and
 # device.network_actions.ping/flush_dns only when YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1, which a run
 # whose agent has no sudo NOPASSWD grant for resolvectl (see scripts/install-agent-user.sh) or no
 # raw-socket capability (a bwrap rig: no_new_privs) should set. A provisioned host leaves it unset
@@ -157,6 +159,12 @@ Optional:
                            or integers) — overrides for the schema-synthesised
                            defaults; for destructive/forensic it is required and
                            is the whole params object. See the runner's --help.
+                           Rows skipped by name (reason in each row's note and
+                           printed at the start): agent.http_client.get/head and
+                           crossplatform.echo.configure always;
+                           device.network_actions.ping/flush_dns only when
+                           YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1 is exported (a run
+                           whose agent lacks the sudo NOPASSWD grant or raw sockets).
   --output FILE            write per-instruction outcomes JSON
   --verbose                print every outcome (default: fail/error only)
 EOF

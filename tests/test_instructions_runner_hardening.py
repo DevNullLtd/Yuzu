@@ -1269,12 +1269,31 @@ class BroadcastGrading(unittest.TestCase):
         self.assertEqual(self.sent[-1], ("crossplatform.echo.query", {"from": "x"}))
         self.assertEqual(bad.status, "fail")
 
+    def test_list_dir_and_read_are_sent_the_seeded_paths_through_exercise(self):
+        schema = {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}}
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_seedcase_") as base, \
+                ir.seeded_directory(base) as seed:
+            self.grade([row()], def_id="device.filesystem.list_dir", parameters=schema)
+            self.grade([row()], def_id="device.filesystem.read", parameters=schema)
+            self.grade([row()], def_id="device.filesystem.exists", parameters=schema)
+        self.assertEqual(self.sent[0], ("device.filesystem.list_dir", {"path": seed}))
+        self.assertEqual(self.sent[1], ("device.filesystem.read", {"path": os.path.join(seed, "a.txt")}))
+        self.assertEqual(self.sent[2][1]["path"], ir._HOST_PATHS[ir.HOST]["file"])  # per definition
+
     def test_named_skips_dispatch_nothing_and_say_why(self):
         for def_id in ("agent.http_client.get", "agent.http_client.head"):
             with self.subTest(def_id=def_id):
                 result = self.grade([row()], def_id=def_id)
                 self.assertEqual(result.status, "skip")
                 self.assertIn("SSRF", result.note)
+        self.assertEqual(self.sent, [])
+
+    def test_echo_configure_is_skipped_by_name_and_never_written(self):
+        schema = {"type": "object", "properties": {"db_budget_bytes": {"type": "string"}}}
+        result = self.grade([row()], risk="mutating", def_id="crossplatform.echo.configure",
+                            parameters=schema)
+        self.assertEqual(result.status, "skip")
+        self.assertIn("Echo byte budget", result.note)
         self.assertEqual(self.sent, [])
 
     def test_privileged_rows_skip_only_when_the_rig_says_so(self):
