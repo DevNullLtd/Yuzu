@@ -460,6 +460,18 @@ extern const char* const kYuzuIconsSvg;
 extern const std::string kHtmxJs;
 extern const std::string kSseJs;
 namespace yuzu::server {
+
+namespace {
+/// WP06 F57: true when `req` carries any proxy-evidence header (web_utils.hpp's
+/// `kForwardingEvidenceHeaders`; kept here because web_utils.hpp is httplib-free by design).
+[[nodiscard]] bool request_has_forwarding_evidence(const httplib::Request& req) {
+    for (auto h : kForwardingEvidenceHeaders)
+        if (req.has_header(std::string(h)))
+            return true;
+    return false;
+}
+} // namespace
+
 extern const std::string kYuzuCss; // server/core/static/yuzu.css (build-time embed)
 extern const std::string kYuzuChartsJs;
 extern const std::string kEChartsJs; // server/core/vendor/echarts.min.js (Apache-2.0)
@@ -5914,6 +5926,20 @@ public:
         // plugin="unknown" and can neither displace a real plugin nor collide with one. Set once,
         // before the health recompute thread's first sweep (started in run()).
         health_store_.set_known_plugins(yuzu::server::catalogue_plugin_names(capability_registry_));
+        // WP06 F31: the served plugin catalogue (discover_plugins, dashboard help) is bounded to
+        // what the same capability catalogue recognises. `classify` is const and the registry is
+        // fixed after construction, so the filter is safe to run under the registry's lock.
+        registry_.set_catalogue_filter([this](std::string_view plugin, std::string_view action) {
+            return capability_registry_.classify(std::string(plugin), std::string(action)).has_value();
+        });
+        for (const char* field : {"name", "version", "description", "actions", "action", "plugins", "duplicate"})
+            metrics_.counter("yuzu_server_agent_registry_plugin_meta_dropped_total",
+                             {{"field", field}});
+        metrics_.describe("yuzu_server_agent_registry_plugin_meta_dropped_total",
+                          "Agent-reported plugin metadata fields dropped at registration because "
+                          "they fell outside their bound (a plugin entry beyond the per-agent "
+                          "cap counts under field=plugins). Zero means every report was within bounds.",
+                          "counter");
 
         // The bulk device-CI read's concurrency cap (#7949/#7951, bulk_read_slots.hpp), resolved
         // against the EFFECTIVE pool size (the same fallback the pool construction below uses).
@@ -14782,6 +14808,28 @@ private:
     /// store error, or no auth store at all — yields an EMPTY-principal,
     /// deny-all caller, which `build_classified_command` refuses as
     /// `AnonymousOperator` before any permission check runs.
+    /// The ONE arming check, used by BOTH the schedule runner and the outbox delivery loop (a
+    /// second hand-copied lambda is how the two would drift). Tri-state: permitted / denied /
+    /// UNAVAILABLE (a transient auth-store fault while resolving the creator's role): the caller
+    /// holds, it never records "authority denied" for an infrastructure fault. The creator's
+    /// legacy admin role is read LAZILY and fresh (never cached); JIT elevation does not count (a
+    /// background fire has no session). No auth store wired, or no creator = denied (fail closed).
+    [[nodiscard]] yuzu::server::ArmingResult schedule_arming(const std::string& principal,
+                                                             const std::string& plugin,
+                                                             const std::string& action,
+                                                             const std::unordered_map<std::string, std::string>& parameters) {
+        return yuzu::server::schedule_arming_permitted(
+            capability_registry_, rbac_store_.get(), principal, plugin, action, parameters,
+            [this, &principal]() -> yuzu::server::ArmingResult {
+                if (!auth_db_ || principal.empty())
+                    return false;
+                auto user = auth_db_->get_user(principal);
+                if (user)
+                    return user->role == auth::Role::admin;
+                return yuzu::server::legacy_admin_lookup_failure(user.error());
+            });
+    }
+
     yuzu::server::DispatchCaller derive_dispatch_caller_for_username(const std::string& username) {
         bool principal_resolves = false;
         std::string role_label;
@@ -17929,15 +17977,20 @@ private:
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
-            // /metrics: localhost always unauthenticated; remote depends on config
+            // /metrics (WP06 F57): authenticated unless `--metrics-no-auth`, or the operator
+            // opted in to trusting a direct loopback peer (`--metrics-trust-loopback`, default
+            // OFF: a same-host proxy/sidecar makes remote callers look loopback). The loopback
+            // decision is web_utils.hpp `metrics_loopback_peer_exempt` (one copy).
             if (req.path == "/metrics") {
-                if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1") {
+                if (cfg_.metrics_trust_loopback &&
+                    metrics_loopback_peer_exempt(req.remote_addr,
+                                                 request_has_forwarding_evidence(req))) {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
                 if (!cfg_.metrics_require_auth) {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
-                // Remote callers fall through to normal auth check below
+                // Everyone else falls through to the normal auth check below
             }
 
             auto session = auth_routes_->resolve_session(req);
@@ -19396,6 +19449,8 @@ private:
         yuzu::server::legacy_events::register_legacy_events_routes(
             inline_sink, yuzu::server::legacy_events::Deps{
                              .deny_service_scoped_fn = deny_service_scoped_fn,
+                             .fleet_read_fn = fleet_read_fn, // WP06 F11
+                             .audit_fn = audit_fn,
                              .resolve_session_fn = resolve_session_fn,
                              .event_bus = &event_bus_,
                              .stream_budget = stream_budget_.get(),
@@ -20257,6 +20312,32 @@ private:
                           "which denies fail-closed). Zero means the check ran and passed.",
                           "counter");
         metrics_.counter("yuzu_schedule_arming_denied_total");
+        // The arming answer could not be determined (a transient auth-store fault): the occurrence
+        // is HELD (schedule not advanced / outbox rescheduled), never counted as a denial.
+        metrics_.describe("yuzu_schedule_arming_unavailable_total",
+                          "Scheduled occurrences held because the arming principal's authority "
+                          "could not be determined (auth-store fault). Not a denial; retried.",
+                          "counter");
+        metrics_.counter("yuzu_schedule_arming_unavailable_total");
+        // Starvation signal: a held schedule is skipped without being asked, so without these two
+        // series nothing says how much scheduled work is not running during an auth-store outage.
+        metrics_.describe("yuzu_schedule_arming_deferred_total",
+                          "Due scheduled occurrences skipped this tick because an earlier arming "
+                          "check for them was unavailable and their hold has not lapsed. Not a "
+                          "denial; asked again when the hold lapses.",
+                          "counter");
+        metrics_.counter("yuzu_schedule_arming_deferred_total");
+        metrics_.describe("yuzu_schedule_due_held",
+                          "Scheduled occurrences currently held because their arming check was "
+                          "unavailable (auth-store fault), as of the last scheduler tick. 0 = none.",
+                          "gauge");
+        metrics_.gauge("yuzu_schedule_due_held").set(0.0);
+        metrics_.describe("yuzu_server_command_outbox_deliver_arming_unavailable_total",
+                          "Outbox occurrences rescheduled because the arming principal's "
+                          "authority could not be determined at send time (auth-store fault). "
+                          "Not a denial; retried with back-off.",
+                          "counter");
+        metrics_.counter("yuzu_server_command_outbox_deliver_arming_unavailable_total");
         // ADR-1007: absent-vs-zero carries the same meaning as the arming
         // counter above — zero means the second definition read always
         // succeeded and per-device enforcement applied to every fire;
@@ -20328,10 +20409,8 @@ private:
             // cases and the legacy-open posture are documented there.
             .arming_check = [this](const std::string& principal, const std::string& plugin,
                                    const std::string& action,
-                const std::unordered_map<std::string, std::string>& parameters) -> bool {
-                return yuzu::server::schedule_arming_permitted(capability_registry_,
-                                                               rbac_store_.get(), principal,
-                                                               plugin, action, parameters);
+                const std::unordered_map<std::string, std::string>& parameters) -> yuzu::server::ArmingResult {
+                return schedule_arming(principal, plugin, action, parameters);
             },
             // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
             // is an error, not an empty answer, so the runner holds rather than fires.
@@ -20374,12 +20453,10 @@ private:
                 // re-verified AGAIN here at send time (authority may have changed
                 // between enqueue and delivery), the load-bearing re-authorization.
                 .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                       const std::string& action,
-                const std::unordered_map<std::string, std::string>& parameters) -> bool {
-                    return yuzu::server::schedule_arming_permitted(capability_registry_,
-                                                                   rbac_store_.get(), principal,
-                                                                   plugin, action, parameters);
-                },
+                                   const std::string& action,
+                const std::unordered_map<std::string, std::string>& parameters) -> yuzu::server::ArmingResult {
+                return schedule_arming(principal, plugin, action, parameters);
+            },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
                 // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is
                 // measured on. An unwired tracker reads as unreadable, which HOLDS every
@@ -20435,6 +20512,8 @@ private:
                         if (leader_gate_permits<background_job_class("schedule_runner.tick")>(
                                 leader_elector_.get()))
                             schedule_runner_->tick();
+                        else
+                            schedule_runner_->on_demoted();
                     } catch (const std::exception& e) {
                         metrics_.counter("yuzu_schedule_tick_errors_total").increment();
                         spdlog::error("schedule_runner: tick threw ({}) — thread continuing",

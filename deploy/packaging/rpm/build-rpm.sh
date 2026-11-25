@@ -41,6 +41,10 @@ done
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-server.service" "$TOPDIR/SOURCES/"
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent.service" "$TOPDIR/SOURCES/"
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent-dmi-snapshot.sh" "$TOPDIR/SOURCES/"
+# Read-only firewall snapshot broker (ADR-3007): socket unit, per-connection service unit, script
+cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-fw-snapshot.socket" "$TOPDIR/SOURCES/"
+cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-fw-snapshot@.service" "$TOPDIR/SOURCES/"
+cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-fw-snapshot.sh" "$TOPDIR/SOURCES/"
 # Postgres provisioning helper, shipped in the server RPM (ADR-0006, #1320)
 cp "$SCRIPT_DIR/../../../scripts/install-server-postgres.sh" "$TOPDIR/SOURCES/"
 

@@ -354,6 +354,21 @@ has the same effect:
   answer: a failure is counted and alerted (`YuzuCryptoLayoutEraseFailed`),
   and the remedy is in
   [Crypto: Deprovision erasure](crypto.md#deprovision-erasure).
+- **Open event streams are NOT closed.** A `GET /events`, `GET /api/v1/events` or
+  `GET /sse/executions/{id}` stream that was already open keeps the credential and scope it
+  attached with and has no maximum lifetime: deprovisioning does not end it. (The MCP stream
+  re-validates its credential on every heartbeat and does end.) Add these steps to your offboarding
+  runbook, in this order:
+  1. Deprovision first: deactivate or delete the user, and confirm the SCIM call answered `2xx`.
+     Ending streams before this lets the client reconnect with a still-valid credential.
+  2. Find where the stream is held. This build lists no open streams and their owners.
+     `yuzu_http_held_open_responses` (per replica; `yuzu_http_held_open_capacity` is its ceiling)
+     shows which replicas hold any, and your reverse proxy's connection log shows the client
+     address and the replica it reached.
+  3. End it: restart the replica holding it. **A restart drops every held-open stream on that
+     replica, for every operator and service**, so drain the replica first.
+  4. Verify: the user's reconnect attempt is refused (`401`), and `yuzu_http_held_open_responses` on
+     that replica no longer counts the stream.
 
 > **API/MCP tokens ARE now revoked on deprovision — including federated
 > (SSO) tokens, if the user is linked.** SCIM deprovisioning (and the
@@ -859,9 +874,9 @@ cannot serve this right now" status, while `429` means the client is sending too
 **What to check.**
 
 1. `/readyz` on the server: it answers `503` with `pg_reachable` in `failed_stores` when Postgres is unreachable. A total outage may stop
-   the `/metrics` scrape too (a remote scrape resolves its token against Postgres), so
+   the `/metrics` scrape too (a scrape resolves its token against Postgres), so
    `YuzuScimGuardStoreUnavailable` and the Postgres alerts may be silent until recovery. The
-   honest backstops are `/readyz` and an operator-defined `up == 0` (scrape target down) alert.
+   honest backstops are `/readyz` and the shipped `YuzuServerMetricsScrapeDown` alert (`up == 0` on a job named `yuzu-server`).
    **Pool saturation with Postgres still reachable keeps `/readyz` green:** its `pg_reachable` and
    `pg_pool` rows go red on a connect failure, not on a saturated pool. For saturation read
    `yuzu_pg_pool_in_use` against the pool size, `yuzu_pg_acquire_wait_seconds`, and the guard counter

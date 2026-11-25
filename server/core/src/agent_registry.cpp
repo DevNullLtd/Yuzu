@@ -23,6 +23,7 @@
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
+#include "plugin_meta_rules.hpp" // WP06 F31: ingest bounds for agent-reported plugin text
 #include "plugin_init_failed_labels.hpp" // catalogue-bounded plugin label for yuzu_fleet_plugin_init_failed
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
 #include "echo_corruption_audit.hpp" // #1567 tag keys + parse helpers
@@ -107,13 +108,51 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         session->scopable_tags[k] = v;
     }
     for (const auto& p : info.plugins()) {
-        session->plugin_names.push_back(p.name());
+        // One entry per plugin name, bounded in count and length: a repeated entry would
+        // otherwise be one catalogue vote per copy, and an unbounded name list would grow
+        // the session (review M3). The first entry for a name is the one kept.
+        if (plugin_meta_rules::plugin_name_ok(p.name()) &&
+            session->plugin_names.size() < plugin_meta_rules::kMaxPluginsPerAgent &&
+            std::ranges::find(session->plugin_names, p.name()) == session->plugin_names.end())
+            session->plugin_names.push_back(p.name());
+        // WP06 F31: the PluginMeta copy (served to LLM clients as the plugin catalogue) is
+        // bounded at ingest; an out-of-bound field is DROPPED and counted, never truncated.
+        auto drop = [&](const char* field) {
+            metrics_.counter("yuzu_server_agent_registry_plugin_meta_dropped_total",
+                             {{"field", field}})
+                .increment();
+        };
+        if (!plugin_meta_rules::plugin_name_ok(p.name())) {
+            drop("name");
+            continue;
+        }
+        if (session->plugin_meta.size() >= plugin_meta_rules::kMaxPluginsPerAgent) {
+            drop("plugins");
+            continue;
+        }
+        if (std::ranges::any_of(session->plugin_meta, [&](const PluginMeta& m) { return m.name == p.name(); })) {
+            drop("duplicate");
+            continue;
+        }
         PluginMeta pm;
         pm.name = p.name();
-        pm.version = p.version();
-        pm.description = p.description();
+        if (plugin_meta_rules::version_ok(p.version()))
+            pm.version = p.version();
+        else
+            drop("version");
+        if (plugin_meta_rules::description_ok(p.description()))
+            pm.description = p.description();
+        else
+            drop("description");
+        if (static_cast<std::size_t>(p.capabilities_size()) > plugin_meta_rules::kMaxActions)
+            drop("actions");
         for (const auto& cap : p.capabilities()) {
-            pm.actions.push_back(cap);
+            if (pm.actions.size() >= plugin_meta_rules::kMaxActions)
+                break;
+            if (plugin_meta_rules::action_name_ok(cap))
+                pm.actions.push_back(cap);
+            else
+                drop("action");
         }
         session->plugin_meta.push_back(std::move(pm));
     }
@@ -231,6 +270,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         // must not have moved for a session that was never installed.
         const bool was_tar = it != agents_.end() && it->second->retired_tar_only;
         agents_[info.agent_id()] = session;
+        ++catalogue_gen_;
         if (was_tar)
             --retired_tar_only_n_;
         if (session->retired_tar_only)
@@ -242,8 +282,14 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     // The hostname is agent-supplied and sits between two genuine `key=value` tokens, so it takes
     // the closed-set id fold (space, '=', ',' and every non-ASCII byte become '_'): a hostname such
     // as `x' plugins=0 id=victim '` cannot close the quote and add a same-line token.
-    spdlog::info("Agent registered: id={}, hostname='{}', plugins={}", safe_agent_id,
-                 ::yuzu::log_id_token(info.hostname()), info.plugins_size());
+    if (info.plugins_size() > 0 && session->plugin_names.empty()) {
+        spdlog::warn("AgentRegistry::register_agent({}): reported {} plugin entries and none had a "
+                     "valid name; its plugin inventory is treated as unknown",
+                     safe_agent_id, info.plugins_size());
+    }
+    spdlog::info("Agent registered: id={}, hostname='{}', plugins={} (kept {})", safe_agent_id,
+                 ::yuzu::log_id_token(info.hostname()), info.plugins_size(),
+                 session->plugin_names.size());
     return session;
 }
 
@@ -398,6 +444,7 @@ void AgentRegistry::remove_agent(const std::string& agent_id) {
             if (it->second->retired_tar_only)
                 --retired_tar_only_n_;
             agents_.erase(it);
+            ++catalogue_gen_;
         }
     }
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
@@ -421,6 +468,7 @@ bool AgentRegistry::remove_agent_if_session(const std::string& agent_id,
         if (it->second->retired_tar_only)
             --retired_tar_only_n_;
         agents_.erase(it);
+        ++catalogue_gen_;
     }
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
     bus_.publish("agent-offline", agent_id);
@@ -445,6 +493,7 @@ void AgentRegistry::remove_agent_if_same(const std::string& agent_id,
         if (it->second->retired_tar_only)
             --retired_tar_only_n_;
         agents_.erase(it);
+        ++catalogue_gen_;
     }
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
     bus_.publish("agent-offline", agent_id);
@@ -1344,27 +1393,133 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
     return m;
 }
 
+namespace {
+/// Caps on what ONE report and the served catalogue may carry (a flood otherwise grows it).
+constexpr std::size_t kMaxServedPlugins = 512;
+
+/// WP06 F31: one catalogue entry per plugin NAME, built from what the fleet reports but only from
+/// what the server's own capability catalogue recognises, so an endpoint can neither invent a
+/// plugin or an action nor steer the entry:
+///   - `known(plugin, action)` is the filter (the capability catalogue, `classify`). An action it
+///     rejects is dropped; a plugin with no recognised action is omitted. Unset = nothing served
+///     (fail closed).
+///   - entries are chosen by agent COUNT per identical filtered action set; ties go to the larger
+///     set (every member is catalogue-known, so extra reported names add nothing), then the
+///     lexicographically smallest set - neither is steerable beyond reporting a subset of genuine
+///     names;
+///   - the served version is the version most agents with the chosen set report; on a tie it is
+///     EMPTY rather than picked (one agent reporting `0` must not win a 1-vs-1 tie).
+/// Agent-reported description text is never read here.
+template <class Agents>
+std::vector<PluginMeta>
+select_catalog_entries(const Agents& agents, const AgentRegistry::CatalogueFilterFn& known) {
+    std::vector<PluginMeta> out;
+    if (!known)
+        return out;
+    struct Cand {
+        std::vector<std::string> actions;
+        std::size_t count{0};
+        std::map<std::string, std::size_t> versions;
+    };
+    std::map<std::string, std::map<std::string, Cand>> by_name; // name -> action-set key -> cand
+    // `known` is a linear scan of the capability catalogue and the registry's lock is held, so it
+    // runs once per DISTINCT (plugin, action) - not once per agent x plugin x action. Lookups are
+    // by string_view (no allocation per probe).
+    struct SvHash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view v) const noexcept {
+            return std::hash<std::string_view>{}(v);
+        }
+    };
+    using ActionMemo = std::unordered_map<std::string, bool, SvHash, std::equal_to<>>;
+    std::unordered_map<std::string, ActionMemo, SvHash, std::equal_to<>> known_memo;
+    auto is_known = [&](const std::string& plugin, const std::string& action) {
+        auto pit = known_memo.find(std::string_view(plugin));
+        if (pit == known_memo.end())
+            pit = known_memo.emplace(plugin, ActionMemo{}).first;
+        auto ait = pit->second.find(std::string_view(action));
+        if (ait == pit->second.end())
+            ait = pit->second.emplace(action, known(plugin, action)).first;
+        return ait->second;
+    };
+    for (const auto& s : agents | std::views::values) {
+        for (const auto& pm : s->plugin_meta) {
+            std::vector<std::string> acts;
+            for (const auto& a : pm.actions)
+                if (is_known(pm.name, a))
+                    acts.push_back(a);
+            if (acts.empty())
+                continue;
+            std::ranges::sort(acts);
+            acts.erase(std::unique(acts.begin(), acts.end()), acts.end());
+            std::string key;
+            for (const auto& a : acts) {
+                key += a;
+                key += '\n';
+            }
+            auto& c = by_name[pm.name][key];
+            if (c.count == 0)
+                c.actions = acts;
+            ++c.count;
+            ++c.versions[pm.version];
+        }
+    }
+    for (const auto& [name, sets] : by_name) {
+        if (out.size() >= kMaxServedPlugins)
+            break;
+        const Cand* best = nullptr;
+        for (const auto& [key, c] : sets) { // map order = smallest key first
+            if (best == nullptr || c.count > best->count ||
+                (c.count == best->count && c.actions.size() > best->actions.size()))
+                best = &c;
+        }
+        if (best == nullptr)
+            continue;
+        PluginMeta pm;
+        pm.name = name;
+        pm.actions = best->actions;
+        std::size_t top = 0;
+        std::size_t tied = 0;
+        for (const auto& [v, n] : best->versions) {
+            if (n > top) {
+                top = n;
+                tied = 1;
+                pm.version = v;
+            } else if (n == top) {
+                ++tied;
+            }
+        }
+        if (tied != 1)
+            pm.version.clear();
+        out.push_back(std::move(pm));
+    }
+    return out; // std::map iteration is already sorted by plugin name
+}
+} // namespace
+
+void AgentRegistry::set_catalogue_filter(CatalogueFilterFn fn) {
+    std::lock_guard lock(mu_);
+    catalogue_filter_ = std::move(fn);
+    ++catalogue_gen_;
+}
+
+/// The served catalogue, recomputed only when a session was added/removed or the filter changed
+/// (a generation counter), so a heartbeat-heavy fleet does not pay the selection per read.
+/// Caller holds `mu_`.
+const std::vector<PluginMeta>& AgentRegistry::catalogue_locked() const {
+    if (catalogue_cache_gen_ != catalogue_gen_) {
+        catalogue_cache_ = select_catalog_entries(agents_, catalogue_filter_);
+        catalogue_cache_gen_ = catalogue_gen_;
+    }
+    return catalogue_cache_;
+}
+
 std::string AgentRegistry::help_json() const {
     std::lock_guard lock(mu_);
 
-    // Deduplicate plugins by name (take the richest action list)
-    std::unordered_map<std::string, const PluginMeta*> best;
-    for (const auto& s : agents_ | std::views::values) {
-        for (const auto& pm : s->plugin_meta) {
-            auto it = best.find(pm.name);
-            if (it == best.end() || pm.actions.size() > it->second->actions.size()) {
-                best[pm.name] = &pm;
-            }
-        }
-    }
-
-    // Sort by plugin name
     std::vector<const PluginMeta*> sorted;
-    sorted.reserve(best.size());
-    for (const auto* pm : best | std::views::values)
-        sorted.push_back(pm);
-    std::ranges::sort(sorted,
-                      [](const PluginMeta* a, const PluginMeta* b) { return a->name < b->name; });
+    for (const auto& e : catalogue_locked())
+        sorted.push_back(&e);
 
     const auto& descs = action_descriptions();
     nlohmann::json plugins_arr = nlohmann::json::array();
@@ -1374,7 +1529,8 @@ std::string AgentRegistry::help_json() const {
         nlohmann::json pj;
         pj["name"] = pm->name;
         pj["version"] = pm->version;
-        pj["description"] = pm->description;
+        // Agent-reported free text is NOT catalogue documentation (WP06 F31): never served.
+        pj["description"] = "";
 
         // Build actions as objects with name + description
         nlohmann::json actions_arr = nlohmann::json::array();
@@ -1402,20 +1558,9 @@ std::string AgentRegistry::help_json() const {
 std::string AgentRegistry::help_html(std::string_view filter) const {
     std::lock_guard lock(mu_);
 
-    std::unordered_map<std::string, const PluginMeta*> best;
-    for (const auto& s : agents_ | std::views::values)
-        for (const auto& pm : s->plugin_meta) {
-            auto it = best.find(pm.name);
-            if (it == best.end() || pm.actions.size() > it->second->actions.size())
-                best[pm.name] = &pm;
-        }
-
     std::vector<const PluginMeta*> sorted;
-    sorted.reserve(best.size());
-    for (const auto* pm : best | std::views::values)
-        sorted.push_back(pm);
-    std::ranges::sort(sorted,
-                      [](const PluginMeta* a, const PluginMeta* b) { return a->name < b->name; });
+    for (const auto& e : catalogue_locked())
+        sorted.push_back(&e);
 
     if (!filter.empty()) {
         std::erase_if(sorted, [&](const PluginMeta* pm) { return pm->name != filter; });
@@ -1458,7 +1603,7 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
                 "</td>"
                 "<td title=\"\u2014\">\u2014</td>"
                 "<td title=\"" +
-                esc(pm->description) + "\">" + esc(pm->description) +
+                esc(std::string_view{}) + "\">" + esc(std::string_view{}) +
                 "</td></tr>"
                 "<tr class=\"result-detail\"><td colspan=\"3\"><div class=\"detail-content\">"
                 "<div class=\"detail-label\">Plugin</div><div class=\"detail-value\">" +
@@ -1466,7 +1611,7 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
                 "</div>"
                 "<div class=\"detail-label\">Action</div><div class=\"detail-value\">\u2014</div>"
                 "<div class=\"detail-label\">Description</div><div class=\"detail-value\">" +
-                esc(pm->description) +
+                esc(std::string_view{}) +
                 "</div>"
                 "</div></td></tr>";
             ++row_count;
@@ -1531,13 +1676,9 @@ std::string AgentRegistry::autocomplete_html(std::string_view query) const {
     std::string q{query};
     std::ranges::transform(q, q.begin(), ::tolower);
 
-    std::unordered_map<std::string, const PluginMeta*> best;
-    for (const auto& s : agents_ | std::views::values)
-        for (const auto& pm : s->plugin_meta) {
-            auto it = best.find(pm.name);
-            if (it == best.end() || pm.actions.size() > it->second->actions.size())
-                best[pm.name] = &pm;
-        }
+    std::vector<const PluginMeta*> best;
+    for (const auto& e : catalogue_locked())
+        best.push_back(&e);
 
     const auto& descs = action_descriptions();
     auto esc = [](std::string_view s) {
@@ -1574,13 +1715,13 @@ std::string AgentRegistry::autocomplete_html(std::string_view query) const {
     // "help" pseudo-command
     all_cmds.push_back({"help", "List all plugins and actions"});
 
-    for (const auto& [name, pm] : best) {
-        all_cmds.push_back({pm->name, pm->description});
+    for (const auto* pm : best) {
+        all_cmds.push_back({pm->name, std::string{}});
         for (const auto& act : pm->actions) {
             auto key = pm->name + "." + act;
             auto it = descs.find(key);
             all_cmds.push_back(
-                {pm->name + " " + act, it != descs.end() ? it->second : pm->description});
+                {pm->name + " " + act, it != descs.end() ? it->second : std::string{}});
         }
     }
 
@@ -1614,13 +1755,9 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
     std::string q{query};
     std::ranges::transform(q, q.begin(), ::tolower);
 
-    std::unordered_map<std::string, const PluginMeta*> best;
-    for (const auto& s : agents_ | std::views::values)
-        for (const auto& pm : s->plugin_meta) {
-            auto it = best.find(pm.name);
-            if (it == best.end() || pm.actions.size() > it->second->actions.size())
-                best[pm.name] = &pm;
-        }
+    std::vector<const PluginMeta*> best;
+    for (const auto& e : catalogue_locked())
+        best.push_back(&e);
 
     const auto& descs = action_descriptions();
     auto esc = [](std::string_view s) {
@@ -1656,11 +1793,11 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
     std::vector<Entry> results;
     std::unordered_set<std::string> seen_plugins;
 
-    for (const auto& [pname, pm] : best) {
+    for (const auto* pm : best) {
         for (const auto& act : pm->actions) {
             auto key = pm->name + "." + act;
             auto it = descs.find(key);
-            std::string desc = it != descs.end() ? it->second : pm->description;
+            std::string desc = it != descs.end() ? it->second : std::string{};
             std::string full = pm->name + " " + act;
             std::string full_lower = full;
             std::ranges::transform(full_lower, full_lower.begin(), ::tolower);
@@ -1680,7 +1817,7 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
             auto& first_act = pm->actions.front();
             auto key = pm->name + "." + first_act;
             auto it = descs.find(key);
-            std::string desc = it != descs.end() ? it->second : pm->description;
+            std::string desc = it != descs.end() ? it->second : std::string{};
             results.push_back({pm->name + " " + first_act, desc, pm->name, first_act});
         }
     }

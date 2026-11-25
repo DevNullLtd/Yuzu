@@ -42,7 +42,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
 
 An authenticated dynamic route (every `/api/v1/` route, every dashboard fragment and page, `/metrics`) answers `HEAD` with `405 Method Not Allowed` and `Allow: GET`, **without running the handler**: a `HEAD` used to run the whole handler (a database read, a render) only to discard the body. These keep answering `HEAD`: the four health probes (`/livez`, `/readyz`, `/health`, `/api/health`), static assets (`/static/`), the sign-in pages, the OIDC and SAML sign-in endpoints, the SCIM prefix, and the public CA files (`/api/v1/ca/root`, `/api/v1/ca/crl`). Only a route registered for `GET` answers `HEAD`: a `POST`-only route in that set (`/saml/acs`, the `/login` form posts) has no `HEAD` handler and does not gain one. Two limits to know. RFC 9110 section 9.1 says a general-purpose server MUST support `HEAD`; this server declines it on dynamic routes on purpose, and an external monitor that sends `HEAD` to an authenticated route must send `GET` instead. And RFC 9110 section 15.5.6 says a 405's `Allow` header lists the methods the resource supports; this one names `GET` only, even where the same path also accepts `POST`, `PUT`, `PATCH` or `DELETE`, because listing the others would mean reading the route table from inside the request chokepoint for a rarely hit answer.
 
-The `405` applies only to an authenticated request that the same-site check has already admitted. An unauthenticated `HEAD` is answered by the same pre-routing authentication step as a `GET` (`401` for an API path, a redirect to the sign-in page for a page) and never reaches the `405`. The one exception is `/metrics`: it is served without a session when requested from loopback or under `--metrics-no-auth`, so a `HEAD` to it answers `405` directly.
+The `405` applies only to an authenticated request that the same-site check has already admitted. An unauthenticated `HEAD` is answered by the same pre-routing authentication step as a `GET` (`401` for an API path, a redirect to the sign-in page for a page) and never reaches the `405`. The one exception is `/metrics`: it is served without a session only under `--metrics-no-auth` (any source) or `--metrics-trust-loopback` (a direct loopback peer), so a `HEAD` to it in either mode answers `405` directly; otherwise it is answered `401` like any other unauthenticated request.
 
 **Compression.** A dynamic text or JSON response sent to a client that accepts `br` (brotli) is encoded at a fixed quality (5, not the library maximum of 11, which costs seconds of one worker for a multi-megabyte body) and carries `Content-Encoding: br` and `Vary: Accept-Encoding`; the `Vary` field is added beside any `Vary` a handler set, never in place of it. Which responses are compressed is unchanged. A response a handler already encoded, a chunked or ranged response and a file are not touched. See [Server Administration](server-admin.md) (`--http-worker-threads`) for the measured worker time.
 
@@ -2275,8 +2275,53 @@ gate and the same `503` on a degraded read apply to them. **Any other value, an 
 > `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
 > boundary. A device that was already contained under other operator exceptions keeps them: for a
 > record that was never confirmed, `last_confirmed_at` stays `0` (audit `quarantine.reapply`,
-> `allow_set_not_applied`), and the whitelist is not on the device until it is released and quarantined
-> again.
+> `allow_set_not_applied`), and the whitelist is not on the device until it is released and
+> quarantined again. Not where the apply was refused (the reply stored under the audit row's
+> `command_id` reads `status|refused|self_host` or `status|refused|own_addresses_unreadable`, see "A
+> device that refuses" below): there the release lifts the containment and a new quarantine cannot
+> put it back, so change the device's exceptions with `firewall.quarantine_allow` until they equal
+> the record's whitelist (the next apply then carries no note and the status read confirms).
+>
+> **A device that refuses (`refused|self_host`, `refused|own_addresses_unreadable`).** Every
+> `firewall.quarantine` apply that is not `repair=1` is checked, whoever sent it: an operator's
+> dispatch, the reconciler's apply (a record created over REST is only ever applied by the
+> reconciler) or an MCP re-apply, an apply to an already-contained device included. A device whose
+> control endpoint is one of its own addresses, loopback included, or whose own addresses it cannot
+> read, answers the apply with that refusal. The refusal changes nothing: no leg is built, no record
+> is stored, and an existing record and its containment are left as they were; it is in the apply's
+> stored reply (the `status|refused|<token>` row, `GET /api/v1/responses/{command_id}`; the
+> `command_id` is in the device's `quarantine.reapply` audit row) and in the agent log. So the token
+> alone does not say whether the device is contained; `firewall.quarantine_status` does. A device
+> that held no containment stays uncontained, so a record that was never confirmed never confirms
+> (`last_confirmed_at` stays `0`) and `YuzuQuarantineEndpointUnconfirmed` fires after 15 minutes. A
+> device that was already contained stays contained: its repair and its boot re-apply keep the
+> stored containment, and the server's re-apply is refused there. A time limit set on the device (by
+> a `firewall.quarantine` dispatch outside the quarantine routes; a server apply carries none) still
+> ends that containment, and the server cannot then contain it again. On a device whose own record
+> (the one the plugin keeps on the device) is active, the refusal carries
+> `note|allow_set_unchanged_use_quarantine_allow=1` when the request's exceptions differ as a set
+> from those in force (the same rule and text as a retry that is not refused), and a never-confirmed
+> record then stays unconfirmed (`allow_set_not_applied`); with equal exceptions there is no note
+> and the status read confirms. Do not release and quarantine again to change the whitelist on such
+> a device: the release lifts the containment and the new quarantine is refused, so the device ends
+> uncontained; use `firewall.quarantine_allow`. `own_addresses_unreadable` is permanent where the
+> agent cannot read its interfaces (for example a unit or seccomp profile that denies `AF_NETLINK`):
+> allow `AF_NETLINK` for the agent, the agent log names the errno. The record still refuses operator
+> commands to the device. The server keeps re-dispatching, so nothing ends the record by itself: end
+> it with `DELETE /api/v1/quarantine/{agent_id}`. A device that was never contained holds no rules,
+> so it answers a release with `status|inactive` and a plain `DELETE` ends the record; where the
+> device refuses the release (the packaged Linux unit, `privilege_unavailable`) the record stays
+> `releasing`: poll, do not repeat the `DELETE`, and use `?force=true` only if it is still
+> `releasing` (see the `DELETE` section below). A single-host stack (agent and server on one
+> machine) ends this way whenever the agent reaches the server at one of the host's own addresses,
+> loopback included. A server in a container or VM on the same host reached at a bridge address is
+> not refused: that host is contained with `forward` at policy drop and no rules, so forwarded
+> traffic is dropped and the server's published ports vanish for the whole fleet; a server apply
+> carries no time limit and the 60-second repair puts back a table removed by hand. A host that runs
+> the server while its agent reaches a remote gateway or VIP passes the check the same way. The
+> exits are the `DELETE` while the API is reachable, otherwise console recovery (the steps are in
+> `docs/user-manual/security-hardening.md` "A device that is its own server refuses new
+> containment").
 >
 > **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
 > progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed,
@@ -2424,11 +2469,12 @@ Quarantine a device.
 >   call — a brand-new record isn't in the heartbeat fast path's cache until
 >   the next periodic tick populates it, so a heartbeat arriving in that
 >   narrow window doesn't shortcut the wait. A record created here for a
->   reachable device does not stay dormant — the one exception is a stored
->   `whitelist` the re-dispatch validator refuses. As of #3425 (`d1f71c58f`)
+>   reachable device does not stay dormant — the exceptions are a stored
+>   `whitelist` the re-dispatch validator refuses and a device that refuses the apply (see "A
+>   device that refuses" above). As of #3425 (`d1f71c58f`)
 >   this route validates `whitelist` at write time (`400` instead of `201`
 >   for a malformed value), the same rule MCP's `quarantine_device`
->   enforces — so a fresh write here cannot land in this state. A
+>   enforces — so a fresh write here cannot land in the first case. A
 >   `validation_failed` reconcile points at a record written under an
 >   earlier, looser rule, not a fresh call. Either way, every reconcile
 >   attempt then counts `validation_failed` and nothing is ever dispatched.
@@ -8730,7 +8776,7 @@ See also `docs/scope-walking-design.md` and `docs/asset-tagging-guide.md` for th
 
 #### `GET /api/v1/discover/plugins`
 
-Plugin/action catalog observed across currently-connected agents (deduplicated by plugin name; the richest reported action list wins). **Not** a build-time manifest of every plugin that could ever load — a plugin no currently-connected agent reports is absent.
+Plugin/action catalog observed across currently-connected agents (deduplicated by plugin name; of the differing lists reported for one plugin, the one reported by the most agents wins, then the larger recognised set, and a tie serves an empty version). Only plugins and actions the server's own capability catalogue recognises are listed (an endpoint cannot add free text to this catalogue), and an agent-reported plugin description is never served. **Not** a build-time manifest of every plugin that could ever load — a plugin no currently-connected agent reports is absent.
 
 **Permission:** `Infrastructure:Read`
 
@@ -14871,6 +14917,8 @@ backport-aware matching (M1b/OVAL) lands.
 
 #### `GET /events`
 
+**Authorization.** This legacy stream carries untagged, pre-rendered output rows, command status and agent / pending-agent ids for the whole fleet, so it cannot be narrowed per device. It is therefore opened only by a caller with **unrestricted** `Response:Read` **and** `Execution:Read` authority (the same admit-then-filter gate as `GET /api/v1/events`, `require_fleet_read`): a caller whose read authority is confined to a management group or a service, a role without the grants, and an engine principal without those grants get `403` (an unreadable RBAC store, `503`), and a service-scoped token is denied. An engine principal is admitted only if it holds unrestricted `Response:Read` and `Execution:Read` through an explicit RBAC grant (engine principals never inherit legacy or service-scoped access). Under the default RBAC-off mode every signed-in human is still admitted. The dashboard console's live panel is unavailable to a scoped role; use the scoped `GET /api/v1/events` stream instead. As with the other two streams, the scope and the credential are checked once, at connect. A stream already open keeps delivering fleet-wide output after the caller's grant is removed, the session is revoked, the session expires from inactivity or the account is deprovisioned, until the client disconnects or the server restarts: the server never closes it for these reasons and there is no maximum lifetime (#7815). After removing a grant or deprovisioning an operator, restart the replica holding the stream to end streams already open. A scoped caller's refusal is audited as `events.stream.access_denied`.
+
 Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications. Live output events never carry a row written by a Forensics-tier plugin (see "Forensics-tier rows" under Command/Instruction Responses); a Forensics-tier frame publishes nothing to the live output stream (no row, no notice; the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder; open the execution results instead.
 
 **Example (curl):**
@@ -14994,6 +15042,8 @@ The browser-oriented `/sse/executions/{id}` route is preserved for the dashboard
 **Forensics-tier output is not published (#4990).** The live output events never carry a row written by a Forensics-tier plugin (`app_usage`, `browser_inventory`, `execution_artifacts`, `file_search`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), whoever is subscribed, and the failure text in the execution events of such a command is a short machine token or the fixed value `forensics_error`. Read the rows through the response routes, which require `Forensics:Read`. Such a frame publishes nothing to the live output stream, not even a notice (the timing and command-status events, which carry no plugin output, still go out), so the dashboard Console's results table stays on its "Waiting for results..." placeholder for such an action; open the execution results instead.
 
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check - a management-group-confined operator is admitted and then sees only their in-scope agents' events. The execution's dispatcher is always admitted to the stream (visibility only - avoids a false 404 on a just-dispatched execution with zero responses yet), never a bypass of the per-event redaction below. A service-scoped token has no dispatcher admission (#5557): it is admitted only once an agent in its service scope has a status row for the execution, and before that the route answers `404` as for a nonexistent execution. RBAC-off → unrestricted (legacy-open). This route shares one event projector (`execution_event_scope.hpp`) with the dashboard's `/sse/executions/{id}` sibling - see that section for the drop/sanitize table (`agent-transition` filtered by `agent_id`, `execution-progress` dropped, `execution-completed` sanitized to `status` only), and for the same subscribe-time-only gate staleness caveat (tracked: #3788) - this route shares that gap. The same applies to a service-scoped token: a stream's scope is fixed when it attaches, and revoking the token, retagging an agent out of its service scope or switching RBAC enforcement off does not close an open stream (tracked as #7815). **Residual: the number of withheld events is inferable.** Event ids are per-execution counters, one per published event (every `agent-transition`, every `execution-progress` tick and the `execution-completed`, for all agents), and this route puts the raw id on the wire (the `id:` line and the JSON `event_id`). A confined or service-scoped subscriber of an execution it is admitted to can therefore infer how many events were withheld from it, namely every dropped `execution-progress` tick and every out-of-scope `agent-transition`, so roughly two per status update of an agent outside its scope, from gaps between the ids it receives and from the id on the sanitized `execution-completed` frame. On this route the `replay-gap` frame is a further signal: its `missing_to` is computed from the raw ring front, so it is present only once the ring has evicted (about 1000 events), and probing `since=` reads it at will. No event content and no per-agent attribution is disclosed, but the fleet-count withholding protects values, not counts. A dense per-connection id cannot be substituted without breaking `Last-Event-ID` resume; an opaque resumable cursor is tracked as #7816.
+
+**Open-stream limit (#7815).** The scope and the credential are checked once, when the stream attaches. A stream already open keeps delivering after the grant is removed, the token or session is revoked or expires from inactivity, or the account is deprovisioned, and it has no maximum lifetime; to end an open stream, restart the replica holding the stream.
 
 **Required query parameter:**
 
@@ -16496,8 +16546,10 @@ Prometheus exposition format. Returns all server metrics.
 **Example (curl):**
 
 ```bash
-curl https://yuzu.example.com/metrics
+curl -H "Authorization: Bearer $YUZU_METRICS_TOKEN" https://yuzu.example.com/metrics
 ```
+
+`/metrics` requires authentication from every peer, loopback included, and accepts the API token of any principal (it checks no permission). Without a token the answer is `401`, unless the server runs with `--metrics-no-auth` or `--metrics-trust-loopback`. To mint a token and configure Prometheus, follow the one worked recipe: [Scraping /metrics with a bearer token](metrics.md#scraping-metrics-with-a-bearer-token).
 
 **Example output (excerpt):**
 
@@ -16555,6 +16607,6 @@ yuzu_server_command_queue_depth 5
 yuzu_server_uptime_seconds 86400
 ```
 
-> **Note:** Process health metrics (CPU, memory, connections, queue depth) are exposed on `/metrics` for all callers. When `--metrics-no-auth` is enabled, this data is accessible to unauthenticated remote clients.
+> **Note:** Process health metrics (CPU, memory, connections, queue depth) are exposed on `/metrics` to any caller that authenticates, whatever its permissions. When `--metrics-no-auth` is enabled, this data is accessible to unauthenticated remote clients.
 
 All server metrics use the `yuzu_server_` prefix. Standard labels: `agent_id`, `plugin`, `method`, `status`, `os`, `arch`.
