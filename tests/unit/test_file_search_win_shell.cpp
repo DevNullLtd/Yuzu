@@ -77,6 +77,11 @@ struct Owned {
     [[nodiscard]] bool ok() const { return h != INVALID_HANDLE_VALUE; }
 };
 
+/// unique_ptr deleter for a LocalAlloc block from the Win32 API (the ACL SetEntriesInAclW returns).
+struct LocalFreeDeleter {
+    void operator()(void* p) const noexcept { LocalFree(p); }
+};
+
 void write_file(const fs::path& p, const std::string& content) {
     fs::create_directories(p.parent_path());
     std::ofstream(p, std::ios::binary) << content;
@@ -421,12 +426,12 @@ TEST_CASE("file_search windows shell: a directory with a deny ACL is a permissio
     deny.Trustee.TrusteeForm = TRUSTEE_IS_SID;
     deny.Trustee.TrusteeType = TRUSTEE_IS_USER;
     deny.Trustee.ptstrName = reinterpret_cast<LPWSTR>(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid);
-    PACL acl = nullptr;
-    REQUIRE(SetEntriesInAclW(1, &deny, nullptr, &acl) == ERROR_SUCCESS);
+    PACL raw_acl = nullptr;
+    REQUIRE(SetEntriesInAclW(1, &deny, nullptr, &raw_acl) == ERROR_SUCCESS); // allocates on success
+    const std::unique_ptr<ACL, LocalFreeDeleter> acl(raw_acl);
     const DWORD set = SetNamedSecurityInfoW(const_cast<LPWSTR>(locked.c_str()), SE_FILE_OBJECT,
                                             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr,
-                                            nullptr, acl, nullptr);
-    LocalFree(acl);
+                                            nullptr, acl.get(), nullptr);
     // restores access whatever happens below, so the fixture can be removed
     struct Restore {
         std::wstring path;
