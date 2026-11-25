@@ -48,7 +48,8 @@ metadata:
     non-administrator without Forensics:Read can start a search under an approval and cannot
     continue it. Linux, macOS and Windows are searched; on Windows only fixed local volumes are
     searched, one volume per search, through no-reparse opens, and a cloud placeholder or
-    offline file or folder is never opened for use, listed or read.
+    offline folder is never opened for use or listed, and such a file is named in its match
+    row but never read or recalled.
   tags: [filesystem, search, inventory, extents]
 
 spec:

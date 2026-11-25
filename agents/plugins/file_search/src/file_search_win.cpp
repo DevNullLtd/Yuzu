@@ -182,16 +182,14 @@ namespace {
                 c = static_cast<char>(c - 'a' + 'A');
         return out;
     }
-    // Not ASCII: strict UTF-8 to UTF-16, the invariant locale's upper-casing, back to UTF-8. Any failure
-    // leaves the bytes as they are (a name that cannot be converted compares as the bytes it is).
-    const int wide_len = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.data(), static_cast<int>(name.size()),
-                                               nullptr, 0);
-    if (wide_len <= 0)
+    // Not ASCII: UTF-8 to UTF-16 through win_str.hpp, the invariant locale's upper-casing, back to UTF-8. Any
+    // failure leaves the bytes as they are (a name that cannot be converted compares as the bytes it is). The
+    // shared conversion replaces an invalid sequence rather than failing, so strictness is the round trip: a
+    // name that does not convert back to its own bytes was not valid UTF-8.
+    const std::wstring wide = yuzu::win::to_wide(name);
+    if (wide.empty() || yuzu::win::from_wide(wide.data(), static_cast<int>(wide.size())) != name)
         return std::string(name);
-    std::wstring wide(static_cast<std::size_t>(wide_len), L'\0');
-    if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.data(), static_cast<int>(name.size()), wide.data(),
-                              wide_len) != wide_len)
-        return std::string(name);
+    const int wide_len = static_cast<int>(wide.size());
     const int up_len = ::LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, wide.data(), wide_len, nullptr, 0, nullptr,
                                        nullptr, 0);
     if (up_len <= 0)

@@ -669,7 +669,11 @@ EnumerateResult enumerate_records(HANDLE dir, const EnumBudget& budget) {
             // bytes, is an OS error -- never a silent break, which would truncate
             // the listing while reporting a complete enumeration. The same checks
             // hold for both record layouts.
-            if (cursor < buffer.data() || cursor + sizeof(Info) > buffer_end) {
+            // Compared as a remaining byte count, never as `cursor + sizeof(Info)`, which would form a pointer
+            // past one-past-the-end when fewer bytes remain. `cursor` stays within [data, end] by the
+            // advance check below; the range test states it.
+            if (cursor < buffer.data() || cursor > buffer_end ||
+                static_cast<std::size_t>(buffer_end - cursor) < sizeof(Info)) {
                 spdlog::warn("confined_fs::enumerate_at: directory entry header out of bounds");
                 result.reason = Reason::OsError;
                 result.os_error = static_cast<int>(ERROR_INVALID_DATA);

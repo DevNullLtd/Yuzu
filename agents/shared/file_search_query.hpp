@@ -42,8 +42,15 @@ inline constexpr std::size_t kMaxStars = 4;
 inline constexpr std::size_t kMinLiteralBytes = 3;
 // A canonical pattern or name longer than this cannot be matched (bounds the matcher's work).
 inline constexpr std::size_t kMaxCanonicalPatternBytes = 4 * kMaxPatternBytes;
+// The assert below proves one thing only: a RAW name at the position bound (kMaxNameBytes, 765) fits the
+// matcher before it is canonicalised. It does not prove the canonical form fits. Windows upper-casing maps
+// UTF-16 units one to one, so a 255-unit name stays within 765 bytes and is always evaluated; the macOS
+// canonicaliser (normalisation and case folding) can expand, and a long name it pushes past this cap is
+// not_evaluated, which the walk records as a `name_too_long` gap (file_search_driver.hpp), never as a
+// non-match. That gap is the intended honest answer, pinned in test_file_search_query.cpp ("A canonicaliser
+// that expands a short name past the cap"); raising the cap only moves where the gap starts.
 inline constexpr std::size_t kMaxCanonicalNameBytes = 4 * 255;
-static_assert(kMaxCanonicalNameBytes >= kMaxNameBytes, "a name a Position can hold must still be evaluable");
+static_assert(kMaxCanonicalNameBytes >= kMaxNameBytes, "a raw name a Position can hold must fit the matcher");
 
 enum class PatternError { empty, too_long, too_many_stars, too_few_literals, forbidden_byte };
 
