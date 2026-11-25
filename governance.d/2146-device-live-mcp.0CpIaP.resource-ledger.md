@@ -99,3 +99,15 @@ on every fix commit).
 
 Suggested sanitizer coverage: unchanged (no lifetime or threading surface was added). The Postgres-backed tests ran in the scoped
 suite with `YUZU_TEST_POSTGRES_DSN` set (5047 cases, 441935 assertions, exit 0, on the tip tree).
+
+## Dev merge and the device-id outcome word (`12c3c9e522..`, merges `c125b9ca7e` and `4b2899d4af`, follow-up `f86f240b16`)
+
+Resource Ledger: no new or changed fd, HANDLE, SOCKET, `FILE*`, `sqlite3*`/`sqlite3_stmt*`, OpenSSL/BCrypt object, allocated C string,
+mapped library, temp path, subprocess, callback context or thread on this branch's side. The follow-up is one `LiveOutcome`
+enumerator (`kBadDeviceId`, appended as value 31) with its token arm and set-size updates, and one `outcome = ...` assignment in the REST
+handler: the `OutcomeRecorder` holds a `const LiveOutcome&` to a handler local declared before it (so it is destroyed first) and a
+`std::string_view` of a static literal from `live::kind_label`. The pre-seed loop walks `kAllLiveOutcomes`, so the counter grows from
+186 to 192 pre-seeded series (6 more: 2 surfaces x 3 kinds x 1 word); the row "Pre-seeded counters and gauge" in the table above
+(186, 2 x 3 x 31) is superseded by this one. Dev's merged ownership changes on the shared path (the `registry_` catalogue filter
+`[this]` callback, the `BulkReadSlots` `unique_ptr`, the echo-corruption gate callbacks) were inspected by cpp-safety: no ownership or
+ordering defect. No manual cleanup added; no exceptions. cpp-safety and cpp-expert reviewed at Gate 3 on the merge.
