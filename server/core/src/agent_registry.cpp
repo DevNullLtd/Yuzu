@@ -1262,6 +1262,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "Machine-context Windows Installer products (product code, name, version, publisher) for "
          "the daily installed-software inventory; per-user MSI products are never listed; macOS "
          "and Linux report unsupported"},
+        {"msi_packages.installer_records",
+         "Per-product Windows Installer records: the registry's InstallProperties values and the "
+         "cached package's own Property rows (product code, version, manufacturer, upgrade code); "
+         "paths under a user profile are withheld; Windows only, read-only, nothing is executed; "
+         "macOS and Linux report unsupported"},
         // windows_optional_features
         {"windows_optional_features.list", "List Windows optional OS features with enabled/disabled/pending state (DISM)"},
         {"windows_optional_features.info", "Describe one Windows optional feature: display name, state, restart requirement (DISM)"},
