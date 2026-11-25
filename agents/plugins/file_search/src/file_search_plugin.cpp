@@ -98,9 +98,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "their attributes and never read",
          "constrained: fixed NTFS, ReFS, FAT, FAT32 and exFAT volumes only; names compare upper-cased; links, "
          "junctions and mount points are skipped and counted; a populated cloud-synced folder is searched; "
-         "placeholder and offline files and folders are never opened; file ids are reported on NTFS only; a "
-         "folder the agent's token is refused is a gap; the search takes no extra privilege; the verdict "
-         "reads partial when any volume, directory or name was not searched"},
+         "placeholder and offline files and folders are never opened, except that each folder of the "
+         "operator-named root's own path is opened (never listed) before any listing decision (tracked in "
+         "#8755); file ids are reported on NTFS only; a folder the agent's token is refused is a gap; the "
+         "search takes no extra privilege; the verdict reads partial when any volume, directory or name was "
+         "not searched"},
     },
 };
 

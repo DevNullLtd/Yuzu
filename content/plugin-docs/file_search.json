@@ -19,7 +19,7 @@
           "support": "constrained"
         },
         "windows": {
-          "fallback": "constrained: fixed NTFS, ReFS, FAT, FAT32 and exFAT volumes only; names compare upper-cased; links, junctions and mount points are skipped and counted; a populated cloud-synced folder is searched; placeholder and offline files and folders are never opened; file ids are reported on NTFS only; a folder the agent's token is refused is a gap; the search takes no extra privilege; the verdict reads partial when any volume, directory or name was not searched",
+          "fallback": "constrained: fixed NTFS, ReFS, FAT, FAT32 and exFAT volumes only; names compare upper-cased; links, junctions and mount points are skipped and counted; a populated cloud-synced folder is searched; placeholder and offline files and folders are never opened, except that each folder of the operator-named root's own path is opened (never listed) before any listing decision (tracked in #8755); file ids are reported on NTFS only; a folder the agent's token is refused is a gap; the search takes no extra privilege; the verdict reads partial when any volume, directory or name was not searched",
           "mechanism": "resumable sorted depth-first search of one fixed volume through parent-handle-relative no-reparse opens; the volume type and the drive type decide whether it is searched; the extents of every matched file from FSCTL_GET_RETRIEVAL_POINTERS on an attribute-only handle, after FSCTL_GET_EXTERNAL_BACKING rules out an externally backed file; matched files are opened for their attributes and never read",
           "rung": "1",
           "support": "constrained"
