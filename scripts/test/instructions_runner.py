@@ -962,9 +962,11 @@ def _post_verdict(code: int, payload: Any) -> str:
 # targets as an SSRF block by design, so no value the runner can invent succeeds offline.
 _NO_PUBLIC_EGRESS_SKIPS = frozenset({"agent.http_client.get", "agent.http_client.head"})
 
-# These two need host privileges an isolated rig removes (no_new_privs blocks the sudo that
-# flush_dns uses; ping needs cap_net_raw). They are skipped ONLY when the operator says the run is in
-# such a rig, so a normal host still runs them and a real failure there still fails the gate.
+# These two need host privileges a bare checkout or an isolated rig may not give the agent: on Linux
+# flush_dns runs `sudo -n resolvectl flush-caches`, which needs the NOPASSWD grant that
+# scripts/install-agent-user.sh installs (or a root agent), and ping needs cap_net_raw. They are
+# skipped ONLY when the operator says the run lacks those (the bwrap rig: no_new_privs and dropped
+# capabilities), so a provisioned host still runs them and a real failure there still fails the gate.
 _PRIVILEGED_SKIPS = frozenset({"device.network_actions.ping", "device.network_actions.flush_dns"})
 SKIP_PRIVILEGED_ENV = "YUZU_INSTRUCTIONS_SKIP_PRIVILEGED"
 
@@ -976,8 +978,8 @@ def named_skip_reason(def_id: str, environ: dict[str, str] | None = None) -> str
         return ("needs a public host: the plugin SSRF-blocks private, loopback and unresolvable "
                 "targets, so no synthesised URL can succeed")
     if def_id in _PRIVILEGED_SKIPS and env.get(SKIP_PRIVILEGED_ENV, "") == "1":
-        return (f"{SKIP_PRIVILEGED_ENV}=1: this run is in an isolated rig without the host "
-                "privileges the action needs (sudo / cap_net_raw)")
+        return (f"{SKIP_PRIVILEGED_ENV}=1: this run lacks the host privileges the "
+                "action needs (sudo NOPASSWD grant / cap_net_raw)")
     return ""
 
 

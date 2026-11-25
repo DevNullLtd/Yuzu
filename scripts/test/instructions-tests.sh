@@ -41,9 +41,10 @@
 #
 # Rows the runner skips by name, with the reason recorded (never passed): agent.http_client.get/head
 # always (the plugin SSRF-blocks every target the runner could reach offline), and
-# device.network_actions.ping/flush_dns only when YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1, which an
-# isolated rig that removes sudo and raw sockets (bwrap no_new_privs) should set. A normal host
-# leaves it unset and still runs, and can still fail, those two.
+# device.network_actions.ping/flush_dns only when YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1, which a run
+# whose agent has no sudo NOPASSWD grant for resolvectl (see scripts/install-agent-user.sh) or no
+# raw-socket capability (a bwrap rig: no_new_privs) should set. A provisioned host leaves it unset
+# and still runs, and can still fail, those two.
 #
 # Usage:
 #   bash scripts/test/instructions-tests.sh \
