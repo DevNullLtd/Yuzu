@@ -305,6 +305,36 @@ class RunnerCase(unittest.TestCase):
         return mock.patch.object(ir.concurrent.futures, "wait", wait)
 
 
+class NamedSkipBanner(RunnerCase):
+    """The run says up front which runnable rows it will skip by name, and why."""
+
+    def banner(self, env, overrides=None):
+        defs = [definition("agent.http_client.get", "safe"),
+                definition("device.network_actions.ping", "mutating")]
+        base = {k: v for k, v in os.environ.items() if k != ir.SKIP_PRIVILEGED_ENV}
+        with mock.patch.dict(os.environ, {**base, **env}, clear=True):
+            return self.run_runner(defs, risks=("safe", "mutating"), targeted=False,
+                                   overrides=overrides)
+
+    def test_ids_and_reasons_are_printed_and_the_rows_skip(self):
+        r = self.banner({})
+        self.assertIn("1 runnable row(s) will be skipped by name", r.out)
+        self.assertIn("agent.http_client.get: needs a public host", r.out)
+        self.assertNotIn("device.network_actions.ping:", r.out)   # not skipped without the opt-in
+        self.assertNotIn("=1 is set", r.err)
+
+    def test_the_privileged_opt_in_is_announced_and_lists_its_rows(self):
+        r = self.banner({ir.SKIP_PRIVILEGED_ENV: "1"})
+        self.assertIn("2 runnable row(s) will be skipped by name", r.out)
+        self.assertIn("device.network_actions.ping: ", r.out)
+        self.assertIn(f"{ir.SKIP_PRIVILEGED_ENV}=1 is set", r.err)
+
+    def test_an_override_for_a_skipped_row_is_reported_as_ignored(self):
+        r = self.banner({}, overrides={"agent.http_client.get": {"url": "https://example.com/"}})
+        self.assertIn("--params-override for agent.http_client.get is ignored", r.err)
+        self.assertNotIn("agent.http_client.get", self.fake.posted_ids())
+
+
 class OverrideGate(RunnerCase):
     DEFS = [definition("t.clear", "destructive", properties=["opt"]),
             definition("t.path", "destructive", required=["path", "mode"]),

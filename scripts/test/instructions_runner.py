@@ -1748,10 +1748,15 @@ def run(args: argparse.Namespace) -> int:
     say(f"instructions_runner: {len(all_defs)} total definitions, "
           f"{len(runnable)} runnable (risks={','.join(sorted(selected_risks))}), "
           f"{len(skipped)} skipped")
-    named = sorted(d.id for d in runnable if named_skip_reason(d.id))
+    named = sorted((d.id, named_skip_reason(d.id)) for d in runnable if named_skip_reason(d.id))
     if named:   # always visible: a skip the operator did not select must not be silent
-        say(f"instructions_runner: {len(named)} runnable row(s) will be skipped by name "
-            f"(reason in each row's note): {', '.join(esc(i) for i in named)}")
+        say(f"instructions_runner: {len(named)} runnable row(s) will be skipped by name:")
+        for def_id, why in named:
+            say(f"instructions_runner:   {esc(def_id)}: {esc(why)}")
+        for def_id in sorted(param_overrides):
+            if any(def_id == n for n, _ in named):
+                say(f"instructions_runner: --params-override for {esc(def_id)} is ignored: "
+                    "the row is skipped by name", file=sys.stderr)
     if os.environ.get(SKIP_PRIVILEGED_ENV, "") == "1":
         say(f"instructions_runner: {SKIP_PRIVILEGED_ENV}=1 is set: network_actions.ping and "
             "flush_dns are skipped on this run", file=sys.stderr)
