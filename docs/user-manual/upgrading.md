@@ -11,6 +11,30 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: an access-review attestation must name the scope of the grant (#6969)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: any client that records an access-review decision, that is `POST /api/v1/access-reviews/{id}/attestations`, the MCP `record_attestation` tool, and a dashboard page that was loaded before this build started. To do: send `scope` on every attestation request, copied from the attestation row in `GET /api/v1/access-reviews/{id}` (REST) or `get_access_review` (MCP).
+
+**What changed.**
+
+- **`scope` is always required** on an attestation request. It is `fleet` or `management_group`. For `fleet`, `scope_group_id` may be absent or `""` (anything else is refused). For `management_group`, `scope_group_id` is required: a nonempty string of at most 64 bytes without a NUL byte. A request that omits `scope`, or sends a value that contradicts it, is refused with `400` (REST) or invalid params (MCP) and nothing is recorded.
+- **A fleet-wide grant is a fleet grant.** Every grant frozen by this build is fleet-wide, so for now a client sends `"scope": "fleet"` (with `scope_group_id` absent or `""`). Echoing the two fields from the campaign row is the form that stays correct when a row carries a management group.
+- **The campaign read shows the scope.** Each attestation row in `GET /api/v1/access-reviews/{id}` and `get_access_review` carries `scope`, `scope_group_id` and `scope_group_name`, always present (a fleet-wide row is `"fleet"`, `""`, `""`). The Settings and Access page campaign tables show a Scope column reading "Fleet-wide", and their confirmation dialogs name the scope.
+- **A grant is identified by five parts.** `(campaign_id, principal_type, principal_id, role_name, scope_group_id)`. The attestation and history tables gain `scope_group_id TEXT NOT NULL DEFAULT ''` (schema v4); existing rows read as fleet-wide.
+- **Audit detail.** The `access_review.attested` and `access_review.flagged` detail gains ` scope=fleet` or ` scope=management_group scope_group_id=<id>` after `role=<role>`. A parser that reads the earlier tokens by prefix is unaffected; one that matched the whole `detail` line, or took the last token as the role, is not. See [`audit-log.md`](audit-log.md).
+
+**Who is affected.** Scripts, integrations and MCP clients that attest by sending only the principal, role and decision. A dashboard tab loaded before the upgrade also sends no scope, so its Attest and Flag buttons answer `400` until the page is reloaded; no fallback guesses the scope for it.
+
+**What to do.**
+
+- Update clients to send `scope` (and `scope_group_id` for a management-group scope), copied from the campaign row.
+- Reload any open Settings or Access page after the upgrade.
+- Match audit rows for an attestation on the new `scope=` tokens, and do not read the last token of `detail` as the role.
+- **Start one replica first.** The v4 migration takes ACCESS EXCLUSIVE locks on both attestation tables for its duration, and a second replica that starts while it runs can fail waiting for the runner's lock and refuse to start. Measured at about 9 seconds for 1,000,000 rows in each table, on synthetic rows, one run, one machine: that is not a production timing. Under the fresh-database deployment contract the tables are empty at v4 and the cost is nil.
+- **Do not run an older build against a database this build has migrated.** The migration runner only warns when the database schema is ahead of the binary; it does not stop the older build, which would then read and update scoped rows with unscoped queries. This page does not describe a rollback as supported: the recovery is a fresh database, as the "Deployment contract (hard cutover)" requires.
+
 ## Behaviour change: the firewall `state` and `rules` reads answer through granted privilege on macOS and a root snapshot broker on packaged Linux, and a Windows rule property that cannot be read is `unknown`
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

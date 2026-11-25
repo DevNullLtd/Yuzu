@@ -5059,6 +5059,7 @@ reaches this check (see "Refusals that come before this gate" above).
     "attestations": [
       {
         "principal_type": "user", "principal_id": "bob", "role_name": "Operator",
+        "scope": "fleet", "scope_group_id": "", "scope_group_name": "",
         "decision": "pending", "reviewer": "", "decided_at_ms": 0,
         "justification": "", "grant_snapshot": { "display_name": "bob", "...": "..." },
         "decision_seq": 0, "history": []
@@ -5069,6 +5070,14 @@ reaches this check (see "Refusals that come before this gate" above).
   "meta": { "api_version": "v1" }
 }
 ```
+
+Each attestation row also carries the scope of its grant, always as three
+fields: `scope` (`"fleet"` or `"management_group"`), `scope_group_id` and
+`scope_group_name`. A fleet-wide grant reads `"fleet"`, `""`, `""`. In this
+build every frozen grant is fleet-wide, because the campaign population is
+unchanged; the fields are present so a client can echo them back to
+`POST .../attestations` (below), where they are required. The scope is part of the
+identity of a grant: the same principal and role at two scopes would be two rows.
 
 `decision_seq` is the number of decisions recorded for the grant: `0` exactly
 while it is `pending`, then `1`, `2` and so on. `history[]` lists the grant's
@@ -5150,6 +5159,8 @@ gate, so a caller without the permission still gets the `403`.
   "principal_type": "user",
   "principal_id": "bob",
   "role_name": "Operator",
+  "scope": "fleet",
+  "scope_group_id": "",
   "decision": "attested",
   "justification": "Confirmed still required for on-call rotation."
 }
@@ -5160,6 +5171,8 @@ gate, so a caller without the permission still gets the `403`.
 | `principal_type` | string | Yes | `user` \| `group` \| `engine` |
 | `principal_id` | string | Yes | Principal identifier, 1 to 1024 bytes, no NUL byte |
 | `role_name` | string | Yes | Role being reviewed, 1 to 1024 bytes, no NUL byte |
+| `scope` | string | Yes | `fleet` \| `management_group`. Always required; copy it from the attestation row in `GET /api/v1/access-reviews/{id}`. |
+| `scope_group_id` | string | Only for `management_group` | For `fleet`, absent or `""` (anything else is refused). For `management_group`, a nonempty string of at most 64 bytes with no NUL byte. Copy it from the attestation row. |
 | `decision` | string | Yes | `attested` \| `flagged_revoke` |
 | `justification` | string | No | Free-text reviewer note, at most 4096 bytes. It is kept with the decision and the application never deletes it: do not enter personal data beyond what the review requires. |
 
@@ -5178,6 +5191,13 @@ decision. `400`, one cause each:
 - The campaign id is malformed (see the rule above).
 - `principal_type`, `principal_id` or `role_name` is missing, or `decision` is neither `attested` nor
   `flagged_revoke`.
+- `scope` is missing, not a string, or neither `fleet` nor `management_group`; `scope` is `fleet` and
+  `scope_group_id` is present and nonempty (or not a string); or `scope` is `management_group` and
+  `scope_group_id` is missing, empty, not a string, over 64 bytes or contains a NUL byte. The message says
+  to copy `scope` and `scope_group_id` from the campaign row. This is a breaking change: a request that
+  omits `scope` is refused (see "Breaking: an access-review attestation must name the scope of the
+  grant" in `docs/user-manual/upgrading.md`). A page loaded before the upgrade sends no scope and gets this
+  `400` until it is reloaded.
 - `principal_type`, `principal_id` or `role_name` is longer than 1024 bytes or contains a NUL byte. The
   message is `principal_type, principal_id and role_name must be 1-1024 bytes without NUL`. It is decided
   before any lookup, so it holds for all three principal types, and it writes no audit row (the schema
@@ -5241,7 +5261,7 @@ independence as unevidenced if that row was not persisted (`Sec-Audit-Failed: tr
 on the response).
 
 **Every decision is kept.** A second decision for the same `(campaign_id,
-principal_type, principal_id, role_name)` does not replace the first: it is
+principal_type, principal_id, role_name, scope_group_id)` (the scope is part of the key; `""` is fleet-wide) does not replace the first: it is
 appended to the grant's history at the next `seq`, with the decision it replaced.
 Only the grant's current decision, reviewer and justification are replaced, and
 a grant cannot return to `pending`. An identical repeat is appended too, as a new
@@ -5291,7 +5311,8 @@ Audited as `access_review.attested` (decision `attested`) or
 separately countable/alertable, not one verb with a buried field. Every row of
 these two verbs for an outcome that reaches the gate or the store has
 `target_id=<campaign_id>` alone and the grant in the detail as
-`principal_type=<t> principal_id=<id> role=<role>`; the refusal of an engine session
+`principal_type=<t> principal_id=<id> role=<role>` followed by ` scope=fleet` or
+` scope=management_group scope_group_id=<id>`; the refusal of an engine session
 and the `415` refusal carry an empty `target_id`. On the REST route the engine-session
 refusal writes that row; on the MCP twin it writes only the `mcp.record_attestation`
 wrapper row and no `access_review.*` row. Each value is passed through the
