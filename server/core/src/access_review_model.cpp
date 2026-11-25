@@ -382,6 +382,8 @@ std::string freeze_snapshot(const AccessReviewRow& r) {
     append_json_string_member(out, "lifecycle_state", r.lifecycle_state);
     out += ',';
     append_json_string_member(out, "source", r.source);
+    out += ',';
+    append_json_string_member(out, "scope_group_name", r.scope_group_name);
     out += '}';
     return out;
 }
@@ -395,7 +397,7 @@ std::vector<GrantRef> freeze_population(const std::vector<AccessReviewRow>& rows
             continue;
         const std::string snapshot = freeze_snapshot(r);
         for (const auto& role : r.roles)
-            frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot});
+            frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot, r.scope_group_id});
     }
     return frozen;
 }

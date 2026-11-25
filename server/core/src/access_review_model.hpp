@@ -133,7 +133,23 @@ struct AccessReviewRow {
     std::string source; ///< "local" | "scim" | "idp" | "engine" | "orphan" — best-effort
                         ///< normalisation of the principal's provenance ("orphan" = grant with no
                         ///< matching roster row, UP-1); see the .cpp for the exact mapping
+    /// The scope the row's grants are held at (#6969): `""` is fleet-wide, any other value is a
+    /// management group's id. Always empty today: `build_access_review` lists fleet-wide grants
+    /// only, so the population is unchanged. Part of the identity a campaign freezes and an
+    /// attestation names (`GrantRef::scope_group_id`).
+    std::string scope_group_id;
+    /// The group's name when the row was built (freeze-time evidence), `""` for a fleet-wide row
+    /// or when the name is unavailable. Written into the frozen snapshot as `scope_group_name`; a
+    /// snapshot written before that key existed has none, and a reader treats it as `""`.
+    std::string scope_group_name;
 };
+
+/// The wire word for a scope id: `""` (fleet-wide) is `"fleet"`, any other id is
+/// `"management_group"`. The ONE mapping, so no surface re-derives it.
+[[nodiscard]] constexpr std::string_view scope_kind(std::string_view scope_group_id) noexcept {
+    return scope_group_id.empty() ? std::string_view{"fleet"}
+                                  : std::string_view{"management_group"};
+}
 
 /// Build the full cross-principal access-review export. `users`, `rbac`, and
 /// `engines` are REQUIRED — a null pointer, or a store that reports itself
@@ -289,17 +305,39 @@ decision_cap_wire_message(std::string_view store_error) noexcept {
     return std::nullopt;
 }
 
-/// True when `principal_type`, `principal_id` and `role_name` are each within their cap and free of
-/// a NUL byte (emptiness is the caller's own check). `pg/pg_exec.hpp` binds `c_str()`, so a NUL
-/// would truncate the bound value and name a different grant than the one audited.
+/// Longest scope group id, in bytes (a real management-group id is 12). Enforced by ONE helper,
+/// `scope_group_id_within_bounds`, at freeze (`open_campaign` refuses a `GrantRef` over it, so a
+/// campaign can never hold a row its attest endpoint would always refuse) and at attest.
+inline constexpr std::size_t kScopeGroupIdMaxLen = 64;
+
+/// The store's refusal text (prefixed `bad_request: `) for a scope id over the cap or holding a
+/// NUL byte. It spells out 64, pinned below. The empty id is valid: it is fleet-wide.
+inline constexpr std::string_view kScopeGroupIdInvalidMessage =
+    "scope_group_id must be at most 64 bytes without NUL";
+static_assert(kScopeGroupIdMaxLen == 64,
+              "kScopeGroupIdInvalidMessage spells out 64: update the text with the constant");
+
+/// True when a scope id is within `kScopeGroupIdMaxLen` and free of a NUL byte (`pg/pg_exec.hpp`
+/// binds `c_str()`, so a NUL would truncate the bound value and name a different scope). The empty
+/// id (fleet-wide) passes; whether a scope is REQUIRED is the caller's own rule.
+[[nodiscard]] inline bool scope_group_id_within_bounds(std::string_view scope_group_id) noexcept {
+    return scope_group_id.size() <= kScopeGroupIdMaxLen &&
+           scope_group_id.find('\0') == std::string_view::npos;
+}
+
+/// True when `principal_type`, `principal_id`, `role_name` and `scope_group_id` are each within
+/// their cap and free of a NUL byte (emptiness is the caller's own check; an empty scope is
+/// fleet-wide). `pg/pg_exec.hpp` binds `c_str()`, so a NUL would truncate the bound value and name
+/// a different grant than the one audited.
 [[nodiscard]] inline bool attest_grant_fields_within_bounds(std::string_view principal_type,
                                                             std::string_view principal_id,
-                                                            std::string_view role_name) noexcept {
+                                                            std::string_view role_name,
+                                                            std::string_view scope_group_id) noexcept {
     const auto ok = [](std::string_view s, std::size_t cap) {
         return s.size() <= cap && s.find('\0') == std::string_view::npos;
     };
     return ok(principal_type, kPrincipalIdMaxLen) && ok(principal_id, kPrincipalIdMaxLen) &&
-           ok(role_name, kRoleNameMaxLen);
+           ok(role_name, kRoleNameMaxLen) && scope_group_id_within_bounds(scope_group_id);
 }
 
 /// The single shared campaign id validator: 1..kCampaignIdMaxLen bytes, each in `[A-Za-z0-9_-]`.

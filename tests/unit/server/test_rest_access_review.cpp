@@ -76,6 +76,10 @@ using namespace yuzu::server;
 
 namespace {
 
+// The fleet-wide scope of a grant (the empty scope id), named wherever a test attests straight
+// through the store.
+const std::string kFleetScope;
+
 void setup_access_review_rest_pg_template(const std::string& dsn) {
     yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 2}};
     EnginePrincipalStore eps{pool};
@@ -3274,7 +3278,7 @@ TEST_CASE("access review store errors: every string the store returns maps to on
     const std::string kFrozenOwnerErr{yuzu::server::kStoreForbiddenEngineOwner};
     const Row rows[] = {
         {"not_found: no frozen grant matches (campaign_id, principal_type, principal_id, "
-         "role_name) in an open campaign",
+         "role_name, scope_group_id) in an open campaign",
          404, kInvalidParams},
         {"not_found: no campaign with this id", 404, kInvalidParams},
         {"not_found: campaign missing or already closed", 404, kInvalidParams},
@@ -3405,12 +3409,19 @@ TEST_CASE(
                                            .dump())
                 ->status == 200);
 
+    // The wire carries no scope field until the scope-on-the-wire change, so this lookup cannot take
+    // one yet; it refuses an ambiguous id instead of returning the first of two rows.
     const auto find_att = [](const nlohmann::json& atts, const std::string& id) {
+        nlohmann::json found;
+        int matches = 0;
         for (const auto& a : atts)
-            if (a["principal_id"] == id)
-                return a;
-        FAIL("attestation not found: " << id);
-        return nlohmann::json{};
+            if (a["principal_id"] == id) {
+                found = a;
+                ++matches;
+            }
+        if (matches != 1)
+            FAIL("expected exactly one attestation for " << id << ", found " << matches);
+        return found;
     };
 
     auto rest = h.sink.Get("/api/v1/access-reviews/" + cid);
@@ -3576,7 +3587,7 @@ TEST_CASE("decision history: a grant at the decision limit serialises under the 
     const auto cid = h.open_campaign_rest("read ceiling");
     for (std::int32_t i = 1; i <= yuzu::server::kMaxDecisionsPerGrant; ++i) {
         REQUIRE(h.access_review_store
-                    ->record_attestation(cid, "user", "bob", "Operator",
+                    ->record_attestation(cid, "user", "bob", "Operator", kFleetScope,
                                          i % 2 ? "attested" : "flagged_revoke", "carol",
                                          std::string(yuzu::server::kMaxJustificationBytes, 'j'))
                     .has_value());
@@ -3615,7 +3626,7 @@ void fill_grant_to_cap(AccessReviewHarness& h, const std::string& cid, const std
                        const std::string& reviewer) {
     for (std::int32_t i = 1; i <= yuzu::server::kMaxDecisionsPerGrant; ++i) {
         auto r = h.access_review_store->record_attestation(
-            cid, "user", user, "Operator", i % 2 ? "attested" : "flagged_revoke", reviewer, "");
+            cid, "user", user, "Operator", kFleetScope, i % 2 ? "attested" : "flagged_revoke", reviewer, "");
         REQUIRE(r.has_value());
         REQUIRE(r->seq == i);
     }

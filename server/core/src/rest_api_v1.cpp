@@ -11838,7 +11838,8 @@ void RestApiV1::register_routes(
             // Bound the grant tuple BEFORE the gate: the gate's refusal rows and the failure row
             // embed it, and the gate answers for a grant that may not exist, so an unbounded or
             // NUL-bearing id would write a forged, oversized audit row per request.
-            if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name)) {
+            if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name,
+                                                  std::string_view{})) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, kGrantFieldInvalidMessage),
                                 "application/json");
@@ -11871,8 +11872,8 @@ void RestApiV1::register_routes(
             }
 
             auto rec_res = access_review_store->record_attestation(
-                campaign_id, principal_type, principal_id, role_name, decision, session->username,
-                justification);
+                campaign_id, principal_type, principal_id, role_name, std::string{}, decision,
+                session->username, justification);
             if (!rec_res) {
                 if (const auto sod = access_review_sod::sod_from_store_error(rec_res.error())) {
                     refuse({*sod, {}});

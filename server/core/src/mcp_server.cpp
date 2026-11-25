@@ -33770,7 +33770,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // refusal rows and the failure row embed it, so an unbounded or NUL-bearing id
                 // would write a forged, oversized audit row per call. The schema's maxLength is
                 // discovery metadata only; this is the enforcement.
-                if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name)) {
+                if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name,
+                                                      std::string_view{})) {
                     res.set_content(a4_error(kInvalidParams, kGrantFieldInvalidMessage),
                                     "application/json");
                     return;
@@ -33814,7 +33815,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto rec_res = access_review_store->record_attestation(
-                    campaign_id, principal_type, principal_id, role_name, decision,
+                    campaign_id, principal_type, principal_id, role_name, std::string{}, decision,
                     session->username, justification);
                 if (!rec_res) {
                     if (const auto sod =

@@ -59,9 +59,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "test_auth_db_pg_helper.hpp"
@@ -818,16 +821,18 @@ TEST_CASE("freeze_population: one GrantRef per (row, role), snapshot byte for by
     const std::string alice_snap =
         R"({"display_name":"Alice","owner_or_email":"alice@example.com",)"
         R"("effective_permission_count":7,"last_activity_ms":0,"last_activity_kind":"n/a",)"
-        R"("classification":"","lifecycle_state":"active","source":"local"})";
+        R"("classification":"","lifecycle_state":"active","source":"local",)"
+        R"("scope_group_name":""})";
     const std::string engine_snap =
         R"({"display_name":"svc","owner_or_email":"ops-owner","effective_permission_count":12,)"
         R"("last_activity_ms":1700000000000,"last_activity_kind":"last_used",)"
-        R"("classification":"external","lifecycle_state":"active","source":"engine"})";
+        R"("classification":"external","lifecycle_state":"active","source":"engine",)"
+        R"("scope_group_name":""})";
     const std::string group_snap =
         "{\"display_name\":\"Eng \\\"Team\\\"\\\\ \\n\\u0001 \xc3\xa9\","
         R"("owner_or_email":"","effective_permission_count":0,"last_activity_ms":0,)"
         R"("last_activity_kind":"n/a","classification":"","lifecycle_state":"",)"
-        R"("source":"idp"})";
+        R"("source":"idp","scope_group_name":""})";
 
     CHECK(frozen[0].principal_type == "user");
     CHECK(frozen[0].principal_id == "alice");
@@ -854,4 +859,75 @@ TEST_CASE("freeze_population: one GrantRef per (row, role), snapshot byte for by
 
 TEST_CASE("freeze_population: empty input yields no grants", "[access_review][model][freeze]") {
     CHECK(freeze_population({}).empty());
+}
+
+// #6969: a row's scope is carried into every GrantRef it expands to, and the group's name is frozen
+// into the snapshot. Every pre-existing snapshot key is still present and in its old order (the
+// name is APPENDED), the engine owner included, and a fleet-wide row freezes the empty scope.
+TEST_CASE("freeze_population: the scope id is carried into each GrantRef and the group name into "
+          "the snapshot",
+          "[access_review][model][freeze][scope]") {
+    auto fleet = freeze_row("user", "alice", "Alice", "", {"Operator"}, 3, 0, "n/a", "", "active",
+                            "local");
+    auto grp = freeze_row("user", "alice", "Alice", "", {"Operator", "Viewer"}, 3, 0, "n/a", "",
+                          "active", "local");
+    grp.scope_group_id = "g-1";
+    grp.scope_group_name = "Eng \"West\"";
+    auto eng = freeze_row("engine", "engine:svc", "svc", "ops-owner", {"Writer"}, 1, 5, "last_used",
+                          "internal", "active", "engine");
+    eng.scope_group_id = "g-2";
+    eng.scope_group_name = "ops";
+
+    const auto frozen = freeze_population({fleet, grp, eng});
+    REQUIRE(frozen.size() == 4);
+    // One GrantRef per (row, role), scope per ROW: both roles of the group row carry g-1.
+    CHECK(frozen[0].scope_group_id.empty());
+    CHECK(frozen[1].scope_group_id == "g-1");
+    CHECK(frozen[2].scope_group_id == "g-1");
+    CHECK(frozen[1].role_name == "Operator");
+    CHECK(frozen[2].role_name == "Viewer");
+    CHECK(frozen[3].scope_group_id == "g-2");
+
+    CHECK(frozen[0].grant_snapshot.ends_with(R"("source":"local","scope_group_name":""})"));
+    CHECK(frozen[1].grant_snapshot.ends_with(
+        R"("source":"local","scope_group_name":"Eng \"West\""})"));
+    CHECK(frozen[1].grant_snapshot == frozen[2].grant_snapshot);
+    // Every key a pre-existing snapshot carried, in its old order, with the group name APPENDED
+    // (the stored text is evidence: the existing prefix must not move). nlohmann sorts keys, so the
+    // order is read from the raw text.
+    const std::vector<std::string> ordered = {
+        "display_name", kSnapshotOwnerKey, "effective_permission_count", "last_activity_ms",
+        "last_activity_kind", "classification", "lifecycle_state", "source", "scope_group_name"};
+    std::size_t at = 0;
+    for (const auto& key : ordered) {
+        const auto found = frozen[3].grant_snapshot.find("\"" + key + "\":", at);
+        INFO("key " << key);
+        REQUIRE(found != std::string::npos);
+        at = found;
+    }
+    const auto snap = nlohmann::json::parse(frozen[3].grant_snapshot);
+    CHECK(snap[kSnapshotOwnerKey] == "ops-owner");
+    CHECK(snap["scope_group_name"] == "ops");
+}
+
+TEST_CASE("scope_kind and the scope id bound are one definition for every surface",
+          "[access_review][model][scope]") {
+    CHECK(yuzu::server::scope_kind("") == "fleet");
+    CHECK(yuzu::server::scope_kind("g-1") == "management_group");
+    CHECK(yuzu::server::scope_kind("000000000000") == "management_group");
+
+    using yuzu::server::attest_grant_fields_within_bounds;
+    using yuzu::server::scope_group_id_within_bounds;
+    CHECK(scope_group_id_within_bounds(""));
+    CHECK(scope_group_id_within_bounds(std::string(yuzu::server::kScopeGroupIdMaxLen, 'x')));
+    CHECK_FALSE(scope_group_id_within_bounds(std::string(yuzu::server::kScopeGroupIdMaxLen + 1, 'x')));
+    CHECK_FALSE(scope_group_id_within_bounds(std::string_view("g\0x", 3)));
+    // The combined helper for REST, MCP and the store backstop includes the scope.
+    CHECK(attest_grant_fields_within_bounds("user", "alice", "Admin", ""));
+    CHECK(attest_grant_fields_within_bounds("user", "alice", "Admin", "g-1"));
+    CHECK_FALSE(attest_grant_fields_within_bounds(
+        "user", "alice", "Admin", std::string(yuzu::server::kScopeGroupIdMaxLen + 1, 'x')));
+    CHECK_FALSE(attest_grant_fields_within_bounds("user", "alice", "Admin",
+                                                  std::string_view("g\0", 2)));
+    CHECK_FALSE(attest_grant_fields_within_bounds(std::string_view("al\0ice", 6), "x", "Admin", ""));
 }
