@@ -1845,8 +1845,11 @@ flip, with a red-first test each:
     - The pre-flip measurement of Security-log behaviour (#7877 item 39) covers watched DIRECTORIES (File: default ON,
       every 5 s, and a UNC path means a periodic NTLM sign-in) as well as Registry keys; neither is measured.
     - #7877: the umbrella of the remaining verification residuals is triaged, File and Registry. The Registry items
-      are item 31 (a rename followed by a re-creation of the path before the next sample is not noticed; ACCEPTED
-      residual, Dave, no independent adjudicator) and two more accepted residuals found by the #7836 governance
+      are item 31 (R1: with the opt-in check enabled, a parent renamed away and its path re-created is now detected at
+      the next verification sample, by comparing the held handle's name with the one recorded at commit and the fresh
+      open's name with the held one; a rename away and back inside one interval stays an ACCEPTED residual, Dave, no
+      independent adjudicator, and the HKCR merged view and a link re-point are covered by the second compare only by
+      construction, unverified on a rig) and two more accepted residuals found by the #7836 governance
       review: item 32 (an undecided verification keeps the old handle and so misses a rename it saw until the next
       verification that decides) and item 33 (an Ancestor-mode watch is never verified, so a later rename of its
       shelter ancestor, including one re-committed in Ancestor mode after a verdict, is missed); item 34 (a Fired
@@ -1869,9 +1872,11 @@ flip, with a red-first test each:
     defeats a Registry guard IS in the Guardian threat model, so a deaf watch that reads Healthy is a security-control
     failure (I1) at the flip, not only a lost wakeup (I3). Before any `prefer_spark` flip each of these needs code, a
     measurement, or a fresh explicit owner decision recorded against it:
-    - #7877 item 31: a Registry parent renamed and the original path recreated within one verification interval leaves
-      the watch Healthy and deaf. Detect it before any flip (for example the held-handle name check through a
-      `DuplicateHandle` of the held `HKEY`, which the rig showed to be feasible).
+    - #7877 item 31: a Registry parent renamed and the original path recreated within one verification interval left
+      the watch Healthy and deaf. R1 detects it at the sampling bound with both compares (the held handle's name
+      against the name recorded at commit, through a `DuplicateHandle` of the held `HKEY`, and the fresh open's name
+      against the held one), only while the opt-in check is enabled (the default stays off until R3). The case where
+      the parent is renamed away and back inside one interval remains, and is R3's.
     - #7877 items 32 and 33: an undecided Registry verification keeps the old handle, and an Ancestor-mode Registry
       watch is never verified.
     - The File residual "renamed away and back between two samples" (the same class as item 31): not noticed.
@@ -2002,12 +2007,15 @@ flip, with a red-first test each:
     does not bypass the validation. On a Windows service that shows as Service Control Manager error 1053 with nothing in
     the agent log. A trailing `#` comment on the environment line is fatal too, because a systemd `EnvironmentFile` does
     not strip comments and the whole text becomes the value.
-    **Open residuals of the Registry fix** (none is claimed as covered; the first three are ACCEPTED residuals, owner
-    Dave, no independent adjudicator, tracked in #7877): a parent renamed away and a key re-created at
-    the original path BEFORE the next sample is not noticed (#7877 item 31), because the fresh open succeeds and is not
-    compared with the key the watch holds (a held-handle name check, `NtQueryKey(KeyNameInformation)` on a duplicate of
-    the notify handle, was measured to work on the rig, see the Runs paragraph, and is not implemented: it needs a handle
-    duplication under the pass lock; a test pins the residual); an undecided verification keeps the old handle, so a
+    **Open residuals of the Registry fix** (none is claimed as covered; the item 32 and item 33 clauses below are ACCEPTED
+    residuals, owner Dave, no independent adjudicator, tracked in #7877). **Item 31 (R1, #7877):** a parent renamed away
+    and a key re-created at the original path is detected at the next verification sample, only while the opt-in check is
+    enabled (see the dated R1 paragraph in the Runs record below): the held handle's canonical name
+    (`NtQueryKey(KeyNameInformation)` on a duplicate taken under the pass lock) is compared with the name recorded at
+    commit, and the fresh open's name with the held one. The first compare runs only for a watch whose commit recorded
+    a name, and a deny-ACE re-creation that makes the fresh open fail is caught by it and stays a visible fault. What R1
+    does not close is stated in the clauses below (the rename away and back inside one interval; the HKCR and link
+    sub-cases, unverified). An undecided verification keeps the old handle, so a
     rename the probe saw but could not conclude on (its ancestor walk failed) is missed until the next verification that
     decides; an Ancestor-mode watch is never verified, so after a verdict re-commits the watch in Ancestor mode a later
     rename of its shelter ancestor is missed (and an Ancestor-mode watch whose shelter ancestor is renamed is not
@@ -2015,9 +2023,14 @@ flip, with a red-first test each:
     a key deleted and re-created around a verification (an installer) can fault a healthy watch with the same reason
     text and leave it without coverage until the retry, about 30 s, the synthetic fire covering the gap;
     a persistent access-denied on the verification open leaves the watch unverified with no fault and no streak (unlike
-    File); HKCR is a merged view, so a user-hive key that appears later changes what the path resolves to, and a
-    registry link re-pointed to another target is the same class (the verification open follows links; both are
-    sub-cases of the rename-plus-recreate residual, item 31); every
+    File), except where the held handle's name shows the key moved (item 31 above); HKCR is a merged view, so a
+    user-hive key that appears later changes what the path resolves to, and a registry link re-pointed to another target
+    does the same (the verification open follows links; both are sub-cases of the item 31 class): the second compare
+    covers both by construction, but that rests on `NtQueryKey(KeyNameInformation)` on a handle opened through HKCR
+    reporting the underlying hive's canonical name, which is UNVERIFIED (no rig case exists), and for a link the name
+    reported through it was not measured (a volatile link key was created and resolved on the rig on 2026-11-25), so
+    neither sub-case is claimed as detected; an `HKCR` watch can also fault and recover at the retry when a per-user
+    class key appears over the machine one (unverified on a rig); every
     watch commits at about the same time at startup, so N watches launch their verifications together against the
     16-slot probe lane (no fairness queue like File's; a refused launch is retried on the admission backoff and does not
     demote coverage); a verification that hangs pins one probe-lane slot and that watch stays unverified, and because the
@@ -2434,11 +2447,37 @@ flip, with a red-first test each:
     faulted. All seven mutations were caught. Not run: any TSan run, the 50, 200 and 500 key cost measurements (no
     figure is quoted anywhere), the flip-time chaos scenarios, and the object-access audit behaviour on a key with a
     SACL.
+    **2026-11-25, R1 (#7877 item 31): dated note; the record above is unchanged.** The held-handle name compare described
+    above as not made is implemented by R1 (the held handle's name, read from a duplicate, against the name recorded at
+    commit, and the fresh open's name against the held one; the fault reasons are `registry watch key moved from its
+    path`, `registry watch path re-pointed to another key` and `registry watch hive unloaded`). The bytes, md5s, counts
+    and runs recorded in this record are the #7836 bytes and stand; they were not re-run for R1. R1 does not close the
+    family: a rename away and back inside one interval, the HKCR merged view and a link re-point remain (see the open
+    residuals above), and the check stays off by default until R3. Measurements taken for R1 on 2026-11-25 on the
+    weecolin rig (build 26100, elevated, peer-run and spot-checked, author-reported like the rest of this record, not
+    a CI run, scripts not in the tree): three runs of 33 checks each, 33 passed, 0 failed, re-measured the three
+    `DuplicateHandle` facts above (works on a `KEY_NOTIFY`-only `HKEY`; the duplicate's name tracks a rename of the
+    PARENT; closing the duplicate does not cancel the original's notify) and found that closing the original while a
+    duplicate is alive defers the notify's rundown until the duplicate, the last handle, closes. `DuplicateHandle`
+    p99 was 0.4 to 0.9 us over 500 keys and `NtQueryKey(KeyNameInformation)` p50 1.6 to 1.9 us (cost on a healthy hive,
+    P/Invoke overhead included; the claim that taking the duplicate under the pass lock cannot block on a hung hive is an
+    inference from the object model, not a measurement). Audit, on a key whose SACL audits all access for Everyone
+    (success and failure), two runs of 34 checks each, 34 passed: the duplicate adds no audit events under the
+    Registry subcategory alone; if an operator also enables the Handle Manipulation subcategory, each verification
+    adds one 4690 and one 4658 for the duplicate (2 events), the audited by-path open itself gains 3 events (4 in total
+    instead of 1; the Registry-only single-event figure is from an earlier peer run), and the new `NtQueryKey` calls add none. That is 1,440 events a day per key at a 60 s interval
+    (17,280 at 5 s) with Registry auditing alone, and 8,640 (103,680 at 5 s) with Handle Manipulation also on; a
+    narrower SACL yields fewer. There is no independent positive control for the Handle Manipulation subcategory, so
+    its zeros mean zero observed. Not measured: establishment and re-arm latency through the real probe job, the name
+    `NtQueryKey` reports through HKCR or a registry link, a profile unload against the mechanism, and the real
+    (narrower) SACLs of a fleet.
     **Governance review and the fixes after it (#7836).** A scoped `/governance` run (range `da67bf0371..5731eb0632`, ten
     governance agents; happy-path, compliance-officer and enterprise-readiness were omitted by the caller, and the chaos
     plan was written, not executed) was NOT a pass: it raised 43 findings (REG-01 to REG-43), four of them blocking-provisional
     (REG-01, REG-02, REG-03 and the test-side REG-07) and one owner-accepted row (REG-04). REG-01, REG-02 and REG-04 are
-    ACCEPTED residuals (owner Dave, no independent adjudicator; deferred to #7877, see the residuals above); REG-03 is
+    ACCEPTED residuals (owner Dave, no independent adjudicator; deferred to #7877, see the residuals above; as of
+    2026-11-25 REG-04, item 31, is detected at the sampling bound by R1 when the opt-in check is enabled, and its
+    rename-away-and-back case remains, see the dated R1 note above); REG-03 is
     adjudicated separately. Four commits follow `5731eb0632`: a test commit (`96882cae88`, whole-repo tree `6086bb292f87b1e7633c3fdbd25590180704c618`; REG-07: the
     `ProbeGate` hook of the Registry cases now owns its state by value) and three documentation and comment commits (`9c04408b6a`, `1beb84467e`, `b330b7c60a`; no behaviour
     change: `git diff -U0` over `spark_registry.cpp` and `spark_mechanism.hpp` shows comment lines only). **Rig run of the final
@@ -4110,16 +4149,21 @@ Needs its own fix + timeline, tracked separately. Only #2797's spark-branch half
 
 **#7877 items 31, 32 and 33 and the File away-and-back residual** (a Registry or File watch can read Healthy and
 stay deaf after a rename; review ids REG-04, REG-01, REG-02)
-- Detection signal: none. A watch that missed a rename reports Healthy; the Registry `verify_lost` and
-  `verify_undecided` counters are test-only (#7658).
+- Detection signal: none for items 32 and 33 and the File residual. A watch that missed a rename reports Healthy; the
+  Registry `verify_lost` and `verify_undecided` counters are test-only (#7658). Item 31 (R1, 2026-11-25) is detected
+  at the sampling bound when the opt-in Registry check is enabled: the watch faults with `registry watch key moved from
+  its path` (the held handle's name differs from the one recorded at commit), `registry watch path re-pointed to
+  another key` (the fresh open names another key than the held one) or `registry watch hive unloaded`; the new name
+  counters are test-only too (#7658). The residual for item 31 is a parent renamed away and back inside one interval
+  (not noticed), plus the HKCR and link sub-cases, which are unverified on a rig.
 - Operator action: none exists beyond restarting the agent or `--spark-disable`. Not confirmed as a documented
   runbook step.
 - Compensating control: Spark File and Registry are not live (`prefer_spark_` is false in production), so only
   rig-flipped agents can meet them. The legacy `IGuard` path stays the live detector.
 - Owner: Dave (repository owner), who accepted these as documented residuals deferred to #7877 (item 31 for REG-04,
-  item 32 for REG-01, item 33 for REG-02). The same person authored the commits and no independent adjudicator
-  reviewed the acceptance. On 2026-11-16 the owner ruled that a local administrator defeating a Registry guard is in
-  the threat model, so each of these, and the File "renamed away and back between samples" residual, is an I1
+  item 32 for REG-01, item 33 for REG-02; R1 has since changed what item 31 leaves open, see the detection signal
+  above). The same person authored the commits and no independent adjudicator reviewed the acceptance. On 2026-11-16
+  the owner ruled that a local administrator defeating a Registry guard is in the threat model, so each of these, and the File "renamed away and back between samples" residual, is an I1
   (security-control failure) at the flip and flip-blocking, not only I3.
 - Milestone: not assigned.
 - Revisit trigger: before any `prefer_spark` flip.
