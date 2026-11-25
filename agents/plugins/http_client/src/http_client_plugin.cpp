@@ -45,6 +45,7 @@
 #include <httplib.h>
 
 #include "http_client_download.hpp" // completeness / finalize rules (pure; unit-tested)
+#include "http_client_get_output.hpp" // `get` refuses a body whose peer sent a Content-Encoding
 #include <local_path_policy.hpp>      // refuse a UNC / device / network-mount destination
 #include <outbound_address_policy.hpp> // resolve-once address vetting
 
@@ -370,8 +371,10 @@ int download_url(std::string_view url, std::string& body, bool hash_will_verify,
 }
 
 // HTTP GET via httplib (no shell, no command injection)
-std::string http_get(std::string_view url, int& status_code, bool& truncated) {
+std::string http_get(std::string_view url, int& status_code, bool& truncated,
+                     std::string& content_encodings) {
     truncated = false;
+    content_encodings.clear();
     ParsedUrl parsed;
     if (!parse_url(url, parsed)) {
         status_code = 0;
@@ -398,10 +401,19 @@ std::string http_get(std::string_view url, int& status_code, bool& truncated) {
                               body.clear();
                               truncated = false;
                               seen_status = 0;
+                              content_encodings.clear();
                               return cli.Get(
                                   parsed.path,
                                   [&](const httplib::Response& r) {
                                       seen_status = r.status;
+                                      // EVERY Content-Encoding line, not just the first: a peer that
+                                      // sends `identity` then `br` must not pass the check.
+                                      const auto range = r.headers.equal_range("Content-Encoding");
+                                      for (auto it = range.first; it != range.second; ++it) {
+                                          if (!content_encodings.empty())
+                                              content_encodings += ',';
+                                          content_encodings += it->second;
+                                      }
                                       return true;
                                   },
                                   [&](const char* data, size_t len) {
@@ -627,8 +639,18 @@ private:
 
         int status = 0;
         bool truncated = false;
-        auto body = http_get(url, status, truncated);
+        std::string content_encodings;
+        auto body = http_get(url, status, truncated, content_encodings);
         ctx.write_output(std::format("status|{}", status));
+        // The client decodes nothing: a body the peer declared encoded is still encoded, so it is
+        // refused here rather than scrubbed into a row that looks like text.
+        if (status != 0) {
+            if (const auto refusal = yuzu::http_client::encoding_refusal_row(content_encodings);
+                !refusal.empty()) {
+                ctx.write_output(refusal);
+                return 1;
+            }
+        }
         // A body is peer data: cut at a scalar boundary when truncated and scrubbed to well-formed
         // UTF-8 without NUL, LF, CR or any other C0 control but TAB before it is one wire row (a NUL
         // would silently cut the row at the ABI; LF or CR would let the body start a sibling row).
