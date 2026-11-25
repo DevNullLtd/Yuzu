@@ -1802,8 +1802,8 @@ private:
         } else if (!w.subkey.empty()) {
             undecided = true; // no duplicate for a non-root watch: DuplicateHandle failed
         }
-        // A root-key watch (empty subkey) has no name to compare: its fresh query fails by
-        // design (the predefined pseudo-handle), which is neither a verdict nor undecided.
+        // A root-key watch (empty subkey) has no name to compare and is skipped here by
+        // design: no duplicate is taken for it and no verdict or undecided count is made.
         if (!w.subkey.empty() && r.ok && r.mode == WatchMode::Target && r.key_name_queried) {
             if (r.key_name_status != 0)
                 undecided = true;
@@ -1815,8 +1815,9 @@ private:
 
     /// Take the duplicate of the held handle for the verification job just staged as
     /// `work.probe_launches.back()`, under mu_ (#7877 item 31, R1). Only for a non-root
-    /// watch (an empty subkey names a predefined root: DuplicateHandle of a pseudo-handle
-    /// fails, NtQueryKey refuses it, and a predefined root cannot be renamed).
+    /// watch (an empty subkey names a predefined root, which cannot be renamed; whether the
+    /// handle the open returns for an empty subkey is a pseudo-handle is not established,
+    /// and the skip does not depend on it).
     ///
     /// Why under mu_ and not off-lock: under mu_ the watch is in watches_, so it cannot be
     /// retired or drained, and `open_key` is the handle this watch owns at this instant.
