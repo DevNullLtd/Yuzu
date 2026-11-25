@@ -103,10 +103,12 @@ is actually used.
    test-only changes may skip it.
 5. **Documentation gates run in CI** on every PR. The ones that can stop a merge are the two
    required `docs-lint.yml` jobs: *CBOM schema* (the CBOM goldens and per-artifact SBOMs
-   validated against their schemas) and the steps inside *CHANGELOG order*: besides the changelog order
-   itself, these include the docs-drift fact-parity check, the issue-lifecycle docs hygiene check
-   (including the `CLAUDE.md` size cap), RBAC doc/seed parity and the governance-ledger linter
-   self-test (`docs-lint.yml`, job `changelog-order`). The
+   validated against their schemas) and *CHANGELOG order*. *CHANGELOG order* runs none of the gates
+   itself: it fails unless all three `docs-lint-*` shard jobs succeed, and those hold every gate
+   it covers. Besides the changelog order itself, they include the docs-drift fact-parity check, the
+   issue-lifecycle docs hygiene check (including the `CLAUDE.md` size cap), RBAC doc/seed parity
+   and the governance-ledger linter self-test (`docs-lint.yml`, job `changelog-order` and the
+   shard jobs its `needs:` lists). The
    plugin README touch rule, the changelog-fragment lint and the doc-coupling touch rule are
    separate, non-required jobs, so their red results are advisory until the repository owner
    adds them to the rulesets (`docs/docs-drift-gate.md`, `docs/plugin-readme-standard.md`).
