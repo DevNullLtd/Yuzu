@@ -8,6 +8,9 @@
  * never host values: which capabilities and limits a CI runner holds is unknown. Shape includes
  * the facet's row kinds and counts, and a fully readable own process answering supported: a
  * process always reads its own five /proc files, so a constrained answer there is a defect.
+ * The macOS cases also use the test's own pid: sched is compared with getpriority for this
+ * process (no value pinned), the five other facets answer one unsupported row, the start_time
+ * token links one inspect to the next, and a pid that cannot exist answers no_such_process.
  *
  * Tagged [process_introspect] ONLY: a carved tag would move a case to another shard.
  */
@@ -29,8 +32,13 @@
 #include <string_view>
 #include <vector>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
+#endif
+#if defined(__APPLE__)
+#include <sys/resource.h>
+
+#include <cerrno>
 #endif
 
 namespace fs = std::filesystem;
@@ -120,7 +128,7 @@ yuzu::agent::LocalDispatcher::Result inspect(const LoadedPlugin& plugin, const s
 }
 
 std::string own_pid() {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     return std::to_string(static_cast<long>(::getpid()));
 #else
     return "1";
@@ -129,7 +137,7 @@ std::string own_pid() {
 
 } // namespace
 
-TEST_CASE("process_introspect plugin: one action, Linux constrained, macOS and Windows planned",
+TEST_CASE("process_introspect plugin: one action, Linux and macOS constrained, Windows planned",
           "[process_introspect]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -142,7 +150,7 @@ TEST_CASE("process_introspect plugin: one action, Linux constrained, macOS and W
     const auto& d = plugin->descriptor->action_descriptors[0];
     CHECK(std::string_view{d.action} == "inspect");
     CHECK(d.linux_leg.support == YUZU_SUPPORT_CONSTRAINED);
-    CHECK(d.macos_leg.support == YUZU_SUPPORT_PLANNED);
+    CHECK(d.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
     CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);
 }
 
@@ -289,9 +297,116 @@ TEST_CASE("process_introspect plugin (Linux): a pid that cannot exist answers a 
     CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
 }
 
-#else // macOS and Windows: planned
+#elif defined(__APPLE__)
 
-TEST_CASE("process_introspect plugin (macOS, Windows): valid parameters answer the shared planned row",
+TEST_CASE("process_introspect plugin (macOS): sched of the test's own pid answers the nice value",
+          "[process_introspect]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    static const std::regex sched_shape{R"(^sched\|-\|(-?[0-9]{1,2})\|-\|-$)"};
+    const auto r = inspect(*plugin, own_pid(), "sched");
+    CHECK(r.rc == 0);
+    const auto rows = captured_rows(r.captured);
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[0] == "status|inspect|constrained|macos:process_introspect:sched:nice_only");
+    const std::string expect_prefix = "target|" + own_pid() + "|";
+    CHECK(rows[1].starts_with(expect_prefix));
+    CHECK(rows[1].ends_with("|sched"));
+    std::smatch nice;
+    REQUIRE(std::regex_match(rows[2], nice, sched_shape));
+    // The shell is the only code that maps pbi_nice to a number, so compare it with the kernel's
+    // own answer for this process: any nice setting passes and no value is pinned. A legitimate
+    // -1 return leaves errno at 0.
+    errno = 0;
+    const int own_nice = getpriority(PRIO_PROCESS, 0);
+    REQUIRE(errno == 0);
+    CHECK(std::stoi(nice[1].str()) == own_nice);
+    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+}
+
+TEST_CASE("process_introspect plugin (macOS): the five unsupported facets answer one status row",
+          "[process_introspect]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    struct Case {
+        const char* facet;
+        const char* token;
+    };
+    const Case cases[] = {
+        {"resource_limits", "resource_limits:not_exposed_by_libproc"},
+        {"sigmasks", "sigmasks:not_exposed_by_libproc"},
+        {"oom", "oom:not_exposed_by_libproc"},
+        {"caps", "caps:no_os_equivalent"},
+        {"seccomp", "seccomp:no_os_equivalent"},
+    };
+    for (const auto& c : cases) {
+        const auto r = inspect(*plugin, own_pid(), c.facet);
+        INFO(c.facet);
+        CHECK(r.rc == 0);
+        const auto rows = captured_rows(r.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == std::string{"status|inspect|unsupported|macos:process_introspect:"} + c.token);
+        CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+    }
+}
+
+TEST_CASE("process_introspect plugin (macOS): the start_time token from one inspect guards the next",
+          "[process_introspect]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    const auto first = inspect(*plugin, own_pid(), "sched");
+    const auto first_rows = captured_rows(first.captured);
+    REQUIRE(first_rows.size() == 3);
+    const std::string& target = first_rows[1];
+    const std::size_t a = target.find('|', 7);
+    REQUIRE(a != std::string::npos);
+    const std::size_t b = target.find('|', a + 1);
+    REQUIRE(b != std::string::npos);
+    const std::string token = target.substr(a + 1, b - a - 1);
+
+    const auto same = inspect(*plugin, own_pid(), "sched", token);
+    const auto same_rows = captured_rows(same.captured);
+    REQUIRE(same_rows.size() == 3);
+    CHECK(same_rows[1] == target);
+
+    const std::string other = token.substr(0, 8) == "ffffffff" ? "00000000.1" : "ffffffff.1";
+    const auto reused = inspect(*plugin, own_pid(), "sched", other);
+    const auto rows = captured_rows(reused.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "status|inspect|unavailable|macos:process_introspect:pid_reused");
+    CHECK(reused.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+}
+
+TEST_CASE("process_introspect plugin (macOS): a pid that cannot exist answers no_such_process",
+          "[process_introspect]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    const auto r = inspect(*plugin, "2147483647", "sched");
+    CHECK(r.rc == 0);
+    const auto rows = captured_rows(r.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "status|inspect|unavailable|macos:process_introspect:no_such_process");
+    CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+}
+
+#else // Windows: planned
+
+TEST_CASE("process_introspect plugin (Windows): valid parameters answer the shared planned row",
           "[process_introspect]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -302,12 +417,8 @@ TEST_CASE("process_introspect plugin (macOS, Windows): valid parameters answer t
     CHECK(r.rc == 0);
     const auto rows = captured_rows(r.captured);
     REQUIRE(rows.size() == 1);
-#if defined(_WIN32)
     // MUTATION: removing the report_planned call changes this row.
     CHECK(rows[0] == "status|inspect|unsupported|windows:planned");
-#else
-    CHECK(rows[0] == "status|inspect|unsupported|macos:planned");
-#endif
     CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
     CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
 }
