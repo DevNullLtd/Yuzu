@@ -1112,6 +1112,30 @@ ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTi
             // The ranking is one of two fixed literals, never caller text.
             const char* const rank = q.order_by_id ? "id DESC" : "timestamp DESC, id DESC";
             const char* const out_rank = q.order_by_id ? "r.id DESC" : "r.timestamp DESC, r.id DESC";
+            // Decision facts (live poll only): computed over EVERY row the WHERE admits, before the
+            // row limit and the byte cut, so the cut cannot hide a failure, a terminal row or an
+            // `error|` head chunk. The same `where` (scope and tier included) is repeated, so a row
+            // the caller may not read cannot reach a fact. Absent unless requested: other callers
+            // keep byte-identical SQL.
+            const std::string chars = std::to_string(kBoundedFactsTextChars);
+            std::string facts_cte;
+            std::string facts_cols;
+            std::string facts_join;
+            if (q.with_decision_facts) {
+                facts_cte =
+                    ", facts AS (SELECT COALESCE(bool_or(status >= 2), false) AS any_failed, "
+                    "COALESCE(bool_or(status >= 1), false) AS any_terminal, "
+                    "COALESCE((SELECT left(error_detail, " + chars +
+                    ") FROM response_store.responses" + where +
+                    " AND status >= 2 ORDER BY id DESC LIMIT 1), '') AS failed_detail, "
+                    "COALESCE((SELECT left(output, " + chars + ") FROM response_store.responses" +
+                    where +
+                    " AND COALESCE(output, '') <> '' ORDER BY id ASC LIMIT 1), '') AS head_output "
+                    "FROM response_store.responses" + where + ")";
+                facts_cols = ", facts.any_failed, facts.any_terminal, facts.failed_detail, "
+                             "facts.head_output";
+                facts_join = " CROSS JOIN facts";
+            }
             std::string sql =
                 "WITH lim AS (SELECT id, timestamp, "
                 "COALESCE(octet_length(output), 0) + COALESCE(octet_length(error_detail), 0) "
@@ -1128,13 +1152,13 @@ ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTi
                 ") AS cut_bytes FROM ranked), "
                 "kept AS (SELECT id FROM ranked WHERE rn <= " +
                 limit_ph + " AND (rn = 1 OR running - sz < " + cap_ph +
-                ")) "
-                "SELECT r.id, r.instruction_id, r.agent_id, r.timestamp, r.status, r.output, "
+                "))" + facts_cte +
+                " SELECT r.id, r.instruction_id, r.agent_id, r.timestamp, r.status, r.output, "
                 "r.error_detail, r.ttl_expires_at, r.plugin, r.execution_id, r.received_at_ms, "
-                "COALESCE(r.plugin_result_status, 0), meta.total, meta.cut_bytes "
-                "FROM kept JOIN response_store.responses r ON r.id = kept.id CROSS JOIN meta "
-                "ORDER BY " +
-                std::string(out_rank);
+                "COALESCE(r.plugin_result_status, 0), meta.total, meta.cut_bytes" +
+                facts_cols +
+                " FROM kept JOIN response_store.responses r ON r.id = kept.id CROSS JOIN meta" +
+                facts_join + " ORDER BY " + std::string(out_rank);
             pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
@@ -1143,12 +1167,20 @@ ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTi
             out.rows.reserve(static_cast<std::size_t>(n));
             for (int i = 0; i < n; ++i)
                 out.rows.push_back(parse_response_row(res.get(), i));
+            if (q.with_decision_facts)
+                out.facts = BoundedFacts{}; // no kept row means no permitted row: all facts empty
             if (n > 0) {
                 // A zero-row result still carries its column descriptors, so the memory
                 // size is only reported when rows came back (0 otherwise, as documented).
                 out.result_bytes = PQresultMemorySize(res.get());
                 out.row_cap_hit = to_i64(PQgetvalue(res.get(), 0, 12)) > limit;
                 out.byte_cap_hit = to_i64(PQgetvalue(res.get(), 0, 13)) > 0;
+                if (q.with_decision_facts) {
+                    out.facts->any_failed = PQgetvalue(res.get(), 0, 14)[0] == 't';
+                    out.facts->any_terminal = PQgetvalue(res.get(), 0, 15)[0] == 't';
+                    out.facts->failed_detail = PQgetvalue(res.get(), 0, 16);
+                    out.facts->head_output = PQgetvalue(res.get(), 0, 17);
+                }
             }
             return out;
         });

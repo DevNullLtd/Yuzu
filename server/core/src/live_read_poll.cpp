@@ -28,7 +28,8 @@ std::string detail_of(std::string_view text) {
 
 } // namespace
 
-LiveRowsVerdict reduce_rows(std::span<const StoredResponse> rows, std::string_view agent_id) {
+LiveRowsVerdict reduce_rows(std::span<const StoredResponse> rows, std::string_view agent_id,
+                            const BoundedFacts* facts, bool rows_cut) {
     // Only this agent's rows, ordered ascending by row id alone: the id is assigned at insert, so
     // it is ingest order, which the second-resolution timestamp is not (see the header).
     std::vector<const StoredResponse*> mine;
@@ -52,6 +53,17 @@ LiveRowsVerdict reduce_rows(std::span<const StoredResponse> rows, std::string_vi
             terminal = true;
     }
 
+    // The store's facts see every permitted row, including any the row limit or the byte cut left
+    // out of `rows`: a failing or terminal row that later chunks pushed out must still decide.
+    if (facts != nullptr) {
+        if (facts->any_failed) {
+            failed = true;
+            failure_text = facts->failed_detail; // the newest failing row over ALL rows speaks last
+        }
+        if (facts->any_terminal)
+            terminal = true;
+    }
+
     // FAILURE WINS: a failed row answers a failure even when partial output is also present, and
     // before any joining work is spent on output that will be discarded.
     if (failed) {
@@ -71,9 +83,14 @@ LiveRowsVerdict reduce_rows(std::span<const StoredResponse> rows, std::string_vi
         v.output = std::move(joined);
         return v; // outcome stays kTimeout (undecided)
     }
-    if (joined.rfind("error|", 0) == 0) {
+    // `error|` is read from the head of the answer. When the store cut the oldest rows, the head of
+    // `joined` is a later chunk, so the true head chunk (from the facts) decides instead.
+    const bool head_from_facts = facts != nullptr && rows_cut;
+    const std::string_view head_text = head_from_facts ? std::string_view(facts->head_output)
+                                                       : std::string_view(joined);
+    if (head_text.starts_with("error|")) {
         v.outcome = LiveOutcome::kDeviceError;
-        v.detail = detail_of(std::string_view(joined).substr(6));
+        v.detail = detail_of(head_text.substr(6));
         return v;
     }
     v.outcome = LiveOutcome::kOk; // a terminal row, with or without output (empty success)
@@ -151,7 +168,8 @@ LivePollOutcome poll_live_output(const LiveRowsFn& read_rows, std::string_view a
             ++degraded;
             continue;
         }
-        auto verdict = reduce_rows(read->rows, agent_id);
+        auto verdict = reduce_rows(read->rows, agent_id, read->facts ? &*read->facts : nullptr,
+                                   read->capped);
         LivePollOutcome out;
         switch (verdict.outcome) {
         case LiveOutcome::kOk:
@@ -213,6 +231,10 @@ LivePollOutcome poll_live_output(const ResponseStore& store, const std::string& 
     // the LIMIT edge is deterministic. A cut or a row-limit hit means the head of the answer is
     // missing: `capped`.
     q.order_by_id = true;
+    // And decide from facts over every stored row, not only the rows that survive the cut: a
+    // failing row, the terminal row or an `error|` head chunk that later rows (a late or duplicate
+    // delivery) pushed past the row limit or the byte cap must still answer.
+    q.with_decision_facts = true;
     return poll_live_output(
         [&]() -> std::optional<LiveRowsRead> {
             auto bounded = store.query_bounded(command_id, tier, q, std::nullopt, limits.max_output_bytes);
@@ -221,6 +243,7 @@ LivePollOutcome poll_live_output(const ResponseStore& store, const std::string& 
             LiveRowsRead read;
             read.capped = bounded->row_cap_hit || bounded->byte_cap_hit;
             read.rows = std::move(bounded->rows);
+            read.facts = std::move(bounded->facts);
             return read;
         },
         agent_id, limits, sleep_fn, should_stop, now_fn);

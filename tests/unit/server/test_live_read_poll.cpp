@@ -272,6 +272,74 @@ TEST_CASE("reduce_rows: a RUNNING row with no output is still undecided and not 
     CHECK_FALSE(v.partial);
 }
 
+// G-UP-1: decision facts cover rows the bounded read cut. The facts come from the store, over every
+// permitted row, so the reducer must decide from them when the rows it was handed are thinned.
+TEST_CASE("reduce_rows: decision facts decide over rows the bounded read left out", "[live][poll][2146]") {
+    BoundedFacts facts;
+    SECTION("a failure the cut dropped still answers, with the facts' text") {
+        // The surviving rows are late RUNNING chunks; the failing row is not among them.
+        const std::vector<StoredResponse> rows{row(90, 100, 0, "late|1\n"), row(91, 100, 0, "late|2\n")};
+        facts.any_failed = true;
+        facts.any_terminal = true;
+        facts.failed_detail = "agent exploded";
+        const auto v = live::reduce_rows(rows, "agent-1", &facts, /*rows_cut=*/true);
+        CHECK(v.outcome == live::LiveOutcome::kDeviceFailed);
+        CHECK(v.detail == "agent exploded");
+        CHECK(v.output.empty());
+    }
+    SECTION("the facts' failure text is bounded like a row's") {
+        facts.any_failed = true;
+        facts.failed_detail = std::string(500, 'e');
+        const auto v = live::reduce_rows({}, "agent-1", &facts, true);
+        CHECK(v.outcome == live::LiveOutcome::kDeviceFailed);
+        CHECK(v.detail.size() == live::kLiveDetailMaxBytes);
+    }
+    SECTION("a terminal row the cut dropped still makes the answer decidable") {
+        const std::vector<StoredResponse> rows{row(90, 100, 0, "late|1\n")};
+        facts.any_terminal = true;
+        const auto v = live::reduce_rows(rows, "agent-1", &facts, true);
+        CHECK(v.outcome == live::LiveOutcome::kOk);
+        CHECK_FALSE(v.partial);
+    }
+    SECTION("no facts: the same rows are undecided, as before") {
+        const std::vector<StoredResponse> rows{row(90, 100, 0, "late|1\n")};
+        const auto v = live::reduce_rows(rows, "agent-1");
+        CHECK(v.outcome == live::LiveOutcome::kTimeout);
+        CHECK(v.partial);
+    }
+    SECTION("facts that show nothing change nothing") {
+        const std::vector<StoredResponse> rows{row(1, 100, 1, "proc|1|a\n")};
+        const auto v = live::reduce_rows(rows, "agent-1", &facts, false);
+        CHECK(v.outcome == live::LiveOutcome::kOk);
+        CHECK(v.output == "proc|1|a\n");
+    }
+}
+
+TEST_CASE("reduce_rows: when the oldest rows were cut, the true head chunk decides `error|`", "[live][poll][2146]") {
+    BoundedFacts facts;
+    facts.any_terminal = true;
+    const std::vector<StoredResponse> rows{row(90, 100, 0, "later|1\n"), row(91, 100, 1, "")};
+    SECTION("the head chunk was an error| answer the cut dropped") {
+        facts.head_output = "error|device said no";
+        const auto v = live::reduce_rows(rows, "agent-1", &facts, /*rows_cut=*/true);
+        CHECK(v.outcome == live::LiveOutcome::kDeviceError);
+        CHECK(v.detail == "device said no");
+    }
+    SECTION("a surviving chunk that starts with error| is data when the true head is not an error") {
+        const std::vector<StoredResponse> data{row(90, 100, 0, "error|looks-like-one\n"), row(91, 100, 1, "")};
+        facts.head_output = "proc|1|a";
+        const auto v = live::reduce_rows(data, "agent-1", &facts, true);
+        CHECK(v.outcome == live::LiveOutcome::kOk);
+    }
+    SECTION("nothing was cut: the joined output decides, as before") {
+        facts.head_output = "error|ignored"; // would flip the answer if it were read without a cut
+        const std::vector<StoredResponse> whole{row(1, 100, 1, "proc|1|a\n")};
+        const auto v = live::reduce_rows(whole, "agent-1", &facts, /*rows_cut=*/false);
+        CHECK(v.outcome == live::LiveOutcome::kOk);
+        CHECK(v.output == "proc|1|a\n");
+    }
+}
+
 TEST_CASE("utf8_clamp_prefix: never ends inside a multi-byte character", "[live][poll][utf8]") {
     using yuzu::server::utf8_clamp_prefix;
     const std::string euro = "\xE2\x82\xAC"; // 3 bytes
@@ -924,6 +992,208 @@ TEST_CASE("poll_live_output [pg]: chunks finalized in place as a failure answer 
                                             &yuzu::server::test::forensics_plugin_set(), limits, no_sleep);
     CHECK(out.outcome == live::LiveOutcome::kDeviceFailed);
     CHECK(out.detail == "agent exploded");
+}
+
+// G-UP-1: rows that reach the store AFTER the answer was decided (a late or redelivered chunk) must
+// not hide it. The failure, the terminal row and an `error|` head chunk are read as facts over every
+// permitted row, so the row limit and the byte cut cannot drop them.
+TEST_CASE("poll_live_output [pg]: late chunks past the cut cannot hide a stored device failure",
+          "[live][poll][pg][2146]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::test::PostgresTestDb db{live_poll_tpl};
+    REQUIRE(db.available());
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+    const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+
+    SECTION("chunks finalized in place as a failure, then more than the row limit of late RUNNING rows") {
+        for (int i = 0; i < 5; ++i)
+            seed(store, "cmd-late-fail", "agent-1", 0, "proc|" + std::to_string(i) + "|x\n");
+        REQUIRE(store.finalize_terminal_status("cmd-late-fail", "agent-1", 2, "agent exploded", "", 0) ==
+                ResponseStore::FinalizeResult::Updated);
+        for (int i = 0; i < live::kLivePollRowLimit + 6; ++i)
+            seed(store, "cmd-late-fail", "agent-1", 0, "late|" + std::to_string(i) + "\n");
+
+        auto limits = fast_limits(1);
+        limits.over_cap = GENERATE(live::OverCapPolicy::kTruncateAtNewline, live::OverCapPolicy::kRefuse);
+        const auto out = live::poll_live_output(store, "cmd-late-fail", "agent-1", plugins, limits, no_sleep);
+        CHECK(out.outcome == live::LiveOutcome::kDeviceFailed);
+        CHECK(out.detail == "agent exploded");
+    }
+    SECTION("a separately inserted failing terminal row, then more than the row limit of late RUNNING rows") {
+        seed(store, "cmd-late-sep", "agent-1", 0, "proc|1|x\n");
+        seed(store, "cmd-late-sep", "agent-1", 2, "", "os_info", "agent exploded");
+        for (int i = 0; i < live::kLivePollRowLimit + 6; ++i)
+            seed(store, "cmd-late-sep", "agent-1", 0, "late|" + std::to_string(i) + "\n");
+
+        auto limits = fast_limits(1);
+        limits.over_cap = GENERATE(live::OverCapPolicy::kTruncateAtNewline, live::OverCapPolicy::kRefuse);
+        const auto out = live::poll_live_output(store, "cmd-late-sep", "agent-1", plugins, limits, no_sleep);
+        CHECK(out.outcome == live::LiveOutcome::kDeviceFailed);
+        CHECK(out.detail == "agent exploded");
+    }
+    SECTION("byte cap: large late chunks fill the cap after the failing row") {
+        seed(store, "cmd-late-bytes", "agent-1", 2, "", "os_info", "agent exploded");
+        for (int i = 0; i < 5; ++i)
+            seed(store, "cmd-late-bytes", "agent-1", 0, std::string(100, 'a' + i) + "\n");
+
+        auto limits = fast_limits(1);
+        limits.max_output_bytes = 150;
+        limits.over_cap = GENERATE(live::OverCapPolicy::kTruncateAtNewline, live::OverCapPolicy::kRefuse);
+        const auto out = live::poll_live_output(store, "cmd-late-bytes", "agent-1", plugins, limits, no_sleep);
+        CHECK(out.outcome == live::LiveOutcome::kDeviceFailed);
+        CHECK(out.detail == "agent exploded");
+    }
+    SECTION("the NEWEST failing row's text wins, over a row the cut dropped") {
+        seed(store, "cmd-two-fail", "agent-1", 2, "", "os_info", "first failure");
+        seed(store, "cmd-two-fail", "agent-1", 2, "", "os_info", "second failure");
+        for (int i = 0; i < live::kLivePollRowLimit + 6; ++i)
+            seed(store, "cmd-two-fail", "agent-1", 0, "late|" + std::to_string(i) + "\n");
+
+        const auto out = live::poll_live_output(store, "cmd-two-fail", "agent-1", plugins, fast_limits(1), no_sleep);
+        CHECK(out.outcome == live::LiveOutcome::kDeviceFailed);
+        CHECK(out.detail == "second failure");
+    }
+}
+
+TEST_CASE("poll_live_output [pg]: a terminal row or an error| head chunk the cut dropped still decides",
+          "[live][poll][pg][2146]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::test::PostgresTestDb db{live_poll_tpl};
+    REQUIRE(db.available());
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+    const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+
+    SECTION("a success terminal finalized in place, then late rows: decided and flagged, never incomplete") {
+        for (int i = 0; i < 3; ++i)
+            seed(store, "cmd-late-ok", "agent-1", 0, "proc|" + std::to_string(i) + "|x\n");
+        REQUIRE(store.finalize_terminal_status("cmd-late-ok", "agent-1", 1, "", "", 0) ==
+                ResponseStore::FinalizeResult::Updated);
+        for (int i = 0; i < live::kLivePollRowLimit + 6; ++i)
+            seed(store, "cmd-late-ok", "agent-1", 0, "late|" + std::to_string(i) + "\n");
+
+        auto limits = fast_limits(1);
+        limits.over_cap = live::OverCapPolicy::kTruncateAtNewline;
+        const auto cut = live::poll_live_output(store, "cmd-late-ok", "agent-1", plugins, limits, no_sleep);
+        CHECK(cut.outcome == live::LiveOutcome::kOk);
+        CHECK(cut.truncated); // the head is missing, and the answer says so
+        limits.over_cap = live::OverCapPolicy::kRefuse;
+        const auto refused = live::poll_live_output(store, "cmd-late-ok", "agent-1", plugins, limits, no_sleep);
+        CHECK(refused.outcome == live::LiveOutcome::kOutputTooLarge);
+    }
+    SECTION("an error| head chunk, then more than the row limit of later rows and a terminal row") {
+        seed(store, "cmd-head-err", "agent-1", 0, "error|device said no");
+        for (int i = 0; i < live::kLivePollRowLimit + 6; ++i)
+            seed(store, "cmd-head-err", "agent-1", 0, "later|" + std::to_string(i) + "\n");
+        seed(store, "cmd-head-err", "agent-1", 1, "");
+
+        auto limits = fast_limits(1);
+        limits.over_cap = GENERATE(live::OverCapPolicy::kTruncateAtNewline, live::OverCapPolicy::kRefuse);
+        const auto out = live::poll_live_output(store, "cmd-head-err", "agent-1", plugins, limits, no_sleep);
+        CHECK(out.outcome == live::LiveOutcome::kDeviceError);
+        CHECK(out.detail == "device said no");
+    }
+    SECTION("a data head chunk is not turned into an error by a surviving error| line") {
+        seed(store, "cmd-head-data", "agent-1", 0, "proc|1|a\n");
+        for (int i = 0; i < live::kLivePollRowLimit + 6; ++i)
+            seed(store, "cmd-head-data", "agent-1", 0, "error|row-" + std::to_string(i) + "\n");
+        seed(store, "cmd-head-data", "agent-1", 1, "");
+
+        auto limits = fast_limits(1);
+        limits.over_cap = live::OverCapPolicy::kTruncateAtNewline;
+        const auto out = live::poll_live_output(store, "cmd-head-data", "agent-1", plugins, limits, no_sleep);
+        CHECK(out.outcome == live::LiveOutcome::kOk);
+        CHECK(out.truncated);
+    }
+}
+
+// The facts ride the same WHERE as the rows: another agent's failure and a Forensics-tier failure
+// must never reach any fact, however new, and the cut never changes them.
+TEST_CASE("ResponseStore::query_bounded [pg]: decision facts cover every permitted row, only the permitted rows",
+          "[live][poll][pg][2146]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::test::PostgresTestDb db{live_poll_tpl};
+    REQUIRE(db.available());
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto tier = ResponseTierFilter::for_fixed_plugin_poll(&yuzu::server::test::forensics_plugin_set());
+    ResponseQuery q;
+    q.agent_id = "agent-1";
+    q.order_by_id = true;
+    q.limit = 1; // the cut keeps ONE row; the facts must still see the rest
+
+    SECTION("a failure the cut dropped, the head chunk, and the newest failure's text") {
+        seed(store, "cmd-facts", "agent-1", 0, "head|chunk\n");
+        seed(store, "cmd-facts", "agent-1", 2, "", "os_info", "older failure");
+        seed(store, "cmd-facts", "agent-1", 2, "", "os_info", std::string(400, 'f'));
+        seed(store, "cmd-facts", "agent-1", 0, "late\n");
+
+        q.with_decision_facts = true;
+        const auto got = store.query_bounded("cmd-facts", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        REQUIRE(got->rows.size() == 1);
+        CHECK(got->rows[0].output == "late\n"); // the cut kept only the newest row
+        CHECK(got->row_cap_hit);
+        REQUIRE(got->facts.has_value());
+        CHECK(got->facts->any_failed);
+        CHECK(got->facts->any_terminal);
+        CHECK(got->facts->failed_detail == std::string(kBoundedFactsTextChars, 'f')); // newest failure, cut
+        CHECK(got->facts->head_output == "head|chunk\n"); // oldest non-empty output
+    }
+    SECTION("the head is the oldest NON-EMPTY output") {
+        seed(store, "cmd-facts-empty", "agent-1", 0, "");
+        seed(store, "cmd-facts-empty", "agent-1", 0, "second\n");
+        seed(store, "cmd-facts-empty", "agent-1", 0, "third\n");
+        q.with_decision_facts = true;
+        const auto got = store.query_bounded("cmd-facts-empty", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        REQUIRE(got->facts.has_value());
+        CHECK(got->facts->head_output == "second\n");
+        CHECK_FALSE(got->facts->any_failed);
+        CHECK_FALSE(got->facts->any_terminal);
+        CHECK(got->facts->failed_detail.empty());
+    }
+    SECTION("another agent's failure and a Forensics-tier failure reach no fact") {
+        seed(store, "cmd-facts-vis", "agent-1", 0, "mine\n");
+        seed(store, "cmd-facts-vis", "agent-2", 2, "", "os_info", "foreign failure");
+        seed(store, "cmd-facts-vis", "agent-1", 2, "", yuzu::server::test::kForensicsPlugin, "secret failure");
+        seed(store, "cmd-facts-vis", "agent-2", 1, "foreign head\n");
+        q.with_decision_facts = true;
+        const auto got = store.query_bounded("cmd-facts-vis", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        REQUIRE(got->facts.has_value());
+        CHECK_FALSE(got->facts->any_failed);
+        CHECK_FALSE(got->facts->any_terminal);
+        CHECK(got->facts->failed_detail.empty());
+        CHECK(got->facts->head_output == "mine\n");
+        CHECK_FALSE(got->row_cap_hit); // the withheld rows set no cap flag either
+    }
+    SECTION("no rows: facts are present and empty") {
+        q.with_decision_facts = true;
+        const auto got = store.query_bounded("cmd-facts-none", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        REQUIRE(got->facts.has_value());
+        CHECK_FALSE(got->facts->any_failed);
+        CHECK(got->facts->head_output.empty());
+    }
+    SECTION("not requested: no facts, and the rows are unchanged") {
+        seed(store, "cmd-facts-off", "agent-1", 2, "", "os_info", "boom");
+        const auto got = store.query_bounded("cmd-facts-off", tier, q, std::nullopt, 1u << 20);
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->facts.has_value());
+        CHECK(got->rows.size() == 1);
+    }
 }
 
 TEST_CASE("ResponseStore::query_bounded [pg]: order_by_id ranks by id alone, the default still ranks by timestamp",

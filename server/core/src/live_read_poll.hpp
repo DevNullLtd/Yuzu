@@ -25,7 +25,9 @@
 ///     when the text so far does not already end in one (a plugin writes whole lines, and the
 ///     agent flushes a long answer as several frames, so a chunk boundary is a line boundary);
 ///   - ANY row with status >= 2 is a failure, even when partial output is also present (a failed
-///     command must not answer a false success);
+///     command must not answer a false success). The production read supplies decision facts
+///     computed over all stored rows before the row limit and the byte cut, so a failing row that
+///     later chunks pushed out of the bounded read still answers the failure;
 ///   - an answer is decided ONLY once a terminal row exists, meaning ANY stored row with
 ///     status >= 1. Output that has arrived without a terminal row is a partial answer and is
 ///     NOT decided: the loop reads again. Two ingest shapes both end in a terminal row: the
@@ -39,6 +41,9 @@
 /// How a poll ends without an answer: nothing at all by the deadline is `timeout`; output but no
 /// terminal row by the deadline is `incomplete` (the partial output is discarded, never returned);
 /// every read degraded is `store_degraded`; the stop predicate firing is `shutting_down`.
+///
+/// A device `error|` answer is recognised from the first non-empty chunk: when the bounded read
+/// left the oldest rows out, from the head chunk the facts carry, not from the first survivor.
 ///
 /// Known limit (response-store ingest, not this unit): if the server fails to store one MIDDLE
 /// chunk of a multi-chunk answer, the remaining rows still look complete here, so the answer can
@@ -71,6 +76,11 @@ inline constexpr std::string_view kLiveIncompleteDetail = "the device began to a
 /// stops a misbehaving agent from making the poll read an unbounded set.
 inline constexpr int kLivePollRowLimit = 64;
 
+// The store cuts the decision-fact texts to `kBoundedFactsTextChars` characters, at least one byte
+// each, so the cut text always holds the `error|` prefix plus every byte of the detail we return.
+static_assert(static_cast<std::size_t>(kBoundedFactsTextChars) >= kLiveDetailMaxBytes + 6,
+              "the fact text must hold the error| prefix and the whole returned detail");
+
 /// What `reduce_rows` decided from one poll's rows. `outcome` is kOk (use `output`, which may
 /// be empty for a success terminal with no output), kDeviceFailed, kDeviceError, or kTimeout,
 /// which here means "nothing decided yet"; the poll loop reads again.
@@ -86,8 +96,18 @@ struct LiveRowsVerdict {
 
 /// Pure reduction of one poll's rows (no store, no clock). Rows whose `agent_id` is not
 /// `agent_id` are ignored. `rows` need not be sorted.
+///
+/// `facts`, when the store supplied them, are decision facts over EVERY permitted row of the
+/// command, not only the rows in `rows` (which the row limit and the byte cut may have thinned):
+///   - a failure anywhere (`any_failed`) is a failure, and its text is `failed_detail`, the newest
+///     failing row's, so a failing row the cut dropped still answers;
+///   - a terminal row anywhere (`any_terminal`) is a terminal row;
+///   - when `rows_cut` (the store left the OLDEST rows out), the `error|` test reads the true head
+///     chunk (`head_output`) instead of the first chunk that survived the cut.
+/// With no facts (`nullptr`) the reduction is over `rows` alone, as before.
 [[nodiscard]] LiveRowsVerdict reduce_rows(std::span<const StoredResponse> rows,
-                                          std::string_view agent_id);
+                                          std::string_view agent_id,
+                                          const BoundedFacts* facts = nullptr, bool rows_cut = false);
 
 /// What to do with joined output over `max_output_bytes`.
 enum class OverCapPolicy {
@@ -129,6 +149,8 @@ struct LivePollOutcome {
 struct LiveRowsRead {
     std::vector<StoredResponse> rows;
     bool capped = false;
+    /// Decision facts over all permitted rows (see `reduce_rows`); empty when the read has none.
+    std::optional<BoundedFacts> facts;
 
     LiveRowsRead() = default;
     // Implicit on purpose: a read that has no cap to report returns its rows directly.
