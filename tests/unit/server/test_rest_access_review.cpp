@@ -37,6 +37,7 @@
  */
 
 #include "access_review_attest_gate.hpp"
+#include "access_review_model.hpp"
 #include "access_review_store.hpp"
 #include "access_reviews_routes.hpp"
 #include "engine_principal_store.hpp"
@@ -58,7 +59,9 @@
 
 #include <httplib.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -79,6 +82,8 @@ namespace {
 // The fleet-wide scope of a grant (the empty scope id), named wherever a test attests straight
 // through the store.
 const std::string kFleetScope;
+// The wire word for it (`scope` on an attest request), the one spelling every test body below uses.
+constexpr const char* kFleetWire = "fleet";
 
 void setup_access_review_rest_pg_template(const std::string& dsn) {
     yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 2}};
@@ -510,7 +515,7 @@ TEST_CASE("access-reviews: read routes require AccessReview:Read, write routes r
         };
         auto res = h.sink.Post("/api/v1/access-reviews/whatever/attestations",
                                R"({"principal_type":"user","principal_id":"a",)"
-                               R"("role_name":"R","decision":"attested"})");
+                               R"("role_name":"R","scope":"fleet","decision":"attested"})");
         REQUIRE(res);
         CHECK(res->status == 403);
     }
@@ -542,7 +547,7 @@ TEST_CASE("access-reviews: a session with only AccessReview:Read can export but 
 
     auto attest_res = h.sink.Post("/api/v1/access-reviews/whatever/attestations",
                                   R"({"principal_type":"user","principal_id":"a",)"
-                                  R"("role_name":"R","decision":"attested"})");
+                                  R"("role_name":"R","scope":"fleet","decision":"attested"})");
     REQUIRE(attest_res);
     CHECK(attest_res->status == 403);
 
@@ -578,7 +583,7 @@ TEST_CASE("access-reviews: an AuditLog:Read-only principal is denied all six ops
 
     auto attest_res = h.sink.Post("/api/v1/access-reviews/whatever/attestations",
                                   R"({"principal_type":"user","principal_id":"a",)"
-                                  R"("role_name":"R","decision":"attested"})");
+                                  R"("role_name":"R","scope":"fleet","decision":"attested"})");
     REQUIRE(attest_res);
     CHECK(attest_res->status == 403);
 
@@ -615,6 +620,7 @@ TEST_CASE("MCP: an AuditLog:Read-only principal is denied all six access-review 
                                                               {"principal_type", "user"},
                                                               {"principal_id", "a"},
                                                               {"role_name", "R"},
+                                                              {"scope", kFleetWire},
                                                               {"decision", "attested"}});
     REQUIRE(attest_res);
     CHECK(attest_res->status == 403);
@@ -659,6 +665,7 @@ TEST_CASE("access-reviews: a Reviewer-equivalent grant (AccessReview:Read + "
         nlohmann::json{{"principal_type", "user"},
                       {"principal_id", "revallow"},
                       {"role_name", "ReviewerAllowRole"},
+                      {"scope", kFleetWire},
                       {"decision", "attested"}}
             .dump());
     REQUIRE(attest_res);
@@ -707,6 +714,7 @@ TEST_CASE("MCP: a Reviewer-equivalent grant (AccessReview:Read + AccessReview:At
                                                               {"principal_type", "user"},
                                                               {"principal_id", "mcprevallow"},
                                                               {"role_name", "McpReviewerAllowRole"},
+                                                              {"scope", kFleetWire},
                                                               {"decision", "attested"}});
     REQUIRE(attest_res);
     CHECK(attest_res->status == 200);
@@ -739,7 +747,7 @@ TEST_CASE("access-reviews: an engine-classed session is denied on every route",
 
     auto attest_res = h.sink.Post("/api/v1/access-reviews/whatever/attestations",
                                   R"({"principal_type":"user","principal_id":"a",)"
-                                  R"("role_name":"R","decision":"attested"})");
+                                  R"("role_name":"R","scope":"fleet","decision":"attested"})");
     REQUIRE(attest_res);
     CHECK(attest_res->status == 403);
 
@@ -769,7 +777,7 @@ TEST_CASE("attestations: decision outside {attested,flagged_revoke} -> 400",
     AccessReviewHarness h;
     auto res = h.sink.Post("/api/v1/access-reviews/whatever/attestations",
                            R"({"principal_type":"user","principal_id":"a","role_name":"R",)"
-                           R"("decision":"maybe"})");
+                           R"("scope":"fleet","decision":"maybe"})");
     REQUIRE(res);
     CHECK(res->status == 400);
 }
@@ -800,6 +808,7 @@ TEST_CASE("attestations: wrong-typed decision/principal_type degrades to 400, ne
             nlohmann::json{{"principal_type", "user"},
                           {"principal_id", "a"},
                           {"role_name", "R"},
+                          {"scope", kFleetWire},
                           {"decision", 123}}
                 .dump());
         REQUIRE(res);
@@ -812,6 +821,7 @@ TEST_CASE("attestations: wrong-typed decision/principal_type degrades to 400, ne
             nlohmann::json{{"principal_type", 123},
                           {"principal_id", "a"},
                           {"role_name", "R"},
+                          {"scope", kFleetWire},
                           {"decision", "attested"}}
                 .dump());
         REQUIRE(res);
@@ -857,6 +867,7 @@ TEST_CASE("access-reviews: an audit-persist failure on open/attest/close still c
             nlohmann::json{{"principal_type", "user"},
                           {"principal_id", "auditfailuser"},
                           {"role_name", "AuditFailRole"},
+                          {"scope", kFleetWire},
                           {"decision", "attested"}}
                 .dump());
         REQUIRE(res);
@@ -930,6 +941,7 @@ TEST_CASE("record_attestation decision validity is consistent across REST and th
                 nlohmann::json{{"principal_type", "user"},
                               {"principal_id", "a"},
                               {"role_name", "R"},
+                              {"scope", kFleetWire},
                               {"decision", decision}}
                     .dump());
             REQUIRE(rest_res);
@@ -943,6 +955,7 @@ TEST_CASE("record_attestation decision validity is consistent across REST and th
                                            {"principal_type", "user"},
                                            {"principal_id", "a"},
                                            {"role_name", "R"},
+                                           {"scope", kFleetWire},
                                            {"decision", decision}});
             REQUIRE(mcp_res);
             CHECK(mcp_res->status == 200); // JSON-RPC transport-level 200 either way
@@ -960,6 +973,7 @@ TEST_CASE("record_attestation decision validity is consistent across REST and th
             nlohmann::json{{"principal_type", "user"},
                           {"principal_id", "a"},
                           {"role_name", "R"},
+                          {"scope", kFleetWire},
                           {"decision", "maybe"}}
                 .dump());
         REQUIRE(rest_res);
@@ -969,6 +983,7 @@ TEST_CASE("record_attestation decision validity is consistent across REST and th
                                                               {"principal_type", "user"},
                                                               {"principal_id", "a"},
                                                               {"role_name", "R"},
+                                                              {"scope", kFleetWire},
                                                               {"decision", "maybe"}});
         REQUIRE(mcp_res);
         CHECK(mcp_res->status == 200); // JSON-RPC transport-level 200; error is in the body
@@ -995,6 +1010,7 @@ TEST_CASE("attestations: decision=flagged_revoke records evidence only — the u
         nlohmann::json{{"principal_type", "user"},
                       {"principal_id", "alice"},
                       {"role_name", "SomeRole"},
+                      {"scope", kFleetWire},
                       {"decision", "flagged_revoke"},
                       {"justification", "looks stale"}}
             .dump());
@@ -1029,6 +1045,7 @@ TEST_CASE("attest/get/close on an unknown campaign_id -> 404, not 503",
         nlohmann::json{{"principal_type", "user"},
                       {"principal_id", "a"},
                       {"role_name", "R"},
+                      {"scope", kFleetWire},
                       {"decision", "attested"}}
             .dump());
     REQUIRE(attest_res);
@@ -1052,6 +1069,7 @@ TEST_CASE("attest on a user grant naming the session user -> 403 REST / kPermiss
                             nlohmann::json{{"principal_type", "user"},
                                            {"principal_id", "admin"},
                                            {"role_name", "R"},
+                                           {"scope", kFleetWire},
                                            {"decision", "attested"}}
                                 .dump());
     REQUIRE(rest);
@@ -1061,6 +1079,7 @@ TEST_CASE("attest on a user grant naming the session user -> 403 REST / kPermiss
                                                       {"principal_type", "user"},
                                                       {"principal_id", "admin"},
                                                       {"role_name", "R"},
+                                                      {"scope", kFleetWire},
                                                       {"decision", "attested"}});
     REQUIRE(mcp);
     auto body = nlohmann::json::parse(mcp->body);
@@ -1098,6 +1117,7 @@ TEST_CASE("access-reviews: export/attest/flag emit their own self-audit rows",
         nlohmann::json{{"principal_type", "user"},
                       {"principal_id", "bob"},
                       {"role_name", "AuditRole"},
+                      {"scope", kFleetWire},
                       {"decision", "attested"}}
             .dump());
     REQUIRE(attest_res);
@@ -1113,6 +1133,7 @@ TEST_CASE("access-reviews: export/attest/flag emit their own self-audit rows",
         nlohmann::json{{"principal_type", "user"},
                       {"principal_id", "bob"},
                       {"role_name", "AuditRole"},
+                      {"scope", kFleetWire},
                       {"decision", "flagged_revoke"}}
             .dump());
     REQUIRE(flag_res);
@@ -1459,6 +1480,7 @@ TEST_CASE("MCP: a session with only AccessReview:Read can export/get/list but no
                                        {"principal_type", "user"},
                                        {"principal_id", "a"},
                                        {"role_name", "R"},
+                                       {"scope", kFleetWire},
                                        {"decision", "attested"}});
     REQUIRE(attest_res);
     CHECK(attest_res->status == 403);
@@ -1493,6 +1515,7 @@ TEST_CASE("MCP: an engine-classed session is denied (kTierDenied) on every acces
                                                         {"principal_type", "user"},
                                                         {"principal_id", "a"},
                                                         {"role_name", "R"},
+                                                        {"scope", kFleetWire},
                                                         {"decision", "attested"}}));
     check_denied(h.mcp_call_tool("close_access_review", {{"campaign_id", "whatever"}}));
 }
@@ -1561,6 +1584,7 @@ TEST_CASE("access-reviews: the 4 new metrics are wired with the documented names
         nlohmann::json{{"principal_type", "user"},
                       {"principal_id", "metricsuser"},
                       {"role_name", "MetricsRole"},
+                      {"scope", kFleetWire},
                       {"decision", "attested"}}
             .dump());
     REQUIRE(attest_res);
@@ -1576,6 +1600,7 @@ TEST_CASE("access-reviews: the 4 new metrics are wired with the documented names
         nlohmann::json{{"principal_type", "user"},
                       {"principal_id", "metricsuser"},
                       {"role_name", "MetricsRole"},
+                      {"scope", kFleetWire},
                       {"decision", "flagged_revoke"}}
             .dump());
     REQUIRE(flag_res);
@@ -1609,6 +1634,7 @@ std::string attest_body(const std::string& user, const std::string& role,
     return nlohmann::json{{"principal_type", "user"},
                           {"principal_id", user},
                           {"role_name", role},
+                          {"scope", kFleetWire},
                           {"decision", decision}}
         .dump();
 }
@@ -1848,6 +1874,7 @@ TEST_CASE("REST get/attest/close refuse a malformed campaign id with 400 and tou
     const nlohmann::json attest_body = {{"principal_type", "user"},
                                         {"principal_id", "csrfuser"},
                                         {"role_name", "CsrfRole"},
+                                        {"scope", kFleetWire},
                                         {"decision", "attested"}};
 
     for (const auto& [label, bad] : bad_campaign_ids(cid)) {
@@ -1934,6 +1961,7 @@ TEST_CASE("MCP get/record/close refuse a malformed campaign id with invalid-para
                                                                     {"principal_type", "user"},
                                                                     {"principal_id", "csrfuser"},
                                                                     {"role_name", "CsrfRole"},
+                                                                    {"scope", kFleetWire},
                                                                     {"decision", "attested"}}));
         CHECK(c2 == yuzu::server::mcp::kInvalidParams);
         CHECK(m2 == kCampaignIdMessage);
@@ -1975,6 +2003,7 @@ TEST_CASE("the store's bad_request prefix maps to 400 and invalid-params, not 50
                             nlohmann::json{{"principal_type", "user"},
                                            {"principal_id", "csrfuser"},
                                            {"role_name", "CsrfRole"},
+                                           {"scope", kFleetWire},
                                            {"decision", "attested"},
                                            {"justification", huge}}
                                 .dump());
@@ -1985,6 +2014,7 @@ TEST_CASE("the store's bad_request prefix maps to 400 and invalid-params, not 50
                                                       {"principal_type", "user"},
                                                       {"principal_id", "csrfuser"},
                                                       {"role_name", "CsrfRole"},
+                                                      {"scope", kFleetWire},
                                                       {"decision", "attested"},
                                                       {"justification", huge}});
     REQUIRE(mcp);
@@ -2015,7 +2045,8 @@ double refused_count(AccessReviewHarness& h, const char* surface, const char* re
 std::string sod_body(const std::string& type, const std::string& id, const std::string& role,
                      const std::string& decision = "attested") {
     return nlohmann::json{
-        {"principal_type", type}, {"principal_id", id}, {"role_name", role}, {"decision", decision}}
+        {"principal_type", type}, {"principal_id", id}, {"role_name", role},
+        {"scope", kFleetWire}, {"decision", decision}}
         .dump();
 }
 
@@ -2025,6 +2056,7 @@ nlohmann::json sod_args(const std::string& cid, const std::string& type, const s
             {"principal_type", type},
             {"principal_id", id},
             {"role_name", role},
+            {"scope", kFleetWire},
             {"decision", decision}};
 }
 
@@ -2040,15 +2072,19 @@ std::vector<AuditRecord> audit_rows(const AccessReviewHarness& h, const std::str
     return out;
 }
 
+// The scope is a required argument (no default): a lookup that ignored it would inspect the fleet
+// row twice when the same principal and role are frozen at two scopes (#6969).
 AccessReviewAttestationRow grant_row(const AccessReviewHarness& h, const std::string& cid,
                                      const std::string& type, const std::string& id,
-                                     const std::string& role) {
+                                     const std::string& role, const std::string& scope_group_id) {
     auto v = h.access_review_store->get_campaign(cid, /*include_history=*/true);
     REQUIRE(v.has_value());
     for (const auto& a : v->attestations)
-        if (a.principal_type == type && a.principal_id == id && a.role_name == role)
+        if (a.principal_type == type && a.principal_id == id && a.role_name == role &&
+            a.scope_group_id == scope_group_id)
             return a;
-    FAIL("grant not frozen in the campaign: " << type << ":" << id << ":" << role);
+    FAIL("grant not frozen in the campaign: " << type << ":" << id << ":" << role << " scope '"
+                                              << scope_group_id << "'");
     return {};
 }
 
@@ -2200,7 +2236,7 @@ TEST_CASE("attestation SoD: the subject of a user grant is refused on REST and M
     const auto cid = h.open_campaign_rest("sod self");
     h.session_user = "bob";
     h.audit_log.clear();
-    const std::string tuple = " principal_type=user principal_id=bob role=Operator";
+    const std::string tuple = " principal_type=user principal_id=bob role=Operator scope=fleet";
 
     SECTION("REST") {
         auto res = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
@@ -2215,7 +2251,7 @@ TEST_CASE("attestation SoD: the subject of a user grant is refused on REST and M
         // A persisted refusal row sets no failure header.
         CHECK(res->get_header_value("Sec-Audit-Failed").empty());
 
-        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        const auto row = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
         CHECK(row.decision == "pending");
         CHECK(row.decision_seq == 0);
         CHECK(row.history.empty());
@@ -2251,7 +2287,7 @@ TEST_CASE("attestation SoD: the subject of a user grant is refused on REST and M
         REQUIRE(wrapper.size() == 1);
         CHECK(wrapper[0].result == "denied");
 
-        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        const auto row = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
         CHECK(row.decision == "pending");
         CHECK(row.history.empty());
         CHECK(refused_count(h, "mcp", "self_subject") == 1.0);
@@ -2266,7 +2302,7 @@ TEST_CASE("attestation SoD: a different reviewer records, and every decision is 
     const auto cid = h.open_campaign_rest("sod other");
     h.session_user = "carol";
     h.audit_log.clear();
-    const std::string tuple = " principal_type=user principal_id=bob role=Operator";
+    const std::string tuple = " principal_type=user principal_id=bob role=Operator scope=fleet";
 
     SECTION("REST: attest, attest again, then flag") {
         auto r1 = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
@@ -2312,7 +2348,7 @@ TEST_CASE("attestation SoD: a different reviewer records, and every decision is 
         CHECK(flagged[0].detail ==
               "decision=flagged_revoke previous=attested seq=3 sod=pass" + tuple);
 
-        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        const auto row = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
         CHECK(row.decision == "flagged_revoke");
         CHECK(row.reviewer == "carol");
         CHECK(row.decision_seq == 3);
@@ -2346,7 +2382,7 @@ TEST_CASE("attestation SoD: a different reviewer records, and every decision is 
         CHECK(rows[0].result == "success");
         CHECK(rows[0].target_id == cid);
         CHECK(rows[0].detail == "decision=attested previous=pending seq=1 sod=pass" + tuple);
-        CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
+        CHECK(grant_row(h, cid, "user", "bob", "Operator", kFleetScope).decision_seq == 1);
 
         // A second call (a different decision) reports seq 2 over the first.
         auto again = h.mcp_call_tool("record_attestation",
@@ -2395,7 +2431,7 @@ TEST_CASE("attestation: a present justification that is not a string is refused 
             CHECK(res->body.find(msg) != std::string::npos);
         }
         // Nothing was recorded and no row was written for the malformed requests.
-        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        const auto row = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
         CHECK(row.decision == "pending");
         CHECK(row.decision_seq == 0);
         CHECK(row.history.empty());
@@ -2417,7 +2453,7 @@ TEST_CASE("attestation: a present justification that is not a string is refused 
         auto second = h.sink.Post(attest_url(cid), numeric.dump());
         REQUIRE(second);
         CHECK(second->status == 200);
-        const auto row2 = grant_row(h, cid, "user", "bob", "Operator");
+        const auto row2 = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
         REQUIRE(row2.history.size() == 2);
         CHECK(row2.history.back().justification == "123");
     }
@@ -2432,7 +2468,7 @@ TEST_CASE("attestation: a present justification that is not a string is refused 
             CHECK(err.value("code", 0) == yuzu::server::mcp::kInvalidParams);
             CHECK(err.value("message", std::string{}) == msg);
         }
-        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        const auto row = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
         CHECK(row.decision == "pending");
         CHECK(row.decision_seq == 0);
         CHECK(row.history.empty());
@@ -2446,7 +2482,7 @@ TEST_CASE("attestation: a present justification that is not a string is refused 
         const auto okbody = nlohmann::json::parse(ok->body, nullptr, false);
         REQUIRE_FALSE(okbody.is_discarded());
         CHECK_FALSE(okbody.contains("error"));
-        CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
+        CHECK(grant_row(h, cid, "user", "bob", "Operator", kFleetScope).decision_seq == 1);
 
         // A numeric string is a string: accepted and kept as the note.
         auto numeric = sod_args(cid, "user", "bob", "Operator");
@@ -2454,7 +2490,7 @@ TEST_CASE("attestation: a present justification that is not a string is refused 
         auto second = h.mcp_call_tool("record_attestation", numeric);
         REQUIRE(second);
         CHECK_FALSE(nlohmann::json::parse(second->body, nullptr, false).contains("error"));
-        const auto row2 = grant_row(h, cid, "user", "bob", "Operator");
+        const auto row2 = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
         REQUIRE(row2.history.size() == 2);
         CHECK(row2.history.back().justification == "123");
     }
@@ -2554,7 +2590,7 @@ TEST_CASE("attestation SoD: a subject cannot un-flag a grant that a reviewer fla
     h.session_user = "bob";
     check_rest_sod_refusal(h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator")));
 
-    const auto row = grant_row(h, cid, "user", "bob", "Operator");
+    const auto row = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
     CHECK(row.decision == "flagged_revoke");
     CHECK(row.reviewer == "carol");
     CHECK(row.decision_seq == 1);
@@ -2570,7 +2606,7 @@ TEST_CASE("attestation SoD: the owner of an engine principal is refused, revoked
     REQUIRE(h.rbac->assign_role({"engine", "engine:ghost", "Writer"}).has_value());
     const auto cid = h.open_campaign_rest("sod engine");
     h.audit_log.clear();
-    const std::string tuple = " principal_type=engine principal_id=engine:svc role=Writer";
+    const std::string tuple = " principal_type=engine principal_id=engine:svc role=Writer scope=fleet";
 
     SECTION("REST: the owner is refused, another reviewer records") {
         h.session_user = "bob";
@@ -2582,13 +2618,13 @@ TEST_CASE("attestation SoD: the owner of an engine principal is refused, revoked
         CHECK(rows[0].target_id == cid);
         CHECK(rows[0].detail == "sod_engine_owner" + tuple);
         CHECK(refused_count(h, "rest", "engine_owner") == 1.0);
-        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").history.empty());
+        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer", kFleetScope).history.empty());
 
         h.session_user = "carol";
         auto ok = h.sink.Post(attest_url(cid), sod_body("engine", "engine:svc", "Writer"));
         REQUIRE(ok);
         CHECK(ok->status == 200);
-        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").decision_seq == 1);
+        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer", kFleetScope).decision_seq == 1);
     }
 
     SECTION("REST: a REVOKED engine owned by the reviewer is still refused") {
@@ -2634,12 +2670,12 @@ TEST_CASE("attestation SoD: a FORMER engine owner (transferred since the campaig
     const auto cid = h.open_campaign_rest("sod former owner"); // freezes bob as the owner
     // The snapshot the REST open handler wrote carries the owner under the shared key: the
     // backstop reads it, so a rename in the builder must fail here, not silently admit everyone.
-    CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer")
+    CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer", kFleetScope)
               .grant_snapshot.find(std::string("\"") + yuzu::server::kSnapshotOwnerKey +
                                    "\":\"bob\"") != std::string::npos);
     REQUIRE(h.eps->transfer_owner("engine:svc", "carol").has_value());
     h.audit_log.clear();
-    const std::string tuple = " principal_type=engine principal_id=engine:svc role=Writer";
+    const std::string tuple = " principal_type=engine principal_id=engine:svc role=Writer scope=fleet";
 
     SECTION("REST: bob (owner at open, not now) is refused after the live read passes") {
         h.session_user = "bob";
@@ -2650,7 +2686,7 @@ TEST_CASE("attestation SoD: a FORMER engine owner (transferred since the campaig
         CHECK(rows[0].result == "denied");
         CHECK(rows[0].detail == "sod_engine_owner" + tuple);
         CHECK(refused_count(h, "rest", "engine_owner") == 1.0);
-        const auto row = grant_row(h, cid, "engine", "engine:svc", "Writer");
+        const auto row = grant_row(h, cid, "engine", "engine:svc", "Writer", kFleetScope);
         CHECK(row.decision == "pending");
         CHECK(row.decision_seq == 0);
         CHECK(row.history.empty());
@@ -2666,7 +2702,7 @@ TEST_CASE("attestation SoD: a FORMER engine owner (transferred since the campaig
         REQUIRE(rows.size() == 1);
         CHECK(rows[0].detail == "sod_engine_owner" + tuple);
         CHECK(refused_count(h, "mcp", "engine_owner") == 1.0);
-        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").history.empty());
+        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer", kFleetScope).history.empty());
     }
 
     SECTION("the current owner is refused by the live read; a third reviewer is admitted") {
@@ -2677,7 +2713,7 @@ TEST_CASE("attestation SoD: a FORMER engine owner (transferred since the campaig
         auto ok = h.sink.Post(attest_url(cid), sod_body("engine", "engine:svc", "Writer"));
         REQUIRE(ok);
         CHECK(ok->status == 200);
-        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").decision_seq == 1);
+        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer", kFleetScope).decision_seq == 1);
     }
 }
 
@@ -2690,7 +2726,7 @@ TEST_CASE("attestation SoD: a member of a group is refused; a non-member and a g
     REQUIRE(h.rbac->assign_role({"group", "ghosts", "Reader"}).has_value());
     const auto cid = h.open_campaign_rest("sod group");
     h.audit_log.clear();
-    const std::string tuple = " principal_type=group principal_id=eng role=Reader";
+    const std::string tuple = " principal_type=group principal_id=eng role=Reader scope=fleet";
 
     SECTION("REST") {
         h.session_user = "bob";
@@ -2701,7 +2737,7 @@ TEST_CASE("attestation SoD: a member of a group is refused; a non-member and a g
         CHECK(rows[0].target_id == cid);
         CHECK(rows[0].detail == "sod_group_member" + tuple);
         CHECK(refused_count(h, "rest", "group_member") == 1.0);
-        CHECK(grant_row(h, cid, "group", "eng", "Reader").history.empty());
+        CHECK(grant_row(h, cid, "group", "eng", "Reader", kFleetScope).history.empty());
 
         h.session_user = "carol";
         auto ok = h.sink.Post(attest_url(cid), sod_body("group", "eng", "Reader"));
@@ -2766,7 +2802,7 @@ TEST_CASE("attestation SoD: a closed campaign is 404 for another reviewer, but t
         const auto err = mcp_error_of(
             h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator")));
         CHECK(err["code"] == yuzu::server::mcp::kInvalidParams);
-        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        const auto row = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
         CHECK(row.decision == "pending");
         CHECK(row.history.empty());
     }
@@ -2777,7 +2813,7 @@ TEST_CASE("attestation SoD: a closed campaign is 404 for another reviewer, but t
         const auto err = mcp_error_of(
             h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator")));
         CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
-        CHECK(grant_row(h, cid, "user", "bob", "Operator").history.empty());
+        CHECK(grant_row(h, cid, "user", "bob", "Operator", kFleetScope).history.empty());
     }
 }
 
@@ -2797,7 +2833,7 @@ TEST_CASE("attestation SoD: an engine or group lookup that cannot be answered fa
         drop_table_cascade(db.dsn(), "engine_principal_store.engine_principals");
         h.session_user = "carol";
         h.audit_log.clear();
-        const std::string tuple = " principal_type=engine principal_id=engine:svc role=Writer";
+        const std::string tuple = " principal_type=engine principal_id=engine:svc role=Writer scope=fleet";
 
         auto rest = h.sink.Post(attest_url(cid), sod_body("engine", "engine:svc", "Writer"));
         REQUIRE(rest);
@@ -2811,7 +2847,7 @@ TEST_CASE("attestation SoD: an engine or group lookup that cannot be answered fa
         CHECK(rows[0].target_id == cid);
         CHECK(rows[0].detail == "sod_check_unavailable store=engine" + tuple);
         CHECK(refused_count(h, "rest", "check_unavailable") == 1.0);
-        const auto row = grant_row(h, cid, "engine", "engine:svc", "Writer");
+        const auto row = grant_row(h, cid, "engine", "engine:svc", "Writer", kFleetScope);
         CHECK(row.decision == "pending");
         CHECK(row.history.empty());
 
@@ -2820,7 +2856,7 @@ TEST_CASE("attestation SoD: an engine or group lookup that cannot be answered fa
         CHECK(err["code"] == yuzu::server::mcp::kInternalError);
         CHECK(err["data"]["retry_after_ms"] == 5000);
         CHECK(refused_count(h, "mcp", "check_unavailable") == 1.0);
-        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").history.empty());
+        CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer", kFleetScope).history.empty());
     }
 
     SECTION("rbac group store unavailable (RBAC off, administrator session)") {
@@ -2829,7 +2865,7 @@ TEST_CASE("attestation SoD: an engine or group lookup that cannot be answered fa
         drop_table_cascade(db.dsn(), "rbac_store.group_members");
         h.session_user = "carol";
         h.audit_log.clear();
-        const std::string tuple = " principal_type=group principal_id=eng role=Reader";
+        const std::string tuple = " principal_type=group principal_id=eng role=Reader scope=fleet";
 
         auto rest = h.sink.Post(attest_url(cid), sod_body("group", "eng", "Reader"));
         REQUIRE(rest);
@@ -2840,7 +2876,7 @@ TEST_CASE("attestation SoD: an engine or group lookup that cannot be answered fa
         CHECK(rows[0].result == "failure");
         CHECK(rows[0].detail == "sod_check_unavailable store=rbac" + tuple);
         CHECK(refused_count(h, "rest", "check_unavailable") == 1.0);
-        CHECK(grant_row(h, cid, "group", "eng", "Reader").history.empty());
+        CHECK(grant_row(h, cid, "group", "eng", "Reader", kFleetScope).history.empty());
 
         const auto err = mcp_error_of(
             h.mcp_call_tool("record_attestation", sod_args(cid, "group", "eng", "Reader")));
@@ -2863,7 +2899,7 @@ TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when
         auto res = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
         check_rest_sod_refusal(res);
         CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-        CHECK(grant_row(h, cid, "user", "bob", "Operator").history.empty());
+        CHECK(grant_row(h, cid, "user", "bob", "Operator", kFleetScope).history.empty());
         CHECK(refused_count(h, "rest", "self_subject") == 1.0); // counted though the row failed
     }
 
@@ -2874,7 +2910,7 @@ TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when
         REQUIRE(res);
         CHECK(res->status == 200);
         CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        const auto row = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
         CHECK(row.decision == "attested");
         CHECK(row.decision_seq == 1);
         CHECK(row.history.size() == 1);
@@ -2889,7 +2925,7 @@ TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when
         CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
         CHECK(err["message"] == std::string(sod::kSodMessage));
         CHECK(err["data"]["audit_persisted"] == false);
-        CHECK(grant_row(h, cid, "user", "bob", "Operator").history.empty());
+        CHECK(grant_row(h, cid, "user", "bob", "Operator", kFleetScope).history.empty());
     }
 
     SECTION("MCP refusal, only the mcp.<tool> wrapper row fails") {
@@ -2924,7 +2960,7 @@ TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when
         REQUIRE(body.contains("result"));
         CHECK(body["result"]["structuredContent"]["recorded"] == true);
         CHECK(body["result"]["structuredContent"]["audit_persisted"] == false);
-        CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
+        CHECK(grant_row(h, cid, "user", "bob", "Operator", kFleetScope).decision_seq == 1);
     }
 
     SECTION("MCP success, audit callback throws after the mutation") {
@@ -2939,7 +2975,7 @@ TEST_CASE("attestation SoD: a refusal stands and a recorded decision stands when
         REQUIRE(body.contains("result"));
         CHECK(body["result"]["structuredContent"]["recorded"] == true);
         CHECK(body["result"]["structuredContent"]["audit_persisted"] == false);
-        CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 1);
+        CHECK(grant_row(h, cid, "user", "bob", "Operator", kFleetScope).decision_seq == 1);
     }
 
     SECTION("open_access_review success, audit row returns false") {
@@ -3055,7 +3091,7 @@ TEST_CASE("attestation SoD at the route: a case or whitespace variant of the sub
         REQUIRE(ok);
         CHECK(ok->status == 200);
         CHECK(refused_count(h, "rest", r.refusal) == before + 1.0); // the variant was not refused
-        CHECK(grant_row(h, cid, r.type, r.id, r.role).reviewer == r.variant);
+        CHECK(grant_row(h, cid, r.type, r.id, r.role, kFleetScope).reviewer == r.variant);
     }
 
     // MCP reaches the same answers through the same gate.
@@ -3125,8 +3161,8 @@ TEST_CASE("attestation bounds: an over-long or NUL-bearing principal_type, princ
         CHECK(h.audit_log.empty());
         CHECK(no_refusal_counted());
     }
-    CHECK(grant_row(h, cid, "group", "eng", "Reader").history.empty());
-    CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer").history.empty());
+    CHECK(grant_row(h, cid, "group", "eng", "Reader", kFleetScope).history.empty());
+    CHECK(grant_row(h, cid, "engine", "engine:svc", "Writer", kFleetScope).history.empty());
 
     // The boundary is inclusive: exactly 1024 bytes passes the bound and reaches the store, which
     // answers not_found for a grant that was never frozen (404 / invalid-params, not 400's text).
@@ -3155,8 +3191,8 @@ TEST_CASE("attestation bounds: a frozen grant with the longest ids the identity 
     seed_group_grant(h, group_id, "bob", long_role);
     const auto cid = h.open_campaign_rest("long ids");
     // The grants really are frozen with these ids (the tuple is exactly what the page shows).
-    REQUIRE(grant_row(h, cid, "user", oidc_id, "Operator").decision == "pending");
-    REQUIRE(grant_row(h, cid, "group", group_id, long_role).decision == "pending");
+    REQUIRE(grant_row(h, cid, "user", oidc_id, "Operator", kFleetScope).decision == "pending");
+    REQUIRE(grant_row(h, cid, "group", group_id, long_role, kFleetScope).decision == "pending");
     h.session_user = "carol";
     h.audit_log.clear();
 
@@ -3171,8 +3207,8 @@ TEST_CASE("attestation bounds: a frozen grant with the longest ids the identity 
     REQUIRE(mcp_group);
     CHECK(nlohmann::json::parse(mcp_group->body).contains("result"));
 
-    CHECK(grant_row(h, cid, "user", oidc_id, "Operator").decision == "attested");
-    CHECK(grant_row(h, cid, "group", group_id, long_role).decision_seq == 2);
+    CHECK(grant_row(h, cid, "user", oidc_id, "Operator", kFleetScope).decision == "attested");
+    CHECK(grant_row(h, cid, "group", group_id, long_role, kFleetScope).decision_seq == 2);
 
     // The audit rows carry the tuple through audit_token, which neutralises bytes but does not
     // shorten, so a row is bounded by the three field caps plus its fixed labels: a few KiB.
@@ -3200,7 +3236,7 @@ TEST_CASE("attestation store failure: REST and MCP answer a fixed message with a
     drop_table_cascade(db.dsn(), "access_review_store.access_review_attestation_history");
     h.session_user = "carol";
     h.audit_log.clear();
-    const std::string tuple = " principal_type=user principal_id=bob role=Operator";
+    const std::string tuple = " principal_type=user principal_id=bob role=Operator scope=fleet";
     const std::string fixed(sod::kStoreFailureMessage);
     const auto leaks_db_text = [](const std::string& text) {
         return text.find("does not exist") != std::string::npos ||
@@ -3395,6 +3431,7 @@ TEST_CASE(
                 .Post(attest_url(cid), nlohmann::json{{"principal_type", "user"},
                                                       {"principal_id", "bob"},
                                                       {"role_name", "Operator"},
+                                                      {"scope", kFleetWire},
                                                       {"decision", "attested"},
                                                       {"justification", long_note}}
                                            .dump())
@@ -3404,23 +3441,26 @@ TEST_CASE(
                 .Post(attest_url(cid), nlohmann::json{{"principal_type", "user"},
                                                       {"principal_id", "bob"},
                                                       {"role_name", "Operator"},
+                                                      {"scope", kFleetWire},
                                                       {"decision", "flagged_revoke"},
                                                       {"justification", "left <the> team"}}
                                            .dump())
                 ->status == 200);
 
-    // The wire carries no scope field until the scope-on-the-wire change, so this lookup cannot take
-    // one yet; it refuses an ambiguous id instead of returning the first of two rows.
-    const auto find_att = [](const nlohmann::json& atts, const std::string& id) {
+    // A grant is a principal, a role AND a scope (#6969), so the lookup takes the scope id and
+    // refuses an ambiguous match instead of returning the first of two rows.
+    const auto find_att = [](const nlohmann::json& atts, const std::string& id,
+                             const std::string& scope_group_id) {
         nlohmann::json found;
         int matches = 0;
         for (const auto& a : atts)
-            if (a["principal_id"] == id) {
+            if (a["principal_id"] == id && a["scope_group_id"] == scope_group_id) {
                 found = a;
                 ++matches;
             }
         if (matches != 1)
-            FAIL("expected exactly one attestation for " << id << ", found " << matches);
+            FAIL("expected exactly one attestation for " << id << " at scope '" << scope_group_id
+                                                         << "', found " << matches);
         return found;
     };
 
@@ -3428,7 +3468,7 @@ TEST_CASE(
     REQUIRE(rest);
     REQUIRE(rest->status == 200);
     const auto rest_atts = nlohmann::json::parse(rest->body)["data"]["attestations"];
-    const auto bob = find_att(rest_atts, "bob");
+    const auto bob = find_att(rest_atts, "bob", kFleetScope);
     CHECK(bob["decision"] == "flagged_revoke");
     CHECK(bob["reviewer"] == "dave");
     CHECK(bob["decision_seq"] == 2);
@@ -3453,7 +3493,7 @@ TEST_CASE(
     CHECK(bob["justification"] == "left <the> team");
 
     // A grant nobody has decided: seq 0 and an empty array, never absent.
-    const auto alice = find_att(rest_atts, "alice");
+    const auto alice = find_att(rest_atts, "alice", kFleetScope);
     CHECK(alice["decision"] == "pending");
     CHECK(alice["decision_seq"] == 0);
     REQUIRE(alice.contains("history"));
@@ -3467,8 +3507,8 @@ TEST_CASE(
     REQUIRE(mcp_body.contains("result"));
     const auto mcp_atts = mcp_body["result"]["structuredContent"]["attestations"];
     CHECK(mcp_atts.dump() == rest_atts.dump());
-    CHECK(find_att(mcp_atts, "bob")["history"].size() == 2);
-    CHECK(find_att(mcp_atts, "bob")["history"][0]["justification_truncated"] == true);
+    CHECK(find_att(mcp_atts, "bob", kFleetScope)["history"].size() == 2);
+    CHECK(find_att(mcp_atts, "bob", kFleetScope)["history"][0]["justification_truncated"] == true);
 
     // OpenAPI names exactly the keys the route emits, on both the row and the history entry.
     const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
@@ -3509,9 +3549,9 @@ TEST_CASE(
             schema_found = true;
             const auto& mcp_hist = t["outputSchema"]["properties"]["attestations"]["items"]
                                     ["properties"]["history"]["items"];
-            CHECK(property_names(mcp_hist) == keys_of(find_att(mcp_atts, "bob")["history"][0]));
+            CHECK(property_names(mcp_hist) == keys_of(find_att(mcp_atts, "bob", kFleetScope)["history"][0]));
             CHECK(std::set<std::string>(mcp_hist["required"].begin(), mcp_hist["required"].end()) ==
-                  keys_of(find_att(mcp_atts, "bob")["history"][0]));
+                  keys_of(find_att(mcp_atts, "bob", kFleetScope)["history"][0]));
         }
         CHECK(schema_found);
     }
@@ -3644,14 +3684,14 @@ TEST_CASE("attestation cap: the decision after the 100th is 400 on REST and inva
     fill_grant_to_cap(h, cid, "bob", "carol");
     h.session_user = "carol";
     h.audit_log.clear();
-    const std::string tuple = " principal_type=user principal_id=bob role=Operator";
+    const std::string tuple = " principal_type=user principal_id=bob role=Operator scope=fleet";
     // The wire text is the bare message: the store's `bad_request: ` classification prefix is
     // stripped for this refusal (the audit detail below keeps the store text).
     const std::string expected{yuzu::server::kDecisionCapMessage};
     REQUIRE_FALSE(expected.starts_with("bad_request"));
 
     const auto unchanged = [&] {
-        const auto row = grant_row(h, cid, "user", "bob", "Operator");
+        const auto row = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
         CHECK(row.decision_seq == 100);
         CHECK(row.decision == "flagged_revoke"); // the 100th decision is even
         CHECK(row.reviewer == "carol");
@@ -3755,7 +3795,7 @@ TEST_CASE("attestation wire text: only the cap refusal loses the bad_request pre
         CHECK(err["message"] == expected);
     }
     // Nothing was recorded.
-    CHECK(grant_row(h, cid, "user", "bob", "Operator").decision_seq == 0);
+    CHECK(grant_row(h, cid, "user", "bob", "Operator", kFleetScope).decision_seq == 0);
 }
 
 TEST_CASE("attestation success body: OpenAPI and the MCP output schema name exactly the fields the "
@@ -4055,4 +4095,395 @@ TEST_CASE("bounded history read: a grant carrying 105 history rows returns its l
     // The grant with a complete history shows no such line (the phrase appears once).
     const auto first = frag->body.find("earlier decisions are not shown");
     CHECK(frag->body.find("earlier decisions are not shown", first + 1) == std::string::npos);
+}
+
+// ── The scope of an attestation (#6969) ─────────────────────────────────────
+//
+// A grant is a principal, a role AND a scope, so an attest request names its scope on BOTH
+// transports through ONE parser (`parse_attest_scope`). These cases drive the request matrix, the
+// attestability and audit tokens of a group-scoped row, and the three always-present output fields.
+
+namespace {
+
+// A campaign holding `bob`/`Operator` at fleet scope with a snapshot older than the name key, and the
+// same principal and role at management groups `g-1` (named) and `g-2` (snapshot without a name).
+// Planted through the store: nothing in the population is group-scoped yet.
+std::string plant_scoped_campaign(AccessReviewHarness& h) {
+    const std::vector<GrantRef> grants = {
+        {"user", "bob", "Operator", R"({"display_name":"bob"})", ""},
+        {"user", "bob", "Operator", R"({"display_name":"bob","scope_group_name":"Ops team"})", "g-1"},
+        {"user", "bob", "Operator", R"({"display_name":"bob"})", "g-2"},
+        {"user", "bob", "Viewer", R"({"display_name":"bob","scope_group_name":"Ops team"})", "g-1"},
+    };
+    auto cid = h.access_review_store->open_campaign("scoped", "admin", grants, "disabled");
+    REQUIRE(cid.has_value());
+    return *cid;
+}
+
+nlohmann::json scoped_body(const std::string& role, const std::string& scope,
+                           const std::string& scope_group_id) {
+    nlohmann::json b = nlohmann::json::parse(sod_body("user", "bob", role));
+    b["scope"] = scope;
+    if (!scope_group_id.empty())
+        b["scope_group_id"] = scope_group_id;
+    return b;
+}
+
+// "No retry hint" is an absent or null `retry_after_ms` (the A4 envelope carries the key as null
+// when nothing is offered), never a number.
+bool has_retry_hint(const nlohmann::json& holder) {
+    return holder.is_object() && holder.contains("retry_after_ms") &&
+           !holder["retry_after_ms"].is_null();
+}
+
+void check_no_retry_hint_rest(const std::unique_ptr<httplib::Response>& res) {
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(has_retry_hint(body["error"]));
+}
+
+void check_no_retry_hint_mcp(const nlohmann::json& err) {
+    CHECK_FALSE(has_retry_hint(err));
+    CHECK_FALSE(has_retry_hint(err.value("data", nlohmann::json::object())));
+}
+
+} // namespace
+
+TEST_CASE("attest scope request: a missing or contradictory scope is refused on REST and MCP, "
+          "records nothing, writes no audit row and offers no retry",
+          "[pg][access_review][rest][mcp][access-reviews][6969]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("scope matrix");
+    h.session_user = "carol";
+    h.audit_log.clear();
+
+    struct Case {
+        std::string label;
+        std::function<void(nlohmann::json&)> mutate;
+        std::string message;
+    };
+    const std::string invalid{yuzu::server::kAttestScopeInvalidMessage};
+    const std::string fleet_id{yuzu::server::kAttestScopeFleetIdMessage};
+    const std::string group_id{yuzu::server::kAttestScopeGroupIdMessage};
+    const auto set = [](const char* key, nlohmann::json v) {
+        return [key, v](nlohmann::json& b) { b[key] = v; };
+    };
+    const auto with_group = [](nlohmann::json id) {
+        return [id](nlohmann::json& b) {
+            b["scope"] = "management_group";
+            if (!id.is_discarded())
+                b["scope_group_id"] = id;
+        };
+    };
+    const std::vector<Case> cases = {
+        {"scope absent", [](nlohmann::json& b) { b.erase("scope"); }, invalid},
+        {"scope null", set("scope", nullptr), invalid},
+        {"scope number", set("scope", 5), invalid},
+        {"scope bool", set("scope", true), invalid},
+        {"scope object", set("scope", nlohmann::json::object()), invalid},
+        {"scope array", set("scope", nlohmann::json::array({"fleet"})), invalid},
+        {"scope unknown string", set("scope", "group"), invalid},
+        {"scope empty string", set("scope", ""), invalid},
+        {"scope wrong case", set("scope", "Fleet"), invalid},
+        {"group, id absent", with_group(nlohmann::json(nlohmann::json::value_t::discarded)),
+         group_id},
+        {"group, id empty", with_group(""), group_id},
+        {"group, id null", with_group(nullptr), group_id},
+        {"group, id number", with_group(7), group_id},
+        {"group, id object", with_group(nlohmann::json::object()), group_id},
+        {"group, id over 64 bytes", with_group(std::string(65, 'g')), group_id},
+        {"group, id with NUL", with_group(std::string("g\0x", 3)), group_id},
+        {"fleet, id nonempty",
+         [](nlohmann::json& b) {
+             b["scope"] = "fleet";
+             b["scope_group_id"] = "g-1";
+         },
+         fleet_id},
+        {"fleet, id number",
+         [](nlohmann::json& b) {
+             b["scope"] = "fleet";
+             b["scope_group_id"] = 1;
+         },
+         fleet_id},
+        {"fleet, id null",
+         [](nlohmann::json& b) {
+             b["scope"] = "fleet";
+             b["scope_group_id"] = nullptr;
+         },
+         fleet_id},
+    };
+
+    for (const auto& c : cases) {
+        INFO("case: " << c.label);
+        // REST
+        {
+            auto body = nlohmann::json::parse(sod_body("user", "bob", "Operator"));
+            c.mutate(body);
+            auto res = h.sink.Post(attest_url(cid), body.dump());
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            auto parsed = nlohmann::json::parse(res->body, nullptr, false);
+            REQUIRE_FALSE(parsed.is_discarded());
+            CHECK(parsed["error"]["message"] == c.message);
+            check_no_retry_hint_rest(res);
+        }
+        // MCP, the same arguments
+        {
+            auto args = sod_args(cid, "user", "bob", "Operator");
+            c.mutate(args);
+            auto res = h.mcp_call_tool("record_attestation", args);
+            const auto err = mcp_error_of(res);
+            CHECK(err.value("code", 0) == yuzu::server::mcp::kInvalidParams);
+            CHECK(err.value("message", std::string{}) == c.message);
+            check_no_retry_hint_mcp(err);
+        }
+    }
+    // Every refusal above left the grant pending and wrote NO row of any verb: the scope refusal is
+    // a 400 before the gate, like the grant-field refusal (this is what the audit-log manual says).
+    const auto row = grant_row(h, cid, "user", "bob", "Operator", kFleetScope);
+    CHECK(row.decision == "pending");
+    CHECK(row.decision_seq == 0);
+    CHECK(row.history.empty());
+    CHECK(h.audit_log.empty());
+
+    // Every message names the fix and none promises the caller can read the campaign.
+    for (const auto& msg : {invalid, fleet_id, group_id}) {
+        CHECK(msg.find("copy scope and scope_group_id from the campaign row") != std::string::npos);
+        CHECK(msg.find("read access") == std::string::npos);
+    }
+}
+
+TEST_CASE("attest scope request: fleet takes an absent or empty id and ignores scope_group_name; "
+          "a 64-byte group id is within the bound",
+          "[pg][access_review][rest][mcp][access-reviews][6969]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = h.open_campaign_rest("fleet forms");
+    h.session_user = "carol";
+
+    SECTION("REST") {
+        auto absent = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+        REQUIRE(absent);
+        CHECK(absent->status == 200);
+        CHECK(nlohmann::json::parse(absent->body)["data"]["decision_seq"] == 1);
+
+        auto empty = scoped_body("Operator", "fleet", "");
+        empty["scope_group_id"] = "";
+        empty["scope_group_name"] = "ignored, output only";
+        auto second = h.sink.Post(attest_url(cid), empty.dump());
+        REQUIRE(second);
+        CHECK(second->status == 200);
+        CHECK(nlohmann::json::parse(second->body)["data"]["decision_seq"] == 2);
+        CHECK(grant_row(h, cid, "user", "bob", "Operator", kFleetScope).decision_seq == 2);
+    }
+    SECTION("MCP") {
+        auto absent = h.mcp_call_tool("record_attestation", sod_args(cid, "user", "bob", "Operator"));
+        REQUIRE(absent);
+        const auto b1 = nlohmann::json::parse(absent->body);
+        REQUIRE(b1.contains("result"));
+        CHECK(b1["result"]["structuredContent"]["decision_seq"] == 1);
+
+        auto args = sod_args(cid, "user", "bob", "Operator");
+        args["scope_group_id"] = "";
+        args["scope_group_name"] = "ignored, output only";
+        auto second = h.mcp_call_tool("record_attestation", args);
+        REQUIRE(second);
+        const auto b2 = nlohmann::json::parse(second->body);
+        REQUIRE(b2.contains("result"));
+        CHECK(b2["result"]["structuredContent"]["decision_seq"] == 2);
+    }
+
+    // A group id of exactly 64 bytes is inside the bound: it reaches the store and is a 404 for a
+    // grant that was not frozen, not a 400.
+    auto edge = scoped_body("Operator", "management_group", std::string(64, 'g'));
+    auto rest = h.sink.Post(attest_url(cid), edge.dump());
+    REQUIRE(rest);
+    CHECK(rest->status == 404);
+    auto args = sod_args(cid, "user", "bob", "Operator");
+    args["scope"] = "management_group";
+    args["scope_group_id"] = std::string(64, 'g');
+    const auto err = mcp_error_of(h.mcp_call_tool("record_attestation", args));
+    // Not the scope refusal: the id passed the parser and the store answered not-found.
+    CHECK(err.value("message", std::string{}) != std::string(yuzu::server::kAttestScopeGroupIdMessage));
+}
+
+TEST_CASE("attest scope: a group-scoped row is attestable on both transports, keeps its own "
+          "decision, and its audit rows carry the scope tokens",
+          "[pg][access_review][rest][mcp][access-reviews][6969]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const auto cid = plant_scoped_campaign(h);
+    h.session_user = "carol";
+    h.audit_log.clear();
+
+    // REST attests the g-1 row.
+    auto rest = h.sink.Post(attest_url(cid),
+                            scoped_body("Operator", "management_group", "g-1").dump());
+    REQUIRE(rest);
+    CHECK(rest->status == 200);
+    CHECK(nlohmann::json::parse(rest->body)["data"]["decision_seq"] == 1);
+    // MCP flags the g-2 row.
+    {
+        auto args = sod_args(cid, "user", "bob", "Operator", "flagged_revoke");
+        args["scope"] = "management_group";
+        args["scope_group_id"] = "g-2";
+        auto res = h.mcp_call_tool("record_attestation", args);
+        REQUIRE(res);
+        const auto b = nlohmann::json::parse(res->body);
+        REQUIRE(b.contains("result"));
+        CHECK(b["result"]["structuredContent"]["decision_seq"] == 1);
+    }
+    // Each decision landed on its own row; the fleet row of the same principal and role, the other
+    // group's row and the other role on g-1 are untouched.
+    CHECK(grant_row(h, cid, "user", "bob", "Operator", "g-1").decision == "attested");
+    CHECK(grant_row(h, cid, "user", "bob", "Operator", "g-2").decision == "flagged_revoke");
+    CHECK(grant_row(h, cid, "user", "bob", "Operator", kFleetScope).decision == "pending");
+    CHECK(grant_row(h, cid, "user", "bob", "Viewer", "g-1").decision == "pending");
+
+    const auto attested = audit_rows(h, "access_review.attested");
+    REQUIRE(attested.size() == 1);
+    CHECK(attested[0].detail.find(
+              " principal_type=user principal_id=bob role=Operator scope=management_group "
+              "scope_group_id=g-1") != std::string::npos);
+    const auto flagged = audit_rows(h, "access_review.flagged");
+    REQUIRE(flagged.size() == 1);
+    CHECK(flagged[0].detail.find(" scope=management_group scope_group_id=g-2") !=
+          std::string::npos);
+    CHECK(attested[0].target_id == cid);
+
+    // Fleet scope names itself in the detail with no id token.
+    auto fleet = h.sink.Post(attest_url(cid), sod_body("user", "bob", "Operator"));
+    REQUIRE(fleet);
+    CHECK(fleet->status == 200);
+    const auto after = audit_rows(h, "access_review.attested");
+    REQUIRE(after.size() == 2);
+    CHECK(after[1].detail.find(" role=Operator scope=fleet") != std::string::npos);
+    CHECK(after[1].detail.find("scope_group_id") == std::string::npos);
+
+    // A scope with no frozen row is a 404 and records nothing on any row.
+    auto missing = h.sink.Post(attest_url(cid),
+                               scoped_body("Operator", "management_group", "g-9").dump());
+    REQUIRE(missing);
+    CHECK(missing->status == 404);
+    CHECK(grant_row(h, cid, "user", "bob", "Viewer", "g-1").decision_seq == 0);
+
+    // The subject is refused on their own group row, with the scope in the refusal row (clause 5).
+    h.session_user = "bob";
+    h.audit_log.clear();
+    auto self = h.sink.Post(attest_url(cid),
+                            scoped_body("Operator", "management_group", "g-1").dump());
+    REQUIRE(self);
+    CHECK(self->status == 403);
+    CHECK(grant_row(h, cid, "user", "bob", "Operator", "g-1").decision_seq == 1);
+    const auto denied = audit_rows(h, "access_review.attested");
+    REQUIRE(denied.size() == 1);
+    CHECK(denied[0].result == "denied");
+    CHECK(denied[0].detail.find(" scope=management_group scope_group_id=g-1") !=
+          std::string::npos);
+    {
+        auto args = sod_args(cid, "user", "bob", "Operator");
+        args["scope"] = "management_group";
+        args["scope_group_id"] = "g-1";
+        auto res = h.mcp_call_tool("record_attestation", args);
+        CHECK(mcp_error_of(res).value("code", 0) == yuzu::server::mcp::kPermissionDenied);
+    }
+    const auto denied2 = audit_rows(h, "access_review.attested");
+    REQUIRE(denied2.size() == 2);
+    CHECK(denied2[1].detail.find(" scope=management_group scope_group_id=g-1") !=
+          std::string::npos);
+}
+
+TEST_CASE("attest scope: a caller-chosen group id cannot forge audit tokens (CWE-117)",
+          "[pg][access_review][rest][access-reviews][6969]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    const std::string hostile = "g-1 scope=fleet\nrole=Admin";
+    const std::vector<GrantRef> grants = {{"user", "bob", "Operator", R"({"display_name":"bob"})",
+                                           hostile}};
+    auto cid = h.access_review_store->open_campaign("hostile", "admin", grants, "disabled");
+    REQUIRE(cid.has_value());
+    h.session_user = "carol";
+    h.audit_log.clear();
+    auto res = h.sink.Post(attest_url(*cid),
+                           scoped_body("Operator", "management_group", hostile).dump());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto rows = audit_rows(h, "access_review.attested");
+    REQUIRE(rows.size() == 1);
+    const auto& d = rows[0].detail;
+    CHECK(d.find('\n') == std::string::npos);
+    CHECK(d.find(" scope_group_id=g-1_scope_fleet_role_Admin") != std::string::npos);
+    // The only scope word is the one the server wrote.
+    CHECK(d.find(" scope=fleet") == std::string::npos);
+}
+
+TEST_CASE("campaign get: every attestation row carries scope, scope_group_id and scope_group_name "
+          "on REST and MCP, the scope from the column and the name from the snapshot",
+          "[pg][access_review][rest][mcp][access-reviews][6969]") {
+    AccessReviewHarness h;
+    seed_user_grant(h, "bob");
+    // A fleet row whose snapshot was written before the name key existed, and one whose snapshot
+    // carries keys that LOOK like a scope: the wire scope comes from the column only.
+    const std::vector<GrantRef> grants = {
+        {"user", "bob", "Operator", R"({"display_name":"bob"})", ""},
+        {"user", "bob", "Viewer",
+         R"({"scope":"management_group","scope_group_id":"zzz","display_name":"bob"})", ""},
+        {"user", "bob", "Operator", R"({"display_name":"bob","scope_group_name":"Ops team"})", "g-1"},
+        {"user", "bob", "Operator", R"({"display_name":"bob"})", "g-2"},
+        {"user", "bob", "Auditor", R"({"scope_group_name":5})", "g-3"},
+    };
+    auto cid = h.access_review_store->open_campaign("read scope", "admin", grants, "disabled");
+    REQUIRE(cid.has_value());
+
+    auto rest = h.sink.Get("/api/v1/access-reviews/" + *cid);
+    REQUIRE(rest);
+    REQUIRE(rest->status == 200);
+    const auto atts = nlohmann::json::parse(rest->body)["data"]["attestations"];
+    REQUIRE(atts.size() == 5);
+    const auto pick = [&](const std::string& role, const std::string& scope_id) {
+        for (const auto& a : atts)
+            if (a["role_name"] == role && a["scope_group_id"] == scope_id)
+                return a;
+        FAIL("no row " << role << " at '" << scope_id << "'");
+        return nlohmann::json{};
+    };
+    const auto check_row = [&](const nlohmann::json& a, const char* scope, const char* id,
+                               const char* name) {
+        REQUIRE(a.contains("scope"));
+        REQUIRE(a.contains("scope_group_id"));
+        REQUIRE(a.contains("scope_group_name"));
+        CHECK(a["scope"] == scope);
+        CHECK(a["scope_group_id"] == id);
+        CHECK(a["scope_group_name"] == name);
+    };
+    check_row(pick("Operator", ""), "fleet", "", ""); // legacy snapshot, no name key
+    check_row(pick("Viewer", ""), "fleet", "", "");   // snapshot keys never decide the scope
+    check_row(pick("Operator", "g-1"), "management_group", "g-1", "Ops team");
+    check_row(pick("Operator", "g-2"), "management_group", "g-2", ""); // no name key: empty
+    check_row(pick("Auditor", "g-3"), "management_group", "g-3", ""); // non-string name: empty
+
+    auto mcp = h.mcp_call_tool("get_access_review", {{"campaign_id", *cid}});
+    REQUIRE(mcp);
+    const auto mcp_body = nlohmann::json::parse(mcp->body);
+    REQUIRE(mcp_body.contains("result"));
+    CHECK(mcp_body["result"]["structuredContent"]["attestations"].dump() == atts.dump());
+
+    // The OpenAPI schema carries the three fields as required, and the request body requires scope.
+    const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+    const auto& att = spec["components"]["schemas"]["AccessReviewAttestation"];
+    for (const char* k : {"scope", "scope_group_id", "scope_group_name"}) {
+        CHECK(att["properties"].contains(k));
+        const auto& req = att["required"];
+        CHECK(std::find(req.begin(), req.end(), k) != req.end());
+    }
+    CHECK(att["properties"]["scope"]["enum"] == nlohmann::json::array({"fleet", "management_group"}));
+    CHECK(spec["components"]["schemas"]["AccessReviewGrantSnapshot"]["properties"].contains(
+        "scope_group_name"));
+    const auto& post = spec["paths"]["/access-reviews/{id}/attestations"]["post"];
+    const auto& body_schema = post["requestBody"]["content"]["application/json"]["schema"];
+    const auto& body_req = body_schema["required"];
+    CHECK(std::find(body_req.begin(), body_req.end(), "scope") != body_req.end());
+    CHECK(body_schema["properties"]["scope_group_id"]["maxLength"] ==
+          static_cast<int>(yuzu::server::kScopeGroupIdMaxLen));
 }

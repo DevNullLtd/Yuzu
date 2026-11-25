@@ -95,6 +95,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <nlohmann/json_fwd.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -339,6 +340,50 @@ static_assert(kScopeGroupIdMaxLen == 64,
     return ok(principal_type, kPrincipalIdMaxLen) && ok(principal_id, kPrincipalIdMaxLen) &&
            ok(role_name, kRoleNameMaxLen) && scope_group_id_within_bounds(scope_group_id);
 }
+
+/// The refusal texts of `parse_attest_scope`, shared by REST (400) and MCP (invalid-params) so the
+/// two transports cannot drift. Each names the fix (copy `scope` and `scope_group_id` from the
+/// campaign row) and none promises the caller can read the campaign: Attest without Read is a
+/// separate, known gap (#7183). 64 is spelled out and pinned to `kScopeGroupIdMaxLen`.
+inline constexpr std::string_view kAttestScopeInvalidMessage =
+    "scope is required and must be \"fleet\" or \"management_group\"; copy scope and "
+    "scope_group_id from the campaign row";
+inline constexpr std::string_view kAttestScopeFleetIdMessage =
+    "scope_group_id must be absent or empty when scope is \"fleet\"; copy scope and "
+    "scope_group_id from the campaign row";
+inline constexpr std::string_view kAttestScopeGroupIdMessage =
+    "scope_group_id is required when scope is \"management_group\" and must be a nonempty string "
+    "of at most 64 bytes without NUL; copy scope and scope_group_id from the campaign row";
+static_assert(kScopeGroupIdMaxLen == 64,
+              "kAttestScopeGroupIdMessage spells out 64: update the text with the constant");
+
+/// The ONE parser of the scope of an attestation request, used by REST and MCP (#6969). It reads
+/// the PARSED body, because the string helpers of both transports turn a missing or non-string
+/// value into "" and so cannot tell "fleet" from "forgot". Rules: `scope` is REQUIRED, a string,
+/// `"fleet"` or `"management_group"` (missing, null, any other type or value is refused). `"fleet"`
+/// takes a `scope_group_id` that is absent or `""` (anything else, including null and a non-string,
+/// is a contradiction and refused). `"management_group"` requires a nonempty string
+/// `scope_group_id` within `scope_group_id_within_bounds`. `scope_group_name` is output only and is
+/// never read. On success the value is the scope group id (`""` for fleet), which is what
+/// `AccessReviewStore::record_attestation` takes; on refusal it is the wire text. A parse refusal is
+/// the caller's to correct and offers no retry hint.
+[[nodiscard]] std::expected<std::string, std::string> parse_attest_scope(const nlohmann::json& body);
+
+/// The group name a frozen `grant_snapshot` carries as `scope_group_name`, or `""` when the key is
+/// absent (a snapshot written before it existed), not a string, or the snapshot is not JSON. It is
+/// the NAME only: the scope itself always comes from the attestation row's column, never from the
+/// snapshot.
+[[nodiscard]] std::string snapshot_scope_group_name(std::string_view grant_snapshot_json);
+
+/// What a Scope table cell shows, plain text (the caller HTML-escapes both fields): `Fleet-wide`
+/// for a fleet-wide grant; `Group: <name>` with the id as the tooltip for a group; `Group: name
+/// unavailable (<id>)` when the name is empty. Never empty, never "not found".
+struct ScopeCell {
+    std::string text;
+    std::string title; ///< the group id for a named group, else ""
+};
+[[nodiscard]] ScopeCell scope_cell(std::string_view scope_group_id,
+                                   std::string_view scope_group_name);
 
 /// The single shared campaign id validator: 1..kCampaignIdMaxLen bytes, each in `[A-Za-z0-9_-]`.
 /// REST, MCP, the Access page and the Settings campaign fragment all call this;

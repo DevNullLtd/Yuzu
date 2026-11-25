@@ -319,6 +319,115 @@ class FreezePopulation(unittest.TestCase):
             self.assertEqual(freeze_problems(name, text + "\n// GrantRef{a}\n/* GrantRef{b} */\n"), [])
 
 
+SETTINGS_CPP = SRC_DIR / "settings_routes.cpp"
+REST_CPP = SRC_DIR / "rest_api_v1.cpp"
+MCP_CPP = SRC_DIR / "mcp_server.cpp"
+RENDER_CPP = SRC_DIR / "access_reviews_render.cpp"
+
+# The campaign handlers by their own text: REST by route pattern, MCP by tool name. A region ends at
+# the next handler, so a token in a neighbour does not count against this one.
+REST_GET = ('R"(/api/v1/access-reviews/([^/]+))"', 'R"(/api/v1/access-reviews/([^/]+)/attestations)"')
+REST_ATTEST = (REST_GET[1], 'R"(/api/v1/access-reviews/([^/]+)/close)"')
+MCP_ATTEST = ('if (tool_name == "record_attestation")', 'if (tool_name == "get_access_review")')
+MCP_GET = (MCP_ATTEST[1], 'if (tool_name == "list_access_reviews")')
+
+
+def region(text, start, end):
+    """The normalised text from `start` to `end`, or None when either marker is gone."""
+    t = normalise(strip_block_comments(text))
+    a = t.find(normalise(start))
+    if a < 0:
+        return None
+    b = t.find(normalise(end), a + 1)
+    return None if b < 0 else t[a:b]
+
+
+def settings_campaign_region(text):
+    """From the Settings Scope-cell helper to the end of the campaign fragment function."""
+    t = normalise(strip_block_comments(text))
+    a = t.find("std::string ar_scope_cell(")
+    b = t.find("SettingsRoutes::render_access_review_campaign_fragment(", a + 1) if a >= 0 else -1
+    if a < 0 or b < 0:
+        return None
+    # the function body ends at the first top-level close after its opening brace
+    end = t.find("\n}", b)
+    return t[a:] if end < 0 else t[a:]  # normalise collapsed newlines: keep to the file end
+
+
+def forbidden_problems(label, text, tokens):
+    return [f"{label}: contains `{tok}`" for tok in tokens if tok in text]
+
+
+class AttestHandlersNeverRevoke(unittest.TestCase):
+    """Flag is evidence only (clause 2): no RBAC or engine-principal mutation on an attest path."""
+
+    TOKENS = ("unassign_role(", "revoke_role(", "assign_role(")
+
+    def regions(self):
+        rest = REST_CPP.read_text(encoding="utf-8")
+        mcp = MCP_CPP.read_text(encoding="utf-8")
+        return {"REST attest handler": region(rest, *REST_ATTEST),
+                "MCP record_attestation handler": region(mcp, *MCP_ATTEST)}
+
+    def test_no_mutation_call_in_the_attest_handlers_or_the_review_sources(self):
+        for label, text in self.regions().items():
+            self.assertIsNotNone(text, f"{label}: marker lost, update the gate")
+            p = forbidden_problems(label, text, self.TOKENS)
+            for m in p:
+                print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+            self.assertEqual(p, [])
+        for path in sorted(SRC_DIR.glob("access_review_*.[ch]pp")):
+            code = normalise(strip_block_comments(path.read_text(encoding="utf-8")))
+            self.assertEqual(forbidden_problems(path.name, code, self.TOKENS[:1]), [])
+
+    def test_pattern_is_live(self):
+        rest = REST_CPP.read_text(encoding="utf-8")
+        mcp = MCP_CPP.read_text(encoding="utf-8")
+        mutated = rest.replace(REST_ATTEST[0], REST_ATTEST[0] + ' /* x */ rbac_store->unassign_role(a);', 1)
+        # the injected call sits at the route pattern, inside the handler's own region
+        self.assertTrue(forbidden_problems("r", region(mutated, *REST_ATTEST), self.TOKENS))
+        mutated = mcp.replace(MCP_ATTEST[0], MCP_ATTEST[0] + ' { rbac_store->unassign_role(a); }', 1)
+        self.assertTrue(forbidden_problems("m", region(mutated, *MCP_ATTEST), self.TOKENS))
+        # A mention in a comment is not code.
+        mutated = rest.replace(REST_ATTEST[0], REST_ATTEST[0] + ' /* unassign_role( */ // unassign_role(\n', 1)
+        self.assertEqual(forbidden_problems("r", region(mutated, *REST_ATTEST), self.TOKENS), [])
+
+
+class FrozenRowIsSelfContained(unittest.TestCase):
+    """A campaign row names its group by the id and name FROZEN at open (D1): no read, render, attest
+    or audit path for a campaign looks up the live management group, so a rename, a re-parent or a
+    delete-and-recreate under the same id can never re-point evidence."""
+
+    TOKENS = ("get_group(", "management_group_store.", "management_group_store->")
+
+    def sources(self):
+        rest = REST_CPP.read_text(encoding="utf-8")
+        mcp = MCP_CPP.read_text(encoding="utf-8")
+        return {
+            "access_review_store.cpp": normalise(strip_block_comments(STORE_CPP.read_text(encoding="utf-8"))),
+            "access_reviews_render.cpp": normalise(strip_block_comments(RENDER_CPP.read_text(encoding="utf-8"))),
+            "settings_routes.cpp campaign fragment": settings_campaign_region(SETTINGS_CPP.read_text(encoding="utf-8")),
+            "REST GET /access-reviews/{id}": region(rest, *REST_GET),
+            "REST attest handler": region(rest, *REST_ATTEST),
+            "MCP get_access_review": region(mcp, *MCP_GET),
+            "MCP record_attestation": region(mcp, *MCP_ATTEST),
+        }
+
+    def test_no_live_group_lookup_on_a_campaign_path(self):
+        for label, text in self.sources().items():
+            self.assertIsNotNone(text, f"{label}: marker lost, update the gate")
+            p = forbidden_problems(label, text, self.TOKENS)
+            for m in p:
+                print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+            self.assertEqual(p, [])
+
+    def test_pattern_is_live(self):
+        for label, text in self.sources().items():
+            for tok in self.TOKENS:
+                with self.subTest(path=label, token=tok):
+                    self.assertTrue(forbidden_problems(label, text + " " + tok + "x);", self.TOKENS))
+
+
 class DashboardDecisionFeedback(unittest.TestCase):
     """Both dashboard surfaces must say when a decision replaced another one, and the Settings
     buttons must stay disabled while a request is in flight (each extra click appends a decision)."""

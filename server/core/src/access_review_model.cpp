@@ -8,6 +8,8 @@
 
 #include <yuzu/server/auth_db.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cstdio>
 #include <locale>
@@ -309,6 +311,51 @@ std::string to_csv(const std::vector<AccessReviewRow>& rows, const std::string& 
            << csv_field(r.source) << "\r\n";
     }
     return ss.str();
+}
+
+std::expected<std::string, std::string> parse_attest_scope(const nlohmann::json& body) {
+    if (!body.is_object() || !body.contains("scope") || !body["scope"].is_string())
+        return std::unexpected(std::string(kAttestScopeInvalidMessage));
+    const auto scope = body["scope"].get<std::string>();
+    const bool has_id = body.contains("scope_group_id");
+    if (scope == "fleet") {
+        if (has_id) {
+            const auto& id = body["scope_group_id"];
+            if (!id.is_string() || !id.get<std::string>().empty())
+                return std::unexpected(std::string(kAttestScopeFleetIdMessage));
+        }
+        return std::string{};
+    }
+    if (scope == "management_group") {
+        if (!has_id || !body["scope_group_id"].is_string())
+            return std::unexpected(std::string(kAttestScopeGroupIdMessage));
+        auto id = body["scope_group_id"].get<std::string>();
+        if (id.empty() || !scope_group_id_within_bounds(id))
+            return std::unexpected(std::string(kAttestScopeGroupIdMessage));
+        return id;
+    }
+    return std::unexpected(std::string(kAttestScopeInvalidMessage));
+}
+
+std::string snapshot_scope_group_name(std::string_view grant_snapshot_json) {
+    if (grant_snapshot_json.empty())
+        return {};
+    const auto j = nlohmann::json::parse(grant_snapshot_json.begin(), grant_snapshot_json.end(),
+                                         nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.is_object())
+        return {};
+    const auto it = j.find("scope_group_name");
+    if (it == j.end() || !it->is_string())
+        return {};
+    return it->get<std::string>();
+}
+
+ScopeCell scope_cell(std::string_view scope_group_id, std::string_view scope_group_name) {
+    if (scope_group_id.empty())
+        return {"Fleet-wide", {}};
+    if (scope_group_name.empty())
+        return {"Group: name unavailable (" + std::string(scope_group_id) + ")", {}};
+    return {"Group: " + std::string(scope_group_name), std::string(scope_group_id)};
 }
 
 std::string access_review_rbac_enforcement(const RbacStore* rbac) {
