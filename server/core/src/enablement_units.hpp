@@ -150,6 +150,9 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // by SAM-49 (POSIX legs supported, Windows leg planned for python and node; the scan and native Windows leg added by SAM-49 Windows); process_introspect inspect added by PR13.1-a, Windows and macOS legs planned so applicable on all three;
 // file_search search added with the file_search plugin, Windows leg planned so applicable on all three), 254 rows.
 inline constexpr std::array<UnitOsRow, 254> kUnitOs{{
+// by SAM-49 (POSIX legs supported, Windows leg planned for all four); process_introspect inspect added by PR13.1-a (macOS leg by PR13.1-c, Windows leg planned), applicable on all three;
+// file_search search added with the file_search plugin, Windows leg planned so applicable on all three; msi_packages installer_records added by SAM-46), 255 rows.
+inline constexpr std::array<UnitOsRow, 255> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -270,6 +273,7 @@ inline constexpr std::array<UnitOsRow, 254> kUnitOs{{
     {"msi_packages", "list", kWin | kMac},
     {"msi_packages", "product_codes", kWin | kMac},
     {"msi_packages", "list_inventory", kWin},
+    {"msi_packages", "installer_records", kWin},
     {"netprobe", "icmp", kWin | kLin | kMac},
     {"netprobe", "tcp", kWin | kLin | kMac},
     {"netprobe", "dns", kWin | kLin | kMac},
@@ -340,7 +344,7 @@ inline constexpr std::array<UnitOsRow, 254> kUnitOs{{
     {"services", "set_start_mode", kWin | kLin | kMac},
     // remote_access_audit: Linux is constrained, macOS supported, Windows `planned` (applicable).
     {"remote_access_audit", "list", kWin | kLin | kMac},
-    // process_introspect: Linux is constrained, macOS and Windows `planned` (applicable).
+    // process_introspect: Linux and macOS are constrained, Windows `planned` (applicable).
     {"process_introspect", "inspect", kWin | kLin | kMac},
     // file_search: Linux and macOS are constrained, Windows `planned` (applicable).
     {"file_search", "search", kWin | kLin | kMac},

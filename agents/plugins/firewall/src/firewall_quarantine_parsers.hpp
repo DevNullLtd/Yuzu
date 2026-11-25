@@ -779,6 +779,77 @@ build_allow_set(std::string_view control_ips_csv, std::string_view server_addres
     return add_exceptions(std::move(set), exceptions);
 }
 
+// ── Self-host refusal ───────────────────────────────────────────────────────
+
+namespace detail {
+
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as the plain IPv4 it stands for, so a
+/// control address and an interface address compare equal whichever form either
+/// side was written in. Anything else is returned unchanged.
+[[nodiscard]] inline IpAddr unmap_v4(const IpAddr& a) noexcept {
+    if (!a.v6)
+        return a;
+    for (std::size_t i = 0; i < 10; ++i)
+        if (a.b[i] != 0)
+            return a;
+    if (a.b[10] != 0xff || a.b[11] != 0xff)
+        return a;
+    IpAddr v4;
+    for (std::size_t i = 0; i < 4; ++i)
+        v4.b[i] = a.b[12 + i];
+    return v4;
+}
+
+/// 0.0.0.0 or ::. A control endpoint that is unspecified names no other host, so it can
+/// only ever be reached on this one.
+[[nodiscard]] inline bool is_unspecified(const IpAddr& a) noexcept {
+    const std::size_t n = a.v6 ? 16 : 4;
+    for (std::size_t i = 0; i < n; ++i)
+        if (a.b[i] != 0)
+            return false;
+    return true;
+}
+
+} // namespace detail
+
+/// Why this host must not be contained, or nullopt when it may be: the plugin answers
+/// `refused|<reason>` before it builds a leg. A containment that cuts the host off from
+/// the server it is meant to reach is refused, because its own control endpoint would
+/// have to ride the same allow set that is meant to cut the host off, and the server
+/// would then be unable to release it. `control` is the allow set's control endpoints
+/// and `own_literals` every address the host answers to (loopback and link-local
+/// included), or nullopt when the enumeration failed. Order:
+///   1. a control address that is loopback or unspecified (v4, v6, v4-mapped):
+///      `self_host`, without consulting the enumeration;
+///   2. an enumeration that is nullopt, or in which no entry parses: `own_addresses_
+///      unreadable` -- unknown is not "not this host", so it fails closed;
+///   3. a control address equal to an own address (v4-mapped normalised): `self_host`.
+/// Port, protocol and direction play no part; an own entry that does not parse is
+/// skipped. Addresses only: a server reached at a bridge address of a container or VM on
+/// the same host is not an own address (documented limit, no heuristic).
+[[nodiscard]] inline std::optional<std::string_view>
+self_host_refusal(const std::vector<Endpoint>& control,
+                  const std::optional<std::vector<std::string>>& own_literals) {
+    for (const auto& c : control) {
+        const auto ip = detail::unmap_v4(c.ip);
+        if (is_loopback(ip) || detail::is_unspecified(ip))
+            return "self_host";
+    }
+    std::vector<IpAddr> own;
+    if (own_literals)
+        for (const auto& lit : *own_literals)
+            if (const auto ip = parse_ip(detail::trim(lit)))
+                own.push_back(detail::unmap_v4(*ip));
+    if (own.empty())
+        return "own_addresses_unreadable";
+    for (const auto& c : control) {
+        const auto ip = detail::unmap_v4(c.ip);
+        if (std::find(own.begin(), own.end(), ip) != own.end())
+            return "self_host";
+    }
+    return std::nullopt;
+}
+
 /// True when `e` names an allowance the quarantine cannot work without:
 /// loopback, a control-channel endpoint, a DNS resolver on 53, or DHCP
 /// (udp 67/68). ICMPv6 neighbour discovery is also mandatory but cannot be
@@ -2816,6 +2887,9 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
 }
 [[nodiscard]] inline Argv pfctl_info_argv() { return {std::string{kPfctlPath}, "-s", "info"}; }
 [[nodiscard]] inline Argv pfctl_rules_argv() { return {std::string{kPfctlPath}, "-s", "rules"}; }
+/// The state and rules reads' top-level anchor list. Not pfctl_siblings_argv: `-a com.apple -s
+/// Anchors` lists only the com.apple children, a different answer with its own grant line.
+[[nodiscard]] inline Argv pfctl_anchors_argv() { return {std::string{kPfctlPath}, "-s", "Anchors"}; }
 [[nodiscard]] inline Argv pfctl_anchor_rules_argv() {
     return {std::string{kPfctlPath}, "-a", std::string{kPfAnchor}, "-s", "rules"};
 }
@@ -4086,6 +4160,30 @@ inline Outcome roll_back(Env& env, QuarantineState st, std::string reason, std::
 
 } // namespace detail
 
+/// The note an apply carries when the device kept its stored allow set instead of applying
+/// the requested one: the device's own record is `active` and the requested operator
+/// EXCEPTIONS differ from the ones in force, as a set (order is not a difference). Not when
+/// only the control peer or the resolvers differ: the live peer leads a new request's control
+/// set and the resolvers are re-read, so those differ on a healthy retry. Any other record
+/// (applying, releasing, unreadable, absent) has no stored set to keep, so no note. The
+/// server keys on this note to learn that a new record's whitelist was not applied (the
+/// stored set was kept). It rides the two answers that call this helper, the `active` branch
+/// of apply_and_verify and the self-host refusal in do_quarantine, so the condition and the
+/// text cannot drift apart; the other refusals of an apply to an active record (the allow-set
+/// errors, `privilege_unavailable`, `unsupported_platform`, `staging_unavailable`) do not
+/// carry it (#8519).
+[[nodiscard]] inline std::optional<std::string_view>
+allow_set_unchanged_note(const StateLoad& stored,
+                         const std::vector<Endpoint>& requested_exceptions) {
+    if (stored.kind != StateLoad::Kind::ok || stored.state.phase != Phase::active)
+        return std::nullopt;
+    const auto& in_force = stored.state.allow.exceptions;
+    if (std::is_permutation(in_force.begin(), in_force.end(), requested_exceptions.begin(),
+                            requested_exceptions.end()))
+        return std::nullopt;
+    return "allow_set_unchanged_use_quarantine_allow=1";
+}
+
 struct ApplyRequest {
     AllowSet allow;
     std::string probe_target; // "ip:port" | "[v6]:port" | empty
@@ -4142,14 +4240,8 @@ struct ApplyRequest {
                 if (o.status != "degraded")
                     o.notes.emplace_back("already_active=1");
             }
-            // Said when the operator EXCEPTIONS differ, as a set (order is not a difference).
-            // Not when only the control peer or the resolvers differ: the live peer leads a
-            // new request's control set and the resolvers are re-read, so those differ on a
-            // healthy retry. The server keys on this note to learn that a new record's
-            // whitelist was not applied (the stored set was kept).
-            if (!std::is_permutation(cur.allow.exceptions.begin(), cur.allow.exceptions.end(),
-                                     req.allow.exceptions.begin(), req.allow.exceptions.end()))
-                o.notes.emplace_back("allow_set_unchanged_use_quarantine_allow=1");
+            if (const auto note = allow_set_unchanged_note(loaded, req.allow.exceptions))
+                o.notes.emplace_back(*note);
             // Same rule for the TTL: a retry never rewrites a contained host's expiry.
             if (req.ttl_seconds != 0)
                 o.notes.emplace_back("ttl_unchanged_release_then_quarantine=1");

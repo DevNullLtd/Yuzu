@@ -1,6 +1,7 @@
 Directory: tests/unit/fixtures/software-estate/msi_packages/windows/
 Captured 2026-10-17 for the msi_packages list_inventory tests (test_msi_packages_inventory.cpp,
-loaded through YUZU_TEST_FIXTURE_DIR).
+loaded through YUZU_TEST_FIXTURE_DIR). products-system.txt and installer-records-system.txt are
+captures; corrupt-package.msi (last section) is NOT a capture.
 
 products-system.txt
   Status: REAL CAPTURE, one redaction (below)
@@ -34,3 +35,36 @@ products-system.txt
             returned ERROR_MORE_DATA (234) with the reported length excluding the NUL (15 for
             "Python Launcher"). These are the codes the plugin treats as "the product has no such
             property"; any other code is a failed read.
+
+installer-records-system.txt
+  Status: REAL CAPTURE, one redaction (below). Read-only SYSTEM registry capture.
+  host:     Windows 11 (build 26200)
+  identity: NT AUTHORITY\SYSTEM (scheduled task)
+  date:     2026-11-23T23:40:40Z
+  reads:    registry reads only, no write, no Installer API call:
+              HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\<packed>\InstallProperties
+            and HKLM\SOFTWARE\Classes\Installer\UpgradeCodes.
+  Used by:  test_msi_installer_records.cpp (loaded through YUZU_TEST_FIXTURE_DIR).
+  Format:   `P|<packed product key>|<braced code>|DisplayName|DisplayVersion|Publisher|InstallDate|
+            InstallLocation|InstallSource|LocalPackage` per product with an InstallProperties key,
+            `N|<packed product key>|<braced code>` per Products subkey with none, and
+            `U|<packed upgrade code>|<braced code>|<packed product code>,...` per UpgradeCodes subkey.
+            The braced codes were computed by an independent implementation of the documented
+            packing rule, not by the plugin's codec.
+  Rows:     136 products with InstallProperties (P), 1 with no_install_properties (N), 136
+            upgrade-code entries (U). Every product is named under exactly one upgrade code, and
+            all 136 are covered.
+  Redacted: user profile paths are replaced by C:\Users\jsmith\. Nothing else is edited. The raw
+            capture is not committed.
+  Not held: no product here has a LocalPackage outside C:\Windows\Installer, no product records
+            no package, no product's InstallLocation is under a profile (several InstallSource
+            values are), and no product is named under two upgrade codes. The tests build those
+            shapes from these rows. The missing-package and corrupt-package shapes are built in
+            the test too.
+  Measured: all 136 database upgrade codes read from the cached packages equal the sixth token
+            list_inventory reports for the same product, on this host as SYSTEM.
+
+corrupt-package.msi
+  Status: SYNTHETIC. A small file that is not an OLE compound document, so MsiOpenDatabaseW refuses
+          it. It is opened only by the Windows-only body of test_msi_database_read.cpp, which copies
+          it into a yuzu_test_ scratch directory first.
