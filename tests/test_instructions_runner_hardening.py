@@ -1740,6 +1740,31 @@ class BashEntry(unittest.TestCase):
                 self.assertEqual(r.returncode, 2, r.stderr)
                 self.assertFalse(self.rec.exists())  # nothing was started
 
+    def test_a_target_hostname_selects_the_remote_ceremony(self):
+        base = ("--risks", "network-disrupt", "--target-agent-id", "id 1")
+        argv = self.run_bash(*base, "--target-agent-hostname", "host b", "--console-access-to-agent")
+        self.assertIn("--remote", argv)
+        self.assertEqual(argv[argv.index("--agent-hostname") + 1], "host b")
+        self.assertIn("--i-have-console-access-to-the-agent", argv)
+        argv = self.run_bash(*base, "--target-agent-hostname", "host b")
+        self.assertIn("--remote", argv)
+        self.assertEqual(argv[argv.index("--agent-hostname") + 1], "host b")
+        self.assertNotIn("--i-have-console-access-to-the-agent", argv)
+        argv = self.run_bash(*base)
+        self.assertNotIn("--remote", argv)
+        self.assertNotIn("--agent-hostname", argv)
+
+    def test_the_console_flag_without_a_target_hostname_is_refused(self):
+        env = dict(os.environ, PATH=f"{self.tmp}{os.pathsep}{os.environ['PATH']}", REC=str(self.rec))
+        r = subprocess.run(["bash", str(ROOT / "scripts" / "test" / "instructions-tests.sh"),
+                            "--dashboard", "http://127.0.0.1:1", "--password", "p",
+                            "--risks", "network-disrupt", "--target-agent-id", "a",
+                            "--console-access-to-agent"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--target-agent-hostname", r.stderr)
+        self.assertFalse(self.rec.exists())  # nothing was started
+
     def test_values_with_spaces_arrive_as_single_arguments(self):
         argv = self.run_bash("--confirm-target", "Host name 1", "--manifest", "/tmp/a b/m.jsonl",
                              "--params-override", "/tmp/o v/x.json", "--target-agent-id", "id 1")

@@ -43,7 +43,10 @@
 #       macOS), the only programs the sudoers file lets the agent account run as root for
 #       the work that needs more than a fixed command:
 #         yuzu-fw-helper   firewall containment: iptables / ip6tables and the nftables
-#                          ruleset load on Linux, the pf anchor load on macOS
+#                          ruleset load on Linux, the pf anchor load on macOS; and one
+#                          read-only word, snapshot, that lists the host's nftables and
+#                          iptables rulesets (on a Mac it prints [absent] for nft and
+#                          [failed] for the two legacy iptables sections)
 #         yuzu-svc-helper  services.set_start_mode: systemctl enable|disable|mask|unmask on
 #                          Linux, launchctl enable|disable on macOS
 #       Linux: /usr/local/sbin.  macOS: /Library/PrivilegedHelperTools.
@@ -104,7 +107,11 @@
 # ARGUMENTS
 # ─────────
 #   --dry-run        Print every command the script would run, without
-#                    executing any of them. Use this first.
+#                    executing any of them. Use this first. It also prints the
+#                    verdict on each helper directory (ok, warn, would be refused
+#                    or would be created) and exits 1 when the real run would
+#                    refuse it: owned by anyone but root, writable by all users,
+#                    or a path that exists and is not a directory.
 #   --check          Verify the install is correct (user exists with
 #                    expected attributes, sudoers file present + valid,
 #                    both helpers present with the expected owner, mode
@@ -536,6 +543,11 @@ EOF
 # pfctl grant. The anchor name sorts first among Apple's com.apple/* sub-anchors, and the release
 # flush is -F rules / -F nat on that anchor only (never -F all: that is global). The installer
 # writes the helper before this file; a host without it is provisioned with this build's installer.
+# The helper also takes one read-only word, snapshot, with no other argument; on a Mac it prints
+# [absent] for nft and [failed] for the two legacy iptables sections (there is no /proc/net), at most
+# 4 MiB, and the pf reads below stay on the exact pfctl lines. The state and rules reads use three of them, read-only and with no
+# wildcard: -s info, -s rules and -s Anchors (the top-level anchor list; the com.apple line below is
+# a different, narrower read that the containment path uses).
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E
 EOF
@@ -552,6 +564,7 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple -s Anchors
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -F states
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s info
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s Anchors
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s References
 
 # services.set_start_mode — launchd system domain. The agent account may run one program as root
@@ -587,7 +600,16 @@ EOF
 # takes a file name or an argument pattern. A sudo regular expression could pin the arguments in
 # this file instead, but it needs sudo 1.9.10, which RHEL 8 and 9, Ubuntu 22.04 and earlier and
 # Debian 11 do not ship. The installer writes the helper before this file; a host without it is
-# provisioned with this build's installer.
+# provisioned with this build's installer. The helper also takes one read-only word, snapshot,
+# with no other argument: it prints the nft ruleset and the legacy iptables and ip6tables tables of
+# the host (at most 4 MiB), changes no ruleset and writes no file, so the agent account can read the
+# host ruleset through this same line. Two reads can make the kernel load a module, both measured
+# (ADR-3007, clause 3): an nft read on a host where nf_tables is not loaded makes the kernel load
+# nf_tables, and a save tool that asks for a table whose module is not loaded makes the kernel load
+# that module. In one removal race a save tool starts modprobe itself, for its family's core
+# module, when that module and a table's module are both removed between the kernel listing the
+# table and the tool asking for it (read in the tool's source; ADR-3007, clause 3); the helper has
+# no sandbox that refuses that load.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 
 # firewall plugin — nftables containment (own table inet yuzu_quarantine). The ruleset is loaded
@@ -690,7 +712,8 @@ remove_sudoers() {
 # compares each installed file with it byte for byte. The sudoers file names each helper with no
 # argument and no wildcard:
 #   - $FW_HELPER_PATH, firewall containment: iptables, ip6tables and the nftables ruleset load on
-#     Linux, the pf anchor load on macOS.
+#     Linux, the pf anchor load on macOS; and one read-only word, snapshot, that lists the host's
+#     nft and iptables rulesets.
 #   - $SVC_HELPER_PATH, services.set_start_mode: systemctl on Linux, launchctl on macOS.
 #
 # The firewall helper's contract (the C++ twins are iptables_helper_argv, nft_ruleset_text and
@@ -709,6 +732,15 @@ remove_sudoers() {
 #   - pf load: the same, for the macOS anchor: the staged file is read ONCE, every line is checked
 #     against the ruleset the plugin generates, and pfctl is given a ruleset the helper builds from
 #     its own literals plus the checked tokens on standard input.
+#   - snapshot: exactly one argument, the word snapshot, and read-only. It runs $NFT -a list
+#     ruleset and, for each address family, that family's legacy save tool by its own name
+#     ($XT4 for IPv4, $XT6 for IPv6; with no argument: they list every instantiated table and, for
+#     the tables the kernel lists, load no module), each with those fixed arguments and nothing from the caller, and prints them under
+#     `== <label>` headings: `[absent]` for the nft tool not installed (that section was not read),
+#     `[failed]` after the output of a tool that exits non-zero, `[failed]` alone for a legacy
+#     section when /proc/net cannot be stat'ed, then `== end`. A legacy family with no save tool
+#     prints `[tables]` and then the kernel's own list of its tables (`[tables]` alone: no table).
+#     The whole listing is cut at 4 MiB (a cut one has no `== end`) and the exit status is 0.
 #   - anything else exits 64 having run nothing.
 # The helper is ONE text on both platforms. An action whose tool is not on the host (iptables or
 # nft on a Mac, pfctl on Linux) fails at exec, after the same validation, having changed nothing.
@@ -731,6 +763,7 @@ generate_fw_helper_content() {
 # Usage: yuzu-fw-helper iptables|ip6tables <tokens>
 #        yuzu-fw-helper nft load <path>
 #        yuzu-fw-helper pf load <path>
+#        yuzu-fw-helper snapshot
 # <tokens> are exactly those of one of these shapes (<ours> is a yuzu-fwq-<generation>[-f] chain,
 # the generation 1 to 10 digits and at most 2147483647):
 #   -S
@@ -755,6 +788,27 @@ generate_fw_helper_content() {
 # The caller's arguments are never passed on. Each branch below matches the token count and the
 # fixed tokens, validates the variable ones, and execs the tool with an argument list made of its
 # own literals plus the validated values. Anything else exits 64, having run nothing.
+#
+# snapshot takes exactly one argument, the word snapshot, and only reads. It prints three sections,
+# each headed by a line `== <label>`: `== nft -a list ruleset`, `== iptables-legacy-save` and
+# `== ip6tables-legacy-save`. The nft section holds the tool's output; a tool that is not installed
+# prints `[absent]` (nft only: that section was not read) and one that exits non-zero adds a
+# `[failed]` line after whatever it printed (a newline is written first, so the marker never joins a
+# line the tool left unfinished). Each legacy section holds the output of the family's legacy save
+# tool run with no argument, which lists every instantiated table; when /proc/net cannot be stat'ed
+# the section is `[failed]` alone and no tool is run; when the family has no save tool the section
+# is `[tables]` and then the kernel's own list of the family's tables, one name per line (`[tables]`
+# alone is a family that holds no table). The listing ends with `== end`, the whole of it is cut at
+# 4194304 bytes, and the exit status is 0. A listing that was cut has no `== end`. The tools are run
+# with their own fixed arguments and nothing from the caller. It reads the host ruleset, which
+# includes rule handles, and changes no ruleset and writes no file. Two reads can make the kernel
+# load a module, both measured (ADR-3007, clause 3): an nft read on a host where nf_tables is not
+# loaded makes the kernel load nf_tables, and a save tool that asks for a table whose module is not
+# loaded makes the kernel load that module. In one removal race a save tool starts modprobe itself,
+# for its family's core module (ip_tables or ip6_tables): when that module and a table's module are
+# both removed between the kernel listing the table and the tool asking for it (read in the tool's
+# source; ADR-3007, clause 3). This helper runs as root with no sandbox, so nothing in it refuses
+# that load.
 #
 # nft load <path> and pf load <path>: <path> is absolute, at most 512 characters with no control
 # character, in a directory named firewall-staging, and its file name is yuzu-fwq-<letters, digits,
@@ -798,6 +852,8 @@ export PATH LC_ALL
 IPT=/usr/sbin/iptables
 IP6T=/usr/sbin/ip6tables
 NFT=/usr/sbin/nft
+XT4=/usr/sbin/iptables-legacy-save
+XT6=/usr/sbin/ip6tables-legacy-save
 PFCTL=/sbin/pfctl
 PF_ANCHOR=com.apple/000.yuzu_quarantine
 # No pathname expansion and a single-space field separator before any word split below.
@@ -821,6 +877,59 @@ tok_is() {
         "$2") return 0 ;;
     esac
     return 1
+}
+
+# snap_one LABEL TOOL ARGS: one section of the snapshot. Reads only: the tool is run with the
+# fixed arguments the caller of this function names, and its standard error is dropped. A failed
+# tool's marker is written after a newline, so it is a line of its own even when the tool died in
+# the middle of one (a reader that matches the whole line `[failed]` then always sees it).
+snap_one() {
+    printf '== %s\n' "$1"
+    snap_tool=$2
+    shift 2
+    if [ ! -x "$snap_tool" ]; then
+        printf '[absent]\n'
+        return 0
+    fi
+    "$snap_tool" "$@" 2>/dev/null || printf '\n[failed]\n'
+}
+
+# snap_xt LABEL TOOL NAMES: a legacy xtables section, read by the family's legacy save tool under
+# its own name, with no argument. That tool lists every instantiated table; for the tables the
+# kernel lists it loads no kernel module, runs no modprobe and takes no lock. Empty output with exit
+# 0 is a family that holds no table, and a non-zero exit is a failure (`[failed]` through snap_one).
+# Two decisions are made here, before any tool runs, from host state and never from input. If
+# /proc/net cannot be stat'ed the process cannot see the kernel's tables at all, and a save tool
+# reads a missing table list as no table, so the section is `[failed]` and no tool is run. If the
+# family has no save tool, nothing here can list its tables; the kernel's own list of them is
+# printed under `[tables]`, which is the names file NAMES, present exactly while the family's core
+# module is loaded. `[tables]` alone says the family holds no table; `[tables]` and a name say
+# tables exist that nothing listed, and the reader treats them as unread. NAMES that cannot be
+# stat'ed is read as no table (behind the /proc/net check above, which rules out every cause at
+# directory level); a name list that cannot be read is `[failed]`. No file is created.
+snap_xt() {
+    if [ ! -e /proc/net/dev ]; then
+        printf '== %s\n\n[failed]\n' "$1"
+        return 0
+    fi
+    if [ -x "$2" ]; then
+        snap_one "$1" "$2"
+        return 0
+    fi
+    printf '== %s\n[tables]\n' "$1"
+    [ ! -e "$3" ] || head -c 4096 "$3" 2>/dev/null || printf '\n[failed]\n'
+}
+
+# host_snapshot: yuzu-fw-helper snapshot. Never returns. The group is cut at 4 MiB, so a listing
+# that was cut has no end line.
+host_snapshot() {
+    {
+        snap_one 'nft -a list ruleset' "$NFT" -a list ruleset
+        snap_xt 'iptables-legacy-save' "$XT4" /proc/net/ip_tables_names
+        snap_xt 'ip6tables-legacy-save' "$XT6" /proc/net/ip6_tables_names
+        printf '== end\n'
+    } | head -c 4194304
+    exit 0
 }
 
 all_digits() {
@@ -1396,6 +1505,12 @@ pf_load() {
     exit $?
 }
 
+# snapshot is the only one-argument action; a bare call, or one that is not exactly that word, is
+# refused (snapshot with anything after it falls through to the refusal of the case below).
+if [ $# -eq 1 ]; then
+    tok_is "$1" snapshot || refuse
+    host_snapshot
+fi
 [ $# -ge 2 ] || refuse
 case $1 in
     iptables) tool=$IPT ;;
@@ -1632,14 +1747,39 @@ check_helper_dir() {
     esac
 }
 
+# helper_dir_verdict DIR: ok, warn or refuse for DIR as it is now (refuse also when its owner and
+# mode cannot be read), by the same rule check_helper_dir applies.
+helper_dir_verdict() {
+    local info uid mode grp
+    info=$(dir_info "$1" 2>/dev/null) || { echo refuse; return; }
+    read -r uid mode grp <<<"$info"
+    fw_dir_verdict "$uid" "$mode"
+}
+
 # install_helper PATH GENERATOR: writes the helper GENERATOR prints to PATH, root:$ROOT_GROUP 0755.
 install_helper() {
     local path="$1" generator="$2"
     if [[ "$SKIP_SUDOERS" -eq 1 ]]; then return 0; fi
 
-    local dir tmp
+    local dir tmp v
     dir=$(dirname "$path")
     if [[ "$DRY_RUN" -eq 1 ]]; then
+        # Say what the real run would find in the helper directory, and fail as it would: a directory
+        # that would be refused fails the dry run too, so the dry run is no longer a promise the real
+        # run breaks. (This line starts "[dry-run] " with one space: only the "[dry-run]   " block
+        # below is the helper text.)
+        if [[ -d "$dir" ]]; then
+            v=$(helper_dir_verdict "$dir")
+            [[ $v == ok || $v == warn ]] || v="would be refused"
+            echo "[dry-run] helper directory $dir: $v"
+            check_helper_dir "$dir" || return 1
+        elif [[ -e "$dir" || -L "$dir" ]]; then
+            # A dangling link or a file where the directory belongs: the real run cannot create it.
+            echo "[dry-run] helper directory $dir: would be refused (the path exists and is not a directory)"
+            return 1
+        else
+            echo "[dry-run] helper directory $dir: would be created root:$ROOT_GROUP 0755"
+        fi
         echo "[dry-run] would write the following to $path (root:$ROOT_GROUP 0755):"
         "$generator" | sed 's/^/[dry-run]   /'
         return 0
@@ -1933,10 +2073,14 @@ case "$ACTION" in
         cap_rc=0
         strip_file_capabilities || cap_rc=$?
         if [[ "$helper_rc" -ne 0 ]]; then
-            if [[ -e "$SUDOERS_FILE" ]]; then
+            # A dry run only prints the removal, so the file still exists there: it is a failure only
+            # when a real run could not remove it.
+            if [[ "$DRY_RUN" -ne 1 && -e "$SUDOERS_FILE" ]]; then
                 fail "a root-owned helper was not installed and $SUDOERS_FILE could not be removed: remove it by hand, correct the helper directory and re-run this installer"
             fi
-            fail "a root-owned helper was not installed, so $SUDOERS_FILE was removed: until the helper directory is corrected (owned by root, not writable by all users) and this installer is re-run, every sudo-backed action fails on a non-root agent, firewall containment and services.set_start_mode included"
+            removed="was removed"
+            if [[ "$DRY_RUN" -eq 1 ]]; then removed="would be removed"; fi
+            fail "a root-owned helper was not installed, so $SUDOERS_FILE $removed: until the helper directory is corrected (owned by root, not writable by all users) and this installer is re-run, every sudo-backed action fails on a non-root agent, firewall containment and services.set_start_mode included"
         fi
         if [[ "$sudoers_rc" -ne 0 ]]; then
             warn "$SUDOERS_FILE was not installed (status $sudoers_rc); removing any earlier file so no old grant stays"

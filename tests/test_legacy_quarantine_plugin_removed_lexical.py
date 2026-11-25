@@ -283,6 +283,14 @@ def render_installer(platform, *extra, visudo=None):
             with open(os.path.join(d, "visudo"), "w") as f:
                 f.write("#!/bin/sh\n" + visudo + "\n")
             os.chmod(os.path.join(d, "visudo"), 0o755)
+        # The dry run says what it would find in the helper directory, with the stat form of the SIMULATED
+        # platform, which this host's stat may not speak (GNU `-f` is a different mode, BSD has no `-c`): answer
+        # the owner-and-mode read of either form with a directory the verdict accepts, and leave every other
+        # stat call to the real one.
+        stat = os.path.join(d, "stat")
+        with open(stat, "w") as f:
+            f.write('#!/bin/sh\ncase "$1 $2" in "-L -c" | "-L -f") echo "0 755 root"; exit 0 ;; esac\nexec /usr/bin/stat "$@"\n')
+        os.chmod(stat, 0o755)
         env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""))
         r = subprocess.run(["bash", os.path.join(REPO, INSTALLER), "--dry-run", *extra],
                            capture_output=True, text=True, timeout=60, env=env)
@@ -584,8 +592,11 @@ class IptablesHelperRuns(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_fwhelper_")
         d = cls.tmp.name
         text = helper_text()
+        # the snapshot word names the legacy save tools (`/usr/sbin/iptables-legacy-save`), which begin with the
+        # same text: only a use that is not followed by a name character is the containment words' exec target
         for tool in ("/usr/sbin/iptables", "/usr/sbin/ip6tables"):
-            assert text.count(tool) == 1, "the helper must name %s exactly once, as its exec target" % tool
+            assert len(re.findall(re.escape(tool) + r"(?![-\w])", text)) == 1, \
+                "the helper must name %s exactly once, as its exec target" % tool
         cls.stubs = {}
         for fam, target in (("iptables", "/usr/sbin/iptables"), ("ip6tables", "/usr/sbin/ip6tables")):
             stub = os.path.join(d, "stub-" + fam)
@@ -594,7 +605,7 @@ class IptablesHelperRuns(unittest.TestCase):
                 f.write("#!/bin/sh\nprintf 'RAN %s\\n' \"${0##*/}\"\nfor a; do printf '%s\\n' \"$a\"; done\n")
             os.chmod(stub, 0o755)
             cls.stubs[fam] = stub
-            text = text.replace(target, stub)
+            text = re.sub(re.escape(target) + r"(?![-\w])", lambda _m, stub=stub: stub, text)
         cls.path = os.path.join(d, "yuzu-fw-helper")
         with open(cls.path, "w") as f:
             f.write(text)
@@ -633,16 +644,458 @@ class IptablesHelperRuns(unittest.TestCase):
                 self.assertNotEqual(r.returncode, 0, (shell, argv))
                 self.assertEqual(r.stdout, "", (shell, argv))
 
-    def test_the_environment_cannot_change_what_runs(self):
-        env = dict(os.environ, PATH="/nonexistent", IFS="-", ENV="/nonexistent", BASH_ENV="/nonexistent")
+    def test_an_unusable_path_still_runs_the_tool_at_its_fixed_path(self):
+        # The only environment variable this observes is PATH: a PATH that names nothing still runs the
+        # stub tool at its own fixed path. Nothing here resolves a command through PATH, so this proves
+        # no more than that; the planted-command case is SnapshotRuns' (its `head` is resolved by name).
+        env = {"PATH": "/nonexistent"}
         for shell in available_shells():
             r = subprocess.run([shell, self.path, "iptables", "-N", "yuzu-fwq-1"], capture_output=True,
                                text=True, timeout=30, env=env)
             self.assertEqual((r.returncode, r.stdout), (0, "RAN stub-iptables\n-N\nyuzu-fwq-1\n"), shell)
 
 
+BROKER_SCRIPT = "deploy/systemd/yuzu-fw-snapshot.sh"
+PARSERS_HEADER = "agents/plugins/firewall/src/firewall_parsers.hpp"
+
+
+def broker_script_text():
+    """The shipped broker script (run by yuzu-fw-snapshot@.service), exactly as packaged."""
+    text = read_text(BROKER_SCRIPT)
+    if text is None:
+        raise AssertionError("the broker script is gone: " + BROKER_SCRIPT)
+    return text
+
+
+def sh_function(text, name):
+    """The text of one shell function, from `name() {` to its closing `}` on a line of its own."""
+    m = re.search(r"^%s\(\) \{\n.*?\n\}\n" % re.escape(name), text, re.S | re.M)
+    if not m:
+        raise AssertionError("no function %s" % name)
+    return m.group(0)
+
+
+# What the stub tools run by default: print its own name, then each argument it was handed.
+STUB_ECHO = 'printf "RAN %s\\n" "${0##*/}"\nfor a; do printf "%s\\n" "$a"; done\n'
+# A stub that is not installed (the path does not exist), and one whose file has no execute bit.
+NOT_INSTALLED = None
+NOT_EXECUTABLE = object()
+# a table-list file that is a directory: opening it for reading fails whatever the account
+DIR = object()
+
+
+class SnapshotCase:
+    """What the helper's `snapshot` word and the broker script share: three sections (nft, and the legacy
+    iptables and ip6tables tables), each printed under `== <label>`, then `== end`, cut at four MiB. The text
+    under test is run with its tool paths and the three host paths it tests replaced by paths inside a case
+    directory, where each case builds the host state it wants: which tools exist, whether /proc/net/dev is
+    visible and what the kernel's table lists hold. A mixin: the helper's class and the script's class use
+    it with their own source text and their own cases."""
+
+    # (section label, the tool path the text names once, the arguments it must be run with)
+    NFT = ("nft -a list ruleset", "/usr/sbin/nft", ["-a", "list", "ruleset"])
+    XT4 = ("iptables-legacy-save", "/usr/sbin/iptables-legacy-save", [])
+    XT6 = ("ip6tables-legacy-save", "/usr/sbin/ip6tables-legacy-save", [])
+    TOOLS = (NFT, XT4, XT6)
+    PROC_DEV = "/proc/net/dev"
+    NAMES = {XT4[1]: "/proc/net/ip_tables_names", XT6[1]: "/proc/net/ip6_tables_names"}
+    CAP = 4194304
+    # a stub tool whose output is over the cap
+    BIG = "head -c %d /dev/zero | tr '\\000' 'a'\n" % (CAP + 100000)
+    FILE_NAME = "yuzu-fw-helper"
+    # the bodies map of a host with neither legacy save tool installed
+    NO_SAVE_TOOLS = {XT4[1]: NOT_INSTALLED, XT6[1]: NOT_INSTALLED}
+
+    def ran_marker(self):
+        """A path and the stub body that creates it: a section whose tool ran leaves the file."""
+        marker = os.path.join(self.tmp.name, "ran-" + os.urandom(6).hex())
+        return marker, ': > "%s"\n' % marker + STUB_ECHO
+
+    @staticmethod
+    def source_text():
+        raise NotImplementedError
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_fwsnap_")
+        cls.counter = 0
+        for _label, tool, _args in cls.TOOLS:
+            assert cls.source_text().count(tool) == 1, "the text must name %s exactly once" % tool
+        for path in (cls.PROC_DEV, *cls.NAMES.values()):
+            assert cls.source_text().count(path) == 1, "the text must name %s exactly once" % path
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def make_helper(self, bodies=None, dev=True, names=None):
+        """The text with each tool path replaced by a stub whose script body is bodies[tool] (STUB_ECHO
+        by default; NOT_INSTALLED is a path that does not exist and NOT_EXECUTABLE a file with no execute
+        bit). /proc/net/dev is replaced by a file that exists only when `dev`. `names` maps a legacy tool
+        path to what its table-list file holds (a string, or NOT_INSTALLED for no file at all, the
+        default); a directory stands where the file is read and cannot be, when it is the value `DIR`."""
+        bodies = bodies or {}
+        names = names or {}
+        type(self).counter += 1
+        d = os.path.join(self.tmp.name, "case%d" % self.counter)
+        os.makedirs(os.path.join(d, "proc", "net"))
+        text = self.source_text()
+        for _label, tool, _args in self.TOOLS:
+            body = bodies.get(tool, STUB_ECHO)
+            stub = os.path.join(d, "stub-" + os.path.basename(tool))
+            if body is not NOT_INSTALLED:
+                with open(stub, "w") as f:
+                    f.write("#!/bin/sh\n" + (body if body is not NOT_EXECUTABLE else STUB_ECHO))
+                os.chmod(stub, 0o644 if body is NOT_EXECUTABLE else 0o755)
+            text = text.replace(tool, stub)
+        text = text.replace(self.PROC_DEV, os.path.join(d, "proc", "net", "dev"))
+        for tool, proc_path in self.NAMES.items():
+            where = os.path.join(d, "proc", "net", os.path.basename(proc_path))
+            text = text.replace(proc_path, where)
+            content = names.get(tool, NOT_INSTALLED)
+            if content is DIR:
+                os.mkdir(where)
+            elif content is not NOT_INSTALLED:
+                with open(where, "w") as f:
+                    f.write(content)
+        if dev:
+            open(os.path.join(d, "proc", "net", "dev"), "w").close()
+        path = os.path.join(d, self.FILE_NAME)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def run_helper(self, shell, path, args, env=None):
+        return subprocess.run([shell, path] + list(args), capture_output=True, text=True, timeout=30, env=env)
+
+    def run_snapshot(self, shell, path):
+        return self.run_helper(shell, path, ["snapshot"])
+
+    @staticmethod
+    def echo_section(label, stub, args):
+        return "== %s\n" % label + "RAN %s\n" % stub + "".join(a + "\n" for a in args)
+
+    @classmethod
+    def echo_listing(cls):
+        """What the echo stubs make the whole listing when each tool exists and /proc/net is visible: each
+        section's header, the stub's own name and the arguments it was handed, then the end line."""
+        return "".join(cls.echo_section(label, "stub-" + os.path.basename(tool), args)
+                       for label, tool, args in cls.TOOLS) + "== end\n"
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the helper under a POSIX shell")
+class SnapshotRuns(SnapshotCase, unittest.TestCase):
+    """`yuzu-fw-helper snapshot`, the one read-only word of the helper: the helper text run with its three
+    tool paths replaced by stubs, under each POSIX shell found (sh, dash, bash), like the other helper
+    cases. It runs each tool with exactly its own fixed arguments (nothing from the caller), prints one
+    headed section per tool, then `== end`, and is cut at four MiB."""
+
+    @staticmethod
+    def source_text():
+        return helper_text()
+
+    def test_the_sections_come_in_order_each_with_the_tools_own_fixed_arguments(self):
+        # nft with its three arguments; each legacy save tool with NO argument at all
+        want = self.echo_listing()
+        self.assertIn("== iptables-legacy-save\nRAN stub-iptables-legacy-save\n== ip6tables-legacy-save\n", want)
+        for shell in available_shells():
+            r = self.run_snapshot(shell, self.make_helper())
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, ""), shell)
+
+    def test_nft_that_is_not_installed_is_absent_and_the_rest_still_run(self):
+        for shell in available_shells():
+            r = self.run_snapshot(shell, self.make_helper({self.NFT[1]: NOT_INSTALLED}))
+            self.assertEqual(r.returncode, 0, shell)
+            lines = r.stdout.split("\n")
+            self.assertEqual(lines[:2], ["== nft -a list ruleset", "[absent]"], shell)
+            self.assertIn("== iptables-legacy-save", lines, shell)
+            self.assertEqual(lines[-2:], ["== end", ""], shell)
+            self.assertEqual(r.stdout.count("[absent]"), 1, shell)
+
+    def test_a_legacy_family_with_no_save_tool_is_never_absent_it_reports_the_kernels_table_list(self):
+        # the legacy sections never reach snap_one's no-tool branch: with no tool they print `[tables]` and the
+        # kernel's own list (nothing when the file is not there), never `[absent]`
+        none = {t: NOT_INSTALLED for _l, t, _a in self.TOOLS}
+        for shell in available_shells():
+            r = self.run_snapshot(shell, self.make_helper(none))
+            self.assertEqual(
+                (r.returncode, r.stdout),
+                (0, "== nft -a list ruleset\n[absent]\n== iptables-legacy-save\n[tables]\n"
+                    "== ip6tables-legacy-save\n[tables]\n== end\n"), shell)
+            self.assertEqual(r.stdout.count("[absent]"), 1, shell)
+
+    def test_a_tool_that_exits_non_zero_is_marked_failed_after_what_it_printed(self):
+        failing = 'printf "partial\\n"; echo "to stderr" >&2; exit 3\n'
+        for shell in available_shells():
+            # nft, then a legacy tool: each section keeps what it printed, then the marker, once
+            r = self.run_snapshot(shell, self.make_helper({self.XT4[1]: failing}))
+            self.assertEqual((r.returncode, r.stderr), (0, ""), (shell, "the helper exits 0 and drops stderr"))
+            self.assertIn("== iptables-legacy-save\npartial\n\n[failed]\n== ip6tables-legacy-save\n", r.stdout, shell)
+            self.assertTrue(r.stdout.endswith("== end\n"), shell)
+            self.assertEqual(r.stdout.count("[failed]"), 1, shell)
+            # a failing tool with nothing printed is a failure, not an empty table list (measured: exit 1)
+            r = self.run_snapshot(shell, self.make_helper({self.XT6[1]: 'echo "to stderr" >&2; exit 1\n'}))
+            self.assertIn("== ip6tables-legacy-save\n\n[failed]\n== end\n", r.stdout, shell)
+            self.assertEqual(r.stdout.count("[failed]"), 1, shell)
+
+    def test_the_failed_marker_is_a_line_of_its_own_even_after_a_half_written_line(self):
+        # A tool that dies in the middle of a line must not leave the marker glued to it: a reader
+        # that matches the whole line `[failed]` (the restore comparison does) would miss it.
+        halfway = 'printf "table inet filter {\\n\\tchain input {"; exit 1\n'
+        for shell in available_shells():
+            r = self.run_snapshot(shell, self.make_helper({self.NFT[1]: halfway}))
+            self.assertEqual(r.returncode, 0, shell)
+            self.assertIn("\tchain input {\n[failed]\n== iptables-legacy-save\n", r.stdout, shell)
+            self.assertIn("[failed]", r.stdout.split("\n"), (shell, "the marker is not a whole line"))
+            self.assertEqual(r.stdout.count("[failed]"), 1, shell)
+            self.assertTrue(r.stdout.endswith("== end\n"), shell)
+
+    def test_a_hidden_proc_net_is_failed_for_both_legacy_sections_and_no_tool_is_run(self):
+        # A save tool reads a missing table list as no table (measured: exit 0, empty), so a process that cannot
+        # stat /proc/net must not reach one: both legacy sections are `[failed]`, never empty
+        for shell in available_shells():
+            marker4, body4 = self.ran_marker()
+            marker6, body6 = self.ran_marker()
+            names = {self.XT4[1]: "filter\n", self.XT6[1]: "filter\n"}
+            r = self.run_snapshot(shell, self.make_helper({self.XT4[1]: body4, self.XT6[1]: body6}, dev=False, names=names))
+            self.assertEqual((r.returncode, r.stdout),
+                             (0, self.echo_section(*self.nft_echo()) +
+                              "== iptables-legacy-save\n\n[failed]\n== ip6tables-legacy-save\n\n[failed]\n== end\n"), shell)
+            self.assertFalse(os.path.exists(marker4) or os.path.exists(marker6), (shell, "a legacy tool ran"))
+            # and with no save tool either, the table lists are not read: still `[failed]`, not `[tables]`
+            none = self.NO_SAVE_TOOLS
+            r = self.run_snapshot(shell, self.make_helper(none, dev=False, names=names))
+            self.assertEqual(r.stdout.count("[failed]"), 2, shell)
+            self.assertNotIn("[tables]", r.stdout, shell)
+            self.assertNotIn("filter", r.stdout, shell)
+
+    @classmethod
+    def nft_echo(cls):
+        return cls.NFT[0], "stub-nft", cls.NFT[2]
+
+    def test_a_save_tool_that_is_installed_is_run_with_no_argument_whatever_the_table_lists_say(self):
+        # the tool opens the list itself, so the shell does not read it: with the file absent, present, or
+        # unreadable the tool's own output is the section, and it was run with no argument
+        for shell in available_shells():
+            for names in ({}, {self.XT4[1]: "", self.XT6[1]: ""}, {self.XT4[1]: "filter\n", self.XT6[1]: DIR}):
+                r = self.run_snapshot(shell, self.make_helper(names=names))
+                self.assertEqual(r.stdout, self.echo_listing(), (shell, names))
+
+    def test_a_family_with_no_save_tool_prints_the_marker_and_the_kernels_own_list(self):
+        none = self.NO_SAVE_TOOLS
+        head = self.echo_section(*self.nft_echo())
+        for shell in available_shells():
+            # no list file: the family holds no table
+            r = self.run_snapshot(shell, self.make_helper(none))
+            self.assertEqual(r.stdout, head + "== iptables-legacy-save\n[tables]\n== ip6tables-legacy-save\n[tables]\n== end\n", shell)
+            # an empty list file: the same
+            r = self.run_snapshot(shell, self.make_helper(none, names={self.XT4[1]: "", self.XT6[1]: ""}))
+            self.assertEqual(r.stdout, head + "== iptables-legacy-save\n[tables]\n== ip6tables-legacy-save\n[tables]\n== end\n", shell)
+            # a list with names: the marker, then the names, so tables exist that nothing listed
+            r = self.run_snapshot(shell, self.make_helper(none, names={self.XT4[1]: "filter\nnat\n", self.XT6[1]: "filter\n"}))
+            self.assertEqual(
+                r.stdout, head + "== iptables-legacy-save\n[tables]\nfilter\nnat\n== ip6tables-legacy-save\n[tables]\nfilter\n== end\n",
+                shell)
+
+    def test_each_family_reads_its_own_list_file(self):
+        # only the IPv6 list has a name: IPv4 is `[tables]` alone and IPv6 lists it; the reverse likewise (a pair
+        # of files read the wrong way round gives the other answer in both cases)
+        none = self.NO_SAVE_TOOLS
+        head = self.echo_section(*self.nft_echo())
+        for shell in available_shells():
+            r = self.run_snapshot(shell, self.make_helper(none, names={self.XT6[1]: "filter\n"}))
+            self.assertEqual(r.stdout, head + "== iptables-legacy-save\n[tables]\n== ip6tables-legacy-save\n[tables]\nfilter\n== end\n", shell)
+            r = self.run_snapshot(shell, self.make_helper(none, names={self.XT4[1]: "nat\n"}))
+            self.assertEqual(r.stdout, head + "== iptables-legacy-save\n[tables]\nnat\n== ip6tables-legacy-save\n[tables]\n== end\n", shell)
+            # a family's own tool decides its own section: a save tool for IPv4 beside none for IPv6
+            r = self.run_snapshot(shell, self.make_helper({self.XT6[1]: NOT_INSTALLED}, names={self.XT6[1]: "filter\n"}))
+            self.assertEqual(
+                r.stdout, head + self.echo_section(self.XT4[0], "stub-iptables-legacy-save", []) +
+                "== ip6tables-legacy-save\n[tables]\nfilter\n== end\n", shell)
+
+    def test_a_table_list_that_cannot_be_read_is_failed_after_the_marker(self):
+        none = self.NO_SAVE_TOOLS
+        for shell in available_shells():
+            r = self.run_snapshot(shell, self.make_helper(none, names={self.XT4[1]: DIR}))
+            self.assertIn("== iptables-legacy-save\n[tables]\n\n[failed]\n== ip6tables-legacy-save\n", r.stdout, (shell, "head fails"))
+            self.assertEqual(r.stdout.count("[failed]"), 1, shell)
+            self.assertTrue(r.stdout.endswith("== end\n"), shell)
+
+    def test_a_tool_that_is_not_executable_is_run_by_nobody_and_reads_as_no_tool(self):
+        for shell in available_shells():
+            # nft without an execute bit is `[absent]`; a legacy save tool without one is a family with no tool
+            helper = self.make_helper({self.NFT[1]: NOT_EXECUTABLE, self.XT4[1]: NOT_EXECUTABLE, self.XT6[1]: NOT_EXECUTABLE})
+            r = self.run_snapshot(shell, helper)
+            self.assertEqual(
+                (r.returncode, r.stdout),
+                (0, "== nft -a list ruleset\n[absent]\n== iptables-legacy-save\n[tables]\n"
+                    "== ip6tables-legacy-save\n[tables]\n== end\n"), shell)
+
+    def test_the_alternatives_selected_iptables_and_ip6tables_are_never_run_by_the_snapshot(self):
+        # the legacy tables are read by the legacy save tools under their own names; the alternatives link
+        # /usr/sbin/iptables names the nft shim on an nft-backed host, which lists nothing the nft section does
+        # not and says nothing of the legacy tables. The snapshot's functions never name them.
+        text = self.source_text()
+        for name in ("snap_one", "snap_xt", "host_snapshot"):
+            body = sh_function(text, name)
+            for shim in (r"/usr/sbin/iptables(?![-\w])", r"/usr/sbin/ip6tables(?![-\w])", r"\$IPT\b", r"\$IP6T\b",
+                         r"\biptables-save\b", r"\bip6tables-save\b", r"\biptables -S\b", r"(?<![-\w])-S(?![-\w])"):
+                self.assertIsNone(re.search(shim, body), (name, shim))
+
+    def test_a_listing_longer_than_the_cap_is_cut_and_has_no_end_line(self):
+        for shell in available_shells():
+            r = subprocess.run([shell, self.make_helper({self.NFT[1]: self.BIG}), "snapshot"],
+                               capture_output=True, timeout=60)
+            self.assertEqual(r.returncode, 0, shell)
+            self.assertEqual(len(r.stdout), self.CAP, shell)
+            self.assertNotIn(b"== end", r.stdout, shell)
+            self.assertTrue(r.stdout.startswith(b"== nft -a list ruleset\naaaa"), shell)
+
+    def test_anything_but_exactly_the_one_word_exits_non_zero_having_run_nothing(self):
+        bad = ([], [""], ["SNAPSHOT"], ["Snapshot"], ["snapshot "], [" snapshot"], ["-snapshot"],
+               ["snapshots"], ["snapshot", ""], ["snapshot", "extra"], ["snapshot", "snapshot"],
+               ["snapshot", "-a", "list", "ruleset"], ["iptables", "snapshot"], ["snapshot;id"],
+               ["snapshot", "--help"], ["--snapshot"], ["status"], ["list"])
+        helper = self.make_helper()
+        for shell in available_shells():
+            for args, r in zip(bad, run_all([[shell, helper] + list(a) for a in bad])):
+                self.assertNotEqual(r.returncode, 0, (shell, args))
+                self.assertEqual(r.stdout, "", (shell, args, "a tool ran or something was printed"))
+
+    def test_a_hostile_path_cannot_change_what_runs(self):
+        # PATH is the only variable observed here (the helper resets it itself); the others are not
+        # reachable through the sudo grant, whose env_reset strips them. The snapshot resolves one
+        # command by name (`head`, the byte cap and the table-list read), so a `head` that writes a marker is
+        # planted first in the caller's PATH: it must never run. Deleting the helper's own PATH line, or
+        # appending to the caller's PATH instead of replacing it, would run it. The table-list read is the
+        # second use of `head`: a family with no save tool and a name in its list runs it too.
+        none = self.NO_SAVE_TOOLS
+        names = {self.XT4[1]: "filter\n", self.XT6[1]: "filter\n"}
+        for shell in available_shells():
+            plant = tempfile.TemporaryDirectory(prefix="yuzu_test_fwplant_")
+            self.addCleanup(plant.cleanup)
+            marker = os.path.join(plant.name, "ran")
+            planted = os.path.join(plant.name, "head")
+            with open(planted, "w") as f:
+                f.write('#!/bin/sh\n: > "%s"\nPATH=/usr/bin:/bin\nexec head "$@"\n' % marker)
+            os.chmod(planted, 0o755)
+            env = {"PATH": plant.name + ":/usr/bin:/bin"}
+            want = self.echo_listing()
+            r = self.run_helper(shell, self.make_helper(), ["snapshot"], env=env)
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, ""), shell)
+            r = self.run_helper(shell, self.make_helper(none, names=names), ["snapshot"], env=env)
+            self.assertIn("[tables]\nfilter\n", r.stdout, shell)
+            self.assertFalse(os.path.exists(marker), (shell, "the planted head ran"))
+
+    def test_the_environment_is_not_read(self):
+        # a LC_ALL or locale or PATH value the caller sets changes nothing the helper prints
+        want = self.echo_listing()
+        for shell in available_shells():
+            for env in ({}, {"LC_ALL": "de_DE.UTF-8", "LANG": "de_DE.UTF-8"}, {"IFS": "x", "XT4": "/bin/false"}):
+                r = self.run_helper(shell, self.make_helper(), ["snapshot"], env=dict(env, PATH="/usr/bin:/bin"))
+                self.assertEqual((r.returncode, r.stdout), (0, want), (shell, env))
+
+    def test_the_label_format_is_the_one_the_restore_comparison_reads(self):
+        # The section labels and the markers are kept by hand in three places: the helper, this
+        # test (TOOLS) and tests/unit/firewall_restore_compare.hpp. Drift fails closed, but only in the
+        # live run; this pins the helper's labels to the header's string literals in the unit suite.
+        header = read_text(RESTORE_COMPARE_HEADER)
+        self.assertIsNotNone(header, RESTORE_COMPARE_HEADER)
+        for label, _tool, _args in self.TOOLS:
+            self.assertIn('"%s"' % label, header, label)
+        for marker in ("[absent]", "[failed]", "== end"):
+            self.assertIn('"%s"' % marker, header, marker)
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the broker script under a POSIX shell")
+class BrokerSnapshotScriptRuns(SnapshotCase, unittest.TestCase):
+    """The shipped broker script (deploy/systemd/yuzu-fw-snapshot.sh). Its assignments and three functions
+    are the helper's byte for byte (pinned below), so the behaviour of every branch is SnapshotRuns' to
+    prove, once, under every shell. This class keeps what is the script FILE's own: it takes NO argument
+    at all (the helper's one-word call is the script's bare call), reads nothing from its standard input,
+    cuts its reply at four MiB, and prints one whole reply end to end, each under every shell."""
+
+    FILE_NAME = "yuzu-fw-snapshot.sh"
+
+    @staticmethod
+    def source_text():
+        return broker_script_text()
+
+    def run_bare(self, shell, path):
+        return subprocess.run([shell, path], capture_output=True, text=True, timeout=30)
+
+    def test_one_whole_reply_end_to_end_under_every_shell(self):
+        want = self.echo_listing()
+        for shell in available_shells():
+            r = self.run_bare(shell, self.make_helper())
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, ""), shell)
+            # a family with no save tool and a name in its list, beside a failing nft
+            none = self.NO_SAVE_TOOLS
+            r = self.run_bare(shell, self.make_helper({self.NFT[1]: 'exit 1\n', **none}, names={self.XT4[1]: "filter\n"}))
+            self.assertEqual(
+                (r.returncode, r.stdout),
+                (0, "== nft -a list ruleset\n\n[failed]\n== iptables-legacy-save\n[tables]\nfilter\n"
+                    "== ip6tables-legacy-save\n[tables]\n== end\n"), shell)
+
+    def test_a_listing_longer_than_the_cap_is_cut_and_has_no_end_line(self):
+        for shell in available_shells():
+            r = subprocess.run([shell, self.make_helper({self.NFT[1]: self.BIG})],
+                               capture_output=True, timeout=60)
+            self.assertEqual(r.returncode, 0, shell)
+            self.assertEqual(len(r.stdout), self.CAP, shell)
+            self.assertNotIn(b"== end", r.stdout, shell)
+            self.assertTrue(r.stdout.startswith(b"== nft -a list ruleset\naaaa"), shell)
+
+    def test_any_argument_at_all_exits_64_having_run_nothing_and_printed_nothing(self):
+        bad = ([""], ["snapshot"], ["x"], ["-a"], ["snapshot", "extra"], ["list", "ruleset"], ["--help"], [" "])
+        marker, body = self.ran_marker()
+        script = self.make_helper({self.NFT[1]: body})
+        for shell in available_shells():
+            for args, r in zip(bad, run_all([[shell, script] + list(a) for a in bad])):
+                self.assertEqual((r.returncode, r.stdout, r.stderr), (64, "", ""), (shell, args))
+            self.assertFalse(os.path.exists(marker), (shell, "a tool ran"))
+
+    def test_it_reads_nothing_from_its_standard_input(self):
+        # A script that read its input would take what is written to it: a closed stdin, /dev/null and
+        # a stream of bytes all give the same listing.
+        want = self.echo_listing()
+        script = self.make_helper()
+        for shell in available_shells():
+            for stdin in (b"", b"junk\n" * 1000, b"snapshot\n"):
+                r = subprocess.run([shell, script], input=stdin, capture_output=True, timeout=30)
+                self.assertEqual((r.returncode, r.stdout.decode()), (0, want), (shell, stdin[:10]))
+
+    def test_the_assignments_and_the_three_functions_are_byte_identical_to_the_helpers(self):
+        script, helper = broker_script_text(), helper_text()
+        assignments = ("NFT=/usr/sbin/nft\nXT4=/usr/sbin/iptables-legacy-save\n"
+                       "XT6=/usr/sbin/ip6tables-legacy-save\n")
+        self.assertIn(assignments, script)
+        self.assertIn(assignments, helper)
+        for name in ("snap_one", "snap_xt", "host_snapshot"):
+            self.assertEqual(sh_function(script, name), sh_function(helper, name), name)
+        for line in ("set -u", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", "export PATH LC_ALL"):
+            self.assertIn("\n%s\n" % line, script, line)
+            self.assertIn("\n%s\n" % line, helper, line)
+        self.assertTrue(script.startswith("#!/bin/sh\n"))
+        # the script has no containment words: the helper's IPT and IP6T stay in the helper only
+        self.assertNotIn("IPT=", script)
+        self.assertNotIn("IP6T=", script)
+
+    def test_the_labels_and_markers_are_the_string_literals_of_the_plugin_header_too(self):
+        header = read_text(PARSERS_HEADER)
+        self.assertIsNotNone(header, PARSERS_HEADER)
+        for label, _tool, _args in self.TOOLS:
+            self.assertIn('"%s"' % label, header, label)
+        for marker in ("[absent]", "[failed]", "[tables]", "== end"):
+            self.assertIn('"%s"' % marker, header, marker)
+        self.assertNotIn("[unloaded]", header)
+        self.assertIn('kFwSnapshotSocketPath = "/run/yuzu-fw-snapshot.sock"', header)
+        self.assertIn("kFwSnapshotMaxBytes = %d" % self.CAP, header)
+
+
 GOLDEN_RE = re.compile(r'kGoldenNftRuleset = R"NFTGOLDEN\((.*?)\)NFTGOLDEN";', re.S)
 PARSERS_TEST = "tests/unit/test_firewall_quarantine_parsers.cpp"
+RESTORE_COMPARE_HEADER = "tests/unit/firewall_restore_compare.hpp"
 
 
 def golden_ruleset():
@@ -1564,11 +2017,28 @@ class RenderedSudoers(unittest.TestCase):
                   p + "/sbin/pfctl -F states",
                   p + "/sbin/pfctl -s info",
                   p + "/sbin/pfctl -s rules",
+                  p + "/sbin/pfctl -s Anchors",
                   p + "/sbin/pfctl -s References",
                   p + "/Library/PrivilegedHelperTools/yuzu-svc-helper",
                   p + "/usr/bin/dscacheutil -flushcache",
                   p + "/usr/bin/killall -HUP mDNSResponder"])
         self.assertEqual(self.grants["macos"], mac)
+
+    def test_each_macos_state_and_rules_read_argv_is_a_grant_line(self):
+        """The three pfctl reads the firewall state and rules actions run through `sudo -n --` are
+        read out of the C++ argv pin case (what the plugin builds), and each, joined into one string,
+        is a NOPASSWD line of the rendered sudoers: a read the installer does not grant exits 1."""
+        cpp = read_text(PARSERS_TEST)
+        want = {}
+        for name in ("pfctl_info_argv", "pfctl_rules_argv", "pfctl_anchors_argv"):
+            m = re.search(r'CHECK\(join\(%s\(\)\) == "(/sbin/pfctl [^"]+)"\)' % name, cpp)
+            self.assertIsNotNone(m, name)
+            want[name] = m.group(1)
+        self.assertEqual(set(want.values()), {"/sbin/pfctl -s info", "/sbin/pfctl -s rules",
+                                              "/sbin/pfctl -s Anchors"})
+        for name, argv in want.items():
+            self.assertEqual([g for g in self.grants["macos"] if g.endswith("NOPASSWD: " + argv)],
+                             ["_yuzu ALL=(root) NOPASSWD: " + argv], name)
 
     @unittest.skipUnless(shutil.which("visudo"), "visudo is not installed")
     def test_visudo_accepts_the_rendered_text_of_each_platform(self):
@@ -1638,6 +2108,135 @@ class InstallerDryRun(unittest.TestCase):
             self.assertIn("[dry-run]   %s ALL=(root) NOPASSWD: %s\n" % (acct, fw), out, platform)
             self.assertIn("[dry-run]   %s ALL=(root) NOPASSWD: %s\n" % (acct, svc), out, platform)
             self.assertNotRegex(out, r"NOPASSWD: /usr/sbin/ip6?tables", platform)
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the installer under bash")
+class InstallerDryRunHelperDirectory(unittest.TestCase):
+    """`--dry-run` says what the real run would find in the helper directory and fails as it would: a
+    directory that would be refused prints the verdict and ends the dry run non-zero, ok and warn end it 0,
+    and an absent directory says it would be created. The installer is run from a copy with the account
+    steps stubbed and the helper paths pointed into a temporary directory (the real host's own
+    directories are never judged here), so the verdict is the one the stubbed owner and mode give."""
+
+    BASH = "/bin/bash" if os.path.exists("/bin/bash") else "bash"
+    ANCHOR = 'case "$ACTION" in\n    install)\n'
+    MARK = "# yuzu-test-splice"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = read_text(INSTALLER)
+        assert cls.text is not None and cls.text.count(cls.ANCHOR) == 1, "the install dispatch moved"
+
+    def dry_run(self, d, helper_dir, dir_info=None):
+        stub = "\n".join([
+            self.MARK,
+            "require_root() { :; }",
+            "macos_create_user() { :; }",
+            "linux_user_exists() { return 0; }",
+            "create_state_dirs() { :; }",
+            "strip_file_capabilities() { :; }",
+            "SUDOERS_FILE='%s'" % os.path.join(d, "yuzu-agent"),
+            "FW_HELPER_PATH='%s'" % os.path.join(helper_dir, "yuzu-fw-helper"),
+            "SVC_HELPER_PATH='%s'" % os.path.join(helper_dir, "yuzu-svc-helper"),
+            "" if dir_info is None else "dir_info() { echo '%s'; }" % dir_info,
+            "",
+        ])
+        spliced = self.text.replace(self.ANCHOR, stub + self.ANCHOR, 1)
+        self.assertEqual(spliced.count(self.MARK), 1)   # an unspliced copy is the real installer: never run it
+        script = os.path.join(d, "install.sh")
+        with open(script, "w") as f:
+            f.write(spliced)
+        r = subprocess.run([self.BASH, script, "--dry-run"], capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout, r.stderr
+
+    def test_a_refused_directory_prints_the_verdict_and_fails_the_dry_run(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+            helper_dir = os.path.join(d, "helpers")
+            os.mkdir(helper_dir)
+            # an owner that is not root and a world-writable mode: anyone could replace the helper
+            rc, out, err = self.dry_run(d, helper_dir, dir_info="501 777 staff")
+            self.assertNotEqual(rc, 0, (out, err))
+            self.assertIn("[dry-run] helper directory %s: would be refused\n" % helper_dir, out)
+            self.assertIn("must live in a directory owned by root", err)
+            self.assertNotIn("would write the following to %s" % os.path.join(helper_dir, "yuzu-fw-helper"), out)
+            self.assertEqual(os.listdir(helper_dir), [], "a dry run writes nothing")
+
+    def test_a_real_world_writable_directory_is_refused_as_it_is_without_a_stub(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+            helper_dir = os.path.join(d, "helpers")
+            os.mkdir(helper_dir)
+            os.chmod(helper_dir, 0o777)
+            rc, out, err = self.dry_run(d, helper_dir)
+            self.assertNotEqual(rc, 0, (out, err))
+            self.assertIn("[dry-run] helper directory %s: would be refused\n" % helper_dir, out)
+
+    def test_ok_and_warn_end_the_dry_run_zero_and_print_the_helpers(self):
+        for verdict, info in (("ok", "0 755 root"), ("warn", "0 775 staff")):
+            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+                helper_dir = os.path.join(d, "helpers")
+                os.mkdir(helper_dir)
+                rc, out, err = self.dry_run(d, helper_dir, dir_info=info)
+                self.assertEqual(rc, 0, (out, err))
+                self.assertIn("[dry-run] helper directory %s: %s\n" % (helper_dir, verdict), out)
+                self.assertIn("would write the following to %s" % os.path.join(helper_dir, "yuzu-fw-helper"), out)
+                self.assertIn("would write the following to %s" % os.path.join(helper_dir, "yuzu-svc-helper"), out)
+                self.assertEqual(os.listdir(helper_dir), [], "a dry run writes nothing")
+                if verdict == "warn":
+                    self.assertIn("writable by group staff", err)
+
+    def test_an_absent_directory_says_it_would_be_created(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+            helper_dir = os.path.join(d, "not-yet")
+            rc, out, err = self.dry_run(d, helper_dir)
+            self.assertEqual(rc, 0, (out, err))
+            self.assertRegex(out, r"\[dry-run\] helper directory %s: would be created root:(root|wheel) 0755\n"
+                             % re.escape(helper_dir))
+            self.assertFalse(os.path.exists(helper_dir), "a dry run creates nothing")
+
+    def test_a_path_that_is_not_a_directory_is_refused_as_the_real_run_refuses_it(self):
+        # a regular file and a dangling link where the helper directory belongs: the real run cannot
+        # create the directory, so the dry run says so and fails too
+        for kind in ("a file", "a dangling link"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+                helper_dir = os.path.join(d, "helpers")
+                if kind == "a file":
+                    with open(helper_dir, "w") as f:
+                        f.write("not a directory\n")
+                else:
+                    os.symlink(os.path.join(d, "nowhere"), helper_dir)
+                rc, out, err = self.dry_run(d, helper_dir)
+                self.assertNotEqual(rc, 0, (out, err))
+                self.assertIn("[dry-run] helper directory %s: would be refused (the path exists and is not a "
+                              "directory)\n" % helper_dir, out)
+                self.assertNotIn("would be created", out)
+                self.assertNotIn("would write the following to %s" % os.path.join(helper_dir, "yuzu-fw-helper"), out)
+
+    def test_a_refused_directory_with_a_sudoers_file_present_does_not_report_a_removal_failure(self):
+        # a dry run only prints the removal of the sudoers file, so the file is still there afterwards;
+        # that must not be read as "could not be removed" (a failure only a real run can have)
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+            helper_dir = os.path.join(d, "helpers")
+            os.mkdir(helper_dir)
+            sudoers = os.path.join(d, "yuzu-agent")
+            with open(sudoers, "w") as f:
+                f.write(InstallerFailedHelper.EARLIER)
+            rc, out, err = self.dry_run(d, helper_dir, dir_info="501 777 staff")
+            self.assertNotEqual(rc, 0, (out, err))
+            self.assertNotIn("could not be removed", err + out)
+            self.assertIn("[dry-run] helper directory %s: would be refused\n" % helper_dir, out)
+            with open(sudoers) as f:
+                self.assertEqual(f.read(), InstallerFailedHelper.EARLIER, "a dry run removes nothing")
+
+    def test_the_verdict_line_is_not_part_of_the_helper_text_the_render_reads(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+            helper_dir = os.path.join(d, "helpers")
+            os.mkdir(helper_dir)
+            rc, out, err = self.dry_run(d, helper_dir, dir_info="0 755 root")
+            self.assertEqual(rc, 0, (out, err))
+            self.assertNotIn("[dry-run]   helper directory", out)   # one space: not a line of the `[dry-run]   ` block
+            prefix = "[dry-run] would write the following to %s (root:" % os.path.join(helper_dir, "yuzu-fw-helper")
+            marker = next(l for l in out.splitlines() if l.startswith(prefix))
+            self.assertEqual(rendered_section(out, marker), helper_text())
 
 
 @unittest.skipIf(sys.platform == "win32", "runs the installer under bash")
@@ -1885,7 +2484,7 @@ class HelperSitesAreGovernedInterpreterSites(unittest.TestCase):
 
     SITES = ("firewall/sudo_runner#1", "firewall/sudo_runner#4", "firewall/sudo_runner#5",
              "firewall/sudo_runner#6", "firewall/sudo_runner#7", "firewall/sudo_runner#8",
-             "firewall/sudo_runner#14", "services/set_start_mode_linux#1",
+             "firewall/sudo_runner#14", "firewall/try_snapshot#1", "services/set_start_mode_linux#1",
              "services/set_start_mode_macos#1")
 
     def test_each_helper_site_is_a_registered_decision_5_interpreter_site(self):
