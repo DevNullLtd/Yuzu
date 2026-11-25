@@ -303,7 +303,9 @@ assert_status_any "GET /readyz returns 200 or 503" "$HTTP_STATUS" 200 503
 http_get_noauth "$SERVER_URL/health"
 assert_eq "GET /health returns 200" "200" "$HTTP_STATUS"
 
-# GET /metrics
+# GET /metrics (unauthenticated): answers 200 only for a server started with --metrics-no-auth or
+# --metrics-trust-loopback (every shipped UAT launcher passes --metrics-no-auth); /metrics requires
+# authentication from every peer otherwise.
 http_get_noauth "$SERVER_URL/metrics"
 assert_eq "GET /metrics returns 200" "200" "$HTTP_STATUS"
 assert_contains "GET /metrics body contains 'yuzu_'" "yuzu_" "$HTTP_BODY"

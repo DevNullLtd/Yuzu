@@ -795,6 +795,9 @@ int main(int argc, char* argv[]) {
         .data_dir = cfg.data_dir,
     };
     const auto log_opts = yuzu::agent::make_log_handoff_options(log_cli);
+    // WP06 F55: publish the RESOLVED log path to the plugins (the filesystem plugin refuses it).
+    if (log_opts.log_file)
+        cfg.log_file = *log_opts.log_file;
 
     auto created_log_handoff = yuzu::agent::LogHandoff::create(log_opts);
     if (!created_log_handoff) {
