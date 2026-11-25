@@ -384,7 +384,7 @@ def seeded_directory(base: str | None = None):
         except OSError as exc:
             last_error = exc
             continue
-        _SEED.update(dir=path, sha256=digest)
+        _SEED.update(dir=path, sha256=digest, text_file=os.path.join(path, _SEED_FILES[0][0]))
         break
     if path is None:
         say(f"instructions_runner: seed directory unavailable ({last_error}); "
@@ -397,10 +397,43 @@ def seeded_directory(base: str | None = None):
             shutil.rmtree(path, ignore_errors=True)
 
 
-def _synth_string(name: str, schema: dict) -> str:
+# Per-definition parameters whose meaning the name alone does not carry: a `path` that must be a
+# directory for one action and a readable text file for another. Value is the _SEED key to use; when
+# nothing is seeded the ordinary name-based default applies. Without these, `path` resolves to
+# /bin/ls (a binary file), which list_dir refuses ("not a directory") and read refuses ("binary").
+_DEFINITION_PARAM_SEEDS: dict[tuple[str, str], str] = {
+    ("device.filesystem.list_dir", "path"): "dir",
+    ("device.filesystem.read", "path"): "text_file",
+}
+
+# Parameters whose accepted shape is fixed by their documented contract, matched by exact name.
+# `from`/`to` are Unix epoch seconds (echo.query, echo.export; a non-numeric value is refused with
+# "invalid 'from' parameter (must be epoch seconds)"). `db_budget_bytes` is a whole number of bytes
+# >= 33554432; its documented default is sent, which leaves the configured budget unchanged.
+_ECHO_DB_BUDGET_DEFAULT = "262144000"
+
+
+def _contract_string(name: str) -> str | None:
+    if name == "from":
+        return "0"
+    if name == "to":
+        return str(int(time.time()))
+    if name == "db_budget_bytes":
+        return _ECHO_DB_BUDGET_DEFAULT
+    return None
+
+
+def _synth_string(name: str, schema: dict, def_id: str = "") -> str:
     """Best-effort string default for a parameter, host-aware."""
     nl = name.lower()
     paths = _HOST_PATHS[HOST]
+
+    seeded = _SEED.get(_DEFINITION_PARAM_SEEDS.get((def_id, name), ""), "")
+    if seeded:
+        return seeded
+    contract = _contract_string(name)
+    if contract is not None:
+        return contract
 
     # Order matters: longer/more-specific tokens first.
     if nl == "sql" or nl.endswith("_sql") or "query" == nl:
@@ -475,7 +508,7 @@ def _fit_pattern(value: str, schema: dict) -> str:
     return next((c for c in (value, *_PATTERN_FALLBACKS) if rx.search(c)), value)
 
 
-def _value_for_property(name: str, schema: dict) -> Any:
+def _value_for_property(name: str, schema: dict, def_id: str = "") -> Any:
     """Synthesise a sane default for a single parameter property.
 
     Honours, in order: explicit YAML `default:`, `enum:`, then a per-host
@@ -495,7 +528,7 @@ def _value_for_property(name: str, schema: dict) -> Any:
     t = schema.get("type", "string")
 
     if t in ("string", None):
-        return _fit_pattern(_synth_string(name, schema), schema)
+        return _fit_pattern(_synth_string(name, schema, def_id), schema)
 
     if t in ("integer", "int", "int32", "int64", "number"):
         validation = schema.get("validation", {}) or {}
@@ -513,7 +546,8 @@ def _value_for_property(name: str, schema: dict) -> Any:
     return ""
 
 
-def synthesise_params(spec_params: dict, override: dict[str, Any] | None = None) -> dict:
+def synthesise_params(spec_params: dict, override: dict[str, Any] | None = None,
+                      def_id: str = "") -> dict:
     """Build a parameter dict that satisfies `required` and `properties`.
 
     `override` (if provided) wins per-key, so a hand-written --params-override entry
@@ -524,14 +558,14 @@ def synthesise_params(spec_params: dict, override: dict[str, Any] | None = None)
     required = set(spec_params.get("required", []) or [])
     for prop_name in required:
         prop_schema = properties.get(prop_name, {}) or {}
-        out[prop_name] = _value_for_property(prop_name, prop_schema)
+        out[prop_name] = _value_for_property(prop_name, prop_schema, def_id)
     # If the definition has no `required:` block but does declare properties
     # (e.g. security.ioc.check — all optional, but at least one must be
     # supplied), synthesise one property so dispatch exercises the plugin
     # rather than erroring at "no parameters provided".
     if not required and properties:
         first_name = next(iter(properties))
-        out[first_name] = _value_for_property(first_name, properties[first_name] or {})
+        out[first_name] = _value_for_property(first_name, properties[first_name] or {}, def_id)
     if override:
         out.update(override)
     return out
@@ -920,6 +954,33 @@ def _post_verdict(code: int, payload: Any) -> str:
     return "unknown"
 
 
+# Rows the runner cannot make succeed in the environment it is run from, skipped with a recorded
+# reason (never passed, and never hidden: the reason lands in the Outcome note and the test-runs DB).
+# A plugin FAILURE on any other row still fails the gate; this is not a verdict loosening.
+#
+# These two always need a public host: the plugin refuses private, loopback and unresolvable
+# targets as an SSRF block by design, so no value the runner can invent succeeds offline.
+_NO_PUBLIC_EGRESS_SKIPS = frozenset({"agent.http_client.get", "agent.http_client.head"})
+
+# These two need host privileges an isolated rig removes (no_new_privs blocks the sudo that
+# flush_dns uses; ping needs cap_net_raw). They are skipped ONLY when the operator says the run is in
+# such a rig, so a normal host still runs them and a real failure there still fails the gate.
+_PRIVILEGED_SKIPS = frozenset({"device.network_actions.ping", "device.network_actions.flush_dns"})
+SKIP_PRIVILEGED_ENV = "YUZU_INSTRUCTIONS_SKIP_PRIVILEGED"
+
+
+def named_skip_reason(def_id: str, environ: dict[str, str] | None = None) -> str:
+    """Why `def_id` is skipped as unrunnable here, or "" when it runs."""
+    env = os.environ if environ is None else environ
+    if def_id in _NO_PUBLIC_EGRESS_SKIPS:
+        return ("needs a public host: the plugin SSRF-blocks private, loopback and unresolvable "
+                "targets, so no synthesised URL can succeed")
+    if def_id in _PRIVILEGED_SKIPS and env.get(SKIP_PRIVILEGED_ENV, "") == "1":
+        return (f"{SKIP_PRIVILEGED_ENV}=1: this run is in an isolated rig without the host "
+                "privileges the action needs (sudo / cap_net_raw)")
+    return ""
+
+
 def targeted_skip_reason(defn: Definition, param_overrides: dict[str, dict[str, Any]],
                          target_os: str = "") -> str:
     """Why a destructive/forensic definition must not be dispatched, or "" if it may be.
@@ -1266,9 +1327,13 @@ def _exercise(client: YuzuClient, defn: Definition,
             return Outcome(defn.id, defn.risk, "skip", ms(),
                            note=f"host={HOST} not in platforms={sorted(eligible)}")
 
+    why = named_skip_reason(defn.id)
+    if why:
+        return Outcome(defn.id, defn.risk, "skip", ms(), note=why)
+
     try:
         params = (dict(param_overrides[defn.id]) if targeted
-                  else synthesise_params(defn.parameters, param_overrides.get(defn.id)))
+                  else synthesise_params(defn.parameters, param_overrides.get(defn.id), defn.id))
     except Exception as e:
         return Outcome(defn.id, defn.risk, "error", ms(), note=f"param-synth: {e}")
 

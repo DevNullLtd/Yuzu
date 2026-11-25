@@ -1206,6 +1206,7 @@ class BroadcastGrading(unittest.TestCase):
     def setUp(self):
         self.now = 0.0
         self.calls = []
+        self.sent = []
         self.addCleanup(ir._INTERRUPT.clear)
         ir._INTERRUPT.clear()
         for name, value in (("monotonic", lambda: self.now), ("sleep", self.advance)):
@@ -1216,13 +1217,15 @@ class BroadcastGrading(unittest.TestCase):
     def advance(self, seconds):
         self.now += seconds
 
-    def grade(self, *polls, risk="safe", reached=1, timeout=2, payload=None):
+    def grade(self, *polls, risk="safe", reached=1, timeout=2, payload=None, def_id="g",
+              parameters=None, overrides=None):
         owner = self
 
         class Client:
             n = -1
 
-            def execute_instruction(self, def_id, params):
+            def execute_instruction(self, sent_id, params):
+                owner.sent.append((sent_id, dict(params)))
                 return 200, payload if payload is not None else {"command_id": "c", "agents_reached": reached}
 
             def get_responses(self, command_id, *, offset=0):
@@ -1234,9 +1237,10 @@ class BroadcastGrading(unittest.TestCase):
                     return answer(offset)
                 return {"responses": answer} if isinstance(answer, list) else answer
 
-        d = ir.Definition(id="g", plugin="p", action="a", type="action", platforms=[], parameters={},
-                          result_columns=[], approval_mode="auto", risk=risk, file="g.yaml")
-        return ir.exercise(Client(), d, {}, timeout)
+        d = ir.Definition(id=def_id, plugin="p", action="a", type="action", platforms=[],
+                          parameters=parameters or {}, result_columns=[], approval_mode="auto",
+                          risk=risk, file="g.yaml")
+        return ir.exercise(Client(), d, overrides or {}, timeout)
 
     def test_success_including_empty_or_error_looking_output_passes(self):
         for risk in ("safe", "mutating"):
@@ -1252,6 +1256,41 @@ class BroadcastGrading(unittest.TestCase):
                         result = self.grade([row(), row(status=status, output=output)], risk=risk)
                         self.assertEqual(result.status, "fail")
                         self.assertIn(ir.STATUS_NAMES[status], result.note)
+
+    def test_a_plugin_failure_on_a_synthesis_fixed_row_still_fails_the_gate(self):
+        # echo.query used to fail because the runner sent from="x". The fix changes what is SENT, not
+        # how the answer is graded: the same row with the bad value forced back in must still fail.
+        schema = {"type": "object", "properties": {"from": {"type": "string"}}}
+        good = self.grade([row()], def_id="crossplatform.echo.query", parameters=schema)
+        self.assertEqual(good.status, "pass")
+        self.assertEqual(self.sent[-1], ("crossplatform.echo.query", {"from": "0"}))
+        bad = self.grade([row(status=FAILURE, output="error|invalid 'from' parameter (must be epoch seconds)")],
+                         def_id="crossplatform.echo.query", parameters=schema, overrides={"crossplatform.echo.query": {"from": "x"}})
+        self.assertEqual(self.sent[-1], ("crossplatform.echo.query", {"from": "x"}))
+        self.assertEqual(bad.status, "fail")
+
+    def test_named_skips_dispatch_nothing_and_say_why(self):
+        for def_id in ("agent.http_client.get", "agent.http_client.head"):
+            with self.subTest(def_id=def_id):
+                result = self.grade([row()], def_id=def_id)
+                self.assertEqual(result.status, "skip")
+                self.assertIn("SSRF", result.note)
+        self.assertEqual(self.sent, [])
+
+    def test_privileged_rows_skip_only_when_the_rig_says_so(self):
+        for def_id in ("device.network_actions.ping", "device.network_actions.flush_dns"):
+            with self.subTest(def_id=def_id):
+                with mock.patch.dict(os.environ, {ir.SKIP_PRIVILEGED_ENV: "1"}):
+                    skipped = self.grade([row()], risk="mutating", def_id=def_id)
+                self.assertEqual(skipped.status, "skip")
+                self.assertIn(ir.SKIP_PRIVILEGED_ENV, skipped.note)
+                self.assertEqual(self.sent, [])
+                env = {k: v for k, v in os.environ.items() if k != ir.SKIP_PRIVILEGED_ENV}
+                with mock.patch.dict(os.environ, env, clear=True):
+                    ran = self.grade([row(status=FAILURE)], risk="mutating", def_id=def_id)
+                self.assertEqual(ran.status, "fail")   # a normal host still runs it and still fails it
+                self.assertEqual(len(self.sent), 1)
+                self.sent.clear()
 
     def test_running_output_waits_for_terminal_and_historical_chunks_are_allowed(self):
         running = row(status=RUNNING, output="partial")

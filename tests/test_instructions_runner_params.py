@@ -76,6 +76,75 @@ class PatternSynthesis(unittest.TestCase):
         self.assertEqual(synth(string_schema("[")), ir._synth_string("p", {}))
 
 
+class ContractShapedParameters(unittest.TestCase):
+    """Parameters whose accepted shape the plugin enforces (the 2026-11 Instructions gate failures)."""
+
+    def real(self, def_id):
+        return next(d for d in ir.load_definitions(ROOT / "content" / "definitions", {}) if d.id == def_id)
+
+    def test_echo_query_sends_epoch_seconds_not_a_placeholder(self):
+        params = ir.synthesise_params(self.real("crossplatform.echo.query").parameters,
+                                      def_id="crossplatform.echo.query")
+        self.assertRegex(params["from"], r"^[0-9]+$")
+
+    def test_from_and_to_are_epoch_seconds(self):
+        with mock.patch.object(ir.time, "time", return_value=1234567890.9):
+            self.assertEqual(ir._synth_string("from", {}), "0")
+            self.assertEqual(ir._synth_string("to", {}), "1234567890")
+
+    def test_echo_configure_sends_the_documented_default_budget(self):
+        params = ir.synthesise_params(self.real("crossplatform.echo.configure").parameters,
+                                      def_id="crossplatform.echo.configure")
+        self.assertEqual(params, {"db_budget_bytes": "262144000"})
+        self.assertGreaterEqual(int(params["db_budget_bytes"]), 33554432)
+
+    def test_list_dir_gets_the_seeded_directory_and_read_the_seeded_text_file(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_seedcase_") as base, \
+                ir.seeded_directory(base) as seed:
+            list_dir = ir.synthesise_params(self.real("device.filesystem.list_dir").parameters,
+                                            def_id="device.filesystem.list_dir")["path"]
+            read = ir.synthesise_params(self.real("device.filesystem.read").parameters,
+                                        def_id="device.filesystem.read")["path"]
+            self.assertEqual(list_dir, seed)
+            self.assertTrue(os.path.isdir(list_dir))
+            self.assertEqual(read, os.path.join(seed, "a.txt"))
+            self.assertTrue(os.path.isfile(read))
+            self.assertNotIn(b"\0", Path(read).read_bytes())   # text, not the "binary" the plugin refuses
+
+    def test_the_seed_rules_are_per_definition_and_fall_back_without_a_seed(self):
+        # Other definitions keep the name-based path default, and with nothing seeded so do these.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_seedcase_") as base, ir.seeded_directory(base):
+            self.assertEqual(ir._synth_string("path", {}, "device.filesystem.exists"),
+                             ir._HOST_PATHS[ir.HOST]["file"])
+        self.assertEqual(ir._synth_string("path", {}, "device.filesystem.list_dir"),
+                         ir._HOST_PATHS[ir.HOST]["file"])
+
+    def test_an_override_still_wins_over_every_rule(self):
+        got = ir.synthesise_params(self.real("crossplatform.echo.query").parameters,
+                                   {"from": "x"}, "crossplatform.echo.query")
+        self.assertEqual(got["from"], "x")
+
+
+class NamedSkips(unittest.TestCase):
+    def test_http_client_rows_are_always_skipped_with_the_ssrf_reason(self):
+        for def_id in ("agent.http_client.get", "agent.http_client.head"):
+            self.assertIn("SSRF", ir.named_skip_reason(def_id, {}))
+
+    def test_privileged_rows_skip_only_on_the_exact_opt_in_value(self):
+        for def_id in ("device.network_actions.ping", "device.network_actions.flush_dns"):
+            self.assertEqual(ir.named_skip_reason(def_id, {}), "")
+            self.assertEqual(ir.named_skip_reason(def_id, {ir.SKIP_PRIVILEGED_ENV: "0"}), "")
+            self.assertEqual(ir.named_skip_reason(def_id, {ir.SKIP_PRIVILEGED_ENV: ""}), "")
+            self.assertIn(ir.SKIP_PRIVILEGED_ENV, ir.named_skip_reason(def_id, {ir.SKIP_PRIVILEGED_ENV: "1"}))
+
+    def test_no_other_row_is_ever_skipped_by_name(self):
+        env = {ir.SKIP_PRIVILEGED_ENV: "1"}
+        skipped = {d.id for d in ir.load_definitions(ROOT / "content" / "definitions", {})
+                   if ir.named_skip_reason(d.id, env)}
+        self.assertEqual(skipped, {"agent.http_client.get", "agent.http_client.head",
+                                   "device.network_actions.ping", "device.network_actions.flush_dns"})
+
+
 class SeededDirectory(unittest.TestCase):
     """seeded_directory(): the per-run directory directory-shaped parameters resolve to (#5624).
 
