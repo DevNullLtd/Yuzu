@@ -2787,8 +2787,9 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
     CHECK(in["properties"]["scope"]["enum"] == nlohmann::json::array({"fleet", "management_group"}));
     CHECK(in["properties"]["scope"]["type"] == "string");
     CHECK(in["properties"]["scope_group_id"]["type"] == "string");
-    CHECK(in["properties"]["scope_group_id"]["maxLength"] ==
-          static_cast<int>(yuzu::server::kScopeGroupIdMaxLen));
+    // The exact bound, as a literal: the management-group id contract (kMgmtGroupIdMaxBytes).
+    CHECK(in["properties"]["scope_group_id"]["maxLength"] == 256);
+    CHECK(yuzu::server::kScopeGroupIdMaxLen == 256);
     const auto& in_required = in["required"];
     CHECK(std::find(in_required.begin(), in_required.end(), "scope") != in_required.end());
     CHECK(std::find(in_required.begin(), in_required.end(), "scope_group_id") == in_required.end());

@@ -5172,9 +5172,15 @@ gate, so a caller without the permission still gets the `403`.
 | `principal_id` | string | Yes | Principal identifier, 1 to 1024 bytes, no NUL byte |
 | `role_name` | string | Yes | Role being reviewed, 1 to 1024 bytes, no NUL byte |
 | `scope` | string | Yes | `fleet` \| `management_group`. Always required; copy it from the attestation row in `GET /api/v1/access-reviews/{id}`. |
-| `scope_group_id` | string | Only for `management_group` | For `fleet`, absent or `""` (anything else is refused). For `management_group`, a nonempty string of at most 64 bytes with no NUL byte. Copy it from the attestation row. |
+| `scope_group_id` | string | Only for `management_group` | For `fleet`, absent or `""` (anything else is refused). For `management_group`, a nonempty string of at most 256 bytes with no NUL byte (the management-group id limit). Copy it from the attestation row. |
 | `decision` | string | Yes | `attested` \| `flagged_revoke` |
 | `justification` | string | No | Free-text reviewer note, at most 4096 bytes. It is kept with the decision and the application never deletes it: do not enter personal data beyond what the review requires. |
+
+In the OpenAPI document (`GET /api/v1/openapi.json`) the request body's `required` list is `principal_type`,
+`principal_id`, `role_name`, `scope` and `decision`. `scope_group_id` is not in that list: its schema carries
+`maxLength` 256 and its description states the rule (required, nonempty, no NUL, when `scope` is
+`management_group`; absent or empty when `fleet`), so a client generated from the schema alone is not told
+that `management_group` needs it. The handler enforces the rule, not the schema.
 
 **`flagged_revoke` records evidence ONLY — it never itself revokes the
 grant.** No RBAC/EnginePrincipal mutation happens on this path; acting on
@@ -5193,11 +5199,16 @@ decision. `400`, one cause each:
   `flagged_revoke`.
 - `scope` is missing, not a string, or neither `fleet` nor `management_group`; `scope` is `fleet` and
   `scope_group_id` is present and nonempty (or not a string); or `scope` is `management_group` and
-  `scope_group_id` is missing, empty, not a string, over 64 bytes or contains a NUL byte. The message says
-  to copy `scope` and `scope_group_id` from the campaign row. This is a breaking change: a request that
-  omits `scope` is refused (see "Breaking: an access-review attestation must name the scope of the
-  grant" in `docs/user-manual/upgrading.md`). A page loaded before the upgrade sends no scope and gets this
-  `400` until it is reloaded.
+  `scope_group_id` is missing, empty, not a string, over 256 bytes or contains a NUL byte. This is a breaking
+  change: a request that omits `scope` is refused (see "Breaking: an access-review attestation must name the
+  scope of the grant" in `docs/user-manual/upgrading.md`). It is refused before the gate, like the other
+  grant-field refusals below, and writes no audit row. The message is one of three, and each ends
+  `reload the page so it sends the scope (a page opened before this field existed sends none); API callers must send scope`.
+  The first is `scope is required and must be "fleet" or "management_group"` (a missing, non-string or unknown
+  `scope`), the second is `scope_group_id must be absent or empty when scope is "fleet"`, and the third is
+  `scope_group_id is required when scope is "management_group" and must be a nonempty string of at most 256 bytes without NUL`.
+  A dashboard page loaded before the upgrade sends no scope and gets this `400` until it is reloaded; an API
+  caller must send `scope` itself. A queued or saved request that predates the change needs `scope` added.
 - `principal_type`, `principal_id` or `role_name` is longer than 1024 bytes or contains a NUL byte. The
   message is `principal_type, principal_id and role_name must be 1-1024 bytes without NUL`. It is decided
   before any lookup, so it holds for all three principal types, and it writes no audit row (the schema
@@ -5220,7 +5231,11 @@ without `AccessReview:Attest` (or an engine-classed caller), for a browser
 (session-cookie) request that carries no `Origin`/`Referer` naming this site
 (audited as `csrf.denied`; API-token callers are exempt), or because the reviewer
 is the subject of the grant (see the next paragraph). `404` — no campaign with
-that id, no such frozen grant in it, or the campaign is already closed (a
+that id, no such frozen grant in it, or the campaign is already closed. A grant is matched on all five key
+parts, so attesting a grant under a scope that has no such row in the campaign (a `management_group` request
+for a principal and role frozen fleet-wide, or the reverse, or the wrong `scope_group_id`) is a `404`: the
+store finds no row and the message names `(campaign_id, principal_type, principal_id, role_name, scope_group_id)`;
+read the campaign and copy `scope` and `scope_group_id` from the row. (A
 reviewer who is the subject of the grant, of any of the three types, gets the
 `403` instead, even for a closed campaign). `415` — `Content-Type` is not `application/json`. `503` — the
 access-review store is unavailable, a genuine write failure (including a row-lock

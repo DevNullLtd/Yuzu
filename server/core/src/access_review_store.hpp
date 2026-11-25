@@ -146,8 +146,9 @@ struct GrantRef {
     /// that instant), stored and returned verbatim and immutable once written.
     /// Free-form (typically JSON) EXCEPT for one key: for an ENGINE grant,
     /// `record_attestation` parses the snapshot and reads `kSnapshotOwnerKey`
-    /// (the owner frozen at open) for its frozen-owner refusal. Both open-campaign
-    /// builders (REST, MCP) must keep writing it under that name.
+    /// (the owner frozen at open) for its frozen-owner refusal. The one builder,
+    /// `freeze_population` (access_review_model.cpp, called by REST and MCP campaign open), must keep
+    /// writing it under that name.
     std::string grant_snapshot;
     /// The scope the grant is held at: `""` is fleet-wide, any other value is the id of the
     /// management group the role was assigned on. Part of the grant's identity (the fifth key

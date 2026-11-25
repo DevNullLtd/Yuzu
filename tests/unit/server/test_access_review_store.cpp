@@ -559,11 +559,11 @@ TEST_CASE("get_campaign(include_history) returns each grant's latest kMaxDecisio
              {"ALTER TABLE " + att + " DISABLE TRIGGER access_review_attestation_guard",
               "ALTER TABLE " + hist + " DISABLE TRIGGER access_review_history_consistent",
               "INSERT INTO " + hist +
-                  " (campaign_id, principal_type, principal_id, role_name, seq, decision, "
-                  "previous_decision, reviewer, justification, decided_at_ms) "
+                  " (campaign_id, principal_type, principal_id, role_name, scope_group_id, seq, "
+                  "decision, previous_decision, reviewer, justification, decided_at_ms) "
                   "SELECT '" +
                   cid +
-                  "','group','eng','Reader', g, 'attested', 'attested', "
+                  "','group','eng','Reader','', g, 'attested', 'attested', "
                   "'carol', 'row ' || g, g FROM generate_series(2,105) g",
               "UPDATE " + att + " SET decision_seq=105 WHERE campaign_id='" + cid +
                   "' AND principal_id='eng'"}) {
@@ -1506,9 +1506,10 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     // A decided row inserted directly.
     CHECK(integrity_violation(
         sqlstate_of(c, "INSERT INTO " + att +
-                           " (campaign_id, principal_type, principal_id, role_name, decision, "
-                           "reviewer, decided_at_ms, justification, grant_snapshot) VALUES ('" +
-                           cid + "','user','mallory','Admin','attested','carol',1,'','{}')")));
+                           " (campaign_id, principal_type, principal_id, role_name, scope_group_id, "
+                           "decision, reviewer, decided_at_ms, justification, grant_snapshot) "
+                           "VALUES ('" +
+                           cid + "','user','mallory','Admin','','attested','carol',1,'','{}')")));
     // A justification-only edit of a pending row.
     CHECK(integrity_violation(sqlstate_of(c, "UPDATE " + att + " SET justification='x' WHERE " +
                                                  key + "group' AND principal_id='eng'")));
@@ -1525,9 +1526,9 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     CHECK(sqlstate_of(c,
                       "INSERT INTO " + hist +
                           " (campaign_id, principal_type, principal_id, "
-                          "role_name, seq, decision, previous_decision, reviewer, justification, "
-                          "decided_at_ms) VALUES ('" +
-                          cid + "','user','alice','Admin',2,'attested','attested','alice','',9)") ==
+                          "role_name, scope_group_id, seq, decision, previous_decision, reviewer, "
+                          "justification, decided_at_ms) VALUES ('" +
+                          cid + "','user','alice','Admin','',2,'attested','attested','alice','',9)") ==
           "23514");
 
     // A history row committed with no state change is refused AT COMMIT (deferred consistency
@@ -1536,9 +1537,9 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     CHECK(
         sqlstate_of(c, "INSERT INTO " + hist +
                            " (campaign_id, principal_type, principal_id, "
-                           "role_name, seq, decision, previous_decision, reviewer, justification, "
-                           "decided_at_ms) VALUES ('" +
-                           cid + "','group','eng','Reader',1,'attested','pending','carol','',5)")
+                           "role_name, scope_group_id, seq, decision, previous_decision, reviewer, "
+                           "justification, decided_at_ms) VALUES ('" +
+                           cid + "','group','eng','Reader','',1,'attested','pending','carol','',5)")
             .empty());
     CHECK(integrity_violation(sqlstate_of(c, "COMMIT")));
 
@@ -1548,9 +1549,9 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     CHECK(
         sqlstate_of(c, "INSERT INTO " + hist +
                            " (campaign_id, principal_type, principal_id, "
-                           "role_name, seq, decision, previous_decision, reviewer, justification, "
-                           "decided_at_ms) VALUES ('" +
-                           cid + "','group','eng','Reader',1,'attested','pending','carol','',5)")
+                           "role_name, scope_group_id, seq, decision, previous_decision, reviewer, "
+                           "justification, decided_at_ms) VALUES ('" +
+                           cid + "','group','eng','Reader','',1,'attested','pending','carol','',5)")
             .empty());
     CHECK(sqlstate_of(c, "UPDATE " + att +
                              " SET decision='attested', reviewer='carol', "
@@ -1628,9 +1629,9 @@ TEST_CASE("schema v3 guard: every field the state row must share with its histor
                               "AND role_name='Reader'";
     const auto insert_history = [&](int seq) {
         return "INSERT INTO " + hist +
-               " (campaign_id, principal_type, principal_id, role_name, seq, decision, "
-               "previous_decision, reviewer, justification, decided_at_ms) VALUES ('" +
-               cid + "','group','eng','Reader'," + std::to_string(seq) +
+               " (campaign_id, principal_type, principal_id, role_name, scope_group_id, seq, "
+               "decision, previous_decision, reviewer, justification, decided_at_ms) VALUES ('" +
+               cid + "','group','eng','Reader',''," + std::to_string(seq) +
                ",'attested','pending','carol','j',5)";
     };
     // The state UPDATE with every value matching the history row, `set` overriding one.
@@ -1673,10 +1674,10 @@ TEST_CASE("schema v3 guard: every field the state row must share with its histor
         REQUIRE(failure_of(c, "BEGIN").empty());
         REQUIRE(failure_of(
                     c, "INSERT INTO " + hist +
-                           " (campaign_id, principal_type, principal_id, role_name, seq, "
-                           "decision, previous_decision, reviewer, justification, decided_at_ms) "
-                           "VALUES ('" +
-                           cid + "','group','eng','Reader',1,'attested','attested','carol','j',5)")
+                           " (campaign_id, principal_type, principal_id, role_name, scope_group_id, "
+                           "seq, decision, previous_decision, reviewer, justification, "
+                           "decided_at_ms) VALUES ('" +
+                           cid + "','group','eng','Reader','',1,'attested','attested','carol','j',5)")
                     .empty());
         const auto got = failure_of(c, update_state("attested", "carol", "5", "j", 1));
         REQUIRE(failure_of(c, "ROLLBACK").empty());
@@ -2496,7 +2497,9 @@ TEST_CASE("schema v4: a wrong scope is not_found; an over-long or NUL scope is b
         CHECK(r.error().find("scope_group_id") != std::string::npos);
     }
 
-    // The bound: 64 bytes pass the bound check (and are then simply not frozen), 65 and a NUL fail it.
+    // The bound is the management-group id contract: 256 bytes pass the bound check, 257 and a NUL
+    // fail it.
+    STATIC_REQUIRE(yuzu::server::kScopeGroupIdMaxLen == 256);
     const std::string at_cap(yuzu::server::kScopeGroupIdMaxLen, 'x');
     const std::string over(yuzu::server::kScopeGroupIdMaxLen + 1, 'x');
     const std::string nul("g\0-1", 4);
@@ -2822,11 +2825,15 @@ TEST_CASE("schema v4: a populated v3 database upgrades with every row fleet-wide
                        "scope_group_id <> ''") == "0");
     CHECK(scalar_of(c, "SELECT count(*) FROM access_review_store.access_review_attestation_history "
                        "WHERE scope_group_id <> ''") == "0");
-    // The column is NOT NULL with a fleet default.
-    CHECK(scalar_of(c, "SELECT is_nullable || '|' || column_default FROM "
-                       "information_schema.columns WHERE table_schema = 'access_review_store' AND "
-                       "table_name = 'access_review_attestation' AND column_name = "
-                       "'scope_group_id'") == "NO|''::text");
+    // The column is NOT NULL and, once v4 has backfilled the old rows, has NO default (on both
+    // tables): see the "has no default" test below for what that refuses.
+    for (const char* table : {"access_review_attestation", "access_review_attestation_history"}) {
+        INFO(table);
+        CHECK(scalar_of(c, std::string("SELECT is_nullable || '|' || coalesce(column_default, '<none>') "
+                                       "FROM information_schema.columns WHERE table_schema = "
+                                       "'access_review_store' AND table_name = '") +
+                               table + "' AND column_name = 'scope_group_id'") == "NO|<none>");
+    }
     // Both primary keys name the scope (history: before seq).
     CHECK(key_columns_of(c, "access_review_attestation") ==
           "campaign_id,principal_type,principal_id,role_name,scope_group_id");
@@ -2876,8 +2883,8 @@ TEST_CASE("schema v4: a populated v3 database upgrades with every row fleet-wide
     CHECK(find_row(*reread, "user", "alice", "Admin", "g-1")->decision == "attested");
 }
 
-TEST_CASE("schema v4: a failure on v4's LAST statement rolls back everything v4 did, and the store "
-          "then reaches v4 once the cause is removed (A7b)",
+TEST_CASE("schema v4: a failure on v4's foreign-key statement rolls back everything v4 did, and the "
+          "store then reaches v4 once the cause is removed (A7b)",
           "[access_review][store][pg][migration][6969]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     seed_v3_database(db.dsn());
@@ -2892,8 +2899,9 @@ TEST_CASE("schema v4: a failure on v4's LAST statement rolls back everything v4 
         history_key_before = key_columns_of(c, "access_review_attestation_history");
         fk_before = history_state_fk_of(c);
         REQUIRE_FALSE(fk_before.empty());
-        // A constraint already holding the name v4's final statement adds: that statement fails
-        // after every earlier one succeeded. A CHECK (not a foreign key), so v4's lookup of the
+        // A constraint already holding the name v4's foreign-key statement adds (the last
+        // statement that can fail on a name; only the two DROP DEFAULTs follow it): that statement
+        // fails after every earlier one succeeded. A CHECK (not a foreign key), so v4's lookup of the
         // history table's foreign key is not confused by it.
         PgResult plant{PQexec(c, "ALTER TABLE access_review_store.access_review_attestation_history "
                                  "ADD CONSTRAINT access_review_history_grant_fk CHECK (seq >= 1)")};
@@ -2907,8 +2915,9 @@ TEST_CASE("schema v4: a failure on v4's LAST statement rolls back everything v4 
         AccessReviewStore store{pool};
         log.stop();
         CHECK_FALSE(store.is_open());
-        // It failed at the LAST statement (the one adding the named constraint), not earlier: the
-        // database's message names the planted constraint, so everything before it had run.
+        // It failed at the foreign-key statement (the one adding the named constraint), not
+        // earlier: the database's message names the planted constraint, so everything before it
+        // had run.
         CHECK(log.text().find("access_review_history_grant_fk") != std::string::npos);
     }
 
@@ -2916,7 +2925,8 @@ TEST_CASE("schema v4: a failure on v4's LAST statement rolls back everything v4 
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
         PGconn* c = conn.get();
-        // Nothing of v4 survived: version, hash row, column, keys, foreign key, both functions, data.
+        // Nothing of v4 survived: version, hash row, column, keys, foreign key, both functions, data
+        // (the DROP DEFAULTs never ran, and the column they act on is gone with the rollback).
         CHECK(scalar_of(c, "SELECT version FROM public.schema_meta WHERE store = "
                            "'access_review_store'") == "3");
         CHECK(scalar_of(c, "SELECT count(*) FROM public.yuzu_schema_migrations WHERE store = "
@@ -2950,4 +2960,194 @@ TEST_CASE("schema v4: a failure on v4's LAST statement rolls back everything v4 
     CHECK(history_state_fk_of(conn.get()) ==
           "access_review_history_grant_fk|r|"
           "campaign_id,principal_type,principal_id,role_name,scope_group_id");
+}
+
+TEST_CASE("schema v4: scope_group_id has no default on either table, so a write that omits it "
+          "fails NOT NULL instead of landing on the fleet-wide row",
+          "[access_review][store][pg][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("No default", "admin",
+                                        {GrantRef{"user", "alice", "Operator", "{}", ""}}, "enabled");
+    REQUIRE(open_res.has_value());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PGconn* c = conn.get();
+    for (const char* table : {"access_review_attestation", "access_review_attestation_history"}) {
+        INFO(table);
+        // information_schema reports a NULL column_default for a column with no default; the
+        // sentinel makes a missing row read differently from a NULL one.
+        CHECK(scalar_of(c, std::string("SELECT coalesce(column_default, '<none>') FROM "
+                                       "information_schema.columns WHERE table_schema = "
+                                       "'access_review_store' AND table_name = '") +
+                               table + "' AND column_name = 'scope_group_id'") == "<none>");
+    }
+    // What an old binary's four-column write does now: 23502 (not_null_violation), on both tables.
+    CHECK(sqlstate_of(c, "INSERT INTO access_review_store.access_review_attestation "
+                         "(campaign_id, principal_type, principal_id, role_name, decision, "
+                         "grant_snapshot) VALUES ('" +
+                             *open_res + "','user','mallory','Admin','pending','{}')") == "23502");
+    CHECK(sqlstate_of(c, "INSERT INTO access_review_store.access_review_attestation_history "
+                         "(campaign_id, principal_type, principal_id, role_name, seq, decision, "
+                         "previous_decision, reviewer, justification, decided_at_ms) VALUES ('" +
+                             *open_res + "','user','alice','Operator',1,'attested','pending',"
+                                         "'carol','',1)") == "23502");
+    // The store's own writes name the column, so they are unaffected.
+    CHECK(store.record_attestation(*open_res, "user", "alice", "Operator", kFleetScope, "attested",
+                                   "carol", "")
+              .has_value());
+}
+
+TEST_CASE("schema v4: the same grant attested under fleet and under a group scope by two "
+          "concurrent reviewers lands as two independent rows, neither overwritten",
+          "[access_review][store][pg][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign(
+        "Two scopes", "admin",
+        {GrantRef{"user", "alice", "Operator", "{}", ""},
+         GrantRef{"user", "alice", "Operator", "{}", "g-1"}},
+        "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // Repeat the paired writes from a shared start gate. This checks scope isolation (each scope
+    // keeps its own row, decision, seq and history); it does not force a particular interleaving.
+    constexpr int kRounds = 8;
+    std::atomic<bool> go{false};
+    std::atomic<int> failures{0};
+    auto attest = [&](const std::string& scope, const std::string& decision,
+                      const std::string& reviewer) {
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        for (int i = 0; i < kRounds; ++i) {
+            auto r = store.record_attestation(cid, "user", "alice", "Operator", scope, decision,
+                                              reviewer, "round " + std::to_string(i));
+            if (!r.has_value() || r->seq != i + 1)
+                failures.fetch_add(1);
+        }
+    };
+    std::thread fleet_thread{attest, std::string(), std::string("attested"), std::string("carol")};
+    std::thread group_thread{attest, std::string("g-1"), std::string("flagged_revoke"),
+                             std::string("dave")};
+    go.store(true, std::memory_order_release);
+    fleet_thread.join();
+    group_thread.join();
+    CHECK(failures.load() == 0);
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    REQUIRE(view->attestations.size() == 2);
+    const auto* fleet = find_row(*view, "user", "alice", "Operator", kFleetScope);
+    const auto* group = find_row(*view, "user", "alice", "Operator", "g-1");
+    REQUIRE(fleet != nullptr);
+    REQUIRE(group != nullptr);
+    // Each row carries its OWN reviewer, decision and a full, ordered history of its own.
+    CHECK(fleet->decision == "attested");
+    CHECK(fleet->reviewer == "carol");
+    CHECK(fleet->decision_seq == kRounds);
+    CHECK(group->decision == "flagged_revoke");
+    CHECK(group->reviewer == "dave");
+    CHECK(group->decision_seq == kRounds);
+    REQUIRE(fleet->history.size() == static_cast<std::size_t>(kRounds));
+    REQUIRE(group->history.size() == static_cast<std::size_t>(kRounds));
+    for (int i = 0; i < kRounds; ++i) {
+        CHECK(fleet->history[static_cast<std::size_t>(i)].seq == i + 1);
+        CHECK(fleet->history[static_cast<std::size_t>(i)].reviewer == "carol");
+        CHECK(group->history[static_cast<std::size_t>(i)].seq == i + 1);
+        CHECK(group->history[static_cast<std::size_t>(i)].reviewer == "dave");
+    }
+}
+
+TEST_CASE("schema v4: the migration refuses, and rolls back whole, a database whose constraint "
+          "shape it cannot find exactly once (the DO-block guards)",
+          "[access_review][store][pg][migration][6969]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    seed_v3_database(db.dsn());
+
+    constexpr const char* kAttTable = "access_review_store.access_review_attestation";
+    constexpr const char* kHistTable = "access_review_store.access_review_attestation_history";
+    // Drops the one constraint of `contype` ('f' or 'p') on `table` (for 'f', only the one into
+    // the state table). Plain statements, so a planted shape is built without editing a migration.
+    const auto drop_constraint = [](const std::string& table, char contype) {
+        const std::string extra =
+            contype == 'f' ? std::string(" AND confrelid = 'access_review_store."
+                                         "access_review_attestation'::regclass")
+                           : std::string();
+        return "DO $d$ DECLARE n text; BEGIN SELECT conname INTO STRICT n FROM pg_constraint WHERE "
+               "contype = '" +
+               std::string(1, contype) + "' AND conrelid = '" + table + "'::regclass" + extra +
+               "; EXECUTE format('ALTER TABLE " + table + " DROP CONSTRAINT %I', n); END $d$;";
+    };
+
+    struct Plant {
+        const char* name;
+        std::vector<std::string> sql;
+        const char* message;
+    };
+    const std::vector<Plant> plants = {
+        {"no foreign key from the history table",
+         {drop_constraint(kHistTable, 'f')},
+         "expected exactly one foreign key from the history table to the state table, found 0"},
+        {"two foreign keys from the history table",
+         {std::string("ALTER TABLE ") + kHistTable +
+          " ADD CONSTRAINT plant_second_fk FOREIGN KEY (campaign_id, principal_type, principal_id, "
+          "role_name) REFERENCES " +
+          kAttTable + "(campaign_id, principal_type, principal_id, role_name)"},
+         "expected exactly one foreign key from the history table to the state table, found 2"},
+        {"no primary key on the state table",
+         {drop_constraint(kHistTable, 'f'), drop_constraint(kAttTable, 'p'),
+          std::string("ALTER TABLE ") + kAttTable +
+              " ADD CONSTRAINT plant_state_unique UNIQUE (campaign_id, principal_type, "
+              "principal_id, role_name)",
+          std::string("ALTER TABLE ") + kHistTable +
+              " ADD CONSTRAINT plant_fk FOREIGN KEY (campaign_id, principal_type, principal_id, "
+              "role_name) REFERENCES " +
+              kAttTable + "(campaign_id, principal_type, principal_id, role_name)"},
+         "expected exactly one primary key on the state table, found 0"},
+        {"no primary key on the history table",
+         {drop_constraint(kHistTable, 'p')},
+         "expected exactly one primary key on the history table, found 0"},
+    };
+
+    for (const auto& plant : plants) {
+        DYNAMIC_SECTION(plant.name) {
+            {
+                PgConn conn{PQconnectdb(db.dsn().c_str())};
+                REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+                for (const auto& sql : plant.sql) {
+                    INFO(sql);
+                    REQUIRE(sqlstate_of(conn.get(), sql).empty());
+                }
+            }
+            yuzu::test::LogCapture log;
+            {
+                PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+                REQUIRE(pool.valid());
+                AccessReviewStore store{pool};
+                log.stop();
+                CHECK_FALSE(store.is_open());
+            }
+            INFO(log.text());
+            CHECK(log.text().find(plant.message) != std::string::npos);
+            // The refusal rolled v4 back whole: still v3, the column its first statement adds is
+            // gone, and no v4 hash row was recorded.
+            PgConn conn{PQconnectdb(db.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            CHECK(scalar_of(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                        "'access_review_store'") == "3");
+            CHECK(scalar_of(conn.get(), "SELECT count(*) FROM information_schema.columns WHERE "
+                                        "table_schema = 'access_review_store' AND column_name = "
+                                        "'scope_group_id'") == "0");
+            CHECK(scalar_of(conn.get(), "SELECT count(*) FROM public.yuzu_schema_migrations "
+                                        "WHERE store = 'access_review_store' AND version = 4") ==
+                  "0");
+        }
+    }
 }

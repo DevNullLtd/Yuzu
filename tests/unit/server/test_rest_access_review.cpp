@@ -4012,11 +4012,11 @@ TEST_CASE("bounded history read: a grant carrying 105 history rows returns its l
              {"ALTER TABLE " + att + " DISABLE TRIGGER access_review_attestation_guard",
               "ALTER TABLE " + hist + " DISABLE TRIGGER access_review_history_consistent",
               "INSERT INTO " + hist +
-                  " (campaign_id, principal_type, principal_id, role_name, seq, decision, "
-                  "previous_decision, reviewer, justification, decided_at_ms) "
+                  " (campaign_id, principal_type, principal_id, role_name, scope_group_id, seq, "
+                  "decision, previous_decision, reviewer, justification, decided_at_ms) "
                   "SELECT '" +
                   cid +
-                  "','user','bob','Operator', g, 'attested', 'attested', "
+                  "','user','bob','Operator','', g, 'attested', 'attested', "
                   "'carol', '', g FROM generate_series(2,105) g",
               "UPDATE " + att + " SET decision_seq=105 WHERE campaign_id='" + cid +
                   "' AND principal_id='bob'"}) {
@@ -4192,8 +4192,18 @@ TEST_CASE("attest scope request: a missing or contradictory scope is refused on 
         {"group, id null", with_group(nullptr), group_id},
         {"group, id number", with_group(7), group_id},
         {"group, id object", with_group(nlohmann::json::object()), group_id},
-        {"group, id over 64 bytes", with_group(std::string(65, 'g')), group_id},
+        {"group, id over 256 bytes", with_group(std::string(257, 'g')), group_id},
         {"group, id with NUL", with_group(std::string("g\0x", 3)), group_id},
+        // "\u0000" on the wire: a NUL is not the empty string, so it contradicts scope fleet. This
+        // row pins the non-empty-by-length refusal, not the NUL bound (the "group, id with NUL" row
+        // does that). A C-string bind would also truncate it to "", naming the fleet row the caller did
+        // not mean.
+        {"fleet, id NUL",
+         [](nlohmann::json& b) {
+             b["scope"] = "fleet";
+             b["scope_group_id"] = std::string("\0", 1);
+         },
+         fleet_id},
         {"fleet, id nonempty",
          [](nlohmann::json& b) {
              b["scope"] = "fleet";
@@ -4247,15 +4257,17 @@ TEST_CASE("attest scope request: a missing or contradictory scope is refused on 
     CHECK(row.history.empty());
     CHECK(h.audit_log.empty());
 
-    // Every message names the fix and none promises the caller can read the campaign.
+    // Every message says what to do (a stale page is reloaded, an API caller sends scope) and
+    // none promises the caller can read the campaign.
     for (const auto& msg : {invalid, fleet_id, group_id}) {
-        CHECK(msg.find("copy scope and scope_group_id from the campaign row") != std::string::npos);
+        CHECK(msg.find("reload the page so it sends the scope") != std::string::npos);
+        CHECK(msg.find("API callers must send scope") != std::string::npos);
         CHECK(msg.find("read access") == std::string::npos);
     }
 }
 
 TEST_CASE("attest scope request: fleet takes an absent or empty id and ignores scope_group_name; "
-          "a 64-byte group id is within the bound",
+          "a 256-byte group id is within the bound",
           "[pg][access_review][rest][mcp][access-reviews][6969]") {
     AccessReviewHarness h;
     seed_user_grant(h, "bob");
@@ -4294,18 +4306,61 @@ TEST_CASE("attest scope request: fleet takes an absent or empty id and ignores s
         CHECK(b2["result"]["structuredContent"]["decision_seq"] == 2);
     }
 
-    // A group id of exactly 64 bytes is inside the bound: it reaches the store and is a 404 for a
-    // grant that was not frozen, not a 400.
-    auto edge = scoped_body("Operator", "management_group", std::string(64, 'g'));
+    // A group id of exactly 256 bytes (the management-group id contract) is inside the bound: it
+    // reaches the store and is a 404 for a grant that was not frozen, not a 400.
+    auto edge = scoped_body("Operator", "management_group", std::string(256, 'g'));
     auto rest = h.sink.Post(attest_url(cid), edge.dump());
     REQUIRE(rest);
     CHECK(rest->status == 404);
     auto args = sod_args(cid, "user", "bob", "Operator");
     args["scope"] = "management_group";
-    args["scope_group_id"] = std::string(64, 'g');
+    args["scope_group_id"] = std::string(256, 'g');
     const auto err = mcp_error_of(h.mcp_call_tool("record_attestation", args));
     // Not the scope refusal: the id passed the parser and the store answered not-found.
     CHECK(err.value("message", std::string{}) != std::string(yuzu::server::kAttestScopeGroupIdMessage));
+}
+
+TEST_CASE("attest scope request: the permission gate runs BEFORE the scope parse, so a caller "
+          "without AccessReview:Attest gets 403, not the scope 400, on REST and MCP",
+          "[pg][access_review][rest][mcp][gate][access-reviews][6969]") {
+    AccessReviewHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return !(t == "AccessReview" && op == "Attest");
+    };
+
+    // Each body is a malformed scope that the parser refuses with a 400 for a permitted caller
+    // (the matrix test above): absent, an unknown value, a group scope without its id, a fleet
+    // scope with a stray id.
+    const std::vector<std::function<void(nlohmann::json&)>> malformed = {
+        [](nlohmann::json& b) { b.erase("scope"); },
+        [](nlohmann::json& b) { b["scope"] = "group"; },
+        [](nlohmann::json& b) { b["scope"] = "management_group"; },
+        [](nlohmann::json& b) {
+            b["scope"] = "fleet";
+            b["scope_group_id"] = "g-1";
+        },
+    };
+    int i = 0;
+    for (const auto& mutate : malformed) {
+        INFO("malformed scope #" << i++);
+        {
+            auto body = nlohmann::json::parse(sod_body("user", "bob", "Operator"));
+            mutate(body);
+            auto res = h.sink.Post(attest_url("whatever"), body.dump());
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            CHECK(res->body.find("scope") == std::string::npos);
+        }
+        {
+            auto args = sod_args("whatever", "user", "bob", "Operator");
+            mutate(args);
+            auto res = h.mcp_call_tool("record_attestation", args);
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            CHECK(res->body.find("scope") == std::string::npos);
+        }
+    }
+    CHECK(h.audit_log.empty());
 }
 
 TEST_CASE("attest scope: a group-scoped row is attestable on both transports, keeps its own "
@@ -4484,6 +4539,5 @@ TEST_CASE("campaign get: every attestation row carries scope, scope_group_id and
     const auto& body_schema = post["requestBody"]["content"]["application/json"]["schema"];
     const auto& body_req = body_schema["required"];
     CHECK(std::find(body_req.begin(), body_req.end(), "scope") != body_req.end());
-    CHECK(body_schema["properties"]["scope_group_id"]["maxLength"] ==
-          static_cast<int>(yuzu::server::kScopeGroupIdMaxLen));
+    CHECK(body_schema["properties"]["scope_group_id"]["maxLength"] == 256);
 }

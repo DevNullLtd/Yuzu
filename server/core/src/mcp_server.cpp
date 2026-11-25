@@ -4091,7 +4091,7 @@ static const ToolDef kTools[] = {
      "justification that is present and not a string is refused with invalid params). scope is "
      "required: 'fleet' or 'management_group', copied with scope_group_id from the grant's row in "
      "get_access_review (scope_group_id is absent or empty for fleet, and a nonempty id of at most "
-     "64 bytes for management_group); a missing or contradictory scope is refused with invalid "
+     "256 bytes for management_group); a missing or contradictory scope is refused with invalid "
      "params and records nothing. Each grant "
      "keeps at most 100 recorded decisions, the 100th is final: a further one is refused with "
      "invalid params and records nothing, and the way to review that grant again is to open a "
@@ -4116,7 +4116,7 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","minLength":1,"maxLength":1024,"description":"Id of the principal that holds the grant, as listed in get_access_review (at most 1024 bytes)"},)j"
      R"j("role_name":{"type":"string","minLength":1,"maxLength":1024,"description":"Role of the grant being decided (at most 1024 bytes)"},)j"
      R"j("scope":{"type":"string","enum":["fleet","management_group"],"description":"Where the grant is held, copied from the same attestation row in get_access_review. Always required"},)j"
-     R"j("scope_group_id":{"type":"string","maxLength":64,"description":"The management group's id, copied from the attestation row. Required (nonempty, at most 64 bytes, no NUL) when scope is management_group; absent or empty when scope is fleet"},)j"
+     R"j("scope_group_id":{"type":"string","maxLength":256,"description":"The management group's id, copied from the attestation row. Required (nonempty, at most 256 bytes, no NUL) when scope is management_group; absent or empty when scope is fleet"},)j"
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"],"description":"attested records that the grant is still appropriate; flagged_revoke records evidence that it should be revoked. Neither changes any grant"},)j"
      R"j("justification":{"type":"string","maxLength":4096,"description":"Reviewer's reason (at most 4096 bytes). Only the latest entry of a grant's history is returned whole"})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","scope","decision"]})j",
@@ -7750,15 +7750,16 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // population, or an already-closed campaign: client input, not a server
 // fault, so it maps to kInvalidParams like the REST twin's 404. The
 // "bad_request: " prefix (campaign_id shape, an embedded NUL, an oversized
-// justification) is client input the store refused before touching the pool,
+// justification or scope_group_id) is client input the store refused before touching the pool,
 // so it is kInvalidParams too, like the REST twin's 400. The "forbidden: "
 // prefix (the reviewer is the subject of the grant) is kPermissionDenied, like
 // the REST twin's 403. Any other message is a genuine read/write failure ->
 // kInternalError (retryable).
 //
 // Contract pin: every tool handler above pre-validates its own required
-// fields (title/decision/campaign_id/principal_type/principal_id/role_name)
-// BEFORE calling into AccessReviewStore, so the store's other
+// fields (title/decision/campaign_id/principal_type/principal_id/role_name,
+// and scope with scope_group_id, which record_attestation reads through
+// parse_attest_scope) BEFORE calling into AccessReviewStore, so the store's other
 // input-validation strings never actually reach this function today; an
 // unprefixed one would land in the `else -> kInternalError` arm, which is
 // wrong (client error, not retryable). Callers MUST keep pre-validating, and

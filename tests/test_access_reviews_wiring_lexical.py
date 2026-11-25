@@ -343,15 +343,14 @@ def region(text, start, end):
 
 
 def settings_campaign_region(text):
-    """From the Settings Scope-cell helper to the end of the campaign fragment function."""
+    """From the Settings Scope-cell helper to the end of the file. The campaign fragment function is
+    defined after the helper, so the region covers it; running to the file end is the conservative
+    direction for a forbidden-token scan. None when the helper or the fragment function is gone."""
     t = normalise(strip_block_comments(text))
     a = t.find("std::string ar_scope_cell(")
-    b = t.find("SettingsRoutes::render_access_review_campaign_fragment(", a + 1) if a >= 0 else -1
-    if a < 0 or b < 0:
+    if a < 0 or t.find("SettingsRoutes::render_access_review_campaign_fragment(", a + 1) < 0:
         return None
-    # the function body ends at the first top-level close after its opening brace
-    end = t.find("\n}", b)
-    return t[a:] if end < 0 else t[a:]  # normalise collapsed newlines: keep to the file end
+    return t[a:]
 
 
 def forbidden_problems(label, text, tokens):

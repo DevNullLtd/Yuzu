@@ -4,6 +4,7 @@
 #include "data_export.hpp"
 #include "directory_sync.hpp"
 #include "engine_principal_store.hpp"
+#include "mgmt_group_limits.hpp"
 #include "rbac_store.hpp"
 
 #include <yuzu/server/auth_db.hpp>
@@ -11,7 +12,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cstdio>
 #include <locale>
 #include <map>
 #include <sstream>
@@ -20,6 +20,10 @@
 #include <unordered_set>
 
 namespace yuzu::server {
+
+// The scope id cap is the management-group id contract (see kScopeGroupIdMaxLen), so a group id the
+// group store accepts can always be frozen and attested.
+static_assert(kScopeGroupIdMaxLen == kMgmtGroupIdMaxBytes);
 
 namespace {
 
@@ -365,9 +369,10 @@ std::string access_review_rbac_enforcement(const RbacStore* rbac) {
 namespace {
 
 /// Append `sv` as a JSON string body (no surrounding quotes): the double quote, the backslash and
-/// the C0 controls escaped, every other byte copied. Same escaping as the REST and MCP
-/// `json_escape` this replaces, so a frozen snapshot is byte-identical to the one the handlers
-/// used to build.
+/// the C0 controls escaped, every other byte copied. It escapes exactly as the file-local
+/// `json_escape` in rest_api_v1.cpp and mcp_server.cpp does (those stay, for their other JSON
+/// builders); this is a separate copy so the snapshot the freeze builds is the one those
+/// handlers used to build.
 void append_json_escaped(std::string& out, std::string_view sv) {
     for (char c : sv) {
         switch (c) {
@@ -394,10 +399,13 @@ void append_json_escaped(std::string& out, std::string_view sv) {
             break;
         default:
             if (static_cast<unsigned char>(c) < 0x20) {
-                char hex[8];
-                std::snprintf(hex, sizeof(hex), "\\u%04x",
-                              static_cast<unsigned int>(static_cast<unsigned char>(c)));
-                out += hex;
+                // A C0 control is below 0x20, so the escape is always \u00 plus two lowercase hex
+                // digits (the high digit is 0 or 1).
+                constexpr std::string_view kHexDigits = "0123456789abcdef";
+                const auto b = static_cast<unsigned char>(c);
+                out += "\\u00";
+                out += kHexDigits[b >> 4];
+                out += kHexDigits[b & 0x0F];
             } else {
                 out += c;
             }

@@ -92,10 +92,11 @@
 
 #include "access_review_store.hpp" // GrantRef, the element type freeze_population builds
 
+#include <nlohmann/json_fwd.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <nlohmann/json_fwd.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -306,17 +307,20 @@ decision_cap_wire_message(std::string_view store_error) noexcept {
     return std::nullopt;
 }
 
-/// Longest scope group id, in bytes (a real management-group id is 12). Enforced by ONE helper,
-/// `scope_group_id_within_bounds`, at freeze (`open_campaign` refuses a `GrantRef` over it, so a
-/// campaign can never hold a row its attest endpoint would always refuse) and at attest.
-inline constexpr std::size_t kScopeGroupIdMaxLen = 64;
+/// Longest scope group id, in bytes (a real management-group id is 12). It matches the
+/// management-group id contract, `kMgmtGroupIdMaxBytes` (256, `mgmt_group_limits.hpp`), so a group
+/// id the group store accepts can always be frozen and attested; access_review_model.cpp pins the
+/// two equal. Enforced by ONE helper, `scope_group_id_within_bounds`, at freeze (`open_campaign`
+/// refuses a `GrantRef` over it, so a campaign can never hold a row its attest endpoint would
+/// always refuse) and at attest.
+inline constexpr std::size_t kScopeGroupIdMaxLen = 256;
 
 /// The store's refusal text (prefixed `bad_request: `) for a scope id over the cap or holding a
-/// NUL byte. It spells out 64, pinned below. The empty id is valid: it is fleet-wide.
+/// NUL byte. It spells out 256, pinned below. The empty id is valid: it is fleet-wide.
 inline constexpr std::string_view kScopeGroupIdInvalidMessage =
-    "scope_group_id must be at most 64 bytes without NUL";
-static_assert(kScopeGroupIdMaxLen == 64,
-              "kScopeGroupIdInvalidMessage spells out 64: update the text with the constant");
+    "scope_group_id must be at most 256 bytes without NUL";
+static_assert(kScopeGroupIdMaxLen == 256,
+              "kScopeGroupIdInvalidMessage spells out 256: update the text with the constant");
 
 /// True when a scope id is within `kScopeGroupIdMaxLen` and free of a NUL byte (`pg/pg_exec.hpp`
 /// binds `c_str()`, so a NUL would truncate the bound value and name a different scope). The empty
@@ -342,20 +346,22 @@ static_assert(kScopeGroupIdMaxLen == 64,
 }
 
 /// The refusal texts of `parse_attest_scope`, shared by REST (400) and MCP (invalid-params) so the
-/// two transports cannot drift. Each names the fix (copy `scope` and `scope_group_id` from the
-/// campaign row) and none promises the caller can read the campaign: Attest without Read is a
-/// separate, known gap (#7183). 64 is spelled out and pinned to `kScopeGroupIdMaxLen`.
+/// two transports cannot drift. Each ends with the same action: a dashboard page opened before the
+/// scope field existed sends none, so the fix there is to reload it, and an API caller must send
+/// `scope` itself. None promises the caller can read the campaign: Attest without Read is a
+/// separate, known gap (#7183). 256 is spelled out and pinned to `kScopeGroupIdMaxLen`.
 inline constexpr std::string_view kAttestScopeInvalidMessage =
-    "scope is required and must be \"fleet\" or \"management_group\"; copy scope and "
-    "scope_group_id from the campaign row";
+    "scope is required and must be \"fleet\" or \"management_group\"; reload the page so it sends "
+    "the scope (a page opened before this field existed sends none); API callers must send scope";
 inline constexpr std::string_view kAttestScopeFleetIdMessage =
-    "scope_group_id must be absent or empty when scope is \"fleet\"; copy scope and "
-    "scope_group_id from the campaign row";
+    "scope_group_id must be absent or empty when scope is \"fleet\"; reload the page so it sends "
+    "the scope (a page opened before this field existed sends none); API callers must send scope";
 inline constexpr std::string_view kAttestScopeGroupIdMessage =
     "scope_group_id is required when scope is \"management_group\" and must be a nonempty string "
-    "of at most 64 bytes without NUL; copy scope and scope_group_id from the campaign row";
-static_assert(kScopeGroupIdMaxLen == 64,
-              "kAttestScopeGroupIdMessage spells out 64: update the text with the constant");
+    "of at most 256 bytes without NUL; reload the page so it sends the scope (a page opened before "
+    "this field existed sends none); API callers must send scope";
+static_assert(kScopeGroupIdMaxLen == 256,
+              "kAttestScopeGroupIdMessage spells out 256: update the text with the constant");
 
 /// The ONE parser of the scope of an attestation request, used by REST and MCP (#6969). It reads
 /// the PARSED body, because the string helpers of both transports turn a missing or non-string

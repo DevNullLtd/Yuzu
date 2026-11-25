@@ -4651,7 +4651,7 @@ grants `pending`.
 
 **The decision history.** The current-state row in `access_review_attestation` is keyed by the five-part grant
 identity `(campaign_id, principal_type, principal_id, role_name, scope_group_id)` (schema v4 added
-`scope_group_id TEXT NOT NULL DEFAULT ''` to both tables; `''` is fleet-wide, and every existing row and every
+`scope_group_id TEXT NOT NULL DEFAULT ''` to both tables; `''` is fleet-wide, and every
 grant frozen by this build is fleet-wide) and
 holds the latest decision plus `decision_seq` (0 while pending). The table
 `access_review_attestation_history` holds one row per recorded decision, keyed by the same five parts and
@@ -4737,16 +4737,18 @@ The audit side of the comparison is the `access_review.attested` and `access_rev
 1000 rows per request; page with `offset` or narrow with `since`/`until`). The `detail` of a success row carries
 `seq=<n>` and the grant, so a grant's `seq` values can be matched against its history rows; rows written before the
 build that introduced the history carry the earlier `target_id` shape and are not matched by that filter. Both
-queries were run for syntax and result against a throwaway PostgreSQL 18 database built from the schema DDL of
-migrations v1 to v3 (they returned the expected rows, and the reconciliation returned the grant after a history row was
-deleted with the guard trigger disabled); they were not run against a populated production database. Three caveats.
+queries were run for syntax and result, in their earlier form without `scope_group_id`, against a throwaway PostgreSQL 18
+database built from the schema DDL of migrations v1 to v3 (they returned the expected rows, and the reconciliation
+returned the grant after a history row was deleted with the guard trigger disabled). The forms shown here name
+`scope_group_id`, which exists only from schema v4 (migrations v1 to v4); that is the only difference, and this page does
+not claim a run of the scope-aware forms. Neither form was run against a populated production database. Three caveats.
 This read is outside the product, and Yuzu does not audit it. It needs a database credential, the same trust class that
 could edit these rows, so it shows what the tables hold, not that they were never altered; the audit rows exported off
 the database and the reconciliation are the independent comparison. And the API and the Access page do not return the
 full text of a superseded decision at all: only this database read does.
 
 **Scope.** An attestation request must name the scope of the grant: `scope` is `fleet` or `management_group`, and
-`scope_group_id` is `""` (or absent) for `fleet` and a nonempty string of at most 64 bytes without a NUL byte for
+`scope_group_id` is `""` (or absent) for `fleet` and a nonempty string of at most 256 bytes without a NUL byte (the management-group id limit) for
 `management_group`. A missing, mistyped or contradictory scope is a `400` / invalid-params before the gate. Every
 grant frozen by this build is fleet-wide.
 
@@ -4899,7 +4901,11 @@ It refuses again on every boot until the database is replaced. Deploy into a fre
 is detected: decisions on engine or group grants made by earlier builds are not checked and read as "previous:
 not recorded". This is the project's "Deployment contract (hard cutover)" posture, a decision of the project
 owner recorded in `docs/user-manual/upgrading.md`; the executable refuses a schema state, it does not verify
-where the database came from.
+where the database came from. The schema v4 migration (the scope key, #6969) is written so that a populated v3 table
+keeps every row, each reading fleet-wide (`scope_group_id = ''`), and a unit test populates a v3 database and checks
+that; that is a property of the migration SQL, not a supported upgrade path. A database written by an earlier build is
+outside the supported population, no operation alongside an earlier build or return to one is described, and the
+executable does not stop an earlier binary from opening a database this build has migrated (the runner only warns).
 
 ## Render-time permission probes (capability hints)
 

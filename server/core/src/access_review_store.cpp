@@ -254,13 +254,19 @@ CREATE CONSTRAINT TRIGGER access_review_history_consistent AFTER INSERT
         // so, unlike a migration that updates attestation rows (the v3 note above), this one needs no
         // DISABLE TRIGGER USER, and none is added: the trigger bindings are left untouched.
         //
+        // The DEFAULT exists only to backfill those rows. The final two statements DROP it from both
+        // columns, so a write that does not name scope_group_id (a binary that still keys a grant by
+        // four columns) fails the NOT NULL check loudly instead of silently landing on the
+        // fleet-wide row ''. Every INSERT this store makes names the column explicitly.
+        //
         // The history table's foreign key to the state table was unnamed in v3, and a primary key's
         // name is a Postgres default, so none is guessed: the DO block finds each in pg_constraint,
         // RAISES unless it finds exactly one, and drops it by its quoted name. The history table
         // also holds a foreign key to the campaign table: the lookup filters on the referenced
         // table. The history key is dropped BEFORE the state primary key it depends on and re-added
-        // LAST (named access_review_history_grant_fk, five columns, ON DELETE RESTRICT): last on
-        // purpose, as the slowest step and the point a late failure rolls back from.
+        // after everything else but the two metadata-only DROP DEFAULT statements (named
+        // access_review_history_grant_fk, five columns, ON DELETE RESTRICT): late on purpose, as
+        // the slowest step and the point a late failure rolls back from.
         //
         // The two functions are replaced in place (CREATE OR REPLACE): a trigger binds to its
         // function, so none is re-created, and access_review_history_keep is untouched. Locks and
@@ -368,6 +374,8 @@ ALTER TABLE access_review_attestation_history
   FOREIGN KEY (campaign_id, principal_type, principal_id, role_name, scope_group_id)
   REFERENCES access_review_attestation(campaign_id, principal_type, principal_id, role_name, scope_group_id)
   ON DELETE RESTRICT;
+ALTER TABLE access_review_attestation ALTER COLUMN scope_group_id DROP DEFAULT;
+ALTER TABLE access_review_attestation_history ALTER COLUMN scope_group_id DROP DEFAULT;
 )sql"},
     };
     return kMigrations;
@@ -455,7 +463,6 @@ AttestationHistoryRow read_history(PGresult* res, int i) {
 // `a` is the state row (LEFT JOINed: a history row whose state row is missing still reaches the
 // merge below, which reports it, and is treated as superseded here).
 // The history grant's scope is the LAST column; read_history starts at 4 and stops before it.
-constexpr int kHistoryScopeCol = 11;
 constexpr const char* kHistoryCols =
     "h.campaign_id, h.principal_type, h.principal_id, h.role_name, h.seq, h.decision, "
     "h.previous_decision, h.reviewer, "
@@ -463,6 +470,27 @@ constexpr const char* kHistoryCols =
     "     ELSE left(h.justification, $3::integer) END, "
     "(h.seq IS DISTINCT FROM a.decision_seq AND length(h.justification) > $3::integer), "
     "h.decided_at_ms, h.scope_group_id";
+
+/// The number of select-list columns in `cols`: commas outside any parentheses, plus one. The
+/// `left(h.justification, ...)` call above holds a comma of its own, inside its parentheses.
+constexpr int top_level_column_count(std::string_view cols) {
+    int depth = 0;
+    int n = 1;
+    for (const char c : cols) {
+        if (c == '(')
+            ++depth;
+        else if (c == ')')
+            --depth;
+        else if (c == ',' && depth == 0)
+            ++n;
+    }
+    return n;
+}
+// Derived from kHistoryCols, so the index cannot drift from the SELECT list; the assert pins that
+// the last column really is the scope.
+constexpr int kHistoryScopeCol = top_level_column_count(kHistoryCols) - 1;
+static_assert(kHistoryScopeCol == 11, "kHistoryCols lists the scope column last, at index 11");
+static_assert(std::string_view(kHistoryCols).ends_with("h.scope_group_id"));
 
 } // namespace
 

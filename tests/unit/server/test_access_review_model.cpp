@@ -921,6 +921,9 @@ TEST_CASE("scope_kind and the scope id bound are one definition for every surfac
     CHECK(scope_group_id_within_bounds(""));
     CHECK(scope_group_id_within_bounds(std::string(yuzu::server::kScopeGroupIdMaxLen, 'x')));
     CHECK_FALSE(scope_group_id_within_bounds(std::string(yuzu::server::kScopeGroupIdMaxLen + 1, 'x')));
+    // The exact boundary, as literals: the management-group id contract (kMgmtGroupIdMaxBytes).
+    CHECK(scope_group_id_within_bounds(std::string(256, 'x')));
+    CHECK_FALSE(scope_group_id_within_bounds(std::string(257, 'x')));
     CHECK_FALSE(scope_group_id_within_bounds(std::string_view("g\0x", 3)));
     // The combined helper for REST, MCP and the store backstop includes the scope.
     CHECK(attest_grant_fields_within_bounds("user", "alice", "Admin", ""));
