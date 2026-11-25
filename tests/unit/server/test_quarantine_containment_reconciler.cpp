@@ -2335,6 +2335,26 @@ TEST_CASE("reconciler (firewall): a new record on a device already contained und
         for (const auto& r : rig.audit("quarantine.reapply"))
             CHECK(r.detail.find("already_active") == std::string::npos);
     }
+    SECTION("a device that refuses the apply and carries the note: the same, and no status read") {
+        // The status script stays `status|active`, so a status read sent in error would confirm
+        // the record and fail this section.
+        RECON_RIG(rig);
+        const auto rec = rig.quarantine("10.0.0.2");
+        rig.reply("status|refused|self_host\nrefused|self_host\n"
+                  "note|allow_set_unchanged_use_quarantine_allow=1",
+                  "status|active");
+        rig.run(8);
+        CHECK(rig.count_sent("firewall.quarantine") >= 2); // the entry keeps applying on its backoff
+        CHECK(rig.count_sent("firewall.quarantine_status") == 0); // but never reads status after a declined apply
+        const auto row = rig.active();
+        REQUIRE(row.has_value());
+        CHECK(row->last_confirmed_at == 0);
+        CHECK(rig.rows_with("quarantine.reapply", "allow_set_not_applied") == 1); // one per entry
+        CHECK(rig.has_row("quarantine.reapply", "failure",
+                          "allow_set_not_applied record_id=" + std::to_string(rec.id) + " command_id=cmd-1"));
+        CHECK(rig.rows_with("quarantine.reapply", "CONFIRMED") == 0);
+        CHECK(rig.counter("confirmed") == 0);
+    }
     SECTION("the same exceptions: the apply reply carries no such note, and the record is confirmed") {
         RECON_RIG(rig);
         rig.quarantine("10.0.0.2");

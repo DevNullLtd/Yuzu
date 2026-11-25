@@ -1,0 +1,7 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-24 · euid 501 · leg-hash f46b598757de
+== action=inspect pid=2743 facet=sched
+status|inspect|constrained|macos:process_introspect:sched:nice_only
+target|2743|ef25df78.17348789716386304698|sched
+sched|-|10|-|-
+[result_status] CONSTRAINED / PARTIAL / macos:process_introspect:sched:nice_only
+

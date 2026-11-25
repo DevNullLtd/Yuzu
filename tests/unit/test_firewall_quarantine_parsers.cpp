@@ -18,7 +18,9 @@
 #include <yuzu/agent/trigger_engine.hpp>
 
 #include <algorithm>
+#include <initializer_list>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -676,6 +678,147 @@ TEST_CASE("allow set: remove never removes a mandatory allowance", "[agent][fire
 }
 
 // ── ports are service ports, per direction, on every leg ────────────────────
+
+// ── self-host refusal ───────────────────────────────────────────────────────
+
+namespace {
+
+// The control endpoints of an allow set built from one or more literals; the port is fixed.
+std::vector<Endpoint> control_of(std::initializer_list<std::string_view> ips) {
+    std::vector<Endpoint> out;
+    for (const auto ip : ips) {
+        const auto parsed = parse_ip(ip);
+        INFO("control literal: " << ip);
+        REQUIRE(parsed.has_value());
+        Endpoint e;
+        e.ip = *parsed;
+        e.port = 50051;
+        e.proto = Proto::tcp;
+        e.dir = Dir::out;
+        out.push_back(e);
+    }
+    return out;
+}
+
+using Own = std::optional<std::vector<std::string>>;
+
+const Own kOwn = std::vector<std::string>{"127.0.0.1", "::1", "192.0.2.10", "2001:db8::10",
+                                          "fe80::1", "169.254.7.7"};
+
+} // namespace
+
+TEST_CASE("self_host: a loopback control address is refused with no enumeration",
+          "[agent][firewall_quarantine]") {
+    for (const auto lit : {"127.0.0.1", "127.9.9.9", "::1", "::ffff:127.0.0.1"}) {
+        INFO("control literal: " << lit);
+        const auto why = self_host_refusal(control_of({lit}), std::nullopt);
+        REQUIRE(why.has_value());
+        CHECK(*why == "self_host");
+    }
+}
+
+TEST_CASE("self_host: an unspecified control address is refused", "[agent][firewall_quarantine]") {
+    for (const auto lit : {"0.0.0.0", "::", "::ffff:0.0.0.0"}) {
+        INFO("control literal: " << lit);
+        const auto why = self_host_refusal(control_of({lit}), kOwn);
+        REQUIRE(why.has_value());
+        CHECK(*why == "self_host");
+    }
+}
+
+TEST_CASE("self_host: a control address equal to an own address is refused, wherever it sits",
+          "[agent][firewall_quarantine]") {
+    // first, middle, and as the live peer that leads the set
+    for (const auto& control :
+         {control_of({"192.0.2.10", "198.51.100.7"}),
+          control_of({"198.51.100.7", "192.0.2.10", "198.51.100.8"}),
+          control_of({"198.51.100.7", "2001:db8::10"})}) {
+        const auto why = self_host_refusal(control, kOwn);
+        REQUIRE(why.has_value());
+        CHECK(*why == "self_host");
+    }
+    // the live peer leads a set built by the allow-set builder
+    const auto built = build_allow_set("198.51.100.7", "198.51.100.7:50051", {}, {}, "192.0.2.10:50051");
+    REQUIRE(built);
+    REQUIRE(built->control.front().ip == *parse_ip("192.0.2.10"));
+    const auto why = self_host_refusal(built->control, kOwn);
+    REQUIRE(why.has_value());
+    CHECK(*why == "self_host");
+}
+
+TEST_CASE("self_host: v4-mapped and plain v4 compare equal in both directions",
+          "[agent][firewall_quarantine]") {
+    // a mapped control address against a plain own address
+    const auto a = self_host_refusal(control_of({"::ffff:192.0.2.10"}), kOwn);
+    REQUIRE(a.has_value());
+    CHECK(*a == "self_host");
+    // a plain control address against a mapped own address
+    const Own mapped = std::vector<std::string>{"::ffff:192.0.2.10"};
+    const auto b = self_host_refusal(control_of({"192.0.2.10"}), mapped);
+    REQUIRE(b.has_value());
+    CHECK(*b == "self_host");
+    // and a mapped address that is not an own address stays admitted
+    CHECK_FALSE(self_host_refusal(control_of({"::ffff:198.51.100.7"}), kOwn).has_value());
+}
+
+TEST_CASE("self_host: a link-local own address matches", "[agent][firewall_quarantine]") {
+    for (const auto lit : {"169.254.7.7", "fe80::1"}) {
+        INFO("control literal: " << lit);
+        const auto why = self_host_refusal(control_of({lit}), kOwn);
+        REQUIRE(why.has_value());
+        CHECK(*why == "self_host");
+    }
+}
+
+TEST_CASE("self_host: the port, protocol and direction play no part", "[agent][firewall_quarantine]") {
+    auto control = control_of({"192.0.2.10"});
+    control[0].port = 1;
+    control[0].proto = Proto::udp;
+    control[0].dir = Dir::in;
+    const auto why = self_host_refusal(control, kOwn);
+    REQUIRE(why.has_value());
+    CHECK(*why == "self_host");
+}
+
+TEST_CASE("self_host: one own address among several control endpoints refuses",
+          "[agent][firewall_quarantine]") {
+    const auto why = self_host_refusal(
+        control_of({"198.51.100.7", "198.51.100.8", "2001:db8::10", "203.0.113.9"}), kOwn);
+    REQUIRE(why.has_value());
+    CHECK(*why == "self_host");
+}
+
+TEST_CASE("self_host: no match answers nullopt", "[agent][firewall_quarantine]") {
+    CHECK_FALSE(self_host_refusal(control_of({"198.51.100.7", "2001:db8::7"}), kOwn).has_value());
+    // an empty control set has nothing to match (the allow-set builder refuses it earlier)
+    CHECK_FALSE(self_host_refusal({}, kOwn).has_value());
+}
+
+TEST_CASE("own_addresses_unreadable: nullopt, empty and all-unparseable enumerations fail closed",
+          "[agent][firewall_quarantine]") {
+    const auto control = control_of({"198.51.100.7"});
+    for (const Own& own : {Own{std::nullopt}, Own{std::vector<std::string>{}},
+                           Own{std::vector<std::string>{"", "not-an-ip", "300.1.1.1", "fe80::1%en0"}}}) {
+        const auto why = self_host_refusal(control, own);
+        REQUIRE(why.has_value());
+        CHECK(*why == "own_addresses_unreadable");
+    }
+    // an unparseable entry beside a parseable one is skipped, not fatal
+    const Own mixed = std::vector<std::string>{"not-an-ip", "192.0.2.10"};
+    CHECK_FALSE(self_host_refusal(control, mixed).has_value());
+    const auto hit = self_host_refusal(control_of({"192.0.2.10"}), mixed);
+    REQUIRE(hit.has_value());
+    CHECK(*hit == "self_host");
+}
+
+TEST_CASE("self_host: precedence, a loopback control with an unreadable enumeration is self_host",
+          "[agent][firewall_quarantine]") {
+    for (const Own& own : {Own{std::nullopt}, Own{std::vector<std::string>{}}}) {
+        const auto why = self_host_refusal(control_of({"198.51.100.7", "127.0.0.1"}), own);
+        REQUIRE(why.has_value());
+        CHECK(*why == "self_host");
+    }
+}
 
 TEST_CASE("direction-aware ports: out is the remote port, in is the local port",
           "[agent][firewall_quarantine]") {
@@ -2117,13 +2260,16 @@ TEST_CASE("pfctl argv: the anchor sorts first, flush is scoped to our anchor, no
     CHECK(join(pfctl_flush_anchor_nat_argv()) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -F nat");
     CHECK(join(pfctl_info_argv()) == "/sbin/pfctl -s info");
     CHECK(join(pfctl_rules_argv()) == "/sbin/pfctl -s rules");
+    // the state and rules reads: the top-level anchor list, NOT the com.apple children below
+    CHECK(join(pfctl_anchors_argv()) == "/sbin/pfctl -s Anchors");
     CHECK(join(pfctl_anchor_rules_argv()) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -s rules");
     CHECK(join(pfctl_siblings_argv()) == "/sbin/pfctl -a com.apple -s Anchors");
     for (const auto& a : {pfctl_load_argv("/tmp/x.pf"), pf_helper_load_argv("/tmp/x.pf"),
                           pfctl_flush_states_argv(), pfctl_references_argv(),
                           pfctl_release_argv("123456"), pfctl_enable_argv(),
                           pfctl_flush_anchor_rules_argv(), pfctl_flush_anchor_nat_argv(), pfctl_info_argv(),
-                          pfctl_rules_argv(), pfctl_anchor_rules_argv(), pfctl_siblings_argv()})
+                          pfctl_rules_argv(), pfctl_anchors_argv(), pfctl_anchor_rules_argv(),
+                          pfctl_siblings_argv()})
         CHECK(all_tokens_safe(a));
 }
 
@@ -2294,9 +2440,12 @@ TEST_CASE("quarantine: apply, verify, record -- and release restores the host",
     CHECK(rel.status == "inactive");
     CHECK_FALSE(rig.world.table);
     CHECK(rig.store.raw.empty());
-    // release is idempotent
+    // release is idempotent, and with no record (a device that was never contained, as one that refused
+    // every apply with `self_host` is) it answers `inactive` and says it found no record: the answer the
+    // REST manual gives for ending such a record with a plain DELETE
     const auto rel2 = release(rig.env, ReleaseRequest{}, dl);
     CHECK(rel2.status == "inactive");
+    CHECK(contains(rel2.notes, "no_state_record=1"));
 }
 
 TEST_CASE("quarantine: no probe target means the block is reported unproven",
@@ -4940,6 +5089,72 @@ TEST_CASE("quarantine on an active record names the allow-set note only when the
             CHECK(contains(o.notes, "allow_set_unchanged_use_quarantine_allow=1"));
             CHECK(rig.store.state()->allow.exceptions.size() == 2); // the stored set was kept
         }
+    }
+}
+
+TEST_CASE("allow_set_unchanged_note: the shared condition and text, from the stored record alone",
+          "[agent][firewall_quarantine]") {
+    constexpr std::string_view note = "allow_set_unchanged_use_quarantine_allow=1";
+    const std::vector<Endpoint> in_force{ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out")};
+    const auto stored = [&](StateLoad::Kind kind, Phase phase) {
+        StateLoad l;
+        l.kind = kind;
+        l.state.phase = phase;
+        l.state.allow = make_set({"203.0.113.53"}, in_force);
+        return l;
+    };
+    const std::vector<std::vector<Endpoint>> differing{
+        {ex("10.0.0.5:22/tcp/in"), ex("10.9.9.9:22/tcp/in")}, // one different
+        {ex("10.0.0.5:22/tcp/in")},                           // fewer
+        {ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out"), ex("10.9.9.9:22/tcp/in")}, // more
+        {},                                                                               // none
+    };
+
+    SECTION("an ok and active record: the note exactly when the exceptions differ as a set") {
+        const auto active = stored(StateLoad::Kind::ok, Phase::active);
+        CHECK_FALSE(allow_set_unchanged_note(active, in_force).has_value());
+        const std::vector<Endpoint> reordered{in_force[1], in_force[0]};
+        CHECK_FALSE(allow_set_unchanged_note(active, reordered).has_value());
+        for (const auto& requested : differing) {
+            INFO("exceptions requested: " << requested.size());
+            const auto n = allow_set_unchanged_note(active, requested);
+            REQUIRE(n.has_value());
+            CHECK(*n == note);
+        }
+        // and the other way: a record holding none, a request naming some
+        auto none_held = active;
+        none_held.state.allow = make_set({"203.0.113.53"}, {});
+        const auto n = allow_set_unchanged_note(none_held, in_force);
+        REQUIRE(n.has_value());
+        CHECK(*n == note);
+        CHECK_FALSE(allow_set_unchanged_note(none_held, {}).has_value());
+    }
+    SECTION("an applying or releasing record has no stored set to keep: no note") {
+        for (const auto phase : {Phase::applying, Phase::releasing}) {
+            INFO(to_string(phase));
+            for (const auto& requested : differing)
+                CHECK_FALSE(
+                    allow_set_unchanged_note(stored(StateLoad::Kind::ok, phase), requested)
+                        .has_value());
+        }
+    }
+    SECTION("an unreadable or absent record is never read as active, whatever its state holds") {
+        // The default phase is `applying`, so the state is set to active by hand: only the
+        // kind check keeps these two from answering the note.
+        for (const auto kind : {StateLoad::Kind::unreadable, StateLoad::Kind::absent}) {
+            for (const auto& requested : differing)
+                CHECK_FALSE(allow_set_unchanged_note(stored(kind, Phase::active), requested)
+                                .has_value());
+        }
+    }
+    SECTION("on the wire a self_host refusal carries the note as its last row") {
+        auto o = refused("self_host");
+        const auto n = allow_set_unchanged_note(stored(StateLoad::Kind::ok, Phase::active), {});
+        REQUIRE(n.has_value());
+        o.notes.emplace_back(*n);
+        const std::vector<std::string> expected{"status|refused|self_host", "refused|self_host",
+                                                "note|allow_set_unchanged_use_quarantine_allow=1"};
+        CHECK(render_rows(o) == expected);
     }
 }
 

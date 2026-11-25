@@ -3238,12 +3238,49 @@ groups:
             record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
             record_id=... command_id=..." once per transition to confirmed,
             or "drift status=..." when a re-verify no longer confirms).
+            This alert also fires when the device refuses the apply.
+            status|refused|self_host: the device's control endpoint is one of
+            its own addresses, so every apply that is not a repair is refused,
+            an apply to an already-contained device included, and the refusal
+            changes nothing: no rules are built, no record is stored and an
+            existing record and its containment are left as they were. The
+            token alone does not say whether the device is contained; read
+            firewall.quarantine_status. A device that held no containment stays
+            uncontained and never confirms; the way out is DELETE
+            /api/v1/quarantine/{agent_id} (a device that was never contained
+            answers the release with inactive; add ?force=true if the record
+            stays releasing, as it does on the packaged Linux unit). A device
+            that was already contained stays contained: its repair and its boot
+            re-apply keep the stored containment, the server's re-apply is
+            refused there, and firewall.release or the console steps lift it. A
+            time limit set on the device (by a firewall.quarantine dispatch
+            outside the quarantine routes; a server apply carries none) still
+            ends that containment, and the server cannot then contain it again.
+            On a device whose own record (the one the plugin keeps on the
+            device) is active the refusal carries
+            note|allow_set_unchanged_use_quarantine_allow=1 when the request's
+            exceptions differ from those in force, and a never-confirmed record
+            then stays unconfirmed (allow_set_not_applied); with equal
+            exceptions there is no note and the status read confirms. Do not
+            release and quarantine again to change the whitelist on such a
+            device: the release lifts the containment and the new quarantine is
+            refused, so the device ends uncontained; use quarantine_allow. Each
+            refused apply is a failed command, so YuzuHighCommandFailureRate
+            can also fire on an otherwise idle server while the record stands.
+            status|refused|own_addresses_unreadable: the agent could not
+            read its own addresses, so fix the read rather than delete the
+            record (a unit or seccomp profile that denies AF_NETLINK makes it
+            permanent: allow AF_NETLINK for the agent; the agent log names the
+            errno). The token is in the apply's reply under the command_id of
+            the quarantine.reapply row, and in the agent log
+            (firewall: quarantine -> refused:<token>). The record still blocks
+            operator commands to the device while it exists.
             This alert also fires when the device's agent lacks the
             firewall plugin: the dispatch is accepted but never
             confirmed. An agent without the firewall plugin comes from an
             earlier build, which is unsupported: reprovision the host into a
             fresh deployment of this build. On a Linux host running the
-            packaged systemd unit every containment action is refused
+            packaged systemd unit every mutating containment action is refused
             (privilege_unavailable), so a record there stays unconfirmed.
             It also fires when a NEW record lands on a device that is already
             contained under other operator exceptions: the device keeps the
@@ -3254,7 +3291,13 @@ groups:
             yuzu_server_quarantine_reapply_total{result="unconfirmed"}. The
             remedy is to release the device (DELETE /api/v1/quarantine/{agent_id})
             and then quarantine it again, so the new whitelist is applied to a
-            device that holds no containment.
+            device that holds no containment. Not where the apply was refused
+            (the reply stored under the row's command_id reads
+            status|refused|self_host or status|refused|own_addresses_unreadable):
+            there the release lifts the containment and a new quarantine cannot
+            put it back, so change the device's exceptions with
+            firewall.quarantine_allow until they equal the record's whitelist
+            (the next apply then carries no note and the status read confirms).
 
       - alert: YuzuQuarantineReleasePending
         expr: |
