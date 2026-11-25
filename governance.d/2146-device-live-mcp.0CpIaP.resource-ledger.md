@@ -74,3 +74,28 @@ and both Gate 8 rounds" now read as five rounds (the mechanical trigger grep was
 
 Suggested sanitizer coverage: unchanged (no lifetime or threading surface was added). The Postgres-backed tests ran in the
 scoped suite with `YUZU_TEST_POSTGRES_DSN` set (4934 cases, 438572 assertions, exit 0, on the tip tree).
+
+## Fix rounds 6 and 7 (G-UP-1: decision facts), `c96396fa9e..8c234a0331`
+
+Commits `3856487c87` (the facts), `c8791b167a` (governance fixes) and `8c234a0331` (Gate 8 follow-up). cpp-safety at Gate 3 and
+Gate 8, cpp-expert at Gate 3 and Gate 8; the mechanical trigger grep for raw resource APIs, casts, process and library loading,
+detached threads and callbacks found nothing new in either round.
+
+No new fd, HANDLE, SOCKET, `FILE*`, `sqlite3*`/statement, OpenSSL/BCrypt object, allocated C string, mapped library, temp path,
+subprocess, callback context or thread. New automatic objects only:
+
+| Item | Ownership | Why safe |
+|---|---|---|
+| `BoundedFacts` (`bool`, `bool`, two `std::string`) and `std::optional<BoundedFacts>` on `BoundedResponses` and `LiveRowsRead` | plain value members, moved from the store result into the poll's read | no pointer or view is stored; the optional is moved once (`bounded->facts`) after the cap flags are read |
+| `std::string` SQL fragments `facts_cte`, `facts_cols`, `facts_join`, `chars`, and `const bool want_facts` in `query_bounded` | locals of the read lambda | fixed literals plus `std::to_string(constexpr int)`; never caller text; the libpq result stays owned by the existing `pg::PgResult`, and every `PQgetvalue` pointer (columns 14 to 17) is read in-statement and copied into a `std::string` before the result dies |
+| `const BoundedFacts*` passed to `reduce_rows`; `std::string_view head_text` | borrowed | the pointer targets the caller's `read->facts`, alive for the whole loop iteration; the view aliases `facts->head_output` or `joined`, is consumed by `detail_of` (which returns a `std::string` copy) before either is moved or destroyed |
+| Tests | Catch2 locals; the UTF-8 probe leases a pooled connection and holds its `PgResult` in the same scope | RAII (`PgPool` lease, `PgResult`); `seed()` now `REQUIRE`s `StoreOutcome::Stored` |
+
+Statements in the sections above that this change set made stale (kept for the record, not edited): the `ResponseStore` reads row
+of Table 2 omits that `query_bounded` can now also return decision facts when the live poll sets `with_decision_facts` (the scope
+clause, the `ResponseTierFilter::for_fixed_plugin_poll` tier clause and the four `unrestricted_internal_consumer()` sites are
+unchanged, and the facts reuse the one `where` string); and "five rounds" above now reads as seven (the trigger grep was repeated
+on every fix commit).
+
+Suggested sanitizer coverage: unchanged (no lifetime or threading surface was added). The Postgres-backed tests ran in the scoped
+suite with `YUZU_TEST_POSTGRES_DSN` set (5047 cases, 441935 assertions, exit 0, on the tip tree).
