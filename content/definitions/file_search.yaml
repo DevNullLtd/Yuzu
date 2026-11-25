@@ -13,8 +13,8 @@
 ##
 ## ON BY DEFAULT: the server seeds no kill switch for this plugin, so the action dispatches
 ## unless an operator turns it off with the server-side plugin-config kill switch
-## (`PUT /api/v1/plugin-config/file_search/kill-switch {"enabled":false}`). The server no
-## longer writes that row; a row already present is left as it is.
+## (`PUT /api/v1/plugin-config/file_search/kill-switch {"enabled":false}`). The server
+## never writes that row; it exists only when an operator sets it.
 ##
 ## ONE action, one slice of the search per call: the caller loops on the cursor row until a
 ## slice answers with none. Every slice ends with exactly one `search` row. Nine row kinds

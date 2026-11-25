@@ -750,8 +750,8 @@ TEST_CASE("ServerImpl's boot sequence seeds NO default-off kill switch for file_
         seeded[source.substr(quote + 1, name_end - quote - 1)] = source.substr(at, block_end - at);
     }
 
-    // file_search ships ON: a seed that is added back fails this case. An existing row that is OFF
-    // stays OFF (no migration), and nothing here turns one on.
+    // file_search ships ON: a seed that is added back fails this case. An OFF row exists only when
+    // an operator sets it, and nothing here turns one on.
     CHECK(seeded.find("file_search") == seeded.end());
 
     // The five plugins that still start off, each failing the boot closed on a seed error.
