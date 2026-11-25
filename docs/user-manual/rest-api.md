@@ -2275,8 +2275,53 @@ gate and the same `503` on a degraded read apply to them. **Any other value, an 
 > `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
 > boundary. A device that was already contained under other operator exceptions keeps them: for a
 > record that was never confirmed, `last_confirmed_at` stays `0` (audit `quarantine.reapply`,
-> `allow_set_not_applied`), and the whitelist is not on the device until it is released and quarantined
-> again.
+> `allow_set_not_applied`), and the whitelist is not on the device until it is released and
+> quarantined again. Not where the apply was refused (the reply stored under the audit row's
+> `command_id` reads `status|refused|self_host` or `status|refused|own_addresses_unreadable`, see "A
+> device that refuses" below): there the release lifts the containment and a new quarantine cannot
+> put it back, so change the device's exceptions with `firewall.quarantine_allow` until they equal
+> the record's whitelist (the next apply then carries no note and the status read confirms).
+>
+> **A device that refuses (`refused|self_host`, `refused|own_addresses_unreadable`).** Every
+> `firewall.quarantine` apply that is not `repair=1` is checked, whoever sent it: an operator's
+> dispatch, the reconciler's apply (a record created over REST is only ever applied by the
+> reconciler) or an MCP re-apply, an apply to an already-contained device included. A device whose
+> control endpoint is one of its own addresses, loopback included, or whose own addresses it cannot
+> read, answers the apply with that refusal. The refusal changes nothing: no leg is built, no record
+> is stored, and an existing record and its containment are left as they were; it is in the apply's
+> stored reply (the `status|refused|<token>` row, `GET /api/v1/responses/{command_id}`; the
+> `command_id` is in the device's `quarantine.reapply` audit row) and in the agent log. So the token
+> alone does not say whether the device is contained; `firewall.quarantine_status` does. A device
+> that held no containment stays uncontained, so a record that was never confirmed never confirms
+> (`last_confirmed_at` stays `0`) and `YuzuQuarantineEndpointUnconfirmed` fires after 15 minutes. A
+> device that was already contained stays contained: its repair and its boot re-apply keep the
+> stored containment, and the server's re-apply is refused there. A time limit set on the device (by
+> a `firewall.quarantine` dispatch outside the quarantine routes; a server apply carries none) still
+> ends that containment, and the server cannot then contain it again. On a device whose own record
+> (the one the plugin keeps on the device) is active, the refusal carries
+> `note|allow_set_unchanged_use_quarantine_allow=1` when the request's exceptions differ as a set
+> from those in force (the same rule and text as a retry that is not refused), and a never-confirmed
+> record then stays unconfirmed (`allow_set_not_applied`); with equal exceptions there is no note
+> and the status read confirms. Do not release and quarantine again to change the whitelist on such
+> a device: the release lifts the containment and the new quarantine is refused, so the device ends
+> uncontained; use `firewall.quarantine_allow`. `own_addresses_unreadable` is permanent where the
+> agent cannot read its interfaces (for example a unit or seccomp profile that denies `AF_NETLINK`):
+> allow `AF_NETLINK` for the agent, the agent log names the errno. The record still refuses operator
+> commands to the device. The server keeps re-dispatching, so nothing ends the record by itself: end
+> it with `DELETE /api/v1/quarantine/{agent_id}`. A device that was never contained holds no rules,
+> so it answers a release with `status|inactive` and a plain `DELETE` ends the record; where the
+> device refuses the release (the packaged Linux unit, `privilege_unavailable`) the record stays
+> `releasing`: poll, do not repeat the `DELETE`, and use `?force=true` only if it is still
+> `releasing` (see the `DELETE` section below). A single-host stack (agent and server on one
+> machine) ends this way whenever the agent reaches the server at one of the host's own addresses,
+> loopback included. A server in a container or VM on the same host reached at a bridge address is
+> not refused: that host is contained with `forward` at policy drop and no rules, so forwarded
+> traffic is dropped and the server's published ports vanish for the whole fleet; a server apply
+> carries no time limit and the 60-second repair puts back a table removed by hand. A host that runs
+> the server while its agent reaches a remote gateway or VIP passes the check the same way. The
+> exits are the `DELETE` while the API is reachable, otherwise console recovery (the steps are in
+> `docs/user-manual/security-hardening.md` "A device that is its own server refuses new
+> containment").
 >
 > **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
 > progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed,
@@ -2424,11 +2469,12 @@ Quarantine a device.
 >   call — a brand-new record isn't in the heartbeat fast path's cache until
 >   the next periodic tick populates it, so a heartbeat arriving in that
 >   narrow window doesn't shortcut the wait. A record created here for a
->   reachable device does not stay dormant — the one exception is a stored
->   `whitelist` the re-dispatch validator refuses. As of #3425 (`d1f71c58f`)
+>   reachable device does not stay dormant — the exceptions are a stored
+>   `whitelist` the re-dispatch validator refuses and a device that refuses the apply (see "A
+>   device that refuses" above). As of #3425 (`d1f71c58f`)
 >   this route validates `whitelist` at write time (`400` instead of `201`
 >   for a malformed value), the same rule MCP's `quarantine_device`
->   enforces — so a fresh write here cannot land in this state. A
+>   enforces — so a fresh write here cannot land in the first case. A
 >   `validation_failed` reconcile points at a record written under an
 >   earlier, looser rule, not a fresh call. Either way, every reconcile
 >   attempt then counts `validation_failed` and nothing is ever dispatched.

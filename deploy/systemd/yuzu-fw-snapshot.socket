@@ -1,0 +1,35 @@
+# yuzu-fw-snapshot.socket: the root-owned socket the Yuzu agent reads the host firewall through.
+#
+# The agent unit (NoNewPrivileges, one capability) can read neither the nftables ruleset nor
+# iptables, and sudo cannot elevate under it. systemd, as root, owns this socket and starts one
+# yuzu-fw-snapshot@.service per connection; that service runs one fixed read-only script
+# (yuzu-fw-snapshot.sh) and writes its listing to the connection. The contract is
+# docs/adr/3007-os-activated-read-helpers.md. Disable it by stopping the socket and then masking it:
+# `systemctl stop yuzu-fw-snapshot.socket`, then `systemctl mask yuzu-fw-snapshot.socket`. The agent
+# then reads no firewall state through it: on a firewalld host the plugin answers firewalld's own rows,
+# elsewhere `unknown`, in both cases after the error rows of the reads it was refused. Measured on
+# Rocky 9.9 (systemd 252): `systemctl mask --now` alone left the socket file, and the agent then
+# reported `error|snapshot:connect:refused`; stop first, then mask, or remove the stale file.
+# The broker units need systemd 239 or later; the agent's README names the versions they have
+# been measured on.
+[Unit]
+Description=Yuzu agent read-only firewall snapshot socket
+Documentation=https://github.com/DevNullLtd/Yuzu
+# Stops and restarts with the agent; the agent unit pulls it in (Wants=), so there is no [Install].
+PartOf=yuzu-agent.service
+
+[Socket]
+# The path the agent connects to (kFwSnapshotSocketPath in firewall_parsers.hpp).
+ListenStream=/run/yuzu-fw-snapshot.sock
+# Who may connect is this owner, group and mode: root owns it, the agent's group may use it, and
+# nobody else may. The agent also refuses a socket whose creator is not root (SO_PEERCRED).
+SocketUser=root
+SocketGroup=yuzu-agent
+SocketMode=0660
+# One service instance per connection, at most four at once. A connection over the limit is accepted
+# and closed at once (measured on Rocky 9.9, systemd 252): the agent reads no byte and reports `empty`.
+Accept=yes
+MaxConnections=4
+# Stopping the socket removes the file, so a broker that is stopped and then masked leaves none and the
+# agent declines silently instead of reporting connect:refused on a socket nothing listens on.
+RemoveOnStop=yes

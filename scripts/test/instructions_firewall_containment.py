@@ -24,18 +24,45 @@ DO NOT RUN THE CONTAINMENT STEP ON A REMOTE / SSH-ONLY HOST. It briefly blocks a
 the allow set (loopback plus the agent's control channel). It refuses to run when an SSH session
 is detected (SSH_CONNECTION / SSH_CLIENT / SSH_TTY) unless --i-have-console-access is given, and
 never runs without --apply-containment. The SSH check reads environment variables that `sudo` and a
-long-lived tmux/screen session can drop, so --i-have-console-access is the real control. The dashboard
-URL must be loopback (this host); that checks the URL, not the network path, so it is also a
-precondition that the server and its stores are reachable over loopback while this host is contained
-(a server whose Postgres is published from a Docker network is not: the containment would cut it off
-and the release could not be dispatched, exit 3). --ttl-seconds must be at least 300 (default 900;
-0 and negative values are refused in apply mode), so the limit outlasts the release confirmation and
-still ends a containment after a SIGKILL or a power loss. Run it on a local box with a keyboard and a
-screen. The login user needs read access to /api/agents (Infrastructure:Read), which is how a login is
-proven.
+long-lived tmux/screen session can drop, so --i-have-console-access is the real control. A plain http
+dashboard at a non-loopback address is refused in every mode (exit 2, nothing dispatched, no login) unless
+--allow-cleartext is given: the login would send the admin password and the session cookie unencrypted,
+so the flag is the operator's explicit acceptance of that on a network they trust; a loopback or https
+dashboard needs nothing, and with the flag the run still warns. The dashboard
+URL must be loopback (this host), or the run must be --remote (below); that checks the URL, not the
+network path, so it is also a precondition that the server and its stores are reachable over loopback
+while this host is contained (a server whose Postgres is published from a Docker network is not: the
+containment would cut it off and the release could not be dispatched, exit 3). --ttl-seconds must be
+at least 300 (default 900; 0 and negative values are refused in apply mode), so the limit outlasts the
+release confirmation and still ends a containment after a SIGKILL or a power loss. Run it on a local box
+with a keyboard and a screen. The login user needs read access to /api/agents (Infrastructure:Read),
+which is how a login is proven.
+
+ONE HOST CANNOT RUN THE CONTAINMENT. A containment whose control endpoint is the host itself is refused
+by the agent (`refused|self_host`, exit 2 here, nothing changed, nothing released), by design: the server
+it must keep reaching would be the host that is cut off. So an --apply-containment run with the agent and
+the server on one host (a loopback dashboard against this host's own agent) ends that way whenever the
+agent's control endpoint is one of the host's own addresses, loopback included; a containment round trip
+needs the server on ANOTHER host and --remote. The agent compares ADDRESSES only: a server in a container
+or VM on this host, reached at a bridge address, is not one of them (see the standing ruling below).
+Any other refusal the agent answers to the apply (`own_addresses_unreadable` among them) is not a
+precondition of this script: it ends exit 1 with the `NOT released` message, nothing released.
+
+--remote: this script runs on the server's host (or any other host), and the agent it contains is on a
+DIFFERENT machine that this script does not run on, so nothing here is cut off and the dashboard may be
+any address. With --apply-containment it needs all of: --agent-id, --agent-hostname (the agent's own
+hostname, typed by the operator: it must equal the hostname the agent reported to the server, be the one
+registered agent under that name, and not be one of THIS machine's names or localhost) and
+--i-have-console-access-to-the-agent (the operator is at the agent's console, so a release the network
+cannot deliver can still be done by hand). The SSH check does not apply (this machine is not contained),
+and the local install check is not run: `install-agent-user.sh --check` on the AGENT host is the
+operator's precondition. --agent-hostname and --i-have-console-access-to-the-agent without --remote are a
+usage error (exit 2). The release is dispatched through the server and depends on the agent's control
+endpoint staying reachable while it is contained; the time limit (--ttl-seconds) is the backstop.
 
 Exit codes: 0 passed; 1 a check failed; 2 precondition or usage error (nothing changed);
-3 release could not be confirmed: clear the firewall by hand (see agents/plugins/firewall/README.md).
+3 release could not be confirmed: clear the firewall by hand (see docs/user-manual/security-hardening.md,
+"A device that is its own server refuses new containment").
 
 --agent-id is required with --apply-containment (it never contains "the first agent listed") and must be
 registered exactly once under one of this machine's hostnames (full name, case-insensitive; a first-label
@@ -45,25 +72,54 @@ something: an `inactive` read after a refused release, or after the time limit o
 already released the host (`no_state_record`, `state_unreadable`), exits 1 ("release unproven"), not 0.
 A login that does not yield an authenticated session exits 2. The host binding trusts the hostname each agent
 reported about itself: it stops a mistyped or remote agent id, it is not an authentication (a remote clone with
-the same default name, while this host's own agent is not registered, would bind). The release is never skipped
+the same default name, while this host's own agent is not registered, would bind). Remote mode is
+therefore clone-tolerant: a clone that reports the typed hostname and the agent id satisfies the binding, so the
+operator's console access to the agent is the real control. The release is never skipped
 by a failing terminal: every message after the apply goes through a print that cannot raise.
 
 An --apply-containment run holds an exclusive lock on yuzu_firewall_containment_ceremony.lock in the temp
 directory from before its first dispatch until its release is confirmed: a second run started while it is
-held exits 2 with nothing dispatched, so two runs cannot release each other's containment.
+held exits 2 with nothing dispatched, so two runs cannot release each other's containment. The lock file is
+in the temp directory, which on macOS is per user (runs by different users, or under sudo, do not exclude
+each other), and on Linux a lock file another user created there makes this run refuse to start (`could not
+open the run lock`, exit 2: a different message from a held lock).
 
 The ceremony dispatches `quarantine`, `release` and `quarantine_status` only. `quarantine_allow` (the
 fourth containment action) is not exercised here: it has no ceremony coverage, only its unit tests.
 
+--record PATH writes one JSON object when the run ends, on every exit path of a run (UTC time, mode local or
+remote, agent id, hostname, the statuses read in order, contained and released, the exit code, the
+agent's refusal token if it refused): the retained pass or fail record of the run. The file is created
+for this run alone, mode 0600: a PATH that already exists (a file or a symlink) is refused (exit 2,
+nothing dispatched) and left as it was, so a second run never replaces the record of the first.
+
+A command that cannot be dispatched (the server refuses the POST, for example a user who is not an
+administrator) ends `dispatch refused: <reason>` (exit 1): nothing was applied, so there is nothing to
+release and RELEASE NOT CONFIRMED (exit 3) is not printed. That holds for the refused apply, not for a
+release the server refuses AFTER an apply went out: the host may be contained, so that release is
+retried and can still end exit 3. A status read whose row stays RUNNING with no
+change for NO_PROGRESS_POLLS polls in a row ends that read early (`no progress`) instead of consuming
+its whole budget; an apply or release is never cut short that way, because its row legitimately stays
+RUNNING while the plugin works.
+
+Standing ruling (the URL-versus-path precondition of #7860, item d): the agent refuses
+(`refused|self_host`) when its control endpoint is one of its host's own addresses, loopback included,
+and a --remote run is not on the contained host, so in both cases this script's own calls cannot be cut
+by its own apply. One case remains: a server in a container or VM on this host, reached at a bridge
+address, is not an own address, so a local run does contain the host and its loopback dashboard calls
+can then be cut (the hazard described above). There the precondition above is the operator's to meet,
+and the time limit (--ttl-seconds) is the backstop. No authenticated-read probe is added.
+
 The status is read from the exact `status|<token>` row of the agent's reply, taken only from a SUCCESS
 (status 1) row once no row is still RUNNING (status 0); FAILURE, TIMEOUT and REJECTED rows are no answer. The flow is covered
 against a recording fake (tests/test_firewall_containment_ceremony.py); the live apply/release round
-trip needs a UAT stack on a local host and has not been run live on any OS yet.
+trip needs a UAT stack whose server is on another host than the agent it contains (--remote).
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import http.client
 import ipaddress
 import json
@@ -110,6 +166,10 @@ DEFAULT_TTL_S = 900  # the floor plus the retried-release tail (about 646 s wors
 # CommandResponse.status (proto/yuzu/agent/v1/agent.proto): only SUCCESS is an answer; RUNNING is an
 # interim row to poll past; FAILURE, TIMEOUT and REJECTED carry no usable status.
 STATUS_RUNNING, STATUS_SUCCESS = 0, 1
+# A status read whose rows stay RUNNING with an unchanged body for this many successful polls in a row (0.5 s
+# apart, so 10 s) is stuck, not slow: a status read takes a second or two. The poll ends there, as `no
+# progress`, instead of spending the rest of its budget. An apply or release is never held to it.
+NO_PROGRESS_POLLS = 20
 
 
 def say(*args, **kw) -> None:
@@ -123,7 +183,7 @@ def say(*args, **kw) -> None:
 
 
 # What to run on the host when the ceremony cannot confirm a release (the names are the plugin's own).
-HAND_RELEASE = ("dispatch firewall.release from the dashboard (the plugin's own undo; a rule removed by hand "
+HAND_RELEASE = ("dispatch firewall.release from the dashboard (the plugin's own undo; a containment removed by hand "
                 "while its record is still active is re-applied within 60 s). Only when the agent cannot be "
                 "reached: stop the agent service first, then Linux: sudo nft delete table inet yuzu_quarantine "
                 "(without nft: delete the yuzu-fwq-* chains and the jumps to them, in iptables and ip6tables), "
@@ -136,6 +196,11 @@ def signal_note(got: list) -> str:
 
 class LoginError(RuntimeError):
     """The dashboard did not give this client an authenticated session."""
+
+
+class DispatchRefused(RuntimeError):
+    """The server refused to dispatch a command (it answered the POST with a client error, or with no
+    command id), so the command never reached the agent: nothing was applied."""
 
 
 class Client(instructions_runner.YuzuClient):
@@ -164,12 +229,16 @@ class Client(instructions_runner.YuzuClient):
         with self.post_opener.open(req, timeout=self.timeout) as r:
             return json.loads(r.read() or b"{}")
 
-    def poll_response(self, command_id: str, timeout_s: int = POLL_S) -> dict:
+    def poll_response(self, command_id: str, timeout_s: int = POLL_S, no_progress_polls: int = 0) -> dict:
         """The responses once every row has left RUNNING (a RUNNING row is interim, not the answer), or
         whatever was last read when the deadline passes. A failed read (`get_responses` answers with an
         `error`: a reset, a timeout, a non-JSON body, an expired session's 401/403) is one lost poll, and the
-        last such error is reported when the poll ends without an answer."""
+        last such error is reported when the poll ends without an answer. With `no_progress_polls` set, a
+        command whose rows stay RUNNING with the response body unchanged for that many consecutive successful
+        polls ends the poll early (`no progress`, reported); the deadline stays the outer limit, and a lost
+        poll neither counts toward the bound nor resets it."""
         deadline, last, lost = time.monotonic() + timeout_s, {}, ""
+        previous, unchanged = None, 0
         while time.monotonic() < deadline:
             got = self.get_responses(command_id)
             if got.get("error"):
@@ -179,36 +248,79 @@ class Client(instructions_runner.YuzuClient):
                 rows = [r for r in got.get("responses") or [] if isinstance(r, dict)]
                 if rows and not any(r.get("status") == STATUS_RUNNING for r in rows):
                     return last
+                body = json.dumps(got, sort_keys=True, default=str)
+                unchanged = unchanged + 1 if body == previous else 0
+                previous = body
+                if no_progress_polls and unchanged >= no_progress_polls:
+                    say(f"poll for {command_id}: no progress: the rows stayed RUNNING and unchanged for "
+                        f"{no_progress_polls} polls in a row", file=sys.stderr)
+                    return last
             time.sleep(0.5)
         if lost:
             say(f"poll for {command_id}: last error: {lost}", file=sys.stderr)
         return last
 
 
-def take_run_lock() -> int | None:
+def take_run_lock() -> tuple[int | None, str | None, str]:
     """An exclusive, non-blocking lock on LOCK_PATH, held (by the returned descriptor) until the run ends, so a
-    second containment run cannot release the first one's containment. None when another run holds it."""
+    second containment run cannot release the first one's containment. Returns (fd, reason, error): `fd` is the
+    held descriptor, or None with a `reason` of "held" (another run holds the lock), "open_failed" (the lock
+    file could not be opened) or "lock_failed" (the lock call itself failed, for example ENOLCK on a file
+    system without locks); `error` says why for the last two. They are different faults and are reported as
+    such: only a lock another run holds is "held".
+    LOCK_PATH is in the temp directory, which on macOS is per user (runs by different users, or under sudo,
+    do not exclude each other); on Linux a lock file another user created there makes this run refuse to start."""
     try:
         fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError as e:
-        say(f"cannot open the run lock {LOCK_PATH}: {e}", file=sys.stderr)
-        return None
+        return None, "open_failed", str(e)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except BlockingIOError:
         os.close(fd)
-        return None
-    return fd
+        return None, "held", ""
+    except OSError as e:
+        os.close(fd)
+        return None, "lock_failed", str(e)
+    return fd, None, ""
 
 
 def refusal(args: argparse.Namespace, env=os.environ) -> str | None:
     """Why this run must not start, or None. Pure so the tests bind it without a network."""
     if platform.system() not in ("Linux", "Darwin"):
         return "POSIX hosts only (use scripts/install-agent-user.ps1 -Check on Windows)"
-    if args.apply_containment and not args.i_have_console_access:
+    remote = getattr(args, "remote", False)
+    if not remote and (getattr(args, "agent_hostname", "") or getattr(args, "i_have_console_access_to_agent", False)):
+        return "--agent-hostname and --i-have-console-access-to-the-agent are only for --remote runs (usage error)"
+    # In remote mode this machine is not contained, so an SSH session here is no risk.
+    if args.apply_containment and not remote and not args.i_have_console_access:
         ssh = [v for v in SSH_VARS if env.get(v)]
         if ssh:
             return f"an SSH session is detected ({', '.join(ssh)}): containment could lock you out"
+    record = getattr(args, "record", "")
+    if record and os.path.lexists(record):
+        return (f"--record {record!r} already exists: a record is never overwritten and never written through a "
+                "symlink (a second run keeps the first run's record: choose a new path)")
+    return None
+
+
+def remote_refusal(args: argparse.Namespace, nodes) -> str | None:
+    """Why a --remote --apply-containment run must not start, or None (pure). The agent is on another
+    machine, so the operator names it and says they can reach its console: a release the network cannot
+    deliver (the agent's control endpoint is blocked while it is contained) can still be done by hand."""
+    if not args.agent_id:
+        return ("--agent-id is required with --apply-containment (the ceremony contains exactly the "
+                "host you name, never the first agent the dashboard lists)")
+    name = (getattr(args, "agent_hostname", "") or "").strip().lower().rstrip(".")
+    if not name or name in ("localhost", "localhost.localdomain"):
+        return ("--remote --apply-containment needs --agent-hostname, the agent's own hostname (not empty and "
+                "not localhost): the ceremony only contains the machine you name")
+    if not getattr(args, "i_have_console_access_to_agent", False):
+        return ("--remote --apply-containment needs --i-have-console-access-to-the-agent: the release goes "
+                "through the network the containment blocks, and the time limit is only the backstop")
+    if _host_names(name) & {n for node in nodes for n in _host_names(node)}:
+        return (f"--agent-hostname {name!r} is one of this machine's own names: that is the one-host case, "
+                "which the agent refuses (refused|self_host). Run without --remote, or name the other machine")
     return None
 
 
@@ -219,12 +331,26 @@ def install_check() -> tuple[int, str]:
 
 
 def dispatch(client: Client, agent_id: str, action: str, params: dict) -> dict:
-    sent = client.post_json("/api/command", {"plugin": "firewall", "action": action, "agent_ids": [agent_id],
-                                             "params": {k: str(v) for k, v in params.items()}})
-    cid = sent.get("command_id", "")
-    # an apply or release can take the plugin up to a minute plus its verify: wait for the answer
-    wait = POLL_APPLY_S if action in ("quarantine", "release") else POLL_S
-    return client.poll_response(cid, timeout_s=wait) if cid else {}
+    """Send one command and poll for the answer. Raises DispatchRefused when the server refuses it (a 4xx on
+    the POST, such as a user who is not an administrator) or answers without a command id: the command never
+    reached the agent. Any other failure of the POST (a reset, a timeout, a 5xx) is NOT a refusal: the server
+    may already have sent it, so it propagates as the error it is."""
+    try:
+        sent = client.post_json("/api/command", {"plugin": "firewall", "action": action, "agent_ids": [agent_id],
+                                                 "params": {k: str(v) for k, v in params.items()}})
+    except urllib.error.HTTPError as e:
+        if 400 <= e.code < 500:
+            raise DispatchRefused(f"HTTP {e.code} {e.reason}") from e
+        raise
+    cid = sent.get("command_id", "") if isinstance(sent, dict) else ""
+    if not cid:
+        raise DispatchRefused(f"the server answered without a command id ({str(sent)[:120]})")
+    # an apply or release can take the plugin up to a minute plus its verify: wait for the answer, with no
+    # no-progress bound (its row stays RUNNING while the plugin works). A status read is quick: a row that
+    # sits RUNNING and unchanged is stuck.
+    long_wait = action in ("quarantine", "release")
+    return client.poll_response(cid, timeout_s=POLL_APPLY_S if long_wait else POLL_S,
+                                no_progress_polls=0 if long_wait else NO_PROGRESS_POLLS)
 
 
 _STATUS_ROW = re.compile(r"status\|([a-z_]+)(?:\|.*)?")
@@ -249,23 +375,49 @@ def answer_lines(answer, agent_id: str) -> list[str]:
     return lines
 
 
-def status_token(client: Client, agent_id: str) -> str:
+def status_token(client: Client, agent_id: str, seen: list | None = None) -> str:
     """The `status|<token>` row of this agent's `quarantine_status` output, exactly: `active`, `inactive`,
     `active_unproven`, `partial`, `degraded`. Only a whole output LINE of a SUCCESS (status 1) response row
     that names this agent counts: a RUNNING, FAILURE, TIMEOUT or REJECTED row, a row with no integer status,
     a substring of an error string and another agent's row never do, and the rows must agree. Empty when
-    no agent answered -- never a guess ("inactive" contains "active")."""
+    no agent answered -- never a guess ("inactive" contains "active"). `seen`, when given, collects every
+    token read (the run record's `statuses`)."""
     tokens = set()
     for line in answer_lines(dispatch(client, agent_id, "quarantine_status", {}), agent_id):
         m = _STATUS_ROW.fullmatch(line)
         if m:
             tokens.add(m.group(1))
-    return tokens.pop() if len(tokens) == 1 else ""
+    token = tokens.pop() if len(tokens) == 1 else ""
+    if seen is not None:
+        seen.append(token)
+    return token
 
 
 # The only terminal states a FIRST clean apply of this run can answer: it took hold (`active`,
 # `active_unproven`, `partial`) or it undid itself (`rolled_back`).
 _OWN_APPLY_STATUSES = frozenset({"active", "active_unproven", "partial", "rolled_back"})
+
+
+def agent_rows(answer, agent_id: str) -> list[str]:
+    """Every output line (stripped, lower-cased) of this agent's response rows, whatever their status: a
+    non-zero rc keeps its rows in `output` or in `error_detail`."""
+    lines: list[str] = []
+    for r in (answer.get("responses") if isinstance(answer, dict) else None) or []:
+        if isinstance(r, dict) and r.get("agent_id") == agent_id:
+            for field in ("output", "error_detail"):
+                if isinstance(r.get(field), str):
+                    lines.extend(line.strip().lower() for line in r[field].splitlines())
+    return lines
+
+
+def refusal_token(answer, agent_id: str):
+    """The text after `status|refused|` of the first such row this agent answered (`self_host`,
+    `own_addresses_unreadable`, `privilege_unavailable`, ...), else None: what --record keeps as the refusal."""
+    prefix = "status|refused|"
+    for line in agent_rows(answer, agent_id):
+        if line.startswith(prefix):
+            return line[len(prefix):] or None
+    return None
 
 
 def apply_was_not_ours(answer, agent_id: str) -> bool:
@@ -275,12 +427,7 @@ def apply_was_not_ours(answer, agent_id: str) -> bool:
     `refused`, `update_failed`: another actor's apply or record got there first). A lost or unreadable answer
     (no status line at all) and an apply that threw (`degraded|exception`) are NOT a verdict: the apply may
     still be landing or may have landed before the throw, so the release runs."""
-    lines: list[str] = []
-    for r in (answer.get("responses") if isinstance(answer, dict) else None) or []:
-        if isinstance(r, dict) and r.get("agent_id") == agent_id:
-            for field in ("output", "error_detail"):  # a non-zero rc keeps its rows in either field
-                if isinstance(r.get(field), str):
-                    lines.extend(line.strip().lower() for line in r[field].splitlines())
+    lines = agent_rows(answer, agent_id)
     if any(line in _NOT_OURS_NOTES for line in lines):
         return True
     if "status|degraded|exception" in lines:
@@ -311,7 +458,7 @@ def _signals(handler, sigs):
             signal.signal(sig, prev)
 
 
-def release_and_confirm(client: Client, agent_id: str) -> tuple[bool, bool]:
+def release_and_confirm(client: Client, agent_id: str, seen: list | None = None) -> tuple[bool, bool]:
     """Dispatch `firewall.release` (again, up to RELEASE_ATTEMPTS times, while the host is not inactive) and
     require an explicit `inactive` answer, re-reading the status a few times (a slow apply can still be
     finishing). Returns (confirmed, proven): `confirmed` is the host reading `inactive`; `proven` is that a
@@ -328,7 +475,7 @@ def release_and_confirm(client: Client, agent_id: str) -> tuple[bool, bool]:
         for _ in range(RELEASE_READS):
             time.sleep(2)
             try:
-                if status_token(client, agent_id) == "inactive":
+                if status_token(client, agent_id, seen) == "inactive":
                     if proven or attempt == RELEASE_ATTEMPTS - 1:
                         return True, proven
                     # `inactive` with no release of this run proven: the release was refused (`busy` while an
@@ -366,6 +513,26 @@ def agent_is_this_host(agents, agent_id: str, nodes, os_name: str = "") -> bool:
     return not any(a is not hits[0] and _host_names(str(a.get("hostname") or "")) & mine for a in entries)
 
 
+def agent_is_named_remote(agents, agent_id: str, agent_hostname: str, nodes) -> bool:
+    """True iff exactly one registry entry carries `agent_id`, the hostname it reported equals
+    `agent_hostname` (the operator's typed name) under `_host_names`, that name is NOT one of this machine's
+    (`nodes`: the ceremony runs elsewhere), and no other registered agent carries it (two agents under one
+    name cannot be told apart). An empty or `localhost` name never binds. The agent's OS is not checked: the
+    agent is on another machine and may be any OS."""
+    entries = [a for a in agents or [] if isinstance(a, dict)]
+    hits = [a for a in entries if (a.get("agent_id") or a.get("id")) == agent_id]
+    if len(hits) != 1:
+        return False
+    want = _host_names(agent_hostname)
+    host = str(hits[0].get("hostname") or "").strip().lower().rstrip(".")
+    if not want or host in ("", "localhost", "localhost.localdomain") or not _host_names(host) & want:
+        return False
+    mine = {n for node in nodes for n in _host_names(node)}
+    if want & mine or _host_names(host) & mine:
+        return False
+    return not any(a is not hits[0] and _host_names(str(a.get("hostname") or "")) & want for a in entries)
+
+
 def this_host_names() -> list[str]:
     return [platform.node(), socket.gethostname()]
 
@@ -386,30 +553,150 @@ def dashboard_is_local(dashboard: str) -> bool:
         return False
 
 
+def cleartext_refusal(args: argparse.Namespace) -> str | None:
+    """Why the login must not be sent, or None: a plain http dashboard at a non-loopback address without
+    --allow-cleartext (pure). The host only is named, never a URL that could carry credentials."""
+    base = args.dashboard.rstrip("/")
+    if cleartext_login(base) and not getattr(args, "allow_cleartext", False):
+        return CLEARTEXT_REFUSAL.format(host=urllib.parse.urlparse(base).hostname)
+    return None
+
+
+def cleartext_login(dashboard: str) -> bool:
+    """Is the dashboard plain http at an address that is not loopback? The login then sends the admin
+    password and the session cookie across the network unencrypted (pure)."""
+    return urllib.parse.urlparse(dashboard).scheme.lower() == "http" and not dashboard_is_local(dashboard)
+
+
+CLEARTEXT_REFUSAL = ("the dashboard at {host} is plain http at a non-loopback address: the login would send "
+                     "the admin password and the session cookie across the network unencrypted. Use an https "
+                     "dashboard or run this on the server's host (a loopback dashboard); --allow-cleartext "
+                     "accepts the risk on a network you trust")
+
+CLEARTEXT_WARNING = ("warning: the dashboard at {host} is plain http at a non-loopback address: the admin "
+                     "password and the session cookie cross the network unencrypted. Run this on the server's host "
+                     "(a loopback dashboard) or use an https dashboard")
+
+LOOPBACK_REFUSAL = ("refused: the dashboard must be loopback (http://127.0.0.1:<port>) so the release can reach it "
+                    "while this host is contained, or pass --remote (the server on another host, with "
+                    "--agent-hostname and --i-have-console-access-to-the-agent). A run where the agent and the "
+                    "server are on one host ends refused|self_host (exit 2) by design: the agent will not contain "
+                    "the host its own control endpoint is on, so a containment round trip needs --remote. The "
+                    "check compares the host's own addresses only: a server in a container or VM on this host, "
+                    "reached at a bridge address, is not one of them, so the agent does contain that host")
+
+SELF_HOST_TEXT = ("the agent's control endpoint is the agent host itself, so it refused to contain it "
+                  "(status|refused|self_host): nothing was changed and no release was dispatched. The check compares "
+                  "the host's own addresses only. The ceremony needs the server on another host: run it with "
+                  "--remote (and --agent-hostname, --i-have-console-access-to-the-agent) against that server")
+
+REMOTE_NOTE = ("remote mode: the agent host is not this machine. The release goes through the server and depends "
+               "on the agent's control endpoint staying reachable while it is contained; the time limit "
+               "(--ttl-seconds) is the backstop. The install check on the agent host "
+               "(scripts/install-agent-user.sh --check) is your precondition, and it was not run here")
+
+
 def parse_args(argv):
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
+                                epilog="One host cannot run the containment: an --apply-containment run whose agent "
+                                       "control endpoint is one of the host's own addresses (the agent and the "
+                                       "server on the same host) ends refused|self_host (exit 2) by design, and a "
+                                       "containment round trip needs --remote. A server in a container or VM on "
+                                       "this host, reached at a bridge address, is not refused. The run lock file is "
+                                       "in the temp directory, which on macOS is per user (runs by different users, "
+                                       "or under sudo, do not exclude each other), and on Linux a lock file another "
+                                       "user created there makes the run refuse to start. See the module docstring.")
     p.add_argument("--dashboard", required=True)
     p.add_argument("--user", default="admin")
     p.add_argument("--password", default=os.environ.get("YUZU_PASSWORD", ""),
                    help="dashboard password (default: $YUZU_PASSWORD; an argv value is visible in the process list)")
     p.add_argument("--agent-id", default="",
                    help="the agent to probe or contain; required with --apply-containment, where it must be "
-                        "registered exactly once under this machine's hostname")
+                        "registered exactly once under this machine's hostname (or, with --remote, under "
+                        "--agent-hostname)")
     p.add_argument("--exceptions", default="127.0.0.1", help="allow-set entries for the containment step")
     p.add_argument("--probe-target", default="", help="ip:port the plugin probes before/after the apply; without it the status reads active_unproven")
     p.add_argument("--ttl-seconds", type=int, default=DEFAULT_TTL_S,
                    help=f"dead-man time limit on the containment, at least {MIN_TTL_S} (apply mode refuses 0 and anything shorter)")
     p.add_argument("--apply-containment", action="store_true", help="really contain and release (guarded)")
     p.add_argument("--i-have-console-access", action="store_true", help="allow --apply-containment from an SSH session")
+    p.add_argument("--remote", action="store_true",
+                   help="this script runs on the server's host (or another one), NOT on the agent: the dashboard may "
+                        "be any address and the SSH check does not apply. With --apply-containment it needs "
+                        "--agent-id, --agent-hostname and --i-have-console-access-to-the-agent. A plain http "
+                        "dashboard at a non-loopback address is refused unless --allow-cleartext is given "
+                        "(see below)")
+    p.add_argument("--allow-cleartext", action="store_true",
+                   help="log in to a plain http dashboard at a non-loopback address, sending the admin password and "
+                        "the session cookie across the network unencrypted (refused without this flag; a loopback "
+                        "or https dashboard needs nothing)")
+    p.add_argument("--agent-hostname", default="",
+                   help="--remote only: the agent's own hostname, typed by you; it must equal the hostname the "
+                        "agent reported to the server and not be one of this machine's names")
+    p.add_argument("--i-have-console-access-to-the-agent", dest="i_have_console_access_to_agent",
+                   action="store_true",
+                   help="--remote only: you are at the agent's console, so a release the network cannot "
+                        "deliver can be done by hand")
+    p.add_argument("--record", default="",
+                   help="write one JSON record of the run to PATH when it ends, on every exit path of a run (mode 0600; "
+                        "a PATH that already exists, a symlink included, is refused: a record is never overwritten)")
     return p.parse_args(argv)
+
+
+def new_record(args: argparse.Namespace) -> dict:
+    """The run record `--record` retains: filled in as the run goes, written when it ends."""
+    return {"time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "mode": "remote" if getattr(args, "remote", False) else "local",
+            "agent_id": getattr(args, "agent_id", ""), "hostname": getattr(args, "agent_hostname", ""),
+            "statuses": [], "contained": False, "released": False, "exit_code": EXIT_FAIL, "refusal": None}
+
+
+def write_record(path: str, rec: dict) -> None:
+    """Write the run record to a file this call creates (O_EXCL: an existing path, a symlink included, is
+    never opened, truncated or written through), mode 0600 (a new file has at most the creation mode). A
+    failure to write it is reported and never changes the run's exit code; a write that fails after this
+    call created the file removes it, and an open that fails never removes anything."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as e:   # EEXIST: the file is another run's record, never ours to remove
+        say(f"could not write the run record {path}: {e}", file=sys.stderr)
+        return
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(rec, f, indent=2, sort_keys=True)
+            f.write("\n")
+    except OSError as e:   # a partial file this call created would block the corrected retry
+        # Best-effort cleanup that unlinks by name, so someone who controls the record's directory could
+        # rename a file onto the path and have it removed. That actor can already replace the record, and
+        # this only runs after this call's own failed write.
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        say(f"could not write the run record {path}: {e}", file=sys.stderr)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    rec = new_record(args)
+    rc = EXIT_FAIL
+    try:
+        rc = checked_run(args, rec)
+        return rc
+    finally:
+        rec["exit_code"] = rc
+        if getattr(args, "record", ""):
+            write_record(args.record, rec)
+
+
+def checked_run(args: argparse.Namespace, rec: dict) -> int:
     why = refusal(args)
     if why:
         say(f"refused: {why}", file=sys.stderr)
         return EXIT_PRECONDITION
+    why = cleartext_refusal(args)
+    if why:
+        say(f"refused: {why}", file=sys.stderr)
+        return EXIT_PRECONDITION
+    remote = getattr(args, "remote", False)
     if args.apply_containment and args.ttl_seconds < MIN_TTL_S:
         say(f"refused: --ttl-seconds must be at least {MIN_TTL_S}: a shorter limit could end the containment "
               "before the first release confirmation finishes (a release that has to be retried can still outlast "
@@ -420,33 +707,62 @@ def main(argv=None) -> int:
         say("refused: --agent-id is required with --apply-containment (the ceremony contains exactly the "
               "host you name, never the first agent the dashboard lists)", file=sys.stderr)
         return EXIT_PRECONDITION
-    if args.apply_containment and not dashboard_is_local(args.dashboard):
-        say("refused: the dashboard must be loopback (http://127.0.0.1:<port>) so the release can reach it "
-              "while this host is contained", file=sys.stderr)
+    if args.apply_containment and remote:
+        why = remote_refusal(args, this_host_names())
+        if why:
+            say(f"refused: {why}", file=sys.stderr)
+            return EXIT_PRECONDITION
+    elif args.apply_containment and not dashboard_is_local(args.dashboard):
+        say(LOOPBACK_REFUSAL, file=sys.stderr)
         return EXIT_PRECONDITION
-    lock = take_run_lock() if args.apply_containment else None
-    if args.apply_containment and lock is None:
-        say(f"refused: another containment run holds {LOCK_PATH}; nothing was dispatched", file=sys.stderr)
-        return EXIT_PRECONDITION
+    lock = None
+    if args.apply_containment:
+        lock, reason, error = take_run_lock()
+        if lock is None and reason in ("open_failed", "lock_failed"):
+            what = "open" if reason == "open_failed" else "take"
+            say(f"refused: could not {what} the run lock {LOCK_PATH}: {error}; nothing was dispatched",
+                file=sys.stderr)
+            return EXIT_PRECONDITION
+        if lock is None:
+            say(f"refused: another containment run holds {LOCK_PATH}; nothing was dispatched", file=sys.stderr)
+            return EXIT_PRECONDITION
     try:
-        return run(args)
+        return run(args, rec)
     finally:
         if lock is not None:
             os.close(lock)
 
 
-def run(args: argparse.Namespace) -> int:
-    rc, last = install_check()
-    if rc != 0:
-        say(f"precondition failed: install-agent-user.sh --check exited {rc}: {last}", file=sys.stderr)
-        return EXIT_PRECONDITION
+def run(args: argparse.Namespace, rec: dict | None = None) -> int:
+    rec = rec if rec is not None else new_record(args)
+    remote = getattr(args, "remote", False)
+    if remote:
+        # The agent is on another machine: its install check is the operator's precondition there, not ours.
+        say(REMOTE_NOTE if args.apply_containment else
+            "remote mode: the install check on the agent host (scripts/install-agent-user.sh --check) is your "
+            "precondition, and it was not run here")
+    else:
+        rc, last = install_check()
+        if rc != 0:
+            say(f"precondition failed: install-agent-user.sh --check exited {rc}: {last}", file=sys.stderr)
+            return EXIT_PRECONDITION
     base = args.dashboard.rstrip("/")
+    if cleartext_login(base):  # every mode logs in the same way, a probe-only run included
+        say(CLEARTEXT_WARNING.format(host=urllib.parse.urlparse(base).hostname), file=sys.stderr)
     client = Client(base)
     try:
         agents = client.login(args.user, args.password)
         agent_id = args.agent_id
         agents = agents.get("agents", agents) if isinstance(agents, dict) else agents
-        if args.apply_containment and not agent_is_this_host(agents, agent_id, this_host_names(), this_host_os()):
+        if args.apply_containment and remote:
+            if not agent_is_named_remote(agents, agent_id, args.agent_hostname, this_host_names()):
+                reg = [a.get("hostname") for a in agents or [] if isinstance(a, dict) and a.get("agent_id") == agent_id]
+                say(f"refused: agent {agent_id!r} is not the only agent registered under the name you typed "
+                      f"({args.agent_hostname!r}; registry says {reg or 'no such agent'}), or that name is one of this "
+                      f"machine's ({this_host_names()}); the ceremony only contains the machine you named",
+                      file=sys.stderr)
+                return EXIT_PRECONDITION
+        elif args.apply_containment and not agent_is_this_host(agents, agent_id, this_host_names(), this_host_os()):
             reg = [a.get("hostname") for a in agents or [] if isinstance(a, dict) and a.get("agent_id") == agent_id]
             say(f"refused: agent {agent_id!r} is not the only agent registered under this host's name and "
                   f"OS (registry says {reg or 'no such agent'}, this host is {this_host_names()} / "
@@ -458,7 +774,11 @@ def run(args: argparse.Namespace) -> int:
                       "(the probe picks one only when exactly one is registered)", file=sys.stderr)
                 return EXIT_PRECONDITION
             agent_id = agents[0].get("agent_id") or agents[0].get("id", "")
-        before = status_token(client, agent_id)
+        rec["agent_id"] = agent_id
+        reported = [a.get("hostname") for a in agents or [] if isinstance(a, dict)
+                    and (a.get("agent_id") or a.get("id")) == agent_id]
+        rec["hostname"] = (reported[0] if reported and reported[0] else rec["hostname"]) or ""
+        before = status_token(client, agent_id, rec["statuses"])
         if not before:
             say("precondition failed: firewall.quarantine_status got no agent answer (plugin or grant missing?)", file=sys.stderr)
             return EXIT_PRECONDITION
@@ -478,21 +798,36 @@ def run(args: argparse.Namespace) -> int:
         ok = False
         err = None
         not_ours = False
+        refused = None
         with _signals(lambda signum, _frame: got.append(signum), (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)):
             try:
                 params = {"exceptions": args.exceptions, "ttl_seconds": args.ttl_seconds}
                 if args.probe_target:
                     params["probe_target"] = args.probe_target
-                not_ours = apply_was_not_ours(dispatch(client, agent_id, "quarantine", params), agent_id)
-                if not not_ours:
-                    time.sleep(2)
-                    token = status_token(client, agent_id)
-                    ok = token == "active" or (token == "active_unproven" and not args.probe_target)
-                    if token == "active_unproven" and ok:
-                        say("note: contained but unproven (no --probe-target); pass one to require a verified containment")
-                    say(f"contained: {ok}")
+                try:
+                    answer = dispatch(client, agent_id, "quarantine", params)
+                except DispatchRefused as e:
+                    refused = e  # the server never sent it: nothing was applied
+                if refused is None:
+                    rec["refusal"] = refusal_token(answer, agent_id)
+                    if rec["refusal"] == "self_host":
+                        say(SELF_HOST_TEXT + signal_note(got), file=sys.stderr)
+                        return EXIT_PRECONDITION
+                    not_ours = apply_was_not_ours(answer, agent_id)
+                    if not not_ours:
+                        time.sleep(2)
+                        token = status_token(client, agent_id, rec["statuses"])
+                        ok = token == "active" or (token == "active_unproven" and not args.probe_target)
+                        if token == "active_unproven" and ok:
+                            say("note: contained but unproven (no --probe-target); pass one to require a verified containment")
+                        say(f"contained: {ok}")
+                        rec["contained"] = ok
             except BaseException as e:  # noqa: BLE001 - the release below must run for ANY failure
                 err = e
+            if refused is not None:
+                say(f"dispatch refused: {refused}: the apply was never sent, so nothing was applied and there is "
+                      f"nothing to release{signal_note(got)}", file=sys.stderr)
+                return EXIT_FAIL
             if err is not None:
                 say(f"containment step failed: {err!r}", file=sys.stderr)
             if not_ours:
@@ -505,8 +840,9 @@ def run(args: argparse.Namespace) -> int:
                       f"({HAND_RELEASE}){signal_note(got)}.", file=sys.stderr)
                 return EXIT_FAIL
             # ALWAYS release, then re-raise whatever stopped the containment step.
-            released, proven = release_and_confirm(client, agent_id)
+            released, proven = release_and_confirm(client, agent_id, rec["statuses"])
         say(f"released: {released}")
+        rec["released"] = released
         if not released:
             say("RELEASE NOT CONFIRMED: the host did not read inactive after "
                   f"{RELEASE_ATTEMPTS} release attempts; clear the firewall by hand ({HAND_RELEASE})"
@@ -528,6 +864,10 @@ def run(args: argparse.Namespace) -> int:
     except LoginError as e:
         say(f"precondition failed: {e}", file=sys.stderr)
         return EXIT_PRECONDITION
+    except DispatchRefused as e:
+        # A read before the apply (or a probe-only run): the server refused it, nothing was changed.
+        say(f"dispatch refused: {e}: nothing was applied", file=sys.stderr)
+        return EXIT_FAIL
     except KeyboardInterrupt:
         return EXIT_FAIL
     except Exception as e:  # noqa: BLE001 - a script exit code, not a library

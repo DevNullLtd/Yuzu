@@ -56,9 +56,13 @@
 /// and writes one `quarantine.reapply` failure row (`allow_set_not_applied record_id=<id>
 /// command_id=<id>`, no device text). The record stays unconfirmed and
 /// `YuzuQuarantineEndpointUnconfirmed` fires. This component does not make the device take the
-/// whitelist (a release, then a new quarantine, does). A record that was confirmed once keeps the
-/// behaviour above: later allow-list drift stays undetected (its detection is out of scope here),
-/// so a re-apply after a restart or a loss of containment is confirmed by the status read.
+/// whitelist (a release, then a new quarantine, does, except where the apply was refused: a
+/// device that answers `refused|self_host` or `refused|own_addresses_unreadable` loses its
+/// containment on the release and the new quarantine is refused, so there
+/// `firewall.quarantine_allow` changes its exceptions until they equal the record's whitelist).
+/// A record that was confirmed once keeps the behaviour above: later allow-list drift stays
+/// undetected (its detection is out of scope here), so a re-apply after a restart or a loss of
+/// containment is confirmed by the status read.
 ///
 /// RE-VERIFY AND DRIFT. A confirmed record is re-read every `kReverifyInterval`
 /// (5 minutes) while its device is connected; the record stays confirmed meanwhile
