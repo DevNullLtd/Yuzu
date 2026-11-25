@@ -2151,8 +2151,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        containment-release confirmation wait, which skips the wait and answers
        `202` when no slot is free. The metric `yuzu_server_live_requests_total`
        is relabelled `{surface, kind, outcome}` with a closed outcome word set
-       of 31 words, every series pre-seeded at boot; the HTTP status label is
-       removed, and the gauge is renamed `yuzu_server_live_in_flight`. The
+       of 32 words (31 at first, plus `bad_device_id`, added on 2026-11-25 for the
+       device-id floor that #7811 put in front of the route), every series
+       pre-seeded at boot; the HTTP status label is removed, and the gauge is renamed `yuzu_server_live_in_flight`. The
        upgrade note is in `docs/user-manual/upgrading.md`.
      - **Poll.** One shared reader scopes the stored rows to the device at the
        store, answers only after the device has finished (a stored row with a

@@ -22244,8 +22244,9 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_device_live") {
                 namespace live = yuzu::server::live;
                 // The ONE outcome of this call, counted at exit by the destructor below. It stays
-                // unset (and uncounted) for an argument-shape refusal: the closed outcome set has
-                // no token for one. It is armed as `kInternal` once the arguments are valid, so a
+                // unset (and uncounted) for an argument-shape refusal: this surface validates its
+                // arguments before it arms an outcome (the REST route counts only its device-id
+                // refusal, as `bad_device_id`). It is armed as `kInternal` once the arguments are valid, so a
                 // path that forgets to set it (an exception) is still counted.
                 std::optional<live::LiveOutcome> outcome;
                 std::string kind;
@@ -22313,8 +22314,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string agent_id = agent_it->get<std::string>();
+                // The device-id floor for this tool, inline on purpose and a strict SUPERSET of
+                // `auth::agent_id_is_audit_safe` (the REST live route's floor: over 256 bytes or a
+                // byte below 0x20): it also refuses the empty id, `__all__` and a DEL byte (0x7f).
+                // It runs before any row that carries the id and writes no audit row, so the shared
+                // floor adds nothing here; if that predicate tightens, update this check with it.
                 if (agent_id.empty() || agent_id.size() > 256) {
-                    refuse_input("agent_id must be 1 to 256 characters");
+                    refuse_input("agent_id must be 1 to 256 bytes");
                     return;
                 }
                 if (agent_id == "__all__") {

@@ -4361,6 +4361,13 @@ TEST_CASE("REST dex/devices/{id}/live: an unsafe device id is counted bad_device
     REQUIRE(res2);
     CHECK(res2->status == 400);
     CHECK(rest_live_count(h, "unknown", "bad_device_id") == 1.0); // an unserved kind is `unknown`
+    // The over-long arm (257 bytes) is counted the same way, and the scoped gate was never asked.
+    auto res3 = h.sink.Post("/api/v1/dex/devices/" + std::string(257, 'a') + "/live?kind=processes", "");
+    REQUIRE(res3);
+    CHECK(res3->status == 400);
+    CHECK(rest_live_count(h, "processes", "bad_device_id") == 1.0);
+    CHECK(h.last_scoped_agent_id.empty());
+    CHECK(h.last_live_plugin.empty());
 }
 
 // QE-1: a dashboard-only kind (a REAL row of the live kind table that the REST view does not

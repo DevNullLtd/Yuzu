@@ -11944,9 +11944,13 @@ TEST_CASE("MCP get_device_live: strict arguments (object, agent_id 1..256 and ne
     CHECK(probe.calls == 0);
     CHECK(ts.audit_log.empty());
     CHECK(budget.active() == 0);
-    // An argument-shape refusal has no outcome token, so it is not counted at all.
+    // An argument-shape refusal is validated before the tool arms an outcome, so it is not counted at
+    // all: not as bad_kind or internal, and never as bad_device_id (the REST route's own word for
+    // a refused device id), under any kind the call named.
     CHECK(mcp_live_count(metrics, "unknown", "bad_kind") == 0.0);
     CHECK(mcp_live_count(metrics, "unknown", "internal") == 0.0);
+    for (const char* kind : {"uptime", "processes", "unknown"})
+        CHECK(mcp_live_count(metrics, kind, "bad_device_id") == 0.0);
 }
 
 TEST_CASE("MCP get_device_live: agent_id is accepted at 256 characters and refused at 257",

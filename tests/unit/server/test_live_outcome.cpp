@@ -53,7 +53,7 @@ TEST_CASE("LiveOutcome: the closed token set is exactly the ruled one", "[live][
     CHECK(expected.size() == 32);
 }
 
-TEST_CASE("LiveOutcome: the three tokens added after the first release keep their spelling and index", "[live][outcome]") {
+TEST_CASE("LiveOutcome: the tokens added after the first release keep their spelling and index", "[live][outcome]") {
     CHECK(live::to_token(live::LiveOutcome::kShuttingDown) == "shutting_down");
     CHECK(live::to_token(live::LiveOutcome::kIncomplete) == "incomplete");
     CHECK(live::to_token(live::LiveOutcome::kGateUnreadable) == "gate_unreadable");
