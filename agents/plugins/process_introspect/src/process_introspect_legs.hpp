@@ -1,12 +1,13 @@
 /**
- * process_introspect_legs.hpp -- the seam between the plugin TU and the Linux shell TU.
+ * process_introspect_legs.hpp -- the seam between the plugin TU and the per-OS shell TUs
+ * (process_introspect_linux.cpp, process_introspect_macos.cpp).
  *
  * Holds the request grammar check (parse_request), the pure errno classification (the ONLY place
- * an errno is interpreted), the injected /proc boundary (ProcSource), the OS-free decision
- * (inspect_linux), report (the SINGLE writer of the `status|inspect|...` row) and execute_inspect
- * (the plugin's whole execute() body and its ONE try/catch). Everything here compiles on every
- * OS so the decisions are unit-tested on every OS over an in-memory fake ProcSource; the shell
- * (process_introspect_linux.cpp) only binds syscalls.
+ * an errno is interpreted), the injected /proc and libproc boundaries (ProcSource, MacSource),
+ * the OS-free decisions (inspect_linux, inspect_macos), report (the SINGLE writer of the
+ * `status|inspect|...` row) and execute_inspect (the plugin's whole execute() body and its ONE
+ * try/catch). Everything here compiles on every OS so the decisions are unit-tested on every OS
+ * over an in-memory fake source; the shells only bind syscalls.
  *
  * What is read, in order (Linux): /proc/<pid> is opened ONCE as a directory descriptor; every
  * per-process read is openat on that descriptor, so a recycled pid cannot be read. The only
@@ -16,6 +17,12 @@
  * pid_reused and nothing else is read; then the facet's sources; then `stat` is re-read and any
  * change discards every row (torn_read).
  *
+ * macOS (inspect_macos): libproc only, never a task port. ONE proc_pidinfo(PROC_PIDTBSDINFO)
+ * snapshot carries both the start time and the nice value, and proc_pid_rusage adds the
+ * monotonic start stamp, so there is no re-read and no torn_read; the token folds both stamps;
+ * the boot identity is the kern.bootsessionuuid sysctl; of the six facets only sched
+ * (nice value only) is read, the rest answer one permanent `unsupported` row and read nothing.
+ *
  * Invalid parameters return 1; every process-state outcome returns 0 with a typed status.
  */
 #pragma once
@@ -24,6 +31,7 @@
 
 #include <constraint_accumulator.hpp>
 #include <wire_utf8.hpp>
+#include <yuzu/agent/proc_snapshot_read.hpp> // ProcSnapshotStatus (header-only types)
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
@@ -82,11 +90,24 @@ struct RawRead {
 
 enum class ReadState { ok, not_found, denied, oversized, io };
 
-/// A not-found open is NOT proof the process is gone; see inspect_linux.
+/// On Linux a not-found open is NOT proof the process is gone, see inspect_linux; on macOS ESRCH
+/// is the kernel's own answer for a pid that does not exist, see inspect_macos.
 [[nodiscard]] constexpr ReadState classify_open_errno(int err) noexcept {
     if (err == 0)
         return ReadState::ok;
     if (err == ENOENT || err == ESRCH)
+        return ReadState::not_found;
+    if (err == EACCES || err == EPERM)
+        return ReadState::denied;
+    return ReadState::io;
+}
+
+/// macOS: only ESRCH means the pid does not exist. ENOENT is not an answer proc_pidinfo documents, so
+/// it must never read as "the process is gone": it is an unreadable identity like any other errno.
+[[nodiscard]] constexpr ReadState classify_macos_errno(int err) noexcept {
+    if (err == 0)
+        return ReadState::ok;
+    if (err == ESRCH)
         return ReadState::not_found;
     if (err == EACCES || err == EPERM)
         return ReadState::denied;
@@ -166,19 +187,22 @@ inline void report(yuzu::CommandContext& ctx, const Inspection& r) {
 }
 
 // ---------------------------------------------------------------------------
-// The Linux decision (OS-free)
+// Shared helpers and the Linux decision (OS-free)
 // ---------------------------------------------------------------------------
 
 namespace detail {
 
 inline constexpr std::string_view kTok = "linux:process_introspect:";
+inline constexpr std::string_view kMacTok = "macos:process_introspect:";
 
-[[nodiscard]] inline Inspection refuse(StatusState s, std::string_view cause) {
-    return Inspection{s, std::string{kTok} + std::string{cause}, {}};
+[[nodiscard]] inline Inspection refuse(StatusState s, std::string_view cause,
+                                       std::string_view tok = kTok) {
+    return Inspection{s, std::string{tok} + std::string{cause}, {}};
 }
 
-[[nodiscard]] inline std::string facet_token(Facet f, std::string_view cause) {
-    return std::string{kTok} + std::string{facet_name(f)} + ':' + std::string{cause};
+[[nodiscard]] inline std::string facet_token(Facet f, std::string_view cause,
+                                             std::string_view tok = kTok) {
+    return std::string{tok} + std::string{facet_name(f)} + ':' + std::string{cause};
 }
 
 } // namespace detail
@@ -392,6 +416,131 @@ inline constexpr std::size_t kOomCap = 64;
 }
 
 // ---------------------------------------------------------------------------
+// The macOS decision (OS-free)
+// ---------------------------------------------------------------------------
+
+/// The numbers one bounded libproc read yields (proc_pidinfo(PROC_PIDTBSDINFO) and the monotonic
+/// start stamp from proc_pid_rusage). Numbers only: the process name in
+/// the kernel's struct is never copied, so a text member must not be added.
+struct MacBsdInfo {
+    int err = 0; ///< errno of the call; 0 when it succeeded
+    std::uint64_t start_sec = 0;
+    std::uint64_t start_usec = 0;
+    std::int32_t nice = 0;
+    std::uint64_t start_abstime = 0; ///< monotonic start stamp (mach absolute time)
+    /// Whether the bounded call produced an answer. Anything but `answered` carries no numbers.
+    enum class Bound {
+        answered,          ///< the call returned within the deadline (err may still be set)
+        deadline_exceeded, ///< no answer arrived: deadline hit, read threw, or never started
+        abandoned_pending, ///< an earlier call hit its deadline and is still blocked in the kernel
+        call_in_progress,  ///< another dispatch's healthy read is in flight; none was started
+    };
+    Bound bound = Bound::answered;
+};
+
+/// How the bounded libproc call ended, as the decision sees it. Pure, so every branch is unit
+/// tested on every OS: TimedOut, a throwing read and a Rejected admission (the worker never ran)
+/// all read `deadline_exceeded`; a healthy overlap and an abandoned worker are told apart.
+[[nodiscard]] constexpr MacBsdInfo::Bound
+mac_bound_from(yuzu::agent::ProcSnapshotStatus s) noexcept {
+    switch (s) {
+    case yuzu::agent::ProcSnapshotStatus::Completed:
+        return MacBsdInfo::Bound::answered;
+    case yuzu::agent::ProcSnapshotStatus::Abandoned:
+        return MacBsdInfo::Bound::abandoned_pending;
+    case yuzu::agent::ProcSnapshotStatus::Busy:
+        return MacBsdInfo::Bound::call_in_progress;
+    case yuzu::agent::ProcSnapshotStatus::TimedOut:
+    case yuzu::agent::ProcSnapshotStatus::Rejected:
+        return MacBsdInfo::Bound::deadline_exceeded;
+    }
+    return MacBsdInfo::Bound::deadline_exceeded; // an unlisted status fails closed
+}
+
+/// The injected libproc / sysctl boundary. `bsdinfo` is called at most ONCE per decision and is
+/// bounded by a deadline in the shell (an owned worker in agent-core), never here.
+struct MacSource {
+    std::function<MacBsdInfo()> bsdinfo;
+    std::function<RawRead()> boot_session; ///< kern.bootsessionuuid
+};
+
+/// Order: the facet's answer (an unsupported facet reads nothing, so it is no existence oracle),
+/// ONE identity-and-value read, the boot identity, the caller's start_time guard, state.
+///
+/// Identity and the facet value come from ONE bounded libproc read of one process, so the Linux
+/// re-read (which exists because facet files are read after identity) is deliberately not
+/// mirrored: this leg never answers `supported` and never answers `torn_read`.
+[[nodiscard]] inline Inspection inspect_macos(const Request& req, const MacSource& src) {
+    using detail::kMacTok;
+    using detail::refuse;
+    const Facet f = req.facet;
+    const MacFacetAnswer a = mac_facet_answer(f);
+    // Anything but the one read facet answers unsupported, so an unlisted enumerator fails closed.
+    if (a != MacFacetAnswer::nice_only)
+        return Inspection{StatusState::unsupported,
+                          detail::facet_token(f,
+                                              a == MacFacetAnswer::no_os_equivalent
+                                                  ? "no_os_equivalent"
+                                                  : "not_exposed_by_libproc",
+                                              kMacTok),
+                          {}};
+
+    const MacBsdInfo b = src.bsdinfo();
+    // A bounded call that did not answer is never an empty success and never `supported`: the
+    // named token says which, and the status is the same `unavailable` as every identity refusal.
+    if (b.bound == MacBsdInfo::Bound::deadline_exceeded)
+        return refuse(StatusState::unavailable, "deadline_exceeded", kMacTok);
+    if (b.bound == MacBsdInfo::Bound::abandoned_pending)
+        return refuse(StatusState::unavailable, "abandoned_call_pending", kMacTok);
+    if (b.bound == MacBsdInfo::Bound::call_in_progress)
+        return refuse(StatusState::unavailable, "call_in_progress", kMacTok);
+    switch (classify_macos_errno(b.err)) {
+    case ReadState::ok:
+        break;
+    case ReadState::not_found:
+        return refuse(StatusState::unavailable, "no_such_process", kMacTok);
+    case ReadState::denied:
+        return refuse(StatusState::permission_denied, "permission_denied", kMacTok);
+    case ReadState::oversized:
+    case ReadState::io:
+        return refuse(StatusState::unavailable, "identity_unreadable", kMacTok);
+    }
+    const auto start = mac_identity_number(b.start_sec, b.start_usec, b.start_abstime);
+    if (!start)
+        return refuse(StatusState::unavailable, "identity_unreadable", kMacTok);
+
+    const RawRead bs = src.boot_session();
+    switch (classify_read(bs.error, bs.err)) {
+    case ReadState::ok:
+        break;
+    case ReadState::denied:
+        return refuse(StatusState::permission_denied, "permission_denied", kMacTok);
+    case ReadState::not_found:
+    case ReadState::oversized:
+    case ReadState::io:
+        return refuse(StatusState::unavailable, "identity_unreadable", kMacTok);
+    }
+    const auto boot8 = boot_session_prefix(bs.data);
+    if (!boot8)
+        return refuse(StatusState::unavailable, "identity_unreadable", kMacTok);
+    const std::string token = start_time_token(*boot8, *start);
+
+    if (!req.start_time.empty() && req.start_time != token)
+        return refuse(StatusState::unavailable, "pid_reused", kMacTok);
+
+    Inspection out;
+    out.status = StatusState::constrained;
+    out.rows.push_back(format_target(req.pid, token, f));
+    if (const auto nice = mac_nice(b.nice)) {
+        out.rows.push_back(format_sched_nice_only(*nice));
+        out.reason = detail::facet_token(f, "nice_only", kMacTok);
+    } else {
+        out.reason = detail::facet_token(f, "malformed", kMacTok);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // The plugin's execute() body
 // ---------------------------------------------------------------------------
 
@@ -399,6 +548,9 @@ using LegFn = int (*)(yuzu::CommandContext&, const Request&);
 
 /// Linux shell (process_introspect_linux.cpp).
 int run_linux(yuzu::CommandContext& ctx, const Request& req);
+
+/// macOS shell (process_introspect_macos.cpp).
+int run_macos(yuzu::CommandContext& ctx, const Request& req);
 
 /// Dispatch, validation and the single ABI containment. An unknown action writes one non-status
 /// line and returns 1; an invalid parameter writes one `unavailable` status row and returns 1;
