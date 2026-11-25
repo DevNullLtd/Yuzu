@@ -75,6 +75,8 @@ tus=(
     agents/plugins/file_search/src/file_search_plugin.cpp # Windows answers planned; checks the portable driver, plan and row headers
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
+    agents/core/src/msi_database_read.cpp
+    agents/plugins/msi_packages/src/msi_packages_plugin.cpp
     agents/plugins/firmware_posture/src/firmware_posture_win.cpp
     agents/plugins/hardware/src/hardware_plugin.cpp
     agents/plugins/hardware/src/hardware_estate_win.cpp

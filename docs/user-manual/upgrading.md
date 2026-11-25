@@ -62,6 +62,23 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - On each packaged Linux host, check the socket once the agent runs: `systemctl is-active yuzu-fw-snapshot.socket`. The socket starts with the agent (the agent unit pulls it in), so there is none until the agent has been started; the `.deb` enables the agent and does not start it, and the `.rpm`, installed with `rpm -i`, starts nothing and leaves enabling to the host's preset policy (on Rocky 9.9 the agent's unit read `disabled` after the install; enable and start the agent there with `systemctl enable --now yuzu-agent`). The troubleshooting list under "Firewall snapshot broker" in `security-hardening.md` covers a socket that is stopped, masked or failed.
 - Treat a Windows rule row with an `unknown` field, or a rule named `unknown` beside an `error|rule_property:` row, as a rule that was not fully read, not as a disabled, blocking or unnamed rule.
 
+## Behaviour change: the agent's HTTP clients do not decode compressed responses
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: anyone who pins a `sha256` for `content_dist` `stage`, or an `expected_hash` for `http_client` `download`, against a server that compresses its responses. The pinned hash is of the bytes on the wire.
+
+**What this build does.**
+
+- `http_client` `download` and `content_dist` `stage` hash and store exactly the bytes the server sends. A `Content-Encoding` such as `br` or `gzip` is neither decoded nor removed: the file on disk is the compressed file.
+- `http_client` `get` sends `Accept-Encoding: identity`. If a peer answers with a `Content-Encoding` other than `identity` (in any one of several header lines), `get` writes `status|N` and `error|peer sent Content-Encoding <token>; body not decoded`, writes no `body|` row, and exits non-zero. It never writes a compressed body.
+- `http_client` `head` sends `Accept-Encoding: identity` and decodes nothing; it has no body to decode.
+- The `printing` plugin's local IPP calls send `Accept-Encoding: identity` and decode nothing.
+
+**How to spot it.** A `stage` or `download` whose pinned hash is of the decompressed content fails with `hash mismatch: expected=<your hash>, got=<hash of the bytes the server sent>`. The file is removed.
+
+**What to do.** `stage` and `download` set no `Accept-Encoding` header of their own, so they cannot ask a server for an uncompressed file: pin the `sha256` of the bytes on the wire. Compute it with `curl -s URL | sha256sum`, without `--compressed` and without an `Accept-Encoding` header. Or serve the artefact uncompressed (`Content-Encoding` absent). A `get` that answers `error|peer sent Content-Encoding <token>; body not decoded` means the peer compressed the response even though `get` asked for `identity`: serve that resource without a `Content-Encoding`, or fetch it with `download` and pin the hash of the bytes on the wire.
+
 ## ⚠️ Breaking: policy evaluation does not dispatch gated, destructive, reserved or unclassifiable actions, and the devices show `blocked` (G01)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

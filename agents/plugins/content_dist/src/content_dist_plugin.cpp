@@ -331,6 +331,7 @@ int download_file(std::string_view url, const fs::path& dest, std::string& error
         httplib::SSLClient cli(parsed.host, parsed.port);
         cli.set_connection_timeout(30);
         cli.set_read_timeout(300);
+        cli.set_decompress(false);
         cli.enable_server_certificate_verification(true);
         res = cli.Get(parsed.path, content_receiver);
 #else
@@ -342,6 +343,7 @@ int download_file(std::string_view url, const fs::path& dest, std::string& error
         httplib::Client cli(parsed.host, parsed.port);
         cli.set_connection_timeout(30);
         cli.set_read_timeout(300);
+        cli.set_decompress(false);
         res = cli.Get(parsed.path, content_receiver);
     }
 
@@ -831,6 +833,8 @@ private:
         httplib::SSLClient client(base.host, base.port);
         client.set_connection_timeout(30);
         client.set_read_timeout(300);
+        client.set_decompress(false);
+        client.set_default_headers({{"Accept-Encoding", "identity"}});
         client.enable_server_certificate_verification(true);
 
         // The destination is opened EXACTLY ONCE for this upload. Every
