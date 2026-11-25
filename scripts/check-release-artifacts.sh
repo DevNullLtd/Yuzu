@@ -59,6 +59,7 @@
 #   --attempt), every attempt of the run:
 #     trivy-<image>.attempt-<N>.json + .txt + .gate.txt
 #                                  (e.g. trivy-yuzu-server.attempt-1.json)
+#     grype-<image>.attempt-<N>.json + .txt + .gate.txt  (the second scanner)
 #     publish-<image>.attempt-<N>.txt  (scripts/ci/image-publish.sh; only for
 #                                  an attempt whose gate passed)
 #   A re-run adds its attempt's files beside the earlier attempts' (which stay,
@@ -68,10 +69,9 @@
 #   beside gate reports that all record `gate: pass`. For each image the
 #   PUBLISHED attempt is the highest one whose journal ends `tagged`
 #   (`image-publish.sh published`): there must be one, no higher attempt may
-#   end `tagging` (its tags may name another digest), and Trivy's three reports
-#   for it must be present and non-empty. Another scanner's reports
-#   (grype-<image>.attempt-<N>.*) are optional; its .gate.txt counts in the
-#   journal's gate check. A gate report or journal not named per attempt is
+#   end `tagging` (its tags may name another digest), and Trivy's and grype's
+#   three reports for it must be present and non-empty; both scanners'
+#   .gate.txt count in the journal's gate check. A gate report or journal not named per attempt is
 #   refused. (The agent bundle's files are attached after the release, for the
 #   same reason as its SBOM: release.yml attach-bundle-gate-report.)
 #
@@ -247,18 +247,37 @@ for img in "${GATE_REPORT_IMAGES[@]}"; do
     fail=1
     continue
   fi
-  # The published attempt's reports. image-vuln-gate.sh refuses, before any
-  # push, an image whose table it could not write (G8P5-unhappy-path-1), so a
-  # published attempt always has all three non-empty.
-  for suffix in json txt gate.txt; do
-    f="trivy-${img}.attempt-${n}.${suffix}"
-    if [[ ! -s "$ART_DIR/$f" ]]; then
-      echo "::error::missing or empty image vulnerability gate report: $f (attempt $n is the published one)" >&2
-      fail=1
-    fi
+  # The published attempt's reports, both scanners'. image-vuln-gate.sh refuses,
+  # before any push, an image whose table it could not write (G8P5-unhappy-path-1),
+  # so a published attempt always has all three non-empty for each scanner.
+  for scanner in trivy grype; do
+    for suffix in json txt gate.txt; do
+      f="${scanner}-${img}.attempt-${n}.${suffix}"
+      if [[ ! -s "$ART_DIR/$f" ]]; then
+        echo "::error::missing or empty image vulnerability gate report: $f (attempt $n is the published one)" >&2
+        fail=1
+      fi
+    done
   done
   echo "  ${img}: published by attempt ${n}"
 done
+
+# A degraded pass (an image that passed under a grype provider waiver) keeps
+# `gate: pass`, so nothing above refuses it; say so here, non-fatally, from the
+# published attempt's report (scripts/ci/release-degraded.sh, which also writes
+# the release notes' statement). A report that cannot be read is reported the
+# same way: never silence.
+deg_rc=0
+deg_out="$(bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ci/release-degraded.sh" "$ART_DIR" 2>/dev/null)" || deg_rc=$?
+if [[ "$deg_rc" -ne 0 ]]; then
+  echo "::warning::DEGRADED: an image of this release passed the vulnerability gate under a grype provider waiver, or whether it did could not be determined from its report; the release notes must say so (docs/ci-architecture.md \"A grype DB provider is stale\")" >&2
+  if [[ -n "$deg_out" ]]; then
+    printf '%s\n' "$deg_out" | sed 's/^/  /'
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+      printf '%s\n' "$deg_out" >>"$GITHUB_STEP_SUMMARY" || true
+    fi
+  fi
+fi
 
 # ── Per-package SBOMs, and no SBOM without an artifact (S8) ─────────
 for f in "$ART_DIR"/*.deb "$ART_DIR"/*.rpm "$ART_DIR"/*.exe "$ART_DIR"/*.pkg; do

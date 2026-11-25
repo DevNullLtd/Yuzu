@@ -7,7 +7,10 @@
  * with stub scoped-perm / audit / command-dispatch, and drives the DESTRUCTIVE
  * endpoint end-to-end so a future refactor that drops one of its gates fails here:
  *   - source allowlist (only process/tcp/service/user),
- *   - per-device scope gate (Infrastructure:Delete via scoped_perm_fn, fail-closed),
+ *   - per-device scope gate (Infrastructure:Delete via the typed scoped gate, fail-closed),
+ *   - the metric vocabulary on surface=rest: every refusal class of the gate, every outage, and
+ *     every outcome counts under its own result, with the status, body and audit row of each
+ *     path unchanged,
  *   - audit-before-dispatch fail-closed (no dispatch if the evidence row is lost),
  *   - the success dispatch shape (echo/purge_source targeting the one device, {source}).
  *
@@ -54,7 +57,10 @@ struct PurgeHarness {
 
     std::vector<DispatchCall> calls;
     std::vector<AuditRow> audits;
-    bool scope_allow{true}; // scoped_perm_fn verdict
+    bool scope_allow{true}; // the scoped gate's verdict
+    /// The class the gate answers with when `scope_allow` is false, and the status and body the
+    /// real gate writes for it (the route reads the class and leaves the response alone).
+    ScopedGateOutcome scope_refusal{ScopedGateOutcome::Denied};
     bool audit_ok{true};    // AuditFn return (false → fail-closed 503, no dispatch)
     /// The `failure` outcome row alone is lost (the `requested` row persisted): the answer must
     /// carry `Sec-Audit-Failed`, since that row is the only evidence nothing was sent.
@@ -86,7 +92,12 @@ struct PurgeHarness {
     /// being nullopt: that is a callback ANSWERING "unfiltered".
     bool wire_exec_visible{true};
 
-    explicit PurgeHarness(bool with_exec_visible = true) : wire_exec_visible(with_exec_visible) {
+    /// @param with_exec_visible false: register with an EMPTY `exec_visible_fn`.
+    /// @param wire_typed_gate false: leave the typed scoped gate unset (the route fails closed).
+    /// @param with_dispatch false: register with an EMPTY dispatch function.
+    explicit PurgeHarness(bool with_exec_visible = true, bool wire_typed_gate = true,
+                          bool with_dispatch = true)
+        : wire_exec_visible(with_exec_visible) {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
             if (session_gone)
@@ -122,6 +133,28 @@ struct PurgeHarness {
             }
             return scope_allow;
         };
+        // The route authorizes through THIS gate: set before register_routes, as server.cpp does.
+        if (wire_typed_gate) {
+            api.set_scoped_gate_fn(
+                [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                       const std::string&, const std::string&) -> ScopedGateOutcome {
+                    ++scoped_calls;
+                    if (scope_allow)
+                        return ScopedGateOutcome::Admitted;
+                    switch (scope_refusal) {
+                        case ScopedGateOutcome::Unauthenticated: res.status = 401; break;
+                        case ScopedGateOutcome::Unavailable: res.status = 503; break;
+                        case ScopedGateOutcome::Denied:
+                        case ScopedGateOutcome::MgmtGroupReadDegraded:
+                        case ScopedGateOutcome::RbacReadDegraded:
+                        case ScopedGateOutcome::Admitted: res.status = 403; break;
+                    }
+                    res.set_content(
+                        R"({"error":{"code":403,"message":"forbidden"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return scope_refusal;
+                });
+        }
         RestApiV1::CommandDispatchFn dispatch =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string&,
@@ -160,7 +193,8 @@ struct PurgeHarness {
             /*tag_push_fn=*/{}, /*inventory_store=*/nullptr, /*product_pack_store=*/nullptr,
             /*sw_deploy_store=*/nullptr, /*device_token_store=*/nullptr, /*license_store=*/nullptr,
             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
-            /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr, dispatch,
+            /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
+            with_dispatch ? dispatch : RestApiV1::CommandDispatchFn{},
             /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*network_api=*/{},
             /*lockout_clear_fn=*/{}, /*baseline_store=*/nullptr, scoped,
             /*software_inventory_store=*/nullptr,
@@ -191,6 +225,16 @@ struct PurgeHarness {
                 ++n;
         return n;
     }
+    /// One series of the purge counter on this surface.
+    double metric(const std::string& result) {
+        return metrics
+            .counter("yuzu_echo_source_purge_total", {{"result", result}, {"surface", "rest"}})
+            .value();
+    }
+    /// The label-less `{result}` series the surface label replaced: it no longer moves.
+    double metric_without_surface(const std::string& result) {
+        return metrics.counter("yuzu_echo_source_purge_total", {{"result", result}}).value();
+    }
 };
 
 } // namespace
@@ -213,6 +257,36 @@ TEST_CASE("REST purge: rejects non-JSON / missing fields / bad source (400, no d
     CHECK(st == 400);
     CHECK(h.calls.empty());
     CHECK(h.audits_for("echo.source.purge") == 0); // never reached the pre-dispatch audit
+}
+
+// #7811: the device id reaches the permission-denial audit and `target_id`, so an over-long or
+// control-byte id is refused with a 400 before the scope gate, any audit row and any dispatch.
+// The gate here refuses every device (403), so a 400 with `scoped_calls == 0` proves the id check
+// runs first, where an empty audit log and no dispatch are also true of a route that refuses late.
+TEST_CASE("REST purge: an unsafe device id answers 400 before the scope gate, any audit row or dispatch",
+          "[server][echo][purge][rest][audit]") {
+    PurgeHarness h;
+    h.scope_allow = false;
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        int st = 0;
+        const auto j = h.post(nlohmann::json{{"device_id", id}, {"source", "process"}}.dump(), st);
+        CHECK(st == 400);
+        REQUIRE(j.is_object());
+        CHECK(j["error"]["message"] == "Invalid device id.");
+    }
+    CHECK(h.scoped_calls == 0);
+    CHECK(h.calls.empty());
+    CHECK(h.audits.empty());
+    CHECK(h.metric("invalid_input") == static_cast<double>(bad.size()));
+
+    // The same route does reach the scope gate for a safe id at the 256-byte limit.
+    int st = 0;
+    h.post(nlohmann::json{{"device_id", std::string(256, 'a')}, {"source", "process"}}.dump(), st);
+    CHECK(st == 403);
+    CHECK(h.scoped_calls == 1);
 }
 
 TEST_CASE("REST purge: per-device scope gate denies (403, no dispatch, no audit)",
@@ -370,7 +444,7 @@ TEST_CASE("POST /api/v1/echo/retention-paused/purge: Infrastructure:Delete withd
     CHECK(h.audits[1].action == "echo.source.purge");
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].detail.rfind("permission_revoked device=dev-A source=process cid=", 0) == 0);
-    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "denied"}}).value() == 1.0);
+    CHECK(h.metric("denied") == 1.0);
 }
 
 // Kills: reverting the recheck's `fail` lambda to a bare audit_fn call (the lost outcome row would
@@ -406,7 +480,7 @@ TEST_CASE("REST purge: a caller that stops resolving inside the requested-row wr
     CHECK(h.audits[1].action == "echo.source.purge");
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].detail.rfind("caller_unresolved device=dev-A source=process cid=", 0) == 0);
-    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "denied"}}).value() == 1.0);
+    CHECK(h.metric("denied") == 1.0);
 }
 
 TEST_CASE("REST purge: a denied outcome is reported as dispatch_denied reason=<token> and counted, "
@@ -460,9 +534,155 @@ TEST_CASE("REST purge: a denied outcome is reported as dispatch_denied reason=<t
             CHECK(h.audits[1].result == "failure");
             CHECK(h.audits[1].detail.rfind("dispatch_denied reason=" + token +
                                                " device=dev-A source=process cid=", 0) == 0);
-            CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", token}}).value() == 1.0);
-            CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "agent_not_connected"}})
-                      .value() == 0.0);
+            CHECK(h.metric(token) == 1.0);
+            CHECK(h.metric("agent_not_connected") == 0.0);
         }
     }
+}
+
+// ── #2536 / #2532: the metric vocabulary on surface=rest ─────────────────────────────────────
+//
+// One closed result set, shared with the dashboard fragments: every refusal class of the scoped
+// gate, every outage and every outcome counts under its own result. Only the metric changed: the
+// status, body and audit rows of each path are the ones this suite pinned before (the one audit
+// detail that moved is the recheck's failure row under a degraded authorization read, which now
+// carries the shared `store_unavailable store=` token).
+
+TEST_CASE("REST purge: every refusal and outage counts under its own result on surface=rest",
+          "[server][echo][purge][rest][2536][2532]") {
+    static constexpr const char* kBody = R"({"device_id":"dev-A","source":"process"})";
+    // Sequential posts on one harness: no step dispatches except the last, so none starts anything
+    // the next depends on (this surface has no repeat bound at all).
+    PurgeHarness h;
+    int st = 0;
+    // Posts one request and requires that `result` moved by exactly one.
+    const auto expect = [&](const char* step, const char* result, int status,
+                            const char* body = nullptr) {
+        CAPTURE(step, result);
+        const double before = h.metric(result);
+        const auto json = h.post(body != nullptr ? std::string{body} : std::string{kBody}, st);
+        if (status != 0) // 0: the status is the authenticator's, which this harness leaves unset
+            CHECK(st == status);
+        CHECK(h.metric(result) == before + 1.0);
+        return json;
+    };
+    const auto reset = [&h] {
+        h.scope_allow = true;
+        h.scope_refusal = ScopedGateOutcome::Denied;
+        h.revoke_on_requested = false;
+        h.drop_session_on_requested = false;
+        h.session_gone = false;
+        h.audit_ok = true;
+        h.dispatch_sent = 1;
+    };
+
+    // Malformed body: before any gate.
+    expect("malformed body", "invalid_input", 400, "not json");
+
+    // Admission, by the gate's class. The gate's own status and body are unchanged.
+    h.scope_allow = false;
+    auto body = expect("denied at admission", "scope_violation", 403);
+    CHECK(body["error"]["message"] == "forbidden");
+    h.scope_refusal = ScopedGateOutcome::Unauthenticated;
+    expect("unauthenticated at admission", "denied", 401);
+    CHECK(h.metric("scope_violation") == 1.0); // not a scope violation
+    h.scope_refusal = ScopedGateOutcome::Unavailable;
+    expect("unavailable at admission", "infra_unavailable", 503);
+    for (const auto outcome : {ScopedGateOutcome::MgmtGroupReadDegraded,
+                               ScopedGateOutcome::RbacReadDegraded}) {
+        h.scope_refusal = outcome;
+        body = expect("degraded read at admission", "store_unavailable", 403);
+        CHECK(body["error"]["message"] == "forbidden"); // the gate's fail-closed 403, unchanged
+    }
+    CHECK(h.metric("scope_violation") == 1.0); // still just the plain denial above
+    CHECK(h.audits_for("echo.source.purge") == 0); // every one refused before the requested row
+    reset();
+
+    // The requested row is not stored.
+    h.audit_ok = false;
+    expect("requested row not stored", "audit_unavailable", 503);
+    reset();
+
+    // The recheck, after the requested row. The failure row's detail is the shared token for a
+    // degraded read, `scoped_gate_unavailable` for a gate 503 and `permission_revoked` otherwise.
+    h.revoke_on_requested = true;
+    expect("denied at the recheck", "denied", 403);
+    CHECK(h.audits.back().detail.rfind("permission_revoked device=dev-A source=process cid=", 0) == 0);
+    reset();
+    h.revoke_on_requested = true;
+    h.scope_refusal = ScopedGateOutcome::Unauthenticated;
+    expect("unauthenticated at the recheck", "denied", 401);
+    CHECK(h.audits.back().detail.rfind("permission_revoked device=dev-A source=process cid=", 0) == 0);
+    reset();
+    h.revoke_on_requested = true;
+    h.scope_refusal = ScopedGateOutcome::Unavailable;
+    expect("unavailable at the recheck", "infra_unavailable", 503);
+    CHECK(h.audits.back().result == "failure");
+    CHECK(h.audits.back().detail.rfind("scoped_gate_unavailable device=dev-A source=process cid=", 0) == 0);
+    CHECK(h.calls.empty()); // fail closed: nothing was dispatched
+    reset();
+    h.revoke_on_requested = true;
+    h.scope_refusal = ScopedGateOutcome::MgmtGroupReadDegraded;
+    expect("management-group read degraded at the recheck", "store_unavailable", 403);
+    CHECK(h.audits.back().result == "failure");
+    CHECK(h.audits.back().detail.rfind(
+              "store_unavailable store=mgmt_group_store device=dev-A source=process cid=", 0) == 0);
+    CHECK(h.calls.empty());
+    reset();
+    h.revoke_on_requested = true;
+    h.scope_refusal = ScopedGateOutcome::RbacReadDegraded;
+    expect("RBAC read degraded at the recheck", "store_unavailable", 403);
+    CHECK(h.audits.back().result == "failure");
+    CHECK(h.audits.back().detail.rfind(
+              "store_unavailable store=rbac_store device=dev-A source=process cid=", 0) == 0);
+    CHECK(h.calls.empty());
+    reset();
+
+    // The caller stops resolving after the requested row.
+    h.drop_session_on_requested = true;
+    expect("caller_unresolved", "denied", 0);
+    CHECK(h.audits.back().detail.rfind("caller_unresolved device=dev-A source=process cid=", 0) == 0);
+    reset();
+
+    // Dispatch outcomes.
+    h.dispatch_sent = 0;
+    expect("zero reach", "agent_not_connected", 404);
+    reset();
+    expect("success", "success", 202);
+
+    // Both degrade classes were counted store_unavailable twice and once at the recheck apiece.
+    CHECK(h.metric("store_unavailable") == 4.0);
+    // The label-less series the surface label replaced no longer moves.
+    for (const char* result : {"denied", "scope_violation", "infra_unavailable", "success",
+                               "invalid_input", "audit_unavailable", "agent_not_connected"})
+        CHECK(h.metric_without_surface(result) == 0.0);
+    // The surface label is spelled exactly.
+    CHECK(h.metrics
+              .counter("yuzu_echo_source_purge_total", {{"result", "success"}, {"surface", "rest"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("REST purge: an unset typed gate answers the fail-closed 500 and counts infra_unavailable",
+          "[server][echo][purge][rest][2536][2532]") {
+    // The positional scoped function IS wired (so a route that still read it would admit); only
+    // the typed gate is missing.
+    PurgeHarness h(/*with_exec_visible=*/true, /*wire_typed_gate=*/false);
+    int st = 0;
+    h.post(R"({"device_id":"dev-A","source":"process"})", st);
+    CHECK(st == 500);
+    CHECK(h.calls.empty());
+    CHECK(h.audits_for("echo.source.purge") == 0);
+    CHECK(h.metric("infra_unavailable") == 1.0);
+    CHECK(h.metric_without_surface("denied") == 0.0);
+}
+
+TEST_CASE("REST purge: an unwired dispatch function answers 503 and counts infra_unavailable",
+          "[server][echo][purge][rest][2536][2532]") {
+    PurgeHarness h(/*with_exec_visible=*/true, /*wire_typed_gate=*/true, /*with_dispatch=*/false);
+    int st = 0;
+    h.post(R"({"device_id":"dev-A","source":"process"})", st);
+    CHECK(st == 503);
+    CHECK(h.audits_for("echo.source.purge") == 0); // refused before the requested row
+    CHECK(h.metric("infra_unavailable") == 1.0);
+    CHECK(h.metric("denied") == 0.0);
 }

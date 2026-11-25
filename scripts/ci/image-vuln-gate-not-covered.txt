@@ -4,8 +4,11 @@
 # package at all: a scan that saw nothing is not a clean scan. An image listed
 # here passes that check anyway, and the gate prints NOT COVERED with the reason
 # for it on every run (and records it in the report). Listing an image is a
-# reviewed decision that its OS packages ship UNSCANNED; it is not an acceptance
-# of any vulnerability in them.
+# reviewed decision that its OS packages ship UNSCANNED by Trivy; it is not an
+# acceptance of any vulnerability in them. (The gate's second scanner, grype,
+# identifies only a few of these images' OS packages (busybox and openssl on the image checked) and refuses a fixable CRITICAL it
+# reports there, but nothing proves that coverage: docs/ci-architecture.md
+# "What it does not see". Each listing's reason describes Trivy's view.)
 #
 # Format, one image per line (validated by image-vuln-gate-checks.py; a
 # malformed line refuses the whole list):
@@ -28,11 +31,17 @@
 # warns when a listed image does have OS packages.
 #
 # Why these four: they are assembled FROM scratch from Ubuntu package slices cut
-# with Canonical's chisel. A chiselled root has no dpkg status database, and
-# these images do not cut the base-files_chisel slice that would write a chisel
-# manifest, so Trivy 0.70.0 detects Ubuntu 26.04 but reports "No OS package is
+# with Canonical's chisel. The scanners read a dpkg package database (including
+# /var/lib/dpkg/status.d, the distroless format), and a chiselled root ships
+# none, so Trivy 0.70.0 detects Ubuntu 26.04 but reports "No OS package is
 # detected" (0 packages, checked 2026-11-18 on the v0.15.0 server and gateway
-# chisel images). What ships unscanned is each Dockerfile's SLICES list.
+# chisel images). Cutting base-files_chisel is NOT a fix: it writes a chisel
+# manifest, and no pinned scanner reads one (string check only, see
+# docs/ci-architecture.md). What ships unscanned is each Dockerfile's SLICES
+# list. These four listings are not to be renewed when they expire; the planned
+# fix is a scanner-readable package manifest (dpkg status.d stanzas emitted in
+# the chisel stage, tracked in #8415). From 2027-02-15 the gate refuses these
+# four images unless #8415 has shipped or a renewal is deliberately approved.
 yuzu-server-chisel: approved_by=fjarvis approved_on=2026-11-18 approval_ref=#8315 expires=2027-02-15 reason=chiselled FROM scratch, no dpkg database or chisel manifest; ships unscanned Ubuntu 26.04 slices of libc6, libgcc-s1, libstdc++6, libssl3t64, libpq5 (and its krb5/ldap dependencies), zlib1g, openssl config, ca-certificates, netbase, busybox-static (deploy/docker/Dockerfile.server.chisel SLICES)
 yuzu-gateway-chisel: approved_by=fjarvis approved_on=2026-11-18 approval_ref=#8315 expires=2027-02-15 reason=chiselled FROM scratch, no dpkg database or chisel manifest; ships unscanned Ubuntu 26.04 slices of libc6, libgcc-s1, libstdc++6, libncursesw6, libtinfo6, libssl3t64, zlib1g, openssl config, ca-certificates, netbase, busybox-static (deploy/docker/Dockerfile.gateway.chisel SLICES); the bundled Erlang/OTP runtime is not identified by Trivy either
 yuzu-agent-chisel: approved_by=fjarvis approved_on=2026-11-18 approval_ref=#8315 expires=2027-02-15 reason=chiselled FROM scratch, no dpkg database or chisel manifest; ships unscanned Ubuntu 26.04 slices of libc6, libgcc-s1, libstdc++6, libssl3t64, libsqlite3-0, libsystemd0, libblkid1, zlib1g, openssl config, ca-certificates, netbase, busybox-static (deploy/docker/Dockerfile.agent.chisel SLICES)

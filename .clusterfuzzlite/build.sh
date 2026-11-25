@@ -2,7 +2,7 @@
 # ClusterFuzzLite build script — compiles each libFuzzer harness directly with
 # the OSS-Fuzz-provided instrumented toolchain ($CC/$CXX/$CXXFLAGS/
 # $LIB_FUZZING_ENGINE). Deliberately NO meson/vcpkg in here: the fuzz targets
-# are closure-light (STL + nlohmann only), and a from-source vcpkg bootstrap
+# are closure-light (in-tree sources, the STL, and nlohmann where a target parses JSON), and a from-source vcpkg bootstrap
 # inside this container would be minutes of fragility for zero extra coverage.
 #
 # KEEP IN SYNC with tests/fuzz/meson.build (same harness list, same extra
@@ -14,7 +14,7 @@
 # EXACT repo-name case — CFLite mounts the checkout at $SRC/Yuzu (see the
 # Dockerfile comment).
 SRC_DIR="$SRC/Yuzu"
-INC="-I$SRC_DIR/server/core/src -I$SRC_DIR/common/include -I$SRC/nlohmann_json/include"
+INC="-I$SRC_DIR/server/core/src -I$SRC_DIR/agents/shared -I$SRC_DIR/common/include -I$SRC/nlohmann_json/include"
 STD="-std=c++23"
 
 build_target() {
@@ -43,6 +43,9 @@ build_target fuzz_binary_header_elf \
 build_target fuzz_binary_header_macho \
   "$SRC_DIR/tests/fuzz/fuzz_binary_header_macho.cpp"
 
+build_target fuzz_component_native \
+  "$SRC_DIR/tests/fuzz/fuzz_component_native.cpp"
+
 build_target fuzz_deployment_parse \
   "$SRC_DIR/tests/fuzz/fuzz_deployment_parse.cpp"
 
@@ -64,3 +67,11 @@ build_target fuzz_file_search_names \
 
 build_target fuzz_file_search_glob \
   "$SRC_DIR/tests/fuzz/fuzz_file_search_glob.cpp"
+
+# file_search_volumes.hpp includes the shared file_search headers and the walker by bare name, so this
+# harness needs the three include paths tests/fuzz/meson.build gives it.
+build_target fuzz_file_search_volume_cursor \
+  "-I$SRC_DIR/agents/shared" \
+  "-I$SRC_DIR/agents/plugins/file_search/src" \
+  "-I$SRC_DIR/agents/plugins/component_inventory/src" \
+  "$SRC_DIR/tests/fuzz/fuzz_file_search_volume_cursor.cpp"

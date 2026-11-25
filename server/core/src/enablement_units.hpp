@@ -146,9 +146,10 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // middleware ibm_mq added by SAM.2; runtimes python added 2026-10-28; hardware drivers_inventory
 // added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added 2026-11-08,
 // virtualization runtime_posture added by PR12.1-b2; firewall quarantine, release, quarantine_status
-// and quarantine_allow added by PRQ.1; PRQ.2 removed the old containment plugin's four rows; component_inventory scan added by SAM-16, Windows leg planned
-// so applicable on all three; process_introspect inspect added by PR13.1-a, Windows and macOS legs planned so applicable on all three), 250 rows.
-inline constexpr std::array<UnitOsRow, 250> kUnitOs{{
+// and quarantine_allow added by PRQ.1; PRQ.2 removed the old containment plugin's four rows; component_inventory scan added by SAM-16, native by SAM-22 and python and node
+// by SAM-49 (POSIX legs supported, Windows leg planned for all four); process_introspect inspect added by PR13.1-a (macOS leg by PR13.1-c, Windows leg planned), applicable on all three;
+// file_search search added with the file_search plugin, Windows leg planned so applicable on all three; msi_packages installer_records added by SAM-46), 255 rows.
+inline constexpr std::array<UnitOsRow, 255> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -177,6 +178,9 @@ inline constexpr std::array<UnitOsRow, 250> kUnitOs{{
     {"chargen", "chargen_start", kWin | kLin | kMac},
     {"chargen", "chargen_stop", kWin | kLin | kMac},
     {"component_inventory", "scan", kWin | kLin | kMac},
+    {"component_inventory", "native", kWin | kLin | kMac},
+    {"component_inventory", "python", kWin | kLin | kMac},
+    {"component_inventory", "node", kWin | kLin | kMac},
     {"content_dist", "stage", kWin | kLin | kMac},
     {"content_dist", "execute_staged", kWin | kLin | kMac},
     {"content_dist", "list_staged", kWin | kLin | kMac},
@@ -266,6 +270,7 @@ inline constexpr std::array<UnitOsRow, 250> kUnitOs{{
     {"msi_packages", "list", kWin | kMac},
     {"msi_packages", "product_codes", kWin | kMac},
     {"msi_packages", "list_inventory", kWin},
+    {"msi_packages", "installer_records", kWin},
     {"netprobe", "icmp", kWin | kLin | kMac},
     {"netprobe", "tcp", kWin | kLin | kMac},
     {"netprobe", "dns", kWin | kLin | kMac},
@@ -336,8 +341,10 @@ inline constexpr std::array<UnitOsRow, 250> kUnitOs{{
     {"services", "set_start_mode", kWin | kLin | kMac},
     // remote_access_audit: Linux is constrained, macOS supported, Windows `planned` (applicable).
     {"remote_access_audit", "list", kWin | kLin | kMac},
-    // process_introspect: Linux is constrained, macOS and Windows `planned` (applicable).
+    // process_introspect: Linux and macOS are constrained, Windows `planned` (applicable).
     {"process_introspect", "inspect", kWin | kLin | kMac},
+    // file_search: Linux and macOS are constrained, Windows `planned` (applicable).
+    {"file_search", "search", kWin | kLin | kMac},
     // shares: Linux, Windows and macOS are all supported.
     {"shares", "list", kWin | kLin | kMac},
     {"software_actions", "list_upgradable", kWin | kLin | kMac},

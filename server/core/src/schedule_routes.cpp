@@ -1,4 +1,5 @@
 #include "schedule_routes.hpp"
+#include "dispatch_target_shape.hpp" // count_param_key_invalid / kReasonParamKeyInvalid
 
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
@@ -266,6 +267,12 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
                 params_raw = j["parameters"].dump();
             auto canon_params = validate_and_canonicalize_schedule_params(params_raw);
             if (!canon_params) {
+                if (canon_params.error() == ScheduleParamsError::kMalformedKey) {
+                    // sg10 / UP-1: counted and audited like every other ingress refusal.
+                    count_param_key_invalid(deps.metrics, "schedule");
+                    (void)deps.audit_fn(req, "schedule.create", "denied", "schedule", "",
+                                        std::string("reason=") + std::string(kReasonParamKeyInvalid));
+                }
                 res.status = 400;
                 res.set_content(
                     nlohmann::json({{"error", std::string(to_string(canon_params.error()))}})

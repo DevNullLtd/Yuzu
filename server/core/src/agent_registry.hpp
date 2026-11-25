@@ -122,7 +122,8 @@ classify_and_authorize_dispatch(
     const CommandCapabilityRegistry& registry, const DispatchCaller& caller,
     std::string_view plugin, std::string_view action,
     const std::function<bool(std::string_view principal, std::string_view securable,
-                             authz::Operation operation)>& has_permission) {
+                             authz::Operation operation)>& has_permission,
+    const std::unordered_map<std::string, std::string>* parameters = nullptr) {
     auto classified = registry.classify(plugin, action);
     if (!classified) {
         return std::unexpected(DispatchDenial{
@@ -130,7 +131,22 @@ classify_and_authorize_dispatch(
                                                                   : DispatchDenialReason::Unclassified,
             {}, authz::Operation::Read});
     }
-    const CommandCapability cap = *classified;
+    CommandCapability cap = *classified;
+    // sg10 / UP-1: a parameter key with a control byte, a NUL or invalid UTF-8 is a DENIAL, never
+    // a truncation: the agent's C-string key would match a name the server's exact lookup missed.
+    // Judged for system callers too, before their early return.
+    if (parameters != nullptr && !parameters_well_formed(*parameters))
+        return std::unexpected(DispatchDenial{DispatchDenialReason::Forbidden,
+                                              std::string(effective_securable(cap, parameters)),
+                                              cap.operation});
+    // sg10: a row that escalates its securable on a parameter (`CommandCapability::
+    // param_escalation_key`) is judged, and reported, under the escalated securable when the
+    // parameter is supplied and non-empty. `parameters == nullptr` means the caller does not know
+    // them (the MCP/REST pre-dispatch DRY RUN): the escalation is then NOT evaluated here and is
+    // enforced at the send path, `ServerImpl::build_classified_command`, which always passes them, and
+    // at schedule/outbox arming (`schedule_arming_permitted`), which judges the same rule at fire
+    // and at delivery. A `.system = true` caller (below) skips the permission check entirely.
+    cap.securable = effective_securable(cap, parameters);
 
     // #1398 defense in depth: see DispatchDenialReason::Unclassified's doc
     // comment — every fragment's compile-time sweep should make this
@@ -145,8 +161,22 @@ classify_and_authorize_dispatch(
             DispatchDenial{DispatchDenialReason::Unclassified, {}, authz::Operation::Read});
     }
 
-    if (caller.system)
+    if (caller.system) {
+        // sg10 RULE for every `.system = true` dispatch (policy evaluator, preflight, canned
+        // panels): a system caller holds no grant, so
+        // a PARAMETER-ESCALATED securable (`cap.securable` above differs from the row's own) has no one to
+        // prove it and is REFUSED, never admitted by the early return. Operator-authored
+        // parameters therefore cannot ride a system dispatch past an escalation. A system dispatch with
+        // NO escalating parameter (policy evaluator, triggers, pre-flight, canned panels) is
+        // unaffected. Schedule and outbox dispatches are not system dispatches: they re-resolve the
+        // arming principal and are authorised against the escalated securable at arming
+        // (`schedule_arming_permitted`) and again here as that caller.
+        if (cap.securable != classified->securable)
+            return std::unexpected(
+                DispatchDenial{DispatchDenialReason::Forbidden, std::string(cap.securable),
+                               cap.operation});
         return cap;
+    }
 
     // No anonymous operator dispatch (PLAN item 2): an empty principal must
     // never reach `has_permission`, where a legacy-open store would admit it
@@ -480,6 +510,9 @@ struct AgentSession {
     std::string agent_version;
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
+    /// True when the inventory reported the retired plugin name `tar` and no `echo` (set once in
+    /// register_agent, before the session is published). Counted by retired_tar_only_count().
+    bool retired_tar_only = false;
     std::unordered_map<std::string, std::string> scopable_tags;
     std::string gateway_node; // Non-empty if agent is connected via gateway
     /// HA WS-4 4.3: the gateway cluster this session's most recent CONNECTED
@@ -942,6 +975,13 @@ public:
     // Per-action description map: "plugin.action" -> human-readable description.
     static const std::unordered_map<std::string, std::string>& action_descriptions();
 
+    /// WP06 F31: the predicate that decides which agent-reported (plugin, action) pairs may appear
+    /// in the served plugin catalogue (`help_json` and the dashboard help): the server's
+    /// capability catalogue (`CommandCapabilityRegistry::classify`). UNSET = nothing agent-reported
+    /// is served (fail closed). Does not touch `plugin_names` (Echo gating, heartbeat logic).
+    using CatalogueFilterFn = std::function<bool(std::string_view plugin, std::string_view action)>;
+    void set_catalogue_filter(CatalogueFilterFn fn);
+
     // Build help catalog: deduplicated plugin metadata across all agents.
     std::string help_json() const;
 
@@ -1075,6 +1115,11 @@ public:
         grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) const;
 
     std::size_t agent_count() const;
+
+    /// Server-held sessions whose agent reports the retired `tar` plugin and no `echo` (not an
+    /// Echo agent: its corruption signal is never read). A count over this replica's sessions,
+    /// so a true zero; published by the health sweep as yuzu_fleet_retired_tar_plugin_agents.
+    std::size_t retired_tar_only_count() const;
 
     // Map a session_id to an agent_id (called when Subscribe completes handshake).
     void map_session(const std::string& session_id, const std::string& agent_id);
@@ -1292,6 +1337,16 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;
+    // The served plugin catalogue (WP06 F31), recomputed only when `catalogue_gen_` moved.
+    std::function<bool(std::string_view, std::string_view)> catalogue_filter_;
+    std::uint64_t catalogue_gen_{0};
+    mutable std::uint64_t catalogue_cache_gen_{~std::uint64_t{0}};
+    mutable std::vector<PluginMeta> catalogue_cache_;
+    [[nodiscard]] const std::vector<PluginMeta>& catalogue_locked() const;
+    /// Entries of agents_ with retired_tar_only, kept at every insert, replace and erase (guarded
+    /// by mu_), so the health sweep reads it in O(1) instead of scanning the fleet under the
+    /// routing lock.
+    std::size_t retired_tar_only_n_ = 0;
     std::unordered_map<std::string, std::string> session_to_agent_;
     EventBus& bus_;
     yuzu::MetricsRegistry& metrics_;

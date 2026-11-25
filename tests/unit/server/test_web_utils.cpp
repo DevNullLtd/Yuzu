@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -701,6 +703,21 @@ TEST_CASE("format_iso_utc: epoch 0 sentinel vs known UTC moment",
     REQUIRE(format_iso_utc(1777466096) == "2026-04-29T12:34:56Z");
 }
 
+TEST_CASE("format_iso_utc: a value past year 9999 or beyond the platform range is the sentinel",
+          "[web_utils][time]") {
+    REQUIRE(format_iso_utc(INT64_MAX) == "—");
+    REQUIRE(format_iso_utc(INT64_MIN) == "—");
+    REQUIRE(format_iso_utc(12345678901234567LL) == "—"); // 17 digits
+#ifdef _WIN32
+    // MSVC's gmtime_s fails past year 3000 (32535215999), so 3001-9999 is the sentinel there.
+    REQUIRE(format_iso_utc(32535215999LL) == "3000-12-31T23:59:59Z");
+    REQUIRE(format_iso_utc(253402300799LL) == "—");
+#else
+    REQUIRE(format_iso_utc(253402300799LL) == "9999-12-31T23:59:59Z");
+#endif
+    REQUIRE(format_iso_utc(253402300800LL) == "—");
+}
+
 TEST_CASE("format_iso_utc: format is fixed-width", "[web_utils][time]") {
     auto s = format_iso_utc(1735689600);
     REQUIRE(s.size() == 20); // "YYYY-MM-DDTHH:MM:SSZ"
@@ -1257,7 +1274,7 @@ TEST_CASE("agent_error_display bounds the FIRST record, not a byte window",
         "error|Echo storage is offline on this endpoint; the database was closed after a "
         "transaction could not be rolled back. Collection and retention are both stopped. The "
         "read-only query connection is unavailable too, so `echo sql` cannot read the historical "
-        "data either. Restart the agent to recover.\nstorage_state|offline";
+        "data either. Restart the agent to recover.\nstorage_state|offline|rollback_wedged";
 
     const auto shown = yuzu::server::agent_error_display(offline);
     CHECK(shown.starts_with("Echo storage is offline")); // prefix stripped
@@ -1528,4 +1545,50 @@ TEST_CASE("html_escape_marked: truncated and malformed UTF-8 passes through with
         CHECK(html_escape_marked(s) == html_escape(s));
     // A marked character after a truncated lead is still found.
     CHECK(html_escape_marked(std::string("\xE2\xE2\x80\xAE")) == "\xE2&lt;U+202E&gt;");
+}
+
+// ── metrics_loopback_peer_exempt (WP06 F57) ────────────────────────────────
+
+TEST_CASE("metrics_loopback_peer_exempt: only a direct loopback peer with no forwarding "
+          "evidence qualifies (the caller additionally requires the operator opt-in)",
+          "[web_utils][metrics]") {
+    CHECK(metrics_loopback_peer_exempt("127.0.0.1", false));
+    CHECK(metrics_loopback_peer_exempt("::1", false));
+    // A proxy-evidence header demotes a loopback peer to remote.
+    CHECK_FALSE(metrics_loopback_peer_exempt("127.0.0.1", true));
+    CHECK_FALSE(metrics_loopback_peer_exempt("::1", true));
+}
+
+TEST_CASE("metrics_loopback_peer_exempt: remote, empty and lookalike addresses fail closed",
+          "[web_utils][metrics]") {
+    CHECK_FALSE(metrics_loopback_peer_exempt("10.0.0.5", false));
+    CHECK_FALSE(metrics_loopback_peer_exempt("", false));
+    CHECK_FALSE(metrics_loopback_peer_exempt("127.0.0.1.evil", false));
+    CHECK_FALSE(metrics_loopback_peer_exempt("::ffff:127.0.0.1", false));
+    CHECK_FALSE(metrics_loopback_peer_exempt("127.0.0.2", false));
+}
+
+TEST_CASE("kForwardingEvidenceHeaders names the common proxy headers", "[web_utils][metrics]") {
+    bool xff = false, fwd = false, real = false;
+    for (auto h : kForwardingEvidenceHeaders) {
+        xff |= h == "X-Forwarded-For";
+        fwd |= h == "Forwarded";
+        real |= h == "X-Real-IP";
+    }
+    CHECK(xff);
+    CHECK(fwd);
+    CHECK(real);
+}
+
+// WP06 F57 wiring: the default is OFF and the pre-routing handler consults the opt-in first.
+TEST_CASE("server.cpp: /metrics loopback exemption is gated on the opt-in flag",
+          "[web_utils][metrics]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    CHECK(src.find("cfg_.metrics_trust_loopback &&") != std::string::npos);
+    CHECK(src.find("req.remote_addr == \"127.0.0.1\"") == std::string::npos);
 }

@@ -33,15 +33,20 @@
 #       place — a syntactically broken sudoers file would brick the
 #       entire sudo subsystem on this host, so we never write to
 #       /etc/sudoers.d/ directly.
-# 5.  (Linux only) Sets file capabilities on the agent binary so plugins
-#       that need raw sockets, ptrace, or ip-route management can do
-#       so without an extra sudo round-trip:
-#         cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace +eip
+# 5.  (Linux only) Sets NO file capability on the agent binary and strips any it finds
+#       (`setcap -r`). A file capability on a 0755 binary is a local privilege escalation:
+#       any local account that runs it receives the capability, and the invoker chooses
+#       the plugin directory the agent loads. Capabilities belong to the service only
+#       (systemd AmbientCapabilities in the packaged unit, `setpriv --ambient-caps` in
+#       scripts/start-UAT.sh --as-user).
 # 6.  Installs two root-owned helper programs (root:root 0755 on Linux, root:wheel 0755 on
 #       macOS), the only programs the sudoers file lets the agent account run as root for
 #       the work that needs more than a fixed command:
 #         yuzu-fw-helper   firewall containment: iptables / ip6tables and the nftables
-#                          ruleset load on Linux, the pf anchor load on macOS
+#                          ruleset load on Linux, the pf anchor load on macOS; and one
+#                          read-only word, snapshot, that lists the host's nftables and
+#                          iptables rulesets (on a Mac it prints [absent] for nft and
+#                          [failed] for the two legacy iptables sections)
 #         yuzu-svc-helper  services.set_start_mode: systemctl enable|disable|mask|unmask on
 #                          Linux, launchctl enable|disable on macOS
 #       Linux: /usr/local/sbin.  macOS: /Library/PrivilegedHelperTools.
@@ -96,14 +101,17 @@
 #   - removes the agent's filesystem hierarchy (logs are preserved
 #     under /var/log/yuzu-agent.removed-<timestamp>/ for forensics)
 #   - deletes the user account
-# Capabilities applied to the agent binary are NOT removed because the
-# binary itself is not owned by this script — uninstall the package to
-# remove the binary, capabilities go with it.
+# The agent binary is not owned by this script, so it is left in place (this script sets
+# no file capability on it); uninstall the package to remove the binary.
 #
 # ARGUMENTS
 # ─────────
 #   --dry-run        Print every command the script would run, without
-#                    executing any of them. Use this first.
+#                    executing any of them. Use this first. It also prints the
+#                    verdict on each helper directory (ok, warn, would be refused
+#                    or would be created) and exits 1 when the real run would
+#                    refuse it: owned by anyone but root, writable by all users,
+#                    or a path that exists and is not a directory.
 #   --check          Verify the install is correct (user exists with
 #                    expected attributes, sudoers file present + valid,
 #                    both helpers present with the expected owner, mode
@@ -113,29 +121,37 @@
 #                    state dirs.
 #   --account-name N Override the default account name (_yuzu / yuzu).
 #                    Useful for parallel test environments.
-#   --binary-path P  Override the path to the agent binary for setcap.
+#   --binary-path P  Override the path to the agent binary whose file capabilities
+#                    are stripped. On Linux, for install and --check, a P that is not a
+#                    regular file exits 2 (with or without --no-cap-cleanup). A value
+#                    that starts with "-" is refused (exit 2), as for --account-name.
 #                    Default: /usr/local/bin/yuzu-agent (Linux) or
 #                    /Library/Application\ Support/Yuzu/yuzu-agent (macOS).
-#                    On macOS this is a no-op (no setcap equivalent).
+#                    On macOS this is a no-op (no file capabilities).
 #   --no-sudoers     Skip the sudoers file install and the two helpers it
 #                    names. Useful in test environments where you don't
 #                    want any privilege grants; the agent will still run
 #                    but the firewall containment actions and other
 #                    privileged plugins will fail at dispatch time (which
 #                    the test ladder catches).
-#   --no-setcap      Skip the setcap step on Linux. Useful if you set
-#                    capabilities via a packaging tool (.deb postinst,
-#                    .rpm %post).
+#   --no-cap-cleanup Skip stripping file capabilities from the binary
+#                    (Linux). The script never GRANTS file capabilities;
+#                    this only skips stripping file capabilities from the binary.
 #
 # EXIT CODES
 # ──────────
 #   0  - install/check/uninstall succeeded
 #   1  - install/check/uninstall failed; details on stderr (an install that could not
 #        install a helper also exits 1, after removing the sudoers file)
-#   2  - argument or precondition error (not run as root, unsupported OS)
+#   2  - argument error (an unknown flag, an explicit --binary-path that is not a regular
+#        file) or an unsupported OS; not running as root is exit 1
 #   3  - sudoers file failed visudo validation; it was not installed and the
 #        installer removed any earlier file, so no old grant stays (another
 #        install failure of that file exits with that command's own status)
+#   5  - file capabilities may still be live on the binary (`setcap` missing while the
+#        binary carries them, or `getcap` also missing so that cannot be ruled out;
+#        `setcap -r` failed; or `getcap` still shows them afterwards). Checked after the
+#        helper and sudoers steps, so a helper failure (1) or a sudoers failure (3) wins.
 #
 # THIS SCRIPT MUST BE RUN AS ROOT.
 # We don't try to be cute about that — every action below requires root.
@@ -150,6 +166,7 @@ SUDOERS_FILE="/etc/sudoers.d/yuzu-agent"   # fixed: never read from the environm
 DRY_RUN=0
 ACCOUNT_NAME=""            # filled in based on platform if not specified
 BINARY_PATH=""             # filled in based on platform if not specified
+BINARY_PATH_EXPLICIT=0     # 1 when --binary-path was given
 SKIP_SUDOERS=0
 SKIP_SETCAP=0
 
@@ -220,10 +237,12 @@ while [[ $# -gt 0 ]]; do
         --dry-run)        DRY_RUN=1; shift ;;
         --check)          ACTION="check"; shift ;;
         --uninstall)      ACTION="uninstall"; shift ;;
-        --account-name)   ACCOUNT_NAME="$2"; shift 2 ;;
-        --binary-path)    BINARY_PATH="$2"; shift 2 ;;
+        --account-name)   [[ $# -ge 2 && "$2" != -* ]] || { echo "--account-name needs a value (not an option); use --help for usage." >&2; exit 2; }
+                          ACCOUNT_NAME="$2"; shift 2 ;;
+        --binary-path)    [[ $# -ge 2 && "$2" != -* ]] || { echo "--binary-path needs a value (not an option); use --help for usage." >&2; exit 2; }
+                          BINARY_PATH="$2"; BINARY_PATH_EXPLICIT=1; shift 2 ;;
         --no-sudoers)     SKIP_SUDOERS=1; shift ;;
-        --no-setcap)      SKIP_SETCAP=1; shift ;;
+        --no-cap-cleanup) SKIP_SETCAP=1; shift ;;
         -h|--help)        usage; exit 0 ;;
         *)                echo "unknown arg: $1" >&2; echo "use --help for usage." >&2; exit 2 ;;
     esac
@@ -231,6 +250,13 @@ done
 
 ACCOUNT_NAME="${ACCOUNT_NAME:-$DEFAULT_ACCOUNT}"
 BINARY_PATH="${BINARY_PATH:-$DEFAULT_BINARY_PATH}"
+# An explicit --binary-path that is not a regular file is an argument error (exit 2): the
+# file-capability strip and check would otherwise silently have nothing to look at.
+if [[ "$BINARY_PATH_EXPLICIT" -eq 1 && "$PLATFORM" == "linux" && "$ACTION" != "uninstall" \
+      && ! -f "$BINARY_PATH" ]]; then
+    echo "--binary-path $BINARY_PATH is not a regular file" >&2
+    exit 2
+fi
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -517,6 +543,11 @@ EOF
 # pfctl grant. The anchor name sorts first among Apple's com.apple/* sub-anchors, and the release
 # flush is -F rules / -F nat on that anchor only (never -F all: that is global). The installer
 # writes the helper before this file; a host without it is provisioned with this build's installer.
+# The helper also takes one read-only word, snapshot, with no other argument; on a Mac it prints
+# [absent] for nft and [failed] for the two legacy iptables sections (there is no /proc/net), at most
+# 4 MiB, and the pf reads below stay on the exact pfctl lines. The state and rules reads use three of them, read-only and with no
+# wildcard: -s info, -s rules and -s Anchors (the top-level anchor list; the com.apple line below is
+# a different, narrower read that the containment path uses).
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E
 EOF
@@ -533,6 +564,7 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple -s Anchors
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -F states
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s info
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s Anchors
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s References
 
 # services.set_start_mode — launchd system domain. The agent account may run one program as root
@@ -568,7 +600,16 @@ EOF
 # takes a file name or an argument pattern. A sudo regular expression could pin the arguments in
 # this file instead, but it needs sudo 1.9.10, which RHEL 8 and 9, Ubuntu 22.04 and earlier and
 # Debian 11 do not ship. The installer writes the helper before this file; a host without it is
-# provisioned with this build's installer.
+# provisioned with this build's installer. The helper also takes one read-only word, snapshot,
+# with no other argument: it prints the nft ruleset and the legacy iptables and ip6tables tables of
+# the host (at most 4 MiB), changes no ruleset and writes no file, so the agent account can read the
+# host ruleset through this same line. Two reads can make the kernel load a module, both measured
+# (ADR-3007, clause 3): an nft read on a host where nf_tables is not loaded makes the kernel load
+# nf_tables, and a save tool that asks for a table whose module is not loaded makes the kernel load
+# that module. In one removal race a save tool starts modprobe itself, for its family's core
+# module, when that module and a table's module are both removed between the kernel listing the
+# table and the tool asking for it (read in the tool's source; ADR-3007, clause 3); the helper has
+# no sandbox that refuses that load.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 
 # firewall plugin — nftables containment (own table inet yuzu_quarantine). The ruleset is loaded
@@ -671,7 +712,8 @@ remove_sudoers() {
 # compares each installed file with it byte for byte. The sudoers file names each helper with no
 # argument and no wildcard:
 #   - $FW_HELPER_PATH, firewall containment: iptables, ip6tables and the nftables ruleset load on
-#     Linux, the pf anchor load on macOS.
+#     Linux, the pf anchor load on macOS; and one read-only word, snapshot, that lists the host's
+#     nft and iptables rulesets.
 #   - $SVC_HELPER_PATH, services.set_start_mode: systemctl on Linux, launchctl on macOS.
 #
 # The firewall helper's contract (the C++ twins are iptables_helper_argv, nft_ruleset_text and
@@ -690,6 +732,15 @@ remove_sudoers() {
 #   - pf load: the same, for the macOS anchor: the staged file is read ONCE, every line is checked
 #     against the ruleset the plugin generates, and pfctl is given a ruleset the helper builds from
 #     its own literals plus the checked tokens on standard input.
+#   - snapshot: exactly one argument, the word snapshot, and read-only. It runs $NFT -a list
+#     ruleset and, for each address family, that family's legacy save tool by its own name
+#     ($XT4 for IPv4, $XT6 for IPv6; with no argument: they list every instantiated table and, for
+#     the tables the kernel lists, load no module), each with those fixed arguments and nothing from the caller, and prints them under
+#     `== <label>` headings: `[absent]` for the nft tool not installed (that section was not read),
+#     `[failed]` after the output of a tool that exits non-zero, `[failed]` alone for a legacy
+#     section when /proc/net cannot be stat'ed, then `== end`. A legacy family with no save tool
+#     prints `[tables]` and then the kernel's own list of its tables (`[tables]` alone: no table).
+#     The whole listing is cut at 4 MiB (a cut one has no `== end`) and the exit status is 0.
 #   - anything else exits 64 having run nothing.
 # The helper is ONE text on both platforms. An action whose tool is not on the host (iptables or
 # nft on a Mac, pfctl on Linux) fails at exec, after the same validation, having changed nothing.
@@ -712,6 +763,7 @@ generate_fw_helper_content() {
 # Usage: yuzu-fw-helper iptables|ip6tables <tokens>
 #        yuzu-fw-helper nft load <path>
 #        yuzu-fw-helper pf load <path>
+#        yuzu-fw-helper snapshot
 # <tokens> are exactly those of one of these shapes (<ours> is a yuzu-fwq-<generation>[-f] chain,
 # the generation 1 to 10 digits and at most 2147483647):
 #   -S
@@ -736,6 +788,27 @@ generate_fw_helper_content() {
 # The caller's arguments are never passed on. Each branch below matches the token count and the
 # fixed tokens, validates the variable ones, and execs the tool with an argument list made of its
 # own literals plus the validated values. Anything else exits 64, having run nothing.
+#
+# snapshot takes exactly one argument, the word snapshot, and only reads. It prints three sections,
+# each headed by a line `== <label>`: `== nft -a list ruleset`, `== iptables-legacy-save` and
+# `== ip6tables-legacy-save`. The nft section holds the tool's output; a tool that is not installed
+# prints `[absent]` (nft only: that section was not read) and one that exits non-zero adds a
+# `[failed]` line after whatever it printed (a newline is written first, so the marker never joins a
+# line the tool left unfinished). Each legacy section holds the output of the family's legacy save
+# tool run with no argument, which lists every instantiated table; when /proc/net cannot be stat'ed
+# the section is `[failed]` alone and no tool is run; when the family has no save tool the section
+# is `[tables]` and then the kernel's own list of the family's tables, one name per line (`[tables]`
+# alone is a family that holds no table). The listing ends with `== end`, the whole of it is cut at
+# 4194304 bytes, and the exit status is 0. A listing that was cut has no `== end`. The tools are run
+# with their own fixed arguments and nothing from the caller. It reads the host ruleset, which
+# includes rule handles, and changes no ruleset and writes no file. Two reads can make the kernel
+# load a module, both measured (ADR-3007, clause 3): an nft read on a host where nf_tables is not
+# loaded makes the kernel load nf_tables, and a save tool that asks for a table whose module is not
+# loaded makes the kernel load that module. In one removal race a save tool starts modprobe itself,
+# for its family's core module (ip_tables or ip6_tables): when that module and a table's module are
+# both removed between the kernel listing the table and the tool asking for it (read in the tool's
+# source; ADR-3007, clause 3). This helper runs as root with no sandbox, so nothing in it refuses
+# that load.
 #
 # nft load <path> and pf load <path>: <path> is absolute, at most 512 characters with no control
 # character, in a directory named firewall-staging, and its file name is yuzu-fwq-<letters, digits,
@@ -779,6 +852,8 @@ export PATH LC_ALL
 IPT=/usr/sbin/iptables
 IP6T=/usr/sbin/ip6tables
 NFT=/usr/sbin/nft
+XT4=/usr/sbin/iptables-legacy-save
+XT6=/usr/sbin/ip6tables-legacy-save
 PFCTL=/sbin/pfctl
 PF_ANCHOR=com.apple/000.yuzu_quarantine
 # No pathname expansion and a single-space field separator before any word split below.
@@ -802,6 +877,59 @@ tok_is() {
         "$2") return 0 ;;
     esac
     return 1
+}
+
+# snap_one LABEL TOOL ARGS: one section of the snapshot. Reads only: the tool is run with the
+# fixed arguments the caller of this function names, and its standard error is dropped. A failed
+# tool's marker is written after a newline, so it is a line of its own even when the tool died in
+# the middle of one (a reader that matches the whole line `[failed]` then always sees it).
+snap_one() {
+    printf '== %s\n' "$1"
+    snap_tool=$2
+    shift 2
+    if [ ! -x "$snap_tool" ]; then
+        printf '[absent]\n'
+        return 0
+    fi
+    "$snap_tool" "$@" 2>/dev/null || printf '\n[failed]\n'
+}
+
+# snap_xt LABEL TOOL NAMES: a legacy xtables section, read by the family's legacy save tool under
+# its own name, with no argument. That tool lists every instantiated table; for the tables the
+# kernel lists it loads no kernel module, runs no modprobe and takes no lock. Empty output with exit
+# 0 is a family that holds no table, and a non-zero exit is a failure (`[failed]` through snap_one).
+# Two decisions are made here, before any tool runs, from host state and never from input. If
+# /proc/net cannot be stat'ed the process cannot see the kernel's tables at all, and a save tool
+# reads a missing table list as no table, so the section is `[failed]` and no tool is run. If the
+# family has no save tool, nothing here can list its tables; the kernel's own list of them is
+# printed under `[tables]`, which is the names file NAMES, present exactly while the family's core
+# module is loaded. `[tables]` alone says the family holds no table; `[tables]` and a name say
+# tables exist that nothing listed, and the reader treats them as unread. NAMES that cannot be
+# stat'ed is read as no table (behind the /proc/net check above, which rules out every cause at
+# directory level); a name list that cannot be read is `[failed]`. No file is created.
+snap_xt() {
+    if [ ! -e /proc/net/dev ]; then
+        printf '== %s\n\n[failed]\n' "$1"
+        return 0
+    fi
+    if [ -x "$2" ]; then
+        snap_one "$1" "$2"
+        return 0
+    fi
+    printf '== %s\n[tables]\n' "$1"
+    [ ! -e "$3" ] || head -c 4096 "$3" 2>/dev/null || printf '\n[failed]\n'
+}
+
+# host_snapshot: yuzu-fw-helper snapshot. Never returns. The group is cut at 4 MiB, so a listing
+# that was cut has no end line.
+host_snapshot() {
+    {
+        snap_one 'nft -a list ruleset' "$NFT" -a list ruleset
+        snap_xt 'iptables-legacy-save' "$XT4" /proc/net/ip_tables_names
+        snap_xt 'ip6tables-legacy-save' "$XT6" /proc/net/ip6_tables_names
+        printf '== end\n'
+    } | head -c 4194304
+    exit 0
 }
 
 all_digits() {
@@ -1377,6 +1505,12 @@ pf_load() {
     exit $?
 }
 
+# snapshot is the only one-argument action; a bare call, or one that is not exactly that word, is
+# refused (snapshot with anything after it falls through to the refusal of the case below).
+if [ $# -eq 1 ]; then
+    tok_is "$1" snapshot || refuse
+    host_snapshot
+fi
 [ $# -ge 2 ] || refuse
 case $1 in
     iptables) tool=$IPT ;;
@@ -1613,14 +1747,39 @@ check_helper_dir() {
     esac
 }
 
+# helper_dir_verdict DIR: ok, warn or refuse for DIR as it is now (refuse also when its owner and
+# mode cannot be read), by the same rule check_helper_dir applies.
+helper_dir_verdict() {
+    local info uid mode grp
+    info=$(dir_info "$1" 2>/dev/null) || { echo refuse; return; }
+    read -r uid mode grp <<<"$info"
+    fw_dir_verdict "$uid" "$mode"
+}
+
 # install_helper PATH GENERATOR: writes the helper GENERATOR prints to PATH, root:$ROOT_GROUP 0755.
 install_helper() {
     local path="$1" generator="$2"
     if [[ "$SKIP_SUDOERS" -eq 1 ]]; then return 0; fi
 
-    local dir tmp
+    local dir tmp v
     dir=$(dirname "$path")
     if [[ "$DRY_RUN" -eq 1 ]]; then
+        # Say what the real run would find in the helper directory, and fail as it would: a directory
+        # that would be refused fails the dry run too, so the dry run is no longer a promise the real
+        # run breaks. (This line starts "[dry-run] " with one space: only the "[dry-run]   " block
+        # below is the helper text.)
+        if [[ -d "$dir" ]]; then
+            v=$(helper_dir_verdict "$dir")
+            [[ $v == ok || $v == warn ]] || v="would be refused"
+            echo "[dry-run] helper directory $dir: $v"
+            check_helper_dir "$dir" || return 1
+        elif [[ -e "$dir" || -L "$dir" ]]; then
+            # A dangling link or a file where the directory belongs: the real run cannot create it.
+            echo "[dry-run] helper directory $dir: would be refused (the path exists and is not a directory)"
+            return 1
+        else
+            echo "[dry-run] helper directory $dir: would be created root:$ROOT_GROUP 0755"
+        fi
         echo "[dry-run] would write the following to $path (root:$ROOT_GROUP 0755):"
         "$generator" | sed 's/^/[dry-run]   /'
         return 0
@@ -1698,39 +1857,86 @@ check_helpers() {
     return "$rc"
 }
 
-# ── linux capabilities ──────────────────────────────────────────────────────
-# Capabilities granted to the agent binary directly. These avoid a
-# sudo round-trip for syscalls the agent makes itself (raw sockets,
-# routing-table writes, ptrace). They do NOT transfer through execve,
-# so plugins that shell out to iptables still need the sudoers entry
-# for the firewall helper above — capabilities cover only the agent's own
-# syscalls, not its child processes.
-#
-# +eip means the capability is in the binary's effective, inheritable,
-# AND permitted sets. eip is the right combination for a daemon
-# binary; +ep alone wouldn't survive setuid (we don't setuid) and +ei
-# alone wouldn't be effective without explicit cap_set_proc().
+# ── linux capabilities: file capabilities are REMOVED, never granted ─────────
+# A file capability such as `cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip`
+# on the agent binary is a hazard. The binary is 0755, so ANY local user who executes it would
+# receive those capabilities, and that user chooses --plugin-dir / YUZU_PLUGIN_DIR, which the
+# agent dlopens: local root. Capabilities belong to the SERVICE only (systemd
+# AmbientCapabilities in the packaged unit; `setpriv --ambient-caps` in
+# scripts/start-UAT.sh --as-user). This script never grants file capabilities. Each run removes
+# any file capability found on the binary at `--binary-path` (idempotent).
 
-apply_setcap() {
+# Reads the file capabilities of $BINARY_PATH into FILE_CAPS_OUT. Returns 0 only when getcap ran
+# cleanly: exit status 0 AND nothing on stderr (a real getcap can exit 0 with its error on stderr
+# alone). Any other outcome is UNVERIFIABLE (return 1), never "no file capabilities".
+FILE_CAPS_OUT=""
+read_file_caps() {
+    FILE_CAPS_OUT=""
+    local errf rc err
+    errf=$(mktemp "${TMPDIR:-/tmp}/yuzu-getcap.XXXXXX") || return 1
+    FILE_CAPS_OUT=$(getcap "$BINARY_PATH" 2>"$errf")
+    rc=$?
+    err=$(<"$errf")
+    rm -f "$errf"
+    [[ "$rc" -eq 0 && -z "$err" ]]
+}
+
+strip_file_capabilities() {
     if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
     if [[ "$SKIP_SETCAP" -eq 1 ]]; then
-        log "skipping setcap (--no-setcap)"
-        return 0
-    fi
-    if ! command -v setcap >/dev/null 2>&1; then
-        warn "setcap not installed — skipping (apt: libcap2-bin, dnf: libcap)"
+        log "skipping file-capability cleanup (--no-cap-cleanup)"
+        # Loud, on stderr: this flag can leave an exploitable file capability on a binary that
+        # any local user can execute, and the install still exits 0.
+        if [[ -f "$BINARY_PATH" ]] && command -v getcap >/dev/null 2>&1; then
+            if ! read_file_caps; then
+                warn "--no-cap-cleanup: getcap could not read $BINARY_PATH: cannot tell whether it carries file capabilities"
+            elif [[ -n "$FILE_CAPS_OUT" ]]; then
+                warn "--no-cap-cleanup: file capabilities are STILL LIVE on $BINARY_PATH: $FILE_CAPS_OUT"
+                warn "  any local user can run that binary with them; remove with: setcap -r $BINARY_PATH"
+            fi
+        elif [[ -f "$BINARY_PATH" ]]; then
+            warn "--no-cap-cleanup: getcap not found on PATH: cannot tell whether $BINARY_PATH carries file capabilities"
+        fi
         return 0
     fi
     if [[ ! -f "$BINARY_PATH" ]]; then
-        warn "agent binary not found at $BINARY_PATH — skipping setcap"
-        warn "  re-run with --binary-path PATH after the agent is installed,"
-        warn "  or set capabilities from your packaging tool (postinst hook)."
+        log "agent binary not found at $BINARY_PATH - no file capabilities to strip"
         return 0
     fi
-
-    log "applying capabilities to $BINARY_PATH"
-    log "  cap_net_admin, cap_net_raw, cap_dac_read_search, cap_sys_ptrace +eip"
-    run setcap "cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip" "$BINARY_PATH"
+    local have_getcap=0
+    if command -v getcap >/dev/null 2>&1; then
+        have_getcap=1
+        if read_file_caps; then
+            if [[ -z "$FILE_CAPS_OUT" ]]; then
+                log "no file capabilities on $BINARY_PATH (good)"
+                return 0
+            fi
+            log "stripping file capabilities from $BINARY_PATH: $FILE_CAPS_OUT"
+        else
+            # getcap failed or wrote to stderr: the capability state is UNKNOWN, so treat it as
+            # possibly live and strip anyway; the post-check below must then read cleanly.
+            warn "getcap could not read $BINARY_PATH (exit status or stderr): treating its file capabilities as possibly live"
+        fi
+    fi
+    if ! command -v setcap >/dev/null 2>&1; then
+        # FAIL (exit 5), never "skip": with the capability possibly still live the install is NOT
+        # safe, and the caller must not report success.
+        warn "setcap not installed - cannot strip file capabilities from $BINARY_PATH"
+        warn "  remove them by hand: setcap -r $BINARY_PATH   (needs libcap: apt libcap2-bin, dnf libcap)"
+        return 5
+    fi
+    run setcap -r "$BINARY_PATH" || { warn "setcap -r $BINARY_PATH failed"; return 5; }
+    if [[ "$DRY_RUN" -eq 0 && "$have_getcap" -eq 1 ]]; then
+        if ! read_file_caps; then
+            warn "getcap could not verify $BINARY_PATH after setcap -r: file capabilities may still be present"
+            return 5
+        fi
+        if [[ -n "$FILE_CAPS_OUT" ]]; then
+            warn "file capabilities STILL present on $BINARY_PATH after setcap -r: $FILE_CAPS_OUT"
+            return 5
+        fi
+    fi
+    return 0
 }
 
 # ── verification ────────────────────────────────────────────────────────────
@@ -1799,17 +2005,27 @@ check_install() {
         check_helpers || ((errs++))
     fi
 
-    # 5. capabilities (Linux only)
-    if [[ "$PLATFORM" == "linux" && "$SKIP_SETCAP" -eq 0 && -f "$BINARY_PATH" ]]; then
+    # 5. file capabilities (Linux only): their PRESENCE is drift (this installer strips them);
+    # a missing getcap means that cannot be verified, which is also drift.
+    if [[ "$PLATFORM" == "linux" && "$SKIP_SETCAP" -eq 1 ]]; then
+        log "file-capability check skipped (--no-cap-cleanup): a pass does not prove the binary carries none"
+    elif [[ "$PLATFORM" == "linux" && -f "$BINARY_PATH" ]]; then
         if command -v getcap >/dev/null 2>&1; then
-            local caps
-            caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
-            if [[ -z "$caps" ]]; then
-                warn "no capabilities set on $BINARY_PATH"; ((errs++))
-            else
-                log "capabilities on $BINARY_PATH: $caps"
+            if ! read_file_caps; then
+                warn "getcap could not read $BINARY_PATH (exit status or stderr): cannot verify that it carries no file capability"
+                ((errs++))
+            elif [[ -n "$FILE_CAPS_OUT" ]]; then
+                warn "file capabilities present on $BINARY_PATH: $FILE_CAPS_OUT (re-run this installer to strip them)"
+                ((errs++))
             fi
+        else
+            warn "getcap not found on PATH: cannot verify that $BINARY_PATH carries no file capability"
+            ((errs++))
         fi
+    elif [[ "$PLATFORM" == "linux" ]]; then
+        # Only reachable with the DEFAULT path (an explicit --binary-path that is not a file
+        # exits 2 earlier): a host that runs the agent from a build tree has nothing at the default.
+        log "file-capability check skipped: no binary at $BINARY_PATH (default path); pass --binary-path to check a binary. A pass does not prove any agent binary is capability-free"
     fi
 
     if [[ "$errs" -eq 0 ]]; then
@@ -1854,12 +2070,17 @@ case "$ACTION" in
             helper_rc=1
             remove_sudoers
         fi
-        apply_setcap
+        cap_rc=0
+        strip_file_capabilities || cap_rc=$?
         if [[ "$helper_rc" -ne 0 ]]; then
-            if [[ -e "$SUDOERS_FILE" ]]; then
+            # A dry run only prints the removal, so the file still exists there: it is a failure only
+            # when a real run could not remove it.
+            if [[ "$DRY_RUN" -ne 1 && -e "$SUDOERS_FILE" ]]; then
                 fail "a root-owned helper was not installed and $SUDOERS_FILE could not be removed: remove it by hand, correct the helper directory and re-run this installer"
             fi
-            fail "a root-owned helper was not installed, so $SUDOERS_FILE was removed: until the helper directory is corrected (owned by root, not writable by all users) and this installer is re-run, every sudo-backed action fails on a non-root agent, firewall containment and services.set_start_mode included"
+            removed="was removed"
+            if [[ "$DRY_RUN" -eq 1 ]]; then removed="would be removed"; fi
+            fail "a root-owned helper was not installed, so $SUDOERS_FILE $removed: until the helper directory is corrected (owned by root, not writable by all users) and this installer is re-run, every sudo-backed action fails on a non-root agent, firewall containment and services.set_start_mode included"
         fi
         if [[ "$sudoers_rc" -ne 0 ]]; then
             warn "$SUDOERS_FILE was not installed (status $sudoers_rc); removing any earlier file so no old grant stays"
@@ -1869,11 +2090,18 @@ case "$ACTION" in
             fi
             exit "$sudoers_rc"
         fi
+        if [[ "$cap_rc" -ne 0 ]]; then
+            warn "install INCOMPLETE: file capabilities may still be present on $BINARY_PATH (exit $cap_rc)"
+            exit "$cap_rc"
+        fi
         log "install complete. Verify with: $0 --check"
         ;;
 
     check)
+        # The exit status IS the contract ("exits non-zero on any drift"): without this the case
+        # falls through to the trailing `exit 0` and --check can never fail.
         check_install
+        exit $?
         ;;
 
     uninstall)

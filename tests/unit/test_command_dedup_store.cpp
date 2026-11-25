@@ -23,10 +23,12 @@
 #include <sqlite3.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -36,6 +38,7 @@
 #ifndef _WIN32
 #include <csignal>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -1034,6 +1037,189 @@ TEST_CASE("dedup_quarantine: a sidecar quarantine name that is taken is never ov
     CHECK(r.notes[0].find("could not preserve") != std::string::npos);
 }
 
+TEST_CASE("sqlite_quarantine: a sidecar whose copy fails part-way leaves no partial file in the set",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // #7472: a full disk can leave a truncated `<claimed>-wal` that would pass for the evidence.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes");
+
+    int copy_calls = 0;
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied); // the injected rename failure
+    };
+    ops.copy = [&](const fs::path&, const fs::path& to, std::error_code& ec) {
+        ++copy_calls;
+        write_bytes(to, "wal"); // the part that landed before the disk filled
+        ec = std::make_error_code(std::errc::no_space_on_device);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(copy_calls == 1);
+    REQUIRE(r.dest.has_value());
+    CHECK(read_bytes(*r.dest) == "main");
+    CHECK(fs::symlink_status(fs::path(r.dest->string() + "-wal")).type() ==
+          fs::file_type::not_found);
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found); // source sidecar gone
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+    CHECK(r.notes[0].find("partial copy") != std::string::npos);
+    CHECK(r.notes[0].find("was removed") != std::string::npos);
+}
+
+TEST_CASE("sqlite_quarantine: a failed copy onto a quarantine name that already exists never removes it",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The destructive step must be unreachable when anything was already at the name: the copy
+    // seam fails with a NON-file_exists error, which would trigger the removal if the destination
+    // check were bypassed.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "new wal");
+    const fs::path kept{db.string() + ".corrupt-1234-wal"};
+    write_bytes(kept, "stray older wal");
+
+    int copy_calls = 0;
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    ops.copy = [&](const fs::path&, const fs::path&, std::error_code& ec) {
+        ++copy_calls;
+        ec = std::make_error_code(std::errc::no_space_on_device);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(r.dest.has_value());
+    CHECK(copy_calls == 0);
+    REQUIRE(fs::is_regular_file(kept));
+    CHECK(read_bytes(kept) == "stray older wal");
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+    CHECK(r.notes[0].find("partial copy") == std::string::npos);
+}
+
+TEST_CASE("sqlite_quarantine: a copy that reports file_exists leaves what it found at the name alone",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // #7472: the name was free when this call checked it, and something took it before the copy
+    // landed (the copy seam stands in for that racer and answers file_exists). Whatever is there
+    // is not ours: it is not removed and the note does not claim a partial copy.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes");
+
+    int copy_calls = 0;
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    ops.copy = [&](const fs::path&, const fs::path& to, std::error_code& ec) {
+        ++copy_calls;
+        write_bytes(to, "racer bytes");
+        ec = std::make_error_code(std::errc::file_exists);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(copy_calls == 1);
+    REQUIRE(r.dest.has_value());
+    const fs::path racer{r.dest->string() + "-wal"};
+    REQUIRE(fs::is_regular_file(racer));
+    CHECK(read_bytes(racer) == "racer bytes");
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found); // source sidecar gone
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+    CHECK(r.notes[0].find("partial copy") == std::string::npos);
+}
+
+#ifndef _WIN32
+TEST_CASE("sqlite_quarantine: a dangling link at the sidecar quarantine name is neither followed nor removed",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // exists() reads a dangling link as absent, so the rename step runs; the move hook plants the
+    // link at its destination (as a racing writer could) and fails. The copy step must then treat
+    // the link as an entry: no copy through it, and the link stays.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes");
+    const auto nowhere = dir.path / "nowhere.bin";
+
+    int copy_calls = 0;
+    bool planted = false;
+    sq::FsOps ops;
+    ops.move = [&](const fs::path&, const fs::path& to, std::error_code& ec) {
+        std::error_code lec;
+        fs::create_symlink(nowhere, to, lec);
+        planted = !lec;
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    ops.copy = [&](const fs::path&, const fs::path&, std::error_code& ec) {
+        ++copy_calls;
+        ec = std::make_error_code(std::errc::no_space_on_device);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(planted);
+    REQUIRE(r.dest.has_value());
+    const fs::path link{r.dest->string() + "-wal"};
+    CHECK(copy_calls == 0);
+    CHECK(fs::is_symlink(link));
+    CHECK_FALSE(fs::exists(nowhere)); // nothing was created through the link
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+}
+
+TEST_CASE("sqlite_quarantine: a partial sidecar copy that cannot be removed is reported and left in place",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // #7472: the removal is the one destructive step, so its failure is reported, never hidden.
+    // The copy seam leaves a partial file and then makes the directory read-only, which fails the
+    // removal of that partial and of the source sidecar alike (the second note).
+    if (::geteuid() == 0)
+        SKIP("root bypasses directory permissions; the removal cannot be made to fail");
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes");
+
+    struct RestorePerms {
+        fs::path d;
+        ~RestorePerms() {
+            std::error_code e;
+            fs::permissions(d, fs::perms::owner_all, fs::perm_options::replace, e);
+        }
+    } restore{dir.path};
+    int copy_calls = 0;
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    ops.copy = [&](const fs::path&, const fs::path& to, std::error_code& ec) {
+        ++copy_calls;
+        write_bytes(to, "wal");
+        std::error_code pec;
+        fs::permissions(dir.path, fs::perms::owner_read | fs::perms::owner_exec,
+                        fs::perm_options::replace, pec);
+        REQUIRE_FALSE(pec);
+        ec = std::make_error_code(std::errc::no_space_on_device);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(copy_calls == 1);
+    REQUIRE(r.dest.has_value());
+    const fs::path partial{r.dest->string() + "-wal"};
+    CHECK(fs::is_regular_file(partial)); // the removal failed, so the partial is still there
+    REQUIRE(r.notes.size() == 2);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+    CHECK(r.notes[0].find("could not be removed") != std::string::npos);
+    CHECK(r.notes[0].find("was removed") == std::string::npos);
+    CHECK(r.notes[1].find("a stale sidecar may remain") != std::string::npos); // the source too
+}
+#endif
+
 #ifndef _WIN32
 TEST_CASE("dedup_quarantine: a dangling symlink at a sidecar name travels into the quarantine set as a link",
           "[command_dedup][corruption][quarantine_fs]") {
@@ -1054,6 +1240,419 @@ TEST_CASE("dedup_quarantine: a dangling symlink at a sidecar name travels into t
     CHECK(fs::is_symlink(fs::path(r.dest->string() + "-wal")));                // carried as a link
     CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);        // nothing at the live name
     CHECK_FALSE(fs::exists(dir.path / "nowhere.bin"));                         // nothing created through it
+}
+#endif
+
+#ifndef _WIN32
+// The descriptor copy (the default sidecar copy on POSIX). The helper is called directly where the
+// case needs a state the pre-checks in quarantine_corrupt_db would refuse first: a link at the
+// source or an entry at the destination that appears after the pre-check.
+namespace {
+int g_write_calls = 0;
+// Writes at most 3 bytes per call (a short write the copy loop must continue).
+ssize_t short_write(int fd, const void* b, std::size_t n) {
+    ++g_write_calls;
+    return ::write(fd, b, n < 3 ? n : 3);
+}
+// Lands 3 bytes, then fails like a full disk.
+ssize_t full_disk_write(int fd, const void* b, std::size_t n) {
+    if (g_write_calls++ == 0)
+        return ::write(fd, b, n < 3 ? n : 3);
+    errno = ENOSPC;
+    return -1;
+}
+// A publish that fails with something other than file_exists (a full directory).
+void full_directory_link(const fs::path&, const fs::path&, std::error_code& ec) {
+    ec = std::make_error_code(std::errc::no_space_on_device);
+}
+int g_fsync_calls = 0;
+int failing_fsync(int) {
+    ++g_fsync_calls;
+    errno = EIO;
+    return -1;
+}
+int eintr_once_fsync(int fd) {
+    if (g_fsync_calls++ == 0) {
+        errno = EINTR;
+        return -1;
+    }
+    return ::fsync(fd);
+}
+// Entries of the temporary-name form the descriptor copy writes before it links a file into place.
+std::size_t partial_temporaries(const fs::path& dir) {
+    std::size_t n = 0;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (e.path().filename().string().find(std::string{sq::detail::kPartialInfix}) !=
+            std::string::npos)
+            ++n;
+    }
+    return n;
+}
+// The name of a temporary in `dir` (empty when there is none).
+std::string temporary_name_in(const fs::path& dir) {
+    for (const auto& e : fs::directory_iterator(dir)) {
+        const auto name = e.path().filename().string();
+        if (name.find(std::string{sq::detail::kPartialInfix}) != std::string::npos)
+            return name;
+    }
+    return {};
+}
+// Records, at every write, whether anything is at the destination name and how many temporaries exist.
+std::string g_probe_temp_name;
+fs::path g_probe_dst;
+bool g_dst_seen = false;
+std::size_t g_probe_temps = 0;
+ssize_t probing_write(int fd, const void* b, std::size_t n) {
+    std::error_code pec;
+    if (fs::symlink_status(g_probe_dst, pec).type() != fs::file_type::not_found)
+        g_dst_seen = true;
+    const auto t = partial_temporaries(g_probe_dst.parent_path());
+    g_probe_temps = t > g_probe_temps ? t : g_probe_temps;
+    if (auto name = temporary_name_in(g_probe_dst.parent_path()); !name.empty())
+        g_probe_temp_name = std::move(name);
+    return ::write(fd, b, n);
+}
+std::string mode_of(const fs::path& p) {
+    struct stat st {};
+    REQUIRE(::lstat(p.c_str(), &st) == 0);
+    return std::format("{:o}", static_cast<unsigned>(st.st_mode & 0777));
+}
+} // namespace
+
+TEST_CASE("sqlite_quarantine: the descriptor copy never reads through a link at the source",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // #7472: a link swapped in at the sidecar's live name after the regular-file check must not
+    // have its TARGET copied into the quarantine set as evidence.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto victim = dir.path / "victim.bin";
+    write_bytes(victim, "victim bytes");
+    const auto src = dir.path / "x.db-wal";
+    std::error_code lec;
+    fs::create_symlink(victim, src, lec);
+    if (lec == std::errc::operation_not_permitted || lec == std::errc::permission_denied)
+        SKIP("cannot create a symlink here: " << lec.message());
+    REQUIRE_FALSE(lec);
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial);
+    CHECK(ec == std::errc::too_many_symbolic_link_levels);
+    CHECK_FALSE(partial.created);
+    CHECK(fs::symlink_status(dst).type() == fs::file_type::not_found); // nothing copied through
+    CHECK(read_bytes(victim) == "victim bytes");
+}
+
+TEST_CASE("sqlite_quarantine: the descriptor copy refuses a source that is not a regular file",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    REQUIRE(fs::create_directories(dir.path));
+    SECTION("a directory") {
+        REQUIRE(fs::create_directory(src));
+    }
+    SECTION("a fifo (the open must not block)") {
+        REQUIRE(::mkfifo(src.c_str(), 0600) == 0);
+    }
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial);
+    CHECK(ec == std::errc::not_supported);
+    CHECK_FALSE(partial.created);
+    CHECK(fs::symlink_status(dst).type() == fs::file_type::not_found); // nothing created
+}
+
+TEST_CASE("sqlite_quarantine: the descriptor copy publishes exclusively",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // #7472: an entry that appears at the quarantine name after the pre-check is neither
+    // overwritten nor written through, and is never removed as if it were a partial copy.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    write_bytes(src, "wal bytes");
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+
+    SECTION("a regular file keeps its bytes") {
+        write_bytes(dst, "racer bytes");
+        sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial);
+        CHECK(ec == std::errc::file_exists);
+        CHECK_FALSE(partial.created);
+        CHECK(read_bytes(dst) == "racer bytes");
+    }
+    SECTION("a dangling link stays a link and nothing is created through it") {
+        const auto nowhere = dir.path / "nowhere.bin";
+        std::error_code lec;
+        fs::create_symlink(nowhere, dst, lec);
+        if (lec == std::errc::operation_not_permitted || lec == std::errc::permission_denied)
+            SKIP("cannot create a symlink here: " << lec.message());
+        REQUIRE_FALSE(lec);
+        sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial);
+        CHECK(ec == std::errc::file_exists);
+        CHECK_FALSE(partial.created);
+        CHECK(fs::is_symlink(dst));
+        CHECK_FALSE(fs::exists(nowhere));
+    }
+    SECTION("a link to an existing file leaves that file as it was") {
+        const auto victim = dir.path / "victim.bin";
+        write_bytes(victim, "victim bytes");
+        std::error_code lec;
+        fs::create_symlink(victim, dst, lec);
+        if (lec == std::errc::operation_not_permitted || lec == std::errc::permission_denied)
+            SKIP("cannot create a symlink here: " << lec.message());
+        REQUIRE_FALSE(lec);
+        sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial);
+        CHECK(ec == std::errc::file_exists);
+        CHECK(fs::is_symlink(dst));
+        CHECK(read_bytes(victim) == "victim bytes");
+    }
+    CHECK(read_bytes(src) == "wal bytes"); // the source is never touched by the copy
+    CHECK(partial_temporaries(dir.path) == 0); // the temporary of a refused publish is removed
+}
+
+TEST_CASE("sqlite_quarantine: the descriptor copy is byte-exact, owner-only and continues short writes",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+
+    SECTION("larger than one chunk, with embedded NULs") {
+        std::string big(200'000, '\0');
+        for (std::size_t i = 0; i < big.size(); ++i)
+            big[i] = static_cast<char>(i * 31 + 7);
+        write_bytes(src, big);
+        sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial);
+        CHECK_FALSE(ec);
+        CHECK(read_bytes(dst) == big);
+        CHECK(mode_of(dst) == "600");
+    }
+    SECTION("a write that lands 3 bytes at a time") {
+        write_bytes(src, "wal bytes!");
+        g_write_calls = 0;
+        sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial, &short_write);
+        CHECK_FALSE(ec);
+        CHECK(g_write_calls == 4); // 10 bytes in 3+3+3+1
+        CHECK(read_bytes(dst) == "wal bytes!");
+    }
+}
+
+TEST_CASE("sqlite_quarantine: a descriptor copy that fails part-way removes the temporary it wrote",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    write_bytes(src, "wal bytes");
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    g_write_calls = 0;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial, &full_disk_write);
+    CHECK(ec == std::errc::no_space_on_device);
+    CHECK(partial.created);
+    CHECK_FALSE(partial.removal);
+    CHECK(fs::symlink_status(dst).type() == fs::file_type::not_found); // 3 bytes landed, then gone
+    CHECK(partial_temporaries(dir.path) == 0); // and the temporary that held them is removed
+    CHECK(read_bytes(src) == "wal bytes");
+}
+
+TEST_CASE("sqlite_quarantine: the descriptor copy never has a file at the quarantine name until it is complete",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // #8427: a process that dies mid-copy must not leave a truncated file at the quarantine name.
+    // The probe runs inside every write of a multi-chunk copy: the name is still free and exactly
+    // one temporary holds the bytes; afterwards only the final file is left.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    std::string big(200'000, 'w');
+    write_bytes(src, big);
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    g_probe_dst = dst;
+    g_dst_seen = false;
+    g_probe_temps = 0;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial, &probing_write);
+    CHECK_FALSE(ec);
+    CHECK_FALSE(g_dst_seen);
+    CHECK(g_probe_temps == 1);
+    CHECK(read_bytes(dst) == big);
+    CHECK(partial_temporaries(dir.path) == 0);
+}
+
+TEST_CASE("sqlite_quarantine: a publish that fails with another error keeps the complete copy",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The original sidecar is dropped right after a failed copy, so a complete, synced copy whose
+    // only failure is the publish (the directory has no room for a second entry) is the last one:
+    // it is kept under its temporary name and the helper says where.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    write_bytes(src, "wal bytes");
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial, &::write, &::fsync,
+                                           &full_directory_link);
+    CHECK(ec == std::errc::no_space_on_device);
+    CHECK(partial.kept);
+    CHECK(partial.created);
+    CHECK(partial.temporary.filename().string().find(std::string{sq::detail::kPartialInfix}) !=
+          std::string::npos);
+    CHECK(read_bytes(partial.temporary) == "wal bytes");
+    CHECK(mode_of(partial.temporary) == "600");
+    CHECK(fs::symlink_status(dst).type() == fs::file_type::not_found);
+    CHECK(partial_temporaries(dir.path) == 1);
+    CHECK(read_bytes(src) == "wal bytes");
+}
+
+TEST_CASE("sqlite_quarantine: the failed-copy note names what became of the bytes",
+          "[command_dedup][corruption][quarantine_fs]") {
+    const fs::path side{"/data/echo.db-wal"};
+    const fs::path dest{"/data/echo.db.corrupt-1-wal"};
+    const fs::path temp{"/data/echo.db.corrupt-1-wal.partial-7-0"};
+
+    const auto kept = sq::detail::failed_copy_note(side, dest, "No space left on device", "",
+                                                   temp.string());
+    CHECK(kept.find("the complete copy was kept as " + temp.string()) != std::string::npos);
+    CHECK(kept.find("its content is not kept") == std::string::npos);
+
+    const auto removed = sq::detail::failed_copy_note(
+        side, dest, "No space left on device", sq::detail::removal_note({}, temp), "");
+    CHECK(removed.find("its content is not kept; the partial copy was removed") !=
+          std::string::npos);
+
+    const auto stuck = sq::detail::failed_copy_note(
+        side, dest, "No space left on device",
+        sq::detail::removal_note(std::make_error_code(std::errc::permission_denied), temp), "");
+    CHECK(stuck.find("the partial copy could not be removed from " + temp.string()) !=
+          std::string::npos);
+    CHECK(stuck.find(std::make_error_code(std::errc::permission_denied).message()) !=
+          std::string::npos);
+}
+
+TEST_CASE("sqlite_quarantine: the descriptor copy never reuses a stale temporary name",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // A temporary left by a crashed copy (same pid, a later counter value) is never overwritten or
+    // reused: the copy takes the next name, and gives up with file_exists after eight collisions.
+    // The first copy reveals the counter value in use through the probe.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    write_bytes(src, "wal bytes");
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+
+    const auto first = dir.path / "x.db.corrupt-1-wal";
+    g_probe_dst = first;
+    g_probe_temp_name.clear();
+    sq::detail::copy_sidecar_by_descriptor(src, first, ec, partial, &probing_write);
+    REQUIRE_FALSE(ec);
+    REQUIRE_FALSE(g_probe_temp_name.empty());
+    const auto used = std::stoul(g_probe_temp_name.substr(g_probe_temp_name.rfind('-') + 1));
+    const auto pid = ::getpid();
+    const auto stale_for = [&](const fs::path& to, unsigned long n) {
+        return fs::path(to.string() + std::string{sq::detail::kPartialInfix} + std::to_string(pid) +
+                        "-" + std::to_string(n));
+    };
+
+    SECTION("one stale name is skipped and left as found") {
+        const auto second = dir.path / "x.db.corrupt-2-wal";
+        const auto stale = stale_for(second, used + 1); // the name the next copy tries first
+        write_bytes(stale, "stale bytes");
+        sq::detail::copy_sidecar_by_descriptor(src, second, ec, partial);
+        CHECK_FALSE(ec);
+        CHECK(read_bytes(second) == "wal bytes");
+        CHECK(read_bytes(stale) == "stale bytes");
+    }
+    SECTION("eight stale names exhaust the retries without touching any of them") {
+        const auto third = dir.path / "x.db.corrupt-3-wal";
+        for (unsigned long n = used + 1; n <= used + 8; ++n)
+            write_bytes(stale_for(third, n), "stale bytes");
+        sq::detail::copy_sidecar_by_descriptor(src, third, ec, partial);
+        CHECK(ec == std::errc::file_exists);
+        CHECK_FALSE(partial.created);
+        CHECK(fs::symlink_status(third).type() == fs::file_type::not_found);
+        for (unsigned long n = used + 1; n <= used + 8; ++n)
+            CHECK(read_bytes(stale_for(third, n)) == "stale bytes");
+    }
+    CHECK(read_bytes(src) == "wal bytes");
+}
+
+TEST_CASE("sqlite_quarantine: a stray temporary of a crashed copy is never read as quarantined evidence",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const std::string stem = "x.db.corrupt-";
+    CHECK(sq::parse_quarantine_name(stem, "x.db.corrupt-1-wal").has_value());
+    CHECK_FALSE(sq::parse_quarantine_name(stem, "x.db.corrupt-1-wal.partial-123-0").has_value());
+
+    const auto db = dir.path / "x.db";
+    for (const char* e : {"1", "2", "3", "4", "5"})
+        write_bytes(fs::path(db.string() + ".corrupt-" + e), "old");
+    const fs::path stray{db.string() + ".corrupt-3-wal.partial-123-0"};
+    write_bytes(stray, "truncated");
+    sq::prune_old_quarantines(db, fs::path(db.string() + ".corrupt-5"), 3);
+    CHECK(fs::exists(stray)); // a bystander: never counted, never pruned
+    CHECK_FALSE(fs::exists(fs::path(db.string() + ".corrupt-1")));
+    CHECK(fs::exists(fs::path(db.string() + ".corrupt-5")));
+}
+
+TEST_CASE("sqlite_quarantine: a failed flush keeps the complete copy and reports it",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The earlier copy_file never fsynced, so a flush error must not turn a finished copy into none.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    write_bytes(src, "wal bytes");
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    g_fsync_calls = 0;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial, &::write, &failing_fsync);
+    CHECK_FALSE(ec);
+    CHECK(partial.created);
+    CHECK(partial.unsynced);
+    CHECK(partial.sync_error == std::errc::io_error);
+    CHECK(g_fsync_calls == 1);
+    CHECK(read_bytes(dst) == "wal bytes");
+    CHECK(mode_of(dst) == "600");
+    CHECK(partial_temporaries(dir.path) == 0);
+}
+
+TEST_CASE("sqlite_quarantine: an interrupted flush is retried",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    write_bytes(src, "wal bytes");
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    g_fsync_calls = 0;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial, &::write, &eintr_once_fsync);
+    CHECK_FALSE(ec);
+    CHECK_FALSE(partial.unsynced);
+    CHECK(g_fsync_calls == 2);
+    CHECK(read_bytes(dst) == "wal bytes");
+}
+
+TEST_CASE("sqlite_quarantine: the default sidecar copy preserves the bytes owner-only and drops the original",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The whole path with no copy seam: only the rename is made to fail.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes");
+
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(r.dest.has_value());
+    const fs::path copied{r.dest->string() + "-wal"};
+    CHECK(read_bytes(copied) == "wal bytes");
+    CHECK(mode_of(copied) == "600");
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("copied") != std::string::npos);
 }
 #endif
 
@@ -1498,6 +2097,34 @@ TEST_CASE("CommandDedupStore: a fresh store that cannot be created after a quara
     auto next = CommandDedupStore::open(path);
     REQUIRE(next.has_value());
     CHECK(next->claim("cmd-after-recovery").status == ClaimStatus::Claimed);
+}
+
+TEST_CASE("sqlite_quarantine: a failed default sidecar copy reports the partial copy removed "
+          "(whole path, no copy seam)",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // Only the rename is made to fail; the real descriptor copy then creates its temporary and
+    // every write fails (EFBIG), so it removes what it made. The note must carry that outcome: it
+    // is the one branch that turns the descriptor copy's result into the operator's note.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes"); // fixtures are written before the size limit is in force
+
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    FileSizeLimit no_writes;
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(r.dest.has_value());
+    const fs::path partial{r.dest->string() + "-wal"};
+    CHECK(fs::symlink_status(partial).type() == fs::file_type::not_found);
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+    CHECK(r.notes[0].find("the partial copy was removed") != std::string::npos);
+    CHECK(partial_temporaries(dir.path) == 0); // the quarantine set holds nothing stray either
 }
 #endif
 

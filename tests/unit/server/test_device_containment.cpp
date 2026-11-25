@@ -823,7 +823,7 @@ struct EstateHarness {
 
 } // namespace
 
-// Kills: dropping id_is_safe (control byte reaches the audit trail), a second probe.
+// Kills: dropping the auth::agent_id_is_audit_safe check (control byte reaches the audit trail), a second probe.
 TEST_CASE("fragment: stored data — id safety, one Decommission:Delete probe, allow",
           "[quarantine][route]") {
     EstateHarness h;

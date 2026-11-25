@@ -94,8 +94,13 @@ namespace {
 // read unchanged.
 bool compose_arming_check(const CommandCapabilityRegistry& registry, const RbacStore* rbac,
                           const std::string& principal, const std::string& plugin,
-                          const std::string& action) {
-    return yuzu::server::schedule_arming_permitted(registry, rbac, principal, plugin, action);
+                          const std::string& action, bool legacy_admin = true,
+                          const std::unordered_map<std::string, std::string>& parameters = {}) {
+    return yuzu::server::schedule_arming_permitted(registry, rbac, principal, plugin, action, parameters,
+                                                   [legacy_admin]() -> ArmingResult {
+                                                       return legacy_admin;
+                                                   })
+        .value_or(false);
 }
 
 } // namespace
@@ -138,6 +143,7 @@ yuzu::test::PgTestTemplate twins_instr_tpl{"optwinsinstr", [](const std::string&
     yuzu::server::pg::PgPool twins_pool_fx_{{.conninfo = twins_db_fx_.dsn(), .size = 4}};          \
     REQUIRE(twins_pool_fx_.valid());                                                               \
     RbacStore store_var{twins_pool_fx_};                                                           \
+    store_var.use_no_session_store_for_test(); /* no session_store schema in this fixture */       \
     REQUIRE(store_var.is_open())
 
 #define TWINS_INSTR(pool_var)                                                                      \
@@ -217,6 +223,100 @@ TEST_CASE("arming_check composition: RBAC off arms for a human but never for an 
     REQUIRE_FALSE(rbac.is_rbac_enabled());
     CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "exists"));
     CHECK_FALSE(compose_arming_check(registry, &rbac, "engine:vuln", "filesystem", "exists"));
+}
+
+TEST_CASE("arming_check composition: RBAC off, a creator who is no longer admin cannot arm a "
+          "non-Read pair, but still arms a Read pair (WP06 F53)",
+          "[server][routes][mcp][pg]") {
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
+    TWINS_RBAC(rbac);
+    rbac.set_rbac_enabled(false);
+    REQUIRE_FALSE(rbac.is_rbac_enabled());
+    // filesystem.create_temp is a Write-class pair; filesystem.exists is Read.
+    CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "create_temp",
+                               /*legacy_admin=*/true));
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "alice", "filesystem", "create_temp",
+                                     /*legacy_admin=*/false));
+    CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "exists",
+                               /*legacy_admin=*/false));
+    // An engine principal is never armed under legacy-open, admin bit or not.
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "engine:vuln", "filesystem", "exists",
+                                     /*legacy_admin=*/true));
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "engine:vuln", "filesystem", "create_temp",
+                                     /*legacy_admin=*/true));
+}
+
+TEST_CASE("arming_check composition: tri-state - an auth-store fault is UNAVAILABLE, and the "
+          "admin lookup is lazy (WP06 F53)",
+          "[server][routes][mcp][pg]") {
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
+    TWINS_RBAC(rbac);
+    rbac.set_rbac_enabled(false);
+    int lookups = 0;
+    auto fault = [&]() -> ArmingResult {
+        ++lookups;
+        return std::unexpected(std::string("auth store error"));
+    };
+    // Non-Read pair, RBAC off: the lookup runs and its fault is reported as UNAVAILABLE.
+    auto r = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "create_temp", {}, fault);
+    CHECK_FALSE(r.has_value());
+    CHECK(lookups == 1);
+    // Read pair: never consults the auth store.
+    auto rd = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "exists", {}, fault);
+    REQUIRE(rd.has_value());
+    CHECK(*rd);
+    CHECK(lookups == 1);
+    // Engine principal: denied without a lookup.
+    auto en = schedule_arming_permitted(registry, &rbac, "engine:x", "filesystem", "create_temp", {}, fault);
+    REQUIRE(en.has_value());
+    CHECK_FALSE(*en);
+    CHECK(lookups == 1);
+    // RBAC enforced: the legacy lookup is not consulted at all.
+    rbac.set_rbac_enabled(true);
+    (void)schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "create_temp", {}, fault);
+    CHECK(lookups == 1);
+}
+
+TEST_CASE("arming_check composition: enforced RBAC with an unreadable grant store is UNAVAILABLE "
+          "(held), never DENIED; a null or unopened store is UNAVAILABLE too (WP06 F53)",
+          "[server][routes][mcp][pg]") {
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
+    TWINS_RBAC(rbac);
+    rbac.set_rbac_enabled(true);
+    REQUIRE(rbac.assign_role(PrincipalRole{"user", "alice", "Administrator"}).has_value());
+    auto never = []() -> ArmingResult { return false; };
+    // Healthy: a definitive answer either way.
+    auto granted = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "exists", {}, never);
+    REQUIRE(granted.has_value());
+    CHECK(*granted);
+    auto denied = schedule_arming_permitted(registry, &rbac, "nobody", "filesystem", "exists", {}, never);
+    REQUIRE(denied.has_value());
+    CHECK_FALSE(*denied);
+    // The role table cannot be read: the question has no answer, so it is not a denial.
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(twins_db_fx_.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult dr{PQexec(c.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(dr.ok());
+    }
+    auto faulted = schedule_arming_permitted(registry, &rbac, "bob", "filesystem", "exists", {}, never);
+    CHECK_FALSE(faulted.has_value());
+    // No store wired: also unavailable (held), not a recorded denial.
+    auto none = schedule_arming_permitted(registry, nullptr, "alice", "filesystem", "exists", {}, never);
+    CHECK_FALSE(none.has_value());
+}
+
+TEST_CASE("arming_check composition: a creator the auth store can never resolve is DENIED, an "
+          "auth-store fault is UNAVAILABLE (WP06 F53)",
+          "[server][routes][mcp]") {
+    using yuzu::server::AuthDBError;
+    using yuzu::server::legacy_admin_lookup_failure;
+    for (auto e : {AuthDBError::UserNotFound, AuthDBError::InvalidUsername}) {
+        auto r = legacy_admin_lookup_failure(e);
+        REQUIRE(r.has_value()); // a definitive answer: the caller audits the denial and advances
+        CHECK_FALSE(*r);
+    }
+    CHECK_FALSE(legacy_admin_lookup_failure(AuthDBError::QueryFailed).has_value());
 }
 
 TEST_CASE("arming_check composition: RBAC legacy-open (disabled) admits regardless of grant",
@@ -301,8 +401,9 @@ struct Harness {
                   },
               .arming_check =
                   [this](const std::string& principal, const std::string& plugin,
-                        const std::string& action) {
-                      return compose_arming_check(registry, &rbac, principal, plugin, action);
+                        const std::string& action, const std::unordered_map<std::string, std::string>& parameters) {
+                      return compose_arming_check(registry, &rbac, principal, plugin, action,
+                                                  /*legacy_admin=*/true, parameters);
                   },
               // #6096: the outbox spent-ticket ledger. This harness's enqueue_fn writes no
               // outbox row, so the ledger is empty and no occurrence has run.
@@ -375,6 +476,7 @@ TEST_CASE("arming_check (auto path): a schedule whose creator lost the required 
     yuzu::test::AuthDbPg twins_auth_fx_;
     RbacStore rbac{twins_auth_fx_.pool()};
     REQUIRE(rbac.is_open());
+    rbac.use_no_session_store_for_test(); // no session_store schema in this fixture
     TWINS_INSTR(instr_pool);
     Harness h{instr_pool, rbac};
     // A second Administrator holder so unassigning carol's grant below doesn't
@@ -417,6 +519,7 @@ TEST_CASE("arming_check (approval path): a schedule whose creator lost the requi
     yuzu::test::AuthDbPg twins_auth_fx_;
     RbacStore rbac{twins_auth_fx_.pool()};
     REQUIRE(rbac.is_open());
+    rbac.use_no_session_store_for_test(); // no session_store schema in this fixture
     TWINS_INSTR(instr_pool);
     Harness h{instr_pool, rbac};
     // A second Administrator holder — see the identical comment in the

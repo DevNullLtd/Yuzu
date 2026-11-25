@@ -1048,3 +1048,51 @@ TEST_CASE("device lenses: Guardian lens distinguishes a pending-evidence timeout
         CHECK(body.find("timed out") == std::string::npos);
     }
 }
+
+// #7811: a lens takes the device id raw from the URL and hands it to the scoped permission check,
+// whose denial audit carries it, and to `target_id`. An over-long or control-byte id is refused
+// with a 400 before that check and before any audit row. The scoped gate here refuses every
+// device, so a route that reached it would answer 403: a 400 with `scoped_calls == 0` proves the
+// id check runs first. No store is wired, so this runs without Postgres.
+TEST_CASE("device lenses: an unsafe device id is refused before the scoped check and any audit row",
+          "[device][routes][audit][authz]") {
+    int scoped_calls = 0;
+    auto denyScoped = [&scoped_calls](const httplib::Request&, httplib::Response& res,
+                                      const std::string&, const std::string&, const std::string&) {
+        ++scoped_calls;
+        res.status = 403;
+        return false;
+    };
+    std::vector<std::string> audited;
+    auto audit = [&audited](const httplib::Request&, const std::string& action, const std::string&,
+                            const std::string&, const std::string& target_id,
+                            const std::string&) -> bool {
+        audited.push_back(action + "|" + target_id);
+        return true;
+    };
+    DeviceLensRoutes routes;
+    yuzu::server::test::TestRouteSink sink; // after `routes`: its handlers capture `this`
+    routes.register_routes(sink, denyScoped, /*dex_api=*/nullptr, /*guardian_api=*/nullptr, audit);
+
+    const std::vector<std::string> bad = {std::string(257, 'a'), "dev%00A", "dev%0D%0AA", "dev%0AA",
+                                          "dev%09A"};
+    for (const char* path : {"/fragments/device/dex", "/fragments/device/guardian"}) {
+        INFO(path);
+        for (const auto& id : bad) {
+            INFO(id.substr(0, 16));
+            auto r = sink.Get(std::string(path) + "?id=" + id);
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(r->body.find("Invalid device id.") != std::string::npos);
+        }
+        // The same route does reach the permission check for a safe id, at the 256-byte limit.
+        const int before = scoped_calls;
+        auto safe = sink.Get(std::string(path) + "?id=" + std::string(256, 'a'));
+        REQUIRE(safe);
+        CHECK(safe->status == 403);
+        CHECK(safe->body.find("Invalid device id.") == std::string::npos);
+        CHECK(scoped_calls == before + 1);
+    }
+    CHECK(scoped_calls == 2); // the two safe-id controls only: no refused id reached the gate
+    CHECK(audited.empty());
+}

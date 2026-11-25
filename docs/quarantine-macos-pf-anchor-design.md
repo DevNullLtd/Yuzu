@@ -392,8 +392,13 @@ root-owned helper and the fixed argv the leg uses. **There is no bare
 /sbin/pfctl -F states
 /sbin/pfctl -s info
 /sbin/pfctl -s rules
+/sbin/pfctl -s Anchors
 /sbin/pfctl -s References
 ```
+
+The `-s info`, `-s rules` and `-s Anchors` lines are also the three pf reads the firewall `state` and
+`rules` actions make (`-s Anchors` is the top-level anchor list; `-a com.apple -s Anchors` above lists
+only the `com.apple` children and serves the sibling check).
 
 **The anchor load goes through the helper.** The helper is written by the installer
 (`root:wheel` 0755, in place before the sudoers file) and named with no argument

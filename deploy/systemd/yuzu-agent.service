@@ -3,6 +3,18 @@ Description=Yuzu Endpoint Management Agent
 Documentation=https://github.com/DevNullLtd/Yuzu
 After=network-online.target
 Wants=network-online.target
+# The root-owned socket the firewall plugin reads the host firewall through
+# (docs/adr/3007-os-activated-read-helpers.md). This unit's own [Service] sandbox below is unchanged:
+# NoNewPrivileges stays true and the bounding set stays the one capability. The agent only connects to
+# the socket and reads; the service that answers is started by systemd, never by the agent. Wants=
+# starts the socket whenever the agent starts and its PartOf= stops it with the agent;
+# `systemctl stop yuzu-fw-snapshot.socket` and then `systemctl mask yuzu-fw-snapshot.socket` opts out
+# (`mask --now` alone left the socket file on Rocky 9.9, systemd 252). With no socket file the plugin
+# answers as a host without the broker does: firewalld's own rows on a firewalld host, `unknown`
+# elsewhere, after the refused netlink read's error row. A unit file copied without the socket and service
+# units has no socket file either, so it reads the same way.
+Wants=yuzu-fw-snapshot.socket
+After=yuzu-fw-snapshot.socket
 
 # Crash-loop backstop (ADR-0021 rung 7.7a). Restart=always + RestartSec=10 would
 # otherwise restart forever; paired with the Guardian F3 orphan-exit (hard_exit on a
@@ -57,6 +69,20 @@ ExecStart=/usr/local/bin/yuzu-agent \
     --data-dir /var/lib/yuzu-agent
 Restart=always
 RestartSec=10
+# A stop waits, with no bound of the agent's own, for every command already running its plugin to
+# return (the command pool's join; a command blocked in the kernel on a stalled mount or resolver
+# holds it, and the agent's 20 s shutdown watchdog does not cover it). 60 s lets an ordinary
+# stop finish and then ends a stuck one with SIGKILL (status=9/KILL) instead of waiting out
+# systemd's default. A stop that ends this way leaves the unit failed (Result=timeout) and stopped:
+# systemd does not restart a unit whose stop was requested, so it stays down until it is
+# started again. The wait also covers a protective
+# action (a firewall containment) that runs while the command pool closes: its drain is
+# unbounded and, during a systemd stop, inside this budget, so a long drain ends in SIGKILL too, and a command killed
+# mid-execution leaves an in-flight dedup row that answers RUNNING for its command id; to clear
+# it, stop the agent, remove /var/lib/yuzu-agent/command_dedup.db, start it (docs/command-dedup.md).
+# The server unit uses 210 s and
+# the gateway unit 40 s.
+TimeoutStopSec=60
 WorkingDirectory=/var/lib/yuzu-agent
 StateDirectory=yuzu-agent
 

@@ -48,13 +48,54 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
       with --require-approved (the release gate), an entry whose approval_ref
       is `pending`. Prints `in_force=N` and `pending=M` for the caller.
 
+  grype-ignore-file PATH [--emit OUT] [--require-approved]
+      Validate .grypeignore.yaml, the acceptances for the gate's second
+      scanner (grype), with the same parser, the same statement, expiry and
+      approval rules and the same in-force rules as ignore-file. Only the
+      scope differs, because grype matches a package, not a path or a purl:
+
+        vulnerabilities:
+          - id: CVE-2026-1234          first key of every entry
+            package_name: erlang       required: grype's package name, exact
+            package_version: 28.5.0.2  required: a rule without a version
+                                       would accept every version
+            package_type: binary       optional: grype's package type
+            statement: >-              ... then statement, expired_at,
+                                       approved_by, approved_on and
+                                       approval_ref, exactly as ignore-file
+
+      No glob character in any scope field. With --emit OUT it writes the
+      entries in force as a grype config holding only `ignore:` rules
+      (vulnerability, package name, version and type); grype reads that
+      file (`-c`), never PATH. Prints in_force=, pending= and
+      pending_not_honoured= like ignore-file, and waivers_in_force=.
+
+      The file may also hold one optional `provider_waivers:` section, parsed
+      by the same parser under the same shape rules:
+
+        provider_waivers:
+          - provider: nvd              first key: nvd, alpine, debian or ubuntu
+            statement: >-              required: why, with the evidence that
+              ...                      the upstream source is stalled
+            expired_at: 2026-11-30     required, at most MAX_WAIVER_DAYS out
+            approved_by, approved_on, approval_ref: as for an entry
+
+      A waiver lets grype-db-providers admit that provider's capture when it
+      is older than MAX_DB_AGE_HOURS, and nothing else. A duplicate provider,
+      an unknown one, an expiry more than MAX_WAIVER_DAYS out, and an EXPIRED
+      waiver refuse the whole file (an expired entry is only not in force);
+      with --require-approved a pending one is not in force. With
+      --emit-waivers OUT it writes the waivers in force (JSON, without the
+      statement) for grype-db-providers --waivers.
+
   not-covered PATH [--require-approved]
       Validate scripts/ci/image-vuln-gate-not-covered.txt (same approval
       fields; format in that file's header).
 
-  pending IGNORE_FILE NOT_COVERED_FILE
-      The release skills' pre-tag check: validate both files and fail (exit 1)
-      when any ignore entry or not-covered listing that is not expired still
+  pending IGNORE_FILE NOT_COVERED_FILE GRYPE_IGNORE_FILE
+      The release skills' pre-tag check: validate the three files and fail
+      (exit 1) when any ignore entry (of either scanner), provider waiver or
+      not-covered listing that is not expired still
       has approval_ref `pending`, when any of them has EXPIRED or expires
       within RELEASE_WINDOW_DAYS (each publish leg re-reads the date, so one
       lapsing during the release fails the legs that have not run yet), or
@@ -106,6 +147,49 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
   canary-check REPORT_JSON FAMILY OS_NAME
       Fail unless the canary scan detected FAMILY OS_NAME and matched at least
       one vulnerability.
+
+  grype-db-listing LISTING_JSON
+      Read grype's DB listing (latest.json: status, schemaVersion, built,
+      path, checksum) and print path=, checksum=, built= and schema= for the
+      gate, which downloads that archive and checks its sha256 before grype
+      imports it. Fails unless the status is `active`, the schema is v6, the
+      path is a bare archive name, the checksum is a sha256, and `built` is
+      at most MAX_DB_AGE_HOURS old and not more than an hour in the future.
+      The listing is not signed upstream: TLS to the listing's host and the
+      recorded checksum are the evidence of which DB was used.
+
+  grype-db-status STATUS_JSON --built BUILT --schema SCHEMA
+      Read `grype db status -o json` after the import and fail unless grype
+      reports the DB valid, with the listing's `built` and schemaVersion, and
+      at most MAX_DB_AGE_HOURS old: the DB grype will scan with is the one the
+      gate downloaded and verified.
+
+  grype-db-providers PROVIDERS_JSON [--waivers WAIVERS_JSON] PROVIDER...
+      Read `grype db providers -o json` and fail unless every named provider
+      is listed with a dateCaptured at most MAX_DB_AGE_HOURS old (and not more
+      than an hour in the future). The DB's own `built` time says when it was
+      assembled, not how fresh each source in it is: a provider whose capture
+      went stale would otherwise read as current. With --waivers (the file
+      grype-ignore-file --emit-waivers wrote), a provider with a waiver in
+      force whose readable capture is merely older than MAX_DB_AGE_HOURS
+      passes, with a `waiver: ...` line naming its age and the waiver; a
+      missing provider, an unreadable or future capture time, or an
+      unreadable waivers file still fails.
+
+  grype-components CYCLONEDX_JSON NAME[=VERSION]...
+      Read grype's CycloneDX output (every catalogued component) and fail
+      unless each NAME is a component with a version identified by grype
+      itself (purl pkg:generic/NAME@VERSION), not an OS package of that name;
+      with =VERSION, grype must report exactly that version. Used for an image whose
+      point in running grype is a component Trivy cannot see (the gateway's
+      Erlang/OTP runtime, `erlang`): grype's JSON report lists only matches, so
+      a runtime grype never catalogued would otherwise read as clean.
+
+  grype-report REPORT_JSON
+      Read a GRYPE JSON report (another scanner's report is refused) and print
+      grype_version=, image_id=, distro_family=, distro_version=, matches=,
+      ignored=, fixable_critical= (in matches: not accepted) and
+      fixable_critical_accepted= (in ignoredMatches: accepted) lines.
 """
 
 import datetime as dt
@@ -125,10 +209,37 @@ WARN_DAYS = 21
 # tomorrow): a release, re-runs included, can run past midnight.
 RELEASE_WINDOW_DAYS = 2
 MAX_DB_AGE_HOURS = 72
+# A provider waiver (`provider_waivers:` in .grypeignore.yaml) admits one grype
+# DB provider whose capture is older than MAX_DB_AGE_HOURS, for a release that
+# cannot wait for a stalled upstream. It waives that one freshness check and
+# nothing else (not a missing provider, not an unreadable or future capture
+# time, not the DB's own age, checksum or status, not a finding), so its expiry
+# is far tighter than an acceptance's. The providers are a closed set: NVD (the
+# OTP runtime's matches) and the canary families' OS providers.
+MAX_WAIVER_DAYS = 14
+WAIVABLE_PROVIDERS = ("nvd", "alpine", "debian", "ubuntu")
+WAIVER_KEYS = ("provider", "statement", "expired_at", "approved_by", "approved_on", "approval_ref")
 
 ENTRY_KEYS = ("id", "paths", "purls", "statement", "expired_at", "approved_by",
               "approved_on", "approval_ref")
 LIST_KEYS = ("paths", "purls")
+GRYPE_ENTRY_KEYS = ("id", "package_name", "package_version", "package_type", "statement", "expired_at",
+                    "approved_by", "approved_on", "approval_ref")
+# grype 0.121.3 matches an ignore rule's package version and type by equality,
+# but its package NAME as an anchored regular expression: checked 2026-11-20
+# against a real match, `er+lang`, `erl[a]ng`, `erlang|zzz`, `e\wlang` and
+# `^erlang$` all suppressed package `erlang`, `erlang++` (an invalid pattern)
+# suppressed nothing, while `e.lang`, `rlang` and `erlan` did not match (`.` is
+# read literally). So a name may hold only characters grype reads literally:
+# no `+`, brackets, `|`, `\`, `^`, `$`, `*`, `?`, parentheses or braces. A
+# package whose name needs one (libstdc++) cannot be accepted here; its finding
+# fails the gate until it is fixed. No field may hold whitespace either, so an
+# entry cannot be read as wider than one package version.
+GRYPE_PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,213}$")
+GRYPE_PACKAGE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:~-]{0,127}$")
+GRYPE_PACKAGE_TYPE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+GRYPE_DB_PATH = re.compile(r"^vulnerability-db_v6\.[0-9]+\.[0-9]+_[0-9TZ:.-]+_[0-9]+\.tar\.(?:zst|gz|xz)$")
+GRYPE_DB_SCHEMA = re.compile(r"^v6\.[0-9]+\.[0-9]+$")
 # A GitHub login: 1-39 alphanumerics or single hyphens, not starting with one.
 LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
 # A CVE or GHSA id must be well formed; another vendor id (DLA-, ALAS-, ...)
@@ -183,6 +294,9 @@ TRIVY_RESULT_NAMES = frozenset(n.casefold() for n in (
 # OS families the gate has a canary for (canary-rootfs). Every image the
 # release publishes is on one of these; another family fails the gate until a
 # canary is added for it.
+# The gate's grype OS cross-check compares these names with grype's
+# distro.name, which uses the same three spellings; a family added here must be
+# checked against grype's name for it, or every image of that family is refused.
 CANARY_FAMILIES = ("debian", "ubuntu", "alpine")
 OS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+~-]{0,63}$")
 # A pre-release marker in an OS version: Alpine `_alpha`/`_beta`/`_pre`/`_rc`/
@@ -226,12 +340,20 @@ def plain_scalar(raw, where):
     return v
 
 
-def parse_ignore(text):
+def parse_sections(text, sections):
+    """The one parser of an acceptance file: {section: [entries]} for each
+    top-level block list named in `sections`, {name: (first key, entry keys,
+    list keys)}: for .trivyignore.yaml `vulnerabilities` with ENTRY_KEYS and
+    LIST_KEYS; for .grypeignore.yaml `vulnerabilities` with GRYPE_ENTRY_KEYS
+    and no list key, and `provider_waivers` with WAIVER_KEYS (the schemas'
+    sixth field). `vulnerabilities` is required; another section is optional,
+    each at most once. Every section's entries follow the same shape rules."""
     lines = text.split("\n")
-    entries = []
-    top_seen = False
+    out = {}
+    section = None
     i = 0
     n = len(lines)
+    names = ", ".join(f"`{s}:`" for s in sections)
 
     def skip(line):
         s = line.strip()
@@ -248,23 +370,25 @@ def parse_ignore(text):
         indent = len(line) - len(line.lstrip(" "))
         body = line.strip()
         if indent == 0:
-            if body != "vulnerabilities:":
-                raise Bad(f"{where}: only a `vulnerabilities:` key is allowed at the top level")
-            if top_seen:
-                raise Bad(f"{where}: second `vulnerabilities:` key")
-            top_seen = True
+            if not body.endswith(":") or body[:-1] not in sections:
+                raise Bad(f"{where}: only {names} allowed at the top level")
+            if body[:-1] in out:
+                raise Bad(f"{where}: second `{body}` key")
+            section = body[:-1]
+            out[section] = []
             i += 1
             continue
-        if not top_seen:
-            raise Bad(f"{where}: content before `vulnerabilities:`")
+        if section is None:
+            raise Bad(f"{where}: content before {names}")
+        first_key, entry_keys, list_keys = sections[section]
         if indent != 2 or not body.startswith("- "):
-            raise Bad(f"{where}: expected an entry `  - id: ...` at indentation 2")
-        # One entry: "  - id: X" then keys at indentation 4.
+            raise Bad(f"{where}: expected an entry `  - {first_key}: ...` at indentation 2")
+        # One entry: "  - id: X" (or "  - provider: X") then keys at indentation 4.
         first = body[2:]
         m = re.match(r"^([a-z_]+):(?:\s+(.*))?$", first)
-        if not m or m.group(1) != "id":
-            raise Bad(f"{where}: every entry starts with `- id:`")
-        entry = {"_line": i + 1, "id": plain_scalar(m.group(2) or "", where)}
+        if not m or m.group(1) != first_key:
+            raise Bad(f"{where}: every `{section}` entry starts with `- {first_key}:`")
+        entry = {"_line": i + 1, first_key: plain_scalar(m.group(2) or "", where)}
         i += 1
         while i < n:
             line = lines[i]
@@ -283,12 +407,12 @@ def parse_ignore(text):
             if not m:
                 raise Bad(f"{where}: expected `key: value`")
             key, raw = m.group(1), (m.group(2) or "")
-            if key not in ENTRY_KEYS or key == "id":
+            if key not in entry_keys or key == first_key:
                 raise Bad(f"{where}: key `{key}` is not allowed in an entry")
             if key in entry:
                 raise Bad(f"{where}: duplicate key `{key}`")
             i += 1
-            if key in LIST_KEYS:
+            if key in list_keys:
                 if raw.strip():
                     raise Bad(f"{where}: `{key}` must be a block list (`- \"...\"` lines at indentation 6)")
                 items = []
@@ -343,10 +467,12 @@ def parse_ignore(text):
                     if nind > 4:
                         raise Bad(f"line {j + 1}: continuation of `{key}`; use `statement: >-` for long text")
                 entry[key] = v
-        entries.append(entry)
-    if not top_seen:
+        out[section].append(entry)
+    if "vulnerabilities" not in out:
         raise Bad("no `vulnerabilities:` key")
-    return entries
+    for s in sections:
+        out.setdefault(s, [])
+    return out
 
 
 def list_item(raw, where):
@@ -443,18 +569,149 @@ def emit_trivy_yaml(entries, out):
         f.write("\n".join(lines) + "\n")
 
 
-def cmd_ignore_file(path, emit=None, require_approved=False):
+def trivy_scope_errors(tag, e, errors):
+    if "paths" not in e and "purls" not in e:
+        errors.append(f"{tag}: no `paths` or `purls` scope (never a bare id: it would hide the CVE in every package)")
+    for p in e.get("paths", ()):
+        why = path_problem(p)
+        if why:
+            errors.append(f"{tag}: paths item {p!r} {why}")
+    for p in e.get("purls", ()):
+        why = purl_problem(p)
+        if why:
+            errors.append(f"{tag}: purls item {p!r} {why}")
+    return (e["id"], tuple(e.get("paths", ())), tuple(e.get("purls", ())))
+
+
+def grype_scope_errors(tag, e, errors):
+    for k, rx, what in (("package_name", GRYPE_PACKAGE_NAME, "grype's package name"),
+                        ("package_version", GRYPE_PACKAGE_VERSION, "the package version")):
+        v = e.get(k)
+        if v is None:
+            errors.append(f"{tag}: no `{k}` ({what}; never a bare id: an entry is one package version)")
+        elif not rx.match(v):
+            errors.append(f"{tag}: {k} {v!r} must be {what}, with no whitespace, glob or regular-expression "
+                          f"character (grype reads a package name as a regular expression)")
+    t = e.get("package_type")
+    if t is not None and not GRYPE_PACKAGE_TYPE.match(t):
+        errors.append(f"{tag}: package_type {t!r} must be a grype package type (lower-case, e.g. apk, binary)")
+    return (e["id"], e.get("package_name"), e.get("package_version"), e.get("package_type"))
+
+
+def emit_grype_yaml(entries, out):
+    """The in-force entries as a grype config holding only `ignore:` rules.
+    Every value is JSON-encoded (a JSON string is a valid YAML double-quoted
+    scalar), so this file says exactly what was validated and nothing else."""
+    lines = ["# Generated by image-vuln-gate-checks.py from the validated grype ignore file.",
+             "ignore:"]
+    for e in entries:
+        lines.append(f"  - vulnerability: {json.dumps(e['id'])}")
+        lines.append("    package:")
+        lines.append(f"      name: {json.dumps(e['package_name'])}")
+        lines.append(f"      version: {json.dumps(e['package_version'])}")
+        if e.get("package_type"):
+            lines.append(f"      type: {json.dumps(e['package_type'])}")
+    if not entries:
+        lines[-1] = "ignore: []"
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+TRIVY_SCHEMA = (ENTRY_KEYS, LIST_KEYS, trivy_scope_errors, emit_trivy_yaml,
+                "a concrete scope, a statement, an expiry and approval fields (format-checked only)",
+                {"vulnerabilities": ("id", ENTRY_KEYS, LIST_KEYS)})
+GRYPE_SCHEMA = (GRYPE_ENTRY_KEYS, (), grype_scope_errors, emit_grype_yaml,
+                "a package name and version, a statement, an expiry and approval fields (format-checked only)",
+                {"vulnerabilities": ("id", GRYPE_ENTRY_KEYS, ()),
+                 "provider_waivers": ("provider", WAIVER_KEYS, ())})
+
+
+def read_ignore_sections(path, schema):
+    """({section: entries}, None) or (None, message) for an unreadable or
+    unparsable file."""
     try:
         with open(path, encoding="utf-8") as f:
             text = f.read()
     except (OSError, UnicodeDecodeError) as e:
-        print(f"{path}: unreadable: {e}", file=sys.stderr)
-        return 1
+        return None, f"{path}: unreadable: {e}"
     try:
-        entries = parse_ignore(text)
+        return parse_sections(text, schema[5]), None
     except Bad as e:
-        print(f"{path}: {e}", file=sys.stderr)
+        return None, f"{path}: {e}"
+
+
+def check_waivers(path, waivers, require_approved, errors, excluded, pending_all):
+    """The in-force provider waivers of a grype acceptance file, and the
+    problems with any, into `errors`. An expired waiver, or one more than
+    MAX_WAIVER_DAYS out, is an ERROR that refuses the whole file (an expired
+    acceptance merely stops being in force): a waiver is a temporary exception
+    to a hard check, and one left behind must not linger in the tree. With
+    `require_approved` (the release gate) a pending one is not in force."""
+    now = today()
+    seen = set()
+    in_force = []
+    for w in waivers:
+        prov = w["provider"]
+        tag = f"{path}:{w['_line']}: provider waiver {prov}"
+        if prov not in WAIVABLE_PROVIDERS:
+            errors.append(f"{tag}: provider must be one of {', '.join(WAIVABLE_PROVIDERS)}")
+        if prov in seen:
+            errors.append(f"{tag}: duplicate provider waiver")
+        seen.add(prov)
+        if "statement" not in w:
+            errors.append(f"{tag}: no `statement` (why, with the evidence that the upstream source is stalled)")
+        pending = check_approval(tag, w.get("approved_by"), w.get("approved_on"), w.get("approval_ref"), errors)
+        exp = parse_date(w.get("expired_at"))
+        if "expired_at" not in w or exp is None:
+            errors.append(f"{tag}: expired_at must be a YYYY-MM-DD date")
+            continue
+        left = (exp - now).days
+        if left > MAX_WAIVER_DAYS:
+            errors.append(f"{tag}: expired_at {exp} is {left} days out; the maximum for a provider waiver is "
+                          f"{MAX_WAIVER_DAYS}")
+            continue
+        if left < 0:
+            errors.append(f"{tag}: expired on {exp}; an expired provider waiver refuses the file: remove it "
+                          f"(or renew it with a new review and approval)")
+            continue
+        if pending:
+            pending_all.append(w)
+        if pending and require_approved:
+            excluded.append(w)
+            print(f"NOT IN FORCE: {tag}: approval_ref is pending; a release gate honours only a provider waiver "
+                  f"whose approval is recorded (docs/ci-architecture.md \"Recording an approval\")")
+            continue
+        if pending:
+            print(f"warning: {tag}: approval_ref is pending; honoured here, but the release gate "
+                  f"(--release) does not honour it")
+        print(f"note: {tag}: in force until {exp}: an image may be judged with grype DB provider {prov} "
+              f"older than {MAX_DB_AGE_HOURS} hours, and its report then says so; a release judged with it "
+              f"must say so in its release notes")
+        in_force.append(w)
+    return in_force
+
+
+def emit_waivers_json(path, waivers, out):
+    """The in-force provider waivers, for grype-db-providers --waivers. Every
+    value written has passed the format checks above (the statement is left
+    out: it is free text, and the reports and logs name the file line)."""
+    rows = [{"provider": w["provider"], "expired_at": w["expired_at"], "approved_by": w["approved_by"],
+             "approval_ref": w["approval_ref"], "approved_on": w.get("approved_on") or "-",
+             "where": f"{os.path.basename(path)}:{w['_line']}"} for w in waivers]
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(rows, f)
+        f.write("\n")
+
+
+def cmd_ignore_file(path, emit=None, require_approved=False, schema=TRIVY_SCHEMA, emit_waivers=None):
+    sections, why = read_ignore_sections(path, schema)
+    if sections is None:
+        print(why, file=sys.stderr)
         return 1
+    entries = sections["vulnerabilities"]
+    waiver_errors, waivers_excluded, waivers_pending = [], [], []
+    waivers_in_force = check_waivers(path, sections.get("provider_waivers", []), require_approved,
+                                     waiver_errors, waivers_excluded, waivers_pending)
     now = today()
     errors = []
     seen = set()
@@ -466,18 +723,8 @@ def cmd_ignore_file(path, emit=None, require_approved=False):
         for k in ("statement", "expired_at"):
             if k not in e:
                 errors.append(f"{tag}: no `{k}`")
-        if "paths" not in e and "purls" not in e:
-            errors.append(f"{tag}: no `paths` or `purls` scope (never a bare id: it would hide the CVE in every package)")
-        for p in e.get("paths", ()):
-            why = path_problem(p)
-            if why:
-                errors.append(f"{tag}: paths item {p!r} {why}")
-        for p in e.get("purls", ()):
-            why = purl_problem(p)
-            if why:
-                errors.append(f"{tag}: purls item {p!r} {why}")
+        key = schema[2](tag, e, errors)
         pending = check_approval(tag, e.get("approved_by"), e.get("approved_on"), e.get("approval_ref"), errors)
-        key = (e["id"], tuple(e.get("paths", ())), tuple(e.get("purls", ())))
         if key in seen:
             errors.append(f"{tag}: duplicate entry")
         seen.add(key)
@@ -508,20 +755,27 @@ def cmd_ignore_file(path, emit=None, require_approved=False):
             print(f"warning: {tag}: approval_ref is pending; honoured here, but the release gate "
                   f"(--release) does not honour it")
         in_force.append(e)
+    errors += waiver_errors
     if errors:
         for m in errors:
             print(m, file=sys.stderr)
         return 1
-    if emit:
-        try:
-            emit_trivy_yaml(in_force, emit)
-        except OSError as e:
-            print(f"cannot write {emit}: {e}", file=sys.stderr)
-            return 1
-    print(f"{path}: {len(entries)} entry(ies), each with a concrete scope, a statement, an expiry and approval fields (format-checked only)")
+    try:
+        if emit:
+            schema[3](in_force, emit)
+        if emit_waivers:
+            emit_waivers_json(path, waivers_in_force, emit_waivers)
+    except OSError as e:
+        print(f"cannot write the generated file: {e}", file=sys.stderr)
+        return 1
+    print(f"{path}: {len(entries)} entry(ies), each with {schema[4]}")
     print(f"in_force={len(in_force)}")
     print(f"pending={pending_excluded + pending_honoured}")
     print(f"pending_not_honoured={pending_excluded}")
+    if "provider_waivers" in schema[5]:
+        print(f"waivers_in_force={len(waivers_in_force)}")
+        print(f"waivers_pending={len(waivers_pending)}")
+        print(f"waivers_pending_not_honoured={len(waivers_excluded)}")
     return 0
 
 
@@ -723,17 +977,20 @@ def cmd_not_covered(path, require_approved=False):
     return 0
 
 
-def cmd_pending(ignore_path, not_covered_path):
-    """Exit 1 when either file is malformed or anything in force is pending."""
+def cmd_pending(ignore_path, not_covered_path, grype_path):
+    """Exit 1 when any file is malformed or anything in force is pending."""
     found = []
-    try:
-        with open(ignore_path, encoding="utf-8") as f:
-            entries = parse_ignore(f.read())
-    except (OSError, UnicodeDecodeError, Bad) as e:
-        print(f"{ignore_path}: {e}", file=sys.stderr)
-        return 1
-    if cmd_ignore_file(ignore_path) != 0:
-        return 1
+    files = []
+    waivers = []
+    for path, schema in ((ignore_path, TRIVY_SCHEMA), (grype_path, GRYPE_SCHEMA)):
+        sections, why = read_ignore_sections(path, schema)
+        if sections is None:
+            print(why, file=sys.stderr)
+            return 1
+        if cmd_ignore_file(path, schema=schema) != 0:
+            return 1
+        files.append((path, sections["vulnerabilities"]))
+        waivers += [(path, w) for w in sections.get("provider_waivers", [])]
     now = today()
 
     def check_expiry(tag, exp):
@@ -747,12 +1004,19 @@ def cmd_pending(ignore_path, not_covered_path):
         elif left <= WARN_DAYS:
             print(f"warning: {tag}: expires on {exp} ({left} days)")
 
-    for e in entries:
-        exp = parse_date(e.get("expired_at"))
-        tag = f"{ignore_path}:{e['_line']}: {e['id']}"
-        if exp is not None:
-            check_expiry(tag, exp)
-        if e.get("approval_ref") == PENDING and exp is not None and exp >= now:
+    for path, entries in files:
+        for e in entries:
+            exp = parse_date(e.get("expired_at"))
+            tag = f"{path}:{e['_line']}: {e['id']}"
+            if exp is not None:
+                check_expiry(tag, exp)
+            if e.get("approval_ref") == PENDING and exp is not None and exp >= now:
+                found.append(f"{tag}: approval_ref is pending")
+    for path, w in waivers:
+        # Validation above already refused an expired or too-distant waiver.
+        tag = f"{path}:{w['_line']}: provider waiver {w['provider']}"
+        check_expiry(tag, parse_date(w["expired_at"]))
+        if w.get("approval_ref") == PENDING:
             found.append(f"{tag}: approval_ref is pending")
     try:
         listed = read_not_covered(not_covered_path, require_approved=True)
@@ -946,6 +1210,253 @@ def cmd_canary_check(report, family, os_name):
     return 0
 
 
+# ── grype: the DB listing, the imported DB, the report ─────────────────────
+def _db_age(what, built_raw):
+    """(kind, why, age_hours): kind None (usable), "unreadable", "future" or
+    "stale" (older than MAX_DB_AGE_HOURS). Only "stale" is ever waivable, and
+    only for a grype DB provider (cmd_grype_db_providers)."""
+    try:
+        built = parse_time(built_raw)
+    except (ValueError, TypeError):
+        return "unreadable", f"{what}: built {built_raw!r} is not an RFC 3339 time", None
+    age_h = (dt.datetime.now(dt.timezone.utc) - built).total_seconds() / 3600
+    if age_h < -1:
+        return "future", f"{what}: built {built_raw} is in the future", age_h
+    if age_h > MAX_DB_AGE_HOURS:
+        return "stale", (f"{what}: built {age_h:.0f} hours ago ({built_raw}), more than {MAX_DB_AGE_HOURS}; a "
+                         f"stale DB misses recent fixes, so the gate does not pass on it"), age_h
+    return None, None, age_h
+
+
+def _db_age_problem(what, built_raw):
+    """None, or why a DB built at `built_raw` may not be used."""
+    return _db_age(what, built_raw)[1]
+
+
+def _load_json_object(path, what):
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError(f"{path} is not a JSON object ({what})")
+    return d
+
+
+def cmd_grype_db_listing(path):
+    try:
+        d = _load_json_object(path, "grype DB listing")
+    except (OSError, ValueError, RecursionError) as e:
+        print(f"grype DB listing {path} is missing or unreadable ({e})", file=sys.stderr)
+        return 1
+    problems = []
+    if d.get("status") != "active":
+        problems.append(f"status {d.get('status')!r} is not 'active'")
+    schema = d.get("schemaVersion")
+    if not isinstance(schema, str) or not GRYPE_DB_SCHEMA.match(schema):
+        problems.append(f"schemaVersion {schema!r} is not v6.N.N")
+    db_path = d.get("path")
+    if not isinstance(db_path, str) or not GRYPE_DB_PATH.match(db_path):
+        problems.append(f"path {db_path!r} is not a bare vulnerability-db_v6 archive name")
+    checksum = d.get("checksum")
+    if not isinstance(checksum, str) or not DIGEST.match(checksum):
+        problems.append(f"checksum {checksum!r} is not sha256:<64 hex>")
+    built = d.get("built")
+    why = _db_age_problem("the listed grype DB", built if isinstance(built, str) else repr(built))
+    if why:
+        problems.append(why)
+    if problems:
+        for m in problems:
+            print(f"grype DB listing {path}: {m}", file=sys.stderr)
+        return 1
+    print(f"path={db_path}")
+    print(f"checksum={checksum}")
+    print(f"built={built}")
+    print(f"schema={schema}")
+    return 0
+
+
+def cmd_grype_db_status(path, built, schema):
+    try:
+        d = _load_json_object(path, "grype db status")
+    except (OSError, ValueError, RecursionError) as e:
+        print(f"grype db status {path} is missing or unreadable ({e}); refusing to scan with a DB of unknown "
+              f"state", file=sys.stderr)
+        return 1
+    problems = []
+    if d.get("valid") is not True:
+        problems.append(f"grype reports the DB as not valid ({d.get('error')!r})")
+    if d.get("built") != built:
+        problems.append(f"built {d.get('built')!r} is not the listing's {built!r}: not the DB this run verified")
+    if d.get("schemaVersion") != schema:
+        problems.append(f"schemaVersion {d.get('schemaVersion')!r} is not the listing's {schema!r}")
+    why = _db_age_problem("the imported grype DB", d.get("built") if isinstance(d.get("built"), str)
+                          else repr(d.get("built")))
+    if why:
+        problems.append(why)
+    if problems:
+        for m in problems:
+            print(f"grype db status: {m}", file=sys.stderr)
+        return 1
+    print(f"grype_db_built={built}")
+    print(f"grype_db_schema={schema}")
+    return 0
+
+
+def read_waivers_json(path):
+    """{provider: waiver} from the file grype-ignore-file --emit-waivers wrote.
+    Raises ValueError on anything else. A waiver whose date has passed since
+    that file was written (a run crossing midnight) is left out."""
+    with open(path, encoding="utf-8") as f:
+        rows = json.load(f)
+    if not isinstance(rows, list):
+        raise ValueError("not a JSON list of provider waivers")
+    out = {}
+    for w in rows:
+        if not isinstance(w, dict) or w.get("provider") not in WAIVABLE_PROVIDERS or w["provider"] in out:
+            raise ValueError(f"not a provider waiver of a waivable provider: {w!r}")
+        for k in ("expired_at", "approved_by", "approval_ref", "approved_on", "where"):
+            if not isinstance(w.get(k), str):
+                raise ValueError(f"provider waiver {w['provider']}: no {k}")
+        exp = parse_date(w["expired_at"])
+        if exp is None:
+            raise ValueError(f"provider waiver {w['provider']}: expired_at is not a date")
+        if exp >= today():
+            out[w["provider"]] = w
+    return out
+
+
+def _hours(age_h):
+    return "an unknown number of hours" if age_h is None else f"{age_h:.0f} hours"
+
+
+def cmd_grype_db_providers(path, required, waivers_path=None):
+    try:
+        waivers = read_waivers_json(waivers_path) if waivers_path is not None else {}
+    except (OSError, ValueError, RecursionError) as e:
+        print(f"provider waivers {waivers_path} are missing or unreadable ({e})", file=sys.stderr)
+        return 1
+    try:
+        with open(path, encoding="utf-8") as f:
+            rows = json.load(f)
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise ValueError("not a JSON list of provider objects")
+    except (OSError, ValueError, RecursionError) as e:
+        print(f"grype db providers {path} is missing or unreadable ({e})", file=sys.stderr)
+        return 1
+    by_name = {r.get("name"): r for r in rows if isinstance(r.get("name"), str)}
+    problems = []
+    for name in required:
+        r = by_name.get(name)
+        if r is None:
+            # A waiver never admits a missing provider: there is nothing to be stale.
+            problems.append(f"provider {name!r} is not in the DB")
+            continue
+        captured = r.get("dateCaptured")
+        kind, why, age_h = _db_age(f"provider {name}", captured if isinstance(captured, str) else repr(captured))
+        if kind is None:
+            print(f"provider_{name}={captured}")
+        elif kind == "stale" and name in waivers:
+            # The ONE thing a provider waiver admits: a capture time that reads
+            # fine and is merely older than MAX_DB_AGE_HOURS.
+            w = waivers[name]
+            print(f"provider_{name}={captured}")
+            print(f"waiver: provider {name} captured {captured}, {_hours(age_h)} old (over the "
+                  f"{MAX_DB_AGE_HOURS}-hour limit), admitted by the provider waiver at {w['where']}: expires "
+                  f"{w['expired_at']}, approved_by {w['approved_by']}, approval_ref {w['approval_ref']}, "
+                  f"approved_on {w['approved_on']}")
+        else:
+            if kind == "stale":
+                why += (f" (only a reviewed provider waiver for {name} in .grypeignore.yaml admits a stale "
+                        f"provider: docs/ci-architecture.md \"A grype DB provider is stale\")")
+            problems.append(why)
+    if problems:
+        for m in problems:
+            print(f"grype db providers: {m}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_grype_components(path, names):
+    try:
+        d = _load_json_object(path, "grype CycloneDX output")
+        comps = d.get("components")
+        if not isinstance(comps, list):
+            raise ValueError(f"{path} has no components list")
+    except (OSError, ValueError, RecursionError) as e:
+        print(f"grype components: cannot read {e}", file=sys.stderr)
+        return 1
+    # A component counts only as grype's own binary identification of it
+    # (purl pkg:generic/<name>@<version>, as grype 0.121.3 reports the
+    # gateway's beam.smp), so an OS package of the same name cannot stand in.
+    found = {}
+    for comp in comps:
+        if not isinstance(comp, dict):
+            continue
+        name, ver, purl = comp.get("name"), comp.get("version"), comp.get("purl")
+        if isinstance(name, str) and isinstance(ver, str) and ver and isinstance(purl, str) \
+                and purl == f"pkg:generic/{name}@{ver}":
+            found.setdefault(name, ver)
+    missing, wrong = [], []
+    for spec in names:
+        n, _, want = spec.partition("=")
+        if n not in found:
+            missing.append(n)
+        elif want and found[n] != want:
+            wrong.append(f"{n} {found[n]} (expected {want})")
+        else:
+            print(f"component_{n}={found[n]}")
+    if wrong:
+        print(f"grype catalogued {', '.join(wrong)}: a version grype misread, or an image whose runtime is not "
+              f"the one the gate's table pins", file=sys.stderr)
+    if missing:
+        print(f"grype did not catalogue {', '.join(missing)} (as pkg:generic, with a version) in the image, so it "
+              f"could not "
+              f"match its vulnerabilities", file=sys.stderr)
+    return 1 if missing or wrong else 0
+
+
+def cmd_grype_report(path):
+    try:
+        d = _load_json_object(path, "grype report")
+        desc = d.get("descriptor")
+        if not isinstance(desc, dict) or desc.get("name") != "grype" or not isinstance(d.get("matches"), list):
+            raise ValueError(f"{path} is not a grype JSON report (descriptor.name grype, a matches list)")
+        ignored = d.get("ignoredMatches") or []
+        if not isinstance(ignored, list):
+            raise ValueError(f"{path}: ignoredMatches is not a list")
+        distro = d.get("distro") or {}
+        source = d.get("source") or {}
+        target = source.get("target") if isinstance(source, dict) else None
+        if not isinstance(distro, dict) or (target is not None and not isinstance(target, dict)):
+            raise ValueError(f"{path}: distro or source.target is not an object")
+        def fixable_critical(rows):
+            n = 0
+            for m in rows:
+                v = m.get("vulnerability") if isinstance(m, dict) else None
+                if not isinstance(v, dict):
+                    raise ValueError(f"{path}: a match has no vulnerability object")
+                fix = v.get("fix") if isinstance(v.get("fix"), dict) else {}
+                if v.get("severity") == "Critical" and fix.get("state") == "fixed":
+                    n += 1
+            return n
+
+        # The record scan already applies the acceptances: an accepted finding
+        # is in ignoredMatches, not matches. Count both, never one as the other.
+        crit = fixable_critical(d["matches"])
+        crit_accepted = fixable_critical(ignored)
+    except (OSError, ValueError, RecursionError, AttributeError) as e:
+        print(f"grype report: cannot read {e}", file=sys.stderr)
+        return 1
+    print(f"grype_version={desc.get('version', '?')}")
+    print(f"image_id={(target or {}).get('imageID') or '?'}")
+    print(f"distro_family={distro.get('name') or ''}")
+    print(f"distro_version={distro.get('version') or ''}")
+    print(f"matches={len(d['matches'])}")
+    print(f"ignored={len(ignored)}")
+    print(f"fixable_critical={crit}")
+    print(f"fixable_critical_accepted={crit_accepted}")
+    return 0
+
+
 def main(argv):
     def flags(rest, allowed):
         out, pos = {}, []
@@ -973,8 +1484,27 @@ def main(argv):
             pos, f = flags(argv[1:], {"--require-approved": False})
             if len(pos) == 1:
                 return cmd_not_covered(pos[0], bool(f.get("--require-approved")))
-        elif len(argv) == 3 and argv[0] == "pending":
-            return cmd_pending(argv[1], argv[2])
+        elif argv and argv[0] == "grype-ignore-file":
+            pos, f = flags(argv[1:], {"--emit": True, "--emit-waivers": True, "--require-approved": False})
+            if len(pos) == 1:
+                return cmd_ignore_file(pos[0], f.get("--emit"), bool(f.get("--require-approved")),
+                                       schema=GRYPE_SCHEMA, emit_waivers=f.get("--emit-waivers"))
+        elif len(argv) == 4 and argv[0] == "pending":
+            return cmd_pending(argv[1], argv[2], argv[3])
+        elif len(argv) == 2 and argv[0] == "grype-db-listing":
+            return cmd_grype_db_listing(argv[1])
+        elif argv and argv[0] == "grype-db-status":
+            pos, f = flags(argv[1:], {"--built": True, "--schema": True})
+            if len(pos) == 1 and f.get("--built") and f.get("--schema"):
+                return cmd_grype_db_status(pos[0], f["--built"], f["--schema"])
+        elif argv and argv[0] == "grype-db-providers":
+            pos, f = flags(argv[1:], {"--waivers": True})
+            if len(pos) >= 2:
+                return cmd_grype_db_providers(pos[0], pos[1:], f.get("--waivers"))
+        elif len(argv) >= 3 and argv[0] == "grype-components":
+            return cmd_grype_components(argv[1], argv[2:])
+        elif len(argv) == 2 and argv[0] == "grype-report":
+            return cmd_grype_report(argv[1])
         elif argv and argv[0] == "db-age":
             pos, f = flags(argv[1:], {"--downloaded-after": True})
             if len(pos) == 1:

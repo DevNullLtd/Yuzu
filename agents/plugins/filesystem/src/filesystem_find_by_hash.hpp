@@ -1,14 +1,20 @@
 #pragma once
 
 // filesystem_find_by_hash.hpp -- the bounded, symlink-safe walk behind the filesystem plugin's
-// find_by_hash action (#5624).
+// find_by_hash action (#5624). The header holds THE bounded walker of the plugin (walk_bounded):
+// search_dir (#6478) rides it too, with a name-only visitor. It keeps its find_by_hash name; the
+// numbers listed below are find_by_hash's limits, and search_dir passes its own
+// (filesystem_search_dir.hpp).
 //
-// The walk is a PURE CORE with every OS interaction injected (WalkEnv): a clock, a cancel
+// The walk reads directories and entry types itself; WalkEnv injects the rest: a clock, a cancel
 // predicate, a per-entry hasher, a directory-readability probe and the network mount list. The
 // unit suites drive it with fakes -- no sleep, no real process, no network -- and the production
-// hashers (hash_entry_posix / hash_entry_win, at the bottom) are the thin OS shells.
+// hashers (hash_entry_posix / hash_entry_win, at the bottom) are the thin OS shells. The one
+// process-state change the core makes itself is on macOS: walk_bounded switches the thread's
+// dataless-file materialization policy off for the walk (DatalessMaterializationOff), so no action
+// riding the walker can omit it.
 //
-// What is bounded, and why the numbers are what they are:
+// What is bounded, and why the numbers are what they are (find_by_hash's limits):
 //   * wall clock    kWalkDeadline 20 s -- the Instructions gate polls at 30 s and the result still
 //                   has to travel agent -> server -> store -> poll; this leaves a 10 s margin.
 //   * entries       kMaxFilesVisited 50,000 -- about 20 s of stat/open at ~2,500 entries/s on a
@@ -31,7 +37,8 @@
 
 #include "filesystem_acl_parsers.hpp" // yuzu::filesystem::acl::row_field (row-field escaping)
 
-#include <sha256.hpp> // yuzu::shared::Sha256
+#include <macos_dataless_off.hpp> // yuzu::shared::DatalessMaterializationOff (self-gated to __APPLE__)
+#include <sha256.hpp>             // yuzu::shared::Sha256
 
 #include <atomic>
 #include <chrono>
@@ -58,6 +65,7 @@
 #include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
 // clang-format on
 #include <bcrypt.h>
+#include <win_str.hpp>                // yuzu::win::from_wide (path_utf8)
 #include <yuzu/agent/confined_fs.hpp> // confined_fs::WinHandle, the shared HANDLE owner
 #pragma comment(lib, "bcrypt.lib")
 #else
@@ -191,15 +199,21 @@ struct WalkOutcome {
 /// not visible on REST, MCP or CSV, so this row is the operator-visible signal.
 inline constexpr std::string_view kMountGuardUnavailableRow = "network_mount_guard|unavailable";
 
+/// The label of find_by_hash's closing count row. search_dir shares this formatter and passes its
+/// own label (search_dir::kCountLabel).
+inline constexpr std::string_view kCountLabel = "matches_found";
+
 /// The rows that close a walk, in order: the guard-off row when the mount table was unreadable,
-/// the `truncated|...` trailer when anything was skipped or stopped short, then `matches_found|N`.
-[[nodiscard]] inline std::vector<std::string> format_outcome_rows(const WalkOutcome& o) {
+/// the `truncated|...` trailer when anything was skipped or stopped short, then `<count_label>|N`
+/// (`matches_found|N` unless the caller names another label).
+[[nodiscard]] inline std::vector<std::string>
+format_outcome_rows(const WalkOutcome& o, std::string_view count_label = kCountLabel) {
     std::vector<std::string> rows;
     if (o.mount_table_incomplete)
         rows.emplace_back(kMountGuardUnavailableRow);
     if (o.trailer_needed())
         rows.push_back(format_trailer(o));
-    rows.push_back(std::format("matches_found|{}", o.matches));
+    rows.push_back(std::format("{}|{}", count_label, o.matches));
     return rows;
 }
 
@@ -211,12 +225,15 @@ inline constexpr std::string_view kMountGuardUnavailableRow = "network_mount_gua
     return std::format("match|{}|{}", acl::row_field(path), size);
 }
 
-/// The path as UTF-8 bytes for a match row. On Windows path::string() is the ANSI code page and
-/// throws for a name it cannot hold; u8string() cannot, and is byte-identical for ASCII names.
+/// The path as UTF-8 bytes, for a match row and for search_dir's name predicate. On Windows
+/// path::string() is the ANSI code page and throws for a name it cannot hold, and u8string() throws
+/// for a name with an unpaired UTF-16 surrogate, which Windows allows. from_wide, the shared
+/// converter, does neither: such a unit becomes U+FFFD and every other name gets the bytes
+/// u8string() gave.
 [[nodiscard]] inline std::string path_utf8(const fs::path& p) {
 #ifdef _WIN32
-    const auto u8 = p.u8string();
-    return std::string{reinterpret_cast<const char*>(u8.data()), u8.size()};
+    const std::wstring& wide = p.native();
+    return yuzu::win::from_wide(wide.data(), static_cast<int>(wide.size()));
 #else
     return p.string();
 #endif
@@ -390,6 +407,15 @@ struct WalkEnv {
     std::function<bool(const fs::path&)> can_enter = [](const fs::path&) {
         return true;
     };
+    /// WP06 F55: true = the entry is refused (a reserved agent path). It canonicalises, so it is
+    /// asked only AFTER the mount check and the symlink_status classification: for a directory (before
+    /// can_enter; a refused one is not descended into and not visited) and for a regular file (before
+    /// the visitor, so the walk cannot be used as a content-hash oracle on one). Never asked for a
+    /// symlink, a junction, a FIFO, a device, a socket or an entry under a mount. A refused entry is
+    /// counted as unreadable.
+    std::function<bool(const fs::path&)> is_refused = [](const fs::path&) {
+        return false;
+    };
     /// Mount points whose subtrees are refused. Empty = no guard.
     std::vector<std::string> network_mounts;
     /// False when the mount table could not be read in full: the list above is then empty or
@@ -402,17 +428,39 @@ struct WalkEnv {
     }
 };
 
-/// Walk `root` to `max_depth` (root's children are depth 1), emitting one `match|...` row per
-/// regular file whose SHA-256 equals `target_lower`. The ORDER of the checks is the safety
-/// property: the mount check is a string comparison that precedes every call touching the path.
-template <class Emit>
-WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_lower, int max_depth,
-                              const WalkLimits& limits, const WalkEnv& env, Emit emit) {
+/// What the walk found at an entry it hands to a visitor.
+enum class EntryKind { directory, regular };
+
+/// A visitor's verdict: none (not a match), match (counts toward max_results, runs the one-entry
+/// look-ahead), stop (the visitor's own budget tripped: the walk ends with budget.stop()). A
+/// visitor returns stop only after the budget it was handed has tripped (otherwise the walk ends
+/// early with reason `none`, as if not cut short), and its `entry` is valid only for that call.
+enum class Visit { none, match, stop };
+
+#ifdef __APPLE__
+// The walk's dataless guard is the shared one (agents/shared/macos_dataless_off.hpp).
+using yuzu::shared::DatalessMaterializationOff;
+#endif
+
+/// THE bounded, symlink-safe walker of the plugin: `root` to `max_depth` (root's children are
+/// depth 1). The ORDER of the checks is the safety property: the mount check is a string
+/// comparison that precedes every call touching the path, and `env.is_refused` (which
+/// canonicalises, and so follows a link) is asked only for a directory or regular file that is
+/// neither under a mount nor a link. `visit(entry, kind, budget, counters)` is called for a
+/// directory AFTER its depth and can_enter decisions were applied (so it may be asked about one
+/// that is never opened), and for a regular file; a symlink, junction, FIFO, device, socket or
+/// refused entry is counted and never reaches it. find_by_hash and search_dir are both thin
+/// visitors over this.
+template <class VisitFn>
+WalkOutcome walk_bounded(const std::string& root, int max_depth, const WalkLimits& limits,
+                         const WalkEnv& env, VisitFn visit) {
+#ifdef __APPLE__
+    const DatalessMaterializationOff dataless_off; // first: it must span the root probe
+#endif
     WalkOutcome out;
     out.mount_table_incomplete = !env.mount_table_complete;
     WalkCounters& c = out.c;
     HashBudget budget{limits, env.now, env.cancelled, c};
-    bool over_budget = false; // a file was skipped for want of byte budget
 
     // The root first: a root under a network mount is refused before any syscall names it, and an
     // unreadable root is counted -- skip_permission_denied would otherwise turn it into a clean,
@@ -447,6 +495,7 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
 
         const fs::directory_entry& entry = *it;
         const fs::path& path = entry.path();
+        Visit verdict = Visit::none;
 
         // A mount point under a walked directory is refused BEFORE lstat can block on it. With no
         // mount list there is nothing to compare, so the path is not even converted to a string
@@ -465,23 +514,71 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
             ++c.skipped_symlink;
             it.disable_recursion_pending();
         } else if (fs::is_directory(st)) {
-            // Children of a directory at depth d sit at d + 1: a directory AT the limit is never
-            // opened, and one we cannot list is counted instead of being skipped silently.
-            if (it.depth() + 1 >= max_depth) {
+            // The reserved decision (it canonicalises, so it follows links) is asked ONLY for an
+            // entry that is neither under a mount nor a link, never before the mount check and the
+            // symlink_status classification above. A refused directory is not descended into.
+            bool refused_dir = false;
+            if (env.is_refused(path)) {
+                refused_dir = true;
+                ++c.skipped_unreadable;
+                it.disable_recursion_pending();
+            } else if (it.depth() + 1 >= max_depth) {
                 it.disable_recursion_pending();
             } else if (!env.can_enter(path)) {
                 ++c.skipped_unreadable;
                 it.disable_recursion_pending();
             }
+            if (!refused_dir)
+                verdict = visit(entry, EntryKind::directory, budget, c);
         } else if (st.type() != fs::file_type::regular) {
             // FIFO, device, socket: never opened (an open of a FIFO can block).
             ++c.skipped_not_regular;
+        } else if (env.is_refused(path)) {
+            // A refused file is counted as unreadable and never hashed or matched.
+            ++c.skipped_unreadable;
         } else {
+            verdict = visit(entry, EntryKind::regular, budget, c);
+        }
+
+        if (verdict == Visit::stop) {
+            out.stop = budget.stop();
+            break;
+        }
+        if (verdict == Visit::match && ++out.matches >= limits.max_results) {
+            // Stopping at the cap is only honest if nothing is left to look at: look one entry
+            // ahead, so exactly `max_results` matches in a fully walked tree is clean.
+            it.increment(ec);
+            if (ec)
+                ++c.skipped_unreadable; // the entry that could not be looked at
+            if (ec || it != end)
+                out.stop = StopReason::max_results;
+            break;
+        }
+
+        it.increment(ec);
+        if (ec) { // an enumeration error ends the iterator on every STL
+            ++c.skipped_unreadable;
+            break;
+        }
+    }
+    return out;
+}
+
+/// Walk `root` to `max_depth` (root's children are depth 1), emitting one `match|...` row per
+/// regular file whose SHA-256 equals `target_lower`: a hashing visitor over walk_bounded.
+template <class Emit>
+WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_lower, int max_depth,
+                              const WalkLimits& limits, const WalkEnv& env, Emit emit) {
+    bool over_budget = false; // a file was skipped for want of byte budget
+    WalkOutcome out = walk_bounded(
+        root, max_depth, limits, env,
+        [&](const fs::directory_entry& entry, EntryKind kind, HashBudget& budget,
+            WalkCounters& c) {
+            if (kind != EntryKind::regular)
+                return Visit::none;
             const HashOutcome h = env.hash_entry(entry, budget, limits);
-            if (h.kind == HashKind::stopped) {
-                out.stop = budget.stop();
-                break;
-            }
+            if (h.kind == HashKind::stopped)
+                return Visit::stop;
             switch (h.kind) {
             case HashKind::symlink:
                 ++c.skipped_symlink;
@@ -504,27 +601,11 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
                 break;
             }
             if (h.kind == HashKind::hashed && h.hex == target_lower) {
-                emit(format_match_row(path_utf8(path), h.size));
-                if (++out.matches >= limits.max_results) {
-                    // Stopping at the cap is only honest if nothing is left to look at: look one
-                    // entry ahead, so exactly `max_results` matches in a fully walked tree is
-                    // clean.
-                    it.increment(ec);
-                    if (ec)
-                        ++c.skipped_unreadable; // the entry that could not be looked at
-                    if (ec || it != end)
-                        out.stop = StopReason::max_results;
-                    break;
-                }
+                emit(format_match_row(path_utf8(entry.path()), h.size));
+                return Visit::match;
             }
-        }
-
-        it.increment(ec);
-        if (ec) { // an enumeration error ends the iterator on every STL
-            ++c.skipped_unreadable;
-            break;
-        }
-    }
+            return Visit::none;
+        });
     // The walk went on past a file the byte cap kept it from examining: that is a tripped bound,
     // unless an earlier one already ended the walk and named itself.
     if (over_budget && out.stop == StopReason::none)

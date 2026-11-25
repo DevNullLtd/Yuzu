@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# instructions-tests.sh — exercise every (safe + mutating) InstructionDefinition
-# against a live UAT stack via the REST API.
+# instructions-tests.sh: exercise the (safe + mutating) InstructionDefinitions, less the rows
+# skipped by name (below), against a live UAT stack via the REST API.
 #
 # This is the bash entry point for the /test --instructions gate. The
 # real work is in scripts/test/instructions_runner.py — this script just
@@ -15,10 +15,18 @@
 # and a non-loopback --dashboard also needs --allow-remote; the runner's --help
 # has the full rules and the side effects),
 # server-internal (catalog-only definitions the dispatch chokepoint denies, so they
-# cannot pass),
+# cannot pass), default-off (an action the server boot-seeds kill-switched: refused until
+# an operator enables its kill switch, then broadcast like a safe row),
 # interactive, and network-disrupt (the firewall containment actions: --risks network-disrupt
 # runs scripts/test/instructions_firewall_containment.py against --target-agent-id, the disposable
-# agent on this host, instead of dispatching them; see that script for its guards).
+# agent, instead of dispatching them; see that script for its guards. A containment whose agent has
+# a control endpoint that is one of its own host's addresses (agent and server on ONE host) ends
+# refused|self_host (exit 2) by design; the check compares addresses only, so a server in a container
+# or VM reached at a bridge address is not one. A containment round trip needs the server on another
+# host: --target-agent-hostname NAME with --console-access-to-agent runs the ceremony in its --remote
+# mode. This wrapper forwards none of --record, --probe-target, --ttl-seconds and --exceptions, so
+# a retained record or a verified containment needs the script run directly (--record,
+# --probe-target).
 # scripts/test/instructions-risk-classification.json is the authority.
 #
 # A destructive/forensic run is by hand, on a dedicated disposable stack. NOTE: --risks
@@ -30,6 +38,15 @@
 # Permissions: Execution:Execute to dispatch, Response:Read to poll the results and
 # Infrastructure:Read for the agent lookup. The manifest is an attempt log, not outcome
 # evidence; see the runner's --help for the recovery recipe after a stop.
+#
+# Rows the runner skips by name, with the reason recorded (never passed): agent.http_client.get/head
+# always (the plugin SSRF-blocks every target the runner could reach offline),
+# crossplatform.echo.configure and windows.rdp.set_state always (a synthesised value would overwrite
+# each reached agent's Echo byte budget, or turn remote desktop on), and device.network_actions.ping/flush_dns only when
+# YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1, which a run
+# whose agent has no sudo NOPASSWD grant for resolvectl (see scripts/install-agent-user.sh) or no
+# raw-socket capability (a bwrap rig: no_new_privs) should set. A provisioned host leaves it unset
+# and still runs, and can still fail, those two.
 #
 # Usage:
 #   bash scripts/test/instructions-tests.sh \
@@ -49,7 +66,8 @@
 #        manifest that already exists)
 #   130  interrupted (Ctrl-C, Ctrl-Break or SIGTERM)
 #   --risks network-disrupt returns the ceremony's own codes (0 passed, 1 a check failed,
-#   2 nothing changed, 3 the release could not be confirmed: clear the firewall by hand)
+#   2 nothing changed (a one-host run ends there, refused|self_host), 3 the release could not be
+#   confirmed: clear the firewall by hand)
 
 set -uo pipefail
 
@@ -63,6 +81,8 @@ RUN_ID=""
 GATE_NAME="instructions"
 RISKS=("safe" "mutating")
 TARGET_AGENT_ID=""
+TARGET_AGENT_HOSTNAME=""
+CONSOLE_ACCESS_TO_AGENT=0
 CONFIRM_TARGET=""
 MANIFEST=""
 ALLOW_REMOTE=0
@@ -92,14 +112,30 @@ Optional:
                            runner takes them space-separated)
                            (default: safe,mutating; choices: safe, mutating,
                            destructive, forensic, server-internal,
-                           network-disrupt, interactive; destructive and
+                           network-disrupt, interactive, default-off;
+                           destructive and
                            forensic need --target-agent-id, --confirm-target,
                            --run-id and --params-override, and
-                           server-internal cannot pass; network-disrupt
+                           server-internal cannot pass; default-off passes
+                           only once an operator has enabled the action's
+                           kill switch on the stack; network-disrupt
                            runs alone, as the firewall containment
                            ceremony against --target-agent-id)
   --target-agent-id ID     the id of the one connected agent sent as the target
                            of destructive and forensic dispatches
+  --target-agent-hostname NAME
+                           network-disrupt only: the agent's own hostname. The
+                           ceremony then runs --remote (this machine is the
+                           server's host, the agent is another machine) and
+                           needs --console-access-to-agent as well (exit 2
+                           without it); without it the agent must be on this
+                           host, and then the agent refuses the containment
+                           (refused|self_host, exit 2) when its control
+                           endpoint is one of this host's own addresses (the
+                           check compares addresses only)
+  --console-access-to-agent
+                           network-disrupt, with --target-agent-hostname: you
+                           are at the agent's console (the ceremony requires it)
   --confirm-target HOST    that agent's hostname (must match the server's agent
                            list; required whenever destructive or forensic is
                            selected, with --target-agent-id and --run-id)
@@ -123,6 +159,13 @@ Optional:
                            or integers) — overrides for the schema-synthesised
                            defaults; for destructive/forensic it is required and
                            is the whole params object. See the runner's --help.
+                           Rows skipped by name (ids and reasons printed at the
+                           start, reason also in each row's note and --output):
+                           agent.http_client.get/head and
+                           crossplatform.echo.configure and windows.rdp.set_state always;
+                           device.network_actions.ping/flush_dns only when
+                           YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1 is exported (a run
+                           whose agent lacks the sudo NOPASSWD grant or raw sockets).
   --output FILE            write per-instruction outcomes JSON
   --verbose                print every outcome (default: fail/error only)
 EOF
@@ -137,6 +180,8 @@ while [[ $# -gt 0 ]]; do
         --gate-name)        GATE_NAME="$2"; shift 2 ;;
         --risks)            IFS=',' read -ra RISKS <<< "$2"; shift 2 ;;
         --target-agent-id)  TARGET_AGENT_ID="$2"; shift 2 ;;
+        --target-agent-hostname) TARGET_AGENT_HOSTNAME="$2"; shift 2 ;;
+        --console-access-to-agent) CONSOLE_ACCESS_TO_AGENT=1; shift ;;
         --confirm-target)   CONFIRM_TARGET="$2"; shift 2 ;;
         --manifest)         MANIFEST="$2"; shift 2 ;;
         --allow-remote)     ALLOW_REMOTE=1; shift ;;
@@ -174,15 +219,23 @@ fi
 
 # network-disrupt is never a dispatch of its definitions: it runs the firewall containment ceremony
 # (scripts/test/instructions_firewall_containment.py) against the one --target-agent-id, which must be
-# the disposable agent on this host. It runs alone, never beside another class, and never in /test.
+# the disposable agent, on this host or, with --target-agent-hostname, on another host (the ceremony's
+# --remote mode). It runs alone, never beside another class, and never in /test.
 for r in "${RISKS[@]}"; do
     [[ "$r" == "network-disrupt" ]] || continue
     if [[ "${#RISKS[@]}" -ne 1 || -z "$TARGET_AGENT_ID" ]]; then
-        echo "error: --risks network-disrupt runs alone and needs --target-agent-id (the disposable agent on this host)" >&2
+        echo "error: --risks network-disrupt runs alone and needs --target-agent-id (the disposable agent)" >&2
         exit 2
     fi
-    YUZU_PASSWORD="$PASSWORD" exec python3 "$HERE/instructions_firewall_containment.py" \
-        --dashboard "$DASHBOARD_URL" --user "$USERNAME" --agent-id "$TARGET_AGENT_ID" --apply-containment
+    CEREMONY_ARGS=(--dashboard "$DASHBOARD_URL" --user "$USERNAME" --agent-id "$TARGET_AGENT_ID" --apply-containment)
+    if [[ -n "$TARGET_AGENT_HOSTNAME" ]]; then
+        CEREMONY_ARGS+=(--remote --agent-hostname "$TARGET_AGENT_HOSTNAME")
+        [[ "$CONSOLE_ACCESS_TO_AGENT" -eq 1 ]] && CEREMONY_ARGS+=(--i-have-console-access-to-the-agent)
+    elif [[ "$CONSOLE_ACCESS_TO_AGENT" -eq 1 ]]; then
+        echo "error: --console-access-to-agent needs --target-agent-hostname (the remote ceremony)" >&2
+        exit 2
+    fi
+    YUZU_PASSWORD="$PASSWORD" exec python3 "$HERE/instructions_firewall_containment.py" "${CEREMONY_ARGS[@]}"
 done
 
 ARGS=(

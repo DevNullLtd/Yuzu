@@ -68,8 +68,8 @@ certificate at build time and cannot be restamped.
 | SPDX SBOMs | `*.spdx.json`, the same set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` where present: the platform archives and native installers of v0.11.0-rc2 and later (the Docker images' provenance is in GitHub's attestation registry only; which releases the registry holds is in section 4) | `gh attestation verify` |
 | Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` (the `-chisel` variants' operating-system packages are not vulnerability-scanned: [below](#image-vulnerability-scan-before-publishing)) | `cosign verify` |
-| Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.attempt-<N>.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.attempt-<N>.{json,txt,gate.txt}`, `<N>` being the workflow run attempt, and each passing attempt's publish journal `publish-<image>.attempt-<N>.txt` (none on v0.15.0 or any earlier release: the scan postdates them) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
-| Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}` and `publish-yuzu-agent-bundle-chisel.attempt-<N>.txt`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` and `.sigstore` (none on v0.15.0 or any earlier release) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list ([commands below](#image-vulnerability-scan-before-publishing)) |
+| Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.attempt-<N>.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.attempt-<N>.{json,txt,gate.txt}`, and the same names with `grype-` for the second scanner, `<N>` being the workflow run attempt, and each passing attempt's publish journal `publish-<image>.attempt-<N>.txt` (none on v0.15.0 or any earlier release: the scan postdates them) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
+| Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}`, `grype-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}` and `publish-yuzu-agent-bundle-chisel.attempt-<N>.txt`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` and `.sigstore` (none on v0.15.0 or any earlier release) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list ([commands below](#image-vulnerability-scan-before-publishing)) |
 
 **Do not trust an image tag that has no GitHub Release.** The images are pushed, signed and tagged
 before the GitHub Release is created, and a failed publish job stops the release. A release workflow
@@ -119,14 +119,15 @@ whether any attempt moved the tag.
 
 ## Image vulnerability scan before publishing
 
-Before `release.yml` pushes an image, it scans the locally built image (by image ID) with a pinned
-Trivy and refuses to push it when the scanner finds a **CRITICAL vulnerability that has a fix
-available** in what it can see and the finding is not an accepted one. "What it can see" is narrower
-than the image: the list below says what it does not cover. Accepted findings are listed in
-`.trivyignore.yaml` in the repository at the release tag; the release scan honours an entry only when
-it is scoped to concrete file paths inside the image (each a path with a `/`, with no wildcard
-character and not a scanner result name such as `Python`) or to packages at exact versions, never to
-a bare vulnerability id; states why the finding does not apply; expires at most 92 days out; and carries an
+Before `release.yml` pushes an image, it scans the locally built image (by image ID) with two pinned
+scanners, Trivy and grype, and refuses to push it when either finds a **CRITICAL vulnerability that
+has a fix available** in what it can see and the finding is not an accepted one. grype reads an export
+of that local image (`docker save`), never a registry. "What they can see" is narrower than the image:
+the list below says what is not covered. Accepted findings are listed in the repository at the
+release tag, in `.trivyignore.yaml` for Trivy and `.grypeignore.yaml` for grype; the release scan
+honours an entry only when it is scoped to concrete file paths inside the image (each a path with a
+`/`, with no wildcard character and not a scanner result name such as `Python`) or to packages at
+exact versions (for grype: a package name and its exact version), never to a bare vulnerability id; states why the finding does not apply; expires at most 92 days out; and carries an
 approver's login, an approval date and a pull-request reference that are not `pending`. The release
 scan checks those three approval fields for **format only**: it does not confirm with GitHub that the
 pull request exists or that the named person approved it, and nothing stops the approver it names
@@ -146,7 +147,64 @@ The release scan also refuses to push, rather than report a clean scan, when:
   `_rc`, `~rc1`, `-rc`, Debian testing or sid, Alpine edge, and similar markers) or not a plain
   release number; or a test scan of that release holding packages older than every fix matches
   nothing. A clean scan of such an image would prove nothing about what it ships;
-- the vulnerability database is older than 72 hours, or was not downloaded by that run.
+- either vulnerability database is older than 72 hours, or was not downloaded by that run (for
+  grype: the database archive does not match the checksum its publisher's listing gives, or grype
+  does not report the imported database as that one);
+- grype does not detect the operating-system release whose packages Trivy scanned (it would then
+  match none of them);
+- one of the grype database's providers that the image needs (NVD for every image, and the Alpine,
+  Debian or Ubuntu feed for an image on that release) is missing, or was last captured more than 72
+  hours ago, unless a provider waiver for it is in force (next paragraph).
+
+**A degraded pass: grype provider waivers.** One provider inside grype's database can stop
+updating because its upstream source stalls, while the database itself is still rebuilt. For a
+release that cannot wait, the release tag's `.grypeignore.yaml` may hold a reviewed provider waiver
+for exactly that provider (`nvd`, `alpine`, `debian` or `ubuntu`): a statement with the evidence of
+the stall, an expiry at most 14 days out, and the same approval fields as an accepted finding
+(checked for format only, and not honoured while `pending`). A waiver admits only that provider's
+capture being older than 72 hours. It never admits a finding, a missing provider, an unreadable
+capture time, a database that is itself older than 72 hours or does not match its checksum, or any
+other refusal above, and no setting of the release workflow can turn one on. An image scanned with
+a waiver passes **degraded**: grype matched that provider's packages against advisories as old as
+the capture, so a fix published upstream since then may be missing from the verdict. Its grype
+`.gate.txt` still says `gate: pass`, and also carries a `provider waiver: provider <name> captured
+<time>, <N> hours old (over the 72-hour limit), admitted by the provider waiver at
+.grypeignore.yaml:<line>: expires ..., approved_by ..., approval_ref ..., approved_on ...` line and a
+`DEGRADED: provider waiver in force (<name>)` line; a scan that used none says `provider waiver:
+none used`. `DEGRADED:` appears only for an image that passed under a waiver. The release notes
+of such a release carry an "Image scan: DEGRADED" section, written from the published
+attempt's own reports. To see it yourself (in the directory of its verified assets):
+
+```bash
+grep -H -e '^gate:' -e '^provider waiver:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt
+```
+
+Only the highest attempt of each image whose publish journal ends `publish: tagged` counts: the
+release also attaches the reports of refused earlier attempts. A grype `.gate.txt` with no
+`provider waiver:` line at all records nothing either way. A `gate: pass` line alone therefore
+does not say whether a pass was degraded; read the `DEGRADED:` line too. A report that is not a
+pass can carry one of these `provider waiver:` lines instead, and none of them is a degraded
+pass:
+
+- `stale and not waived: the <name> waiver lapsed during this run ...`: the waiver's date passed
+  while the release was being scanned, so the stale provider was not admitted for that image and
+  its `gate:` line is a `FAIL`.
+- `not admitted: the waivers file could not be read again ...` or `not admitted: re-checking the
+  run's provider waiver failed ...`: the gate could not confirm the waiver for that image and
+  refused it (a `FAIL`); this is not a lapse.
+- `in force (<name>), but the image did not pass, so nothing was admitted by it`: the image failed
+  for another reason.
+- `in force for this run (<name>), but the image was not judged`, or `stale and not waived ...
+  and the image was not judged`: the gate stopped (or was cancelled) before this image.
+
+The waiver bounds how long it is in force (14 days), not how old the capture it admits may be:
+the capture's age is on the `provider waiver:` line. The release workflow writes the "Image
+scan: DEGRADED" section into the release notes from the published attempt's reports (the
+attempt found as described above); the agent-bundle image is scanned after the notes are
+written and is NOT covered by it, so audit its reports with the same `grep`. The reports are the
+record either way. Follow the waiver's `approval_ref` to audit it,
+as for an accepted finding, and read its `statement` (the evidence of the stall) in the tag's own
+file: `git show vX.Y.Z:.grypeignore.yaml`.
 
 After the release, the pre-release QA workflow scans the published tags again with a newer database;
 a finding there is reported, it cannot unpublish anything.
@@ -155,24 +213,40 @@ What this does **not** gate:
 
 - HIGH and lower findings, and CRITICAL findings with no fix released: they are in the report, not
   refused.
-- The operating-system packages of the chiselled images (`yuzu-*-chisel`, and the agent-bundle delivery
-  image): they are built from Ubuntu package slices with no package database the scanner can read, so
-  their OS packages are not scanned at all. Each report's `.gate.txt` says `coverage: not-covered` for
-  them. Choose the non-chisel image if you need its OS packages covered by this scan.
+- The operating-system packages of the chiselled images (`yuzu-*-chisel` and the agent-bundle delivery
+  image) are not covered by this scan. They are built from Ubuntu package slices and carry no package
+  database either scanner reads, so Trivy scans none of their OS packages. grype identifies only the few
+  packages whose binaries name their own package (busybox and openssl on the image we checked), and the
+  scan does not check that even those were matched against current advisories. Each Trivy `.gate.txt`
+  says `coverage: not-covered`. A passing scan of a chisel image is not evidence about its OS packages.
+  Use the non-chisel image if you need them covered. The four not-covered listings expire 2027-02-15 and
+  are not to be renewed; the planned fix is a scanner-readable package manifest emitted at build time
+  (#8415), a plan and not something shipped; until it ships, these images stop passing the release
+  gate after that date.
 - PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
   which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
-- The gateway's bundled Erlang/OTP runtime, and anything statically linked into the server and agent
-  binaries.
-- The integrity of the vulnerability database itself: its publisher does not sign it. Each report
-  records the database's registry digest, so the database a scan used can be identified afterwards,
-  but a database altered before the download is not detected.
+- Anything statically linked into the server and agent binaries. The gateway's bundled Erlang/OTP
+  runtime (this release's `yuzu-gateway` ships OTP 28.5.0.8, ERTS 16.4.0.7; grype's `.gate.txt` records it as
+  `required components: erlang <version>`, and the release scan refuses a gateway image in which grype
+  does not find it) is matched by
+  grype only (Trivy does not identify it): a vulnerability grype's data does not attribute to that
+  OTP version is not gated.
+- The integrity of the vulnerability databases themselves: their publishers do not sign them. Each
+  report records which database the scan used (Trivy's registry digest; grype's archive name, checksum
+  and build time), so it can be identified afterwards, but a database altered before the download is
+  not detected.
 
 Each release carries the reports for the six images it publishes (inside `SHA256SUMS`):
 `trivy-<image>.attempt-<N>.json` (the full report, including the image ID, the layer digests and
 every package), `trivy-<image>.attempt-<N>.txt` (the same as a table) and
 `trivy-<image>.attempt-<N>.gate.txt` (the run attempt, the Trivy version, the database's digest and
 date, the OS, the OS package count, the coverage, the advisory-data check, the accepted-findings
-file's hash and the result). `<N>` is the release workflow's run attempt; every attempt's reports are
+file's hash and the result), and grype's `grype-<image>.attempt-<N>.json`, `.txt` and `.gate.txt`
+(the grype version, the database's archive, checksum and build time, the image ID, the detected
+distribution, the matches not accepted and the accepted ones with the fixable CRITICALs among each,
+the components grype was required to find, the provider waivers it used (`provider waiver: none used`
+when none), the accepted-findings file's hash and grype's result). `<N>` is the
+release workflow's run attempt; every attempt's reports are
 kept, a refused or cancelled attempt's (`gate: FAIL: <reason>`, `gate: FAIL: cancelled ...`)
 included. Beside each attempt whose scan passed is its publish journal,
 `publish-<image>.attempt-<N>.txt`: one line per publishing step that attempt completed, in this
@@ -263,6 +337,7 @@ TAG=vX.Y.Z
 gh release download "$TAG" --repo DevNullLtd/Yuzu --dir bundle-scan \
   --pattern 'yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*' \
   --pattern 'trivy-yuzu-agent-bundle-chisel.attempt-*' \
+  --pattern 'grype-yuzu-agent-bundle-chisel.attempt-*' \
   --pattern 'publish-yuzu-agent-bundle-chisel.attempt-*'
 cd bundle-scan
 for sums in yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*.SHA256SUMS; do
@@ -272,14 +347,16 @@ for sums in yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*.SHA256SUMS; do
     "$sums"
   sha256sum -c "$sums"
 done
-grep -H '^gate:' trivy-yuzu-agent-bundle-chisel.attempt-*.gate.txt
+grep -H -e '^gate:' -e '^provider waiver:' -e '^DEGRADED:' trivy-yuzu-agent-bundle-chisel.attempt-*.gate.txt \
+  grype-yuzu-agent-bundle-chisel.attempt-*.gate.txt
 for f in $(ls publish-yuzu-agent-bundle-chisel.attempt-*.txt | sort -V); do echo "$f: $(tail -n 1 "$f")"; done
 docker buildx imagetools inspect "ghcr.io/${OWNER}/yuzu-agent-bundle-chisel:${TAG#v}" --format '{{.Manifest.Digest}}'
 ```
 
 Every list must print `Verified OK` and every file `OK`. The highest attempt whose journal's last
 line is `publish: tagged ...` is the published bundle image: the digest on that line must equal
-what the last command prints, and that attempt's `gate:` line must be `gate: pass`. If an attempt
+what the last command prints, and that attempt's `gate:` line must be `gate: pass` (a grype
+`gate: pass` beside a `DEGRADED:` line is a degraded pass: see "A degraded pass" above). If an attempt
 above it ends `publish: tagging`, the tag may name either digest: do not deploy the bundle until a
 later attempt ends `tagged`. When no attempt ends `publish: tagged`, the record cannot say what the
 tag names: an attempt ending `tagging` may have moved it, and so may an attempt whose record was
@@ -502,6 +579,23 @@ in it:
   (`NOASSERTION` in SPDX), and the SBOM names those libraries in its
   `yuzu:sbom:licence-noassertion` note (see "Reading the `yuzu:sbom:` notes"
   below).
+- **The third-party files compiled into `yuzu-server`**, on every file that
+  holds it (and on the `yuzu-server` and `yuzu-server-chisel` image SBOMs; see
+  "Docker image SBOMs" below): the web assets the dashboard serves (htmx and
+  its SSE extension, Apache ECharts with the ZRender and tslib code bundled
+  inside it, three.js, Cytoscape.js, the IBM Plex fonts) and the QR-code
+  library (qrcodegen) behind MFA enrolment. No scanner can see them inside
+  the binary, so they come from
+  `server/core/vendored-components.json` in the source tree, which records
+  each one's version, licence, upstream and SHA-256, and which the release
+  checks against the files it built from. They carry `pkg:npm` purls
+  (`pkg:github` for the QR-code library) and a `yuzu:vendored:*` property
+  naming the source file and hash; the bundled ZRender and tslib appear inside
+  ECharts. A version the vendored file does not state is left blank rather
+  than guessed: today the htmx SSE extension (its bytes are upstream `sse.js`
+  plus one trailing newline, and `sse.js` is identical in 2.2.2 and 2.2.3) and
+  tslib. The SBOM's `yuzu:sbom:vendored` note says how many it
+  lists and from which manifest.
 - **The gateway's Erlang/OTP release:** its applications (Hex packages carry a
   `pkg:hex` purl) and the Erlang runtime, as one `erlang` component.
 - **Anything else a scanner recognises in the unpacked file.**
@@ -518,9 +612,7 @@ file the installer holds, whichever components an installation selects, and
 does not record which component installs each one. The SBOM says this in its
 `yuzu:sbom:contents` note, and its root names the installer and its SHA-256.
 
-Not listed yet, though the file holds it: code vendored into the source tree
-and compiled into `yuzu-server` (qrcodegen, and the web assets it embeds: htmx,
-ECharts, three.js, Cytoscape, IBM Plex fonts; see `NOTICE`), the Windows
+Not listed yet, though the file holds it: the Windows
 installer's own InnoSetup runtime and what the compiler embeds beside the
 packed files (the licence text, the icon and the installer's compiled script),
 and the code the gateway's bundled Erlang
@@ -531,17 +623,18 @@ so in the data: a CycloneDX `compositions` entry with `aggregate: incomplete`
 for its root, and in SPDX (which has no such field) a `CONTAINS NOASSERTION`
 relationship on the described package. The `yuzu:sbom:incomplete-reasons`
 note names why, by the tokens below, and the `yuzu:sbom:incomplete` note says
-it in prose. The marker follows what a file holds, not its name: every SBOM of
-a file holding `yuzu-server` is marked (`server-vendored`), as are the
-installer's and every gateway SBOM. Today the files holding `yuzu-server` are
-the Linux archive and the server `.deb` and `.rpm`, so the agent's files (the
-Windows and macOS archives, the agent `.deb`, `.rpm` and `.pkg`) carry no
-marker: no release after 0.15.0 puts `yuzu-server.exe` or a macOS `yuzu-server`
-in them, and the Windows release job refuses an agent archive holding
-`yuzu-server.exe`. (v0.15.0 and earlier shipped the server in
-`yuzu-windows-x64.zip` and `yuzu-macos-arm64.tar.gz`; their SBOMs predate this
-change and carry no marker at all, so their silence says nothing about
-completeness.) Image SBOMs are marked too (below).
+it in prose. The marker follows what a file holds, not its name: the
+installer's SBOM and every gateway SBOM are marked. An SBOM of a file holding
+`yuzu-server` lists the third-party files compiled into it (above) and is not
+marked for them. Today the files holding `yuzu-server` are the Linux archive
+and the server `.deb` and `.rpm`; no release after 0.15.0 puts
+`yuzu-server.exe` or a macOS `yuzu-server` in the agent's files (the Windows
+and macOS archives, the agent `.deb`, `.rpm` and `.pkg`), and the Windows
+release job refuses an agent archive holding `yuzu-server.exe`. (v0.15.0 and
+earlier shipped the server in `yuzu-windows-x64.zip` and
+`yuzu-macos-arm64.tar.gz`; their SBOMs predate this change and carry no marker
+at all, so their silence says nothing about completeness.) Image SBOMs are
+marked too (below).
 
 Libraries the binaries load from the operating system at run time (glibc,
 `libsystemd`, the MSVC runtime, and the host OpenSSL `libcrypto` the gateway's
@@ -557,7 +650,6 @@ existing token keeps its meaning. Read the tokens, not the prose, in a script.
 
 | Token | On | What the SBOM does not list |
 |---|---|---|
-| `server-vendored` | a file or image holding `yuzu-server` | qrcodegen and the web assets compiled into it |
 | `installer-runtime` | the Windows installer | InnoSetup's setup loader and uninstaller, and the licence text, icon and compiled installer script the compiler embeds |
 | `erts-static` | a gateway file or image | what the Erlang emulator `beam.smp` vendors: PCRE2, asmjit, zstd, Ryu, OpenSSL's MD5 |
 | `image-static-cpp` | a server or agent image | the vcpkg libraries linked statically into `yuzu-server` or `yuzu-agent`, which the image scan cannot see (the matching package's SBOM lists them) |
@@ -573,8 +665,9 @@ holds no vulnerable component: read the marker yourself, as below.
 **The SBOM is not an attribution source yet.** Every vcpkg library carries the
 licence vcpkg records, but its copyright text (SPDX `copyrightText`) is
 `NOASSERTION`, because vcpkg's records hold none; the release would carry one
-over if they did. Third-party attribution for the release is in `NOTICE`, which
-is not generated from these SBOMs.
+over if they did. Third-party attribution for the release is in the source
+repository's `NOTICE` and the per-component `*-NOTICE.txt` files, which are not
+yet packaged with the release artefacts and are not generated from these SBOMs.
 
 SBOMs of releases before this change were a scan of the whole build workspace
 and list thousands of components (the vcpkg ports catalogue among them) that
@@ -597,13 +690,21 @@ Dependency-Track or a similar tool, expect:
 - **No dependency graph for the vcpkg libraries.** They are listed as
   components of the file; the SBOM does not record which library depends on
   which.
+- **Real matches for the vendored web assets.** The third-party files compiled
+  into `yuzu-server` (on its file and image SBOMs) carry pinned versions, so an
+  advisory a scanner reports against one of them is a real match to triage
+  (for example, ECharts 5.6.0 matches GHSA-fgmj-fm8m-jvvx). The two listed
+  without a version, the htmx SSE extension and tslib, may match every
+  advisory for the name or none, depending on the scanner. The QR-code library
+  carries a `pkg:github` purl and no CPE, so a scanner matching by package
+  name or CPE does not match it at all.
 
 ### Reading the `yuzu:sbom:` notes
 
 The release writes its notes on an SBOM's root under one key per note, spelled
 the same in both formats: `yuzu:sbom:incomplete-reasons`,
-`yuzu:sbom:incomplete`, `yuzu:sbom:contents`, `yuzu:sbom:licence-noassertion`
-and the others. In CycloneDX each note is a `metadata.properties` entry whose
+`yuzu:sbom:incomplete`, `yuzu:sbom:contents`, `yuzu:sbom:licence-noassertion`,
+`yuzu:sbom:vendored` and the others. In CycloneDX each note is a `metadata.properties` entry whose
 `name` is the key. SPDX has no properties, so each note is one line of the
 described package's `comment`, the key, a colon and a space, then the value:
 
@@ -616,8 +717,8 @@ A note that is absent means the SBOM does not carry it (no
 `yuzu:sbom:incomplete-reasons` note: no marker). The release writes each note
 once: treat a file that carries two copies of one as altered. The release
 check refuses a second copy of the notes it reads (`yuzu:sbom:unpacked-files`
-on a file SBOM, `yuzu:sbom:incomplete-reasons` on an image SBOM pair); it does
-not read the others. To read one note from either
+on a file SBOM, `yuzu:sbom:incomplete-reasons` and `yuzu:sbom:vendored` on an
+image SBOM pair); it does not read the others. To read one note from either
 format (set `KEY` to the note you want, and the file names to your SBOMs):
 
 ```bash
@@ -632,13 +733,13 @@ jq -r '(.relationships[] | select(.spdxElementId == "SPDXRef-DOCUMENT" and .rela
 
 ```bash
 # Every note, and the CycloneDX marker itself
-jq -r '.metadata.properties[] | select(.name | startswith("yuzu:sbom:")) | "\(.name): \(.value)"' yuzu-linux-x64.cdx.json
-jq '.compositions' yuzu-linux-x64.cdx.json
+jq -r '.metadata.properties[] | select(.name | startswith("yuzu:sbom:")) | "\(.name): \(.value)"' yuzu-gateway-linux-x64.cdx.json
+jq '.compositions' yuzu-gateway-linux-x64.cdx.json
 # Every note, and the SPDX marker itself (the CONTAINS NOASSERTION relationship)
 jq -r '(.relationships[] | select(.spdxElementId == "SPDXRef-DOCUMENT" and .relationshipType == "DESCRIBES")
         | .relatedSpdxElement) as $root | .packages[] | select(.SPDXID == $root) | .comment // empty' \
-  yuzu-linux-x64.spdx.json | grep '^yuzu:sbom:'
-jq '.relationships[] | select(.relationshipType == "CONTAINS" and .relatedSpdxElement == "NOASSERTION")' yuzu-linux-x64.spdx.json
+  yuzu-gateway-linux-x64.spdx.json | grep '^yuzu:sbom:'
+jq '.relationships[] | select(.relationshipType == "CONTAINS" and .relatedSpdxElement == "NOASSERTION")' yuzu-gateway-linux-x64.spdx.json
 ```
 
 ### CycloneDX
@@ -677,6 +778,11 @@ cyclonedx validate --input-file yuzu-linux-x64.cdx.json
 # Count components
 jq '.components | length' yuzu-linux-x64.cdx.json
 
+# The third-party files compiled into yuzu-server: 10 lines (ZRender and
+# tslib are nested under ECharts, in its .components; recurse lists them too)
+jq -r '.components[] | recurse(.components[]?) | select(."bom-ref" // "" | startswith("vendored-"))
+       | "\(.name)\t\(.version // "unresolved")\t\(.purl)"' yuzu-linux-x64.cdx.json
+
 # Find all dependencies declaring a specific license
 jq -r '.components[] | select(.licenses[]? | (.license.id // .expression) == "MIT") | .name' \
   yuzu-linux-x64.cdx.json
@@ -710,13 +816,27 @@ image's files, so it does not list the C++ libraries linked statically into
 `yuzu-server` and `yuzu-agent` package SBOMs list those), nor what the gateway
 images' Erlang emulator vendors, nor the `yuzu-postgres` image's pgvector. The
 release marks each of the six incomplete the same way as a file SBOM: the two
-server images `server-vendored, image-static-cpp`, the agent image
-`image-static-cpp`, the two gateway images `erts-static`, and the
-`yuzu-postgres` image `pgvector-source`. Beyond those, an image SBOM lists what
-syft recognises and no more. The release's SBOM scope check does not hold image
-SBOMs to the file rules (entry bound, forbidden paths), but it refuses an image
-SBOM pair that should carry the marker and does not, one carrying only part of
-it, and one named as a release image that lacks that image's title label.
+server images and the agent image `image-static-cpp`, the two gateway images
+`erts-static`, and the `yuzu-postgres` image `pgvector-source`.
+
+The SBOMs of the two images that hold `yuzu-server` (`yuzu-server-image.*` and
+`yuzu-server-chisel-image.*`) also list the third-party files compiled into it,
+the same entries as the server's file SBOMs (web assets and the QR-code
+library, `vendored-*` in CycloneDX, `SPDXRef-Package-vendored-*` in SPDX), from
+`server/core/vendored-components.json`, checked against the source the image was
+built from, and carry the same `yuzu:sbom:vendored` note; they are not a reason
+for the marker. Everything the scan found is kept as it was. Beyond those, an
+image SBOM lists what syft recognises and no more.
+
+The release's SBOM scope check does not hold image SBOMs to the file rules
+(entry bound, forbidden paths), but it refuses an image SBOM pair that should
+carry the marker and does not, one carrying only part of it, one named as a
+release image that lacks that image's title label, and a pair that does not
+list yuzu-server's vendored components in both formats when the image holds
+`yuzu-server` (or lists them when it does not). Listing them means the
+`yuzu:sbom:vendored` note and exactly the components of the release's
+`server/core/vendored-components.json`, each once: a pair missing one of them,
+or listing one the manifest does not, is refused.
 
 The agent-bundle image (`yuzu-agent-bundle-chisel`) is not a release image: it
 is built from the published release afterwards, by a separate job. Its syft
@@ -727,6 +847,11 @@ package SBOMs inside the release list that binary's libraries.
 ```bash
 jq '.components | length' yuzu-server-image.cdx.json
 jq -r '.components[] | "\(.name)@\(.version)"' yuzu-server-image.cdx.json | sort -u
+
+# The third-party files compiled into yuzu-server (10 lines, the nested
+# ZRender and tslib included)
+jq -r '.components[] | recurse(.components[]?) | select(."bom-ref" // "" | startswith("vendored-"))
+       | "\(.name)\t\(.version // "unresolved")\t\(.purl)"' yuzu-server-chisel-image.cdx.json
 ```
 
 ## 6. End-to-end verification script

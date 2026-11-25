@@ -13,15 +13,18 @@
 namespace yuzu::server {
 
 /// One installed-software entry. **Machine-scope collection only** (see
-/// ADR-0016 §8): no per-user rows and no username/SID fields. The wire tail's
-/// `uninstall_string` slot (14) stays reserved: the server neither stores nor hashes it
-/// (#5186). Slot 13 (`install_location`) is stored from the blob-v3 `+` record only; the v2
-/// path still parses and discards it, so a v2 row's `install_location` is always empty.
+/// ADR-0016 §8): no per-user rows and no username/SID fields. Slot 13 (`install_location`) and
+/// slot 14 (`attributes`, the validated `key=value` field of
+/// common/include/yuzu/install_row_attributes.hpp, SAM-46) are stored from the blob-v3 `+` record
+/// only; the v2 path still parses and discards both, so a v2 row's `install_location` and
+/// `attributes` are always empty (the wire tail's old `uninstall_string` meaning of slot 14,
+/// #5186, is withdrawn).
 ///
 /// Blob contract v2 + extended tail: member order == the wire/hash field order (append-only —
-/// the canonical hash walks this exact sequence, except that wire slot 14 has no member and
-/// is hashed as empty, and `install_location` (slot 13) is hashed as empty on the v2 path;
-/// the agent's blob builder walks the first 12 today, the tail rule is the agent's to mirror).
+/// the canonical v2 hash walks this exact sequence, except that `install_location` (slot 13) and
+/// `attributes` (slot 14) are hashed as empty on the v2 path; the section hash of the v3 path
+/// walks all 16 slots; the agent's blob builder walks the first 12 today, the tail rule is the
+/// agent's to mirror).
 /// Fields an ecosystem does not store are EMPTY, never synthesised: NEVRA +
 /// signature populate on Linux package managers per their capability (rpm =
 /// full; deb = no signature; apk/pacman = name/EVR only); Windows/macOS rows
@@ -44,8 +47,11 @@ struct SoftwareEntry {
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
     // Wire slot 13 (blob v3 only; always empty on the v2 path, which discards it). Sits here so
-    // member order == wire order; slot 14 has no member.
+    // member order == wire order.
     std::string install_location;
+    // Wire slot 14 (blob v3 only; always empty on the v2 path): the canonical attribute field,
+    // validated at the parser (inventory_blob_v3.hpp) and hashed as sent. Empty = no attributes.
+    std::string attributes;
     // Extended tail (wire slots 15-16): enters the canonical v2 hash ONLY when package_id or
     // source is non-empty — a v2 agent's 12-field bytes are unchanged.
     std::string package_id;

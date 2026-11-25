@@ -305,6 +305,36 @@ class RunnerCase(unittest.TestCase):
         return mock.patch.object(ir.concurrent.futures, "wait", wait)
 
 
+class NamedSkipBanner(RunnerCase):
+    """The run says up front which runnable rows it will skip by name, and why."""
+
+    def banner(self, env, overrides=None):
+        defs = [definition("agent.http_client.get", "safe"),
+                definition("device.network_actions.ping", "mutating")]
+        base = {k: v for k, v in os.environ.items() if k != ir.SKIP_PRIVILEGED_ENV}
+        with mock.patch.dict(os.environ, {**base, **env}, clear=True):
+            return self.run_runner(defs, risks=("safe", "mutating"), targeted=False,
+                                   overrides=overrides)
+
+    def test_ids_and_reasons_are_printed_and_the_rows_skip(self):
+        r = self.banner({})
+        self.assertIn("1 runnable row(s) will be skipped by name", r.out)
+        self.assertIn("agent.http_client.get: needs a public host", r.out)
+        self.assertNotIn("device.network_actions.ping:", r.out)   # not skipped without the opt-in
+        self.assertNotIn("=1 is set", r.err)
+
+    def test_the_privileged_opt_in_is_announced_and_lists_its_rows(self):
+        r = self.banner({ir.SKIP_PRIVILEGED_ENV: "1"})
+        self.assertIn("2 runnable row(s) will be skipped by name", r.out)
+        self.assertIn("device.network_actions.ping: ", r.out)
+        self.assertIn(f"{ir.SKIP_PRIVILEGED_ENV}=1 is set", r.err)
+
+    def test_an_override_for_a_skipped_row_is_reported_as_ignored(self):
+        r = self.banner({}, overrides={"agent.http_client.get": {"url": "https://example.com/"}})
+        self.assertIn("--params-override for agent.http_client.get is ignored", r.err)
+        self.assertNotIn("agent.http_client.get", self.fake.posted_ids())
+
+
 class OverrideGate(RunnerCase):
     DEFS = [definition("t.clear", "destructive", properties=["opt"]),
             definition("t.path", "destructive", required=["path", "mode"]),
@@ -1206,6 +1236,7 @@ class BroadcastGrading(unittest.TestCase):
     def setUp(self):
         self.now = 0.0
         self.calls = []
+        self.sent = []
         self.addCleanup(ir._INTERRUPT.clear)
         ir._INTERRUPT.clear()
         for name, value in (("monotonic", lambda: self.now), ("sleep", self.advance)):
@@ -1216,13 +1247,15 @@ class BroadcastGrading(unittest.TestCase):
     def advance(self, seconds):
         self.now += seconds
 
-    def grade(self, *polls, risk="safe", reached=1, timeout=2, payload=None):
+    def grade(self, *polls, risk="safe", reached=1, timeout=2, payload=None, def_id="g",
+              parameters=None, overrides=None):
         owner = self
 
         class Client:
             n = -1
 
-            def execute_instruction(self, def_id, params):
+            def execute_instruction(self, sent_id, params):
+                owner.sent.append((sent_id, dict(params)))
                 return 200, payload if payload is not None else {"command_id": "c", "agents_reached": reached}
 
             def get_responses(self, command_id, *, offset=0):
@@ -1234,9 +1267,10 @@ class BroadcastGrading(unittest.TestCase):
                     return answer(offset)
                 return {"responses": answer} if isinstance(answer, list) else answer
 
-        d = ir.Definition(id="g", plugin="p", action="a", type="action", platforms=[], parameters={},
-                          result_columns=[], approval_mode="auto", risk=risk, file="g.yaml")
-        return ir.exercise(Client(), d, {}, timeout)
+        d = ir.Definition(id=def_id, plugin="p", action="a", type="action", platforms=[],
+                          parameters=parameters or {}, result_columns=[], approval_mode="auto",
+                          risk=risk, file="g.yaml")
+        return ir.exercise(Client(), d, overrides or {}, timeout)
 
     def test_success_including_empty_or_error_looking_output_passes(self):
         for risk in ("safe", "mutating"):
@@ -1252,6 +1286,60 @@ class BroadcastGrading(unittest.TestCase):
                         result = self.grade([row(), row(status=status, output=output)], risk=risk)
                         self.assertEqual(result.status, "fail")
                         self.assertIn(ir.STATUS_NAMES[status], result.note)
+
+    def test_a_plugin_failure_on_a_synthesis_fixed_row_still_fails_the_gate(self):
+        # echo.query used to fail because the runner sent from="x". The fix changes what is SENT, not
+        # how the answer is graded: the same row with the bad value forced back in must still fail.
+        schema = {"type": "object", "properties": {"from": {"type": "string"}}}
+        good = self.grade([row()], def_id="crossplatform.echo.query", parameters=schema)
+        self.assertEqual(good.status, "pass")
+        self.assertEqual(self.sent[-1], ("crossplatform.echo.query", {"from": "0"}))
+        bad = self.grade([row(status=FAILURE, output="error|invalid 'from' parameter (must be epoch seconds)")],
+                         def_id="crossplatform.echo.query", parameters=schema, overrides={"crossplatform.echo.query": {"from": "x"}})
+        self.assertEqual(self.sent[-1], ("crossplatform.echo.query", {"from": "x"}))
+        self.assertEqual(bad.status, "fail")
+
+    def test_list_dir_and_read_are_sent_the_seeded_paths_through_exercise(self):
+        schema = {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}}
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_seedcase_") as base, \
+                ir.seeded_directory(base) as seed:
+            self.grade([row()], def_id="device.filesystem.list_dir", parameters=schema)
+            self.grade([row()], def_id="device.filesystem.read", parameters=schema)
+            self.grade([row()], def_id="device.filesystem.exists", parameters=schema)
+        self.assertEqual(self.sent[0], ("device.filesystem.list_dir", {"path": seed}))
+        self.assertEqual(self.sent[1], ("device.filesystem.read", {"path": os.path.join(seed, "a.txt")}))
+        self.assertEqual(self.sent[2][1]["path"], ir._HOST_PATHS[ir.HOST]["file"])  # per definition
+
+    def test_named_skips_dispatch_nothing_and_say_why(self):
+        for def_id in ("agent.http_client.get", "agent.http_client.head"):
+            with self.subTest(def_id=def_id):
+                result = self.grade([row()], def_id=def_id)
+                self.assertEqual(result.status, "skip")
+                self.assertIn("SSRF", result.note)
+        self.assertEqual(self.sent, [])
+
+    def test_echo_configure_is_skipped_by_name_and_never_written(self):
+        schema = {"type": "object", "properties": {"db_budget_bytes": {"type": "string"}}}
+        result = self.grade([row()], risk="mutating", def_id="crossplatform.echo.configure",
+                            parameters=schema)
+        self.assertEqual(result.status, "skip")
+        self.assertIn("Echo byte budget", result.note)
+        self.assertEqual(self.sent, [])
+
+    def test_privileged_rows_skip_only_when_the_rig_says_so(self):
+        for def_id in ("device.network_actions.ping", "device.network_actions.flush_dns"):
+            with self.subTest(def_id=def_id):
+                with mock.patch.dict(os.environ, {ir.SKIP_PRIVILEGED_ENV: "1"}):
+                    skipped = self.grade([row()], risk="mutating", def_id=def_id)
+                self.assertEqual(skipped.status, "skip")
+                self.assertIn(ir.SKIP_PRIVILEGED_ENV, skipped.note)
+                self.assertEqual(self.sent, [])
+                env = {k: v for k, v in os.environ.items() if k != ir.SKIP_PRIVILEGED_ENV}
+                with mock.patch.dict(os.environ, env, clear=True):
+                    ran = self.grade([row(status=FAILURE)], risk="mutating", def_id=def_id)
+                self.assertEqual(ran.status, "fail")   # a normal host still runs it and still fails it
+                self.assertEqual(len(self.sent), 1)
+                self.sent.clear()
 
     def test_running_output_waits_for_terminal_and_historical_chunks_are_allowed(self):
         running = row(status=RUNNING, output="partial")
@@ -1739,6 +1827,31 @@ class BashEntry(unittest.TestCase):
                                    env=env, capture_output=True, text=True, timeout=60)
                 self.assertEqual(r.returncode, 2, r.stderr)
                 self.assertFalse(self.rec.exists())  # nothing was started
+
+    def test_a_target_hostname_selects_the_remote_ceremony(self):
+        base = ("--risks", "network-disrupt", "--target-agent-id", "id 1")
+        argv = self.run_bash(*base, "--target-agent-hostname", "host b", "--console-access-to-agent")
+        self.assertIn("--remote", argv)
+        self.assertEqual(argv[argv.index("--agent-hostname") + 1], "host b")
+        self.assertIn("--i-have-console-access-to-the-agent", argv)
+        argv = self.run_bash(*base, "--target-agent-hostname", "host b")
+        self.assertIn("--remote", argv)
+        self.assertEqual(argv[argv.index("--agent-hostname") + 1], "host b")
+        self.assertNotIn("--i-have-console-access-to-the-agent", argv)
+        argv = self.run_bash(*base)
+        self.assertNotIn("--remote", argv)
+        self.assertNotIn("--agent-hostname", argv)
+
+    def test_the_console_flag_without_a_target_hostname_is_refused(self):
+        env = dict(os.environ, PATH=f"{self.tmp}{os.pathsep}{os.environ['PATH']}", REC=str(self.rec))
+        r = subprocess.run(["bash", str(ROOT / "scripts" / "test" / "instructions-tests.sh"),
+                            "--dashboard", "http://127.0.0.1:1", "--password", "p",
+                            "--risks", "network-disrupt", "--target-agent-id", "a",
+                            "--console-access-to-agent"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--target-agent-hostname", r.stderr)
+        self.assertFalse(self.rec.exists())  # nothing was started
 
     def test_values_with_spaces_arrive_as_single_arguments(self):
         argv = self.run_bash("--confirm-target", "Host name 1", "--manifest", "/tmp/a b/m.jsonl",

@@ -447,7 +447,9 @@ else the `PACKAGER` tag.
 > `InstalledProductName`/`VersionString`/`Publisher`. The product code travels in
 > the blob's extended-tail `package_id` field (the tail appended after the twelve
 > v2 fields); the tail's first two slots, `install_location` and
-> `uninstall_string`, stay reserved and empty (#5186). A `constrained`
+> `uninstall_string`, stay reserved and empty (#5186). (**Superseded 2026-11-21:**
+> slot 14 is the stored attribute field on the v3 path, see the 2026-11-21 Update; no
+> uninstall string is collected.) A `constrained`
 > enumeration, or a product-property read that fails for any reason other than
 > the product not having the property, fails the action and skips the whole
 > cycle, like `pkg_inventory.packages`. (**Superseded 2026-11-09:** a constrained or
@@ -496,11 +498,49 @@ else the `PACKAGER` tag.
 > affected; the per-item shortfall rule above is unchanged. See the Update of
 > 2026-11-09 below.)
 
+> **Update (2026-11-20):** a `pkg_inventory.packages` Homebrew row is five or eleven
+> tokens, for either manager, on purpose. A five-token Homebrew row maps as before, with
+> empty `install_date` and `install_location`. Any other width is dropped under a
+> `supported` status, and a supported answer with fewer rows is an authoritative section,
+> so narrowing the accepted widths would delete a device's stored rows. Five is the width
+> the adapter already accepted, kept as it was. An eleven-token `machine` row fills
+> `install_date` (the install receipt's install time, formula rows only) and
+> `install_location` (the machine prefix, kept by the slot 13 allowlist), so a formula or
+> cask installed under both machine prefixes is two rows, one per `install_location`. A
+> `user`-scope row is never collected, and the receipt's tap, its requested flag and the
+> owner have no slot. The v3 contract, its slots and the hash functions are unchanged.
+>
+> *One-time ledger effect on a carried database.* `install_location` is part of a row's
+> identity (a changed location is "a removal and an install", below), and a Homebrew
+> row's location goes from empty to the machine prefix. A fresh database is not affected:
+> the first full section for a facet is a baseline and writes no ledger rows (the
+> Baseline rule, below), and a supported deployment starts from a fresh database. Only a
+> development or UAT database that already holds a Mac's Homebrew rows from an earlier
+> build is affected (an in-place upgrade is not a supported path). On that Mac's first
+> sync from this build each Homebrew formula and cask row is recorded as one `remove` and
+> one `install` at an unchanged version. They show in
+> `GET /api/v1/inventory/software/changes`, the MCP `list_software_changes`, the
+> summary's install and removal counts and `yuzu_software_changes_total{kind}`. A pair is
+> recognisable: the same device, facet `pkg_inventory.packages`, name and version, one
+> `observed_at`; a reinstall at an unchanged version writes nothing, so that shape only
+> means the record's location, arch or vendor changed. There is no cause label. The pairs
+> are pruned with the ledger after 400 days and need no action.
+>
+> *Deviation from the per-user rule in the Decision.* The Decision says per-user
+> enumeration is "a later, gated, pseudonymized addition". `pkg_inventory.packages` now
+> lists a per-user Homebrew on the command surface, ungated (`Inventory`, execute gate
+> `None`) and with the home directory's name in clear as the row's owner. That is
+> deliberate, under the owner's rulings of 2026-11-18 (the owner name, inside `packages`)
+> and 2026-11-20 (no receipt field is read or carried on a user row: its install time, tap
+> and requested flag are `-`). The sync still never collects a user row. ADR-0024 D11's
+> pseudonymous `user_ref` is not reused: that ADR confines it to its own source and
+> requires any other use to be its own decision.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no
   proto change, no gateway pb regen (§6 applies only to outer-envelope fields).
-- Collection is a new `installed_apps` action **`list_inventory`** (13-token
+- Collection is a new `installed_apps` action **`list_inventory`** (14-token
   `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
   stable contract whose fields this ADR left byte-unchanged (rpm `list` keeps
   VENDOR). On Windows, `get_installed_apps_windows()` feeds `list` and `query`, and
@@ -850,7 +890,7 @@ kind:
 | Record | Fields after the kind | Meaning |
 |---|---|---|
 | `S` | `facet`, `status`, `base`, `token`, `duration_ms`, `bytes_read`, `expect` | opens a section; `expect` is the section hash after the agent applies it (64 lowercase hex, mandatory on `delta`, see the SAM-14 entry below) |
-| `+` | `name`, `version`, `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`, `install_location`, *slot 14 (reserved, empty)*, `package_id`, `source` | an install row |
+| `+` | `name`, `version`, `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`, `install_location`, `attributes` (slot 14: empty, or the canonical `key=value` field of the 2026-11-21 Update), `package_id`, `source` | an install row |
 | `-` | `row_hash` | a deletion by row hash (64 lowercase hex); applied by the SAM-14 delta apply below |
 | `comp` | `kind`, `name`, `version`, `version_source`, `path`, `size`, `mtime`, `anchor_app` | a component row; `version_source` is one of `filename`, `pom`, `manifest`, `metadata`, `package_json`, `pe`, `elf`, `macho`, `unreadable`; stored by the SAM-14 component store below |
 
@@ -882,7 +922,8 @@ v2 parser is unchanged.
 **Containment.** A grammar violation inside a section refuses that section only: a `+`, `-` or
 `comp` record in a status-only section; a `-` record in a `full` section; a `+` source other
 than the facet; `+` in `component_inventory` or `comp` anywhere else; an unknown status, facet or
-record kind; a malformed row hash; an unknown `version_source`; a repeated facet; a row over the
+record kind; a malformed row hash; an unknown `version_source`; a `+` whose slot 14 is not a
+canonical attribute field (`bad_attributes`); a repeated facet; a row over the
 per-call cap; a record holding a NUL byte; a final record with no terminator. The rest of a refused section is skipped to the next `S`, and the other sections
 still apply. A defect that cannot be attributed to a facet fails the whole blob (a record before
 any section, a header with no section after it, an `S` record whose facet is empty or outside
@@ -894,7 +935,8 @@ the charset, more than 32 sections, over 3 MiB): the ingest seam answers the who
 the nack for a hash-only claim the server cannot match and for an unattributable v3 blob.
 
 **Section hash.** `canonical_section_hash(rows)` is the SHA-256 hex of the section's rows,
-sorted and de-duplicated, each written as all 16 wire slots (slot 14 empty, and no conditional
+sorted and de-duplicated, each written as all 16 wire slots (slot 14 the attribute field, empty
+when a row has none, and no conditional
 tail: unlike the v2 hash, `package_id` and `source` are always written), `0x1F`-joined and
 `0x1E`-terminated. The sort walks the stored fields in wire order: `name`, `version`,
 `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`,
@@ -952,7 +994,8 @@ advisory lock as the v2 replace):
 **Slot 13 is stored on v3 only.** `install_location` (wire slot 13) is stored from the v3 `+`
 record. The v2 path still parses and discards it, so a v2 row's location is always empty and the
 v2 canonical hash is unchanged. Slot 14 (`uninstall_string`) stays reserved on both paths, so
-#5186 is closed for slot 13 only.
+#5186 is closed for slot 13 only. (**Superseded 2026-11-21:** slot 14 is the stored attribute field on the v3
+path, see that Update; the v2 path still discards it, and no uninstall string is collected.)
 
 *§8 outcome for slot 13 (this change re-opens §8 for the server store).* `install_location` is
 operator-tier: machine-scope roots only (ADR-0028), but a root can still name an account's home
@@ -1389,11 +1432,13 @@ the fallback.
 | `runtimes.dotnet` | the constant `Microsoft` (.NET is a Microsoft product; the adapter drops the row's vendor column, which is `-` on Linux and on the native macOS root) | n/a |
 | `runtimes.jvm` | the row's vendor column: the `release` file's self-reported `IMPLEMENTOR`, or on macOS, for a bundle with an openable `Contents` and no `release` file under `Contents/Home`, its `Info.plist` `JVMVendor` | `via:jvm` when the column is `-` (the home reports no vendor, or it is a Windows home known only by its registry tag) |
 
-The rpm `list_inventory` query format (`kRpmInvQueryFormat`) has ten columns, the two free-text
-tags last: `%{VENDOR}` then `%{PACKAGER}`. The pinned argv literal in
-`docs/agent-spawn-sink-manifest.md` carries the same format. `parse_rpm_inv_line` takes at least
-nine tokens: the publisher is `VENDOR` when set, else `PACKAGER`, each read as the text before any
-tab it contains. The `list` action has its own columns.
+Until SAM-45 (see its Update below) the rpm `list_inventory` acquisition was a subprocess with a ten-column
+query format (`kRpmInvQueryFormat`, the two free-text tags last: `%{VENDOR}` then `%{PACKAGER}`), pinned as an argv
+literal in `docs/agent-spawn-sink-manifest.md`, and `parse_rpm_inv_line` took at least nine tokens and read each free-text
+field as the text before any tab it contained. All three of those are retired: the format and the parser are
+test-only now (`tests/unit/installed_apps_old_path_oracle.hpp`), the manifest rows are removed, and the rows come
+from the database through `inv_record_from_rpm`, where a tab, pipe or newline no longer truncates a value. The
+publisher rule is unchanged: `VENDOR` when set, else `PACKAGER`. The `list` action has its own columns.
 
 **The server rule.** `normalize_vendor` returns the empty vendor when the RAW value starts with
 `kOriginLabelPrefix` (`via:`), as its first statement, before lower-casing or tokenising. The test
@@ -1831,7 +1876,7 @@ Five REST v1 reads over the typed installed-software store, all `Inventory:Read`
 **Dropped from the earlier read-model plan, with reasons.**
 
 - Tombstones for removed packages: dropped. A removal is already a hard delete plus a `remove` ledger row carrying the name, publisher and version, so no read needs a `removed_at` filter and the change feed is the record of removals.
-- Reading the reserved slot 14 (`uninstall_string`): dropped. The slot stays reserved and empty in the v3 record (#5186), stays in the hash as an empty slot, and no read exposes it; nothing in the host or feed views needs it.
+- Reading the reserved slot 14 (`uninstall_string`): dropped. The slot stays reserved and empty in the v3 record (#5186), stays in the hash as an empty slot, and no read exposes it; nothing in the host or feed views needs it. (**Superseded 2026-11-21:** slot 14 is now the stored attribute field on the v3 path, see the 2026-11-21 Update; no uninstall string is collected, and the field is still on no read route.)
 - A separate freshness field per row: dropped. The row `status` (`current`, `unconfirmed`, `disabled`) and `last_confirmed_at`, derived from the facet state, already say how fresh a row is, and the hosts read exposes both per facet.
 - Device record fields on the host rows (OS, serial, system UUID, MAC addresses, agent version): dropped. A host row carries `agent_id`, the roster `hostname`, `last_seen` and the facet states, the same hostname join the lookup rows use. The full device record is served by the hardware list under the behavioural-PII access audit (`emit_behavioral_audit`), while these five routes audit set-and-proceed, so joining those fields here would change this route's audit contract and data tier, which this change neither planned nor reviewed. The runbook sends the operator to `GET /api/v1/devices/{id}` for the OS and the agent version. Which fields belong on a host row is tracked by #7784.
 - A `scope` parameter on the hosts list: dropped as unbacked, the same ruling that leaves `scope=expr` off the installs route; nothing in this read model resolves a scope expression. The hosts list reads `q`, `last_synced_before`, `limit` and `cursor` only, and the caller's gate scope is applied on every page, so a request cannot widen or narrow it.
@@ -1919,8 +1964,188 @@ neither end carries handling for a peer that predates it.
   withheld collectors, carrying a per-OS or per-action kill switch (only the plugin-wide switch is carried,
   which is the one the effective-settings route shows), and zone conversion on the agent.
 
+### 2026-11-21 — install-row attributes in wire slot 14 (SAM-46)
+
+**Decision.** Slot 14 of the blob-v3 `+` record, reserved as `uninstall_string` since #5186 and always
+sent empty, is now the **attribute field**: a validated `key=value` text that rides the synced install
+row, stored on the server and covered by the section hash. The first key is `upgrade_code` (the MSI
+UpgradeCode, the identifier shared by every version of one Windows product). The `uninstall_string`
+reservation is withdrawn: nothing sends, stores or hashes an uninstall string, and slot 14 will not
+carry one. SAM-45b (#8361) adds its keys to this field and lands after this change, with no new wire
+change, migration or parser change.
+
+- **Canonical form.** `key=value` pairs joined by `;`, keys in strictly ascending byte order, each key at
+  most once, no leading or trailing `;`, no empty key or value, the whole field at most 1,024 bytes (the
+  v3 field cap). The empty string means no attributes and is what the slot carried before this change. A
+  value holds no `;`, no `=` and no control byte (`0x00-0x1F` and `0x7F`, which covers NUL and both
+  wire separators, `0x1E` and `0x1F`). The validator checks and never repairs: a canonical value is
+  returned unchanged and anything else is refused whole, so nothing is re-ordered, re-cased or trimmed
+  into shape. The only step before it is the field step every slot gets, and the two sides differ: the
+  agent's `clamp_field` scrubs invalid UTF-8, clamps the length and then strips `0x1F`, `0x1E` and NUL,
+  so a canonical value with a stray wire separator or NUL appended is sent as the canonical value; the
+  server's scrub-and-clamp only repairs invalid UTF-8 and clamps the length and strips nothing (a NUL
+  is refused as `nul_byte`, and a stray `0x1F` or `0x1E` is a framing fault of the record, never a slot
+  value).
+- **One key registry.** `kAttributeKeys` in `common/include/yuzu/install_row_attributes.hpp` is a closed,
+  name-sorted table of `{name, validator}` (a `static_assert` pins the order), and the same header holds
+  `canonical_attributes`, `attribute_value` and `make_attributes`. The agent writer, the agent adapters
+  and the server parser all include it, so there is one definition of what a row may carry. Version 1 of
+  the table is `upgrade_code`, whose value is exactly `{8-4-4-4-12}` upper-case hex with the braces.
+- **How a key is added.** One row in `kAttributeKeys`, in name order, with its validator, and a golden
+  vector for the key pinned in both the agent and the server tests. That is the whole change: no
+  migration (the column is free text), no parser change (the parser asks the table) and no wire change.
+  #8361 lands after this change and adds its keys that way.
+- **Indexing.** Wire slot 14 is field 14 of the parsed `+` record (the `+` kind marker is field 0) and
+  index 13 of the sixteen-slot record both sides hash, between `install_location` (index 12) and
+  `package_id` (index 14). The agent's `SwEntry.attributes` and the server's `SoftwareEntry.attributes`
+  sit in that position, so member order stays wire order, and both comparators order rows by
+  `install_location`, then `attributes`, then `package_id`, then `source`.
+- **Agent.** `v3_normal_form` keeps a row's attributes, after the field step, only when they are
+  already canonical and drops them otherwise: the writer never sends what the server would refuse,
+  and the row then hashes exactly as if the slot were empty. The `msi_packages.list_inventory`
+  adapter accepts a row of five or six
+  tokens; a sixth token that is a braced GUID in either case becomes `upgrade_code={UPPER}`, and any other
+  sixth token is ignored and the row is kept. This change added no producer: until the
+  `msi_packages` producer change lands, nothing on the wire changes. That change is the
+  installer-records one: the Windows `msi_packages.list_inventory` collector then sends the sixth
+  token for a product named under exactly one upgrade code.
+- **Server.** The parser keeps field 14 and refuses a section whose `+` record carries a value that is
+  not canonical, with the new refusal `bad_attributes` (the `bad_version_source` precedent: that section
+  only, its rows cleared, the other sections of the call apply). A refused section is resent in full,
+  as every refusal is. Schema v13 adds `installed_software.attributes TEXT NOT NULL DEFAULT ''`: a
+  constant default, so metadata-only on every supported Postgres version, no rewrite and no index. The
+  comparator, the sixteen-slot record, the batched insert and the row load that recomputes a section
+  hash all carry the column. `instance_key`, the SHA-256 of the record, therefore changes when a row's
+  attributes change, and a `-` record names a row by it.
+- **Hash agreement.** An empty slot 14 hashes to the bytes it hashed to before, so no stored row, no
+  section hash and no held agent state moves, and no agent resends. A row carrying `upgrade_code` is
+  pinned by one golden vector whose literal record bytes and SHA-256 are identical in
+  `tests/unit/test_installed_software_v3.cpp` and `tests/unit/server/test_software_inventory_store.cpp`;
+  both fail if either side moves.
+- **Not in this change.** Any REST, MCP or UI field for `attributes` (stored, not yet on a read route;
+  #8441 exposes `upgrade_code` on the installed-software read routes, then the MCP twin); any use of
+  an attribute in `identity_key` or the change ledger (the ledger pairs rows by identity and
+  version, so an attribute-only change at the same version writes no ledger event); the v2 path, where
+  slot 14 is still parsed and discarded.
+### 2026-11-20 — Linux dpkg and rpm rows are read from the package databases in-process (SAM-45)
+
+**What changed.** The `installed_apps` plugin no longer runs `dpkg-query` or `rpm -qa` on Linux for
+`list_inventory`, `list`, `query` or `list_per_user`. It reads the databases itself, read-only: the dpkg
+status text (and the `status.d` directory minimal images use), and the rpm database in whichever format the
+host keeps, sqlite (Fedora, RHEL 9 and later), ndb (SUSE) or Berkeley DB hash (RHEL 7 and 8). All three rpm
+formats store the same rpm header blob, so one header parser serves them. `pacman` and `apk` keep their
+subprocess legs. The readers live in `agents/shared` (`dpkg_status_parsers.hpp`, `rpmdb_parsers.hpp`,
+`pkgdb_budget.hpp`) and the plugin's POSIX shell is `installed_apps_pkgdb_read.hpp`.
+
+**What did not change.** The rows, the wire and the section hash. Every `inv|` and `app|` row the readers
+produce equals, as a set, the row the subprocess path produced for the same database on every capture taken
+for this change (eleven captures: Debian 12, Ubuntu 24.04, Fedora 41, AlmaLinux 8 on arm64 and on s390x,
+AlmaLinux 9, openSUSE Leap 15.6 and Tumbleweed, plus a dense variant of Debian, Fedora and Leap). Eight of them are
+committed, trimmed, as test fixtures (the dense variants are not); the eleven full captures were measured once through
+`YUZU_TEST_PKGDB_FIXTURE_ROOT` and are not in the tree. There is no server
+change, no resend and no change-ledger event on upgrade. The earlier text of this ADR that names the line
+parsers (`parse_dpkg_inv_line`, `parse_rpm_inv_line`, `kRpmInvQueryFormat`, `parse_dpkg_list`,
+`parse_rpm_list`) describes the OLD path: those functions are now test-only, kept verbatim in
+`tests/unit/installed_apps_old_path_oracle.hpp` as the independent interpreter of the old path's captured
+output. The rpm publisher rule (VENDOR, else PACKAGER, else the `via:rpm` label) and the dpkg rule (any
+`installed` state, held packages included) are the ones the subprocess path applied.
+
+**Deliberate differences.** None changes a row on any capture; each is a behaviour the old path had and this one
+does not, or the reverse.
+
+- The package manager is detected by its DATABASE file rather than its tool binary. A dpkg status is the answer only
+  when at least one stanza is `installed` (the state both row mappers require): an empty one, or one holding only
+  config-files, half-installed and other non-installed states, falls through to rpm. An rpm database that was read and
+  holds no package does not end detection either: the next candidate directory is tried, and when none yields a package
+  the host is read by the `pacman` leg (and, for `list_inventory` only, the `apk` leg) as before. The old path chose by binary and did not fall through;
+  what is new is a database present without its binary.
+- A tab, pipe or newline inside a Maintainer, VENDOR or PACKAGER value no longer truncates the value or splits
+  the row (the separators are removed from an `inv` row, or escaped in a `list` row, at format time). A host that carries
+  one has those rows hashed over the full value, so they are sent once more on the first cycle after upgrade; every
+  other row and hash is unchanged.
+- `list` renders an rpm header with no INSTALLTIME as `-` and one with no RELEASE as `VERSION-`, where the old path
+  printed `(none)` for each (the `inv` row writes both empty, as before: the old path mapped `(none)` to empty there).
+  Only a hostile or damaged header lacks either tag.
+- A dpkg `Status` is accepted only as dpkg writes it: three lowercase words of dpkg's vocabulary (want `unknown`,
+  `install`, `hold`, `deinstall` or `purge`; flag `ok` or `reinstreq`; state `not-installed`, `config-files`,
+  `half-installed`, `unpacked`, `half-configured`, `triggers-awaited`, `triggers-pending` or `installed`) separated
+  by single spaces. A word outside its table is `dpkg_status:corrupt` for the whole read, as it was for `dpkg-query`,
+  which exited nonzero on it: a package is never silently left out of a roster published as complete. `dpkg-query` also
+  read mixed case and repeated blanks, which dpkg never writes, so a hand-edited file of that kind is
+  `dpkg_status:corrupt` until dpkg next rewrites it.
+- A host whose packages live only in `/var/lib/dpkg/status.d/` (the layout minimal images with no shell use,
+  which `dpkg-query` never read) now reports them: new install rows and install events for that host. Each
+  package there is a control file with no `Status` field, plus a `.md5sums` sibling that is skipped; a present
+  file is read as installed, and a file that does carry a `Status` is held to the same three-word rule. The
+  converse is also new: a host with a healthy status file and one `status.d` control file that does not hold exactly one stanza, and that one in the installed state (a `not-installed` stanza beside it is ignored; unparseable, zero-byte and comment-only files are refused, and so is a second stanza of any other kind, or a single one in another state such as config-files or half-installed) is
+  degraded (`dpkg_status_d:corrupt`, no rows) where `dpkg-query` ignored the directory, and the status file's own
+  packages are withheld with it, because a roster without the `status.d`-only packages would be published as the
+  host's complete one. Two control files that name the same package and architecture are refused the same way (the first would hide the other). The remedy is to restore the file (from the image, or by reinstalling the package that owns it; for a duplicate pair, the one that holds the other package's record), not to delete it or hide it with a leading dot: either drops that package from a roster then read as complete. Remove or hide a file only once it is verified extraneous.
+- A symlinked leaf is refused where the tools followed it: a symlinked status file, `status.d` directory or rpm
+  database file is `symlink_refused` (the directories above the leaf are reached by path and are followed, as before).
+  An rpm candidate DIRECTORY that is a symlink is never followed and is skipped; when a database file exists behind
+  such a link, the read is `rpmdb:symlink_refused` (a stat only; nothing is opened through the link; a link whose target the
+  agent cannot search is `rpmdb:unreadable`, never taken for no database) instead of an empty list, unless the link resolves, by device and inode, to a directory whose database this reader read itself (an
+  empty one counts). That is decided when a database is about to be accepted and, if none was, once every candidate has been tried, because on
+  the older layout the sysimage link is seen before the `/var/lib/rpm` directory it points at; a populated directory read
+  after a link that hides a different database is refused too. The current Fedora, RHEL and SUSE layout
+  (`/var/lib/rpm` linking to the sysimage copy, which is read first) and the older one are unaffected; a link to a
+  populated directory elsewhere is refused when it is seen before a populated database is accepted, or whatever
+  candidate it is on when no candidate yields a package (an emptied database does not end the search). A link on a
+  candidate later than the accepted directory is not examined (#8574). A regular file where an rpm
+  candidate directory belongs is `rpmdb:not_regular`, not an absent database.
+- An rpm sqlite database without its WAL sidecars is readable by an unprivileged account (measured on one
+  AlmaLinux 9 image: `rpm -qa` fails there as `nobody`).
+- **A running rpm transaction answers `locked` on ndb and Berkeley DB.** rpm rewrites those two files in place and
+  every rpm writer holds its transaction lock (an fcntl write lock on `.rpm.lock`, beside the database) for the whole
+  run, while a read-only `rpm -qa` was isolated from a writer by the library's own lock (ndb: a shared flock on `Packages.db`; Berkeley DB: the shared environment), which a raw reader of the file does not have. The
+  reader takes the same precaution in the only way open to it: after the first change stamp and before the first
+  read it asks `fcntl(F_GETLK)` whether a write lock on `.rpm.lock` would conflict, and a held lock is
+  `<source>:locked` with no rows and the server keeping its stored ones. It never TAKES a lock, so it cannot delay
+  rpm; a missing lock file means no transaction has run; a symlinked or non-regular one is its named cause, never
+  "not locked". sqlite keeps its own isolation (a shared lock for a rollback journal, a snapshot for WAL) and does not
+  consult it. The change stamp stays as the second line of defence. Residual: rpm's lock path is configurable
+  (`%_rpmlock_path`), and a lock file moved out of the database directory is not seen.
+- **A pending dpkg update journal answers `locked`.** `dpkg-query -W` replays `/var/lib/dpkg/updates/` in memory
+  over the status file before it answers, so it printed the status MERGED with a run in progress, or left by an
+  interrupted one until dpkg next runs. This reader reads the status file alone, which in that state is the
+  pre-journal roster. It does not re-implement dpkg's record-replacement rules (multi-arch slots, a not-installed
+  record deleting an entry): a name made only of ASCII digits in that directory (dpkg's own selection rule; `tmp.i` and
+  every other name is ignored) is `dpkg_updates:locked`, with no rows, no fall-through to rpm and the status packages
+  discarded as a `status.d` failure discards them. The directory is listed by name only (nothing in it is opened); an
+  absent directory means no journal, and a link or non-directory in its place, or a listing that fails, is a named
+  failure. The operator's remedy is `dpkg --configure -a` when no dpkg run is in progress. The check runs on any host
+  with such a file, whether or not a status file or `status.d` exists, including an rpm host that carries a stale dpkg
+  tree: no dpkg exists there to run, so the leftover record is removed by hand. A merged view can be added on top of
+  this refusal later if wanted.
+- A read that fails is a degraded acquisition with a NAMED reason, `installed_apps:<source>:<cause>`, in the
+  result's provenance, the `list`/`query` error row and the agent log. The section token the daily sync sends
+  is still the generic constrained one (`sync_source_installed_software.cpp` reads only the exit code) until a
+  follow-up carries the reason end to end.
+
+**Where it runs.** The whole read is one bounded call (`bounded_call_ex`, 20 s, the inner bound; the daily sync's
+own outer bound is unchanged) on a worker, polled by the same deadline, by the plugin's stop flag and by the agent's
+shutdown latch (`subprocess_cancel_requested()`, the latch the old subprocess leg polled), so an agent stop ends a slow
+read at its next poll. `shutdown()` raises the flag and waits a fixed 5 s for callers still inside a read. What this
+cannot close is `bounded_wait.hpp`'s accepted residual: a worker blocked in a kernel read that never returns can
+outlive the unload (the ceiling on abandoned workers and the missing single-flight are #8364's). One trade is new: the
+parsers now run INSIDE the agent process, where the old path isolated `dpkg-query` and `rpm` in a child, so a memory
+error in a parser would take the agent with it. That is why every length is checked in 64-bit arithmetic before
+anything is allocated, every loop is bounded, the sqlite connection is opened read-only with the untrusted-database
+posture, and the parsers are tested against edited real databases.
+
+**Failure semantics are unchanged in kind.** A degraded answer is rc 1 with no rows and CONSTRAINED/PARTIAL,
+so the writer's status-only section keeps the server's stored rows (the `v3:` held-facet rule). Every limit
+(20 s wall clock; 50,000 packages, which for dpkg is a cap on stanzas; 32 MiB of dpkg text in total across the status
+file and `status.d`; 32 MiB per rpm header; 1 GiB of rpm headers read; and 8 MiB of text KEPT across the rpm headers
+in total, charged apart from the bytes read because one stored string can be named by several fields of a hostile
+header, so what a record keeps is a multiple of what it was charged for reading) and every damaged record
+degrades the whole read instead of returning a shorter roster (except a Berkeley DB hash page that is zeroed or retyped to free or overflow, or whose item count and item-area start are both damaged, which has no checksum: #8545). Reading rpm signer data and non-installed dpkg
+states onto the wire (slot 14 of the v3 record, which the server consumes without keeping) is NOT part of this
+change; it needs a server change and is tracked as SAM-45b (#8361).
+
 ## Routed-concern invariants
 
 Moved verbatim from the `Agent daily-sync framework` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
 
-Agent daily-sync framework + installed-software inventory (ADR-0016) — agent pushes per-source state daily over `ReportInventory` (hash-skip); sources: #1 `installed_software` (blob v3, a section per source: `installed_apps.list_inventory` — `list` rows are never hashed; `pkg_inventory.*`, `windows_optional_features.list`, `msi_packages.list_inventory`, `runtimes.*`, `middleware.ibm_mq`, `hardware.drivers_inventory`), #2 `app_perf`, #3 `device_ci` (serial/UUID/MAC = GDPR personal data → behavioural-PII tier). CRITICAL: (1) `inventory_state.last_seen`/`first_seen` = SERVER receipt time, never agent `collected_at` (#1685); (2) a new sync source is a new `plugin_data` map KEY, NOT a proto field (no `agent_pb`/`gateway_pb` regen); (3) Windows registry STRING reads use `Reg*W` via `win_str.hpp`, never `Reg*A` (#1662/#1682); (4) the v3 section hash is hashed byte-for-byte on agent (`agents/core/src/installed_software_v3.cpp`, the only writer) + server (`software_inventory_store.cpp`): 16 slots, slot 14 (uninstall_string) RESERVED (#5186), slot 13 (install_location) an agent-side allowlist (§8: kept under a machine root, else blanked), source = facet, publisher never empty — a one-sided change breaks hash agreement for good; the writer follows the `v3:` held-facet rule and commits on ack (a status-only ack ERASES the facet's acked set); a degraded answer is a status-only section, never rows; collector workers drain before plugin shutdown.
+Agent daily-sync framework + installed-software inventory (ADR-0016) — agent pushes per-source state daily over `ReportInventory` (hash-skip); sources: #1 `installed_software` (blob v3, a section per source: `installed_apps.list_inventory` — `list` rows are never hashed; `pkg_inventory.*`, `windows_optional_features.list`, `msi_packages.list_inventory`, `runtimes.*`, `middleware.ibm_mq`, `hardware.drivers_inventory`), #2 `app_perf`, #3 `device_ci` (serial/UUID/MAC = GDPR personal data → behavioural-PII tier). CRITICAL: (1) `inventory_state.last_seen`/`first_seen` = SERVER receipt time, never agent `collected_at` (#1685); (2) a new sync source is a new `plugin_data` map KEY, NOT a proto field (no `agent_pb`/`gateway_pb` regen); (3) Windows registry STRING reads use `Reg*W` via `win_str.hpp`, never `Reg*A` (#1662/#1682); (4) the v3 section hash is hashed byte-for-byte on agent (`agents/core/src/installed_software_v3.cpp`, the only writer) + server (`software_inventory_store.cpp`): 16 slots, slot 14 the attribute field (the ONE key table and canonical form of `common/include/yuzu/install_row_attributes.hpp`, included by both ends; the `uninstall_string` reservation of #5186 is withdrawn), slot 13 (install_location) an agent-side allowlist (§8: kept under a machine root, else blanked), source = facet, publisher never empty — a one-sided change breaks hash agreement for good; the writer follows the `v3:` held-facet rule and commits on ack (a status-only ack ERASES the facet's acked set); a degraded answer is a status-only section, never rows; collector workers drain before plugin shutdown.

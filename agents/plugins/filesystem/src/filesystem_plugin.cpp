@@ -41,8 +41,13 @@
 
 #include "filesystem_acl_parsers.hpp"
 #include "filesystem_find_by_hash.hpp"
+#include <agent_reserved_path_keys.hpp>
+#include "filesystem_reserved_paths.hpp" // WP06 F55: refuse the agent's own secrets
+#include "filesystem_stdio_identity.hpp"  // POSIX: the agent's own stdout/stderr when a regular file
 #include "filesystem_posix_names.hpp"
+#include "filesystem_search_dir.hpp"
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
+#include <local_path_policy.hpp> // yuzu::shared::local_path: UNC / device / non-fixed-drive refusal
 #include <network_fstype.hpp>
 
 #include <spdlog/spdlog.h>
@@ -56,6 +61,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -107,7 +113,6 @@
 #ifdef __APPLE__
 #include <sys/mount.h> // getmntinfo_r_np
 #include <sys/param.h>
-#include <sys/resource.h> // getiopolicy_np / setiopolicy_np
 #endif
 #endif
 
@@ -124,10 +129,358 @@ using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 
 // ── Path validation ─────────────────────────────────────────────────────
 
+// A path as UTF-8 bytes, NON-THROWING: path::string() throws on Windows for a name the active code
+// page cannot represent and u8string() throws for a name with an unpaired UTF-16 surrogate (which
+// Windows allows). The shared converter (find_by_hash::path_utf8, from_wide on Windows) does neither:
+// such a unit becomes U+FFFD. Used for comparison and for the reserved Set; a path is rebuilt from
+// those bytes only through path_from_bytes.
+std::string path_bytes(const fs::path& p) { return yuzu::filesystem::find_by_hash::path_utf8(p); }
+
+// The inverse of path_bytes for every name that has a UTF-8 form (a lone UTF-16 surrogate was already
+// replaced by U+FFFD and cannot be rebuilt; invalid UTF-8 yields an empty path). The reserved Set is
+// UTF-8 by construction: the narrow
+// fs::path constructor would decode those bytes as the active code page on MSVC and name a different
+// (mojibake) path, so the identity, hard-link and planted-link legs would compare against nothing.
+fs::path path_from_bytes(const std::string& s) {
+#ifdef _WIN32
+    return fs::path{yuzu::win::to_wide(s)};
+#else
+    return fs::path{s};
+#endif
+}
+
+// WP06 F55: the agent's own data dir, log file and TLS key/cert/CA paths, captured at init and
+// refused by every validate_path* below (best effort, see filesystem_reserved_paths.hpp).
+//
+// FAIL CLOSED: the set STARTS as a compiled-in baseline (the agent's default data directories) and
+// init() only ADDS to it; shutdown() does not clear it. A missing/empty `agent.data_dir`, a plugin
+// whose init never ran, and a call racing shutdown therefore all still refuse the defaults.
+yuzu::filesystem::reserved::Set baseline_reserved() {
+    yuzu::filesystem::reserved::Set set;
+    std::error_code ec;
+    auto add = [&](const fs::path& p) {
+        auto c = fs::weakly_canonical(p, ec);
+        set.dirs.push_back(path_bytes(ec ? p.lexically_normal() : c));
+        ec.clear();
+    };
+#ifdef _WIN32
+    if (const char* v = std::getenv("LOCALAPPDATA"); v && *v) add(fs::path{v} / "yuzu");
+    if (const char* v = std::getenv("ProgramData"); v && *v) add(fs::path{v} / "Yuzu");
+#else
+    if (const char* v = std::getenv("XDG_DATA_HOME"); v && *v) add(fs::path{v} / "yuzu");
+    if (const char* v = std::getenv("HOME"); v && *v) {
+#ifdef __APPLE__
+        add(fs::path{v} / "Library" / "Application Support" / "yuzu");
+#else
+        add(fs::path{v} / ".local" / "share" / "yuzu");
+#endif
+    }
+#ifdef __APPLE__
+    add("/Library/Application Support/Yuzu");
+#else
+    add("/var/lib/yuzu");
+#endif
+#endif
+    return set;
+}
+
+std::mutex g_reserved_mu;
+// Built on first use (never at library load, where file I/O would run under the loader lock).
+yuzu::filesystem::reserved::Set& g_reserved_set() {
+    static yuzu::filesystem::reserved::Set set = baseline_reserved();
+    return set;
+}
+
+long own_pid() {
+#ifdef _WIN32
+    return 0;
+#else
+    return static_cast<long>(::getpid());
+#endif
+}
+
+// "No such file" is the only stat outcome that proves a name is a DIFFERENT object. Everything else
+// (EACCES, ELOOP, EIO, ...) is undecidable and the callers REFUSE.
+bool absent_error(const std::error_code& e) {
+    return e == std::errc::no_such_file_or_directory || e == std::errc::not_a_directory;
+}
+
+// CandidateUnknown: the candidate's own stat failed, so what it is cannot be told: REFUSE.
+// ReservedUnknown: the RESERVED object cannot be stat'ed (e.g. under a directory this uid cannot
+// search). That alone says nothing about the candidate: a candidate that cannot be a hard link to
+// it (a single-link file, a directory) is matched to it by PATH, which the string and
+// re-canonicalised comparisons already decided; a bind mount or other alias that reaches it by
+// neither is not detected (best effort, as everywhere in this guard). It must not deny every
+// unrelated path.
+constexpr int kMaxLinkHops = 40;
+
+enum class Ident { Different, Same, CandidateUnknown, ReservedUnknown };
+
+Ident identity_of(const fs::path& a, const fs::path& b) {
+    std::error_code e;
+    const bool ea = fs::exists(a, e);
+    if (e)
+        return Ident::CandidateUnknown;
+    if (!ea)
+        return Ident::Different;
+    const bool eb = fs::exists(b, e);
+    if (e)
+        return Ident::ReservedUnknown;
+    if (!eb)
+        return Ident::Different;
+    const bool same = fs::equivalent(a, b, e);
+    if (e)
+        return absent_error(e) ? Ident::Different : Ident::CandidateUnknown;
+    return same ? Ident::Same : Ident::Different;
+}
+
+// Decide by IDENTITY, not spelling (a hard link, a bind mount, `..`, a case or Unicode alias all
+// name the same object under a different string). `p` need not exist. Any error resolving the
+// CANDIDATE refuses (fail closed). Best effort against a writer who controls a parent directory.
+//
+// A reserved path that does not exist yet is compared by STRING (its canonical spelling), not by
+// identity: there is no object to compare. It is re-canonicalised at every decision so a symlink
+// planted at it after the snapshot is followed.
+bool path_is_reserved_unguarded(const fs::path& p) {
+    // path_bytes (UTF-8), never p.string(): on MSVC string() throws for a name the active code page
+    // cannot hold, and the guard turns a throw into a refusal, so such a name would be refused as if it
+    // were reserved.
+    if (yuzu::filesystem::reserved::contains_nul(path_bytes(p)))
+        return true;
+#ifdef _WIN32
+    // A spelling Win32 normalises to another name (an alternate data stream, a trailing space or dot)
+    // is refused before any comparison: a not-yet-existing reserved file is compared by string only.
+    if (yuzu::filesystem::reserved::is_windows_alias_spelling(path_bytes(p)))
+        return true;
+#endif
+    std::error_code ec;
+    const fs::path canon = fs::weakly_canonical(p, ec);
+    if (ec)
+        return true;
+    const std::string cs = path_bytes(canon);
+    if (yuzu::filesystem::reserved::contains_nul(cs))
+        return true;
+    if (yuzu::filesystem::reserved::is_proc_secret_path(cs, own_pid()))
+        return true;
+#ifndef _WIN32
+    // launchd's StandardErrorPath and systemd's StandardOutput=file: make fd 1 or 2 a regular file the
+    // log-file rule does not name: the same file (st_dev, st_ino) is the agent's own log.
+    if (yuzu::filesystem::reserved::is_agent_stdio_file(canon))
+        return true;
+    // macOS has no /proc: the agent's own descriptors are /dev/fd/N, /dev/stdin|stdout|stderr.
+    if (yuzu::filesystem::reserved::is_dev_fd_path(cs) ||
+        yuzu::filesystem::reserved::is_dev_fd_path(path_bytes(p.lexically_normal())))
+        return true;
+#ifdef __APPLE__
+    if (yuzu::filesystem::reserved::is_apple_vol_path(path_bytes(p.lexically_normal())) ||
+        yuzu::filesystem::reserved::is_apple_vol_path(cs))
+        return true;
+#endif
+#endif
+    yuzu::filesystem::reserved::Set snapshot;
+    {
+        std::lock_guard lk(g_reserved_mu);
+        snapshot = g_reserved_set();
+    }
+    // Re-canonicalise every reserved path NOW: a symlink created after the snapshot at a reserved
+    // name that did not exist then would otherwise hide the real target.
+    {
+        // Returns false when a link chain does not resolve within the hop cap: the decision then
+        // REFUSES (an unresolved link is a reserved name that may lead anywhere).
+        auto refresh = [](std::vector<std::string>& v) -> bool {
+            const auto n = v.size();
+            for (std::size_t i = 0; i < n; ++i) {
+                // weakly_canonical does not follow a DANGLING link at the leaf (the link's target
+                // does not exist, so it treats the name as a plain missing one): follow it by hand,
+                // bounded, so a link planted at a not-yet-existing reserved name reaches its target.
+                fs::path cur = path_from_bytes(v[i]);
+                bool ok = true;
+                bool resolved = false;
+                for (int hop = 0; hop < kMaxLinkHops && ok; ++hop) {
+                    std::error_code rec;
+                    cur = fs::weakly_canonical(cur, rec);
+                    // FAIL CLOSED: only a failure that says the reserved entry cannot be reached by THIS
+                    // process (absent, or an unsearchable parent) skips it. Any other error, the
+                    // kernel's hop cap and MSVC's ERROR_CANT_RESOLVE_FILENAME (1921, a link chain past
+                    // the reparse limit, which has no errc mapping) included, is an unresolvable link
+                    // chain and REFUSES.
+                    if (rec) {
+                        if (absent_error(rec) || rec == std::errc::permission_denied ||
+                            rec == std::errc::operation_not_permitted) {
+                            ok = false;
+                            break;
+                        }
+                        return false;
+                    }
+                    const auto st = fs::symlink_status(cur, rec);
+                    if (rec && !absent_error(rec))
+                        return false;
+                    if (rec || !fs::is_symlink(st)) {
+                        resolved = true;
+                        break;
+                    }
+                    auto t = fs::read_symlink(cur, rec);
+                    if (rec) {
+                        if (absent_error(rec) || rec == std::errc::permission_denied ||
+                            rec == std::errc::operation_not_permitted) {
+                            ok = false;
+                            break;
+                        }
+                        return false;
+                    }
+                    cur = t.is_relative() ? cur.parent_path() / t : t;
+                }
+                if (ok && !resolved)
+                    return false; // the cap was hit on a link: do not push an unresolved path
+                if (ok) {
+                    auto cstr = path_bytes(cur);
+                    if (cstr != v[i])
+                        v.push_back(std::move(cstr));
+                }
+            }
+            return true;
+        };
+        if (!refresh(snapshot.files) || !refresh(snapshot.dirs))
+            return true;
+    }
+    if (yuzu::filesystem::reserved::is_agent_reserved_path(snapshot, cs))
+        return true;
+
+    // Can the candidate be a hard link to a reserved object? Only a regular file with more than one
+    // link (or one whose link count cannot be read) can be one under another name.
+    bool may_be_hard_link = false;
+    {
+        std::error_code e3;
+        const bool regular = fs::is_regular_file(canon, e3);
+        if (e3 && !absent_error(e3))
+            return true;
+        if (regular) {
+            const auto links = fs::hard_link_count(canon, e3);
+            may_be_hard_link = e3 || links > 1;
+        }
+    }
+
+    // Identity: the candidate (or an ancestor of it) IS a reserved object. A candidate-side stat
+    // failure REFUSES; a reserved-side one refuses only a candidate that could be a hard link to it.
+    for (const auto& f : snapshot.files) {
+        const auto id = identity_of(canon, path_from_bytes(f));
+        if (id == Ident::Same || id == Ident::CandidateUnknown ||
+            (id == Ident::ReservedUnknown && may_be_hard_link))
+            return true;
+    }
+    // A HARD LINK to a file inside a reserved directory has no ancestor in it: enumerate the reserved
+    // dirs (bounded) and compare identity. EVERY error other than "no such file" refuses.
+    if (may_be_hard_link) {
+        constexpr std::size_t kMaxScan = 20000;
+        std::size_t seen = 0;
+        for (const auto& d : snapshot.dirs) {
+            std::error_code e4;
+            const bool dir_exists = fs::exists(path_from_bytes(d), e4);
+            if (e4)
+                return true;
+            if (!dir_exists)
+                continue;
+            // No skip_permission_denied: a subdirectory this process cannot read may hold the very
+            // file this candidate links to, so an unreadable entry REFUSES.
+            fs::recursive_directory_iterator it{path_from_bytes(d), fs::directory_options::none, e4};
+            if (e4)
+                return true;
+            const fs::recursive_directory_iterator end{};
+            while (it != end) {
+                if (++seen > kMaxScan)
+                    return true;
+                std::error_code e5;
+                const bool reg = it->is_regular_file(e5);
+                if (e5 && !absent_error(e5))
+                    return true;
+                if (reg && !e5) {
+                    std::error_code e6;
+                    const bool same = fs::equivalent(it->path(), canon, e6);
+                    if (e6 && !absent_error(e6))
+                        return true;
+                    if (same && !e6)
+                        return true;
+                }
+                it.increment(e4);
+                if (e4)
+                    return true;
+            }
+        }
+    }
+    for (fs::path a = canon; !a.empty(); a = a.parent_path()) {
+        for (const auto& d : snapshot.dirs) {
+            const auto id = identity_of(a, path_from_bytes(d));
+            if (id == Ident::Same || id == Ident::CandidateUnknown ||
+                (id == Ident::ReservedUnknown && may_be_hard_link))
+                return true;
+        }
+        if (a == a.parent_path())
+            break;
+    }
+    return false;
+}
+
+// Any exception (an unrepresentable name, bad_alloc) REFUSES.
+bool path_is_reserved(const fs::path& p) {
+    try {
+        return path_is_reserved_unguarded(p);
+    } catch (...) {
+        return true;
+    }
+}
+
+// The raw-spelling form: the fs::path is built INSIDE the guard, because MSVC can throw while
+// converting a narrow string the active code page cannot represent, and a throw is a refusal.
+bool path_is_reserved_raw(std::string_view raw) {
+    try {
+        return path_is_reserved_unguarded(fs::path(std::string{raw}));
+    } catch (...) {
+        return true;
+    }
+}
+
+bool is_reserved_canonical(const std::string& canonical) {
+    return path_is_reserved_raw(canonical);
+}
+
+void add_reserved(yuzu::filesystem::reserved::Set& set, std::string_view raw, bool is_dir) {
+    if (raw.empty())
+        return;
+    std::error_code ec;
+    // weakly_canonical: the key/log may not exist yet; resolves the existing prefix's symlinks.
+    auto c = fs::weakly_canonical(fs::path{std::string{raw}}, ec);
+    if (ec)
+        c = fs::path{std::string{raw}}.lexically_normal(); // never drop a reserved entry
+    (is_dir ? set.dirs : set.files).push_back(path_bytes(c));
+}
+
+// Windows network/device refusal. The agent runs as LocalSystem, so a `\\host\share\f` path would
+// make the machine account authenticate to that host and read from it, outside the caller's
+// per-device dispatch visibility. The shared predicate (agents/shared/local_path_policy.hpp;
+// find_by_hash applies the same drive-type rule to its root) judges the LEXICAL spelling BEFORE any
+// filesystem call, and again on the canonical result. RESIDUAL: the Windows decision is lexical, so
+// a junction or directory symlink to a share is followed by the canonicalising call itself before
+// the re-check can refuse it (follow-up: #8208); this plugin does not open handle-relative. POSIX: no mount-table
+// check here -- validate_path runs several times per action and operators legitimately read NFS
+// paths; find_by_hash keeps its own mount guard.
+[[nodiscard]] yuzu::shared::local_path::Refusal path_refusal([[maybe_unused]] std::string_view p) {
+#ifdef _WIN32
+    return yuzu::shared::local_path::local_path_refusal(p);
+#else
+    return yuzu::shared::local_path::Refusal::none;
+#endif
+}
+
+[[nodiscard]] bool path_refused_as_network(std::string_view p) {
+    return yuzu::shared::local_path::refused(path_refusal(p));
+}
+
 // Canonicalize a path and optionally enforce a base directory restriction.
 // Returns empty string on failure (path doesn't exist, escapes base_dir, etc.)
-std::string validate_path(std::string_view raw_path, std::string_view base_dir) {
+std::string validate_path_impl(std::string_view raw_path, std::string_view base_dir) {
     if (raw_path.empty())
+        return {};
+    if (path_refused_as_network(raw_path))
         return {};
 
     std::error_code ec;
@@ -140,6 +493,8 @@ std::string validate_path(std::string_view raw_path, std::string_view base_dir) 
     // Resolve all symlinks and normalize the path
     auto canonical = fs::canonical(path_str, ec);
     if (ec)
+        return {};
+    if (path_refused_as_network(canonical.string()))
         return {};
 
     // If a base_dir is configured, ensure the canonical path is within it
@@ -164,20 +519,60 @@ std::string validate_path(std::string_view raw_path, std::string_view base_dir) 
         }
     }
 
+    // WP06 F55: the agent's own secrets are never readable through this plugin.
+    if (is_reserved_canonical(canonical.string()))
+        return {};
+
     return canonical.string();
 }
 
+// A refusal, never a throw: path::string() throws on MSVC for a canonical name the active code page
+// cannot hold (a long name an 8.3 short name expands to included), and an exception here would leave
+// the action half-run. Any throw is a clean refusal (an empty answer).
+std::string validate_path(std::string_view raw_path, std::string_view base_dir) {
+    try {
+        return validate_path_impl(raw_path, base_dir);
+    } catch (...) {
+        return {};
+    }
+}
+
 // For paths that might not exist yet (exists check), validate the parent
-std::string validate_path_or_parent(std::string_view raw_path, std::string_view base_dir) {
+std::string validate_path_or_parent_impl(std::string_view raw_path, std::string_view base_dir) {
     if (raw_path.empty())
+        return {};
+    if (path_refused_as_network(raw_path))
         return {};
 
     std::error_code ec;
     std::string path_str{raw_path};
 
-    // If it exists, do full validation
+    // If it exists, do full validation (the _impl: a throw must reach this function's wrapper, which
+    // tells `exists` a throw apart from "does not exist")
     if (fs::exists(path_str, ec)) {
-        return validate_path(raw_path, base_dir);
+        return validate_path_impl(raw_path, base_dir);
+    }
+
+    // A symlink leaf that does not resolve is a dangling link: a write through it would create
+    // its target, wherever that is (possibly inside a reserved directory). Refuse it.
+    {
+        std::error_code lec;
+        const auto st = fs::symlink_status(path_str, lec);
+        if (lec ? (lec != std::errc::no_such_file_or_directory) : fs::is_symlink(st))
+            return {};
+#ifdef _WIN32
+        // MSVC reports a dangling NTFS junction as file_type::junction (not symlink), and a write
+        // through it follows the target. Refuse a junction and ANY reparse-point leaf (mount point,
+        // other tag): a leaf that does not exist has no business carrying one.
+        if (!lec && st.type() == fs::file_type::junction)
+            return {};
+        {
+            const std::wstring wide = fs::path{path_str}.wstring();
+            const DWORD attrs = ::GetFileAttributesW(wide.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                return {};
+        }
+#endif
     }
 
     // For non-existent paths, validate the parent directory
@@ -187,6 +582,8 @@ std::string validate_path_or_parent(std::string_view raw_path, std::string_view 
 
     auto canonical_parent = fs::canonical(parent, ec);
     if (ec)
+        return {};
+    if (path_refused_as_network(canonical_parent.string()))
         return {};
 
     if (!base_dir.empty()) {
@@ -207,8 +604,28 @@ std::string validate_path_or_parent(std::string_view raw_path, std::string_view 
         }
     }
 
+    // WP06 F55: refuse creating/targeting a not-yet-existing name inside the agent's own dirs.
+    if (is_reserved_canonical((canonical_parent / fs::path(path_str).filename()).string()))
+        return {};
+
     // Return the original path (parent is validated, file just doesn't exist)
     return path_str;
+}
+
+// Same contract as validate_path: a throw is a clean refusal. `threw` (optional) lets a caller whose
+// empty answer would otherwise read as "does not exist" (`exists`) tell a throw apart from absence.
+std::string validate_path_or_parent_ex(std::string_view raw_path, std::string_view base_dir, bool* threw) {
+    try {
+        return validate_path_or_parent_impl(raw_path, base_dir);
+    } catch (...) {
+        if (threw)
+            *threw = true;
+        return {};
+    }
+}
+
+std::string validate_path_or_parent(std::string_view raw_path, std::string_view base_dir) {
+    return validate_path_or_parent_ex(raw_path, base_dir, nullptr);
 }
 
 #ifdef _WIN32
@@ -346,9 +763,9 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 
 #endif
 
-// ── find_by_hash network-mount list (#5624) ─────────────────────────────
+// ── network-mount list of the bounded walk: find_by_hash (#5624) and search_dir (#6478) ──
 
-// The mount points find_by_hash must not touch, acquired ONCE per dispatch BEFORE any call that
+// The mount points the bounded walk must not touch, acquired ONCE per dispatch BEFORE any call that
 // names the caller's path: an open/stat/getdents on a dead hard-mounted server pins one of the
 // agent's shared command workers with no deadline, so the guard has to decide from a source that
 // never reads the target (the kernel's mount table; on Windows the raw path's own spelling).
@@ -390,7 +807,7 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
     if (!table.ok()) {
         static std::once_flag warned;
         std::call_once(warned, [&] {
-            spdlog::warn("filesystem find_by_hash: /proc/self/mountinfo unreadable ({}); the "
+            spdlog::warn("filesystem walk: /proc/self/mountinfo unreadable ({}); the "
                          "network-mount guard is off",
                          table.error == yuzu::shared::ReadError::oversized
                              ? std::string{"larger than the 16 MiB read bound"}
@@ -414,7 +831,7 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
     if (n <= 0 || raw == nullptr) {
         static std::once_flag warned;
         std::call_once(warned, [] {
-            spdlog::warn("filesystem find_by_hash: getmntinfo_r_np returned no mounts; the "
+            spdlog::warn("filesystem walk: getmntinfo_r_np returned no mounts; the "
                          "network-mount guard is off");
         });
     }
@@ -429,34 +846,6 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
     return yuzu::filesystem::find_by_hash::mount_list_from(n > 0 && raw != nullptr, std::move(out));
 }
 
-// Dataless (iCloud / File Provider) files and directories must not be materialised by a walk: the
-// download runs inside a read the deadline cannot interrupt. The policy is per THREAD and this
-// runs on a shared pool thread, so it is read, switched OFF for the walk and restored on every
-// exit path. With it off a dataless file or directory fails its open with EDEADLK, which the walk
-// already counts as unreadable (CONSTRAINED), and a dataless directory is refused by the
-// directory open before the iterator names its children.
-class DatalessMaterializationOff {
-public:
-    DatalessMaterializationOff() {
-        previous_ = ::getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD);
-        if (previous_ < 0)
-            previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
-        changed_ = ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
-                                    IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0;
-    }
-    ~DatalessMaterializationOff() {
-        if (changed_)
-            ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
-                             previous_);
-    }
-    DatalessMaterializationOff(const DatalessMaterializationOff&) = delete;
-    DatalessMaterializationOff& operator=(const DatalessMaterializationOff&) = delete;
-
-private:
-    int previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
-    bool changed_ = false;
-};
-
 #else
 
 yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std::string&) {
@@ -464,6 +853,32 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
 }
 
 #endif
+
+#ifdef _WIN32
+// Can the directory be listed? The walker's can_enter probe on Windows, shared by find_by_hash and
+// search_dir: a directory_iterator open, which is what the walk would do next.
+bool can_enter_win(const fs::path& dir) {
+    std::error_code probe_ec;
+    fs::directory_iterator probe{dir, probe_ec};
+    return !probe_ec;
+}
+#endif
+
+// The one report of a finished (or refused) bounded walk, shared by find_by_hash and search_dir:
+// the closing rows (the guard-off row, the trailer when anything was skipped or stopped short, then
+// the count under `count_label`), then the typed CONSTRAINED/PARTIAL status when part of the tree
+// was not examined.
+int emit_walk_outcome(yuzu::CommandContext& ctx,
+                      const yuzu::filesystem::find_by_hash::WalkOutcome& o,
+                      std::string_view count_label) {
+    namespace fbh = yuzu::filesystem::find_by_hash;
+    for (const auto& row : fbh::format_outcome_rows(o, count_label))
+        ctx.write_output(row);
+    if (o.constrained())
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              fbh::constrained_reason(o));
+    return 0;
+}
 
 // ── Regex subject SIZE limit (F9) ──────────────────────────────────────
 // Operator-pattern regex runs only on subjects up to this size. This is a SIZE limit and nothing
@@ -749,8 +1164,21 @@ public:
         return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
+    yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
+        // WP06 F55: capture the agent's own paths once; an absent key simply reserves nothing.
+        yuzu::filesystem::reserved::Set set = baseline_reserved(); // init only ADDS to the baseline
+        // Derived from the ONE authoritative list (agent_reserved_path_keys.hpp).
+        for (auto key : yuzu::shared::agent_paths::kReservedDirKeys)
+            add_reserved(set, ctx.get_config(key), /*is_dir=*/true);
+        for (auto key : yuzu::shared::agent_paths::kReservedFileKeys)
+            add_reserved(set, ctx.get_config(key), /*is_dir=*/false);
+        std::lock_guard lk(g_reserved_mu);
+        g_reserved_set() = std::move(set);
+        return {};
+    }
 
+    // The reserved set is deliberately NOT cleared here: nothing is safer for it to be empty, and a
+    // call racing shutdown must still refuse (fail closed).
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
@@ -817,27 +1245,58 @@ private:
 
         auto base_dir = params.get("base_dir");
 
+        // Refuse a network/device path UP FRONT. validate_path_or_parent answers "" both for
+        // "refused" and for "does not exist", so the refusal is decided here, before it, and the action
+        // never touches the raw caller path (a refused UNC path would be stat'ed as LocalSystem).
+        if (const auto refusal = path_refusal(path); yuzu::shared::local_path::refused(refusal)) {
+            ctx.write_output(std::format(
+                "error|{}", yuzu::shared::local_path::refusal_token(refusal)));
+            return 1;
+        }
+
+        // WP06 F55: existence, type and size of the agent's own secrets are refused too (an empty
+        // base_dir would otherwise fall back to the raw path below).
+        if (path_is_reserved_raw(path)) { // a refuse-only decision; the raw spelling reaches no other call
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
         // For exists check, use validate_path_or_parent (path may not exist)
-        auto validated = validate_path_or_parent(path, base_dir);
+        bool validate_threw = false;
+        auto validated = validate_path_or_parent_ex(path, base_dir, &validate_threw);
+        if (validate_threw) {
+            // A throw (a canonical name the code page cannot hold) is a refusal, never `exists|false`.
+            ctx.write_output("error|path is not accessible or was refused");
+            return 1;
+        }
         if (validated.empty() && !base_dir.empty()) {
             ctx.write_output("error|path is outside allowed base directory");
             return 1;
         }
 
+        // No fallback to the raw caller path: an empty `validated` (refused, or neither the path
+        // nor its parent exists) answers "does not exist" without touching it.
         std::error_code ec;
-        std::string path_str = validated.empty() ? std::string{path} : validated;
-        bool exists = fs::exists(path_str, ec);
-        ctx.write_output(std::format("exists|{}", exists ? "true" : "false"));
+        const std::string path_str = validated;
+        const bool exists = !path_str.empty() && fs::exists(path_str, ec);
 
+        // ONE consistent answer: when the path exists, the canonical re-check runs BEFORE any
+        // result row, so a refusal is an error row alone and never `exists|true` followed by an
+        // error (a first-row parser must not see a true that the action then retracts).
+        std::string check_path;
         if (exists) {
-            // Re-validate with canonical now that we know it exists
             auto canon = validate_path(path, base_dir);
-            if (canon.empty() && !base_dir.empty()) {
-                ctx.write_output("error|path resolves outside allowed base directory");
+            if (canon.empty()) {
+                ctx.write_output(base_dir.empty()
+                                     ? "error|path is not accessible or was refused"
+                                     : "error|path resolves outside allowed base directory");
                 return 1;
             }
-            auto& check_path = canon.empty() ? path_str : canon;
+            check_path = std::move(canon);
+        }
 
+        ctx.write_output(std::format("exists|{}", exists ? "true" : "false"));
+        if (exists) {
             if (fs::is_regular_file(check_path, ec)) {
                 ctx.write_output("type|file");
                 auto sz = fs::file_size(check_path, ec);
@@ -882,7 +1341,11 @@ private:
                 continue;
 
             const auto& entry = *it;
-            std::string entry_name = entry.path().filename().string();
+            // A reserved entry is not listed: its name and size are metadata of a refused object.
+            if (path_is_reserved(entry.path()))
+                continue;
+            // UTF-8 and non-throwing: path::string() throws on MSVC for a name the active code page cannot hold.
+            std::string entry_name = yuzu::filesystem::find_by_hash::path_utf8(entry.path().filename());
             std::string entry_type = "other";
             std::uintmax_t entry_size = 0;
 
@@ -964,11 +1427,32 @@ private:
         return 0;
     }
 
+    /// A temp-file prefix or suffix is spliced into `<directory>/<prefix>XXXXXX<suffix>`, so a
+    /// separator in either would move the object out of the directory that was validated (and
+    /// into a reserved one). Accept one filename component only: no separator, no NUL, and on
+    /// Windows no ':' (an alternate data stream).
+    static bool is_single_name_component(std::string_view v) {
+        for (const char c : v) {
+            if (c == '/' || c == '\\' || c == '\0')
+                return false;
+#ifdef _WIN32
+            if (c == ':')
+                return false;
+#endif
+        }
+        return true;
+    }
+
     int do_create_temp(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto prefix = params.get("prefix", "yuzu-");
         auto suffix = params.get("suffix", ".tmp");
         auto directory = params.get("directory");
         auto persist = params.get("persist", "true");
+
+        if (!is_single_name_component(prefix) || !is_single_name_component(suffix)) {
+            ctx.write_output("error|prefix and suffix must be a single file name component");
+            return 1;
+        }
 
         // Validate directory if provided
         if (!directory.empty()) {
@@ -1125,6 +1609,11 @@ private:
         auto prefix = params.get("prefix", "yuzu-");
         auto directory = params.get("directory");
         auto persist = params.get("persist", "true");
+
+        if (!is_single_name_component(prefix)) {
+            ctx.write_output("error|prefix must be a single file name component");
+            return 1;
+        }
 
         if (!directory.empty()) {
             auto validated = validate_path(directory, {});
@@ -1639,15 +2128,86 @@ private:
 
     // ── search_dir: Find directories/files by name pattern ────────────────
 
+    //
+    // A thin shell over the bounded walk (filesystem_search_dir.hpp, #6478). The ORDER is part of the
+    // safety property, as in do_find_by_hash: validate the parameters without touching the
+    // filesystem, read the mount list and refuse the RAW root (and base_dir) lexically under a
+    // network mount, and only then validate_path, whose exists/canonical would block on a dead hard
+    // mount.
+
     int do_search_dir(yuzu::CommandContext& ctx, yuzu::Params params) {
+        namespace fbh = yuzu::filesystem::find_by_hash;
+        namespace sd = yuzu::filesystem::search_dir;
+
         auto root = params.get("root");
         auto pattern = params.get("pattern");
         if (root.empty() || pattern.empty()) {
             ctx.write_output("error|missing required parameters: root, pattern");
             return 1;
         }
+        if (pattern.size() > sd::kMaxPatternBytes) {
+            ctx.write_output("error|pattern too long (max 256 chars)");
+            return 1;
+        }
+        const auto match_type = sd::parse_match_type(params.get("match_type", "directories"));
+        if (!match_type) {
+            ctx.write_output("error|invalid match_type (expected directories, files or both)");
+            return 1;
+        }
 
+        const bool use_regex = (params.get("regex", "false") == "true");
+        std::regex re;
+        if (use_regex) {
+            std::string pat_str{pattern};
+            if (has_nested_quantifiers(pat_str)) {
+                ctx.write_output("error|regex contains nested quantifiers (potential ReDoS)");
+                return 1;
+            }
+            // No standard library bounds a lookahead and one regex_match cannot be interrupted
+            // by the walk's deadline (sd::has_lookahead), so it never reaches the engine.
+            if (sd::has_lookahead(pat_str)) {
+                ctx.write_output("error|regex lookahead is not supported (use (?: to group)");
+                return 1;
+            }
+            auto flags = std::regex::ECMAScript | std::regex::optimize;
+#if defined(__GLIBCXX__)
+            // The GNU library's breadth-first executor does not backtrack: with no lookahead
+            // (refused above) one match costs about the name's length times the compiled pattern's
+            // size, which can far exceed its text (has_nested_quantifiers is a heuristic, not a
+            // bound). Without the flag one name could outlive the walk deadline. A back-reference,
+            // or a compiled pattern over the library's limit, fails the compile below.
+            flags |= std::regex_constants::__polynomial;
+#endif
+            try {
+                re = std::regex(pat_str, flags);
+            } catch (const std::regex_error& e) {
+                ctx.write_output(std::format("error|invalid regex: {}", e.what()));
+                return 1;
+            }
+        }
+
+        // Refuse a root (or base_dir) under a network mount on its spelling, before any call that
+        // touches it.
         auto base_dir = params.get("base_dir");
+        auto mounts = find_by_hash_network_mounts(std::string{root});
+        bool refused = fbh::root_lexically_under_mount(root, mounts.mounts);
+        if (!refused && !base_dir.empty()) {
+#ifdef _WIN32
+            // Windows judges a path by its own spelling, so base_dir gets its own answer.
+            const auto base_mounts = find_by_hash_network_mounts(std::string{base_dir});
+            refused = fbh::root_lexically_under_mount(base_dir, base_mounts.mounts);
+#else
+            // The table is host-wide: the one read above answers for base_dir too, and a second
+            // read could fail where the first succeeded.
+            refused = fbh::root_lexically_under_mount(base_dir, mounts.mounts);
+#endif
+        }
+        if (refused) {
+            fbh::WalkOutcome o;
+            o.c.skipped_network_mount = 1;
+            return emit_walk_outcome(ctx, o, sd::kCountLabel);
+        }
+
         auto validated = validate_path(root, base_dir);
         if (validated.empty()) {
             ctx.write_output("error|root is not accessible or outside allowed base directory");
@@ -1660,86 +2220,60 @@ private:
             return 1;
         }
 
-        auto use_regex_str = params.get("regex", "false");
-        bool use_regex = (use_regex_str == "true");
-        auto match_type = params.get("match_type", "directories");
-
         int max_depth = 5;
-        auto depth_str = params.get("max_depth", "5");
-        try { max_depth = std::stoi(std::string{depth_str}); } catch (...) {}
+        try { max_depth = std::stoi(std::string{params.get("max_depth", "5")}); } catch (...) {}
         if (max_depth < 1) max_depth = 1;
         if (max_depth > 20) max_depth = 20;
 
         int max_results = 100;
-        auto results_str = params.get("max_results", "100");
-        try { max_results = std::stoi(std::string{results_str}); } catch (...) {}
+        try { max_results = std::stoi(std::string{params.get("max_results", "100")}); } catch (...) {}
         if (max_results < 1) max_results = 1;
         if (max_results > 1000) max_results = 1000;
 
-        // Compile regex if requested
-        std::regex re;
-        if (use_regex) {
-            std::string pat_str{pattern};
-            if (pat_str.size() > 256) {
-                ctx.write_output("error|pattern too long (max 256 chars)");
-                return 1;
-            }
-            if (has_nested_quantifiers(pat_str)) {
-                ctx.write_output("error|regex contains nested quantifiers (potential ReDoS)");
-                return 1;
-            }
+        // Set by the name predicate when the regex library gives up on a name: the walk then ends
+        // through env.cancelled and the shell ends the run with the regex-too-complex error row
+        // (return code 1, no trailer and no count).
+        bool regex_gave_up = false;
+        fbh::WalkEnv env;
+        env.is_refused = [](const fs::path& p) { return path_is_reserved(p); }; // WP06 F55
+        env.cancelled = [&regex_gave_up] {
+            return regex_gave_up || yuzu::agent::subprocess_cancel_requested();
+        };
+#ifdef _WIN32
+        env.can_enter = can_enter_win;
+        // The refusal was decided on the RAW root above; a canonical, real-cased path would not
+        // string-match it, so the walk core is handed no mount list here.
+#else
+        env.can_enter = fbh::can_enter_posix;
+        env.set_mounts(std::move(mounts));
+#endif
+
+        const std::function<bool(std::string_view)> name_matches =
+            [&](std::string_view name) -> bool {
+            if (!use_regex)
+                return glob_match(pattern, name);
             try {
-                re = std::regex(pat_str, std::regex::ECMAScript | std::regex::optimize);
-            } catch (const std::regex_error& e) {
-                ctx.write_output(std::format("error|invalid regex: {}", e.what()));
+                return std::regex_match(std::string{name}, re);
+            } catch (const std::regex_error&) {
+                regex_gave_up = true; // a too-costly match on this library: stop, say so
+                return false;
+            }
+        };
+
+        try {
+            const auto outcome = sd::walk_search_dir(
+                validated, name_matches, *match_type, max_depth, sd::limits_for(max_results), env,
+                [&](const std::string& row) { ctx.write_output(row); });
+            if (regex_gave_up) {
+                ctx.write_output("error|regex too complex for a file name (simplify the pattern)");
                 return 1;
             }
+            return emit_walk_outcome(ctx, outcome, sd::kCountLabel);
+        } catch (const std::exception& e) {
+            ctx.write_output("error|search_dir failed: " +
+                             yuzu::filesystem::acl::row_field(e.what()));
+            return 1;
         }
-
-        int found_count = 0;
-        auto base_depth = std::count(validated.begin(), validated.end(), '/') +
-                          std::count(validated.begin(), validated.end(), '\\');
-
-        for (auto it = fs::recursive_directory_iterator(validated,
-                 fs::directory_options::skip_permission_denied, ec);
-             it != fs::recursive_directory_iterator() && found_count < max_results;
-             it.increment(ec)) {
-            if (ec) continue;
-
-            const auto& entry = *it;
-            auto entry_path = entry.path().string();
-            auto depth = std::count(entry_path.begin(), entry_path.end(), '/') +
-                         std::count(entry_path.begin(), entry_path.end(), '\\') - base_depth;
-            if (depth > max_depth) {
-                it.disable_recursion_pending();
-                continue;
-            }
-
-            std::error_code fec;
-            bool is_dir = entry.is_directory(fec);
-            bool is_file = entry.is_regular_file(fec);
-
-            if (match_type == "directories" && !is_dir) continue;
-            if (match_type == "files" && !is_file) continue;
-            if (match_type == "both" && !is_dir && !is_file) continue;
-
-            auto name = entry.path().filename().string();
-            bool matched = false;
-            if (use_regex) {
-                matched = std::regex_match(name, re);
-            } else {
-                matched = glob_match(pattern, name);
-            }
-
-            if (matched) {
-                auto type_str = is_dir ? "directory" : "file";
-                ctx.write_output(std::format("result|{}|{}", yuzu::filesystem::acl::row_field(entry_path), type_str));
-                ++found_count;
-            }
-        }
-
-        ctx.write_output(std::format("total_matches|{}", found_count));
-        return 0;
     }
 
     // ── get_version_info: Extract PE version resource (Windows) ─────────
@@ -2403,22 +2937,11 @@ private:
             return 1;
         }
 
-        // The one report of a finished (or refused) walk: the trailer when anything was skipped or
-        // stopped short, the count, then the typed status when part of the tree was not examined.
-        const auto emit_outcome = [&ctx](const fbh::WalkOutcome& o) {
-            for (const auto& row : fbh::format_outcome_rows(o))
-                ctx.write_output(row);
-            if (o.constrained())
-                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                      YUZU_RESULT_COMPLETENESS_PARTIAL, fbh::constrained_reason(o));
-            return 0;
-        };
-
         auto mounts = find_by_hash_network_mounts(std::string{directory});
         if (fbh::root_lexically_under_mount(directory, mounts.mounts)) {
             fbh::WalkOutcome refused;
             refused.c.skipped_network_mount = 1;
-            return emit_outcome(refused);
+            return emit_walk_outcome(ctx, refused, fbh::kCountLabel);
         }
 
         auto validated = validate_path(directory, {});
@@ -2444,20 +2967,14 @@ private:
         std::transform(target.begin(), target.end(), target.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-#ifdef __APPLE__
-        const DatalessMaterializationOff dataless_off; // restored when the walk returns
-#endif
         fbh::WalkEnv env;
+        env.is_refused = [](const fs::path& p) { return path_is_reserved(p); }; // WP06 F55
         env.cancelled = [] {
             return yuzu::agent::subprocess_cancel_requested();
         };
 #ifdef _WIN32
         env.hash_entry = fbh::hash_entry_win;
-        env.can_enter = [](const fs::path& dir) {
-            std::error_code probe_ec;
-            fs::directory_iterator probe{dir, probe_ec};
-            return !probe_ec;
-        };
+        env.can_enter = can_enter_win;
         // The refusal was decided on the RAW root above; a canonical, real-cased path would not
         // string-match it, so the walk core is handed no mount list here.
 #else
@@ -2471,7 +2988,7 @@ private:
             fbh::walk_find_by_hash(validated, target, max_depth, fbh::WalkLimits{}, env,
                                    [&](const std::string& row) { ctx.write_output(row); });
 
-        return emit_outcome(outcome);
+        return emit_walk_outcome(ctx, outcome, fbh::kCountLabel);
     }
 };
 

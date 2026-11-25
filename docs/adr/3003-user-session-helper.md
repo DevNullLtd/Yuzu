@@ -5,6 +5,8 @@ status-note: >-
   the listed items on merge, and it is merged; the five items it excludes stay unsettled.
   Implementation has not started: no user-session helper code exists under `agents/`.
   Kept accepted while unimplemented by @Tr3kkR (Nathan Dornbrook), 2026-11-14.
+  Item (a) is written for helpers that the system service manager starts and that take no input
+  by ADR-3007 (2026-11-22); per-user resident activation stays open.
 date: 2026-07-30
 owner: "@Doomgoose (Alex Young)"
 deciders: >-
@@ -217,3 +219,14 @@ Each affected plugin remains responsible for its own ADR-3002 descriptor, machin
 - **Service-side cross-session launch (`WTSQueryUserToken` + `CreateProcessAsUser`) on Windows.** Rejected on evidence and by prior decision. The Stage-0 spike built it and it failed with `ERROR_PRIVILEGE_NOT_HELD`: the call needs `SeTcbPrivilege`, which the agent does not hold. Granting it was considered and rejected in its own right — it re-opens a session-impersonation hole that partially defeats the least-privilege account #1442 exists to deliver. Moving the privileged session placement into Task Scheduler dissolves the conflict instead of working around it.
 - **Daemon dials into the user's session on Linux (`AF_UNIX` under `XDG_RUNTIME_DIR`).** Rejected — unreachable as specified. `/run/user/<uid>` is mode 0700 and owned by the login user; the unprivileged `yuzu-agent` account cannot traverse it, and `ProtectSystem=strict` additionally leaves it no writable path outside its state directory. Making it work would require `CAP_DAC_OVERRIDE` or per-user group membership — a privilege grant on the very platform whose model is narrowest. Reversing the direction costs nothing and needs no grant.
 - **Extend `CommandRequest` with a session/mutability field.** Rejected — the gpb gateway strips unknown wire fields, and the daemon↔helper channel is local; adding a wire field would be inert end-to-end and is unnecessary.
+
+## Update (2026-11-21) -- on-demand file search lists user-profile directories from the system context
+
+The `file_search` plugin searches the local disks of a device by file or directory name, and a search from a root such as `/` lists names under every user's profile directory (`/home/<user>`, `/root`, `/var/home/<user>` and `/var/roothome` on Linux; `/Users/<user>` and `/private/var/root` on macOS). That reach belongs to the system-context agent daemon, not to the session helper, so it is recorded here as a deliberate and narrow reading of this ADR's boundary, not as a use of any tier above and not as a precedent for reading user content.
+
+- The system-context agent (the root LaunchDaemon on macOS, LocalSystem on Windows, and on Linux the dedicated account with its packaged read capability) MAY list user-profile directories for file search. It reads names, types, sizes, times and extents only. No file content is read or hashed.
+- What a search stores is readable only by callers who hold `Forensics:Read` (Administrator and ForensicsAnalyst by default; Administrator only while RBAC is off). Launching a search is a separate gate: `FileRetrieval` with `AdminOrApproval`, so a non-administrator needs an approval and cannot read the stored rows without `Forensics:Read`.
+- Results from user directories are tagged (`user` in the last column of the match row), so a consumer of the rows can drop them. The tag is a rule on the absolute path, so a home relocated outside the standard prefixes is not tagged.
+- No new privilege is taken. On Linux the packaged unit's `CAP_DAC_READ_SEARCH` is already held by the agent for every plugin (`docs/agent-privilege-model.md`); on macOS the daemon already runs as root, and what the system's privacy controls refuse it is reported as a `permission_denied` gap. No impersonation, no `sudo -u` hop and no helper process is involved, and nothing here changes the three-tier partition, the no-arbitrary-exec invariant or the de-escalation-only principle.
+
+A per-user read of file content, or of per-session state, still needs the helper tiers decided above and is not covered by this Update.

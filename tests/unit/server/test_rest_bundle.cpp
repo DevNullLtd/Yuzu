@@ -546,6 +546,45 @@ TEST_CASE("REST POST rejects empty agent_id", "[pg][bundle][rest][unhappy]") {
     CHECK(status == 400);
 }
 
+// #7811: the bundle's agent id reaches the scoped gate's denial audit and `target_id` on the
+// per-step and `bundle.dispatch` rows, so an over-long or control-byte id is refused with a 400
+// before the gate, any audit row and any dispatch. The gate admits every device, so a 400 with no
+// gate call proves the id check runs first.
+TEST_CASE("POST /api/v1/bundles: an unsafe agent id is a 400 before the scoped gate, any audit "
+          "row or dispatch",
+          "[pg][bundle][rest][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\r\nA", "dev\nA", "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        int status = 0;
+        auto j = h.post("/api/v1/bundles",
+                        nlohmann::json{{"agent_id", id},
+                                       {"steps", nlohmann::json::array(
+                                                     {{{"plugin", "os_info"}, {"action", "uptime"}}})}}
+                            .dump(),
+                        status);
+        CHECK(status == 400);
+        REQUIRE(j.is_object());
+        CHECK(j["error"]["message"] == "Invalid device id.");
+    }
+    CHECK(h.last_scoped_agent.empty()); // the scoped gate was never asked
+    CHECK(h.calls.empty());
+    CHECK(h.audits.empty());
+
+    // A 256-byte printable id is safe and reaches the scoped gate.
+    int status = 0;
+    h.post("/api/v1/bundles",
+           nlohmann::json{{"agent_id", std::string(256, 'a')},
+                          {"steps", nlohmann::json::array({{{"plugin", "os_info"}, {"action", "uptime"}}})}}
+               .dump(),
+           status);
+    CHECK(h.last_scoped_agent.size() == 256);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // json-dump-depth-guard fix (#2437-class): nlohmann::json::dump() is
 // unboundedly recursive. The REST handler's OWN guard checks the RAW body
@@ -756,4 +795,34 @@ TEST_CASE("GET /api/v1/bundles/{id}: a Forensics step with no response yet write
     REQUIRE(status == 200);
     CHECK(a["data"]["steps"][0]["state"] == "pending");
     CHECK(forensics_audit_rows(h.audits).empty()); // nothing was served, so nothing is audited
+}
+
+// sg10 / UP-1: a step whose params key the agent would truncate is a 400, audited and counted, and
+// nothing is dispatched.
+TEST_CASE("POST /api/v1/bundles: a step params key with a NUL or control byte is refused 400, audited "
+          "and counted (sg10)",
+          "[pg][bundle][rest][sg10]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    for (const char* key : {"targets\\u0000x", "a\\u0007b"}) {
+        int status = 0;
+        h.audits.clear();
+        (void)h.post("/api/v1/bundles",
+                     std::string(R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime",)") +
+                         R"("params":{")" + key + R"(":"h"}}]})",
+                     status);
+        CHECK(status == 400);
+        bool saw = false;
+        for (const auto& a : h.audits)
+            if (a.verb == "bundle.dispatch" && a.result == "denied" &&
+                a.detail == "reason=param_key_invalid")
+                saw = true;
+        CHECK(saw);
+    }
+    CHECK(h.calls.empty());
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "bundle"}, {"reason", "param_key_invalid"}})
+              .value() == 2.0);
 }

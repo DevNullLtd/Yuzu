@@ -21,6 +21,7 @@
 #include "instruction_store.hpp"
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
+#include "schedule_arming_check.hpp"
 #include "schedule_runner.hpp"
 
 #include "../test_helpers.hpp"
@@ -34,6 +35,7 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
 #include <expected>
 #include <functional>
@@ -131,6 +133,8 @@ struct Harness {
     // construction time, since Deps is copied into the runner once and
     // there's no other way to change should_stop's behavior per-test.
     std::function<bool()> should_stop_hook;
+    // WP06 F53: the arming-hold clock (epoch seconds); unset = the real clock.
+    std::function<std::int64_t()> now_hook;
     // #6096: when set, the fake enqueue_fn models the real outbox's idempotence on the
     // occurrence key (a repeat is AlreadyEnqueued and adds no row). `outbox_rows` is then the
     // number of durable occurrences, i.e. the number of times the schedule actually RAN.
@@ -157,7 +161,8 @@ struct Harness {
     // blocks it. D7-specific test cases pass `false` or an explicitly empty
     // ScheduleRunner::ArmingCheckFn{} to prove the deny/unset paths.
     explicit Harness(ScheduleRunner::ArmingCheckFn arming =
-                          [](const std::string&, const std::string&, const std::string&) {
+                          [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
                               return true;
                           },
                       AuditStore* audit = nullptr, yuzu::MetricsRegistry* metrics_reg = nullptr,
@@ -215,6 +220,14 @@ struct Harness {
                   return outbox_rows.contains(occurrence_id);
               },
               .should_stop = [this] { return should_stop_hook && should_stop_hook(); },
+              .now_epoch_fn =
+                  [this]() -> std::int64_t {
+                  if (now_hook)
+                      return now_hook();
+                  return std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+              },
           }) {
         INFO("[schedrunner instr] fixture status (blank == database came up OK): "
              << instr_db.error());
@@ -265,6 +278,18 @@ struct Harness {
                 return s;
         FAIL("schedule not found: " + id);
         return {};
+    }
+
+    // Overwrite a schedule's stored parameter text with arbitrary text (bypassing create-time
+    // canonicalisation).
+    void set_stored_parameters(const std::string& id, const std::string& text) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(instr_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const char* values[2] = {text.c_str(), id.c_str()};
+        yuzu::server::pg::PgResult res{PQexecParams(
+            conn.get(), "UPDATE schedule_engine.schedules SET parameter_values = $1 WHERE id = $2", 2,
+            nullptr, values, nullptr, nullptr, 0)};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
 
     // Force an already-advanced schedule due again (a "next occurrence").
@@ -452,7 +477,8 @@ TEST_CASE("ScheduleRunner: InstructionStore DB error skips the occurrence WITHOU
     REQUIRE_FALSE(broken_is.is_open());
 
     Harness h(
-        [](const std::string&, const std::string&, const std::string&) { return true; }, nullptr,
+        [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; }, nullptr,
         nullptr, &broken_is);
     auto id = h.make_due("test.def", "interval");
 
@@ -1216,7 +1242,8 @@ TEST_CASE("ScheduleRunner: an approved ticket already used by an earlier occurre
 TEST_CASE("ScheduleRunner: a failed ledger-spent settle holds the occurrence (#6096)",
           "[schedule][runner][approval][pg][6096]") {
     yuzu::MetricsRegistry metrics;
-    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; },
               nullptr, &metrics);
     h.model_outbox = true;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -1277,7 +1304,8 @@ TEST_CASE("ScheduleRunner: an unreadable outbox on the already-ran check holds a
           "(#6096)",
           "[schedule][runner][approval][pg][6096]") {
     yuzu::MetricsRegistry metrics;
-    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; },
               nullptr, &metrics);
     h.model_outbox = true;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -1297,7 +1325,8 @@ TEST_CASE("ScheduleRunner: the already-ran branch settles observed tickets befor
           "and a settle failure holds (#6096)",
           "[schedule][runner][approval][pg][6096]") {
     yuzu::MetricsRegistry metrics;
-    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; },
               nullptr, &metrics);
     h.model_outbox = true;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -1364,7 +1393,8 @@ TEST_CASE("ScheduleRunner: ledger settle ok then an A4 settle failure holds and 
           "(#6096)",
           "[schedule][runner][approval][pg][6096]") {
     yuzu::MetricsRegistry metrics;
-    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; },
               nullptr, &metrics);
     h.model_outbox = true;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -1522,7 +1552,8 @@ TEST_CASE("ScheduleRunner: an unwired outbox ledger holds an approval-gated occu
                                req.execution_id, req.principal, req.approval_id, req.parameters});
             return yuzu::server::OutboxEnqueueOutcome::Enqueued;
         },
-        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+        .arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
             return true;
         },
     });
@@ -1741,7 +1772,8 @@ TEST_CASE("ScheduleRunner: a schedule created with no parameters defaults to the
 
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval) fire path",
           "[schedule][runner][d7][pg]") {
-    Harness h([](const std::string&, const std::string&, const std::string&) { return false; });
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return false; });
     auto id = h.make_due("test.def", "interval");
 
     h.runner.tick();
@@ -1750,9 +1782,250 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval)
     CHECK(h.get(id).next_execution_at > 1); // advanced — must not spin
 }
 
+TEST_CASE("ScheduleRunner: an UNAVAILABLE arming answer (auth-store fault) HOLDS the schedule: "
+          "it is not advanced, nothing is enqueued, and the next tick retries (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    bool fault = true;
+    Harness h([&](const std::string&, const std::string&, const std::string&,
+                  const std::unordered_map<std::string, std::string>&)
+                  -> std::expected<bool, std::string> {
+        if (fault)
+            return std::unexpected(std::string("auth store error"));
+        return true;
+    });
+    std::int64_t clock = 1'000'000;
+    h.now_hook = [&] { return clock; };
+    auto id = h.make_due("test.def", "interval");
+    const auto before = h.get(id).next_execution_at;
+
+    h.runner.tick();
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at == before); // NOT advanced: the occurrence is not lost
+
+    fault = false; // the store recovers
+    h.runner.tick();
+    CHECK(h.enqueues.empty()); // still inside the 90 s hold: not asked again yet
+    clock += yuzu::server::kArmingHoldSeconds + 1;
+    h.runner.tick();
+    CHECK(h.enqueues.size() == 1); // the hold lapsed: the held occurrence fires
+}
+
+TEST_CASE("ScheduleRunner: a tick stops asking the arming check after kMaxArmingUnavailablePerTick "
+          "UNAVAILABLE answers, and holds the rest (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    int asked = 0;
+    Harness h([&](const std::string&, const std::string&, const std::string&,
+                  const std::unordered_map<std::string, std::string>&)
+                  -> std::expected<bool, std::string> {
+        ++asked;
+        return std::unexpected(std::string("auth store error"));
+    });
+    std::vector<std::string> ids;
+    for (int i = 0; i < 6; ++i) {
+        auto id = h.make_due("test.def", "interval");
+        ids.push_back(id);
+    }
+    h.runner.tick();
+    CHECK(asked == yuzu::server::kMaxArmingUnavailablePerTick); // not one per due schedule
+    CHECK(h.enqueues.empty());
+    for (const auto& id : ids)
+        CHECK(h.get(id).next_execution_at == 1); // nothing advanced, nothing lost
+    h.runner.tick(); // the counter resets: the next tick asks again
+    CHECK(asked == 2 * yuzu::server::kMaxArmingUnavailablePerTick);
+}
+
+TEST_CASE("ScheduleRunner: held schedules do not starve a healthy one behind them, and are asked "
+          "again once their hold lapses (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    int asked_held = 0;
+    Harness h([&](const std::string& principal, const std::string&, const std::string&,
+                const std::unordered_map<std::string, std::string>&)
+                  -> std::expected<bool, std::string> {
+        if (principal == "admin") {
+            ++asked_held;
+            return std::unexpected(std::string("auth store error"));
+        }
+        return true; // a creator whose check needs no store read
+    });
+    std::int64_t clock = 1'000'000;
+    h.now_hook = [&] { return clock; };
+    std::vector<std::string> held_ids;
+    for (int i = 0; i < 4; ++i) {
+        InstructionSchedule s;
+        s.name = "held-" + std::to_string(i);
+        s.definition_id = "test.def";
+        s.frequency_type = "interval";
+        s.interval_minutes = 60;
+        s.enabled = true;
+        s.created_by = "admin";
+        s.next_execution_at = 1 + i;
+        auto id = h.engine.create_schedule(s);
+        REQUIRE(id.has_value());
+        held_ids.push_back(*id);
+    }
+    InstructionSchedule healthy;
+    healthy.name = "healthy";
+    healthy.definition_id = "test.def";
+    healthy.frequency_type = "interval";
+    healthy.interval_minutes = 60;
+    healthy.enabled = true;
+    healthy.created_by = "reader";
+    healthy.next_execution_at = 100; // behind every held schedule in the due order
+    REQUIRE(h.engine.create_schedule(healthy).has_value());
+
+    h.runner.tick(); // asks the first three held, then stops
+    CHECK(asked_held == yuzu::server::kMaxArmingUnavailablePerTick);
+    CHECK(h.enqueues.empty());
+
+    h.runner.tick(); // the three are skipped UNASKED; the fourth is asked; the healthy one runs
+    CHECK(asked_held == 4);
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].principal == "reader");
+
+    h.runner.tick(); // every held schedule is still inside its hold: nobody is asked
+    CHECK(asked_held == 4);
+
+    clock += yuzu::server::kArmingHoldSeconds + 1; // the hold lapses: asked again
+    h.runner.tick();
+    CHECK(asked_held > 4);
+    for (const auto& id : held_ids)
+        CHECK(h.get(id).next_execution_at < 100); // never advanced, never lost
+}
+
+TEST_CASE("ScheduleRunner: with 50 held schedules and lapsing holds a Read-pair schedule at the tail "
+          "still fires in bounded ticks (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    int asked_held = 0;
+    // The harness check stands in for the real one and is keyed on the PAIR the way the real one
+    // is: a Read-class pair needs no store read and answers at once; every other pair needs the
+    // (failing) auth store. (The production arming function is covered in test_operator_surface_twins.)
+    Harness h([&](const std::string&, const std::string& plugin, const std::string&,
+                const std::unordered_map<std::string, std::string>&)
+                  -> std::expected<bool, std::string> {
+        if (plugin == "ro")
+            return true;
+        ++asked_held;
+        return std::unexpected(std::string("auth store error"));
+    });
+    {
+        InstructionDefinition d;
+        d.id = "read.def";
+        d.name = "read.def";
+        d.version = "1.0.0";
+        d.type = "question";
+        d.plugin = "ro";
+        d.action = "list";
+        d.enabled = true;
+        REQUIRE(h.is.create_definition(d).has_value());
+    }
+    std::int64_t clock = 1'000'000;
+    h.now_hook = [&] { return clock; };
+    for (int i = 0; i < 50; ++i) {
+        InstructionSchedule s;
+        s.name = "held-" + std::to_string(i);
+        s.definition_id = "test.def";
+        s.frequency_type = "interval";
+        s.interval_minutes = 60;
+        s.enabled = true;
+        s.created_by = "admin";
+        s.next_execution_at = 1 + i;
+        REQUIRE(h.engine.create_schedule(s).has_value());
+    }
+    InstructionSchedule tail;
+    tail.name = "tail-read-pair";
+    tail.definition_id = "read.def";
+    tail.frequency_type = "interval";
+    tail.interval_minutes = 60;
+    tail.enabled = true;
+    tail.created_by = "reader";
+    tail.next_execution_at = 1000; // position 51 of 51
+    REQUIRE(h.engine.create_schedule(tail).has_value());
+
+    // A tick every 30 s of the (fake) clock: a hold lapses after 90 s, i.e. every third tick, so
+    // without a rotating start the first three schedules would be asked again before the tail is
+    // ever reached.
+    int ticks = 0;
+    while (h.enqueues.empty() && ticks < 40) {
+        h.runner.tick();
+        clock += 30;
+        ++ticks;
+    }
+    REQUIRE_FALSE(h.enqueues.empty());
+    CHECK(h.enqueues[0].plugin == "ro");
+    CHECK(ticks <= 18); // ceil(50/3) + 1: the documented bound
+}
+
+TEST_CASE("ScheduleRunner: schedules due at the same instant are asked in id order (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    std::vector<std::string> asked;
+    Harness h([&](const std::string& principal, const std::string&, const std::string&,
+                const std::unordered_map<std::string, std::string>&)
+                  -> std::expected<bool, std::string> {
+        asked.push_back(principal);
+        return std::unexpected(std::string("auth store error"));
+    });
+    std::map<std::string, std::string> id_of; // principal -> schedule id
+    for (int i = 0; i < 6; ++i) {
+        InstructionSchedule s;
+        s.name = "tie-" + std::to_string(i);
+        s.definition_id = "test.def";
+        s.frequency_type = "interval";
+        s.interval_minutes = 60;
+        s.enabled = true;
+        s.created_by = "u" + std::to_string(i);
+        s.next_execution_at = 5; // identical for all six
+        auto id = h.engine.create_schedule(s);
+        REQUIRE(id.has_value());
+        id_of[s.created_by] = *id;
+    }
+    h.runner.tick(); // asks the first three in due order, then stops at the cap
+    REQUIRE(asked.size() == 3);
+    std::vector<std::string> by_id;
+    for (const auto& [principal, id] : id_of)
+        by_id.push_back(id);
+    std::sort(by_id.begin(), by_id.end());
+    std::vector<std::string> asked_ids;
+    for (const auto& p : asked)
+        asked_ids.push_back(id_of[p]);
+    CHECK(asked_ids == std::vector<std::string>(by_id.begin(), by_id.begin() + 3));
+}
+
+TEST_CASE("ScheduleRunner: the held gauge and deferred counter report the hold, a failed due read "
+          "keeps it, and a demotion clears it (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    yuzu::MetricsRegistry metrics;
+    Harness h([](const std::string&, const std::string&, const std::string&,
+                const std::unordered_map<std::string, std::string>&)
+                  -> std::expected<bool, std::string> {
+        return std::unexpected(std::string("auth store error"));
+    },
+              nullptr, &metrics);
+    std::int64_t clock = 1'000'000;
+    h.now_hook = [&] { return clock; };
+    for (int i = 0; i < 2; ++i)
+        (void)h.make_due("test.def", "interval");
+    h.runner.tick();
+    CHECK(metrics.gauge("yuzu_schedule_due_held").value() == 2.0);
+    h.runner.tick(); // both held: skipped, counted as deferred
+    CHECK(metrics.counter("yuzu_schedule_arming_deferred_total").value() == 2.0);
+
+    // The due read fails: the holds and the gauge must not be wiped.
+    h.exec_sql("ALTER TABLE schedule_engine.schedules RENAME TO schedules_hidden");
+    h.runner.tick();
+    h.exec_sql("ALTER TABLE schedule_engine.schedules_hidden RENAME TO schedules");
+    CHECK(metrics.gauge("yuzu_schedule_due_held").value() == 2.0);
+    const double deferred = metrics.counter("yuzu_schedule_arming_deferred_total").value();
+    h.runner.tick(); // still inside the hold: both skipped unasked, so the holds survived the failure
+    CHECK(metrics.counter("yuzu_schedule_arming_deferred_total").value() == deferred + 2.0);
+
+    h.runner.on_demoted();
+    CHECK(metrics.gauge("yuzu_schedule_due_held").value() == 0.0);
+}
+
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fire path",
           "[schedule][runner][d7][approval][pg]") {
-    Harness h([](const std::string&, const std::string&, const std::string&) { return false; });
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return false; });
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
     h.runner.tick();
@@ -1763,6 +2036,30 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fir
     CHECK(h.enqueues.empty());
     CHECK(h.approvals.query({.status = "pending"}).empty());
     CHECK(h.get(id).next_execution_at > 1);
+}
+
+TEST_CASE("ScheduleRunner: stored parameters that do not decode are a denial and never reach the "
+          "arming check or the enqueue",
+          "[schedule][runner][d7][sg10][pg]") {
+    int arming_calls = 0;
+    Harness h([&](const std::string&, const std::string&, const std::string&,
+                  const std::unordered_map<std::string, std::string>&) {
+        ++arming_calls;
+        return true; // would admit: only the undecodable text can be what denies
+    });
+    // The engine canonicalises parameters on create, so the undecodable text is written to the
+    // stored row directly (a hand-edited or damaged row is the case being pinned).
+    auto bad_json = h.make_due("test.def", "interval");
+    auto not_object = h.make_due("test.def", "interval");
+    h.set_stored_parameters(bad_json, "not json {");
+    h.set_stored_parameters(not_object, "[1,2]");
+
+    h.runner.tick();
+
+    CHECK(arming_calls == 0);   // authority is never decided on a guess
+    CHECK(h.enqueues.empty());  // nothing dispatched
+    CHECK(h.get(bad_json).next_execution_at > 1);   // advanced: a denied schedule must not spin
+    CHECK(h.get(not_object).next_execution_at > 1);
 }
 
 TEST_CASE("ScheduleRunner: D7 an UNSET arming_check denies both the auto and approval-gated "
@@ -1783,7 +2080,8 @@ TEST_CASE("ScheduleRunner: D7 an UNSET arming_check denies both the auto and app
 TEST_CASE("ScheduleRunner: D7 true arming_check still lets the auto and approved-ticket paths "
           "fire (existing approval behaviour unchanged)",
           "[schedule][runner][d7][approval][pg]") {
-    Harness h([](const std::string&, const std::string&, const std::string&) { return true; });
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; });
 
     auto auto_id = h.make_due("test.def", "interval");
     h.runner.tick();
@@ -1822,7 +2120,8 @@ TEST_CASE("ScheduleRunner: D7 a denied arming check audits the principal + targe
     AuditStore audit{pool};
     REQUIRE(audit.is_open());
     yuzu::MetricsRegistry metrics;
-    Harness h([](const std::string&, const std::string&, const std::string&) { return false; },
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return false; },
              &audit, &metrics);
     h.make_due("test.def", "interval");
 
@@ -1864,7 +2163,8 @@ TEST_CASE("ScheduleRunner: a content mismatch audits once, with the approved vs.
     AuditStore audit{pool};
     REQUIRE(audit.is_open());
     Harness h(
-        [](const std::string&, const std::string&, const std::string&) { return true; }, &audit);
+        [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; }, &audit);
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
     h.runner.tick(); // submits a ticket for procs.list
@@ -1964,7 +2264,8 @@ TEST_CASE("ScheduleRunner: an unset should_stop fires every due schedule, "
                                req.parameters});
             return yuzu::server::OutboxEnqueueOutcome::Enqueued;
         },
-        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+        .arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
             return true;
         },
         // .should_stop left unset (default std::function<bool()>{}).
@@ -2028,7 +2329,8 @@ TEST_CASE("ScheduleRunner: mark_cancelled failing on a FencedOut fire is now "
                         .status() == PGRES_COMMAND_OK);
             return yuzu::server::OutboxEnqueueOutcome::FencedOut;
         },
-        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+        .arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
             return true;
         },
     });
@@ -2048,4 +2350,54 @@ TEST_CASE("ScheduleRunner: mark_cancelled failing on a FencedOut fire is now "
     // genuinely failed, not merely was skipped.
     const auto s = h.get(id);
     CHECK(s.next_execution_at == 1);
+}
+
+// ── sg10: the arming check judges the schedule's own parameters ─────────────
+
+TEST_CASE("ScheduleRunner: the arming check receives the schedule's decoded parameters",
+          "[schedule][runner][sg10][pg]") {
+    std::unordered_map<std::string, std::string> seen;
+    Harness h([&seen](const std::string&, const std::string&, const std::string&,
+                      const std::unordered_map<std::string, std::string>& parameters) {
+        seen = parameters;
+        return true;
+    });
+    h.make_due("test.def", "interval", /*requires_approval=*/false,
+               R"({"targets":"https://wsus.example.test/","n":3})");
+
+    h.runner.tick();
+
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(seen.at("targets") == "https://wsus.example.test/");
+    CHECK(seen.at("n") == "3"); // a non-string value arrives as its JSON text
+}
+
+TEST_CASE("ScheduleRunner: stored parameters that do not decode deny the arming, never arm on a "
+          "guess",
+          "[schedule][runner][sg10][pg]") {
+    // create_schedule refuses such text, so the row is planted directly (a legacy row, or one
+    // written by another path): the fire must deny, not hold, never ask the arming check, and
+    // never enqueue.
+    for (const std::string bad : {std::string("[1,2]"), std::string("{not json"),
+                                  std::string(R"({"targets\u0000x":"h"})"),
+                                  std::string(R"({"targets\u0001":"h"})")}) {
+        bool asked = false;
+        Harness h([&asked](const std::string&, const std::string&, const std::string&,
+                           const std::unordered_map<std::string, std::string>&) {
+            asked = true;
+            return true;
+        });
+        auto id = h.make_due("test.def", "interval");
+        std::string quoted;
+        for (char c : bad)
+            quoted += (c == '\'') ? std::string("''") : std::string(1, c);
+        h.exec_sql("UPDATE schedule_engine.schedules SET parameter_values = '" + quoted +
+                   "' WHERE id = '" + id + "'");
+
+        h.runner.tick();
+
+        CHECK_FALSE(asked);
+        CHECK(h.enqueues.empty());
+        CHECK(h.get(id).next_execution_at > 1); // advanced: a poisoned row must not spin
+    }
 }

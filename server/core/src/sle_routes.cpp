@@ -146,6 +146,9 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                  const auto cid = make_cid();
                  res.set_header("X-Correlation-Id", cid);
                  const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+                 // Before the scope gate and any audit row: the id reaches target_id on both.
+                 if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                     return;
 
                  // Per-device scope is MANDATORY — fail CLOSED if the gate is unwired
                  // rather than silently widening to a global read (mirrors the dex
@@ -208,7 +211,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // exists). Gate: ONE SCOPED securable, `Decommission:Delete` (ADR-0024 Decision
     // 9, amended Wave 7 PR7.2) — a device-level erasure grant that authorizes for
     // the cascade's WHOLE blast radius, not the individual securables that govern
-    // each store's READ. The radius is NINE stores: InventoryStore,
+    // each store's READ. The radius is TEN stores: InventoryStore,
     // SoftwareInventoryStore, DeviceInventoryStore (all three read-gated by
     // `Inventory`), AppPerfDailyStore (read-gated by `GuaranteedState` — DEX
     // behavioural PII), SoftwareLicensingStore (read-gated by
@@ -218,7 +221,19 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // `Response`), and CertificateInventoryStore (slice-2 PR 2a-2a: fleet certificate
     // inventory; read securable arrives in PR 2a-2b), and GuaranteedStateStore (#5675: the
     // Guardian compliance census, read-gated by `GuaranteedState`; the device's pending census
-    // evidence is retired, its Guardian event log and DEX observations are not erased).
+    // evidence is retired, its Guardian event log and DEX observations are not erased), and the
+    // agent's management-group memberships (#6352, key `management_group_memberships`,
+    // read-gated by `ManagementGroup`: every group, static, dynamic and root; the enrolment row is
+    // NOT touched, so the same id can reconnect and its next Register attempts to add it back to the
+    // root group only).
+    // Owner ruling (Dave Rae, 2026-11-17): `Decommission:Delete` is the
+    // authority to remove the device's membership rows in every group, including groups the caller
+    // could not otherwise write (a service-scoped token admitted for a device in its service cannot
+    // hold the global `ManagementGroup:Write` that member-removal routes require). The rows are
+    // agent-keyed links to the retired device and nothing is granted; removal narrows reach and also
+    // ends group-targeted compliance policy, Guardian and collection-settings coverage of the
+    // device, which the owner accepted. Tags stay outside the cascade. The outcome audit row records
+    // the groups the device left (`management_group_memberships.groups=<n>:<ids>`).
     // Compat: the seeded
     // matrix is unchanged (Administrator + ITServiceOwner keep the ability, granted
     // via seed_defaults() with no migration); an operator-authored custom role that
@@ -249,6 +264,10 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
             const auto cid = make_cid();
             res.set_header("X-Correlation-Id", cid);
             const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+            // Before the scope gate and any audit row: the id reaches target_id on both, and
+            // this is the destructive cascade.
+            if (detail::refuse_unsafe_device_id_a4(res, agent_id))
+                return;
             if (!scoped_perm_fn_) {
                 send_json(res, 503, a4_error(503, "scope gate not configured", cid));
                 return;
@@ -290,6 +309,15 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 breakdown += '=';
                 breakdown += to_string(s.outcome);
                 breakdown += ' ';
+                // Evidence of WHAT a store removed (the groups the device left), as its own
+                // token so a SIEM rule keyed on `<store>=<outcome>` is unchanged. Group ids are
+                // server-generated hex, never caller text.
+                if (!s.detail.empty()) {
+                    breakdown += s.store;
+                    breakdown += ".groups=";
+                    breakdown += s.detail;
+                    breakdown += ' ';
+                }
                 if (s.write_paused)
                     paused.push_back(s.store);
             }
@@ -325,7 +353,10 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 if (paused.empty()) {
                     msg = "agent decommission incomplete — one or more stores failed (" +
                           std::to_string(r.failed) +
-                          " failed); re-issue the DELETE (the cascade is idempotent)";
+                          " failed); re-issue the DELETE (the cascade is idempotent; a caller whose "
+                          "Decommission:Delete grant is scoped to a management group is refused "
+                          "(403) once the device has left its groups, so use an Administrator "
+                          "or a global grant)";
                 } else {
                     msg = "agent decommission incomplete: the removal was not attempted for " +
                           paused.dump() +
@@ -333,7 +364,10 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                           "mismatch. Retrying before the collation repair is finished and the "
                           "pause has lifted (the server rechecks about once a minute) will fail "
                           "the same way; re-issue the DELETE only AFTER the repair (the cascade "
-                          "is idempotent).";
+                          "is idempotent). A caller whose Decommission:Delete grant is scoped to a "
+                          "management group is refused (403) when it re-issues if this "
+                          "call has removed the device from its groups; use an "
+                          "Administrator or a global grant.";
                     if (other_failed > 0)
                         msg += " " + std::to_string(other_failed) +
                                " other store(s) also failed for a different reason (see "

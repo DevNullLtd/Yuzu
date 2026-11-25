@@ -386,6 +386,9 @@ jobs:
       # the binaries are static). It never scans the checkout: the old
       # `path: .` scan listed the vcpkg ports catalogue and test tooling
       # (40,853 components on v0.15.0) and none of the shipped libraries.
+      # An artifact holding yuzu-server also lists the web assets and QR-code
+      # library compiled into it, from server/core/vendored-components.json in
+      # this checkout (the run fails if the manifest and the files disagree).
       # Each SBOM is named after its artifact (yuzu-linux-x64.cdx.json for the
       # archive, <package without .deb/.rpm>.cdx.json for a package) and
       # records its SHA-256; the release job checks both.
@@ -1707,14 +1710,15 @@ jobs:
 
       # ── Image vulnerability gate (WP15/S9) ─────────────────────────────
       # Scans the image just built and probed (by its pinned ID), BEFORE
-      # "Build and push": a CRITICAL vulnerability with a fix, not accepted in
-      # .trivyignore.yaml, fails this leg, so no tag is pushed and the release
-      # job (which needs this job) does not run. The push build normally
-      # reuses this build's layers from the same buildkitd (see above);
-      # "Verify the pushed image is the scanned one" proves it did.
-      # The script installs its own pinned, checksum-verified Trivy and keeps
-      # the DB under RUNNER_TEMP, never $HOME (one OS identity for all Big Tam
-      # runners, #1871). Recovery: docs/ci-architecture.md "Release image
+      # "Build and push": a CRITICAL vulnerability with a fix that Trivy or
+      # grype reports, not accepted in .trivyignore.yaml / .grypeignore.yaml,
+      # fails this leg, so no tag is pushed and the release job (which needs
+      # this job) does not run. The push build normally reuses this build's
+      # layers from the same buildkitd (see above); "Verify the pushed image
+      # is the scanned one" proves it did. The script installs its own pinned,
+      # checksum-verified Trivy and grype and keeps their DBs (and grype's
+      # `docker save` of the image) under RUNNER_TEMP, never $HOME (one OS
+      # identity for all Big Tam runners, #1871). Recovery: docs/ci-architecture.md "Release image
       # vulnerability gate".
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
         id: gate
@@ -1875,8 +1879,23 @@ jobs:
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
         run: exec scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
 
+      # syft cannot see the web assets and QR-code library compiled into
+      # yuzu-server: add them from server/core/vendored-components.json (checked
+      # against this checkout; a mismatch fails). No-op without yuzu-server.
+      # After `signed-attested` and before mark-image, the upload and the tags
+      # (#5242): like mark-image it edits only the local SBOM files the upload
+      # sends, which still describe the verified digest. A failure here leaves
+      # the journal at `signed-attested`: the digest is signed and attested but
+      # no release tag names it. The release job's SBOM check refuses a server
+      # image pair without them.
+      - name: Add yuzu-server's vendored components to the image SBOM
+        env:
+          SBOM: yuzu-${{ matrix.image }}-image
+        run: python3 scripts/ci/artifact-sbom.py augment --cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"
+
       # syft's image scan cannot see the vcpkg libraries linked into yuzu-server
-      # or yuzu-agent, nor what the Erlang emulator vendors: mark the pair
+      # or yuzu-agent, nor what the Erlang emulator vendors (the vendored
+      # components compiled into yuzu-server are listed above): mark the pair
       # incomplete, with the reason (no-op for an image holding neither).
       # After attest + sign, like the upload (#5242), and before the tags move:
       # it edits only the local SBOM files the next step uploads, which still
@@ -1933,7 +1952,8 @@ jobs:
         # Trivy report: image ID, layers, every package, the findings and the
         # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
         # repository@digest and dates, image ID, coverage, advisory canary,
-        # result), each named .attempt-<run attempt>, and the publish journal
+        # result), grype's grype-*.{json,txt,gate.txt} beside them (WP15),
+        # each named .attempt-<run attempt>, and the publish journal
         # publish-<image>.attempt-<run attempt>.txt when the gate passed. It runs whenever
         # the gate ran, PASS, FAIL OR CANCELLED (an explicit status function: a
         # bare `if:` would be success() only, and a refusal, the control
@@ -2280,7 +2300,8 @@ jobs:
         # Trivy report: image ID, layers, every package, the findings and the
         # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
         # repository@digest and dates, image ID, coverage, advisory canary,
-        # result), each named .attempt-<run attempt>, and the publish journal
+        # result), grype's grype-*.{json,txt,gate.txt} beside them (WP15),
+        # each named .attempt-<run attempt>, and the publish journal
         # publish-<image>.attempt-<run attempt>.txt when the gate passed. It runs whenever
         # the gate ran, PASS, FAIL OR CANCELLED (an explicit status function: a
         # bare `if:` would be success() only, and a refusal, the control
@@ -2660,6 +2681,13 @@ jobs:
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
         run: exec scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
 
+      # As in docker-publish: yuzu-server's vendored components, server leg
+      # only, after `signed-attested` and before mark-image.
+      - name: Add yuzu-server's vendored components to the image SBOM
+        env:
+          SBOM: yuzu-${{ matrix.image }}-chisel-image
+        run: python3 scripts/ci/artifact-sbom.py augment --cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"
+
       # As in docker-publish.
       - name: Mark the image SBOM incomplete where the scan cannot see
         env:
@@ -2712,7 +2740,8 @@ jobs:
         # Trivy report: image ID, layers, every package, the findings and the
         # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
         # repository@digest and dates, image ID, coverage, advisory canary,
-        # result), each named .attempt-<run attempt>, and the publish journal
+        # result), grype's grype-*.{json,txt,gate.txt} beside them (WP15),
+        # each named .attempt-<run attempt>, and the publish journal
         # publish-<image>.attempt-<run attempt>.txt when the gate passed. It runs whenever
         # the gate ran, PASS, FAIL OR CANCELLED (an explicit status function: a
         # bare `if:` would be success() only, and a refusal, the control
@@ -3009,7 +3038,8 @@ jobs:
         # Trivy report: image ID, layers, every package, the findings and the
         # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
         # repository@digest and dates, image ID, coverage, advisory canary,
-        # result), each named .attempt-<run attempt>, and the publish journal
+        # result), grype's grype-*.{json,txt,gate.txt} beside them (WP15),
+        # each named .attempt-<run attempt>, and the publish journal
         # publish-yuzu-agent-bundle-chisel.attempt-<run attempt>.txt when the
         # gate passed. It runs whenever
         # the gate ran, PASS, FAIL OR CANCELLED (an explicit status function: a
@@ -3175,6 +3205,15 @@ jobs:
           for n in "${attempts[@]}"; do
             [[ -s "trivy-${name}.attempt-${n}.gate.txt" ]] \
               || { err "attempt $n has files but no trivy-${name}.attempt-${n}.gate.txt; not attaching anything"; exit 1; }
+            # grype's is required for an attempt that opened a journal (the
+            # journal check below, image-publish.sh gates_pass, refuses one
+            # without it). An attempt that never opened one is evidence of a
+            # refusal or a stop and is attached as it is: a gate killed before
+            # writing grype's verdict must not block every later attach.
+            if [[ -e "publish-${name}.attempt-${n}.txt" ]]; then
+              [[ -s "grype-${name}.attempt-${n}.gate.txt" ]] \
+                || { err "attempt $n has a publish journal but no grype-${name}.attempt-${n}.gate.txt; not attaching anything"; exit 1; }
+            fi
           done
 
           # The journals: legal prefixes only, each beside a passing gate. Exit
@@ -3435,7 +3474,9 @@ jobs:
           # tests/, .git/ or .github/ (the marks of a checkout, build-tree or
           # test-tree scan, which is what the pre-S8 SBOMs were). Each image
           # SBOM pair must carry the marker mark-image adds where the image
-          # holds what syft cannot list. A failure here comes after the images
+          # holds what syft cannot list, and list yuzu-server's vendored
+          # components (augment) exactly when the image holds yuzu-server.
+          # A failure here comes after the images
           # are pushed: see the release skill's failure table (most causes need
           # a fix and re-tag; a transfer fault needs only a re-run).
           python3 scripts/ci/artifact-sbom.py check --artifacts-dir artifacts
@@ -3446,7 +3487,7 @@ jobs:
           # *.zip glob covers both yuzu-agent-windows-x64.zip and yuzu-compose-wizard-*.zip.
           # SBOMs (*.cdx.json, *.spdx.json) are included so customers can
           # verify the SBOM they download matches the SBOM we shipped.
-          # trivy-* (and grype-*, once a second scanner writes reports) are the
+          # trivy-* and grype-* (each scanner's reports) are the
           # image vulnerability gate's reports (WP15/S9), the evidence of what
           # each image was scanned with and found. nullglob for that list only:
           # a scanner with no reports adds nothing, while every other pattern
@@ -3588,6 +3629,19 @@ jobs:
             echo "" >> release-notes.md
           fi
 
+          # An image that passed the grype gate under a provider waiver says so
+          # here, from the published attempt's own report (fail-safe: a report
+          # that cannot be read is stated as undetermined, never omitted).
+          deg_rc=0
+          deg="$(bash scripts/ci/release-degraded.sh artifacts)" || deg_rc=$?
+          if [ "$deg_rc" -ne 0 ]; then
+            if [ -n "$deg" ]; then
+              printf '%s\n\n' "$deg" >> release-notes.md
+            else
+              printf '%s\n\n' "## Image scan: DEGRADED" "Whether this release's images were scanned degraded could not be determined; treat them as degraded until verified." >> release-notes.md
+            fi
+          fi
+
           cat >> release-notes.md <<NOTES_EOF
           ## Enterprise installers
 
@@ -3645,17 +3699,18 @@ jobs:
           Each binary archive, package and installer has its own CycloneDX and SPDX SBOM,
           named after the file (\`<name without .tar.gz/.zip/.deb/.rpm/.exe/.pkg>.{cdx,spdx}.json\`).
           It lists what is inside that file: the vcpkg libraries its C++ binaries
-          are built with (from the installed vcpkg tree), for the gateway the
-          Erlang/OTP release, and anything else syft recognises in it. The
+          are built with (from the installed vcpkg tree), for a file holding
+          \`yuzu-server\` the third-party code compiled into it (qrcodegen, and
+          the web assets it embeds: htmx, ECharts, three.js, Cytoscape, IBM Plex
+          fonts; the \`yuzu-server\` image SBOMs list these too), for the gateway
+          the Erlang/OTP release, and anything else syft recognises in it. The
           Windows installer's SBOM lists the files of
           \`yuzu-agent-windows-x64.zip\` that the installer installs.
-          Not listed yet, though the file holds it: code vendored into the
-          source tree and compiled into \`yuzu-server\` (qrcodegen, and the
-          web assets it embeds: htmx, ECharts, three.js, Cytoscape, IBM Plex
-          fonts), the Windows installer's own InnoSetup runtime, and what the
-          gateway's Erlang emulator (\`beam.smp\`) vendors (PCRE2, asmjit,
-          zstd, Ryu, OpenSSL's MD5). An SBOM whose file or image holds
-          something it does not list says so: a CycloneDX composition with
+          Not listed yet, though the file holds it: the Windows installer's
+          own InnoSetup runtime, and what the gateway's Erlang emulator
+          (\`beam.smp\`) vendors (PCRE2, asmjit, zstd, Ryu, OpenSSL's MD5).
+          An SBOM whose file or image holds something it does not list says
+          so: a CycloneDX composition with
           \`aggregate: incomplete\`, in SPDX a \`CONTAINS NOASSERTION\`
           relationship on its root, and the reason tokens in the
           \`yuzu:sbom:incomplete-reasons\` note (a CycloneDX property; in SPDX
@@ -3721,13 +3776,14 @@ jobs:
           v1.57.2 scan of the image by the digest this release signs). An image
           scan does not see the C++ libraries linked statically into
           \`yuzu-server\` and \`yuzu-agent\` (the \`yuzu-linux-x64\`, server
-          and agent package SBOMs list them), what the gateway's Erlang emulator vendors,
-          or the \`yuzu-postgres\` image's source-built pgvector, so each of
-          the six image SBOMs is marked incomplete with its reasons
-          (server: \`server-vendored, image-static-cpp\`; agent:
-          \`image-static-cpp\`; gateway: \`erts-static\`; postgres:
-          \`pgvector-source\`). The agent-bundle image published after the
-          release has no SBOM among the release assets. GitHub-native
+          and agent package SBOMs list them), what the gateway's Erlang
+          emulator vendors, or the \`yuzu-postgres\` image's source-built
+          pgvector, so each of the six image SBOMs is marked incomplete with
+          its reasons (server and agent: \`image-static-cpp\`; gateway:
+          \`erts-static\`; postgres: \`pgvector-source\`). The two server
+          image SBOMs also list the third-party files compiled into
+          \`yuzu-server\`, as its file SBOMs do. The agent-bundle image
+          published after the release has no SBOM among the release assets. GitHub-native
           SLSA build provenance attestations for every binary archive
           and Docker image, and cosign keyless signatures on both the
           Docker images and the \`SHA256SUMS\` manifest. See
@@ -3735,10 +3791,11 @@ jobs:
           for the full verification workflow (\`gh attestation verify\`,
           \`cosign verify\`, CycloneDX / SPDX validation).
 
-          Each image was scanned for vulnerabilities before it was pushed; the
-          reports are the \`trivy-yuzu-*\` assets (inside \`SHA256SUMS\`): the
-          full Trivy JSON, a table, and a \`.gate.txt\` summary with the Trivy
-          version, the vulnerability DB digest and date, the image ID and which
+          Each image was scanned for vulnerabilities by two scanners, Trivy and
+          grype, before it was pushed; the reports are the \`trivy-yuzu-*\` and
+          \`grype-yuzu-*\` assets (inside \`SHA256SUMS\`): each scanner's full
+          JSON, a table, and a \`.gate.txt\` summary with the scanner version,
+          the vulnerability DB it used, the image ID and (Trivy's) which
           images' OS packages the scanner could not see. The agent-bundle
           image's report is attached after the release, with its own signed
           checksum list (\`yuzu-agent-bundle-chisel-image-vuln-gate.attempt-N.SHA256SUMS\`).

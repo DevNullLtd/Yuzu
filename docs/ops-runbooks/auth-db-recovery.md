@@ -41,7 +41,7 @@ the Windows event log shows one of these, and they mean different things:
 | `SecretCodec::init() failed` … `kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
 | `AuthDB: the MFA factor-generation trigger (auth.users_mfa_factor_gen) is missing, not ENABLE ALWAYS, or altered - auth store disabled`, followed by `Failed to open the Postgres auth store (migration or MFA trigger check failed; see the preceding AuthDB log line)` | The trigger that binds an MFA proof to the account's factor generation is not in force | [MFA binding enforcement failed](#mfa-binding-enforcement-failed) |
 | `SessionStore: sessions_mfa_rebind_guard is missing, not ENABLE ALWAYS, or altered; refusing to open …`, followed by `[PG] Refusing to start: session store migration/open failed` | The session rebind guard trigger is not in force | [MFA binding enforcement failed](#mfa-binding-enforcement-failed) |
-| `PgMigrationRunner: migration v3 failed for auth: …` or `PgMigrationRunner: migration v3 failed for session_store: …`, ending `canceling statement due to lock timeout` (SQLSTATE `55P03`), followed by the refusal line for that store; or the same line printed by the first `yuzu-server --mfa-reset` | The migration could not get its table lock within 3 seconds because another session holds a lock on `auth.users` or `session_store.sessions`; it rolled back whole and changed nothing | [Migration lock timeout](#migration-lock-timeout) |
+| `PgMigrationRunner: migration v3 failed for auth: …`, `PgMigrationRunner: migration v4 failed for auth: …` or `PgMigrationRunner: migration v3 failed for session_store: …`, ending `canceling statement due to lock timeout` (SQLSTATE `55P03`), followed by the refusal line for that store; or the same line printed by the first `yuzu-server --mfa-reset` | The migration could not get its table lock within 3 seconds because another session holds a lock on `auth.users` or `session_store.sessions`; it rolled back whole and changed nothing | [Migration lock timeout](#migration-lock-timeout) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
 A server that refuses to start serves no `/metrics`, so the two binding gauges below cannot report this
@@ -155,7 +155,7 @@ opened. Usual causes, in likelihood order:
 
 ### Migration lock timeout
 
-The `PgMigrationRunner` line above means another session held a lock on `auth.users` (the `auth` v3 migration) or
+The `PgMigrationRunner` line above means another session held a lock on `auth.users` (the `auth` v3 or v4 migration) or
 `session_store.sessions` (the `session_store` v3 migration) for longer than the migration's 3 second wait. Nothing
 was applied. Find the holder:
 
@@ -430,9 +430,23 @@ psql "$YUZU_POSTGRES_DSN" -c "SELECT store, version FROM public.schema_meta WHER
 
 # 3. The KEK resolved — this must be ZERO, or absent entirely. A non-zero
 #    kek_unresolvable count is the signature of a dump restored against the
-#    wrong keys directory. /metrics is on the same web port and is always
-#    unauthenticated over loopback.
-curl -fsS http://127.0.0.1:8080/metrics | grep secret_decrypt_failures_total
+#    wrong keys directory. /metrics requires a bearer token from EVERY peer,
+#    loopback included (docs/user-manual/metrics.md, "Scraping /metrics with
+#    a bearer token"), so a bare curl is answered 401 and its body matches
+#    nothing: that would read as "absent entirely", a false pass. This step
+#    therefore (a) sends the token, (b) requires HTTP 200, and (c) requires a
+#    series that exists on every healthy server (yuzu_server_uptime_seconds)
+#    before the zero check means anything. If any of the three fails, STOP:
+#    the check did not run.
+#    With HTTPS on (the default) /metrics is on the HTTPS port, 8443, not on
+#    8080 (which only redirects); -k is for the self-signed default certificate
+#    (use --cacert with your CA otherwise).
+METRICS=$(curl -sSk -o /tmp/yuzu-metrics.txt -w '%{http_code}' \
+  -H "Authorization: Bearer $YUZU_METRICS_TOKEN" https://127.0.0.1:8443/metrics)
+[ "$METRICS" = "200" ] || { echo "FAIL: /metrics answered $METRICS, not 200; the KEK check did not run"; false; }
+grep -q '^yuzu_server_uptime_seconds' /tmp/yuzu-metrics.txt \
+  || { echo "FAIL: no yuzu_server_uptime_seconds: the scrape is not a real /metrics"; false; }
+grep secret_decrypt_failures_total /tmp/yuzu-metrics.txt   # zero or absent: pass
 
 # 4. Both MFA binding triggers are in force: two rows, both with tgenabled = 'A'.
 #    Any other value means the server will refuse to start, or has already
@@ -442,7 +456,9 @@ psql "$YUZU_POSTGRES_DSN" -c "SELECT tgrelid::regclass AS tbl, tgname, tgenabled
      AND tgname IN ('users_mfa_factor_gen', 'sessions_mfa_rebind_guard');"
 
 # 5. The server's own view of the same fact: both series read 1.
-curl -fsS http://127.0.0.1:8080/metrics | grep yuzu_auth_mfa_binding_enforcement_ok
+#    Same rule as step 3: both series must be PRESENT with value 1; an empty
+#    result (a 401 body, a missing series) is a failure, not a pass.
+grep yuzu_auth_mfa_binding_enforcement_ok /tmp/yuzu-metrics.txt
 
 # 6. A real MFA login works end-to-end (not just "the page loads").
 ```
@@ -569,11 +585,12 @@ exists. This writes no audit row; record it in your change-management system, as
 ```bash
 # Inspect first.
 psql "$YUZU_POSTGRES_DSN" -c \
-  "SELECT username, failed_login_count, locked_until FROM auth.users WHERE username = 'alice';"
+  "SELECT username, failed_login_count, locked_until, mfa_failed_count, mfa_locked_until FROM auth.users WHERE username = 'alice';"
 
 # Clear one account.
 psql "$YUZU_POSTGRES_DSN" -c \
-  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL WHERE username = 'alice';"
+  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL,
+   mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL WHERE username = 'alice';"
 ```
 
 Mass-unlock is a threshold-misconfiguration remedy only (e.g. someone deployed
@@ -582,7 +599,8 @@ you will be back:
 
 ```bash
 psql "$YUZU_POSTGRES_DSN" -c \
-  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL;"
+  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL,
+   mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL;"
 ```
 
 **Bulk unlock after an auth-store blip.** Before #5342 a login whose account
@@ -612,6 +630,42 @@ psql "$YUZU_POSTGRES_DSN" -c \
 Like the single-account fallback, this writes no audit row; record it. The
 locks expire on their own after `--auth-lockout-window-secs`, so waiting is
 still the zero-risk choice.
+
+## Second-factor (MFA) lock, `429` and `503` on sign-in
+
+**Second factor locked.** Wrong TOTP or recovery codes spend a durable per-account budget
+(`auth.users.mfa_failed_count` / `mfa_locked_until` / `mfa_last_attempt_at`, added by schema
+migration **v4**). A locked account answers the uniform `401` at `/login/mfa` and `/login/mfa/stepup`
+until `--auth-lockout-window-secs` passes (audit: `auth.mfa.lockout.applied`, then
+`mfa.login.failed` / `mfa.step_up.failed` with detail `mfa locked`). Remedies, cheapest first:
+
+1. **Wait the window** (default 900 s): zero risk.
+2. **Another administrator**, or an admin API/MCP token **minted beforehand** (you cannot mint one
+   while locked out): `POST /api/v1/users/{name}/unlock` or the MCP `unlock_account` tool (clears the
+   password lock and the MFA lock in one statement).
+3. **Host CLI**: `yuzu-server --break-glass-arm` resets the lock, but ONLY for the configured
+   break-glass user; `yuzu-server --mfa-reset <user>` removes the factor (and the lock) and the user
+   re-enrols.
+4. **Direct SQL** (last resort, writes no audit row; see the fallback above, which clears the
+   three MFA columns too).
+
+**Clock note.** Lock windows are measured by the Postgres clock (`now()`), so a step of the database clock shifts them: a forward step of at least the REMAINING lock time ends a live lock early and starts a fresh failure count (a new set of guesses), and a backward step lengthens it. An operator unlock still clears a lock. Accepted by the owner (2026-11-18) as a documented residual.
+
+**Sole-administrator wedge.** If the only administrator's second factor is locked, they hold no API
+token and no break-glass account is configured, options 2 and `--break-glass-arm` are unavailable:
+use `--mfa-reset <user>` and re-enrol, or wait out the window. A self-service password change does
+**not** clear the lock; an administrative reset does.
+
+**`503` with `Retry-After` and audit detail `mfa attempt could not be counted`.** The attempt could
+not be reserved in the auth store, so the code was deliberately NOT checked (fail closed). Treat it
+as an auth-store outage (see the store sections above), not a wrong code.
+
+**`429` with `Retry-After: 2` at `/login`, `/login/mfa` or the password-change proof.** A concurrency limit refused the request before any password was checked or counted. Read `reason` on `yuzu_auth_pbkdf2_budget_rejected_total{route,class,reason}`: `per_source` / `per_principal` / `class_full` / `global_full` (a hashing lane is full), `stripe_busy` (waited 150 ms for the per-username stripe), or `stripe_cap` (the per-stripe limit of 2 waiters, or the global waiter ceiling, was reached). A sustained rate from many addresses is login load, not a store fault; behind a proxy, raise `--auth-pbkdf2-per-source-cap`. The stripe is per server process (N replicas: about threshold + (N - 1) guesses per window; tracked as #8215).
+
+**Pinned worker pool with no `429`s.** If `/metrics`, `/livez` or `/readyz` time out while the process is alive and no `yuzu_auth_pbkdf2_budget_rejected_total` series moves, the HTTP worker pool may be saturated by requests the budget does not count (requests waiting on a stripe or a database connection, or a stalled store). Check: (1) the rate of `yuzu_http_requests_total{status="401",principal_class="none"}` against baseline, (2) `yuzu_auth_login_stripe_waiters` (an instantaneous 15 s sample: zero does not rule it out), (3) login failure audit rows per second by source, (4) Postgres pool lease waits; the pool size is `yuzu_http_worker_pool_size` and there is no worker-busy gauge yet. Mitigate at the edge with per-source or /64 rate limits and request-body limits.
+
+**v4 migration did not apply** ("Migration lock timeout" above): the `ALTER TABLE` uses a 3 s
+`lock_timeout` and the next boot retries it. Until it applies the auth store does not open and the server refuses to start (fail closed).
 
 ## Password reset
 
@@ -1262,6 +1316,18 @@ only — it does not come from `yuzu-server.cfg`, so the one-shot must repeat
 whatever the running service passes in its unit file. Omit it and the command
 exits non-zero with `error: --break-glass-arm requires --break-glass-user`,
 arming nothing.
+
+**After the break-glass login: revoke its sessions.** The arm window authorises the sign-in. The password step and the MFA step both check it (the arm being removed or the window ending between them, within the pending-token life of 120 seconds by default, ends the login with the generic `401`). A session that was already minted inside the window lives its full 8 hours and is NOT revoked when the window ends, and an API token minted from that session stays valid until its own expiry or revocation (token use does not check the arm state). So, after the incident, end the break-glass user's sessions AND revoke its API tokens. Before leaving the break-glass session, call `DELETE /api/v1/sessions/me` (with the session cookie the request needs a same-site `Origin` header) and read its answer: it ends every session of the user and revokes every API token it owns, and `db_persisted` and `api_tokens_db_persisted` must both be `true`. The answer is `200` even when a write did not persist. The Settings button **Sign out everywhere** makes the same call but sends the browser to the sign-in page whatever the answer was, so after using it read the `session.revoke_all.self` audit row instead: `result=success` means both writes persisted, and `result=partial` means one did not (`db_error=true` or `api_tokens_db_error=true` in its detail), so repeat the call (your cookie was cleared, so this needs a new break-glass sign-in, and a new `--break-glass-arm` if the window has ended), or, as an administrator, end the sessions (`db_error=true`) or revoke the tokens (`api_tokens_db_error=true`) as below. If there is no such row at all, the audit write failed (the API answer then carries `audit_emitted=false`): repeat with `DELETE /api/v1/sessions/me` and read its answer. `POST /logout` ends only the current session and leaves API tokens valid. An administrator with `UserManagement:Write` and a fresh MFA proof can run `DELETE /api/v1/sessions?username=<break-glass user>`, which also leaves API tokens valid. To revoke them as an administrator, open Access, Tokens and principals (`/access/tokens`, from a signed-in browser session): an administrator sees every owner's tokens there. Use **Revoke** on each token owned by the break-glass user, then check that it is no longer listed under Active (it is listed as Revoked under All). A revoke needs `ApiToken:Delete`, an effective administrator (or a just-in-time elevation) and a fresh MFA proof. `DELETE /api/v1/tokens/{token_id}` takes the token's id as that page shows it, not its name (the `api_token.create` audit row records the name), and it answers `404 token not found` for an id that does not exist or that you may not revoke; revoking a token that is already revoked answers `200`, so, for an administrator, a `404` means the id is wrong, not that the token is already revoked. There is no host-side command that ends sessions only. Do NOT use `--mfa-reset` for this: it also clears the account's MFA, and the next `--auth-mode=sso-only` start then refuses to boot.
+
+**Arm-state lag and read failures.** The gate that decides whether the break-glass user is armed reads the database at most once per second and fails closed. There is no disarm command: the window ends by itself at its authored end, which the server enforces locally on its monotonic clock. A change before that end (a later `--break-glass-arm`, which writes a new window end; the automatic un-arm when the arming audit row cannot be written; a deactivated account) stops being honoured within about 2 seconds when the database answers inside its caps (a read of at most 1 second plus the 1 second cache), and within 4.5 seconds otherwise: the server stops honouring an "armed" answer once 4.5 seconds have passed, on its monotonic clock, since the start of the read that produced it. That clock does not advance while the host or virtual machine is suspended, and the local end of the window and the life of the cache are measured on it too: after a resume, the password step and the first MFA check can still be answered "armed" from a cache entry that is up to one second old on that clock, even though the authored end has passed. When the second MFA check can read the database, the database's answer decides, on its own clock, with one exception: an "armed" answer is still refused, as a disarm, when this server has recorded a "not armed" read after that check's own read started; a suspend after it has answered and before the session is created is not seen. When that read fails, the login is admitted only if the wall clock also shows at most 4.5 seconds since the read behind the first check started (a wall clock that moved backwards changes nothing, and wall time is never used to admit). That check sees a suspend only if the wall clock moves forward across it, as it does for a host suspend; a virtual machine that its hypervisor pauses may stop the wall clock together with the monotonic clock until time is synchronised again, and then neither clock can see the pause. The 4.5 seconds bound the DECISION to admit; creating the session follows that decision and takes its own bounded database writes, which the figure does not include. If `yuzu_auth_break_glass_arm_gate_total{result="read_failed"}` rises (the server also logs `break-glass arm-state read failed`), the auth store is slow or unreachable and a break-glass login is refused at the password step until a read succeeds; `result="refresh_busy"` counts answers given while a refresh was in flight and the cache was older than 1 second (a flood naming the user, or a database answering slowly), and `result="stale_read"` counts "armed" reads that started more than 4.5 seconds earlier. While any of the three is rising, break-glass logins are being refused, and the cause to fix is the auth store's latency or reachability. None of the three is recorded as "not armed". `yuzu_auth_break_glass_pending_refused_total{reason,stage}` counts logins refused at the MFA step: `reason="disarmed"` (the arm was removed, or this server read it as not armed during the login), `"window_ended"`, or `"transient"` (the arm state could not be read); `stage="pre_verify"` (nothing was verified or spent, and for `transient` the pending token stays usable, so retry) or `"pre_mint"` (after the code was verified). `yuzu_auth_break_glass_pending_transient_admitted_total` counts logins completed while the arm state could not be re-read, inside the bound taken from the read made before verification. The second check at the MFA step reads the arm state itself (it does not wait for another request's read). A `transient` refusal at `pre_mint` needs that read to fail, or to take longer than 4.5 seconds, and either more than 4.5 seconds to have passed since the first check's read started (a slow or failing step in between: the auth store, the recovery-code hash scan, the audit write or the event emission) or this server to have seen a different arm window during the login (a "not armed" read seen in that time is counted as `disarmed`, not `transient`), or the wall clock to have moved forward by more than 4.5 seconds since that read started (a host suspend or a forward clock step). No shipped alert rule covers these series or the login concurrency caps.
+
+**Recovery codes at a break-glass login.** Prefer the TOTP code. A recovery code is consumed as soon as it is checked, so ANY refusal after that (`stage="pre_mint"`: `disarmed`, `window_ended` or `transient`), and a session that cannot then be created because the auth store fails, leaves the code spent behind the same `401` as a wrong code. Each `mfa.recovery_code.used` audit row is one spent code: it is written, best effort, right after the code is consumed, so it also counts a code spent when the server restarted or the connection dropped before any answer reached you (a server killed before even that row was written, or an audit write that failed, spends a code with no row, so when in doubt strike it). After ANY answer other than a success at the code step, a `401` or a dropped connection included, strike that code off and never resubmit it; after a refusal that follows a TOTP code, wait for the next code, because a TOTP code is single-use too. A spent code that is resubmitted counts as a wrong code, and `--auth-lockout-threshold` of them (5 when `0`) lock the second factor (`--break-glass-arm` clears that lock). While `yuzu_auth_break_glass_arm_gate_total` is rising or the Postgres alerts are firing, do not try another recovery code: wait until the auth store answers normally, or use TOTP. For a `window_ended` or `disarmed` refusal, re-arm first. The account has 10 recovery codes; keep them with this runbook, and regenerate them after the incident (Settings, Two-factor sign-in, Regenerate recovery codes). A `disarmed` refusal can also happen while the account is armed: when another break-glass sign-in read the account as not armed just before a `--break-glass-arm` took effect, this server keeps that read, and a sign-in whose own check started before that read was recorded is refused. Re-arming again is harmless, but what clears this case is time: after `--break-glass-arm`, wait at least 5 seconds (longer than the 4.5-second bound on an arm-state answer) before signing in, do not run two break-glass sign-ins at once, and sign in with TOTP rather than a recovery code. Before each retry, count the codes spent: each `mfa.recovery_code.used` row is one, but a spent code can leave no row (see above), so the rows give the fewest codes spent, not the most.
+
+Break-glass password attempts are bounded without a lockout: they take no per-username stripe; each attempt takes a non-blocking slot in the break-glass lane (one per TCP peer address, so everyone behind a proxy shares one; so a second request from the same address is refused at once with the generic `401`, the same answer as a wrong password; `yuzu_auth_pbkdf2_budget_rejected_total{route="login",class="break_glass"}` with `reason` `per_source` or `class_full`). The lane is `min(4, cap/4)` slots: 4 from a pool of 64, 2 on pools of 16-47, and ONE on pools of 10-15, where a single address that keeps an attempt in flight makes the operator's own attempt be refused with that same generic `401` until it stops (a refused attempt is indistinguishable from a wrong password; read the metric above); retry, nothing is locked. A change to the arm state made with `--break-glass-arm` is honoured within about 2 seconds, and within 4.5 seconds at most (see "Arm-state lag and read failures" above). The lane is per server process (N replicas allow N times as many concurrent attempts). The break-glass exemption is from the **password lockout only**: wrong TOTP or recovery codes still
+spend the per-account second-factor failure budget, so a break-glass login can be refused with the
+uniform `401` while that account's second factor is locked. Arming resets that lock in the same
+statement (the audit row says so), which is the host-side remedy; see
+[Second-factor (MFA) lock, `429` and `503` on sign-in](#second-factor-mfa-lock-429-and-503-on-sign-in).
 
 Arming is fail-closed on audit: the audit store is checked reachable and
 migrated *before* the mutate, and if the row fails to persist afterwards the

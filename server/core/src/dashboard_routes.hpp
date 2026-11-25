@@ -29,6 +29,8 @@
 #include "command_capability.hpp" // PR6.0b: CommandCapability / ClassificationError — ClassifyFn's return type
 #include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
+#include "echo_source_action_rules.hpp" // EchoActionCooldown: the repeat bound on Echo purge/re-enable
+#include "scoped_gate_outcome.hpp"      // ScopedPermFn's return type: the gate's refusal class
 
 namespace yuzu::server {
 
@@ -210,6 +212,25 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// #2540 - the per-device scoped-permission chokepoint, backing the Echo purge and re-enable
+    /// fragment POSTs so they authorize exactly like the REST purge twin: one probe of the
+    /// handler's own (securable, operation) pair on the posted device, asked again after the
+    /// `attempted` audit row. It is those handlers' SOLE authorization gate (never stacked with
+    /// `perm_fn_`). Same signature as `RestApiV1::ScopedGateFn`; server.cpp wires the SAME
+    /// `scoped_gate_fn` lambda into both. It returns the gate's refusal class and the handlers
+    /// admit ONLY on `== ScopedGateOutcome::Admitted`: a denial collapses to the 404 body, while
+    /// an authorization that could not be evaluated (the gate answered 503, or a read it depends
+    /// on failed) answers 503. It writes its own refusal and `auth.scoped_permission_required`
+    /// audit row into the Response it is handed, so the handlers feed it a throwaway. FAIL CLOSED
+    /// when unset: both POSTs answer 503 and dispatch nothing. Same setter idiom as
+    /// `set_fleet_read_fn`: set before `register_routes`.
+    using ScopedPermFn =
+        std::function<ScopedGateOutcome(const httplib::Request&, httplib::Response&,
+                                        const std::string& securable_type,
+                                        const std::string& operation,
+                                        const std::string& agent_id)>;
+    void set_scoped_perm_fn(ScopedPermFn fn) { scoped_perm_fn_ = std::move(fn); }
+
     /// #4990 - the Forensics plugin set the stored-response read tier excludes
     /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). Same setter idiom
     /// as `set_fleet_read_fn`: handlers read the member per request. Unset (nullptr, a test
@@ -291,11 +312,10 @@ public:
     /// When `true` (the REST/MCP twins), `extra_scope` (= `gate.scope`, the
     /// ADR-0017-authorized set) is the SOLE filter — `visible_set` is skipped
     /// entirely, matching the two device pickers' identical fix
-    /// (`EchoTreeRoutes::all_devices_fn_`). Default `false` preserves the HTML
-    /// fragment caller's existing membership-only behavior unchanged (it has
-    /// no `fleet_read_fn_` gate to defer to yet — out of scope this round,
-    /// same recorded exception as the two un-migrated device-picker
-    /// fragments).
+    /// (`EchoTreeRoutes::all_devices_fn_`). Default `false` keeps the
+    /// membership-only behavior for a caller with no gate scope to defer to;
+    /// the HTML frame (#2540) now gates on `fleet_read_fn_` and passes
+    /// `true` like its REST twin.
     EchoRetentionPausedScan
     gather_echo_retention_paused(const std::string& username,
                                 const authz::VisibleSet& extra_scope = std::nullopt,
@@ -347,6 +367,7 @@ private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
     FleetReadFn fleet_read_fn_;
+    ScopedPermFn scoped_perm_fn_; // #2540 - see set_scoped_perm_fn
     AuditFn audit_fn_;
     ResponseStore* response_store_{nullptr};
     const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
@@ -512,8 +533,14 @@ private:
     /// output for `<source>_enabled=false` rows, and renders an HTML table
     /// body fragment. The username + visibility filter close the
     /// Gate 2 cross-operator data-leak finding.
+    ///
+    /// `gate_scope` is the `fleet_read_fn_` gate's authoritative scope (#2540), the SOLE row
+    /// filter exactly as on the REST twin; the default (nullopt, unfiltered) is for the unit
+    /// seam only.
     std::string render_echo_retention_paused(const std::string& username, bool can_execute,
-                                            bool can_delete) const;
+                                            bool can_delete,
+                                            const authz::VisibleSet& gate_scope = std::nullopt,
+                                            bool scope_is_authoritative = false) const;
 
     /// Parse f_* filter params from request into FacetFilter vector.
     std::vector<FacetFilter> parse_filters(const httplib::Request& req,
@@ -539,6 +566,10 @@ private:
     mutable std::mutex echo_scan_mu_;
     std::unordered_map<std::string, EchoScanState> echo_scans_by_user_;
     static constexpr std::size_t kEchoScanStateCap = 256;
+
+    // The repeat bound on the Echo purge and re-enable POSTs (one dispatch per action, device and
+    // source per 30 s); per server process, see its class comment.
+    echo_source::EchoActionCooldown echo_action_cooldown_;
 
     // Unit-test seam (#562): render_echo_retention_paused and its inputs
     // (response_store_, mgmt_group_store_, echo_scans_by_user_) are private, and

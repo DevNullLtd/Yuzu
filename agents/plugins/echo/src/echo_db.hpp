@@ -552,9 +552,9 @@ struct OpenSeams {
     /// (#1527). Production never sets it.
     std::function<void()> before_integrity_check;
     /// The filesystem steps of the quarantine that follows a corrupt verdict (the hard-link
-    /// claim, a sidecar move, a remove), forwarded to `quarantine_corrupt_db`. An empty member is
-    /// the real call. A test's `link` runs between the verdict and the claim, which is where a
-    /// swapped-in link has to be caught (#1527). Production never sets one.
+    /// claim, a sidecar move, a sidecar copy, a remove), forwarded to `quarantine_corrupt_db`. An
+    /// empty member is the real call. A test's `link` runs between the verdict and the claim, which
+    /// is where a swapped-in link has to be caught (#1527). Production never sets one.
     yuzu::shared::sqlite_quarantine::FsOps quarantine_ops;
     /// Called by the v10 migration after its pre-transaction reads, right before BEGIN IMMEDIATE,
     /// with the migrating connection. It stands in for another process acting in the gap between
@@ -567,6 +567,17 @@ struct OpenSeams {
     /// True = abandon the v10 migration (rolled back, the file untouched). Production: the open
     /// retry loop's stop flag, so a shutdown does not wait out a long attempt.
     std::function<bool()> v10_cancel;
+    /// Runs in place of the plain `ROLLBACK` that `execute_atomic_batch` and `checked_transaction`
+    /// (the v10 step included) issue after a failed transaction, and returns its result code. A
+    /// test returns an error WITHOUT rolling back, which leaves the connection inside the
+    /// transaction and takes the real close path; one that rolls back and then reports an error
+    /// takes the benign branch. Copied into the database by open() before the schema steps, so it
+    /// covers the open itself. Covers those two sites only: the open-time helpers (the DDL batch,
+    /// the rename step and the v3 to v8 ladder) issue their own plain ROLLBACK, and a failure there
+    /// is an open failure, never a run-time wedge. The production sites test the result code before
+    /// they ask for autocommit, so a seam returning SQLITE_OK with the transaction still open is
+    /// not caught. Empty = the real ROLLBACK; production never sets it.
+    std::function<int(sqlite3*)> rollback;
 };
 
 /// What `PRAGMA integrity_check` says about echo.db at open (#559, #7286). Only `corrupt` moves the
@@ -807,7 +818,9 @@ public:
     /// wedged transaction forced `execute_atomic_batch` to close it. Callers that
     /// REPORT state (rather than just read it) must consult this: with the
     /// connection gone every getter returns its default, so an unguarded status
-    /// surface describes a dead store as a healthy empty one (#2361 Gate 8).
+    /// surface describes a dead store as a healthy empty one (#2361 Gate 8). The Echo plugin's
+    /// slow collect tick also reads it to publish the closed-at-run-time store as storage offline
+    /// with reason `rollback_wedged` (echo_status_format.hpp online_offline_tag_action).
     [[nodiscard]] bool is_open() const noexcept { return db_ != nullptr; }
 
     /// True while the read-only query connection (`echo sql`) is usable.
@@ -818,6 +831,14 @@ public:
     /// failure there is warned and tolerated, echo_db.cpp), and promising a read
     /// path that is not there is worse than admitting the store is dark.
     [[nodiscard]] bool query_engine_available() const noexcept { return query_db_ != nullptr; }
+
+    /// False when open() succeeded but `create_warehouse_tables` failed (a broken
+    /// table or index DDL on an otherwise readable file): the store is open and
+    /// its config and state rows work, but the registry-declared warehouse tables
+    /// are incomplete. Set once in open() before the object is published, so it
+    /// needs no lock. Reported on the `echo status` surface as
+    /// `config|warehouse_tables_ok` (#2626).
+    [[nodiscard]] bool warehouse_tables_ok() const noexcept { return warehouse_tables_ok_; }
 
     /// Epoch at which THIS open() quarantined a corrupt echo.db; nullopt for a
     /// clean open. Drives only the echo.status db_health value — the durable
@@ -1109,9 +1130,11 @@ private:
     bool refuse_open_transaction_locked(const char* what) const;
 
     // ATOMIC because it is written at RUNTIME, not only at open/close: the
-    // wedged-rollback path in execute_atomic_batch nulls it under mu_ while
-    // is_open() reads it WITHOUT mu_ from another thread (do_status runs on the
-    // command-dispatch thread, the wedge on the rollup thread). Before that
+    // wedged-rollback paths null it under mu_ -- execute_atomic_batch, checked_transaction and
+    // rollback_open_transaction, the last of which runs a plain ROLLBACK that is not behind the
+    // OpenSeams::rollback seam, so no test can force that close -- while is_open() reads it
+    // WITHOUT mu_ from other threads (do_status runs on the command-dispatch thread and the slow
+    // collect tick reconciles the offline tag, the wedge on the rollup thread). Before that
     // runtime write existed the unlocked read was benign; adding it made this a
     // data race (#2361 governance Gate 2).
     //
@@ -1134,9 +1157,14 @@ private:
     // so there is no concurrent writer to race with.
     sqlite3* query_db_{nullptr};
     std::optional<int64_t> quarantined_at_{};
+    bool warehouse_tables_ok_{true}; // cleared by open() when create_warehouse_tables fails (#2626)
     /// The ONE roll-up writer for this database (echo_fold.hpp: one instance per database is a
     /// construction rule, so it lives here). Built by open(); null only in a moved-from object.
     std::unique_ptr<EchoFold> fold_;
+    /// Issues the rollback of a failed transaction on `db_` (mu_ held): the OpenSeams::rollback
+    /// seam when one was given, else a plain ROLLBACK. Always empty in production.
+    int rollback_locked(char** errmsg);
+    std::function<int(sqlite3*)> rollback_;
     std::mutex mu_;
     std::mutex query_mu_;
 };

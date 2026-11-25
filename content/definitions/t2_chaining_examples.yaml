@@ -332,7 +332,9 @@ status:
 ## 3. Version Info + Inventory Evaluation:
 ##    Step 1: device.filesystem.get_version_info (path=path)
 ##    PolicyFragment check: inventory.filesystem.product_version version_gte minimum_version
-##    Fix: software deployment or content_dist.stage + execute_staged
+##    Fix: software deployment (a policy fix may not use an action that has an execute gate, so
+##    content_dist.stage and content_dist.execute_staged are not usable as a policy fix: policy
+##    evaluation does not dispatch them and the policy shows `blocked`)
 ##
 ## Each workflow step references an InstructionDefinition by ID.
 ## Parameter binding passes outputs from prior steps:

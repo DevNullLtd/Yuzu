@@ -12,7 +12,9 @@
 /// absent costs only its own section.
 ///   installed_apps.list_inventory           blob rows (the 12 original fields + install_location)
 ///   pkg_inventory.packages                  Homebrew formulae/casks and Chocolatey packages
-///                                           (ecosystems `brew`, `chocolatey`)
+///                                           (ecosystems `brew`, `chocolatey`); a Homebrew
+///                                           machine row also fills install_date and
+///                                           install_location, a user-scope row is not mapped
 ///   pkg_inventory.managers                  presence rows: `homebrew` (publisher `Homebrew`),
 ///                                           `chocolatey` and `winget` (labelled `via:`)
 ///   pkg_inventory.store_packages            active snaps/flatpaks and Appx packages
@@ -77,10 +79,14 @@ struct SwEntry {
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
     // Wire slot 13. Machine-scope roots only: the v3 writer keeps a location only under a known
-    // machine root (installed_software_v3.hpp machine_install_location). Slot 14 (uninstall_string) is
-    // reserved and always sent empty (#5186). Inserted here, between distro_version and
-    // package_id, so the member order stays the wire order.
+    // machine root (installed_software_v3.hpp machine_install_location). Inserted here, between
+    // distro_version and package_id, so the member order stays the wire order.
     std::string install_location;
+    // Wire slot 14: validated `key=value` attributes in the canonical form of
+    // common/include/yuzu/install_row_attributes.hpp (SAM-46; the slot was the reserved
+    // uninstall_string, #5186, always sent empty). Empty = none. The v3 writer keeps only a value
+    // that is already canonical (v3_normal_form), so an adapter builds it with make_attributes.
+    std::string attributes;
     std::string package_id;
     std::string source; // "<plugin>.<action>" that produced the row
 };
@@ -130,10 +136,14 @@ YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& 
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_managers_output(const std::string& out);
 
 /// Adapt `pkg_inventory` `packages` output (`status|packages|<level>|...` plus
-/// `package|homebrew|<id>|<version>|<formula|cask>`): formula -> kind `pkg`,
-/// cask -> kind `app`, ecosystem `brew`. Windows Chocolatey rows
+/// `package|homebrew|<id>|<version>|<formula|cask>`, optionally widened to eleven tokens with
+/// `|<install_time or ->|<tap or ->|<on_request or ->|<machine|user>|<owner or ->|<prefix>`):
+/// formula -> kind `pkg`, cask -> kind `app`, ecosystem `brew`. An eleven-token `machine` row
+/// maps its install_time (digits only) to install_date and its prefix to install_location (the
+/// v3 writer still gates that to machine roots); tap, on_request and owner are not mapped, and a
+/// `user` (or any non-`machine`) row is seen and not mapped. Windows Chocolatey rows
 /// (`package|chocolatey|<id>|<version or ->|pkg`) -> kind `pkg`, ecosystem
-/// `chocolatey`, version empty when `-`.
+/// `chocolatey`, version empty when `-`. A row of any other width is dropped.
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& out);
 
 /// Adapt `pkg_inventory` `store_packages` output (`status|store_packages|<level>|...`
@@ -148,10 +158,11 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& o
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out);
 
 /// Adapt `msi_packages` `list_inventory` output (`status|list_inventory|<level>|...` plus
-/// five-token `inv|<product_code>|<name>|<version>|<publisher>`). Each row becomes
-/// {kind=pkg, ecosystem=msi} with package_id = the product code exactly as registered
-/// (no case normalisation). An empty name is seen-not-mapped. The producer strips `|`,
-/// tab, CR, LF and NUL from the fields, so no unescape is needed.
+/// five or six token `inv|<product_code>|<name>|<version>|<publisher>[|<upgrade_code>]`). Each
+/// row becomes {kind=pkg, ecosystem=msi} with package_id = the product code exactly as registered
+/// (no case normalisation); a sixth token that is a braced GUID is kept as the `upgrade_code`
+/// attribute, any other sixth token is ignored. An empty name is seen-not-mapped. The producer
+/// strips `|`, tab, CR, LF and NUL from the fields, so no unescape is needed.
 YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out);
 
 /// Whether the `runtimes` `python` vendor column is read as a vendor on this host's OS: true on

@@ -8,12 +8,71 @@ kind: InstructionDefinition
 metadata:
   id: device.filesystem.search_dir
   displayName: Search Directories by Name Pattern
-  version: 0.4.0
+  version: 0.5.0
   description: >
     Search a directory tree for files or directories matching a name pattern.
     Supports both glob matching (default) and regex. Walks the tree recursively
     up to max_depth with configurable result limits. Paths are canonicalized;
-    optional base_dir restricts the search scope.
+    optional base_dir restricts the search scope. The walk is bounded: it stops
+    after 20 seconds, 400,000 directory entries visited, or max_results matches
+    (a search ordinarily ends within 20 seconds; a single blocked read or
+    directory listing is not interrupted). Only the shutdown signal cancels a
+    running search; there is no per-command cancel. Entries at depth 1 to
+    max_depth are examined and a directory at max_depth is matched but not
+    opened. Below the search root a symlink or junction is never followed and
+    never matches (it is counted), a FIFO, device or socket is never matched,
+    on Linux pseudo-filesystems such as /proc and /sys are never entered (one
+    the walk would open counts as unreadable, so that search is reported
+    constrained), and on macOS and Linux a subtree on a network mount is
+    skipped before anything under it is read; a root (or base_dir) on a network
+    mount is refused on its spelling before it is touched. A refused root is
+    not an error: the run returns 0 with skipped_network_mount=1 in the
+    truncated row, total_matches|0 and a constrained result. On Windows that
+    covers a UNC share, a drive that is not a fixed disk and a root written
+    with a \\?\ or \\.\ prefix (pass the plain drive spelling); a host whose /
+    is itself a network or paravirtual mount (9p, virtiofs) refuses every root.
+    The root itself is resolved through any symlink, as before. When
+    the mount table cannot be read the walk runs without that guard, says so
+    with a network_mount_guard|unavailable row ahead of the count, and is
+    reported constrained and partial. When anything was skipped or the walk
+    stopped early, one trailing row
+    truncated|reason|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N
+    says what was not examined (reason is deadline, file_cap, cancelled or
+    max_results; none means no bound tripped and the counters say what was
+    skipped; hashed and skipped_oversize are always 0 for this action); a clean
+    run writes no such row. The result is reported as constrained and partial
+    when a bound tripped, an entry could not be read, or a network mount was
+    skipped, but only the status number is stored on the server: the truncated
+    and network_mount_guard rows are the operator-visible signal, and
+    total_matches|0 beside either means not found in the part examined. Only
+    result rows are data rows to a column matcher. A device whose constrained
+    answer holds no row that satisfies a result-set column matcher on a
+    declared column is not left out as a plain non-match: the set counts it in
+    agents_failed and reads partial (a constrained answer with a matching row
+    is a member).
+    The bounds are fixed: when the reason is deadline, file_cap or max_results,
+    search a narrower root or lower max_depth; max_results means the cap was
+    reached while entries remained, whether or not any of them would have
+    matched. Regex mode uses the platform's standard-library engine and refuses
+    a lookahead ((?= or (?!: any (? group other than the non-capturing (?:)
+    with error|regex lookahead is not supported (use (?: to group), because no
+    engine bounds one and a match over one name cannot be interrupted. With no
+    lookahead, on Linux the time for one match grows with the name's length and
+    with the size of the compiled pattern, which can be far larger than the
+    pattern's text; a compiled pattern over the engine's own limit, and a
+    back-reference, are refused; on macOS and Windows a pattern too costly for a
+    name ends the run with an error row: the rows already written stay, no
+    total_matches row follows and the run fails with return code 1, so the
+    device counts as failed. An unexpected failure ends a run the same way on
+    any OS (error|search_dir failed: <cause>). A pattern over 256 bytes and an
+    unknown match_type are refused. In a result path a CR or LF is shown as a
+    space, a pipe is escaped, a name byte that is not valid UTF-8 is shown as
+    '?' and a last character that is a backslash is shown as a forward slash,
+    so two names that differ only in such characters can read alike. To find a
+    file by content hash use device.filesystem.find_by_hash; to search inside
+    one file use device.filesystem.search. An agent older than this release
+    still runs the earlier walk: unbounded, and it reported a link to a
+    matching file or directory by its target's type.
   tags: [filesystem, search, diagnostics, inventory]
 
 spec:
@@ -41,6 +100,7 @@ spec:
         description: >
           Glob pattern (default) or regex to match against entry names.
           Examples: "*.log", "config*", "^backup-\d+$" (with regex=true).
+          Matching is case-sensitive on every OS.
         validation:
           maxLength: 256
       regex:
@@ -48,7 +108,7 @@ spec:
         displayName: Use Regex
         description: >
           If "true", interpret the pattern as an ECMAScript regex instead
-          of a glob. Default: "false".
+          of a glob. A lookahead ((?= or (?!) is refused. Default: "false".
         default: "false"
         validation:
           enum: ["true", "false"]
@@ -89,22 +149,32 @@ spec:
           maxLength: 4096
 
   result:
+    # result|<path>|<directory|file>
+    # network_mount_guard|unavailable   (only when the mount table could not be read in full)
+    # truncated|<reason>|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N   (only when something was skipped or the walk stopped early)
+    # total_matches|<count>   (the last row of every run that returns 0)
+    # error|<message>   (a failed run, return code 1, in place of total_matches; a run that fails part-way -- a regex too costly for a name on macOS and Windows, or an unexpected failure on any OS -- writes it after result rows already written, with no truncated row)
+    # Read by the server (docs/yaml-dsl-spec.md, spec.result): a device whose CONSTRAINED answer
+    # satisfies no result-set column matcher on a declared column is counted in the set's agents_failed.
+    partialWhenConstrained: true
     columns:
+      - name: row_kind
+        type: string
+        discriminator: true
+        description: "Row shape discriminator (the wire row's leading tag). Values: result (one per matched entry), truncated (at most one, only when something was skipped or the walk stopped early), total_matches (exactly one, and last, on every run that returns 0; a failed run instead ends with a two-field error|<message> row, which is never a data row), network_mount_guard (at most one, after any result rows and ahead of the other two, only when the mount table could not be read in full). Only result rows are data rows to column matchers; the other kinds have a different field count and never match."
+        values: [result, truncated, total_matches, network_mount_guard]
+        example: result
+        platforms: [windows, linux, darwin]
       - name: path
         type: string
-        description: "Absolute path of a matched file or directory."
-        example: "not observed in any capture (every platform's capture returned total_matches|0 with no result rows)"
+        description: "result rows: absolute path of a matched file or directory. (A truncated row carries its stop reason in this position -- deadline, file_cap, cancelled, max_results, or none when no bound tripped -- and a total_matches row the count; neither is a data row to a column matcher.)"
+        example: "/var/log/system.log"
         platforms: [windows, linux, darwin]
       - name: entry_type
         type: string
-        description: "Whether the matched entry is a file or a directory, as classified by match_type."
+        description: "result rows: whether the matched entry is a file or a directory, as classified by match_type. (A truncated row carries its counters here and in the fields after it; neither it nor total_matches|N is a data row to a column matcher.)"
         values: [file, directory]
-        example: "not observed in any capture (every platform's capture returned total_matches|0 with no result rows)"
-        platforms: [windows, linux, darwin]
-      - name: total_matches
-        type: int32
-        description: "Count of matching entries returned in this result, capped by max_results. Values: integer."
-        example: 0
+        example: directory
         platforms: [windows, linux, darwin]
 
   readablePayload: "Search for ${match_type} matching '${pattern}' in ${root}"
@@ -698,6 +768,10 @@ spec:
           Comma-separated list of URLs to test connectivity against.
           If empty, uses platform-default patch servers (e.g. Windows Update
           endpoints, apt/yum/dnf repos, macOS Software Update).
+          At most 16 targets (more is refused). A target that resolves to a
+          loopback, unspecified, link-local (cloud metadata), multicast or
+          reserved address is answered `refused|address_not_probeable` with
+          no connect attempt; RFC 1918 targets (a WSUS server) are allowed.
           Example: "https://update.microsoft.com,https://download.windowsupdate.com"
       timeout_seconds:
         type: int32

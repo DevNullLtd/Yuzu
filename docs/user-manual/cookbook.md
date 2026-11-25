@@ -544,7 +544,7 @@ int(result.value) >= 22621
 #### Recipe: Preview, Apply and Undo a Registry Plan
 
 `windows.registry.apply` is Destructive, so it takes explicit `agent_ids` (scope and broadcast are refused) and an
-administrator or an approval; it needs registry 2.1.0 on the agent (see [Upgrading](upgrading.md)).
+administrator or an approval.
 
 1. **Preview.** Run it with the default `dry_run=true` and this `plan`:
 
@@ -569,8 +569,8 @@ administrator or an approval; it needs registry 2.1.0 on the agent (see [Upgradi
 #### Recipe: Change One Value in a User's Hive
 
 `hive=HKCU` is the agent's own hive (LocalSystem's `HKU\.DEFAULT`), not the logged-on user's, so a person's setting
-is changed with `windows.registry.set_user_value`. It needs an administrator or an approval and registry 2.1.0 on the
-agent, and it has no dry run: it writes at once. Its twin `windows.registry.delete_user_value` is Destructive, so it
+is read with `windows.registry.get_user_value` (the ungated reads refuse `hive=HKU` with a user SID and answer
+`per_user_hive_requires_get_user_value`) and changed with `windows.registry.set_user_value`. It needs an administrator or an approval, and it has no dry run: it writes at once. Its twin `windows.registry.delete_user_value` is Destructive, so it
 also takes explicit `agent_ids`.
 
 1. **Find the profile.** Run `windows.registry.list_profiles` on the device. Each row is
@@ -602,8 +602,7 @@ also takes explicit `agent_ids`.
 #### Recipe: Remove a Registry Branch Safely
 
 `windows.registry.delete_key` is Destructive (explicit `agent_ids`, administrator or approval) and deletes by default.
-Send `dry_run=true` only to agents verified at registry 2.1.0: an older agent ignores it and DELETES a key that has no
-subkeys (see [Upgrading](upgrading.md)).
+An earlier registry agent is unsupported (see the registry README, "Earlier agents").
 
 1. **Preview.** Run it with `hive` = `HKLM`, `key` = `SOFTWARE\AcmeLegacy`, `recursive=true` and `dry_run=true`. The
    reply ends `status|ok`, `counted_keys|<n>`, `counted_values|<n>`, `dry_run|1` and `capped|0`. Nothing is deleted;
@@ -696,7 +695,7 @@ A policy sees the plugin's whole output as ONE text value, `result.output` (the 
 
 #### macOS Homebrew coverage
 
-On macOS, `vuln_scan` reads applications from `system_profiler` only. Homebrew formulae and casks are not scanned (Homebrew CVE matching is tracked in #8256), so a macOS result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed; it says nothing about Homebrew packages, and matched Homebrew CVEs are not available. `pkg_inventory.packages` lists Homebrew packages (machine scope) but does not match them against CVE rules.
+On macOS, `vuln_scan` reads applications from `system_profiler` only. Homebrew formulae and casks are not scanned (Homebrew CVE matching is tracked in #8256), so a macOS result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed; it says nothing about Homebrew packages, and matched Homebrew CVEs are not available. `pkg_inventory.packages` lists Homebrew packages (the machine prefixes and the user-owned prefixes) but does not match them against CVE rules.
 
 The scan says so in its own output: every coverage problem the agent detects is an `UNREADABLE` row or an `INFO` Coverage row, and these rows mark the cases that mean "not assessed". Problems the agent cannot detect remain (see the notes after the list):
 
@@ -948,7 +947,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `crossplatform.process.query` | query | Q | WLM | name:string (req) | found:bool, pid:int64, name:string |
 | `crossplatform.service.list` | list | Q | WLM | *(none)* | name:string, display_name:string, status:string, startup_type:string |
 | `crossplatform.service.running` | running | Q | WLM | *(none)* | name:string, display_name:string, status:string, startup_type:string |
-| `crossplatform.service.set_start_mode` | set_start_mode | A | WLM | name:string (req), mode:enum (req) | status:string, service:string, mode:string |
+| `crossplatform.service.set_start_mode` | set_start_mode | A | WLM | name:string (req), mode:enum (req) | status:string, service:string, mode:string (Linux also writes state:string, and note:string for static, indirect, alias or generated units) |
 
 ### User & Session
 
@@ -1008,7 +1007,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `security.certificates.delete` | delete | A | WLM | thumbprint:string (req), store:string | status:string |
 | `device.event_logs.errors` | errors | Q | WLM | log:string, hours:int32 | timestamp:string, event_id:string, source:string, message:string |
 | `device.event_logs.query` | query | Q | WLM | log:string (req), filter:string (req), count:int32 | timestamp:string, level:string, event_id:string, message:string |
-| `security.ioc.check` | ioc check | Q | WLM | ip_addresses:string, domains:string, file_hashes:string | type:string, value:string, matched:bool, detail:string |
+| `security.ioc.check` | ioc check | Q | WLM | ip_addresses:string, domains:string, file_hashes:string | type:string, value:string, matched:string, detail:string |
 | `security.vuln_scan.scan` | vuln scan | Q | WLM | *(none)* | severity:string, category:string, title:string, detail:string |
 | `security.vuln_scan.summary` | vuln summary | Q | WLM | *(none)* | severity:string, count:int32 |
 | `security.encryption.state` | bitlocker | Q | WLM | *(none)* | volume:string, protection_status:string, encryption_method:string |

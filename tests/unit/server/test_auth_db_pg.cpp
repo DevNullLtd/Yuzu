@@ -1622,7 +1622,7 @@ TEST_CASE("AuthDB migrates v1 -> v2: clean enrollment/pending shape + import_met
     REQUIRE(adb.is_open()); // the v2 and v3 steps applied
 
     PgConn conn = connect(db.dsn());
-    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "4");
 
     // v1 dead shapes gone, clean shape present (no `is_used`, has `max_uses`/`token_id`).
     CHECK(scalar(conn.get(), "SELECT count(*) FROM auth.enrollment_tokens") == "0");
@@ -3021,6 +3021,35 @@ void remove_commit_failer(PGconn* c, const std::string& table) {
 
 } // namespace
 
+TEST_CASE("AuthDB migrates v3 -> v4: the MFA budget columns are added with inert defaults",
+          "[pg][auth_db][migration][mfa_budget]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        yuzu::test::TempDir keys{"yuzu_test_keys_"};
+        FileKeyProvider provider(keys.path);
+        SecretCodec codec(provider);
+        PgConn conn = connect(db.dsn());
+        REQUIRE(codec.init(conn.get()).has_value());
+        AuthDB first{pool, codec, 0};
+        REQUIRE(first.is_open());
+    }
+    PgConn conn = connect(db.dsn());
+    // Rewind to the v3 shape and seed a row that predates the columns.
+    run_sql(conn.get(), "ALTER TABLE auth.users DROP COLUMN mfa_failed_count, "
+                        "DROP COLUMN mfa_locked_until, DROP COLUMN mfa_last_attempt_at");
+    run_sql(conn.get(), "UPDATE public.schema_meta SET version = 3 WHERE store = 'auth'");
+    run_sql(conn.get(), "INSERT INTO auth.users (username) VALUES ('seed_v3')");
+    CHECK(second_store_opens(db.dsn())); // applies v4
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "4");
+    CHECK(scalar(conn.get(), "SELECT mfa_failed_count FROM auth.users WHERE username='seed_v3'") ==
+          "0");
+    CHECK(scalar(conn.get(),
+                 "SELECT (mfa_locked_until IS NULL AND mfa_last_attempt_at IS NULL)::text FROM "
+                 "auth.users WHERE username='seed_v3'") == "true");
+}
+
 TEST_CASE(
     "AuthDB migrates v2 -> v3: existing rows start at generation 0 (hard cutover, no seed) and "
     "the trigger is ENABLE ALWAYS",
@@ -3038,18 +3067,20 @@ TEST_CASE(
         REQUIRE(first.is_open());
     }
     PgConn conn = connect(db.dsn());
-    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "4");
 
-    // Rewind to the v2 shape: no column, no trigger, schema_meta at 2.
+    // Rewind to the v2 shape (also drop the v4 MFA-budget columns, which a v2 database lacks): no column, no trigger, schema_meta at 2.
     run_sql(conn.get(), "DROP TRIGGER users_mfa_factor_gen ON auth.users");
     run_sql(conn.get(), "DROP FUNCTION auth.users_mfa_factor_gen()");
     run_sql(conn.get(), "ALTER TABLE auth.users DROP COLUMN mfa_factor_gen");
+    run_sql(conn.get(), "ALTER TABLE auth.users DROP COLUMN mfa_failed_count, "
+                        "DROP COLUMN mfa_locked_until, DROP COLUMN mfa_last_attempt_at");
     run_sql(conn.get(), "UPDATE public.schema_meta SET version = 2 WHERE store = 'auth'");
     run_sql(conn.get(), "INSERT INTO auth.users (username, mfa_enrolled_at) VALUES "
                         "('seed_enrolled', now()), ('seed_never', NULL)");
 
-    CHECK(second_store_opens(db.dsn())); // applies v3
-    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "3");
+    CHECK(second_store_opens(db.dsn())); // applies v3 then v4
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "4");
     // No seed: a row that was already enrolled when the migration ran reads generation 0, which
     // every gate refuses until the account is re-enrolled (the cutover starts from a fresh
     // database). The next enrolment change assigns it a fresh value.
@@ -4253,3 +4284,45 @@ TEST_CASE("AuthDB generation trigger fires under session_replication_role = repl
 }
 
 #endif // YUZU_TEST_ENABLE_PG
+
+TEST_CASE("AuthDB consume_and_enroll(require_single_use): a multi-use token is refused INSIDE the "
+          "consume UPDATE, never counted, never enrolling; a single-use token still works (WP01)",
+          "[pg][auth_db][enrollment][wp01]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    auto multi = h.db.create_token("fleet", 5, std::chrono::seconds(3600), "admin");
+    auto unlimited = h.db.create_token("unlimited", 0, std::chrono::seconds(3600), "admin");
+    auto single = h.db.create_token("recover", 1, std::chrono::seconds(3600), "admin");
+    REQUIRE(multi.has_value());
+    REQUIRE(unlimited.has_value());
+    REQUIRE(single.has_value());
+
+    for (const auto& t : {*multi, *unlimited}) {
+        auto r = h.db.consume_and_enroll(t.raw_token, "agent-su", "h", "", "", "",
+                                         /*enforce_new_id_charset=*/true, /*require_single_use=*/true);
+        REQUIRE(r.has_value());
+        CHECK(r->kind == CEK::token_rejected);
+        CHECK(r->not_single_use);
+        // Nothing was consumed and no enrollment row was created.
+        CHECK(scalar(h.conn.get(),
+                     "SELECT use_count::text FROM auth.enrollment_tokens WHERE token_id = $1",
+                     {t.token_id}) == "0");
+        CHECK(scalar(h.conn.get(), "SELECT count(*) FROM auth.pending_agents WHERE agent_id = $1",
+                     {"agent-su"}) == "0");
+    }
+    // The same multi-use token is still usable WITHOUT the requirement (ordinary enrolment).
+    auto ok = h.db.consume_and_enroll(multi->raw_token, "agent-su", "h", "", "", "");
+    REQUIRE(ok.has_value());
+    CHECK(ok->kind == CEK::enrolled);
+    CHECK_FALSE(ok->not_single_use);
+
+    auto s1 = h.db.consume_and_enroll(single->raw_token, "agent-su2", "h", "", "", "", true, true);
+    REQUIRE(s1.has_value());
+    CHECK(s1->kind == CEK::enrolled);
+    // A spent single-use token is "already consumed", not "not single use".
+    auto s2 = h.db.consume_and_enroll(single->raw_token, "agent-su3", "h", "", "", "", true, true);
+    REQUIRE(s2.has_value());
+    CHECK(s2->kind == CEK::token_rejected);
+    CHECK_FALSE(s2->not_single_use);
+    CHECK(s2->token_error == EnrollmentTokenError::already_consumed);
+}
