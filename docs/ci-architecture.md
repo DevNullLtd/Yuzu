@@ -4438,7 +4438,7 @@ yet establish a complete per-case execution inventory.
 
 The Instructions gate requires terminal SUCCESS from every agent counted in an
 untargeted dispatch's `agents_reached`, reads response pages, validates command
-and agent identities, and rejects any failure or malformed/incomplete evidence.
+and agent identities, and rejects any failure or malformed/incomplete evidence. Rows the runner skips by name (`agent.http_client.get`/`head`, `crossplatform.echo.configure` and `windows.rdp.set_state` always; `network_actions.ping`/`flush_dns` when `YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1`) are never dispatched by this gate: they are skips, not passes, and the reasons are printed at the start and kept in each row's note.
 Earlier RUNNING chunks are allowed when that agent has terminal success. The
 opt-in destructive/forensic path retains its separate stricter grading. These
 checks establish reported execution success, not action-specific postconditions.
