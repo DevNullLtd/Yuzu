@@ -566,17 +566,22 @@ this claim describes is real in the source. Claim holds.)*
 Firewall (`socketfilterfw --getglobalstate`) as the primary signal, with the
 pf packet filter demoted to a secondary row; `rules` lists pf rules. Both
 actions also read the unprivileged per-app allow/block list
-(`socketfilterfw --listapps`) on `rules`, and the root-only pf anchor list
-(`pfctl -s Anchors`) and rule count (`pfctl -s rules`) on both actions —
+(`socketfilterfw --listapps`) on `rules`, and the pf anchor list
+(`pfctl -s Anchors`) and rule count (`pfctl -s rules`) on both actions, read
+as root or through the installer's exact sudo grants for the non-root
+account —
 each degrading to no anchor rows / `ruleset|unknown` rather than a false
 answer when the read is refused or incomplete. Windows adds a `ruleset|<n>`
 row on both actions via `INetFwRules::get_Count` — `state`'s is the true
 policy-wide total, `rules`' is the count of rows actually emitted that call
 (capped at 100), a distinct number from `state`'s. Linux probes a fixed
-backend ladder — firewalld (sd-bus) → nftables (netlink, kernel-origin-
-verified via `nl_pid == 0`) → ufw → iptables — stopping at the first that
-answers; a refused or partial read reports `unknown`, never a false-safe
-guess, and each backend emits its own `ruleset|<n>` rule count (or
+backend ladder — firewalld (sd-bus; it answers first only when its read was
+complete, a partly read firewalld is held behind the nftables and snapshot reads) → nftables
+(netlink, kernel-origin-verified via `nl_pid == 0`) → the root snapshot broker
+(a root-owned systemd socket on the packaged unit, ADR-3007; the installer
+helper's `snapshot` word through sudo on an installer-provisioned host) → ufw →
+iptables — stopping at the first that answers; a refused or partial read
+reports `unknown`, never a false-safe guess, and each backend emits its own `ruleset|<n>` rule count (or
 `ruleset|unknown` on an incomplete/refused read).
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
@@ -1839,7 +1844,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 
 ### 42.12 Process Introspection :large_orange_diamond: `T2` *(new row, 2026-11-16)*
 
-`process_introspect` plugin `inspect`: one pid and one facet per request (`resource_limits`, `sigmasks`, `caps`, `seccomp`, `oom`, `sched`) as numbers, masks and fixed tokens — never file or memory contents, environment values, socket payloads or command-line arguments. Forensics securable, default-off, AdminOrApproval, single-target. Linux constrained, macOS and Windows planned. *(Evidence: `agents/plugins/process_introspect/README.md`.)*
+`process_introspect` plugin `inspect`: one pid and one facet per request (`resource_limits`, `sigmasks`, `caps`, `seccomp`, `oom`, `sched`) as numbers, masks and fixed tokens — never file or memory contents, environment values, socket payloads or command-line arguments. Forensics securable, default-off, AdminOrApproval, single-target. Linux and macOS constrained (macOS reads only the `sched` nice value through libproc, never a task port; the other five facets answer a permanent `unsupported`), Windows planned. *(Evidence: `agents/plugins/process_introspect/README.md`.)*
 
 ---
 
@@ -1915,7 +1920,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | update_source_trust | - | Y | - | Security |
 | mgmt_posture | - | 🟡 | Y | Security |
 | remote_access_audit | - | 🟡 | Y | Security |
-| process_introspect | - | 🟡 | - | Security |
+| process_introspect | - | 🟡 | 🟡 | Security |
 | shares | Y | Y | Y | Network |
 | virtualization | 🟡 | Y | Y | System Info |
 | agent_logging | Y | Y | Y | Agent Mgmt |
