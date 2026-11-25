@@ -187,8 +187,13 @@ inline NoReparseHandle open_volume_root(wchar_t drive_letter) {
 } // namespace no_reparse_detail
 
 /// Open `path` (`X:\...` or `X:/...`) for reading with no reparse point followed below the drive
-/// root. See the file banner for the mechanism and the status mapping.
-[[nodiscard]] inline NoReparseOpenResult open_file_no_reparse(const std::wstring& path) {
+/// root. See the file banner for the mechanism and the status mapping. `share_access` is the
+/// NtCreateFile ShareAccess mask (FILE_SHARE_*); the default lets other writers, renamers and
+/// deleters proceed while the handle is held, and a caller that holds the handle to pin the file
+/// passes FILE_SHARE_READ so a rename, delete or rewrite of it fails while the handle is open.
+[[nodiscard]] inline NoReparseOpenResult
+open_file_no_reparse(const std::wstring& path,
+                     ULONG share_access = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) {
     using namespace no_reparse_detail;
     NoReparseOpenResult result;
 
@@ -229,7 +234,7 @@ inline NoReparseHandle open_volume_root(wchar_t drive_letter) {
     IO_STATUS_BLOCK iosb{};
     const NTSTATUS status = nt_create_file(
         &raw, FILE_GENERIC_READ, &attrs, &iosb, /*AllocationSize=*/nullptr, /*FileAttributes=*/0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, kFileOpen,
+        share_access, kFileOpen,
         kFileNonDirectoryFile | kFileSynchronousIoNonalert | kFileOpenReparsePoint,
         /*EaBuffer=*/nullptr, /*EaLength=*/0);
     if (status >= 0) {

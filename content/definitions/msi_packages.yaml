@@ -1,7 +1,8 @@
 ## MSI / pkgutil Package Inventory Definitions
 ## Enumerates installed packages and product codes: MSI products via
-## MsiEnumProducts on Windows, pkgutil receipts on macOS.
-## Plugin: msi_packages | Actions: list, product_codes, list_inventory
+## MsiEnumProducts on Windows, pkgutil receipts on macOS; installer_records
+## (Windows) reads the Installer's own registry records and cached packages.
+## Plugin: msi_packages | Actions: list, product_codes, list_inventory, installer_records
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -157,7 +158,8 @@ metadata:
   description: >
     Lists the Windows Installer products installed for the whole machine
     (MsiEnumProductsExW in the machine install context, with
-    MsiGetProductInfoExW for the name, version and publisher), in the form the
+    MsiGetProductInfoExW for the name, version and publisher, and the
+    Installer's UpgradeCodes registry map for the upgrade code), in the form the
     daily installed-software inventory collects them. Per-user MSI products are
     never listed by this action. A property the product does not have is an
     empty field, never a placeholder, and a product with no name (for example
@@ -187,10 +189,11 @@ spec:
 
   result:
     # status|list_inventory|<supported|constrained|unsupported>|<failure tokens or ->
-    # inv|<product_code>|<name>|<version>|<publisher>
+    # inv|<product_code>|<name>|<version>|<publisher>|<upgrade_code>
     # Two row shapes on one stream, discriminated by field 0; a status row
     # populates the first four columns (product_code = the action name,
-    # name = the level, version = the tokens) and leaves publisher empty.
+    # name = the level, version = the tokens) and leaves publisher and
+    # upgrade_code empty.
     columns:
       - name: row_kind
         type: string
@@ -210,13 +213,18 @@ spec:
         platforms: [windows]
       - name: version
         type: string
-        description: 'Inventory rows: the VersionString property, empty when the product has none. Status rows: the failure token, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610, windows:msi_prop:1610 or windows:msi_prop:oversized), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw).'
+        description: 'Inventory rows: the VersionString property, empty when the product has none. Status rows: the failure token, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610, windows:msi_prop:1610, windows:msi_prop:oversized, windows:msi_upgrade_map:<winerror> or windows:msi_upgrade_map:over_cap), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw).'
         example: "26.04.00.0"
         platforms: [windows]
       - name: publisher
         type: string
         description: 'Inventory rows only: the Publisher property, empty when the product has none.'
         example: "Igor Pavlov"
+        platforms: [windows]
+      - name: upgrade_code
+        type: string
+        description: 'Inventory rows only: the product''s UpgradeCode as the Windows Installer registry map (HKLM\SOFTWARE\Classes\Installer\UpgradeCodes) records it, braced and upper case. Empty when no upgrade code names the product, when more than one does, or when the map is absent. A failed read of the map, or a read cut short by one of its bounds, makes the status row `constrained` with a `windows:msi_upgrade_map:<code>` or `windows:msi_upgrade_map:over_cap` token instead.'
+        example: "{23170F69-40C1-2702-2604-000000000000}"
         platforms: [windows]
     aggregation:
       groupBy:
@@ -226,6 +234,158 @@ spec:
         - count
 
   readablePayload: "List machine-context MSI products for inventory"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [msi_packages]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.software.msi.installer_records
+  displayName: Read Windows Installer Records
+  version: 1.0.0
+  description: >
+    Reports what Windows Installer itself recorded for each machine-context
+    product: the InstallProperties registry values under the Installer UserData
+    tree for the SYSTEM account (display name, version, publisher, install
+    date, install location, install source, cached package path) and the
+    Property table of the cached package under the Windows Installer
+    directory (ProductCode, UpgradeCode, ProductVersion, Manufacturer,
+    ProductName), read read-only. Nothing is executed: no product is opened,
+    repaired, installed or configured. Only the system Installer cache is ever
+    opened: a path outside it, or one naming a reserved device, is refused, and
+    the package is held open through a handle that follows no reparse point
+    while it is read. One package is read at a time, for at most 5000 products
+    and 20 MB of text, 5 seconds per package and 45 seconds of package reads per
+    dispatch. A product whose cached package is missing, refused or corrupt
+    keeps its row with a reason and does not constrain the result. A failed
+    registry read, an exceeded bound or a package read that timed out or found
+    the single package reader busy makes the status row `constrained` with a
+    `windows:installer_records:<detail>` token. Install locations and sources
+    under the user profiles directory, or under a registered user profile's
+    folder, are reported as `withheld:user_path`. When the user-profile list cannot be read in full, every non-empty one of these paths is `withheld:profile_list_incomplete` and the status is `constrained`, even when no field holds a path (fail closed). A path off the allow-list (a plain drive-absolute or UNC path of plain segments; no stream colon, device or namespace form, loopback or administrative share) is `withheld:path_unverifiable`.
+    Exactly one status row leads the result.
+  tags: [software, msi, inventory, windows]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: msi_packages
+    action: installer_records
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|installer_records|<supported|constrained|unsupported>|<failure tokens or ->
+    # rec|<product_code>|<name>|<version>|<publisher>|<install_date>|<install_location>|<install_source>|<local_package>|<upgrade_code>|<db_product_code>|<db_version>|<db_manufacturer>|<db_name>|<reason or ->
+    # Two row shapes on one stream, discriminated by field 0; a status row
+    # populates the first four columns (product_code = the action name,
+    # name = the level, version = the tokens) and leaves the rest empty.
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator. Values: status (exactly one per result, always first), rec (one per machine-context product).'
+        values: [status, rec]
+        example: rec
+        platforms: [windows]
+      - name: product_code
+        type: string
+        description: 'Record rows: the product code, unpacked from the registry key name (braced, upper case). Status rows: the action name, always installer_records.'
+        example: "{23170F69-40C1-2702-2604-000001000000}"
+        platforms: [windows]
+      - name: name
+        type: string
+        description: 'Record rows: the InstallProperties DisplayName value, empty when unset. Status rows: the completeness level. Values: supported, constrained (a registry read failed or a bound cut the read short), unsupported (macOS, Linux).'
+        example: "7-Zip 26.04 (x64 edition)"
+        platforms: [windows]
+      - name: version
+        type: string
+        description: 'Record rows: the DisplayVersion value, empty when unset. Status rows: the failure tokens, comma-joined, or "-" when none. Tokens read <os>:installer_records:<detail> (enum:<code>, row_cap, access_denied, profile_list_incomplete, msi_db:deadline, msi_db:busy), macos:no_windows_installer, linux:no_msi or msi_packages:exception (the action threw).'
+        example: "26.04.00.0"
+        platforms: [windows]
+      - name: publisher
+        type: string
+        description: 'Record rows only: the Publisher value, empty when unset.'
+        example: "Igor Pavlov"
+        platforms: [windows]
+      - name: install_date
+        type: string
+        description: 'Record rows only: the InstallDate value as recorded (normally YYYYMMDD), empty when unset.'
+        example: "20261017"
+        platforms: [windows]
+      - name: install_location
+        type: string
+        description: 'Record rows only: the InstallLocation value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder, `withheld:profile_list_incomplete` when the user-profile list could not be read in full, `withheld:path_unverifiable` when the path is off the path allow-list.'
+        example: "C:\\Program Files\\7-Zip\\"
+        platforms: [windows]
+      - name: install_source
+        type: string
+        description: 'Record rows only: the InstallSource value, empty when unset. `withheld:user_path` when it is under the user profiles directory or a registered user profile folder, `withheld:profile_list_incomplete` when the user-profile list could not be read in full, `withheld:path_unverifiable` when the path is off the path allow-list; a UNC source is reported as recorded only when its server and share are plain names and its share and path are not under a UNC profile root (a UNC root matches on share and path whatever the server).'
+        example: "C:\\ProgramData\\Package Cache\\"
+        platforms: [windows]
+      - name: local_package
+        type: string
+        description: 'Record rows only: the LocalPackage value, the cached package the Installer keeps for the product (normally under the Windows Installer directory), empty when unset; `withheld:user_path`, `withheld:profile_list_incomplete` or `withheld:path_unverifiable` as for the install location.'
+        example: "C:\\WINDOWS\\Installer\\1a2b3c.msi"
+        platforms: [windows]
+      - name: upgrade_code
+        type: string
+        description: 'Record rows only: the UpgradeCode Property of the cached package, braced and upper case. Empty when the package was not read or has none.'
+        example: "{23170F69-40C1-2702-2604-000000000000}"
+        platforms: [windows]
+      - name: db_product_code
+        type: string
+        description: 'Record rows only: the ProductCode Property of the cached package, braced and upper case. Empty when the package was not read. A value that differs from product_code carries the `product_code_mismatch` reason.'
+        example: "{23170F69-40C1-2702-2604-000001000000}"
+        platforms: [windows]
+      - name: db_version
+        type: string
+        description: 'Record rows only: the ProductVersion Property of the cached package, empty when the package was not read.'
+        example: "26.04.00.0"
+        platforms: [windows]
+      - name: db_manufacturer
+        type: string
+        description: 'Record rows only: the Manufacturer Property of the cached package, empty when the package was not read.'
+        example: "Igor Pavlov"
+        platforms: [windows]
+      - name: db_name
+        type: string
+        description: 'Record rows only: the ProductName Property of the cached package, empty when the package was not read.'
+        example: "7-Zip 26.04 (x64 edition)"
+        platforms: [windows]
+      - name: reason
+        type: string
+        description: 'Record rows only: why the row is incomplete, or "-". Values: package_missing, package_path_refused, package_unreadable:<code>, deadline_skipped, no_install_properties, install_properties_unreadable, no_local_package, product_code_mismatch.'
+        example: "-"
+        platforms: [windows]
+    aggregation:
+      groupBy:
+      # row_kind (autoruns.yaml precedent): a status row is its own group, never a bogus product named after the action.
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "Read Windows Installer records for machine-context products"
 
   gather:
     ttlSeconds: 300
