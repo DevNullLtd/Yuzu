@@ -18761,10 +18761,14 @@ TEST_CASE("Registry spark (real mechanism): a rename landing inside a verificati
 }
 
 // T5: R1 must not add a NAME-verdict fault to an ordinary delete-and-recreate of the watched
-// key, even when the re-creation changes the case of the leaf. The held query is read AFTER the
-// fresh one, so it answers STATUS_KEY_DELETED (undecided) rather than a case-only mismatch,
-// and the delete's own fire re-arms onto the new key. The path-level false fault of #7877
-// item 37 (the fresh open landing in the delete-to-recreate gap) is untouched and tolerated:
+// key, even when the re-creation changes the case of the leaf, and the watch must converge back
+// onto the new key every time. Ten rounds alternate the leaf case and END on the variant that
+// differs from the one the watch was armed on, so a committed name that a re-arm failed to
+// re-record would disagree with the held key's name during the closing hold and fault it
+// (the hold below runs verification at 20 ms). What it does NOT exercise: the STATUS_KEY_DELETED
+// answer of a held query read after a delete (no verification was seen to launch during
+// the churn on the rig; the by-name undecided table is the T8 case), and the path-level false fault of #7877 item 37 (a
+// fresh open landing in the delete-to-recreate gap), which is untouched and tolerated:
 // `verify_lost` is deliberately NOT asserted, only the name verdicts.
 TEST_CASE("Registry spark (real mechanism): deleting the watched key and re-creating it, even "
           "under a different case, adds no name-verdict fault (#7877 item 31)",
@@ -18777,15 +18781,26 @@ TEST_CASE("Registry spark (real mechanism): deleting the watched key and re-crea
         const auto fired0 = h.fired();
         const auto rsyn0 = h.counters().synthetic_fires;
         REQUIRE(::RegDeleteTreeA(HKEY_CURRENT_USER, rig.child.c_str()) == ERROR_SUCCESS);
-        REQUIRE(create_leaf(rig, (i % 2 == 0) ? "child" : "Child"));
+        REQUIRE(create_leaf(rig, (i % 2 == 0) ? "Child" : "child")); // ends on "child"
         // The delete signals the held handle; then the watch must settle back onto the new key.
         REQUIRE(eventually([&] { return h.fired() > fired0; }, kDeafBound));
         REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
         REQUIRE(write_fires(h, rig, static_cast<DWORD>(i + 1)));
     }
+    // The last write_fires is itself a change the watch consumes: every consumed notification
+    // is a coverage gap until the re-arm commits (on_fire marks None, the sweeper commits one or
+    // two passes later; 31 ms on the rig, 2026-11-25), so coverage read straight after it is
+    // None by design and proves nothing. Wait for that re-arm, then require the watch to STAY
+    // covered and unfaulted for a window with verification still running at 20 ms: a standing
+    // or recurring fault would show here, and a name verdict in the counters below.
+    REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
+                       kDeafBound));
+    const auto verifies0 = h.counters().verify_launched;
+    CHECK(stays_healthy(h, 300ms));
+    // The hold really ran verifications against the re-created key (it is not vacuous).
+    CHECK(h.counters().verify_launched >= verifies0 + 3);
     CHECK(h.counters().verify_name_lost == 0);
     CHECK(h.counters().verify_dup_failed == 0);
-    CHECK(h.all_notification());
     h.engine.stop();
 }
 
@@ -18946,8 +18961,9 @@ TEST_CASE("Registry spark (real mechanism): STATUS_HIVE_UNLOADED on the held han
 // T8 (e): the SECONDARY compare's CI-side oracle. The fresh key reports a name that differs
 // from the held key's real name (injected, status 0) while the held side is the real,
 // unmoved key: the path now names a DIFFERENT key (a user-hive class shadowing the machine
-// one, a re-pointed link). Whether NtQueryKey reports the underlying key through HKCR or a
-// link is UNVERIFIED on a rig; this case proves the compare and the reason, not that premise.
+// one, a re-pointed link). NtQueryKey through HKCR was measured to report the underlying
+// key's name (2026-11-25); a shadow appearing over a held key and a link re-point were not
+// driven, so this case proves the compare and the reason, not those two events.
 TEST_CASE("Registry spark (real mechanism): a fresh key whose name differs from the held key's "
           "faults the watch as 're-pointed' and the retry recovers (#7877 item 31)",
           "[spark][mechanism][windows][5719][7877]") {
@@ -19015,11 +19031,26 @@ TEST_CASE("Registry spark (real mechanism): a failed DuplicateHandle leaves the 
     std::this_thread::sleep_for(200ms);
     CHECK(h.counters().verify_dup_failed == failed);
     CHECK(h.counters().verify_name_undecided == undecided);
-    // ... and the name check catches a rename-plus-recreate again.
+    // ... and the name check catches a rename-plus-recreate again. The rename and the
+    // re-creation are two calls, so for about 0.4 ms between them the path genuinely names
+    // nothing, and a verification whose open lands there is rightly judged by the PATH verdict
+    // (the Ancestor row, which has precedence and its own reason). On Windows that is not a
+    // rare overlap: in the logged runs the rename began within tens of microseconds of the
+    // sweeper's pass (both appear to wake on the same coarse timer tick), so a rename-and-
+    // recreate made while verification runs at 20 ms hit the gap in 6 of 8 isolated runs and
+    // 28 of 40 runs with a random delay (rig, 2026-11-25).
+    // So verification is held off (60 s) across the two calls and then released, which is the
+    // order the other rename cases use; the by-name verdict is what is then decided, and its
+    // reason is asserted exactly.
+    h.apply(ctl(60s, false));
+    std::this_thread::sleep_for(100ms); // a verification already staged finishes
     REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
     REQUIRE(rig.create_child());
+    h.apply(ctl(20ms, false));
     CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
     CHECK(first_fault_reason(h) == kRegReasonMoved);
+    CHECK(h.counters().verify_name_lost >= 1);
+    CHECK(h.counters().verify_lost == 0); // the path resolved at every verification
     h.engine.stop();
 }
 
@@ -19135,11 +19166,23 @@ TEST_CASE("Registry spark (real mechanism): a verification refused by the probe 
 }
 
 // T11: a root-key watch (an EMPTY subkey) names a predefined root. It is never duplicated and
-// never name-compared (a predefined root cannot be renamed), so a verification is by path only:
-// it is launched, and is neither a name verdict nor counted as name-undecided (counting it
-// would drown the signal for the life of the watch).
-// The engine refuses an empty subkey at arm(), so the mechanism is driven directly; if the
-// mechanism refuses it too, the case skips and the skip is review-only.
+// never name-compared (a predefined root cannot be renamed), and counting it as name-undecided
+// would drown the signal for the life of the watch. What this case PROVES, and only this: once
+// the first verification of the root watch has been staged and launched, its staging took no
+// duplicate (no duplicate failure) and the watch recorded no fault and no missing-name count.
+// The name-verdict counters are asserted zero too, but they are NOT evidence about the verdict
+// side: a root-key verification never reaches resolve_verify_locked (below), so the
+// empty-subkey guards in name_verdict_locked are not exercised by this case.
+// What it does NOT prove, measured on the rig (build 26100, 2026-11-25): a root-key watch is
+// not verified REPEATEDLY, and its verification is never JUDGED. RegOpenKeyExW(HKCU, "")
+// returns the predefined pseudo-handle itself, so a verification's own RegNotifyChangeKeyValue
+// lands on the handle the live notify already uses and signals it; the verification is then
+// converted into the re-arm (resolve_verify_locked was never reached in 4 s), and each re-arm
+// commit closes the shared handle, which keeps the watch re-arming about every 30 ms with a
+// synthetic fire each time. With verification off the same watch stays quiet. That behaviour is
+// older than R1 and unreachable through the engine (it refuses an empty key), so it is recorded
+// here, not asserted. The mechanism is driven directly (the engine refuses an empty subkey at
+// arm()); if the mechanism refuses it too, the case skips and the skip is review-only.
 TEST_CASE("Registry spark (real mechanism): a root-key watch is verified by path only and is "
           "never counted as name-undecided (#7877 item 31)",
           "[spark][mechanism][windows][5719][7877]") {
@@ -19168,7 +19211,8 @@ TEST_CASE("Registry spark (real mechanism): a root-key watch is verified by path
     const auto counters = [&] {
         return registry_debug_counters_for_test(*mech).value_or(RegistryMechanismDebugCounters{});
     };
-    REQUIRE(eventually([&] { return counters().verify_launched >= 3; }, kDeafBound));
+    // One launch is all a root-key watch was observed to give (see the header).
+    REQUIRE(eventually([&] { return counters().verify_launched >= 1; }, kDeafBound));
     std::this_thread::sleep_for(300ms);
     const auto c = counters();
     CHECK(c.verify_name_undecided == 0);
@@ -19177,10 +19221,9 @@ TEST_CASE("Registry spark (real mechanism): a root-key watch is verified by path
     CHECK(c.verify_undecided == 0);
     CHECK(c.commit_name_missing == 0); // a root key is not "a watch that could not record one"
     CHECK(faults->load() == 0);
-    // Deliberately NOT asserted: whether a name was recorded. Whether the empty-subkey open
-    // returns the predefined pseudo-handle (NtQueryKey refuses it) or a new real handle to the
-    // same key (NtQueryKey names it) is a Win32 detail this case does not depend on: row 8
-    // is only that a root-key watch is never duplicated, compared or counted as undecided.
+    // Deliberately NOT asserted: whether a name was recorded (the open returns the predefined
+    // pseudo-handle and NtQueryKey answers STATUS_INVALID_HANDLE for it, so none is) and the
+    // number of verifications or re-arms (see the header).
     mech->stop();
 }
 

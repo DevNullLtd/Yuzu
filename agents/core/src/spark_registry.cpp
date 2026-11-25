@@ -82,9 +82,12 @@
  *     merged view, so a user-hive key appearing later changes what the path resolves
  *     to, and a registry link re-pointed to another target is the same class (the
  *     verification open follows links): the fresh-versus-held compare is built to
- *     catch both, but that rests on NtQueryKey reporting the underlying key's name
- *     through HKCR or a link, which no rig case has verified, so treat both as
- *     residual until one does;
+ *     catch both. Measured on the rig (2026-11-25): NtQueryKey on a key opened through
+ *     HKCR reports the underlying key's canonical name (a per-user `_Classes` key where
+ *     one exists, a machine `SOFTWARE\Classes` key otherwise), not an HKCR spelling.
+ *     NOT observed: a per-user key appearing over a machine one while a watch is held,
+ *     and a registry link re-pointed (the link case rests on the same reporting), so
+ *     treat both as residual until a rig case drives them;
  *     every watch commits at about the same time at startup, so a large fleet of
  *     watches launches its verifications together (probe lane cap, refusals
  *     defer without demoting coverage); a registry open that hangs pins one slot
@@ -1725,8 +1728,10 @@ private:
     ///      the path now resolves to a DIFFERENT key object while the held key did not
     ///      move (a user-hive HKCR class key shadowing the machine one, a registry link
     ///      re-pointed). Its window is a shadowing landing between the fresh open and the
-    ///      fresh-name query, which the next sample catches. Premise UNVERIFIED on a rig:
-    ///      that NtQueryKey reports the underlying key's name through HKCR or a link.
+    ///      fresh-name query, which the next sample catches. Measured on a rig
+    ///      (2026-11-25): NtQueryKey through HKCR reports the underlying key's name (per-user
+    ///      `_Classes` or machine `SOFTWARE\Classes`); the shadowing and link re-point
+    ///      themselves were not driven.
     ///      Fault: re-pointed.
     ///   5. Otherwise, not ok (open or notify refused, hook or probe threw): undecided.
     ///      The watch keeps its handle and is NOT faulted (an unreadable path is not
@@ -1815,9 +1820,14 @@ private:
 
     /// Take the duplicate of the held handle for the verification job just staged as
     /// `work.probe_launches.back()`, under mu_ (#7877 item 31, R1). Only for a non-root
-    /// watch (an empty subkey names a predefined root, which cannot be renamed; whether the
-    /// handle the open returns for an empty subkey is a pseudo-handle is not established,
-    /// and the skip does not depend on it).
+    /// watch (an empty subkey names a predefined root, which cannot be renamed). Measured on
+    /// the rig (build 26100, 2026-11-25, #7877 R1): RegOpenKeyExW(HKCU, HKLM, HKCR or HKU,
+    /// empty or null subkey) returns the predefined pseudo-handle itself (the same value),
+    /// and NtQueryKey on it answers STATUS_INVALID_HANDLE (0xC0000008), so there is no name
+    /// to read. A second RegNotifyChangeKeyValue on that shared handle signalled the first
+    /// notify's event in a standalone probe, so a verification of a root-key watch converts
+    /// to a re-arm instead of being judged (test T11 records the observation; the engine
+    /// refuses an empty key, so only a direct caller of the mechanism can arm one).
     ///
     /// Why under mu_ and not off-lock: under mu_ the watch is in watches_, so it cannot be
     /// retired or drained, and `open_key` is the handle this watch owns at this instant.
