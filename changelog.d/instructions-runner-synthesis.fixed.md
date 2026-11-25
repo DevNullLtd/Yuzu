@@ -3,5 +3,6 @@
   directory and text file. Rows that cannot succeed honestly are skipped with a recorded reason,
   never passed: `agent.http_client.get`/`head` (the plugin SSRF-blocks every offline target),
   `echo.configure` (any synthesised value would overwrite each reached agent's Echo byte budget),
+  `windows.rdp.set_state` (the synthesised `enable` would turn remote desktop on),
   and `network_actions.ping`/`flush_dns` only when `YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1` is set by a
   rig that lacks sudo or raw sockets. Verdict grading is unchanged.

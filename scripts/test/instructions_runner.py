@@ -30,10 +30,10 @@ and gate_notes):
                     dispatch (no override entry, required parameter missing,
                     server.* row, not eligible on the target's OS), a definition
                     whose host platforms exclude this host, or a row skipped by name
-                    (named_skip_reason: agent.http_client.get/head always,
-                    crossplatform.echo.configure always, network_actions.ping/flush_dns
-                    only with YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1); the reason is the
-                    row's note
+                    (named_skip_reason: agent.http_client.get/head,
+                    crossplatform.echo.configure and windows.rdp.set_state always;
+                    network_actions.ping/flush_dns only with
+                    YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1); the reason is the row's note
   error             internal runner error (network, JSON parse, etc.) -
                     distinct from `fail` so flake-watching can separate
                     "instruction broken" from "test infra broken"
@@ -978,11 +978,19 @@ _PRIVILEGED_SKIPS = frozenset({"device.network_actions.ping", "device.network_ac
 SKIP_PRIVILEGED_ENV = "YUZU_INSTRUCTIONS_SKIP_PRIVILEGED"
 
 # A mutating row whose only synthesisable value is a REAL write to every reached agent's own
-# configuration. echo.configure takes one optional setting per call and the runner sends the first
-# property when none is required, so it would overwrite each agent's Echo database byte budget; a
-# value that is a no-op is the agent's CURRENT one, which the runner cannot know without a
-# read-then-write step this runner does not have.
-_UNSAFE_TO_SYNTHESISE = frozenset({"crossplatform.echo.configure"})
+# configuration or security posture, so there is no value that is safe to invent. Each takes one
+# optional setting (or one required state) per call and the runner would send it to every reached
+# agent: echo.configure would overwrite each agent's Echo database byte budget (a no-op value is the
+# agent's CURRENT one, which the runner cannot know without a read-then-write step it does not
+# have), and windows.rdp.set_state would be sent `enable`, turning remote desktop on.
+_UNSAFE_TO_SYNTHESISE = {
+    "crossplatform.echo.configure":
+        "any synthesised value is a real write of each reached agent's Echo byte budget "
+        "(lowering it deletes history for good); needs the agent's current value",
+    "windows.rdp.set_state":
+        "the synthesised state `enable` would turn remote desktop on for every reached "
+        "Windows agent; the runner has no safe value to send",
+}
 
 
 def named_skip_reason(def_id: str, environ: dict[str, str] | None = None) -> str:
@@ -992,8 +1000,7 @@ def named_skip_reason(def_id: str, environ: dict[str, str] | None = None) -> str
         return ("needs a public host: the plugin SSRF-blocks private, loopback and unresolvable "
                 "targets, so no synthesised URL can succeed")
     if def_id in _UNSAFE_TO_SYNTHESISE:
-        return ("any synthesised value is a real write of each reached agent's Echo byte budget "
-                "(lowering it deletes history for good); needs the agent's current value")
+        return _UNSAFE_TO_SYNTHESISE[def_id]
     if def_id in _PRIVILEGED_SKIPS and env.get(SKIP_PRIVILEGED_ENV, "") == "1":
         return (f"{SKIP_PRIVILEGED_ENV}=1: this run lacks the host privileges the "
                 "action needs (sudo NOPASSWD grant / cap_net_raw)")

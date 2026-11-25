@@ -98,6 +98,9 @@ class ContractShapedParameters(unittest.TestCase):
         self.assertIsNone(ir._contract_string("db_budget_bytes"))
         self.assertIn("Echo byte budget", ir.named_skip_reason("crossplatform.echo.configure", {}))
 
+    def test_rdp_set_state_is_skipped_by_name_not_sent_enable(self):
+        self.assertIn("remote desktop", ir.named_skip_reason("windows.rdp.set_state", {}))
+
     def test_contract_rules_match_exact_names_only(self):
         for name in ("from_date", "xfrom", "From", "to_address", "tool", "total", "since"):
             with self.subTest(name=name):
@@ -147,7 +150,7 @@ class NamedSkips(unittest.TestCase):
         skipped = {d.id for d in ir.load_definitions(ROOT / "content" / "definitions", {})
                    if ir.named_skip_reason(d.id, env)}
         self.assertEqual(skipped, {"agent.http_client.get", "agent.http_client.head",
-                                   "crossplatform.echo.configure",
+                                   "crossplatform.echo.configure", "windows.rdp.set_state",
                                    "device.network_actions.ping", "device.network_actions.flush_dns"})
 
     def test_an_empty_environ_argument_is_honoured_not_replaced_by_the_process_one(self):
