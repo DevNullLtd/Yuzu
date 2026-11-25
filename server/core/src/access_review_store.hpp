@@ -44,7 +44,7 @@
 /// Three tables (schema-qualified at runtime, unqualified in the migration —
 /// the runner sets `search_path` for the migration transaction):
 ///   * access_review_campaign    — one row per opened review campaign.
-///   * access_review_attestation — one row per (campaign, principal, role, scope)
+///   * access_review_attestation: one row per (campaign, principal, role, scope)
 ///     grant frozen at open; PK is the full 5-tuple (schema v4 added `scope_group_id`,
 ///     `''` = fleet-wide, else a management group's id) so a decision can only
 ///     ever be recorded against a grant that was actually in the frozen

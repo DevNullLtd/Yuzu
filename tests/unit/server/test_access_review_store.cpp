@@ -2308,7 +2308,7 @@ std::string hist_insert_sql(const std::string& cid, const std::string& scope, in
 
 TEST_CASE("schema v4: the same principal and role at fleet scope and on two groups freeze as "
           "distinct pending rows, in scope-id order",
-          "[access_review][store][pg][scope]") {
+          "[access_review][store][pg][6969]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AccessReviewStore store{pool};
@@ -2345,7 +2345,7 @@ TEST_CASE("schema v4: the same principal and role at fleet scope and on two grou
 }
 
 TEST_CASE("schema v4: decisions on each scope's row count, chain and read back independently",
-          "[access_review][store][pg][scope]") {
+          "[access_review][store][pg][6969]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AccessReviewStore store{pool};
@@ -2435,7 +2435,7 @@ TEST_CASE("schema v4: decisions on each scope's row count, chain and read back i
 }
 
 TEST_CASE("schema v4: a group row round-trips: decide, replace, history of two, previous chain",
-          "[access_review][store][pg][scope]") {
+          "[access_review][store][pg][6969]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AccessReviewStore store{pool};
@@ -2474,7 +2474,7 @@ TEST_CASE("schema v4: a group row round-trips: decide, replace, history of two, 
 
 TEST_CASE("schema v4: a wrong scope is not_found; an over-long or NUL scope is bad_request at "
           "attest and at open_campaign, and nothing is written",
-          "[access_review][store][pg][scope]") {
+          "[access_review][store][pg][6969]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AccessReviewStore store{pool};
@@ -2536,7 +2536,7 @@ TEST_CASE("schema v4: a wrong scope is not_found; an over-long or NUL scope is b
 
 TEST_CASE("schema v4: the reviewer-differs-from-subject rule holds on a group row, in the store "
           "and in the database",
-          "[access_review][store][pg][scope]") {
+          "[access_review][store][pg][6969]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AccessReviewStore store{pool};
@@ -2576,7 +2576,7 @@ TEST_CASE("schema v4: the reviewer-differs-from-subject rule holds on a group ro
 }
 
 TEST_CASE("schema v4 guards: scope is part of every history-to-state comparison",
-          "[access_review][store][pg][scope]") {
+          "[access_review][store][pg][6969]") {
     YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AccessReviewStore store{pool};
@@ -2781,7 +2781,7 @@ std::string triggers_of(PGconn* c) {
 
 TEST_CASE("schema v4: a populated v3 database upgrades with every row fleet-wide and every "
           "guard intact (A7a)",
-          "[access_review][store][pg][migration][scope]") {
+          "[access_review][store][pg][migration][6969]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     seed_v3_database(db.dsn());
     V3Facts before;
@@ -2878,7 +2878,7 @@ TEST_CASE("schema v4: a populated v3 database upgrades with every row fleet-wide
 
 TEST_CASE("schema v4: a failure on v4's LAST statement rolls back everything v4 did, and the store "
           "then reaches v4 once the cause is removed (A7b)",
-          "[access_review][store][pg][migration][scope]") {
+          "[access_review][store][pg][migration][6969]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     seed_v3_database(db.dsn());
     V3Facts before;
@@ -2907,6 +2907,9 @@ TEST_CASE("schema v4: a failure on v4's LAST statement rolls back everything v4 
         AccessReviewStore store{pool};
         log.stop();
         CHECK_FALSE(store.is_open());
+        // It failed at the LAST statement (the one adding the named constraint), not earlier: the
+        // database's message names the planted constraint, so everything before it had run.
+        CHECK(log.text().find("access_review_history_grant_fk") != std::string::npos);
     }
 
     {

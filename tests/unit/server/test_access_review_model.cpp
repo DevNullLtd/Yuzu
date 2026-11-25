@@ -866,7 +866,7 @@ TEST_CASE("freeze_population: empty input yields no grants", "[access_review][mo
 // name is APPENDED), the engine owner included, and a fleet-wide row freezes the empty scope.
 TEST_CASE("freeze_population: the scope id is carried into each GrantRef and the group name into "
           "the snapshot",
-          "[access_review][model][freeze][scope]") {
+          "[access_review][model][freeze][6969]") {
     auto fleet = freeze_row("user", "alice", "Alice", "", {"Operator"}, 3, 0, "n/a", "", "active",
                             "local");
     auto grp = freeze_row("user", "alice", "Alice", "", {"Operator", "Viewer"}, 3, 0, "n/a", "",
@@ -911,7 +911,7 @@ TEST_CASE("freeze_population: the scope id is carried into each GrantRef and the
 }
 
 TEST_CASE("scope_kind and the scope id bound are one definition for every surface",
-          "[access_review][model][scope]") {
+          "[access_review][model][6969]") {
     CHECK(yuzu::server::scope_kind("") == "fleet");
     CHECK(yuzu::server::scope_kind("g-1") == "management_group");
     CHECK(yuzu::server::scope_kind("000000000000") == "management_group");
