@@ -21,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "file_search_extents.hpp"
+#include "file_search_request.hpp"
 #include "file_search_rows.hpp"
 #include "file_search_state.hpp"
 #include "file_search_volumes.hpp"
@@ -260,6 +261,38 @@ TEST_CASE("file_search rows: the user-directory tag per OS", "[file_search][file
     CHECK(std::string(to_token(Scope::system)) == "system");
 }
 
+TEST_CASE("file_search rows: the Windows user tag in both label forms", "[file_search][file_search_rows]") {
+    const std::string vol = "/Volume{0f1e2d3c-1111-2222-3333-44445555aabb}";
+    for (const std::string& base : {std::string("/C:"), vol}) {
+        INFO(base);
+        CHECK(is_user_profile_path(base + "/Users/alice", Os::windows));
+        CHECK(is_user_profile_path(base + "/Users/alice/Desktop/x.txt", Os::windows));
+        for (const char* shared : {"Public", "Default", "Default User", "All Users"})
+            CHECK_FALSE(is_user_profile_path(base + "/Users/" + shared, Os::windows));
+        CHECK_FALSE(is_user_profile_path(base + "/Windows", Os::windows));
+        CHECK_FALSE(is_user_profile_path(base + "/Users", Os::windows));
+    }
+    CHECK(is_user_profile_path("/c:/users/ALICE", Os::windows)); // ASCII-case-insensitive
+    CHECK_FALSE(is_user_profile_path("/C:/users/PUBLIC", Os::windows));
+    CHECK_FALSE(is_user_profile_path("/Users/alice", Os::windows)); // the first component is the volume
+}
+
+TEST_CASE("file_search rows: under_user_root is on a component boundary and folds ASCII only",
+          "[file_search][file_search_rows]") {
+    const std::vector<std::string> roots = {"/C:/Profiles/alice", "/D:/Staff"};
+    CHECK(under_user_root("/C:/Profiles/alice", roots));
+    CHECK(under_user_root("/C:/Profiles/alice/x/y.txt", roots));
+    CHECK(under_user_root("/c:/profiles/ALICE/x", roots));   // ASCII fold
+    CHECK(under_user_root("/D:/Staff/b", roots));
+    CHECK_FALSE(under_user_root("/C:/Profiles/alicex", roots)); // a sibling prefix is not it
+    CHECK_FALSE(under_user_root("/C:/Profiles", roots));
+    CHECK_FALSE(under_user_root("/E:/Profiles/alice", roots));
+    CHECK_FALSE(under_user_root("/C:/Profiles/al\xc3\xaf" "ce", roots)); // no non-ASCII folding
+    CHECK_FALSE(under_user_root("/C:/anything", {}));                   // no roots: nothing is one
+    const std::vector<std::string> empty_root = {""};
+    CHECK_FALSE(under_user_root("/C:/anything", empty_root)); // an empty prefix never matches everything
+}
+
 TEST_CASE("file_search rows: a gap path over the bound is counted, never emitted",
           "[file_search][file_search_rows]") {
     CHECK(gap_path_fits(std::string(kMaxGapPathBytes, 'a')));
@@ -290,10 +323,26 @@ TEST_CASE("file_search constants: the named budgets hold the values of the plan"
     CHECK(kSliceRowBytes == 8u * 1024 * 1024);
     CHECK(kMaxGapPathBytes == 1'024);
     CHECK(kMaxMatchesPerDirectory == 500);
+    CHECK(kMaxMatchRowBytes == 192u * 1024);
     CHECK(kMaxExtents == 32);
     CHECK(kMaxAbandoned == 2);
     CHECK(kMaxLineages == 32);
     CHECK(kMaxRootBytes == 4'096);
     CHECK(kMaxVolumePathBytes == 4'096);
     CHECK(kMaxFstypeBytes == 64);
+}
+
+TEST_CASE("file_search constants: the raised bounds and the relations that tie them together",
+          "[file_search][file_search_rows]") {
+    // 255 UTF-16 units are at most 765 UTF-8 bytes; every bound derived from the longest name moves with it.
+    static_assert(fsr::kMaxNameBytes == 765);
+    static_assert(fsr::kMaxCursorTokenBytes == 65'408);
+    static_assert(fsr::kMaxPositionDepth == 61);
+    static_assert(fsr::kMaxCanonicalNameBytes >= fsr::kMaxNameBytes);
+    static_assert(kMaxRequestCursorBytes == fsr::kMaxCursorTokenBytes + 128);
+    static_assert(kMaxRequestCursorBytes == 64u * 1024); // the server's limit on one instruction parameter
+    static_assert(3 * (kMaxRootBytes + (fsr::kMaxPositionDepth + 1) * (fsr::kMaxNameBytes + 1)) + 512 <= kMaxMatchRowBytes);
+    CHECK(fsr::kMaxNameBytes == 765);
+    CHECK(fsr::kMaxCursorTokenBytes == 65'408);
+    CHECK(yuzu::component_inventory::kMaxOrderedRetainedBytes == 48u * 1024 * 1024);
 }

@@ -1079,8 +1079,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "leaf-name pattern: names, types, sizes, times and the extents of every matched file; "
          "matched files are opened and never read and no file content is read or hashed. One call is one slice: "
          "repeat with the cursor row until a slice answers without one, and read the coverage row "
-         "(an empty result is never confusable with a partial or failed one). Linux and macOS, "
-         "Windows is planned; read-only, default-off, AdminOrApproval; stored results are "
+         "(an empty result is never confusable with a partial or failed one). Linux, macOS and "
+         "Windows (fixed volumes, walk and extents only); read-only, on by default, AdminOrApproval; stored results are "
          "readable only with Forensics:Read; busy, timed_out, rejected, no_progress retryable "
          "on the same cursor; bad_cursor, max_slices, mount_table_changed terminal; each slice "
          "is its own dispatch, and a non-admin on the supervised MCP tier needs ONE approval "
@@ -1311,14 +1311,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"component_inventory.scan",
          "List Java archives (.jar/.war/.ear) and the libraries nested one level inside them "
          "under the machine-wide application roots, with name, version, version source, path, "
-         "size and anchor application (Linux and macOS; Windows planned; read-only, no "
+         "size and anchor application (Linux, macOS and Windows; read-only, no "
          "subprocess, machine roots only)"},
         {"component_inventory.native",
-         "List versioned shared libraries (ELF .so on Linux, Mach-O .dylib on macOS) shipped "
-         "inside applications under the machine-wide application roots, with name, version, "
-         "version source, path, size and anchor application, at most 5,000 rows (Linux and "
-         "macOS; Windows planned; read-only, no subprocess; package-owned trees are not read; "
-         "switched off until an operator enables it)"},
+         "List versioned shared libraries (ELF .so on Linux, Mach-O .dylib on macOS, PE .dll "
+         "on Windows) shipped inside applications under the machine-wide application roots, "
+         "with name, version, version source, path, size and anchor application, at most "
+         "5,000 rows (Linux, macOS and Windows; read-only, no subprocess; package-owned trees "
+         "are not read; switched off until an operator enables it)"},
         {"component_inventory.python",
          "List installed Python distributions (the METADATA, PKG-INFO or .egg-info file of each) "
          "under the machine-wide Python roots, with name, version, version source, path, size "
@@ -1347,7 +1347,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // middleware
         {"middleware.ibm_mq",
          "List installed IBM MQ installations by version and install path from installer metadata "
-         "(Linux: mqinst.ini + swidtag names; no subprocess; Windows and macOS planned)"},
+         "(Linux: mqinst.ini + swidtag names; Windows: registry Installation subkeys; no "
+         "subprocess; macOS planned)"},
         // storage
         {"storage.set", "Store a key-value pair in persistent storage"},
         {"storage.get", "Retrieve a value by key from persistent storage"},

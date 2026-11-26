@@ -26,11 +26,14 @@
 
 namespace yuzu::shared::file_search {
 
-// The longest directory-entry name a Position can hold (the POSIX NAME_MAX). A longer name that a
-// filesystem allows (255 UTF-16 units can be 765 UTF-8 bytes on HFS-family and Windows volumes) is
-// never placed in a Position: the walker reports it as a `name_too_long` gap instead.
-inline constexpr std::size_t kMaxNameBytes = 255;
-inline constexpr std::size_t kMaxPositionDepth = 64;
+// The longest directory-entry name a Position can hold: 765 bytes, the UTF-8 form of the longest name
+// a Windows or HFS-family volume allows (255 UTF-16 units, at most 3 bytes each); it also covers the
+// POSIX NAME_MAX of 255. A longer name is never placed in a Position: the walker reports it as a
+// `name_too_long` gap instead.
+inline constexpr std::size_t kMaxNameBytes = 765;
+// The deepest directory a Position names (a deeper one is a `depth` gap). 61 is the deepest position of
+// kMaxNameBytes names that fits kMaxCursorTokenBytes (62 needs 65,824 against 65,408): file_search_cursor.hpp.
+inline constexpr std::size_t kMaxPositionDepth = 61;
 
 enum class GapCause {
     depth,
@@ -42,11 +45,15 @@ enum class GapCause {
     permission_denied,
     dataless,
     private_namespace,
-    // an entry whose name a Position cannot hold (valid_component false: over kMaxNameBytes, or
-    // holding '/' or NUL): not searched
+    // an entry whose name a Position cannot hold or the search cannot carry: valid_component false (over
+    // kMaxNameBytes, or holding '/' or NUL), a Windows name that cannot round-trip UTF-8, or a name too
+    // long to compare or to fit a result row: not searched
     name_too_long,
     // matches in one directory beyond the per-directory cap of one slice were not reported
-    match_cap
+    match_cap,
+    // an entry whose reparse tag is not one the leg understands (or a directory whose kind the leg will
+    // not enter): not searched
+    reparse_unknown
 };
 
 [[nodiscard]] constexpr const char* to_token(GapCause c) noexcept {
@@ -73,6 +80,8 @@ enum class GapCause {
         return "name_too_long";
     case GapCause::match_cap:
         return "match_cap";
+    case GapCause::reparse_unknown:
+        return "reparse_unknown";
     }
     return "unknown";
 }
@@ -109,7 +118,7 @@ struct Position {
     return (dev != 0 && dev != later_dev) || (id != 0 && id != later_id);
 }
 
-/// One directory-entry name: 1..255 bytes, no NUL, no '/', not "." or "..".
+/// One directory-entry name: 1..kMaxNameBytes bytes, no NUL, no '/', not "." or "..".
 [[nodiscard]] inline bool valid_component(std::string_view s) noexcept {
     if (s.empty() || s.size() > kMaxNameBytes || s == "." || s == "..")
         return false;

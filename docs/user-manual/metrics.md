@@ -1990,7 +1990,9 @@ This is the one worked recipe; other pages link here.
    something this page promises, so revoke it yourself when the account goes.
 
 A scraper that cannot read the file or sends a wrong token is answered `401`,
-`up{job="yuzu-server"}` is 0 and `YuzuServerMetricsScrapeDown` fires. Verify:
+`up{job="yuzu-server"}` is 0 and `YuzuServerMetricsScrapeDown` fires. A `401` is also what a
+scrape gets while the server cannot read its token store, so check the server's health and log
+before concluding the token has expired. Verify:
 `curl -sS -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $(cat /etc/prometheus/yuzu-metrics-token)" https://yuzu.example.com:8443/metrics`
 must print `200` (add `--cacert <ca>` for a verified connection, or `-k` for a self-signed lab certificate).
 

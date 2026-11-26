@@ -3765,13 +3765,22 @@ TEST_CASE("Groups integration: sec-L3 caps over HTTP — oversized displayName o
     CHECK(json::parse(get_res->body)["displayName"] == "CapsGroup");
 }
 
+// Client read timeout for the tests that PATCH or POST against a group already holding
+// kMaxGroupMembers (5000) members. Measured on the nightly ASan leg: one of these cases took
+// 2.2 s start to finish (5000-row seeding included) on a quiet night, and its sibling took 7.4 s
+// on the night the 5 s read timeout expired. That turned a slow runner into a null response
+// (`REQUIRE(res)` failing with no HTTP status to look at) instead of the 400 the test is about.
+// This is a liveness bound on the client, not a property under test, so a longer one weakens no
+// assertion.
+constexpr int kBigGroupReadTimeoutSecs = 30;
+
 TEST_CASE("Groups integration: sec-L3/#7 member cap over HTTP — >5000 members 400s + denied",
           "[pg][scim][routes][integration][groups][caps][members]") {
     ScimIntegrationServer ts;
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
     cli.set_connection_timeout(5);
-    cli.set_read_timeout(5);
+    cli.set_read_timeout(kBigGroupReadTimeoutSecs);
     httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
 
     // The cap check runs BEFORE any per-member resolution, so a synthetic
@@ -4214,7 +4223,7 @@ TEST_CASE("Groups integration: PATCH rejected by the member cap must not commit 
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
     cli.set_connection_timeout(5);
-    cli.set_read_timeout(5);
+    cli.set_read_timeout(kBigGroupReadTimeoutSecs);
     httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
 
     auto member_id = create_scim_user_over_wire(cli, ts.token, "admin_member");
@@ -4422,7 +4431,7 @@ TEST_CASE("Groups integration: PATCH with bogus removes cannot buy cap headroom 
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
     cli.set_connection_timeout(5);
-    cli.set_read_timeout(5);
+    cli.set_read_timeout(kBigGroupReadTimeoutSecs);
     httplib::Headers hdr{{"Authorization", "Bearer " + ts.token}};
 
     auto group_post = cli.Post("/scim/v2/Groups", hdr, R"({"displayName":"BigGroup"})",

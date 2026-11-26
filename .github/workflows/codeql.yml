@@ -230,10 +230,11 @@ jobs:
     # green unless the skip is surfaced) or a query-filters exclude in
     # codeql-config.yml (drops that query on both legs and requires
     # updating scripts/ci/test_runner_health_check.py's pin of exactly two
-    # excludes) — not another bump. #6873 tracks the same incident and
-    # proposes further knobs not covered here (an explicit `threads:`/`ram:`
-    # on the init step — the action autodetects the whole 64-CPU host while
-    # each runner is pinned to 16 CPUs — and a Windows-specific budget).
+    # excludes) — not another bump. #6873 tracks the same incident. The
+    # explicit `threads:`/`ram:` cap on the init step is now set per leg in
+    # the matrix below (`codeql_ram`/`codeql_threads`); a Windows-specific
+    # budget and the cpp/overrun-write question are still open there. If the
+    # slowdown is the cap itself, see the matrix comment on `codeql_ram`.
     #
     # Scheduled runs execute the DEFAULT-branch copy of this file, so this
     # value takes effect only once it reaches main. Measure with a
@@ -262,6 +263,22 @@ jobs:
             category: "/language:c-cpp-linux"
             languages: "c-cpp,actions"
             disk_min_gb: 40
+            # CodeQL resource caps, passed to the init step (which the analyze step
+            # inherits). Without them the action autodetects the WHOLE host: the
+            # 2026-10-21 to 11-01 runs logged `finalize --threads=64 --ram=239468` on a
+            # runner pinned to 16 CPUs (#6873), and on 2026-11-23 the evaluator's java
+            # process reached 141 GB RSS on the 246 GB shared Big Tam box, was
+            # OOM-killed, and took the co-hosted runner-0 service down with it.
+            # 49152 MB is a quarter of the host
+            # (one of four runners) less headroom for the other three jobs' compiles. It
+            # is a judgement, not a derived bound: nobody has measured what these queries
+            # need. `--ram` bounds the evaluator's heap, not its total RSS and not a cgroup
+            # limit, so this reduces the blast radius but is not a hard cap. If a main
+            # workflow_dispatch shows an evaluator out-of-memory error, or a leg nearing
+            # its timeout that the log ties to heap pressure, raise it in steps rather
+            # than removing it.
+            codeql_ram: "49152"
+            codeql_threads: "16"
             shell: bash
           - os: windows
             # yuzu-weetam-windows pin — successor to the retiring Shulgi
@@ -286,6 +303,11 @@ jobs:
             # actions.
             languages: "c-cpp"
             disk_min_gb: 45
+            # Threads only: the runner is pinned to 16 CPUs (YUZU_BUILD_JOBS) but the
+            # action autodetects the 64-CPU host (#6873). No ram cap here: the Wee Tam
+            # memory budget was not checked, and an empty value leaves the action default.
+            codeql_ram: ""
+            codeql_threads: "16"
             # The default `shell: bash` on a self-hosted Windows runner
             # resolves to C:\Windows\system32\bash.EXE which is WSL
             # bash. WSL refuses to run as LOCAL SYSTEM (the runner's
@@ -494,6 +516,9 @@ jobs:
           # Scope the scan to first-party code; see the config file for
           # the list of vendored/generated paths that are excluded.
           config-file: ./.github/codeql/codeql-config.yml
+          # See the matrix comment: an explicit cap instead of the autodetected whole host.
+          ram: ${{ matrix.codeql_ram }}
+          threads: ${{ matrix.codeql_threads }}
 
       - name: Configure (Meson debug) — linux
         if: matrix.os == 'linux'

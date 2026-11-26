@@ -54,6 +54,15 @@
 /// the marker of a typed value hashes its JSON text, so the same secret sent as a string and as
 /// a number binds two different markers (a recall must repeat the original argument exactly). A
 /// `url` string value has only its userinfo (`user:pass@`) replaced by the same kind of marker.
+///
+/// KEY-SPELLING RESIDUAL (recorded, not a defect today): a key matches only when its bytes equal a
+/// listed name exactly, in lower case. `Secret`, `clientSecret`, `client-secret`, `password` and
+/// `token` are NOT matched, nor is a key that merely contains a listed name. No shipped
+/// approval-gated tool or definition carries a secret under any of those spellings, so nothing
+/// shipped leaks, but a custom definition may name a parameter `password` or `token`, and a new
+/// secret-carrying parameter or tool argument must be added to the list under the exact name it
+/// is sent as (`tests/unit/server/test_sensitive_instruction_params.cpp` pins this rule), and
+/// widening the matcher itself (case folding, separators, substrings) is a security decision.
 
 ///
 /// A SECOND list, `kUnretainedInstructionParamKeys`, holds parameters that are NOT secrets but are

@@ -14,6 +14,12 @@
  * the volume is searched again. At most kMaxAbandoned workers are recorded: with that many still blocked
  * every search answers busy until one returns.
  *
+ * BLOCKED VOLUME QUERIES. The Windows shell asks the system about a volume inside a bounded call, and a call
+ * that times out leaves its thread blocked. BlockedQueries records it (the same {key, done flag} record,
+ * keyed by the volume's spelling because the query is made before the volume's identity is known) so the
+ * shell does not ask again while it is blocked: one blocked query per volume spelling at most, and another
+ * volume is unaffected. No cap of its own: one entry per real spelling is the bound.
+ *
  * STALL COUNT. record_slice (file_search_governor.hpp) counts consecutive non-advancing attempts on ONE
  * cursor. The count is held here, per lineage (the cursor's query hash, sequence and generation), so the
  * agent is the holder and a caller needs no counter. The map is bounded; the oldest lineage is evicted,
@@ -30,6 +36,7 @@
 #include <file_search_cursor.hpp>
 #include <file_search_governor.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -52,8 +59,30 @@ using DoneFlag = std::shared_ptr<std::atomic<bool>>;
 [[nodiscard]] inline DoneFlag make_done_flag() { return std::make_shared<std::atomic<bool>>(false); }
 
 struct Abandoned {
-    std::string volume; // the volume key (Unit::key in file_search_volumes.hpp)
+    std::string volume; // the volume key (Unit::key in file_search_volumes.hpp); a blocked query's volume spelling
     DoneFlag done;      // set by the abandoned worker, and only by it, when it returns
+};
+
+/// Volume queries that timed out and have not returned, one per volume spelling. Touched only by the pool
+/// thread that holds the slice slot; a blocked query thread sets only its own done flag.
+class BlockedQueries {
+public:
+    /// True while a query for `volume` has not returned. Forgets every one that has.
+    [[nodiscard]] bool blocked(const std::string& volume) {
+        std::erase_if(entries_, [](const Abandoned& a) { return a.done->load(std::memory_order_acquire); });
+        return std::ranges::any_of(entries_, [&](const Abandoned& a) { return a.volume == volume; });
+    }
+
+    /// Records a query left blocked in `volume`; nothing when it has already returned or when one is already
+    /// recorded for that volume.
+    void add(std::string volume, DoneFlag done) {
+        if (!done || done->load(std::memory_order_acquire) || blocked(volume))
+            return;
+        entries_.push_back({std::move(volume), std::move(done)});
+    }
+
+private:
+    std::vector<Abandoned> entries_;
 };
 
 /// The cursor a slice resumed from: what its stall count belongs to.
