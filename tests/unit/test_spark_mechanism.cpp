@@ -18551,7 +18551,6 @@ struct SweeperFirst {
 ///     ordinary re-arm, which gets the confirming read, so `commit_capture_retry` is now >= 1
 ///     here (it was 0). What this still pins is unchanged: no fault, the real 0xC000017C seen
 ///     on the held key's object, no name verdict, and the watch converges.
-
 ///   sweeper first : the sweep hook forces the sweeper to take the worker's result before
 ///     the delete's callback can run (see SweeperFirst): the held query is the by-name
 ///     undecided row, `verify_name_undecided` goes 0 to 1.
@@ -20551,8 +20550,8 @@ TEST_CASE("Registry spark (real mechanism): an unreadable held name hides a rena
 // instead of being committed; a watch that recorded no name warns at its first verification; a
 // deferred commit warns once per episode; and the per-watch warn claim is identity-checked by a
 // serial. The same rules as above apply: salted keys, RAII cleanup, hook state by shared_ptr,
-// skip_or_fail_registry for a missing privilege. None of these cases was built or run on
-// Windows in the session that wrote them.
+// skip_or_fail_registry for a missing privilege.
+// RIG RESULT FOR THE FIX-ROUND TESTS: pending
 
 namespace {
 /// Makes the CONFIRMING read of a commit disagree, by call sequence: every probe that commits a
@@ -20589,6 +20588,12 @@ NameHookFn confirm_poison_hook(std::shared_ptr<ConfirmPoison> st) {
 class RegLogCapture {
 public:
     RegLogCapture() : sink_(std::make_shared<Sink>()), prev_(spdlog::default_logger()) {
+        // The captured lines are WARN lines: a default logger raised above warn would hide them
+        // from the sink, and a case would then SKIP (or, on the CI leg, fail) for a reason
+        // unrelated to the code under test. Refuse here, before anything is swapped, as
+        // reg_run_log_off_lock does for its own level.
+        INFO("default logger level " << static_cast<int>(prev_->level()));
+        REQUIRE(prev_->level() <= spdlog::level::warn);
         std::vector<spdlog::sink_ptr> sinks = prev_->sinks();
         sinks.push_back(sink_);
         auto logger = std::make_shared<spdlog::logger>(kName, sinks.begin(), sinks.end());
@@ -20735,13 +20740,21 @@ TEST_CASE("Registry spark (real mechanism): a verification converted into the re
     RegRenameRig rig(deny ? "name_fireconv_deny" : "name_fireconv");
     REQUIRE(rig.ok);
     NameHookGate gate; // before the harness: the hook outlives nothing the engine joins
+    // Counts every fresh-side (held == false) name call at ENTRY, before the gate can park it.
+    // Owned by value in the hook (shared_ptr), like every other hook state in this file.
+    auto fresh_calls = std::make_shared<std::atomic<int>>(0);
     auto ctl = [&](std::chrono::milliseconds verify) {
         auto c = rename_controls(verify);
-        c.name_hook = gate.hook();
+        c.name_hook = [fresh_calls, inner = gate.hook()](std::string_view key, bool held) {
+            if (!held)
+                fresh_calls->fetch_add(1, std::memory_order_acq_rel);
+            return inner(key, held);
+        };
         return c;
     };
     RegVerifyHarness h({rig.child}, ctl(60s));
     const auto retry0 = h.counters().commit_capture_retry;
+    const int fresh0 = fresh_calls->load(std::memory_order_acquire); // after the establishment
     gate.park_next(false); // the next FRESH read parks: the verification's, after open and arm
     h.apply(ctl(50ms));
     REQUIRE(eventually([&] { return gate.parked() >= 1; }, kDeafBound));
@@ -20774,6 +20787,20 @@ TEST_CASE("Registry spark (real mechanism): a verification converted into the re
     gate.release(); // the worker now reads the MOVED name through its pre-rename handle
 
     CHECK(eventually([&] { return h.counters().commit_capture_retry > retry0; }, kDeafBound));
+    // The retry MUST perform the confirming read (QE2-1). Counted on the fresh side from the
+    // end of the establishment: the verification's own read is call 1, and every commit that
+    // follows (the retry, and any later re-arm) makes a PAIR (the capture, then the confirming
+    // read) while the check is on. So the delta is odd, and at least 3, exactly when at least
+    // one commit completed with its confirming read: a retry that skipped the confirming read
+    // would leave the delta at 2 (even), and extra pairs keep the parity, so an unrelated
+    // spurious re-arm cannot turn that into a pass. `>= 3` rather than `== 3` because a stray
+    // notification (the rename itself) may cause an additional, complete re-arm. In the deny
+    // variant the retry's open is refused until the ACE is lifted, so the same condition is
+    // reached only after the lift (the wait below is bounded by kDeafBound * 2).
+    auto confirming_read_made = [&] {
+        const int delta = fresh_calls->load(std::memory_order_acquire) - fresh0;
+        return delta >= 3 && delta % 2 == 1;
+    };
     bool poisoned = false;
     if (!deny) {
         const bool healthy = eventually(
@@ -20788,6 +20815,7 @@ TEST_CASE("Registry spark (real mechanism): a verification converted into the re
         REQUIRE(recorded.has_value());
         CHECK(name_names_key(*recorded, rig.child));
         CHECK(lower_name(*recorded).find(L"_renamed") == std::wstring::npos);
+        CHECK(eventually(confirming_read_made, kDeafBound)); // before write_fires adds re-arms
         CHECK(write_fires(h, rig, 2)); // on the NEW key, not deaf on the renamed tree
     } else {
         CHECK(eventually([&] { return h.engine.stats().armed_faulted == 1; }, kDeafBound));
@@ -20805,6 +20833,7 @@ TEST_CASE("Registry spark (real mechanism): a verification converted into the re
         REQUIRE(recorded.has_value());
         CHECK(name_names_key(*recorded, rig.child));
         CHECK(lower_name(*recorded).find(L"_renamed") == std::wstring::npos);
+        CHECK(eventually(confirming_read_made, kDeafBound));
         CHECK(write_fires(h, rig, 2));
     }
     h.engine.stop();
