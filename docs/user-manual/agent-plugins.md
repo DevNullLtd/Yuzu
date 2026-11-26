@@ -25,7 +25,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `browser_policy` | 🟡 🟡 ✅ | Enterprise-managed Chrome, Chromium and Edge browser policy inventory | [README](../../agents/plugins/browser_policy/README.md) |
 | `certificates` | ✅ ✅ ✅ | Certificate inventory and management for system stores | [README](../../agents/plugins/certificates/README.md) |
 | `chargen` | ✅ ✅ ✅ | RFC 864 character generator — streams rotating ASCII lines | [README](../../agents/plugins/chargen/README.md) |
-| `component_inventory` | 🟡 ✅ ✅ | Installed software components found in application trees (Java archives, native libraries, Python distributions, Node packages) | [README](../../agents/plugins/component_inventory/README.md) |
+| `component_inventory` | ✅ ✅ ✅ | Installed software components found in application trees (Java archives, native libraries, Python distributions, Node packages) | [README](../../agents/plugins/component_inventory/README.md) |
 | `content_dist` | ✅ ✅ ✅ | Content staging — download, verify, execute, and manage staged files (no shell-out) | [README](../../agents/plugins/content_dist/README.md) |
 | `device_identity` | ✅ ✅ ✅ | Reports device hostname, domain membership, and AD organizational unit | [README](../../agents/plugins/device_identity/README.md) |
 | `diagnostics` | ✅ ✅ ✅ | Agent diagnostics — log level, certificates, connection info | [README](../../agents/plugins/diagnostics/README.md) |
@@ -49,7 +49,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `license_scan` | ✅ ✅ 🟡 | Detects software licences across OS, vendor and per-user surfaces | [README](../../agents/plugins/license_scan/README.md) |
 | `local_security_policy` | 🟡 🟡 🟡 | Reports local password, lockout and audit policy posture and sudoers content | [README](../../agents/plugins/local_security_policy/README.md) |
 | `mgmt_posture` | 🟡 ✅ 🟡 | Management-plane posture: which plane controls the device (facts only) | [README](../../agents/plugins/mgmt_posture/README.md) |
-| `middleware` | 🟡 🟡 ✅ | Installed middleware inventory from installer metadata (table-driven; IBM MQ) | [README](../../agents/plugins/middleware/README.md) |
+| `middleware` | ✅ 🟡 ✅ | Installed middleware inventory from installer metadata (table-driven; IBM MQ) | [README](../../agents/plugins/middleware/README.md) |
 | `msi_packages` | ✅ ✅ ⛔ | Enumerates installed packages and product codes (Windows MSI / macOS pkgutil) | [README](../../agents/plugins/msi_packages/README.md) |
 | `netprobe` | ✅ ✅ ✅ | Active network measurement: ICMP/TCP round-trip time, jitter, loss, and DNS resolution timing to operator-chosen targets | [README](../../agents/plugins/netprobe/README.md) |
 | `netstat` | ✅ ✅ ✅ | Enumerates active network connections and listening sockets | [README](../../agents/plugins/netstat/README.md) |

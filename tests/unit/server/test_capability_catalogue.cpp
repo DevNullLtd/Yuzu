@@ -1086,3 +1086,30 @@ TEST_CASE("capability catalogue: middleware.ibm_mq pins its exact classification
     CHECK(row.system_reserved == false);
     CHECK(row.execute_gate == ExecuteGate::None);
 }
+
+/// Exact-row pin for `msi_packages.installer_records` (SAM-46): a read-only report of what
+/// Windows Installer recorded per product (registry values and the cached package's Property
+/// table; nothing is executed), `Inventory`:Read with no execute gate, checked on the fragment
+/// AND as the composed registry classifies it, so a re-typing cannot drift it into a mutating
+/// class or behind a gate unnoticed.
+TEST_CASE("capability catalogue: msi_packages.installer_records pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_d();
+    const auto it = std::find_if(rows.begin(), rows.end(), [](const auto& r) {
+        return r.plugin == "msi_packages" && r.action == "installer_records";
+    });
+    REQUIRE(it != rows.end());
+    CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+    CHECK(it->mutability == Mutability::None);
+    CHECK(it->securable == "Inventory");
+    CHECK(it->operation == authz::Operation::Read);
+    CHECK(it->risk_tier == authz::RiskTier::Low);
+    CHECK(it->system_reserved == false);
+    CHECK(it->execute_gate == ExecuteGate::None);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("msi_packages", "installer_records");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Inventory");
+    CHECK(classified->execute_gate == ExecuteGate::None);
+}

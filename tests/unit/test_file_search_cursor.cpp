@@ -77,11 +77,11 @@ std::string body_of(const fs::Cursor& c) { return fs::detail::cursor_body(c); }
 
 TEST_CASE("valid_component / valid_position", "[file_search]") {
     CHECK(fs::valid_component("a"));
-    CHECK(fs::valid_component(std::string(255, 'x')));
+    CHECK(fs::valid_component(std::string(765, 'x'))); // 255 UTF-16 units are at most 765 UTF-8 bytes
     CHECK(fs::valid_component(".hidden"));
     CHECK(fs::valid_component("..."));
     CHECK_FALSE(fs::valid_component(""));
-    CHECK_FALSE(fs::valid_component(std::string(256, 'x')));
+    CHECK_FALSE(fs::valid_component(std::string(766, 'x')));
     CHECK_FALSE(fs::valid_component("."));
     CHECK_FALSE(fs::valid_component(".."));
     CHECK_FALSE(fs::valid_component("a/b"));
@@ -178,15 +178,26 @@ TEST_CASE("cursor token: round-trips at depth 0, 1 and kMaxPositionDepth", "[fil
     const auto back = fs::decode_cursor(fs::encode_cursor(start), start.query_hash);
     REQUIRE(back);
     CHECK(*back == start);
-    // Maximal names and non-ASCII names.
+    // Non-ASCII names.
     auto c = deep_cursor(fs::kMaxPositionDepth);
-    for (auto& f : c.position.dirs)
-        f.name = std::string(255, 'n');
     c.position.after = "caf\xc3\xa9";
-    REQUIRE(fs::encode_cursor(c).size() <= fs::kMaxCursorTokenBytes);
     const auto big = fs::decode_cursor(fs::encode_cursor(c), c.query_hash);
     REQUIRE(big);
     CHECK(*big == c);
+}
+
+TEST_CASE("cursor token: the deepest position of the longest names fits the token bound", "[file_search]") {
+    static_assert(fs::kMaxNameBytes == 765);
+    auto c = deep_cursor(fs::kMaxPositionDepth);
+    for (auto& f : c.position.dirs)
+        f.name = std::string(fs::kMaxNameBytes, 'n');
+    c.position.after = std::string(fs::kMaxNameBytes, 'a');
+    REQUIRE(fs::valid_position(c.position));
+    const auto token = fs::encode_cursor(c);
+    CHECK(token.size() <= fs::kMaxCursorTokenBytes);
+    const auto back = fs::decode_cursor(token, c.query_hash);
+    REQUIRE(back);
+    CHECK(*back == c);
 }
 
 TEST_CASE("cursor token: framing errors", "[file_search]") {
@@ -255,7 +266,7 @@ TEST_CASE("cursor token: position errors", "[file_search]") {
         CHECK(err(in_after) == E::bad_position);
     }
     auto long_name = deep_cursor(1);
-    long_name.position.dirs[0].name = std::string(256, 'x');
+    long_name.position.dirs[0].name = std::string(fs::kMaxNameBytes + 1, 'x');
     CHECK(err(long_name) == E::bad_position);
     CHECK(err(deep_cursor(fs::kMaxPositionDepth + 1)) == E::bad_position);
     // encode_cursor refuses to write what the decoder would refuse.

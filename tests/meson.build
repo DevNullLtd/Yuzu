@@ -132,6 +132,9 @@ elif host_machine.system() == 'windows'
   # test_app_usage_local_dispatcher.cpp's foreign-owner case calls SetNamedSecurityInfoW and
   # AdjustTokenPrivileges directly, as echo_test_deps' Windows block does for its DACL cases.
   agent_test_native_deps += cxx.find_library('advapi32')
+  # component_fs_win.cpp is compiled into this exe (SAM-49): SHGetKnownFolderPath is shell32's; its
+  # CoTaskMemFree comes from ole32, above.
+  agent_test_native_deps += cxx.find_library('shell32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -476,6 +479,7 @@ agent_test_exe = executable(
                                                 # script_exec.dll (Windows-only TU guard; proves BR3-001's
                                                 # windows_system_directory() PowerShell resolution end to end)
     'unit/test_script_exec_parsers.cpp',       # Wave 5 PR5.1: pure argv-assembly / PATH-resolution helpers (no I/O)
+    'unit/test_http_client_get_output.cpp',   # WP14-A: pure http_client get Content-Encoding refusal decision
     'unit/test_content_dist_actions.cpp',      # Wave 5 PR5.1: content_dist dispatch gates via LocalDispatcher (POSIX-only TU guard)
     'unit/test_content_dist_exec_parsers.cpp', # Wave 5 PR5.1: pure SubprocessResult -> wire mapping + options builder (no I/O)
     'unit/test_content_dist_exec_seam.cpp',    # Wave 5 PR5.1 round-2 remediation (BR-006): real staged-file
@@ -555,6 +559,8 @@ agent_test_exe = executable(
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (macOS and Windows, self-gated)
     'unit/test_msi_packages_inventory.cpp',   # pure list_inventory builder over the committed Kingsley REAL CAPTURE (fixture via YUZU_TEST_FIXTURE_DIR; runs on every OS)
+    'unit/test_msi_installer_records.cpp',   # SAM-46: pure Installer-records builder over a real SYSTEM capture fixture (packed GUID codec, path gate, caps, row-level reasons), runs on every OS
+    'unit/test_msi_database_read.cpp',   # SAM-46: agent-core bounded MSI Property-table read (single-flight slot on every OS; real-API cases Windows-only)
     'unit/test_install_row_attributes.cpp',   # SAM-46: shared install-row attribute field (canonical form, closed key table), portable
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
@@ -694,6 +700,7 @@ agent_test_exe = executable(
     'unit/test_component_node_parsers.cpp',      # component_inventory: Node package.json reader and node_modules path shape over real captured fixtures (SAM-49)
     'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
     'unit/test_component_walk_ordered.cpp',      # file search core: sorted depth-first resumable walk_ordered over MemTree and a fake clock, unguarded on every OS
+    'unit/test_file_search_walk_win_macros.cpp', # file search core: the walker and the driver compile with min and max defined as function-like macros (the #8272 acceptance; the macros are Windows-only)
     'unit/test_network_fstype_mounts.cpp',       # shared mount-table entries + local filesystem allow-list (agents/shared/network_fstype.hpp), portable
     'unit/test_file_search_cursor.cpp',          # file search core: walk position order + fs1 cursor codec (agents/shared/file_search_{position,cursor}.hpp), portable
     'unit/test_file_search_names.cpp',           # file search core: reversible name encoding, file identity, match row (agents/shared/file_search_names.hpp), portable
@@ -704,13 +711,16 @@ agent_test_exe = executable(
     'unit/test_file_search_volumes.cpp',         # file search plugin: volume plan, units and refused rows, fsv1 cursor and its transition rule (agents/plugins/file_search/src), portable
     'unit/test_file_search_driver.cpp',          # file search plugin: request parsing, in-memory state and the one-slice driver over fakes (MemTree, fake clock, fake runner), portable
     'unit/test_file_search_rows.cpp',            # file search plugin: row arity, budgets, extents model and the user-directory tag (agents/plugins/file_search/src), portable
+    'unit/test_file_search_win_rules.cpp',       # file search plugin: every pure Windows decision -- root normaliser, label, entry classifier, extents decision and mapper, id policy, volume tokens (agents/plugins/file_search/src/file_search_win_rules.hpp), portable
+    'unit/test_file_search_win_shell.cpp',       # file search plugin: the Windows shell over a salted temp tree -- listing, root check, facts and the two ioctls, volume reader, name rule, key, profile roots (body Windows-only)
     'unit/test_file_search_posix_shell.cpp',     # file search plugin: the POSIX shell's own pieces -- extents of real files, the macOS name rule and mount converter, the thread-capability planner (body POSIX-only; the capability syscalls Linux-only and root-only)
     'unit/test_file_search_local_dispatcher.cpp', # file search plugin: real plugin via LocalDispatcher, unguarded on every OS (one real slice over a fixture under the build root on POSIX)
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
     'unit/test_component_native_scan.cpp',       # component_inventory: native-library scan over an in-memory tree and a fake clock; one POSIX-only case through the real leg and parsers (SAM-22)
     'unit/test_component_pkg_scan.cpp',          # component_inventory: Python and Node scans over an in-memory tree and a fake clock (SAM-49)
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
-    'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
+    'unit/test_component_fs_win.cpp',            # SAM-49: Windows filesystem leg (reparse refusal, read_at, unchanged) over a salted real tree; root planning portable
+    'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (scan and native are dispatched on Windows only, as a hidden host-walk entry)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_python_parsers.cpp',     # runtimes python: pure python layer + macOS framework walk over a materialized fixture tree (walk body POSIX-only)
@@ -726,10 +736,14 @@ agent_test_exe = executable(
     '../agents/plugins/pkg_inventory/src/pkg_inventory_linux.cpp', # pkg_inventory Linux legs: run_linux (self-gated to __linux__, empty elsewhere)
     'unit/test_middleware_parsers.cpp',   # SAM.2: product table, pure kv/file-name parsers and the generic runner over a FakeFs, unguarded on every OS
     'unit/test_middleware_linux_parsers.cpp',       # SAM.2: Linux leg over a materialized tree manifest (REAL registered-install capture plus labelled inline cases; body POSIX-only)
+    'unit/test_middleware_win_parsers.cpp',         # SAM-47: Windows registry leg over FakeOps (dual-view merge, caps, tokens), unguarded on every OS
     'unit/test_middleware_local_dispatcher.cpp',    # SAM.2: real middleware plugin via LocalDispatcher and the table-generated descriptors, unguarded on every OS
     '../agents/plugins/middleware/src/middleware_linux.cpp', # SAM.2: run_linux (self-gated to __linux__, empty elsewhere)
     '../agents/plugins/component_inventory/src/component_fs_posix.cpp',  # SAM-16: POSIX filesystem leg (self-gated to non-Windows, empty on Windows)
+    '../agents/plugins/component_inventory/src/component_fs_win.cpp',  # SAM-49: Windows filesystem leg (self-gated to _WIN32, empty elsewhere)
+    '../agents/plugins/file_search/src/file_search_shell.cpp',          # file search plugin: the OS-neutral shell (slot, stop flag, search state, cursor key, worker runner, live slice)
     '../agents/plugins/file_search/src/file_search_posix.cpp',          # file search plugin: the POSIX shell (self-gated to non-Windows, empty on Windows)
+    '../agents/plugins/file_search/src/file_search_win.cpp',            # file search plugin: the Windows shell (self-gated to Windows, empty elsewhere)
     '../agents/plugins/file_search/src/file_search_extents_linux.cpp',  # file search plugin: FIEMAP shell (self-gated to __linux__, empty elsewhere)
     '../agents/plugins/file_search/src/file_search_extents_macos.cpp',  # file search plugin: F_LOG2PHYS_EXT shell (self-gated to __APPLE__, empty elsewhere)
   ),
@@ -783,6 +797,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
     include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
+    include_directories('../agents/plugins/http_client/src'),   # http_client_get_output.hpp (WP14-A pure get Content-Encoding refusal)
     include_directories('../agents/plugins/script_exec/src'),   # script_exec_parsers.hpp (Wave 5 PR5.1 pure helpers)
     include_directories('../agents/plugins/network_actions/src'), # network_actions_parsers.hpp (Wave 2 WP-D)
     include_directories('../agents/plugins/wol/src'),             # wol_check_plan.hpp (Wave 2 WP-E)
@@ -1304,6 +1319,24 @@ foreach shard, spec : agent_shard_specs
     depends: agent_shard_deps,
   )
 endforeach
+
+# The component_inventory dispatcher's Windows host walk (SAM-49). The case dispatches the real plugin's
+# `scan` and `native` over this host's own Program Files; each walk ends only at the plugin's own
+# budget (WalkLimits: 400,000 entries, 45 s), so two walks bound the case at about 90 s, under 50% of
+# this entry's 240 s (docs/testing/unit-test-conventions.md "Budget rule"). No shard has that room (A
+# measures 98-102 s on the Windows MSVC debug leg, above), so the case is hidden from every shard by
+# its [.] tag and runs here alone. Windows only: the case does not exist elsewhere. No
+# --allow-running-no-tests, so a renamed tag fails loudly, as on 'agent tsan-heavy checkpoints'.
+if host_machine.system() == 'windows'
+  test(
+    'component_inventory windows host walk',
+    agent_test_exe,
+    args: ['[component_inventory_host_walk]', '--durations=yes'],
+    suite: 'agent',
+    timeout: 240,
+    depends: agent_shard_deps,
+  )
+endif
 
 # Structural partition-invariant check for the agent shards (#5073): proves, against
 # the real compiled binary via --list-tests, that every case matched by
@@ -3673,6 +3706,15 @@ test('image vulnerability gate',
   priority: 10,
 )
 
+# WP15: deploy/docker/chisel-emit-status.py records a chiselled image's packages
+# where the image scanners read them; its refusals and its four call sites.
+test('chisel status.d emission',
+  _python3_test,
+  args: [files('test_chisel_emit_status.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
 # outcomes x stop points x publish shapes runs release.yml's publish steps in
 # the workflow's order against a stub registry and checks the journal never
@@ -4511,7 +4553,8 @@ if _bash_test.found()
   )
   # #4262: -Dbuild_examples=false must keep configuring a real build.
   # Configure-only smoke test (no compile) so it stays cheap on every leg;
-  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.
+  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet, or holds only
+  # host tools with no CLI11 (e.g. a sanitizer-triplet install, #6719).
   # platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
   # it selects the per-OS vcpkg triplet (`uname -s`).
   test('build_examples=false gating smoke test',
@@ -4726,6 +4769,16 @@ test('virtualization wsl Windows shell wiring lexical gate',
   _python3_test,
   args: [files('test_virtualization_wsl_pin_lexical.py')],
   suite: 'docs',
+  timeout: 30,
+)
+
+# WP14-A: every httplib::Client / SSLClient built under agents/ calls set_decompress(false) (the
+# agent build defines CPPHTTPLIB_BROTLI_SUPPORT globally, so a client otherwise decodes Brotli from
+# an operator-chosen peer inside the long-lived agent process). Lexical; carries its own mutation self-test.
+test('agent httplib clients disable response decompression lexical gate (WP14-A)',
+  _python3_test,
+  args: [files('test_agent_http_no_decompress_lexical.py')],
+  suite: 'agent',
   timeout: 30,
 )
 
@@ -5677,8 +5730,11 @@ test('file_search read tier tripwire selftest',
 # a file (the pinned spellings are listed in the script's docstring: the FIEMAP sync flag, the write,
 # create, truncate and append open flags, write, sync, stdio, stream, vectored, receive, pread and mmap
 # calls, the shared bounded readers, any read call beyond the mount table reader, and a second fm_flags
-# assignment), and ApprovalManager::covers_continuation keeps its one production caller, the MCP
-# execute_instruction arm. The self-test mutates the sources in memory and requires each mutation to be
+# assignment; on Windows the read, write, delete, move, map and set-information calls, every path-resolving
+# open, every data access right, the backup and restore privileges, the process-wide error mode, every
+# FSCTL_ and IOCTL_ name but the two the leg may spell, and a count rule of exactly two DeviceIoControl
+# calls, only in file_search_win.cpp), and ApprovalManager::covers_continuation keeps its one production
+# caller, the MCP execute_instruction arm. The self-test mutates the sources in memory and requires each mutation to be
 # named. Both also run in .github/workflows/docs-lint.yml on every PR.
 test('file_search source tripwire',
   _python3_test,

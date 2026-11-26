@@ -34,7 +34,7 @@ class MiddlewareDefinitionColumns(unittest.TestCase):
         for action, d in defs.items():
             self.assertEqual(d["spec"]["execution"]["plugin"], "middleware")
             self.assertEqual(d["metadata"]["id"], f"crossplatform.middleware.{action}")
-            self.assertEqual(d["spec"]["platforms"], ["linux"])
+            self.assertEqual(d["spec"]["platforms"], ["linux", "windows"])
 
     def test_row_kind_leads_and_the_columns_match_the_wire_row(self):
         for action, d in _definitions().items():

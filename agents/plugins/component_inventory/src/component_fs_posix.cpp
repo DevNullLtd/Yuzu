@@ -47,7 +47,9 @@
  * else does; (4) it reports the facts the search needs: a listed directory's device and inode, a match's
  * size and time from the opened descriptor, and what a root path is.
  *
- * No Windows code: that leg is a later change and the shell answers `planned` there.
+ * No Windows code: the scan's Windows leg is component_fs_win.cpp, over the pure decisions in
+ * component_legs_win.hpp; the search leg has no Windows leg yet (a later change; the file search shell
+ * answers `planned` there).
  */
 #include "component_legs.hpp"
 

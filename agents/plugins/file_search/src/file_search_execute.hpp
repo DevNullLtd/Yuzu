@@ -1,6 +1,7 @@
 /**
  * file_search_execute.hpp -- the whole body of the plugin's execute() and the ABI seam's try/catch, and the entry
- * points the POSIX shell (file_search_posix.cpp) exports to the plugin TU.
+ * points the OS-neutral shell (file_search_shell.cpp) exports to the plugin TU. The OS bindings the shell
+ * stands on are declared in file_search_os.hpp.
  *
  * It sits between the plugin TU (file_search_plugin.cpp: descriptors, init, shutdown, the heartbeat and log
  * hooks) and the pure driver (file_search_driver.hpp). The slice itself is injected (SliceFn), so a test
@@ -31,6 +32,7 @@
 #include <wire_utf8.hpp>
 
 #include "file_search_driver.hpp"
+#include "file_search_os.hpp"
 #include "file_search_request.hpp"
 
 #if !defined(_WIN32)
@@ -52,7 +54,7 @@ inline constexpr std::string_view kSearchAction = "search";
 /// called inside the seam's try block.
 using SemanticsFn = std::function<fsr::NameSemantics()>;
 
-/// One slice of a parsed request. Production: run_posix_slice. A test injects its own.
+/// One slice of a parsed request. Production: run_live_slice. A test injects its own.
 using SliceFn = std::function<SliceResult(const Request&)>;
 
 /// Called once with a finished slice's result, after its rows and typed status were written: the plugin TU's
@@ -77,11 +79,12 @@ inline void report_status(yuzu::CommandContext& ctx, const SliceResult& r) {
 } // namespace execute_detail
 
 /// Dispatch, validation and the single ABI containment. `semantics` yields the name rule of this OS (the
-/// pattern is compiled with it); `provenance_on_throw` is the typed status provenance when the body throws.
+/// pattern is compiled with it); `provenance_on_throw` is the typed status provenance when the body throws;
+/// `normalise` is the OS's root normaliser (the POSIX rule by default).
 inline int execute_search(yuzu::CommandContext& ctx, std::string_view action, std::string_view root,
                           std::string_view pattern, std::string_view kinds, std::string_view cursor,
                           const SemanticsFn& semantics, const SliceFn& run, const AfterSliceFn& after,
-                          std::string_view provenance_on_throw) {
+                          std::string_view provenance_on_throw, RootNormaliser normalise = &normalise_root) {
     try {
         if (action != kSearchAction) {
             std::string a{action};
@@ -89,7 +92,7 @@ inline int execute_search(yuzu::CommandContext& ctx, std::string_view action, st
             ctx.write_output("unknown action: " + yuzu::util::safe_output_field(a));
             return 1;
         }
-        const auto req = parse_request(root, pattern, kinds, cursor, semantics());
+        const auto req = parse_request(root, pattern, kinds, cursor, semantics(), normalise);
         if (!req) {
             const std::string reason = to_token(req.error());
             ctx.write_output(format_search_row({.status = Status::invalid, .reason = reason}));
@@ -121,42 +124,40 @@ inline int execute_search(yuzu::CommandContext& ctx, std::string_view action, st
     }
 }
 
+// ---- the OS-neutral shell (file_search_shell.cpp) ----
+
+/// One slice over the live filesystem: the mount table, a leg per unit and the profile roots (each made on
+/// the slice's worker), a worker thread per slice, all bound through file_search_os.hpp. Never throws except
+/// for an allocation failure, which the execute seam contains.
+[[nodiscard]] SliceResult run_live_slice(const Request& req);
+
+/// Runs `work` on a fresh worker thread for at most `timeout`, inside the OS's worker environment
+/// (os_in_worker_environment). The driver's BoundedRunner in production. Exported so the shell tests run the
+/// environment the plugin runs.
+[[nodiscard]] RunOutcome<WorkResult> run_on_worker(std::chrono::milliseconds timeout,
+                                                   std::function<WorkResult()> work);
+
+/// Draws the process's cursor key (os_draw_cursor_key) if it has not been drawn; false if it cannot be, and
+/// then no search runs. The first draw is final either way: a failure is remembered and never retried, and a
+/// success is never drawn again, so a re-init keeps the cursors it issued valid for as long as the process
+/// lives.
+[[nodiscard]] bool init_cursor_key() noexcept;
+
+/// Asks a slice that is running to end at the next entry (the stop flag the worker polls). Idempotent.
+void request_stop() noexcept;
+
+/// Clears the stop flag: a plugin that is initialised again after a shutdown (the module stays mapped, so
+/// its statics outlive the unload) must not start cancelled.
+void clear_stop() noexcept;
+
 #if !defined(_WIN32)
 
 // ---- the POSIX shell (file_search_posix.cpp) ----
-
-/// The name rule of this OS: byte-exact on Linux (`bytes`), Unicode NFC plus case folding on macOS
-/// (`macos_nfc_casefold_v1`).
-[[nodiscard]] fsr::NameSemantics posix_name_semantics();
-
-/// One slice over the live filesystem: the mount table, a leg per unit, a worker thread per slice. Never
-/// throws except for an allocation failure, which the execute seam contains.
-[[nodiscard]] SliceResult run_posix_slice(const Request& req);
 
 /// The hook the search leg wraps around every lookup that may need a capability. Linux: raises
 /// CAP_DAC_READ_SEARCH on the calling thread for the lookup and drops it after; macOS: empty. Exported so
 /// the shell test runs the hook the plugin runs.
 [[nodiscard]] ci::AroundLookup around_lookup_hook();
-
-/// Runs `work` on a fresh worker thread for at most `timeout`, inside the worker environment (Linux: the
-/// capability dropped from the thread's effective set and the idle I/O class; macOS: dataless
-/// materialisation off and the throttled disk class). The driver's BoundedRunner in production. Exported so
-/// the shell test runs the environment the plugin runs.
-[[nodiscard]] RunOutcome<WorkResult> run_on_worker(std::chrono::milliseconds timeout,
-                                                   std::function<WorkResult()> work);
-
-/// Draws the process's cursor key (32 bytes from getentropy) if it has not been drawn; false if it cannot be,
-/// and then no search runs. The first draw is final either way: a failure is remembered and never retried, and
-/// a success is never drawn again, so a re-init keeps the cursors it issued valid for as long as the process
-/// lives.
-[[nodiscard]] bool posix_init_cursor_key() noexcept;
-
-/// Asks a slice that is running to end at the next entry (the stop flag the worker polls). Idempotent.
-void posix_request_stop() noexcept;
-
-/// Clears the stop flag: a plugin that is initialised again after a shutdown (the module stays mapped, so
-/// its statics outlive the unload) must not start cancelled.
-void posix_clear_stop() noexcept;
 
 #if defined(__APPLE__)
 /// The canonical form macOS names are compared in: ASCII folded inline; any other well-formed UTF-8

@@ -19,6 +19,23 @@ spellings, never a `write*` or `read_file*` prefix, so the plugin's own `write_o
     `fgets` and `[io]?fstream`; `readv`, `recv`, `recvfrom`, `recvmsg`; and the shared bounded readers
     of posix_secure_read.hpp (`read_open_fd`, `read_file`, `read_file_at`, `read_file_no_follow`,
     `read_file_no_follow_at`);
+  - on Windows the same clause in the same exact-spelling form: the read, write, delete, move, flush, map
+    and set-information calls (`ReadFile`, `WriteFile`, `NtReadFile`, `SetFileInformationByHandle`,
+    `DeleteFile`, `MoveFile*`, `MapViewOfFile*`, ...), every path-resolving open (`CreateFile*(`, `NtCreateFile`,
+    `NtOpenFile`, `FindFirstFile*`: the plugin opens only through confined_fs), the destructive and bounded-read
+    members of confined_fs (`unlink_at`, `delete_matching`, `read_file_bounded`, `open_no_reparse`), every data
+    access right (`GENERIC_*`, `FILE_READ_DATA`, `FILE_LIST_DIRECTORY`, the write rights, `MAXIMUM_ALLOWED`, the bare
+    `DELETE`, ...), the backup and restore privileges and `FILE_FLAG_BACKUP_SEMANTICS`, the process-wide
+    `SetErrorMode(` and the process-wide placeholder compatibility switch `RtlSetProcessPlaceholderCompatibilityMode`
+    (the thread-scoped `SetThreadErrorMode(` and `RtlSetThreadPlaceholderCompatibilityMode(` are the allowed forms);
+  - every `FSCTL_*` and `IOCTL_*` name except `FSCTL_GET_RETRIEVAL_POINTERS` and `FSCTL_GET_EXTERNAL_BACKING`,
+    and a count rule over the one allowed pair: `DeviceIoControl(` occurs nowhere, or exactly twice and only in
+    file_search_win.cpp, and then each of the two allowed names occurs exactly once in that file (the plugin's
+    capability descriptor may still NAME them in its text: a name is not a call);
+  - the attribute-only file open of confined_fs (agents/core/src/confined_fs_win.cpp, loaded for this one
+    check and never for the forbidden list: the primitive itself opens by path and lists directories)
+    requests exactly `FILE_READ_ATTRIBUTES | SYNCHRONIZE`, so a handle the leg holds on a matched file has no
+    data right and can neither read nor hydrate it;
   - exactly one `read(` call, the `::read(` of the mount table reader in file_search_posix.cpp;
   - the extents request is built as `m->fm_flags = want.flags;` and that is the ONLY assignment to
     `fm_flags` in scope (the value is the pure builder's, which is flags 0).
@@ -65,6 +82,9 @@ SERVER_SRC = os.path.join("server", "core", "src")
 SERVER_INCLUDE = os.path.join("server", "core", "include")
 EXTENTS_LINUX = os.path.join(PLUGIN_SRC, "file_search_extents_linux.cpp")
 POSIX_CPP = os.path.join(PLUGIN_SRC, "file_search_posix.cpp")
+CONFINED_WIN = os.path.join("agents", "core", "src", "confined_fs_win.cpp")
+# Loaded for the required-statement check only, never scanned for the forbidden spellings.
+PIN_ONLY = frozenset({CONFINED_WIN})
 APPROVAL_HPP = os.path.join(SERVER_SRC, "approval_manager.hpp")
 APPROVAL_CPP = os.path.join(SERVER_SRC, "approval_manager.cpp")
 MCP_CPP = os.path.join(SERVER_SRC, "mcp_server.cpp")
@@ -111,16 +131,43 @@ SRC_FORBIDDEN: list[tuple[str, str, str]] = [
      "a matched file is opened and never read through stdio or a stream"),
     ("vector-read", _ID + r"(?:readv|recv|recvfrom|recvmsg)\(",
      "a matched file is opened and never read"),
-    ("bounded-reader", _ID + r"(?:read_open_fd|read_file|read_file_at|read_file_no_follow|read_file_no_follow_at)\b",
+    ("bounded-reader", _ID + r"(?:read_open_fd|read_file|read_file_at|read_file_no_follow|read_file_no_follow_at|"
+     r"read_file_bounded|open_no_reparse)\b",
      "the shared bounded readers read a file's bytes: a matched file is opened and never read"),
+    ("win-io-call", _ID + r"(?:ReadFile|ReadFileEx|ReadFileScatter|WriteFile|WriteFileEx|WriteFileGather|NtReadFile|"
+     r"NtWriteFile|SetFileInformationByHandle|NtSetInformationFile|SetEndOfFile|FlushFileBuffers|DeleteFile[AW]?|"
+     r"RemoveDirectory[AW]?|MoveFile\w*|MapViewOfFile\w*|CreateFileMapping\w*)\b",
+     "a search reads no file, writes nothing, deletes nothing, moves nothing and maps nothing"),
+    ("win-path-open", _ID + r"(?:CreateFile[AW2]?\(|NtCreateFile\b|NtOpenFile\b|FindFirstFile\w*)",
+     "the plugin opens nothing by path: every open goes through confined_fs, parent-handle-relative"),
+    ("confined-destructive", _ID + r"(?:unlink_at|delete_matching)\b",
+     "the destructive members of confined_fs are never reachable from a search"),
+    ("data-access-right", _ID + r"(?:GENERIC_READ|GENERIC_WRITE|GENERIC_ALL|GENERIC_EXECUTE|FILE_GENERIC_READ|"
+     r"FILE_GENERIC_WRITE|FILE_READ_DATA|FILE_WRITE_DATA|FILE_APPEND_DATA|FILE_LIST_DIRECTORY|FILE_ADD_FILE|"
+     r"FILE_WRITE_ATTRIBUTES|FILE_WRITE_EA|FILE_ALL_ACCESS|MAXIMUM_ALLOWED|WRITE_DAC|WRITE_OWNER|DELETE)"
+     r"(?![A-Za-z0-9_])",
+     "no handle the plugin asks for carries a data right: attribute-only handles cannot read or hydrate a file"),
+    ("win-privilege", _ID + r"(?:SeBackupPrivilege|SeRestorePrivilege|SE_BACKUP_NAME|SE_RESTORE_NAME|"
+     r"AdjustTokenPrivileges|FILE_FLAG_BACKUP_SEMANTICS)\b",
+     "a search runs with the agent's own token: no backup or restore privilege, no privilege adjustment"),
+    ("win-process-state", _ID + r"(?:SetErrorMode\(|RtlSetProcessPlaceholderCompatibilityMode\b)",
+     "process-wide state is never changed by a search (SetThreadErrorMode( and "
+     "RtlSetThreadPlaceholderCompatibilityMode( are the thread-scoped forms)"),
+    ("win-ioctl", _ID + r"(?:FSCTL_(?!(?:GET_RETRIEVAL_POINTERS|GET_EXTERNAL_BACKING)\b)\w+|IOCTL_\w+)",
+     "only the extent query and the external-backing query are control codes a search may spell"),
 ]
 READ_CALL = re.compile(_ID + r"read\(")
+WIN_CPP = os.path.join(PLUGIN_SRC, "file_search_win.cpp")
+IOCTL_CALL = re.compile(_ID + r"DeviceIoControl\(")
+IOCTL_NAMES = ("FSCTL_GET_EXTERNAL_BACKING", "FSCTL_GET_RETRIEVAL_POINTERS")
 FM_FLAGS_WRITE = re.compile(_ID + r"fm_flags(?:<<|>>|[|&^+\-])?=(?!=)")
 
 # (id, file, a C++ snippet, why). The snippet is canonicalised like the text it is looked for in.
 SRC_REQUIRED: list[tuple[str, str, str, str]] = [
     ("fiemap-flags", EXTENTS_LINUX, "m->fm_flags = want.flags;",
      "the FIEMAP request carries the flags of the pure request builder (flags 0, no sync)"),
+    ("attr-only-open", CONFINED_WIN, "nt_open_relative(parent, wide, FILE_READ_ATTRIBUTES | SYNCHRONIZE,",
+     "the attribute-only file open asks for FILE_READ_ATTRIBUTES | SYNCHRONIZE and no data right"),
 ]
 
 
@@ -143,12 +190,19 @@ def load_sources(root: str = REPO_ROOT) -> dict[str, str]:
     for rel in _scope_files(root):
         with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
             out[rel] = canonical(fh.read())
+    for rel in sorted(PIN_ONLY):
+        pinned = os.path.join(root, rel)
+        if os.path.exists(pinned):
+            with open(pinned, encoding="utf-8", errors="replace") as fh:
+                out[rel] = canonical(fh.read())
     return out
 
 
 def source_problems(texts: dict[str, str]) -> list[tuple[str, str]]:
     """Every violated part-1 rule as (id, message); empty when the gate holds."""
     found: list[tuple[str, str]] = []
+    pins = texts
+    texts = {path: text for path, text in texts.items() if path not in PIN_ONLY}
     for rid, pattern, why in SRC_FORBIDDEN:
         for path, text in sorted(texts.items()):
             if re.search(pattern, text):
@@ -159,13 +213,23 @@ def source_problems(texts: dict[str, str]) -> list[tuple[str, str]]:
         found.append(("read-call", f"expected exactly one read( call, the `::read(` of the mount table "
                       f"reader in {POSIX_CPP}; found {sites or 'none'}: a matched file is opened and "
                       f"never read{SRC_HINT}"))
+    calls = {path: n for path, text in sorted(texts.items()) if (n := len(IOCTL_CALL.findall(text)))}
+    if calls and calls != {WIN_CPP: 2}:
+        found.append(("ioctl-count", f"expected DeviceIoControl( nowhere, or exactly twice and only in {WIN_CPP}; "
+                      f"found {calls}: the two ioctls are the extent query and the external-backing query{SRC_HINT}"))
+    if calls:
+        for name in IOCTL_NAMES:
+            have = len(re.findall(_ID + name + r"\b", texts.get(WIN_CPP, "")))
+            if have != 1:
+                found.append(("ioctl-name", f"{name} must occur exactly once in {WIN_CPP} while its two DeviceIoControl( "
+                              f"calls exist; found {have}{SRC_HINT}"))
     writes = [(path, len(FM_FLAGS_WRITE.findall(text)))
               for path, text in sorted(texts.items()) if FM_FLAGS_WRITE.search(text)]
     if writes != [(EXTENTS_LINUX, 1)]:
         found.append(("fm-flags-write", f"expected exactly one assignment to fm_flags, in {EXTENTS_LINUX}; "
                       f"found {writes or 'none'}: the extent request carries no flags{SRC_HINT}"))
     for rid, path, snippet, why in SRC_REQUIRED:
-        text = texts.get(path)
+        text = pins.get(path)
         if text is None:
             found.append((rid, f"{path} is missing: {why}{SRC_HINT}"))
         elif canonical(snippet).strip() not in text:
@@ -247,7 +311,7 @@ def selftest() -> int:
     src, srv = load_sources(), load_server()
     base = problems(src, srv)
     expect(base == [], "the real tree must pass the gate: " + "; ".join(m for _, m in base))
-    expect(len(SRC_FORBIDDEN) >= 9 and len(SRC_REQUIRED) >= 1, "the rule lists must not shrink silently")
+    expect(len(SRC_FORBIDDEN) >= 16 and len(SRC_REQUIRED) >= 1, "the rule lists must not shrink silently")
 
     def src_ids(extra_path: str, spelling: str, replace: dict[str, str] | None = None) -> set[str]:
         texts = dict(src, **(replace or {}))
@@ -306,6 +370,73 @@ def selftest() -> int:
                           ("bounded-reader", "auto r = sh::read_file_at(d, n, 4);"),
                           ("bounded-reader", "auto r = sh::read_file_no_follow(p, 4);"),
                           ("bounded-reader", "auto r = sh::read_file_no_follow_at(d, n, 4);"),
+                          ("bounded-reader", "auto r = sh::read_file_bounded(d, n, 4);"),
+                          ("bounded-reader", "auto r = sh::open_no_reparse(p);"),
+                          ("win-io-call", "ReadFile(h, b, 4, &n, nullptr);"),
+                          ("win-io-call", "::ReadFileEx(h, b, 4, &o, cb);"),
+                          ("win-io-call", "ReadFileScatter(h, s, 4, nullptr, &o);"),
+                          ("win-io-call", "WriteFile(h, b, 4, &n, nullptr);"),
+                          ("win-io-call", "WriteFileEx(h, b, 4, &o, cb);"),
+                          ("win-io-call", "WriteFileGather(h, s, 4, nullptr, &o);"),
+                          ("win-io-call", "NtReadFile(h, 0, 0, 0, &io, b, 4, 0, 0);"),
+                          ("win-io-call", "NtWriteFile(h, 0, 0, 0, &io, b, 4, 0, 0);"),
+                          ("win-io-call", "SetFileInformationByHandle(h, c, &i, 4);"),
+                          ("win-io-call", "NtSetInformationFile(h, &io, &i, 4, c);"),
+                          ("win-io-call", "SetEndOfFile(h);"),
+                          ("win-io-call", "FlushFileBuffers(h);"),
+                          ("win-io-call", "DeleteFileW(p);"),
+                          ("win-io-call", "DeleteFile(p);"),
+                          ("win-io-call", "RemoveDirectoryW(p);"),
+                          ("win-io-call", "MoveFileExW(a, b, 0);"),
+                          ("win-io-call", "MoveFile(a, b);"),
+                          ("win-io-call", "void* v = MapViewOfFile(m, 4, 0, 0, 0);"),
+                          ("win-io-call", "void* v = MapViewOfFileEx(m, 4, 0, 0, 0, 0);"),
+                          ("win-io-call", "HANDLE m = CreateFileMappingW(h, 0, 2, 0, 0, 0);"),
+                          ("win-path-open", "HANDLE h = CreateFileW(p, 0, 0, 0, 3, 0, 0);"),
+                          ("win-path-open", "HANDLE h = CreateFileA(p, 0, 0, 0, 3, 0, 0);"),
+                          ("win-path-open", "HANDLE h = CreateFile2(p, 0, 0, 3, 0);"),
+                          ("win-path-open", "HANDLE h = CreateFile (p, 0, 0, 0, 3, 0, 0);"),
+                          ("win-path-open", "NtCreateFile(&h, a, &oa, &io, 0, 0, 7, 1, o, 0, 0);"),
+                          ("win-path-open", "NtOpenFile(&h, a, &oa, &io, 7, o);"),
+                          ("win-path-open", "HANDLE h = FindFirstFileW(p, &d);"),
+                          ("win-path-open", "HANDLE h = FindFirstFileExW(p, 1, &d, 0, 0, 0);"),
+                          ("confined-destructive", "auto r = confined_fs::unlink_at(h, n);"),
+                          ("confined-destructive", "auto r = confined_fs::delete_matching(h, rules);"),
+                          ("data-access-right", "DWORD a = GENERIC_READ;"),
+                          ("data-access-right", "DWORD a = GENERIC_WRITE;"),
+                          ("data-access-right", "DWORD a = GENERIC_ALL;"),
+                          ("data-access-right", "DWORD a = GENERIC_EXECUTE;"),
+                          ("data-access-right", "DWORD a = FILE_GENERIC_READ;"),
+                          ("data-access-right", "DWORD a = FILE_GENERIC_WRITE;"),
+                          ("data-access-right", "DWORD a = FILE_READ_ATTRIBUTES | FILE_READ_DATA;"),
+                          ("data-access-right", "DWORD a = FILE_WRITE_DATA;"),
+                          ("data-access-right", "DWORD a = FILE_APPEND_DATA;"),
+                          ("data-access-right", "DWORD a = FILE_LIST_DIRECTORY | SYNCHRONIZE;"),
+                          ("data-access-right", "DWORD a = FILE_ADD_FILE;"),
+                          ("data-access-right", "DWORD a = FILE_WRITE_ATTRIBUTES;"),
+                          ("data-access-right", "DWORD a = FILE_WRITE_EA;"),
+                          ("data-access-right", "DWORD a = FILE_ALL_ACCESS;"),
+                          ("data-access-right", "DWORD a = MAXIMUM_ALLOWED;"),
+                          ("data-access-right", "DWORD a = WRITE_DAC;"),
+                          ("data-access-right", "DWORD a = WRITE_OWNER;"),
+                          ("data-access-right", "DWORD a = DELETE | SYNCHRONIZE;"),
+                          ("data-access-right", "DWORD a = (DELETE);"),
+                          ("win-privilege", "const wchar_t* n = SE_BACKUP_NAME;"),
+                          ("win-privilege", "const wchar_t* n = SE_RESTORE_NAME;"),
+                          ("win-privilege", "auto p = L\"SeBackupPrivilege\";"),
+                          ("win-privilege", "auto p = SeRestorePrivilege;"),
+                          ("win-privilege", "AdjustTokenPrivileges(t, 0, &p, 0, 0, 0);"),
+                          ("win-privilege", "DWORD f = FILE_FLAG_BACKUP_SEMANTICS;"),
+                          ("win-process-state", "SetErrorMode(SEM_FAILCRITICALERRORS);"),
+                          ("win-process-state", "::SetErrorMode(1);"),
+                          ("win-process-state", "RtlSetProcessPlaceholderCompatibilityMode(2);"),
+                          ("win-ioctl", "DWORD c = FSCTL_SET_EXTERNAL_BACKING;"),
+                          ("win-ioctl", "DWORD c = FSCTL_GET_REPARSE_POINT;"),
+                          ("win-ioctl", "DWORD c = FSCTL_SET_SPARSE;"),
+                          ("win-ioctl", "DWORD c = FSCTL_DELETE_REPARSE_POINT;"),
+                          ("win-ioctl", "DWORD c = FSCTL_GET_RETRIEVAL_POINTERS_AND_REFCOUNT;"),
+                          ("win-ioctl", "DWORD c = IOCTL_DISK_GET_DRIVE_GEOMETRY;"),
+                          ("win-ioctl", "DWORD c = IOCTL_STORAGE_QUERY_PROPERTY;"),
                           ("positional-read", "auto n = pread(fd, b, 4, 0);"),
                           ("positional-read", "auto n = pread64(fd, b, 4, 0);"),
                           ("mapped-read", "void* p = mmap(0, 4, 1, 1, fd, 0);"),
@@ -342,6 +473,47 @@ def selftest() -> int:
     own_ids = {r for r, _ in source_problems(dict(src, **{driver: src[driver] + own}))}
     expect(own_ids == set(), f"scope: write_output(, read_file_extents( and the like must not count: {sorted(own_ids)}")
 
+    # The Windows spellings that merely contain a pinned one, or that the leg legitimately uses, are not named.
+    win_own = canonical("SetThreadErrorMode(SEM_FAILCRITICALERRORS, &old); read_file_extents(p, 4); "
+                        "CHAR m = RtlSetThreadPlaceholderCompatibilityMode(2); "
+                        "DWORD s = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE; "
+                        "DWORD a = FILE_READ_ATTRIBUTES | SYNCHRONIZE; DWORD f = FILE_ATTRIBUTE_REPARSE_POINT; "
+                        "auto c = FILE_DELETE_ON_CLOSE_X; auto d = DELETED; auto e = my_DELETE; "
+                        "auto g = ReadFileLike; auto h = WriteFiles;")
+    win_ids = {r for r, _ in source_problems(dict(src, **{driver: src[driver] + win_own}))}
+    expect(win_ids == set(), f"win: SetThreadErrorMode(, RtlSetThreadPlaceholderCompatibilityMode(, read_file_extents( "
+                             f"and look-alikes must not count: {sorted(win_ids)}")
+
+    # The two ioctls: nowhere, or exactly twice and only in file_search_win.cpp, each allowed name once.
+    two = canonical("DeviceIoControl(h, FSCTL_GET_EXTERNAL_BACKING, nullptr, 0, b, 4, &n, nullptr); "
+                    "DeviceIoControl(h, FSCTL_GET_RETRIEVAL_POINTERS, &i, 4, o, 4, &n, nullptr);")
+
+    def ioctl_ids(replace: dict[str, str]) -> set[str]:
+        return {r for r, _ in source_problems(dict(src, **replace)) if r.startswith("ioctl-") or r == "win-ioctl"}
+
+    expect(ioctl_ids({WIN_CPP: two}) == set(), "ioctl: two calls in file_search_win.cpp, each allowed name once, must pass")
+    expect(ioctl_ids({WIN_CPP: two + canonical("// DeviceIoControl(h, FSCTL_SET_SPARSE, 0, 0, 0, 0, &n, 0);")}) == set(),
+           "ioctl: a comment spelling a third call must not count")
+    expect("ioctl-count" in ioctl_ids({WIN_CPP: canonical("DeviceIoControl(h, FSCTL_GET_RETRIEVAL_POINTERS, &i, 4, o, 4, &n, 0);")}),
+           "ioctl: a lone DeviceIoControl( was NOT detected")
+    expect("ioctl-count" in ioctl_ids({WIN_CPP: two + canonical("DeviceIoControl(h, FSCTL_GET_RETRIEVAL_POINTERS, &i, 4, o, 4, &n, 0);")}),
+           "ioctl: a third DeviceIoControl( was NOT detected")
+    expect("ioctl-count" in ioctl_ids({WIN_CPP: two, driver: src[driver] + canonical("DeviceIoControl(h, 1, 0, 0, 0, 0, &n, 0);")}),
+           "ioctl: a call in another file was NOT detected")
+    expect("ioctl-count" in ioctl_ids({driver: src[driver] + two}),
+           "ioctl: both calls in a file other than file_search_win.cpp were NOT detected")
+    expect("ioctl-name" in ioctl_ids({WIN_CPP: two.replace("FSCTL_GET_EXTERNAL_BACKING", "FSCTL_GET_RETRIEVAL_POINTERS")}),
+           "ioctl: a repeated FSCTL name (and a missing one) was NOT detected")
+    # a name is not a call: the capability descriptor (and any other file) may still name an allowed code
+    expect(ioctl_ids({WIN_CPP: two, driver: src[driver] + canonical("auto c = FSCTL_GET_EXTERNAL_BACKING;")}) == set(),
+           "ioctl: an allowed FSCTL name in another file must not count while the two calls stand")
+    expect(ioctl_ids({driver: src[driver] + canonical("auto c = FSCTL_GET_RETRIEVAL_POINTERS;")}) == set(),
+           "ioctl: an allowed FSCTL name with no DeviceIoControl( call is only a name")
+    expect("win-ioctl" in ioctl_ids({WIN_CPP: two + canonical("auto c = FSCTL_SET_EXTERNAL_BACKING;")}),
+           "ioctl: FSCTL_SET_EXTERNAL_BACKING beside the two allowed calls was NOT detected")
+    expect("win-ioctl" in ioctl_ids({WIN_CPP: two + canonical("auto c = FSCTL_GET_REPARSE_POINT;")}),
+           "ioctl: FSCTL_GET_REPARSE_POINT beside the two allowed calls was NOT detected")
+
     # The required statement: deleted, or only mentioned in a comment, is named.
     for rid, path, snippet, _why in SRC_REQUIRED:
         text = src.get(path, "")
@@ -351,9 +523,26 @@ def selftest() -> int:
             continue
         ids = {r for r, _ in source_problems(dict(src, **{path: text.replace(needle, "", 1)}))}
         expect(rid in ids, f"{rid}: deleting its statement was NOT detected")
-        expect("fm-flags-write" in ids, "fm-flags-write: deleting the only fm_flags write was NOT detected")
+        if rid == "fiemap-flags":
+            expect("fm-flags-write" in ids, "fm-flags-write: deleting the only fm_flags write was NOT detected")
         ids = {r for r, _ in source_problems(dict(src, **{path: canonical("// " + snippet + "\n")}))}
         expect(rid in ids, f"{rid}: a comment mentioning its statement satisfied it")
+
+    # The attribute-only open of confined_fs: widening its access mask (or dropping SYNCHRONIZE) is named,
+    # and the file stays outside the forbidden-list scope (the primitive opens by path and lists directories).
+    pin_text = src.get(CONFINED_WIN, "")
+    expect(canonical("FILE_READ_ATTRIBUTES | SYNCHRONIZE,") in pin_text,
+           "attr-only-open: confined_fs_win.cpp no longer holds the attribute-only open (stale gate)")
+    for widened in ("FILE_READ_ATTRIBUTES | FILE_READ_DATA | SYNCHRONIZE", "FILE_READ_ATTRIBUTES | GENERIC_READ | SYNCHRONIZE",
+                    "FILE_READ_ATTRIBUTES", "FILE_READ_ATTRIBUTES | SYNCHRONIZE | DELETE"):
+        mutated = pin_text.replace(canonical("nt_open_relative(parent, wide, FILE_READ_ATTRIBUTES | SYNCHRONIZE,"),
+                                   canonical(f"nt_open_relative(parent, wide, {widened},"), 1)
+        expect("attr-only-open" in {r for r, _ in source_problems(dict(src, **{CONFINED_WIN: mutated}))},
+               f"attr-only-open: changing the access mask to `{widened}` was NOT detected")
+    expect(CONFINED_WIN not in _scope_files(REPO_ROOT), "scope: confined_fs_win.cpp must stay outside the scanned scope")
+    expect(source_problems(dict(src, **{CONFINED_WIN: pin_text + canonical(
+        "HANDLE h = CreateFileW(p, FILE_LIST_DIRECTORY, 0, 0, 3, 0, 0); DeleteFileW(p); DWORD d = DELETE;")})) == [],
+           "scope: forbidden spellings in confined_fs_win.cpp must not count (it is pinned, not scanned)")
 
     # A file out of scope is not scanned: the match open and pread_range live in component_fs_posix.cpp.
     expect(os.path.join("agents", "plugins", "component_inventory", "src", "component_fs_posix.cpp") not in src,

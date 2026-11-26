@@ -1,5 +1,5 @@
-// win_no_reparse_open.hpp -- open ONE local-drive file with no reparse point followed anywhere
-// below the drive root, in a single kernel name resolution.
+// win_no_reparse_open.hpp -- open ONE local-drive file or directory with no reparse point
+// followed anywhere below the drive root, in a single kernel name resolution.
 //
 // WHY. A path-resolving open (CreateFileW on `X:\a\b\file`) follows a reparse point in any
 // ancestor directory, and a separate attribute check of each ancestor first leaves a window in
@@ -33,6 +33,14 @@
 //
 // The header never logs (agents/shared headers do not pull spdlog into consumers); a consumer
 // that wants the `unsupported` cause in its log reads the status.
+//
+// TWO OPENS, ONE MECHANISM. `open_file_no_reparse` opens a regular file for reading (the read
+// primitive behind the runtimes plugin's JVM `release` read); `open_dir_no_reparse` opens a
+// directory for listing (the component_inventory Windows leg), through the same root handle, the
+// same `drive_relative_name` filter and the same OBJ_DONT_REPARSE | FILE_OPEN_REPARSE_POINT
+// NtCreateFile call, with the same status mapping. The directory variant adds one by-handle check
+// of its own (below) because a leaf reparse point is opened as itself, not followed. The file open
+// is unchanged by it.
 //
 // The Windows body is `#ifdef _WIN32`; `drive_relative_name` is pure and above the guard so every
 // OS tests it.
@@ -90,6 +98,7 @@ namespace yuzu::win {
 #include <winternl.h> // UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK, NTSTATUS (after windows.h)
 
 #include <limits>
+#include <utility>
 
 namespace yuzu::win {
 
@@ -152,6 +161,7 @@ constexpr ULONG kObjDontReparse = 0x00001000UL;
 constexpr ULONG kFileOpen = 0x00000001UL;
 constexpr ULONG kFileNonDirectoryFile = 0x00000040UL;
 constexpr ULONG kFileOpenReparsePoint = 0x00200000UL;
+constexpr ULONG kFileDirectoryFile = 0x00000001UL;
 constexpr ULONG kFileSynchronousIoNonalert = 0x00000020UL;
 constexpr DWORD kFileTraverse = 0x00000020UL;
 constexpr NTSTATUS kStatusObjectNameNotFound = static_cast<NTSTATUS>(0xC0000034L);
@@ -187,8 +197,13 @@ inline NoReparseHandle open_volume_root(wchar_t drive_letter) {
 } // namespace no_reparse_detail
 
 /// Open `path` (`X:\...` or `X:/...`) for reading with no reparse point followed below the drive
-/// root. See the file banner for the mechanism and the status mapping.
-[[nodiscard]] inline NoReparseOpenResult open_file_no_reparse(const std::wstring& path) {
+/// root. See the file banner for the mechanism and the status mapping. `share_access` is the
+/// NtCreateFile ShareAccess mask (FILE_SHARE_*); the default lets other writers, renamers and
+/// deleters proceed while the handle is held, and a caller that holds the handle to pin the file
+/// passes FILE_SHARE_READ so a rename, delete or rewrite of it fails while the handle is open.
+[[nodiscard]] inline NoReparseOpenResult
+open_file_no_reparse(const std::wstring& path,
+                     ULONG share_access = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) {
     using namespace no_reparse_detail;
     NoReparseOpenResult result;
 
@@ -229,12 +244,80 @@ inline NoReparseHandle open_volume_root(wchar_t drive_letter) {
     IO_STATUS_BLOCK iosb{};
     const NTSTATUS status = nt_create_file(
         &raw, FILE_GENERIC_READ, &attrs, &iosb, /*AllocationSize=*/nullptr, /*FileAttributes=*/0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, kFileOpen,
+        share_access, kFileOpen,
         kFileNonDirectoryFile | kFileSynchronousIoNonalert | kFileOpenReparsePoint,
         /*EaBuffer=*/nullptr, /*EaLength=*/0);
     if (status >= 0) {
         result.file = NoReparseHandle(raw); // owned at the statement it is produced
         result.status = NoReparseOpen::ok;
+    } else if (status == kStatusObjectNameNotFound || status == kStatusObjectPathNotFound) {
+        result.status = NoReparseOpen::absent;
+    } else if (status == kStatusInvalidParameter) {
+        result.status = NoReparseOpen::unsupported;
+    } // else refused (STATUS_REPARSE_POINT_ENCOUNTERED, access denied, ...)
+    return result;
+}
+
+/// Open the directory `path` (`X:\...` or `X:/...`, never the bare drive root) for listing with no
+/// reparse point followed below the drive root: the file open's mechanism with FILE_DIRECTORY_FILE
+/// and list access. The status mapping is the file open's. One more refusal: a leaf that is a
+/// reparse point is opened as itself (FILE_OPEN_REPARSE_POINT, never its target), so the handle's own
+/// attributes are read before it is returned and a reparse point, or anything that is not a
+/// directory, is `refused` with the handle closed. The returned handle is synchronous: list it with
+/// GetFileInformationByHandleEx(FileIdBothDirectoryInfo).
+[[nodiscard]] inline NoReparseOpenResult open_dir_no_reparse(const std::wstring& path) {
+    using namespace no_reparse_detail;
+    NoReparseOpenResult result;
+
+    const auto relative = drive_relative_name(path);
+    if (!relative)
+        return result; // refused: a name the NT open would resolve differently
+
+    const NtCreateFileFn nt_create_file = resolve_ntcreatefile();
+    if (nt_create_file == nullptr) {
+        result.status = NoReparseOpen::unsupported;
+        return result;
+    }
+
+    // UNICODE_STRING::Length is a USHORT byte count.
+    const std::size_t bytes = relative->size() * sizeof(wchar_t);
+    if (bytes > (std::numeric_limits<USHORT>::max)())
+        return result;
+
+    const NoReparseHandle root = open_volume_root(path[0]);
+    if (root.get() == INVALID_HANDLE_VALUE)
+        return result;
+
+    UNICODE_STRING name{};
+    name.Length = static_cast<USHORT>(bytes);
+    name.MaximumLength = name.Length;
+    // const_cast proof: as in open_file_no_reparse, the Buffer is an input NtCreateFile never writes
+    // through, borrowing `*relative`, a local that outlives the call below.
+    name.Buffer = const_cast<PWSTR>(relative->c_str());
+
+    OBJECT_ATTRIBUTES attrs{};
+    attrs.Length = sizeof(attrs);
+    attrs.RootDirectory = root.get();
+    attrs.ObjectName = &name;
+    attrs.Attributes = kObjCaseInsensitive | kObjDontReparse;
+
+    HANDLE raw = INVALID_HANDLE_VALUE;
+    IO_STATUS_BLOCK iosb{};
+    const NTSTATUS status = nt_create_file(
+        &raw, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attrs, &iosb,
+        /*AllocationSize=*/nullptr, /*FileAttributes=*/0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, kFileOpen,
+        kFileDirectoryFile | kFileSynchronousIoNonalert | kFileOpenReparsePoint,
+        /*EaBuffer=*/nullptr, /*EaLength=*/0);
+    if (status >= 0) {
+        NoReparseHandle owned(raw); // owned at the statement it is produced
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (GetFileInformationByHandle(owned.get(), &info) &&
+            (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            result.file = std::move(owned);
+            result.status = NoReparseOpen::ok;
+        } // else refused: a leaf reparse point opened as itself, or not a directory; closed here
     } else if (status == kStatusObjectNameNotFound || status == kStatusObjectPathNotFound) {
         result.status = NoReparseOpen::absent;
     } else if (status == kStatusInvalidParameter) {

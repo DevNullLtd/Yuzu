@@ -601,7 +601,7 @@ else
 fi
 
 # Instructions content-suite gate — schema-driven REST exerciser.
-# Drives every default-risk (safe + mutating) InstructionDefinition and
+# Drives the default-risk (safe + mutating) InstructionDefinitions, less the rows skipped by name (below), and
 # records per-instruction pass/fail/timing into the test-runs DB.
 # The destructive, forensic, server-internal, interactive, network-disrupt and
 # default-off classes are opt-in via --risks; default-mode invocation excludes them.
@@ -633,6 +633,8 @@ When the operator runs `/test --instructions`, the orchestration is **truncated*
 - A YAML under `content/definitions/` changed (added/edited/removed an InstructionDefinition).
 - The instruction-engine dispatch path (`workflow_routes.cpp` `POST /api/instructions/:id/execute`, `agent_service_impl.cpp` `cmd_execution_ids_`, response store) was touched.
 - Investigating a content regression flagged by the trend tooling.
+
+Four definitions are always skipped by name and two more on opt-in (ids and reasons are printed at the start, and each reason is in the row's note and the `--output` JSON): `agent.http_client.get`/`head` (the plugin SSRF-blocks every target the runner can reach offline), `crossplatform.echo.configure` (any synthesised value would overwrite each reached agent's Echo byte budget) and `windows.rdp.set_state` (the synthesised `enable` would turn remote desktop on) always, and `device.network_actions.ping`/`flush_dns` only when `YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1` is exported (a rig whose agent has no `sudo -n resolvectl` grant or raw sockets, such as a bwrap netns). Skips never count as passes.
 
 Wall clock is dominated by Phase 4 (~60-90s) and the gate itself (5-15 min for the runnable instructions at parallelism=4). The gate writes per-instruction timings to `test_timings` so `bash scripts/test/test-db-query.sh --trend timing=phase5-instructions.<id>` shows latency drift over time.
 

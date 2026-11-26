@@ -1226,22 +1226,36 @@ that could not mean anything:
   is listed, in force, in `scripts/ci/image-vuln-gate-not-covered.txt` (exact name match). Each
   listing carries the reason, `approved_by`, `approved_on`, `approval_ref` (the approving pull
   request) and an expiry at most 92 days out; an expired listing is not in force, and one whose
-  `approval_ref` is `pending` is not in force in a release (`--release`). A listed image is
-  printed as `NOT COVERED` (and a step warning) on every run. Today four images are listed: the
-  three chisel images and the agent bundle. They are assembled FROM scratch from chisel slices
-  (all four Dockerfiles cut `base-files_{base,etc,var,tmp,release-info}` and no
-  `base-files_chisel`, then `COPY --from=chisel /rootfs /`). The scanners read a dpkg package
-  database, including `/var/lib/dpkg/status.d` (the distroless format), and these images ship
-  none, so Trivy 0.70.0 reports "No OS package is detected". Cutting `base-files_chisel` would not
-  change that: it writes a chisel manifest, and a string check of the Trivy 0.70.0, grype 0.122.0
-  and syft 1.57.2 binaries found `dpkg/status.d` in all three and neither `manifest.wall` nor
-  `var/lib/chisel` in any (string evidence, not a scan, and on grype 0.122.0 rather than the
-  pinned 0.121.3). **Their libc6, libssl3t64, zlib1g and other slices ship unscanned by Trivy**
-  (grype identifies only a few packages, best effort: "What it does not see" below). These four
-  listings expire 2027-02-15 and are not to be renewed; the planned fix, not a shipped one, is a
-  scanner-readable package manifest (dpkg `status.d` stanzas emitted in the chisel stage, #8415).
-  Consequence: from 2027-02-15 the release gate refuses these four images unless #8415 has shipped
-  or a renewal is deliberately approved by the owner.
+  `approval_ref` is `pending` is not in force in a release (`--release`). A listing applies only
+  while Trivy sees no OS package in the image: it is then printed as `NOT COVERED` (and a step
+  warning) on every run. When Trivy sees OS packages in a listed image, the gate treats the image
+  as covered (`verdict=covered`), prints a `warning:` that the listing is stale, runs the OS-family,
+  end-of-life and advisory-canary checks, and refuses on a fixable CRITICAL from Trivy or grype like
+  any other image; the listing's expiry is not consulted in that case (the release skill's
+  `pending` pre-flight does report an expired listing). No image is listed. The three chisel
+  images and the agent bundle are assembled FROM scratch from chisel slices: all four
+  Dockerfiles cut `base-files_{base,etc,var,tmp,release-info,chisel}`, run
+  `deploy/docker/chisel-emit-status.py` on the same slice list, then `COPY --from=chisel /rootfs /`.
+  The scanners read a dpkg package database, including `/var/lib/dpkg/status.d` (the distroless
+  format). Chisel writes none; it writes a manifest (`base-files_chisel`), and a string check of
+  the Trivy 0.70.0, grype 0.122.0 and syft 1.57.2 binaries found `dpkg/status.d` in all three and
+  neither `manifest.wall` nor `var/lib/chisel` in any (string evidence, not a scan, and on grype
+  0.122.0 rather than the pinned 0.121.3). The script converts the manifest into one `status.d`
+  stanza per package (`Package`, `Status`, `Architecture`, `Version`, and the archive's `Source`,
+  which the Ubuntu advisories are keyed on: a stanza without it makes Trivy and grype report
+  nothing for a package built from a differently named source) and fails the build if a slice's
+  package is missing from the manifest, a package has no archive record at its version, the
+  manifest or an archive record is malformed, or the written set differs from the manifest. The
+  cut, the index refresh and the script run in one retried step, so a transient archive failure
+  retries all three. The records are per package: a slice is recorded as its whole package, so a
+  finding in a file the slice does not ship can be reported; no finding is hidden by that.
+  Reading these records with Trivy was checked by hand on one image (not reproducible from the
+  repository, and not a CI check); the gate behaviour above is covered by
+  `tests/test_image_vuln_gate.py` and the script's behaviour and call sites by
+  `tests/test_chisel_emit_status.py`. None of the four is listed, so if the records regress to
+  zero OS packages the gate refuses the image as unscanned (`tests/test_image_vuln_gate.py`
+  pins that for each of the four names). The gate does not compare the packages Trivy reads
+  with the Dockerfile's `SLICES`: it refuses zero packages, not a missing one.
   The gate learns an image's name from
   `NAME=IMAGE` (release.yml) or the tag (pre-release.yml); a bare image ID can never match the list.
 - an ignore file that `scripts/ci/image-vuln-gate-checks.py` does not accept (below).
@@ -1288,8 +1302,8 @@ after Trivy:
   multi-platform image succeeds, and grype reads it).
 - **OS cross-check.** When Trivy scanned the image's OS packages (`coverage: covered`), grype must
   have detected the same OS family; otherwise it matched none of those packages and the image
-  fails (`grype did not detect the OS (<family>)`). An image listed as not covered has no OS
-  packages Trivy could see, so there is nothing to cross-check. This check can only refuse an
+  fails (`grype did not detect the OS (<family>)`). An image listed as not covered (no image is listed)
+  has no OS packages Trivy could see, so there is nothing to cross-check. This check can only refuse an
   image; Trivy's report stays the only coverage reader.
 - **Required components.** grype's JSON lists matches only, so a runtime grype did not recognise
   would read as clean. For `yuzu-gateway` and `yuzu-gateway-chisel`, whose Erlang/OTP runtime is
@@ -1708,9 +1722,8 @@ journal stays at `push-started`, and the release job does not run.
 **Current packages.** The Debian and Alpine images upgrade their packages in the final stage
 (`apt-get upgrade`, `apk upgrade`; `yuzu-postgres` holds the PGDG server packages so the
 PostgreSQL minor stays the pinned one), and the chisel images cut their slices from the live
-Ubuntu archive (a fact about build time, not a scan: it is no vulnerability coverage for the
-chisel images, whose OS packages are not scanned; see "What it does not see" in "Release image
-vulnerability gate"). A package index that cannot be fetched fails the build: the Debian runtime
+Ubuntu archive (a fact about build time, not a scan; the chisel images' OS packages reach the
+scanners as `status.d` records, see "Release image vulnerability gate"). A package index that cannot be fetched fails the build: the Debian runtime
 stages run `apt-get update --error-on=any` (plain `apt-get update` exits 0 when, say, the
 security pocket is unreachable, and the upgrade then ships without it; checked 2026-11-18 on
 bookworm's apt 2.6 and trixie's apt 3.0, both exit 100 with the option), and Alpine's
@@ -1770,7 +1783,7 @@ decoy line cannot satisfy it), the gate refuses a file that breaks any rule, and
 the checker's canonical copy of the entries in force. It warns 21 days before an entry expires. An
 expired entry is not in force, so the next release fails on that finding again. Today there is one
 entry: the Go standard library CVE-2025-68121 in the upstream postgres image's `gosu` (gosu does not
-link `crypto/tls`); it and the four not-covered listings record their approval as `"#8315"`. An
+link `crypto/tls`); it records its approval as `"#8315"`. An
 entry is a commit, so it is in the tag a release builds: it can only help a release cut after it.
 
 A grype finding is accepted in `.grypeignore.yaml`, which the same checker parses with the same
@@ -1936,9 +1949,11 @@ except the agent bundle:
   the mirror normally lags by under a day, so wait and "Re-run failed jobs"; if it stays stale,
   check whether the mirror or Trivy's DB publishing is broken before anything else.
 - **OS packages not scanned** (an image newly showing 0 OS packages): something removed the
-  package database from an image that used to have one. Fix the image; listing it in
-  `image-vuln-gate-not-covered.txt` is a reviewed decision that its OS packages ship unscanned by
-  Trivy.
+  package database from an image that used to have one. For a chisel image, check that
+  `deploy/docker/chisel-emit-status.py` ran in its Dockerfile and that `/var/lib/dpkg/status.d`
+  holds records; after a Trivy version bump, scan one chisel image and confirm it reports more than
+  zero OS packages. Fix the image; listing it in `image-vuln-gate-not-covered.txt` is a reviewed
+  decision that its OS packages ship unscanned by Trivy, and it needs its own reviewed pull request.
   Either is a commit, so re-tag. On a listed image the log says why the listing is not in force:
   it expired (re-review it), or its `approval_ref` is `pending` (record the approval, above).
 - **An acceptance `NOT IN FORCE`**: its `approval_ref` is `pending`. Record the approval as
@@ -2052,19 +2067,14 @@ published images (a tracked gap).
 
 **What it does not see.**
 
-- **The chisel images' and the agent bundle's OS packages, to Trivy** (above): listed as not
-  covered, so Trivy matches none of their CVEs in libc6, libssl3t64, zlib1g and the other slices.
-  grype identifies only the few packages whose binaries name their own package: the committed
-  `yuzu-server-chisel` image SBOM (syft 1.57.2) has exactly two `pkg:deb` components, busybox and
-  openssl, both from `elf-binary-package-cataloger`; libc6, libstdc++6, libpq5 (and its
-  krb5/ldap closure), zlib1g and ca-certificates are not catalogued. On `yuzu-gateway-chisel` grype
-  matched Ubuntu 26.04 advisories to busybox and openssl (checked 2026-11-20), and a fixable
-  CRITICAL it reports there fails the image like any other; but the gate proves nothing about even
-  that coverage (no canary, no OS cross-check, and the `ubuntu` provider's freshness is checked
-  only for images Trivy covers: `want_family` in `image-vuln-gate.sh` is set only when the
-  coverage is `covered`, so a stale `ubuntu` provider is not detected for chisel images). **A
-  passing scan of a chisel image is not evidence about its OS packages.** Use the non-chisel image
-  if you need them covered.
+- **The chisel images' and the agent bundle's OS packages, at package granularity.** The scanners
+  read one `status.d` record per cut package (above), not a file list: a slice is recorded as its
+  whole package, so a finding in a file the slice does not ship can be reported, and no finding is
+  hidden by that. Unfixed MEDIUM and lower findings in these Ubuntu packages are reported and not
+  gated, as everywhere else. The records exist only if the build ran the script. The gate
+  refuses an image with no OS package at all, but not one that lost some of them. The gate
+  does not check what grype matched in these images beyond the gateway images' `erlang`
+  component.
 - **PostgreSQL itself.** In `yuzu-postgres` Trivy lists `postgresql-18`, `libpq5` and
   `postgresql-common` as packages but matches no vulnerability to them: they come from the PGDG
   repository, and Trivy's Debian advisories cover Debian's own packages only. And the image holds
@@ -4441,7 +4451,7 @@ yet establish a complete per-case execution inventory.
 
 The Instructions gate requires terminal SUCCESS from every agent counted in an
 untargeted dispatch's `agents_reached`, reads response pages, validates command
-and agent identities, and rejects any failure or malformed/incomplete evidence.
+and agent identities, and rejects any failure or malformed/incomplete evidence. Rows the runner skips by name (`agent.http_client.get`/`head`, `crossplatform.echo.configure` and `windows.rdp.set_state` always; `network_actions.ping`/`flush_dns` when `YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1`) are never dispatched by this gate: they are skips, not passes, and the reasons are printed at the start and kept in each row's note.
 Earlier RUNNING chunks are allowed when that agent has terminal success. The
 opt-in destructive/forensic path retains its separate stricter grading. These
 checks establish reported execution success, not action-specific postconditions.
@@ -5140,7 +5150,9 @@ the 2026-10-04 re-balance; A's did not).
 Every CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
 nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
 sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`
-is unsharded and unchanged.
+is unsharded and unchanged. `component_inventory windows host walk` (Windows only, suite `agent`,
+240 s) is a separate entry too: it runs the one hidden `[.][component_inventory_host_walk]` case, which
+walks the host's real Program Files twice (one walk per action, 45 s each at most) and has no room in a shard.
 
 Partition rule and measured balance live in the comment above the entries in
 `tests/meson.build`: a case runs in the lowest-numbered shard holding any of its
@@ -5291,6 +5303,12 @@ compilation, so no self-hosted dependency — builds the image without pushing,
 runs the release image vulnerability gate on it, pushes it, and cosign-signs +
 SBOMs + attests the pushed `yuzu-agent-bundle-chisel` image like the other
 publish jobs.
+
+Each chiselled rootfs is cut with `base-files_chisel` and then given a dpkg `status.d` record per
+package by `deploy/docker/chisel-emit-status.py` (see "Release image vulnerability gate"), so the
+scanners and the published SBOMs list the cut OS packages at package granularity. The script and
+the cut run in one retried step, and the bundle's build context carries the script
+(`scripts/build-agent-bundle.sh` stages it).
 
 ## vcpkg state corruption — recovery path
 

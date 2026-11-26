@@ -27,7 +27,7 @@
 /// (`dispatch_destructive_gate.hpp`'s `requires_explicit_targets` keys on the row's securable),
 /// and a search must stay launchable at a fleet or a group. `AdminOrApproval` plus
 /// `authz::RiskTier::High`: a listing of file names under every user's directories is
-/// reconnaissance material. Ships default-off behind the plugin-config kill switch.
+/// reconnaissance material. Ships ON by default; the plugin-config kill switch still turns it off.
 ///
 /// STORED-ROW read tier: `StoredRowTier::ForensicsRead`. What the search stored is withheld from
 /// every reader that does not hold a global `Forensics:Read`, exactly like the stored rows of a

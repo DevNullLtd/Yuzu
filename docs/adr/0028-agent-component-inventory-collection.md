@@ -1553,9 +1553,11 @@ path-filtered to `zip_directory*`. The Java file-name, manifest and `pom.propert
 capped inflate are covered by unit tests only, not by a fuzz target.
 
 **Still open.**
-- The Windows leg (answers `windows:planned` today). It also brings the name-based exclusion of
-  OS-owned trees (`\WindowsApps`, `\Windows Kits`, `\WinSxS`, `\Windows`, `\System32`, `\SysWOW64`).
-  The Linux and macOS roots above hold no OS-owned tree, so this slice excludes no directory by name.
+- The Windows leg (answered `windows:planned` when this slice shipped; it shipped with the 2026-11-21
+  update below). It also brings the name-based exclusion of OS-owned trees (`\WindowsApps`,
+  `\Windows Kits`, `\WinSxS`, `\Windows`, `\System32`, `\SysWOW64`; the 2026-11-21 update records
+  which of these the Windows leg excludes). The Linux and macOS roots above hold no OS-owned tree, so
+  this slice excludes no directory by name.
 - The hard per-cycle time bound (the sync assembler's bounded wait) arrives with the daily-report
   section. Until then the 45 second budget is checked between directories and between archives, so one
   blocked read inside a listing or a file read is not interrupted.
@@ -1572,8 +1574,8 @@ definition `crossplatform.components.native`, plugin version 1.1.0. Kind: `nativ
 (ELF `.so` and `.so.<version>` on Linux, Mach-O `.dylib` on macOS), one row per library, 5,000 rows at
 most. The walk, the one deadline, the one open per file and the completeness rule are `scan`'s; the
 row is `comp|native|name|version|version_source|path|size|mtime|anchor_app`, and the status row names
-`native`. Windows answers `windows:planned`: the plugin has no Windows filesystem leg, and a Windows
-walk (reparse-point safe, network-drive aware) is its own change.
+`native`. Windows answered `windows:planned` at this point: the plugin had no Windows filesystem leg,
+and a Windows walk (reparse-point safe, network-drive aware) was its own change (the 2026-11-21 update).
 
 **Roots and exclusions (Decision 1, Decision 4).** Linux `/opt` and `/usr/local/lib`; macOS
 `/Applications`, `/usr/local` and `/opt/homebrew`. The package-owned and OS trees are excluded: on
@@ -1609,5 +1611,55 @@ ReadOnly, `Inventory:Read`, gate `None`: the off-switch is the kill-switch row, 
 may publish. The fleet cost evidence wanted before the action is ever on by default is therefore not
 collected by this plugin yet.
 
-**Still open.** The Windows leg of both actions; the daily-report section and the permanent customer
-opt-out (above); extension-less macOS framework binaries; a hard per-cycle time bound.
+**Still open.** The daily-report section and the permanent customer opt-out (above); extension-less
+macOS framework binaries; a hard per-cycle time bound. (The Windows leg of both actions shipped with
+the 2026-11-21 update below.)
+
+## Update (2026-11-21) — Windows leg for `scan` and `native`
+
+**What shipped.** Both actions now run on Windows; neither answers `windows:planned` any more. The leg
+is a Windows binding of the existing filesystem seam and nothing else: the walk, the limits, the
+archive reads and the answer assembly are the portable code the Linux and macOS legs already use. It
+is declared `supported` on the measured scope (one host, Windows 11 build 26200, an elevated
+administrator session, `docs/samples/windows.txt`) and answers `constrained` when a directory is refused
+or a bound is reached; the descriptor says so.
+
+*Capture, 2026-11-24.* The measured scope was captured on 2026-11-24, after this update was first
+written. `scan` answered `constrained` with `dir_unreadable` at a refused system directory; `native`
+returned exactly 5,000 rows, the row limit.
+
+**Roots (Decision 1).** The 64-bit and 32-bit Program Files directories, named by the shell's
+known-folder lookup and never by an environment variable, on fixed local drives only. A root on a UNC
+path, a mapped network drive, removable or optical media or a RAM drive is dropped and counted in
+`network_fs_skipped`. A drive whose type cannot be told, or a known-folder path that names no walkable
+directory (empty, relative or a bare drive root), is dropped and answers `constrained` with
+`mount_table_unreadable`: no candidate is dropped silently, and a tree that was never read never reads as
+an empty one. A lookup that fails walks nothing and answers the same: a failed read is never an empty
+host. The drive type is asked again before every directory and every file is opened, not only when the
+roots are planned, so a drive that stops being a fixed local disk during a scan is refused from then on.
+Per-user locations are not read. Python and Node components on Windows are a later change.
+
+**No reparse point is followed (Decision 4).** Every directory and file is opened relative to its
+volume root in one kernel name resolution that refuses a reparse point at any path component
+(`NtCreateFile` with `OBJ_DONT_REPARSE`, in `agents/shared/win_no_reparse_open.hpp`, shared with the
+`runtimes` plugin). An entry that is itself a reparse point (a junction, a symbolic link, a mount
+point, a cloud placeholder) is counted in `link_skipped` and never opened; a file is read through the
+handle that was opened and checked, never by path again.
+
+**Exclusions (Decision 4).** The `WindowsApps` directory directly under each root, matched by exact
+path without regard to case, is not entered by either action. It is counted and reported on a
+`supported` status row by `package_tree_skipped`, as the macOS Cellar trees are for `native`; this is
+the one name-based exclusion of the Windows leg. `\Windows Kits`, which sits under Program Files
+(x86), is not excluded by this change; `\WinSxS`, `\Windows`, `\System32` and `\SysWOW64` are not
+under either root and need no exclusion.
+
+**`native` on Windows.** A candidate is a file whose leaf ends `.dll`, compared without regard to case
+(`.dll.mui` is not one). The version is the fixed file version of the PE's `VS_VERSIONINFO` resource,
+read by the shared bounded PE reader (`agents/shared/binary_header_pe.hpp`) through the same file view;
+`version_source` is `pe`. A PE with no version resource, or a fixed version of 0.0.0.0, is a row with
+an empty version and `version_source` `unreadable`; a file named `.dll` that has no PE header gives no
+row. The 5,000-row cap and the default-off kill switch are unchanged.
+
+**Known limits.** The open, listing and read calls carry no deadline of their own, so the 45 second
+budget is checked between operations and a dead fixed volume can park one call, as it can for the
+`runtimes` plugin's read of the same primitive.

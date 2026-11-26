@@ -4,7 +4,8 @@
  *
  * RUNS ON ALL THREE PLATFORMS, deliberately: no platform guard on the TU (a guarded dispatcher TU is how a
  * sibling plugin once shipped a compiled-out Windows leg and stayed green). Only the expectations differ per
- * host: Windows answers `planned`, and the POSIX cases drive one real search over a fixture directory.
+ * host: the POSIX cases drive one real search over a fixture directory, the Windows cases the same over a
+ * fixture under the build root, in the canonical label form (`/C:/...`).
  *
  * THE FIXTURE lives under the canonical build root (MESON_BUILD_ROOT) in a yuzu_test_ directory with the
  * test helpers' salt, never under $TMPDIR: /var is a link on macOS and /tmp is often tmpfs or overlay on
@@ -19,8 +20,8 @@
  * cases warn and return, which is a false green outside `meson test`.
  *
  * MUTATION NOTES (each case FAILS if the named production rule is removed):
- *  - descriptors: adding a second action, changing a declared leg, or loading the wrong plugin fails the
- *    descriptor case; removing the planned reporter on Windows fails the planned case.
+ *  - descriptors: adding a second action, changing a declared leg (the Windows leg is constrained, rung 1),
+ *    or loading the wrong plugin fails the descriptor case.
  *  - invalid rows: a parameter error that reaches the filesystem, or that is not a typed `invalid` trailer
  *    with the status 1, fails the refusal case; a forged cursor that is not refused before the mount table
  *    is read fails it too (its fixture root does not exist).
@@ -36,6 +37,9 @@
  *    dlclose (glibc) when the case runs before any other init in the process. macOS's dyld keeps this
  *    plugin's image resident whether or not it is pinned (checked with a bare dlopen/dlclose pair), so on
  *    that host the case cannot fail; the Linux run is the one that discriminates.
+ *  - shutdown: a shutdown that does not set the stop flag, an init that does not clear it, or a shell that
+ *    does not hand the flag to the driver fails the shutdown case (the next search is not cancelled, or the
+ *    one after a re-init still is).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -46,8 +50,10 @@
 
 #include "file_search_rows.hpp"
 #include "file_search_test_support.hpp"
+#include "file_search_win_rules.hpp"
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
+#include "win_junction_test_support.hpp"
 
 #include <file_search_names.hpp>
 #include <network_fstype.hpp>
@@ -62,7 +68,15 @@
 #include <string_view>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -177,8 +191,6 @@ struct Call {
     }
 };
 
-#if !defined(_WIN32)
-
 void write_file(const fs::path& p, const std::string& content) {
     fs::create_directories(p.parent_path());
     std::ofstream(p, std::ios::binary) << content;
@@ -221,6 +233,20 @@ bool fixture_was_searched(const Search& s) {
     return false;
 }
 
+std::vector<std::string> found_paths(const Search& s) {
+    std::vector<std::string> out;
+    for (const auto& row : s.rows)
+        if (starts(row, "match|")) {
+            const auto path = fsr::decode_name(split(row)[1]);
+            REQUIRE(path.has_value());
+            out.push_back(*path);
+        }
+    std::ranges::sort(out);
+    return out;
+}
+
+#if !defined(_WIN32)
+
 /// What the OS itself says about the fixture root's filesystem, independent of the rows under
 /// test: true when it is a type the plan's allow-list admits. That allow-list is
 /// `is_searchable_local_fstype` in agents/shared/network_fstype.hpp. macOS calls it over the statfs
@@ -255,18 +281,6 @@ void require_searched_when_searchable(const fs::path& root, const Search& s, boo
     FAIL("the fixture's filesystem is one the plan searches, yet no volume was searched; volume rows:" << volumes);
 }
 
-std::vector<std::string> found_paths(const Search& s) {
-    std::vector<std::string> out;
-    for (const auto& row : s.rows)
-        if (starts(row, "match|")) {
-            const auto path = fsr::decode_name(split(row)[1]);
-            REQUIRE(path.has_value());
-            out.push_back(*path);
-        }
-    std::ranges::sort(out);
-    return out;
-}
-
 #if defined(__APPLE__)
 constexpr const char* kSemantics = "macos_nfc_casefold_v1";
 constexpr yuzu::file_search::Os kOs = yuzu::file_search::Os::macos;
@@ -275,7 +289,45 @@ constexpr const char* kSemantics = "bytes";
 constexpr yuzu::file_search::Os kOs = yuzu::file_search::Os::linux_os;
 #endif
 
-#endif // !_WIN32
+#else // _WIN32
+
+constexpr const char* kSemantics = "windows_upcase_v1";
+constexpr yuzu::file_search::Os kOs = yuzu::file_search::Os::windows;
+
+/// What the OS itself says about the fixture's volume, independent of the rows under test: a fixed drive whose
+/// filesystem the plan's allow-list admits must have been searched (the positive control, made mandatory where
+/// the host can state it). Anything else keeps the refused branch.
+bool volume_is_searchable(const fs::path& root) {
+    wchar_t mount[MAX_PATH + 1] = {};
+    if (!GetVolumePathNameW(root.c_str(), mount, MAX_PATH) || GetDriveTypeW(mount) != DRIVE_FIXED)
+        return false;
+    wchar_t name[MAX_PATH + 1] = {};
+    if (!GetVolumeInformationW(mount, nullptr, 0, nullptr, nullptr, nullptr, name, MAX_PATH))
+        return false;
+    for (const wchar_t* ok : {L"NTFS", L"ReFS", L"FAT", L"FAT32", L"exFAT"})
+        if (std::wstring_view(name) == ok)
+            return true;
+    return false;
+}
+
+void require_searched_when_searchable(const fs::path& root, const Search& s, bool searched) {
+    if (searched || !volume_is_searchable(root))
+        return;
+    std::string volumes;
+    for (const auto& row : s.rows)
+        if (starts(row, "volume|"))
+            volumes += "\n  " + row;
+    FAIL("the fixture's volume is one the plan searches, yet no volume was searched; volume rows:" << volumes);
+}
+
+/// The canonical label of a Windows path, as the rows spell it.
+std::string label_of(const fs::path& p) {
+    const auto label = yuzu::file_search::win_rules::normalise_windows_root(p.string());
+    REQUIRE(label.has_value());
+    return *label;
+}
+
+#endif // _WIN32
 
 } // namespace
 
@@ -303,7 +355,8 @@ TEST_CASE("file_search plugin: exactly one action, `search`, with the declared l
     CHECK(d.linux_leg.rung == 1);
     CHECK(d.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
     CHECK(d.macos_leg.rung == 1);
-    CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);
+    CHECK(d.windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(d.windows_leg.rung == 1);
 }
 
 TEST_CASE("file_search plugin: an unknown action is refused with one non-status line",
@@ -329,21 +382,239 @@ TEST_CASE("file_search plugin: an unknown action is refused with one non-status 
 }
 
 #if defined(_WIN32)
-TEST_CASE("file_search plugin: the Windows leg answers the planned row at once", "[file_search][file_search_dispatcher]") {
+
+TEST_CASE("file_search plugin (Windows): a missing or malformed root answers one typed invalid row and the status 1",
+          "[file_search][file_search_dispatcher]") {
     auto plugin = load_plugin();
     if (!plugin) {
         require_plugin_or_skip();
         return;
     }
-    yuzu::agent::LocalDispatcher dispatcher;
-    const auto result = dispatcher.run(plugin->descriptor, "search");
-    CHECK(result.rc == 0); // a planned leg is not a failed command
-    const auto rows = captured_rows(result.captured);
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "status|search|unsupported|windows:planned");
-    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
-    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+    const auto check = [&](const Call& call, const std::string& token, const std::string& semantics_and_query) {
+        const auto r = call.run(plugin->descriptor);
+        INFO(token);
+        const auto rows = captured_rows(r.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(starts(rows[0], "search|invalid|" + token + "|" + semantics_and_query));
+        CHECK(rows[0].find("|links_skipped=0") != std::string::npos);
+        CHECK(r.rc == 1);
+        CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(r.result_provenance == "file_search:" + token);
+    };
+    // Refused before any pattern is compiled: no semantics and no query to name.
+    check({"", "yuzu-fs-control-*.bin", "", ""}, "missing_root", "-|seq=0|q=-|");
+    check({"relative\\dir", "yuzu-fs-control-*.bin", "", ""}, "root_not_absolute", "-|seq=0|q=-|");
+    check({"C:", "yuzu-fs-control-*.bin", "", ""}, "root_not_absolute", "-|seq=0|q=-|");
+    check({"C:\\does\\..\\x", "yuzu-fs-control-*.bin", "", ""}, "root_bad_component", "-|seq=0|q=-|");
+    check({"\\\\.\\C:\\", "yuzu-fs-control-*.bin", "", ""}, "root_device_path", "-|seq=0|q=-|");
+    check({"C:\\", "", "", ""}, "missing_pattern", "-|seq=0|q=-|");
+    check({"C:\\", "ab", "", ""}, "pattern_too_few_literals", "-|seq=0|q=-|");
+    check({"C:\\", "yuzu-fs-control-*.bin", "everything", ""}, "bad_kinds", "-|seq=0|q=-|");
+    // A forged cursor is refused by the driver, before the mount table is read: the root need not exist.
+    check({"C:\\does\\not\\exist", "yuzu-fs-control-*.bin", "", "fsv1.0.0000000000000000.0000000000000000.forged"},
+          "bad_cursor", std::string{kSemantics} + "|seq=0|q=");
 }
+
+TEST_CASE("file_search plugin (Windows): a UNC root answers root_unc and nothing is opened",
+          "[file_search][file_search_dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    for (const char* root : {"\\\\server\\share", "//server/share", "\\\\?\\UNC\\server\\share"}) {
+        const auto r = Call{root, "yuzu-fs-control-*.bin", "", ""}.run(plugin->descriptor);
+        const auto rows = captured_rows(r.captured);
+        INFO(root);
+        REQUIRE(rows.size() == 1); // the trailer alone: no volume, no coverage, no match
+        CHECK(starts(rows[0], "search|invalid|root_unc|"));
+        CHECK(r.rc == 1);
+    }
+}
+
+TEST_CASE("file_search plugin (Windows): one real search over a fixture finds the controls once, with their extents",
+          "[file_search][file_search_dispatcher][file_search_real]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::StandalonePluginContext pctx("file_search", {});
+    REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
+    yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(pctx.get()); }};
+
+    Fixture fx{"yuzu_test_fs_disp_"};
+    const std::string salt = fx.root.filename().string();
+    const std::string c1 = "yuzu-fs-control-" + salt + "-1.bin";
+    const std::string c2 = "yuzu-fs-control-" + salt + "-2.bin";
+    fs::path deep = fx.root;
+    for (int i = 1; i <= 11; ++i)
+        deep /= "d" + std::to_string(i);
+    write_file(fx.root / c1, "control");                         // depth 1, seven bytes
+    write_file(deep / c2, "");                                   // depth 12, empty
+    write_file(fx.root / "d1" / "noise.txt", "not a match");
+    fs::create_directories(fx.root / ("yuzu-fs-control-" + salt + "-dir.bin")); // a directory: not a file match
+    fs::create_directories(fx.root / "junction-target");
+    REQUIRE(yuzu::test::create_junction(fx.root / ("yuzu-fs-control-" + salt + "-junc.bin"), fx.root / "junction-target"));
+    yuzu::test::JunctionCleanup junction_cleanup{fx.root / ("yuzu-fs-control-" + salt + "-junc.bin")}; // removes the link, never the target
+
+    const Search s = search_all(plugin->descriptor, {fx.root.string(), "yuzu-fs-control-" + salt + "-*.bin", "", ""});
+    REQUIRE_FALSE(s.slices.empty());
+    const auto& last = s.last();
+    CHECK(last.rc == 0);
+
+    const bool searched = fixture_was_searched(s);
+    require_searched_when_searchable(fx.root, s, searched);
+    WARN(std::string{"file_search real slice: branch="} + (searched ? "allowed (the plan searched the fixture's volume)"
+                                                                    : "refused (the plan reported the fixture's volume and did not search it)"));
+    const auto trailer = captured_rows(last.captured).back();
+    REQUIRE(starts(trailer, "search|"));
+    const auto t = split(trailer);
+    REQUIRE(t.size() == 7);
+    CHECK(t[1] == "ok");
+    CHECK(t[3] == kSemantics);
+
+    if (searched) {
+        const std::string label = label_of(fx.root);
+        std::string deep_label = label;
+        for (int i = 1; i <= 11; ++i)
+            deep_label += "/d" + std::to_string(i);
+        std::vector<std::string> expected{label + "/" + c1, deep_label + "/" + c2};
+        std::ranges::sort(expected);
+        CHECK(found_paths(s) == expected);
+        for (const auto& row : s.rows) {
+            if (!starts(row, "match|"))
+                continue;
+            const auto f = split(row);
+            REQUIRE(f.size() == 7);
+            CHECK(f[2] == "file");
+            const std::string path = *fsr::decode_name(f[1]);
+            if (yuzu::file_search::is_user_profile_path(path, kOs))
+                CHECK(f[6] == "user"); // a fixture inside a profile; another account's relocated profile may also tag user
+            else
+                CHECK((f[6] == "system" || f[6] == "user"));
+            if (path == label + "/" + c1) {
+                CHECK(f[4] == "7"); // size, from the opened handle
+            } else {
+                CHECK(f[4] == "0");
+            }
+            CHECK(f[5] != "-"); // a modification time
+            // A file's extents row follows its match row. Counting by the identity key would see
+            // both controls' rows under each where the id is unknown (`device:0`: ReFS, FAT).
+            const auto next = static_cast<std::size_t>(&row - s.rows.data()) + 1;
+            REQUIRE(next < s.rows.size());
+            REQUIRE(starts(s.rows[next], "extents|" + f[3] + "|"));
+            const auto e = split(s.rows[next]);
+            REQUIRE(e.size() == 5);
+            const std::string state = e[2].substr(0, e[2].find(':'));
+            CHECK((state == "ok" || state == "unsupported" || state == "compressed" ||
+                   state == "failed"));
+        }
+        const auto count_kind = [&](const std::string& kind) {
+            return std::ranges::count_if(s.rows,
+                                         [&](const std::string& r) { return starts(r, kind); });
+        };
+        CHECK(count_kind("extents|") == count_kind("match|"));
+        CHECK(std::ranges::none_of(s.rows, [](const std::string& r) { return starts(r, "gap|"); }));
+        CHECK(std::ranges::any_of(s.rows, [](const std::string& r) { return starts(r, "coverage|complete|"); }));
+        CHECK(t[2] == "none");
+        CHECK(t[6] == "links_skipped=1"); // the planted junction: counted, never followed
+        CHECK(last.result_status == YUZU_RESULT_STATUS_OK);
+        CHECK(last.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+
+        // The same fixture with kinds=both: the directory joins the two controls as a third match, with no size, no
+        // time and no extents row (a directory is never opened); the junction is still counted and never matched.
+        const Search both = search_all(plugin->descriptor, {fx.root.string(), "yuzu-fs-control-" + salt + "-*.bin", "both", ""});
+        REQUIRE_FALSE(both.slices.empty());
+        const std::string dir_path = label + "/yuzu-fs-control-" + salt + "-dir.bin";
+        std::vector<std::string> expected_both = expected;
+        expected_both.push_back(dir_path);
+        std::ranges::sort(expected_both);
+        CHECK(found_paths(both) == expected_both);
+        std::size_t dir_rows = 0;
+        for (const auto& row : both.rows) {
+            if (!starts(row, "match|"))
+                continue;
+            const auto f = split(row);
+            REQUIRE(f.size() == 7);
+            if (*fsr::decode_name(f[1]) != dir_path)
+                continue;
+            ++dir_rows;
+            CHECK(f[2] == "directory");
+            CHECK(f[4] == "-");
+            CHECK(f[5] == "-");
+        }
+        CHECK(dir_rows == 1);
+        CHECK(std::ranges::count_if(both.rows, [](const std::string& r) { return starts(r, "extents|"); }) == 2); // the controls only
+        CHECK(std::ranges::none_of(both.rows, [](const std::string& r) { return starts(r, "gap|"); }));
+        CHECK(std::ranges::any_of(both.rows, [](const std::string& r) { return starts(r, "coverage|complete|"); }));
+        const auto both_trailer = split(captured_rows(both.last().captured).back());
+        REQUIRE(both_trailer.size() == 7);
+        CHECK(both_trailer[1] == "ok");
+        CHECK(both_trailer[2] == "none");
+        CHECK(both_trailer[6] == "links_skipped=1");
+        CHECK(both.last().result_status == YUZU_RESULT_STATUS_OK);
+        CHECK(both.last().result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    } else {
+        CHECK(std::ranges::none_of(s.rows, [](const std::string& r) { return starts(r, "match|"); }));
+        CHECK(std::ranges::any_of(s.rows, [](const std::string& r) { return starts(r, "volume|") && r.find("|not_searched|") != std::string::npos; }));
+        CHECK(std::ranges::any_of(s.rows, [](const std::string& r) { return starts(r, "coverage|partial|"); }));
+    }
+}
+
+TEST_CASE("file_search plugin (Windows): init pins the module, so it stays mapped after the handle that loaded it is released",
+          "[file_search][file_search_dispatcher][file_search_pin]") {
+    const fs::path path = find_plugin();
+    if (path.empty()) {
+        require_plugin_or_skip();
+        return;
+    }
+    {
+        auto plugin = load_plugin();
+        REQUIRE(plugin.has_value());
+        yuzu::agent::StandalonePluginContext pctx("file_search", {});
+        REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
+        plugin->descriptor->shutdown(pctx.get());
+    } // the PluginHandle is destroyed here: FreeLibrary, which unmaps an unpinned module
+    // GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: the probe itself adds no reference.
+    HMODULE still_mapped = nullptr;
+    CHECK(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, path.filename().c_str(), &still_mapped) != 0);
+    CHECK(still_mapped != nullptr);
+}
+
+// After the pin case on purpose: that case discriminates only when it runs before any other init.
+TEST_CASE("file_search plugin (Windows): the heartbeat totals count from this process's start, not from the KV file's",
+          "[file_search][file_search_dispatcher][file_search_heartbeat]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::test::TempDir dir_guard{"yuzu_test_fs_hb_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    REQUIRE(kv->set("file_search", "heartbeat.stalled", "4"));
+    REQUIRE(kv->set("file_search", "heartbeat.slices", "9"));
+
+    yuzu::agent::StandalonePluginContext pctx("file_search", {}, &*kv);
+    REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
+    yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(pctx.get()); }};
+    CHECK_FALSE(kv->get("file_search", "heartbeat.stalled").has_value());
+    CHECK_FALSE(kv->get("file_search", "heartbeat.slices").has_value());
+
+    Fixture fx{"yuzu_test_fs_disp_"};
+    const std::string salt = fx.root.filename().string();
+    write_file(fx.root / ("yuzu-fs-control-" + salt + "-1.bin"), "control");
+    const auto r = Call{fx.root.string(), "yuzu-fs-control-" + salt + "-*.bin", "", ""}.run(plugin->descriptor);
+    REQUIRE(r.rc == 0);
+    const auto slices = kv->get("file_search", "heartbeat.slices");
+    REQUIRE(slices.has_value());
+    CHECK(*slices == "1");
+    CHECK_FALSE(kv->get("file_search", "heartbeat.stalled").has_value());
+}
+
 #else
 
 TEST_CASE("file_search plugin: a missing or malformed parameter answers one typed invalid row and the status 1",
@@ -595,3 +866,44 @@ TEST_CASE("file_search plugin: the heartbeat totals count from this process's st
 }
 
 #endif // !_WIN32
+
+// Runs after the pin and heartbeat cases on purpose: it inits the plugin twice. Wiring only: the driver's
+// handling of the flag is pinned in test_file_search_driver.cpp ("a stop request ends the slice cancelled").
+TEST_CASE("file_search plugin: shutdown ends the next search cancelled and the next init clears it",
+          "[file_search][file_search_dispatcher][file_search_shutdown]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    Fixture fx{"yuzu_test_fs_disp_"};
+    const std::string salt = fx.root.filename().string();
+    write_file(fx.root / ("yuzu-fs-control-" + salt + "-1.bin"), "control");
+    const Call call{fx.root.string(), "yuzu-fs-control-" + salt + "-*.bin", "", ""};
+
+    yuzu::agent::StandalonePluginContext pctx("file_search", {});
+    REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
+    plugin->descriptor->shutdown(pctx.get()); // sets the stop flag
+    const auto stopped = call.run(plugin->descriptor);
+    REQUIRE(plugin->descriptor->init(pctx.get()) == 0); // clears it
+    yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(pctx.get()); }};
+    const Search running = search_all(plugin->descriptor, call);
+
+    // The cancelled end is reached only by a walk, so a fixture the plan refuses cannot show it.
+    const bool searched = fixture_was_searched(running);
+    require_searched_when_searchable(fx.root, running, searched);
+    if (!searched) {
+        WARN("file_search shutdown: the fixture's filesystem is not searched here; the cancelled end is not checked");
+        return;
+    }
+    const auto stopped_rows = captured_rows(stopped.captured);
+    REQUIRE_FALSE(stopped_rows.empty());
+    CHECK(starts(stopped_rows.back(), "search|failed|cancelled|"));
+    CHECK(std::ranges::none_of(stopped_rows, [](const std::string& r) { return starts(r, "cursor|"); }));
+
+    REQUIRE_FALSE(running.slices.empty());
+    const auto trailer = split(captured_rows(running.last().captured).back());
+    REQUIRE(trailer.size() == 7);
+    CHECK(trailer[1] == "ok");
+    CHECK(std::ranges::any_of(running.rows, [](const std::string& r) { return starts(r, "match|"); }));
+}

@@ -2,8 +2,9 @@
  * component_native_parsers.hpp -- the adapter and the name and version rules behind the `native`
  * action of the component_inventory plugin.
  *
- * PARSING IS NOT DONE HERE. The ELF SONAME and the Mach-O LC_ID_DYLIB come from the shared, bounded,
- * fuzz-tested readers in agents/shared (binary_header_elf.hpp, binary_header_macho.hpp). This header
+ * PARSING IS NOT DONE HERE. The ELF SONAME, the Mach-O LC_ID_DYLIB and the PE fixed file version come
+ * from the shared, bounded, fuzz-tested readers in agents/shared (binary_header_elf.hpp,
+ * binary_header_macho.hpp, binary_header_pe.hpp). This header
  * only (a) turns a ReadAt (the signature of FileView::read_at) into the shared Source, (b) maps the
  * readers' results onto the three outcomes the scan needs, and (c) holds the pure rules that turn a
  * declared name into a row.
@@ -18,7 +19,10 @@
  * section the reader flagged dynamic_unreadable. An ELF is a library only when its
  * type is ET_DYN; a Mach-O only through the FIRST slice that has no error and is an MH_DYLIB, and a
  * slice that errored is never read as a value. The ELF magic on 4 to 15 bytes is unreadable (a
- * file-name row); under 4 bytes or another magic is not a library.
+ * file-name row); under 4 bytes or another magic is not a library. A PE is a library when it has the
+ * MZ and PE signatures (read_pe_version answers not_this_format otherwise); a PE with no version
+ * resource, or one whose fixed file version is 0.0.0.0, is a library that declares no version, and a
+ * truncated or malformed one is unreadable.
  *
  * CONSUMER OBLIGATIONS of the shared readers, kept here: the caller checks FileView::unchanged()
  * after the parse (scan_native does); the ReadAt it passes is deadline-aware (scan_native wraps it);
@@ -30,6 +34,9 @@
 
 #include <binary_header_elf.hpp>   // yuzu::shared::binary_header::read_elf (agents/shared)
 #include <binary_header_macho.hpp> // yuzu::shared::binary_header::read_macho (agents/shared)
+#include <binary_header_pe.hpp>    // yuzu::shared::binary_header::read_pe_version (agents/shared)
+
+#include "component_java_parsers.hpp" // java_detail::iequals (ASCII case-insensitive equality)
 
 #include <algorithm>
 #include <cstddef>
@@ -140,6 +147,27 @@ namespace native_detail {
     }
 }
 
+/// The fixed file version ("a.b.c.d") of the PE image in `size` bytes read through `rd`, from its
+/// VS_VERSIONINFO resource. A value of nullopt is a PE that declares none: no resource, no fixed block,
+/// or 0.0.0.0. Never throws.
+[[nodiscard]] inline std::expected<std::optional<std::string>, NativeError> native_pe(const ReadAt& rd,
+                                                                                       std::uint64_t size) {
+    namespace bh = yuzu::shared::binary_header;
+    using namespace native_detail;
+    try {
+        const auto info = bh::read_pe_version(bh::Source{rd, size});
+        if (!info)
+            return from_parse_error(info.error());
+        const auto& v = info->file_version;
+        if (!info->has_fixed || (v[0] == 0 && v[1] == 0 && v[2] == 0 && v[3] == 0))
+            return std::optional<std::string>{};
+        return std::optional<std::string>{std::to_string(v[0]) + '.' + std::to_string(v[1]) + '.' +
+                                          std::to_string(v[2]) + '.' + std::to_string(v[3])};
+    } catch (...) {
+        return std::unexpected(NativeError::unreadable);
+    }
+}
+
 // ---- candidates, names and versions ----
 
 namespace native_detail {
@@ -201,7 +229,9 @@ struct NumericTail {
 } // namespace native_detail
 
 /// Candidates: a Linux shared object is `<stem>.so` or `<stem>.so.<digits and dots>`; a macOS dynamic
-/// library is `<stem>.dylib`. (Extension-less framework binaries are not read: a stated limit.)
+/// library is `<stem>.dylib`; a Windows library is `<stem>.dll`, the extension compared ASCII
+/// case-insensitively (`.DLL` and `.dll` are both candidates; `.dll.mui` is not). (Extension-less
+/// framework binaries are not read: a stated limit.)
 [[nodiscard]] constexpr bool is_linux_native_candidate(std::string_view leaf) noexcept {
     return native_detail::so_suffix_at(leaf) != std::string_view::npos;
 }
@@ -209,13 +239,19 @@ struct NumericTail {
     return leaf.size() > 6 && leaf.ends_with(".dylib");
 }
 
-enum class NativeVersionSource { filename, elf, macho, unreadable };
+/// A Windows library is a name of at least one character before a `.dll` extension.
+[[nodiscard]] constexpr bool is_windows_native_candidate(std::string_view leaf) noexcept {
+    return leaf.size() > 4 && java_detail::iequals(leaf.substr(leaf.size() - 4), ".dll");
+}
+
+enum class NativeVersionSource { filename, elf, macho, pe, unreadable };
 
 [[nodiscard]] constexpr std::string_view to_token(NativeVersionSource s) noexcept {
     switch (s) {
     case NativeVersionSource::filename: return "filename";
     case NativeVersionSource::elf: return "elf";
     case NativeVersionSource::macho: return "macho";
+    case NativeVersionSource::pe: return "pe";
     case NativeVersionSource::unreadable: return "unreadable";
     }
     return "unreadable";
@@ -280,6 +316,20 @@ struct NativeDescription {
     return d;
 }
 
+/// Windows name and version. `version` is the file's fixed file version, when it declares one. The
+/// name is the file name without its extension: the PE format carries no library name of its own.
+[[nodiscard]] inline NativeDescription describe_windows(std::string_view leaf, const std::optional<std::string>& version) {
+    using namespace native_detail;
+    NativeDescription d;
+    const std::string_view stem = is_windows_native_candidate(leaf) ? leaf.substr(0, leaf.size() - 4) : leaf;
+    d.name = printable(stem);
+    if (version) {
+        d.version = *version;
+        d.version_source = NativeVersionSource::pe;
+    }
+    return d;
+}
+
 /// What the scan asks of a file: its description, or nullopt when it is not a shared library (no
 /// row). A library that cannot be read inside the bounds is described by its file name alone, with
 /// version_source unreadable unless the name carries a version.
@@ -297,6 +347,14 @@ struct NativeDescription {
     if (!r && r.error() == NativeError::not_library)
         return std::nullopt;
     return describe_macos(leaf, r ? *r : std::optional<DylibId>{});
+}
+
+[[nodiscard]] inline std::optional<NativeDescription> describe_windows_file(std::string_view leaf, const ReadAt& rd,
+                                                                             std::uint64_t size) {
+    const auto r = native_pe(rd, size);
+    if (!r && r.error() == NativeError::not_library)
+        return std::nullopt;
+    return describe_windows(leaf, r ? *r : std::optional<std::string>{});
 }
 
 } // namespace yuzu::component_inventory

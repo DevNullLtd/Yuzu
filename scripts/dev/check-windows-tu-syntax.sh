@@ -70,11 +70,17 @@ tus=(
     agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header
     agents/plugins/middleware/src/middleware_win.cpp
     agents/plugins/middleware/src/middleware_linux.cpp # empty on Windows: checks the portable half
-    agents/plugins/component_inventory/src/component_inventory_plugin.cpp # Windows answers planned; checks the portable scan headers
+    agents/plugins/component_inventory/src/component_inventory_plugin.cpp # the Windows branch of execute and the portable scan headers
+    agents/plugins/component_inventory/src/component_fs_win.cpp
     agents/plugins/process_introspect/src/process_introspect_plugin.cpp # Windows answers planned; checks the portable parsers and seam headers
-    agents/plugins/file_search/src/file_search_plugin.cpp # Windows answers planned; checks the portable driver, plan and row headers
+    agents/plugins/file_search/src/file_search_plugin.cpp # the Windows descriptor and pin; checks the portable driver, plan and row headers
+    agents/plugins/file_search/src/file_search_shell.cpp # the OS-neutral shell (slot, worker runner, live slice), compiled on every OS
+    agents/plugins/file_search/src/file_search_win.cpp # the Windows leg: volume, handle-relative leg, the two ioctls, name rule, key, profile roots
+    agents/core/src/confined_fs_win.cpp # the handle-relative primitive the Windows leg stands on (ReparseDirs, open_file_attributes_at, the id class)
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
+    agents/core/src/msi_database_read.cpp
+    agents/plugins/msi_packages/src/msi_packages_plugin.cpp
     agents/plugins/firmware_posture/src/firmware_posture_win.cpp
     agents/plugins/hardware/src/hardware_plugin.cpp
     agents/plugins/hardware/src/hardware_estate_win.cpp
