@@ -637,7 +637,8 @@ no process is started.
   `unreadable`; that is a gap in one row and does not make the scan incomplete. A file whose name
   looks like a library but whose header says it is not one is not listed, even when the rest of it
   is damaged.
-- **Bounds.** The scan's (400,000 directory entries, 45 seconds, 32 levels, 50,000 entries per
+- **Bounds.** A file that matches by name counts toward the row caps even when it gives no row.
+  The scan's (400,000 directory entries, 45 seconds, 32 levels, 50,000 entries per
   directory, 3,000 rows per application folder) with 5,000 rows in all. Per library, at most 128
   ELF program headers, 4,096 dynamic entries, a 255-byte name, 16 fat slices and 1,024 load
   commands in 512 KiB, and for a PE 96 sections, 4,096 resource directory entries, 256 KiB of
