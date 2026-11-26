@@ -5,12 +5,14 @@
  * UserSession records for diff-based change detection (login/logout).
  *
  * Platform support:
- *   Windows -- WTSEnumerateSessionsW + WTSQuerySessionInformationW
+ *   Windows -- the Terminal Services session list, read bounded by agent-core
+ *              (yuzu/agent/win_wts_sessions.hpp)
  *   Linux   -- /var/run/utmp (struct utmp)
  *   macOS   -- who command output
  */
 
 #include "echo_collectors.hpp"
+#include "echo_wts_sessions.hpp" // user_sessions_from_wts (the Windows leg's conversion)
 
 #include <spdlog/spdlog.h>
 
@@ -36,8 +38,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
-#include <wtsapi32.h>
+#include <wtsapi32.h> // WTS_CONNECTSTATE_CLASS, for the static_asserts below
 #endif
 
 namespace yuzu::echo {
@@ -45,66 +46,12 @@ namespace yuzu::echo {
 // -- Windows implementation ---------------------------------------------------
 #ifdef _WIN32
 
-namespace {
-
-// wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
-// behaviour-identical to the old NUL-terminated wide_to_utf8_user for valid input.
-using yuzu::win::from_wide;
-
-} // namespace
+static_assert(kWtsStateActive == static_cast<std::uint32_t>(WTSActive));
+static_assert(kWtsStateDisconnected == static_cast<std::uint32_t>(WTSDisconnected));
 
 std::vector<UserSession> enumerate_users() {
-    std::vector<UserSession> sessions;
-
-    WTS_SESSION_INFOW* wts_sessions = nullptr;
-    DWORD count = 0;
-    if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &wts_sessions, &count))
-        return sessions;
-
-    for (DWORD i = 0; i < count; ++i) {
-        if (wts_sessions[i].State != WTSActive && wts_sessions[i].State != WTSDisconnected)
-            continue;
-
-        LPWSTR user_buf = nullptr;
-        DWORD user_len = 0;
-        LPWSTR domain_buf = nullptr;
-        DWORD domain_len = 0;
-
-        WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, wts_sessions[i].SessionId,
-                                    WTSUserName, &user_buf, &user_len);
-        WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, wts_sessions[i].SessionId,
-                                    WTSDomainName, &domain_buf, &domain_len);
-
-        auto user = from_wide(user_buf);
-        auto domain = from_wide(domain_buf);
-
-        if (user_buf)
-            WTSFreeMemory(user_buf);
-        if (domain_buf)
-            WTSFreeMemory(domain_buf);
-
-        if (user.empty())
-            continue;
-
-        UserSession us;
-        us.user = user;
-        us.domain = domain.empty() ? "local" : domain;
-        us.session_id = std::to_string(wts_sessions[i].SessionId);
-        us.disconnected = wts_sessions[i].State == WTSDisconnected;
-
-        // Determine logon type from session name
-        auto station_name = from_wide(wts_sessions[i].pWinStationName);
-        if (station_name.find("RDP") != std::string::npos ||
-            station_name.find("rdp") != std::string::npos) {
-            us.logon_type = "remote";
-        } else {
-            us.logon_type = "interactive";
-        }
-
-        sessions.push_back(std::move(us));
-    }
-    WTSFreeMemory(wts_sessions);
-    return sessions;
+    return user_sessions_from_wts(
+        yuzu::agent::win::read_wts_sessions(yuzu::agent::win::kWtsSessionsDeadline));
 }
 
 // -- Linux implementation -----------------------------------------------------

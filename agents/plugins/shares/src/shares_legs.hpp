@@ -442,6 +442,9 @@ struct WinPage {
     std::uint32_t status = 0;
     std::vector<WinShareRec> shares;
     std::uint32_t total = 0;
+    /// Cause token of a read that did not complete (agent-core's bounded_cause; static
+    /// storage), empty for an answered page. When set, the other fields mean nothing.
+    std::string_view unanswered;
 };
 
 /// Successive calls at one level return successive pages. The shell owns the resume handle
@@ -461,8 +464,9 @@ inline constexpr std::uint32_t kRpcUnknownIf = 1717;          ///< RPC_S_UNKNOWN
 
 /// Level 2 first; ERROR_ACCESS_DENIED at level 2 discards what was gathered and retries
 /// level 1 (names, no paths) as `constrained`. A stopped Server service is typed
-/// `unsupported`, never an empty list. Any other status on any page discards every row (a
-/// partial drain is never reported as a complete list).
+/// `unsupported`, never an empty list. Any other status on any page, and a page whose read did
+/// not complete (`unanswered`), discards every row (a partial drain is never reported as a
+/// complete list).
 ///
 /// The enumeration is NOT a snapshot: NetShareEnum's resume handle is an index into the live
 /// share list, so a share deleted before the cursor makes the next page skip one and a share
@@ -495,6 +499,11 @@ inline Listing list_windows(const WinPageFn& page) {
     for (;;) {
         const WinPage p = page(level);
 
+        if (!p.unanswered.empty()) { // no answer: there is no status to classify
+            t.acc.add_failure(tok(p.unanswered));
+            failed = true;
+            break;
+        }
         if (p.status == kWinAccessDenied) {
             got.clear();
             seen.clear();

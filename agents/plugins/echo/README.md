@@ -169,6 +169,16 @@ empty); `n/a` means the source does not apply to that OS. The table is read from
   OS-retained history, bounded by `netconn_lookback_seconds`, `power_lookback_seconds` (effective on
   macOS only) and `removable_lookback_seconds` (default 7 days, `0` means forward-only). If the
   setting cannot be read, Echo reads forward-only.
+- **Windows `user` and `mapdrive` reads.** The Terminal Services session list (`user`) and the
+  inbound `NetSessionEnum` drain (`mapdrive`) are made by agent-core with a 5 second limit per read
+  (one per `NetSessionEnum` level tried). A read that is not answered, or that is cut at a cap (4096
+  sessions for `user`, the source's entry cap for `mapdrive`), skips that source's tick: nothing is
+  diffed or written, the baseline is kept, its health reads `capture_incomplete` and `snapshot`
+  answers `partial`. A call already blocked stays blocked until the service answers, and no further
+  read of that kind starts behind it. A session listing that fails (for example Win32 error 259
+  under a virtual service account) skips the `user` tick the same way, so it is never recorded as
+  nobody logged on; such an agent records no `user` events. The outbound `mapdrive` (WNet)
+  enumeration has no time limit.
 - **`mapdrive` history backfill.** A one-time historical pass runs at agent init. A profile it could
   not read is retried individually, at most 7 attempts in total and no more than once per 24 hours,
   until it resolves or is abandoned. A hive mount that exceeds its 30 s bound ends that run's

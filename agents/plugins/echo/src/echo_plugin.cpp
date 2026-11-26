@@ -2756,29 +2756,43 @@ private:
         // User diff
         const auto user_state = yuzu::echo::source_enabled_state(*db_, "user");
         if (user_state.value_or(false)) {
-            const std::string usr_key{yuzu::echo::diff_state_key("user")}; // #538
-            auto current = yuzu::echo::enumerate_users();
-            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
-            auto prev_json = db_->get_state(usr_key);
-            auto previous = json_to_users(prev_json);
-
-            auto typed = yuzu::echo::compute_user_events(previous, current, ts, snap_id);
-            // Events + baseline in ONE transaction (#1654).
-            const std::string state_json = users_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
-            const bool ok = typed.empty()
-                                ? db_->set_state(usr_key, state_json)
-                                : db_->fold_user_events(
-                                      typed, yuzu::echo::StateWrite{usr_key, state_json});
-            if (!ok) {
-                const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
-                spdlog::error("ECHO: user {} — nothing persisted, next tick re-diffs", tok);
-                ctx.write_output(typed.empty() ? "error|user state_save_failed"
-                                               : "error|user insert failed");
-                note_health("user", tok);
-                return 1;
+            // enumerate_users() throws when the Windows session read did not answer, failed or
+            // was cut at the cap: same collect-or-retain contract as mapdrive below, so an
+            // unanswered read is never diffed as "everyone logged off".
+            auto res = yuzu::echo::collect_or_retain([] { return yuzu::echo::enumerate_users(); });
+            auto current = std::move(res.current);
+            if (!current) {
+                spdlog::warn("ECHO: user snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+                if (skipped_sources)
+                    skipped_sources->push_back("user");
+                note_health("user", "capture_incomplete");
             }
-            total_events += static_cast<int>(typed.size());
-            note_health("user", "events_recorded");
+            if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
+                const std::string usr_key{yuzu::echo::diff_state_key("user")}; // #538
+                auto prev_json = db_->get_state(usr_key);
+                auto previous = json_to_users(prev_json);
+
+                auto typed = yuzu::echo::compute_user_events(previous, *current, ts, snap_id);
+                // Events + baseline in ONE transaction (#1654).
+                const std::string state_json = users_to_json(*current).dump(
+                    -1, ' ', false, nlohmann::json::error_handler_t::replace);
+                const bool ok =
+                    typed.empty()
+                        ? db_->set_state(usr_key, state_json)
+                        : db_->fold_user_events(typed, yuzu::echo::StateWrite{usr_key, state_json});
+                if (!ok) {
+                    const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                    spdlog::error("ECHO: user {} — nothing persisted, next tick re-diffs", tok);
+                    ctx.write_output(typed.empty() ? "error|user state_save_failed"
+                                                   : "error|user insert failed");
+                    note_health("user", tok);
+                    return 1;
+                }
+                total_events += static_cast<int>(typed.size());
+                note_health("user", "events_recorded");
+            }
         } else {
             note_health("user", skip_token(user_state));
         }
