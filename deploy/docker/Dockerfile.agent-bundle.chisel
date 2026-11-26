@@ -64,12 +64,13 @@ RUN set -eux; mkdir -p /rootfs; \
     SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
       base-files_release-info base-files_chisel base-passwd_data busybox-static_bins"; \
     ok=0; for i in 1 2 3 4 5; do \
-      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \
-      echo "chisel cut attempt $i failed; retrying in 5s"; sleep 5; \
+      rm -rf /rootfs; mkdir -p /rootfs; \
+      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES} \
+         && apt-get update -qq \
+         && python3 /usr/local/bin/chisel-emit-status.py --root /rootfs --slices "${SLICES}"; then ok=1; break; fi; \
+      echo "chisel cut or status.d attempt $i failed; retrying in 5s"; sleep 5; \
     done; \
     [ "$ok" = 1 ]; \
-    apt-get update -qq; \
-    python3 /usr/local/bin/chisel-emit-status.py --root /rootfs --slices "${SLICES}"; \
     rm -rf /var/lib/apt/lists/*
 
 # The pre-staged bundle tree, assembled on the host by build-agent-bundle.sh

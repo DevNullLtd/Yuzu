@@ -26,8 +26,17 @@ zstd. Nothing here executes in the final image.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+
+# Debian policy shapes. A value outside them never reaches a file name or a
+# stanza line: the name is a path component and the version, architecture and
+# source are written into a line-oriented record.
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]+$")
+VERSION_RE = re.compile(r"^[A-Za-z0-9.+~:-]+$")
+ARCH_RE = re.compile(r"^[a-z0-9-]+$")
+SOURCE_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]+( \([A-Za-z0-9.+~:-]+\))?$")
 
 
 def parse_manifest(text):
@@ -40,10 +49,18 @@ def parse_manifest(text):
         row = json.loads(line)
         if row.get("kind") != "package":
             continue
-        name = row["name"]
+        try:
+            name, version, arch = row["name"], row["version"], row["arch"]
+        except KeyError as e:
+            raise ValueError("a manifest package row has no %s field" % e)
+        if not (isinstance(name, str) and NAME_RE.match(name)
+                and isinstance(version, str) and VERSION_RE.match(version)
+                and isinstance(arch, str) and ARCH_RE.match(arch)):
+            raise ValueError("manifest package row has a malformed name, version or arch: %r"
+                             % (row,))
         if name in pkgs:
             raise ValueError("package %r appears twice in the manifest" % name)
-        pkgs[name] = (row["version"], row["arch"])
+        pkgs[name] = (version, arch)
     return pkgs
 
 
@@ -70,7 +87,11 @@ def source_from_show(text, name, version):
             k, v = line.split(":", 1)
             fields.setdefault(k, v.strip())
         if fields.get("Package") == name and fields.get("Version") == version:
-            return fields.get("Source", "")
+            source = fields.get("Source", "")
+            if source and not SOURCE_RE.match(source):
+                raise ValueError("archive record for %s=%s has a malformed Source: %r"
+                                 % (name, version, source))
+            return source
     raise ValueError("no archive record for %s=%s" % (name, version))
 
 

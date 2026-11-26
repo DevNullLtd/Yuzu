@@ -96,12 +96,13 @@ RUN set -eux; mkdir -p /rootfs; \
       libstdc++6_libs libncursesw6_libs libtinfo6_libs libssl3t64_libs \
       zlib1g_libs busybox-static_bins"; \
     ok=0; for i in 1 2 3 4 5; do \
-      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \
-      echo "chisel cut attempt $i failed; retrying in 5s"; sleep 5; \
+      rm -rf /rootfs; mkdir -p /rootfs; \
+      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES} \
+         && apt-get update -qq \
+         && python3 /usr/local/bin/chisel-emit-status.py --root /rootfs --slices "${SLICES}"; then ok=1; break; fi; \
+      echo "chisel cut or status.d attempt $i failed; retrying in 5s"; sleep 5; \
     done; \
     [ "$ok" = 1 ]; \
-    apt-get update -qq; \
-    python3 /usr/local/bin/chisel-emit-status.py --root /rootfs --slices "${SLICES}"; \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/_build/prod/rel/yuzu_gw/ /rootfs/opt/yuzu_gw/
