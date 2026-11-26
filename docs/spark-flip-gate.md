@@ -2513,6 +2513,17 @@ flip, with a red-first test each:
     fresh new target, not signalled); through the real mechanism each gave one `registry watch path re-pointed to
     another key` fault, recovery onto the new key and no flap, using scratch Catch2 cases that are NOT committed. A
     per-user key deleted while held answered `0xC000017C` and fired the notify, so the watch settled with no fault.
+    The delete race was then driven through the real mechanism with parked-worker scratch cases (not committed; 20 of 20
+    runs, no flake). When the delete's own fire is consumed before the verification result is judged, which is the
+    natural order, the real `0xC000017C` is returned but the result is committed as the re-arm and the name verdict is
+    never reached, so `verify_name_undecided` stays 0 and the watch converges; the undecided-by-name row is reached only
+    when the sweeper judges the result first (forced with a sweep hook: counter 0 to 1, no fault, converges). An
+    unforced run of 1500 delete and re-create rounds at a 1 ms interval never reached it. Two side findings, both
+    outside the R1 verdicts: with the sweeper first and the key deleted before the probe's open, a plain delete with no
+    re-create faults the watch with `registry watch key renamed or replaced` (the existing path-level row, the item 37
+    class in #8188), recovers at the retry once the key exists, and gives no fault in the natural order; and a delete
+    that lands between the held and fresh name queries commits with no recorded name, which logs the one-time
+    `no canonical name could be recorded` warning with status `0xc000017c` and heals at the next re-arm.
     Token check: all 15 cases passed, none skipped, under an elevated token and under `runas /trustlevel:0x20000`
     tokens (Administrators deny-only, one also at Medium integrity); the `[7877]` cases touch only HKCU and the test
     code has no privilege guard. A scheduled task with `RunLevel Limited` did not give a filtered token on this rig, a
