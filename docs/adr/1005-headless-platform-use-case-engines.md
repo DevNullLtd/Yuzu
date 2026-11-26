@@ -2155,6 +2155,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        device-id floor that #7811 put in front of the route), every series
        pre-seeded at boot; the HTTP status label is removed, and the gauge is renamed `yuzu_server_live_in_flight`. The
        upgrade note is in `docs/user-manual/upgrading.md`.
+     - **Versioning basis.** The REST changes in this entry (the status and
+       reason of several answers, the new refusals, the shared limit, the poll
+       answering only a finished device) are
+       breaking under `docs/api-versioning-policy.md` and ship in place, on
+       `/api/v1`, without a `/api/v2` path or a deprecation window. Owner
+       ruling 2026-11-26: this route has no external consumer yet, so the
+       version increment is waived for this change. The announcement is the
+       `Breaking` changelog fragment and the upgrade note in
+       `docs/user-manual/upgrading.md`.
      - **Poll.** One shared reader scopes the stored rows to the device at the
        store, answers only after the device has finished (a stored row with a
        terminal status; partial output without one is discarded and answered
