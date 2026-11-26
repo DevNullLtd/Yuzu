@@ -156,7 +156,8 @@ template <typename Ops> RegRead walk_registry(const RegRequest& request, Ops& op
     RegRead out;
     // A name holding a NUL would be cut at the Win32 call and read something else.
     const auto has_nul = [](const auto& name) {
-        return name.find('\0') != name.npos;
+        // Not find('\0'): MSVC calls that ambiguous for char16_t names.
+        return std::ranges::any_of(name, [](auto c) { return c == 0; });
     };
     if (request.hklm_subkey.empty() || request.value_names.size() > kMaxRegValueNames ||
         has_nul(request.hklm_subkey) || std::ranges::any_of(request.value_names, has_nul)) {
