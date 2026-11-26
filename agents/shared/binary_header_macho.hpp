@@ -56,12 +56,13 @@ struct MachoBuildVersion {
 struct MachoSlice {
     std::uint64_t offset{0};
     std::uint64_t size{0};
-    std::optional<ParseError> error; // set: only the fat_arch fields hold (offset, size, cpu_type, cpu_subtype), plus file_type when the slice header was read (else 0); byte_order is the table's, the rest defaults
+    std::optional<ParseError> error; // set: only the fat_arch fields hold (offset, size, cpu_type, cpu_subtype), plus file_type and header_read when the slice header was read; byte_order is the table's, the rest defaults
     bool is64{false};
     std::endian byte_order{std::endian::little};
     std::uint32_t cpu_type{0};
     std::uint32_t cpu_subtype{0};
     std::uint32_t file_type{0};
+    bool header_read{false}; // the slice header was read, so file_type is what the file states
     std::uint32_t flags{0};
     std::uint32_t load_command_count{0};
     std::optional<MachoDylibId> id_dylib;
@@ -159,6 +160,7 @@ parse_thin(Reader& r, std::uint64_t base, std::uint64_t size, std::string_view h
     s.cpu_type = u32(head, 4, o);
     s.cpu_subtype = u32(head, 8, o);
     s.file_type = u32(head, 12, o);
+    s.header_read = true;
     if (header_file_type)
         *header_file_type = s.file_type;
     const std::uint32_t ncmds = u32(head, 16, o);
@@ -323,18 +325,26 @@ read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {
         } else {
             const std::size_t n =
                 s.size < kHeader64Bytes ? static_cast<std::size_t>(s.size) : kHeader64Bytes;
-            auto sh = slice_read(r, s.offset, s.size, 0, n);
-            if (!sh) {
-                s.error = sh.error();
-            } else {
-                std::optional<std::uint32_t> seen;
-                auto parsed = parse_thin(r, s.offset, s.size, *sh, lim, &seen);
-                if (parsed) {
-                    s = std::move(*parsed);
+            std::optional<std::uint32_t> seen;
+            // One slice's failure, a thrown read or allocation included, stays that slice's error,
+            // so a type its header stated is not lost with it.
+            try {
+                auto sh = slice_read(r, s.offset, s.size, 0, n);
+                if (!sh) {
+                    s.error = sh.error();
                 } else {
-                    s.error = parsed.error();
-                    s.file_type = seen.value_or(0);
+                    auto parsed = parse_thin(r, s.offset, s.size, *sh, lim, &seen);
+                    if (parsed)
+                        s = std::move(*parsed);
+                    else
+                        s.error = parsed.error();
                 }
+            } catch (...) {
+                s.error = ParseError::io;
+            }
+            if (s.error && seen) {
+                s.file_type = *seen;
+                s.header_read = true;
             }
         }
         info.slices.push_back(std::move(s));

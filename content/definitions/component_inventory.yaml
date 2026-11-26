@@ -208,7 +208,7 @@ status:
 ## file name's .so.<version> suffix, else the SONAME's suffix. macOS: the version is the Mach-O
 ## current_version when it is not 0.0.0, else the file name's version (libfoo.1.2.dylib reads 1.2).
 ## Windows: the version is the fixed file version of the PE's version resource (a.b.c.d, version_source
-## `pe`); a PE with no version resource, or a fixed version of 0.0.0.0, is a row with an empty version
+## `pe`); a DLL with no version resource, or a fixed version of 0.0.0.0, is a row with an empty version
 ## and `unreadable`, and a file named .dll without the MZ and PE signatures, or whose COFF header is
 ## read and does not set IMAGE_FILE_DLL, gives no row.
 ##

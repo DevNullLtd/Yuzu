@@ -11,9 +11,9 @@
  *  - the candidate predicate is the leaf name of a shared library (WalkPolicy::is_candidate);
  *  - the section cap is 5,000 rows (native_limits()), every other bound is the scan's;
  *  - a file whose name matches but whose magic does not, or whose header states a type that is not
- *    a library's, gives no row; any other file with the right magic that cannot be parsed inside its
- *    bounds gives a row with what the file name offers (version_source `unreadable` unless the name carries a version) and the scan stays
- *    complete: an item-level gap, nothing hidden;
+ *    a library's, gives no row; any other file with the right magic that cannot be parsed inside
+ *    its bounds gives a row with what the file name offers (version_source `unreadable` unless the
+ *    name carries a version) and the scan stays complete: an item-level gap, nothing hidden;
  *  - a file the walk listed that cannot be opened (a link or non-regular file it was swapped for,
  *    refused, or gone) is a file that changed under the scan: Stop::archive_changed, no row;
  *  - package-owned trees (WalkPolicy::skip_dir) are counted and reported on the status row by the

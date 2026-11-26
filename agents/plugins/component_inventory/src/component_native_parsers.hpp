@@ -142,7 +142,7 @@ namespace native_detail {
         for (const auto& s : info->slices) {
             if (s.error) {
                 // A slice whose header was read as another type is no dylib: not a gap.
-                if (s.file_type == 0 || s.file_type == 6 /* MH_DYLIB */)
+                if (!s.header_read || s.file_type == 6 /* MH_DYLIB */)
                     slice_error = true;
                 continue;
             }

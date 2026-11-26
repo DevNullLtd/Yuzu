@@ -1593,7 +1593,7 @@ result to three outcomes: `not_this_format` is not a library (no row); `io`, `tr
 and `limit_exceeded` are unreadable (a row from the file name, `version_source` `unreadable`, an
 item-level gap; the scan stays complete). An ELF is a library only when its type is `ET_DYN`; a Mach-O
 file only through the first slice that has no error and is an `MH_DYLIB`, and a slice that could not be
-read is never an answer. The consumer obligations of the shared readers are met here: the file's
+read is never an answer (narrowed by *Correction, 2026-11-26* below). The consumer obligations of the shared readers are met here: the file's
 `unchanged()` is checked after every parse (`archive_changed`), each read is wrapped in the scan
 deadline, one `catch(...)` per file read keeps every exception inside the plugin, and every string
 taken from a reader passes the name sanitiser before it reaches a row. A name or version a file
@@ -1659,15 +1659,16 @@ under either root and need no exclusion.
 **`native` on Windows.** A candidate is a file whose leaf ends `.dll`, compared without regard to case
 (`.dll.mui` is not one). The version is the fixed file version of the PE's `VS_VERSIONINFO` resource,
 read by the shared bounded PE reader (`agents/shared/binary_header_pe.hpp`) through the same file view;
-`version_source` is `pe`. A PE with no version resource, or a fixed version of 0.0.0.0, is a row with
+`version_source` is `pe`. A DLL with no version resource, or a fixed version of 0.0.0.0, is a row with
 an empty version and `version_source` `unreadable`; a file named `.dll` without the MZ and PE
 signatures gives no row. The 5,000-row cap and the default-off kill switch are unchanged.
 
 *Correction, 2026-11-26.* A candidate whose COFF header is read and does not set `IMAGE_FILE_DLL`
-gives no row (a renamed executable, or a .NET application's own entry assembly), whatever fails after
+gives no row (a renamed executable, or a .NET application entry assembly built without the flag, such as `pwsh.dll`), whatever fails after
 that header; it still counts toward the section caps. One cut short before its COFF header is a
 file-name row with `unreadable`. The same rule holds on the other legs: an ELF `e_type` other than
-`ET_DYN`, or a Mach-O `filetype` other than `MH_DYLIB`, gives no row once the header has stated it.
+`ET_DYN`, or a thin Mach-O `filetype` other than `MH_DYLIB`, gives no row once the header has stated
+it; a universal file still gets a file-name row when an unreadable slice is, or may be, a dylib.
 
 **Known limits.** The open, listing and read calls carry no deadline of their own, so the 45 second
 budget is checked between operations and a dead fixed volume can park one call, as it can for the

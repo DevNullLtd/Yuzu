@@ -629,8 +629,8 @@ no process is started.
   Mach-O `current_version` when it is not `0.0.0`, else from the file name's version
   (`libfoo.1.2.dylib` reads `1.2`). On Windows, from the fixed file version of the PE's version
   resource (source `pe`; `.dll` and `.DLL` are both read, `.dll.mui` is not; a file whose PE
-  header is read and does not set `IMAGE_FILE_DLL` is not listed, a .NET application's own entry
-  assembly included); a DLL with no version
+  header is read and does not set `IMAGE_FILE_DLL` is not listed, some .NET application entry
+  assemblies such as `pwsh.dll` included); a DLL with no version
   resource, or one whose fixed version is `0.0.0.0`, is listed with `version_source` `unreadable`. A
   library whose header cannot be read inside the fixed
   bounds, or that names no version, is still listed from its file name with `version_source`

@@ -805,7 +805,28 @@ TEST_CASE("native: a header that states a non-library type gives no library even
         for (const bool fat64 : {false, true}) {
             expect_error(run_macho(make_fat({bad_exec, bad_exec}, fat64)), NativeError::not_library);
             expect_error(run_macho(make_fat({bad_exec, bad_dylib}, fat64)), NativeError::unreadable);
+            // a slice whose header was never read stays a gap
+            expect_error(run_macho(make_fat({bad_exec, std::string(32, '\0')}, fat64)), NativeError::unreadable);
         }
+    }
+    { // universal: a throw on a slice's load commands keeps that slice's stated type
+        MachoSpec x;
+        x.filetype = 2;
+        for (const bool fat64 : {false, true}) {
+            const auto exec = make_fat({make_macho(x)}, fat64);
+            expect_error(native_macho(throwing_at(exec, 3), exec.size()), NativeError::not_library);
+            const auto dylib = make_fat({make_macho(MachoSpec{})}, fat64);
+            expect_error(native_macho(throwing_at(dylib, 3), dylib.size()), NativeError::unreadable);
+        }
+    }
+    { // a stated filetype of 0 is a stated non-library type, thin or in a universal slice
+        MachoSpec z;
+        z.filetype = 0;
+        auto bad = make_macho(z);
+        put(bad, 16, 5000, 4, false);
+        expect_error(run_macho(bad), NativeError::not_library);
+        for (const bool fat64 : {false, true})
+            expect_error(run_macho(make_fat({bad}, fat64)), NativeError::not_library);
     }
     { // PE: a throw after the COFF header of an executable, and of a DLL
         auto exe = pe_without_resources();

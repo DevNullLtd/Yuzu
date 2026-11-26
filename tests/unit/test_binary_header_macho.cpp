@@ -276,6 +276,34 @@ TEST_CASE("macho: thin 64-bit little-endian image yields exact fields and comman
     check_canon_slice64(r->slices[0], kArm64);
 }
 
+TEST_CASE("macho: the header type is handed back when the load commands do not parse",
+          "[binary_header][macho]") {
+    const Bytes whole = canon_thin64();
+    const Bytes cut = whole.substr(0, 40); // the header, not its load commands
+    std::optional<std::uint32_t> type{99};
+    const std::span<const std::byte> sp(reinterpret_cast<const std::byte*>(cut.data()), cut.size());
+    REQUIRE_FALSE(read_macho(span_source(sp), {}, {}, &type).has_value());
+    CHECK(type == std::uint32_t{6});
+
+    const Bytes none = whole.substr(0, 8); // ends inside the header: cleared, never the previous type
+    const std::span<const std::byte> sn(reinterpret_cast<const std::byte*>(none.data()), none.size());
+    REQUIRE_FALSE(read_macho(span_source(sn), {}, {}, &type).has_value());
+    CHECK_FALSE(type.has_value());
+
+    MachoLimits one; // a universal file leaves the out-parameter empty and marks the failed slice
+    one.max_load_commands = 0;
+    type = 99;
+    const Bytes two = canon_fat64();
+    const std::span<const std::byte> sf(reinterpret_cast<const std::byte*>(two.data()), two.size());
+    const auto r = read_macho(span_source(sf), one, {}, &type);
+    REQUIRE(r.has_value());
+    CHECK_FALSE(type.has_value());
+    REQUIRE(r->slices.size() == 2);
+    CHECK(r->slices[0].error.has_value());
+    CHECK(r->slices[0].header_read);
+    CHECK(r->slices[0].file_type == 6);
+}
+
 TEST_CASE("macho: thin 32-bit big-endian image yields exact fields and the version_min mapping",
           "[binary_header][macho]") {
     const auto r = parse(canon_thin32be());
