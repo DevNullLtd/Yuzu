@@ -455,7 +455,7 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.10 Middleware Inventory :large_orange_diamond: `T3` *(new row, v4.1)*
 
-`middleware` plugin: installed middleware from installer metadata, table-driven, with IBM MQ (`ibm_mq`) as the one product so far; no subprocess. **Linux only** — Windows and macOS are planned. Feeds the installed-software daily-sync source (§35.2). *(Evidence: `agents/plugins/middleware/README.md`.)*
+`middleware` plugin: installed middleware from installer metadata, table-driven, with IBM MQ (`ibm_mq`) as the one product so far; no subprocess. **Linux and Windows** (Windows supported: its registry key and value names were confirmed on one real IBM MQ 9.4.5.0 install); macOS is planned. Feeds the installed-software daily-sync source (§35.2). *(Evidence: `agents/plugins/middleware/README.md`.)*
 
 ### 7.11 Browser and Profile Inventory :large_orange_diamond: `T3` *(new row, v4.1)*
 
@@ -1878,7 +1878,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | runtimes | Y | Y | Y | Software |
 | msi_packages | Y | - | Y | Software |
 | pkg_inventory | Y | Y | Y | Software |
-| middleware | - | Y | - | Software |
+| middleware | Y | Y | - | Software |
 | component_inventory | - | Y | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |

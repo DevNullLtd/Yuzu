@@ -1015,8 +1015,7 @@
       "agents/plugins/component_inventory/src/component_pkg_scan.hpp",
       "agents/plugins/component_inventory/src/component_python_parsers.hpp",
       "agents/plugins/component_inventory/src/component_scan.hpp",
-      "agents/plugins/component_inventory/src/component_walk.hpp",
-      "agents/plugins/component_inventory/src/zip_directory.hpp"
+      "agents/plugins/component_inventory/src/component_walk.hpp"
     ],
     "privilege_row": true,
     "tests": [

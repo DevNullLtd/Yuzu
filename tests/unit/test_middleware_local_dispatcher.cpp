@@ -7,18 +7,19 @@
  * guarded dispatcher TU is how a sibling plugin once shipped a compiled-out
  * Windows leg and stayed green). Only the EXPECTATIONS differ per host, selected
  * with `#if` on the expectation, never on the test:
- *   Linux -- status row first (supported or constrained, never unsupported),
- *            following rows six escape-aware fields. Mutation: removing the
- *            run_linux wiring leaves a stub `unsupported` row and fails the
- *            never-unsupported status assertion.
- *   macOS / Windows -- exactly `status|<action>|unsupported|<os>:planned`: both legs are
- *            planned placeholders in this build.
+ *   Linux / Windows -- status row first (supported or constrained, never unsupported), following
+ *            rows six escape-aware fields. Mutation: removing the run_linux or run_windows wiring
+ *            leaves a stub `unsupported` row and fails the never-unsupported status assertion.
+ *   macOS -- exactly `status|<action>|unsupported|macos:planned`: the macOS leg is a planned
+ *            placeholder in this build.
  * No host-specific count or name assertion for ibm_mq: CI runners are unknown hosts where the
- * product is not installed. The populated rows are asserted host-independently in
- * test_middleware_linux_parsers.cpp.
+ * product is not installed. The populated Linux rows are asserted host-independently in
+ * test_middleware_linux_parsers.cpp, the Windows registry merge in test_middleware_win_parsers.cpp
+ * and the registry runner in test_middleware_parsers.cpp.
  *
  * The plugin sources are also scanned for any way of starting a process (the shared bounded runner
- * included), because a version probe's output cannot show that a binary was never run.
+ * included), because a version probe's output cannot show that a binary was never run, and for an
+ * ANSI registry call (the daily-sync rule: registry strings are read with Reg*W only).
  *
  * The descriptors and the action list are GENERATED from the product table
  * (agents/shared/middleware_products.hpp); the descriptor cases below pin them to that table, so
@@ -159,8 +160,6 @@ std::vector<std::string> table_actions() {
 
 #if defined(__APPLE__)
 constexpr const char* kPlannedToken = "macos:planned";
-#elif defined(_WIN32)
-constexpr const char* kPlannedToken = "windows:planned";
 #endif
 
 /// Seam probes: the production execute body (middleware_legs.hpp execute_action) over an
@@ -325,7 +324,7 @@ TEST_CASE("middleware plugin: a throwing leg is contained and reported as intern
 // discard the output and still answer `-`), and scripts/ci/check-plugin-spawn-lexical.sh accepts
 // `yuzu::agent::run_bounded_subprocess`. So the acquisition boundary is pinned at the source: the
 // same source-tripwire family as the YUZU_AGENT_SRC_DIR tests, a few small files read once.
-TEST_CASE("middleware plugin: no source spawns a process directly or through the shared runner",
+TEST_CASE("middleware plugin: no source spawns a process or calls an ANSI registry function",
           "[middleware][contract][subprocess]") {
     // Positive controls: the scan sees each way of starting a process, and ignores prose and
     // quoted text, so the real scan below cannot pass vacuously.
@@ -356,13 +355,18 @@ TEST_CASE("middleware plugin: no source spawns a process directly or through the
         const std::string text{std::istreambuf_iterator<char>{in},
                                std::istreambuf_iterator<char>{}};
         CHECK(spawn_identifiers(text).empty());
+        // The ANSI-registry ban is a plain find on the RAW text, not through spawn_identifiers
+        // (which strips comments and strings): an ANSI call mangles a non-ASCII install path.
+        for (const char* banned :
+             {"RegOpenKeyExA", "RegQueryValueExA", "RegEnumKeyExA", "RegGetValueA"})
+            CHECK(text.find(banned) == std::string::npos);
         scanned.insert(f.filename().string());
     }
     for (const char* must : {"middleware_products.hpp", "middleware_parsers.hpp",
                              "middleware_runner.hpp", "middleware_legs.hpp",
                              "middleware_linux_parsers.hpp", "middleware_linux.cpp",
                              "middleware_macos.cpp", "middleware_win.cpp",
-                             "middleware_plugin.cpp"}) {
+                             "middleware_win_parsers.hpp", "middleware_plugin.cpp"}) {
         INFO("expected source not scanned: " << must);
         CHECK(scanned.contains(must));
     }
@@ -411,10 +415,37 @@ TEST_CASE("middleware plugin: the actions and the ABI4 descriptors are generated
         }
         CHECK(std::string_view{a.linux_leg.mechanism} == p.linux.mechanism);
         CHECK(std::string_view{a.windows_leg.mechanism} == p.windows.mechanism);
-        // A planned leg carries the shared note; the shipped Linux leg carries the table's.
+        // A planned leg carries the shared note; the shipped legs carry the table's.
         CHECK(std::string_view{a.macos_leg.fallback} == mw::kPlannedNote);
         if (p.linux.note == nullptr) CHECK(a.linux_leg.fallback == nullptr);
         else CHECK(std::string_view{a.linux_leg.fallback} == p.linux.note);
+        if (p.windows.note == nullptr) CHECK(a.windows_leg.fallback == nullptr);
+        else CHECK(std::string_view{a.windows_leg.fallback} == p.windows.note);
+    }
+}
+
+TEST_CASE("middleware plugin: ibm_mq is linux supported, windows supported and macos planned",
+          "[middleware][descriptors]") {
+    // The table, not only the plugin, says so: the Windows value names were confirmed on a real
+    // 9.4.5.0 capture, so the leg is SUPPORTED.
+    const mw::Product* p = mw::find_product("ibm_mq");
+    REQUIRE(p != nullptr);
+    CHECK(p->linux.support == YUZU_SUPPORT_SUPPORTED);
+    CHECK(p->windows.support == YUZU_SUPPORT_SUPPORTED);
+
+    auto plugin = load_middleware_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    const YuzuPluginDescriptor& d = *plugin->descriptor;
+    REQUIRE(d.action_descriptors != nullptr);
+    for (std::size_t i = 0; i < d.action_descriptor_count; ++i) {
+        const YuzuActionDescriptor& a = d.action_descriptors[i];
+        if (std::string_view{a.action} != "ibm_mq") continue;
+        CHECK(a.linux_leg.support == YUZU_SUPPORT_SUPPORTED);
+        CHECK(a.windows_leg.support == YUZU_SUPPORT_SUPPORTED);
+        CHECK(a.macos_leg.support == YUZU_SUPPORT_PLANNED);
     }
 }
 
@@ -472,9 +503,9 @@ TEST_CASE("middleware plugin: an unknown action is refused and not silently igno
     CHECK(split_fields_escape_aware(hrows[0]).size() == 1);
 }
 
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__)
 
-TEST_CASE("middleware plugin: the planned legs emit exactly the planned status row",
+TEST_CASE("middleware plugin: the planned leg emits exactly the planned status row",
           "[middleware][actions]") {
     auto plugin = load_middleware_plugin();
     if (!plugin) {
@@ -496,7 +527,7 @@ TEST_CASE("middleware plugin: the planned legs emit exactly the planned status r
     }
 }
 
-#else // Linux
+#else // Linux and Windows
 
 TEST_CASE("middleware plugin: the shipped leg reads the host and never reports unsupported",
           "[middleware][actions]") {
@@ -519,6 +550,7 @@ TEST_CASE("middleware plugin: the shipped leg reads the host and never reports u
         // build-completeness tripwire the peripherals TU also carries.
         CHECK((st[2] == "supported" || st[2] == "constrained"));
         CHECK(rows[0].find(":leg:not_implemented") == std::string::npos);
+        CHECK(rows[0].find(":planned") == std::string::npos); // never `unsupported|windows:planned`
         if (st[2] == "supported") {
             CHECK(st[3] == "-");
             CHECK(result.result_status == YUZU_RESULT_STATUS_OK);

@@ -9,8 +9,8 @@
  * A leg receives the PRODUCT (a row of the table in agents/shared/middleware_products.hpp), not an
  * action enum: adding a product is a table row, and no function here changes.
  *
- * Shipped legs: Linux. Windows and macOS are PLANNED placeholders that emit
- * `status|<action>|unsupported|<os>:planned` for every product.
+ * Shipped legs: Linux (file reads) and Windows (registry reads). macOS is a PLANNED placeholder that
+ * emits `status|<action>|unsupported|macos:planned` for every product.
  */
 #pragma once
 
