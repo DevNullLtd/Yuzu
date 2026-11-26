@@ -156,11 +156,13 @@ namespace native_detail {
     namespace bh = yuzu::shared::binary_header;
     using namespace native_detail;
     try {
-        const auto info = bh::read_pe_version(bh::Source{rd, size});
+        std::optional<std::uint16_t> flags;
+        const auto info = bh::read_pe_version(bh::Source{rd, size}, {}, {}, &flags);
+        // Before the parse result: a renamed executable is no library even when the rest is damaged.
+        if (flags && (*flags & bh::kImageFileDll) == 0)
+            return std::unexpected(NativeError::not_library);
         if (!info)
             return from_parse_error(info.error());
-        if ((info->characteristics & 0x2000) == 0) // not IMAGE_FILE_DLL: a renamed executable
-            return std::unexpected(NativeError::not_library);
         const auto& v = info->file_version;
         if (!info->has_fixed || (v[0] == 0 && v[1] == 0 && v[2] == 0 && v[3] == 0))
             return std::optional<std::string>{};

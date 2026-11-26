@@ -751,6 +751,13 @@ TEST_CASE("native_pe: a PE that is not a DLL (a renamed executable) is not a lib
     Rd rd(exe);
     CHECK_FALSE(describe_windows_file("tool.dll", rd.fn(), exe.size()).has_value());
     CHECK_FALSE(rd.bad);
+
+    auto broken = pe_without_resources();
+    put(broken, 64 + 22, 0, 2, false); // not a DLL, in a readable COFF header
+    put(broken, 64 + 24, 0, 2, false); // and an optional header the reader refuses
+    Rd rd2(broken);
+    CHECK_FALSE(describe_windows_file("broken.dll", rd2.fn(), broken.size()).has_value());
+    CHECK_FALSE(rd2.bad);
 }
 
 TEST_CASE("native_pe: not a PE is not a library; a truncated or malformed PE is unreadable and never throws",

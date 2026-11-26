@@ -369,7 +369,9 @@ TEST_CASE("binary_header_pe: PE32 and PE32+ builder images parse to the exact va
         REQUIRE(r.has_value());
         CHECK(r->pe32_plus == plus);
         CHECK(r->machine == (plus ? 0x8664 : 0x14C));
-        CHECK(r->characteristics == 0x2000);
+        std::optional<std::uint16_t> flags;
+        REQUIRE(read_pe_version(span_source(as_span(img.bytes)), {}, {}, &flags).has_value());
+        CHECK(flags == kImageFileDll);
         check_canonical_values(*r);
     }
 }

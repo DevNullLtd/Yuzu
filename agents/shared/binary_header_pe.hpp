@@ -48,7 +48,6 @@ struct PeStringTable {
 
 struct PeVersionInfo {
     std::uint16_t machine{0};
-    std::uint16_t characteristics{0}; // COFF file header flags; 0x2000 is IMAGE_FILE_DLL
     bool pe32_plus{false};
     bool has_version{false};
     bool has_fixed{false};
@@ -320,12 +319,18 @@ private:
 
 } // namespace pe_detail
 
+inline constexpr std::uint16_t kImageFileDll{0x2000}; // COFF Characteristics: IMAGE_FILE_DLL
+
+// `coff_characteristics`, when given, is set as soon as the COFF header is read, so a caller can
+// still classify an image whose later headers do not parse; it stays empty when that header cannot
+// be read.
 // not_this_format: no MZ header or no PE signature. truncated: an MZ file that ends before
 // e_lfanew or before the PE header it names. A PE with no resource directory or no
 // RT_VERSION entry is a VALUE with has_version == false. The version resource is the first
 // language of the first RT_VERSION entry.
 [[nodiscard]] inline std::expected<PeVersionInfo, ParseError>
-read_pe_version(const Source& src, const PeLimits& lim = {}, ReadBudget budget = {}) {
+read_pe_version(const Source& src, const PeLimits& lim = {}, ReadBudget budget = {},
+                std::optional<std::uint16_t>* coff_characteristics = nullptr) {
     using namespace pe_detail;
     const auto fail = [](ParseError e) { return std::unexpected(e); };
     Reader rd(src, budget);
@@ -351,7 +356,8 @@ read_pe_version(const Source& src, const PeLimits& lim = {}, ReadBudget budget =
         return fail(ParseError::not_this_format);
     PeVersionInfo info;
     info.machine = *load<std::uint16_t>(*coff, 4, kLE);
-    info.characteristics = *load<std::uint16_t>(*coff, 22, kLE);
+    if (coff_characteristics)
+        *coff_characteristics = *load<std::uint16_t>(*coff, 22, kLE);
     const std::size_t num_sections = *load<std::uint16_t>(*coff, 6, kLE);
     const std::size_t opt_size = *load<std::uint16_t>(*coff, 20, kLE);
     if (num_sections > lim.max_sections)
