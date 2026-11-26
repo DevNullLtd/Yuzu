@@ -70,7 +70,8 @@ tus=(
     agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header
     agents/plugins/middleware/src/middleware_win.cpp
     agents/plugins/middleware/src/middleware_linux.cpp # empty on Windows: checks the portable half
-    agents/plugins/component_inventory/src/component_inventory_plugin.cpp # Windows answers planned; checks the portable scan headers
+    agents/plugins/component_inventory/src/component_inventory_plugin.cpp # the Windows branch of execute and the portable scan headers
+    agents/plugins/component_inventory/src/component_fs_win.cpp
     agents/plugins/process_introspect/src/process_introspect_plugin.cpp # Windows answers planned; checks the portable parsers and seam headers
     agents/plugins/file_search/src/file_search_plugin.cpp # the Windows descriptor and pin; checks the portable driver, plan and row headers
     agents/plugins/file_search/src/file_search_shell.cpp # the OS-neutral shell (slot, worker runner, live slice), compiled on every OS

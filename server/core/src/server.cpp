@@ -17981,14 +17981,17 @@ private:
             auto session = auth_routes_->resolve_session(req);
 
             if (!session) {
-                // API calls and MCP endpoint get 401 JSON, pages get redirect
-                if (req.path.starts_with("/api/") || req.path == "/events" ||
-                    req.path.starts_with("/mcp/")) {
+                // The answer is decided by web_utils.hpp `unauthenticated_answer` (one copy):
+                // machine paths (`/api/`, `/events`, `/mcp/`, the `/metrics` scrape) get 401
+                // JSON, an htmx panel gets 401 + HX-Redirect, pages get the sign-in redirect.
+                const auto answer =
+                    unauthenticated_answer(req.path, !req.get_header_value("HX-Request").empty());
+                if (answer == UnauthenticatedAnswer::Json401) {
                     res.status = 401;
                     res.set_content(
                         R"({"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}})",
                         "application/json");
-                } else if (!req.get_header_value("HX-Request").empty()) {
+                } else if (answer == UnauthenticatedAnswer::HtmxRedirect401) {
                     // An htmx panel request: a 302 would be followed silently and the
                     // whole sign-in page swapped (script tags included) into the panel.
                     // 401 plus HX-Redirect makes htmx leave the page instead.

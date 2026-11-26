@@ -28,6 +28,8 @@
 
 #include <yuzu/agent/keychain_read.hpp>
 
+#include "test_helpers.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -138,7 +140,27 @@ TEST_CASE("read_keychain_bounded gives the caller its thread back when the read 
     // g_outstanding_bounded_calls is shared process-wide (this image's copy;
     // see the ceiling test below), so a guard this test leaves outstanding
     // past its own scope would corrupt that test's saturation count.
-    auto baseline =
+    //
+    // The baseline must be ZERO, not whatever the counter happens to read here
+    // (seen in the nightly ASan leg as `baseline 1, then 0`: the check read `0 == 1`
+    // with the counter at 0 and the baseline at 1). The counter is shared with every
+    // bounded_call_ex consumer in this binary, and an earlier test case's abandoned
+    // worker can still hold a guard when this one starts. Sampling that as the
+    // baseline made the closing check wait for a value the counter would never
+    // return to: the earlier worker retired (1 -> 0) and the loop below spun its
+    // whole 5 s for 1. Settle to zero first, as the saturation test below does.
+    // The deadline is a liveness bound only (spin_until scales it on a sanitizer
+    // leg). A settle that times out means a guard from an earlier case is still held:
+    // that is CHECKed (non-fatal) so it is visible. Otherwise it would be absorbed into
+    // the baseline below, and the final REQUIRE would fail spuriously (counter under
+    // baseline) when that guard retired, with nothing pointing at the earlier case.
+    CHECK(yuzu::test::spin_until(
+        [] {
+            return yuzu::shared::detail::g_outstanding_bounded_calls.load(
+                       std::memory_order_relaxed) == 0;
+        },
+        10s));
+    const auto baseline =
         yuzu::shared::detail::g_outstanding_bounded_calls.load(std::memory_order_relaxed);
 
     auto started = std::chrono::steady_clock::now();
@@ -165,12 +187,12 @@ TEST_CASE("read_keychain_bounded gives the caller its thread back when the read 
     // test can survive into the ceiling-saturation test below and let its
     // "Rejected" call through uncontended -- a real, observed flake (a
     // quality-engineer governance pass caught it failing ~1 run in 6).
-    auto deadline = std::chrono::steady_clock::now() + 5s;
-    while (yuzu::shared::detail::g_outstanding_bounded_calls.load(std::memory_order_relaxed) !=
-               baseline &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(5ms);
-    }
+    (void)yuzu::test::spin_until(
+        [&] {
+            return yuzu::shared::detail::g_outstanding_bounded_calls.load(
+                       std::memory_order_relaxed) == baseline;
+        },
+        10s);
     REQUIRE(yuzu::shared::detail::g_outstanding_bounded_calls.load(std::memory_order_relaxed) ==
             baseline);
 }
