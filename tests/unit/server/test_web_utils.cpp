@@ -1568,6 +1568,40 @@ TEST_CASE("metrics_loopback_peer_exempt: remote, empty and lookalike addresses f
     CHECK_FALSE(metrics_loopback_peer_exempt("127.0.0.2", false));
 }
 
+// ── unauthenticated_answer (#8732) ─────────────────────────────────────────
+// These cases prove the pure decision. That server.cpp's pre-routing handler calls it is pinned
+// lexically (`PINNED_RESOLVE_TO_GATE` in tests/test_same_site_wiring_lexical.py); no test drives a
+// live handler, so the default loopback refusal and the `--metrics-trust-loopback` and
+// `--metrics-no-auth` admissions are covered only by `metrics_loopback_peer_exempt`'s cases above.
+
+TEST_CASE("unauthenticated_answer: /metrics is a 401 JSON for a scraper, with or without an "
+          "htmx header",
+          "[web_utils][metrics]") {
+    CHECK(unauthenticated_answer("/metrics", false) == UnauthenticatedAnswer::Json401);
+    // The 401 JSON branch is ahead of the htmx branch.
+    CHECK(unauthenticated_answer("/metrics", true) == UnauthenticatedAnswer::Json401);
+}
+
+TEST_CASE("unauthenticated_answer: the other machine paths stay 401 JSON",
+          "[web_utils][metrics]") {
+    for (auto p : {"/api/v1/agents", "/api/", "/events", "/mcp/v1/", "/mcp/v1/sse"})
+        CHECK(unauthenticated_answer(p, false) == UnauthenticatedAnswer::Json401);
+}
+
+TEST_CASE("unauthenticated_answer: pages redirect, htmx panels get a 401 with HX-Redirect",
+          "[web_utils][metrics]") {
+    CHECK(unauthenticated_answer("/fleet", false) == UnauthenticatedAnswer::SignInRedirect);
+    CHECK(unauthenticated_answer("/fleet", true) == UnauthenticatedAnswer::HtmxRedirect401);
+}
+
+TEST_CASE("unauthenticated_answer: lookalike paths are not machine paths", "[web_utils][metrics]") {
+    // Matching is exact for /metrics and /events, and prefix-with-slash for /api/ and /mcp/.
+    CHECK(unauthenticated_answer("/metrics/x", false) == UnauthenticatedAnswer::SignInRedirect);
+    CHECK(unauthenticated_answer("/metricsx", false) == UnauthenticatedAnswer::SignInRedirect);
+    CHECK(unauthenticated_answer("/apix", false) == UnauthenticatedAnswer::SignInRedirect);
+    CHECK(unauthenticated_answer("/events/x", false) == UnauthenticatedAnswer::SignInRedirect);
+}
+
 TEST_CASE("kForwardingEvidenceHeaders names the common proxy headers", "[web_utils][metrics]") {
     bool xff = false, fwd = false, real = false;
     for (auto h : kForwardingEvidenceHeaders) {

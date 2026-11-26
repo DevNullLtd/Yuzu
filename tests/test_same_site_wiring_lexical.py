@@ -457,11 +457,12 @@ NORETURN_CALL = re.compile(r"(?<![\w])(?:__builtin_unreachable|__builtin_trap|__
 # condition or status) breaks the equality. Changing it is a review event (see HINT).
 PINNED_RESOLVE_TO_GATE = (
     "auth_routes_->resolve_session(req); if (!session) { "
-    'if (req.path.starts_with("/api/") || req.path == "/events" || '
-    'req.path.starts_with("/mcp/")) { res.status = 401; '
+    "const auto answer = unauthenticated_answer(req.path, "
+    '!req.get_header_value("HX-Request").empty()); '
+    "if (answer == UnauthenticatedAnswer::Json401) { res.status = 401; "
     'res.set_content(R"({"error":{"code":401,"message":"unauthorized"},'
     '"meta":{"api_version":"v1"}})", "application/json"); } '
-    'else if (!req.get_header_value("HX-Request").empty()) { res.status = 401; '
+    "else if (answer == UnauthenticatedAnswer::HtmxRedirect401) { res.status = 401; "
     'res.set_header("HX-Redirect", "/home"); res.set_content("", "text/plain"); } '
     "else { res.set_redirect(home_ui::sign_in_location(req.path)); } "
     "return httplib::Server::HandlerResponse::Handled; } ")
