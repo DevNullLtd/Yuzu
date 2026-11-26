@@ -1,6 +1,6 @@
 /**
  * component_native_scan.hpp -- the `native` action of the component_inventory plugin: versioned shared
- * libraries (ELF .so on Linux, Mach-O .dylib on macOS) shipped inside applications.
+ * libraries (ELF .so on Linux, Mach-O .dylib on macOS, PE .dll on Windows) shipped inside applications.
  *
  * Portable: no OS header. Like scan() it goes through the FsOps seam, so the unit test drives it over
  * an in-memory tree and a fake clock; the adapter over the shared readers (agents/shared/binary_header_*.hpp) is component_native_parsers.hpp.
@@ -54,7 +54,7 @@ inline constexpr std::string_view kNativeAction = "native";
 }
 
 /// Describes the file named `leaf` of `size` bytes read through `rd`, or says it is not a shared
-/// library (nullopt: no row). describe_linux_file / describe_macos_file are the two real ones.
+/// library (nullopt: no row). describe_linux_file / describe_macos_file / describe_windows_file are the three real ones.
 using NativeParse =
     std::function<std::optional<NativeDescription>(std::string_view leaf, const ReadAt& rd, std::uint64_t size)>;
 

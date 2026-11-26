@@ -1311,14 +1311,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"component_inventory.scan",
          "List Java archives (.jar/.war/.ear) and the libraries nested one level inside them "
          "under the machine-wide application roots, with name, version, version source, path, "
-         "size and anchor application (Linux and macOS; Windows planned; read-only, no "
+         "size and anchor application (Linux, macOS and Windows; read-only, no "
          "subprocess, machine roots only)"},
         {"component_inventory.native",
-         "List versioned shared libraries (ELF .so on Linux, Mach-O .dylib on macOS) shipped "
-         "inside applications under the machine-wide application roots, with name, version, "
-         "version source, path, size and anchor application, at most 5,000 rows (Linux and "
-         "macOS; Windows planned; read-only, no subprocess; package-owned trees are not read; "
-         "switched off until an operator enables it)"},
+         "List versioned shared libraries (ELF .so on Linux, Mach-O .dylib on macOS, PE .dll "
+         "on Windows) shipped inside applications under the machine-wide application roots, "
+         "with name, version, version source, path, size and anchor application, at most "
+         "5,000 rows (Linux, macOS and Windows; read-only, no subprocess; package-owned trees "
+         "are not read; switched off until an operator enables it)"},
         {"component_inventory.python",
          "List installed Python distributions (the METADATA, PKG-INFO or .egg-info file of each) "
          "under the machine-wide Python roots, with name, version, version source, path, size "
