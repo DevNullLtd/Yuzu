@@ -260,16 +260,21 @@ LivePollOutcome poll_live_output(const ResponseStore& store, const std::string& 
         },
         agent_id, limits, sleep_fn, should_stop, now_fn);
     // The four answers that carry no device text leave nothing in the audit rows or the response
-    // body that names the agent command. One line here, for both surfaces, ties the caller's
-    // request to the stored rows an operator would look at. Both ids are caller- or
-    // device-influenced text, so they go through `log_token`.
+    // body that names the agent command. One line here, for both surfaces, gives an operator the
+    // command_id, which keys the stored rows. The request's own correlation id (`cid`) is not in
+    // scope in this unit, so a caller's `cid` reaches this line by agent_id and time only.
+    // agent_id is the caller's device id; command_id is server-minted. Both go through
+    // `log_token` (CWE-117), command_id as defence in depth. A shutdown is an expected operator
+    // action, so it logs at info like the other shutdown-time cancellations; the rest warn.
     switch (outcome.outcome) {
     case LiveOutcome::kTimeout:
     case LiveOutcome::kIncomplete:
     case LiveOutcome::kShuttingDown:
     case LiveOutcome::kStoreDegraded:
-        spdlog::warn("live read: {} command_id={} agent_id={}", to_token(outcome.outcome),
-                     ::yuzu::log_token(command_id), ::yuzu::log_token(agent_id));
+        spdlog::log(outcome.outcome == LiveOutcome::kShuttingDown ? spdlog::level::info
+                                                                  : spdlog::level::warn,
+                    "live read: {} command_id={} agent_id={}", to_token(outcome.outcome),
+                    ::yuzu::log_token(command_id), ::yuzu::log_token(agent_id));
         break;
     default:
         break;

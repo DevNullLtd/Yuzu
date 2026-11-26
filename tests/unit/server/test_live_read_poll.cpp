@@ -15,17 +15,15 @@
 #include "test_forensics_tier_fixture.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
-#include <spdlog/sinks/ostream_sink.h>
-#include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -871,17 +869,9 @@ TEST_CASE("poll_live_output [pg]: a no-answer outcome logs the command_id and ag
     ResponseStore store{pool};
     REQUIRE(store.is_open());
 
-    // Capture the default logger for the span of this test only.
-    std::ostringstream captured;
-    auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(captured);
-    auto logger = std::make_shared<spdlog::logger>("live_poll_test", sink);
-    logger->set_level(spdlog::level::trace);
-    const auto previous = spdlog::default_logger();
-    spdlog::set_default_logger(logger);
-    struct Restore {
-        std::shared_ptr<spdlog::logger> prev;
-        ~Restore() { spdlog::set_default_logger(prev); }
-    } restore{previous};
+    // Capture the default logger for the span of this test only (LogCapture drops its registry
+    // entry on stop, so no sink outlives the stream it writes to).
+    yuzu::test::LogCapture capture;
 
     seed(store, "cmd-ok", "agent-1", 1, "proc|1|a\n");
     seed(store, "cmd-run", "agent-1", 0, "proc|2|partial\n");
@@ -893,7 +883,6 @@ TEST_CASE("poll_live_output [pg]: a no-answer outcome logs the command_id and ag
     // An answered read writes no line.
     CHECK(live::poll_live_output(store, "cmd-ok", "agent-1", plugins, limits, sleep).outcome ==
           live::LiveOutcome::kOk);
-    CHECK(captured.str().empty());
 
     // Nothing stored: timeout, named with both ids.
     CHECK(live::poll_live_output(store, "cmd-none", "agent-1", plugins, limits, sleep).outcome ==
@@ -906,10 +895,38 @@ TEST_CASE("poll_live_output [pg]: a no-answer outcome logs the command_id and ag
                                  [] { return true; })
               .outcome == live::LiveOutcome::kShuttingDown);
 
-    const auto text = captured.str();
-    CHECK(text.find("live read: timeout command_id=cmd-none agent_id=agent-1") != std::string::npos);
-    CHECK(text.find("live read: incomplete command_id=cmd-run agent_id=agent-1") != std::string::npos);
-    CHECK(text.find("live read: shutting_down command_id=cmd-ok agent_id=agent-1") !=
+    capture.stop(); // restore the logger before reading the text
+    const auto text = capture.text();
+    // Only the no-answer outcomes write a line, and each is a warning, except a shutdown, which is
+    // an expected operator action and logs at info. The answered read above wrote none: the three
+    // lines below are the only "live read:" lines, so a count of the marker pins that.
+    CHECK(text.find("[warning] live read: timeout command_id=cmd-none agent_id=agent-1") !=
+          std::string::npos);
+    CHECK(text.find("[warning] live read: incomplete command_id=cmd-run agent_id=agent-1") !=
+          std::string::npos);
+    CHECK(text.find("[info] live read: shutting_down command_id=cmd-ok agent_id=agent-1") !=
+          std::string::npos);
+    std::size_t lines = 0;
+    for (auto at = text.find("live read:"); at != std::string::npos; at = text.find("live read:", at + 1))
+        ++lines;
+    CHECK(lines == 3);
+}
+
+TEST_CASE("poll_live_output: a store that is not open answers store_degraded and logs both ids",
+          "[live][poll][2146]") {
+    // No Postgres needed: a pool whose server refuses the connection leaves the store closed, so
+    // every read degrades and the store overload reaches kStoreDegraded.
+    yuzu::server::pg::PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope connect_timeout=1", .size = 1}};
+    ResponseStore store{bad};
+    REQUIRE_FALSE(store.is_open());
+
+    yuzu::test::LogCapture capture;
+    const auto sleep = [](std::chrono::milliseconds) {};
+    const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+    CHECK(live::poll_live_output(store, "cmd-degraded", "agent-1", plugins, fast_limits(2), sleep).outcome ==
+          live::LiveOutcome::kStoreDegraded);
+    capture.stop();
+    CHECK(capture.text().find("[warning] live read: store_degraded command_id=cmd-degraded agent_id=agent-1") !=
           std::string::npos);
 }
 
