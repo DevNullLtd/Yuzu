@@ -26,7 +26,7 @@
 # sample, closes that gap regardless of which plugin a future mistake
 # targets.
 # SKIPs (exit 77): no vcpkg_installed/<triplet> dir, or a tree without
-# share/cli11/CLI11Config.cmake (host-tools-only, #6719). Both are silent in CI.
+# share/cli11/CLI11Config.cmake (host-tools-only, #6719). Both report as a meson SKIP, not a failure, so a leg can go green without exercising the #4262 guard.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { cd "$(dirname "$0")/../.." && pwd; })"
