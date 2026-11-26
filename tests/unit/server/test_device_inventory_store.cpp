@@ -3782,6 +3782,89 @@ TEST_CASE("a v3 database upgrades to v4 behind a lock held longer than the pool'
           std::vector<std::string>{"Agent-up-2", "agent-up-1"});
 }
 
+// Kills: a v6 that trusts a same-named composite left by a cancelled hand build and then drops v4's
+// index, which would leave NO usable keyset index (every page a scan plus a sort) behind a WARN. The
+// fixture is a database stamped v5 that still has v4's index and a same-named composite that is
+// misdefined or invalid; opening must end with a valid composite of the migration's definition, no
+// v4 index and no WARN.
+TEST_CASE("migration v6 replaces a misdefined or invalid same-named composite instead of trusting it",
+          "[pg][device_ci][migration][v6][index_check]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        store_ci(seed, "b-2", "h2");
+        store_ci(seed, "A-1", "h1");
+    }
+    // a database as v5 left it: v4's index present, no composite, recorded version 5
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx");
+    exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                    "((agent_id COLLATE \"C\"))");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 5 WHERE store = 'device_inventory_store'");
+    const auto composite_def = [&] {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(),
+            "SELECT pg_get_indexdef(i.indexrelid) || '|' || i.indisvalid::text FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'device_inventory_store' AND c.relname = 'device_ci_agent_id_c_changed_idx'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0));
+    };
+    const auto open_and_check = [&] {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        DeviceInventoryStore store{pool};
+        cap.stop();
+        REQUIRE(store.is_open());
+        CHECK(cap.text().find("DeviceInventoryStore: index") == std::string::npos);
+        const std::string def = composite_def();
+        INFO(def);
+        CHECK(def.find("USING btree (agent_id COLLATE \"C\", changed_at)|true") != std::string::npos);
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                               "AND indexname = 'device_ci_agent_id_c_idx'") == 0);
+        yuzu::server::DeviceCiKeysetQuery q;
+        CHECK(keyset_ids(store.list_device_ci_after(q)) == std::vector<std::string>{"A-1", "b-2"});
+    };
+
+    SECTION("a same-named composite on the plain column") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id, changed_at)");
+        open_and_check();
+    }
+    SECTION("a same-named composite with the columns the other way round") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(changed_at, agent_id COLLATE \"C\")");
+        open_and_check();
+    }
+    SECTION("an invalid same-named composite (a cancelled build)") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", changed_at)");
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                "UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
+                "'device_inventory_store.device_ci_agent_id_c_changed_idx'::regclass",
+                std::vector<std::string>{});
+            if (res.status() != PGRES_COMMAND_OK)
+                SKIP("the test role cannot update pg_index (not a superuser): "
+                     << PQresultErrorMessage(res.get()));
+        }
+        open_and_check();
+    }
+    SECTION("control: a correct pre-existing composite is rebuilt to the same definition") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", changed_at)");
+        open_and_check();
+    }
+}
+
 // Kills: no runtime check of the v6 keyset index and the v5 changed_at index. `schema_meta` saying v6
 // is not proof the indexes exist (a restore, a hand-run DROP INDEX, a same-named index of another
 // definition that IF NOT EXISTS accepted). Each case below leaves the store OPEN (the read is still
@@ -3883,6 +3966,16 @@ TEST_CASE("opening the store warns when a read index is missing, invalid or defi
         replace_keyset("(agent_id COLLATE \"C\", changed_at)");
         open_and_capture(warn);
         CHECK(warn.find("device_ci_agent_id_c_changed_idx") == std::string::npos);
+    }
+    SECTION("an operator-tuned storage parameter does not read as a different definition") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at) WITH (fillfactor = 70)");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx") == std::string::npos);
+    }
+    SECTION("a storage parameter does not hide an INCLUDE list") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at) INCLUDE (hostname) WITH (fillfactor = 70)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
     }
     SECTION("a partial index of the right columns") {
         replace_keyset("(agent_id COLLATE \"C\", changed_at) WHERE blob_version >= 2");
@@ -4419,13 +4512,16 @@ TEST_CASE("the v5 pre-guard text hashes to the value the upgrading.md drift reci
     CHECK(*current_digest != kPreGuardV5Sha256);
 }
 
-// Kills: a v6 that drops v4's index before the new one exists (a window with no keyset index), loses
-// the transaction-local settings (the runner's pooled connection carries a 30 s statement_timeout and
-// a 10 s lock_timeout, and a failed migration refuses to start the server on every restart), is not
-// idempotent, or uses CONCURRENTLY (the runner's transaction refuses it). v4's and v5's texts are
-// frozen (their hashes are recorded in every database that ran them), so a drift in either is the
-// same kind of break; the v6 text is also what the operator's by-hand DDL is derived from.
-TEST_CASE("migration v6 builds the composite keyset index under transaction-local timeouts, then drops v4's",
+// Kills: a v6 that can drop v4's index while the composite is absent or unusable, loses the
+// transaction-local settings (the runner's pooled connection carries a 30 s statement_timeout and a
+// 10 s lock_timeout, and a failed migration refuses to start the server on every restart), is not
+// idempotent, or uses CONCURRENTLY (the runner's transaction refuses it). The statement ORDER is the
+// point: drop any pre-existing composite, create it, then drop v4's, so a same-named index left by a
+// cancelled hand build is replaced and not trusted. The whole texts of v4, v5 and v6 are pinned by
+// SHA-256 because their hashes are recorded in every database that ran them; changing one is a
+// deliberate act that needs a drift recipe, and these pins make it fail here first. (Within one
+// transaction the order does not change what a concurrent reader sees; it changes only the locks taken.)
+TEST_CASE("migration v6 rebuilds the composite keyset index under transaction-local timeouts, then drops v4's",
           "[device_ci][migration][v6][changed_since]") {
     const auto& all = yuzu::server::device_inventory_migrations();
     REQUIRE(all.size() == 6);
@@ -4434,20 +4530,29 @@ TEST_CASE("migration v6 builds the composite keyset index under transaction-loca
     const auto at = [&](const char* needle) { return sql.find(needle); };
     REQUIRE(at("SET LOCAL lock_timeout = '30s'") != std::string::npos);
     REQUIRE(at("SET LOCAL statement_timeout = 0") != std::string::npos);
+    REQUIRE(at("DROP INDEX IF EXISTS device_ci_agent_id_c_changed_idx") != std::string::npos);
     REQUIRE(at("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_changed_idx ON device_ci "
                "(agent_id COLLATE \"C\", changed_at)") != std::string::npos);
     REQUIRE(at("DROP INDEX IF EXISTS device_ci_agent_id_c_idx") != std::string::npos);
-    CHECK(at("SET LOCAL lock_timeout") < at("CREATE INDEX"));
-    CHECK(at("SET LOCAL statement_timeout") < at("CREATE INDEX"));
-    CHECK(at("CREATE INDEX") < at("DROP INDEX")); // build first, so there is never no keyset index
+    CHECK(at("SET LOCAL lock_timeout") < at("DROP INDEX"));
+    CHECK(at("SET LOCAL statement_timeout") < at("DROP INDEX"));
+    // the composite is dropped, then built, and only then is v4's dropped
+    CHECK(at("DROP INDEX IF EXISTS device_ci_agent_id_c_changed_idx") < at("CREATE INDEX"));
+    CHECK(at("CREATE INDEX") < at("DROP INDEX IF EXISTS device_ci_agent_id_c_idx"));
     CHECK(sql.find("CONCURRENTLY") == std::string::npos);
-    // nothing but the one build and the one drop: the changed_at index and the column are v5's
+    // nothing else: the changed_at index and the column are v5's
     CHECK(sql.find("device_ci_changed_at_idx") == std::string::npos);
     CHECK(sql.find("ALTER") == std::string::npos);
-    CHECK(sql.find("DROP INDEX", at("DROP INDEX") + 1) == std::string::npos);
-    // v4 and v5 are untouched by v6 (frozen texts): v4 still builds its own index by name
-    CHECK(all[3].sql.find("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx ON device_ci "
-                          "((agent_id COLLATE \"C\"))") != std::string::npos);
+
+    // whole-text pins (v4 and v5 are shipped texts; v6 is pinned so a later edit is deliberate)
+    const auto sha = [](const std::string& t) {
+        const auto d = yuzu::server::sha256_hex(t);
+        REQUIRE(d.has_value());
+        return *d;
+    };
+    CHECK(sha(all[3].sql) == "c3278af7579d58415f02d5cedad350bf60df93b17082f10be589355956a37b4e");
+    CHECK(sha(all[4].sql) == "dc82eed9947d2d2e776144f04a59b29c30b0cff8a4e1bc143b35999b541bfccb");
+    CHECK(sha(all[5].sql) == "72776e92f153b08209c45d6405155e52cea28c0d89204a5a9002cbc116130ed5");
 }
 
 // Kills: a v5 that fails on a populated v4 database, rewrites the table (the relfilenode changes
@@ -4629,7 +4734,8 @@ TEST_CASE("changed_since plans a sparse delta on the changed_at index and a dens
 // spelled so the planner cannot test it inside the index. HWCI-DELTA-PLAN-FLIP: with an index on
 // `agent_id` alone, a delta of a few percent of the table that sits at the head of agent_id order
 // made the planner walk that index for the rest of the table and test `changed_at` against each heap
-// row (a `Filter:` line), 3.6 to 3.8 s on the terminal page at 1M rows in the review's measurement.
+// row (a `Filter:` line): 3.6 to 3.8 s on the terminal page at 1M rows in one review's measurement,
+// 262 to 268 ms in a later re-measure that did not reproduce it (the record gives both).
 // With `(agent_id COLLATE "C", changed_at)` the test is an `Index Cond:` on the index itself. The
 // assertion is on the plan's CONDITION LINE, not on a timing, so it is deterministic: the same
 // statement that planned `Filter: (changed_at >= ...)` on v4's index plans `Index Cond: (... AND
@@ -4645,6 +4751,10 @@ TEST_CASE("a clustered delta's terminal page tests changed_at inside the keyset 
     exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, hostname, first_seen, last_seen, "
                     "changed_at) SELECT 'g-' || lpad(i::text, 6, '0'), 'h' || i, 1, 1, "
                     "CASE WHEN i <= 5000 THEN 2000000000 ELSE 1000 END FROM generate_series(1, 100000) AS i");
+    // Without the v5 index the planner has only the keyset index to choose from, so the assertion is
+    // about THAT index carrying `changed_at` as a condition and cannot fail on a cost-model change that
+    // prefers `device_ci_changed_at_idx` plus a sort for this shape.
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
     exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
     yuzu::server::DeviceCiKeysetQuery q;
     q.changed_since = 1500000000;

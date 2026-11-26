@@ -313,13 +313,19 @@ const std::string kMigrationV5Sql =
 // and test `changed_at` in the heap row by row, which is the slow case recorded as HWCI-DELTA-PLAN-FLIP
 // in docs/security-reviews/hardware-ci-changed-since-2026-11.md. With `changed_at` as the second key
 // column the planner tests it inside the index, so the same walk reads only the matching heap rows.
-// It still serves a plain keyset (the leading column is the v4 expression), so v4's index is then
-// redundant: it is dropped here, in the same transaction, after the new one is built (reads of
-// `device_ci` are blocked only for the DROP and the commit, writes for the build). The v5
+// It still serves a plain keyset (the leading column is the v4 expression), so v4's index is a strict
+// prefix of it and redundant (its size and its write cost buy nothing): it is dropped here, in the same
+// transaction (the build holds a SHARE lock, so writes wait; the drops take ACCESS EXCLUSIVE). The v5
 // `device_ci_changed_at_idx` stays: it keeps a sparse delta at a few milliseconds.
+// The statement order is DETERMINISTIC on purpose: DROP the composite if it exists, CREATE it, then
+// DROP v4's. A bare `CREATE INDEX IF NOT EXISTS` would be skipped over a same-named index that is
+// INVALID or differently defined (an operator's cancelled hand build after a lock-timeout failure of
+// this very migration), and the unconditional drop of v4's index would then remove the only usable
+// keyset index. The composite's name has never shipped, so dropping a pre-existing one costs one
+// rebuild (about 0.6 s per million rows) and nothing else.
 // A SEPARATE migration, not an edit of v5, so a database that already applied v5 (a development or
-// UAT rig on a branch build) needs no hash-drift recipe: it only runs v6. Idempotent (IF NOT EXISTS,
-// DROP IF EXISTS), built under v4's transaction-local settings for the same reasons, and not
+// UAT rig on a branch build) needs no hash-drift recipe: it only runs v6. Idempotent (a re-run drops
+// and rebuilds), built under v4's transaction-local settings for the same reasons, and not
 // CONCURRENTLY (the runner's transaction refuses it).
 // ONE spelling for the migration DDL, the operator's DDL in the WARN and the runtime check: the check
 // compares the key list `pg_get_indexdef` prints after `USING btree` to this text and nothing else
@@ -342,8 +348,10 @@ std::string index_ddl(std::string_view name, std::string_view key, std::string_v
     return ddl;
 }
 
-const std::string kMigrationV6Sql = "SET LOCAL lock_timeout = '30s'; "
-                                    "SET LOCAL statement_timeout = 0; " +
+const std::string kMigrationV6Sql = std::string("SET LOCAL lock_timeout = '30s'; "
+                                                "SET LOCAL statement_timeout = 0; "
+                                                "DROP INDEX IF EXISTS ") +
+                                    kKeysetIndexName + "; " +
                                     index_ddl(kKeysetIndexName, kKeysetIndexKey, "device_ci") +
                                     "; DROP INDEX IF EXISTS " + kAgentIdCIndexName + ";";
 
@@ -505,9 +513,16 @@ void warn_if_index_unusable(PGconn* conn, const IndexCheck& chk) {
         const std::string_view key =
             using_at == std::string::npos ? std::string_view{}
                                           : std::string_view{def}.substr(using_at + kUsing.size());
+        // A storage parameter (an operator-tuned `WITH (fillfactor=...)`) prints after the key list
+        // and does not change what the planner can use the index for, so it is accepted; an INCLUDE
+        // list prints between them and a predicate is read from `indpred`, so both still differ.
+        constexpr std::string_view kWith = " WITH (";
+        const bool same_key =
+            key == chk.key || (key.substr(0, chk.key.size()) == chk.key &&
+                               key.substr(chk.key.size(), kWith.size()) == kWith);
         if (valid != "t" || ready != "t")
             problem = "is invalid (an interrupted build)";
-        else if (partial == "t" || key != chk.key)
+        else if (partial == "t" || !same_key)
             problem = "is defined differently from the migration";
     }
     if (problem.empty())
