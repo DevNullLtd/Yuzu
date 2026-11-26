@@ -1,6 +1,7 @@
 /**
- * test_bounded_single_flight.cpp -- yuzu::agent::SingleFlightSlot, detail::bounded_single_flight
- * and the BoundedStatus mapping (bounded_status.hpp).
+ * test_bounded_single_flight.cpp -- yuzu::agent::SingleFlightSlot, detail::bounded_single_flight,
+ * the BoundedStatus mapping (bounded_status.hpp) and the Net* page loop
+ * yuzu::agent::win::detail::drain_net_pages (win_bounded_run.hpp).
  *
  * The driver is instantiated in THIS image with test-owned static slots (a slot must outlive any
  * abandoned worker). Ordering comes from promises and the slot's waiter count, every gate is
@@ -20,6 +21,7 @@
 #include "test_bounded_return.hpp"
 #include "test_helpers.hpp"
 #include "thread_pool.hpp"
+#include "win_bounded_run.hpp" // agents/core/src
 
 #include <algorithm>
 #include <atomic>
@@ -44,6 +46,10 @@ using yuzu::agent::BoundedStatus;
 using yuzu::agent::SingleFlightSlot;
 using yuzu::agent::SlotWait;
 using yuzu::agent::detail::bounded_single_flight;
+using yuzu::agent::win::detail::drain_net_pages;
+using yuzu::agent::win::detail::Drained;
+using yuzu::agent::win::detail::kMaxNetPages;
+using yuzu::agent::win::detail::NetPage;
 
 namespace {
 
@@ -67,6 +73,13 @@ bool recovers(SingleFlightSlot& slot) {
         return bounded_single_flight(slot, 5000ms, SlotWait::none, [] { return 0; }).status ==
                BoundedStatus::Completed;
     });
+}
+
+/// Drains a scripted pager: `calls` counts the pages asked for, and one past the script throws.
+Drained<int> drain_script(std::size_t max_entries, const std::vector<NetPage<int>>& script,
+                          std::size_t& calls) {
+    calls = 0;
+    return drain_net_pages<int>(max_entries, [&] { return script.at(calls++); });
 }
 
 // The fake plugin behind the forward_bounded_failure case; execute runs on the test's thread.
@@ -234,6 +247,31 @@ TEST_CASE("a healthy call is waited for with within_deadline and answered Busy w
     CHECK(calls->load() == 2);
 }
 
+// No deadline orders this case: the test holds the slot and abandons it only once the caller is
+// parked, so a slow runner cannot reorder the two.
+TEST_CASE("mark_abandoned wakes a parked caller, which is answered Abandoned",
+          "[bounded_os_call][agent]") {
+    static SingleFlightSlot slot;
+    const auto held = slot.try_acquire();
+    REQUIRE(held.result == SingleFlightSlot::Acquire::acquired);
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    std::future<BoundedFlight<int>> queued;
+    // After the future: releases the slot first, so a failing REQUIRE cannot leave it parked.
+    yuzu::test::ScopeExit releaser{[] { slot.release(); }};
+
+    queued = std::async(std::launch::async, [calls] {
+        return bounded_single_flight(slot, 1h, SlotWait::within_deadline,
+                                     [calls] { return ++*calls; });
+    });
+    REQUIRE(yuzu::test::spin_until([] { return slot.waiters() == 1; }));
+    slot.mark_abandoned(held.generation);
+    REQUIRE(queued.wait_for(10s) == std::future_status::ready);
+    CHECK(queued.get().status == BoundedStatus::Abandoned);
+    CHECK(calls->load() == 0);
+}
+
+// The same through the driver's own timeout. The second caller may park before that deadline or,
+// on a slow runner, arrive after it: the answer is Abandoned either way.
 TEST_CASE("a caller queued behind a call that times out is answered Abandoned",
           "[bounded_os_call][agent]") {
     static SingleFlightSlot slot;
@@ -246,7 +284,6 @@ TEST_CASE("a caller queued behind a call that times out is answered Abandoned",
     yuzu::test::ScopeExit opener{[&gate] { gate.open(); }}; // after the futures (see above)
 
     first = std::async(std::launch::async, [opened = gate.opened, entered, calls] {
-        // Long enough for the second caller to park before it fires.
         return bounded_single_flight(slot, 1000ms, SlotWait::within_deadline,
                                      [opened, entered, calls] {
                                          ++*calls;
@@ -260,8 +297,6 @@ TEST_CASE("a caller queued behind a call that times out is answered Abandoned",
         return bounded_single_flight(slot, 1h, SlotWait::within_deadline,
                                      [calls] { return ++*calls; });
     });
-    // Fails, rather than passing, if this caller only arrives after the slot was abandoned.
-    REQUIRE(yuzu::test::spin_until([] { return slot.waiters() == 1; }));
     // The gate is still shut: only the first call's deadline can release this caller.
     REQUIRE(queued.wait_for(10s) == std::future_status::ready);
     CHECK(queued.get().status == BoundedStatus::Abandoned);
@@ -347,4 +382,68 @@ TEST_CASE("a stalled slot does not wedge the thread pool", "[bounded_os_call][ag
 
     gate.open();
     CHECK(recovers(slot));
+}
+
+TEST_CASE("drain_net_pages returns every item of every page in order", "[bounded_os_call][agent]") {
+    std::size_t calls = 0;
+    const auto one = drain_script(10, {{0, 2, {1, 2}}}, calls);
+    CHECK(one.items == std::vector<int>{1, 2});
+    CHECK(one.nerr == 0);
+    CHECK_FALSE(one.truncated);
+    CHECK_FALSE(one.no_progress);
+    CHECK(calls == 1);
+
+    // The second page read an entry the caller did not copy: that is still progress.
+    const auto paged =
+        drain_script(10, {{234, 2, {1, 2}}, {234, 1, {}}, {234, 1, {3}}, {0, 1, {4}}}, calls);
+    CHECK(paged.items == std::vector<int>{1, 2, 3, 4});
+    CHECK(paged.nerr == 0);
+    CHECK_FALSE(paged.truncated);
+    CHECK_FALSE(paged.no_progress);
+    CHECK(calls == 4);
+}
+
+TEST_CASE("drain_net_pages stops at the entry past max_entries", "[bounded_os_call][agent]") {
+    std::size_t calls = 0;
+    const auto over = drain_script(3, {{234, 2, {1, 2}}, {234, 2, {3, 4}}}, calls);
+    CHECK(over.items == std::vector<int>{1, 2, 3});
+    CHECK(over.truncated);
+    CHECK_FALSE(over.no_progress);
+    CHECK(over.nerr == 0);
+    CHECK(calls == 2);
+
+    const auto exact = drain_script(3, {{0, 3, {1, 2, 3}}}, calls);
+    CHECK(exact.items.size() == 3);
+    CHECK_FALSE(exact.truncated);
+}
+
+TEST_CASE("drain_net_pages ends a pager that makes no progress", "[bounded_os_call][agent]") {
+    std::size_t calls = 0;
+    const auto empty = drain_script(10, {{234, 0, {}}}, calls);
+    CHECK(empty.no_progress);
+    CHECK_FALSE(empty.truncated);
+    CHECK(empty.nerr == 0);
+    CHECK(calls == 1);
+
+    calls = 0;
+    const auto endless = drain_net_pages<int>(kMaxNetPages + 1, [&calls] {
+        ++calls;
+        return NetPage<int>{234, 1, {7}};
+    });
+    CHECK(calls == kMaxNetPages);
+    CHECK(endless.items.size() == kMaxNetPages);
+    CHECK(endless.no_progress);
+    CHECK_FALSE(endless.truncated);
+    CHECK(endless.nerr == 0);
+}
+
+TEST_CASE("drain_net_pages keeps earlier pages when a later one fails",
+          "[bounded_os_call][agent]") {
+    std::size_t calls = 0;
+    const auto r = drain_script(10, {{234, 2, {1, 2}}, {5, 1, {3}}}, calls);
+    CHECK(r.nerr == 5);
+    CHECK(r.items == std::vector<int>{1, 2});
+    CHECK_FALSE(r.truncated);
+    CHECK_FALSE(r.no_progress);
+    CHECK(calls == 2);
 }

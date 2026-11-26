@@ -2,7 +2,8 @@
 
 /**
  * win_bounded_run.hpp -- the shell the agent-core Windows reads (win_*.cpp) put around
- * detail::bounded_single_flight. Internal to agent-core.
+ * detail::bounded_single_flight, and the one page loop their Net* enumerations share. Internal to
+ * agent-core. Portable, with no Windows type, so both are tested on every OS.
  */
 
 #include <yuzu/agent/bounded_single_flight.hpp>
@@ -10,8 +11,11 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace yuzu::agent::win::detail {
 
@@ -44,6 +48,56 @@ Result run_bounded_read(SingleFlightSlot& slot, std::chrono::milliseconds deadli
         break;
     }
     return out;
+}
+
+/// What one call of a paged Net* enumeration (NetSessionEnum, NetUserEnum,
+/// NetLocalGroupGetMembers) answered.
+template <typename T> struct NetPage {
+    std::uint32_t status = 0;    ///< the call's NET_API_STATUS
+    std::uint32_t raw_count = 0; ///< entries the call read, including any not copied to `entries`
+    std::vector<T> entries;
+};
+
+/// Every page of one enumeration.
+template <typename T> struct Drained {
+    std::uint32_t nerr = 0;   ///< status of a failed call, else 0; never 234 (ERROR_MORE_DATA)
+    bool truncated = false;   ///< more than max_entries entries; the rest were dropped
+    bool no_progress = false; ///< the pages stopped advancing, or reached kMaxNetPages
+    std::vector<T> items;
+};
+
+/// Far more pages than a real result set needs.
+inline constexpr unsigned kMaxNetPages = 4096;
+
+/// Calls `next_page()`, which returns a NetPage<T>, until a page answers status 0. The drain ends
+/// early, keeping the entries already taken, at a failed page (nerr), at the entry past
+/// `max_entries` (truncated), and at an ERROR_MORE_DATA page that read nothing or is the
+/// kMaxNetPages-th (no_progress), so a provider that always has more cannot spin an abandoned
+/// worker for ever.
+template <typename T, typename PageFn>
+Drained<T> drain_net_pages(std::size_t max_entries, PageFn next_page) {
+    constexpr std::uint32_t kMoreData = 234; // ERROR_MORE_DATA
+    Drained<T> out;
+    for (unsigned pages = 1;; ++pages) {
+        NetPage<T> page = next_page();
+        if (page.status != 0 && page.status != kMoreData) {
+            out.nerr = page.status;
+            return out;
+        }
+        for (T& entry : page.entries) {
+            if (out.items.size() >= max_entries) {
+                out.truncated = true;
+                return out;
+            }
+            out.items.push_back(std::move(entry));
+        }
+        if (page.status == 0)
+            return out;
+        if (page.raw_count == 0 || pages >= kMaxNetPages) {
+            out.no_progress = true;
+            return out;
+        }
+    }
 }
 
 } // namespace yuzu::agent::win::detail

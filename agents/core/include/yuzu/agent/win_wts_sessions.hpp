@@ -12,6 +12,14 @@
  * One read is in flight process-wide. A second caller waits for a healthy read inside its own
  * deadline; after a deadline hit, callers are answered Abandoned until the blocked worker returns.
  * Every other field of the result is meaningful only when status == Completed.
+ *
+ * COMPLETENESS (what a consumer may rely on)
+ * ------------------------------------------
+ * `sessions` is the complete session list ONLY when status == Completed, enumerated is true and
+ * truncated is false. A consumer that diffs the list or stores it as a baseline must refuse
+ * anything else. A consumer that only reports rows must mark a truncated list CONSTRAINED +
+ * PARTIAL. A change to a field or to this contract is made here, never worked around in a
+ * consumer.
  */
 
 #include <yuzu/agent/bounded_status.hpp>
