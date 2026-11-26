@@ -5635,6 +5635,38 @@ TEST_CASE("REST dex/devices/{id}/live: output with no terminal row is 504 incomp
     CHECK(rest_live_count(h, "processes", "timeout") == 0.0);
 }
 
+// A processes read whose stored answer cannot be read may still be hashing on the device, and a
+// retry is a fresh command that executes for real: the 503 hint is the run budget, not 2 s.
+TEST_CASE("REST dex/devices/{id}/live: a store fault on a processes read is priced at the run "
+          "budget, a quick kind at 2 s",
+          "[pg][rest][dex][device][live]") {
+    for (const char* kind : {"processes", "uptime"}) {
+        DYNAMIC_SECTION(kind) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
+            AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
+            yuzu::server::detail::live_poll_max_polls().store(2);
+            yuzu::server::detail::live_poll_interval_ms().store(1);
+            RestGsHarness h(true, true, true, true, &pool);
+            yuzu::test::SqlFault fault(pool, "ALTER TABLE response_store.responses RENAME TO responses_gone",
+                                       "ALTER TABLE response_store.responses_gone RENAME TO responses");
+            fault.arm();
+            auto res = h.sink.Post(std::string("/api/v1/dex/devices/WS-1/live?kind=") + kind, "");
+            fault.repair();
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            const auto j = nlohmann::json::parse(res->body);
+            CHECK(j["error"]["reason"].get<std::string>() == "store_degraded");
+            CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() ==
+                  (std::string_view(kind) == "processes"
+                       ? yuzu::server::mcp::kLiveReadProcessesTimeoutRetryMs
+                       : yuzu::server::mcp::kMcpStoreFaultShortRetryMs));
+            CHECK(rest_live_count(h, kind, "store_degraded") == 1.0);
+        }
+    }
+}
+
 // S3 / QE-4: the device's text is cut to 200 bytes before it rides the error body. The store
 // scrubs bytes that are not UTF-8 at ingest, so what can reach the cut is valid text whose
 // character STRADDLES it: a bare byte cut would end inside the two-byte "e acute" and put an

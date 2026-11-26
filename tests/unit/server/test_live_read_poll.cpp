@@ -1503,6 +1503,17 @@ TEST_CASE("live_read_timeout_retry_ms: processes is priced at the plugin's actio
     CHECK(mcp::live_read_timeout_retry_ms("") == mcp::kMcpLiveReadDeviceTimeoutRetryMs);
 }
 
+TEST_CASE("live_read_store_degraded_retry_ms: processes is priced at its run budget, other kinds at the store-fault price",
+          "[live][mcp][retry]") {
+    CHECK(mcp::live_read_store_degraded_retry_ms("uptime") == mcp::kMcpStoreFaultShortRetryMs);
+    CHECK(mcp::live_read_store_degraded_retry_ms("uptime") == 2000);
+    CHECK(mcp::live_read_store_degraded_retry_ms("processes") == mcp::kLiveReadProcessesTimeoutRetryMs);
+    CHECK(mcp::live_read_store_degraded_retry_ms("") == mcp::kMcpStoreFaultShortRetryMs);
+    // A processes read is never told to retry sooner on a store fault than on a timeout: its first
+    // run may still be hashing whichever way the answer was lost.
+    CHECK(mcp::live_read_store_degraded_retry_ms("processes") == mcp::live_read_timeout_retry_ms("processes"));
+}
+
 TEST_CASE("live_read_incomplete_retry_ms: processes is priced at its run budget, other kinds at the poll deadline",
           "[live][retry][2146]") {
     namespace mcp = yuzu::server::mcp;

@@ -2800,8 +2800,8 @@ static const ToolDef kTools[] = {
      "Output is bounded: at most 1000 process rows and 1 MiB of device output, with "
      "'truncated' set when either cut applies; count 0 with truncated true means the size "
      "cap cut everything (the first row alone exceeds it) and a retry returns the same. "
-     "Under truncation the surviving rows are not a stable prefix of the full answer (they "
-     "come from the newest stored output). "
+     "Rows left after a cut are the start of what was read (already the newest stored "
+     "output when the store read left the oldest out), not a prefix of the full answer. "
      "Errors: most errors carry a 'reason' (a cap, a permission or session withdrawn after "
      "the request was audited, an unreadable gate, a dispatch denial token such as "
      "forbidden or approval_required, an offline or withheld device, a poll outcome, or "
@@ -22294,7 +22294,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // so this handler validates itself: object arguments, exactly agent_id and kind,
                 // one device (never __all__). An argument-shape refusal writes no audit row.
                 const auto refuse_input = [&](const std::string& why) {
-                    res.set_content(error_response(id, kInvalidParams, why), // retry-hint-exempt: a permanent refusal of this input, not a store fault
+                    res.set_content(a4_error(kInvalidParams, why, {}, -1, cid), // retry-hint-exempt: a permanent refusal of this input, not a store fault
                                     "application/json");
                 };
                 if (!args.is_object()) {
@@ -22345,7 +22345,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // global gate). Read first (the route's primary gate), then Execute.
                 if (!scoped_perm_fn) {
                     outcome = live::LiveOutcome::kNotConfigured;
-                    res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                    res.set_content(a4_error(kInternalError, "scope gate not configured", {}, -1, cid),
                                     "application/json");
                     return;
                 }
@@ -22386,7 +22386,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto lk = live::resolve_rest_kind(kind);
                 if (!lk) {
                     outcome = live::LiveOutcome::kBadKind;
-                    res.set_content(error_response(id, kInvalidParams, "kind must be uptime or processes"), // retry-hint-exempt: a permanent refusal of this input, not a store fault
+                    res.set_content(a4_error(kInvalidParams, "kind must be uptime or processes", {}, -1, cid), // retry-hint-exempt: a permanent refusal of this input, not a store fault
                                     "application/json");
                     return;
                 }
@@ -22726,10 +22726,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     case live::LiveOutcome::kStoreDegraded:
                         // Every read of the response store degraded: the device may well have
-                        // answered, so this is retryable and is not the device's timeout.
+                        // answered, so this is retryable and is not the device's timeout. A
+                        // processes read may still be hashing, so its hint is the run budget.
                         res.set_content(
                             a4_error(kInternalError, "response store read degraded", "retry shortly",
-                                     mcp::kMcpStoreFaultShortRetryMs, cid, true,
+                                     mcp::live_read_store_degraded_retry_ms(kind), cid, true,
                                      live::to_token(polled.outcome)),
                             "application/json");
                         return;

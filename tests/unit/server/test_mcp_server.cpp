@@ -12010,8 +12010,10 @@ TEST_CASE("MCP get_device_live: the served description states the lease limits t
     CHECK(description.find("count 0 with truncated true means the size cap cut everything") !=
           std::string::npos);
     CHECK(description.find("a retry returns the same") != std::string::npos);
-    CHECK(description.find("not a stable prefix") != std::string::npos);
-    CHECK(description.find("they come from the newest stored output") != std::string::npos);
+    CHECK(description.find("are the start of what was read") != std::string::npos);
+    CHECK(description.find("already the newest stored output") != std::string::npos);
+    CHECK(description.find("not a prefix of the full answer") != std::string::npos);
+    CHECK(description.find("they come from the newest stored output") == std::string::npos); // the old wording
     CHECK(description.find("they are the newest ones") == std::string::npos); // the ambiguous wording
     CHECK(description.size() < 4096);
     // F2: the reason and retry statements are the ones the handler makes. MCP stamps the denial
@@ -13001,6 +13003,18 @@ TEST_CASE("MCP get_device_live: the poll reads the device's rows only (multi-row
         CHECK(err["data"]["reason"] == "store_degraded");
         CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultShortRetryMs);
         CHECK(mcp_live_count(f.metrics, "uptime", "store_degraded") == 1.0);
+    }
+    SECTION("a processes store fault is priced at the run budget: a retry cannot land in a live hash") {
+        yuzu::test::SqlFault fault(f.pool,
+                                   "ALTER TABLE response_store.responses RENAME TO responses_gone",
+                                   "ALTER TABLE response_store.responses_gone RENAME TO responses");
+        fault.arm();
+        const auto err = live_error(f.call("WS-1", "processes"));
+        fault.repair();
+        CHECK(err["data"]["reason"] == "store_degraded");
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kLiveReadProcessesTimeoutRetryMs);
+        CHECK(err["data"]["retry_after_ms"] != yuzu::server::mcp::kMcpStoreFaultShortRetryMs);
+        CHECK(mcp_live_count(f.metrics, "processes", "store_degraded") == 1.0);
     }
     CHECK(f.budget.active() == 0);
 }

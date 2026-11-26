@@ -2158,14 +2158,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **Poll.** One shared reader scopes the stored rows to the device at the
        store, answers only after the device has finished (a stored row with a
        terminal status; partial output without one is discarded and answered
-       `incomplete`, retryable after the poll's 25 second deadline, except an
+       `incomplete`, retryable after the poll's 25 second deadline (120 seconds for `processes`, whose run can hash that long), except an
        answer already over the size cap, which MCP cuts and flags `truncated`
        at once and REST refuses), joins the output chunks with a newline in stored order,
        lets a failure row win, and is bounded by a 25 second wall-clock
        deadline and a bounded store read; the MCP answer is capped at 1000
        rows and 1 MiB with a `truncated` flag (an answer already over the cap is
-       cut and flagged at once, and the surviving rows are not a stable
-       prefix), the REST answer refuses over 4 MiB, 20000 rows or 64 stored
+       cut and flagged at once, and the surviving rows are the start of what
+       was read, not a prefix of the full answer), the REST answer refuses over 4 MiB, 20000 rows or 64 stored
        rows (`output_too_large`). A response-store ingest property remains and
        is not fixed here: if one middle chunk of a multi-chunk device answer
        is not stored, the read cannot detect the hole and may return the

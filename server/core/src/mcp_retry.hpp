@@ -158,6 +158,16 @@ inline constexpr std::int64_t kLiveReadIncompleteRetryMs = 25000;
     return kind == "processes" ? kLiveReadProcessesTimeoutRetryMs : kLiveReadIncompleteRetryMs;
 }
 
+/// The `retry_after_ms` a live read answers when every read of the response store degraded
+/// (`store_degraded`), by the allowlist-resolved kind token. The device may well have answered, so
+/// a quick kind gets the short store-fault price (`kMcpStoreFaultShortRetryMs`, REST parity). A
+/// `processes` read is different: its first run can still be hashing for up to 120 s, and a retry
+/// is a fresh `command_id` that executes for real, so it gets the same price as its `timeout` and
+/// `incomplete` hints. REST and MCP both call this, so the two cannot disagree.
+[[nodiscard]] inline constexpr std::int64_t live_read_store_degraded_retry_ms(std::string_view kind) noexcept {
+    return kind == "processes" ? kLiveReadProcessesTimeoutRetryMs : kMcpStoreFaultShortRetryMs;
+}
+
 /// Metric-name symbol for the poll-rate counter (#3344), so the `describe`/
 /// pre-seed site (`server.cpp`) and the increment site (`mcp_server.cpp`)
 /// cannot silently diverge into a shadow series — same precedent as

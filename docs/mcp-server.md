@@ -195,7 +195,7 @@ command completion, not first-result):
 | `kMcpLiveReadCapRetryMs` | 2000 | `get_device_live` refused at admission because the live-read lease cap is reached (REST `Retry-After: 2` parity) |
 | `kMcpLiveReadDeviceTimeoutRetryMs` | 3000 | `get_device_live` of a quick kind (`uptime`) that the device never answered inside the poll budget |
 | `kLiveReadIncompleteRetryMs` | 25000 | `get_device_live` of a quick kind that began to answer and never finished: the poll's own wall deadline (pinned equal to it by a `static_assert`) |
-| `kLiveReadProcessesTimeoutRetryMs` | 120000 | `get_device_live` of kind `processes`, for both `timeout` and `incomplete`: the plugin's 120 s action budget (pinned by `tests/test_live_retry_budget_lexical.py`) |
+| `kLiveReadProcessesTimeoutRetryMs` | 120000 | `get_device_live` of kind `processes`, for `timeout`, `incomplete` and `store_degraded`: the plugin's 120 s action budget (pinned by `tests/test_live_retry_budget_lexical.py`) |
 
 Several constants share a numeric value with a neighbour — that is
 coincidental historical pricing, not a shared derivation, and each is kept a
