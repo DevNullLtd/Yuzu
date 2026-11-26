@@ -19,20 +19,12 @@
 #     installed" and then fail post-install pkgconfig validation. #741.)
 #   - write the new key to vcpkg_installed/.<triplet>-cachekey.sha256
 #
-# Scope of action on EVERY run (drift or not):
-#   - rm -rf vcpkg_installed/<other-triplet>/   for any sibling tree with no
-#     info/*_<other-triplet>.list entry in vcpkg_installed/vcpkg/ (a tree
-#     orphaned by another triplet's registry wipe; see the "orphaned tree"
-#     block near the end). Symlinks are skipped, and the loop is skipped
-#     entirely when info/ exists but cannot be read.
-#
 # Scope NEVER touched:
 #   - $WS/vcpkg/                   (vcpkg tool root, owned by lukka/run-vcpkg
 #                                    — distinct from $WS/vcpkg_installed/vcpkg/)
 #   - runner.tool_cache/...        (binary cache zips — that's the warm tier)
 #   - ccache (~/.cache/ccache, %LOCALAPPDATA%\ccache)
-#   - any other vcpkg_installed/<other-triplet>/ tree that the shared registry
-#     still lists (an unlisted one is wiped, see above)
+#   - any other vcpkg_installed/<other-triplet>/ tree
 #
 # Cross-platform: bash only, sha256sum (Linux + MSYS2 bash on Windows + macOS).
 # Idempotent. Exit 0 unconditionally — a sentinel mismatch is a normal state,
@@ -158,78 +150,6 @@ if [[ -d "$registry_dir" && ! -d "$installed_dir" ]]; then
   echo "  ${registry_dir} exists but ${installed_dir} does not"
   echo "  wiping ${registry_dir} (workspace registry) to recover"
   rm -rf "$registry_dir"
-fi
-
-# --- defensive invariant: a tree the registry does not list is orphaned ---
-#
-# The inverse of the rule above. `vcpkg_installed/vcpkg/` is ONE registry
-# shared by EVERY triplet tree in the workspace, but the drift branch wipes
-# it when ONE triplet's key changes. Every OTHER triplet's tree survives
-# with its files on disk and no `info/<port>_<ver>_<triplet>.list` entry.
-# The next `vcpkg install` for that triplet then believes nothing is
-# installed, finds its files already present, and aborts on the first
-# symlink: `error: failed: .../tools/protobuf/protoc: File exists`. The
-# sanitizer legs then fail with a missing dependency (CLI11) instead of a
-# real test result.
-#
-# It bites when jobs whose key inputs differ (vcpkg.json, the baseline
-# commit, or a triplet overlay) alternate on one work dir, for example a
-# dev/PR job and the main nightly: each drift of ANY one triplet's key wipes
-# the shared registry and strands the other triplets' trees. A tree with no
-# registry entry is unusable, so wipe it and let vcpkg rebuild it from the
-# binary cache.
-#
-# Known limits (deliberate): the test is per tree, not per port (one matching
-# list file keeps the tree); every real directory under vcpkg_installed/ other
-# than vcpkg/ is treated as a triplet tree; there is no lock, so it assumes
-# one job per workspace at a time (the self-hosted pools use one work dir per
-# runner agent); an rm failure is warned about, not fatal, per this script's
-# exit-0 contract.
-#
-# Runs whether or not the key drifted, so it also heals a workspace that is
-# already in this state.
-info_unreadable=0
-if [[ -d "$registry_dir/info" ]]; then
-  if [[ ! -r "$registry_dir/info" || ! -x "$registry_dir/info" ]]; then
-    info_unreadable=1
-  fi
-fi
-if [[ "$info_unreadable" -eq 1 ]]; then
-  # An unreadable registry looks identical to an empty one; wiping on that
-  # evidence would destroy healthy trees. A MISSING info/ is different (it is
-  # the normal state right after the drift wipe above) and is handled below.
-  echo "::warning::vcpkg sentinel: ${registry_dir}/info is not readable; skipping the orphaned-tree check"
-elif [[ -d "$sentinel_dir" ]]; then
-  for tree in "$sentinel_dir"/*/; do
-    tree="${tree%/}"
-    # Never follow a symlink: vcpkg creates none here, and rm -rf on a link
-    # target would delete data outside the tree.
-    if [[ -L "$tree" ]]; then
-      continue
-    fi
-    if [[ ! -d "$tree" ]]; then
-      continue
-    fi
-    name="${tree##*/}"
-    if [[ "$name" == "vcpkg" ]]; then
-      continue
-    fi
-    listed=0
-    for entry in "$registry_dir"/info/*_"${name}".list; do
-      if [[ -f "$entry" ]]; then
-        listed=1
-        break
-      fi
-    done
-    if [[ "$listed" -eq 0 ]]; then
-      echo "vcpkg sentinel: orphaned tree detected (job triplet=${TRIPLET}, orphan triplet=${name})"
-      echo "  ${tree} has no entry in ${registry_dir}/info"
-      echo "  wiping ${tree} to recover"
-      if ! rm -rf "$tree"; then
-        echo "::warning::vcpkg sentinel: failed to wipe ${tree}; the next vcpkg install may fail with 'File exists'. Manual recovery: rm -rf ${sentinel_dir}"
-      fi
-    fi
-  done
 fi
 
 exit 0

@@ -4982,13 +4982,7 @@ per-workspace registry — `info/`, `status`, `updates/`. Leaving the
 registry behind after wiping the triplet tree leaves orphaned
 `info/<port>_<triplet>.list` entries that make the next `vcpkg install`
 short-circuit to "already installed" and then fail post-install
-pkgconfig validation; this was #741.) That wipe is workspace-wide, so it
-strands every OTHER triplet's tree; on every run, drift or not, the
-sentinel therefore also wipes any `vcpkg_installed/<triplet>/` tree that
-the registry does not list (log line `orphaned tree detected`; symlinks are
-skipped, an unreadable `info/` skips the check), and wipes the registry
-when the current triplet has no tree (`orphaned registry detected`); see
-`docs/ci-troubleshooting.md`. Never touches `$WS/vcpkg/` (the
+pkgconfig validation; this was #741.) Never touches `$WS/vcpkg/` (the
 sibling vcpkg tool root, owned by lukka/run-vcpkg), never
 `runner.tool_cache`, never ccache. Persistence: self-hosted in
 `${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows,macos}`

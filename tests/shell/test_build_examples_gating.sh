@@ -50,6 +50,21 @@ if [ ! -d "$VCPKG_INSTALLED" ]; then
   exit 77
 fi
 
+# A directory that exists is not a populated one (#6719). The sanitizer legs'
+# `vcpkg install --triplet x64-linux-asan|tsan` also install the HOST-tool
+# packages (abseil, protobuf, grpc, ...) into vcpkg_installed/x64-linux, but
+# the build's own dependencies (CLI11 among them) only into the instrumented
+# triplet. Such a host-only tree passes the directory check, and meson then
+# fails on `Dependency "CLI11" not found`. CLI11 is what the top-level
+# meson.build requires on every host, so its config file is the marker that
+# this tree can configure the build at all. Without it the configure smoke
+# test has nothing to test, so SKIP honestly instead of failing for a reason
+# that has nothing to do with build_examples gating.
+if [ ! -f "$VCPKG_INSTALLED/share/cli11/CLI11Config.cmake" ]; then
+  echo "test_build_examples_gating: SKIP — vcpkg_installed/$TRIPLET has no share/cli11/CLI11Config.cmake (a host-tools-only tree, e.g. left by a sanitizer-triplet install; #6719)"
+  exit 77
+fi
+
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/yuzu_test_build_examples_gating.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
