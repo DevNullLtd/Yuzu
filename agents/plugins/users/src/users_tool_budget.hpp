@@ -17,13 +17,6 @@ namespace yuzu::users {
 
 inline constexpr std::chrono::milliseconds kLocalUsersToolBudget{30000};
 
-/// True when the budget cut a tool's deadline below `per_call`: a tool that then hits it was
-/// stopped by the budget, not by its own deadline.
-[[nodiscard]] inline bool deadline_shortened(std::chrono::milliseconds deadline,
-                                             std::chrono::milliseconds per_call) {
-    return deadline < per_call;
-}
-
 class ToolBudget {
 public:
     ToolBudget(std::chrono::steady_clock::time_point start, std::chrono::milliseconds total)
@@ -51,8 +44,8 @@ inline void settle_account_tool(yuzu::CommandContext& ctx, const yuzu::agent::Su
                                 std::chrono::milliseconds deadline,
                                 std::chrono::milliseconds per_call, std::string& output,
                                 bool& status_forwarded, bool& tool_skipped) {
-    if (res.termination_reason == yuzu::agent::TerminationReason::deadline &&
-        deadline_shortened(deadline, per_call)) {
+    // A deadline below `per_call`, once hit: cut by the budget, not by the tool's own deadline.
+    if (res.termination_reason == yuzu::agent::TerminationReason::deadline && deadline < per_call) {
         tool_skipped = true;
         output.clear();
     } else if (!status_forwarded) {

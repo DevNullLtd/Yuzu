@@ -18,7 +18,6 @@
 using namespace std::chrono_literals;
 using yuzu::agent::SubprocessResult;
 using yuzu::agent::TerminationReason;
-using yuzu::users::deadline_shortened;
 using yuzu::users::declare_budget_exhausted;
 using yuzu::users::kLocalUsersToolBudget;
 using yuzu::users::settle_account_tool;
@@ -72,8 +71,6 @@ TEST_CASE("ToolBudget cuts a tool deadline to what is left, then refuses",
     CHECK_FALSE(budget.next_deadline(start + 30s - 1us, 10s).has_value());
     CHECK_FALSE(budget.next_deadline(start + 30s, 10s).has_value());
     CHECK_FALSE(budget.next_deadline(start + 31s, 10s).has_value());
-    // Only a deadline below the per-call one counts as shortened by the budget.
-    CHECK((deadline_shortened(9999ms, 10s) && !deadline_shortened(10000ms, 10s)));
 }
 
 TEST_CASE("a tool cut off by a budget-shortened deadline is skipped and forwards nothing",

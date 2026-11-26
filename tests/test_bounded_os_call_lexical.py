@@ -66,7 +66,7 @@ WIRED = (
      r"[^;]*;\s*if\s*\(\s*yuzu::agent::forward_bounded_failure\s*\(\s*ctx\s*,\s*read\.status\b"
      r"[^;{]*(?:\{[^{}]*)?\breturn\s+1\s*;", 5),
     ("users/src/users_plugin.cpp", r"\brun_account_tool\s*\(\s*ctx\s*,",
-     r"\s*\{[^{}]*\}\s*,\s*\*deadline\s*,", 4),
+     r"\s*\{[^{}]*\}\s*,\s*\*deadline\s*,\s*status_forwarded\s*,\s*tool_skipped\s*\)\s*;", 4),
     ("users/src/users_plugin.cpp", r"\bToolOutcome\s+run_account_tool\s*\(",
      r"[^{}]*\{\s*auto\s+out\s*=\s*run_tool\s*\(\s*std::move\(argv\)\s*,\s*0\s*,\s*deadline\s*\)", 1),
     # ... and every such `deadline` comes from the budget.
@@ -75,8 +75,9 @@ WIRED = (
     # Each per-account tool's outcome is settled against that deadline and the full one,
     ("users/src/users_plugin.cpp", r"\bToolOutcome\s+run_account_tool\s*\(",
      r"[^{}]*\{[^{}]*\byuzu::users::settle_account_tool\s*\(\s*ctx\s*,\s*out\.res\s*,"
-     r"\s*deadline\s*,\s*kUsersCmdDeadline\s*,\s*out\.output\s*,", 1),
-    # ... and each run (Linux, macOS) ends by declaring a spent budget.
+     r"\s*deadline\s*,\s*kUsersCmdDeadline\s*,\s*out\.output\s*,"
+     r"\s*status_forwarded\s*,\s*tool_skipped\s*\)\s*;", 1),
+    # ... and both declare calls (Linux, macOS) keep the two flags in order.
     ("users/src/users_plugin.cpp", r"\byuzu::users::declare_budget_exhausted\s*\(",
      r"\s*ctx\s*,\s*,\s*tool_skipped\s*,\s*status_forwarded\s*\)\s*;", 2),
     # An answered read that is not the whole list is declared before the next read.
@@ -120,19 +121,28 @@ def seams():
             for name in re.findall(r"\b(\w+_for_test)\s*\(", blank(p.read_text(encoding="utf-8")))}
 
 
+@functools.lru_cache(maxsize=None)
+def scan(name, raw, seam):
+    """One file's (a) and (b) findings and its (c) site count. Cached on the name and the full
+    text, so a self-test edit rescans only the file it changes."""
+    code, found = blank(raw), []
+    for m in BANNED_CALL.finditer(code):
+        if (name, m[1]) not in ALLOWED:
+            found.append(f"{name}: calls {m[1]}: use the bounded agent-core read (ADR-3008)")
+    if any(DRIVER.match(raw, m.end()) for m in INCLUDE.finditer(code)):
+        found.append(f"{name}: includes bounded_single_flight.hpp, which is agent-core only")
+    for m in seam.finditer(code):
+        found.append(f"{name}: names {m[1]}, a seam for test binaries")
+    return tuple(found), len(SITE.findall(code))
+
+
 def problems(srcs, table, seam_names):
     found, counts = [], {}
     seam = re.compile(r"\b(" + "|".join(sorted(seam_names)) + r")\b")
     for name, raw in sorted(srcs.items()):
-        code = blank(raw)
-        for m in BANNED_CALL.finditer(code):
-            if (name, m[1]) not in ALLOWED:
-                found.append(f"{name}: calls {m[1]}: use the bounded agent-core read (ADR-3008)")
-        if any(DRIVER.match(raw, m.end()) for m in INCLUDE.finditer(code)):
-            found.append(f"{name}: includes bounded_single_flight.hpp, which is agent-core only")
-        for m in seam.finditer(code):
-            found.append(f"{name}: names {m[1]}, a seam for test binaries")
-        if n := len(SITE.findall(code)):
+        file_found, n = scan(name, raw, seam)
+        found += file_found
+        if n:
             counts[name] = n
     for name in sorted(counts.keys() | table.keys()):
         have, frozen = counts.get(name, 0), table.get(name, 0)
@@ -152,8 +162,9 @@ def problems(srcs, table, seam_names):
 
 
 class BoundedOsCall(unittest.TestCase):
-    def setUp(self):
-        self.srcs, self.seams = sources(), seams()
+    @classmethod
+    def setUpClass(cls):
+        cls.srcs, cls.seams = sources(), seams()  # one read of the tree; no test edits it
 
     def run_gate(self, edits=None, table=GRANDFATHERED):
         return problems({**self.srcs, **(edits or {})}, table, self.seams)
@@ -200,6 +211,7 @@ class BoundedOsCall(unittest.TestCase):
             (users, r"std::move\(argv\), 0, deadline", "std::move(argv)", 1),
             (users, r"deadline =\s+(?:tool_deadline|budget\.next_deadline)\(", "deadline = f(", 5),
             (users, r"yuzu::users::settle_account_tool\([^;]*;", "", 1),
+            (users, r"status_forwarded, tool_skipped\);", "tool_skipped, status_forwarded);", 5),
             (users, r"yuzu::users::declare_budget_exhausted\([^;]*;", "", 2),
             (users, r"declare_partial\(ctx, yuzu::users_win::wts_degraded_provenance\(read\)\);",
              "", 2),

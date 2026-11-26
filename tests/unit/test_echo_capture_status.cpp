@@ -4,7 +4,7 @@
  * that decides whether a bounded-subprocess capture is complete enough to
  * diff/persist as authoritative Echo state (BR-001), and for
  * collect_or_retain(), the collect-or-retain seam every Echo snapshot-diff
- * source (service, mapdrive, arp) applies on top of that decision.
+ * source (service, user, mapdrive, arp) applies on top of that decision.
  *
  * No test here spawns a process, sleeps, or touches the network -- every
  * case feeds fixed tool_ran/timed_out/output_truncated/exit_code values
@@ -542,7 +542,7 @@ TEST_CASE("snapshot_phase_outcome: multiple failed phases are all reported, call
 
 // ── snapshot_phase_outcome: has_earlier_skips (round 5, adversarial-review) ──
 //
-// A collect_or_retain skip (arp/service/mapdrive) leaves every phase rc at 0
+// A collect_or_retain skip (arp/service/user/mapdrive) leaves every phase rc at 0
 // -- it is not a persistence failure, so fast_rc/slow_rc/software_rc alone
 // cannot see it. Previously the action's own return code came ONLY from
 // those three integers, so a forced snapshot that silently retained one of
