@@ -629,7 +629,7 @@ if build_agent
   subdir('agents/plugins/remote_access_audit')  # SSH inbound-access audit (Linux + macOS legs; Windows planned)
   subdir('agents/plugins/process_introspect')  # per-process introspection of one pid (Linux and macOS legs; Windows planned)
   subdir('agents/plugins/runtimes')  # Wave 10 PR10.1-b
-  subdir('agents/plugins/component_inventory')  # SAM-16: Java components found in application trees (Linux + macOS legs; Windows planned)
+  subdir('agents/plugins/component_inventory')  # SAM-16: Java, Python and Node components found in application trees (Linux, macOS; Windows: Java and native libraries, Python and Node planned)
   subdir('agents/plugins/file_search')  # on-demand resumable file-name search of the local disks (Linux, macOS and Windows legs)
   subdir('agents/plugins/virtualization')  # PR12.1-a: VM / hypervisor / container facts (Linux, macOS and Windows legs)
   subdir('agents/plugins/middleware')  # SAM.2: table-driven middleware inventory (Linux leg; Windows + macOS planned)

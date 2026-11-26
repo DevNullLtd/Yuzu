@@ -1,4 +1,4 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-22 · euid 0 · leg-hash f0b0b7eb29ce
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-22 · euid 0 · leg-hash 5af5fa87538c
 == action=scan
 status|scan|supported|linux:component_inventory:link_skipped,linux:component_inventory:version_unreadable
 comp|java|libintl|0.23.2|filename|/usr/share/java/libintl-0.23.2.jar|2594|1763054400|libintl-0.23.2.jar
