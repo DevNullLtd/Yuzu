@@ -238,6 +238,29 @@ differences are visible in the table and are small in absolute terms: the 2% clu
 11 ms to 23 ms on the ordered-heap rig (not on the random one), and C shows why `device_ci_changed_at_idx` stays (a
 sparse delta without it is 28 ms instead of 5).
 
+## Chaos run (2026-11-26)
+
+Run against the final v6 text as a psql emulation of the migration runner (BEGIN, the per-store advisory lock, the
+transaction-local `search_path`, the migration as one message, the stamp, COMMIT; sessions with the pool's
+`lock_timeout` 10 s and `statement_timeout` 30 s) on throwaway PostgreSQL 18.4 containers, 1M rows (6M for the kill and
+deadlock cases), not the real server or pool. Raw logs are not retained. All six scenarios met their criteria:
+
+| Scenario | Observed |
+|---|---|
+| Long reader or slowed `pg_dump` at start | the migration fails at its lock timeout and rolls back completely (stamp 5, v4's index kept, no invalid index); a writer queued during the wait stalled and recovered the moment it failed; pooled `device_ci` requests fail at exactly 10 s (the pool's timeout is shorter than v6's 30 s); a second replica fails at the pool's 10 s on the advisory lock; one restart after the holder ends converges in about 0.5 s |
+| `kill -9` of the client mid-build | the backend finishes the whole message, then rolls back; locks held 2.2 s after the kill (grows with the table); v5 intact; `client_connection_check_interval` shortens it |
+| Client cut after the last statement, before the commit | the session stays `idle in transaction` holding the exclusive and advisory locks (65 s or more observed; about 2 h 11 min of OS keepalive by calculation); restarts fail at 10 s; `pg_terminate_backend` leaves v5 intact and a restart converges; `idle_in_transaction_session_timeout` bounds it |
+| Deadlock against a read-then-write session | the final text never deadlocks (the writer jumps the queue in 0.56 ms; the migration waits for its commit); the rejected SHARE-first text deadlocked with the migration as the victim |
+| Hand `CREATE INDEX CONCURRENTLY` in progress | blocks the migration's lock, which fails at its timeout and rolls back; after the build is cancelled a re-run drops the invalid index and rebuilds |
+| Disk full | error 53100 (sort spill or extending a file), full rollback, reads and writes still served, a re-run converges once space is freed; with a small WAL ring on the same volume PostgreSQL itself crash-restarted twice and recovered |
+| Composite missing, v4's index present (a restore) | plain pages and the first delta page about 0.6 ms; the terminal delta page 640 ms without the composite and 21 to 46 ms after the WARN's statement |
+
+Findings, all documentation (now in `docs/user-manual/upgrading.md`, "Migration v6"): the orphaned-session case and its
+recovery and bounds; the pool's 10 s failure behaviour while v6 waits (v6 keeps its 30 s wait by decision: a shorter one
+gives up on a briefly busy table); the disk and WAL headroom; and that v6 does not remove an invalid
+`device_ci_agent_id_c_idx_ccnew` left by a cancelled `REINDEX CONCURRENTLY`. Not shown by this emulation: the real C++
+runner and pool, foreign-key child writes, a write load, and sizes beyond 6M rows (larger figures are extrapolations).
+
 ## Residuals
 
 None of these is accepted by this record; each is stated so a client, a reviewer and the owner can plan around
@@ -289,9 +312,8 @@ approved, not before). These are MERGE-BLOCKING when the push happens, in this o
    index; a server-side bound on an orphaned migration backend (`idle_in_transaction_session_timeout` in the runner's
    `SET LOCAL`, for a connection cut after v6's last statement); the runner's 10 s advisory-lock wall for a second replica;
    the WARN recognising v4's index so its consequence text is exact when only the composite is missing; a non-superuser way
-   to test the invalid-index replacement; and the chaos runs against the final v6 text (a real `pg_dump` against a
-   starting replica, a hand `CREATE INDEX CONCURRENTLY` in progress while v6 starts, a network cut after v6's last
-   statement, disk full at v6). Deliberately closed rather than filed: a `pg_dump` holding the lock (documented: start
+   to test the invalid-index replacement; and the chaos runs repeated against the real server and pool (the psql emulation above passed; what it cannot show
+   is listed there). Deliberately closed rather than filed: a `pg_dump` holding the lock (documented: start
    outside the dump window), the `pg_get_indexdef` print format changing (stable on 18.4 across C, ICU and tuned indexes;
    revisit on a PostgreSQL major upgrade), the WARN remedy being a plain build (the WARN says so), index bloat after a
    mass content change (autovacuum), the upgrade deadlock (removed by lock-first), a restore without the composite (the
