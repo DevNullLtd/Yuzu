@@ -31,10 +31,10 @@
 # Remove a line as soon as the scanner sees the image's packages; the gate
 # warns when a listed image does have OS packages.
 #
-# Nothing is listed. The four chiselled images that were (yuzu-server-chisel,
-# yuzu-gateway-chisel, yuzu-agent-chisel, yuzu-agent-bundle-chisel, approved in
-# #8315) are covered now: each Dockerfile runs deploy/docker/chisel-emit-status.py,
-# which writes the chisel manifest as /var/lib/dpkg/status.d stanzas, so Trivy and
-# grype read the packages. With the listings gone, an image whose OS scan finds no
+# Nothing is listed. The four chiselled images (yuzu-server-chisel,
+# yuzu-gateway-chisel, yuzu-agent-chisel, yuzu-agent-bundle-chisel) carry
+# /var/lib/dpkg/status.d records: each Dockerfile runs
+# deploy/docker/chisel-emit-status.py, which writes the chisel manifest as those
+# stanzas, so Trivy and grype read the packages. An image whose OS scan finds no
 # package at all fails the gate, so a regression to zero packages is caught.
 # List an image again only as a reviewed decision, with the fields above.

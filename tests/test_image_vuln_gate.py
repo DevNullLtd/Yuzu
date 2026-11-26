@@ -677,7 +677,19 @@ class GateBehaviour(unittest.TestCase):
             with self.subTest(name=name):
                 r = self.run_gate(f"{name}=img:1", os_pkgs="0")
                 self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn("Trivy found no OS package", r.stderr)
                 self.assertNotIn("NOT COVERED", r.stdout)
+
+    def test_a_chisel_image_with_packages_is_covered_on_ubuntu(self):
+        # The path the next release takes: no listing, N>0 packages, Ubuntu 26.04.
+        rep = self.tmp / "rep"
+        for name in ("yuzu-server-chisel", "yuzu-gateway-chisel", "yuzu-agent-chisel", "yuzu-agent-bundle-chisel"):
+            with self.subTest(name=name):
+                r = self.run_gate(f"{name}=img:1", os_pkgs="3", env_extra={"STUB_OS": "ubuntu:26.04"},
+                                  extra=("--report-dir", str(rep)))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertNotIn("NOT COVERED", r.stdout)
+                self.assertIn("coverage: covered", (rep / f"trivy-{name}.gate.txt").read_text(encoding="utf-8"))
 
     def test_package_count_is_printed(self):
         r = self.run_gate("img:1", os_pkgs="7")
@@ -851,16 +863,13 @@ class GateBehaviour(unittest.TestCase):
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def test_not_covered_list_is_empty_and_any_entry_names_a_published_chisel_image(self):
+    def test_not_covered_list_is_empty(self):
         # The four chiselled images carry dpkg status.d records (chisel-emit-status.py),
         # so none is listed: a regression to zero OS packages fails the gate instead of
-        # passing as NOT COVERED. A future entry must still name a published chisel image.
+        # passing as NOT COVERED. Listing an image again means changing this test.
         names = [ln.split(":", 1)[0].strip() for ln in NOT_COVERED.read_text(encoding="utf-8").splitlines()
                  if ln.strip() and not ln.lstrip().startswith("#")]
         self.assertEqual(names, [], "an image is listed as not covered again: remove it or justify it in the PR")
-        for n in names:
-            self.assertIn(n, PUBLISHED, n)
-            self.assertTrue(n.endswith("-chisel"), f"{n}: only FROM-scratch chisel images are expected here")
 
 
     # ── G8-SG-1: an acceptance's scope must be concrete ──

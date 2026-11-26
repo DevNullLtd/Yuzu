@@ -1302,7 +1302,7 @@ after Trivy:
   multi-platform image succeeds, and grype reads it).
 - **OS cross-check.** When Trivy scanned the image's OS packages (`coverage: covered`), grype must
   have detected the same OS family; otherwise it matched none of those packages and the image
-  fails (`grype did not detect the OS (<family>)`). An image listed as not covered (none is today)
+  fails (`grype did not detect the OS (<family>)`). An image listed as not covered (no image is listed)
   has no OS packages Trivy could see, so there is nothing to cross-check. This check can only refuse an
   image; Trivy's report stays the only coverage reader.
 - **Required components.** grype's JSON lists matches only, so a runtime grype did not recognise
@@ -1949,9 +1949,11 @@ except the agent bundle:
   the mirror normally lags by under a day, so wait and "Re-run failed jobs"; if it stays stale,
   check whether the mirror or Trivy's DB publishing is broken before anything else.
 - **OS packages not scanned** (an image newly showing 0 OS packages): something removed the
-  package database from an image that used to have one. Fix the image; listing it in
-  `image-vuln-gate-not-covered.txt` is a reviewed decision that its OS packages ship unscanned by
-  Trivy.
+  package database from an image that used to have one. For a chisel image, check that
+  `deploy/docker/chisel-emit-status.py` ran in its Dockerfile and that `/var/lib/dpkg/status.d`
+  holds records; after a Trivy version bump, scan one chisel image and confirm it reports more than
+  zero OS packages. Fix the image; listing it in `image-vuln-gate-not-covered.txt` is a reviewed
+  decision that its OS packages ship unscanned by Trivy, and it needs its own reviewed pull request.
   Either is a commit, so re-tag. On a listed image the log says why the listing is not in force:
   it expired (re-review it), or its `approval_ref` is `pending` (record the approval, above).
 - **An acceptance `NOT IN FORCE`**: its `approval_ref` is `pending`. Record the approval as
@@ -2069,8 +2071,8 @@ published images (a tracked gap).
   read one `status.d` record per cut package (above), not a file list: a slice is recorded as its
   whole package, so a finding in a file the slice does not ship can be reported, and no finding is
   hidden by that. Unfixed MEDIUM and lower findings in these Ubuntu packages are reported and not
-  gated, as everywhere else. The records exist only if the build ran the script; the four
-  gate refuses an image with no OS package at all, but not one that lost some of them. The gate
+  gated, as everywhere else. The records exist only if the build ran the script. The gate
+  refuses an image with no OS package at all, but not one that lost some of them. The gate
   does not check what grype matched in these images beyond the gateway images' `erlang`
   component.
 - **PostgreSQL itself.** In `yuzu-postgres` Trivy lists `postgresql-18`, `libpq5` and

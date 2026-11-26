@@ -140,7 +140,7 @@ acceptance, follow its pull-request reference and check who approved it there.
 The release scan also refuses to push, rather than report a clean scan, when:
 
 - the scanner sees no operating-system package in an image that is not on the reviewed not-covered
-  list (the chiselled images are on it, below);
+  list (no image is on it; the chiselled images are covered, below);
 - the scanner cannot show its database holds advisories for the image's operating-system release,
   as the scanner identifies that release from the image's files: the scanner marks the release end
   of life; the distribution is not Debian, Ubuntu or Alpine; the version is a pre-release (`_alpha`,
@@ -218,8 +218,12 @@ What this does **not** gate:
   database of their own; the build writes one dpkg `status.d` record per cut package, so Trivy and
   grype read those packages and the gate refuses a fixable CRITICAL in them like in any other
   image. The records are per package: a slice is recorded as its whole package, so a finding in a
-  file the slice does not ship can be reported. No image is on the not-covered list: an image in which
-  Trivy sees no OS package fails the gate as unscanned. Scanning a chisel image with your own Trivy or grype lists those packages
+  file the slice does not ship can be reported. No image is on the not-covered list: an image in
+  which Trivy sees no OS package fails the gate as unscanned, but one that lost only some of its
+  records is not detected. Trivy reading these records was checked by hand on one image, and the
+  gate does not check what grype matched in them. The agent-bundle image has three OS packages
+  (`base-files`, `base-passwd`, `busybox-static`); the release archives it delivers are not OS
+  packages and carry their own SBOMs. Scanning a chisel image with your own Trivy or grype lists those packages
   and their unfixed MEDIUM and lower findings; the gate does not refuse those. If a release
   refuses a chisel image for a fixable CRITICAL, rebuild so the chisel archive resolves the fixed
   package version, or accept the finding in `.trivyignore.yaml` or `.grypeignore.yaml` scoped to
