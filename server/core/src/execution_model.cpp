@@ -97,6 +97,28 @@ nlohmann::json execution_kpi_json(const ExecutionKpi& k) {
     return j;
 }
 
+nlohmann::json execution_coverage_json(const ExecutionCoverage& c) {
+    const auto count = [&c](int64_t v) -> nlohmann::json {
+        return c.recorded ? nlohmann::json(v) : nlohmann::json(nullptr);
+    };
+    return nlohmann::json{
+        {"state", c.recorded ? "recorded" : "unrecorded"},
+        {"population", c.recorded ? nlohmann::json(c.connected_only ? "connected_only" : "listed")
+                                  : nlohmann::json(nullptr)},
+        {"intended", count(c.intended)},
+        {"contacted", count(c.contacted)},
+        {"responded", count(c.responded)},
+        {"failed", count(c.failed)},
+        {"timed_out", count(c.timed_out)},
+        {"offline", count(c.offline)},
+        {"not_sent", count(c.not_sent)},
+        {"withheld", count(c.withheld)},
+        {"pending", count(c.pending)},
+        {"late", count(c.late)},
+        {"deadline_at", count(c.deadline_at)},
+    };
+}
+
 nlohmann::json execution_child_row_json(const Execution& c) {
     return nlohmann::json{
         {"id", c.id},

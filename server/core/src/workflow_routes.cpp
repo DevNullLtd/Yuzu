@@ -6,6 +6,7 @@
 #include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "dispatch_destructive_gate.hpp" // BR-001: evaluate_destructive_targeting / requires_explicit_targets
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
+#include "dispatch_zero_reach.hpp"   // #2673: the shared no-targets wording
 #include "event_bus.hpp"
 #include "json_value_budget.hpp" // json_exceeds_value_count: the JSON-form body breadth bound
 #include "forensics_read_audit.hpp" // #4990: response.forensics.read
@@ -3929,6 +3930,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             exec.parameter_values =
                 nlohmann::json(redact_sensitive_instruction_params(params)).dump();
             exec.dispatched_by = session->username;
+            exec.response_window_s = def.gather_ttl_seconds;
             if (auto created = execution_tracker->create_execution(exec); created.has_value()) {
                 execution_id = *created;
             }
@@ -3975,6 +3977,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // #5294: mirrors unknown_plugin_count for the per-OS kill-switch filter.
         std::size_t kill_switched_os_count = 0;
         bool os_gate_unreadable = false;
+        // #2673: see ConfinedDispatchOutcome's fields of the same names.
+        std::optional<std::size_t> intended_count;
+        bool resolution_failed = false;
         std::optional<std::string> scope_parse_error;
         try {
             // #2500: NAME the broadcast rather than expressing it as "both
@@ -4068,6 +4073,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             unknown_plugin_count = dispatch_outcome.unknown_plugin_count;
             kill_switched_os_count = dispatch_outcome.kill_switched_os_count;
             os_gate_unreadable = dispatch_outcome.os_gate_unreadable;
+            intended_count = dispatch_outcome.intended_count;
+            resolution_failed = dispatch_outcome.resolution_failed;
             scope_parse_error = dispatch_outcome.scope_parse_error;
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
@@ -4134,7 +4141,18 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // scope_parse_error branch above — hand-built, not
             // `detail::a4_error`, to keep `reason` alongside the A4-required
             // `correlation_id`.
-            if (containment_unreadable) {
+            if (resolution_failed) {
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", std::string(kTargetResolutionFailedMessage)},
+                                   {"reason", "target_resolution_failed"},
+                                   {"retry_after_ms", 5000},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+            } else if (containment_unreadable) {
                 res.set_content(
                     nlohmann::json(
                         {{"error", {{"code", 503},
@@ -4214,6 +4232,18 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                "action is switched off — dispatch was withheld, "
                                                "not attempted"},
                                    {"reason", "kill_switched_os"},
+                                   {"retry_after_ms", nullptr},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+            } else if (intended_count && *intended_count == 0) {
+                res.status = 422;
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 422},
+                                   {"message", std::string(kNoTargetsMessage)},
+                                   {"reason", "no_targets"},
                                    {"retry_after_ms", nullptr},
                                    {"correlation_id", detail::ensure_correlation_id(res)}}},
                          {"meta", {{"api_version", "v1"}}}})

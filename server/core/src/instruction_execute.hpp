@@ -196,6 +196,8 @@ struct ExecutionRow {
     std::string scope_expression;
     std::string parameter_values; ///< REDACTED copy (sensitive_instruction_params.hpp)
     std::string dispatched_by;
+    /// #2673: the definition's `gather_ttl_seconds`.
+    std::int64_t response_window_s{0};
 };
 
 using DispatchFn = std::function<ConfinedDispatchOutcome(

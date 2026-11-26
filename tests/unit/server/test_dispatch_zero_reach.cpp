@@ -227,7 +227,8 @@ TEST_CASE("zero_reach: wire tokens are the existing status and reason strings",
 }
 
 TEST_CASE("zero_reach: tokens are distinct and non-empty", "[dispatch_zero_reach]") {
-    constexpr std::array<ZeroReachCause, 9> all{
+    constexpr std::array<ZeroReachCause, 11> all{
+        ZeroReachCause::TargetResolutionFailed, ZeroReachCause::NoTargets,
         ZeroReachCause::Denied,           ZeroReachCause::InvalidScope,     ZeroReachCause::ContainmentUnreadable,
         ZeroReachCause::RouteUnreadable,  ZeroReachCause::OsGateUnreadable,
         ZeroReachCause::Quarantined,      ZeroReachCause::PluginNotFound,
@@ -251,6 +252,36 @@ TEST_CASE("zero_reach: retryable flags match the existing semantics", "[dispatch
     CHECK_FALSE(zero_reach_retryable(ZeroReachCause::PluginNotFound));
     CHECK_FALSE(zero_reach_retryable(ZeroReachCause::KillSwitchedOs));
     CHECK_FALSE(zero_reach_retryable(ZeroReachCause::Denied));
+    // #2673: a failed target read is transient; an empty target is permanent.
+    CHECK(zero_reach_retryable(ZeroReachCause::TargetResolutionFailed));
+    CHECK_FALSE(zero_reach_retryable(ZeroReachCause::NoTargets));
+}
+
+TEST_CASE("zero_reach: an empty resolved target is no_targets, an unset count is not",
+          "[dispatch_zero_reach]") {
+    ConfinedDispatchOutcome empty;
+    empty.intended_count = 0;
+    CHECK(classify_zero_reach(empty, false) == ZeroReachCause::NoTargets);
+    CHECK(zero_reach_token(ZeroReachCause::NoTargets) == "no_targets");
+
+    // Targets existed and none was reached: still the catch-all.
+    ConfinedDispatchOutcome unreached;
+    unreached.intended_count = 2;
+    CHECK(classify_zero_reach(unreached, false) == ZeroReachCause::Generic);
+
+    // A named cause beats an empty count.
+    auto contained = with_containment();
+    contained.intended_count = 0;
+    CHECK(classify_zero_reach(contained, false) == ZeroReachCause::ContainmentUnreadable);
+}
+
+TEST_CASE("zero_reach: a failed target read is never reported as an empty target",
+          "[dispatch_zero_reach]") {
+    ConfinedDispatchOutcome o;
+    o.resolution_failed = true;
+    o.intended_count = 0;
+    CHECK(classify_zero_reach(o, false) == ZeroReachCause::TargetResolutionFailed);
+    CHECK(zero_reach_token(ZeroReachCause::TargetResolutionFailed) == "target_resolution_failed");
 }
 
 TEST_CASE("zero_reach: denied wins over every other flag", "[dispatch_zero_reach][security]") {

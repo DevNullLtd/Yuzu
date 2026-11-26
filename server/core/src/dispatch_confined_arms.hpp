@@ -292,6 +292,15 @@ struct ArmDispatchResult {
     /// because it re-drives the STABLE command_id (dedup-absorbed), not a
     /// fresh one.
     bool route_unreadable = false;
+    /// #2673: how many targets this arm was meant to reach: the candidates inside the caller's
+    /// visible set, counted before containment, the per-OS switch and plugin presence. Unset for
+    /// a present-EMPTY visible set: that deny-all is also what a failed or unwired visibility
+    /// derivation yields (ADR-0033 §2), so it must never be reported as "no targets".
+    std::optional<std::size_t> intended_count{0};
+    /// #2673: the same targets by id, and those whose send was accepted (for a gateway agent,
+    /// queued). Filled only when `collect_targets` was asked for.
+    std::vector<std::string> intended;
+    std::vector<std::string> contacted;
 };
 
 /// Outcome of `resolve_and_dispatch_confined` (dispatch_scope_ladder.hpp) --
@@ -399,6 +408,20 @@ struct ConfinedDispatchOutcome {
     /// dex_routes.cpp, device_routes.cpp and the REST result-set producers still
     /// fold a denial into no-agents.
     std::optional<detail::DispatchDenial> denied;
+    /// #2673: `ArmDispatchResult::intended_count`, plus any concurrency-skipped target. Unset
+    /// when no target list was resolved (a denial, an aborted or unparseable scope, a refusal
+    /// before targeting): unset is never "zero targets".
+    std::optional<std::size_t> intended_count;
+    /// #2673: the target list could not be read (a store degrade), so nobody was resolved.
+    /// Distinct from a resolved list that was empty.
+    bool resolution_failed = false;
+    /// #2673: filled only when target collection was asked for.
+    std::vector<std::string> intended;
+    std::vector<std::string> contacted;
+    /// #2673: intended targets skipped because another run holds their per-device slot.
+    std::vector<std::string> concurrency_skipped;
+    /// #2673: the target record write failed (the caller counts it).
+    bool targets_record_failed = false;
 };
 
 // The closed quarantine-control predicate lives in the shared pure header so the
@@ -705,8 +728,21 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
                        const authz::VisibleSet& exec_visible, bool broadcast_on_none,
                        const ContainmentGate& gate, const ConfinedDispatchSink& sink,
                        const std::unordered_set<std::string>& plugin_missing = {},
-                       const std::unordered_set<std::string>& os_kill_switched = {}) {
+                       const std::unordered_set<std::string>& os_kill_switched = {},
+                       bool collect_targets = false) {
     ArmDispatchResult result;
+
+    // #2673: the two points every arm reports through, so no arm can count one and miss the other.
+    const auto note_intended = [&](const std::string& aid) {
+        ++*result.intended_count;
+        if (collect_targets)
+            result.intended.push_back(aid);
+    };
+    const auto note_sent = [&](const std::string& aid) {
+        ++result.sent;
+        if (collect_targets)
+            result.contacted.push_back(aid);
+    };
 
     // #881: the ONE per-id containment check every arm applies AFTER the
     // #1788 visible-set intersection and BEFORE the send. `!gate.enforced` is
@@ -798,7 +834,7 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
     // already forces, trading the single-snapshot send for a per-id one on
     // exactly the dispatches where it matters, never on the common case where
     // every agent has the plugin.
-    const auto confined_broadcast = [&]() -> int {
+    const auto confined_broadcast = [&]() {
         // HA WS-5 (ADR-2002 §7a): `known_agent_ids()` can now include
         // presence-only (remote) ids, so the fast path below — which walks
         // ONLY local sessions via `send_to_all_unfiltered` and has no per-id
@@ -812,9 +848,13 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
         // non-empty fleet always falls through to the filtered path below.
         auto candidates = authz::filter_to_scope(sink.known_agent_ids(), exec_visible);
         const bool widened = sink.presence_widens ? sink.presence_widens(candidates) : true;
-        if (!exec_visible && !gate.enforced && plugin_missing.empty() &&
-            os_kill_switched.empty() && !widened)
-            return sink.send_to_all_unfiltered();
+        // #2673: the fast path names no ids, so a dispatch collecting its targets walks them.
+        if (!collect_targets && !exec_visible && !gate.enforced && plugin_missing.empty() &&
+            os_kill_switched.empty() && !widened) {
+            result.intended_count = candidates.size();
+            result.sent = sink.send_to_all_unfiltered();
+            return;
+        }
         // WS-4 4.2b Task C: same batched-before-the-walk shape Group/Scope/Ids
         // already use — Broadcast/None previously skipped this call on the
         // (pre-WS-5) assumption that a broadcast candidate is always locally
@@ -822,11 +862,15 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
         // return a presence-only id (see the sink field's own doc comment).
         if (sink.prepare_route_fallback)
             result.route_unreadable = sink.prepare_route_fallback(candidates);
-        int n = 0;
-        for (const auto& aid : candidates)
-            if (!contained(aid) && !os_killed(aid) && !plugin_absent(aid) && sink.send_to(aid))
-                ++n;
-        return n;
+        for (const auto& aid : candidates) {
+            note_intended(aid);
+            if (contained(aid) || os_killed(aid) || plugin_absent(aid))
+                continue;
+            if (sink.send_to(aid))
+                note_sent(aid);
+            else if (collect_targets)
+                result.not_sent.push_back(aid);
+        }
     };
 
     switch (arm) {
@@ -839,10 +883,13 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             if (sink.prepare_route_fallback)
                 result.route_unreadable = sink.prepare_route_fallback(*targets.group_members);
             for (const auto& aid : *targets.group_members) {
-                if (!authz::in_scope(exec_visible, aid) || contained(aid) || os_killed(aid) || plugin_absent(aid))
+                if (!authz::in_scope(exec_visible, aid))
+                    continue;
+                note_intended(aid);
+                if (contained(aid) || os_killed(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
-                    ++result.sent;
+                    note_sent(aid);
                 else
                     result.not_sent.push_back(aid);
             }
@@ -861,10 +908,11 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             if (sink.prepare_route_fallback)
                 result.route_unreadable = sink.prepare_route_fallback(*targets.scope_matched);
             for (const auto& aid : authz::filter_to_scope(*targets.scope_matched, exec_visible)) {
+                note_intended(aid);
                 if (contained(aid) || os_killed(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
-                    ++result.sent;
+                    note_sent(aid);
                 else
                     result.not_sent.push_back(aid);
             }
@@ -876,10 +924,11 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             if (sink.prepare_route_fallback)
                 result.route_unreadable = sink.prepare_route_fallback(*targets.agent_ids);
             for (const auto& aid : authz::filter_to_scope(*targets.agent_ids, exec_visible)) {
+                note_intended(aid);
                 if (contained(aid) || os_killed(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
-                    ++result.sent;
+                    note_sent(aid);
                 else
                     result.not_sent.push_back(aid);
             }
@@ -888,16 +937,18 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
     case DispatchArm::Broadcast:
         // Asked for by its published name (`__all__`) — still narrowed, and
         // still gated: this is the unfiltered fast path's only other caller.
-        result.sent = confined_broadcast();
+        confined_broadcast();
         break;
     case DispatchArm::None:
         // No target named at all. The caller decides what that MEANS; when it
         // means "reach nobody" the caller also owns the counter/log, because
         // there is no `req` here and background runners call this too.
         if (broadcast_on_none)
-            result.sent = confined_broadcast();
+            confined_broadcast();
         break;
     }
+    if (exec_visible && exec_visible->empty())
+        result.intended_count.reset();
     return result;
 }
 
@@ -919,7 +970,8 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
 [[nodiscard]] inline ArmDispatchResult
 dispatch_system_reserved_ids(const std::vector<std::string>& ids,
                              const authz::VisibleSet& exec_visible,
-                             std::function<bool(const std::string&)> send_to) {
+                             std::function<bool(const std::string&)> send_to,
+                             bool collect_targets = false) {
     ConfinedDispatchSink sink;
     sink.send_to = std::move(send_to);
     sink.send_to_all_unfiltered = [] { return 0; }; // never used: only the Ids arm runs
@@ -929,7 +981,7 @@ dispatch_system_reserved_ids(const std::vector<std::string>& ids,
     targets.agent_ids = &ids;
     return dispatch_confined_arms(DispatchArm::Ids, targets, exec_visible,
                                   /*broadcast_on_none=*/false, ContainmentGate::exempt_control_plugin(),
-                                  sink);
+                                  sink, {}, {}, collect_targets);
 }
 
 } // namespace yuzu::server

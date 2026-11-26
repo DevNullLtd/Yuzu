@@ -4346,7 +4346,7 @@ The request body is required: send `{}` when you have no `agent_ids`, `scope` or
 }
 ```
 
-**Zero agents reached** is an error, discriminated by `error.reason`: `dispatch_denied` is `403` (the dispatch chokepoint refused the command for the caller at send time); `invalid_scope` is `400`; `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `quarantined`, `plugin_not_found`, `kill_switched_os` and `no_agents_reached` are `503`. `retry_after_ms` is `5000` for `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached`, and `null` for the permanent causes (`dispatch_denied`, `invalid_scope`, `quarantined`, `plugin_not_found`, `kill_switched_os`), where retrying the same request cannot succeed. The error object also carries `command_id`, `execution_id` (the cancelled execution row) and the counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`. `no_agents_reached` includes the case where a per-device claim excluded every target.
+**Zero agents reached** is an error, discriminated by `error.reason`: `dispatch_denied` is `403` (the dispatch chokepoint refused the command for the caller at send time); `invalid_scope` is `400`; `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `quarantined`, `plugin_not_found`, `kill_switched_os` and `no_agents_reached` and `target_resolution_failed` (the target list could not be read) are `503`; `no_targets` is `422` (the list was read and is empty: nothing you may dispatch to matched, and scope and broadcast consider only connected agents). `retry_after_ms` is `5000` for `target_resolution_failed`, `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached`, and `null` for the permanent causes (`dispatch_denied`, `invalid_scope`, `quarantined`, `plugin_not_found`, `kill_switched_os`, `no_targets`), where retrying the same request cannot succeed. The error object also carries `command_id`, `execution_id` (the cancelled execution row) and the counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`. `no_agents_reached` includes the case where a per-device claim excluded every target.
 
 Other errors use the A4 envelope with a `reason`: `500` `dispatch_exception` (the dispatch threw; a `failure` audit row with `reason=dispatch_exception` is written). The execution row is **not** cancelled: whether any agent already received the command is unknown, so the row is left `running` and results from any agent that did receive it are still recorded against it. The error carries two typed fields, so nothing has to be parsed out of the remediation text: `error.execution_id` (always present for this refusal; an empty string when no execution row exists) and `error.agents_sent` (present only when the send path had accepted the command for at least one agent before the failure; a lower bound, because a send in flight when the dispatch threw is not counted; a gateway-routed agent counts once its command is queued for forwarding, which can still fail). The `failure` audit row carries `agents_sent=<n>` (before `correlation_id=`) whenever at least one send was accepted by the send path, whether or not the count could be stored, and it is written before the count is stored. The remediation depends on what happened:
 
@@ -7874,6 +7874,7 @@ with `error.reason` and `error.execution_id` (the run exists and is readable). T
 check passed, so the caller's grant or the action's gate moved between the two),
 `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached` (offline
 devices, or a per-device concurrency claim), `quarantined`, `plugin_not_found`, `kill_switched_os`,
+`no_targets`, `target_resolution_failed`,
 `late_denied`, `deadline_exceeded` (the 60 second run budget ended the run before any step reached
 an agent) and `run_failed` (the engine ended the run without a single dispatch attempt, or its final
 state could not be read).
@@ -7885,8 +7886,8 @@ forward (use a new idempotency key). Read the run with `GET /api/v1/workflow-exe
 start another under a new key.
 
 *Without a key* nothing was sent, so a retry is safe for the causes that carry `retry_after_ms: 5000`
-(`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached`);
-`dispatch_denied`, `quarantined`, `plugin_not_found`, `kill_switched_os`, `late_denied`, `deadline_exceeded` and
+(`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached`, `target_resolution_failed`);
+`dispatch_denied`, `quarantined`, `plugin_not_found`, `kill_switched_os`, `no_targets`, `late_denied`, `deadline_exceeded` and
 `run_failed` are permanent (`retry_after_ms: null`). Send a key anyway: it is what makes a lost
 answer safe to ask about.
 
@@ -8044,6 +8045,29 @@ per-agent capability stays a single genuine REST+MCP twin (MCP twin: `get_execut
 yet). Unlike the bare request, this expansion **is** audited (`execution.detail.fetch`, REST
 fail-closed 503 on an audit-persist failure) because it discloses raw agent identities. Response
 bodies are a **separate** route (below), not part of this expansion.
+
+**`coverage` (both the bare and the expanded read; MCP `get_execution_status` carries the same
+object).** Who the run was meant for and what happened to each:
+
+| Field | Meaning |
+|---|---|
+| `state` | `recorded`, or `unrecorded` when the target sets are unknown (every other field is then `null`; unknown is not zero) |
+| `population` | `listed`, or `connected_only` when a scope or broadcast chose the targets: only agents connected at dispatch are considered |
+| `intended` | Targets the run was meant to reach: `contacted + offline + not_sent + withheld` |
+| `contacted` | Sends accepted (for a gateway-routed agent, queued): `responded + failed + timed_out + pending` |
+| `responded` | Answered successfully (not the same as the legacy `agents_responded`) |
+| `failed` | Answered with a failure, timeout or rejection |
+| `timed_out` | No answer before the deadline |
+| `offline`, `not_sent`, `withheld` | Not reached: no session or route; send not accepted; withheld by quarantine, plugin absence, a per-OS switch, a concurrency claim or a containment gate |
+| `pending` | Contacted and still awaited |
+| `late` | Timed out, then answered; counted inside `timed_out` |
+| `deadline_at` | Epoch seconds of the response deadline |
+
+A recorded run is `succeeded` only when every intended agent answered successfully, otherwise
+`completed`. Its first final result per agent stands. A silent agent is marked timed out after the
+definition's `gather_ttl_seconds` (never less than 660 seconds without a signal), and
+`agents_failure` includes those. A management-group-confined caller sees counts over visible agents
+only.
 
 #### `GET /api/v1/executions/{id}/responses`
 
@@ -13827,12 +13851,14 @@ marked cancelled), `agents_reached: 0` and the withheld counts in the `error` ob
 |---|---|---|---|---|
 | 0 | `dispatch_denied` | `403` | `null` | The dispatch chokepoint refused the `plugin`/`action` pair for the caller when the command was sent (for example `approval_required`), after the pre-send admission check had passed: an authorization denial, never unreachability. Permanent: retrying alone will not help. |
 | 1 | `invalid_scope` | `400` | `null` | The scope expression did not parse; fix it. |
+| 1b | `target_resolution_failed` | `503` | `5000` | The target list could not be read. |
 | 2 | `containment_unreadable` | `503` | `5000` | The quarantine state is unreadable; dispatch fails closed. |
 | 3 | `route_unreadable` | `503` | `5000` | The gateway routing directory could not be read for some targets. |
 | 4 | `os_gate_unreadable` | `503` | `5000` | Presence could not be read while a per-OS kill switch is set. |
 | 5 | `quarantined` | `409` | `null` | Every target is quarantined. |
 | 6 | `plugin_not_found` | `422` | `null` | The plugin is in no target agent's inventory. |
 | 7 | `kill_switched_os` | `403` | `null` | Every target runs an OS for which the action is switched off. |
+| 7b | `no_targets` | `422` | `null` | Nothing you may dispatch to matched; scope and broadcast consider only connected agents. A caller who can see no device at all gets `no_agents_reached` instead. |
 | 8 | `no_agents_reached` | `503` | `5000` | Every target was unreachable. |
 
 A protective action (the quarantine and firewall control actions and `__guard__.push_rules`) never yields

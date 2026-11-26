@@ -633,6 +633,18 @@ strictly safer than falsely cancelling it, since there is no repair path today t
 `agents_targeted` from `agent_exec_status`. Verified bidirectionally: the regression test fails
 (force-cancels the row) with the clause removed from all three sites, and passes with it restored.
 
+### `ExecutionTracker::sweep_response_deadlines` (#2673)
+
+Not a delete: it marks silent dispatch targets `timed_out` and finishes their runs, a bulk change to authoritative state decided by a clock, so it takes the guarded shape. Recorded decisions:
+
+- **Clock:** the database clock, which also authors every `deadline_at` and `last_signal_at`, so one clock domain decides.
+- **Anchor and repeat:** persisted anchor `target_deadline_anchor`; an implausible reading (backwards, or more than 15 minutes forward against a 30 s cadence) is declined once and recorded in `target_deadline_declined`; the same anomaly again is taken as elapsed time. A corrupt anchor is repaired and that pass declined.
+- **Missing anchor:** accepted. Every deadline was authored by the same clock a window earlier, and declining forever on a fresh database would leave runs unfinishable.
+- **Cap:** 100 runs per pass, unconditionally (two outbox events each, under the cross-replica poll's rows-per-transaction bound).
+- **Would-wipe ratio: DECLINED.** A real outage leaves every open run silent at once, which is exactly when this pass must act; a ratio gate would wedge it.
+- **Per-row second condition:** a target also has to be silent for its whole window, so a live agent's keepalive protects it even past the run deadline.
+- **Single writer:** `pg_try_advisory_xact_lock`; a losing replica skips.
+
 ### `ApprovalManager` ticket liveness (#6061, #6096) - a recorded disposition, not a retention pass
 
 Listed here because the routed trigger fires on any wall-clock cutoff in `approval_manager.cpp`, not

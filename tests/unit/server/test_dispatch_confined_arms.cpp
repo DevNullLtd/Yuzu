@@ -1746,3 +1746,102 @@ TEST_CASE("kSystemReservedPushes lists the five internal pushes, labelled",
     CHECK(std::ranges::find(kSystemReservedPushes, SystemReservedPush::inventory_settings_push) !=
           kSystemReservedPushes.end());
 }
+
+// ── #2673: target-set collection ─────────────────────────────────────────────
+
+TEST_CASE("resolve_and_dispatch_confined: collected targets name the visible set, who was "
+          "contacted and who was withheld",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    const auto gate = ContainmentGate::enforcing(/*fail_closed=*/false, {"dev-B"});
+    const auto outcome = resolve_and_dispatch_confined(
+        {"dev-A", "dev-B", "dev-C", "dev-hidden"}, "", only({"dev-A", "dev-B"}),
+        /*broadcast_on_none=*/false, gate, no_group_no_scope_resolvers(), sink.make(),
+        /*claim_fn=*/nullptr, {}, {}, /*collect_targets=*/true);
+    CHECK(outcome.intended_count == 2u);
+    CHECK(outcome.intended == std::vector<std::string>{"dev-A", "dev-B"});
+    CHECK(outcome.contacted == std::vector<std::string>{"dev-A"});
+
+    const auto targets = yuzu::server::build_dispatch_targets(outcome, {});
+    REQUIRE(targets.size() == 2);
+    CHECK(targets[0].disposition == yuzu::server::TargetDisposition::Contacted);
+    CHECK(targets[1].disposition == yuzu::server::TargetDisposition::Quarantined);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: a fail-closed gate leaves every target withheld",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    const auto gate = ContainmentGate::enforcing(/*fail_closed=*/true, {});
+    const auto outcome = resolve_and_dispatch_confined(
+        {"dev-A"}, "", unfiltered(), false, gate, no_group_no_scope_resolvers(), sink.make(),
+        nullptr, {}, {}, /*collect_targets=*/true);
+    const auto targets = yuzu::server::build_dispatch_targets(outcome, {});
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0].disposition == yuzu::server::TargetDisposition::Withheld);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: a collecting broadcast names every candidate",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    const auto outcome = resolve_and_dispatch_confined(
+        {}, "__all__", unfiltered(), true, kNoContainment, no_group_no_scope_resolvers(),
+        sink.make(), nullptr, {}, {}, /*collect_targets=*/true);
+    CHECK_FALSE(sink.unfiltered_broadcast_used); // the fast path names no ids
+    CHECK(outcome.contacted.size() == 3);
+    CHECK(outcome.intended_count == 3u);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: a concurrency claim keeps the skipped target intended",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    const auto outcome = resolve_and_dispatch_confined(
+        {"dev-A", "dev-B"}, "", unfiltered(), false, kNoContainment,
+        no_group_no_scope_resolvers(), sink.make(),
+        [](const std::vector<std::string>&) { return std::vector<std::string>{"dev-A"}; }, {}, {},
+        /*collect_targets=*/true);
+    CHECK(outcome.intended_count == 2u);
+    CHECK(outcome.concurrency_skipped == std::vector<std::string>{"dev-B"});
+    const auto targets = yuzu::server::build_dispatch_targets(outcome, {});
+    REQUIRE(targets.size() == 2);
+    CHECK(targets[1].disposition == yuzu::server::TargetDisposition::ConcurrencySkipped);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: a present-empty visible set never counts as no "
+          "targets",
+          "[server][dispatch][scope][coverage][security]") {
+    // Deny-all is also what a failed or unwired visibility derivation yields.
+    RecordingSink sink;
+    const auto outcome = resolve_and_dispatch_confined(
+        {"dev-A"}, "", only({}), false, kNoContainment, no_group_no_scope_resolvers(), sink.make());
+    CHECK(outcome.sent == 0);
+    CHECK_FALSE(outcome.intended_count.has_value());
+
+    // A caller who can see devices, targeting one they cannot, did resolve to nothing.
+    const auto hidden = resolve_and_dispatch_confined(
+        {"dev-A"}, "", only({"dev-B"}), false, kNoContainment, no_group_no_scope_resolvers(),
+        sink.make());
+    CHECK(hidden.intended_count == 0u);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: an unreadable group is a failed resolution, an empty "
+          "group is zero targets",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    DispatchResolvers resolvers;
+    resolvers.group_members_fn = [](const std::string&) -> std::optional<std::vector<std::string>> {
+        return std::nullopt;
+    };
+    auto failed = resolve_and_dispatch_confined({}, "group:eng", unfiltered(), false,
+                                                kNoContainment, resolvers, sink.make());
+    CHECK(failed.resolution_failed);
+    CHECK_FALSE(failed.intended_count.has_value());
+
+    resolvers.group_members_fn = [](const std::string&) -> std::optional<std::vector<std::string>> {
+        return std::vector<std::string>{};
+    };
+    auto empty = resolve_and_dispatch_confined({}, "group:eng", unfiltered(), false,
+                                               kNoContainment, resolvers, sink.make());
+    CHECK_FALSE(empty.resolution_failed);
+    CHECK(empty.intended_count == 0u);
+    CHECK(sink.reached.empty());
+}

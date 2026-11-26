@@ -24,6 +24,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <map>
 #include <random>
 #include <string_view>
 #include <unordered_set>
@@ -56,12 +57,13 @@ constexpr const char* kReadDegradeMetric = "yuzu_server_execution_tracker_read_d
 
 constexpr std::array kReadDegradeMethods{ // CTAD: the compiler counts, so no trailing null slot
     "query_executions", "get_execution", "get_agent_statuses", "get_agent_statuses_for_executions",
-    "get_children"};
+    "get_children",     "get_coverage"};
 constexpr const char* kMethodQueryExecutions = kReadDegradeMethods[0];
 constexpr const char* kMethodGetExecution = kReadDegradeMethods[1];
 constexpr const char* kMethodGetAgentStatuses = kReadDegradeMethods[2];
 constexpr const char* kMethodGetAgentStatusesForExecutions = kReadDegradeMethods[3];
 constexpr const char* kMethodGetChildren = kReadDegradeMethods[4];
+constexpr const char* kMethodGetCoverage = kReadDegradeMethods[5];
 
 constexpr std::array kReadDegradeReasons{"store_not_open", "pool_acquire_timeout",
                                          "query_error"};
@@ -620,6 +622,26 @@ const std::vector<pg::PgMigration>& migrations() {
         {10,
          "ALTER TABLE agent_exec_status ADD COLUMN IF NOT EXISTS response_dropped BOOLEAN NOT NULL "
          "DEFAULT false;"},
+        // v11 (#2673): who each run was meant for and what happened to each of them.
+        // `deadline_at > 0` marks a run whose targets were recorded; a run without it keeps the
+        // count-only rules. `execution_target` holds one row per intended agent and is never
+        // truncated. Constant defaults: the ADD COLUMNs are metadata-only. The new table is empty,
+        // so its index build is instant.
+        {11,
+         "ALTER TABLE executions "
+         "  ADD COLUMN IF NOT EXISTS response_window_s BIGINT NOT NULL DEFAULT 0, "
+         "  ADD COLUMN IF NOT EXISTS deadline_at BIGINT NOT NULL DEFAULT 0, "
+         "  ADD COLUMN IF NOT EXISTS target_population TEXT NOT NULL DEFAULT '';"
+         "CREATE TABLE IF NOT EXISTS execution_target ("
+         "  execution_id TEXT NOT NULL,"
+         "  agent_id TEXT NOT NULL,"
+         "  disposition TEXT NOT NULL,"
+         "  outcome TEXT NOT NULL DEFAULT '',"
+         "  resolved_at BIGINT NOT NULL DEFAULT 0,"
+         "  last_signal_at BIGINT NOT NULL DEFAULT 0,"
+         "  PRIMARY KEY (execution_id, agent_id));"
+         "CREATE INDEX IF NOT EXISTS idx_execution_target_open ON execution_target(execution_id) "
+         "  WHERE disposition = 'contacted' AND outcome = '';"},
     };
     return kMigrations;
 }
@@ -808,6 +830,50 @@ std::optional<Execution> exec_by_id_at(PGconn* conn, const std::string& id) {
     return row_to_exec(res.get(), 0);
 }
 
+/// The terminal statuses an agent itself reports.
+bool is_agent_final(std::string_view status) {
+    return status == "success" || status == "failure" || status == "timeout" ||
+           status == "rejected";
+}
+
+/// #2673: record one agent signal against its target row, on the CALLER's transaction. Only an
+/// OPEN row changes, so the first final outcome stands. `status` is the persisted agent status.
+bool mark_target_signal(PGconn* conn, const std::string& execution_id,
+                        const std::string& agent_id, const std::string& status) {
+    const std::string outcome = is_agent_final(status) ? status : std::string{};
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "UPDATE execution_tracker.execution_target SET disposition = 'contacted', "
+        "  last_signal_at = extract(epoch FROM now())::bigint, outcome = $3, "
+        "  resolved_at = CASE WHEN $3 = '' THEN 0 ELSE extract(epoch FROM now())::bigint END "
+        "WHERE execution_id = $1 AND agent_id = $2 AND outcome = ''",
+        std::vector<std::string>{execution_id, agent_id, outcome});
+    if (res.status() == PGRES_COMMAND_OK)
+        return true;
+    spdlog::warn("ExecutionTracker: execution_target update failed: {}",
+                 PQresultErrorMessage(res.get()));
+    return false;
+}
+
+/// #2673: settle open target rows from agent status rows that committed before the target row
+/// existed (a reply can beat `record_dispatch_targets`). A no-op for an unrecorded run.
+bool reconcile_targets(PGconn* conn, const std::string& execution_id) {
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "UPDATE execution_tracker.execution_target t SET disposition = 'contacted', "
+        "  outcome = s.status, resolved_at = s.completed_at "
+        "FROM execution_tracker.agent_exec_status s "
+        "WHERE t.execution_id = $1 AND t.outcome = '' AND s.execution_id = t.execution_id "
+        "  AND s.agent_id = t.agent_id "
+        "  AND s.status IN ('success','failure','timeout','rejected')",
+        std::vector<std::string>{execution_id});
+    if (res.status() == PGRES_COMMAND_OK)
+        return true;
+    spdlog::warn("ExecutionTracker: execution_target reconcile failed: {}",
+                 PQresultErrorMessage(res.get()));
+    return false;
+}
+
 // Appends the #3789 `ExecutionListScope` admission predicate to `sql`
 // (advancing `idx`/`binds`), or does nothing when `scope` is unrestricted
 // (nullopt). MUST be called before `ORDER BY`/`LIMIT` — ADR-0017 INV-3
@@ -850,7 +916,7 @@ void ExecutionTracker::seed_read_degrade_metrics(yuzu::MetricsRegistry& metrics)
     // HELP text is 7-bit ASCII (scripts/ci/check-metrics-help-ascii.sh).
     metrics.describe(
         kReadDegradeMetric,
-        "ExecutionTracker reads (the five _checked readers) that returned a degraded answer "
+        "ExecutionTracker reads (the six _checked readers) that returned a degraded answer "
         "instead of data, by method (query_executions|get_execution|get_agent_statuses|"
         "get_agent_statuses_for_executions|get_children) and reason: store_not_open (the "
         "tracker never opened; a running server refuses to boot in that state, so this stays 0), "
@@ -1291,15 +1357,16 @@ std::expected<std::string, std::string> ExecutionTracker::create_execution(const
         "INSERT INTO execution_tracker.executions "
         "(id, definition_id, status, scope_expression, parameter_values, "
         " dispatched_by, dispatched_at, agents_targeted, agents_responded, "
-        " agents_success, agents_failure, completed_at, parent_id, rerun_of) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+        " agents_success, agents_failure, completed_at, parent_id, rerun_of, response_window_s) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
         std::vector<std::string>{
             id, exec.definition_id, status, exec.scope_expression, exec.parameter_values,
             exec.dispatched_by,
             std::to_string(exec.dispatched_at > 0 ? exec.dispatched_at : now),
             std::to_string(exec.agents_targeted), std::to_string(exec.agents_responded),
             std::to_string(exec.agents_success), std::to_string(exec.agents_failure),
-            std::to_string(exec.completed_at), exec.parent_id, exec.rerun_of});
+            std::to_string(exec.completed_at), exec.parent_id, exec.rerun_of,
+            std::to_string(exec.response_window_s)});
 
     if (res.status() != PGRES_COMMAND_OK) {
         // Scrubbed generic string to the caller (matches ScheduleEngine/
@@ -1321,6 +1388,7 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
     bool should_publish = false;
     nlohmann::json payload;
     std::string persisted_status;
+    bool conflicting_final = false;
 
     // HA WS-2a: the agent_exec_status upsert AND the durable event_outbox append
     // commit in ONE transaction (invariant 1) — this was a bare autocommit
@@ -1340,33 +1408,28 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
             " exit_code, error_detail, plugin_result_status, response_dropped) "
             "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::boolean) "
             "ON CONFLICT (execution_id, agent_id) DO UPDATE SET "
-            // Terminal status is STICKY (CHAOS-TTL-1 keepalive hardening,
-            // #3784): a stale 'running' write arriving AFTER a real terminal
-            // write must not flip an already-terminal row back to 'running'.
+            // The FIRST terminal result is STICKY (#3784, widened by #2673): once a row is
+            // terminal, no later write replaces it -- neither a stale 'running' keepalive nor a
+            // second terminal frame (a redelivery, a synthetic gateway failure racing the real
+            // reply). A finished run's result therefore never changes.
             "  status=CASE WHEN agent_exec_status.status IN "
             "                 ('success','failure','timeout','rejected') "
-            "                 AND excluded.status = 'running' "
             "              THEN agent_exec_status.status ELSE excluded.status END, "
             "  first_response_at=CASE WHEN agent_exec_status.first_response_at=0 "
             "                          THEN excluded.first_response_at "
             "                          ELSE agent_exec_status.first_response_at END, "
             "  completed_at=CASE WHEN agent_exec_status.status IN "
-            "                        ('success','failure','timeout','rejected') "
-            "                        AND excluded.status = 'running' "
-            "                     THEN agent_exec_status.completed_at ELSE excluded.completed_at END, "
+            "                 ('success','failure','timeout','rejected') "
+            "              THEN agent_exec_status.completed_at ELSE excluded.completed_at END, "
             "  exit_code=CASE WHEN agent_exec_status.status IN "
-            "                    ('success','failure','timeout','rejected') "
-            "                    AND excluded.status = 'running' "
-            "                 THEN agent_exec_status.exit_code ELSE excluded.exit_code END, "
+            "                 ('success','failure','timeout','rejected') "
+            "              THEN agent_exec_status.exit_code ELSE excluded.exit_code END, "
             "  error_detail=CASE WHEN agent_exec_status.status IN "
-            "                        ('success','failure','timeout','rejected') "
-            "                        AND excluded.status = 'running' "
-            "                     THEN agent_exec_status.error_detail ELSE excluded.error_detail END, "
+            "                 ('success','failure','timeout','rejected') "
+            "              THEN agent_exec_status.error_detail ELSE excluded.error_detail END, "
             "  plugin_result_status=CASE WHEN agent_exec_status.status IN "
-            "                                ('success','failure','timeout','rejected') "
-            "                                AND excluded.status = 'running' "
-            "                             THEN agent_exec_status.plugin_result_status "
-            "                             ELSE excluded.plugin_result_status END, "
+            "                 ('success','failure','timeout','rejected') "
+            "              THEN agent_exec_status.plugin_result_status ELSE excluded.plugin_result_status END, "
             // STICKY for every status: once a frame of this agent's answer was not kept, no
             // later write (terminal, running or a redelivery) clears it, because a later stored
             // frame cannot restore the lost one. Written in this same upsert as the status.
@@ -1390,6 +1453,13 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
         // because the caller uses it to gate concurrency-claim release/renewal,
         // and the durable append + bus publish below must both reflect it.
         persisted_status = col_str(res.get(), 0, 0);
+        conflicting_final = is_agent_final(s.status) && persisted_status != s.status;
+        // #2673: settle this agent's target row in the SAME transaction, with the PERSISTED
+        // status and only while it is still open, so the first final result stands (a server
+        // `timed_out` included). A signal from a target recorded as unreached proves it was
+        // reached. A run without recorded targets, or an agent outside the set, matches no row.
+        if (!mark_target_signal(conn, execution_id, s.agent_id, persisted_status))
+            return false;
         payload["agent_id"] = s.agent_id;
         payload["status"] = persisted_status;
         payload["exit_code"] = to_i64(col(res.get(), 0, 1));
@@ -1426,6 +1496,9 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
 
     if (!ok)
         return std::nullopt;
+
+    if (conflicting_final && metrics_)
+        metrics_->counter("yuzu_exec_tracker_conflicting_final_total").increment();
 
     if (should_publish) {
         event_bus_->publish(execution_id, "agent-transition", payload.dump());
@@ -1573,114 +1646,166 @@ void ExecutionTracker::refresh_counts(const std::string& execution_id) {
                   execution_id);
 }
 
-bool ExecutionTracker::refresh_counts_once(const std::string& execution_id) {
-    // Snapshot-and-release (perf-B1 / UP-A9): we snapshot up to two SSE payloads
-    // inside the transaction below, then publish after it commits and the lease is
-    // released.
-    bool publish_progress = false;
-    bool publish_terminal = false;
+struct ExecutionTracker::RefreshEvents {
+    bool progress{false};
+    bool terminal{false};
     nlohmann::json progress_payload;
     nlohmann::json terminal_payload;
-    bool transitioned_terminal_was = false;
+};
 
-    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        // Recompute aggregate counts from agent_exec_status. One transaction
-        // for the recompute + read-back + conditional terminal transition
-        // below gives this the same consistency the SQLite-era app-level
-        // mutex provided (a concurrent refresh_counts on the same execution
-        // cannot observe a half-updated row), via Postgres's own MVCC
-        // snapshot isolation instead of an app-level lock.
-        pg::PgResult upd = pg::exec_params(
-            conn,
-            "UPDATE execution_tracker.executions SET "
-            "  agents_responded = (SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
-            "                      WHERE execution_id=$1 AND status IN "
-            "                      ('success','failure','timeout','rejected')), "
-            "  agents_success   = (SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
-            "                      WHERE execution_id=$1 AND status='success'), "
-            "  agents_failure   = (SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
-            "                      WHERE execution_id=$1 AND status IN "
-            "                      ('failure','timeout','rejected')) "
-            "WHERE id=$1",
-            std::vector<std::string>{execution_id});
-        if (upd.status() != PGRES_COMMAND_OK)
-            return false;
-
-        // Check if all agents responded and update status. Lease-free
-        // helper (reuses `conn` directly) — calling the public
-        // get_execution() here would acquire a SECOND connection from the
-        // same pool mid-transaction (pg_pool.hpp's own documented
-        // nesting-deadlock gotcha).
-        auto exec = exec_by_id_at(conn, execution_id);
-        bool transitioned_terminal = false;
-        std::string final_status_str;
-        if (exec && exec->agents_targeted > 0 && exec->agents_responded >= exec->agents_targeted) {
-            const char* final_status = (exec->agents_failure == 0) ? "succeeded" : "completed";
-            pg::PgResult term = pg::exec_params(
-                conn,
-                "UPDATE execution_tracker.executions SET status=$1, completed_at=$2 "
-                "WHERE id=$3 AND status='running' RETURNING 1",
-                std::vector<std::string>{final_status, std::to_string(now_epoch()), execution_id});
-            // RETURNING carries the "row matched" signal in the result's row
-            // count — closes the #1033-class sqlite3_changes()-after-step
-            // race this store carried on the shared SQLite FULLMUTEX
-            // connection (a bare affected-row count read after step() is
-            // not atomic with the step itself under concurrent callers on
-            // one connection; a per-lease Postgres connection plus
-            // RETURNING has no such race to begin with).
-            if (term.status() == PGRES_TUPLES_OK && PQntuples(term.get()) > 0) {
-                transitioned_terminal = true;
-                final_status_str = final_status;
-            }
-        }
-        transitioned_terminal_was = transitioned_terminal;
-
-        // HA WS-2a: build the SSE payloads and durably append them to the
-        // event_outbox INSIDE this transaction (invariant 1: the aggregate/
-        // terminal state mutation above and its events commit atomically). The
-        // payloads are built whenever `exec` resolved — the durable append does
-        // not depend on a bus being attached; only the post-commit in-memory
-        // fan-out (the publish_* flags) does. A false append rolls the whole
-        // recompute+transition back.
-        if (exec) {
-            progress_payload["agents_targeted"] = exec->agents_targeted;
-            progress_payload["agents_responded"] = exec->agents_responded;
-            progress_payload["agents_success"] = exec->agents_success;
-            progress_payload["agents_failure"] = exec->agents_failure;
-            if (transitioned_terminal)
-                progress_payload["status"] = final_status_str;
-            if (!append_event_outbox(conn, execution_id, "execution-progress",
-                                     progress_payload.dump(), transitioned_terminal, replica_id_))
-                return false;
-            if (transitioned_terminal) {
-                terminal_payload["status"] = final_status_str;
-                terminal_payload["agents_success"] = exec->agents_success;
-                terminal_payload["agents_failure"] = exec->agents_failure;
-                if (!append_event_outbox(conn, execution_id, "execution-completed",
-                                         terminal_payload.dump(), /*is_terminal=*/true, replica_id_))
-                    return false;
-            }
-            if (event_bus_) {
-                publish_progress = true;
-                if (transitioned_terminal)
-                    publish_terminal = true;
-            }
-        }
-        return true;
+bool ExecutionTracker::refresh_counts_once(const std::string& execution_id) {
+    // Snapshot-and-release (perf-B1 / UP-A9): the transaction below snapshots up to two SSE
+    // payloads, which are published after it commits and the lease is released.
+    RefreshEvents events;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        events = RefreshEvents{};
+        return refresh_counts_in_txn(conn, execution_id, events);
     }); // transaction committed / lease released here — publishes below run lease-free.
 
     if (!ok)
         return false;
 
-    if (publish_progress) {
-        event_bus_->publish(execution_id, "execution-progress", progress_payload.dump(),
-                            transitioned_terminal_was);
+    publish_refresh_events(execution_id, events);
+    return true;
+}
+
+bool ExecutionTracker::refresh_counts_in_txn(pg_conn* conn, const std::string& execution_id,
+                                             RefreshEvents& events) {
+    // #2673: whether this run's recorded targets are usable for the terminal rule. They are only
+    // when targets were recorded AND at least as many are `contacted` as dispatch reported
+    // reaching; a failed or partial recording falls back to the count-only rule, so it can never
+    // finish a run early.
+    bool recorded = false;
+    {
+        // Reconcile first: a reply can commit before its target row exists.
+        if (!reconcile_targets(conn, execution_id))
+            return false;
+        pg::PgResult rr = pg::exec_params(
+            conn,
+            "SELECT e.deadline_at > 0 AND "
+            "       (SELECT COUNT(*) FROM execution_tracker.execution_target t "
+            "         WHERE t.execution_id = e.id AND t.disposition = 'contacted') "
+            "       >= e.agents_targeted "
+            "FROM execution_tracker.executions e WHERE e.id = $1",
+            std::vector<std::string>{execution_id});
+        if (rr.status() != PGRES_TUPLES_OK)
+            return false;
+        recorded = PQntuples(rr.get()) > 0 && col_str(rr.get(), 0, 0) == "t";
     }
-    if (publish_terminal) {
-        event_bus_->publish(execution_id, "execution-completed", terminal_payload.dump(),
-                            /*is_terminal=*/true);
+
+    // Recompute aggregate counts. One transaction for the recompute + read-back + conditional
+    // terminal transition below gives this the same consistency the SQLite-era app-level mutex
+    // provided, via Postgres's own MVCC snapshot isolation instead of an app-level lock. A
+    // recorded run counts its target outcomes, so an agent outside the intended set and a result
+    // that arrived after the server's `timed_out` cannot change them.
+    const char* const recorded_sql =
+        "UPDATE execution_tracker.executions SET "
+        "  agents_responded = (SELECT COUNT(*) FROM execution_tracker.execution_target "
+        "                      WHERE execution_id=$1 AND outcome IN "
+        "                      ('success','failure','timeout','rejected')), "
+        "  agents_success   = (SELECT COUNT(*) FROM execution_tracker.execution_target "
+        "                      WHERE execution_id=$1 AND outcome='success'), "
+        "  agents_failure   = (SELECT COUNT(*) FROM execution_tracker.execution_target "
+        "                      WHERE execution_id=$1 AND outcome IN "
+        "                      ('failure','timeout','rejected','timed_out')) "
+        "WHERE id=$1";
+    const char* const count_only_sql =
+        "UPDATE execution_tracker.executions SET "
+        "  agents_responded = (SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
+        "                      WHERE execution_id=$1 AND status IN "
+        "                      ('success','failure','timeout','rejected')), "
+        "  agents_success   = (SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
+        "                      WHERE execution_id=$1 AND status='success'), "
+        "  agents_failure   = (SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
+        "                      WHERE execution_id=$1 AND status IN "
+        "                      ('failure','timeout','rejected')) "
+        "WHERE id=$1";
+    pg::PgResult upd = pg::exec_params(conn, recorded ? recorded_sql : count_only_sql,
+                                       std::vector<std::string>{execution_id});
+    if (upd.status() != PGRES_COMMAND_OK)
+        return false;
+
+    // Check whether the run is finished. Lease-free helper (reuses `conn` directly) — calling the
+    // public get_execution() here would acquire a SECOND connection from the same pool
+    // mid-transaction (pg_pool.hpp's own documented nesting-deadlock gotcha).
+    auto exec = exec_by_id_at(conn, execution_id);
+    bool finished = false;
+    bool clean = false;
+    // `agents_targeted > 0` stays the "dispatch is final" signal in both rules.
+    if (exec && exec->agents_targeted > 0) {
+        if (recorded) {
+            pg::PgResult tr = pg::exec_params(
+                conn,
+                "SELECT COUNT(*) FILTER (WHERE disposition = 'contacted' AND outcome = ''), "
+                "       COUNT(*) FILTER (WHERE disposition <> 'contacted') "
+                "FROM execution_tracker.execution_target WHERE execution_id = $1",
+                std::vector<std::string>{execution_id});
+            if (tr.status() != PGRES_TUPLES_OK || PQntuples(tr.get()) != 1)
+                return false;
+            finished = to_i64(col(tr.get(), 0, 0)) == 0;
+            // `succeeded` means EVERY intended agent answered successfully.
+            clean = exec->agents_failure == 0 && to_i64(col(tr.get(), 0, 1)) == 0;
+        } else {
+            finished = exec->agents_responded >= exec->agents_targeted;
+            clean = exec->agents_failure == 0;
+        }
+    }
+    std::string final_status_str;
+    if (finished) {
+        const char* final_status = clean ? "succeeded" : "completed";
+        pg::PgResult term = pg::exec_params(
+            conn,
+            "UPDATE execution_tracker.executions SET status=$1, completed_at=$2 "
+            "WHERE id=$3 AND status='running' RETURNING 1",
+            std::vector<std::string>{final_status, std::to_string(now_epoch()), execution_id});
+        // RETURNING carries the "row matched" signal in the result's row count — closes the
+        // #1033-class sqlite3_changes()-after-step race this store carried on the shared SQLite
+        // FULLMUTEX connection.
+        if (term.status() == PGRES_TUPLES_OK && PQntuples(term.get()) > 0) {
+            events.terminal = true;
+            final_status_str = final_status;
+        }
+    }
+
+    // HA WS-2a: build the SSE payloads and durably append them to the event_outbox INSIDE this
+    // transaction (invariant 1: the aggregate/terminal state mutation above and its events commit
+    // atomically). The payloads are built whenever `exec` resolved — the durable append does not
+    // depend on a bus being attached; only the post-commit in-memory fan-out does. A false append
+    // rolls the whole recompute+transition back.
+    if (exec) {
+        events.progress_payload["agents_targeted"] = exec->agents_targeted;
+        events.progress_payload["agents_responded"] = exec->agents_responded;
+        events.progress_payload["agents_success"] = exec->agents_success;
+        events.progress_payload["agents_failure"] = exec->agents_failure;
+        if (events.terminal)
+            events.progress_payload["status"] = final_status_str;
+        if (!append_event_outbox(conn, execution_id, "execution-progress",
+                                 events.progress_payload.dump(), events.terminal, replica_id_))
+            return false;
+        if (events.terminal) {
+            events.terminal_payload["status"] = final_status_str;
+            events.terminal_payload["agents_success"] = exec->agents_success;
+            events.terminal_payload["agents_failure"] = exec->agents_failure;
+            if (!append_event_outbox(conn, execution_id, "execution-completed",
+                                     events.terminal_payload.dump(), /*is_terminal=*/true,
+                                     replica_id_))
+                return false;
+        }
+        events.progress = true;
     }
     return true;
+}
+
+void ExecutionTracker::publish_refresh_events(const std::string& execution_id,
+                                              const RefreshEvents& events) {
+    if (!event_bus_ || !events.progress)
+        return;
+    event_bus_->publish(execution_id, "execution-progress", events.progress_payload.dump(),
+                        events.terminal);
+    if (events.terminal) {
+        event_bus_->publish(execution_id, "execution-completed", events.terminal_payload.dump(),
+                            /*is_terminal=*/true);
+    }
 }
 
 std::expected<std::string, std::string>
@@ -4066,6 +4191,333 @@ std::expected<int, std::string> ExecutionTracker::poll_event_outbox_once() {
         poll_horizon_ = last_wxid;
     }
     return published;
+}
+
+// ---------------------------------------------------------------------------
+// #2673: per-target coverage
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Rows per multi-row insert, bounding one statement's bind size for a fleet-wide dispatch.
+constexpr std::size_t kTargetInsertChunk = 5000;
+/// Runs one sweep pass handles. Each appends at most two outbox events, keeping the pass well
+/// under the cross-replica poll's rows-per-transaction bound (`poll_event_outbox_once`).
+constexpr int kDeadlineSweepCap = 100;
+/// The sweep runs about every 30 s; a larger jump of the database clock against the persisted
+/// anchor is declined once (docs/clock-guarded-retention.md).
+constexpr std::int64_t kDeadlineSweepMaxPlausibleSkewSecs = 15 * 60;
+
+/// The effective response window of the `executions` row in scope, in SQL.
+const std::string kWindowSql = "GREATEST(COALESCE(NULLIF(executions.response_window_s, 0), " +
+                               std::to_string(kDefaultResponseWindowSecs) + "), " +
+                               std::to_string(kMinResponseWindowSecs) + ")";
+
+} // namespace
+
+bool ExecutionTracker::record_dispatch_targets(const std::string& execution_id,
+                                               const std::vector<DispatchTarget>& targets,
+                                               bool connected_only) {
+    if (!open_)
+        return false;
+    // One row per agent, `contacted` winning; ordered so concurrent writers lock alike.
+    std::map<std::string_view, TargetDisposition> unique;
+    for (const auto& t : targets) {
+        auto [it, inserted] = unique.emplace(t.agent_id, t.disposition);
+        if (!inserted && t.disposition == TargetDisposition::Contacted)
+            it->second = t.disposition;
+    }
+    return pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        const auto fail = [&](const char* what, const pg::PgResult& r) {
+            spdlog::warn("ExecutionTracker::record_dispatch_targets: {} failed for "
+                         "execution_id={}: {}",
+                         what, execution_id, PQresultErrorMessage(r.get()));
+            return false;
+        };
+        pg::PgResult ex = pg::exec_params(
+            conn, "SELECT 1 FROM execution_tracker.executions WHERE id = $1",
+            std::vector<std::string>{execution_id});
+        if (ex.status() != PGRES_TUPLES_OK)
+            return fail("run lookup", ex);
+        if (PQntuples(ex.get()) == 0)
+            return true; // a side-channel correlation id: nothing to record against
+
+        // Targets BEFORE the run row: the same lock order as the recount and the sweep.
+        std::vector<std::string_view> ids;
+        std::vector<std::string_view> dispositions;
+        const auto flush = [&]() -> bool {
+            if (ids.empty())
+                return true;
+            pg::PgResult ins = pg::exec_params(
+                conn,
+                "INSERT INTO execution_tracker.execution_target "
+                "(execution_id, agent_id, disposition) "
+                "SELECT $1, a, d FROM unnest($2::text[], $3::text[]) AS u(a, d) "
+                "ON CONFLICT (execution_id, agent_id) DO UPDATE SET disposition = "
+                "excluded.disposition WHERE excluded.disposition = 'contacted' "
+                "AND execution_target.disposition <> 'contacted'",
+                std::vector<std::string>{execution_id, pg::to_text_array(ids),
+                                         pg::to_text_array(dispositions)});
+            if (ins.status() != PGRES_COMMAND_OK)
+                return fail("target insert", ins);
+            ids.clear();
+            dispositions.clear();
+            return true;
+        };
+        for (const auto& [id, disposition] : unique) {
+            ids.push_back(id);
+            dispositions.push_back(to_token(disposition));
+            if (ids.size() >= kTargetInsertChunk && !flush())
+                return false;
+        }
+        if (!flush())
+            return false;
+        // Replies that beat this write.
+        if (!reconcile_targets(conn, execution_id))
+            return false;
+
+        const std::string deadline_sql =
+            "UPDATE execution_tracker.executions SET deadline_at = GREATEST(deadline_at, "
+            "extract(epoch FROM now())::bigint + " +
+            kWindowSql +
+            "), target_population = CASE WHEN $2::boolean OR target_population = "
+            "'connected_only' THEN 'connected_only' ELSE 'listed' END WHERE id = $1";
+        pg::PgResult upd = pg::exec_params(
+            conn, deadline_sql.c_str(),
+            std::vector<std::string>{execution_id, connected_only ? "true" : "false"});
+        if (upd.status() != PGRES_COMMAND_OK)
+            return fail("deadline update", upd);
+        return true;
+    });
+}
+
+std::optional<ExecutionCoverage> ExecutionTracker::get_coverage_checked(
+    const std::string& execution_id,
+    const std::optional<std::vector<std::string>>& visible_agents) const {
+    if (!open_) {
+        note_read_degrade(metrics_, kMethodGetCoverage, kReasonStoreNotOpen);
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        note_read_degrade(metrics_, kMethodGetCoverage, kReasonPoolTimeout);
+        return std::nullopt;
+    }
+    std::vector<std::string> binds{execution_id};
+    std::string visible_clause;
+    if (visible_agents) {
+        std::vector<std::string_view> views(visible_agents->begin(), visible_agents->end());
+        binds.push_back(pg::to_text_array(views));
+        visible_clause = " AND t.agent_id = ANY($2::text[])";
+    }
+    // `recorded` is judged on the UNFILTERED target set (the same rule the recount applies);
+    // every count honours the visible-agent filter.
+    const std::string sql =
+        "SELECT e.deadline_at > 0 AND (SELECT COUNT(*) FROM execution_tracker.execution_target a "
+        "         WHERE a.execution_id = e.id AND a.disposition = 'contacted') "
+        "         >= e.agents_targeted, "
+        "       e.target_population = 'connected_only', e.deadline_at, c.* "
+        "FROM execution_tracker.executions e CROSS JOIN LATERAL ("
+        "  SELECT COUNT(*), "
+        "    COUNT(*) FILTER (WHERE t.disposition = 'contacted'), "
+        "    COUNT(*) FILTER (WHERE t.outcome = 'success'), "
+        "    COUNT(*) FILTER (WHERE t.outcome IN ('failure','timeout','rejected')), "
+        "    COUNT(*) FILTER (WHERE t.outcome = 'timed_out'), "
+        "    COUNT(*) FILTER (WHERE t.disposition = 'offline'), "
+        "    COUNT(*) FILTER (WHERE t.disposition = 'not_sent'), "
+        "    COUNT(*) FILTER (WHERE t.disposition NOT IN ('contacted','offline','not_sent')), "
+        "    COUNT(*) FILTER (WHERE t.disposition = 'contacted' AND t.outcome = ''), "
+        "    COUNT(*) FILTER (WHERE t.outcome = 'timed_out' AND EXISTS ("
+        "        SELECT 1 FROM execution_tracker.agent_exec_status s "
+        "        WHERE s.execution_id = t.execution_id AND s.agent_id = t.agent_id "
+        "          AND s.status IN ('success','failure','timeout','rejected'))) "
+        "  FROM execution_tracker.execution_target t WHERE t.execution_id = e.id" +
+        visible_clause + ") c WHERE e.id = $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ExecutionTracker::get_coverage_checked: query failed: {}",
+                     PQresultErrorMessage(res.get()));
+        note_read_degrade(metrics_, kMethodGetCoverage, kReasonQueryError);
+        return std::nullopt;
+    }
+    ExecutionCoverage out;
+    if (PQntuples(res.get()) == 0 || col_str(res.get(), 0, 0) != "t")
+        return out; // unrecorded: counts unknown
+    const auto num = [&](int c) { return to_i64(col(res.get(), 0, c)); };
+    out.recorded = true;
+    out.connected_only = col_str(res.get(), 0, 1) == "t";
+    out.deadline_at = num(2);
+    out.intended = num(3);
+    out.contacted = num(4);
+    out.responded = num(5);
+    out.failed = num(6);
+    out.timed_out = num(7);
+    out.offline = num(8);
+    out.not_sent = num(9);
+    out.withheld = num(10);
+    out.pending = num(11);
+    out.late = num(12);
+    return out;
+}
+
+std::expected<ResponseDeadlineSweepOutcome, std::string>
+ExecutionTracker::sweep_response_deadlines() {
+    if (!open_)
+        return std::unexpected("database not open");
+
+    ResponseDeadlineSweepOutcome out;
+    std::vector<std::pair<std::string, RefreshEvents>> publish;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        out = {};
+        publish.clear();
+        pg::PgResult lk = pg::exec_params(
+            c, "SELECT pg_try_advisory_xact_lock(hashtext('execution_tracker:target_deadline'))",
+            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK || PQntuples(lk.get()) == 0) {
+            err = "deadline sweep advisory lock failed";
+            return false;
+        }
+        if (col_str(lk.get(), 0, 0) != "t") {
+            out.skipped = true;
+            return true;
+        }
+        pg::PgResult nr = pg::exec_params(c, "SELECT extract(epoch FROM now())::bigint",
+                                          std::vector<std::string>{});
+        if (nr.status() != PGRES_TUPLES_OK || PQntuples(nr.get()) == 0) {
+            err = "deadline sweep now() read failed";
+            return false;
+        }
+        const auto now = parse_reap_i64(col_str(nr.get(), 0, 0));
+        if (!now || *now < 0) {
+            out.clock_anomaly = true;
+            return true;
+        }
+
+        // Clock guard: the persisted anchor of the last accepted reading, and a marker of the
+        // last declined one. A first implausible reading declines; the same anomaly seen again
+        // is taken as real elapsed time. A corrupt anchor is repaired and declined.
+        pg::PgResult mr = pg::exec_params(
+            c,
+            "SELECT key, value FROM execution_tracker.reap_meta WHERE key IN "
+            "('target_deadline_anchor', 'target_deadline_declined')",
+            std::vector<std::string>{});
+        if (mr.status() != PGRES_TUPLES_OK) {
+            err = "deadline sweep anchor read failed";
+            return false;
+        }
+        std::optional<std::string> anchor_text;
+        std::string declined_text;
+        for (int i = 0; i < PQntuples(mr.get()); ++i) {
+            if (col_str(mr.get(), i, 0) == "target_deadline_anchor")
+                anchor_text = col_str(mr.get(), i, 1);
+            else
+                declined_text = col_str(mr.get(), i, 1);
+        }
+        const auto write_meta = [&](const char* key, const std::string& value) -> bool {
+            pg::PgResult w = pg::exec_params(
+                c,
+                "INSERT INTO execution_tracker.reap_meta (key, value) VALUES ($1, $2) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                std::vector<std::string>{key, value});
+            if (w.status() == PGRES_COMMAND_OK)
+                return true;
+            err = "deadline sweep anchor write failed";
+            return false;
+        };
+        if (anchor_text) {
+            const auto anchor = parse_reap_i64(*anchor_text);
+            if (!anchor || *anchor < 0) {
+                spdlog::warn("ExecutionTracker::sweep_response_deadlines declined: corrupt "
+                             "persisted anchor '{}' — re-anchoring to {}",
+                             *anchor_text, *now);
+                out.clock_anomaly = true;
+                return write_meta("target_deadline_anchor", std::to_string(*now)) &&
+                       write_meta("target_deadline_declined", "");
+            }
+            const bool forward =
+                *now >= *anchor && *now - *anchor > kDeadlineSweepMaxPlausibleSkewSecs;
+            const bool backward = *now < *anchor;
+            if (forward || backward) {
+                const std::string seen =
+                    std::to_string(*anchor) + ":" + (forward ? "forward" : "backward");
+                if (declined_text != seen) {
+                    spdlog::warn("ExecutionTracker::sweep_response_deadlines declined: now {} "
+                                 "implausible against anchor {}",
+                                 *now, *anchor);
+                    out.clock_anomaly = true;
+                    return write_meta("target_deadline_declined", seen);
+                }
+                // Persisted: take it as real and re-anchor to this reading.
+            }
+        }
+        if (!write_meta("target_deadline_anchor", std::to_string(*now)) ||
+            !write_meta("target_deadline_declined", ""))
+            return false;
+
+        const std::string now_s = std::to_string(*now);
+        const std::string silent =
+            "t.disposition = 'contacted' AND t.outcome = '' AND t.last_signal_at + " + kWindowSql +
+            " < $1::bigint";
+        // Eligible: past the deadline, not still owned by the outbox delivery loop, and either
+        // holding a silent target or fully resolved yet unfinished (a reply that raced the
+        // target record).
+        const std::string candidates =
+            "SELECT id FROM execution_tracker.executions WHERE status = 'running' "
+            "AND deadline_at > 0 AND deadline_at < $1::bigint AND " +
+            std::string(CommandDeliveryFinalizationOwner::kPendingOutboxNotExistsClause) +
+            " AND (EXISTS (SELECT 1 FROM execution_tracker.execution_target t "
+            "              WHERE t.execution_id = executions.id AND " +
+            silent +
+            ") OR (agents_targeted > 0 "
+            "      AND NOT EXISTS (SELECT 1 FROM execution_tracker.execution_target t "
+            "        WHERE t.execution_id = executions.id AND t.disposition = 'contacted' "
+            "          AND t.outcome = '') "
+            "      AND (SELECT COUNT(*) FROM execution_tracker.execution_target t "
+            "        WHERE t.execution_id = executions.id AND t.disposition = 'contacted') "
+            "        >= agents_targeted)) "
+            "ORDER BY deadline_at ASC LIMIT $2::bigint";
+        pg::PgResult cr = pg::exec_params(
+            c, candidates.c_str(),
+            std::vector<std::string>{now_s, std::to_string(kDeadlineSweepCap + 1)});
+        if (cr.status() != PGRES_TUPLES_OK) {
+            err = "deadline sweep candidate read failed";
+            return false;
+        }
+        out.capped = PQntuples(cr.get()) > kDeadlineSweepCap;
+        const int rows = (std::min)(PQntuples(cr.get()), kDeadlineSweepCap);
+        const std::string expire =
+            "UPDATE execution_tracker.execution_target t SET outcome = 'timed_out', "
+            "resolved_at = $1::bigint FROM execution_tracker.executions "
+            "WHERE executions.id = $2 AND t.execution_id = executions.id AND " +
+            silent;
+        for (int i = 0; i < rows; ++i) {
+            const std::string id = col_str(cr.get(), i, 0);
+            // A real reply that committed first wins over this pass.
+            if (!reconcile_targets(c, id))
+                return false;
+            pg::PgResult ur =
+                pg::exec_params(c, expire.c_str(), std::vector<std::string>{now_s, id});
+            if (ur.status() != PGRES_COMMAND_OK) {
+                err = "deadline sweep target update failed";
+                return false;
+            }
+            out.timed_out_targets += to_i64(PQcmdTuples(ur.get()));
+            RefreshEvents events;
+            if (!refresh_counts_in_txn(c, id, events)) {
+                err = "deadline sweep recount failed for execution_id=" + id;
+                return false;
+            }
+            out.execution_ids.push_back(id);
+            publish.emplace_back(id, std::move(events));
+        }
+        return true;
+    }); // transaction committed / lease released here — publishes below run lease-free.
+    if (!ok)
+        return std::unexpected(err.empty() ? "deadline sweep failed" : err);
+    for (const auto& [id, events] : publish)
+        publish_refresh_events(id, events);
+    return out;
 }
 
 } // namespace yuzu::server

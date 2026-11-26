@@ -711,6 +711,25 @@ arms, and the frozen set of files that hold the bridge).
 
 This closes the case a principal holding global `Execution:Execute` but only scoped `Execution:Read` exposed: its own fleet-wide dispatch used to report fleet-wide counts on the bridge that the REST events route withheld. A service-scoped session is unchanged: `Execution:Execute` is not on the empty `kServiceScopeGlobalSafe` table, so it never reaches `execute_instruction`. `agents_reached` in the dispatcher's own plain tool result is unchanged: it is the caller's own dispatch response, not a bus event.
 
+## Per-target coverage and the response deadline (#2673)
+
+`execution_target` (schema `execution_tracker`, migration v11) holds one row per **intended** agent of a run: what dispatch did with it (`disposition`: `contacted`, `offline`, `not_sent`, `quarantined`, `plugin_absent`, `os_kill_switched`, `concurrency_skipped`, `withheld`) and how it ended (`outcome`: empty, `success`, `failure`, `timeout`, `rejected`, or the server's own `timed_out`). `contacted` means the send accepted the frame; for a gateway-routed agent that is a queue, not a delivery.
+
+**Who records.** `wire_and_dispatch_confined` (every dispatch through `ServerImpl::dispatch_confined`) and `push_sync_now_confined`, for dispatches that carry an execution id. A correlation id with no `executions` row records nothing. `/api/command` and the legacy forwarder create no execution row and record nothing. A failed record write never fails the dispatch (`yuzu_exec_tracker_bookkeeping_failed_total{op="record_targets"}`).
+
+**Rules, each load-bearing.**
+
+1. **The first final result stands.** A terminal `agent_exec_status` row is not replaced by any later frame, and a target row changes only while its `outcome` is empty. A different later final is counted (`yuzu_exec_tracker_conflicting_final_total`). A known limit: a server-made gateway failure that arrives first also beats a later real success.
+2. **A recorded run finishes** when `agents_targeted > 0` and no `contacted` target is open. It is `succeeded` only if nothing failed or timed out **and no intended agent was left uncontacted**; otherwise `completed`. Its aggregate counts come from `execution_target`, so an agent outside the intended set cannot move them, and `agents_failure` includes `timed_out`.
+3. **A run is recorded only when `deadline_at > 0` and at least `agents_targeted` targets are `contacted`.** Otherwise it keeps the count-only rule, so a failed or partial record can never finish a run early. Coverage then reads `unrecorded` with null counts.
+4. **`record_dispatch_targets` never writes `agents_targeted`**, which remains the "dispatch is final" signal. A later call may raise a target to `contacted`, never lower it.
+5. **A reply can beat the target record.** Both the recount and the sweep reconcile open targets from `agent_exec_status` first.
+6. **Lock order is targets, then the `executions` row** (record, recount, sweep).
+
+**The deadline sweep** (`sweep_response_deadlines`, about every 30 s) marks a contacted target `timed_out` once the run's deadline has passed **and** the target has been silent for the response window, then recounts and finishes the run in the same transaction. The window is the definition's `gather_ttl_seconds` (default 300; software sync adds `delay_max_s`), never below 660 s because agents send a `running` keepalive every 300 s. A run with a pending outbox row is skipped. The sweep writes no `agent_exec_status` row and releases no concurrency claim. A late answer is stored on the agent row and counted as `late`; the run's result does not change. Each swept run writes an `execution.deadline_sweep` audit row (best effort).
+
+**Confined callers** receive coverage counted over their visible agents only; event payloads carry no coverage data.
+
 ## HA WS-2a — durable event outbox (ADR-2002 §5)
 
 The "Restart loss" characteristic above is what WS-2a closes. `ExecutionTracker`

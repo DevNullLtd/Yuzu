@@ -590,6 +590,12 @@ bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std:
         exec.parameter_values =
             s.parameter_values.empty() ? std::string(kEmptyScheduleParams) : s.parameter_values;
         exec.dispatched_by = s.created_by;
+        // #2673: the definition says how long its responses are gathered. An unreadable
+        // definition leaves the default window.
+        if (d_.instruction_store) {
+            if (auto def = d_.instruction_store->get_definition(s.definition_id); def && *def)
+                exec.response_window_s = (*def)->gather_ttl_seconds;
+        }
         if (auto created = d_.execution_tracker->create_execution(exec); created.has_value())
             exec_id = *created;
         else

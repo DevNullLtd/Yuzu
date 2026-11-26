@@ -85,6 +85,11 @@ struct ExecutionKpi {
 [[nodiscard]] ExecutionKpi compute_execution_kpi(const std::vector<AgentExecStatus>& agents);
 nlohmann::json execution_kpi_json(const ExecutionKpi& k);
 
+/// #2673: the `coverage` object of an execution detail read (REST v1 and MCP). The caller has
+/// already filtered the counts to the visible agents. An unrecorded run carries `state` and null
+/// counts: unknown is never zero.
+nlohmann::json execution_coverage_json(const ExecutionCoverage& c);
+
 /// One row of a resolved, already-confined child-execution read (`GET
 /// /api/v1/executions/{id}/children`, the legacy `GET
 /// /api/executions/{id}/children`, and MCP `get_execution_children` -

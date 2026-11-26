@@ -38,6 +38,8 @@
 #include "dispatch_position.hpp"    // DispatchPosition (#3678)
 #include "response_provenance.hpp" // CommandRecord
 
+struct pg_conn; // libpq's PGconn
+
 namespace yuzu::server::pg {
 class PgPool;
 } // namespace yuzu::server::pg
@@ -74,6 +76,88 @@ struct Execution {
     /// behind `perm_fn(req, res, "Execution", "Read")` before serializing to
     /// any caller (mirrors mcp_server.cpp:get_execution_status).
     std::string last_error_detail;
+    /// #2673: write-only on create. How long dispatched targets may stay silent before the
+    /// server marks them `timed_out`; 0 means the default. Never below
+    /// `kMinResponseWindowSecs`.
+    int64_t response_window_s{0};
+};
+
+/// #2673: the response window used when a run names none.
+inline constexpr int64_t kDefaultResponseWindowSecs = 300;
+/// #2673: the floor under every response window. A live agent sends a `running` keepalive for
+/// each in-flight command every 300 s (agent.cpp), so a shorter window would time out work that
+/// is still running; this leaves room for one late or lost keepalive.
+inline constexpr int64_t kMinResponseWindowSecs = 660;
+
+/// #2673: what dispatch did with one intended target. Only `Contacted` means the send accepted
+/// the frame (for a gateway-routed agent, queued for the gateway, not delivered).
+enum class TargetDisposition {
+    Contacted,
+    Offline,
+    NotSent,
+    Quarantined,
+    PluginAbsent,
+    OsKillSwitched,
+    ConcurrencySkipped,
+    Withheld,
+};
+
+/// The stored token of a disposition.
+[[nodiscard]] inline const char* to_token(TargetDisposition d) {
+    switch (d) {
+    case TargetDisposition::Contacted:
+        return "contacted";
+    case TargetDisposition::Offline:
+        return "offline";
+    case TargetDisposition::NotSent:
+        return "not_sent";
+    case TargetDisposition::Quarantined:
+        return "quarantined";
+    case TargetDisposition::PluginAbsent:
+        return "plugin_absent";
+    case TargetDisposition::OsKillSwitched:
+        return "os_kill_switched";
+    case TargetDisposition::ConcurrencySkipped:
+        return "concurrency_skipped";
+    case TargetDisposition::Withheld:
+        return "withheld";
+    }
+    return "withheld";
+}
+
+struct DispatchTarget {
+    std::string agent_id;
+    TargetDisposition disposition{TargetDisposition::Contacted};
+};
+
+/// #2673: per-run coverage counts. When `recorded` is false the counts are unknown, not zero.
+/// `intended = contacted + offline + not_sent + withheld` and
+/// `contacted = responded + failed + timed_out + pending`; `late` (an answer that arrived after
+/// the server's `timed_out`) is a subset of `timed_out`.
+struct ExecutionCoverage {
+    bool recorded{false};
+    /// True when the target set came from a filter or broadcast, which see only connected agents.
+    bool connected_only{false};
+    int64_t intended{0};
+    int64_t contacted{0};
+    int64_t responded{0}; ///< answered successfully
+    int64_t failed{0};    ///< answered with failure, timeout or rejected
+    int64_t timed_out{0}; ///< no answer before the server's deadline
+    int64_t offline{0};
+    int64_t not_sent{0};
+    int64_t withheld{0}; ///< quarantine, plugin absent, per-OS switch, concurrency or gate
+    int64_t pending{0};
+    int64_t late{0};
+    int64_t deadline_at{0};
+};
+
+/// #2673: one `sweep_response_deadlines` pass.
+struct ResponseDeadlineSweepOutcome {
+    int64_t timed_out_targets{0};
+    std::vector<std::string> execution_ids; ///< runs this pass marked or finished
+    bool skipped{false};       ///< another replica held the sweep lock
+    bool clock_anomaly{false}; ///< declined on an implausible database clock reading
+    bool capped{false};        ///< more runs were eligible than one pass handles
 };
 
 struct ExecutionQuery {
@@ -355,7 +439,7 @@ public:
 
     /// ADR-1007 — optional observability sink for the per-device
     /// concurrency-claim path (skip counts, force-releases) and, since #3834,
-    /// the read-degrade counter of the five `_checked` readers
+    /// the read-degrade counter of the six `_checked` readers
     /// (`yuzu_server_execution_tracker_read_degrade_total{method,reason}`).
     /// nullptr (the default) means no metrics — matches every sibling store's
     /// `set_metrics` idiom (a post-construction setter, not a constructor
@@ -372,7 +456,7 @@ public:
     /// site uses those constants (a convention: `note_read_degrade` accepts any string). Call once
     /// at boot, next to `set_metrics()`. Static: it needs no store.
     ///
-    /// The five readers it covers: `query_executions_checked`, `get_execution_checked`,
+    /// The six readers it covers: `get_coverage_checked`, `query_executions_checked`, `get_execution_checked`,
     /// `get_agent_statuses_checked`, `get_agent_statuses_for_executions_checked`,
     /// `get_children_checked`. The counter is bumped INSIDE those bodies, so the unchecked wrappers
     /// that delegate to them (`query_executions`, `get_agent_statuses`,
@@ -523,6 +607,28 @@ public:
     /// is closed or the upsert failed twice).
     bool update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
     void refresh_counts(const std::string& execution_id);
+
+    /// #2673: record who one dispatch was meant for and what happened to each, and set the run's
+    /// response deadline from the database clock. May be called more than once per run (batches,
+    /// redrive): a later call can raise a target to `contacted`, never lower it. A run with no
+    /// execution row (the side-channel correlation ids) is a successful no-op. Does NOT write
+    /// `agents_targeted`. False on a store failure, in which case nothing was recorded.
+    [[nodiscard]] bool record_dispatch_targets(const std::string& execution_id,
+                                               const std::vector<DispatchTarget>& targets,
+                                               bool connected_only);
+
+    /// #2673: coverage counts for one run. With `visible_agents` engaged, only those agents are
+    /// counted (applied in SQL; engaged-empty counts nobody). `nullopt` on a store failure, which
+    /// a caller must not read as zero. An unknown run reads `recorded=false`.
+    [[nodiscard]] std::optional<ExecutionCoverage> get_coverage_checked(
+        const std::string& execution_id,
+        const std::optional<std::vector<std::string>>& visible_agents = std::nullopt) const;
+
+    /// #2673: mark contacted targets that stayed silent past their run's deadline as
+    /// `timed_out`, then recount and finish those runs. Replica-safe (advisory try-lock),
+    /// database-clock driven and capped per pass; see docs/clock-guarded-retention.md.
+    [[nodiscard]] std::expected<ResponseDeadlineSweepOutcome, std::string>
+    sweep_response_deadlines();
 
     /// PR 2: set agents_targeted post-creation. Used by the workflow execute
     /// handler which now creates the execution row BEFORE dispatch (to thread
@@ -1076,6 +1182,14 @@ private:
     /// otherwise, including the ordinary "nothing changed" case. See
     /// `refresh_counts`'s retry-and-log wrapper for why this is split out.
     bool refresh_counts_once(const std::string& execution_id);
+    /// Events a recount appended to the outbox, to publish in-process after commit (defined in
+    /// the .cpp, which keeps the JSON type out of this header).
+    struct RefreshEvents;
+    /// The recount, terminal transition and outbox appends on the CALLER's transaction.
+    /// (`pg_conn` is libpq's `PGconn`, named by its struct tag to keep libpq out of here.)
+    bool refresh_counts_in_txn(pg_conn* conn, const std::string& execution_id,
+                               RefreshEvents& events);
+    void publish_refresh_events(const std::string& execution_id, const RefreshEvents& events);
 
     /// One attempt at `update_agent_status`'s upsert + agent-transition SSE
     /// publish. Returns `nullopt` on a lease-acquire failure or a query

@@ -1854,7 +1854,7 @@ public:
                           "definition_changed (a step was refused at send time), a zero-reach cause "
                           "(dispatch_denied, containment_unreadable, route_unreadable, "
                           "os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, "
-                          "kill_switched_os), "
+                          "kill_switched_os, no_targets, target_resolution_failed), "
                           "run_failed (the engine ended the run before any dispatch), "
                           "dispatch_exception (the run threw after its requested audit row; steps "
                           "may have been sent), or none. A run killed with the process never "
@@ -4414,6 +4414,22 @@ public:
             for (auto surface : {"rest", "mcp", "workflow", "schedule", "outbox"})
                 metrics_.counter("yuzu_exec_tracker_bookkeeping_failed_total",
                                  {{"op", op}, {"surface", surface}});
+        // #2673: per-target coverage. A failed target record leaves that run on the count-only
+        // rules; the sweep outcomes are a closed set, pre-seeded so absent() stays meaningful.
+        metrics_.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                         {{"op", "record_targets"}, {"surface", "dispatch"}});
+        metrics_.describe("yuzu_exec_tracker_conflicting_final_total",
+                          "Agent results ignored because a different final result for the same "
+                          "run and agent was already recorded (#2673)",
+                          "counter");
+        metrics_.counter("yuzu_exec_tracker_conflicting_final_total");
+        metrics_.describe("yuzu_exec_tracker_deadline_sweep_total",
+                          "sweep_response_deadlines() results (#2673), by outcome: timed_out "
+                          "(counts agents marked), capped, skipped, clock_anomaly and degraded "
+                          "(each counts passes)",
+                          "counter");
+        for (auto outcome : {"timed_out", "capped", "skipped", "clock_anomaly", "degraded"})
+            metrics_.counter("yuzu_exec_tracker_deadline_sweep_total", {{"outcome", outcome}});
         // #4982 Part B — the recovery side of the counter above:
         // reap_stuck_running_executions() (execution_tracker.cpp) cancels an
         // execution row permanently wedged at status='running',
@@ -15075,12 +15091,20 @@ private:
         return yuzu::server::software_sync::fleet_admin_answer(facts);
     }
 
+    void count_target_record_failure() {
+        metrics_
+            .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                     {{"op", "record_targets"}, {"surface", "dispatch"}})
+            .increment();
+    }
+
     /// The tracker row of one dispatch, created BEFORE it is sent so a fast reply cannot beat it. The
     /// ONE place this file writes an execution row's dispatcher (the v1 command routes' creator and
     /// the sync Runner's both go through it). `definition_id` is empty for a plain operator command.
     [[nodiscard]] std::expected<std::string, std::string>
     create_execution_row(const std::string& definition_id, const std::string& by,
-                         const std::string& scope, const std::string& parameter_values_json) {
+                         const std::string& scope, const std::string& parameter_values_json,
+                         std::int64_t response_window_s = 0) {
         if (!execution_tracker_)
             return std::unexpected(std::string("no execution tracker"));
         Execution exec;
@@ -15089,6 +15113,7 @@ private:
         exec.scope_expression = scope;
         exec.parameter_values = parameter_values_json;
         exec.dispatched_by = by;
+        exec.response_window_s = response_window_s;
         return execution_tracker_->create_execution(exec);
     }
 
@@ -15143,8 +15168,11 @@ private:
                 nlohmann::json params = {{"source", std::string(software_sync::kSource)}};
                 if (delay_max_s > 0)
                     params["delay_max_s"] = delay_max_s;
+                // #2673: the agents report at an offset inside `delay_max_s`, so the
+                // response window starts counting after it.
                 auto created = create_execution_row(std::string(software_sync::kSyncDefinitionId),
-                                                    sess.username, sel.expr, params.dump());
+                                                    sess.username, sel.expr, params.dump(),
+                                                    kDefaultResponseWindowSecs + delay_max_s);
                 if (!created) {
                     spdlog::warn("software sync: execution record not created ({}); the run goes on "
                                  "untracked",
@@ -15217,8 +15245,26 @@ private:
                     spdlog::warn("software sync: a send threw and counts as not accepted: {}", e.what());
                     return false;
                 }
-            });
+            },
+            /*collect_targets=*/!execution_id.empty());
         out.sent = static_cast<std::size_t>(result.sent);
+        // #2673: this fan-out bypasses `wire_and_dispatch_confined`, so it records its own
+        // targets, before the gateway flush so a reply finds them.
+        if (!execution_id.empty() && execution_tracker_ && !result.intended.empty()) {
+            ConfinedDispatchOutcome recorded;
+            recorded.intended = result.intended;
+            recorded.contacted = result.contacted;
+            recorded.not_sent = result.not_sent;
+            std::unordered_set<std::string> known;
+            if (!recorded.not_sent.empty()) {
+                const auto all = registry_.all_ids();
+                known.insert(all.begin(), all.end());
+            }
+            if (!execution_tracker_->record_dispatch_targets(
+                    execution_id, yuzu::server::build_dispatch_targets(recorded, known),
+                    /*connected_only=*/false))
+                count_target_record_failure();
+        }
         if (out.sent > 0)
             forward_gateway_pending(); // gateway agents are only QUEUED
         return out;
@@ -15739,6 +15785,8 @@ private:
             // consult. Null when the store failed to open at boot — a
             // GatewayRouteFallback with a null store is a pure no-op.
             gateway_route_store_.get());
+        if (outcome.targets_record_failed)
+            count_target_record_failure();
 
         // #881: this seam serves the MAJORITY of dispatch (MCP, workflows,
         // schedules, REST v1) — without this, quarantine enforcement here
@@ -20579,6 +20627,9 @@ private:
                 // execution_tracker.cpp's kStuckExecWindowSecs/kStuckExecMax-
                 // PlausibleSkewSecs for how this cadence sizes those constants.
                 constexpr int kStuckExecReapEveryNTicks = 450; // ~15 minutes at 2s/tick
+                // #2673: the response-deadline sweep. Frequent, because a silent device holds its
+                // run at `running` until this pass marks it.
+                constexpr int kDeadlineSweepEveryNTicks = 15; // ~30 seconds at 2s/tick
                 // ADR-1007: per-device concurrency claim stale-claim reconciler
                 // cadence — see the call site's own comment for the rationale.
                 constexpr int kConcurrencyClaimReconcileEveryNTicks = 150; // ~5 minutes at 2s/tick
@@ -20997,6 +21048,60 @@ private:
                                     .counter("yuzu_exec_tracker_stuck_reap_total",
                                              {{"outcome", "degraded"}})
                                     .increment();
+                            }
+                        }
+
+                        // 2e3) #2673: time out dispatched agents that stayed silent past
+                        // their run's response deadline, then finish those runs.
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kDeadlineSweepEveryNTicks == 0 &&
+                            !stop_requested_.load(std::memory_order_acquire)) {
+                            YUZU_ASSERT_BACKGROUND_JOB( // WS-10 ReplicaSafe
+                                "execution_tracker.sweep_response_deadlines");
+                            const auto count = [this](const char* outcome, double n) {
+                                metrics_
+                                    .counter("yuzu_exec_tracker_deadline_sweep_total",
+                                             {{"outcome", outcome}})
+                                    .increment(n);
+                            };
+                            if (auto swept = execution_tracker_->sweep_response_deadlines()) {
+                                if (swept->timed_out_targets > 0)
+                                    count("timed_out",
+                                          static_cast<double>(swept->timed_out_targets));
+                                if (swept->capped)
+                                    count("capped", 1);
+                                if (swept->skipped)
+                                    count("skipped", 1);
+                                if (swept->clock_anomaly)
+                                    count("clock_anomaly", 1);
+                                // A background writer changing run results is audited, like
+                                // the reap above. Stop at the first failed write: a degraded
+                                // audit pool would hold this shared thread once per run.
+                                if (audit_store_ && audit_store_->is_open()) {
+                                    for (const auto& swept_id : swept->execution_ids) {
+                                        AuditEvent ev;
+                                        ev.timestamp =
+                                            std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count();
+                                        ev.principal = "system";
+                                        ev.action = "execution.deadline_sweep";
+                                        ev.target_type = "execution";
+                                        ev.target_id = swept_id;
+                                        ev.detail = "sweep_response_deadlines";
+                                        ev.result = "success";
+                                        if (!audit_store_->log(ev)) {
+                                            spdlog::warn("deadline sweep: audit write failed for "
+                                                         "execution_id={} -- the rest of this "
+                                                         "pass is unaudited",
+                                                         swept_id);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                spdlog::warn("response deadline sweep failed: {}", swept.error());
+                                count("degraded", 1);
                             }
                         }
 
@@ -26230,6 +26335,11 @@ private:
             } else if (result.kill_switched_os_count > 0) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"every target runs an OS for which this plugin action is switched off — dispatch was withheld, not attempted","reason":"kill_switched_os","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.intended_count == 0) {
+                res.status = 422;
+                res.set_content(
+                    R"({"error":{"code":422,"message":"no targets: nothing you can dispatch to matched this request. Broadcast targeting considers only connected agents.","reason":"no_targets","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else {
                 res.set_content(

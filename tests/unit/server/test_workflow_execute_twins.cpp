@@ -3850,7 +3850,8 @@ TEST_CASE("workflow execute: the zero-reach status list is closed, matches what 
     for (const auto cause : {ZeroReachCause::Denied, ZeroReachCause::ContainmentUnreadable,
                              ZeroReachCause::RouteUnreadable, ZeroReachCause::OsGateUnreadable,
                              ZeroReachCause::Quarantined, ZeroReachCause::PluginNotFound,
-                             ZeroReachCause::KillSwitchedOs, ZeroReachCause::Generic}) {
+                             ZeroReachCause::KillSwitchedOs, ZeroReachCause::TargetResolutionFailed,
+                             ZeroReachCause::NoTargets, ZeroReachCause::Generic}) {
         const auto token = zero_reach_token(cause);
         INFO(token);
         CHECK(std::find(kWorkflowZeroReachStatuses.begin(), kWorkflowZeroReachStatuses.end(),
@@ -3863,7 +3864,7 @@ TEST_CASE("workflow execute: the zero-reach status list is closed, matches what 
     for (const char* own : {"late_denied", "definition_changed", "deadline_exceeded", "run_failed"})
         CHECK(std::count(kWorkflowZeroReachStatuses.begin(), kWorkflowZeroReachStatuses.end(),
                          std::string_view(own)) == 1);
-    CHECK(kWorkflowZeroReachStatuses.size() == 12);
+    CHECK(kWorkflowZeroReachStatuses.size() == 14);
 
     // The three remediation texts that used to say a step with no command_id was never sent.
     CHECK(std::string(kStepNotProvenUnsentText).find("may still have been sent") !=
@@ -3917,13 +3918,14 @@ TEST_CASE("run outcome counter: the closed (outcome, reason) set is reachable-on
                          WorkflowRunOutcome::kAborted})
         tokens.emplace(std::string(workflow_run_outcome_token(o)));
     CHECK(outcomes == tokens);
-    CHECK(series.size() == 27);
+    CHECK(series.size() == 31);
     // Each zero-reach cause the dispatch can note is a `failed` AND an `aborted` reason; `invalid_scope`
     // is not (a workflow names its agents).
     for (const auto cause : {ZeroReachCause::Denied, ZeroReachCause::ContainmentUnreadable,
                              ZeroReachCause::RouteUnreadable, ZeroReachCause::OsGateUnreadable,
                              ZeroReachCause::Quarantined, ZeroReachCause::PluginNotFound,
-                             ZeroReachCause::KillSwitchedOs, ZeroReachCause::Generic}) {
+                             ZeroReachCause::KillSwitchedOs, ZeroReachCause::TargetResolutionFailed,
+                             ZeroReachCause::NoTargets, ZeroReachCause::Generic}) {
         const auto t = zero_reach_token(cause);
         INFO(t);
         CHECK(seen.count({"failed", std::string(t)}) == 1);
