@@ -4985,7 +4985,7 @@ short-circuit to "already installed" and then fail post-install
 pkgconfig validation; this was #741.) Never touches `$WS/vcpkg/` (the
 sibling vcpkg tool root, owned by lukka/run-vcpkg), never
 `runner.tool_cache`, never ccache. Persistence: self-hosted in
-`${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows,macos}`
+`${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,tsan,windows,macos}`
 (per-triplet, outside workspace). macOS joined this model with the BigMags
 cutover; its former `actions/cache@v5` round-trip was removed.
 
