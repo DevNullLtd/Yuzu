@@ -111,3 +111,12 @@ handler: the `OutcomeRecorder` holds a `const LiveOutcome&` to a handler local d
 (186, 2 x 3 x 31) is superseded by this one. Dev's merged ownership changes on the shared path (the `registry_` catalogue filter
 `[this]` callback, the `BulkReadSlots` `unique_ptr`, the echo-corruption gate callbacks) were inspected by cpp-safety: no ownership or
 ordering defect. No manual cleanup added; no exceptions. cpp-safety and cpp-expert reviewed at Gate 3 on the merge.
+
+## Fix round: OpenAPI literal split (`6d90c935f7`, run `2146-device-live-mcp-litsplit.Hq3VzN`)
+
+Three lines in `openapi_spec()` (`server/core/src/rest_api_v1.cpp`): a closing `)json"`, a comment and an opening
+`R"json(` between two path members. Adjacent raw-string literals are joined at translation time, so this adds no fd,
+HANDLE, SOCKET, `FILE*`, `sqlite3*`, OpenSSL or BCrypt object, allocated C string, mapped library, temp path, subprocess,
+callback context or thread, and no cast, `new`, `delete` or `malloc`. `openapi_spec()` still initialises one function-local
+`static const std::string` through `expand_ecosystem_tokens`, so its magic-static initialisation and its returned
+`const&` lifetime are unchanged. Reviewed by cpp-safety at Gate 3: no findings.
