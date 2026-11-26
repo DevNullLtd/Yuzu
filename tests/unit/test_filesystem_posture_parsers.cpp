@@ -21,6 +21,9 @@
  * AND EXECUTES filesystem_posture_legs.hpp in wave 1, the same wave that
  * authors the seam. The formatters are pure (no I/O, no logging), so
  * exercising them here stays within the pure-unit-test rule.
+ *
+ * Section (E3): plan_vss_rows, the pure rows-and-marks plan of the Windows
+ * snapshots action, over constructed VssSnapshotsRead values.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -28,6 +31,7 @@
 #include "filesystem_posture_parsers.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -454,4 +458,188 @@ TEST_CASE("filesystem_posture: format_snapshot_row -- fixed kind literal emitted
     const auto detail = yuzu::util::safe_output_field("snap|detail");
     CHECK(format_snapshot_row("/", "snap|name", "apfs", "snap|detail") ==
           "snapshot|/|" + name + "|apfs|" + detail);
+}
+
+// (E3) Windows snapshots plan -- constructed reads; the COM walk is agent-core's.
+
+namespace {
+
+using yuzu::agent::BoundedStatus;
+using yuzu::agent::win::VssSnapshotsRead;
+using yuzu::agent::win::VssStep;
+
+constexpr const char* kIncompleteDetail =
+    "no shadow copies observed, but the enumeration was incomplete -- see the degraded status "
+    "for why";
+constexpr const char* kSkippedMark =
+    "the provider returned a non-snapshot object; it was skipped";
+constexpr const char* kNarrowedMark =
+    "SetContext(VSS_CTX_ALL) failed; only the default snapshot context was enumerated";
+constexpr const char* kTruncatedMark = "snapshot list truncated at the 1024-entry cap";
+
+VssSnapshotsRead answered_read() {
+    VssSnapshotsRead read;
+    read.status = BoundedStatus::Completed;
+    return read;
+}
+
+VssRowPlan plan_of(const VssSnapshotsRead& read) {
+    return plan_vss_rows(read, [](const std::string& volume) { return "mount-of-" + volume; });
+}
+
+// The wire bytes of every planned row.
+std::vector<std::string> wire_rows(const VssRowPlan& plan) {
+    std::vector<std::string> out;
+    for (const auto& r : plan.rows)
+        out.push_back(format_snapshot_row(r.mount_point, r.name, r.kind, r.detail));
+    return out;
+}
+
+std::string none_wire_row(std::string_view detail) {
+    return format_snapshot_row("-", "-", "none", detail);
+}
+
+} // namespace
+
+TEST_CASE("filesystem_posture: plan_vss_rows -- a complete read writes one row per snapshot",
+          "[filesystem_posture]") {
+    auto read = answered_read();
+    read.snapshots = {{"{id-1}", "volume-1", "device-1"}, {"{id-2}", "", "-"}};
+    const auto plan = plan_of(read);
+    // An empty originating volume is never resolved: its mount point is "-".
+    CHECK(wire_rows(plan) ==
+          std::vector<std::string>{"snapshot|mount-of-volume-1|{id-1}|vss|device-1",
+                                   "snapshot|-|{id-2}|vss|-"});
+    CHECK(plan.marks.empty());
+}
+
+TEST_CASE("filesystem_posture: plan_vss_rows -- an empty complete read says none are present",
+          "[filesystem_posture]") {
+    const auto plan = plan_of(answered_read());
+    CHECK(wire_rows(plan) ==
+          std::vector<std::string>{"snapshot|-|-|none|no shadow copies present on any volume"});
+    CHECK(plan.marks.empty());
+}
+
+TEST_CASE("filesystem_posture: plan_vss_rows -- an empty incomplete read never claims none",
+          "[filesystem_posture]") {
+    struct Case {
+        bool VssSnapshotsRead::*flag;
+        const char* mark;
+    };
+    for (const auto& c : {Case{&VssSnapshotsRead::truncated, kTruncatedMark},
+                          Case{&VssSnapshotsRead::context_narrowed, kNarrowedMark},
+                          Case{&VssSnapshotsRead::skipped_wrong_type, kSkippedMark}}) {
+        CAPTURE(c.mark);
+        auto read = answered_read();
+        read.*(c.flag) = true;
+        const auto plan = plan_of(read);
+        CHECK(wire_rows(plan) == std::vector<std::string>{none_wire_row(kIncompleteDetail)});
+        REQUIRE(plan.marks.size() == 1);
+        CHECK_FALSE(plan.marks[0].denied);
+        CHECK(plan.marks[0].detail == c.mark);
+    }
+}
+
+TEST_CASE("filesystem_posture: plan_vss_rows -- marks run skipped, narrowed, truncated",
+          "[filesystem_posture]") {
+    auto read = answered_read();
+    read.snapshots = {{"{id-1}", "volume-1", "device-1"}};
+    read.truncated = read.context_narrowed = read.skipped_wrong_type = true;
+    const auto plan = plan_of(read);
+    CHECK(plan.rows.size() == 1);
+    REQUIRE(plan.marks.size() == 3);
+    CHECK(plan.marks[0].detail == kSkippedMark);
+    CHECK(plan.marks[1].detail == kNarrowedMark);
+    CHECK(plan.marks[2].detail == kTruncatedMark);
+    for (const auto& mark : plan.marks)
+        CHECK_FALSE(mark.denied);
+}
+
+TEST_CASE("filesystem_posture: plan_vss_rows -- each failed step, denied and otherwise",
+          "[filesystem_posture]") {
+    struct Case {
+        VssStep step;
+        std::string denied;
+        std::string other;
+    };
+    const std::string why_denied =
+        " denied (0x80070005): VSS snapshot enumeration requires administrative rights; this "
+        "commonly indicates the agent service account lacks them";
+    const std::string why_other = " failed: 0x80042306";
+    const std::string com = "COM initialisation failed";
+    const std::vector<Case> cases = {
+        // The shipped reader has no HRESULT for com_init (hr stays 0), so it never marks denied.
+        {VssStep::com_init, com, com},
+        {VssStep::create, "CreateVssBackupComponents" + why_denied,
+         "CreateVssBackupComponents" + why_other},
+        {VssStep::initialize, "InitializeForBackup" + why_denied,
+         "InitializeForBackup" + why_other},
+        {VssStep::query, "Query" + why_denied, "Query" + why_other},
+        {VssStep::next, "IVssEnumObject::Next" + why_denied, "IVssEnumObject::Next" + why_other},
+    };
+    for (const auto& c : cases) {
+        for (const bool denied : {true, false}) {
+            CAPTURE(static_cast<int>(c.step), denied);
+            auto read = answered_read();
+            read.failed_step = c.step;
+            read.hr = static_cast<std::int32_t>(denied ? 0x80070005u : 0x80042306u);
+            read.context_narrowed = true; // a failed step reports itself only
+            const auto plan = plan_of(read);
+            const std::string& detail = denied ? c.denied : c.other;
+            CHECK(wire_rows(plan) == std::vector<std::string>{none_wire_row(detail)});
+            REQUIRE(plan.marks.size() == 1);
+            CHECK(plan.marks[0].denied == denied);
+            CHECK(plan.marks[0].detail == detail);
+        }
+    }
+}
+
+TEST_CASE("filesystem_posture: plan_vss_rows -- a mid-walk failure keeps the rows already read",
+          "[filesystem_posture]") {
+    auto read = answered_read();
+    read.snapshots = {{"{id-1}", "volume-1", "device-1"}};
+    read.failed_step = VssStep::next;
+    read.hr = static_cast<std::int32_t>(0x80042306u);
+    read.truncated = read.context_narrowed = read.skipped_wrong_type = true;
+    const auto plan = plan_of(read);
+    CHECK(wire_rows(plan) ==
+          std::vector<std::string>{"snapshot|mount-of-volume-1|{id-1}|vss|device-1"});
+    REQUIRE(plan.marks.size() == 1);
+    CHECK_FALSE(plan.marks[0].denied);
+    CHECK(plan.marks[0].detail == "IVssEnumObject::Next failed: 0x80042306");
+}
+
+TEST_CASE("filesystem_posture: plan_vss_rows -- an unanswered read names its cause",
+          "[filesystem_posture]") {
+    struct Case {
+        BoundedStatus status;
+        const char* cause;
+    };
+    for (const auto& c : {Case{BoundedStatus::TimedOut, "deadline_exceeded"},
+                          Case{BoundedStatus::Rejected, "deadline_exceeded"},
+                          Case{BoundedStatus::Busy, "call_in_progress"},
+                          Case{BoundedStatus::Abandoned, "abandoned_call_pending"}}) {
+        CAPTURE(c.cause);
+        VssSnapshotsRead read;
+        read.status = c.status;
+        const auto plan = plan_of(read);
+        const std::string detail = std::string{"VSS enumeration did not answer: "} + c.cause;
+        CHECK(wire_rows(plan) == std::vector<std::string>{none_wire_row(detail)});
+        REQUIRE(plan.marks.size() == 1);
+        CHECK_FALSE(plan.marks[0].denied);
+        CHECK(plan.marks[0].detail == detail);
+    }
+}
+
+TEST_CASE("filesystem_posture: plan_vss_rows -- a build without the VSS API says so",
+          "[filesystem_posture]") {
+    auto read = answered_read();
+    read.api_available = false;
+    const auto plan = plan_of(read);
+    CHECK(wire_rows(plan) ==
+          std::vector<std::string>{"snapshot|-|-|none|built without the VSS SDK headers"});
+    REQUIRE(plan.marks.size() == 1);
+    CHECK_FALSE(plan.marks[0].denied);
+    CHECK(plan.marks[0].detail == "SDK header vsbackup.h not present at build time");
 }
