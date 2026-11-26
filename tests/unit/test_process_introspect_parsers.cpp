@@ -1,7 +1,8 @@
 /**
  * test_process_introspect_parsers.cpp -- the pure core of the process_introspect plugin: request
  * grammar, start-time token, /proc/<pid>/stat, the /proc mount-table hidepid check,
- * /proc/<pid>/status, /proc/<pid>/limits, the oom values and the row formatters.
+ * /proc/<pid>/status, /proc/<pid>/limits, the oom values and the row formatters, plus the macOS
+ * pure functions (the per-facet answer, boot-session prefix, start number, nice, sched row).
  *
  * FIXTURES. Each is labelled where it is declared, in one of two kinds.
  *   REAL CAPTURE     -- pasted byte for byte, never edited, from a throwaway root-owned `sleep 600`
@@ -27,6 +28,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
+#include <optional>
 #include <regex>
 #include <string>
 #include <vector>
@@ -637,4 +640,92 @@ TEST_CASE("process_introspect: a process name never reaches any row", "[process_
     for (const auto& row : {format_sched(*st, ss.cpus_allowed_list), format_seccomp(ss),
                             format_oom(1, 2), format_target(1, "0123abcd.1", Facet::sched)})
         CHECK(row.find("SECRETNAME") == std::string::npos);
+}
+
+// ---- macOS pure core -----------------------------------------------------------------------
+
+TEST_CASE("process_introspect: mac_facet_answer rules every facet", "[process_introspect]") {
+    struct Expect {
+        std::string_view facet;
+        MacFacetAnswer answer;
+    };
+    const Expect expected[] = {
+        {"resource_limits", MacFacetAnswer::not_exposed_by_libproc},
+        {"sigmasks", MacFacetAnswer::not_exposed_by_libproc},
+        {"caps", MacFacetAnswer::no_os_equivalent},
+        {"seccomp", MacFacetAnswer::no_os_equivalent},
+        {"oom", MacFacetAnswer::not_exposed_by_libproc},
+        {"sched", MacFacetAnswer::nice_only},
+    };
+    // Every Facet value is covered, each with an explicit expectation.
+    REQUIRE(std::size(expected) == kFacetNames.size());
+    for (const auto& e : expected) {
+        const auto f = parse_facet(e.facet);
+        REQUIRE(f.has_value());
+        INFO(e.facet);
+        CHECK(mac_facet_answer(*f) == e.answer);
+    }
+}
+
+TEST_CASE("process_introspect: boot_session_prefix folds an upper-case UUID", "[process_introspect]") {
+    const std::string upper = "0123ABCD-4567-89AB-CDEF-0123456789AB";
+    const auto p = boot_session_prefix(upper);
+    REQUIRE(p.has_value());
+    CHECK(*p == "0123abcd");
+    CHECK(boot_prefix("0123abcd-4567") == p);
+    CHECK(boot_session_prefix("0123abcd-4567-89ab") == std::optional<std::string>{"0123abcd"});
+    CHECK_FALSE(boot_session_prefix("0123ABC").has_value());
+    CHECK_FALSE(boot_session_prefix("").has_value());
+    CHECK_FALSE(boot_session_prefix("0123ABCG-4567").has_value());
+    CHECK_FALSE(boot_session_prefix("0123abcg-4567").has_value());
+    CHECK_FALSE(boot_session_prefix("0123-BCD-4567").has_value());
+}
+
+TEST_CASE("process_introspect: mac_identity_number folds both start stamps",
+          "[process_introspect]") {
+    // Golden values from an independent FNV-1a implementation over the little-endian bytes of
+    // (sec * 1e6 + usec) and the monotonic stamp.
+    CHECK(mac_identity_number(1700000000, 123456, 10088783211851ULL) ==
+          std::optional<std::uint64_t>{5209951589045475912ULL});
+    CHECK(mac_identity_number(1700000000, 123456, 10088783211852ULL) ==
+          std::optional<std::uint64_t>{14632038698758070891ULL});
+    CHECK(mac_identity_number(1700000000, 123456, 1) ==
+          std::optional<std::uint64_t>{7205747533825640742ULL});
+    // Same wall stamp, different monotonic stamp: different numbers (the UP-3 case).
+    CHECK(mac_identity_number(5, 5, 100) != mac_identity_number(5, 5, 101));
+    // Same monotonic stamp, different wall stamp: different numbers.
+    CHECK(mac_identity_number(5, 5, 100) != mac_identity_number(5, 6, 100));
+    // An unusable wall stamp or a zero monotonic stamp is refused, never folded.
+    CHECK_FALSE(mac_identity_number(0, 5, 100).has_value());
+    CHECK_FALSE(mac_identity_number(1, 1000000, 100).has_value());
+    CHECK_FALSE(mac_identity_number(1, 0, 0).has_value());
+    // Always fits the token's 1-20 digit field.
+    CHECK(std::to_string(*mac_identity_number(1, 0, UINT64_MAX)).size() <= 20);
+}
+
+TEST_CASE("process_introspect: mac_start_number joins sec and usec", "[process_introspect]") {
+    CHECK(mac_start_number(1700000000, 123456) == std::optional<std::uint64_t>{1700000000123456ULL});
+    CHECK(mac_start_number(1, 0) == std::optional<std::uint64_t>{1000000ULL});
+    CHECK(mac_start_number(1, 999999) == std::optional<std::uint64_t>{1999999ULL});
+    CHECK_FALSE(mac_start_number(0, 5).has_value());
+    CHECK_FALSE(mac_start_number(1, 1000000).has_value());
+    CHECK_FALSE(mac_start_number(UINT64_MAX, 0).has_value());
+    CHECK_FALSE(mac_start_number(UINT64_MAX / 1000000ULL + 1, 0).has_value());
+    const auto n = mac_start_number(1700000000, 42);
+    REQUIRE(n.has_value());
+    CHECK(valid_start_time_token(start_time_token("0123abcd", *n)));
+}
+
+TEST_CASE("process_introspect: mac_nice accepts only -20..20", "[process_introspect]") {
+    for (const int ok : {0, 20, -5, -20})
+        CHECK(mac_nice(ok) == std::optional<int>{ok});
+    for (const int bad : {21, -21, 128})
+        CHECK_FALSE(mac_nice(bad).has_value());
+}
+
+TEST_CASE("process_introspect: format_sched_nice_only emits dashes for what libproc lacks",
+          "[process_introspect]") {
+    CHECK(format_sched_nice_only(0) == "sched|-|0|-|-");
+    CHECK(format_sched_nice_only(7) == "sched|-|7|-|-");
+    CHECK(format_sched_nice_only(-5) == "sched|-|-5|-|-");
 }

@@ -455,7 +455,7 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.10 Middleware Inventory :large_orange_diamond: `T3` *(new row, v4.1)*
 
-`middleware` plugin: installed middleware from installer metadata, table-driven, with IBM MQ (`ibm_mq`) as the one product so far; no subprocess. **Linux only** — Windows and macOS are planned. Feeds the installed-software daily-sync source (§35.2). *(Evidence: `agents/plugins/middleware/README.md`.)*
+`middleware` plugin: installed middleware from installer metadata, table-driven, with IBM MQ (`ibm_mq`) as the one product so far; no subprocess. **Linux and Windows** (Windows supported: its registry key and value names were confirmed on one real IBM MQ 9.4.5.0 install); macOS is planned. Feeds the installed-software daily-sync source (§35.2). *(Evidence: `agents/plugins/middleware/README.md`.)*
 
 ### 7.11 Browser and Profile Inventory :large_orange_diamond: `T3` *(new row, v4.1)*
 
@@ -1844,7 +1844,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 
 ### 42.12 Process Introspection :large_orange_diamond: `T2` *(new row, 2026-11-16)*
 
-`process_introspect` plugin `inspect`: one pid and one facet per request (`resource_limits`, `sigmasks`, `caps`, `seccomp`, `oom`, `sched`) as numbers, masks and fixed tokens — never file or memory contents, environment values, socket payloads or command-line arguments. Forensics securable, default-off, AdminOrApproval, single-target. Linux constrained, macOS and Windows planned. *(Evidence: `agents/plugins/process_introspect/README.md`.)*
+`process_introspect` plugin `inspect`: one pid and one facet per request (`resource_limits`, `sigmasks`, `caps`, `seccomp`, `oom`, `sched`) as numbers, masks and fixed tokens — never file or memory contents, environment values, socket payloads or command-line arguments. Forensics securable, default-off, AdminOrApproval, single-target. Linux and macOS constrained (macOS reads only the `sched` nice value through libproc, never a task port; the other five facets answer a permanent `unsupported`), Windows planned. *(Evidence: `agents/plugins/process_introspect/README.md`.)*
 
 ---
 
@@ -1878,7 +1878,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | runtimes | Y | Y | Y | Software |
 | msi_packages | Y | - | Y | Software |
 | pkg_inventory | Y | Y | Y | Software |
-| middleware | - | Y | - | Software |
+| middleware | Y | Y | - | Software |
 | component_inventory | - | Y | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
@@ -1920,7 +1920,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | update_source_trust | - | Y | - | Security |
 | mgmt_posture | - | 🟡 | Y | Security |
 | remote_access_audit | - | 🟡 | Y | Security |
-| process_introspect | - | 🟡 | - | Security |
+| process_introspect | - | 🟡 | 🟡 | Security |
 | shares | Y | Y | Y | Network |
 | virtualization | 🟡 | Y | Y | System Info |
 | agent_logging | Y | Y | Y | Agent Mgmt |

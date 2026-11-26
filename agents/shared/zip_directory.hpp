@@ -3,6 +3,9 @@
 /**
  * zip_directory.hpp - bounded ZIP central-directory reader.
  *
+ * Shared since SAM-47 (agents/shared): the consumers are component_inventory
+ * and, later, middleware.
+ *
  * Pure: no file I/O, no inflate. The caller reads the last
  * min(file_size, kMaxTailBytes) bytes of an archive, asks
  * find_central_directory() where the directory is, reads exactly that range,

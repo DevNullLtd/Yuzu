@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# instructions-tests.sh — exercise every (safe + mutating) InstructionDefinition
-# against a live UAT stack via the REST API.
+# instructions-tests.sh: exercise the (safe + mutating) InstructionDefinitions, less the rows
+# skipped by name (below), against a live UAT stack via the REST API.
 #
 # This is the bash entry point for the /test --instructions gate. The
 # real work is in scripts/test/instructions_runner.py — this script just
@@ -38,6 +38,15 @@
 # Permissions: Execution:Execute to dispatch, Response:Read to poll the results and
 # Infrastructure:Read for the agent lookup. The manifest is an attempt log, not outcome
 # evidence; see the runner's --help for the recovery recipe after a stop.
+#
+# Rows the runner skips by name, with the reason recorded (never passed): agent.http_client.get/head
+# always (the plugin SSRF-blocks every target the runner could reach offline),
+# crossplatform.echo.configure and windows.rdp.set_state always (a synthesised value would overwrite
+# each reached agent's Echo byte budget, or turn remote desktop on), and device.network_actions.ping/flush_dns only when
+# YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1, which a run
+# whose agent has no sudo NOPASSWD grant for resolvectl (see scripts/install-agent-user.sh) or no
+# raw-socket capability (a bwrap rig: no_new_privs) should set. A provisioned host leaves it unset
+# and still runs, and can still fail, those two.
 #
 # Usage:
 #   bash scripts/test/instructions-tests.sh \
@@ -150,6 +159,13 @@ Optional:
                            or integers) — overrides for the schema-synthesised
                            defaults; for destructive/forensic it is required and
                            is the whole params object. See the runner's --help.
+                           Rows skipped by name (ids and reasons printed at the
+                           start, reason also in each row's note and --output):
+                           agent.http_client.get/head and
+                           crossplatform.echo.configure and windows.rdp.set_state always;
+                           device.network_actions.ping/flush_dns only when
+                           YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1 is exported (a run
+                           whose agent lacks the sudo NOPASSWD grant or raw sockets).
   --output FILE            write per-instruction outcomes JSON
   --verbose                print every outcome (default: fail/error only)
 EOF
