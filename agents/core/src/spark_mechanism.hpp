@@ -878,8 +878,11 @@ struct RegistryMechanismDebugCounters {
     /// schedule), and a FIRE-CONVERTED verification retry (a verification result that a
     /// concurrent fire converted into the re-arm; it ran no confirming read and is retried
     /// at once as an ordinary re-arm). This counter alone cannot tell a flapping path from a
-    /// benign fire collision: tell them apart by `warns_claimed_commit_unconfirmed` (only the
-    /// first cause warns) and by whether a fire preceded the retry. The confirming read runs
+    /// benign fire collision, and only one direction is decisive: a NONZERO
+    /// `warns_claimed_commit_unconfirmed` proves the unconfirmed cause occurred (only that
+    /// cause warns), but a ZERO does NOT prove the fire-converted cause (a deferral made
+    /// inside watch() is counted here and never warns, and the warn is once per episode), so
+    /// also look at whether a fire preceded the retry. The confirming read runs
     /// only while the check is on (`path_verify_ms > 0` at launch). Counts retries, not
     /// watches.
     std::uint64_t commit_capture_retry{0};

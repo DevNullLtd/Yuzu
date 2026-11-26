@@ -18084,7 +18084,9 @@ namespace {
 /// YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS is set to a non-empty value other than "0": the same
 /// semantics as skip_or_fail() in test_registry_win_internals.cpp and ci.yml's Windows leg, so a
 /// runner meant to run these cases cannot report them green without having run them. Every
-/// [7877] precondition skip goes through here; none is a bare SKIP().
+/// [7877] precondition skip that is about a missing privilege goes through here. The one
+/// deliberate bare SKIP() is skip_hkcr_case_under_local_system() below: a LocalSystem token
+/// has no per-user class view, which is a premise mismatch, not a privilege to require.
 void skip_or_fail_registry(const std::string& why) {
     const char* req = std::getenv("YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS");
     if (req != nullptr && req[0] != '\0' && std::string_view{req} != "0")
@@ -18341,7 +18343,9 @@ struct NameHookGate {
 /// 20 ms here), so right after a fire `all_notification()` can still show the Notification of
 /// BEFORE the fire and pass before any re-arm has committed. The name counter moves only at
 /// an accepted commit, which closes that window. Not usable for a change that leaves the
-/// watch with no readable name (the counter would not move).
+/// watch with no readable name (the counter would not move). Residue (INFO): in the
+/// delete-race loop a stray LATE commit of an earlier change can still satisfy this and let
+/// a case pass before the commit it meant to wait for; the window is narrow.
 [[nodiscard]] bool rearm_committed(RegVerifyHarness& h, std::uint64_t recorded0) {
     return h.counters().commit_name_recorded > recorded0 && h.all_notification() &&
            h.engine.stats().armed_faulted == 0;
@@ -18394,7 +18398,10 @@ struct NameHookGate {
 }
 
 /// The two HKCR cases need a per-user class layer over HKLM\SOFTWARE\Classes, which a
-/// LocalSystem token does not have. Skips unconditionally (see the block comment above).
+/// LocalSystem token does not have. Skips under LocalSystem (see the block comment above)
+/// even when YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS is set: a CI runner that ran as LocalSystem
+/// would skip these two cases (and so would not exercise the settle fix they carry) while
+/// reporting green; today only #7637 prevents that runner configuration.
 void skip_hkcr_case_under_local_system() {
     if (running_as_local_system())
         SKIP("HKCU is the .DEFAULT hive under LocalSystem: there is no per-user class view to "
@@ -20093,8 +20100,9 @@ TEST_CASE("Registry spark (real mechanism): a key deleted and re-created while i
 
 namespace {
 /// A tree of nine 255-character components under one salted HKCU key: the canonical name of its
-/// leaf is far past the 4 KiB (2046 UTF-16 units) stack buffer of the name query, so reading it
-/// takes the heap retry. Level 0 is the ancestor an administrator renames (to another
+/// leaf is far past the single-call limit of the name query's 4096-byte stack buffer (about
+/// 4092 bytes of name, 2046 UTF-16 units), so reading it takes the heap retry. Level 0 is the
+/// ancestor an administrator renames (to another
 /// 255-character name, so the leaf's name keeps its length and only its spelling moves).
 struct DeepKeyRig : SaltedHkcuTree {
     static constexpr int kLevels = 9;
@@ -20192,7 +20200,8 @@ void parked_worker_stop_cycle() {
 }
 } // namespace
 
-// B1, the real OS side of the 4 KiB limit. The key's canonical name is past the stack buffer, so
+// B1, the real OS side of the single-call limit (4096-byte buffer, about 4092 bytes of name).
+// The key's canonical name is past the stack buffer, so
 // the commit-time name only exists because the query retried into a heap buffer sized from the
 // kernel's reported length; and the held-name compare must still work on such a name. Before the
 // fix the held name overflowed, the verdict was "undecided" and an administrator who built a
@@ -20208,7 +20217,8 @@ TEST_CASE("Registry spark (real mechanism): a watched key whose canonical name i
     const auto before = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
     REQUIRE(before.has_value());
     INFO("committed name has " << before->size() << " UTF-16 units");
-    CHECK(before->size() > 2046); // 4092 usable bytes of the 4 KiB buffer: this went through the retry
+    // 4092 usable bytes of the 4096-byte buffer: a longer name went through the retry
+    CHECK(before->size() > 2046);
     CHECK(name_names_key(*before, rig.deep));
     CHECK(h.counters().commit_name_recorded >= 1);
     CHECK(h.counters().commit_name_missing == 0);
@@ -20706,7 +20716,10 @@ TEST_CASE("Registry spark (real mechanism): an unreadable held name hides a rena
 // deferred commit warns once per episode; and the per-watch warn claim is identity-checked by a
 // serial. The same rules as above apply: salted keys, RAII cleanup, hook state by shared_ptr,
 // skip_or_fail_registry for a missing privilege.
-// RIG RESULT FOR THE FIX-ROUND TESTS: pending
+// Rig result for the bytes at tip 187a56bc75 (author-reported, one box: weecolin, Windows build
+// 26100, MSVC 19.44; not a CI run; raw logs local only): `[7877]` 39 of 39 (1197 assertions) and
+// 40 of 40 sequential repeats; both red proofs of this round (the fire-converted retry disabled,
+// the confirming read ignoring the interval) go red as designed. See docs/spark-flip-gate.md.
 
 namespace {
 /// Makes the CONFIRMING read of a commit disagree, by call sequence: every probe that commits a
@@ -20949,7 +20962,9 @@ TEST_CASE("Registry spark (real mechanism): a verification converted into the re
     // one commit completed with its confirming read: a retry that skipped the confirming read
     // would leave the delta at 2 (even), and extra pairs keep the parity, so an unrelated
     // spurious re-arm cannot turn that into a pass. `>= 3` rather than `== 3` because a stray
-    // notification (the rename itself) may cause an additional, complete re-arm. In the deny
+    // notification may cause an additional, complete re-arm (the rename of the parent does
+    // not signal the child key's own notify handle, so it is not the source; where the stray
+    // notification comes from was not established). In the deny
     // variant the retry's open is refused until the ACE is lifted, so the same condition is
     // reached only after the lift (the wait below is bounded by kDeafBound * 2).
     auto confirming_read_made = [&] {

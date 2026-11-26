@@ -72,7 +72,9 @@
  *     probe threw, a name that could not be read) leaves the live handle in place: it
  *     is counted (test-only counters until #7658) and warned once per watch per blind
  *     episode in the agent log, which says the watch is not protected until a check
- *     decides. A name past the buffer (a deep path of 255-character components) is read
+ *     decides. A name past the buffer (the 4096-byte stack buffer holds a 4-byte header, so
+ *     one call covers names up to about 4092 bytes, 2046 UTF-16 units; a deep path of
+ *     255-character components is longer) is read
  *     through a one-time retry up to 64 KiB, and one past that cap is a proven mismatch
  *     against a recorded name. With the check ON, a commit (establishment, re-arm, retry) is
  *     accepted only when a second by-path read of the name agrees with the first (a rename
@@ -129,10 +131,11 @@
  *     interval can evict older events (irreversible; one peer measurement on one key,
  *     docs/spark-flip-gate.md: 1 event per check with Registry auditing alone, 6 with
  *     Handle Manipulation also on). With the check ON, every establishment, re-arm and
- *     retry of a non-root Target watch (not a verification) also opens the key by path a
- *     second time for the commit-capture confirmation (one more event with Registry
- *     auditing alone, four more with Handle Manipulation also on: DERIVED from that peer
- *     measurement of the by-path open, not measured for the confirming read itself). With
+ *     retry of a non-root Target watch (not a verification) whose first name read succeeds
+ *     also opens the key by path a second time for the commit-capture confirmation (one
+ *     more event with Registry auditing alone, four more with Handle Manipulation also on:
+ *     DERIVED from that peer measurement of the by-path open, not measured for the
+ *     confirming read itself). With
  *     the check OFF (the default) the only addition of the name check is ONE NtQueryKey
  *     per establishment or re-arm on the handle the probe already holds (a peer measured
  *     no audit event for a name query): no second open, no duplicate, no warn. The
@@ -427,8 +430,9 @@ constexpr int kKeyNameInformation = 3;
 // name of at most 32766 UTF-16 units, about 128 levels of 255-character components (each level
 // adds its separator). A name past it is answered with the raw STATUS_BUFFER_OVERFLOW instead
 // of an ever larger allocation. Whether the Configuration Manager lets a real path grow that
-// long has NOT been tried: the real-name test builds 9 levels (a name past the 4 KiB stack
-// buffer), and the cap branch is exercised with an injected status. The verdict reads the raw
+// long has NOT been tried: the real-name test builds 9 levels (a name past the single-call
+// limit of the 4096-byte stack buffer, about 4092 bytes of name), and the cap branch is
+// exercised with an injected status. The verdict reads the raw
 // overflow as a proven mismatch only when the commit recorded a name (which then fit under the
 // cap) and as undecided otherwise (see name_verdict_locked).
 constexpr std::size_t kMaxKeyNameInfoBytes = 64 * 1024;
@@ -470,7 +474,9 @@ using NtQueryKeyFn = LONG(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
 /// failure `out` is left EMPTY, so a half name is never stored or compared. Failures:
 /// the import is missing, a non-zero status, a length that is zero, odd or past the buffer
 /// (kStatusNameMalformed, a local sentinel: the kernel's own 0xC0000023 stays 0xC0000023),
-/// an allocation failure. A name past the 4 KiB stack buffer is answered once more into a
+/// an allocation failure. A name past the stack buffer (4096 bytes including the 4-byte
+/// header, so about 4092 bytes of name, 2046 UTF-16 units, fit one call) is answered once
+/// more into a
 /// worker-local heap buffer sized from the length the kernel reported (STATUS_BUFFER_OVERFLOW
 /// carries it), up to kMaxKeyNameInfoBytes; past that cap the RAW 0x80000005 is returned. A
 /// second overflow whose reported size is within the cap means the name changed length
@@ -2147,8 +2153,8 @@ private:
             } else if (r.held_name_status == kStatusBufferOverflow && !w.committed_name.empty()) {
                 // The held name is past the cap and C fit in it: a PROVEN mismatch, not an
                 // unreadable name. (An adversary-built deep path could otherwise make the held
-                // name unreadable for ever and hide a rename: the 4 KiB version of this was
-                // the undecided row.)
+                // name unreadable for ever and hide a rename: the single-call-buffer version
+                // of this was the undecided row.)
                 return kReasonKeyMoved; // row 2
             } else {
                 undecided = true; // deleted, invalid handle, denied, no memory, no C, ...
