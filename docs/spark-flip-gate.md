@@ -2069,8 +2069,19 @@ flip, with a red-first test each:
     That figure is DERIVED from the by-path-open measurement above, not measured for the confirming open itself. With
     the check OFF (the default; the interval is fixed at launch of each probe) the confirming read does not run: the
     name work is one `NtQueryKey` per establishment or re-arm on the handle the probe already holds (a peer measured no
-    audit event for a name query), with no second open, no duplicate and no warning. A deferred and retried verification
-    takes a new duplicate, two more events with Handle Manipulation on. The cost statement of item (2) below and #7876 (now titled for the File and Registry
+    audit event for a name query), with no second open, no duplicate and no warning. A verification that the probe lane
+    refused (admission) and that is retried takes a new duplicate for the retry, two more events with Handle
+    Manipulation on; a verification that a fire converted into the re-arm is not retried as a verification but as an
+    ordinary re-arm (a commit with the confirming read, no duplicate). Fire-rate worst case (DERIVED from the code, not
+    measured): with the check on, the confirming open runs on every fire-driven re-arm, so the audit cost on a key that
+    fires scales with how often the key fires, not with the interval; the re-arm rate is bounded only by the 50 ms
+    sweep cadence, about 20 commits a second per watch, up to 40 opens a second on an audited key (one by-path open per
+    commit and one for the confirming read; each is one event with Registry auditing alone, four with Handle
+    Manipulation on). Episodes can repeat (DERIVED from the code, not measured): the per-watch warns are once per
+    episode, not once per watch for ever, so an environment that alternates read outcomes can start a new episode and
+    log again, up to about 10 lines a second per watch by code reading; a per-watch hold-off is a follow-up, not done.
+    The "one name read per establishment" statement of the check-off case holds for names under 4 KiB (a longer name
+    takes the heap retry: two calls). The cost statement of item (2) below and #7876 (now titled for the File and Registry
     mechanisms) apply to the Registry verification by reference, which the owner accepted; the operator levers until the
     runtime switch exists are the boot-time Registry interval (0 = off, the default) and `--spark-disable`, a boot-time
     flag that restarts the agent and switches off all three spark mechanisms. (Before R1) A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
@@ -2551,7 +2562,7 @@ flip, with a red-first test each:
     (17,280 at 5 s) with Registry auditing alone, and 8,640 (103,680 at 5 s) with Handle Manipulation also on; a
     narrower SACL yields fewer. There is no independent positive control for the Handle Manipulation subcategory, so
     its zeros mean zero observed. Not measured in these runs: establishment and re-arm latency through the real probe job, the name
-    `NtQueryKey` reports through HKCR (measured on 2026-11-26, see the Gate 7 round) or a registry link, a profile unload against the mechanism, and the real
+    `NtQueryKey` reports through HKCR (measured on 2026-11-26, recorded in the paragraph "2026-11-26, R1: ASan, a 50-repeat run, the HKCR and link cases and a token check" below) or a registry link, a profile unload against the mechanism, and the real
     (narrower) SACLs of a fleet.
     **2026-11-25 (later), R1 (#7877 item 31): first Windows rig run of the item 31 code and tests, which was RED, and the
     green runs after the test-side fixes; every rig figure here is author-reported, one box (weecolin, build 26100), not a
@@ -2641,8 +2652,8 @@ flip, with a red-first test each:
     real non-administrator account and the CI runner's own token (the second run above is a deny-only-Administrators
     token), and ASan on the new cases.
     **2026-11-26, R1 governance fix round (Gate 7); the code and tests changed AFTER every rig figure above, and the new
-    bytes have NOT been built or run on Windows when this was written (a rig run follows; read the rig figures above as
-    figures for the bytes at `d2c1dea0ba`).** Findings addressed: the held name past the 4 KiB buffer (sec-F1: a heap retry
+    bytes have NOT been built or run on Windows when this was written (a rig run follows: **RIG RESULT FOR THE FIX-ROUND
+    BYTES: pending.** Read the rig figures above as figures for the bytes at `d2c1dea0ba`).** Findings addressed: the held name past the 4 KiB buffer (sec-F1: a heap retry
     up to 64 KiB, a held name past the cap against a recorded commit-time name is a proven move, a fresh name past the cap
     against a readable held name is a re-point; the helper's own malformed-length answer is now a distinct local sentinel
     so the kernel's `0xC0000023` stays real); the commit-capture race (sec-F2: a commit-capable result is accepted only
@@ -2659,7 +2670,8 @@ flip, with a red-first test each:
     token cannot write `HKLM\SOFTWARE\Classes`, and the link and deny-ACE cases if it cannot create a link or set a DACL).
     **2026-11-26, R1 governance SECOND fix round (Gate 8); the code and tests changed AFTER the Gate 7 round above, and these
     bytes have NOT been built or run on Windows when this was written (the first fix round's bytes were on the rig
-    while this round was written; the orchestrator records its result here).** Findings addressed: the confirming read
+    while this round was written; the result of that run is recorded here when it reports: **RIG RESULT FOR THE
+    FIX-ROUND BYTES: pending.**).** Findings addressed: the confirming read
     and its deferral now run only while the check is on (the interval is read when each probe is launched, a
     verification never runs it, and a verification whose duplicate failed is still a verification); the name capture
     on the already-open handle stays unconditional, so the default agent pays one `NtQueryKey` per establishment or
@@ -2675,6 +2687,20 @@ flip, with a red-first test each:
     added. Tests: the establishment-site commit race (one-shot and permanent), the fire-converted verification (accessible
     and deny-ACE), the interval-0 case with a check-on positive control, the first-verification no-name warn, the warn
     text, two watches warning independently, and the handle-count case with a warm-up and a positive control.
+    **2026-11-26, R1 governance THIRD fix round (Gate 8, delta); comment, log-text, test and documentation changes only,
+    no behaviour change, and NOT built or run on Windows when this was written. RIG RESULT FOR THE FIX-ROUND BYTES:
+    pending.** The CommitUnconfirmed warn now says what is true during a deferral (no notification coverage, no
+    rename-and-recreate check, the commit not accepted); `commit_capture_retry` is documented as counting both unconfirmed
+    deferrals and fire-converted verification retries; the operator strings say the confirming second open applies to
+    a non-root Target watch whose first name read succeeds; the fire-converted verification case now proves the retry
+    made its confirming read (an odd fresh-side name-call delta of at least 3). Recorded as UNMEASURED: (1) the
+    sweeper-first delete-race window of 4 ms was measured only on an idle box, so a loaded runner can lose it more
+    often than the rig did (the driver repeats the scenario up to five times and asserts nothing on a lost one);
+    (2) the shard B budget: Windows shard B (`agent_shard_timeouts` in `tests/meson.build`) has a 240 s limit, the
+    budget rule of `docs/testing/unit-test-conventions.md` is 50% of the timeout (120 s), and the `[7877]` cases alone
+    took 34.8 s serial at the first-round tip and 80 s under SYSTEM (figures passed to this round by the session that
+    ran the rig, one box, raw logs not in this tree); the rig run of the final tip will report the shard sum, which is
+    not known until then.
     **Governance review and the fixes after it (#7836).** A scoped `/governance` run (range `da67bf0371..5731eb0632`, ten
     governance agents; happy-path, compliance-officer and enterprise-readiness were omitted by the caller, and the chaos
     plan was written, not executed) was NOT a pass: it raised 43 findings (REG-01 to REG-43), four of them blocking-provisional
