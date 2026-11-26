@@ -1691,8 +1691,9 @@ public:
                                                ? "; the configured value was raised to the floor"
                                                : "";
                         spdlog::info("SparkEngine: Registry path verification: every {} ms "
-                                     "(opt-in; floor {} ms){}; each check opens every watched "
-                                     "Registry key",
+                                     "(opt-in; floor {} ms){}; each check re-opens every watched "
+                                     "Registry key, duplicates the held handle and reads canonical "
+                                     "names (audit-load figures: docs/spark-flip-gate.md)",
                                      registry_path_verify.count(), floor_ms, note);
 #else
                         spdlog::info("SparkEngine: Registry path verification: every {} ms "

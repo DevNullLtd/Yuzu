@@ -2063,12 +2063,17 @@ private:
     /// retired or drained, and `open_key` is the handle this watch owns at this instant.
     /// Duplicating off-lock from a value read here is the handle-recycle hazard (the drain
     /// closes the original, a later open reuses the value, the duplicate names a
-    /// stranger's key). The call itself is an object-model INFERENCE, not a document: it
+    /// stranger's key). The call itself rests on the object model, not on a document: it
     /// references the object through the handle table and inserts an entry, the Key type
     /// has no open procedure that dispatches into the configuration manager, so no
-    /// registry lock is taken and a hung hive cannot block it (NtQueryKey does take that
-    /// lock, which is why it runs only on the worker). Measured cost on a healthy hive,
-    /// not a hung-hive proof: p99 under 1 us over 500 keys (#7877 step 0, 2026-11-25).
+    /// registry lock is taken (NtQueryKey does take that lock, which is why it runs only
+    /// on the worker). Measured cost on a healthy hive: p99 under 1 us over 500 keys
+    /// (#7877 step 0, 2026-11-25). Measured against a long hive operation (2026-11-26,
+    /// standalone probe, one box, docs/spark-flip-gate.md): while another process looped
+    /// RegSaveKeyExW over a 276 MB hive that a second process held a KEY_NOTIFY handle in,
+    /// DuplicateHandle stayed at a median of 0.5 us (max 37 us) while NtQueryKey and
+    /// RegOpenKeyExW stalled up to 1.3 s. Not measured: the held key's own hive being
+    /// loaded or unloaded, and Handle Manipulation auditing on.
     /// Precedent for a microsecond kernel call under mu_: SetThreadpoolWait in unwatch()
     /// and the drain-lane launch in retire_locked(). The duplicate carries KEY_NOTIFY only
     /// (DUPLICATE_SAME_ACCESS), which NtQueryKey(KeyNameInformation) accepts. If this ever

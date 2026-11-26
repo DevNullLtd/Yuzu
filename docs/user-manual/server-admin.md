@@ -6957,10 +6957,12 @@ procedure and recovery from a malformed value (it shares the crash-loop backstop
 The same file can carry `YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL` (seconds; `0` or unset = off; `1` to `4` is raised to `5`),
 the boot-time opt-in for the Windows Registry spark mechanism's rename check. A malformed or out-of-range value (negative, above
 86400, non-numeric, or with a trailing `#` comment, which `EnvironmentFile=` does not strip) stops the agent at start on every OS,
-including where the setting is ignored, and `--spark-disable` does not bypass that validation. Enabling it opens every watched
-registry key every interval, which on keys with an auditing SACL can write Security-log events: read
+including where the setting is ignored, and `--spark-disable` does not bypass that validation. Enabling it re-opens every watched
+registry key every interval, duplicates the held handle and reads canonical names, which on keys with an auditing SACL writes
+Security-log events (measured once on one key: 1 per check with Registry auditing alone, 6 with Handle Manipulation also on;
+leave it at `0` where SACLs audit object access): read
 [the Registry paragraph](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only) first. The mechanism is not
-enabled in production.
+enabled in production. Rollback is to unset the variable (or set it to `0`) and restart the agent: nothing is persisted.
 
 **Installation:**
 

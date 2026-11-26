@@ -111,9 +111,12 @@ struct Config {
     // Registry spark periodic path verification (#5719 item 5, #7836, REG-15-I2):
     // --spark-registry-path-verify-interval SECONDS /
     // YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL, boot-time. 0 (the default) = OFF:
-    // the Registry mechanism opens no key for verification, because an open per key per
-    // interval on a key with an auditing SACL writes Security-log events and can evict
-    // older ones. A value of 1..4 is raised to 5 s; the CLI refuses a negative or a
+    // the Registry mechanism runs no verification, because each check re-opens the key by
+    // path, duplicates the held handle and reads canonical names, and on a key with an
+    // auditing SACL that writes Security-log events (measured once on one key: 1 per check
+    // with Registry auditing alone, 6 with Handle Manipulation also on) and can evict older
+    // ones; leave it at 0 where SACLs audit object access. Rollback: unset or 0 and
+    // restart the agent, nothing persists. A value of 1..4 is raised to 5 s; the CLI refuses a negative or a
     // value above 86400. Windows only: accepted and ignored on Linux and macOS, where
     // there is no Registry mechanism.
     int spark_registry_path_verify_interval_s{0};

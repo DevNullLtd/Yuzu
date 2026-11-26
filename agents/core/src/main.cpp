@@ -550,12 +550,16 @@ int main(int argc, char* argv[]) {
     app.add_option("--spark-registry-path-verify-interval",
                    cfg.spark_registry_path_verify_interval_s,
                    "Windows only (accepted and ignored elsewhere): how often, in seconds, the "
-                   "Registry spark re-opens each watched key by path to notice that a parent "
-                   "key was renamed away (otherwise the watch stays healthy and silent). 0 "
-                   "(default) = OFF. Each check opens the key, which on a key with an "
-                   "auditing SACL writes a Security-log event; an open per key per interval "
-                   "can evict older events, so enable it per estate. 1..4 is raised to 5; "
-                   "maximum 86400. Boot-time only, not a server-side runtime toggle. "
+                   "Registry spark checks each watched key for a parent that was renamed "
+                   "away (otherwise the watch stays healthy and silent). 0 (default) = OFF. "
+                   "Each check re-opens the key by path, duplicates the held handle and reads "
+                   "the canonical names of both; on a key with an auditing SACL that writes "
+                   "Security-log events (measured once, on one key: 1 per check with Registry "
+                   "auditing alone, 6 with Handle Manipulation auditing also on), and an open "
+                   "per key per interval can evict older events, so leave it at 0 where SACLs "
+                   "audit object access. 1..4 is raised to 5; maximum 86400. Boot-time only, "
+                   "not a server-side runtime toggle; rollback is to unset it or set 0 and "
+                   "restart the agent (nothing persists). "
                    "Env: YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL.")
         ->default_val(0)
         // The range is checked after the parse, NOT with ->check(CLI::Range): CLI11 runs
