@@ -4066,11 +4066,13 @@ TEST_CASE("Service spark (real mechanism, private bus): losing the bus faults an
 #include <aclapi.h> // SetEntriesInAclW / SetNamedSecurityInfoW (#5719 item 5 DENY-ACL case)
 
 #include <cmath> // std::floor / std::log2 - the #4658 pass-count bound
+#include <cstring> // std::memcpy - the NtQueryKey name buffer (#7877 item 31)
 #include <cstdlib> // std::getenv - YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS (#7877 item 31 skips)
 #include <cwctype> // std::towlower - the #7877 canonical-name tail compare
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <sstream> // std::ostringstream - the failure-output state lines (#7877 item 31)
 
 #include <spdlog/sinks/base_sink.h> // PfStallLogger (#4658 PF-11/PF-12)
 #include <spdlog/spdlog.h>
@@ -18304,6 +18306,46 @@ struct NameHookGate {
     }
     return steady;
 }
+/// One line of the first watch's observable state, for the INFO of an assertion that follows
+/// a wait: the committed name, the ENGINE's view of coverage (the mechanism's last report to
+/// it, not the mechanism's own mark), the fault counts and the commit, retry and verify
+/// counters. A recurrence of a flake prints what the watch was doing, not just `false`.
+[[nodiscard]] std::string describe_watch_state(RegVerifyHarness& h) {
+    const auto c = h.counters();
+    std::ostringstream o;
+    o << "committed name: ";
+    if (const auto n = registry_committed_name_for_test(*h.raw, spark_key(h.specs.at(0))))
+        o << (n->empty() ? std::string("(empty)") : yuzu::win::from_wide(n->c_str()));
+    else
+        o << "(no watch)";
+    o << "; engine coverage: " << deaf_coverage_text(h.engine, h.subs.at(0))
+      << "; armed_faulted " << h.engine.stats().armed_faulted << "; fired " << h.fired()
+      << ", synthetic " << c.synthetic_fires << ", faulted events " << faulted_events(h)
+      << ", recovered events " << recovered_events(h) << "; commit_name_recorded "
+      << c.commit_name_recorded << ", commit_name_missing " << c.commit_name_missing
+      << ", commit_capture_retry " << c.commit_capture_retry << ", verify_launched "
+      << c.verify_launched << ", verify_name_lost " << c.verify_name_lost
+      << ", verify_name_undecided " << c.verify_name_undecided << ", verify_lost "
+      << c.verify_lost << ", verify_undecided " << c.verify_undecided << ", verify_dup_failed "
+      << c.verify_dup_failed << ", warns_claimed_commit_unconfirmed "
+      << c.warns_claimed_commit_unconfirmed << ", warns_claimed_name_missing "
+      << c.warns_claimed_name_missing << ", warns_claimed_undecided " << c.warns_claimed_undecided
+      << ", warns_claimed_dup_failed " << c.warns_claimed_dup_failed;
+    return o.str();
+}
+/// The re-arm that a consumed notification owes has COMMITTED, and the watch reads healthy:
+/// a commit recorded a name beyond `recorded0` (taken BEFORE the change that fires the watch),
+/// and the engine shows Notification coverage and no faulted watch. The engine's coverage is
+/// the mechanism's LAST REPORT: on_fire marks the coverage None under the mechanism's lock,
+/// but the engine hears of it only at the sweeper's next report (up to one sweep cadence,
+/// 20 ms here), so right after a fire `all_notification()` can still show the Notification of
+/// BEFORE the fire and pass before any re-arm has committed. The name counter moves only at
+/// an accepted commit, which closes that window. Not usable for a change that leaves the
+/// watch with no readable name (the counter would not move).
+[[nodiscard]] bool rearm_committed(RegVerifyHarness& h, std::uint64_t recorded0) {
+    return h.counters().commit_name_recorded > recorded0 && h.all_notification() &&
+           h.engine.stats().armed_faulted == 0;
+}
 /// A write through a fresh handle on the registered path fires the watch (it is not deaf).
 [[nodiscard]] bool write_fires(RegVerifyHarness& h, const RegRenameRig& rig, DWORD v) {
     const auto before = h.fired();
@@ -18318,6 +18360,77 @@ struct NameHookGate {
     const std::string path = rig.parent.sub + "\\" + leaf;
     return ::RegCreateKeyExA(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
                              nullptr, &k.h, nullptr) == ERROR_SUCCESS;
+}
+
+// ── #7877 item 31 (R1): the process token and the real HKCU hive ─────────────────────────────
+//
+// Two premises of the HKCR and link cases hold only for an ordinary user token. Under
+// LocalSystem (a service, or a runner started as SYSTEM) HKCU is the `.DEFAULT` hive, not the
+// user's own `<SID>` hive, and the merged HKCR view has no per-user class layer to shadow the
+// machine key (rig run, build 26100, 2026-11-26). A SYSTEM token is therefore a premise
+// mismatch of those cases, not a missing privilege, so the HKCR cases skip on it WITHOUT
+// going through skip_or_fail_registry: YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS must not turn a
+// SYSTEM run into a failure the token can never satisfy.
+
+/// True when the process token's user is LocalSystem (S-1-5-18). Read once per process; false
+/// when the token cannot be read (an unreadable token is not evidence of LocalSystem).
+[[nodiscard]] bool running_as_local_system() {
+    static const bool is_system = [] {
+        HANDLE raw = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &raw))
+            return false;
+        UniqueHandle tok(raw);
+        DWORD n = 0;
+        ::GetTokenInformation(tok.h, TokenUser, nullptr, 0, &n);
+        if (n == 0)
+            return false;
+        std::vector<BYTE> buf(n);
+        if (!::GetTokenInformation(tok.h, TokenUser, buf.data(), n, &n))
+            return false;
+        return ::IsWellKnownSid(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid,
+                                WinLocalSystemSid) != FALSE;
+    }();
+    return is_system;
+}
+
+/// The two HKCR cases need a per-user class layer over HKLM\SOFTWARE\Classes, which a
+/// LocalSystem token does not have. Skips unconditionally (see the block comment above).
+void skip_hkcr_case_under_local_system() {
+    if (running_as_local_system())
+        SKIP("HKCU is the .DEFAULT hive under LocalSystem: there is no per-user class view to "
+             "shadow the machine key");
+}
+
+/// The canonical NT name of the key behind `h` (NtQueryKey, KeyNameInformation), or empty
+/// when it cannot be read. `h` must be a real handle: a predefined root such as
+/// HKEY_CURRENT_USER answers STATUS_INVALID_HANDLE.
+[[nodiscard]] std::wstring nt_key_name(HKEY h) {
+    using NtQueryKeyFn = LONG(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+    static const auto fn = ntdll_export<NtQueryKeyFn>("NtQueryKey");
+    if (fn == nullptr || h == nullptr)
+        return {};
+    alignas(8) unsigned char buf[4096];
+    ULONG len = 0;
+    if (fn(reinterpret_cast<HANDLE>(h), 3 /*KeyNameInformation*/, buf, sizeof(buf), &len) != 0)
+        return {};
+    ULONG bytes = 0; // KEY_NAME_INFORMATION: a ULONG byte length, then the UTF-16 name
+    std::memcpy(&bytes, buf, sizeof(bytes));
+    if (bytes == 0 || bytes > sizeof(buf) - sizeof(ULONG))
+        return {};
+    std::wstring name(bytes / sizeof(wchar_t), L'\0');
+    std::memcpy(name.data(), buf + sizeof(ULONG), name.size() * sizeof(wchar_t));
+    return name;
+}
+
+/// The canonical NT name of the hive HKCU resolves to for THIS token: `\REGISTRY\USER\<SID>`
+/// for a user, `\REGISTRY\USER\.DEFAULT` under LocalSystem. Read from a real handle
+/// (RegOpenCurrentUser), never derived from the token's SID, so it is right for every token.
+/// Empty when it cannot be read.
+[[nodiscard]] std::wstring current_user_hive_name() {
+    RegKeyOwner k;
+    if (::RegOpenCurrentUser(KEY_READ, &k.h) != ERROR_SUCCESS)
+        return {};
+    return nt_key_name(k.h);
 }
 
 // ── #7877 item 31 (R1): rigs for the HKCR, link and delete-race cases ────────────────────────
@@ -18373,12 +18486,14 @@ struct SaltedHkcuTree {
 /// stopped the setup (`ok` false), so a case can skip with the reason.
 struct RegLinkRig : SaltedHkcuTree {
     std::string t1{full("T1")}, t2{full("T2")}, link{full("L")};
-    std::wstring sid{current_user_sid()};
+    /// The NT name of the hive HKCU resolves to for this token (a link target is an NT path):
+    /// `\REGISTRY\USER\<SID>` for a user, `\REGISTRY\USER\.DEFAULT` under LocalSystem.
+    std::wstring hive{current_user_hive_name()};
     bool ok{false};
     LONG err{ERROR_SUCCESS};
 
     explicit RegLinkRig(const char* tag) : SaltedHkcuTree(tag) {
-        if (sid.empty()) {
+        if (hive.empty()) {
             err = ERROR_NO_TOKEN;
             return;
         }
@@ -18416,8 +18531,7 @@ struct RegLinkRig : SaltedHkcuTree {
 private:
     /// A link's target is the NT path of the key it names, kept in `SymbolicLinkValue`.
     [[nodiscard]] LONG set_target(HKEY link_key, const std::string& sub) const {
-        const std::wstring target =
-            L"\\Registry\\User\\" + sid + L"\\" + std::wstring(sub.begin(), sub.end());
+        const std::wstring target = hive + L"\\" + std::wstring(sub.begin(), sub.end());
         return ::RegSetValueExW(link_key, L"SymbolicLinkValue", 0, REG_LINK,
                                 reinterpret_cast<const BYTE*>(target.data()),
                                 static_cast<DWORD>(target.size() * sizeof(wchar_t)));
@@ -18631,10 +18745,10 @@ struct SweeperFirst {
                        kDeafBound));
     CHECK(settles_quietly(h));
     const auto before = h.fired();
+    const auto recorded1 = h.counters().commit_name_recorded;
     REQUIRE(tree.write("Child", 9));
     CHECK(eventually([&] { return h.fired() > before; }, kDeafBound)); // not deaf on the new key
-    REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
-                       kDeafBound));
+    REQUIRE(eventually([&] { return rearm_committed(h, recorded1); }, kDeafBound));
     h.apply(ctl(20ms)); // verification back on: the converged watch must stay healthy
     CHECK(stays_healthy(h, 500ms));
     CHECK(h.counters().verify_name_lost == 0);
@@ -19065,8 +19179,10 @@ TEST_CASE("Registry spark (real mechanism): a refused verification launch does n
 // token may not give (the deny-ACE case can set its ACE or it SKIPs with the reason; the
 // root-key case SKIPs when the mechanism refuses an empty subkey; the two HKCR cases write a
 // machine class key under HKLM\SOFTWARE\Classes and SKIP with the reason when this token
-// cannot; the link case SKIPs when the token cannot create a registry link). None fakes a
-// result: a case that cannot establish its precondition says so and skips.
+// cannot, and ALWAYS skip under a LocalSystem token (no per-user class layer, whatever
+// YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS says); the link case SKIPs when the token cannot create
+// a registry link). None fakes a result: a case that cannot establish its precondition says so
+// and skips.
 
 // The path-level verdict is unchanged by R1 and keeps its OWN reason: a parent renamed away
 // with nothing re-created leaves the path unresolvable, which the existing verdict reports
@@ -19241,21 +19357,31 @@ TEST_CASE("Registry spark (real mechanism): deleting the watched key and re-crea
         INFO("iteration " << i);
         const auto fired0 = h.fired();
         const auto rsyn0 = h.counters().synthetic_fires;
+        const auto recorded0 = h.counters().commit_name_recorded;
         REQUIRE(::RegDeleteTreeA(HKEY_CURRENT_USER, rig.child.c_str()) == ERROR_SUCCESS);
         REQUIRE(create_leaf(rig, (i % 2 == 0) ? "Child" : "child")); // ends on "child"
         // The delete signals the held handle; then the watch must settle back onto the new key.
+        // Settled includes a COMMIT after the delete (a name recorded beyond `recorded0`): the
+        // engine's coverage can still show the Notification of before the fire, so settled()
+        // alone can pass with the re-arm not yet committed.
         REQUIRE(eventually([&] { return h.fired() > fired0; }, kDeafBound));
-        REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
+        REQUIRE(eventually([&] {
+            return h.settled(fired0, rsyn0) && h.counters().commit_name_recorded > recorded0;
+        }, kDeafBound));
+        // write_fires is itself a change the watch consumes: every consumed notification is a
+        // coverage gap until the re-arm commits (on_fire marks None, the sweeper commits one or
+        // two passes later; 31 ms on the rig, 2026-11-25), so coverage read straight after it
+        // is None by design and proves nothing, and the engine's view of it can still be the
+        // stale Notification of before the fire. Wait for that re-arm to COMMIT before the next
+        // round (and, after the last, before the hold), so every round's baseline is a settled
+        // watch and a later wait is never satisfied by an earlier round's commit.
+        const auto recorded_w = h.counters().commit_name_recorded;
         REQUIRE(write_fires(h, rig, static_cast<DWORD>(i + 1)));
+        REQUIRE(eventually([&] { return rearm_committed(h, recorded_w); }, kDeafBound));
     }
-    // The last write_fires is itself a change the watch consumes: every consumed notification
-    // is a coverage gap until the re-arm commits (on_fire marks None, the sweeper commits one or
-    // two passes later; 31 ms on the rig, 2026-11-25), so coverage read straight after it is
-    // None by design and proves nothing. Wait for that re-arm, then require the watch to STAY
-    // covered and unfaulted for a window with verification still running at 20 ms: a standing
-    // or recurring fault would show here, and a name verdict in the counters below.
-    REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
-                       kDeafBound));
+    // Require the watch to STAY covered and unfaulted for a window with verification still
+    // running at 20 ms: a standing or recurring fault would show here, and a name verdict in
+    // the counters below.
     const auto verifies0 = h.counters().verify_launched;
     CHECK(stays_healthy(h, 300ms));
     // The hold really ran verifications against the re-created key (it is not vacuous).
@@ -19736,6 +19862,7 @@ TEST_CASE("Registry spark (real mechanism): a per-user HKCR class key appearing 
           "machine key faults the watch as 're-pointed' and the retry recovers onto it "
           "(#7877 item 31, HKCR)",
           "[spark][mechanism][windows][5719][7877]") {
+    skip_hkcr_case_under_local_system(); // a premise mismatch, not a missing privilege
     if (!hklm_classes_writable())
         skip_or_fail_registry("HKLM\\SOFTWARE\\Classes is not writable with this token: the HKCR "
                               "cases need a machine class key");
@@ -19774,11 +19901,12 @@ TEST_CASE("Registry spark (real mechanism): a per-user HKCR class key appearing 
     REQUIRE(recorded.has_value());
     CHECK(name_is_user_class_key(*recorded, rig.rel_child));
     const auto before = h.fired();
+    const auto recorded1 = h.counters().commit_name_recorded;
     REQUIRE(rig.write_user(3));
     CHECK(eventually([&] { return h.fired() > before; }, kDeafBound));
     // The write's own fire is a coverage gap until the re-arm commits; judge the flap after it.
-    REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
-                       kDeafBound));
+    // Wait for that commit itself (rearm_committed), not for the engine's possibly stale view.
+    REQUIRE(eventually([&] { return rearm_committed(h, recorded1); }, kDeafBound));
     CHECK(stays_healthy(h, 400ms));
     CHECK(faulted_events(h) == 1); // one fault for one shadowing, none after the recovery
     h.engine.stop();
@@ -19793,6 +19921,7 @@ TEST_CASE("Registry spark (real mechanism): a per-user HKCR class key appearing 
 TEST_CASE("Registry spark (real mechanism): the per-user HKCR class key a watch holds being "
           "deleted settles onto the machine key with no fault (#7877 item 31, HKCR)",
           "[spark][mechanism][windows][5719][7877]") {
+    skip_hkcr_case_under_local_system(); // a premise mismatch, not a missing privilege
     if (!hklm_classes_writable())
         skip_or_fail_registry("HKLM\\SOFTWARE\\Classes is not writable with this token: the HKCR "
                               "cases need a machine class key");
@@ -19808,16 +19937,39 @@ TEST_CASE("Registry spark (real mechanism): the per-user HKCR class key a watch 
     const auto rsyn0 = h.counters().synthetic_fires;
     rig.delete_user();
     CHECK(eventually([&] { return h.fired() > fired0; }, kDeafBound)); // the delete's own fire
-    REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
-    CHECK(faulted_events(h) == 0);
-    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
-    REQUIRE(recorded.has_value());
-    CHECK(name_is_machine_class_key(*recorded, rig.rel_child)); // back on the machine key
+    // Wait for the committed name itself, not for a snapshot of it. settled() reads the
+    // ENGINE's coverage, which is the mechanism's last report: the delete's fire marks the
+    // coverage None under the mechanism's lock, but the engine hears of it only at the
+    // sweeper's next report (up to the 20 ms cadence), so right after the fire settled() can
+    // pass on the Notification of before the delete, with the re-arm not yet committed and the
+    // committed name still the per-user one. That is the reading of the one failure seen (1 of
+    // 40 full-set rig runs, 2026-11-26: the name check and the hold below both failed, in the
+    // 500 ms after the harness started); it was derived from the code and the log timing, not
+    // reproduced or measured. The wait is bounded and the state is printed if it expires.
+    const auto on_machine_key = [&] {
+        const auto n = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+        return n.has_value() && name_is_machine_class_key(*n, rig.rel_child);
+    };
+    const bool converged =
+        eventually([&] { return on_machine_key() && h.settled(fired0, rsyn0); }, kDeafBound);
+    {
+        INFO("state when the wait ended: " << describe_watch_state(h));
+        REQUIRE(converged); // committed onto the machine key, healthy, synthetic fires delivered
+        CHECK(faulted_events(h) == 0);
+        const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+        REQUIRE(recorded.has_value());
+        CHECK(name_is_machine_class_key(*recorded, rig.rel_child)); // back on the machine key
+        // Nothing else is still re-arming (a second notification of the same delete would show
+        // here): the hold below starts from a quiet watch.
+        CHECK(settles_quietly(h));
+    }
 
     // Verification on again: it compares the machine key with itself, so no false fault.
     h.apply(rename_controls(20ms));
     const auto launched0 = h.counters().verify_launched;
-    CHECK(stays_healthy(h, 500ms));
+    const bool healthy = stays_healthy(h, 500ms);
+    INFO("state after the hold: " << describe_watch_state(h));
+    CHECK(healthy);
     CHECK(h.counters().verify_launched >= launched0 + 3); // the hold really ran verifications
     CHECK(h.counters().verify_name_lost == 0);
     CHECK(h.counters().verify_name_undecided == 0);
@@ -19828,7 +19980,10 @@ TEST_CASE("Registry spark (real mechanism): the per-user HKCR class key a watch 
 // A registry link re-pointed from T1 to T2 while a watch holds the key behind it. A verification
 // opens the path through the link and so lands on T2, while the held handle still is T1 and
 // nobody told it: the same secondary compare, with the same reason and recovery. HKCU only.
-// The rig removes the link by handle before the tree (a path delete would follow it).
+// The rig removes the link by handle before the tree (a path delete would follow it). A link
+// target is an NT path, so the rig names the hive HKCU really resolves to for this token
+// (`\REGISTRY\USER\<SID>`, or `\REGISTRY\USER\.DEFAULT` under LocalSystem) rather than
+// building it from the token's SID; the case runs under LocalSystem too.
 TEST_CASE("Registry spark (real mechanism): a registry link re-pointed to another key faults "
           "the watch as 're-pointed' and the retry recovers onto the new target "
           "(#7877 item 31, link)",
@@ -19870,10 +20025,10 @@ TEST_CASE("Registry spark (real mechanism): a registry link re-pointed to anothe
     REQUIRE(recorded.has_value());
     CHECK(name_names_key(*recorded, rig.t2));
     const auto before = h.fired();
+    const auto recorded1 = h.counters().commit_name_recorded;
     REQUIRE(rig.write("T2", 7));
     CHECK(eventually([&] { return h.fired() > before; }, kDeafBound));
-    REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
-                       kDeafBound));
+    REQUIRE(eventually([&] { return rearm_committed(h, recorded1); }, kDeafBound));
     CHECK(stays_healthy(h, 400ms));
     CHECK(faulted_events(h) == 1);
     h.engine.stop();
