@@ -48,6 +48,7 @@ struct PeStringTable {
 
 struct PeVersionInfo {
     std::uint16_t machine{0};
+    std::uint16_t characteristics{0}; // COFF file header flags; 0x2000 is IMAGE_FILE_DLL
     bool pe32_plus{false};
     bool has_version{false};
     bool has_fixed{false};
@@ -350,6 +351,7 @@ read_pe_version(const Source& src, const PeLimits& lim = {}, ReadBudget budget =
         return fail(ParseError::not_this_format);
     PeVersionInfo info;
     info.machine = *load<std::uint16_t>(*coff, 4, kLE);
+    info.characteristics = *load<std::uint16_t>(*coff, 22, kLE);
     const std::size_t num_sections = *load<std::uint16_t>(*coff, 6, kLE);
     const std::size_t opt_size = *load<std::uint16_t>(*coff, 20, kLE);
     if (num_sections > lim.max_sections)

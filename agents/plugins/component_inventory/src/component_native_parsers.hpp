@@ -20,7 +20,8 @@
  * type is ET_DYN; a Mach-O only through the FIRST slice that has no error and is an MH_DYLIB, and a
  * slice that errored is never read as a value. The ELF magic on 4 to 15 bytes is unreadable (a
  * file-name row); under 4 bytes or another magic is not a library. A PE is a library when it has the
- * MZ and PE signatures (read_pe_version answers not_this_format otherwise); a PE with no version
+ * MZ and PE signatures (read_pe_version answers not_this_format otherwise) and its COFF header sets
+ * IMAGE_FILE_DLL; a DLL with no version
  * resource, or one whose fixed file version is 0.0.0.0, is a library that declares no version, and a
  * truncated or malformed one is unreadable.
  *
@@ -158,6 +159,8 @@ namespace native_detail {
         const auto info = bh::read_pe_version(bh::Source{rd, size});
         if (!info)
             return from_parse_error(info.error());
+        if ((info->characteristics & 0x2000) == 0) // not IMAGE_FILE_DLL: a renamed executable
+            return std::unexpected(NativeError::not_library);
         const auto& v = info->file_version;
         if (!info->has_fixed || (v[0] == 0 && v[1] == 0 && v[2] == 0 && v[3] == 0))
             return std::optional<std::string>{};

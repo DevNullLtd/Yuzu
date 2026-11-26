@@ -1654,7 +1654,8 @@ the one name-based exclusion of the Windows leg. `\Windows Kits`, which sits und
 under either root and need no exclusion.
 
 **`native` on Windows.** A candidate is a file whose leaf ends `.dll`, compared without regard to case
-(`.dll.mui` is not one). The version is the fixed file version of the PE's `VS_VERSIONINFO` resource,
+(`.dll.mui` is not one) and whose COFF header
+sets `IMAGE_FILE_DLL`, so a renamed executable gives no row. The version is the fixed file version of the PE's `VS_VERSIONINFO` resource,
 read by the shared bounded PE reader (`agents/shared/binary_header_pe.hpp`) through the same file view;
 `version_source` is `pe`. A PE with no version resource, or a fixed version of 0.0.0.0, is a row with
 an empty version and `version_source` `unreadable`; a file named `.dll` that has no PE header gives no

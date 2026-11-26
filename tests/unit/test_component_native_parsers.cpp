@@ -699,6 +699,7 @@ std::string pe_without_resources() {
     put(b, 64 + 4, 0x8664, 2, false);    // machine: x64
     put(b, 64 + 6, 0, 2, false);         // no sections
     put(b, 64 + 20, 112, 2, false);      // SizeOfOptionalHeader
+    put(b, 64 + 22, 0x2000, 2, false);   // Characteristics: IMAGE_FILE_DLL
     put(b, 64 + 24, 0x20b, 2, false);    // optional header magic: PE32+
     return b;                            // NumberOfRvaAndSizes (offset 108) stays 0
 }
@@ -738,6 +739,18 @@ TEST_CASE("native_pe: a PE with no version resource, or a 0.0.0.0 one, is a libr
         REQUIRE(d.has_value());
         CHECK(d->version_source == NativeVersionSource::unreadable);
     }
+}
+
+TEST_CASE("native_pe: a PE that is not a DLL (a renamed executable) is not a library",
+          "[component_native][component_inventory]") {
+    std::string exe = bhtest::load_fixture("pe_version.bin");
+    std::uint32_t e_lfanew = 0;
+    std::memcpy(&e_lfanew, exe.data() + 0x3C, sizeof(e_lfanew)); // little-endian host, as the format is
+    REQUIRE(e_lfanew + 24 <= exe.size());
+    exe[e_lfanew + 23] = static_cast<char>(exe[e_lfanew + 23] & ~0x20); // clear IMAGE_FILE_DLL (0x2000)
+    Rd rd(exe);
+    CHECK_FALSE(describe_windows_file("tool.dll", rd.fn(), exe.size()).has_value());
+    CHECK_FALSE(rd.bad);
 }
 
 TEST_CASE("native_pe: not a PE is not a library; a truncated or malformed PE is unreadable and never throws",

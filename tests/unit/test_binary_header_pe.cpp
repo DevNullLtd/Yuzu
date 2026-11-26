@@ -369,6 +369,7 @@ TEST_CASE("binary_header_pe: PE32 and PE32+ builder images parse to the exact va
         REQUIRE(r.has_value());
         CHECK(r->pe32_plus == plus);
         CHECK(r->machine == (plus ? 0x8664 : 0x14C));
+        CHECK(r->characteristics == 0x2000);
         check_canonical_values(*r);
     }
 }

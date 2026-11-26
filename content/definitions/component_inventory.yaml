@@ -185,10 +185,11 @@ status:
 ##   Windows: the Program Files and Program Files (x86) directories, on fixed local drives. The
 ##            WindowsApps directory under each (the Store packages) is not entered; it is counted
 ##            and reported as `package_tree_skipped`.
-##   All:     the same root, link and network-mount rules as scan: a missing root is not an error,
-##            a root reached through a link or on a network mount (on Windows: a drive that is not
-##            a fixed local disk) is dropped and reported, and no link (on Windows: no reparse
-##            point) is followed at any path component.
+##   All:     the same root, link and network-mount rules as scan: a root reached through a link or
+##            on a network mount (on Windows: a drive that is not a fixed local disk) is dropped and
+##            reported, and no link (on Windows: no reparse point) is followed at any path
+##            component. A missing root is not an error on Linux and macOS; on Windows it answers
+##            constrained (`dir_unreadable`).
 ## Candidates are files named <stem>.so or <stem>.so.<digits and dots> (Linux), <stem>.dylib
 ## (macOS) and <stem>.dll (Windows, the extension compared without regard to case; `.dll.mui` is not
 ## a candidate). Each candidate is opened once and its header is read in-process by the shared bounded
@@ -205,7 +206,8 @@ status:
 ## current_version when it is not 0.0.0, else the file name's version (libfoo.1.2.dylib reads 1.2).
 ## Windows: the version is the fixed file version of the PE's version resource (a.b.c.d, version_source
 ## `pe`); a PE with no version resource, or a fixed version of 0.0.0.0, is a row with an empty version
-## and `unreadable`, and a file named .dll that has no PE header gives no row.
+## and `unreadable`, and a file named .dll that has no PE header, or whose header does not set
+## IMAGE_FILE_DLL, gives no row.
 ##
 ## BOUNDS: 400,000 directory entries, 45 seconds for the whole scan, 32 directory levels, 50,000
 ## entries per directory listing, 3,000 rows per top-level application folder, 5,000 rows in all.
