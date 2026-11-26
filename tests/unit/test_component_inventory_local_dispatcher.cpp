@@ -7,17 +7,32 @@
  * is how a sibling plugin once shipped a compiled-out Windows leg and stayed green). Only the
  * expectations differ per host.
  *
- * `scan`, `native`, `python` and `node` are dispatched on Windows ONLY, where the planned leg answers
- * at once. On Linux and macOS a dispatch would walk this host's real application roots for up to 45 s,
- * which the unit suites must not do, and the plugin takes its roots from nothing a request or the
- * environment can supply, so a test cannot point it at a temporary tree. The populated answers are
- * pinned in test_component_scan.cpp, test_component_native_scan.cpp and test_component_pkg_scan.cpp
- * over an in-memory tree and a materialised one, and the real end-to-end run is the sample capture
- * taken against a host.
+ * `scan` and `native` are dispatched on Windows ONLY, and there for real: the Windows leg reads the
+ * Program Files trees of the host, and the roots (from the shell's known-folder lookup) cannot be
+ * pointed at a temporary tree, so the case costs two real walks, each ending only at the plugin's own
+ * limits (45 s, 400,000 directory entries). That is more than any agent shard has room for, so the case
+ * is hidden from every shard ([.]) and runs as its own entry, 'component_inventory windows host walk'
+ * in tests/meson.build, selected by the tag [component_inventory_host_walk]; the descriptor and
+ * unknown-action cases stay in the shards on every OS. On Linux and macOS a dispatch would walk this
+ * host's real application roots for the same bound, which the unit suites must not do, and the plugin
+ * takes its roots from nothing a request or the environment can supply. The populated answers are
+ * pinned in test_component_scan.cpp and test_component_native_scan.cpp over an in-memory tree and a
+ * materialised one, the Windows leg's own behaviour in test_component_fs_win.cpp, and the real
+ * end-to-end run is the sample capture taken against a host.
  *
  * MUTATION: adding a fifth action, changing a declared leg, or loading the wrong plugin fails the
- * descriptor case; removing the report_planned call on the Windows path, or letting `native`,
- * `python` or `node` reach the unknown-action guard, fails the planned-row cases.
+ * descriptor case; putting the planned-leg reporter back on the Windows path, or letting `native`
+ * reach the unknown-action guard, fails the Windows case (an `unsupported` row); an exception out of
+ * the Windows leg fails it through the internal_error token and the return code; pairing the Windows
+ * `native` action with another OS's candidate test or parser (no .dll is a candidate, or no PE is
+ * described) fails its `pe` row check; leaving WindowsApps out of a Windows action's walk policy fails
+ * the token and path checks where the test account can list it or the walk completes. A constrained
+ * status row names its stop cause alone, so those two checks bite only there, and no wire observable
+ * separates the two builds otherwise.
+ *
+ * `python` and `node` have no Windows leg yet (#8440): on Windows a dispatch answers the shared planned row at
+ * once, so it is cheap and stays in the shards; removing the report_planned call on that path, or letting
+ * either reach the unknown-action guard or a walk, fails the planned-row case.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -27,6 +42,7 @@
 
 #include "local_dispatcher.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
@@ -150,7 +166,17 @@ TEST_CASE("component_inventory plugin: exactly four actions, `scan`, `native`, `
         CHECK(d.linux_leg.rung == 1);
         CHECK(d.macos_leg.support == YUZU_SUPPORT_SUPPORTED);
         CHECK(d.macos_leg.rung == 1);
-        CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);
+        if (i < 2) {
+            // scan and native: Windows is SUPPORTED on the measured scope (one elevated host with a
+            // refused directory, which answered constrained), and says so.
+            CHECK(d.windows_leg.support == YUZU_SUPPORT_SUPPORTED);
+            CHECK(d.windows_leg.rung == 1);
+            REQUIRE(d.windows_leg.fallback != nullptr);
+            CHECK(std::string_view{d.windows_leg.fallback}.contains("measured on one host"));
+        } else {
+            // python and node: no Windows leg yet (#8440).
+            CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);
+        }
     }
 }
 
@@ -177,7 +203,95 @@ TEST_CASE("component_inventory plugin: an unknown action is refused with one non
 }
 
 #if defined(_WIN32)
-TEST_CASE("component_inventory plugin: the Windows leg answers the planned row at once, for every action",
+namespace {
+
+[[nodiscard]] std::string ascii_lower(std::string s) {
+    for (char& c : s)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    return s;
+}
+
+/// %ProgramFiles% in the walk's form (`/` separators), or empty. Only this test reads the environment:
+/// the plugin names its roots through the shell's known-folder lookup, never an environment variable.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+[[nodiscard]] std::string program_files_walk_form() {
+    const char* v = std::getenv("ProgramFiles");
+    std::string out = v != nullptr ? v : "";
+    std::ranges::replace(out, '\\', '/');
+    return out;
+}
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+} // namespace
+
+// HIDDEN ([.]): two real walks of this host's Program Files, up to 45 s each, which no agent shard has
+// room for. It runs as the 'component_inventory windows host walk' entry (tests/meson.build).
+TEST_CASE("component_inventory plugin: on Windows scan and native answer a real status row, never unsupported",
+          "[.][component_inventory_host_walk]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    const std::string program_files = program_files_walk_form();
+    for (const char* action : {"scan", "native"}) {
+        INFO(action);
+        const auto result = dispatcher.run(plugin->descriptor, action);
+        CHECK(result.rc == 0); // a degraded read is not a failed command; an exception out of the leg is
+        const auto rows = captured_rows(result.captured);
+        REQUIRE_FALSE(rows.empty());
+        const std::string prefix = std::string{"status|"} + action + "|";
+        const bool supported = rows[0].starts_with(prefix + "supported|");
+        const bool constrained = rows[0].starts_with(prefix + "constrained|");
+        CHECK((supported || constrained)); // never `unsupported`, never the planned row
+        CHECK(rows[0].find("windows:planned") == std::string::npos);
+        CHECK(rows[0].find("internal_error") == std::string::npos);
+        CHECK((result.result_status == YUZU_RESULT_STATUS_OK || result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
+        // Only the status row first, then component rows of this action's kind.
+        const std::string kind = std::string{"comp|"} + (std::string_view{action} == "scan" ? "java" : "native") + "|";
+        for (std::size_t i = 1; i < rows.size(); ++i)
+            CHECK(rows[i].starts_with(kind));
+
+        // The checks below need a walk that happened: not a root on a non-fixed drive, not a failed
+        // known-folder lookup (both answer with nothing to look at).
+        const auto has = [&](std::string_view token) { return rows[0].find(token) != std::string::npos; };
+        if (has("network_fs_skipped") || has("mount_table_unreadable"))
+            continue;
+
+        // WindowsApps is kept out of BOTH actions (the plugin's policy is windows_walk_policy, run on every
+        // OS in test_component_fs_win.cpp). No row lies under it; and where the walk finished and the
+        // directory is really there, the status row says it was passed over. A constrained row names its
+        // stop cause alone, so the token check applies to a supported row only.
+        if (!program_files.empty()) {
+            const std::string apps = ascii_lower(program_files) + "/windowsapps/";
+            for (std::size_t i = 1; i < rows.size(); ++i)
+                CHECK(ascii_lower(rows[i]).find(apps) == std::string::npos);
+            std::error_code ec;
+            const auto where = fs::symlink_status(fs::path{program_files} / "WindowsApps", ec);
+            if (supported && !ec && where.type() == fs::file_type::directory)
+                CHECK(has("windows:component_inventory:package_tree_skipped"));
+        }
+
+        // `native` on Windows reads PE files: a walk that spent its whole time left none to read a
+        // candidate, but any other ending still writes the rows it reached, and Program Files holds
+        // versioned DLLs. Another OS's candidate test or parser here would write none. This is the first
+        // contact of the PE reader with real DLLs: a failure here is a defect to chase, not a flake.
+        if (std::string_view{action} == "native" && !has("budget_time")) {
+            CHECK(std::ranges::any_of(rows, [](const std::string& r) {
+                return r.starts_with("comp|native|") && r.find("|pe|") != std::string::npos;
+            }));
+        }
+    }
+}
+
+TEST_CASE("component_inventory plugin: on Windows python and node answer the planned row at once",
           "[component_inventory][actions]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -185,7 +299,7 @@ TEST_CASE("component_inventory plugin: the Windows leg answers the planned row a
         return;
     }
     yuzu::agent::LocalDispatcher dispatcher;
-    for (const char* action : {"scan", "native", "python", "node"}) {
+    for (const char* action : {"python", "node"}) {
         const auto result = dispatcher.run(plugin->descriptor, action);
         CHECK(result.rc == 0); // a planned leg is not a failed command
         const auto rows = captured_rows(result.captured);
