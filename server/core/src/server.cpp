@@ -6636,21 +6636,6 @@ public:
             }
         }
 
-        // file_search ships default-off (it lists file names under every user's directories;
-        // its stored rows are Forensics-tier). Enable via PUT
-        // /api/v1/plugin-config/file_search/kill-switch.
-        if (plugin_config_store_ && !startup_failed_) {
-            if (!plugin_config_store_->seed_kill_switch_default_off(
-                    "file_search",
-                    "default-off: lists file names under every user's directories; enable per PUT "
-                    "/api/v1/plugin-config/file_search/kill-switch")) {
-                spdlog::error(
-                    "[PG] Refusing to start: file_search default-off kill-switch "
-                    "seed failed");
-                startup_failed_ = true;
-            }
-        }
-
         // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
         // and session credentials are stored as SHA-256 digests, never a
         // sealed SecretCodec blob (upload_grant_store.hpp file header).

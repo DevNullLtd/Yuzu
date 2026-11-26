@@ -9,6 +9,12 @@
  *
  * PATH TESTS. Every path test here is on a component boundary (under()): /home2 is not under /home.
  *
+ * WINDOWS. A Windows walk never crosses a volume (a mount point is a reparse entry and is skipped), so its
+ * mount table is the ONE volume that holds the root: mount_point is the label `/C:` or `/Volume{guid}`,
+ * root_field the volume GUID path, fstype the filesystem name of a fixed drive or a drive-type token that
+ * the allow-list refuses. The volume GUID path is part of the unit's hash, so a drive letter re-pointed
+ * between slices ends the search (mount_table_changed).
+ *
  * WHAT THE PLAN READS. The mounts at or under the root, plus the mounts that contain the root; a later
  * entry for a mount point covers an earlier one (the plan does that itself, so it never depends on the
  * reader). The mount that contains the root is the longest of the latter.
@@ -50,7 +56,7 @@
  * THE MAC. The verdict is cumulative through the cursor (its prior_gaps, and the units and refused sets it
  * names), so a cursor an agent did not issue must never be believed: a forged last-unit token would read
  * `complete` over volumes never searched. The <mac> is the first 16 bytes (32 lowercase hex digits) of
- * HMAC-SHA-256, under a per-process key the agent draws once (file_search_posix.cpp), over every other
+ * HMAC-SHA-256, under a per-process key the agent draws once (file_search_shell.cpp), over every other
  * byte of the PLAINTEXT token (before the seal below). The inner fs1 token is not authenticated on its
  * own; this enclosing token is. Both codec calls take the key as a required parameter. The mac is compared
  * with no early exit, and a token whose mac is not exact is refused before its inner token is decoded. A
@@ -118,10 +124,12 @@ struct Unit {
     std::string walk_root;
     std::vector<std::string> prune; // mount points strictly below walk_root, in byte order
 
-    /// The key an abandoned worker is recorded under and a cursor's hash covers.
-    [[nodiscard]] std::string key() const {
-        return mount_point + '\x1f' + label + '\x1f' + root_field + '\x1f' + fstype;
-    }
+    /// The key an abandoned worker is recorded under: the volume's identity, never the spelling of its mount
+    /// point (a Windows volume is reached as `/C:` or as `/Volume{guid}`, and one hung volume must not take a
+    /// stalled slot per spelling). It is the identity build_plan already uses for one subtree mounted twice
+    /// (label and root field), plus the type. units_hash below covers the four fields itself, mount point
+    /// included, and does not go through key().
+    [[nodiscard]] std::string key() const { return label + '\x1f' + root_field + '\x1f' + fstype; }
 };
 
 struct Refused {
@@ -196,6 +204,10 @@ inline constexpr const char* kMacosDataVolume = "/System/Volumes/Data";
     return detail::hash16("yuzu.file_search.refused.v1", parts);
 }
 
+/// The `fstype` a Windows volume carries when its drive is a network drive (file_search_win_rules.hpp
+/// fstype_token): not on the allow-list, and the one drive-type token the plan reads as a network mount.
+inline constexpr std::string_view kWindowsRemoteDrive = "remote";
+
 /// Plans the search of `root` over `table`. `root` is absolute and normalised (request parser).
 [[nodiscard]] inline VolumePlan build_plan(const yuzu::shared::MountTable& table, const std::string& root, Os os) {
     using yuzu::shared::MountEntry;
@@ -241,7 +253,8 @@ inline constexpr const char* kMacosDataVolume = "/System/Volumes/Data";
         const auto refuse = [&refused, &mp, e](fsr::Reason why) {
             refused.push_back({mp, e->fstype.substr(0, kMaxFstypeBytes), why});
         };
-        if (yuzu::shared::is_network_mount_fstype(e->fstype))
+        if (yuzu::shared::is_network_mount_fstype(e->fstype) ||
+            (os == Os::windows && e->fstype == kWindowsRemoteDrive))
             refuse(fsr::Reason::network_mount);
         else if (detail::is_private_tmp_bind(*e))
             refuse(fsr::Reason::private_namespace);

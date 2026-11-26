@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """test_file_search_definition.py -- pins the definition YAML to the plugin: the row_kind-first
 field_1..field_6 columns and the row_kind enum (each of the nine kinds a slice emits must also be a
-`"<kind>|"` row prefix in the headers that format it, plus the planned-leg status row), the root, pattern,
-kinds and cursor grammar with its bounds read from the headers that enforce them, the approval mode
-against the catalogue fragment's gate, and the never-disclosed wording.
+`"<kind>|"` row prefix in the headers that format it; the planned-leg `status` row is gone with the
+last planned leg), the root (the POSIX and the Windows forms), pattern, kinds and cursor grammar with
+its bounds read from the headers that enforce them, the approval mode against the catalogue fragment's
+gate, and the never-disclosed wording.
 
 Runnable standalone: `python3 tests/test_file_search_definition.py` (how meson runs it; a bare
 pytest-style file with no runner would execute zero assertions and always exit 0).
@@ -24,11 +25,11 @@ ROW_HEADERS = [PLUGIN_SRC / "file_search_rows.hpp", PLUGIN_SRC / "file_search_ex
                SHARED / "file_search_coverage.hpp", SHARED / "file_search_names.hpp"]
 
 EXPECTED_COLUMNS = ["row_kind"] + [f"field_{i}" for i in range(1, 7)]
-# The nine row kinds of a slice, in the order the plugin documents them, then the one row a leg that
-# is planned and not read yet answers with (the shared planned-leg reporter, Windows today).
+# The nine row kinds of a slice, in the order the plugin documents them. Every leg ships (Linux, macOS and
+# Windows), so there is no planned-leg `status` row any more.
 SLICE_ROW_KINDS = ["match", "extents", "volume", "gap", "gaps_dropped", "volumes_dropped",
                    "coverage", "cursor", "search"]
-ROW_KINDS = SLICE_ROW_KINDS + ["status"]
+ROW_KINDS = SLICE_ROW_KINDS
 KINDS_ENUM = ["files", "directories", "both"]
 
 
@@ -57,6 +58,8 @@ class FileSearchDefinitionColumns(unittest.TestCase):
     def test_row_kind_values_are_the_shapes_the_plugin_emits_today(self):
         row_kind = _definition()["spec"]["result"]["columns"][0]
         self.assertEqual(row_kind["values"], ROW_KINDS)
+        self.assertNotIn("status", row_kind["values"])  # the planned-leg row is gone
+        self.assertNotIn("status:", row_kind["description"])
 
     def test_every_slice_row_kind_is_a_row_prefix_in_the_headers(self):
         text = "\n".join(p.read_text(encoding="utf-8") for p in ROW_HEADERS)
@@ -99,17 +102,27 @@ class FileSearchDefinitionParameters(unittest.TestCase):
         self.assertEqual(props["cursor"]["validation"]["maxLength"],
                          _int_constant(SHARED / "file_search_cursor.hpp", "kMaxCursorTokenBytes")
                          + int(m.group(1)))
+        # The server refuses an instruction parameter value over kMaxParamValueLen on every execute
+        # surface, so a cursor the definition admits must be one a client can pass back.
+        self.assertLessEqual(props["cursor"]["validation"]["maxLength"],
+                             _int_constant(REPO_ROOT / "server" / "core" / "src" / "bundle_service.hpp",
+                                           "kMaxParamValueLen"))
 
-    def test_root_pattern_is_an_absolute_path_prefix(self):
+    def test_root_pattern_is_an_absolute_path_prefix_in_either_form(self):
         root = re.compile(self._params()["properties"]["root"]["validation"]["pattern"])
-        for ok in ("/", "/home", "/srv/data/", "/Users/x"):
+        for ok in ("/", "/home", "/srv/data/", "/Users/x", "/x", "C:\\x", "c:\\", "C:/x",
+                   "\\\\?\\Volume{0f1e2d3c-1111-2222-3333-44445555aabb}\\",
+                   "\\\\?\\volume{0f1e2d3c-1111-2222-3333-44445555aabb}\\dir",
+                   # the agent takes the prefix in any case (file_search_win_rules.hpp, starts_icase)
+                   "\\\\?\\VOLUME{0f1e2d3c-1111-2222-3333-44445555aabb}\\",
+                   "\\\\?\\vOlUmE{0f1e2d3c-1111-2222-3333-44445555aabb}\\dir"):
             self.assertTrue(root.search(ok), ok)
-        for bad in ("", "home", "./x", "../x", " /x"):
+        for bad in ("", "home", "./x", "../x", " /x", "C:", "C:x", "\\foo", "relative\\dir"):
             self.assertFalse(root.search(bad), bad)
 
-    def test_root_description_names_the_three_root_tokens(self):
+    def test_root_description_names_the_root_tokens(self):
         text = " ".join(self._params()["properties"]["root"]["description"].split())
-        for token in ("root_is_link", "root_not_found", "root_not_a_directory"):
+        for token in ("root_is_link", "root_not_found", "root_not_a_directory", "root_unc", "root_device_path"):
             with self.subTest(token=token):
                 self.assertIn(token, text)
 
@@ -122,6 +135,8 @@ class FileSearchDefinitionContract(unittest.TestCase):
         self.assertEqual(spec["execution"]["plugin"], "file_search")
         self.assertEqual(spec["execution"]["action"], "search")
         self.assertEqual(spec["platforms"], ["windows", "linux", "darwin"])
+        for column in spec["result"]["columns"]:
+            self.assertEqual(column["platforms"], ["windows", "linux", "darwin"], column["name"])
         self.assertEqual(spec["execution"]["concurrency"], "per-device")
         self.assertEqual(spec["gather"]["ttlSeconds"], 300)
         self.assertEqual(spec["permissions"]["executeRoles"], ["admin"])
@@ -141,7 +156,7 @@ class FileSearchDefinitionContract(unittest.TestCase):
         text = " ".join(_definition()["metadata"]["description"].lower().split())
         for phrase in (
             "names, types, sizes, times and extents", "opened and never read", "no file content is read or hashed",
-            "off until enabled", "forensics:read", "not a snapshot",
+            "on by default", "forensics:read", "not a snapshot",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)

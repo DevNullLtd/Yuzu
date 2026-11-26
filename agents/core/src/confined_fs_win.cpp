@@ -33,6 +33,17 @@
  * is a well-known landmine. Anything outside that short list surfaces as the
  * raw NTSTATUS value truncated into `os_error`; callers only ever log it, as
  * an opaque diagnostic, never branch on it.
+ *
+ * ── Reparse policy, cloud directories and attribute-only opens ──────────────
+ * No open in this file carries FILE_OPEN_NO_RECALL, and none relies on any open flag to keep a
+ * placeholder from being brought back: with FILE_DIRECTORY_FILE the flag is STATUS_INVALID_PARAMETER on
+ * every directory, and on a handle that can read or enumerate it is not a barrier (a read through such a
+ * handle hydrated the file, and enumerating such a directory handle populated it). What keeps a file
+ * from being recalled is that open_file_attributes_at asks for no data right (FILE_READ_ATTRIBUTES |
+ * SYNCHRONIZE only), so its handle can neither read nor hydrate. open_dir_at admits ONE reparse family,
+ * a populated cloud directory, and only for a caller that opts in (ReparseDirs); the admission is the
+ * pure rule reparse_dir_open_allowed applied to the attributes and tag of the opened handle, before the
+ * caller can enumerate it.
  */
 
 #ifdef _WIN32
@@ -348,7 +359,8 @@ OpenRootResult open_root(const std::filesystem::path& path) {
     return result;
 }
 
-OpenDirResult open_dir_at(HANDLE parent, const std::string& name, const FileIdentity& root_id) {
+OpenDirResult open_dir_at(HANDLE parent, const std::string& name, const FileIdentity& root_id,
+                          ReparseDirs reparse) {
     OpenDirResult result{};
 
     std::wstring wide;
@@ -381,20 +393,96 @@ OpenDirResult open_dir_at(HANDLE parent, const std::string& name, const FileIden
         result.os_error = static_cast<int>(GetLastError());
         return result;
     }
+    result.attributes = info.dwFileAttributes;
     // A junction/mount-point/symlink swapped in mid-walk is opened RAW by
-    // FILE_OPEN_REPARSE_POINT above and rejected here, never traversed.
+    // FILE_OPEN_REPARSE_POINT above and rejected here, never traversed. The ONE exception is a
+    // populated cloud directory for a caller that opted in (reparse_dir_open_allowed): the decision is
+    // taken on THIS handle's attributes and tag, before the caller can enumerate it, and a tag that
+    // cannot be read is a refusal.
     if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        // warn, matching the POSIX leg: this branch fires on a mid-walk junction
-        // swap -- the live TOCTOU attack this primitive exists to defeat, not a
-        // steady-state reparse entry (which decide_entry handles, unlogged).
-        spdlog::warn("confined_fs::open_dir_at: reparse point rejected for '{}'", name);
-        result.reason = Reason::ReparseRejected;
-        return result;
+        FILE_ATTRIBUTE_TAG_INFO tag_info{};
+        const bool have_tag = GetFileInformationByHandleEx(opened.handle.get(), FileAttributeTagInfo,
+                                                           &tag_info, sizeof(tag_info)) != 0;
+        if (have_tag)
+            result.reparse_tag = tag_info.ReparseTag;
+        if (!have_tag || !reparse_dir_open_allowed(reparse, info.dwFileAttributes, tag_info.ReparseTag)) {
+            if (reparse == ReparseDirs::allow_populated_cloud && have_tag && is_cloud_reparse_tag(tag_info.ReparseTag)) {
+                // steady state (a caller that opted in met a cloud folder that is not populated), not an attack
+                spdlog::debug("confined_fs::open_dir_at: cloud directory not admitted for '{}'", name);
+            } else {
+                // warn, matching the POSIX leg: for a caller that did not opt in (the default policy) and
+                // for any tag or unreadable tag, this branch fires on a mid-walk junction swap -- the live
+                // TOCTOU attack this primitive exists to defeat, not a steady-state reparse entry (which
+                // decide_entry handles, unlogged).
+                spdlog::warn("confined_fs::open_dir_at: reparse point rejected for '{}'", name);
+            }
+            result.reason = Reason::ReparseRejected;
+            return result;
+        }
     }
     if (info.dwVolumeSerialNumber != root_id.volume_serial) {
         spdlog::warn("confined_fs::open_dir_at: volume boundary rejected for '{}'", name);
         result.reason = Reason::DeviceBoundary;
         return result;
+    }
+
+    result.h = std::move(opened.handle);
+    result.reason = Reason::None;
+    return result;
+}
+
+// The attribute-only open (confined_fs.hpp states what protects a placeholder): FILE_READ_ATTRIBUTES |
+// SYNCHRONIZE and nothing else, FILE_OPEN_REPARSE_POINT so a link or a placeholder is opened as itself,
+// FILE_NON_DIRECTORY_FILE so the kernel refuses a directory. No data right and no FILE_OPEN_NO_RECALL:
+// the handle can neither read nor hydrate, and what is read from it is its size, time, attributes,
+// reparse tag and volume serial.
+OpenFileResult open_file_attributes_at(HANDLE parent, const std::string& name, const FileIdentity& root_id) {
+    OpenFileResult result;
+
+    std::wstring wide;
+    if (const auto invalid = validate_name(name, wide)) {
+        result.reason = *invalid;
+        return result;
+    }
+
+    NtOpenResult opened = nt_open_relative(parent, wide, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, kFileOpen,
+                                           kFileNonDirectoryFile | kFileOpenReparsePoint |
+                                               kFileSynchronousIoNonalert);
+
+    if (opened.reason == Reason::Unsupported || opened.reason == Reason::InvalidName) {
+        result.reason = opened.reason;
+        return result;
+    }
+    if (opened.reason == Reason::OsError) {
+        result.reason = Reason::OsError;
+        result.os_error = map_ntstatus_to_os_error(opened.status);
+        return result;
+    }
+
+    // opened.handle is transient: it closes itself on every early return below, and is moved out
+    // ONLY on success.
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(opened.handle.get(), &info)) {
+        result.reason = Reason::OsError;
+        result.os_error = static_cast<int>(GetLastError());
+        return result;
+    }
+    if (info.dwVolumeSerialNumber != root_id.volume_serial) {
+        spdlog::warn("confined_fs::open_file_attributes_at: volume boundary rejected for '{}'", name);
+        result.reason = Reason::DeviceBoundary;
+        return result;
+    }
+    result.attributes = info.dwFileAttributes;
+    result.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    result.mtime = filetime_to_unix_seconds(static_cast<std::int64_t>(
+        (static_cast<std::uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+        info.ftLastWriteTime.dwLowDateTime));
+    if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        FILE_ATTRIBUTE_TAG_INFO tag_info{};
+        if (GetFileInformationByHandleEx(opened.handle.get(), FileAttributeTagInfo, &tag_info,
+                                         sizeof(tag_info)) != 0)
+            result.reparse_tag = tag_info.ReparseTag;
     }
 
     result.h = std::move(opened.handle);
@@ -494,13 +582,41 @@ UnlinkOutcome unlink_at(HANDLE parent, const std::string& name, UnlinkKind kind,
     return result;
 }
 
-EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& root_id,
-                              const EnumBudget& budget) {
-    // root_id is accepted for API symmetry with the walker's Ops contract;
-    // the volume boundary is re-verified at every open_dir_at call (the
-    // moment a NEW handle could straddle a swapped-in mount point), not
-    // here -- `dir`'s volume cannot change between its own open and this
-    // enumeration without a fresh open somewhere else.
+namespace {
+
+// The two listing record layouts enumerate_at reads, each with the accessors the loop needs. The default
+// is FILE_FULL_DIR_INFO (the layout every existing consumer has always seen). The opt-in layout is
+// FILE_ID_EXTD_DIR_INFO, which carries the 128-bit file id (the Win32 form of the id-bearing listing
+// class that was measured) and the reparse tag in its own field.
+struct FullRecord {
+    using Info = FILE_FULL_DIR_INFO;
+    static constexpr FILE_INFO_BY_HANDLE_CLASS kRestart = FileFullDirectoryRestartInfo;
+    static constexpr FILE_INFO_BY_HANDLE_CLASS kNext = FileFullDirectoryInfo;
+    static std::uint32_t tag(const Info& e) noexcept { return e.EaSize; } // the tag, for a reparse entry
+    static std::uint64_t id(const Info&) noexcept { return 0; }
+};
+
+struct IdRecord {
+    using Info = FILE_ID_EXTD_DIR_INFO;
+    static constexpr FILE_INFO_BY_HANDLE_CLASS kRestart = FileIdExtdDirectoryRestartInfo;
+    static constexpr FILE_INFO_BY_HANDLE_CLASS kNext = FileIdExtdDirectoryInfo;
+    static std::uint32_t tag(const Info& e) noexcept { return e.ReparsePointTag; }
+    // The id is reported only when the 128-bit value fits 64 bits (the high half is zero), never
+    // truncated: a wider id reads 0 = unknown, so two ids that differ only in the high half cannot be
+    // mistaken for one.
+    static std::uint64_t id(const Info& e) noexcept {
+        std::uint64_t low = 0, high = 0;
+        for (int i = 7; i >= 0; --i) {
+            low = (low << 8) | e.FileId.Identifier[i];
+            high = (high << 8) | e.FileId.Identifier[8 + i];
+        }
+        return high == 0 ? low : 0;
+    }
+};
+
+template <class Record>
+EnumerateResult enumerate_records(HANDLE dir, const EnumBudget& budget) {
+    using Info = typename Record::Info;
     EnumerateResult result;
 
     if (budget.max_entries == 0) {
@@ -518,12 +634,10 @@ EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& ro
             return result;
         }
 
-        // FileFullDirectoryRestartInfo forces enumeration to (re)start from
-        // the beginning on the first call -- a directory HANDLE opened via
-        // open_dir_at is fresh, but this is the documented way to guarantee
+        // The Restart class forces enumeration to (re)start from the beginning on the first call -- a
+        // directory HANDLE opened via open_dir_at is fresh, but this is the documented way to guarantee
         // it regardless of any prior query state on the handle.
-        const FILE_INFO_BY_HANDLE_CLASS query_class =
-            first_call ? FileFullDirectoryRestartInfo : FileFullDirectoryInfo;
+        const FILE_INFO_BY_HANDLE_CLASS query_class = first_call ? Record::kRestart : Record::kNext;
         first_call = false;
 
         if (!GetFileInformationByHandleEx(dir, query_class, buffer.data(),
@@ -540,38 +654,41 @@ EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& ro
         const std::byte* const buffer_end = buffer.data() + buffer.size();
         for (;;) {
             // Aliasing/alignment proof (docs/cpp-conventions.md requires one at a
-        // syscall boundary): `buffer` is a std::vector<std::byte>, whose data()
-        // is suitably aligned for any scalar type, and the kernel writes each
-        // FILE_FULL_DIR_INFO at an 8-byte-aligned offset -- NextEntryOffset is
-        // documented as 8-aligned -- so every `cursor` derived by advancing
-        // through those offsets is correctly aligned for this type. The pointee
-        // is read-only and owned by `buffer`, which outlives every use here.
-        // BOUNDS, before the cast is dereferenced. NextEntryOffset and
-        // FileNameLength are values supplied by the filesystem, and a user-mode
-        // or redirected filesystem (WinFsp/Dokan/SMB) is exactly the hostile
-        // source this primitive's threat model contemplates. The alignment and
-        // aliasing proof below says nothing about extent, so it is checked here:
-        // a header that does not fit, or a name that runs past the returned
-        // bytes, is an OS error -- never a silent break, which would truncate
-        // the listing while reporting a complete enumeration.
-        if (cursor < buffer.data() || cursor + sizeof(FILE_FULL_DIR_INFO) > buffer_end) {
-            spdlog::warn("confined_fs::enumerate_at: directory entry header out of bounds");
-            result.reason = Reason::OsError;
-            result.os_error = static_cast<int>(ERROR_INVALID_DATA);
-            return result;
-        }
-        const auto* entry = reinterpret_cast<const FILE_FULL_DIR_INFO*>(cursor);
-        const std::byte* const name_begin =
-            cursor + offsetof(FILE_FULL_DIR_INFO, FileName);
-        if (entry->FileNameLength > static_cast<ULONG>(buffer_end - name_begin)) {
-            spdlog::warn("confined_fs::enumerate_at: directory entry name out of bounds");
-            result.reason = Reason::OsError;
-            result.os_error = static_cast<int>(ERROR_INVALID_DATA);
-            return result;
-        }
+            // syscall boundary): `buffer` is a std::vector<std::byte>, whose data()
+            // is suitably aligned for any scalar type, and the kernel writes each
+            // record at an 8-byte-aligned offset -- NextEntryOffset is documented as
+            // 8-aligned -- so every `cursor` derived by advancing through those
+            // offsets is correctly aligned for the record type. The pointee is
+            // read-only and owned by `buffer`, which outlives every use here.
+            // BOUNDS, before the cast is dereferenced. NextEntryOffset and
+            // FileNameLength are values supplied by the filesystem, and a user-mode
+            // or redirected filesystem (WinFsp/Dokan/SMB) is exactly the hostile
+            // source this primitive's threat model contemplates. The alignment and
+            // aliasing proof says nothing about extent, so it is checked here:
+            // a header that does not fit, or a name that runs past the returned
+            // bytes, is an OS error -- never a silent break, which would truncate
+            // the listing while reporting a complete enumeration. The same checks
+            // hold for both record layouts.
+            // Compared as a remaining byte count, never as `cursor + sizeof(Info)`, which would form a pointer
+            // past one-past-the-end when fewer bytes remain. `cursor` stays within [data, end] by the
+            // advance check below; the range test states it.
+            if (cursor < buffer.data() || cursor > buffer_end ||
+                static_cast<std::size_t>(buffer_end - cursor) < sizeof(Info)) {
+                spdlog::warn("confined_fs::enumerate_at: directory entry header out of bounds");
+                result.reason = Reason::OsError;
+                result.os_error = static_cast<int>(ERROR_INVALID_DATA);
+                return result;
+            }
+            const auto* entry = reinterpret_cast<const Info*>(cursor);
+            const std::byte* const name_begin = cursor + offsetof(Info, FileName);
+            if (entry->FileNameLength > static_cast<ULONG>(buffer_end - name_begin)) {
+                spdlog::warn("confined_fs::enumerate_at: directory entry name out of bounds");
+                result.reason = Reason::OsError;
+                result.os_error = static_cast<int>(ERROR_INVALID_DATA);
+                return result;
+            }
 
-            const std::wstring_view wide_name(entry->FileName,
-                                               entry->FileNameLength / sizeof(WCHAR));
+            const std::wstring_view wide_name(entry->FileName, entry->FileNameLength / sizeof(WCHAR));
             const bool dot_entry = wide_name == L"." || wide_name == L"..";
 
             if (!dot_entry) {
@@ -589,20 +706,24 @@ EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& ro
                 // by refusing to act on one.
                 de.name_invalid = (yuzu::win::to_wide(de.name) != std::wstring(wide_name));
 
+                const bool is_reparse = (entry->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
                 EntryType type;
-                if ((entry->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                if (is_reparse)
                     type = EntryType::Reparse; // any tag -- symlink, junction, mount point
                 else if ((entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
                     type = EntryType::Directory;
                 else
                     type = EntryType::RegularFile;
 
-                // LastWriteTime is in the SAME FILE_FULL_DIR_INFO record as the
-                // EndOfFile already read -- no extra call, and the enumeration
-                // itself is handle-relative.
+                // LastWriteTime is in the SAME record as the EndOfFile already read -- no extra call,
+                // and the enumeration itself is handle-relative.
                 de.meta = EntryMeta{type, static_cast<std::uint64_t>(entry->EndOfFile.QuadPart),
                                      /*same_device_as_root=*/true,
                                      filetime_to_unix_seconds(entry->LastWriteTime.QuadPart)};
+                // The attributes and the tag come from the SAME record: no extra call.
+                de.meta.attributes = entry->FileAttributes;
+                de.meta.reparse_tag = is_reparse ? Record::tag(*entry) : 0;
+                de.meta.file_id = Record::id(*entry);
                 de.stat_error = 0;
                 result.entries.push_back(std::move(de));
             }
@@ -611,7 +732,7 @@ EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& ro
                 break;
             // The advance itself must stay in the buffer and must make progress;
             // a zero-but-nonterminal or backward offset would loop forever.
-            if (entry->NextEntryOffset < sizeof(FILE_FULL_DIR_INFO) ||
+            if (entry->NextEntryOffset < sizeof(Info) ||
                 entry->NextEntryOffset > static_cast<ULONG>(buffer_end - cursor)) {
                 spdlog::warn("confined_fs::enumerate_at: directory entry offset out of bounds");
                 result.reason = Reason::OsError;
@@ -624,6 +745,19 @@ EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& ro
 
     result.reason = Reason::None;
     return result;
+}
+
+} // namespace
+
+EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& root_id,
+                              const EnumBudget& budget) {
+    // root_id is accepted for API symmetry with the walker's Ops contract;
+    // the volume boundary is re-verified at every open_dir_at call (the
+    // moment a NEW handle could straddle a swapped-in mount point), not
+    // here -- `dir`'s volume cannot change between its own open and this
+    // enumeration without a fresh open somewhere else.
+    return budget.want_file_ids ? enumerate_records<IdRecord>(dir, budget)
+                                : enumerate_records<FullRecord>(dir, budget);
 }
 
 namespace {

@@ -736,7 +736,7 @@ TEST_CASE("file_search volumes: every non-canonical spelling is refused even whe
     bad_hash.units_hash = "nothex";
     CHECK(encode_volume_cursor(bad_hash, kKey).empty());
     VolumeCursor bad_pos = c;
-    bad_pos.inner.position.after = std::string(300, 'a'); // not a position fs1 can spell
+    bad_pos.inner.position.after = std::string(fsr::kMaxNameBytes + 1, 'a'); // not a position fs1 can spell
     CHECK(encode_volume_cursor(bad_pos, kKey).empty());
 }
 
@@ -841,4 +841,65 @@ TEST_CASE("file_search volumes: a walk's stop and a sticky health become the rea
     // health wins over the stop
     CHECK(reason_for(Stop::budget_time, fsr::Health::stalled) == fsr::Reason::stalled);
     CHECK(reason_for(Stop::section_rows, fsr::Health::unstable) == fsr::Reason::unstable);
+}
+
+// ---- Windows: one volume, refused drive types ----
+
+TEST_CASE("file_search volumes: one fixed NTFS volume is one unit walked from the root on Windows",
+          "[file_search][file_search_volumes]") {
+    Mounts m;
+    m.add("/C:", "NTFS", "0:7");
+    const VolumePlan p = build_plan(m.table(), "/C:/Users/x", Os::windows);
+    REQUIRE(p.valid);
+    REQUIRE(p.units.size() == 1);
+    CHECK(p.units[0].mount_point == "/C:");
+    CHECK(p.units[0].walk_root == "/C:/Users/x");
+    CHECK(p.units[0].prune.empty());
+    CHECK(p.refused.empty());
+    for (const char* fs : {"ReFS", "FAT", "FAT32", "exFAT"}) {
+        Mounts other;
+        other.add("/C:", fs, "0:7");
+        CHECK(build_plan(other.table(), "/C:", Os::windows).units.size() == 1);
+    }
+}
+
+TEST_CASE("file_search volumes: a drive type that is not a fixed volume is refused fstype_not_allowed",
+          "[file_search][file_search_volumes]") {
+    for (const char* token : {"removable", "cdrom", "ramdisk", "no_volume", "not_a_volume", "unreadable", "unknown"}) {
+        INFO(token);
+        Mounts m;
+        m.add("/D:", token, "0:7");
+        const VolumePlan p = build_plan(m.table(), "/D:", Os::windows);
+        REQUIRE(p.valid);
+        CHECK(p.units.empty());
+        CHECK(reason_at(p, "/D:") == fsr::Reason::fstype_not_allowed);
+    }
+}
+
+TEST_CASE("file_search volumes: a network drive is network_mount on Windows and not allowed elsewhere",
+          "[file_search][file_search_volumes]") {
+    Mounts m;
+    m.add("/Z:", std::string(kWindowsRemoteDrive), "0:7");
+    const VolumePlan win = build_plan(m.table(), "/Z:", Os::windows);
+    REQUIRE(win.valid);
+    CHECK(win.units.empty());
+    CHECK(reason_at(win, "/Z:") == fsr::Reason::network_mount);
+    // the token means nothing off Windows: it is just a filesystem that is not on the allow-list
+    Mounts lin;
+    lin.add("/", "ext4", "8:1").add("/mnt/z", std::string(kWindowsRemoteDrive), "0:7");
+    const VolumePlan linux_plan = build_plan(lin.table(), "/mnt/z", Os::linux_os);
+    REQUIRE(linux_plan.valid);
+    CHECK(reason_at(linux_plan, "/mnt/z") == fsr::Reason::fstype_not_allowed);
+}
+
+TEST_CASE("file_search volumes: a changed volume GUID path moves the units hash",
+          "[file_search][file_search_volumes]") {
+    const auto hash_for = [](const char* guid_root) {
+        Mounts m;
+        m.add("/C:", "NTFS", "0:7", guid_root);
+        return build_plan(m.table(), "/C:", Os::windows).units_hash;
+    };
+    // a drive letter re-pointed at another volume between slices ends the search (mount_table_changed)
+    CHECK(hash_for("/Volume{0f1e2d3c-1111-2222-3333-44445555aaaa}") != hash_for("/Volume{0f1e2d3c-1111-2222-3333-44445555bbbb}"));
+    CHECK(hash_for("/Volume{0f1e2d3c-1111-2222-3333-44445555aaaa}") == hash_for("/Volume{0f1e2d3c-1111-2222-3333-44445555aaaa}"));
 }

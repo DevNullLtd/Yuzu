@@ -1,28 +1,13 @@
 /**
  * file_search_posix.cpp -- the POSIX shell of the file_search plugin: the live mount table, the leg of each
- * searched unit, the worker thread's environment, the single-flight slot and the name rule of each OS.
- * Everything pure lives in the headers beside it; this file binds the operating system to them. Self-gated
- * to non-Windows (empty there, where the plugin answers `planned`).
+ * searched unit, the worker thread's environment, the cursor key's entropy draw and the name rule of each
+ * OS, bound to the neutral shell through file_search_os.hpp. The slot, the stop flag, the search state, the
+ * worker runner and the slice live once, in file_search_shell.cpp. Everything pure lives in the headers
+ * beside this file; this one binds the operating system to them. Self-gated to non-Windows (empty there,
+ * where file_search_win.cpp binds the same names).
  *
- * THREADS. Two kinds run here. The POOL thread is the one the agent called execute() on: it takes the
- * process-wide slot, reads the mount table, builds legs, writes every row and every heartbeat key, and
- * releases the slot. The WORKER is a fresh thread per slice (shared::bounded_call_ex) that runs the walk. A
- * worker touches only heap state it co-owns (its leg, its pattern, its done flag) and the operating system:
- * never the plugin context, the slot or the search state. On a timeout the pool thread stops waiting and the
- * worker runs on, abandoned, until its next syscall returns; the plugin module is pinned in memory at init
- * (file_search_plugin.cpp) so no worker can ever run unmapped code. After shutdown() returns, a call still
- * in flight when its quiesce bound passed finishes on its pool thread inside the pinned module (it releases
- * the slot, records its abandoned worker and writes its rows), and an abandoned worker touches only state it
- * owns.
- *
- * THE CURSOR KEY. 32 random bytes from getentropy, drawn once per process on first use and held for the life
- * of the (pinned) module: init draws it and fails if it cannot, and a re-init never draws another. It is
- * never written anywhere. A cursor is a token the agent authenticates and seals under it
- * (file_search_volumes.hpp), so a cursor is valid, and readable, only in the agent process that issued it.
- *
- * THE SLOT. One atomic flag, taken with compare_exchange by run_slice on the pool thread before it reads any
- * state and released only by that pool thread's RAII guard (file_search_driver.hpp). A second concurrent call
- * answers busy at once. A worker never touches it: it sets only its own done flag.
+ * THE CURSOR KEY. 32 random bytes from getentropy (os_draw_cursor_key), drawn once per process by the
+ * neutral shell and never written anywhere.
  *
  * THE WORKER'S ENVIRONMENT (WorkerEnvironment), set before the walk and gone with the thread:
  *   Linux  CAP_DAC_READ_SEARCH dropped from the thread's effective set (kept permitted) and raised only
@@ -42,23 +27,21 @@
 
 #include "component_legs.hpp"
 
-#include <bounded_wait.hpp>
 #include <linux_thread_caps.hpp>
 #include <macos_dataless_off.hpp>
 #include <macos_network_mounts.hpp>
 #include <posix_secure_read.hpp>
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cstddef>
+#include <expected>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
+#include <vector>
 
 #include <sys/random.h>
 #include <unistd.h>
@@ -76,55 +59,34 @@
 
 namespace yuzu::file_search {
 
-namespace {
-
-// ---- process-wide state: the slot, the stop flag, the in-memory search state ----
-
-std::atomic<bool> g_slot{false};
-std::atomic<bool> g_stop{false};
-
-/// Touched only by the pool thread that holds the slot (run_slice), never by a worker.
-[[nodiscard]] SearchState& search_state() {
-    static SearchState state;
-    return state;
-}
-
-/// The process's cursor key. Drawn once, by whichever call comes first; a failed draw is final for the
-/// process, so init keeps failing rather than the plugin running with a key it cannot vouch for.
-struct CursorKeyHolder {
-    CursorKey key{};
-    bool ok{false};
-};
-
-[[nodiscard]] const CursorKeyHolder& cursor_key_holder() {
-    static const CursorKeyHolder holder = [] {
-        CursorKeyHolder h;
-        h.ok = ::getentropy(h.key.data(), h.key.size()) == 0;
-        if (!h.ok)
-            h.key.fill(0); // never leave a partial draw behind
-        return h;
-    }();
-    return holder;
-}
+// ---- the platform ----
 
 #if defined(__APPLE__)
-constexpr Os kOs = Os::macos;
+const Os kOs = Os::macos;
+// The exception provenance is a literal per OS: the catch-all must answer without allocating outside its own
+// guarded calls.
+const std::string_view kExceptionProvenance = "macos:file_search:exception";
 #else
-constexpr Os kOs = Os::linux_os;
+const Os kOs = Os::linux_os;
+const std::string_view kExceptionProvenance = "linux:file_search:exception";
 #endif
 
 // ---- the mount table ----
+
+namespace {
 
 /// The mounts one search reads: those at or under the root and those that contain it.
 [[nodiscard]] ci::MountKeep keep_for(const std::string& root) {
     return [&root](const yuzu::shared::MountEntry& e) { return under(e.mount_point, root) || under(root, e.mount_point); };
 }
 
+} // namespace
+
 #if defined(__linux__)
 
 /// /proc/<pid>/mountinfo, reached hop by hop from "/" with no link followed (/proc/self is itself a link),
 /// streamed through the keep rule: the table is never held whole. nullopt when it cannot be had in full.
-[[nodiscard]] std::optional<yuzu::shared::MountTable> read_live_mounts(const std::string& root) {
+std::optional<yuzu::shared::MountTable> os_read_mounts(const std::string& root) {
     namespace sh = yuzu::shared;
     const sh::DirOpen top = sh::open_dir_no_follow("/");
     if (!top.opened())
@@ -149,7 +111,7 @@ constexpr Os kOs = Os::linux_os;
 /// rule as the Linux read; the plan itself lets a later entry for a mount point cover an earlier one. A
 /// table of zero entries is a failed read (the root mount is always listed), as is one with more kept
 /// mounts than ci::kMaxKeptMounts.
-[[nodiscard]] std::optional<yuzu::shared::MountTable> read_live_mounts(const std::string& root) {
+std::optional<yuzu::shared::MountTable> os_read_mounts(const std::string& root) {
     struct statfs* raw = nullptr;
     const int n = ::getmntinfo_r_np(&raw, MNT_NOWAIT);
     const std::unique_ptr<struct statfs, decltype(&::free)> listed{raw, &::free};
@@ -164,8 +126,6 @@ constexpr Os kOs = Os::linux_os;
 }
 
 #endif
-
-} // namespace
 
 // ---- the leg of one unit ----
 
@@ -182,9 +142,7 @@ ci::AroundLookup around_lookup_hook() {
 #endif
 }
 
-namespace {
-
-[[nodiscard]] UnitLeg make_live_leg(const Unit& unit) {
+UnitLeg os_make_leg(const Unit& unit) {
     // The cell the extent hook fills while the leaf is open; the facts wrapper below reads it back. One walk
     // runs one leg at a time on one worker, so no lock is needed.
     const auto cell = std::make_shared<FileExtents>();
@@ -196,19 +154,26 @@ namespace {
     UnitLeg out;
     out.ops = std::move(leg.ops);
     out.root_state = std::move(leg.root_state);
-    out.facts = [facts = std::move(leg.facts), cell](const std::string& dir, const std::string& name) {
+    out.facts = [facts = std::move(leg.facts), cell](const std::string& dir, const ci::DirEntry& entry) {
         *cell = FileExtents{};
         cell->state = ExtentsState::failed; // stays so when the leg never reached the extent reader
         FileFacts f;
-        f.facts = facts(dir, name);
-        if (f.facts.opened)
-            f.extents = std::move(*cell);
+        f.facts = facts(dir, entry.name);
+        f.extents = std::move(*cell); // the leg owns its extents state: failed unless the reader ran
         return f;
     };
     return out;
 }
 
+// ---- the cursor key ----
+
+bool os_draw_cursor_key(CursorKey& key) noexcept {
+    return ::getentropy(key.data(), key.size()) == 0;
+}
+
 // ---- the worker ----
+
+namespace {
 
 /// What the worker thread sets up before the walk. Linux settings die with the thread; the macOS dataless
 /// guard is restored by its destructor, so it is held across the WHOLE walk by living in this object.
@@ -232,34 +197,9 @@ private:
 
 } // namespace
 
-/// Runs `work` on a fresh worker thread for at most `timeout`. The work runs inside the worker environment,
-/// whose scope is the whole call of `work`; a throw before or after it is a failed result, never a timeout.
-/// Declared in file_search_execute.hpp: the shell test runs this one.
-RunOutcome<WorkResult> run_on_worker(std::chrono::milliseconds timeout, std::function<WorkResult()> work) {
-    auto ran = yuzu::shared::bounded_call_ex(timeout, [work = std::move(work)]() -> WorkResult {
-        try {
-            const WorkerEnvironment environment;
-            return work();
-        } catch (...) {
-            WorkResult failed;
-            failed.threw = true;
-            return failed;
-        }
-    });
-    RunOutcome<WorkResult> out;
-    switch (ran.status) {
-    case yuzu::shared::BoundedCallStatus::Completed:
-        out.status = RunStatus::completed;
-        out.value = std::move(ran.value);
-        break;
-    case yuzu::shared::BoundedCallStatus::TimedOut:
-        out.status = RunStatus::timed_out;
-        break;
-    case yuzu::shared::BoundedCallStatus::Rejected:
-        out.status = RunStatus::rejected;
-        break;
-    }
-    return out;
+void os_in_worker_environment(const std::function<void()>& body) {
+    const WorkerEnvironment environment;
+    body();
 }
 
 // ---- names ----
@@ -298,43 +238,27 @@ std::string macos_canonical_name(std::string_view name) {
     return out;
 }
 
-fsr::NameSemantics posix_name_semantics() {
+fsr::NameSemantics os_name_semantics() {
     return {"macos_nfc_casefold_v1", [](std::string_view s) { return macos_canonical_name(s); }};
 }
 
 #else
 
-fsr::NameSemantics posix_name_semantics() {
+fsr::NameSemantics os_name_semantics() {
     return fsr::byte_exact();
 }
 
 #endif
 
-// ---- the slice ----
+// ---- the root and the user directories ----
 
-SliceResult run_posix_slice(const Request& req) {
-    Boundaries b{.state = search_state(), .slot = g_slot};
-    b.read_mounts = &read_live_mounts;
-    b.make_leg = &make_live_leg;
-    b.run_bounded = &run_on_worker;
-    b.now = [] { return fsr::Clock::now(); };
-    b.sleep = [](std::chrono::milliseconds d) { std::this_thread::sleep_for(d); };
-    b.stop_requested = [] { return g_stop.load(std::memory_order_acquire); };
-    b.os = kOs;
-    b.cursor_key = cursor_key_holder().key; // all zero if the draw failed: run_slice refuses it
-    return run_slice(req, b);
+std::expected<std::string, RequestError> os_normalise_root(std::string_view raw) {
+    return normalise_root(raw);
 }
 
-bool posix_init_cursor_key() noexcept {
-    return cursor_key_holder().ok;
-}
-
-void posix_request_stop() noexcept {
-    g_stop.store(true, std::memory_order_release);
-}
-
-void posix_clear_stop() noexcept {
-    g_stop.store(false, std::memory_order_release);
+/// A POSIX unit has no profile directories beyond the path rule of is_user_profile_path.
+std::vector<std::string> os_user_roots(const Unit&) {
+    return {};
 }
 
 } // namespace yuzu::file_search
