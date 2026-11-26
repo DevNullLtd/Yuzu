@@ -293,15 +293,17 @@ enum class Added { ok, anchor_full, section_full };
 } // namespace scan_detail
 
 /**
- * Walk `roots`, then read every candidate archive.
+ * Walk `roots`, then read every candidate archive. `policy` is the walk's directory exclusion
+ * (WalkPolicy::skip_dir); the default excludes nothing, which is every POSIX leg's scan. Its
+ * `is_candidate` is left at the default: the scan reads Java archives.
  */
 [[nodiscard]] inline ScanResult scan(std::span<const std::string> roots, const WalkLimits& limits,
-                                     const FsOps& fs) {
+                                     const FsOps& fs, const WalkPolicy& policy = {}) {
     ScanResult out;
     const auto started = fs.now();
     const auto deadline = started + limits.max_wall;
 
-    WalkResult walked = walk(roots, limits, fs, deadline);
+    WalkResult walked = walk(roots, limits, fs, deadline, policy);
     out.stats = walked.stats;
     out.stop = walked.stop;
     const auto record = [&out](Stop s) {
@@ -475,8 +477,9 @@ struct ScanVerdict {
  * a complete scan is supported; the informational tokens ride that row and never change the level.
  * `roots_link_skipped` counts roots dropped for a link, `links_skipped` the links the walk passed
  * over inside the trees (it follows none), and `network_skipped` the network roots dropped plus the
- * network mounts the walk passed over. `dirs_excluded` is the package-owned trees a native walk kept
- * out of (always 0 for the scan): informational `package_tree_skipped`.
+ * network mounts the walk passed over. `dirs_excluded` is the package-owned trees the walk kept out
+ * of (the native scan's package trees, the Windows scan's WindowsApps; 0 on a POSIX scan):
+ * informational `package_tree_skipped`.
  */
 [[nodiscard]] inline ScanVerdict scan_verdict(std::string_view os, Stop stop, bool mount_table_unreadable,
                                               std::size_t roots_link_skipped, std::size_t links_skipped,
@@ -555,15 +558,16 @@ template <class Targets>
  * mount_table_unreadable, roots_link_skipped, roots_network_skipped); `make_fs(t)` builds its FsOps.
  * An unreadable mount table means a network mount cannot be told from a local one: nothing is
  * walked, `make_fs` is not even called, and the answer is constrained with that cause. Pure over
- * its arguments, so a test passes a factory that fails if it is ever reached.
+ * its arguments, so a test passes a factory that fails if it is ever reached. `policy` is passed
+ * to the walk (see scan()); the default excludes nothing.
  */
 template <class Targets, class MakeFs>
 [[nodiscard]] inline Answer answer_scan(std::string_view os, const Targets& t, MakeFs&& make_fs,
-                                        const WalkLimits& limits) {
+                                        const WalkLimits& limits, const WalkPolicy& policy = {}) {
     ScanResult res;
     if (!t.mount_table_unreadable) {
         const FsOps fs = make_fs(t);
-        res = scan(t.roots, limits, fs);
+        res = scan(t.roots, limits, fs, policy);
     }
     return assemble_answer(kScanAction, os, t, std::move(res));
 }
