@@ -239,7 +239,7 @@ Image build_image(const ImageSpec& s) {
     put32(img, 0);
     put32(img, 0);
     put16(img, static_cast<std::uint32_t>(L.opt_size));
-    put16(img, 0x2000);
+    put16(img, 0x2022); // Characteristics: DLL plus two other bits
     std::string opt(L.opt_size, '\0');
     set16(opt, 0, s.plus ? 0x20B : 0x10B);
     set32(opt, nrva_off, 16);
@@ -371,7 +371,7 @@ TEST_CASE("binary_header_pe: PE32 and PE32+ builder images parse to the exact va
         CHECK(r->machine == (plus ? 0x8664 : 0x14C));
         std::optional<std::uint16_t> flags;
         REQUIRE(read_pe_version(span_source(as_span(img.bytes)), {}, {}, &flags).has_value());
-        CHECK(flags == kImageFileDll);
+        CHECK(flags == std::uint16_t{0x2022}); // the whole COFF word, not the DLL bit alone
         check_canonical_values(*r);
     }
 }
