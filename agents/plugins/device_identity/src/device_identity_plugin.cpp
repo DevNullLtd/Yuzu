@@ -50,9 +50,10 @@
 #endif
 #define SECURITY_WIN32
 #include <windows.h>
-#include <lm.h>       // NetGetJoinInformation, NetApiBufferFree
-#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <lm.h>       // NETSETUP_JOIN_STATUS
 #include <security.h> // GetComputerObjectNameA
+
+#include "device_identity_win.hpp"
 #endif
 
 namespace {
@@ -355,24 +356,19 @@ int do_domain(yuzu::CommandContext& ctx) {
 #endif
 
 #ifdef _WIN32
+static_assert(static_cast<std::uint32_t>(NetSetupDomainName) ==
+              yuzu::device_identity::win::kJoinStatusDomain);
+
 int do_domain(yuzu::CommandContext& ctx) {
-    LPWSTR name_buf = nullptr;
-    NETSETUP_JOIN_STATUS join_status{};
-
-    auto status = NetGetJoinInformation(nullptr, &name_buf, &join_status);
-    if (status == NERR_Success && name_buf) {
-        // Convert wide string to narrow
-        std::string domain = yuzu::win::from_wide(name_buf); // (#1681) -1 convert, NUL dropped
-        NetApiBufferFree(name_buf);
-
-        ctx.write_output(std::format("domain|{}", domain.empty() ? "N/A" : domain));
-        ctx.write_output(
-            std::format("joined|{}", join_status == NetSetupDomainName ? "true" : "false"));
-    } else {
-        ctx.write_output("domain|N/A");
-        ctx.write_output("joined|false");
-    }
-    return 0;
+    // The join read has no deadline of its own, so agent-core bounds it (win_join_info.hpp).
+    const auto read = yuzu::agent::win::read_join_info(yuzu::agent::win::kJoinInfoDeadline);
+    const auto answer = yuzu::device_identity::win::domain_answer(read);
+    for (const auto& row : answer.rows)
+        ctx.write_output(row);
+    // Sets nothing for a completed read.
+    yuzu::agent::forward_bounded_failure(ctx, read.status,
+                                         "windows:device_identity:join_information");
+    return answer.rc;
 }
 #endif
 
@@ -512,7 +508,7 @@ int do_ou(yuzu::CommandContext& ctx) {
 // implementation is explicitly deferred, coordinated with a parallel Wave-2
 // effort), and InfoPipe has no OU surface so "ou" on Linux stays on the
 // realm CLI rather than following "domain" onto sd-bus. Windows uses only
-// native NetGetJoinInformation / GetComputerObjectNameA — rung 1.
+// native NetGetJoinInformation (bounded, in agent-core) / GetComputerObjectNameA — rung 1.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "device_name",
