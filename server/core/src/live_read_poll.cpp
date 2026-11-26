@@ -2,6 +2,10 @@
 
 #include "utf8_clamp.hpp"
 
+#include <yuzu/log_token.hpp>
+
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <thread>
 #include <utility>
@@ -243,7 +247,7 @@ LivePollOutcome poll_live_output(const ResponseStore& store, const std::string& 
     // failing row, the terminal row or an `error|` head chunk that later rows (a late or duplicate
     // delivery) pushed past the row limit or the byte cap must still answer.
     q.with_decision_facts = true;
-    return poll_live_output(
+    auto outcome = poll_live_output(
         [&]() -> std::optional<LiveRowsRead> {
             auto bounded = store.query_bounded(command_id, tier, q, std::nullopt, limits.max_output_bytes);
             if (!bounded)
@@ -255,6 +259,22 @@ LivePollOutcome poll_live_output(const ResponseStore& store, const std::string& 
             return read;
         },
         agent_id, limits, sleep_fn, should_stop, now_fn);
+    // The four answers that carry no device text leave nothing in the audit rows or the response
+    // body that names the agent command. One line here, for both surfaces, ties the caller's
+    // request to the stored rows an operator would look at. Both ids are caller- or
+    // device-influenced text, so they go through `log_token`.
+    switch (outcome.outcome) {
+    case LiveOutcome::kTimeout:
+    case LiveOutcome::kIncomplete:
+    case LiveOutcome::kShuttingDown:
+    case LiveOutcome::kStoreDegraded:
+        spdlog::warn("live read: {} command_id={} agent_id={}", to_token(outcome.outcome),
+                     ::yuzu::log_token(command_id), ::yuzu::log_token(agent_id));
+        break;
+    default:
+        break;
+    }
+    return outcome;
 }
 
 } // namespace yuzu::server::live

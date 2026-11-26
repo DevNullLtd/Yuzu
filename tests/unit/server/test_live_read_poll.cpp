@@ -18,11 +18,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -855,6 +858,59 @@ TEST_CASE("poll_live_output [pg]: a Forensics-plugin row and a null plugin set b
     // An unwired plugin set refuses every row rather than reading unfiltered.
     CHECK(live::poll_live_output(store, "cmd-n", "agent-1", nullptr, limits, sleep).outcome ==
           live::LiveOutcome::kTimeout);
+}
+
+TEST_CASE("poll_live_output [pg]: a no-answer outcome logs the command_id and agent_id, an answer logs nothing",
+          "[live][poll][pg][2146]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::test::PostgresTestDb db{live_poll_tpl};
+    REQUIRE(db.available());
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Capture the default logger for the span of this test only.
+    std::ostringstream captured;
+    auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(captured);
+    auto logger = std::make_shared<spdlog::logger>("live_poll_test", sink);
+    logger->set_level(spdlog::level::trace);
+    const auto previous = spdlog::default_logger();
+    spdlog::set_default_logger(logger);
+    struct Restore {
+        std::shared_ptr<spdlog::logger> prev;
+        ~Restore() { spdlog::set_default_logger(prev); }
+    } restore{previous};
+
+    seed(store, "cmd-ok", "agent-1", 1, "proc|1|a\n");
+    seed(store, "cmd-run", "agent-1", 0, "proc|2|partial\n");
+
+    auto limits = fast_limits(2);
+    const auto sleep = [](std::chrono::milliseconds) {};
+    const auto* plugins = &yuzu::server::test::forensics_plugin_set();
+
+    // An answered read writes no line.
+    CHECK(live::poll_live_output(store, "cmd-ok", "agent-1", plugins, limits, sleep).outcome ==
+          live::LiveOutcome::kOk);
+    CHECK(captured.str().empty());
+
+    // Nothing stored: timeout, named with both ids.
+    CHECK(live::poll_live_output(store, "cmd-none", "agent-1", plugins, limits, sleep).outcome ==
+          live::LiveOutcome::kTimeout);
+    // Output with no terminal row: incomplete.
+    CHECK(live::poll_live_output(store, "cmd-run", "agent-1", plugins, limits, sleep).outcome ==
+          live::LiveOutcome::kIncomplete);
+    // The stop predicate: shutting_down.
+    CHECK(live::poll_live_output(store, "cmd-ok", "agent-1", plugins, limits, sleep,
+                                 [] { return true; })
+              .outcome == live::LiveOutcome::kShuttingDown);
+
+    const auto text = captured.str();
+    CHECK(text.find("live read: timeout command_id=cmd-none agent_id=agent-1") != std::string::npos);
+    CHECK(text.find("live read: incomplete command_id=cmd-run agent_id=agent-1") != std::string::npos);
+    CHECK(text.find("live read: shutting_down command_id=cmd-ok agent_id=agent-1") !=
+          std::string::npos);
 }
 
 TEST_CASE("poll_live_output [pg]: the agent scope is applied in SQL, before the row limit", "[live][poll][pg]") {
