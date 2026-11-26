@@ -697,6 +697,7 @@ agent_test_exe = executable(
     'unit/test_component_node_parsers.cpp',      # component_inventory: Node package.json reader and node_modules path shape over real captured fixtures (SAM-49)
     'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
     'unit/test_component_walk_ordered.cpp',      # file search core: sorted depth-first resumable walk_ordered over MemTree and a fake clock, unguarded on every OS
+    'unit/test_file_search_walk_win_macros.cpp', # file search core: the walker and the driver compile with min and max defined as function-like macros (the #8272 acceptance; the macros are Windows-only)
     'unit/test_network_fstype_mounts.cpp',       # shared mount-table entries + local filesystem allow-list (agents/shared/network_fstype.hpp), portable
     'unit/test_file_search_cursor.cpp',          # file search core: walk position order + fs1 cursor codec (agents/shared/file_search_{position,cursor}.hpp), portable
     'unit/test_file_search_names.cpp',           # file search core: reversible name encoding, file identity, match row (agents/shared/file_search_names.hpp), portable
@@ -707,6 +708,8 @@ agent_test_exe = executable(
     'unit/test_file_search_volumes.cpp',         # file search plugin: volume plan, units and refused rows, fsv1 cursor and its transition rule (agents/plugins/file_search/src), portable
     'unit/test_file_search_driver.cpp',          # file search plugin: request parsing, in-memory state and the one-slice driver over fakes (MemTree, fake clock, fake runner), portable
     'unit/test_file_search_rows.cpp',            # file search plugin: row arity, budgets, extents model and the user-directory tag (agents/plugins/file_search/src), portable
+    'unit/test_file_search_win_rules.cpp',       # file search plugin: every pure Windows decision -- root normaliser, label, entry classifier, extents decision and mapper, id policy, volume tokens (agents/plugins/file_search/src/file_search_win_rules.hpp), portable
+    'unit/test_file_search_win_shell.cpp',       # file search plugin: the Windows shell over a salted temp tree -- listing, root check, facts and the two ioctls, volume reader, name rule, key, profile roots (body Windows-only)
     'unit/test_file_search_posix_shell.cpp',     # file search plugin: the POSIX shell's own pieces -- extents of real files, the macOS name rule and mount converter, the thread-capability planner (body POSIX-only; the capability syscalls Linux-only and root-only)
     'unit/test_file_search_local_dispatcher.cpp', # file search plugin: real plugin via LocalDispatcher, unguarded on every OS (one real slice over a fixture under the build root on POSIX)
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
@@ -733,7 +736,9 @@ agent_test_exe = executable(
     'unit/test_middleware_local_dispatcher.cpp',    # SAM.2: real middleware plugin via LocalDispatcher and the table-generated descriptors, unguarded on every OS
     '../agents/plugins/middleware/src/middleware_linux.cpp', # SAM.2: run_linux (self-gated to __linux__, empty elsewhere)
     '../agents/plugins/component_inventory/src/component_fs_posix.cpp',  # SAM-16: POSIX filesystem leg (self-gated to non-Windows, empty on Windows)
+    '../agents/plugins/file_search/src/file_search_shell.cpp',          # file search plugin: the OS-neutral shell (slot, stop flag, search state, cursor key, worker runner, live slice)
     '../agents/plugins/file_search/src/file_search_posix.cpp',          # file search plugin: the POSIX shell (self-gated to non-Windows, empty on Windows)
+    '../agents/plugins/file_search/src/file_search_win.cpp',            # file search plugin: the Windows shell (self-gated to Windows, empty elsewhere)
     '../agents/plugins/file_search/src/file_search_extents_linux.cpp',  # file search plugin: FIEMAP shell (self-gated to __linux__, empty elsewhere)
     '../agents/plugins/file_search/src/file_search_extents_macos.cpp',  # file search plugin: F_LOG2PHYS_EXT shell (self-gated to __APPLE__, empty elsewhere)
   ),
@@ -5683,8 +5688,11 @@ test('file_search read tier tripwire selftest',
 # a file (the pinned spellings are listed in the script's docstring: the FIEMAP sync flag, the write,
 # create, truncate and append open flags, write, sync, stdio, stream, vectored, receive, pread and mmap
 # calls, the shared bounded readers, any read call beyond the mount table reader, and a second fm_flags
-# assignment), and ApprovalManager::covers_continuation keeps its one production caller, the MCP
-# execute_instruction arm. The self-test mutates the sources in memory and requires each mutation to be
+# assignment; on Windows the read, write, delete, move, map and set-information calls, every path-resolving
+# open, every data access right, the backup and restore privileges, the process-wide error mode, every
+# FSCTL_ and IOCTL_ name but the two the leg may spell, and a count rule of exactly two DeviceIoControl
+# calls, only in file_search_win.cpp), and ApprovalManager::covers_continuation keeps its one production
+# caller, the MCP execute_instruction arm. The self-test mutates the sources in memory and requires each mutation to be
 # named. Both also run in .github/workflows/docs-lint.yml on every PR.
 test('file_search source tripwire',
   _python3_test,

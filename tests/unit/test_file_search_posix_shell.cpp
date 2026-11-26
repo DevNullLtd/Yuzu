@@ -446,7 +446,7 @@ TEST_CASE("file_search extents shell: a clone shares all its blocks and a plain 
 
 TEST_CASE("file_search names: the rule of this OS is named and compiles a pattern",
           "[file_search][file_search_shell][file_search_names]") {
-    const fsr::NameSemantics sem = posix_name_semantics();
+    const fsr::NameSemantics sem = os_name_semantics();
 #if defined(__APPLE__)
     CHECK(sem.id == "macos_nfc_casefold_v1");
 #else
@@ -487,7 +487,7 @@ TEST_CASE("file_search names: macOS folds ASCII inline and normalises and folds 
 
 TEST_CASE("file_search names: a macOS pattern in one spelling and case matches a name in another",
           "[file_search][file_search_shell][file_search_names]") {
-    const fsr::NameSemantics sem = posix_name_semantics();
+    const fsr::NameSemantics sem = os_name_semantics();
     const auto p = fsr::Pattern::compile("CAF\xC3\x89-yuzu-ctl*", sem); // upper case, composed
     REQUIRE(p.has_value());
     CHECK(p->evaluate("cafe\xCC\x81-yuzu-ctl-1.bin") == fsr::Match::yes); // lower case, decomposed
