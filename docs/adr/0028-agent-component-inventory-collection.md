@@ -1542,7 +1542,7 @@ deadline would break the one-deadline bound). Reported but not blocking
 (informational tokens on a `supported` row): `root_link_skipped` (a root dropped for a link),
 `link_skipped` (a link met inside a tree, not entered and not listed), `network_fs_skipped` and
 `version_unreadable` (a row whose version no source gives is listed with `version_source` `unreadable`).
-A missing root is skipped silently on Linux and macOS (Windows answers `constrained`, `dir_unreadable`). A `constrained` answer names its cause alone; the informational
+A missing root is skipped silently (on Linux and macOS; see *Correction, 2026-11-26* under the Windows update). A `constrained` answer names its cause alone; the informational
 tokens ride a `supported` row only.
 
 **Fuzz harness.** `tests/fuzz/fuzz_component_zip.cpp` drives the ZIP central-directory reader
@@ -1639,6 +1639,9 @@ host. The drive type is asked again before every directory and every file is ope
 roots are planned, so a drive that stops being a fixed local disk during a scan is refused from then on.
 Per-user locations are not read. Python and Node components on Windows are a later change.
 
+*Correction, 2026-11-26.* The Windows leg skips no root silently: a root it names but cannot list, or
+one that is a reparse point, answers `constrained` with `dir_unreadable`.
+
 **No reparse point is followed (Decision 4).** Every directory and file is opened relative to its
 volume root in one kernel name resolution that refuses a reparse point at any path component
 (`NtCreateFile` with `OBJ_DONT_REPARSE`, in `agents/shared/win_no_reparse_open.hpp`, shared with the
@@ -1654,12 +1657,17 @@ the one name-based exclusion of the Windows leg. `\Windows Kits`, which sits und
 under either root and need no exclusion.
 
 **`native` on Windows.** A candidate is a file whose leaf ends `.dll`, compared without regard to case
-(`.dll.mui` is not one) and whose COFF header
-sets `IMAGE_FILE_DLL`, so a renamed executable gives no row. The version is the fixed file version of the PE's `VS_VERSIONINFO` resource,
+(`.dll.mui` is not one). The version is the fixed file version of the PE's `VS_VERSIONINFO` resource,
 read by the shared bounded PE reader (`agents/shared/binary_header_pe.hpp`) through the same file view;
 `version_source` is `pe`. A PE with no version resource, or a fixed version of 0.0.0.0, is a row with
-an empty version and `version_source` `unreadable`; a file named `.dll` that has no PE header gives no
-row. The 5,000-row cap and the default-off kill switch are unchanged.
+an empty version and `version_source` `unreadable`; a file named `.dll` without the MZ and PE
+signatures gives no row. The 5,000-row cap and the default-off kill switch are unchanged.
+
+*Correction, 2026-11-26.* A candidate whose COFF header is read and does not set `IMAGE_FILE_DLL`
+gives no row (a renamed executable, or a .NET application's own entry assembly), whatever fails after
+that header; it still counts toward the section caps. One cut short before its COFF header is a
+file-name row with `unreadable`. The same rule holds on the other legs: an ELF `e_type` other than
+`ET_DYN`, or a Mach-O `filetype` other than `MH_DYLIB`, gives no row once the header has stated it.
 
 **Known limits.** The open, listing and read calls carry no deadline of their own, so the 45 second
 budget is checked between operations and a dead fixed volume can park one call, as it can for the

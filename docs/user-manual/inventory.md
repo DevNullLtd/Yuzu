@@ -577,7 +577,8 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   and a row with no readable version (`version_unreadable`) ride the status row as information. On
   Windows a file the OS stores behind a reparse point (a cloud placeholder, a file compressed with the
   Windows Overlay Filter) is counted in `link_skipped` and not read. A `constrained` answer names its one cause only. A missing root is
-  skipped silently on Linux and macOS; on Windows it answers `constrained` (`dir_unreadable`).
+  skipped silently on Linux and macOS. On Windows the answer is `constrained`: `mount_table_unreadable`
+  when the Program Files directories cannot be named, `dir_unreadable` when a named root cannot be listed.
 - **What to do about a token.** Terminal (a repeat gives the same answer): `budget_entries`,
   `section_rows`, `anchor_rows`, `depth`, `dir_truncated`, and `archive_unenumerated` for that
   archive. Retryable: `budget_time` (run again off-peak), `archive_changed`,
@@ -627,13 +628,15 @@ no process is started.
   (`libssl.so.3.0.13` reads `3.0.13`), else from the SONAME's suffix. On macOS, from the library's
   Mach-O `current_version` when it is not `0.0.0`, else from the file name's version
   (`libfoo.1.2.dylib` reads `1.2`). On Windows, from the fixed file version of the PE's version
-  resource (source `pe`; `.dll` and `.DLL` are both read, `.dll.mui` is not; a file whose
-  header does not set `IMAGE_FILE_DLL` is not listed); a DLL with no version
+  resource (source `pe`; `.dll` and `.DLL` are both read, `.dll.mui` is not; a file whose PE
+  header is read and does not set `IMAGE_FILE_DLL` is not listed, a .NET application's own entry
+  assembly included); a DLL with no version
   resource, or one whose fixed version is `0.0.0.0`, is listed with `version_source` `unreadable`. A
   library whose header cannot be read inside the fixed
   bounds, or that names no version, is still listed from its file name with `version_source`
   `unreadable`; that is a gap in one row and does not make the scan incomplete. A file whose name
-  looks like a library but whose header says it is not one is not listed.
+  looks like a library but whose header says it is not one is not listed, even when the rest of it
+  is damaged.
 - **Bounds.** The scan's (400,000 directory entries, 45 seconds, 32 levels, 50,000 entries per
   directory, 3,000 rows per application folder) with 5,000 rows in all. Per library, at most 128
   ELF program headers, 4,096 dynamic entries, a 255-byte name, 16 fat slices and 1,024 load

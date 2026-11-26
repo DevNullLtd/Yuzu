@@ -23,8 +23,8 @@
 ##   Windows: no reparse point (junction, symbolic link, mount point) is followed at any path
 ##            component, and one met inside a tree is counted (`link_skipped`) and never opened. A root
 ##            on a drive that is not a fixed local disk (a mapped network drive, removable or optical
-##            media) is dropped and reported as `network_fs_skipped`. A root that is missing, or is itself a reparse
-##            point, is refused and answers constrained (`dir_unreadable`; the POSIX legs drop a
+##            media) is dropped and reported as `network_fs_skipped`. A root that cannot be listed, or is itself a
+##            reparse point, is refused and answers constrained (`dir_unreadable`; the POSIX legs drop a
 ##            missing root silently); a Program Files location
 ##            the shell cannot name answers constrained (`mount_table_unreadable`). The WindowsApps
 ##            directory directly under each root (the Store packages) is not entered, matched by
@@ -187,9 +187,10 @@ status:
 ##            and reported as `package_tree_skipped`.
 ##   All:     the same root, link and network-mount rules as scan. Linux and macOS: a missing root
 ##            is not an error, and a root reached through a link or on a network mount is dropped
-##            and reported. Windows: a missing root, or one that is a reparse point, answers
-##            constrained (`dir_unreadable`), and a root on a drive that is not a fixed local disk
-##            is dropped and reported. No link (on Windows: no reparse point) is followed at any
+##            and reported. Windows: a root that cannot be listed, or is a reparse point, answers
+##            constrained (`dir_unreadable`), a Program Files location the shell cannot name answers
+##            `mount_table_unreadable`, and a root on a drive that is not a fixed local disk is
+##            dropped and reported. No link (on Windows: no reparse point) is followed at any
 ##            path component.
 ## Candidates are files named <stem>.so or <stem>.so.<digits and dots> (Linux), <stem>.dylib
 ## (macOS) and <stem>.dll (Windows, the extension compared without regard to case; `.dll.mui` is not
@@ -198,7 +199,8 @@ status:
 ## Mach-O load commands in 512 KiB; a universal file uses its first readable dynamic-library slice;
 ## a PE's section table and its three-level resource directory, 256 KiB of version data).
 ## The name and version a file declares are its own claim; no signature is checked. A file whose name matches
-## but whose header says it is not a shared library gives no row. A shared library whose header
+## but whose header says it is not a shared library gives no row, whatever fails after that. A shared
+## library (or a file that breaks before its header states a type) whose header
 ## cannot be read inside those bounds still gives a row, named from its file name, with the version
 ## the file name carries or `unreadable`. Extension-less macOS framework binaries are not read.
 ## The name is the SONAME (Linux) or install name (macOS) without its .so or .dylib suffix and
@@ -207,8 +209,8 @@ status:
 ## current_version when it is not 0.0.0, else the file name's version (libfoo.1.2.dylib reads 1.2).
 ## Windows: the version is the fixed file version of the PE's version resource (a.b.c.d, version_source
 ## `pe`); a PE with no version resource, or a fixed version of 0.0.0.0, is a row with an empty version
-## and `unreadable`, and a file named .dll that has no PE header, or whose header does not set
-## IMAGE_FILE_DLL, gives no row.
+## and `unreadable`, and a file named .dll without the MZ and PE signatures, or whose COFF header is
+## read and does not set IMAGE_FILE_DLL, gives no row.
 ##
 ## BOUNDS: 400,000 directory entries, 45 seconds for the whole scan, 32 directory levels, 50,000
 ## entries per directory listing, 3,000 rows per top-level application folder, 5,000 rows in all.
