@@ -802,13 +802,16 @@ struct RegistryMechanismTestControls {
     /// `probe_hook`, a call that leaves it null clears any installed hook.
     ///
     /// CALL ORDER for a result that can be COMMITTED (an establishment, a re-arm, a retry:
-    /// a probe that took no duplicate, whose fresh key is a Target): the fresh read
+    /// a probe that is not a verification, whose fresh key is a Target and whose first read
+    /// succeeded), WHILE THE CHECK IS ON at launch (`path_verify_ms > 0`): the fresh read
     /// (`held == false`), then the CONFIRMING read (`held == false` again), which runs
     /// BEFORE its second by-path open, so a parked test lands a change between the first read
-    /// and the second open. A value returned for the confirming read is its name and skips the
+    /// and the second open. With the check OFF there is the fresh read only: no confirming
+    /// read, no second open. The interval is fixed when each probe is launched. A value returned for the confirming read is its name and skips the
     /// open (it confirms when its status is 0 and the name equals the first read); `nullopt`
-    /// runs the real open and query. A verification (duplicate present) makes the fresh read,
-    /// then the held read (`held == true`), and no confirming read. Because the first read
+    /// runs the real open and query. A verification (duplicate present, or one whose duplicate
+    /// failed) makes the fresh read, then the held read (`held == true`) when it has a
+    /// duplicate, and no confirming read. Because the first read
     /// follows the probe's own open, parking the FIRST `held == false` call is how a test
     /// lands a rename between the open and the read that a confirmed commit must survive.
     std::function<std::optional<std::pair<long, std::wstring>>(std::string_view subkey, bool held)>
@@ -868,17 +871,23 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t commit_name_missing{0};
     /// DuplicateHandle of the held key failed (or `verify_fail_duplicate`) for a verification.
     std::uint64_t verify_dup_failed{0};
-    /// Commit-capture confirmations that failed (#7877 item 31, R1 governance fix): a probe
-    /// result whose second by-path name read did not agree with the first (or could not be
-    /// made) was NOT committed and the watch was retried on the admission schedule. Counts
-    /// retries, not watches.
+    /// Commits not accepted and retried (#7877 item 31, R1): a probe result whose confirming
+    /// second by-path name read did not agree with the first (or could not be made), on the
+    /// admission schedule; and a verification result that a concurrent fire converted into the
+    /// re-arm, retried at once as an ordinary re-arm (it ran no confirming read). The
+    /// confirming read runs only while the check is on (`path_verify_ms > 0` at launch).
+    /// Counts retries, not watches.
     std::uint64_t commit_capture_retry{0};
-    /// Per-watch warnings actually logged (test-only): the canonical name could not be
-    /// recorded at a commit (counted only while verification is on), a verification could not
-    /// decide (once per blind episode of a watch), a DuplicateHandle failed.
-    std::uint64_t warns_logged_name_missing{0};
-    std::uint64_t warns_logged_undecided{0};
-    std::uint64_t warns_logged_dup_failed{0};
+    /// Per-watch warnings (test-only), counted when the per-watch flag was claimed and the log
+    /// call returned without throwing (the counter cannot see whether a sink wrote the line):
+    /// a watch with no recorded canonical name (at a commit, or at a verification; only while
+    /// verification is on), a verification that could not decide (once per blind episode of a
+    /// watch), a DuplicateHandle failure, and a commit that could not be confirmed (once per
+    /// deferral episode; never from watch(), which logs nothing).
+    std::uint64_t warns_claimed_name_missing{0};
+    std::uint64_t warns_claimed_undecided{0};
+    std::uint64_t warns_claimed_dup_failed{0};
+    std::uint64_t warns_claimed_commit_unconfirmed{0};
     /// The effective verification interval in ms (0 = off). Production default 0.
     std::int64_t path_verify_ms{0};
     std::size_t probe_workers_active{0};
