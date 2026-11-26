@@ -33,8 +33,8 @@ NOT_UNITS = {("__guard__", "push_rules"), ("__sync__", "now")}
 
 def header_rows() -> dict[tuple[str, str], int]:
     text = HEADER.read_text(encoding="utf-8")
-    start = text.index("kUnitOs{{")
-    body = text[start:text.index("}};", start)]
+    start = text.index("kUnitOs = std::to_array<UnitOsRow>({")
+    body = text[start:text.index("\n});", start)]
     out: dict[tuple[str, str], int] = {}
     for plugin, action, expr in ROW_RE.findall(body):
         mask = 0
