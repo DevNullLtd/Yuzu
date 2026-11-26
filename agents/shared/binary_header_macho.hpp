@@ -306,6 +306,7 @@ read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {
     const std::string_view table = *table_read;
 
     info.fat = true;
+    info.slices.reserve(nfat); // so keeping a slice cannot fail after its type was read
     for (std::uint32_t i = 0; i < nfat; ++i) {
         const std::size_t at = static_cast<std::size_t>(i) * entry;
         MachoSlice s;
