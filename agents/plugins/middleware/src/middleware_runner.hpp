@@ -1,6 +1,8 @@
 /**
  * middleware_runner.hpp -- the GENERIC runner of the middleware plugin: one product leg of the table
- * (agents/shared/middleware_products.hpp) turned into data rows and status tokens.
+ * (agents/shared/middleware_products.hpp) turned into data rows and status tokens. Two runners, one
+ * per leg shape of the table: run_leg reads FILES (Linux), run_reg_leg reads the REGISTRY (Windows,
+ * the registry section below). Both build rows with format_row against the same budget.
  *
  * Pure orchestration. No OS header, no filesystem library, no logging, no thread: every OS touch goes
  * through the `Fs` the caller passes, every per-item shortfall through the `Log` callable, so the
@@ -55,6 +57,59 @@
  * exhausted, ends the walk with `<os>:middleware:walk:row_cap`; the candidate being resolved when
  * the Fs budget ran dry gets no row, because its version is no longer trustworthy.
  *
+ * THE REGISTRY LEG (run_reg_leg, MiddlewareRegFs). The Fs owns every registry call, both registry
+ * views and the entries-visited budget, and answers with an Outcome, never an exception:
+ *
+ *   RegKeys reg_subkeys(std::string_view hklm_key)
+ *               the subkey NAMES of HKLM\<key> the Fs could read, and `out` = why the read was not
+ *               whole, when it is not ok (a refused or failed view can still leave the names of the
+ *               view that answered: those are kept, see below)
+ *   Read    reg_value(std::string_view hklm_key, std::string_view subkey, std::string_view value,
+ *                     std::size_t cap)
+ *               the REG_SZ text of HKLM\<key>\<subkey> value `value`, or why not
+ *   exhausted() / os()   as above
+ *
+ * HKLM only: nothing here names a hive. Failure never reads as absent:
+ *
+ *   installation key absent (both views)                supported, zero rows (none found)
+ *   installation key present with no subkey             supported, zero rows (none found): a key
+ *                                                       that answered and is empty registers none
+ *   key refused in either view                          CONSTRAINED  <probe>:permission_denied; rows:
+ *                                                       those of the view that answered, if any
+ *   key failed in either view, in any other way         CONSTRAINED  <probe>:unreadable; rows: as
+ *                                                       above (a refusal outranks a failure)
+ *   more than kMaxRows subkeys                          CONSTRAINED  <probe>:row_cap; the first
+ *                                                       kMaxRows kept, in sorted order
+ *   a listing the Fs's entries budget cut               CONSTRAINED  walk:row_cap; no rows
+ *   entries / row / byte budget out (walk or Fs)        CONSTRAINED  walk:row_cap
+ *   a subkey whose path value was refused (denied)      CONSTRAINED  <probe>:permission_denied;
+ *                                                       that installation gets no row, its
+ *                                                       siblings are kept; one log line
+ *                                                       (ItemReason::unreadable)
+ *   a subkey whose path value failed to read, in any
+ *     other way (not absent, empty, oversized or
+ *     wrong-typed, and not refused)                     CONSTRAINED  <probe>:unreadable; as above:
+ *                                                       no row, not counted as dropped, siblings
+ *                                                       kept, one log line (ItemReason::unreadable)
+ *   some subkeys with an ABSENT, empty, oversized or
+ *     wrong-type (not_text) path value, at least one
+ *     usable                                            supported; one log line per dropped
+ *                                                       subkey (ItemReason::malformed)
+ *   every subkey with such a path value                 CONSTRAINED  <probe>:malformed; wrong value
+ *                                                       names fail loudly on a host with the product
+ *   a version value missing / refused / failed /
+ *     oversized / empty / not text, beside a row that
+ *     has its version                                   supported; logged; that row's version "-"
+ *   EVERY row built has a version value ABSENT on its
+ *     key (every version probe answered absent), at
+ *     least one row                                     CONSTRAINED  <version probe id>:malformed
+ *                                                       (`vrmf:malformed`); the rows are kept with
+ *                                                       "-": a wrong version value name fails
+ *                                                       loudly on a host with the product. Only an
+ *                                                       ABSENT value counts: a refused, failed,
+ *                                                       oversized, empty or non-text one only
+ *                                                       blanks its row
+ *
  * ORDER OF THE VERSION PROBES (a per-item decision, fixed): for a candidate, every dir_name probe in
  * table order; a listing is judged ONCE per distinct sub-directory and in this order --
  *   1. out is refused / network / symlink      -> ItemReason::path_refused
@@ -96,7 +151,11 @@ struct Candidate {
 };
 
 struct Read {
-    enum class Outcome { ok, absent, refused, network, symlink, denied, oversized, failed };
+    /// `not_text` = a registry value of a type other than a string (the registry leg only): a
+    /// wrong-typed value is a data-shape fault, never to be confused with a read that `failed`.
+    enum class Outcome {
+        ok, absent, refused, network, symlink, denied, oversized, failed, not_text
+    };
     Outcome out = Outcome::failed; ///< a default-built Read is a failure, never an empty success
     std::string text;
 };
@@ -108,6 +167,13 @@ struct Listing {
     Read::Outcome out = Read::Outcome::ok;
 };
 
+/// The subkeys of one registry key (MiddlewareRegFs::reg_subkeys). A default-built answer is a
+/// failure, never an empty success.
+struct RegKeys {
+    std::vector<std::string> names;
+    Read::Outcome out = Read::Outcome::failed;
+};
+
 template <class F>
 concept MiddlewareFs = requires(F& fs, const F& cfs) {
     { fs.read_abs(std::string_view{}, std::size_t{}) } -> std::same_as<Read>;
@@ -115,6 +181,18 @@ concept MiddlewareFs = requires(F& fs, const F& cfs) {
     { cfs.exhausted() } -> std::convertible_to<bool>;
     { cfs.os() } -> std::convertible_to<std::string_view>;
 };
+
+template <class F>
+concept MiddlewareRegFs = requires(F& fs, const F& cfs) {
+    { fs.reg_subkeys(std::string_view{}) } -> std::same_as<RegKeys>;
+    { fs.reg_value(std::string_view{}, std::string_view{}, std::string_view{}, std::size_t{}) }
+        -> std::same_as<Read>;
+    { cfs.exhausted() } -> std::convertible_to<bool>;
+    { cfs.os() } -> std::convertible_to<std::string_view>;
+};
+
+/// The most bytes of one registry value text the runner asks for (an install path or a version).
+inline constexpr std::size_t kMaxRegValueBytes = 64 * 1024;
 
 /// A leg's row budget with both limits clamped to the production ceilings.
 [[nodiscard]] inline yuzu::shared::RowByteBudget
@@ -137,9 +215,28 @@ namespace detail {
     case Read::Outcome::ok:
     case Read::Outcome::absent:
     case Read::Outcome::refused:
+    case Read::Outcome::not_text:
     case Read::Outcome::failed:    break;
     }
     return Cause::unreadable;
+}
+
+/// A registry install-path value that did not read, judged: true = a READ fault (refused, or failed
+/// in any other way: the installation is there and its path is unknown), false = a data-shape fault
+/// of that one subkey (absent, empty, oversized or wrong-typed). Not for `ok`.
+[[nodiscard]] constexpr bool reg_path_fault(Read::Outcome o) noexcept {
+    switch (o) {
+    case Read::Outcome::absent:
+    case Read::Outcome::oversized:
+    case Read::Outcome::not_text:
+    case Read::Outcome::ok:        return false;
+    case Read::Outcome::denied:
+    case Read::Outcome::refused:
+    case Read::Outcome::network:
+    case Read::Outcome::symlink:
+    case Read::Outcome::failed:    break;
+    }
+    return true;
 }
 
 [[nodiscard]] constexpr bool path_refused(Read::Outcome o) noexcept {
@@ -263,6 +360,116 @@ template <MiddlewareFs Fs, class Log>
         }
         rows.push_back(std::move(row));
     }
+    return rows;
+}
+
+/// Runs one REGISTRY leg of `p` over `fs` (the table's reg_subkeys enumerator, then its reg_value
+/// version probes) and returns its DATA rows, with the same contract as run_leg: enumeration failures
+/// are `<os>:middleware:<probe id>:<cause>` tokens in `acc`, per-item shortfalls go to `log` only, a
+/// leg with no probes yields nothing.
+template <MiddlewareRegFs Fs, class Log>
+[[nodiscard]] std::vector<std::string> run_reg_leg(const Product& p, const OsLeg& leg, Fs& fs,
+                                                   yuzu::shared::ConstraintAccumulator& acc,
+                                                   yuzu::shared::RowByteBudget& budget, Log&& log)
+    requires std::invocable<Log&, std::string_view, std::string_view, ItemReason, std::string_view>
+{
+    std::vector<std::string> rows;
+    if (leg.probes.empty())
+        return rows;
+    const std::string_view os = fs.os();
+    const auto fail = [&](std::string_view source, Cause c) {
+        acc.add_failure(make_token(os, source, c));
+    };
+
+    // 1. the enumerator: every subkey of probes[0]'s key is a candidate.
+    const Probe& enumerator = leg.probes[0]; // products_well_formed() guarantees a reg_subkeys
+    RegKeys keys = fs.reg_subkeys(enumerator.path);
+    if (keys.out == Read::Outcome::absent)
+        return rows; // no such key in either view: none found, and not a failure
+    if (keys.out != Read::Outcome::ok) {
+        // the registry has two failure causes: a refusal, and anything else. The token constrains
+        // the answer; names the Fs still holds (one view refused or failed, the other answered) are
+        // walked, so a refused view never makes the installations of the other disappear.
+        fail(enumerator.id, keys.out == Read::Outcome::denied ? Cause::permission_denied
+                                                              : Cause::unreadable);
+        if (keys.names.empty())
+            return rows;
+    }
+    if (fs.exhausted()) { // the listing ran the entries budget dry: its names are not the whole key
+        fail("walk", Cause::row_cap);
+        return rows;
+    }
+    std::sort(keys.names.begin(), keys.names.end());
+    if (keys.names.size() > kMaxRows) {
+        fail(enumerator.id, Cause::row_cap);
+        keys.names.resize(kMaxRows);
+    }
+
+    // 2. per candidate: its install path, then the version from the first reg_value probe that
+    //    yields text, then its row.
+    std::size_t dropped = 0;
+    std::size_t versionless = 0; // rows whose every version probe answered ABSENT
+    for (const std::string& name : keys.names) {
+        Candidate c{name, {}, {}};
+        Read path = fs.reg_value(enumerator.path, name, enumerator.path_key, kMaxRegValueBytes);
+        const bool usable = path.out == Read::Outcome::ok && !path.text.empty();
+        bool every_version_absent = false;
+        if (usable) {
+            c.install_path = std::move(path.text);
+            every_version_absent = leg.probes.size() > 1;
+            for (std::size_t i = 1; i < leg.probes.size() && c.version.empty(); ++i) {
+                const Probe& pr = leg.probes[i];
+                Read v = fs.reg_value(enumerator.path, name, pr.name_key, kMaxRegValueBytes);
+                if (v.out != Read::Outcome::absent)
+                    every_version_absent = false;
+                if (v.out == Read::Outcome::ok && !v.text.empty())
+                    c.version = std::move(v.text);
+                else
+                    log(std::string_view{p.id}, std::string_view{pr.id},
+                        (v.out == Read::Outcome::ok || v.out == Read::Outcome::absent)
+                            ? ItemReason::missing
+                            : ItemReason::unreadable,
+                        std::string_view{name});
+            }
+        }
+        if (fs.exhausted()) { // the reads ran the entries budget dry: this candidate gets no row
+            fail("walk", Cause::row_cap);
+            return rows;
+        }
+        if (!usable && detail::reg_path_fault(path.out)) {
+            // An ACCESS or READ fault, never a data-shape one: the installation exists but its path
+            // could not be read (refused, or failed in any other way), so the answer is incomplete.
+            // It gets no row, is not counted in `dropped` (the token already constrains the answer)
+            // and its siblings are kept.
+            fail(enumerator.id, path.out == Read::Outcome::denied ? Cause::permission_denied
+                                                                  : Cause::unreadable);
+            log(std::string_view{p.id}, std::string_view{enumerator.id}, ItemReason::unreadable,
+                std::string_view{name});
+            continue;
+        }
+        if (!usable) {
+            // A data-shape fault of ONE subkey: logged, its siblings are kept.
+            ++dropped;
+            log(std::string_view{p.id}, std::string_view{enumerator.id}, ItemReason::malformed,
+                std::string_view{name});
+            continue;
+        }
+        std::string row = format_row(p.id, p.title, c.name, c.version, c.install_path, "");
+        if (!budget.charge(row.size())) {
+            fail("walk", Cause::row_cap);
+            return rows;
+        }
+        rows.push_back(std::move(row));
+        if (every_version_absent)
+            ++versionless;
+    }
+    if (!keys.names.empty() && dropped == keys.names.size())
+        fail(enumerator.id, Cause::malformed); // every subkey dropped: incomplete, not "none found"
+    // No installation has a version value at all: a misspelt version value name is
+    // indistinguishable from a product that records none, and a quiet `-` on every row would read
+    // as the latter. One row beside a sibling that has its version stays a logged `-`.
+    if (!rows.empty() && versionless == rows.size())
+        fail(leg.probes[1].id, Cause::malformed);
     return rows;
 }
 

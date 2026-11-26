@@ -21,7 +21,7 @@ cadences.
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
   (Windows machine-context MSI products), `runtimes` `python`, `dotnet` and `jvm` (installed
   Python, .NET and Java runtimes), `middleware` `ibm_mq` (IBM MQ
-  installations; Linux) and `hardware` `drivers_inventory` (Windows PnP signed drivers; Linux
+  installations; Linux and Windows) and `hardware` `drivers_inventory` (Windows PnP signed drivers; Linux
   loaded kernel modules). Each action runs on its own bounded worker, 120 seconds for
   `installed_apps`, `windows_optional_features` and `hardware`, 60 for the rest. **A source that
   cannot answer costs only its own section, never the report.** A plugin that is not loaded, or
@@ -287,22 +287,32 @@ cadences.
   stored `jvm` rows stay, shown as unconfirmed. The macOS Java leg is verified against fixture
   trees built from the documented bundle layout, not a real JDK install.
 
-  **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
-  `middleware.ibm_mq`) with `kind` `app`, `ecosystem` `ibm_mq`, `name` `IBM MQ` and `publisher`
-  `IBM`, taken from the plugin's product table. `version` is VRM (version.release.modification,
-  for example `9.4.5`); the fix-pack level is not carried. The install path and edition
+  **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux and Windows;
+  `source` `middleware.ibm_mq`) with `kind` `app`, `ecosystem` `ibm_mq`, `name` `IBM MQ` and `publisher`
+  `IBM`, taken from the plugin's product table. On Linux `version` is VRM
+  (version.release.modification, for example `9.4.5`) and the fix-pack level is not carried; on
+  Windows it is the `VRMF` registry value as the installer wrote it. The install path and edition
   are shown by the `middleware` definition, not carried into installed software. This is a
-  metadata-only read with no subprocess: `mqinst.ini` and the
-  swidtag file names, readable by an unprivileged account (measured as a throwaway
+  metadata-only read with no subprocess: on Linux `mqinst.ini` and the
+  swidtag file names, on Windows the `HKLM\SOFTWARE\IBM\WebSphere MQ\Installation` subkeys in
+  both registry views (`FilePath` and `VRMF` values). The key and both Windows value names were
+  confirmed on one real IBM MQ 9.4.5.0 install, so that leg is declared `supported`; an installation key whose `FilePath` is missing or not text shows as
+  `windows:middleware:installation_key:malformed` when none has one, a `FilePath` the registry
+  refuses shows as `windows:middleware:installation_key:permission_denied` (one that failed to
+  read in any other way as `windows:middleware:installation_key:unreadable`), and a `VRMF` value
+  missing on every installation shows as `windows:middleware:vrmf:malformed` with the rows kept at
+  version `-`: each is a status token, never a quietly shorter list. A key that is present with no
+  subkey is `supported` with no rows. The Linux read is
+  readable by an unprivileged account (measured as a throwaway
   unprivileged uid on one IBM MQ 9.4.5.0 Ubuntu-debs install; not measured as the packaged
-  `yuzu-agent` account or on another version or distribution). If the answer is `constrained`
+  `yuzu-agent` account or on another version or distribution; the Windows read is measured on one real 9.4.5.0 install in an elevated administrator session, not as a standard (non-administrator) user, as the service account, on another version, on a 32-bit-only registration or with several installations). If the answer is `constrained`
   (an access or walk fault such as a refused read or a cap; an unusable `mqinst.ini` stanza
   beside a usable one is only logged) the collector reports this source `constrained` with the
   tokens, logs a warning, and carries on with every other source. The stored IBM MQ rows are
   kept (shown as unconfirmed) until a later read confirms them; a `constrained` section is the
   signal the server holds, and it cannot by itself tell a device with no IBM MQ from one whose
-  read keeps failing: run the `ibm_mq` action on the device and read its status row. Windows and
-  macOS answer `unsupported` (planned) and are reported `not_collected`.
+  read keeps failing: run the `ibm_mq` action on the device and read its status row. macOS
+  answers `unsupported` (planned) and is reported `not_collected`.
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,

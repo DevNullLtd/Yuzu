@@ -147,7 +147,7 @@ inline constexpr std::array<VocabEntry, 11> kSoftwareSources{{
     {"runtimes.python", "runtimes.python",
      "Python interpreters at the standard machine-wide locations (Windows, macOS, Linux)"},
     {"middleware.ibm_mq", "middleware.ibm_mq",
-     "Registered IBM MQ installations, from installer metadata (Linux)"},
+     "Registered IBM MQ installations, from installer metadata (Linux, Windows)"},
     {"runtimes.dotnet", "runtimes.dotnet",
      ".NET runtimes, SDKs and Framework at the standard machine-wide locations (Windows, macOS, "
      "Linux)"},
