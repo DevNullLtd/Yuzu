@@ -642,21 +642,42 @@ class GateBehaviour(unittest.TestCase):
         r = self.run_gate("sha256:" + "d" * 64, os_pkgs="0")
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
 
+    def listed_gate(self, *names):
+        """A copy of the gate in a scratch tree whose not-covered list names `names`.
+
+        The repository list is empty (the chiselled images carry status.d records), so
+        a test of the listing mechanism supplies its own list, hermetically."""
+        ci = self.tmp / "listed" / "scripts" / "ci"
+        ci.mkdir(parents=True, exist_ok=True)
+        for f in (GATE, CHECKS):
+            shutil.copy2(f, ci / f.name)
+        (ci / NOT_COVERED.name).write_text("".join(nc_line(n) for n in names), encoding="utf-8")
+        return ci / GATE.name
+
     def test_listed_image_with_zero_packages_passes_as_not_covered(self):
         rep = self.tmp / "rep"
         for arg in ("yuzu-server-chisel=sha256:" + "e" * 64,
                     "ghcr.io/devnullltd/yuzu-gateway-chisel:9.9.9"):
             with self.subTest(arg=arg):
-                r = self.run_gate(arg, os_pkgs="0", extra=("--report-dir", str(rep)))
+                r = self.run_gate(arg, os_pkgs="0", extra=("--report-dir", str(rep)),
+                                  gate=self.listed_gate("yuzu-server-chisel", "yuzu-gateway-chisel"))
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
                 self.assertIn("NOT COVERED by OS package scanning", r.stdout)
         self.assertIn("coverage: not-covered",
                       (rep / "trivy-yuzu-server-chisel.gate.txt").read_text(encoding="utf-8"))
 
     def test_listed_image_that_has_packages_warns_but_passes(self):
-        r = self.run_gate("yuzu-server-chisel=img:1", os_pkgs="3")
+        r = self.run_gate("yuzu-server-chisel=img:1", os_pkgs="3", gate=self.listed_gate("yuzu-server-chisel"))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("remove it from the list", r.stdout)
+
+    def test_a_chisel_image_that_is_no_longer_listed_fails_at_zero_packages(self):
+        # The repository list is empty: this is the regression the removal closes.
+        for name in ("yuzu-server-chisel", "yuzu-gateway-chisel", "yuzu-agent-chisel", "yuzu-agent-bundle-chisel"):
+            with self.subTest(name=name):
+                r = self.run_gate(f"{name}=img:1", os_pkgs="0")
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertNotIn("NOT COVERED", r.stdout)
 
     def test_package_count_is_printed(self):
         r = self.run_gate("img:1", os_pkgs="7")
@@ -830,10 +851,13 @@ class GateBehaviour(unittest.TestCase):
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def test_not_covered_list_names_only_published_chisel_images(self):
+    def test_not_covered_list_is_empty_and_any_entry_names_a_published_chisel_image(self):
+        # The four chiselled images carry dpkg status.d records (chisel-emit-status.py),
+        # so none is listed: a regression to zero OS packages fails the gate instead of
+        # passing as NOT COVERED. A future entry must still name a published chisel image.
         names = [ln.split(":", 1)[0].strip() for ln in NOT_COVERED.read_text(encoding="utf-8").splitlines()
                  if ln.strip() and not ln.lstrip().startswith("#")]
-        self.assertTrue(names)
+        self.assertEqual(names, [], "an image is listed as not covered again: remove it or justify it in the PR")
         for n in names:
             self.assertIn(n, PUBLISHED, n)
             self.assertTrue(n.endswith("-chisel"), f"{n}: only FROM-scratch chisel images are expected here")
@@ -983,7 +1007,7 @@ class GateBehaviour(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(len(self.canaries()), 1, self.calls())
         self.log.unlink()
-        r = self.run_gate("yuzu-server-chisel=img:3", os_pkgs="0")
+        r = self.run_gate("yuzu-server-chisel=img:3", os_pkgs="0", gate=self.listed_gate("yuzu-server-chisel"))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.canaries(), [])
 

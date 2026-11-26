@@ -1188,7 +1188,7 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   `scripts/build-agent-bundle.sh --push` predate the gate and can push release tags with
   maintainer credentials, bypassing the gate and the journal; they are not used to publish a
   release (Limit 1 of the policy).
-- *Not covered (disclose with the control):* unfixed MEDIUM and lower findings in the OS packages of the chiselled images (the build records each cut package as a dpkg `status.d` file at package granularity, so Trivy and grype read them and the gate refuses a fixable CRITICAL; the four not-covered listings are stale until #8415 removes them, and would pass a regression to zero packages as `NOT COVERED`), PostgreSQL
+- *Not covered (disclose with the control):* unfixed MEDIUM and lower findings in the OS packages of the chiselled images (the build records each cut package as a dpkg `status.d` file at package granularity, so Trivy and grype read them and the gate refuses a fixable CRITICAL; no image is on the not-covered list, so a regression to zero packages fails the gate), PostgreSQL
   in `yuzu-postgres`, the gateway's Erlang/OTP runtime, statically linked code, HIGH and unfixed
   findings (reported, not gated), and the integrity of the vulnerability DB (unsigned upstream).
   `pre-release.yml` rescans the published images afterwards; it is detective only.

@@ -218,12 +218,8 @@ What this does **not** gate:
   database of their own; the build writes one dpkg `status.d` record per cut package, so Trivy and
   grype read those packages and the gate refuses a fixable CRITICAL in them like in any other
   image. The records are per package: a slice is recorded as its whole package, so a finding in a
-  file the slice does not ship can be reported. An image on the not-covered list that Trivy sees
-  OS packages in is treated as covered, and the gate prints a warning that its listing is stale;
-  the listing applies only if Trivy sees no OS package, and then the `.gate.txt` says
-  `coverage: not-covered` and a passing scan is not evidence about the image's OS packages. The
-  four listings are removed by #8415 and expire 2027-02-15; their expiry is not consulted while
-  Trivy sees packages. Scanning a chisel image with your own Trivy or grype lists those packages
+  file the slice does not ship can be reported. No image is on the not-covered list: an image in which
+  Trivy sees no OS package fails the gate as unscanned. Scanning a chisel image with your own Trivy or grype lists those packages
   and their unfixed MEDIUM and lower findings; the gate does not refuse those. If a release
   refuses a chisel image for a fixable CRITICAL, rebuild so the chisel archive resolves the fixed
   package version, or accept the finding in `.trivyignore.yaml` or `.grypeignore.yaml` scoped to
