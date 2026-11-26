@@ -1693,7 +1693,10 @@ public:
                         spdlog::info("SparkEngine: Registry path verification: every {} ms "
                                      "(opt-in; floor {} ms){}; each check re-opens every watched "
                                      "Registry key, duplicates the held handle and reads canonical "
-                                     "names (audit-load figures: docs/spark-flip-gate.md)",
+                                     "names, and every establishment and re-arm opens the key a "
+                                     "second time to confirm its name; on an audited key these "
+                                     "write Security-log events (see docs/user-manual/"
+                                     "guaranteed-state.md)",
                                      registry_path_verify.count(), floor_ms, note);
 #else
                         spdlog::info("SparkEngine: Registry path verification: every {} ms "

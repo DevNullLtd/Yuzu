@@ -1867,7 +1867,7 @@ flip, with a red-first test each:
     - #7901: a CI leg installs `dbus-daemon` and sets `YUZU_REQUIRE_SPARK_DBUS_TESTS`, so the Linux Service case runs.
     - Also below: export of the File debug counters (#7658; the Registry `verify_lost` and `verify_undecided` counters
       and the R1 counters `verify_name_lost`, `verify_name_undecided`, `commit_name_recorded`, `commit_name_missing`,
-      `verify_dup_failed` and `commit_capture_retry` are test-only too and should be exported alongside them, a
+      `verify_dup_failed`, `commit_capture_retry` and the `warns_claimed_*` counters are test-only too and should be exported alongside them, a
       recommendation: #7658 does not yet say so; `verify_name_undecided` and `commit_name_missing` are the ONLY
       discriminators between a blind Registry watch and a healthy one besides the per-watch agent-log warns, so they must
       be exported before the flip), the audit, EDR and SMB sign-in check of item (2), and the Gate 5 flip-time scenarios of
@@ -2063,10 +2063,14 @@ flip, with a red-first test each:
     with Registry auditing alone; with Handle Manipulation also on, 6 per check (4 for the by-path open, 2 for the
     duplicate); 1,440 versus 8,640 events a day per key at 60 s and 17,280 versus 103,680 at 5 s. There is no positive
     control for the Handle Manipulation zeros, and real fleet SACLs, N keys, and fleet-synchronised bursts are not
-    measured. Every establishment, re-arm and retry also opens the key by path a second time (the commit-capture
-    confirmation added in the governance fix round): one more event with Registry auditing alone and four more with
-    Handle Manipulation also on, per commit, independent of the verification interval; a deferred and retried
-    verification takes a new duplicate, two more events with Handle Manipulation on. The cost statement of item (2) below and #7876 (now titled for the File and Registry
+    measured. With the check ON, every establishment, re-arm and retry of a non-root Target watch (not a
+    verification) also opens the key by path a second time (the commit-capture confirmation added in the governance
+    fix rounds): one more event with Registry auditing alone and four more with Handle Manipulation also on, per commit.
+    That figure is DERIVED from the by-path-open measurement above, not measured for the confirming open itself. With
+    the check OFF (the default; the interval is fixed at launch of each probe) the confirming read does not run: the
+    name work is one `NtQueryKey` per establishment or re-arm on the handle the probe already holds (a peer measured no
+    audit event for a name query), with no second open, no duplicate and no warning. A deferred and retried verification
+    takes a new duplicate, two more events with Handle Manipulation on. The cost statement of item (2) below and #7876 (now titled for the File and Registry
     mechanisms) apply to the Registry verification by reference, which the owner accepted; the operator levers until the
     runtime switch exists are the boot-time Registry interval (0 = off, the default) and `--spark-disable`, a boot-time
     flag that restarts the agent and switches off all three spark mechanisms. (Before R1) A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
@@ -2085,8 +2089,10 @@ flip, with a red-first test each:
       `DuplicateHandle` and handle-table exhaustion (measured in the Gate 7 probe: `DuplicateHandle` fails fast with
       `ERROR_NO_SYSTEM_RESOURCES` and succeeds again once a handle is freed). R1 only makes it observable: a per-watch
       warn in the agent log once per blind episode, and the test-only counters `verify_name_undecided` and
-      `commit_name_missing`. Closed by R2 item 32 (an undecided result becomes a visible fault after 3 results). Pinned
-      by the case titled "an unreadable held name hides a rename until a verification can read it".
+      `commit_name_missing`. A name whose length an administrator changes between the helper's two reads (the
+      overflow retry) also answers undecided (`0xE0000002`): the same forcing class, the same residual. Closed by R2
+      item 32 (an undecided result becomes a visible fault after 3 results). Pinned by the case titled "an unreadable
+      held name hides a rename until a verification can read it".
     - **UP-3, a deterministic verification phase (INHERITED from the #7836 sampling design; newly relevant under R1's
       name compare; NOT closed).** A verification is due at `commit time + interval`, with no jitter. An administrator
       who can observe one sample (a SACL audit event, or the interval as a boot setting) can swap in a decoy just after it
@@ -2095,9 +2101,6 @@ flip, with a red-first test each:
     - **Rename away and back inside one interval (EXISTING, #7836; the File mechanism has the same class).** The held
       name is back at its commit-time value, so nothing differs. Not closed; R3. Pinned by the case "a parent renamed
       away and back inside one interval is not noticed, a documented residual".
-    - **A verification converted into the re-arm by a concurrent fire (INTRODUCED by R1, narrow).** It carries a
-      duplicate and no confirming read, so its commit-time name is the single first read, and the commit-capture race
-      (below) applies to it. Not closed.
     - **One false fault, self-healing (INTRODUCED by R1).** A link created at the parent after the parent was renamed, and
       a case-only rename of an ancestor, each leave the path resolving to the same key but the exact name compare sees a
       different spelling: one fault, healed at the retry (the case-only class is pinned with an injected name; whether
@@ -2108,7 +2111,11 @@ flip, with a red-first test each:
       one (sec-F1). (2) A rename landing between a probe's open and its first name read used to record the MOVED name as
       the committed name; a commit is now accepted only when a second by-path read agrees with the first, otherwise it is
       retried on the admission backoff, never faulted (sec-F2). What remains of (2) is a flip between those two
-      back-to-back reads, which the next verification catches.
+      back-to-back reads, which the next verification catches. (3) A verification that a concurrent fire converted into
+      the re-arm used to be committed as it stood (it ran no confirming read, so the commit-capture race applied to it,
+      and the fire is attacker-causable by a value write); the second fix round retries it at once as an ordinary re-arm,
+      which gets the confirming read (Gate 8, sec G8-1). Each of (2) and (3) applies while the check is on: with it off
+      no second read is made.
     - **Not measured (kept open):** Windows builds before 26100 (X1: `NtQueryKey` on a `KEY_NOTIFY`-only duplicate was
       measured only on build 26100); a real non-administrator account; the CI runner's own token; a profile unload against
       the mechanism (a standalone probe saw every held handle answer `0xC0000425`, `probes/unload-run5.local.out`,
@@ -2535,8 +2542,8 @@ flip, with a red-first test each:
     PARENT; closing the duplicate does not cancel the original's notify) and found that closing the original while a
     duplicate is alive defers the notify's rundown until the duplicate, the last handle, closes. `DuplicateHandle`
     p99 was 0.4 to 0.9 us over 500 keys and `NtQueryKey(KeyNameInformation)` p50 1.6 to 1.9 us (cost on a healthy hive,
-    P/Invoke overhead included; the claim that taking the duplicate under the pass lock cannot block on a hung hive is an
-    inference from the object model, not a measurement). Audit, on a key whose SACL audits all access for Everyone
+    P/Invoke overhead included; the claim that taking the duplicate under the pass lock cannot block on a hung hive was
+    an inference from the object model when this paragraph was written, and was measured later, see the Gate 7 round). Audit, on a key whose SACL audits all access for Everyone
     (success and failure), two runs of 34 checks each, 34 passed: the duplicate adds no audit events under the
     Registry subcategory alone; if an operator also enables the Handle Manipulation subcategory, each verification
     adds one 4690 and one 4658 for the duplicate (2 events), the audited by-path open itself gains 3 events (4 in total
@@ -2544,7 +2551,7 @@ flip, with a red-first test each:
     (17,280 at 5 s) with Registry auditing alone, and 8,640 (103,680 at 5 s) with Handle Manipulation also on; a
     narrower SACL yields fewer. There is no independent positive control for the Handle Manipulation subcategory, so
     its zeros mean zero observed. Not measured in these runs: establishment and re-arm latency through the real probe job, the name
-    `NtQueryKey` reports through HKCR (measured later the same day, see the next paragraph) or a registry link, a profile unload against the mechanism, and the real
+    `NtQueryKey` reports through HKCR (measured on 2026-11-26, see the Gate 7 round) or a registry link, a profile unload against the mechanism, and the real
     (narrower) SACLs of a fleet.
     **2026-11-25 (later), R1 (#7877 item 31): first Windows rig run of the item 31 code and tests, which was RED, and the
     green runs after the test-side fixes; every rig figure here is author-reported, one box (weecolin, build 26100), not a
@@ -2650,6 +2657,24 @@ flip, with a red-first test each:
     process handle count, two warn cases, and three residual pins), every precondition skip now fails instead of skipping
     when `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS` is set (a CI Windows leg with that flag set will FAIL the HKCR pair if its
     token cannot write `HKLM\SOFTWARE\Classes`, and the link and deny-ACE cases if it cannot create a link or set a DACL).
+    **2026-11-26, R1 governance SECOND fix round (Gate 8); the code and tests changed AFTER the Gate 7 round above, and these
+    bytes have NOT been built or run on Windows when this was written (the first fix round's bytes were on the rig
+    while this round was written; the orchestrator records its result here).** Findings addressed: the confirming read
+    and its deferral now run only while the check is on (the interval is read when each probe is launched, a
+    verification never runs it, and a verification whose duplicate failed is still a verification); the name capture
+    on the already-open handle stays unconditional, so the default agent pays one `NtQueryKey` per establishment or
+    re-arm and nothing else; a verification converted into the re-arm by a fire is no longer committed (sec G8-1, retried
+    at once as an ordinary re-arm that confirms, the grace of its obligation restarting at the retry decision); a watch
+    that recorded no name is announced at its first verification (sec G8-2); a deferred commit has its own
+    once-per-episode warn (sre F3, from the second attempt on, the first being made inside `watch()` which logs nothing);
+    the warn claim compares a per-watch serial as well as the address (sec G8-5); `process_handle_count` fails loudly.
+    Residual, unchanged and still Dave's: UP-1 and UP-3 (Gate 7 decision, no independent adjudicator). The oscillating
+    name length is added to the UP-1 vector list as the same forcing class, not a new decision. The test-only counters
+    `warns_logged_*` were renamed `warns_claimed_*` (counted when the flag is claimed and the log call returned; the
+    sink is not observed except in the two cases that capture the log) and `warns_claimed_commit_unconfirmed` was
+    added. Tests: the establishment-site commit race (one-shot and permanent), the fire-converted verification (accessible
+    and deny-ACE), the interval-0 case with a check-on positive control, the first-verification no-name warn, the warn
+    text, two watches warning independently, and the handle-count case with a warm-up and a positive control.
     **Governance review and the fixes after it (#7836).** A scoped `/governance` run (range `da67bf0371..5731eb0632`, ten
     governance agents; happy-path, compliance-officer and enterprise-readiness were omitted by the caller, and the chaos
     plan was written, not executed) was NOT a pass: it raised 43 findings (REG-01 to REG-43), four of them blocking-provisional

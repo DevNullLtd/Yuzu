@@ -556,8 +556,11 @@ int main(int argc, char* argv[]) {
                    "the canonical names of both; on a key with an auditing SACL that writes "
                    "Security-log events (measured once, on one key: 1 per check with Registry "
                    "auditing alone, 6 with Handle Manipulation auditing also on), and an open "
-                   "per key per interval can evict older events, so leave it at 0 where SACLs "
-                   "audit object access. 1..4 is raised to 5; maximum 86400. Boot-time only, "
+                   "per key per interval can evict older events. With the check on, every "
+                   "establishment and re-arm also opens the key a second time to confirm its "
+                   "name (derived, not measured: one more event, four with Handle Manipulation "
+                   "on); with it off there is no second open. Leave it at 0 where SACLs audit "
+                   "object access. 1..4 is raised to 5; maximum 86400. Boot-time only, "
                    "not a server-side runtime toggle; rollback is to unset it or set 0 and "
                    "restart the agent (nothing persists). "
                    "Env: YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL.")
