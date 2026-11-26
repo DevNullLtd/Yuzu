@@ -25,6 +25,8 @@
 # unhappy-path UP-6). Checking the full discovered set, not a fixed
 # sample, closes that gap regardless of which plugin a future mistake
 # targets.
+# SKIPs (exit 77): no vcpkg_installed/<triplet> dir, or a tree without
+# share/cli11/CLI11Config.cmake (host-tools-only, #6719). Both are silent in CI.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { cd "$(dirname "$0")/../.." && pwd; })"
