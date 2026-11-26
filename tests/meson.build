@@ -4021,6 +4021,16 @@ test('enablement os applicability',
   timeout: 30,
 )
 
+# docs/os-capability-matrix.md has one row per key in each table, and no .md/.json/.yaml/.yml
+# file under docs/, agents/plugins/ or content/ carries a leftover merge-conflict marker.
+# Hermetic - reads sources only.
+test('matrix duplicate rows',
+  _python3_test,
+  args: [files('test_matrix_duplicate_rows.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Wave 11 PR11.2-a: the network_config `routes` instruction definition exists and matches the
 # row the plugin emits (id, dispatch pair, approval mode, platforms, ordered columns). Hermetic.
 test('network_config routes definition',
