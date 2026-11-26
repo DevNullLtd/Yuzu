@@ -2198,6 +2198,8 @@ jobs:
       # function is implicitly success() and could never fire here.
       - name: Symbolise test crash frames
         if: failure()
+        env:
+          BUILDDIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
         run: scripts/ci/symbolise-crash-frames.sh "$BUILDDIR/meson-logs"
 
       # Run every registered migration pilot on the full Linux debug leg.

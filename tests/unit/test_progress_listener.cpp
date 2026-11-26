@@ -66,7 +66,11 @@
 #include <cstring>
 #include <execinfo.h>
 #include <signal.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #endif
 #endif
 
@@ -122,10 +126,9 @@ std::string format_progress_line(long pid, std::string_view body) {
 //    calls testCaseEnded before re-raising into this handler), so "<none>" means between
 //    cases or in teardown. g_case is written on the test thread and read in the handler
 //    without synchronisation (diagnostic only, TSan excluded).
-//  - If stderr is a blocked pipe the write would hang the dying process, so the handler
-//    arms alarm(5) first; SIGALRM's default action then ends it (as SIGALRM, not SIGSEGV).
-//  - If Catch2's own fatal report faults, no [crash] block appears.
-//  - A stall inside the handler is ended by alarm(5), as SIGALRM, not the original signal.
+//  - A stall inside the handler (e.g. stderr is a blocked pipe) is ended by the alarm(5)
+//    armed first; SIGALRM's default action then ends it (as SIGALRM, not the original).
+//  - If Catch2's own fatal report faults, a [crash] block may not appear.
 //  - Frames print as `<path>(+0xOFFSET)` (hidden visibility, no export_dynamic): ci.yml's
 //    "Symbolise test crash frames" step resolves them with addr2line.
 //  - SIGABRT also covers deliberate abort()/std::terminate, so a banner is not always a bug.
@@ -323,14 +326,22 @@ TEST_CASE("crash capture: a raised fatal signal still kills the process by that 
     const pid_t pid = ::fork();
     REQUIRE(pid >= 0);
     if (pid == 0) {
-        // Child: async-signal-safe calls only until _exit.
-        (void)std::freopen("/dev/null", "w", stderr);
+        // Child: kept minimal (the parent may be multithreaded). alarm() makes a wedged
+        // child die as SIGALRM so the parent's waitpid cannot hang; no core file for the
+        // deliberate SIGBUS; stderr to /dev/null via open+dup2 (no stdio locks).
+        (void)::alarm(10);
+        const struct rlimit no_core{0, 0};
+        (void)::setrlimit(RLIMIT_CORE, &no_core);
+        const int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) (void)::dup2(devnull, STDERR_FILENO);
         crash_capture::install();
         (void)::raise(SIGBUS);
         ::_exit(0); // reached only if the handler swallowed the signal
     }
     int status = 0;
-    REQUIRE(::waitpid(pid, &status, 0) == pid);
+    pid_t waited = -1;
+    do { waited = ::waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+    REQUIRE(waited == pid);
     REQUIRE(WIFSIGNALED(status));
     REQUIRE(WTERMSIG(status) == SIGBUS);
 }
