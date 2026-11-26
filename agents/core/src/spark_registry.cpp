@@ -2254,7 +2254,7 @@ private:
     /// for the kind is already claimed. The claim is NOT taken here but in log_staged_warns (at
     /// log time), so a staged line that is never logged (a pass that threw before
     /// run_off_lock, or watch(), which logs nothing) does not consume the watch's warn: the
-    /// next occurrence stages it again. At most one entry per visited watch per pass (see
+    /// next occurrence stages it again. At most two entries per visited watch per pass (see
     /// StagedWarn), so the per-pass reservation bounds it. A failed push_back drops the line
     /// (a lost diagnostic, never a failed pass or commit).
     void stage_warn_locked(SweepWork& work, SweepWork::StagedWarn::Kind kind, RegWatch& w,
@@ -2391,11 +2391,11 @@ private:
                     spdlog::warn("spark_registry: the key name for '{}' could not be confirmed by a "
                                  "second read when the watch was (re)established ({}: the two "
                                  "back-to-back name reads differed, or the second open or read was "
-                                 "refused or failed), so the commit was retried instead of "
-                                 "accepted; the watch is NOT protected against a parent rename and "
-                                 "re-create, and is reported as pending past its grace, until a "
-                                 "commit is confirmed; not logged again for this watch until one "
-                                 "is",
+                                 "refused or failed), so the commit was retried and has not been "
+                                 "accepted; until a commit is confirmed the watch has no "
+                                 "notification coverage and no rename-and-recreate check, and is "
+                                 "reported as pending past its grace; not logged again for this "
+                                 "watch until one is",
                                  ::yuzu::log_key_token(wn.key), wn.what);
                     break;
                 }

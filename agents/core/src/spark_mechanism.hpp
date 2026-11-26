@@ -807,13 +807,14 @@ struct RegistryMechanismTestControls {
     /// (`held == false`), then the CONFIRMING read (`held == false` again), which runs
     /// BEFORE its second by-path open, so a parked test lands a change between the first read
     /// and the second open. With the check OFF there is the fresh read only: no confirming
-    /// read, no second open. The interval is fixed when each probe is launched. A value returned for the confirming read is its name and skips the
-    /// open (it confirms when its status is 0 and the name equals the first read); `nullopt`
-    /// runs the real open and query. A verification (duplicate present, or one whose duplicate
-    /// failed) makes the fresh read, then the held read (`held == true`) when it has a
-    /// duplicate, and no confirming read. Because the first read
-    /// follows the probe's own open, parking the FIRST `held == false` call is how a test
-    /// lands a rename between the open and the read that a confirmed commit must survive.
+    /// read, no second open. The interval is fixed when each probe is launched. A value
+    /// returned for the confirming read is its name and skips the open (it confirms when its
+    /// status is 0 and the name equals the first read); `nullopt` runs the real open and
+    /// query. A verification (duplicate present, or one whose duplicate failed) makes the
+    /// fresh read, then the held read (`held == true`) when it has a duplicate, and no
+    /// confirming read. Because the first read follows the probe's own open, parking the
+    /// FIRST `held == false` call is how a test lands a rename between the open and the read
+    /// that a confirmed commit must survive.
     std::function<std::optional<std::pair<long, std::wstring>>(std::string_view subkey, bool held)>
         name_hook;
     /// The sweeper treats DuplicateHandle of the held key as failed for every verification
@@ -871,12 +872,16 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t commit_name_missing{0};
     /// DuplicateHandle of the held key failed (or `verify_fail_duplicate`) for a verification.
     std::uint64_t verify_dup_failed{0};
-    /// Commits not accepted and retried (#7877 item 31, R1): a probe result whose confirming
-    /// second by-path name read did not agree with the first (or could not be made), on the
-    /// admission schedule; and a verification result that a concurrent fire converted into the
-    /// re-arm, retried at once as an ordinary re-arm (it ran no confirming read). The
-    /// confirming read runs only while the check is on (`path_verify_ms > 0` at launch).
-    /// Counts retries, not watches.
+    /// Commits not accepted and retried (#7877 item 31, R1). It counts BOTH of two different
+    /// causes: an UNCONFIRMED deferral (a probe result whose confirming second by-path name
+    /// read did not agree with the first, or could not be made; retried on the admission
+    /// schedule), and a FIRE-CONVERTED verification retry (a verification result that a
+    /// concurrent fire converted into the re-arm; it ran no confirming read and is retried
+    /// at once as an ordinary re-arm). This counter alone cannot tell a flapping path from a
+    /// benign fire collision: tell them apart by `warns_claimed_commit_unconfirmed` (only the
+    /// first cause warns) and by whether a fire preceded the retry. The confirming read runs
+    /// only while the check is on (`path_verify_ms > 0` at launch). Counts retries, not
+    /// watches.
     std::uint64_t commit_capture_retry{0};
     /// Per-watch warnings (test-only), counted when the per-watch flag was claimed and the log
     /// call returned without throwing (the counter cannot see whether a sink wrote the line):

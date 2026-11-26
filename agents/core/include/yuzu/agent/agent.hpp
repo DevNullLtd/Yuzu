@@ -115,13 +115,14 @@ struct Config {
     // path, duplicates the held handle and reads canonical names, and on a key with an
     // auditing SACL that writes Security-log events (measured once on one key: 1 per check
     // with Registry auditing alone, 6 with Handle Manipulation also on) and can evict older
-    // ones. With the check ON, each establishment, re-arm and retry also opens the key a
-    // second time to confirm its name (derived: one more event, four with Handle
-    // Manipulation on). With it OFF there is no second open: only one name read per
-    // establishment, on the handle already held. Leave it at 0 where SACLs audit object
-    // access. Rollback: unset or 0 and restart the agent, nothing persists. A value of
-    // 1..4 is raised to 5 s; the CLI refuses a negative or a value above 86400. Windows
-    // only: accepted and ignored on Linux and macOS, where there is no Registry mechanism.
+    // ones. With the check ON, each establishment, re-arm and retry of a non-root Target
+    // watch whose first name read succeeds also opens the key a second time to confirm its
+    // name (derived: one more event, four with Handle Manipulation on). With it OFF there
+    // is no second open: only one name read per establishment, on the handle already held.
+    // Leave it at 0 where SACLs audit object access. Rollback: unset or 0 and restart the
+    // agent, nothing persists. A value of 1..4 is raised to 5 s; the CLI refuses a negative
+    // or a value above 86400. Windows only: accepted and ignored on Linux and macOS, where
+    // there is no Registry mechanism.
     // Operator text: docs/user-manual/guaranteed-state.md.
     int spark_registry_path_verify_interval_s{0};
 

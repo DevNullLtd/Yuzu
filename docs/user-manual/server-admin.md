@@ -6960,10 +6960,10 @@ the boot-time opt-in for the Windows Registry spark mechanism's rename check. A 
 including where the setting is ignored, and `--spark-disable` does not bypass that validation. Enabling it re-opens every watched
 registry key every interval, duplicates the held handle and reads canonical names, which on keys with an auditing SACL writes
 Security-log events (measured once on one key: 1 per check with Registry auditing alone, 6 with Handle Manipulation also on;
-leave it at `0` where SACLs audit object access). With it on, every establishment, re-arm and retry also opens the key a
-second time to confirm its name (derived from the by-path open measurement, not measured for this open: one more event, four
-with Handle Manipulation on); with it off there is no second open, only one name read per establishment on the handle already
-held: read
+leave it at `0` where SACLs audit object access). With it on, every establishment, re-arm and retry of a non-root Target
+watch whose first name read succeeds also opens the key a second time to confirm its name (derived from the
+by-path open measurement, not measured for this open: one more event, four with Handle Manipulation on); with it off
+there is no second open, only one name read per establishment on the handle already held: read
 [the Registry paragraph](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only) first. The mechanism is not
 enabled in production. Rollback is to unset the variable (or set it to `0`) and restart the agent: nothing is persisted.
 

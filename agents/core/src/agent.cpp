@@ -1693,9 +1693,10 @@ public:
                         spdlog::info("SparkEngine: Registry path verification: every {} ms "
                                      "(opt-in; floor {} ms){}; each check re-opens every watched "
                                      "Registry key, duplicates the held handle and reads canonical "
-                                     "names, and every establishment and re-arm opens the key a "
-                                     "second time to confirm its name; on an audited key these "
-                                     "write Security-log events (see docs/user-manual/"
+                                     "names, and every establishment, re-arm and retry of a "
+                                     "non-root Target watch whose first name read succeeds opens "
+                                     "the key a second time to confirm its name; on an audited "
+                                     "key these write Security-log events (see docs/user-manual/"
                                      "guaranteed-state.md)",
                                      registry_path_verify.count(), floor_ms, note);
 #else
