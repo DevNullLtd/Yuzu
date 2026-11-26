@@ -33,9 +33,6 @@
  *
  * Paths are joined with '/' on every leg; the Windows leg converts at its own seam
  * (component_legs_win.hpp). By default no directory is excluded by name (an
- * Paths are '/'-joined LABELS: a leg never hands one to the OS (the POSIX legs open by descriptor,
- * the Windows leg by handle, each from the previous directory), so a label need not be an OS path. By
- * default no directory is excluded by name (an
  * OSGi container keeps its bundles in <product>/system, so such names are ordinary application
  * directories); a WalkPolicy::skip_dir may exclude whole trees, and each one is counted.
  * Links and network mounts are never listed; each is counted in its own stat. Any other entry type is
