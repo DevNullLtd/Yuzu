@@ -82,7 +82,7 @@ class LintFires(unittest.TestCase):
         text = "| a | b |\n|---|---|\n| echo | old |\n| echo | new |\n"
         self.assertEqual(len(duplicate_rows(text)), 1)
 
-    def test_summary_rows_that_differ_only_in_the_count(self):
+    def test_summary_rows_whose_keys_differ_only_in_the_count(self):
         text = "| Agent plugins (74) | old |\n| Agent plugins (75) | new |\n"
         self.assertEqual(len(duplicate_rows(text)), 1)
 
