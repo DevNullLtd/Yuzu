@@ -39,7 +39,7 @@
 # which writes the manifest as status.d stanzas, so Trivy reads the packages and
 # the gate treats a listed image that shows packages as covered (it prints a
 # warning that the listing is stale and does not consult the expiry). The reason=
-# text below records the image as approved in #8315 and is kept unchanged. A listing applies only while Trivy sees no OS package. The
+# text below records the image as approved in #8315 and is kept unchanged. The
 # listings stay until a change removes them together with the test that pins
 # each Dockerfile's SLICES to what the scanner reads (#8415); until then a
 # regression to zero packages would pass as not covered. These four listings are
