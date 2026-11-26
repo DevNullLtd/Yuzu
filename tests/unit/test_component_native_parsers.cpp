@@ -758,6 +758,62 @@ TEST_CASE("native_pe: a PE that is not a DLL (a renamed executable) is not a lib
     Rd rd2(broken);
     CHECK_FALSE(describe_windows_file("broken.dll", rd2.fn(), broken.size()).has_value());
     CHECK_FALSE(rd2.bad);
+
+    auto plain = pe_without_resources();
+    put(plain, 64 + 22, 0x0002, 2, false); // an executable with sound headers and no resources
+    Rd rd3(plain);
+    CHECK_FALSE(describe_windows_file("plain.dll", rd3.fn(), plain.size()).has_value());
+}
+
+TEST_CASE("native: a header that states a non-library type gives no library even when later reads fail or throw",
+          "[component_native][component_inventory]") {
+    // The read with index `bad` throws: the header naming the type has already been read.
+    const auto throwing_at = [](const std::string& image, std::size_t bad) -> ReadAt {
+        return [&image, bad, n = std::size_t{0}](std::uint64_t off, std::size_t len) mutable
+                   -> std::optional<std::string> {
+            if (n++ == bad)
+                throw std::runtime_error("boom");
+            return image.substr(static_cast<std::size_t>(off), len);
+        };
+    };
+
+    { // ELF: ET_EXEC with its program-header table past the end, and a throw on that table
+        auto exec = make_elf(true, false, "libfoo.so.1").b;
+        put(exec, 16, 2, 2, false); // ET_EXEC
+        expect_error(native_elf(throwing_at(exec, 2), exec.size()), NativeError::not_library);
+        exec.resize(100);
+        expect_error(run_elf(exec), NativeError::not_library);
+        auto dyn = make_elf(true, false, "libfoo.so.1").b;
+        expect_error(native_elf(throwing_at(dyn, 2), dyn.size()), NativeError::unreadable);
+    }
+    { // thin Mach-O: MH_EXECUTE with its load commands cut, and a throw on them
+        MachoSpec x;
+        x.filetype = 2; // MH_EXECUTE
+        const auto exec = make_macho(x);
+        expect_error(native_macho(throwing_at(exec, 1), exec.size()), NativeError::not_library);
+        expect_error(run_macho(exec.substr(0, 40)), NativeError::not_library);
+        const auto dylib = make_macho(MachoSpec{});
+        expect_error(native_macho(throwing_at(dylib, 1), dylib.size()), NativeError::unreadable);
+    }
+    { // universal: a damaged executable slice is not a gap, a damaged dylib slice is
+        MachoSpec x;
+        x.filetype = 2;
+        auto bad_exec = make_macho(x);
+        put(bad_exec, 16, 5000, 4, false); // ncmds past the reader's cap
+        auto bad_dylib = make_macho(MachoSpec{});
+        put(bad_dylib, 16, 5000, 4, false);
+        for (const bool fat64 : {false, true}) {
+            expect_error(run_macho(make_fat({bad_exec, bad_exec}, fat64)), NativeError::not_library);
+            expect_error(run_macho(make_fat({bad_exec, bad_dylib}, fat64)), NativeError::unreadable);
+        }
+    }
+    { // PE: a throw after the COFF header of an executable, and of a DLL
+        auto exe = pe_without_resources();
+        put(exe, 64 + 22, 0x0002, 2, false);
+        expect_error(native_pe(throwing_at(exe, 2), exe.size()), NativeError::not_library);
+        const auto dll = pe_without_resources();
+        expect_error(native_pe(throwing_at(dll, 2), dll.size()), NativeError::unreadable);
+    }
 }
 
 TEST_CASE("native_pe: not a PE is not a library; a truncated or malformed PE is unreadable and never throws",

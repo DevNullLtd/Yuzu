@@ -372,6 +372,18 @@ TEST_CASE("binary_header_pe: PE32 and PE32+ builder images parse to the exact va
         std::optional<std::uint16_t> flags;
         REQUIRE(read_pe_version(span_source(as_span(img.bytes)), {}, {}, &flags).has_value());
         CHECK(flags == std::uint16_t{0x2022}); // the whole COFF word, not the DLL bit alone
+
+        auto capped = img.bytes;
+        set16(capped, img.L.coff + 2, 0xFFFF); // a section count past the cap, after the word is read
+        flags.reset();
+        const auto r2 = read_pe_version(span_source(as_span(capped)), {}, {}, &flags);
+        REQUIRE_FALSE(r2.has_value());
+        CHECK(r2.error() == ParseError::limit_exceeded);
+        CHECK(flags == std::uint16_t{0x2022});
+
+        const auto cut = img.bytes.substr(0, img.L.coff + 4); // ends inside the COFF header
+        REQUIRE_FALSE(read_pe_version(span_source(as_span(cut)), {}, {}, &flags).has_value());
+        CHECK_FALSE(flags.has_value()); // cleared on entry, never the previous image's word
         check_canonical_values(*r);
     }
 }

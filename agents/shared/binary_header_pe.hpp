@@ -321,9 +321,9 @@ private:
 
 inline constexpr std::uint16_t kImageFileDll{0x2000}; // COFF Characteristics: IMAGE_FILE_DLL
 
-// `coff_characteristics`, when given, is set as soon as the COFF header is read, so a caller can
-// still classify an image whose later headers do not parse; it stays empty when that header cannot
-// be read.
+// `coff_characteristics`, when given, is cleared on entry and set as soon as the COFF header is
+// read, so a caller can still classify an image whose later headers do not parse; it stays empty
+// when that header cannot be read.
 // not_this_format: no MZ header or no PE signature. truncated: an MZ file that ends before
 // e_lfanew or before the PE header it names. A PE with no resource directory or no
 // RT_VERSION entry is a VALUE with has_version == false. The version resource is the first
@@ -333,6 +333,8 @@ read_pe_version(const Source& src, const PeLimits& lim = {}, ReadBudget budget =
                 std::optional<std::uint16_t>* coff_characteristics = nullptr) {
     using namespace pe_detail;
     const auto fail = [](ParseError e) { return std::unexpected(e); };
+    if (coff_characteristics)
+        coff_characteristics->reset();
     Reader rd(src, budget);
 
     // DOS header: "MZ" and e_lfanew at 0x3C.
