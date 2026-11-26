@@ -119,6 +119,28 @@ TEST_CASE("redact_tool_args_for_ticket replaces every secret-bearing value at an
     CHECK(args["secret"] == kSecret);
 }
 
+TEST_CASE("key matching is exact and lower-case: other spellings are NOT redacted (recorded "
+          "residual, widening is a security decision)",
+          "[server][sensitive_params]") {
+    // The header's KEY-SPELLING RESIDUAL. If this test goes red, the matcher was widened: record
+    // that decision in the header and the ledger, do not just update the expectation.
+    for (std::string_view k : {"Secret", "SECRET", "clientSecret", "client-secret", "Client_Secret",
+                               "grantSecret", "GRANT_ID", "password", "token", "my_grant_secret",
+                               "grant_secret_x", " grant_secret", "grant_secret "}) {
+        CAPTURE(k);
+        CHECK_FALSE(is_redacted_instruction_param_key(k));
+        CHECK_FALSE(is_redacted_tool_arg_key(k));
+    }
+    const std::string kValue = "yuzu_test_sentinel_other_spelling";
+    nlohmann::json args = {{"clientSecret", kValue}, {"Secret", kValue}, {"password", kValue}};
+    auto out = redact_tool_args_for_ticket(args);
+    REQUIRE(out.has_value());
+    CHECK(out->dump().find(kValue) != std::string::npos);
+    // The listed spellings still redact.
+    CHECK(is_redacted_tool_arg_key("secret"));
+    CHECK(is_redacted_instruction_param_key("client_secret"));
+}
+
 TEST_CASE("redact_tool_args_for_ticket binds the secret: a different value gives a different "
           "subject, the same value the same",
           "[server][sensitive_params]") {

@@ -4,9 +4,12 @@
  * direct command dispatch bypasses the definition's schema, so this runs before anything else.
  *
  * PARAMETERS (a missing parameter reads as ""):
- *   root     mandatory. Absolute, at most kMaxRootBytes, no NUL, no "//", no "." or ".." component. One
- *            trailing '/' is stripped; "/" is the whole filesystem. A root that is a link, missing or not
- *            a directory is the driver's to answer, from the leg, because that needs the filesystem.
+ *   root     mandatory. The POSIX form (normalise_root): absolute, at most kMaxRootBytes, no NUL, no "//",
+ *            no "." or ".." component. One trailing '/' is stripped; "/" is the whole filesystem. The
+ *            Windows form is the OS shell's own normaliser (file_search_win_rules.hpp), handed to
+ *            parse_request: it answers the same canonical '/'-joined label shape. A root that is a link,
+ *            missing or not a directory is the driver's to answer, from the leg, because that needs the
+ *            filesystem.
  *   pattern  mandatory. The leaf-name glob of file_search_query.hpp ('*' and '?', no regex), compiled with
  *            the leg's name rule.
  *   kinds    files (default), directories or both.
@@ -35,6 +38,8 @@ enum class RequestError {
     root_not_absolute,
     root_too_long,
     root_bad_component,
+    root_unc,         // Windows: a UNC or network root, never searched
+    root_device_path, // Windows: a device or NT-namespace root other than a volume GUID path
     missing_pattern,
     pattern_too_long,
     pattern_too_many_stars,
@@ -58,6 +63,10 @@ enum class RequestError {
         return "root_too_long";
     case RequestError::root_bad_component:
         return "root_bad_component";
+    case RequestError::root_unc:
+        return "root_unc";
+    case RequestError::root_device_path:
+        return "root_device_path";
     case RequestError::missing_pattern:
         return "missing_pattern";
     case RequestError::pattern_too_long:
@@ -84,13 +93,16 @@ enum class RequestError {
 
 /// The longest cursor token accepted: the fs1 token plus the volume prefix around it.
 inline constexpr std::size_t kMaxRequestCursorBytes = fsr::kMaxCursorTokenBytes + 128;
+static_assert(kMaxRequestCursorBytes <= 64 * 1024,
+              "a cursor longer than the server's per-parameter cap (kMaxParamValueLen, bundle_service.hpp) "
+              "could not be passed back on any surface");
 
 struct Request {
     fsr::Query query;   // pattern (compiled), kinds, root (normalised)
     std::string cursor; // empty for the first slice
 };
 
-/// The root a request may carry, normalised, or the reason it may not.
+/// The root a request may carry, normalised, or the reason it may not (the POSIX rule).
 [[nodiscard]] inline std::expected<std::string, RequestError> normalise_root(std::string_view raw) {
     if (raw.empty())
         return std::unexpected(RequestError::missing_root);
@@ -115,10 +127,13 @@ struct Request {
     return root;
 }
 
+/// The root normaliser of an OS: the POSIX rule above, or the Windows one in file_search_win_rules.hpp.
+using RootNormaliser = std::expected<std::string, RequestError> (*)(std::string_view);
+
 [[nodiscard]] inline std::expected<Request, RequestError>
 parse_request(std::string_view root, std::string_view pattern, std::string_view kinds, std::string_view cursor,
-              const fsr::NameSemantics& semantics) {
-    auto r = normalise_root(root);
+              const fsr::NameSemantics& semantics, RootNormaliser normalise = &normalise_root) {
+    auto r = normalise(root);
     if (!r)
         return std::unexpected(r.error());
 

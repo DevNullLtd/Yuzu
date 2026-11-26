@@ -41,7 +41,9 @@ class ComponentInventoryDefinitionColumns(unittest.TestCase):
             self.assertEqual(d["metadata"]["id"], f"crossplatform.components.{action}")
             self.assertEqual(d["spec"]["execution"]["plugin"], "component_inventory")
             self.assertEqual(d["spec"]["parameters"]["properties"], {})
-            self.assertEqual(d["spec"]["platforms"], ["darwin", "linux"])
+            # python and node have no Windows leg yet (planned, #8440): their definitions stay off Windows.
+            want = ["darwin", "linux", "windows"] if action in ("scan", "native") else ["darwin", "linux"]
+            self.assertEqual(d["spec"]["platforms"], want, action)
 
     def test_row_kind_leads_and_the_columns_match_the_wire_row(self):
         for action in ACTIONS:
@@ -55,8 +57,8 @@ class ComponentInventoryDefinitionColumns(unittest.TestCase):
     def test_native_row_grammar_and_closed_version_sources(self):
         cols = {c["name"]: c for c in _definition("native")["spec"]["result"]["columns"]}
         self.assertEqual(cols["kind"]["example"], "native")
-        # The server's closed version_source set (installed_software_v3.hpp) already holds all four.
-        self.assertEqual(cols["version_source"]["values"], ["filename", "elf", "macho", "unreadable"])
+        # The server's closed version_source set (installed_software_v3.hpp) already holds all five.
+        self.assertEqual(cols["version_source"]["values"], ["filename", "elf", "macho", "pe", "unreadable"])
         self.assertEqual(cols["version_source"]["example"], "filename")
         self.assertEqual(_definition("scan")["spec"]["result"]["columns"][4]["values"],
                          ["filename", "pom", "manifest", "unreadable"])

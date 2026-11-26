@@ -3055,6 +3055,16 @@ TEST_CASE("#5547: an inherited latch survives a full_sync that fails to reconcil
     CHECK(r.persisted_generation().value_or(0) == kGen);
 
     // Step 4: a clean full_sync discharges the debt and acknowledges in that same call.
+    //
+    // Settle any arm the earlier steps left pending BEFORE this dispatch. The ledger advances the
+    // generation only when nothing is pending (`can_advance`), and a receipt from step 2 or 3 can
+    // still be in the ledger on a loaded runner, so the read below could see the old generation
+    // (seen once on the nightly coverage leg: `policy_generation() == kNext` failed). That reading
+    // of the failure is inferred from the code, not reproduced. Draining here keeps the
+    // property this step pins intact: the DISPATCH itself, with no maintenance tick after it,
+    // is what acknowledges. Draining after it would mask a regression that only acknowledged
+    // on a tick.
+    drain_until_idle(r);
     r.dispatch(push_bytes({x, a}, kNext));
     CHECK(r.engine->policy_generation() == kNext); // no tick between the dispatch and this read
     REQUIRE(r.persisted_generation().has_value());

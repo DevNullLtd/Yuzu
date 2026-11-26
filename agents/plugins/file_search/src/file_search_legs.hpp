@@ -1,11 +1,16 @@
 /**
  * file_search_legs.hpp -- the seam between the pure slice driver (file_search_driver.hpp) and the OS
- * shells (file_search_posix.cpp). Everything the driver needs from the world is one of these callables, so
- * the driver is proven over fakes and never runs a real process, file, thread or clock in a unit test.
+ * shells (file_search_posix.cpp, file_search_win.cpp, bound through file_search_os.hpp). Everything the
+ * driver needs from the world is one of these callables, so the driver is proven over fakes and never runs
+ * a real process, file, thread or clock in a unit test.
  *
  *   MountReader    the mount table at or under a root and the mounts that contain it.
- *   LegFactory     one filesystem leg per searched unit (the shell builds the POSIX search leg of
- *                  component_legs.hpp with that unit's walk root and prune set).
+ *   LegFactory     one filesystem leg per searched unit (the POSIX shell builds the search leg of
+ *                  component_legs.hpp with that unit's walk root and prune set; the Windows shell builds
+ *                  its handle-relative leg). CALLED ON THE SLICE'S WORKER, inside the bound: no leg code
+ *                  runs before the cursor is authenticated, the slot is taken and the worker is running,
+ *                  and a factory that blocks is a timed-out slice (the slot released, the worker recorded
+ *                  abandoned), never a held slot.
  *   BoundedRunner  runs the slice's work on a worker thread and waits for it for a bounded time; on a
  *                  timeout the worker is left running and ABANDONED. The production binding is
  *                  shared::bounded_call_ex (bounded_wait.hpp).
@@ -38,17 +43,20 @@ namespace yuzu::file_search {
 namespace ci = yuzu::component_inventory;
 
 /// What a matched file turned out to be when opened for its facts, and its extents when the shell read
-/// them. `facts.opened` false: nothing was read and `extents` says failed.
+/// them. `facts.opened` false: size and time read '-'. `extents` is whatever the LEG says, always: the leg
+/// sets `failed` itself when it never reached the extent reader, `unsupported` with a note when it knows
+/// why none can be had; the driver never rewrites it.
 struct FileFacts {
     ci::MatchFacts facts;
     FileExtents extents;
 };
 
 /// One unit's filesystem: the walk's listing seam, the per-match facts and the root check. All three are
-/// required: the driver calls them without a null check.
+/// required: the driver calls them without a null check. `facts` receives the LISTED entry, so a leg sees
+/// its own `leg_hint` and decides from the listing before it opens anything.
 struct UnitLeg {
     ci::FsOps ops;
-    std::function<FileFacts(const std::string& dir, const std::string& name)> facts;
+    std::function<FileFacts(const std::string& dir, const ci::DirEntry& entry)> facts;
     std::function<ci::RootState(const std::string& path)> root_state;
 };
 
