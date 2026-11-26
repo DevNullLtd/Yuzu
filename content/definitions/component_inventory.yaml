@@ -200,7 +200,7 @@ status:
 ## a PE's section table and its three-level resource directory, 256 KiB of version data).
 ## The name and version a file declares are its own claim; no signature is checked. A file whose name matches
 ## but whose header says it is not a shared library gives no row, whatever fails after that. A shared
-## library (or a file that breaks before its header states a type) whose header
+## library (or a file whose file header cannot be read whole) whose header
 ## cannot be read inside those bounds still gives a row, named from its file name, with the version
 ## the file name carries or `unreadable`. Extension-less macOS framework binaries are not read.
 ## The name is the SONAME (Linux) or install name (macOS) without its .so or .dylib suffix and

@@ -1667,7 +1667,7 @@ signatures gives no row. The 5,000-row cap and the default-off kill switch are u
 gives no row (a renamed executable, or a .NET application entry assembly built without the flag, such as `pwsh.dll`), whatever fails after
 that header; it still counts toward the section caps. One cut short before its COFF header is a
 file-name row with `unreadable`. The same rule holds on the other legs: an ELF `e_type` other than
-`ET_DYN`, or a thin Mach-O `filetype` other than `MH_DYLIB`, gives no row once the header has stated
+`ET_DYN`, or a thin Mach-O `filetype` other than `MH_DYLIB`, gives no row once the whole file header has stated
 it; a universal file still gets a file-name row when an unreadable slice is, or may be, a dylib.
 
 **Known limits.** The open, listing and read calls carry no deadline of their own, so the 45 second
