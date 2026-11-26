@@ -96,7 +96,7 @@ class Behaviour(unittest.TestCase):
 
     def test_malformed_manifest_rows_are_refused(self):
         def row(**kw):
-            d = {"kind": "package", "name": "a", "version": "1", "arch": "amd64"}
+            d = {"kind": "package", "name": "ab", "version": "1", "arch": "amd64"}
             d.update(kw)
             return json.dumps(d)
         for bad in (row(name="ab\n"), row(version="1.0\n"), row(arch="amd64\n"), row(name="../x"), row(name="a/b"), row(name="A"), row(version="1\nSource: x"),
