@@ -1628,6 +1628,11 @@ or a bound is reached; the descriptor says so.
 written. `scan` answered `constrained` with `dir_unreadable` at a refused system directory; `native`
 returned exactly 5,000 rows, the row limit.
 
+*Capture, 2026-11-26.* On the same host, elevated, with the `IMAGE_FILE_DLL` filter of the correction
+below: `native` answered 4,992 rows (4,159 with a `pe` version), `constrained` with `dir_unreadable`.
+Of 10,138 `.dll` files under the two trees, 14 were not marked as DLLs and none of them was listed.
+The committed Windows sample is the 2026-11-24 capture and predates the filter.
+
 **Roots (Decision 1).** The 64-bit and 32-bit Program Files directories, named by the shell's
 known-folder lookup and never by an environment variable, on fixed local drives only. A root on a UNC
 path, a mapped network drive, removable or optical media or a RAM drive is dropped and counted in
