@@ -1542,7 +1542,7 @@ deadline would break the one-deadline bound). Reported but not blocking
 (informational tokens on a `supported` row): `root_link_skipped` (a root dropped for a link),
 `link_skipped` (a link met inside a tree, not entered and not listed), `network_fs_skipped` and
 `version_unreadable` (a row whose version no source gives is listed with `version_source` `unreadable`).
-A missing root is skipped silently. A `constrained` answer names its cause alone; the informational
+A missing root is skipped silently on Linux and macOS (Windows answers `constrained`, `dir_unreadable`). A `constrained` answer names its cause alone; the informational
 tokens ride a `supported` row only.
 
 **Fuzz harness.** `tests/fuzz/fuzz_component_zip.cpp` drives the ZIP central-directory reader

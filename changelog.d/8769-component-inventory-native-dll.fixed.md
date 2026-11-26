@@ -1,0 +1,1 @@
+- **`component_inventory`: `native` on Windows lists DLLs only.** A file named `*.dll` whose PE header does not set `IMAGE_FILE_DLL`, such as a renamed executable, no longer gives a row, including when the rest of its headers are damaged.
