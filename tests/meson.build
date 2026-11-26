@@ -1240,8 +1240,17 @@ endif
 # verified to work (on the pre-shard single entry) - see the header comment on the TEST_CASE for detail.
 # check-pg-shard-partition.py pins this same literal as AGENT_REF_SPEC and fails if any
 # shard spec does not end with it, so edit both together (an edit to only one is caught).
+#
+# RE-BALANCE 2026-11-26 (#7877 item 31, R1): the Spark Registry rename-plus-recreate cases
+# (tag [7877], 39 cases, all also [mechanism]) were added to shard B by the [mechanism] tag and
+# took Windows shard B from about 118s to about 159s run alone against its 240s timeout (66%,
+# over the 50% budget in docs/testing/unit-test-conventions.md; author-reported, one box,
+# weecolin build 26100, raw logs local only). Tag [7877] now sits in shard A, the lowest-numbered
+# shard that holds any of those cases' tags, so shard B drops back and shard A takes the
+# roughly 40s: see docs/spark-flip-gate.md (R1 final rig run) for the measured shard figures.
+# A dedicated shard is the longer-term answer and is tracked as a follow-up, not done here.
 agent_shard_suffix = '~[.]~[tsan-heavy]~[flaky-4086]'
-agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime']
+agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime', '7877']
 agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine', 'log_handoff', 'posix_actions']
 _agent_a_terms = []
 _agent_a_excl = ''
