@@ -140,7 +140,9 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 }};
 
 // matrix: docs/os-capability-matrix.md generated block. No row count or change
-// history here: every PR adding a row edited both, so they conflicted.
+// history here: every PR adding a row edited both, so they conflicted. Add a row
+// next to its plugin's other rows (a new plugin: in name order), not at the end:
+// two PRs appending at the end still conflict.
 inline constexpr auto kUnitOs = std::to_array<UnitOsRow>({
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},

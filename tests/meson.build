@@ -3980,8 +3980,9 @@ test('enablement os applicability',
   timeout: 30,
 )
 
-# docs/os-capability-matrix.md has one row per key in each table, and no doc carries a
-# leftover merge-conflict marker. Hermetic - reads sources only.
+# docs/os-capability-matrix.md has one row per key in each table, and no .md/.json/.yaml/.yml
+# file under docs/, agents/plugins/ or content/ carries a leftover merge-conflict marker.
+# Hermetic - reads sources only.
 test('matrix duplicate rows',
   _python3_test,
   args: [files('test_matrix_duplicate_rows.py')],

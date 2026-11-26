@@ -71,12 +71,6 @@ jobs:
       - name: Issue-lifecycle docs hygiene (CLAUDE.md cap, do-not-close.txt)
         run: python3 tests/test_issue_docs.py
 
-      # A "keep both sides" conflict resolution (including one made in the web
-      # editor, where no local hook runs) leaves two rows for one plugin in the
-      # OS capability matrix. plugin_doc_gen.py --check does not see that.
-      - name: Matrix duplicate-row and conflict-marker lint
-        run: python3 -I tests/test_matrix_duplicate_rows.py
-
       # Gateway peer authorization incident advice: every 'restart the gateway'
       # instruction must carry the #5183 caveat and a conditional marker (a
       # gateway restart can wedge released agents). Docs-only PRs skip the
@@ -163,6 +157,12 @@ jobs:
           # behaviour cannot skip silently.
           YUZU_REQUIRE_PWSH_TEST: '1'
         run: python3 -I tests/test_windows_payload_imports.py
+
+      # A "keep both sides" conflict resolution can leave two rows for one plugin
+      # in the OS capability matrix, which plugin_doc_gen.py --check does not see.
+      # Also fails on leftover conflict markers.
+      - name: Matrix duplicate-row and conflict-marker lint
+        run: python3 -I tests/test_matrix_duplicate_rows.py
 
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,

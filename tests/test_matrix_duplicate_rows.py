@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""test_matrix_duplicate_rows.py — catch a "keep both sides" merge resolution.
+"""test_matrix_duplicate_rows.py: catch a "keep both sides" merge resolution.
 
 Two checks:
   1. docs/os-capability-matrix.md: no table repeats a row key. Hand-written
      tables are keyed on the first cell; the generated per-action tables on
      (plugin, action, os). Keys, not whole lines: the two sides of a bad
-     resolution usually differ in text.
+     resolution usually differ in text, and a "(75)" count in a key is ignored
+     for the same reason.
   2. No leftover merge-conflict marker in the docs, plugin or content trees.
      `=======` alone is not matched: it is also a Markdown heading underline.
 
@@ -22,6 +23,7 @@ MATRIX = REPO_ROOT / "docs" / "os-capability-matrix.md"
 MARKER_ROOTS = ("docs", "agents/plugins", "content")
 MARKER_SUFFIXES = {".md", ".json", ".yaml", ".yml"}
 MARKER_RE = re.compile(r"^(<{7}|\|{7}|>{7})( |$)")
+COUNT_RE = re.compile(r"\(\d+\)")
 GENERATED_HEADING = "## Generated:"
 
 
@@ -36,7 +38,7 @@ def duplicate_rows(text: str) -> list[str]:
             seen = {}  # the table ended
             continue
         cells = [c.strip() for c in line.split("|")[1:]]
-        key = tuple(cells[: 3 if generated else 1])
+        key = tuple(COUNT_RE.sub("(N)", c) for c in cells[: 3 if generated else 1])
         if all(set(c) <= set("-: ") for c in key):
             continue  # separator row, or a blank first cell
         if key in seen:
@@ -51,6 +53,8 @@ def conflict_markers(text: str) -> list[int]:
 
 
 class MatrixDuplicateRows(unittest.TestCase):
+    maxDiff = None  # list every location, not a truncated diff
+
     def test_matrix_has_no_repeated_row_key(self):
         self.assertEqual(
             duplicate_rows(MATRIX.read_text(encoding="utf-8")), [],
@@ -59,6 +63,8 @@ class MatrixDuplicateRows(unittest.TestCase):
         )
 
     def test_no_leftover_conflict_markers(self):
+        for root in MARKER_ROOTS:
+            self.assertTrue((REPO_ROOT / root).is_dir(), f"scan root is missing: {root}")
         bad = [
             f"{path.relative_to(REPO_ROOT)}:{n}"
             for root in MARKER_ROOTS
@@ -74,6 +80,10 @@ class LintFires(unittest.TestCase):
 
     def test_hand_table_keyed_on_first_cell(self):
         text = "| a | b |\n|---|---|\n| echo | old |\n| echo | new |\n"
+        self.assertEqual(len(duplicate_rows(text)), 1)
+
+    def test_summary_rows_that_differ_only_in_the_count(self):
+        text = "| Agent plugins (74) | old |\n| Agent plugins (75) | new |\n"
         self.assertEqual(len(duplicate_rows(text)), 1)
 
     def test_same_key_in_two_tables_is_allowed(self):
