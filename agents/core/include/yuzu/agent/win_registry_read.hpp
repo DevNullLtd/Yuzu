@@ -18,6 +18,9 @@
  * plugin, never operator input, parameter text or data read from the host. A consumer that needs a
  * host-derived path brings its own validation and review.
  *
+ * A name holding a NUL would be cut at the Win32 call and read something else, so it is refused
+ * with win_error 87: in the subkey or a value name the whole request, in a child name that child.
+ *
  * Residual: children are enumerated by index, so a key that is changing during the read can have a
  * child skipped or repeated.
  *
@@ -38,7 +41,7 @@
 
 namespace yuzu::agent::win {
 
-/// What to read. All text is UTF-8.
+/// What to read. All text is UTF-8; a subkey or value name holding a NUL is refused (87).
 struct RegRequest {
     std::string hklm_subkey;              ///< non-empty, relative to HKEY_LOCAL_MACHINE
     std::vector<std::string> value_names; ///< at most kMaxRegValueNames; "" is the default value
@@ -82,10 +85,10 @@ inline constexpr std::size_t kMaxRegChildren = 256;
 inline constexpr std::size_t kMaxRegValueBytes = 64 * 1024;
 inline constexpr std::size_t kMaxRegTotalBytes = 1024 * 1024; ///< value data of one request
 
-/// The requested values, in ONE bounded call. An empty subkey or more than kMaxRegValueNames names
-/// is answered with win_error = 87 (ERROR_INVALID_PARAMETER) and nothing is read. Non-Windows
-/// builds answer Completed with win_error = 120 (ERROR_CALL_NOT_IMPLEMENTED). Out-of-line
-/// (agent-core only).
+/// The requested values, in ONE bounded call. An empty subkey, more than kMaxRegValueNames names
+/// or a NUL in the subkey or a name is answered with win_error = 87 (ERROR_INVALID_PARAMETER) and
+/// nothing is read. Non-Windows builds answer Completed with win_error = 120
+/// (ERROR_CALL_NOT_IMPLEMENTED). Out-of-line (agent-core only).
 YUZU_EXPORT RegRead read_hklm_values(const RegRequest& request, std::chrono::milliseconds deadline);
 
 /// Test seam: same driver and process-wide slot, injected reader. The reader must own everything

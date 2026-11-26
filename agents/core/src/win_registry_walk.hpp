@@ -154,7 +154,12 @@ bool walk_values(const RegRequest& request, Ops& ops, std::size_t& total, RegKey
 /// The whole read of one request. `status` is left to the bounded driver.
 template <typename Ops> RegRead walk_registry(const RegRequest& request, Ops& ops) {
     RegRead out;
-    if (request.hklm_subkey.empty() || request.value_names.size() > kMaxRegValueNames) {
+    // A name holding a NUL would be cut at the Win32 call and read something else.
+    const auto has_nul = [](const auto& name) {
+        return name.find('\0') != name.npos;
+    };
+    if (request.hklm_subkey.empty() || request.value_names.size() > kMaxRegValueNames ||
+        has_nul(request.hklm_subkey) || std::ranges::any_of(request.value_names, has_nul)) {
         out.win_error = kErrorInvalidParameter;
         return out;
     }
@@ -184,8 +189,9 @@ template <typename Ops> RegRead walk_registry(const RegRequest& request, Ops& op
         }
         RegKeyValues& entry = out.keys.emplace_back();
         entry.child = yuzu::shared::binary_header::utf16_to_utf8(child);
-        // A child deleted since it was listed, or refused, is reported and the walk goes on.
-        entry.win_error = ops.open_child(child, access);
+        // A child deleted since it was listed, refused, or holding a NUL (never opened) is
+        // reported and the walk goes on.
+        entry.win_error = has_nul(child) ? kErrorInvalidParameter : ops.open_child(child, access);
         if (entry.win_error == 0 && !walk_values(request, ops, total, entry, out.truncated))
             break;
     }

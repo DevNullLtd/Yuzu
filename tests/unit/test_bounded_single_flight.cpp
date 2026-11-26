@@ -415,6 +415,13 @@ TEST_CASE("drain_net_pages stops at the entry past max_entries", "[bounded_os_ca
     const auto exact = drain_script(3, {{0, 3, {1, 2, 3}}}, calls);
     CHECK(exact.items.size() == 3);
     CHECK_FALSE(exact.truncated);
+
+    // A more-data page that fills the cap: cut, and no further page is asked for.
+    const auto filled = drain_script(3, {{234, 3, {1, 2, 3}}}, calls);
+    CHECK(filled.items == std::vector<int>{1, 2, 3});
+    CHECK(filled.truncated);
+    CHECK(filled.nerr == 0);
+    CHECK(calls == 1);
 }
 
 TEST_CASE("drain_net_pages ends a pager that makes no progress", "[bounded_os_call][agent]") {

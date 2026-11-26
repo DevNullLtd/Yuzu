@@ -12,6 +12,13 @@ namespace yuzu::users {
 
 inline constexpr std::chrono::milliseconds kLocalUsersToolBudget{30000};
 
+/// True when the budget cut a tool's deadline below `per_call`: a tool that then hits it was
+/// stopped by the budget, not by its own deadline.
+[[nodiscard]] inline bool deadline_shortened(std::chrono::milliseconds deadline,
+                                             std::chrono::milliseconds per_call) {
+    return deadline < per_call;
+}
+
 class ToolBudget {
 public:
     ToolBudget(std::chrono::steady_clock::time_point start, std::chrono::milliseconds total)

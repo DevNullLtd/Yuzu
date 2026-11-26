@@ -7,7 +7,10 @@ Over agents/plugins/**/*.{cpp,hpp,mm}, with comments and string/char literals bl
   (b) no include of the agent-core driver bounded_single_flight.hpp, and no use of a *_for_test
       seam declared in agents/core/include/yuzu/agent/win_*.hpp;
   (c) the per-file count of `bounded_call*(` sites equals GRANDFATHERED. A new file or a higher
-      count fails; a lower count fails until the table is lowered, so the freeze only ratchets down.
+      count fails; a lower count fails until the table is lowered, so the freeze only ratchets down;
+  (d) each WIRED site keeps the text that handles a bounded answer, in shells no unit test reaches:
+      shares' unanswered page, users' "did not complete" returns, and the tool budget's deadline on
+      the per-account tools.
 
 Stated limits: a wrapper whose name does not start with `bounded_call` is not seen, nor is a call
 with explicit template arguments (`bounded_call_ex<F>(`); (a) matches the listed spellings only;
@@ -48,6 +51,23 @@ GRANDFATHERED = {
     "procfetch/src/procfetch_plugin.cpp": 1,
     "windows_updates/src/windows_updates_plugin.cpp": 1,
 }
+
+# (d) (file, what starts a site, what must follow it, how many sites there are).
+WIRED = (
+    ("shares/src/shares_win.cpp", r"\bread_share_page\s*\(",
+     r"[^{}]*\bpage\.unanswered\s*=\s*yuzu::agent::bounded_cause\s*\(\s*read\.status\s*\)\s*;", 1),
+    ("users/src/users_plugin.cpp",
+     r"\bread_(?:wts_sessions|local_users|local_group_members)\s*\(",
+     r"[^;]*;\s*if\s*\(\s*yuzu::agent::forward_bounded_failure\s*\(\s*ctx\s*,\s*read\.status\b"
+     r"[^;{]*(?:\{[^{}]*)?\breturn\s+1\s*;", 5),
+    ("users/src/users_plugin.cpp", r"\brun_account_tool\s*\(\s*ctx\s*,",
+     r"\s*\{[^{}]*\}\s*,\s*\*deadline\s*,", 4),
+    ("users/src/users_plugin.cpp", r"\bToolOutcome\s+run_account_tool\s*\(",
+     r"[^{}]*\{\s*auto\s+out\s*=\s*run_tool\s*\(\s*std::move\(argv\)\s*,\s*0\s*,\s*deadline\s*\)", 1),
+    # ... and every such `deadline` comes from the budget.
+    ("users/src/users_plugin.cpp",
+     r"\bdeadline\s*=\s*(?:tool_deadline\s*\(\s*\)|budget\.next_deadline\s*\()", "", 5),
+)
 
 SITE = re.compile(r"\bbounded_call\w*\s*\(")
 BANNED_CALL = re.compile(r"\b(" + "|".join(BANNED) + r")\s*\(")
@@ -102,6 +122,12 @@ def problems(srcs, table, seam_names):
         elif have < frozen:
             found.append(f"{name}: {have} bounded_call sites, {frozen} frozen: lower "
                          "GRANDFATHERED (and the table in ADR-3008)")
+    for name, site, then, expected in WIRED:
+        code = blank(srcs.get(name, ""))
+        sites, handled = (len(re.findall(p, code)) for p in (site, site + then))
+        if (sites, handled) != (expected, expected):
+            found.append(f"{name}: {handled} of {sites} `{site}` sites are handled, {expected} "
+                         "expected: keep the bounded-answer wiring (ADR-3008)")
     return found
 
 
@@ -141,6 +167,27 @@ class BoundedOsCall(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assert_flagged(name, needle, edits=self.append(name, line))
+
+    def test_selftest_dropped_wiring_is_caught(self):
+        shares, users = "shares/src/shares_win.cpp", "users/src/users_plugin.cpp"
+        guard = r"if \(yuzu::agent::forward_bounded_failure\("
+        # (file, what to break, its replacement, how often it occurs): one occurrence at a time.
+        for name, pattern, replacement, expected in (
+            (shares, r"page\.unanswered = [^;]*;", "", 1),
+            (users, r"(?s)" + guard + r".*?return 1;(?:\n    \})?", "", 5),
+            (users, r"(?s)(" + guard + r".*?)return 1;", r"\1", 5),
+            (users, r"\*deadline,", "kUsersCmdDeadline,", 4),
+            (users, r"std::move\(argv\), 0, deadline", "std::move(argv)", 1),
+            (users, r"deadline =\s+(?:tool_deadline|budget\.next_deadline)\(", "deadline = f(", 5),
+        ):
+            src = self.srcs[name]
+            matches = list(re.finditer(pattern, src))
+            self.assertEqual(len(matches), expected, pattern)
+            for m in matches:
+                with self.subTest(pattern=pattern, at=m.start()):
+                    edit = src[:m.start()] + m.expand(replacement) + src[m.end():]
+                    got = self.run_gate(edits={name: edit})
+                    self.assertTrue(got and all(g.startswith(name + ":") for g in got), got)
 
     def test_selftest_the_table_only_ratchets_down(self):
         name = "processes/src/processes_plugin.cpp"

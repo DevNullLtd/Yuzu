@@ -83,12 +83,15 @@ covers the wait for the slot and the call together.
   `forward_bounded_failure()` writes `<prefix>:<cause>`; `shares` and `filesystem_posture` carry the
   same cause token through their own status writers.
 - Echo skips the tick on a user or mapped-drive read that did not complete, and keeps its baseline.
-- Completeness is separate from the deadline. A read that stopped at an entry cap or a page bound
-  (`truncated`, `no_progress`) is partial: reporting actions write the rows and mark them
-  `CONSTRAINED` + `PARTIAL`, and Echo skips the tick and keeps its baseline.
+- Completeness is separate from the deadline. An agent-core read that stopped at an entry cap or a
+  page bound is `Completed` with `truncated` or `no_progress` set, and it is partial: reporting
+  actions write the rows and mark them `CONSTRAINED` + `PARTIAL`, and Echo skips the tick and keeps
+  its baseline.
 - `local_admins` and `group_members` write no member rows when a NetAPI call failed.
-- `shares.list` pages inside the plugin: its row cap keeps the rows, while a listing that stops
-  advancing, or has an unanswered page, discards them.
+- `shares.list` pages inside the plugin (`read_share_page` answers one page and carries neither
+  flag). Its paging rule predates this decision and is unchanged: the row cap keeps the rows; a
+  listing that stops advancing, or has an unanswered page, writes no share rows and still reports
+  `CONSTRAINED` + `PARTIAL`.
 - How a plugin reports an OS error that a call answered with is not decided here.
 
 ### D5. The plugin boundary

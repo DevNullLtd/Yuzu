@@ -61,7 +61,7 @@ template <typename T> struct NetPage {
 /// Every page of one enumeration.
 template <typename T> struct Drained {
     std::uint32_t nerr = 0;   ///< status of a failed call, else 0; never 234 (ERROR_MORE_DATA)
-    bool truncated = false;   ///< more than max_entries entries; the rest were dropped
+    bool truncated = false;   ///< cut: the entry past the cap, or a more-data page that fills it
     bool no_progress = false; ///< the pages stopped advancing, or reached kMaxNetPages
     std::vector<T> items;
 };
@@ -70,10 +70,10 @@ template <typename T> struct Drained {
 inline constexpr unsigned kMaxNetPages = 4096;
 
 /// Calls `next_page()`, which returns a NetPage<T>, until a page answers status 0. The drain ends
-/// early, keeping the entries already taken, at a failed page (nerr), at the entry past
-/// `max_entries` (truncated), and at an ERROR_MORE_DATA page that read nothing or is the
-/// kMaxNetPages-th (no_progress), so a provider that always has more cannot spin an abandoned
-/// worker for ever.
+/// early, keeping the entries already taken, at a failed page (nerr), at the entry past the cap,
+/// or a more-data page that fills it (truncated; the cap is `max_entries`), and at an
+/// ERROR_MORE_DATA page that read nothing or is the kMaxNetPages-th (no_progress), so a provider
+/// that always has more cannot spin an abandoned worker for ever.
 template <typename T, typename PageFn>
 Drained<T> drain_net_pages(std::size_t max_entries, PageFn next_page) {
     constexpr std::uint32_t kMoreData = 234; // ERROR_MORE_DATA
@@ -93,6 +93,10 @@ Drained<T> drain_net_pages(std::size_t max_entries, PageFn next_page) {
         }
         if (page.status == 0)
             return out;
+        if (out.items.size() >= max_entries) { // full, and more to come: no further call
+            out.truncated = true;
+            return out;
+        }
         if (page.raw_count == 0 || pages >= kMaxNetPages) {
             out.no_progress = true;
             return out;

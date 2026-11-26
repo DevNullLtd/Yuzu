@@ -187,8 +187,8 @@ spec:
         example: jsmith
         platforms: [windows, linux, darwin]
       - name: enabled
-        type: bool
-        description: 'Whether the account is enabled. Values: true, false.'
+        type: string
+        description: 'Whether the account is enabled; macOS reports unknown when it did not read the login shell. Values: true, false, unknown.'
         example: "true"
         platforms: [windows, linux, darwin]
       - name: last_logon

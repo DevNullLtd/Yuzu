@@ -274,11 +274,12 @@ TEST_CASE("decode_reg_value: numbers and other types", "[bounded_os_call][agent]
     }
 }
 
-TEST_CASE("walk_registry refuses a request over the caps without an Ops call",
+TEST_CASE("walk_registry refuses a request over the caps or holding a NUL without an Ops call",
           "[bounded_os_call][agent]") {
     for (const RegRequest& request :
          {RegRequest{"SOFTWARE", std::vector<std::string>(65, "name-a")},
-          RegRequest{"", {"name-a"}}}) {
+          RegRequest{"", {"name-a"}}, RegRequest{std::string{"SOFT\0WARE", 9}, {"name-a"}},
+          RegRequest{"SOFTWARE", {"name-a", std::string{"name\0b", 6}}}}) {
         FakeOps ops;
         const auto r = walk_registry(request, ops);
         CHECK(r.win_error == 87);
@@ -360,6 +361,20 @@ TEST_CASE("walk_registry goes on past a child that cannot be opened", "[bounded_
     CHECK(r.keys[2].win_error == 0);
     REQUIRE(r.keys[2].values.size() == 1);
     CHECK(r.keys[2].values.front().present);
+}
+
+TEST_CASE("walk_registry never opens a child whose name holds a NUL", "[bounded_os_call][agent]") {
+    FakeOps ops;
+    ops.children = {u"a", std::u16string{u"b\0x", 3}, u"c"};
+    ops.values["name-a"] = {3, {1}};
+    const auto r = walk_registry({"SOFTWARE", {"name-a"}, true}, ops);
+    CHECK(r.win_error == 0);
+    CHECK_FALSE(r.truncated);
+    CHECK(ops.opened == std::vector<std::u16string>{u"a", u"c"});
+    REQUIRE(r.keys.size() == 3);
+    CHECK(r.keys[1].win_error == 87);
+    CHECK(r.keys[1].values.empty());
+    CHECK(r.keys[2].values.size() == 1);
 }
 
 TEST_CASE("walk_registry keeps what it read when enumeration fails", "[bounded_os_call][agent]") {

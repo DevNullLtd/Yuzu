@@ -16,12 +16,13 @@
  *
  * HOW A READ ENDS
  * ---------------
- * nerr is 0 when the pages ran out, when the list was cut at kMaxLocalAccounts (truncated) and
- * when the pages stopped advancing (a page with no entries, or the 4,096th page: no_progress), so
- * ERROR_MORE_DATA (234) is never a terminal nerr. Any other status is in nerr, with the entries of
- * earlier pages kept. The page bound means a provider that keeps answering ERROR_MORE_DATA cannot
- * spin the worker after its caller has timed out. A list is complete ONLY when status ==
- * Completed, nerr is 0 and neither truncated nor no_progress is set.
+ * nerr is 0 when the pages ran out, when the list was cut at kMaxLocalAccounts (truncated: the
+ * entry past the cap, or a more-data page that fills it) and when the pages stopped advancing (a
+ * page with no entries, or the 4,096th page: no_progress), so ERROR_MORE_DATA (234) is never a
+ * terminal nerr. Any other status is in nerr, with the entries of earlier pages kept. The page
+ * bound means a provider that keeps answering ERROR_MORE_DATA cannot spin the worker after its
+ * caller has timed out. A list is complete ONLY when status == Completed, nerr is 0 and neither
+ * truncated nor no_progress is set.
  */
 
 #include <yuzu/agent/bounded_status.hpp>
@@ -47,7 +48,7 @@ struct LocalUser {
 struct LocalUsersRead {
     BoundedStatus status = BoundedStatus::Rejected;
     std::uint32_t nerr = 0;       ///< NET_API_STATUS of a failed call, else 0
-    bool truncated = false;       ///< more than kMaxLocalAccounts accounts; the rest were dropped
+    bool truncated = false;       ///< cut at kMaxLocalAccounts (see HOW A READ ENDS)
     bool no_progress = false;     ///< the pages stopped advancing before the end of the list
     std::vector<LocalUser> users; ///< every account collected, whatever nerr says
 };
@@ -60,9 +61,9 @@ struct GroupMember {
 
 struct GroupMembersRead {
     BoundedStatus status = BoundedStatus::Rejected;
-    std::uint32_t nerr = 0;   ///< NET_API_STATUS of a failed call, else 0
-    bool truncated = false;   ///< more than kMaxLocalAccounts members; the rest were dropped
-    bool no_progress = false; ///< the pages stopped advancing before the end of the list
+    std::uint32_t nerr = 0;           ///< NET_API_STATUS of a failed call, else 0
+    bool truncated = false;           ///< cut at kMaxLocalAccounts (see HOW A READ ENDS)
+    bool no_progress = false;         ///< the pages stopped advancing before the end of the list
     std::vector<GroupMember> members; ///< every member collected, whatever nerr says
 };
 

@@ -164,6 +164,24 @@ ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0,
     }
     return ToolOutcome{std::move(output), std::move(res)};
 }
+
+/// One per-account tool of local_users, under a deadline from the tool budget. A tool that hits a
+/// deadline the budget shortened counts as skipped: `tool_skipped` is set, nothing is forwarded
+/// and its output is dropped, so its field stays unread. Every other runner failure is forwarded,
+/// the first one winning.
+ToolOutcome run_account_tool(yuzu::CommandContext& ctx, std::vector<std::string> argv,
+                             std::chrono::milliseconds deadline, bool& status_forwarded,
+                             bool& tool_skipped) {
+    auto out = run_tool(std::move(argv), 0, deadline);
+    if (out.res.termination_reason == yuzu::agent::TerminationReason::deadline &&
+        yuzu::users::deadline_shortened(deadline, kUsersCmdDeadline)) {
+        tool_skipped = true;
+        out.output.clear();
+    } else if (!status_forwarded) {
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, out.res);
+    }
+    return out;
+}
 #endif // !_WIN32
 
 #ifdef _WIN32
@@ -535,9 +553,8 @@ int do_local_users(yuzu::CommandContext& ctx) {
             // plugin. `| tail -1` is replicated below, in-process: max_lines
             // caps the FIRST N lines, which would invert `tail`'s "last
             // line" selection.
-            auto res = run_tool({lastlog_path, "-u", user}, 0, *deadline);
-            if (!status_forwarded)
-                status_forwarded = yuzu::agent::forward_runner_failure(ctx, res.res);
+            auto res = run_account_tool(ctx, {lastlog_path, "-u", user}, *deadline,
+                                        status_forwarded, tool_skipped);
             std::istringstream ll_ss(res.output);
             std::string ll_line;
             while (std::getline(ll_ss, ll_line)) {
@@ -638,34 +655,36 @@ int do_local_users(yuzu::CommandContext& ctx) {
             if (const auto deadline = tool_deadline()) {
                 // sink: users/do_local_users#3 — `dscl . -read UserShell` reads
                 // one account's login shell.
-                auto shell_res = run_tool(
-                    {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "UserShell"}, 0,
-                    *deadline);
-                if (!status_forwarded)
-                    status_forwarded = yuzu::agent::forward_runner_failure(ctx, shell_res.res);
-                auto& shell = shell_res.output;
-                // Extract second field (the shell path) without piping to awk
-                bool enabled = true;
-                auto sp = shell.find(' ');
-                if (sp != std::string::npos) {
-                    auto shell_path = shell.substr(sp + 1);
-                    while (!shell_path.empty() && shell_path.front() == ' ')
-                        shell_path.erase(shell_path.begin());
-                    enabled = shell_path.find("false") == std::string::npos &&
-                              shell_path.find("nologin") == std::string::npos;
+                auto shell_res = run_account_tool(
+                    ctx,
+                    {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "UserShell"},
+                    *deadline, status_forwarded, tool_skipped);
+                // Only an answered read decides: a killed or failed dscl leaves "unknown".
+                if (shell_res.res.termination_reason == yuzu::agent::TerminationReason::exited &&
+                    shell_res.res.exit_code == 0) {
+                    auto& shell = shell_res.output;
+                    // Extract second field (the shell path) without piping to awk
+                    bool enabled = true;
+                    auto sp = shell.find(' ');
+                    if (sp != std::string::npos) {
+                        auto shell_path = shell.substr(sp + 1);
+                        while (!shell_path.empty() && shell_path.front() == ' ')
+                            shell_path.erase(shell_path.begin());
+                        enabled = shell_path.find("false") == std::string::npos &&
+                                  shell_path.find("nologin") == std::string::npos;
+                    }
+                    enabled_state = enabled ? "true" : "false";
                 }
-                enabled_state = enabled ? "true" : "false";
             }
 
             std::string desc;
             if (const auto deadline = tool_deadline()) {
                 // sink: users/do_local_users#4 — `dscl . -read RealName` reads
                 // one account's display name.
-                auto desc_res = run_tool(
-                    {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "RealName"}, 0,
-                    *deadline);
-                if (!status_forwarded)
-                    status_forwarded = yuzu::agent::forward_runner_failure(ctx, desc_res.res);
+                auto desc_res = run_account_tool(
+                    ctx,
+                    {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "RealName"},
+                    *deadline, status_forwarded, tool_skipped);
                 auto& desc_raw = desc_res.output;
                 // Extract real name: skip first line ("RealName:"), trim leading space
                 auto nl = desc_raw.find('\n');
@@ -707,10 +726,9 @@ int do_local_users(yuzu::CommandContext& ctx) {
                 // only English day/month names) — /usr/bin/env is a plain
                 // exec wrapper, not an interpreter, so this stays rung 2
                 // with no shell involved.
-                auto last_res = run_tool({"/usr/bin/env", "LC_ALL=C", last_path, "-y", "-1", user},
-                                         0, *deadline);
-                if (!status_forwarded)
-                    status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
+                auto last_res =
+                    run_account_tool(ctx, {"/usr/bin/env", "LC_ALL=C", last_path, "-y", "-1", user},
+                                     *deadline, status_forwarded, tool_skipped);
                 auto& last_out = last_res.output;
                 bool saw_record = false;
                 std::istringstream last_ss(last_out);

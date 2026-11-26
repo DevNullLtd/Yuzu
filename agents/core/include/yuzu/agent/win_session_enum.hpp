@@ -37,7 +37,7 @@ struct SmbSessionsRead {
     BoundedStatus status = BoundedStatus::Rejected;
     std::uint32_t nerr = 0;   ///< status of a failed call, else 0; never 234 (ERROR_MORE_DATA)
     bool no_progress = false; ///< the pages stopped advancing, or reached the page cap
-    bool truncated = false;   ///< more than max_entries sessions; the rest were dropped
+    bool truncated = false;   ///< cut: the entry past the cap, or a more-data page that fills it
     std::vector<SmbSession> sessions;
 };
 
@@ -45,8 +45,8 @@ struct SmbSessionsRead {
 inline constexpr std::chrono::milliseconds kSmbSessionsDeadline{5000};
 
 /// Drains NetSessionEnum at level 502 or 10 (every page, in ONE bounded call), keeping at most
-/// `max_entries` sessions. `sessions` is complete only when status is Completed, nerr is 0 and
-/// neither no_progress nor truncated is set. Any other level answers nerr 124
+/// `max_entries` sessions (the cap). `sessions` is complete only when status is Completed, nerr is
+/// 0 and neither no_progress nor truncated is set. Any other level answers nerr 124
 /// (ERROR_INVALID_LEVEL) without a call.
 /// Non-Windows builds answer Completed with nerr 120 (ERROR_CALL_NOT_IMPLEMENTED). Out-of-line
 /// (agent-core only).
